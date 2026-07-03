@@ -965,7 +965,7 @@ class PostureObserver:
 
     # ---- arc-context input (P0.5 Slice 2) ---------------------------------
 
-    def _read_lss_one_liner(self) -> str:
+    async def _read_lss_one_liner(self) -> str:
         """Best-effort read of the most-recent LastSessionSummary one-liner.
 
         Returns ``""`` when LSS is unavailable, the helper raises, or no
@@ -976,7 +976,7 @@ class PostureObserver:
                 get_default_summary,
             )
             lss = get_default_summary(self._root)
-            line = lss.format_for_prompt() or ""
+            line = await lss.format_for_prompt() or ""
             return str(line)
         except Exception:
             return ""
@@ -1033,7 +1033,7 @@ class PostureObserver:
         # adjustment fires only when JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED=true.
         arc_ctx = None
         try:
-            lss_one_liner = self._read_lss_one_liner()
+            lss_one_liner = await self._read_lss_one_liner()
             arc_ctx = build_arc_context(self._root, lss_one_liner=lss_one_liner)
         except Exception:
             logger.debug("[PostureObserver] arc_context build skipped", exc_info=True)

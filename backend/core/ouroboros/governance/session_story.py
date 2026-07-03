@@ -237,7 +237,10 @@ def aggregate_session_story(
         return []
 
     try:
-        records = summary.load(n_sessions=n)
+        # fs-hot-tier Batch 3 (row 18): load() is now async (offloaded
+        # rglob) — this module's public API stays synchronous;
+        # load_sync() bridges via asyncio.run(), fail-soft.
+        records = summary.load_sync(n_sessions=n)
     except Exception:  # noqa: BLE001
         logger.debug(
             "session_story: load failed", exc_info=True,

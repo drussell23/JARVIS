@@ -969,14 +969,33 @@ class DeepAnalysisSensor:
 
     async def scan_once(self) -> List[DeepAnalysisFinding]:
         """One analysis cycle. Public so operators / tests can drive
-        the sensor synchronously."""
-        findings = await asyncio.get_event_loop().run_in_executor(
-            None, run_all_analyzers, self._root,
-        ) if False else _run_sync(self._root)
-        # (Ran synchronously in-thread — analyzers are already fast;
-        # the executor hop adds latency without benefit. The ``if False``
-        # branch keeps the comment locus for future async-dispatch work.)
-        findings = _run_sync(self._root)
+        the sensor synchronously.
+
+        fs-hot-tier Batch 3 (row 17): ``run_all_analyzers`` (rglob +
+        4 analyzers that AST-parse every repo ``.py`` file — pure-
+        Python CPU work that HOLDS the GIL) is dispatched off the
+        asyncio loop via ``cooperative_fs_io.offload(cpu_bound=True)``
+        — the bounded process pool, not a thread (a thread would still
+        block the loop for the duration of the AST-parse pass). This
+        replaces the prior dead unreachable-ternary executor stub
+        (which used the contested default pool) plus the redundant
+        duplicate synchronous call that followed it.
+        """
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+        result = await offload(
+            run_all_analyzers, repo_root=self._root, cpu_bound=True,
+        )
+        if is_offload_error(result):
+            logger.debug(
+                "[DeepAnalysis] scan_once offload failed for repo=%s "
+                "— degrading to empty finding list", self._repo,
+            )
+            findings: List[DeepAnalysisFinding] = []
+        else:
+            findings = result
         self._last_cycle_count = len(findings)
         fresh = self._filter_cooldown(findings)
         # Apply per-cycle cap so intake doesn't flood.
@@ -1071,8 +1090,3 @@ class DeepAnalysisSensor:
                 )
 
 
-def _run_sync(repo_root: Path) -> List[DeepAnalysisFinding]:
-    """Internal shim — the analyzer functions are sync-safe, but the
-    sensor's ``scan_once`` needs an await boundary. Keeping this
-    extracted lets us swap in an executor later if analyzers grow."""
-    return run_all_analyzers(repo_root=repo_root)

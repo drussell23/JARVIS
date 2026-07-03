@@ -1353,39 +1353,92 @@ def _execution_boundary_verdict(
     )
 
 
+def _governance_verdict_from_comparison(
+    ctx: CommitAuthorityContext,
+    grant: Optional[CommitGrant],
+    comparison: Any,
+) -> Optional[CommitAuthorityVerdictResult]:
+    """Shared verdict logic for both the sync and async governance
+    gates — turns a computed :class:`ManifestComparison` into a DENY
+    verdict iff staged files drift and the matched grant lacks
+    ``governance_amend``. ``None`` = pass."""
+    from backend.core.ouroboros.governance import (
+        governance_manifest as gm,
+    )
+    gov_val = comparison.verdict.value
+    if gm.is_refusal_verdict(comparison.verdict):
+        if grant is not None and grant.governance_amend:
+            return None  # operator explicitly authorized the amend
+        return _verdict(
+            CommitAuthorityVerdict.DENIED_GOVERNANCE_DRIFT,
+            ctx.channel,
+            "staged files drift from operator-signed governance "
+            "manifest; issue a grant with governance_amend=True "
+            "or refresh the manifest",
+            matched_grant_id=grant.grant_id if grant else "",
+            governance_verdict=gov_val,
+        )
+    return None
+
+
 def _governance_gate(
     ctx: CommitAuthorityContext,
     grant: Optional[CommitGrant],
 ) -> Optional[CommitAuthorityVerdictResult]:
     """Compose :mod:`governance_manifest`. Returns a DENY verdict iff
     staged files drift from the operator-signed manifest and the
-    matched grant lacks ``governance_amend``. ``None`` = pass."""
+    matched grant lacks ``governance_amend``. ``None`` = pass.
+
+    Synchronous entry point for the git-hook / CLI / daemon / REPL
+    channels (``verify_pre_commit``'s long-standing sync callers).
+    **Not for use from a coroutine already running on an event loop**
+    — that path (``AutoCommitter.commit``, itself ``async def``) uses
+    :func:`verify_pre_commit_async` instead, which awaits
+    :func:`governance_manifest.verify_governance_state` directly
+    rather than bridging through ``asyncio.run()`` (which would raise
+    if attempted from inside a running loop, or — with the fail-soft
+    bridge — silently degrade to DISABLED on *every* autonomous commit,
+    permanently blinding the hash-cap gate)."""
     if not ctx.staged_files:
         return None
     try:
         from backend.core.ouroboros.governance import (
             governance_manifest as gm,
         )
-        comparison = gm.verify_governance_state(
+        # fs-hot-tier Batch 3 (row 20): verify_governance_state is now
+        # async (offloaded SHA-256 walk); this gate's public
+        # verify_pre_commit API has long-standing synchronous callers
+        # (git hooks / CLI / daemon / REPL channels) — bridges via the
+        # sync wrapper rather than cascading async through those.
+        comparison = gm.verify_governance_state_sync(
             target_files=list(ctx.staged_files)
         )
-        gov_val = comparison.verdict.value
-        if gm.is_refusal_verdict(comparison.verdict):
-            if grant is not None and grant.governance_amend:
-                return None  # operator explicitly authorized the amend
-            return _verdict(
-                CommitAuthorityVerdict.DENIED_GOVERNANCE_DRIFT,
-                ctx.channel,
-                "staged files drift from operator-signed governance "
-                "manifest; issue a grant with governance_amend=True "
-                "or refresh the manifest",
-                matched_grant_id=grant.grant_id if grant else "",
-                governance_verdict=gov_val,
-            )
-        return None
+        return _governance_verdict_from_comparison(ctx, grant, comparison)
     except Exception:  # noqa: BLE001
         # Manifest substrate unavailable — do NOT block on its
         # absence (it has its own opt-in master flag). Pass through.
+        return None
+
+
+async def _governance_gate_async(
+    ctx: CommitAuthorityContext,
+    grant: Optional[CommitGrant],
+) -> Optional[CommitAuthorityVerdictResult]:
+    """Async twin of :func:`_governance_gate` — awaits
+    :func:`governance_manifest.verify_governance_state` directly (no
+    ``asyncio.run()`` bridge) for callers that already have a running
+    event loop. See :func:`verify_pre_commit_async`."""
+    if not ctx.staged_files:
+        return None
+    try:
+        from backend.core.ouroboros.governance import (
+            governance_manifest as gm,
+        )
+        comparison = await gm.verify_governance_state(
+            target_files=list(ctx.staged_files)
+        )
+        return _governance_verdict_from_comparison(ctx, grant, comparison)
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -1547,6 +1600,64 @@ def verify_pre_commit(
         f"(operator={matched.operator_label!r})",
         matched_grant_id=matched.grant_id,
     )
+
+
+async def verify_pre_commit_async(
+    ctx: CommitAuthorityContext,
+) -> CommitAuthorityVerdictResult:
+    """Async twin of :func:`verify_pre_commit` for callers that
+    already run on an event loop — today, exclusively
+    ``AutoCommitter.commit`` (``async def``) on the AUTONOMOUS channel.
+
+    fs-hot-tier Batch 3 (row 20): mirrors ``verify_pre_commit``'s
+    AUTONOMOUS branch exactly, but awaits
+    :func:`_governance_gate_async` (which itself awaits
+    ``governance_manifest.verify_governance_state`` directly) instead
+    of routing through the synchronous ``asyncio.run()`` bridge —
+    calling that bridge from a coroutine already running on a loop
+    would either raise or (via this substrate's fail-soft contract)
+    silently degrade to a DISABLED comparison on *every* autonomous
+    commit, permanently blinding the governance hash-cap gate.
+
+    Non-AUTONOMOUS channels have no known async caller today; they
+    fall through to the synchronous :func:`verify_pre_commit` (its
+    sync bridge is safe there — no loop is running in that thread).
+    """
+    if not master_enabled():
+        return _verdict(
+            CommitAuthorityVerdict.DISABLED,
+            str(ctx.channel),
+            f"OCA disabled via {_ENV_MASTER}=false — legacy hook "
+            "chain proceeds unchanged",
+        )
+
+    channel = CommitChannel.parse(ctx.channel)
+    if channel is None:
+        return _verdict(
+            CommitAuthorityVerdict.CHANNEL_UNKNOWN,
+            str(ctx.channel),
+            f"unrecognized commit channel {ctx.channel!r} — fail "
+            "closed (known: repl/cli/ide/daemon/autonomous)",
+        )
+
+    if channel is not CommitChannel.AUTONOMOUS:
+        return verify_pre_commit(ctx)
+
+    try:
+        repo_root = Path(ctx.repo_root).resolve()
+    except Exception:  # noqa: BLE001
+        repo_root = Path(ctx.repo_root or ".")
+
+    boundary = _execution_boundary_verdict(ctx, repo_root)
+    if boundary is not None:
+        return boundary
+    sov = _autonomous_verdict(ctx, repo_root)
+    if not sov.authorized():
+        return sov
+    gov = await _governance_gate_async(ctx, grant=None)
+    if gov is not None:
+        return gov
+    return sov
 
 
 # ===========================================================================

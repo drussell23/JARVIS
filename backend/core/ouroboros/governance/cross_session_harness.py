@@ -398,7 +398,11 @@ def _digest_session_history(
         )
     try:
         lss = LastSessionSummary(project_root=project_root)
-        records = lss.load(n_sessions=10)
+        # fs-hot-tier Batch 3 (row 18): LastSessionSummary.load is now
+        # async (offloaded rglob). This digester's public API stays
+        # synchronous (broad existing sync test coverage across this
+        # module) — load_sync() bridges via asyncio.run(), fail-soft.
+        records = lss.load_sync(n_sessions=10)
     except Exception as exc:  # noqa: BLE001
         return AxisDigest(
             axis=CoherenceAxis.SESSION_HISTORY,

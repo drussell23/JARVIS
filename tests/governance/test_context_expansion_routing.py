@@ -124,7 +124,9 @@ async def test_routing_appended_when_flag_on(ctx, orch, monkeypatch):
         _fake_result = MagicMock()
         _fake_result.section = _ROUTED_SECTION
         _fake_result.topics = ("topic-a",)
-        MockRouter.return_value.route.return_value = _fake_result
+        # route() is now async (fs-hot-tier Batch 3, row 21) — the mock
+        # must be awaitable, not a plain MagicMock return value.
+        MockRouter.return_value.route = AsyncMock(return_value=_fake_result)
 
         result_ctx = await _run_with_noop_expander(orch, ctx)
 
@@ -176,7 +178,9 @@ async def test_routing_exception_is_swallowed(ctx, orch, monkeypatch):
     ), patch(
         "backend.core.ouroboros.governance.module_routing.ModuleContextRouter"
     ) as MockRouter:
-        MockRouter.return_value.route.side_effect = RuntimeError("router exploded")
+        MockRouter.return_value.route = AsyncMock(
+            side_effect=RuntimeError("router exploded")
+        )
 
         # Must not raise
         result_ctx = await _run_with_noop_expander(orch, ctx)

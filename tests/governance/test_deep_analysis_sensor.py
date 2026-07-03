@@ -591,3 +591,111 @@ def test_all_findings_use_low_urgency():
         finding_id="abc1234567", description="test",
     )
     assert finding.urgency == "low"
+
+
+# ---------------------------------------------------------------------------
+# fs-hot-tier Batch 3 (row 17, 2026-07-03) — DeepAnalysisSensor.scan_once
+# routes run_all_analyzers (rglob + 4 analyzers that AST-parse every
+# repo .py file — pure-Python CPU work that HOLDS the GIL) through
+# cooperative_fs_io.offload(cpu_bound=True), replacing the dead
+# ``if False`` executor stub + redundant duplicate synchronous call.
+# ---------------------------------------------------------------------------
+
+
+def test_dead_if_false_stub_removed():
+    """The dead ``if False`` ternary + redundant duplicate
+    ``_run_sync`` call must be gone — proof the stub was actually
+    replaced, not left dormant alongside the real fix."""
+    src = _read_module_src()
+    assert "if False" not in src
+    assert "_run_sync" not in src
+
+
+class TestSubstrateRouting:
+    @pytest.mark.asyncio
+    async def test_scan_once_routes_through_offload_process_pool(
+        self, tmp_path, monkeypatch,
+    ):
+        """Spy on cooperative_fs_io.offload — run_all_analyzers must be
+        dispatched with cpu_bound=True (process pool: 4 analyzers
+        AST-parse every repo .py file — pure-Python CPU work a thread
+        wouldn't free the GIL for)."""
+        monkeypatch.setenv("JARVIS_DEEP_ANALYSIS_SENSOR_ENABLED", "1")
+        _write(tmp_path / "backend/target.py", """
+            def only_me_exists():
+                return 'orphan'
+        """)
+        from backend.core.ouroboros.governance import cooperative_fs_io
+
+        calls = {"n": 0, "cpu_bound": None}
+        real_offload = cooperative_fs_io.offload
+
+        async def _spy_offload(fn, *args, cpu_bound=False, **kwargs):
+            if fn is run_all_analyzers:
+                calls["n"] += 1
+                calls["cpu_bound"] = cpu_bound
+            return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+        sensor = DeepAnalysisSensor(
+            repo="jarvis", router=None, project_root=tmp_path,
+        )
+        await sensor.scan_once()
+
+        assert calls["n"] == 1, "scan_once must route through offload"
+        assert calls["cpu_bound"] is True, (
+            "4 analyzers AST-parse every .py file after the walk — "
+            "must use the process pool, not a thread"
+        )
+
+
+class TestCorrectness:
+    @pytest.mark.asyncio
+    async def test_scan_once_parity_with_direct_run_all_analyzers(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("JARVIS_DEEP_ANALYSIS_SENSOR_ENABLED", "1")
+        _write(tmp_path / "backend/only_orphan2.py", """
+            def the_orphan_two():
+                return 1
+        """)
+        expected_ids = {
+            f.finding_id for f in run_all_analyzers(repo_root=tmp_path)
+        }
+        sensor = DeepAnalysisSensor(
+            repo="jarvis", router=None, project_root=tmp_path,
+        )
+        got = await sensor.scan_once()
+        assert {f.finding_id for f in got} <= expected_ids
+        assert expected_ids  # sanity — planted tree actually produced findings
+
+
+class TestFailSoft:
+    @pytest.mark.asyncio
+    async def test_offload_error_degrades_to_empty_no_raise(
+        self, tmp_path, monkeypatch,
+    ):
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            OffloadError,
+        )
+        monkeypatch.setenv("JARVIS_DEEP_ANALYSIS_SENSOR_ENABLED", "1")
+        _write(tmp_path / "backend/target.py", """
+            def only_me_exists():
+                return 'orphan'
+        """)
+
+        async def _boom_offload(fn, *args, **kwargs):
+            return OffloadError(
+                fn_name="run_all_analyzers",
+                exc_type="OSError",
+                message="synthetic offload-layer fault",
+                cpu_bound=True,
+            )
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+        sensor = DeepAnalysisSensor(
+            repo="jarvis", router=None, project_root=tmp_path,
+        )
+        result = await sensor.scan_once()
+        assert result == []

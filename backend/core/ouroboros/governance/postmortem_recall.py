@@ -11,7 +11,7 @@ postmortem, learns nothing.
 This service provides a thin recall layer:
 
     recall = PostmortemRecallService(...)
-    lessons = recall.recall_for_op(op_signature, top_k=3)
+    lessons = await recall.recall_for_op(op_signature, top_k=3)
     if lessons:
         prompt += render_recall_section(lessons)
 
@@ -423,7 +423,7 @@ class PostmortemRecallService:
             )
             return None
 
-    def recall_for_op(
+    async def recall_for_op(
         self,
         op_signature: str,
         top_k_override: Optional[int] = None,
@@ -434,7 +434,7 @@ class PostmortemRecallService:
         if not op_signature or not op_signature.strip():
             return []
         try:
-            return self._recall_inner(op_signature, top_k_override)
+            return await self._recall_inner(op_signature, top_k_override)
         except Exception:  # noqa: BLE001
             logger.debug(
                 "[PostmortemRecall] recall_for_op failed — returning []",
@@ -442,7 +442,7 @@ class PostmortemRecallService:
             )
             return []
 
-    def _recall_inner(
+    async def _recall_inner(
         self,
         op_signature: str,
         top_k_override: Optional[int],
@@ -452,54 +452,82 @@ class PostmortemRecallService:
             logger.debug("[PostmortemRecall] no embedder available — returning []")
             return []
 
-        records = _gather_recent_postmortems(
-            self._sessions_dir, max_total=max_postmortems_to_scan(),
+        # fs-hot-tier Batch 3 (row 19): the sessions-dir iterdir scan
+        # AND the embedder inference that follows it are dispatched
+        # together, off the asyncio loop, via a single
+        # cooperative_fs_io.offload(cpu_bound=False) call. THREAD, not
+        # process: the embedder is an ONNX/numpy model whose C-extension
+        # inference RELEASES the GIL — a process pool would re-load the
+        # embedding model in the worker on every call (wrong; expensive).
+        # A closure is fine here since cpu_bound=False never requires
+        # pickling (thread path only).
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
         )
-        if not records:
-            return []
 
-        # Embed query + corpus in one batch for efficiency.
-        texts = [op_signature] + [r.signature_text() for r in records]
-        vectors = embedder.embed(texts)
-        if vectors is None or len(vectors) != len(texts):
+        def _gather_and_score_sync() -> List[RecallMatch]:
+            records = _gather_recent_postmortems(
+                self._sessions_dir, max_total=max_postmortems_to_scan(),
+            )
+            if not records:
+                return []
+
+            # Embed query + corpus in one batch for efficiency.
+            texts = [op_signature] + [r.signature_text() for r in records]
+            vectors = embedder.embed(texts)
+            if vectors is None or len(vectors) != len(texts):
+                logger.debug(
+                    "[PostmortemRecall] embedding returned %s vectors "
+                    "for %d texts — skip",
+                    "None" if vectors is None else len(vectors), len(texts),
+                )
+                return []
+
+            from backend.core.ouroboros.governance.semantic_index import (
+                _cosine,
+            )
+
+            query_vec = vectors[0]
+            corpus_vecs = vectors[1:]
+            now_unix = time.time()
+            threshold = similarity_threshold()
+            halflife = decay_days()
+
+            scored: List[RecallMatch] = []
+            for rec, vec in zip(records, corpus_vecs):
+                raw_sim = float(_cosine(query_vec, vec))
+                age_seconds = max(0.0, now_unix - rec.timestamp_unix)
+                decay = _decay_factor(age_seconds, halflife)
+                decayed = raw_sim * decay
+                if decayed < threshold:
+                    continue
+                scored.append(RecallMatch(
+                    record=rec,
+                    raw_similarity=raw_sim,
+                    decayed_similarity=decayed,
+                    age_days=age_seconds / 86400.0,
+                ))
+
+            scored.sort(key=lambda m: m.decayed_similarity, reverse=True)
+            k = top_k_override if top_k_override is not None else top_k()
+            return scored[:max(0, k)]
+
+        result = await offload(_gather_and_score_sync, cpu_bound=False)
+        if is_offload_error(result):
             logger.debug(
-                "[PostmortemRecall] embedding returned %s vectors for %d texts — skip",
-                "None" if vectors is None else len(vectors), len(texts),
+                "[PostmortemRecall] gather+score offload failed — "
+                "returning []",
             )
             return []
 
-        from backend.core.ouroboros.governance.semantic_index import _cosine
-
-        query_vec = vectors[0]
-        corpus_vecs = vectors[1:]
-        now_unix = time.time()
-        threshold = similarity_threshold()
-        halflife = decay_days()
-
-        scored: List[RecallMatch] = []
-        for rec, vec in zip(records, corpus_vecs):
-            raw_sim = float(_cosine(query_vec, vec))
-            age_seconds = max(0.0, now_unix - rec.timestamp_unix)
-            decay = _decay_factor(age_seconds, halflife)
-            decayed = raw_sim * decay
-            if decayed < threshold:
-                continue
-            scored.append(RecallMatch(
-                record=rec,
-                raw_similarity=raw_sim,
-                decayed_similarity=decayed,
-                age_days=age_seconds / 86400.0,
-            ))
-
-        scored.sort(key=lambda m: m.decayed_similarity, reverse=True)
-        k = top_k_override if top_k_override is not None else top_k()
-        result = scored[:max(0, k)]
         if result:
             self._persist_to_ledger(op_signature, result)
             logger.info(
                 "[PostmortemRecall] op_signature=%r matched %d postmortems "
                 "(threshold=%.2f, top_k=%d, decayed_top=%.3f)",
-                op_signature[:60], len(result), threshold, k,
+                op_signature[:60], len(result), similarity_threshold(),
+                top_k_override if top_k_override is not None else top_k(),
                 result[0].decayed_similarity,
             )
         return result

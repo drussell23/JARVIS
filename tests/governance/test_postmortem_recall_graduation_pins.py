@@ -95,7 +95,7 @@ def test_max_scan_default_500(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_hot_revert_master_off_returns_empty(
+async def test_hot_revert_master_off_returns_empty(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """JARVIS_POSTMORTEM_RECALL_ENABLED=false → recall returns [] even
@@ -109,7 +109,7 @@ def test_hot_revert_master_off_returns_empty(
         PostmortemRecallService,
     )
     svc = PostmortemRecallService(sessions_dir=tmp_path)
-    result = svc.recall_for_op("any signature")
+    result = await svc.recall_for_op("any signature")
     assert result == [], "master-off must return [] regardless of sub-flags"
 
 
@@ -244,7 +244,7 @@ def test_pin_orchestrator_recall_after_conversation_bridge() -> None:
     """
     src = _read("backend/core/ouroboros/governance/orchestrator.py")
     bridge_idx = src.find("ConversationBridge injection skipped")
-    recall_call_idx = src.find("ctx = _inject_postmortem_recall_impl(ctx)")
+    recall_call_idx = src.find("ctx = await _inject_postmortem_recall_impl(ctx)")
     assert bridge_idx > 0, "ConversationBridge marker missing"
     assert recall_call_idx > 0, "PostmortemRecall call site missing"
     assert bridge_idx < recall_call_idx, (

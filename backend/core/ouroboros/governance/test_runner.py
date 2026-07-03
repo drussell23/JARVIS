@@ -314,6 +314,22 @@ class PythonAdapter:
         )
 
 
+def _rglob_so_files_worker(install_tmp_str: str) -> List[str]:
+    """Module-level worker for :meth:`CppAdapter._default_abi_probe`.
+
+    Dispatched into the shared ``advisor-blast`` thread pool via
+    ``cooperative_fs_io.offload`` (fs-hot-tier Batch 3, row 24). Lifted
+    to module level so the offload trampoline doesn't capture any
+    caller-local state. Scoped to ``install_tmp`` (the cmake-install
+    staging dir for ONE build — small, native targets only). NEVER
+    raises — returns ``[]`` on any walk fault.
+    """
+    try:
+        return [str(p) for p in Path(install_tmp_str).rglob("*.so")]
+    except OSError:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # CppAdapter — cmake + ctest subprocess wrapper (implements LanguageAdapter)
 # ---------------------------------------------------------------------------
@@ -540,7 +556,23 @@ class CppAdapter:
         except Exception:
             return True, ""  # no install → no .so → skip probe
 
-        so_files = list(install_tmp.rglob("*.so"))
+        # fs-hot-tier Batch 3 (row 24): the rglob is dispatched off the
+        # asyncio loop via cooperative_fs_io.offload(cpu_bound=False)
+        # — thread pool (a scoped install-dir rglob for one native
+        # build is small and IO-bound). Fail-soft: an OffloadError
+        # degrades to [] — same as "no .so files found", skipping the
+        # probe rather than blocking the adapter.
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+        _so_result = await offload(
+            _rglob_so_files_worker, str(install_tmp), cpu_bound=False,
+        )
+        so_files = (
+            [] if is_offload_error(_so_result)
+            else [Path(p) for p in _so_result]
+        )
         if not so_files:
             return True, ""  # no extension → skip probe
 

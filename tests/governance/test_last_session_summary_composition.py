@@ -130,7 +130,7 @@ def _fresh_ctx(
 # ---------------------------------------------------------------------------
 
 
-def test_integration_v2_ops_digest_tokens_land_in_composed_prompt(
+async def test_integration_v2_ops_digest_tokens_land_in_composed_prompt(
     monkeypatch, tmp_path
 ):
     """Real ``_inject_last_session_summary_impl`` with a v2 fixture must
@@ -154,7 +154,7 @@ def test_integration_v2_ops_digest_tokens_land_in_composed_prompt(
     ctx_in = _fresh_ctx()
     assert ctx_in.strategic_memory_prompt == ""  # pre-condition
 
-    ctx_out = _inject_last_session_summary_impl(tmp_path, ctx_in)
+    ctx_out = await _inject_last_session_summary_impl(tmp_path, ctx_in)
 
     assert ctx_out is not ctx_in  # frozen dataclass — rebind happened
     prompt = ctx_out.strategic_memory_prompt
@@ -172,7 +172,7 @@ def test_integration_v2_ops_digest_tokens_land_in_composed_prompt(
     assert ctx_out.strategic_intent_id == "last-session-v1"
 
 
-def test_integration_preserves_pre_existing_strategic_memory(
+async def test_integration_preserves_pre_existing_strategic_memory(
     monkeypatch, tmp_path
 ):
     """When ``ctx.strategic_memory_prompt`` already has Strategic /
@@ -198,7 +198,7 @@ def test_integration_preserves_pre_existing_strategic_memory(
         existing_intent="strategic-v1",
     )
 
-    ctx_out = _inject_last_session_summary_impl(tmp_path, ctx_in)
+    ctx_out = await _inject_last_session_summary_impl(tmp_path, ctx_in)
 
     prompt = ctx_out.strategic_memory_prompt
     # Strategic header must still be present AND first.
@@ -218,7 +218,7 @@ def test_integration_preserves_pre_existing_strategic_memory(
     assert ctx_out.strategic_intent_id == "strategic-v1"
 
 
-def test_integration_empty_ops_digest_still_renders_v1_line(
+async def test_integration_empty_ops_digest_still_renders_v1_line(
     monkeypatch, tmp_path
 ):
     """v1.1a backward-compat: ``ops_digest={}`` falls through to the v1
@@ -232,7 +232,7 @@ def test_integration_empty_ops_digest_still_renders_v1_line(
         ops_digest={},
     )
     ctx_in = _fresh_ctx()
-    ctx_out = _inject_last_session_summary_impl(tmp_path, ctx_in)
+    ctx_out = await _inject_last_session_summary_impl(tmp_path, ctx_in)
     prompt = ctx_out.strategic_memory_prompt
     assert "bt-2026-04-15-777777" in prompt
     assert "apply=" not in prompt
@@ -240,7 +240,7 @@ def test_integration_empty_ops_digest_still_renders_v1_line(
     assert "commit=" not in prompt
 
 
-def test_integration_disabled_returns_ctx_unchanged(monkeypatch, tmp_path):
+async def test_integration_disabled_returns_ctx_unchanged(monkeypatch, tmp_path):
     """Master switch off — helper is a no-op. Hash identity must match."""
     # Intentionally NOT calling _enable().
     _write_v2_summary(
@@ -249,7 +249,7 @@ def test_integration_disabled_returns_ctx_unchanged(monkeypatch, tmp_path):
         ops_digest={"last_apply_mode": "multi", "last_apply_files": 2},
     )
     ctx_in = _fresh_ctx(existing_prompt="prior content")
-    ctx_out = _inject_last_session_summary_impl(tmp_path, ctx_in)
+    ctx_out = await _inject_last_session_summary_impl(tmp_path, ctx_in)
     # Same object reference (no rebind) — helper exited before
     # with_strategic_memory_context could mint a new instance.
     assert ctx_out is ctx_in
@@ -257,7 +257,7 @@ def test_integration_disabled_returns_ctx_unchanged(monkeypatch, tmp_path):
     assert "apply=" not in ctx_out.strategic_memory_prompt
 
 
-def test_integration_missing_summary_directory_does_not_raise(
+async def test_integration_missing_summary_directory_does_not_raise(
     monkeypatch, tmp_path
 ):
     """Helper must swallow any exception from LSS (missing dir, bad
@@ -266,7 +266,7 @@ def test_integration_missing_summary_directory_does_not_raise(
     _enable(monkeypatch)
     # No .ouroboros/sessions/* created — LSS will discover zero records.
     ctx_in = _fresh_ctx(existing_prompt="survive unchanged")
-    ctx_out = _inject_last_session_summary_impl(tmp_path, ctx_in)
+    ctx_out = await _inject_last_session_summary_impl(tmp_path, ctx_in)
     # LSS emits enabled=true / chars_out=0 and skips the concat branch.
     # ctx identity is preserved because no rebind fired.
     assert ctx_out is ctx_in
@@ -282,7 +282,7 @@ def test_integration_missing_summary_directory_does_not_raise(
 # in the orchestrator path would fail here even if LSS itself is clean.
 
 
-def _invoke_with_stub_lss(
+async def _invoke_with_stub_lss(
     monkeypatch,
     tmp_path,
     *,
@@ -293,11 +293,11 @@ def _invoke_with_stub_lss(
     """Drive the helper with a monkey-patched LSS that returns a known
     rendered string. Isolates the concat contract from LSS internals."""
     class _StubLSS:
-        def inject_metrics(self):
+        async def inject_metrics(self):
             # (enabled, n_sessions, session_id, chars_out, hash8)
             return (enabled, 1, "bt-stub-0001", len(stub_output), "deadbeef")
 
-        def format_for_prompt(self):
+        async def format_for_prompt(self):
             return stub_output
 
     def _stub_factory(_root):
@@ -309,17 +309,17 @@ def _invoke_with_stub_lss(
         _stub_factory,
     )
     ctx_in = _fresh_ctx(existing_prompt=existing_prompt)
-    return _inject_last_session_summary_impl(tmp_path, ctx_in)
+    return await _inject_last_session_summary_impl(tmp_path, ctx_in)
 
 
-def test_concat_contract_preserves_lss_tokens_verbatim(monkeypatch, tmp_path):
+async def test_concat_contract_preserves_lss_tokens_verbatim(monkeypatch, tmp_path):
     """Stub LSS emits the v1.1a tokens; concat must keep every byte."""
     stub = (
         "## Previous Session Closure\n"
         "- stub: cost=$0.10 apply=multi/7 verify=15/16 "
         "commit=0123456789 branch=+42/-8"
     )
-    ctx_out = _invoke_with_stub_lss(
+    ctx_out = await _invoke_with_stub_lss(
         monkeypatch, tmp_path, stub_output=stub
     )
     prompt = ctx_out.strategic_memory_prompt
@@ -330,13 +330,13 @@ def test_concat_contract_preserves_lss_tokens_verbatim(monkeypatch, tmp_path):
     assert "commit=0123456789" in prompt
 
 
-def test_concat_contract_adds_double_newline_between_existing_and_lss(
+async def test_concat_contract_adds_double_newline_between_existing_and_lss(
     monkeypatch, tmp_path
 ):
     """Separator invariant: ``existing + "\\n\\n" + lss`` when existing
     is non-empty."""
     stub = "STUB_LSS_LINE apply=single/1"
-    ctx_out = _invoke_with_stub_lss(
+    ctx_out = await _invoke_with_stub_lss(
         monkeypatch, tmp_path,
         stub_output=stub,
         existing_prompt="PREV_CONTENT",
@@ -344,13 +344,13 @@ def test_concat_contract_adds_double_newline_between_existing_and_lss(
     assert ctx_out.strategic_memory_prompt == f"PREV_CONTENT\n\n{stub}"
 
 
-def test_concat_contract_no_separator_when_existing_empty(
+async def test_concat_contract_no_separator_when_existing_empty(
     monkeypatch, tmp_path
 ):
     """When existing is empty, LSS line stands alone — no leading
     ``\\n\\n`` that would break subsequent composition."""
     stub = "STUB_LSS_LINE apply=single/1"
-    ctx_out = _invoke_with_stub_lss(
+    ctx_out = await _invoke_with_stub_lss(
         monkeypatch, tmp_path,
         stub_output=stub,
         existing_prompt="",
@@ -359,11 +359,11 @@ def test_concat_contract_no_separator_when_existing_empty(
     assert not ctx_out.strategic_memory_prompt.startswith("\n")
 
 
-def test_concat_contract_lss_empty_output_skips_rebind(monkeypatch, tmp_path):
+async def test_concat_contract_lss_empty_output_skips_rebind(monkeypatch, tmp_path):
     """When LSS emits empty string (no prior session found), the INFO
     line still fires but NO rebind of strategic_memory_prompt happens.
     ctx identity must be preserved."""
-    ctx_out = _invoke_with_stub_lss(
+    ctx_out = await _invoke_with_stub_lss(
         monkeypatch, tmp_path,
         stub_output="",
         existing_prompt="keep-me",
@@ -385,6 +385,42 @@ def _orchestrator_ast() -> ast.Module:
         / "backend/core/ouroboros/governance/orchestrator.py"
     )
     return ast.parse(orch_path.read_text(encoding="utf-8"))
+
+
+def test_classify_runner_awaits_lss_injection_helper():
+    """fs-hot-tier Batch 3 (row 18) await-guard: the SECOND live call
+    site — ``ClassifyRunner.run`` (the extracted phase-runner, the
+    default path per ``JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED``) —
+    must also await the now-async helper."""
+    classify_path = (
+        Path(__file__).resolve().parent.parent.parent
+        / "backend/core/ouroboros/governance/phase_runners/classify_runner.py"
+    )
+    tree = ast.parse(classify_path.read_text(encoding="utf-8"))
+
+    run_node = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run":
+            run_node = node
+            break
+    assert run_node is not None, "ClassifyRunner.run not found — refactored?"
+
+    found_awaited_call = False
+    for node in ast.walk(run_node):
+        if not isinstance(node, ast.Await):
+            continue
+        inner = node.value
+        if (
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "_inject_last_session_summary_impl"
+        ):
+            found_awaited_call = True
+            break
+    assert found_awaited_call, (
+        "ClassifyRunner.run calls _inject_last_session_summary_impl "
+        "without 'await'."
+    )
 
 
 def test_run_pipeline_calls_lss_injection_helper():
@@ -422,6 +458,45 @@ def test_run_pipeline_calls_lss_injection_helper():
     )
 
 
+def test_run_pipeline_awaits_lss_injection_helper():
+    """fs-hot-tier Batch 3 (row 18) await-guard: the call site in
+    ``_run_pipeline`` must be an ``await`` expression, not a bare call —
+    ``_inject_last_session_summary_impl`` is now ``async def`` (its
+    ``inject_metrics``/``format_for_prompt`` internally await the
+    offloaded session-dir scan). A missed ``await`` would silently hand
+    ``ctx`` a coroutine object instead of the rebuilt OperationContext,
+    swallowed by the helper's own except-block on the CALLER side (the
+    assignment itself doesn't raise) — this AST pin catches that class
+    of regression statically, without needing a live coroutine warning.
+    """
+    tree = _orchestrator_ast()
+
+    run_pipeline_node = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_pipeline":
+            run_pipeline_node = node
+            break
+    assert run_pipeline_node is not None
+
+    found_awaited_call = False
+    for node in ast.walk(run_pipeline_node):
+        if not isinstance(node, ast.Await):
+            continue
+        inner = node.value
+        if (
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "_inject_last_session_summary_impl"
+        ):
+            found_awaited_call = True
+            break
+    assert found_awaited_call, (
+        "_run_pipeline calls _inject_last_session_summary_impl without "
+        "'await' — since the helper is async def, this silently assigns "
+        "ctx a coroutine object instead of an OperationContext."
+    )
+
+
 def test_helper_body_wires_lss_prompt_into_strategic_memory():
     """``_inject_last_session_summary_impl`` body must contain a call
     to ``ctx.with_strategic_memory_context`` whose
@@ -436,7 +511,7 @@ def test_helper_body_wires_lss_prompt_into_strategic_memory():
     helper_node = None
     for node in ast.walk(tree):
         if (
-            isinstance(node, ast.FunctionDef)
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name == "_inject_last_session_summary_impl"
         ):
             helper_node = node

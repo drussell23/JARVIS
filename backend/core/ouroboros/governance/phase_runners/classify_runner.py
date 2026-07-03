@@ -1058,7 +1058,7 @@ class CLASSIFYRunner(PhaseRunner):
         from backend.core.ouroboros.governance.orchestrator import (
             _inject_last_session_summary_impl,
         )
-        ctx = _inject_last_session_summary_impl(orch._config.project_root, ctx)
+        ctx = await _inject_last_session_summary_impl(orch._config.project_root, ctx)
 
         # ---- P2.4 + Week 2: Goal-directed context injection ----
         # Append the *most relevant* active user goals to the strategic

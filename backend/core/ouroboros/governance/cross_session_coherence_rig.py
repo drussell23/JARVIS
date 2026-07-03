@@ -558,7 +558,10 @@ def _load_session_summaries(
         return ()
     try:
         lss = get_default_summary()
-        records = lss.load(n_sessions=int(limit))
+        # fs-hot-tier Batch 3 (row 18): load() is now async (offloaded
+        # rglob) — this rig's public API stays synchronous; load_sync()
+        # bridges via asyncio.run(), fail-soft.
+        records = lss.load_sync(n_sessions=int(limit))
     except Exception:  # noqa: BLE001
         return ()
     if not records:

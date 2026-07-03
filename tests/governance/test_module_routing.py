@@ -127,7 +127,7 @@ class TestRoutingEnabled:
 # ---------------------------------------------------------------------------
 
 class TestFlagOff:
-    def test_route_returns_empty_when_flag_off(self, tmp_path, monkeypatch):
+    async def test_route_returns_empty_when_flag_off(self, tmp_path, monkeypatch):
         """When JARVIS_MEMORY_ROUTING_ENABLED is false, route() returns empty."""
         monkeypatch.delenv("JARVIS_MEMORY_ROUTING_ENABLED", raising=False)
 
@@ -137,7 +137,7 @@ class TestFlagOff:
 
         from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
         router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-        ctx = router.route(
+        ctx = await router.route(
             target_files=["backend/core/ouroboros/governance/orchestrator.py"],
             query="refactor plan phase",
         )
@@ -150,7 +150,7 @@ class TestFlagOff:
 # ---------------------------------------------------------------------------
 
 class TestSemanticRanking:
-    def test_topics_returned_when_flag_on(self, tmp_path, monkeypatch):
+    async def test_topics_returned_when_flag_on(self, tmp_path, monkeypatch):
         """With flag on and topics dir populated, route() returns topics."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
@@ -168,7 +168,7 @@ class TestSemanticRanking:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["backend/core/ouroboros/governance/orchestrator.py"],
                 query="11-phase orchestrator governance pipeline PLAN phase",
                 max_topics=3,
@@ -178,7 +178,7 @@ class TestSemanticRanking:
         assert ctx.section  # non-empty rendered block
         assert "## Relevant Architecture Memory" in ctx.section
 
-    def test_section_contains_topic_title(self, tmp_path, monkeypatch):
+    async def test_section_contains_topic_title(self, tmp_path, monkeypatch):
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
         topics_dir = tmp_path / "memory_topics"
@@ -191,7 +191,7 @@ class TestSemanticRanking:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["orchestrator.py"],
                 query="orchestrator plan phase",
             )
@@ -204,7 +204,7 @@ class TestSemanticRanking:
 # ---------------------------------------------------------------------------
 
 class TestStructuralBoost:
-    def test_matching_module_topic_ranked_first(self, tmp_path, monkeypatch):
+    async def test_matching_module_topic_ranked_first(self, tmp_path, monkeypatch):
         """A topic whose modules: matches the Oracle-returned related files
         must outrank a purely semantically similar but unrelated topic."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
@@ -224,7 +224,7 @@ class TestStructuralBoost:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["unrelated_target.py"],
                 query="something about voice pipeline",  # semantically points to voice
                 max_topics=2,
@@ -234,7 +234,7 @@ class TestStructuralBoost:
         assert len(ctx.topics) >= 1
         assert ctx.topics[0].source_id == "memory_topic:swarm"
 
-    def test_direct_target_file_match_scores_structural_boost(self, tmp_path, monkeypatch):
+    async def test_direct_target_file_match_scores_structural_boost(self, tmp_path, monkeypatch):
         """A topic whose modules: contains the exact target file gets score=1.0 structural."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
@@ -249,7 +249,7 @@ class TestStructuralBoost:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["orchestrator.py"],
                 query="something",
                 max_topics=2,
@@ -266,7 +266,7 @@ class TestStructuralBoost:
 # ---------------------------------------------------------------------------
 
 class TestBudgetCaps:
-    def test_max_topics_capped(self, tmp_path, monkeypatch):
+    async def test_max_topics_capped(self, tmp_path, monkeypatch):
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
         topics_dir = tmp_path / "memory_topics"
@@ -282,7 +282,7 @@ class TestBudgetCaps:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["orchestrator.py"],
                 query="governance pipeline",
                 max_topics=2,
@@ -290,7 +290,7 @@ class TestBudgetCaps:
 
         assert len(ctx.topics) <= 2
 
-    def test_token_budget_limits_topics(self, tmp_path, monkeypatch):
+    async def test_token_budget_limits_topics(self, tmp_path, monkeypatch):
         """A very small token_budget must limit the number of returned topics."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
@@ -307,7 +307,7 @@ class TestBudgetCaps:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["orchestrator.py"],
                 query="governance pipeline",
                 max_topics=3,
@@ -323,7 +323,7 @@ class TestBudgetCaps:
 # ---------------------------------------------------------------------------
 
 class TestFailSoftOracle:
-    def test_oracle_import_error_returns_semantic_ranking(self, tmp_path, monkeypatch):
+    async def test_oracle_import_error_returns_semantic_ranking(self, tmp_path, monkeypatch):
         """When Oracle import fails, route() must still return topics (no crash)."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
@@ -340,7 +340,7 @@ class TestFailSoftOracle:
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
             # Must not raise
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["orchestrator.py"],
                 query="governance pipeline",
             )
@@ -350,7 +350,7 @@ class TestFailSoftOracle:
         assert isinstance(ctx.topics, tuple)
         assert isinstance(ctx.section, str)
 
-    def test_oracle_call_error_does_not_crash(self, tmp_path, monkeypatch):
+    async def test_oracle_call_error_does_not_crash(self, tmp_path, monkeypatch):
         """When the _get_oracle_related_modules helper raises, route() degrades gracefully."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
@@ -364,7 +364,7 @@ class TestFailSoftOracle:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["orchestrator.py"],
                 query="something",
             )
@@ -377,7 +377,7 @@ class TestFailSoftOracle:
 # ---------------------------------------------------------------------------
 
 class TestFailSoftEmbedder:
-    def test_embedder_unavailable_falls_back_to_structural(self, tmp_path, monkeypatch):
+    async def test_embedder_unavailable_falls_back_to_structural(self, tmp_path, monkeypatch):
         """When the embedder raises, route() falls back to structural-only ranking."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
@@ -401,7 +401,7 @@ class TestFailSoftEmbedder:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["unrelated_target.py"],
                 query="something",
                 max_topics=2,
@@ -412,7 +412,7 @@ class TestFailSoftEmbedder:
         if ctx.topics:
             assert ctx.topics[0].source_id == "memory_topic:swarm"
 
-    def test_embedder_returns_none_handled(self, tmp_path, monkeypatch):
+    async def test_embedder_returns_none_handled(self, tmp_path, monkeypatch):
         """When embedder returns None, route() does not crash."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
@@ -432,7 +432,7 @@ class TestFailSoftEmbedder:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["orchestrator.py"],
                 query="something",
             )
@@ -446,7 +446,7 @@ class TestFailSoftEmbedder:
 # ---------------------------------------------------------------------------
 
 class TestEmptyTopicsDir:
-    def test_empty_dir_returns_empty(self, tmp_path, monkeypatch):
+    async def test_empty_dir_returns_empty(self, tmp_path, monkeypatch):
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
         topics_dir = tmp_path / "memory_topics"
@@ -458,19 +458,19 @@ class TestEmptyTopicsDir:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["orchestrator.py"],
                 query="anything",
             )
 
         assert ctx == ctx.empty()
 
-    def test_nonexistent_topics_dir_returns_empty(self, tmp_path, monkeypatch):
+    async def test_nonexistent_topics_dir_returns_empty(self, tmp_path, monkeypatch):
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
         from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
         router = ModuleContextRouter(tmp_path, topics_dir=tmp_path / "does_not_exist")
-        ctx = router.route(target_files=["foo.py"], query="anything")
+        ctx = await router.route(target_files=["foo.py"], query="anything")
         assert ctx == ctx.empty()
 
 
@@ -523,7 +523,7 @@ class TestRoutedContextEmpty:
         assert ctx.topics == ()
         assert ctx.section == ""
 
-    def test_section_render_with_topics(self, tmp_path, monkeypatch):
+    async def test_section_render_with_topics(self, tmp_path, monkeypatch):
         """Rendered section contains heading and topic title."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
@@ -537,7 +537,7 @@ class TestRoutedContextEmpty:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            ctx = router.route(
+            ctx = await router.route(
                 target_files=["orchestrator.py"],
                 query="plan phase",
             )
@@ -571,7 +571,7 @@ class TestCandidateFirstNarrowing:
             """)
             (topics_dir / f"topic_{i:03d}.md").write_text(content, encoding="utf-8")
 
-    def test_bounded_embedding_with_module_match(self, tmp_path, monkeypatch):
+    async def test_bounded_embedding_with_module_match(self, tmp_path, monkeypatch):
         """When 2 topics match via modules:, embedder gets ≤ 3 texts (query + 2), not 41."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
@@ -604,7 +604,7 @@ class TestCandidateFirstNarrowing:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            router.route(
+            await router.route(
                 target_files=["orchestrator.py"],
                 query="orchestrator plan phase",
                 max_topics=2,
@@ -617,7 +617,7 @@ class TestCandidateFirstNarrowing:
             f"got {total_embedded}. Candidate-first narrowing is not implemented."
         )
 
-    def test_lexical_fallback_bounded(self, tmp_path, monkeypatch):
+    async def test_lexical_fallback_bounded(self, tmp_path, monkeypatch):
         """When no topics match via modules:, embedder gets ≤ prefilter_k+1 texts."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
@@ -650,7 +650,7 @@ class TestCandidateFirstNarrowing:
         ):
             from backend.core.ouroboros.governance.module_routing import ModuleContextRouter
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
-            router.route(
+            await router.route(
                 target_files=["orchestrator.py"],
                 query="orchestrator plan phase",
                 max_topics=2,
@@ -663,7 +663,7 @@ class TestCandidateFirstNarrowing:
             f"got {total_embedded}. Lexical prefilter is not implemented."
         )
 
-    def test_cache_reuse_no_reembedding_on_second_call(self, tmp_path, monkeypatch):
+    async def test_cache_reuse_no_reembedding_on_second_call(self, tmp_path, monkeypatch):
         """Second route() call with same topics must not re-embed (all cached)."""
         monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "true")
 
@@ -699,10 +699,10 @@ class TestCandidateFirstNarrowing:
             router = ModuleContextRouter(tmp_path, topics_dir=topics_dir)
 
             # First call — embeds fresh
-            router.route(target_files=["orchestrator.py"], query="plan phase")
+            await router.route(target_files=["orchestrator.py"], query="plan phase")
             call_index[0] = 1
             # Second call — same topics, same query: cache should be hit
-            router.route(target_files=["orchestrator.py"], query="plan phase")
+            await router.route(target_files=["orchestrator.py"], query="plan phase")
 
         second_call_total = sum(embed_call_sizes_by_call[1])
         assert second_call_total == 0, (
@@ -750,3 +750,88 @@ class TestOracleRealImport:
         assert isinstance(result, list), (
             f"Expected list, got {type(result).__name__!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# fs-hot-tier Batch 3 (row 21, 2026-07-03) — _load_topic_fragments routes
+# the topics_dir rglob('*.md') + per-file read through
+# cooperative_fs_io.offload(cpu_bound=False) instead of running
+# synchronously on the loop thread inside ModuleContextRouter.route().
+# ---------------------------------------------------------------------------
+
+
+class TestLoadTopicFragmentsOffload:
+    async def test_routes_through_offload_thread_pool(self, tmp_path, monkeypatch):
+        topics_dir = tmp_path / "topics"
+        topics_dir.mkdir()
+        (topics_dir / "a.md").write_text("# Topic A\nsome content\n")
+
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.module_routing import (
+            _load_topic_fragments,
+        )
+        calls = {"n": 0, "cpu_bound": None}
+        real_offload = cooperative_fs_io.offload
+
+        async def _spy_offload(fn, *args, cpu_bound=False, **kwargs):
+            calls["n"] += 1
+            calls["cpu_bound"] = cpu_bound
+            return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+        frags = await _load_topic_fragments(topics_dir, tmp_path)
+
+        assert calls["n"] == 1, "_load_topic_fragments must route through offload"
+        assert calls["cpu_bound"] is False, (
+            "read + light parse is IO-bound — must use the thread "
+            "pool, not a process pool"
+        )
+        assert len(frags) == 1
+        assert frags[0].title == "Topic A"
+
+    async def test_parity_with_direct_sync_scan(self, tmp_path):
+        topics_dir = tmp_path / "topics"
+        (topics_dir / "sub").mkdir(parents=True)
+        (topics_dir / "a.md").write_text("# A\ncontent a\n")
+        (topics_dir / "sub" / "b.md").write_text("# B\ncontent b\n")
+
+        from backend.core.ouroboros.governance.module_routing import (
+            _load_topic_fragments,
+        )
+        frags = await _load_topic_fragments(topics_dir, tmp_path)
+        titles = {f.title for f in frags}
+        assert titles == {"A", "B"}
+
+    async def test_missing_topics_dir_returns_empty(self, tmp_path):
+        from backend.core.ouroboros.governance.module_routing import (
+            _load_topic_fragments,
+        )
+        frags = await _load_topic_fragments(
+            tmp_path / "does_not_exist", tmp_path,
+        )
+        assert frags == []
+
+    async def test_offload_error_degrades_to_empty_no_raise(self, tmp_path, monkeypatch):
+        topics_dir = tmp_path / "topics"
+        topics_dir.mkdir()
+        (topics_dir / "a.md").write_text("# A\ncontent\n")
+
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            OffloadError,
+        )
+        from backend.core.ouroboros.governance.module_routing import (
+            _load_topic_fragments,
+        )
+
+        async def _boom_offload(fn, *args, **kwargs):
+            return OffloadError(
+                fn_name="_load_topic_fragments_worker",
+                exc_type="OSError",
+                message="synthetic offload-layer fault",
+                cpu_bound=False,
+            )
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+        frags = await _load_topic_fragments(topics_dir, tmp_path)
+        assert frags == []

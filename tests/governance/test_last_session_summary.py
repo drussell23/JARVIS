@@ -81,11 +81,11 @@ def _write_summary(
 # ---------------------------------------------------------------------------
 
 
-def test_single_session_load(monkeypatch, tmp_path):
+async def test_single_session_load(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write_summary(tmp_path, "bt-2026-04-15-230849", duration_s=1034.0)
     summary = lss.LastSessionSummary(tmp_path)
-    records = summary.load()
+    records = await summary.load()
     assert len(records) == 1
     r = records[0]
     assert r.session_id == "bt-2026-04-15-230849"
@@ -99,12 +99,12 @@ def test_single_session_load(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_missing_sessions_dir_graceful(monkeypatch, tmp_path):
+async def test_missing_sessions_dir_graceful(monkeypatch, tmp_path):
     _enable(monkeypatch)
     # No .ouroboros/sessions/ anywhere under tmp_path.
     summary = lss.LastSessionSummary(tmp_path)
-    assert summary.load() == []
-    assert summary.format_for_prompt() is None
+    assert await summary.load() == []
+    assert await summary.format_for_prompt() is None
 
 
 # ---------------------------------------------------------------------------
@@ -112,14 +112,14 @@ def test_missing_sessions_dir_graceful(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_malformed_json_graceful(monkeypatch, tmp_path):
+async def test_malformed_json_graceful(monkeypatch, tmp_path):
     _enable(monkeypatch)
     session_dir = tmp_path / ".ouroboros" / "sessions" / "bt-2026-04-15-123456"
     session_dir.mkdir(parents=True)
     (session_dir / "summary.json").write_text("{not-valid-json")
 
     summary = lss.LastSessionSummary(tmp_path)
-    assert summary.load() == []
+    assert await summary.load() == []
     assert summary.stats().malformed_files >= 1
 
 
@@ -128,14 +128,14 @@ def test_malformed_json_graceful(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_lex_max_selection_picks_newest(monkeypatch, tmp_path):
+async def test_lex_max_selection_picks_newest(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write_summary(tmp_path, "bt-2026-04-10-100000")
     _write_summary(tmp_path, "bt-2026-04-15-230849")
     _write_summary(tmp_path, "bt-2026-04-12-150000")
 
     summary = lss.LastSessionSummary(tmp_path)
-    records = summary.load(n_sessions=1)
+    records = await summary.load(n_sessions=1)
     assert len(records) == 1
     assert records[0].session_id == "bt-2026-04-15-230849"
 
@@ -145,7 +145,7 @@ def test_lex_max_selection_picks_newest(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_self_skip_when_lex_max_is_active(monkeypatch, tmp_path):
+async def test_self_skip_when_lex_max_is_active(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write_summary(tmp_path, "bt-2026-04-10-100000")
     _write_summary(tmp_path, "bt-2026-04-15-230849")  # lex-max
@@ -153,23 +153,23 @@ def test_self_skip_when_lex_max_is_active(monkeypatch, tmp_path):
 
     lss.set_active_session_id("bt-2026-04-15-230849")
     summary = lss.LastSessionSummary(tmp_path)
-    records = summary.load(n_sessions=1)
+    records = await summary.load(n_sessions=1)
     # Self skipped → the previous one (bt-2026-04-12-150000) wins.
     assert len(records) == 1
     assert records[0].session_id == "bt-2026-04-12-150000"
 
 
-def test_self_skip_only_session_returns_empty(monkeypatch, tmp_path):
+async def test_self_skip_only_session_returns_empty(monkeypatch, tmp_path):
     """If the only session on disk is ourselves, return empty (no fake summary)."""
     _enable(monkeypatch)
     _write_summary(tmp_path, "bt-2026-04-15-230849")
     lss.set_active_session_id("bt-2026-04-15-230849")
     summary = lss.LastSessionSummary(tmp_path)
-    assert summary.load() == []
-    assert summary.format_for_prompt() is None
+    assert await summary.load() == []
+    assert await summary.format_for_prompt() is None
 
 
-def test_defensive_filter_skips_in_flight_session_without_active_id(monkeypatch, tmp_path):
+async def test_defensive_filter_skips_in_flight_session_without_active_id(monkeypatch, tmp_path):
     """Belt-and-suspenders: even without set_active_session_id, dirs whose
     summary.json doesn't exist yet (in-flight session) are skipped.
 
@@ -186,7 +186,7 @@ def test_defensive_filter_skips_in_flight_session_without_active_id(monkeypatch,
 
     # Do NOT set_active_session_id — prove the filter catches it anyway.
     summary = lss.LastSessionSummary(tmp_path)
-    records = summary.load(n_sessions=1)
+    records = await summary.load(n_sessions=1)
     assert len(records) == 1
     assert records[0].session_id == "bt-2026-04-15-090000"
 
@@ -196,20 +196,20 @@ def test_defensive_filter_skips_in_flight_session_without_active_id(monkeypatch,
 # ---------------------------------------------------------------------------
 
 
-def test_n_sessions_clamped_to_hard_max(monkeypatch, tmp_path):
+async def test_n_sessions_clamped_to_hard_max(monkeypatch, tmp_path):
     _enable(monkeypatch, N_SESSIONS="10")  # user requests 10 → clamped to 3
     for i in range(5):
         _write_summary(tmp_path, f"bt-2026-04-0{i}-000000")
     summary = lss.LastSessionSummary(tmp_path)
-    records = summary.load()
+    records = await summary.load()
     assert len(records) == 3  # hard max
 
 
-def test_n_zero_returns_empty(monkeypatch, tmp_path):
+async def test_n_zero_returns_empty(monkeypatch, tmp_path):
     _enable(monkeypatch, N_SESSIONS="0")
     _write_summary(tmp_path, "bt-2026-04-15-230849")
     summary = lss.LastSessionSummary(tmp_path)
-    assert summary.load() == []
+    assert await summary.load() == []
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +217,7 @@ def test_n_zero_returns_empty(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_max_chars_cap_trims_output(monkeypatch, tmp_path):
+async def test_max_chars_cap_trims_output(monkeypatch, tmp_path):
     _enable(monkeypatch, MAX_CHARS="400")
     # Three sessions with realistic content — rendered will exceed 400.
     for i in range(3):
@@ -225,7 +225,7 @@ def test_max_chars_cap_trims_output(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_LAST_SESSION_SUMMARY_N_SESSIONS", "3")
 
     summary = lss.LastSessionSummary(tmp_path)
-    rendered = summary.format_for_prompt()
+    rendered = await summary.format_for_prompt()
     assert rendered is not None
     assert len(rendered) <= 400
     assert rendered.endswith("...")
@@ -236,7 +236,7 @@ def test_max_chars_cap_trims_output(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_sanitizer_strips_control_chars(monkeypatch, tmp_path):
+async def test_sanitizer_strips_control_chars(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write_summary(
         tmp_path, "bt-2026-04-15-230849",
@@ -244,7 +244,7 @@ def test_sanitizer_strips_control_chars(monkeypatch, tmp_path):
         convergence_state="CONVERGED\n\tinjected",
     )
     summary = lss.LastSessionSummary(tmp_path)
-    rendered = summary.format_for_prompt() or ""
+    rendered = await summary.format_for_prompt() or ""
     assert "\x1b" not in rendered
     assert "\x00" not in rendered
     assert "\n\t" not in rendered
@@ -258,14 +258,14 @@ def test_sanitizer_strips_control_chars(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_redaction_via_public_helper(monkeypatch, tmp_path):
+async def test_redaction_via_public_helper(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write_summary(
         tmp_path, "bt-2026-04-15-230849",
         convergence_state="CONVERGED with token sk-abcdefghij1234567890xyz",
     )
     summary = lss.LastSessionSummary(tmp_path)
-    rendered = summary.format_for_prompt() or ""
+    rendered = await summary.format_for_prompt() or ""
     assert "sk-abcdefghij1234567890xyz" not in rendered
     assert "[REDACTED:openai-key]" in rendered
 
@@ -275,20 +275,20 @@ def test_redaction_via_public_helper(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_format_for_prompt_none_when_disabled(tmp_path):
+async def test_format_for_prompt_none_when_disabled(tmp_path):
     # Env unset — master switch off.
     _write_summary(tmp_path, "bt-2026-04-15-230849")
     summary = lss.LastSessionSummary(tmp_path)
-    assert summary.format_for_prompt() is None
+    assert await summary.format_for_prompt() is None
 
 
-def test_format_for_prompt_none_when_prompt_gate_off(monkeypatch, tmp_path):
+async def test_format_for_prompt_none_when_prompt_gate_off(monkeypatch, tmp_path):
     _enable(monkeypatch, PROMPT_INJECTION_ENABLED="false")
     _write_summary(tmp_path, "bt-2026-04-15-230849")
     summary = lss.LastSessionSummary(tmp_path)
     # load() still works, format_for_prompt respects sub-gate.
-    assert summary.load() != []
-    assert summary.format_for_prompt() is None
+    assert await summary.load() != []
+    assert await summary.format_for_prompt() is None
 
 
 # ---------------------------------------------------------------------------
@@ -296,11 +296,11 @@ def test_format_for_prompt_none_when_prompt_gate_off(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_fenced_block_and_authority_copy_present(monkeypatch, tmp_path):
+async def test_fenced_block_and_authority_copy_present(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write_summary(tmp_path, "bt-2026-04-15-230849")
     summary = lss.LastSessionSummary(tmp_path)
-    rendered = summary.format_for_prompt()
+    rendered = await summary.format_for_prompt()
     assert rendered is not None
     assert "## Previous Session Closure (untrusted episodic context)" in rendered
     assert '<previous_sessions untrusted="true">' in rendered
@@ -316,7 +316,7 @@ def test_fenced_block_and_authority_copy_present(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_zero_attempted_ops_appends_deterministic_note(monkeypatch, tmp_path):
+async def test_zero_attempted_ops_appends_deterministic_note(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write_summary(
         tmp_path, "bt-2026-04-15-230849",
@@ -329,18 +329,18 @@ def test_zero_attempted_ops_appends_deterministic_note(monkeypatch, tmp_path):
         cost_breakdown={},
     )
     summary = lss.LastSessionSummary(tmp_path)
-    rendered = summary.format_for_prompt() or ""
+    rendered = await summary.format_for_prompt() or ""
     assert (
         "note: stop_reason=idle_timeout; harness reported zero attempted ops."
         in rendered
     )
 
 
-def test_nonzero_attempted_ops_no_note(monkeypatch, tmp_path):
+async def test_nonzero_attempted_ops_no_note(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write_summary(tmp_path, "bt-2026-04-15-230849")  # default attempted=1
     summary = lss.LastSessionSummary(tmp_path)
-    rendered = summary.format_for_prompt() or ""
+    rendered = await summary.format_for_prompt() or ""
     assert "zero attempted ops" not in rendered
 
 
@@ -349,7 +349,7 @@ def test_nonzero_attempted_ops_no_note(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_singleton_round_trip():
+async def test_singleton_round_trip():
     a = lss.get_default_summary()
     b = lss.get_default_summary()
     assert a is b
@@ -358,11 +358,11 @@ def test_singleton_round_trip():
     assert a is not c
 
 
-def test_inject_metrics_shape(monkeypatch, tmp_path):
+async def test_inject_metrics_shape(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write_summary(tmp_path, "bt-2026-04-15-230849")
     summary = lss.LastSessionSummary(tmp_path)
-    enabled, n, sid, chars, hash8 = summary.inject_metrics()
+    enabled, n, sid, chars, hash8 = await summary.inject_metrics()
     assert enabled is True
     assert n == 1
     assert sid == "bt-2026-04-15-230849"
@@ -371,10 +371,10 @@ def test_inject_metrics_shape(monkeypatch, tmp_path):
     assert all(c in "0123456789abcdef" for c in hash8)
 
 
-def test_inject_metrics_disabled_shape(tmp_path):
+async def test_inject_metrics_disabled_shape(tmp_path):
     _write_summary(tmp_path, "bt-2026-04-15-230849")
     summary = lss.LastSessionSummary(tmp_path)
-    enabled, n, sid, chars, hash8 = summary.inject_metrics()
+    enabled, n, sid, chars, hash8 = await summary.inject_metrics()
     assert enabled is False
     assert n == 0
     assert sid == ""
@@ -387,7 +387,7 @@ def test_inject_metrics_disabled_shape(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_integration_ordering_with_real_op_context(monkeypatch, tmp_path):
+async def test_integration_ordering_with_real_op_context(monkeypatch, tmp_path):
     """Mirror of bridge integration test — prove injection ordering.
 
     Composes all five prompt sources through the same ``with_strategic_memory_context``
@@ -415,7 +415,7 @@ def test_integration_ordering_with_real_op_context(monkeypatch, tmp_path):
     ctx = _apply(ctx, "bridge", '<conversation untrusted="true">[tui_user] hi</conversation>')
     ctx = _apply(ctx, "semantic", "## Recent Focus (semantic — untrusted prior)\n\nstuff")
 
-    lss_section = lss.LastSessionSummary(tmp_path).format_for_prompt()
+    lss_section = await lss.LastSessionSummary(tmp_path).format_for_prompt()
     assert lss_section is not None
     ctx = _apply(ctx, "last-session", lss_section)
 
@@ -436,3 +436,106 @@ def test_integration_ordering_with_real_op_context(monkeypatch, tmp_path):
     )
     # LastSessionSummary content present.
     assert "bt-2026-04-15-230849" in prompt
+
+
+# ---------------------------------------------------------------------------
+# fs-hot-tier Batch 3 (row 18, 2026-07-03) — LastSessionSummary
+# ``_lex_max_session_dirs`` routes the ``.ouroboros/sessions`` iterdir
+# scan through cooperative_fs_io.offload(cpu_bound=False) instead of
+# running the scan synchronously on the loop thread inside ``load()``.
+# ---------------------------------------------------------------------------
+
+
+class TestLexMaxSessionDirsOffload:
+    async def test_routes_through_offload_thread_pool(self, monkeypatch, tmp_path):
+        _enable(monkeypatch)
+        _write_summary(tmp_path, "bt-2026-04-15-230849")
+        summary = lss.LastSessionSummary(tmp_path)
+
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        calls = {"n": 0, "cpu_bound": None}
+        real_offload = cooperative_fs_io.offload
+
+        async def _spy_offload(fn, *args, cpu_bound=False, **kwargs):
+            calls["n"] += 1
+            calls["cpu_bound"] = cpu_bound
+            return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+        records = await summary.load()
+
+        assert calls["n"] == 1, "_lex_max_session_dirs must route through offload"
+        assert calls["cpu_bound"] is False, (
+            "single-level iterdir over a small sessions dir is IO-bound "
+            "— must use the thread pool, not a process pool"
+        )
+        assert len(records) == 1
+
+    async def test_parity_with_direct_iterdir_scan(self, monkeypatch, tmp_path):
+        _enable(monkeypatch)
+        _write_summary(tmp_path, "bt-2026-04-10-100000")
+        _write_summary(tmp_path, "bt-2026-04-15-230849")
+        summary = lss.LastSessionSummary(tmp_path)
+        dirs = await summary._lex_max_session_dirs(10)
+        sessions_root = tmp_path / ".ouroboros" / "sessions"
+        expected = sorted(
+            (p for p in sessions_root.iterdir()
+             if p.is_dir() and p.name.startswith("bt-")),
+            key=lambda p: p.name, reverse=True,
+        )
+        assert [d.name for d in dirs] == [p.name for p in expected]
+
+    async def test_offload_error_degrades_to_empty_no_raise(self, monkeypatch, tmp_path):
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            OffloadError,
+        )
+        _enable(monkeypatch)
+        _write_summary(tmp_path, "bt-2026-04-15-230849")
+        summary = lss.LastSessionSummary(tmp_path)
+
+        async def _boom_offload(fn, *args, **kwargs):
+            return OffloadError(
+                fn_name="_lex_max_session_dirs_worker",
+                exc_type="OSError",
+                message="synthetic offload-layer fault",
+                cpu_bound=False,
+            )
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+        assert await summary.load() == []
+        assert await summary.format_for_prompt() is None
+
+
+class TestLoadSyncBridge:
+    """load_sync()/format_for_prompt_sync() — the non-async bridge for
+    legacy consumers outside the audited CONTEXT_EXPANSION hot path
+    (cross_session_harness, cross_session_coherence_rig, session_story,
+    graduation/cross_session_coherence)."""
+
+    def test_load_sync_matches_async_load(self, monkeypatch, tmp_path):
+        _enable(monkeypatch)
+        _write_summary(tmp_path, "bt-2026-04-15-230849")
+        summary = lss.LastSessionSummary(tmp_path)
+        records = summary.load_sync()
+        assert len(records) == 1
+        assert records[0].session_id == "bt-2026-04-15-230849"
+
+    def test_format_for_prompt_sync_matches_async(self, monkeypatch, tmp_path):
+        _enable(monkeypatch)
+        _write_summary(tmp_path, "bt-2026-04-15-230849")
+        summary = lss.LastSessionSummary(tmp_path)
+        rendered = summary.format_for_prompt_sync()
+        assert rendered is not None
+        assert "bt-2026-04-15-230849" in rendered
+
+    async def test_load_sync_from_inside_running_loop_degrades_no_raise(
+        self, monkeypatch, tmp_path,
+    ):
+        """Calling the sync bridge from within an already-running loop
+        must never raise (asyncio.run() would) — degrades to []."""
+        _enable(monkeypatch)
+        _write_summary(tmp_path, "bt-2026-04-15-230849")
+        summary = lss.LastSessionSummary(tmp_path)
+        result = summary.load_sync()
+        assert result == []

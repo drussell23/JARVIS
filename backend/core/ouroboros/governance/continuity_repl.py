@@ -81,7 +81,7 @@ def _master_enabled() -> bool:
         return False
 
 
-def dispatch_continuity_command(
+async def dispatch_continuity_command(
     line: str,
 ) -> ContinuityReplDispatchResult:
     """Parse ``/continuity`` line. NEVER raises."""
@@ -116,9 +116,9 @@ def dispatch_continuity_command(
 
     try:
         if head == "panel":
-            return _render_panel()
+            return await _render_panel()
         if head == "diff":
-            return _render_diff()
+            return await _render_diff()
         if head == "ticker":
             return _render_ticker()
         if head == "history":
@@ -126,7 +126,7 @@ def dispatch_continuity_command(
                 _parse_limit(args, default=10),
             )
         if head == "status":
-            return _render_status()
+            return await _render_status()
         return ContinuityReplDispatchResult(
             ok=False,
             text=(
@@ -158,11 +158,11 @@ def _parse_limit(args, *, default: int) -> int:
         return default
 
 
-def _render_panel() -> ContinuityReplDispatchResult:
+async def _render_panel() -> ContinuityReplDispatchResult:
     from backend.core.ouroboros.governance.session_continuity import (
         format_session_continuity_panel,
     )
-    out = format_session_continuity_panel()
+    out = await format_session_continuity_panel()
     if not out:
         return ContinuityReplDispatchResult(
             ok=True,
@@ -176,11 +176,11 @@ def _render_panel() -> ContinuityReplDispatchResult:
     )
 
 
-def _render_diff() -> ContinuityReplDispatchResult:
+async def _render_diff() -> ContinuityReplDispatchResult:
     from backend.core.ouroboros.governance.session_continuity import (
         format_cross_session_diff,
     )
-    out = format_cross_session_diff()
+    out = await format_cross_session_diff()
     if not out:
         return ContinuityReplDispatchResult(
             ok=True,
@@ -241,7 +241,7 @@ def _render_history(limit: int) -> ContinuityReplDispatchResult:
     )
 
 
-def _render_status() -> ContinuityReplDispatchResult:
+async def _render_status() -> ContinuityReplDispatchResult:
     from backend.core.ouroboros.governance.session_continuity import (
         master_enabled, get_default_ticker,
         aggregate_cross_session_diff,
@@ -251,7 +251,7 @@ def _render_status() -> ContinuityReplDispatchResult:
     ticker = get_default_ticker()
     history = ticker.history(limit=64)
     parts.append(f"  ticker history    : {len(history)} events")
-    diff = aggregate_cross_session_diff()
+    diff = await aggregate_cross_session_diff()
     parts.append(
         f"  has prev session  : {diff.has_previous}"
     )

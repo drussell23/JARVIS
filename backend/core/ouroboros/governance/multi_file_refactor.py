@@ -306,6 +306,38 @@ class _CheckpointStore:
             shutil.rmtree(str(cp_dir), ignore_errors=True)
 
 
+def _scan_files_python_worker(
+    project_root_str: str, text: str, scope: str, max_files: int,
+) -> List[str]:
+    """Module-level worker for
+    :meth:`MultiFileRefactorEngine._scan_files_python`.
+
+    Dispatched into the shared ``advisor-blast`` thread pool via
+    ``cooperative_fs_io.offload`` (fs-hot-tier Batch 3, row 16). Lifted
+    to module level so the offload trampoline doesn't capture any
+    caller-local state. NEVER raises on a per-file read fault — a
+    single unreadable file is skipped, matching the original
+    ``except (OSError, UnicodeDecodeError): continue`` semantics.
+    """
+    project_root = Path(project_root_str)
+    results: List[str] = []
+    glob_pattern = scope if "**" in scope else f"**/{scope}"
+
+    for p in project_root.glob(glob_pattern):
+        if not p.is_file():
+            continue
+        try:
+            content = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if text in content:
+            results.append(str(p.relative_to(project_root)))
+        if len(results) >= max_files:
+            break
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # MultiFileRefactorEngine
 # ---------------------------------------------------------------------------
@@ -745,23 +777,35 @@ class MultiFileRefactorEngine:
     async def _scan_files_python(
         self, text: str, scope: str
     ) -> List[str]:
-        """Pure-Python fallback file scanner."""
-        results: List[str] = []
-        glob_pattern = scope if "**" in scope else f"**/{scope}"
+        """Pure-Python fallback file scanner.
 
-        for p in self._project_root.glob(glob_pattern):
-            if not p.is_file():
-                continue
-            try:
-                content = p.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            if text in content:
-                results.append(str(p.relative_to(self._project_root)))
-            if len(results) >= _MAX_FILES:
-                break
-
-        return results
+        fs-hot-tier Batch 3 (row 16): the whole-repo glob + per-file
+        read + substring scan is dispatched off the asyncio loop via
+        ``cooperative_fs_io.offload(cpu_bound=False)`` — a thread pool,
+        not a process pool: ``Path.read_text`` releases the GIL on its
+        underlying syscalls and the substring check is cheap, so a
+        thread frees the loop without the process-spawn/arg-pickling
+        cost a process pool would add. This is the grep-subprocess
+        FALLBACK path only (rare — the primary path is the argv-based
+        subprocess in ``_find_files_containing``). Fail-soft: an
+        ``OffloadError`` degrades to ``[]`` — the same empty result a
+        scan that finds nothing would give — never raises.
+        """
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+        result = await offload(
+            _scan_files_python_worker,
+            str(self._project_root), text, scope, _MAX_FILES,
+        )
+        if is_offload_error(result):
+            logger.debug(
+                "[MultiFileRefactor] _scan_files_python offload failed "
+                "for scope=%s — degrading to empty list", scope,
+            )
+            return []
+        return result
 
     def _path_to_module(self, file_path: str) -> Optional[str]:
         """Convert a Python file path to a dotted module path.

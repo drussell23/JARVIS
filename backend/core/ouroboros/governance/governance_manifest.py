@@ -429,25 +429,26 @@ def _compute_manifest_signature(
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
-def compute_current_signatures(
-    governance_dir: Optional[Path] = None,
-    *,
-    max_files: Optional[int] = None,
-) -> Tuple[FileSignature, ...]:
-    """Walk the governance directory and hash every .py file.
+def _compute_current_signatures_worker(
+    governance_dir_str: str,
+    root_str: str,
+    cap: int,
+) -> Tuple[Tuple[str, str, int], ...]:
+    """Module-level worker for :func:`compute_current_signatures`.
 
-    Pure function. NEVER raises. Returns an empty tuple when the
-    directory is missing / unreadable / over the file-count cap.
+    Dispatched into the shared ``advisor-blast`` thread pool via
+    ``cooperative_fs_io.offload`` (fs-hot-tier Batch 3, row 20). THREAD,
+    not process: ``hashlib.sha256`` releases the GIL for sizable reads
+    (C extension), so a thread frees the loop without process-spawn/
+    arg-pickling overhead. Returns plain tuples (not ``FileSignature``
+    dataclasses) — payload-agnostic across the executor boundary; the
+    caller reconstructs the typed dataclasses. NEVER raises — returns
+    ``()`` on any walk-level failure, exactly mirroring the prior
+    synchronous fail-soft contract.
     """
-    if governance_dir is None:
-        governance_dir = _governance_dir()
-    if governance_dir is None or not governance_dir.exists():
-        return ()
-    cap = max_files if max_files is not None else max_files_scan()
-    root = _resolve_repo_root()
-    if root is None:
-        return ()
-    sigs: List[FileSignature] = []
+    governance_dir = Path(governance_dir_str)
+    root = Path(root_str)
+    sigs: List[Tuple[str, str, int]] = []
     try:
         # Sorted for determinism.
         for path in sorted(governance_dir.rglob("*.py")):
@@ -471,11 +472,7 @@ def compute_current_signatures(
                     os.sep, "/",
                 )
                 size = path.stat().st_size
-                sigs.append(FileSignature(
-                    relative_path=rel,
-                    sha256=sha,
-                    size_bytes=size,
-                ))
+                sigs.append((rel, sha, size))
             except Exception:  # noqa: BLE001 — defensive per-file
                 continue
     except Exception:  # noqa: BLE001
@@ -483,7 +480,83 @@ def compute_current_signatures(
     return tuple(sigs)
 
 
-def compute_current_manifest(
+async def compute_current_signatures(
+    governance_dir: Optional[Path] = None,
+    *,
+    max_files: Optional[int] = None,
+) -> Tuple[FileSignature, ...]:
+    """Walk the governance directory and hash every .py file.
+
+    NEVER raises. Returns an empty tuple when the directory is
+    missing / unreadable / over the file-count cap.
+
+    fs-hot-tier Batch 3 (row 20): the rglob + per-file SHA-256 walk is
+    dispatched off the asyncio loop via
+    ``cooperative_fs_io.offload(cpu_bound=False)`` — THREAD pool
+    (hashlib releases the GIL). Fail-soft: an ``OffloadError``
+    degrades to ``()`` — the same empty result the prior synchronous
+    fail-soft gave on any walk failure. This fires on every accepted
+    commit (via ``AutoCommitter.commit`` → ``verify_governance_state``)
+    so a crawl failure must NEVER block or false-fail a commit — it
+    degrades to the pre-fix ``DISABLED``-shaped-comparison behavior.
+    """
+    if governance_dir is None:
+        governance_dir = _governance_dir()
+    if governance_dir is None or not governance_dir.exists():
+        return ()
+    cap = max_files if max_files is not None else max_files_scan()
+    root = _resolve_repo_root()
+    if root is None:
+        return ()
+
+    from backend.core.ouroboros.governance.cooperative_fs_io import (
+        offload,
+        is_offload_error,
+    )
+    result = await offload(
+        _compute_current_signatures_worker,
+        str(governance_dir), str(root), cap,
+        cpu_bound=False,
+    )
+    if is_offload_error(result):
+        logger.debug(
+            "[GovernanceManifest] compute_current_signatures offload "
+            "failed — degrading to empty tuple (never blocks a commit)",
+        )
+        return ()
+    return tuple(
+        FileSignature(relative_path=rel, sha256=sha, size_bytes=size)
+        for rel, sha, size in result
+    )
+
+
+def compute_current_signatures_sync(
+    governance_dir: Optional[Path] = None,
+    *,
+    max_files: Optional[int] = None,
+) -> Tuple[FileSignature, ...]:
+    """Synchronous bridge to :func:`compute_current_signatures` for
+    non-async legacy/CLI consumers (``refresh_signed_manifest``,
+    ``operator_commit_authority._governance_gate`` — see
+    :func:`verify_governance_state_sync`). NEVER raises; degrades to
+    ``()`` if called from within an already-running event loop."""
+    import asyncio as _asyncio
+    try:
+        _asyncio.get_running_loop()
+    except RuntimeError:
+        return _asyncio.run(
+            compute_current_signatures(
+                governance_dir=governance_dir, max_files=max_files,
+            )
+        )
+    logger.debug(
+        "[GovernanceManifest] compute_current_signatures_sync called "
+        "from within a running event loop — degrading to ()",
+    )
+    return ()
+
+
+async def compute_current_manifest(
     operator_label: str = "ephemeral",
     *,
     governance_dir: Optional[Path] = None,
@@ -491,12 +564,11 @@ def compute_current_manifest(
 ) -> ManifestSnapshot:
     """Compute a current-state snapshot WITHOUT writing it.
 
-    Pure-function — useful for comparison or for tests. The
-    ``operator_label`` is informational; use
-    :func:`refresh_signed_manifest` to actually persist with an
-    operator-meaningful label.
+    Useful for comparison or for tests. The ``operator_label`` is
+    informational; use :func:`refresh_signed_manifest` to actually
+    persist with an operator-meaningful label.
     """
-    sigs = compute_current_signatures(governance_dir=governance_dir)
+    sigs = await compute_current_signatures(governance_dir=governance_dir)
     aggregate = _compute_manifest_signature(sigs)
     return ManifestSnapshot(
         schema_version=GOVERNANCE_MANIFEST_SCHEMA_VERSION,
@@ -506,6 +578,43 @@ def compute_current_manifest(
         ),
         signatures=sigs,
         manifest_sha256=aggregate,
+    )
+
+
+def compute_current_manifest_sync(
+    operator_label: str = "ephemeral",
+    *,
+    governance_dir: Optional[Path] = None,
+    now_unix: Optional[float] = None,
+) -> ManifestSnapshot:
+    """Synchronous bridge to :func:`compute_current_manifest` — see
+    :func:`compute_current_signatures_sync` for the rationale. NEVER
+    raises; degrades to an empty-signatures snapshot if called from
+    within an already-running event loop."""
+    import asyncio as _asyncio
+    try:
+        _asyncio.get_running_loop()
+    except RuntimeError:
+        return _asyncio.run(
+            compute_current_manifest(
+                operator_label,
+                governance_dir=governance_dir,
+                now_unix=now_unix,
+            )
+        )
+    logger.debug(
+        "[GovernanceManifest] compute_current_manifest_sync called "
+        "from within a running event loop — degrading to empty "
+        "snapshot",
+    )
+    return ManifestSnapshot(
+        schema_version=GOVERNANCE_MANIFEST_SCHEMA_VERSION,
+        operator_label=operator_label,
+        signed_at_unix=(
+            now_unix if now_unix is not None else time.time()
+        ),
+        signatures=(),
+        manifest_sha256=_compute_manifest_signature(()),
     )
 
 
@@ -659,7 +768,24 @@ def compare_manifests(
 # ===========================================================================
 
 
-def verify_governance_state(
+def _disabled_comparison() -> ManifestComparison:
+    return ManifestComparison(
+        schema_version=GOVERNANCE_MANIFEST_SCHEMA_VERSION,
+        verdict=ManifestVerdict.DISABLED,
+        current_file_count=0,
+        signed_file_count=0,
+        drifted_paths=(),
+        added_paths=(),
+        removed_paths=(),
+        manifest_path_str=str(manifest_path()),
+        detail=(
+            f"gate disabled via {_ENV_MASTER}=false — "
+            "operator opt-in workflow"
+        ),
+    )
+
+
+async def verify_governance_state(
     target_files: Optional[Sequence[str]] = None,
 ) -> ManifestComparison:
     """Top-level end-to-end verifier. NEVER raises.
@@ -672,27 +798,44 @@ def verify_governance_state(
     actually changing in the calling commit — the AutoCommitter
     integration passes its `target_files` argument so unrelated
     governance/ files don't trigger drift on every commit.
+
+    fs-hot-tier Batch 3 (row 20): this is the hottest path — it fires
+    on every accepted commit via ``AutoCommitter.commit``. The
+    underlying SHA-256 walk is now offloaded (see
+    :func:`compute_current_signatures`); a crawl failure there
+    degrades to an empty-signatures snapshot rather than raising, so
+    this verifier NEVER blocks or false-fails a commit.
     """
     if not master_enabled():
-        return ManifestComparison(
-            schema_version=GOVERNANCE_MANIFEST_SCHEMA_VERSION,
-            verdict=ManifestVerdict.DISABLED,
-            current_file_count=0,
-            signed_file_count=0,
-            drifted_paths=(),
-            added_paths=(),
-            removed_paths=(),
-            manifest_path_str=str(manifest_path()),
-            detail=(
-                f"gate disabled via {_ENV_MASTER}=false — "
-                "operator opt-in workflow"
-            ),
-        )
-    current = compute_current_manifest()
+        return _disabled_comparison()
+    current = await compute_current_manifest()
     signed = load_signed_manifest()
     return compare_manifests(
         current, signed, target_files=target_files,
     )
+
+
+def verify_governance_state_sync(
+    target_files: Optional[Sequence[str]] = None,
+) -> ManifestComparison:
+    """Synchronous bridge to :func:`verify_governance_state` for
+    non-async legacy consumers OUTSIDE the audited AutoCommitter hot
+    path — ``operator_commit_authority._governance_gate`` (git hooks /
+    CLI / daemon / REPL channels, whose public ``verify_pre_commit``
+    API has long-standing synchronous callers). NEVER raises; degrades
+    to the ``DISABLED``-shaped comparison if called from within an
+    already-running event loop (never blocks a commit)."""
+    import asyncio as _asyncio
+    try:
+        _asyncio.get_running_loop()
+    except RuntimeError:
+        return _asyncio.run(verify_governance_state(target_files))
+    logger.debug(
+        "[GovernanceManifest] verify_governance_state_sync called "
+        "from within a running event loop — degrading to DISABLED "
+        "comparison (never blocks a commit)",
+    )
+    return _disabled_comparison()
 
 
 # ===========================================================================
@@ -749,7 +892,11 @@ def refresh_signed_manifest(
             error=f"mkdir failed: {type(exc).__name__}",
         )
 
-    snapshot = compute_current_manifest(
+    # fs-hot-tier Batch 3 (row 20): compute_current_manifest is now
+    # async (offloaded SHA-256 walk); refresh_signed_manifest is an
+    # operator-only synchronous entry point — bridges via the sync
+    # wrapper rather than cascading async through this CLI-shaped API.
+    snapshot = compute_current_manifest_sync(
         operator_label=operator_label.strip(),
         now_unix=now_unix,
     )
@@ -1108,10 +1255,13 @@ __all__ = [
     "manifest_path",
     "is_refusal_verdict",
     "compute_current_signatures",
+    "compute_current_signatures_sync",
     "compute_current_manifest",
+    "compute_current_manifest_sync",
     "load_signed_manifest",
     "compare_manifests",
     "verify_governance_state",
+    "verify_governance_state_sync",
     "refresh_signed_manifest",
     "register_shipped_invariants",
     "register_flags",

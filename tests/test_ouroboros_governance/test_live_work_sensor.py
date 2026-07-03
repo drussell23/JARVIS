@@ -82,7 +82,7 @@ def test_is_enabled_default_true() -> None:
     assert is_enabled() is True
 
 
-def test_disabled_via_env_short_circuits(tmp_path: Path, monkeypatch) -> None:
+async def test_disabled_via_env_short_circuits(tmp_path: Path, monkeypatch) -> None:
     import importlib
     import backend.core.ouroboros.governance.live_work_sensor as lws
 
@@ -93,7 +93,7 @@ def test_disabled_via_env_short_circuits(tmp_path: Path, monkeypatch) -> None:
         # Dirty the file so we know a "real" signal exists.
         (repo / "backend" / "main.py").write_text("modified\n", encoding="utf-8")
         sensor = lws.LiveWorkSensor(repo)
-        active, reason = sensor.is_human_active("backend/main.py")
+        active, reason = await sensor.is_human_active("backend/main.py")
         assert active is False
         assert reason is None
         assert sensor.get_active_files() == set()
@@ -107,47 +107,47 @@ def test_disabled_via_env_short_circuits(tmp_path: Path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_clean_file_is_not_active(tmp_path: Path) -> None:
+async def test_clean_file_is_not_active(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     sensor = LiveWorkSensor(repo)
-    active, reason = sensor.is_human_active("backend/main.py")
+    active, reason = await sensor.is_human_active("backend/main.py")
     assert active is False
     assert reason is None
 
 
-def test_unstaged_change_marks_file_active(tmp_path: Path) -> None:
+async def test_unstaged_change_marks_file_active(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     (repo / "backend" / "main.py").write_text("print('modified')\n", encoding="utf-8")
     # Move mtime backwards so only the git signal can fire.
     old_ts = time.time() - 3600
     os.utime(repo / "backend" / "main.py", (old_ts, old_ts))
     sensor = LiveWorkSensor(repo)
-    active, reason = sensor.is_human_active("backend/main.py")
+    active, reason = await sensor.is_human_active("backend/main.py")
     assert active is True
     assert reason is not None
     assert "git status" in reason
 
 
-def test_staged_change_marks_file_active(tmp_path: Path) -> None:
+async def test_staged_change_marks_file_active(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     (repo / "backend" / "main.py").write_text("print('staged')\n", encoding="utf-8")
     subprocess.run(["git", "add", "backend/main.py"], cwd=repo, check=True)
     old_ts = time.time() - 3600
     os.utime(repo / "backend" / "main.py", (old_ts, old_ts))
     sensor = LiveWorkSensor(repo)
-    active, reason = sensor.is_human_active("backend/main.py")
+    active, reason = await sensor.is_human_active("backend/main.py")
     assert active is True
     assert "git status" in (reason or "")
 
 
-def test_untracked_new_file_marks_active(tmp_path: Path) -> None:
+async def test_untracked_new_file_marks_active(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     new_file = repo / "backend" / "new_mod.py"
     new_file.write_text("x = 1\n", encoding="utf-8")
     old_ts = time.time() - 3600
     os.utime(new_file, (old_ts, old_ts))
     sensor = LiveWorkSensor(repo)
-    active, reason = sensor.is_human_active("backend/new_mod.py")
+    active, reason = await sensor.is_human_active("backend/new_mod.py")
     assert active is True
     assert "git status" in (reason or "")
 
@@ -167,7 +167,7 @@ def test_get_active_files_lists_git_dirty(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_recent_mtime_without_git_change(tmp_path: Path) -> None:
+async def test_recent_mtime_without_git_change(tmp_path: Path) -> None:
     """File touched seconds ago but matching its committed content —
     git is clean, so ONLY the mtime signal should fire."""
     repo = _make_repo(tmp_path)
@@ -176,31 +176,31 @@ def test_recent_mtime_without_git_change(tmp_path: Path) -> None:
     now = time.time()
     os.utime(path, (now, now))
     sensor = LiveWorkSensor(repo, active_window_s=180)
-    active, reason = sensor.is_human_active("backend/main.py")
+    active, reason = await sensor.is_human_active("backend/main.py")
     assert active is True
     assert "mtime" in (reason or "")
 
 
-def test_old_mtime_outside_window(tmp_path: Path) -> None:
+async def test_old_mtime_outside_window(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     path = repo / "backend" / "main.py"
     very_old = time.time() - 10_000
     os.utime(path, (very_old, very_old))
     sensor = LiveWorkSensor(repo, active_window_s=180)
-    active, reason = sensor.is_human_active("backend/main.py")
+    active, reason = await sensor.is_human_active("backend/main.py")
     assert active is False
     assert reason is None
 
 
-def test_active_window_configurable(tmp_path: Path) -> None:
+async def test_active_window_configurable(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     path = repo / "backend" / "main.py"
     five_min_ago = time.time() - 300
     os.utime(path, (five_min_ago, five_min_ago))
     tight = LiveWorkSensor(repo, active_window_s=60)
     wide = LiveWorkSensor(repo, active_window_s=600)
-    assert tight.is_human_active("backend/main.py")[0] is False
-    assert wide.is_human_active("backend/main.py")[0] is True
+    assert (await tight.is_human_active("backend/main.py"))[0] is False
+    assert (await wide.is_human_active("backend/main.py"))[0] is True
 
 
 # ---------------------------------------------------------------------------
@@ -208,41 +208,41 @@ def test_active_window_configurable(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_vim_swap_file_detected(tmp_path: Path) -> None:
+async def test_vim_swap_file_detected(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     # vim swap lives next to the target, named .main.py.swp
     (repo / "backend" / ".main.py.swp").write_bytes(b"vim-swap")
     sensor = LiveWorkSensor(repo)
-    active, reason = sensor.is_human_active("backend/main.py")
+    active, reason = await sensor.is_human_active("backend/main.py")
     assert active is True
     assert "ide-lock" in (reason or "")
 
 
-def test_emacs_lock_file_detected(tmp_path: Path) -> None:
+async def test_emacs_lock_file_detected(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     (repo / "backend" / ".#main.py").write_text("user@host.1234", encoding="utf-8")
     sensor = LiveWorkSensor(repo)
-    active, reason = sensor.is_human_active("backend/main.py")
+    active, reason = await sensor.is_human_active("backend/main.py")
     assert active is True
     assert "ide-lock" in (reason or "")
 
 
-def test_backup_file_detected(tmp_path: Path) -> None:
+async def test_backup_file_detected(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     (repo / "backend" / "main.py~").write_text("backup", encoding="utf-8")
     sensor = LiveWorkSensor(repo)
-    active, reason = sensor.is_human_active("backend/main.py")
+    active, reason = await sensor.is_human_active("backend/main.py")
     assert active is True
     assert "ide-lock" in (reason or "")
 
 
-def test_unrelated_swap_file_does_not_trigger(tmp_path: Path) -> None:
+async def test_unrelated_swap_file_does_not_trigger(tmp_path: Path) -> None:
     """A swap file for a DIFFERENT file in the same dir must not mark
     our target as active."""
     repo = _make_repo(tmp_path)
     (repo / "backend" / ".other.py.swp").write_bytes(b"vim-swap")
     sensor = LiveWorkSensor(repo)
-    active, _reason = sensor.is_human_active("backend/main.py")
+    active, _reason = await sensor.is_human_active("backend/main.py")
     assert active is False
 
 
@@ -277,26 +277,108 @@ def test_invalidate_cache_forces_refresh(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_empty_rel_path_is_inactive(tmp_path: Path) -> None:
+async def test_empty_rel_path_is_inactive(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     sensor = LiveWorkSensor(repo)
-    assert sensor.is_human_active("") == (False, None)
+    assert await sensor.is_human_active("") == (False, None)
 
 
-def test_non_git_repo_degrades_gracefully(tmp_path: Path) -> None:
+async def test_non_git_repo_degrades_gracefully(tmp_path: Path) -> None:
     """A directory with no git metadata must not crash the sensor."""
     (tmp_path / "file.txt").write_text("hi\n", encoding="utf-8")
     old_ts = time.time() - 3600
     os.utime(tmp_path / "file.txt", (old_ts, old_ts))
     sensor = LiveWorkSensor(tmp_path)
-    active, reason = sensor.is_human_active("file.txt")
+    active, reason = await sensor.is_human_active("file.txt")
     assert active is False
     assert reason is None
 
 
-def test_missing_file_does_not_crash(tmp_path: Path) -> None:
+async def test_missing_file_does_not_crash(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     sensor = LiveWorkSensor(repo)
-    active, reason = sensor.is_human_active("backend/does_not_exist.py")
+    active, reason = await sensor.is_human_active("backend/does_not_exist.py")
     assert active is False
     assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# fs-hot-tier Batch 3 (row 23, 2026-07-03) — _find_ide_lock routes the
+# single-directory iterdir scan through
+# cooperative_fs_io.offload(cpu_bound=False) instead of running
+# synchronously on the loop thread inside is_human_active().
+# ---------------------------------------------------------------------------
+
+
+class TestFindIdeLockOffload:
+    async def test_routes_through_offload_thread_pool(self, tmp_path, monkeypatch):
+        repo = _make_repo(tmp_path)
+        (repo / "backend" / ".main.py.swp").write_bytes(b"vim-swap")
+
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        calls = {"n": 0, "cpu_bound": None}
+        real_offload = cooperative_fs_io.offload
+
+        async def _spy_offload(fn, *args, cpu_bound=False, **kwargs):
+            calls["n"] += 1
+            calls["cpu_bound"] = cpu_bound
+            return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+        sensor = LiveWorkSensor(repo)
+        active, reason = await sensor.is_human_active("backend/main.py")
+
+        assert calls["n"] == 1, "_find_ide_lock must route through offload"
+        assert calls["cpu_bound"] is False, (
+            "iterdir over a single directory is cheap and IO-bound — "
+            "must use the thread pool, not a process pool"
+        )
+        assert active is True
+        assert "ide-lock" in (reason or "")
+
+    async def test_offload_error_degrades_to_no_lock_no_raise(
+        self, tmp_path, monkeypatch,
+    ):
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            OffloadError,
+        )
+        repo = _make_repo(tmp_path)
+        (repo / "backend" / ".main.py.swp").write_bytes(b"vim-swap")
+
+        async def _boom_offload(fn, *args, **kwargs):
+            return OffloadError(
+                fn_name="_find_ide_lock_worker",
+                exc_type="OSError",
+                message="synthetic offload-layer fault",
+                cpu_bound=False,
+            )
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+        sensor = LiveWorkSensor(repo)
+        active, reason = await sensor.is_human_active("backend/main.py")
+        # Degrades to "no lock found" -- the git-dirty/mtime signals
+        # already evaluated False in _make_repo's clean baseline, so
+        # the whole call resolves inactive, never raises.
+        assert active is False
+        assert reason is None
+
+
+class TestAwaitGuardProductionCallSites:
+    def test_orchestrator_awaits_is_human_active(self):
+        src = (
+            Path(__file__).resolve().parents[2]
+            / "backend/core/ouroboros/governance/orchestrator.py"
+        ).read_text(encoding="utf-8")
+        assert "await _lws.is_human_active(str(_tf))" in src, (
+            "orchestrator.py call site must await the now-async "
+            "is_human_active — a missed await would silently swallow "
+            "the human-active-file guard"
+        )
+
+    def test_slice4b_runner_awaits_is_human_active(self):
+        src = (
+            Path(__file__).resolve().parents[2]
+            / "backend/core/ouroboros/governance/phase_runners/slice4b_runner.py"
+        ).read_text(encoding="utf-8")
+        assert "await _lws.is_human_active(str(_tf))" in src

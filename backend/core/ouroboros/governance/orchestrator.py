@@ -721,6 +721,27 @@ def _phase_runner_gate_extracted() -> bool:
     )
 
 
+def _discover_tests_for_gate_worker(
+    tests_dir_str: str, stem: str,
+) -> List[str]:
+    """Module-level worker for :meth:`Orchestrator._discover_tests_for_gate`.
+
+    Dispatched into the shared ``advisor-blast`` thread pool via
+    ``cooperative_fs_io.offload`` (fs-hot-tier Batch 3, row 15). Lifted
+    out to module level so the offload trampoline doesn't capture any
+    caller-local state, mirroring the pattern used by
+    ``cooperative_fs_io._read_text_worker``. Returns path strings
+    (not ``Path`` objects) — pickle-agnostic and cheap over the
+    thread-pool boundary.
+    """
+    tests_dir = Path(tests_dir_str)
+    found: List[str] = []
+    for candidate in tests_dir.rglob(f"test_{stem}*.py"):
+        if candidate.is_file():
+            found.append(str(candidate))
+    return sorted(found)
+
+
 def _phase_runner_validate_extracted() -> bool:
     """Slice 4a.1 of Wave 2 (5) — VALIDATE phase extraction gate.
 
@@ -881,7 +902,7 @@ def _phase_runner_classify_extracted() -> bool:
     )
 
 
-def _inject_last_session_summary_impl(
+async def _inject_last_session_summary_impl(
     project_root: Path,
     ctx: OperationContext,
 ) -> OperationContext:
@@ -905,10 +926,10 @@ def _inject_last_session_summary_impl(
         )
         _lss = get_default_summary(project_root)
         _lss_enabled, _lss_n, _lss_sid, _lss_chars, _lss_hash8 = (
-            _lss.inject_metrics()
+            await _lss.inject_metrics()
         )
         if _lss_enabled:
-            _lss_prompt = _lss.format_for_prompt()
+            _lss_prompt = await _lss.format_for_prompt()
             if _lss_prompt:
                 _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
                 ctx = ctx.with_strategic_memory_context(
@@ -1024,7 +1045,7 @@ class _PreloadedExplorationRecord:
         self.status = "success"
 
 
-def _inject_postmortem_recall_impl(
+async def _inject_postmortem_recall_impl(
     ctx: OperationContext,
 ) -> OperationContext:
     """Inject prior-op POSTMORTEM lessons into ``ctx.strategic_memory_prompt``.
@@ -1069,7 +1090,7 @@ def _inject_postmortem_recall_impl(
                 f"description={(ctx.description or '')[:200]} | "
                 f"files={_pm_target_files}"
             )
-            _pm_matches = _pm_svc.recall_for_op(_pm_op_signature)
+            _pm_matches = await _pm_svc.recall_for_op(_pm_op_signature)
             _pm_section = _render_pm_recall(_pm_matches)
             if _pm_section:
                 _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
@@ -3553,7 +3574,7 @@ class GovernedOrchestrator:
             # Layer 3 reachability supplement, W3(6) precedent). Body lives at
             # module scope as `_inject_postmortem_recall_impl`. ConversationBridge
             # → PostmortemRecall → SemanticIndex ordering preserved.
-            ctx = _inject_postmortem_recall_impl(ctx)
+            ctx = await _inject_postmortem_recall_impl(ctx)
 
             # ---- Task 6 Prior Ephemeral Knowledge: cross-session experiences ----
             # Helper extraction mirrors LSS/PostmortemRecall pattern. Body lives
@@ -3781,7 +3802,7 @@ class GovernedOrchestrator:
             # Strategic → Bridge → Semantic → LastSession → Goals → UserPrefs.
             # Helper extracted for integration-test coverage of the composed
             # CONTEXT_EXPANSION prompt (see test_last_session_summary_composition).
-            ctx = _inject_last_session_summary_impl(self._config.project_root, ctx)
+            ctx = await _inject_last_session_summary_impl(self._config.project_root, ctx)
 
             # ---- P2.4 + Week 2: Goal-directed context injection ----
             # Append the *most relevant* active user goals to the strategic
@@ -4433,7 +4454,7 @@ class GovernedOrchestrator:
                     )
                     if _mr_enabled():
                         _mr_router = _MR(self._config.project_root)
-                        _mr_result = _mr_router.route(
+                        _mr_result = await _mr_router.route(
                             list(ctx.target_files),
                             ctx.description,
                         )
@@ -9120,7 +9141,7 @@ class GovernedOrchestrator:
                                 # Caller supplies tests — a path-correlated
                                 # discovery helper keeps the wiring minimal
                                 # (Session W style: tests/test_<stem>*.py).
-                                _tests = self._discover_tests_for_gate(_sp)
+                                _tests = await self._discover_tests_for_gate(_sp)
                                 _verdicts.append(
                                     _mg.evaluate_file(_abs_sp, _tests)
                                 )
@@ -9996,7 +10017,7 @@ class GovernedOrchestrator:
                         if _cf:
                             _scan_targets.add(_cf)
                     for _tf in sorted(_scan_targets):
-                        _is_active, _reason = _lws.is_human_active(str(_tf))
+                        _is_active, _reason = await _lws.is_human_active(str(_tf))
                         if _is_active:
                             _active_hit = (str(_tf), _reason or "human active")
                             break
@@ -12814,23 +12835,40 @@ class GovernedOrchestrator:
             write_root=self._swe_bench_write_root(ctx),
         )
 
-    def _discover_tests_for_gate(self, sut_path: Path) -> List[Path]:
+    async def _discover_tests_for_gate(self, sut_path: Path) -> List[Path]:
         """Discover pytest files scoped to one SUT for the MutationGate.
 
         Matches Session-W style fan-out (``tests/test_<stem>*.py``) via
         rglob under the project root's ``tests/`` dir. Returned paths
         are absolute so the mutation runner sees stable targets even
         when the gate is called from a non-project cwd.
+
+        fs-hot-tier Batch 3 (row 15): the rglob scan is dispatched off
+        the asyncio loop via ``cooperative_fs_io.offload`` (thread pool
+        — a scoped ``tests/`` rglob is IO-bound/syscall-dominated, not
+        CPU-after-scan). Fail-soft: an ``OffloadError`` degrades to the
+        same ``[]`` the prior synchronous fail-soft implicitly gave for
+        a missing/unreadable tree — never raises into the GATE phase.
         """
         stem = sut_path.stem
         tests_dir = self._config.project_root / "tests"
         if not tests_dir.is_dir():
             return []
-        found: List[Path] = []
-        for candidate in tests_dir.rglob(f"test_{stem}*.py"):
-            if candidate.is_file():
-                found.append(candidate)
-        return sorted(found)
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+        result = await offload(
+            _discover_tests_for_gate_worker, str(tests_dir), stem,
+        )
+        if is_offload_error(result):
+            logger.debug(
+                "[Orchestrator] _discover_tests_for_gate offload failed "
+                "for stem=%s — degrading to empty list",
+                stem,
+            )
+            return []
+        return [Path(p) for p in result]
 
     async def _apply_multi_file_candidate(
         self,
