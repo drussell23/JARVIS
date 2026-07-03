@@ -157,10 +157,24 @@ class ExplorationSubagent:
 
         # Phase 3: Search for patterns mentioned in the goal
         if goal:
+            # Tier-2 batch 2 row 12 — cooperative_fs_io substrate.
+            # ``_search_codebase`` does a synchronous whole-repo
+            # ``rglob("*.py")`` + per-file read; routed off-loop
+            # via the shared advisor-blast thread pool so subagent
+            # dispatch never wedges the asyncio main loop.
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
             keywords = self._extract_keywords(goal)
             for keyword in keywords[:3]:
                 search_queries.append(keyword)
-                search_results = self._search_codebase(keyword)
+                offloaded = await offload(self._search_codebase, keyword)
+                # Fail-soft: OffloadError degrades to the same empty
+                # result the sync path would produce on any error.
+                search_results = (
+                    [] if is_offload_error(offloaded) else offloaded
+                )
                 for sr in search_results[:5]:
                     findings.append(ExplorationFinding(
                         category="pattern",

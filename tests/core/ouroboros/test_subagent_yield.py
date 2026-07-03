@@ -11,6 +11,7 @@ from backend.core.ouroboros.governance.exploration_subagent import (
     ExplorationSubagent,
     ExplorationReport,
 )
+import backend.core.ouroboros.governance.cooperative_fs_io as fsio
 
 
 # ---------------------------------------------------------------------------
@@ -102,3 +103,97 @@ class TestYieldBreaksExploreLoop:
 
         assert isinstance(report, ExplorationReport)
         assert "module_a.py" in report.files_read
+
+
+# ---------------------------------------------------------------------------
+# Tier-2 batch 2 row 12 — _search_codebase routes through
+# cooperative_fs_io.offload instead of a raw synchronous rglob on the loop.
+# ---------------------------------------------------------------------------
+
+class TestSearchCodebaseOffload:
+    @pytest.mark.asyncio
+    async def test_search_codebase_routes_through_offload(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """(a) Spy: explore()'s Phase 3 keyword search must dispatch
+        _search_codebase via cooperative_fs_io.offload — not a bare
+        synchronous call."""
+        (tmp_path / "needle.py").write_text("def needle_fn(): pass\n")
+
+        calls = []
+        real_offload = fsio.offload
+
+        async def _spy_offload(fn, *a, **k):
+            calls.append(fn.__name__ if hasattr(fn, "__name__") else fn)
+            return await real_offload(fn, *a, **k)
+
+        monkeypatch.setattr(fsio, "offload", _spy_offload)
+
+        agent = _make_agent(tmp_path)
+        report = await agent.explore(
+            goal="find the needle function",
+            entry_files=("needle.py",),
+            max_files=5,
+            max_depth=1,
+        )
+
+        assert calls, "_search_codebase did not route through cooperative_fs_io.offload"
+        assert isinstance(report, ExplorationReport)
+
+    @pytest.mark.asyncio
+    async def test_search_codebase_offload_parity_with_sync(
+        self, tmp_path: Path,
+    ) -> None:
+        """(b) Parity: offloaded search finds the same matches the
+        synchronous _search_codebase would find directly."""
+        (tmp_path / "target.py").write_text(
+            "def widget_handler(): pass\n"
+        )
+        (tmp_path / "other.py").write_text("def unrelated(): pass\n")
+
+        agent = _make_agent(tmp_path)
+        direct = agent._search_codebase("widget_handler")
+
+        report = await agent.explore(
+            goal="find widget_handler usage",
+            entry_files=("target.py",),
+            max_files=5,
+            max_depth=1,
+        )
+        pattern_findings = [
+            f for f in report.findings if f.category == "pattern"
+        ]
+        assert len(direct) >= 1
+        assert len(pattern_findings) >= 1
+        assert any("target.py" in f.file_path for f in pattern_findings)
+
+    @pytest.mark.asyncio
+    async def test_search_codebase_fail_soft_on_offload_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """(c) Fail-soft: an OffloadError degrades to the same empty
+        result the sync path produces on error — explore() never raises."""
+        (tmp_path / "target.py").write_text("def widget_handler(): pass\n")
+
+        async def _boom_offload(fn, *a, **k):
+            return fsio.OffloadError(
+                fn_name="_search_codebase", exc_type="OSError",
+                message="simulated", cpu_bound=False,
+            )
+
+        monkeypatch.setattr(fsio, "offload", _boom_offload)
+
+        agent = _make_agent(tmp_path)
+        report = await agent.explore(
+            goal="find widget_handler usage",
+            entry_files=("target.py",),
+            max_files=5,
+            max_depth=1,
+        )
+        # No pattern findings should have been produced — the offload
+        # failed soft to an empty search result, no exception raised.
+        pattern_findings = [
+            f for f in report.findings if f.category == "pattern"
+        ]
+        assert pattern_findings == []
+        assert isinstance(report, ExplorationReport)
