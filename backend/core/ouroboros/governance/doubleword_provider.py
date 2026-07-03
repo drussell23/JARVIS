@@ -1440,6 +1440,14 @@ class PendingBatch:
     prompt: str
     submitted_at: float  # time.monotonic()
     wall_submitted_at: float = field(default_factory=time.time)
+    # Files whose real on-disk content was embedded into ``prompt`` at
+    # submit time (see ``_build_codegen_prompt``'s ``preloaded_out``).
+    # Carried through to the retrieved ``GenerationResult`` so BACKGROUND/
+    # SPECULATIVE-route candidates (which never run the Venom tool loop and
+    # therefore can never earn live exploration-tool credit) can still
+    # satisfy the Iron Gate's exploration floor via preloaded-prompt credit
+    # — the same mechanism already wired for the RT/lean-prompt path.
+    prompt_preloaded_files: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -2019,12 +2027,23 @@ class DoublewordProvider:
                 "schema (model=%s diff-capable, large target) op=%s",
                 _effective_model, operation_id,
             )
+        # Slice: BACKGROUND/SPECULATIVE never run the Venom tool loop (by
+        # design — cost optimization) and the batch dispatch path never used
+        # the lean/tool-first prompt builder (that would risk
+        # tool_call_without_tool_loop schema failures, see
+        # ``_should_use_lean_prompt``). That left those routes with NO way
+        # to ever earn Iron Gate exploration credit for a mutation-scoped op
+        # — ``_build_codegen_prompt`` already embeds each target file's real
+        # content, it just never reported that fact back to the caller.
+        # ``preloaded_out`` closes that gap (mirrors the RT/lean path).
+        _preloaded_files: List[str] = []
         prompt = prompt_override or _build_codegen_prompt(
             ctx,
             repo_root=self._repo_root,
             repo_roots=self._repo_roots or None,
             force_full_content=_force_full,
             provider_route=getattr(ctx, "provider_route", "") or "",
+            preloaded_out=_preloaded_files,
         )
 
         # Slice 38 — canonical JSONL composition via single helper.
@@ -2142,6 +2161,7 @@ class DoublewordProvider:
                 file_id=file_id,
                 prompt=prompt,
                 submitted_at=time.monotonic(),
+                prompt_preloaded_files=tuple(_preloaded_files),
             )
 
         except asyncio.CancelledError:
@@ -2286,6 +2306,17 @@ class DoublewordProvider:
                     total_input_tokens=input_tokens,
                     total_output_tokens=output_tokens,
                     cost_usd=_batch_cost,
+                )
+            # Carry preloaded-prompt credit from submit-time through to the
+            # retrieved result — mirrors the RT path's
+            # ``dataclasses.replace(result, prompt_preloaded_files=...)``.
+            # Without this, BACKGROUND/SPECULATIVE-route batch candidates
+            # report zero exploration credit even though the target files'
+            # content was genuinely embedded in the submitted prompt.
+            if getattr(pending, "prompt_preloaded_files", ()):
+                result = dataclasses.replace(
+                    result,
+                    prompt_preloaded_files=tuple(pending.prompt_preloaded_files),
                 )
 
             # Slice 0 — provider-latency observability (pure side

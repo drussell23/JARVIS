@@ -3085,6 +3085,7 @@ def _build_codegen_prompt(
     repair_context: Optional[Any] = None,
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
     provider_route: str = "",
+    preloaded_out: Optional[List[str]] = None,
 ) -> str:
     """Build an enriched codegen prompt with file contents, context, and schema.
 
@@ -3093,6 +3094,18 @@ def _build_codegen_prompt(
     strategic-memory block, and emits the appropriate output schema
     specification: schema_version 2b.1 for single-repo operations and
     schema_version 2c.1 for cross-repo operations.
+
+    ``preloaded_out`` (optional): when provided, every ``target_files`` entry
+    whose real on-disk content was actually embedded into ``file_sections``
+    (i.e. not a ``BlockedPathError`` skip and not a nonexistent/new file) is
+    appended to it. This mirrors ``_build_lean_codegen_prompt``'s
+    ``preloaded_out`` contract so callers on the full-prompt path (DW batch,
+    BACKGROUND/SPECULATIVE routes that never run the Venom tool loop) can
+    report genuine preloaded-prompt exploration credit — the model really did
+    see this file's content, it just arrived via the full builder instead of
+    the lean tool-first one. Without this, a route that structurally skips
+    the tool loop AND uses the full builder had no way to ever satisfy the
+    Iron Gate's exploration floor.
 
     Parameters
     ----------
@@ -3226,6 +3239,8 @@ def _build_codegen_prompt(
             )
 
         file_sections.append(f"{header}\n```\n{truncated}\n```")
+        if preloaded_out is not None and abs_path.is_file():
+            preloaded_out.append(str(raw_path))
 
     # ── 2. Discover surrounding context (import sources + tests) ────────
     context_parts: List[str] = []

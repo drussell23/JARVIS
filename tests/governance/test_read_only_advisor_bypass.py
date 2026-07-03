@@ -67,6 +67,15 @@ READ_ONLY_DESCRIPTIONS: Tuple[str, ...] = (
     "Cartography of the implementation surface — documentation only, "
     "do not mutate any code.",
     "Read-only gap analysis. No changes required to the fixed contract.",
+    # ---- Fleet write-intent investigation (bt-iso-1783042643, 2026-07-02):
+    # the A1 self-audit synthetic goal. Confirms operation_advisor correctly
+    # derives read_only=True for this goal (it is NOT the locus of the
+    # "zero ChangeEngine.execute" bug — see test_batch_preload_credit.py
+    # for the actual fix, which is in the DW batch-path exploration-credit
+    # wiring, not here).
+    "A1 self-audit: confirm the autonomous dispatch chain is live\n\n"
+    "Synthetic strategic goal for the A1 soak -- exercises the full "
+    "emit->ingest->dequeue->submit->accept provenance chain end to end.",
 )
 
 MUTATING_DESCRIPTIONS: Tuple[str, ...] = (
@@ -80,6 +89,32 @@ MUTATING_DESCRIPTIONS: Tuple[str, ...] = (
     #      the surrounding text contains read-only-looking words.
     "Read-only audit of X. Then refactor the dispatcher.",
     "Cartography first, then fix the flake.",
+    # ---- Fleet write-intent investigation (bt-iso-1783042643, 2026-07-02):
+    # the A1 roadmap's 3-file docstring-expansion write goal (dag_weight=
+    # heavy, files=3). operation_advisor already derives read_only=False
+    # for it correctly (log: "caution (risk=0.50, blast=50, coverage=100%,
+    # entropy=50%, read_only=False)") -- the fleet-wide zero-writes bug is
+    # NOT here, it is downstream in GENERATE's BACKGROUND-route exploration
+    # credit (see test_batch_preload_credit.py).
+    "Wave 3 (6) Slice 5b / F1 graduation forced-reachability seed — "
+    "REFRAMED TWICE. First reframe 2026-04-24 after F1 Slice 4 S1 "
+    "(bt-2026-04-24-075052) revealed OperationAdvisor auto-blocking the "
+    "original targets (3 × empty package __init__.py files) due to "
+    "blast_radius=50 + coverage=0% composite. Second reframe 2026-04-24 "
+    "after F1 Slice 4 S2 (bt-2026-04-24-091016) revealed risk_engine "
+    "unconditional BLOCK on touches_security_surface from naive substring "
+    "match 'token' in cancellation_token.py (filename false positive "
+    "against the regex any(kw in path for kw in "
+    "['auth','secret','cred','token','encrypt'])). Third-slot target "
+    "swapped to context_memory_loader.py after preflight confirmed clean "
+    "profile flags + no BLOCK from risk_engine + 7-total blast radius + "
+    "100% test coverage. Task: each target module has an existing brief "
+    "module docstring; expand each docstring into a fuller 4-6 sentence "
+    "description covering (1) module purpose, (2) key exported symbols, "
+    "(3) usage context. Safe docstring-only multi-file edit; zero "
+    "behavioral change; 3-file shape preserved so the post-GENERATE "
+    "parallel_dispatch seam receives a multi-file candidate. Classify as "
+    "SAFE_AUTO, trivial complexity, blast_radius=7.",
 )
 
 AMBIGUOUS_DESCRIPTIONS: Tuple[str, ...] = (

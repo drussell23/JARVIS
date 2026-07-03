@@ -331,3 +331,103 @@ def test_prompt_no_truncation_32kb_file(tmp_path):
         repo_roots=None,
     )
     assert "[TRUNCATED" not in prompt, "32KB file should not be truncated with 64KB budget"
+
+
+# ---------------------------------------------------------------------------
+# ``preloaded_out`` — preloaded-prompt exploration credit for the FULL
+# prompt builder (fleet write-intent investigation, bt-iso-1783042643).
+#
+# ``_build_lean_codegen_prompt`` already reports which target files it
+# inlined via ``preloaded_out`` so BACKGROUND/SPECULATIVE-route ops (which
+# never run the Venom tool loop) can satisfy the Iron Gate's exploration
+# floor via preloaded-prompt credit instead of live tool calls. But
+# BACKGROUND route's actual DW dispatch path (``submit_batch`` /
+# ``poll_and_retrieve``) uses ``_build_codegen_prompt`` (the full builder),
+# which had no ``preloaded_out`` at all — even though it *also* embeds each
+# target file's full content. That silent gap meant every BACKGROUND-routed
+# mutation-scoped op reported 0 preloaded credit + 0 tool calls (tool loop
+# structurally suppressed for BACKGROUND) => permanently exploration_
+# insufficient => ForwardProgress stuck-hash trip => state=failed, never
+# reaching ChangeEngine.execute.
+# ---------------------------------------------------------------------------
+
+
+def _minimal_ctx(target_files, op_id="test-op-preload"):
+    from unittest.mock import MagicMock
+    ctx = MagicMock()
+    ctx.op_id = op_id
+    ctx.description = "docstring expansion task"
+    ctx.target_files = target_files
+    ctx.human_instructions = ""
+    ctx.strategic_memory_prompt = ""
+    ctx.expanded_context_files = ()
+    ctx.cross_repo = False
+    ctx.repo_scope = set()
+    ctx.telemetry = None
+    return ctx
+
+
+def test_preloaded_out_records_embedded_target_files(tmp_path):
+    """A target file that genuinely exists on disk and gets embedded into
+    the prompt MUST be recorded in ``preloaded_out`` — the model really did
+    see its content, this just makes that fact reportable to the exploration
+    ledger (mirrors ``_build_lean_codegen_prompt``'s contract)."""
+    from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+
+    (tmp_path / "hypothesis_envelope_factory.py").write_text(
+        '"""Factory module."""\n\ndef build():\n    return {}\n'
+    )
+    (tmp_path / "context_memory_loader.py").write_text(
+        '"""Loader module."""\n\ndef load():\n    return []\n'
+    )
+    ctx = _minimal_ctx([
+        "hypothesis_envelope_factory.py",
+        "context_memory_loader.py",
+    ])
+    preloaded: list = []
+    prompt = _build_codegen_prompt(
+        ctx=ctx,
+        repo_root=tmp_path,
+        repo_roots=None,
+        force_full_content=True,
+        preloaded_out=preloaded,
+    )
+    assert "def build" in prompt
+    assert "def load" in prompt
+    assert preloaded == [
+        "hypothesis_envelope_factory.py",
+        "context_memory_loader.py",
+    ]
+
+
+def test_preloaded_out_skips_nonexistent_target_file(tmp_path):
+    """A target file that doesn't exist on disk (new-file creation) has no
+    real content to have "seen" — it must NOT be credited."""
+    from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+
+    ctx = _minimal_ctx(["brand_new_module.py"])
+    preloaded: list = []
+    _build_codegen_prompt(
+        ctx=ctx,
+        repo_root=tmp_path,
+        repo_roots=None,
+        force_full_content=True,
+        preloaded_out=preloaded,
+    )
+    assert preloaded == []
+
+
+def test_preloaded_out_default_none_is_backward_compatible(tmp_path):
+    """Omitting ``preloaded_out`` entirely must not change behavior or
+    raise — every existing call site is unaffected."""
+    from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+
+    (tmp_path / "module.py").write_text('"""Doc."""\n')
+    ctx = _minimal_ctx(["module.py"])
+    prompt = _build_codegen_prompt(
+        ctx=ctx,
+        repo_root=tmp_path,
+        repo_roots=None,
+        force_full_content=True,
+    )
+    assert "module.py" in prompt
