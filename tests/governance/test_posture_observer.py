@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -32,6 +33,7 @@ from backend.core.ouroboros.governance.posture_observer import (
     hysteresis_window_s,
     observer_interval_s,
     override_max_h,
+    recent_summaries_max,
     reset_default_observer,
     reset_default_store,
 )
@@ -793,6 +795,383 @@ class TestPostureObserverWholesaleOffload:
         still = tmp_store.load_current()
         assert still is not None and still.posture is Posture.EXPLORE
         assert observer.stats()["cycles_failed"] == failed_before + 1
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL fix — loop-affine on_change MUST marshal back to the loop thread
+# (it was invoked inside the offload worker thread = UB: in production it
+# flows into StreamEventBroker.publish -> asyncio.Queue.put_nowait ->
+# loop.call_soon, which is not thread-safe from a foreign thread).
+# ---------------------------------------------------------------------------
+
+
+class _ThreadRecordingCollector:
+    """Records which thread ``build_bundle`` ran on so a test can prove the
+    cadence body genuinely offloaded to a worker (not the loop thread)."""
+
+    def __init__(self, bundle: SignalBundle) -> None:
+        self.bundle = bundle
+        self.build_thread: object = None
+
+    def build_bundle(self) -> SignalBundle:
+        self.build_thread = threading.current_thread()
+        return self.bundle
+
+
+class TestOnChangeMarshalledToLoopThread:
+
+    @pytest.mark.asyncio
+    async def test_on_change_runs_on_loop_thread_not_worker(
+        self, tmp_store: PostureStore, monkeypatch,
+    ):
+        """Under the DEFAULT wholesale-offload path, on a real posture
+        transition, ``on_change`` MUST fire on the loop/main thread — never
+        the offload worker thread. RED against the pre-fix code that called
+        ``self._on_change`` inside ``_process_bundle`` while it ran in the
+        offload worker."""
+        monkeypatch.setenv("JARVIS_POSTURE_HIGH_CONFIDENCE_BYPASS", "0.0")
+        seen_threads: list = []
+
+        def hook(new, prev):
+            seen_threads.append(threading.current_thread())
+
+        collector = _ThreadRecordingCollector(_explore_bundle())
+        observer = PostureObserver(
+            Path("."), tmp_store, collector=collector, on_change=hook,
+        )
+        # Cold-start transition (prev=None) fires on_change.
+        await observer.run_one_cycle()
+        # The cycle body genuinely offloaded to a worker thread...
+        assert collector.build_thread is not threading.main_thread()
+
+        # Real transition EXPLORE -> HARDEN also fires on_change.
+        observer._collector = _ThreadRecordingCollector(_harden_bundle())  # type: ignore[attr-defined]
+        await observer.run_one_cycle()
+
+        # ...yet EVERY on_change invocation landed on the loop/main thread.
+        assert seen_threads, "on_change never fired on a real transition"
+        for t in seen_threads:
+            assert t is threading.main_thread(), (
+                f"on_change ran on worker thread {getattr(t, 'name', t)!r} — "
+                "loop-affine callback was NOT marshalled back to the loop"
+            )
+
+    @pytest.mark.asyncio
+    async def test_legacy_async_path_still_fires_on_change_on_loop(
+        self, tmp_store: PostureStore, monkeypatch,
+    ):
+        """Rollback path (wholesale offload master OFF) preserves the
+        on-loop on_change firing byte-behavior-identically."""
+        monkeypatch.setenv("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED", "false")
+        monkeypatch.setenv("JARVIS_POSTURE_HIGH_CONFIDENCE_BYPASS", "0.0")
+        seen_threads: list = []
+
+        def hook(new, prev):
+            seen_threads.append(threading.current_thread())
+
+        observer = PostureObserver(
+            Path("."), tmp_store,
+            collector=_DualCollector(_explore_bundle()), on_change=hook,
+        )
+        await observer.run_one_cycle()
+        assert seen_threads
+        for t in seen_threads:
+            assert t is threading.main_thread()
+
+
+# ---------------------------------------------------------------------------
+# IMPORTANT 1 — memoization (NOT the offload) is what prevents a C-level
+# GIL-hold (real multi-MB json.loads) from freezing a heartbeat. The
+# existing _SlowCollector uses time.sleep which RELEASES the GIL, so it
+# can't detect this — a genuine parse is needed.
+# ---------------------------------------------------------------------------
+
+
+class TestGilHoldMemoKeepsLoopResponsive:
+
+    @pytest.mark.asyncio
+    async def test_memo_prevents_reparse_gil_freeze(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        import backend.core.ouroboros.governance.posture_observer as po
+
+        # Seed a genuinely large cost_state.json so json.loads is a real
+        # C-level GIL hold (unlike time.sleep, which yields the GIL).
+        cost_path = tmp_path / ".jarvis" / "cost_state.json"
+        cost_path.parent.mkdir(parents=True)
+        big_history = [
+            {"op": i, "usd": 0.0001 * i, "pad": "x" * 80}
+            for i in range(120_000)
+        ]
+        cost_path.write_text(json.dumps({
+            "daily_spent_usd": 0.4, "daily_cap_usd": 1.0,
+            "history": big_history,
+        }))
+        assert cost_path.stat().st_size > 5_000_000, "fixture not large enough"
+
+        # Premise: a raw parse of this file is a real, measurable GIL hold —
+        # NOT instantaneous (else the test would prove nothing).
+        _t0 = time.perf_counter()
+        json.loads(cost_path.read_text(encoding="utf-8"))
+        parse_s = time.perf_counter() - _t0
+        assert parse_s > 0.03, f"parse too fast to be a real GIL hold: {parse_s}s"
+
+        # Count ONLY the multi-MB cost_state parses (isolate from any small
+        # summary/arc-context parses).
+        real_loads = po.json.loads
+        parses = {"n": 0}
+
+        def counting_loads(s, *a, **k):
+            if isinstance(s, str) and len(s) > 1_000_000:
+                parses["n"] += 1
+            return real_loads(s, *a, **k)
+
+        monkeypatch.setattr(po.json, "loads", counting_loads)
+        monkeypatch.setenv("JARVIS_POSTURE_HIGH_CONFIDENCE_BYPASS", "0.0")
+
+        store = PostureStore(tmp_path / ".jarvis")
+        collector = SignalCollector(tmp_path)
+        observer = PostureObserver(tmp_path, store, collector=collector)
+
+        # A "freeze" is an inter-tick gap far larger than the 5ms heartbeat
+        # period — it can only happen while a C-level json.loads holds the
+        # GIL (offload can't help: the GIL is process-wide). Counting freeze
+        # EVENTS (not total ticks) is the robust signal: total ticks are
+        # confounded by wall-time (more parses => longer run => more ticks).
+        freeze_threshold = max(0.015, parse_s * 0.5)
+
+        async def _cycles_count_freezes(n: int, reset_cache_each: bool) -> int:
+            ts: list = []
+            stop = asyncio.Event()
+
+            async def _hb():
+                while not stop.is_set():
+                    ts.append(time.perf_counter())
+                    await asyncio.sleep(0.005)
+
+            hb = asyncio.create_task(_hb())
+            for _ in range(n):
+                if reset_cache_each:
+                    # Defeat the memo => genuine re-parse every cycle.
+                    collector._cost_burn_cache = None  # type: ignore[attr-defined]
+                await observer.run_one_cycle()
+            stop.set()
+            await hb
+            gaps = [ts[i + 1] - ts[i] for i in range(len(ts) - 1)]
+            return sum(1 for g in gaps if g > freeze_threshold)
+
+        # (a) WITHOUT the memo — reset the cache each cycle so the multi-MB
+        #     file is re-parsed every cycle: the heartbeat freezes ONCE PER
+        #     CYCLE (a GIL hold recurs on every tick).
+        collector._cost_burn_cache = None  # type: ignore[attr-defined]
+        parses["n"] = 0
+        freezes_no_memo = await _cycles_count_freezes(3, reset_cache_each=True)
+        parses_no_memo = parses["n"]
+
+        # (b) WITH the memo (the fix) — parse happens exactly once (cycle 1);
+        #     cycles 2+ stat-only, so the heartbeat stays responsive.
+        collector._cost_burn_cache = None  # type: ignore[attr-defined]
+        parses["n"] = 0
+        freezes_memo = await _cycles_count_freezes(3, reset_cache_each=False)
+        parses_memo = parses["n"]
+
+        # Deterministic proof the memo bounds re-parse: 3 without, 1 with.
+        assert parses_no_memo == 3
+        assert parses_memo == 1
+        # The freeze is real and recurring without the memo; the memo
+        # confines it to the unavoidable single first parse. (offload is
+        # identical in both runs — the delta is memoization alone.)
+        assert freezes_no_memo >= 2, (
+            f"expected recurring freezes without memo, got {freezes_no_memo}"
+        )
+        assert freezes_memo <= 1, (
+            f"memoized path should freeze at most once, got {freezes_memo}"
+        )
+        assert freezes_memo < freezes_no_memo
+
+
+# ---------------------------------------------------------------------------
+# IMPORTANT 2 — recent_summaries: ONE shared, bounded scan per cycle across
+# the four summary-derived raters (was 4x re-scan + re-parse, unbounded).
+# ---------------------------------------------------------------------------
+
+
+class TestSharedBoundedRecentSummaries:
+
+    def _seed_sessions(self, tmp_path: Path, count: int) -> None:
+        sessions = tmp_path / ".ouroboros" / "sessions"
+        sessions.mkdir(parents=True)
+        for i in range(count):
+            d = sessions / f"sess-{i:03d}"
+            d.mkdir()
+            (d / "summary.json").write_text(json.dumps({
+                "ops_digest": {"attempted": 10, "verified": 5},
+                "event_counts": {
+                    "generate_total": 4, "iron_gate_reject": 1,
+                    "apply_total": 2, "l2_invoked": 1,
+                },
+                "session_lessons": [{"tag": "infra"}],
+            }))
+
+    def test_build_bundle_parses_at_most_max_and_once_per_cycle(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """20 sessions, N=5: the four raters share ONE bounded scan, so a
+        cycle parses exactly 5 summaries (newest-N) — NOT 20, and NOT 4x5.
+        RED against the old path (each of 4 raters scanned all 20)."""
+        import backend.core.ouroboros.governance.posture_observer as po
+
+        monkeypatch.setenv("JARVIS_POSTURE_RECENT_SUMMARIES_MAX", "5")
+        self._seed_sessions(tmp_path, 20)
+
+        real_loads = po.json.loads
+        parses = {"n": 0}
+
+        def counting_loads(*a, **k):
+            parses["n"] += 1
+            return real_loads(*a, **k)
+
+        monkeypatch.setattr(po.json, "loads", counting_loads)
+        collector = SignalCollector(tmp_path)
+        parses["n"] = 0
+        bundle = collector.build_bundle()
+
+        # Bounded to newest-5 AND scanned/parsed once (not 4x per rater).
+        assert parses["n"] == 5
+        # All four summary-derived ratings still computed + in range.
+        assert 0.0 <= bundle.postmortem_failure_rate <= 1.0
+        assert 0.0 <= bundle.iron_gate_reject_rate <= 1.0
+        assert 0.0 <= bundle.l2_repair_rate <= 1.0
+        assert 0.0 <= bundle.session_lessons_infra_ratio <= 1.0
+
+    def test_shared_scan_matches_standalone_rater_values(
+        self, tmp_path: Path,
+    ):
+        """The shared-scan path yields identical rater values to the legacy
+        per-rater standalone scans (behavior preserved)."""
+        self._seed_sessions(tmp_path, 4)
+        collector = SignalCollector(tmp_path)
+        shared = collector.scan_recent_summaries(
+            collector._summaries_widest_window_h(), recent_summaries_max(),
+        )
+        assert collector.postmortem_failure_rate(shared) == (
+            collector.postmortem_failure_rate()
+        )
+        assert collector.iron_gate_reject_rate(shared) == (
+            collector.iron_gate_reject_rate()
+        )
+        assert collector.l2_repair_rate(shared) == collector.l2_repair_rate()
+        assert collector.session_lessons_infra_ratio(shared) == (
+            collector.session_lessons_infra_ratio()
+        )
+
+    def test_scan_bounds_parse_budget_before_parsing(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Even a huge session-count spike parses at most N (bound applied
+        pre-parse, keyed on newest mtime)."""
+        import backend.core.ouroboros.governance.posture_observer as po
+
+        monkeypatch.setenv("JARVIS_POSTURE_RECENT_SUMMARIES_MAX", "3")
+        self._seed_sessions(tmp_path, 40)
+        real_loads = po.json.loads
+        parses = {"n": 0}
+
+        def counting_loads(*a, **k):
+            parses["n"] += 1
+            return real_loads(*a, **k)
+
+        monkeypatch.setattr(po.json, "loads", counting_loads)
+        collector = SignalCollector(tmp_path)
+        parses["n"] = 0
+        rows = collector.scan_recent_summaries(
+            collector._summaries_widest_window_h(), recent_summaries_max(),
+        )
+        assert parses["n"] == 3
+        assert len(rows) == 3
+
+
+# ---------------------------------------------------------------------------
+# IMPORTANT 3 — epoch guard: a slow cycle N that completes AFTER cycle N+1
+# must NOT overwrite N+1's newer reading (asyncio.wait_for timeout does not
+# cancel the offload worker).
+# ---------------------------------------------------------------------------
+
+
+class TestStaleCycleEpochGuard:
+
+    @pytest.mark.asyncio
+    async def test_epoch_advances_each_offloaded_cycle(
+        self, tmp_store: PostureStore,
+    ):
+        observer = PostureObserver(
+            Path("."), tmp_store, collector=_StubCollector(_explore_bundle()),
+        )
+        assert observer._cycle_epoch == 0
+        await observer.run_one_cycle()
+        assert observer._cycle_epoch == 1
+        await observer.run_one_cycle()
+        assert observer._cycle_epoch == 2
+
+    @pytest.mark.asyncio
+    async def test_stale_cycle_does_not_clobber_newer_reading(
+        self, tmp_store: PostureStore, monkeypatch,
+    ):
+        """Cycle N is dispatched (epoch=1) but times out on the loop while
+        its worker keeps running. Cycle N+1 (epoch=2) completes first and
+        writes HARDEN. When N's worker finally reaches its write with the
+        stale epoch=1, it MUST no-op — HARDEN stays current."""
+        monkeypatch.setenv("JARVIS_POSTURE_HIGH_CONFIDENCE_BYPASS", "0.0")
+        observer = PostureObserver(
+            Path("."), tmp_store, collector=_StubCollector(_explore_bundle()),
+        )
+
+        # Cycle N dispatched — epoch stamped 1 (mirrors the loop-thread stamp).
+        observer._cycle_epoch += 1
+        epoch_n = observer._cycle_epoch
+
+        # Cycle N+1 runs to completion first, advancing the epoch to 2 and
+        # writing HARDEN as the authoritative current.
+        observer._cycle_epoch += 1
+        epoch_n1 = observer._cycle_epoch
+        observer._collector = _StubCollector(_harden_bundle())  # type: ignore[attr-defined]
+        out_n1 = observer._run_one_cycle_sync(epoch_n1)
+        assert out_n1 is not None
+        observer._fire_on_change(out_n1.on_change_args)
+        assert tmp_store.load_current().posture is Posture.HARDEN  # type: ignore[union-attr]
+
+        # The STALE cycle N finally completes with an EXPLORE reading.
+        observer._collector = _StubCollector(_explore_bundle())  # type: ignore[attr-defined]
+        out_n = observer._run_one_cycle_sync(epoch_n)
+        assert out_n is not None
+        # Its write was suppressed (stale epoch) and no on_change marshalled.
+        assert out_n.on_change_args is None
+        # current must STILL be N+1's HARDEN — not clobbered by N's EXPLORE.
+        assert tmp_store.load_current().posture is Posture.HARDEN  # type: ignore[union-attr]
+
+        # Control: the SAME EXPLORE reading with the CURRENT epoch DOES write
+        # — proving it was the stale-epoch guard (not hysteresis) that
+        # suppressed the clobber above.
+        out_ctrl = observer._run_one_cycle_sync(observer._cycle_epoch)
+        assert out_ctrl is not None
+        observer._fire_on_change(out_ctrl.on_change_args)
+        assert tmp_store.load_current().posture is Posture.EXPLORE  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_legacy_inline_path_has_no_epoch_guard(
+        self, tmp_store: PostureStore, monkeypatch,
+    ):
+        """Legacy (master-off) inline path passes epoch=None → the guard is
+        inert (no overlap to race), byte-behavior-identical."""
+        monkeypatch.setenv("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED", "false")
+        observer = PostureObserver(
+            Path("."), tmp_store, collector=_DualCollector(_explore_bundle()),
+        )
+        reading = await observer.run_one_cycle()
+        assert reading is not None
+        assert tmp_store.load_current() is not None
+        # Epoch never advanced by the legacy path.
+        assert observer._cycle_epoch == 0
 
 
 # ---------------------------------------------------------------------------

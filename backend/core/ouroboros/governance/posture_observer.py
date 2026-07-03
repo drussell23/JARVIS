@@ -57,7 +57,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from backend.core.ouroboros.governance.arc_context import (
     build_arc_context,
@@ -132,6 +132,21 @@ def postmortem_window_h() -> int:
 
 def override_max_h() -> int:
     return _env_int("JARVIS_POSTURE_OVERRIDE_MAX_H", 24, minimum=1)
+
+
+def recent_summaries_max() -> int:
+    """Upper bound on how many ``summary.json`` files a single posture
+    cycle scans + parses (IMPORTANT 2). The four summary-derived raters
+    (postmortem_failure_rate / iron_gate_reject_rate / l2_repair_rate /
+    session_lessons_infra_ratio) previously re-scanned + re-parsed the
+    *entire* ``.ouroboros/sessions/*`` tree FOUR times per cycle with no
+    shared memo and no count bound — the same unbounded-scan pathology
+    class as the cost_burn bug. Bounding to the newest-N by mtime (env,
+    default 50) means a session-count spike (or one enormous summary.json)
+    can no longer reintroduce the GIL-hold freeze. Newest-N is selected
+    BEFORE parsing, so the parse budget itself is bounded, not just the
+    result."""
+    return _env_int("JARVIS_POSTURE_RECENT_SUMMARIES_MAX", 50, minimum=1)
 
 
 def wholesale_offload_enabled() -> bool:
@@ -215,6 +230,26 @@ async def _offload_signal(fn: "Callable[..., Any]", *args: Any) -> Any:
 
 # Callable the wiring layer can inject to surface in-flight op count.
 OpenOpsProvider = Callable[[], int]
+
+
+class _CycleOutcome(NamedTuple):
+    """Result of one cadence tick's decision phase (``_process_bundle``).
+
+    CRITICAL fix — the loop-affine ``on_change`` callback must NOT run on
+    the offload worker thread (in production it flows into
+    ``StreamEventBroker.publish`` → ``asyncio.Queue.put_nowait`` →
+    ``loop.call_soon``, which is NOT thread-safe from a foreign thread).
+    So ``_process_bundle`` runs the pure/thread-safe decision (bundle +
+    hysteresis + the thread-safe ``PostureStore`` file IO) and *returns*
+    the on_change payload here instead of invoking it. The caller fires
+    ``on_change`` ON THE LOOP after ``offload(...)`` resolves.
+
+    ``on_change_args`` is ``None`` unless a real posture transition was
+    promoted (and its write actually landed — a stale epoch-guarded cycle
+    suppresses both the write and the callback)."""
+
+    to_persist: Optional[PostureReading]
+    on_change_args: Optional[Tuple[PostureReading, Optional[PostureReading]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -461,41 +496,109 @@ class SignalCollector:
             "test_docs": (counts["test"] + counts["docs"]) / total,
         }
 
-    def recent_summaries(self, window_h: int) -> List[Dict[str, Any]]:
-        """Parse ``.ouroboros/sessions/*/summary.json`` within window."""
+    # IMPORTANT 2 — the widest window any summary-derived rater needs.
+    # postmortem_failure_rate / session_lessons_infra_ratio read
+    # ``postmortem_window_h()`` (default 48h); iron_gate_reject_rate /
+    # l2_repair_rate read a fixed 24h. A single per-cycle scan over the
+    # WIDEST window is a strict superset — each rater re-filters the
+    # shared list down to its own (narrower-or-equal) cutoff, so the
+    # numbers are identical to the old per-rater scans, minus the 3×
+    # redundant re-parse and the unbounded session count.
+    def _summaries_widest_window_h(self) -> int:
+        return max(postmortem_window_h(), 24)
+
+    def scan_recent_summaries(
+        self, window_h: int, limit: int,
+    ) -> List[Tuple[float, Dict[str, Any]]]:
+        """Scan + parse ``.ouroboros/sessions/*/summary.json`` within
+        ``window_h``, bounded to the newest-``limit`` by mtime.
+
+        IMPORTANT 2 — the newest-N bound is applied BEFORE parsing, so a
+        session-count spike (thousands of stale session dirs) can force at
+        most ``limit`` ``json.loads`` calls, never one-per-session. Returns
+        ``(mtime, payload)`` pairs (mtime retained so a shared scan over the
+        widest window can be re-filtered per-rater without a re-scan).
+        Never raises."""
         sessions_dir = self._root / ".ouroboros" / "sessions"
         if not sessions_dir.exists():
             return []
         cutoff = time.time() - (window_h * 3600)
-        out: List[Dict[str, Any]] = []
+        candidates: List[Tuple[float, Path]] = []
         try:
             for sess in sessions_dir.iterdir():
                 if not sess.is_dir():
                     continue
                 summary = sess / "summary.json"
-                if not summary.exists():
-                    continue
                 try:
                     mtime = summary.stat().st_mtime
                 except OSError:
                     continue
                 if mtime < cutoff:
                     continue
-                try:
-                    out.append(json.loads(summary.read_text(encoding="utf-8")))
-                except (OSError, json.JSONDecodeError):
-                    continue
+                candidates.append((mtime, summary))
         except OSError:
             return []
+        # Bound the PARSE budget: keep only the newest-N by mtime, then
+        # parse. A spike in session count can't blow up json.loads calls.
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        out: List[Tuple[float, Dict[str, Any]]] = []
+        for mtime, summary in candidates[: max(1, int(limit))]:
+            try:
+                out.append(
+                    (mtime, json.loads(summary.read_text(encoding="utf-8")))
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
         return out
 
-    def postmortem_failure_rate(self) -> float:
-        summaries = self.recent_summaries(postmortem_window_h())
-        if not summaries:
+    def recent_summaries(self, window_h: int) -> List[Dict[str, Any]]:
+        """Backward-compatible payload-only view over
+        :meth:`scan_recent_summaries` (now bounded to ``recent_summaries_max``
+        newest sessions). Retained for any standalone caller/test."""
+        return [
+            payload
+            for _mtime, payload in self.scan_recent_summaries(
+                window_h, recent_summaries_max(),
+            )
+        ]
+
+    @staticmethod
+    def _filter_summaries_within(
+        summaries: List[Tuple[float, Dict[str, Any]]], window_h: int,
+    ) -> List[Dict[str, Any]]:
+        """Re-filter a shared (widest-window) scan to a rater's own
+        window cutoff — pure, no IO."""
+        cutoff = time.time() - (window_h * 3600)
+        return [payload for mtime, payload in summaries if mtime >= cutoff]
+
+    def _resolve_summaries(
+        self,
+        shared: Optional[List[Tuple[float, Dict[str, Any]]]],
+        window_h: int,
+    ) -> List[Dict[str, Any]]:
+        """Return the payloads a rater should score. When a per-cycle
+        ``shared`` scan is provided, filter it (no IO — the scan already
+        happened once for all four raters). Standalone (``shared is None``)
+        falls back to a self-scan bounded to ``recent_summaries_max``."""
+        if shared is None:
+            return [
+                payload
+                for _mtime, payload in self.scan_recent_summaries(
+                    window_h, recent_summaries_max(),
+                )
+            ]
+        return self._filter_summaries_within(shared, window_h)
+
+    def postmortem_failure_rate(
+        self,
+        summaries: Optional[List[Tuple[float, Dict[str, Any]]]] = None,
+    ) -> float:
+        rows = self._resolve_summaries(summaries, postmortem_window_h())
+        if not rows:
             return 0.0
         total_ops = 0
         failed_ops = 0
-        for s in summaries:
+        for s in rows:
             ops_digest = s.get("ops_digest") or {}
             try:
                 attempted = int(ops_digest.get("attempted", 0))
@@ -509,13 +612,16 @@ class SignalCollector:
             return 0.0
         return min(1.0, failed_ops / total_ops)
 
-    def iron_gate_reject_rate(self) -> float:
-        summaries = self.recent_summaries(24)
-        if not summaries:
+    def iron_gate_reject_rate(
+        self,
+        summaries: Optional[List[Tuple[float, Dict[str, Any]]]] = None,
+    ) -> float:
+        rows = self._resolve_summaries(summaries, 24)
+        if not rows:
             return 0.0
         total = 0
         rejects = 0
-        for s in summaries:
+        for s in rows:
             events = s.get("event_counts") or {}
             try:
                 total += int(events.get("generate_total", 0))
@@ -526,13 +632,16 @@ class SignalCollector:
             return 0.0
         return min(1.0, rejects / total)
 
-    def l2_repair_rate(self) -> float:
-        summaries = self.recent_summaries(24)
-        if not summaries:
+    def l2_repair_rate(
+        self,
+        summaries: Optional[List[Tuple[float, Dict[str, Any]]]] = None,
+    ) -> float:
+        rows = self._resolve_summaries(summaries, 24)
+        if not rows:
             return 0.0
         total = 0
         repairs = 0
-        for s in summaries:
+        for s in rows:
             events = s.get("event_counts") or {}
             try:
                 total += int(events.get("apply_total", 0))
@@ -543,13 +652,16 @@ class SignalCollector:
             return 0.0
         return min(1.0, repairs / total)
 
-    def session_lessons_infra_ratio(self) -> float:
-        summaries = self.recent_summaries(postmortem_window_h())
-        if not summaries:
+    def session_lessons_infra_ratio(
+        self,
+        summaries: Optional[List[Tuple[float, Dict[str, Any]]]] = None,
+    ) -> float:
+        rows = self._resolve_summaries(summaries, postmortem_window_h())
+        if not rows:
             return 0.0
         total = 0
         infra = 0
-        for s in summaries:
+        for s in rows:
             lessons = s.get("session_lessons") or []
             if not isinstance(lessons, list):
                 continue
@@ -663,19 +775,29 @@ class SignalCollector:
     def build_bundle(self) -> SignalBundle:
         """Legacy sync entry — retained for backwards compatibility
         with tests and any call-site that needs a synchronous bundle.
-        Production posture cycle uses :meth:`build_bundle_async`."""
+        Production posture cycle uses :meth:`build_bundle_async`.
+
+        IMPORTANT 2 — the four summary-derived raters share ONE bounded
+        scan (widest window, newest-N) instead of each re-scanning +
+        re-parsing the session tree. This is the path the default
+        wholesale-offload cycle (``_run_one_cycle_sync``) uses, so the
+        shared+bounded scan is exactly where the 4× redundant-scan freeze
+        was most acute."""
         ratios = self.commit_ratios()
+        shared = self.scan_recent_summaries(
+            self._summaries_widest_window_h(), recent_summaries_max(),
+        )
         base = baseline_bundle()
         return SignalBundle(
             feat_ratio=ratios["feat"],
             fix_ratio=ratios["fix"],
             refactor_ratio=ratios["refactor"],
             test_docs_ratio=ratios["test_docs"],
-            postmortem_failure_rate=self.postmortem_failure_rate(),
-            iron_gate_reject_rate=self.iron_gate_reject_rate(),
-            l2_repair_rate=self.l2_repair_rate(),
+            postmortem_failure_rate=self.postmortem_failure_rate(shared),
+            iron_gate_reject_rate=self.iron_gate_reject_rate(shared),
+            l2_repair_rate=self.l2_repair_rate(shared),
             open_ops_normalized=self.open_ops_normalized(),
-            session_lessons_infra_ratio=self.session_lessons_infra_ratio(),
+            session_lessons_infra_ratio=self.session_lessons_infra_ratio(shared),
             time_since_last_graduation_inv=self.time_since_last_graduation_inv(),
             cost_burn_normalized=self.cost_burn_normalized(),
             worktree_orphan_count=self.worktree_orphan_count(),
@@ -717,29 +839,48 @@ class SignalCollector:
             ratios = await self.commit_ratios_async()
         await _asyncio_ls.sleep(0)
 
+        # IMPORTANT 2 — ONE bounded scan of .ouroboros/sessions/*/summary.json
+        # per cycle (widest window, newest-N), shared across the four
+        # summary-derived raters. Previously each of the 4 raters
+        # (postmortem/iron_gate/l2_repair/session_lessons) re-scanned +
+        # re-parsed the whole session tree independently — 4× redundant IO
+        # + json.loads with no count bound (the cost_burn pathology class).
+        # The scan is off-loop via the unified substrate; each rater is then
+        # pure math over the already-parsed shared list (still dispatched
+        # through offload so the per-signal off-loop contract + telemetry
+        # labels are preserved).
+        async with _ls_sink_async("posture.signal.recent_summaries_scan"):
+            shared = await _offload_signal(
+                self.scan_recent_summaries,
+                self._summaries_widest_window_h(),
+                recent_summaries_max(),
+            )
+            if shared is None:
+                shared = []
+        await _asyncio_ls.sleep(0)
+
         # Tier-2b — the 4 filesystem-bound signals
-        # (postmortem/iron_gate/l2_repair/session_lessons all iterate
-        # .ouroboros/sessions/*/summary.json) plus the remaining CPU/git
-        # collectors now ALL route through the single unified
+        # (postmortem/iron_gate/l2_repair/session_lessons) now score the
+        # SHARED bounded scan (no re-scan) through the single unified
         # ``cooperative_fs_io.offload`` gateway (``_offload_signal`` →
         # advisor-blast thread pool). The bespoke ``fs_signal_executor`` and
         # scattered ``to_thread`` calls are gone — one pool, one contract.
         # Fail-soft: ``_offload_signal`` returns ``None`` on collector fault;
         # each signal falls back to its neutral 0.0 default below.
         async with _ls_sink_async("posture.signal.postmortem_failure_rate"):
-            pm = await _offload_signal(self.postmortem_failure_rate)
+            pm = await _offload_signal(self.postmortem_failure_rate, shared)
             if pm is None:
                 pm = 0.0
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.iron_gate_reject_rate"):
-            ig = await _offload_signal(self.iron_gate_reject_rate)
+            ig = await _offload_signal(self.iron_gate_reject_rate, shared)
             if ig is None:
                 ig = 0.0
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.l2_repair_rate"):
-            l2 = await _offload_signal(self.l2_repair_rate)
+            l2 = await _offload_signal(self.l2_repair_rate, shared)
             if l2 is None:
                 l2 = 0.0
         await _asyncio_ls.sleep(0)
@@ -751,7 +892,7 @@ class SignalCollector:
         await _asyncio_ls.sleep(0)
 
         async with _ls_sink_async("posture.signal.session_lessons_infra_ratio"):
-            sl = await _offload_signal(self.session_lessons_infra_ratio)
+            sl = await _offload_signal(self.session_lessons_infra_ratio, shared)
             if sl is None:
                 sl = 0.0
         await _asyncio_ls.sleep(0)
@@ -915,6 +1056,16 @@ class PostureObserver:
         self._last_cycle_attempt_at_unix: Optional[float] = None
         self._last_cycle_ok_at_unix: Optional[float] = None
         self._consecutive_cycle_failures: int = 0
+        # IMPORTANT 3 — monotonic cycle epoch. Incremented on the LOOP
+        # thread at the start of every offloaded cycle. The offload worker
+        # captures its epoch and re-checks it right before ``write_current``;
+        # if a newer cycle has since advanced the epoch (the timed-out
+        # cycle whose worker kept running), the stale worker no-ops its
+        # write so a late cycle-N reading can't clobber cycle-N+1's newer
+        # one. Only ever written on the loop thread (single writer);
+        # workers read it under the GIL (atomic int read). ``0`` sentinel
+        # (never used as a live epoch — first cycle is ``1``).
+        self._cycle_epoch: int = 0
 
     # ---- Q3 Slice 2 — durable hysteresis state hydration ---------------
 
@@ -1120,13 +1271,28 @@ class PostureObserver:
         keep the prior posture, and return ``None`` — never raising into
         the cadence loop or the orchestrator.
         """
+        # NOTE (MINOR): the off-loop guarantee here depends on the
+        # ``cooperative_fs_io`` master switch ``JARVIS_COOPERATIVE_FS_IO_ENABLED``.
+        # When THAT master is OFF, ``offload(...)`` degrades to running the
+        # whole sync cycle INLINE on the loop (its documented byte-identical
+        # rollback) — reintroducing the very starvation this tier closes,
+        # even while ``JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED`` still
+        # reports on. Wholesale-offload is a consumer of the substrate, not
+        # a second dispatch mechanism; both masters must be on for the loop
+        # to actually stay free.
         from backend.core.ouroboros.governance.cooperative_fs_io import (
             offload as _offload,
             is_offload_error as _is_offload_error,
         )
+        # IMPORTANT 3 — stamp this cycle's epoch on the LOOP thread BEFORE
+        # dispatch. A prior timed-out cycle whose worker is still running
+        # will see this newer value at its write and no-op (stale-write
+        # guard). Single writer (loop thread), so the increment is race-free.
+        self._cycle_epoch += 1
+        my_epoch = self._cycle_epoch
         try:
             result = await asyncio.wait_for(
-                _offload(self._run_one_cycle_sync, cpu_bound=False),
+                _offload(self._run_one_cycle_sync, my_epoch, cpu_bound=False),
                 timeout=collector_timeout_s(),
             )
         except asyncio.TimeoutError:
@@ -1142,42 +1308,95 @@ class PostureObserver:
             )
             self._cycles_failed += 1
             return None
-        return result
+        if result is None:
+            return None
+        # CRITICAL — fire the loop-affine ``on_change`` callback HERE, back
+        # on the loop thread, NOT inside the offload worker. The decision
+        # (whether a real transition landed) was computed thread-safely in
+        # ``_process_bundle`` and returned in ``result.on_change_args``.
+        self._fire_on_change(result.on_change_args)
+        return result.to_persist
 
-    def _run_one_cycle_sync(self) -> Optional[PostureReading]:
+    def _fire_on_change(
+        self,
+        on_change_args: Optional[Tuple[PostureReading, Optional[PostureReading]]],
+    ) -> None:
+        """Invoke the injected ``on_change`` callback ON THE CURRENT
+        (loop) thread. MUST only ever be called from the event loop — in
+        production it reaches ``loop.call_soon`` via StreamEventBroker,
+        which is not thread-safe off-loop. Fail-soft: a raising hook never
+        propagates into the cadence loop."""
+        if on_change_args is None or self._on_change is None:
+            return
+        to_persist, previous = on_change_args
+        try:
+            self._on_change(to_persist, previous)
+        except Exception:
+            logger.debug("[PostureObserver] on_change hook raised", exc_info=True)
+
+    def _run_one_cycle_sync(
+        self, epoch: Optional[int] = None,
+    ) -> Optional[_CycleOutcome]:
         """Fully synchronous cadence tick — runs inside the offload
         worker thread (Fix 2). Uses the legacy sync ``build_bundle``
         (each collector's own subprocess/fs timeouts bound the work) and
         shares the ``_process_bundle`` tail with the async path. NEVER
         called on the event loop directly; blocking here blocks a worker
-        thread, never the loop."""
+        thread, never the loop. Returns a :class:`_CycleOutcome` so the
+        loop-affine ``on_change`` can be marshalled back to the loop by
+        the caller (the callback is NOT invoked in this thread)."""
         bundle = self._collector.build_bundle()
         if bundle is None:
             return None
         lss_one_liner = self._read_lss_one_liner_sync()
-        return self._process_bundle(bundle, lss_one_liner=lss_one_liner)
+        return self._process_bundle(
+            bundle, lss_one_liner=lss_one_liner, epoch=epoch,
+        )
 
     async def _run_one_cycle_impl(self) -> Optional[PostureReading]:
         """Legacy async cadence tick (master-off rollback). Per-signal
         chunked-async collect via ``build_bundle_async`` (Tier-2b
         ``_offload_signal``), then the shared sync ``_process_bundle``
-        tail."""
+        tail. Runs entirely ON the loop, so ``on_change`` fires inline
+        here (still on the loop) — byte-behavior-identical to the pre-fix
+        legacy path. ``epoch=None`` disables the stale-write guard (this
+        path is fully awaited, no overlapping cycles to race)."""
         bundle = await self._collect_with_timeout()
         if bundle is None:
             return None
         lss_one_liner = await self._read_lss_one_liner()
-        return self._process_bundle(bundle, lss_one_liner=lss_one_liner)
+        outcome = self._process_bundle(
+            bundle, lss_one_liner=lss_one_liner, epoch=None,
+        )
+        if outcome is None:
+            return None
+        self._fire_on_change(outcome.on_change_args)
+        return outcome.to_persist
 
     def _process_bundle(
         self, bundle: SignalBundle, *, lss_one_liner: str = "",
-    ) -> Optional[PostureReading]:
+        epoch: Optional[int] = None,
+    ) -> Optional[_CycleOutcome]:
         """Shared SYNC tail — arc-context, infer, hysteresis, persist.
 
-        Purely synchronous: called either off-loop inside the offload
-        worker thread (Fix 2 default path) or inline after the legacy
-        async collect. All shared-state mutation happens here under the
-        ``PostureStore`` lock + atomic writes (see
-        ``_run_one_cycle_offloaded`` for the race/atomicity contract)."""
+        Purely synchronous and THREAD-SAFE: called either off-loop inside
+        the offload worker thread (Fix 2 default path) or inline after the
+        legacy async collect. All shared-state mutation happens here under
+        the ``PostureStore`` lock + atomic writes (see
+        ``_run_one_cycle_offloaded`` for the race/atomicity contract).
+
+        CRITICAL — it does NOT invoke the loop-affine ``on_change`` callback
+        (that would run on the worker thread → non-thread-safe
+        ``loop.call_soon`` in production). Instead it computes the decision
+        and returns the callback payload in :class:`_CycleOutcome`; the
+        caller fires it back on the loop.
+
+        IMPORTANT 3 — when ``epoch`` is provided (offloaded path), the
+        ``write_current`` is guarded: if a newer cycle has advanced
+        ``self._cycle_epoch`` since this cycle was dispatched, this stale
+        cycle no-ops its write (and marshals no ``on_change``) so it can't
+        clobber the newer reading. ``epoch=None`` (legacy inline path) has
+        no overlap and skips the guard entirely."""
         # P0.5 Slice 2 — build arc-context (best-effort, never raises) and
         # pass to inferrer. Helper is observability-only by default; score
         # adjustment fires only when JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED=true.
@@ -1251,7 +1470,20 @@ class PostureObserver:
             if now - self._last_change_at >= window:
                 promote = True
 
+        on_change_args: Optional[
+            Tuple[PostureReading, Optional[PostureReading]]
+        ] = None
         if promote:
+            # IMPORTANT 3 — stale-write guard. A cycle that timed out on the
+            # loop keeps running in its worker; if a newer cycle has since
+            # advanced the epoch, this stale cycle must NOT write (it would
+            # clobber the newer reading) and must NOT marshal on_change.
+            if epoch is not None and epoch != self._cycle_epoch:
+                logger.debug(
+                    "[PostureObserver] stale cycle epoch=%s current=%s — "
+                    "suppressing write + on_change", epoch, self._cycle_epoch,
+                )
+                return _CycleOutcome(to_persist=to_persist, on_change_args=None)
             # Q3 Slice 2 — pair the marker write with current ONLY on real
             # posture transitions. Same-posture refreshes pass marker=None
             # so the side-car retains the timestamp at which this posture
@@ -1264,18 +1496,18 @@ class PostureObserver:
             if is_change:
                 self._last_change_at = now
                 self._store.write_current(to_persist, change_marker_at=now)
-                if self._on_change is not None:
-                    try:
-                        self._on_change(to_persist, previous)
-                    except Exception:
-                        logger.debug("[PostureObserver] on_change hook raised", exc_info=True)
+                # CRITICAL — defer the loop-affine callback to the caller
+                # (fired on the loop, never on this possibly-worker thread).
+                on_change_args = (to_persist, previous)
             else:
                 self._store.write_current(to_persist)
             self._cycles_ok += 1
         else:
             self._cycles_skipped_hysteresis += 1
 
-        return to_persist
+        return _CycleOutcome(
+            to_persist=to_persist, on_change_args=on_change_args,
+        )
 
     async def _collect_with_timeout(self) -> Optional[SignalBundle]:
         """Run the collector with a timeout guard.
@@ -1380,6 +1612,7 @@ __all__ = [
     "observer_interval_s",
     "override_max_h",
     "postmortem_window_h",
+    "recent_summaries_max",
     "reset_default_observer",
     "reset_default_store",
     "wholesale_offload_enabled",
