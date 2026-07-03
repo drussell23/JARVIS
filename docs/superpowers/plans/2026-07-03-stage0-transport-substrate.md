@@ -721,7 +721,7 @@ async def test_server_replays_history_since_last_event_id():
     broker = StreamEventBroker(history_maxlen=100)
     # Pre-load three events into history.
     id1 = broker.publish("task_started", "op-1", {"n": 1})
-    id2 = broker.publish("task_progress", "op-1", {"n": 2})
+    id2 = broker.publish("task_updated", "op-1", {"n": 2})
     id3 = broker.publish("task_completed", "op-1", {"n": 3})
     sink = []
     server, client = await _mk_client(broker, _cfg(), sink)
@@ -1544,7 +1544,7 @@ async def test_replay_is_exact_across_drop_and_reorder():
         # Publish 12 events on the server. The proxy drops mid-stream;
         # the client must reconnect and replay the gap from Last-Event-ID.
         for i in range(12):
-            eid = server_broker.publish("task_progress", "op-hostile", {"i": i})
+            eid = server_broker.publish("task_updated", "op-hostile", {"i": i})
             published.append(eid)
             await asyncio.sleep(0.02)
         # Give reconnect + replay time to converge.
@@ -1805,7 +1805,7 @@ async def _main() -> None:
         with open(portfile, "w") as fh:
             fh.write(str(bound))
     for i in range(1000):
-        broker.publish("task_progress", "op-smoke", {"i": i})
+        broker.publish("task_updated", "op-smoke", {"i": i})
         await asyncio.sleep(0.1)
 
 
