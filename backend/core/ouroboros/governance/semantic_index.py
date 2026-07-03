@@ -1662,6 +1662,11 @@ class SemanticIndex:
         self._async_builds_started: int = 0
         self._async_builds_completed: int = 0
         self._async_builds_failed: int = 0
+        # Tier-2b — single-flight guard for the substrate-offloaded build.
+        # Lazily bound to the running loop on first build_offloaded() call
+        # (an asyncio.Lock created outside a loop would bind to the wrong
+        # one). Serializes concurrent offloaded rebuilds deterministically.
+        self._build_offload_lock: "Optional[Any]" = None
 
     # ------------------------------------------------------------------
     # Build
@@ -1945,6 +1950,21 @@ class SemanticIndex:
                 _loop.create_task(self._isolated_build())
                 return "started_isolated"
 
+        # Tier-2b — when a loop is running (intake / CONTEXT_EXPANSION hot
+        # paths), converge the bespoke daemon-thread build onto the single
+        # unified cooperative_fs_io.offload substrate (advisor-blast thread —
+        # fastembed ONNX encode + numpy k-means both RELEASE the GIL, so a
+        # thread frees the loop). No running loop (worker-thread / sync test
+        # callers) → the legacy daemon thread below runs (byte-identical).
+        try:
+            import asyncio as _aio_ba
+            _running_loop = _aio_ba.get_running_loop()
+        except RuntimeError:
+            _running_loop = None
+        if _running_loop is not None:
+            _running_loop.create_task(self._build_async_offloaded_task())
+            return "started"
+
         def _worker() -> None:
             try:
                 ok = self.build(force=True)
@@ -1990,6 +2010,97 @@ class SemanticIndex:
                 ok = self._load_from_cache()
         except Exception:  # noqa: BLE001
             logger.debug("[SemanticIndex] isolated build failed", exc_info=True)
+        finally:
+            with self._lock:
+                if ok:
+                    self._async_builds_completed += 1
+                else:
+                    self._async_builds_failed += 1
+                self._async_build_running = False
+
+    # ------------------------------------------------------------------
+    # Tier-2b — unified offload-substrate build (2nd starvation tier)
+    # ------------------------------------------------------------------
+
+    def _get_build_offload_lock(self) -> "Any":
+        """Lazily create the single-flight asyncio.Lock, bound to the loop
+        that first awaits build_offloaded()."""
+        import asyncio as _aio
+        lock = self._build_offload_lock
+        if lock is None:
+            lock = _aio.Lock()
+            self._build_offload_lock = lock
+        return lock
+
+    async def build_offloaded(self, *, force: bool = False) -> bool:
+        """Run the heavy sync build body OFF the event loop via the unified
+        ``cooperative_fs_io.offload`` substrate (thread path — fastembed ONNX
+        encode + numpy k-means both RELEASE the GIL, so a thread frees the
+        loop; a process pool would reload the embedding model per call).
+
+        Race safety (mandate 4):
+          * Single-flight — concurrent ``build_offloaded`` calls serialize on
+            an ``asyncio.Lock`` so at most one rebuild runs per loop.
+          * Atomic swap — ``_build_impl`` swaps corpus/vectors/centroid/
+            clusters/stats in ONE ``self._lock`` (threading.RLock) critical
+            section, so readers (``score`` / ``boost_for`` /
+            ``format_prompt_sections``) ALWAYS observe either the prior or the
+            fully-rebuilt index, never a half-populated one.
+
+        Fail-soft: an ``OffloadError`` (or the substrate itself faulting)
+        leaves the prior index untouched and returns ``False`` — never raised
+        into the loop.
+        """
+        if not _is_enabled():
+            return False
+        lock = self._get_build_offload_lock()
+        async with lock:
+            now = time.time()
+            with self._lock:
+                if (
+                    not force
+                    and self._built_at > 0
+                    and (now - self._built_at) < _refresh_s()
+                ):
+                    return False
+            try:
+                from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501
+                    offload,
+                    is_offload_error,
+                )
+            except Exception:  # noqa: BLE001 — substrate import fault
+                # Substrate unavailable — still keep the multi-second build
+                # off the loop via a bare thread (never inline).
+                import asyncio as _aio_bo
+                try:
+                    return bool(
+                        await _aio_bo.to_thread(self._build_impl, force=force),
+                    )
+                except Exception:  # noqa: BLE001
+                    return False
+            result = await offload(
+                self._build_impl, cpu_bound=False, force=force,
+            )
+            if is_offload_error(result):
+                logger.debug(
+                    "[SemanticIndex] build_offloaded OffloadError: %r", result,
+                )
+                return False
+            return bool(result)
+
+    async def _build_async_offloaded_task(self) -> None:
+        """Task body scheduled by ``build_async`` when a loop is running.
+
+        Bridges the fire-and-forget ``build_async`` contract (single-flight
+        flag + completed/failed counters) onto ``build_offloaded``. NEVER
+        raises out (runs as a detached task)."""
+        ok = False
+        try:
+            ok = await self.build_offloaded(force=True)
+        except Exception:  # noqa: BLE001 — belt-and-suspenders
+            logger.debug(
+                "[SemanticIndex] offloaded async build raised", exc_info=True,
+            )
         finally:
             with self._lock:
                 if ok:
@@ -2451,6 +2562,96 @@ class SemanticIndex:
             return 0
         raw = int(round(sim * boost_max))
         return max(0, min(boost_max, raw))
+
+    # ------------------------------------------------------------------
+    # Tier-2b — combined boost+score for the off-loop intake path
+    # ------------------------------------------------------------------
+
+    def _boost_and_score_sync(self, text: str) -> Tuple[int, float]:
+        """Embed ``text`` ONCE and return ``(priority_boost, raw_cosine)``.
+
+        Consolidates ``boost_for()`` + ``score()`` into a single fastembed
+        encode for the intake hot path — the previous inline path embedded
+        the same description twice (~2× the ~1.7s block). Mirrors their
+        scoring + shadow-observation + zero-boost-with-evidence logic
+        EXACTLY so the intake routing decision is byte-identical (one encode
+        of a deterministic model yields the same cosine either way). Runs
+        inside the offload thread (fastembed releases the GIL). NEVER raises
+        — degraded inputs return ``(0, 0.0)``."""
+        if not _is_enabled():
+            return (0, 0.0)
+        with self._lock:
+            have_centroid = bool(self._centroid)
+        if not have_centroid:
+            return (0, 0.0)
+        cleaned = _sanitize_corpus_text(text)
+        if not cleaned:
+            return (0, 0.0)
+        vec = self._embedder.embed([cleaned])
+        if not vec:
+            return (0, 0.0)
+        sim, winner, policy_used = self._score_and_align(vec[0])
+        self._observe_cluster_alignment(vec[0])
+        with self._lock:
+            self._stats.signals_scored += 1
+            self._stats.scoring_policy = policy_used
+            self._stats.scored_by_policy[policy_used] = (
+                self._stats.scored_by_policy.get(policy_used, 0) + 1
+            )
+        if (
+            policy_used == "max_cluster"
+            and winner is not None
+            and winner.kind == CLUSTER_KIND_POSTMORTEM
+        ):
+            with self._lock:
+                self._stats.postmortem_boost_suppressions += 1
+            logger.info(
+                "[SemanticIndex] postmortem_suppress cluster_id=%d "
+                "hash8=%s cosine=%.4f size=%d (boost zeroed; alignment "
+                "still observed — offload intake path)",
+                winner.cluster_id, winner.centroid_hash8, sim, winner.size,
+            )
+            return (0, sim)
+        if sim <= 0.0:
+            return (0, sim)
+        boost_max = _boost_max()
+        if boost_max <= 0:
+            return (0, sim)
+        raw = int(round(sim * boost_max))
+        return (max(0, min(boost_max, raw)), sim)
+
+    async def boost_and_score_offloaded(self, text: str) -> Tuple[int, float]:
+        """Off-loop ``(boost, raw_cosine)`` via the unified offload substrate.
+
+        The intake ``_compute_priority`` fast-path previously ran two inline
+        fastembed encodes (``boost_for`` + ``score``) ON the asyncio loop
+        (~3.5s / signal, Tier-2b starvation). This routes the single combined
+        encode through ``cooperative_fs_io.offload(cpu_bound=False)`` — thread
+        pool, because fastembed's ONNX encode releases the GIL. Fail-soft: an
+        ``OffloadError`` degrades to ``(0, 0.0)`` — intake still routes, just
+        without the semantic prior — never raised into the loop."""
+        if not _is_enabled():
+            return (0, 0.0)
+        try:
+            from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501
+                offload,
+                is_offload_error,
+            )
+        except Exception:  # noqa: BLE001
+            try:
+                return self._boost_and_score_sync(text or "")
+            except Exception:  # noqa: BLE001
+                return (0, 0.0)
+        result = await offload(
+            self._boost_and_score_sync, text or "", cpu_bound=False,
+        )
+        if is_offload_error(result):
+            return (0, 0.0)
+        try:
+            boost, sim = result
+            return (int(boost), float(sim))
+        except Exception:  # noqa: BLE001
+            return (0, 0.0)
 
     def score_with_cluster(self, text: str) -> Optional[Dict[str, Any]]:
         """Debug / evidence-stash API — returns full scoring detail.

@@ -344,7 +344,7 @@ def test_lesson_text_truncates_many_files() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_recall_returns_empty_when_master_off(
+async def test_recall_returns_empty_when_master_off(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """Master-off → recall_for_op returns [] without invoking embedder."""
@@ -353,7 +353,7 @@ def test_recall_returns_empty_when_master_off(
         PostmortemRecallService,
     )
     svc = PostmortemRecallService(sessions_dir=tmp_path)
-    result = svc.recall_for_op("any signature")
+    result = await svc.recall_for_op("any signature")
     assert result == []
 
 
@@ -368,7 +368,7 @@ def test_get_default_service_returns_none_when_master_off(
     assert get_default_service() is None
 
 
-def test_recall_empty_signature_returns_empty(
+async def test_recall_empty_signature_returns_empty(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """Empty op_signature → []."""
@@ -377,8 +377,8 @@ def test_recall_empty_signature_returns_empty(
         PostmortemRecallService,
     )
     svc = PostmortemRecallService(sessions_dir=tmp_path)
-    assert svc.recall_for_op("") == []
-    assert svc.recall_for_op("   ") == []
+    assert await svc.recall_for_op("") == []
+    assert await svc.recall_for_op("   ") == []
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +386,7 @@ def test_recall_empty_signature_returns_empty(
 # ---------------------------------------------------------------------------
 
 
-def test_recall_returns_empty_when_no_postmortems(
+async def test_recall_returns_empty_when_no_postmortems(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """Empty sessions dir → recall returns [] cleanly."""
@@ -400,7 +400,7 @@ def test_recall_returns_empty_when_no_postmortems(
     fake_emb.disabled = False
     fake_emb.embed = MagicMock(return_value=[[1.0, 0.0]])
     svc._embedder = fake_emb
-    result = svc.recall_for_op("test op signature")
+    result = await svc.recall_for_op("test op signature")
     assert result == []
 
 
@@ -409,7 +409,7 @@ def test_recall_returns_empty_when_no_postmortems(
 # ---------------------------------------------------------------------------
 
 
-def test_end_to_end_recall_with_mock_embedder(
+async def test_end_to_end_recall_with_mock_embedder(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """Full flow: sessions dir → parse → embed (mocked) → score → top-k."""
@@ -441,12 +441,12 @@ def test_end_to_end_recall_with_mock_embedder(
     ])
     svc._embedder = fake_emb
 
-    matches = svc.recall_for_op("test op signature")
+    matches = await svc.recall_for_op("test op signature")
     assert len(matches) >= 1
     assert (tmp_path / "ledger.jsonl").exists()
 
 
-def test_recall_respects_top_k_override(
+async def test_recall_respects_top_k_override(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """top_k_override caps the result list."""
@@ -478,7 +478,7 @@ def test_recall_respects_top_k_override(
     fake_emb.embed = MagicMock(return_value=[[1.0, 0.0]] * 6)
     svc._embedder = fake_emb
 
-    matches = svc.recall_for_op("sig", top_k_override=2)
+    matches = await svc.recall_for_op("sig", top_k_override=2)
     assert len(matches) == 2
 
 
@@ -614,10 +614,93 @@ def test_pin_orchestrator_recall_after_conversation_bridge() -> None:
     """
     src = _read("backend/core/ouroboros/governance/orchestrator.py")
     bridge_idx = src.find("ConversationBridge injection skipped")
-    recall_call_idx = src.find("ctx = _inject_postmortem_recall_impl(ctx)")
+    recall_call_idx = src.find("ctx = await _inject_postmortem_recall_impl(ctx)")
     assert bridge_idx > 0, "ConversationBridge marker missing"
     assert recall_call_idx > 0, "PostmortemRecall call site missing"
     assert bridge_idx < recall_call_idx, (
         "PostmortemRecall call site must follow ConversationBridge inline "
         "block (per CONTEXT_EXPANSION ordering)"
     )
+
+
+# ---------------------------------------------------------------------------
+# fs-hot-tier Batch 3 (row 19, 2026-07-03) — PostmortemRecallService
+# ``_gather_recent_postmortems`` (sessions-dir iterdir) + the embedder
+# inference that follows it are dispatched together, off the asyncio
+# loop, via cooperative_fs_io.offload(cpu_bound=False).
+# ---------------------------------------------------------------------------
+
+
+class TestGatherAndScoreOffload:
+    async def test_routes_through_offload_thread_pool(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("JARVIS_POSTMORTEM_RECALL_ENABLED", "true")
+        monkeypatch.setenv("JARVIS_POSTMORTEM_RECALL_SIM_THRESHOLD", "0.0")
+        monkeypatch.setenv("JARVIS_POSTMORTEM_RECALL_DECAY_DAYS", "3650")
+
+        sessions_dir = tmp_path / "sessions"
+        sess_dir = sessions_dir / "bt-offload-test"
+        sess_dir.mkdir(parents=True)
+        (sess_dir / "debug.log").write_text(_REAL_POSTMORTEM_LINE + "\n")
+
+        from backend.core.ouroboros.governance.postmortem_recall import (
+            PostmortemRecallService,
+        )
+        svc = PostmortemRecallService(
+            sessions_dir=sessions_dir, ledger_path=tmp_path / "ledger.jsonl",
+        )
+        fake_emb = MagicMock()
+        fake_emb.disabled = False
+        fake_emb.embed = MagicMock(return_value=[[1.0, 0.0], [1.0, 0.0]])
+        svc._embedder = fake_emb
+
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        calls = {"n": 0, "cpu_bound": None}
+        real_offload = cooperative_fs_io.offload
+
+        async def _spy_offload(fn, *args, cpu_bound=False, **kwargs):
+            calls["n"] += 1
+            calls["cpu_bound"] = cpu_bound
+            return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+        matches = await svc.recall_for_op("test signature")
+
+        assert calls["n"] == 1, "recall_for_op must route through offload"
+        assert calls["cpu_bound"] is False, (
+            "the embedder is an ONNX/numpy model that releases the GIL "
+            "during inference — must use the thread pool, not a process "
+            "pool (which would re-load the model per call)"
+        )
+        assert len(matches) >= 1
+
+    async def test_offload_error_degrades_to_empty_no_raise(self, monkeypatch, tmp_path):
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            OffloadError,
+        )
+        monkeypatch.setenv("JARVIS_POSTMORTEM_RECALL_ENABLED", "true")
+
+        sessions_dir = tmp_path / "sessions"
+        sess_dir = sessions_dir / "bt-boom-test"
+        sess_dir.mkdir(parents=True)
+        (sess_dir / "debug.log").write_text(_REAL_POSTMORTEM_LINE + "\n")
+
+        from backend.core.ouroboros.governance.postmortem_recall import (
+            PostmortemRecallService,
+        )
+        svc = PostmortemRecallService(sessions_dir=sessions_dir)
+        fake_emb = MagicMock()
+        fake_emb.disabled = False
+        svc._embedder = fake_emb
+
+        async def _boom_offload(fn, *args, **kwargs):
+            return OffloadError(
+                fn_name="_gather_and_score_sync",
+                exc_type="OSError",
+                message="synthetic offload-layer fault",
+                cpu_bound=False,
+            )
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+        result = await svc.recall_for_op("test signature")
+        assert result == []

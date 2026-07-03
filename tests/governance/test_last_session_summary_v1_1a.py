@@ -89,14 +89,14 @@ def _write(
 # ---------------------------------------------------------------------------
 
 
-def test_v1_summary_parses_with_v1_1a_fields_none(monkeypatch, tmp_path):
+async def test_v1_summary_parses_with_v1_1a_fields_none(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write(
         tmp_path, "bt-2026-04-15-090000",
         schema_version=None,   # v1 file — no schema_version, no ops_digest
     )
     summary = lss.LastSessionSummary(tmp_path)
-    records = summary.load()
+    records = await summary.load()
     assert len(records) == 1
     r = records[0]
     assert r.last_apply_mode is None
@@ -107,7 +107,7 @@ def test_v1_summary_parses_with_v1_1a_fields_none(monkeypatch, tmp_path):
     assert r.last_commit_hash == ""
 
     # Render has no apply/verify/commit tokens — pure v1 line shape.
-    prompt = summary.format_for_prompt() or ""
+    prompt = await summary.format_for_prompt() or ""
     assert "apply=" not in prompt
     assert "verify=" not in prompt
     assert "commit=" not in prompt
@@ -118,7 +118,7 @@ def test_v1_summary_parses_with_v1_1a_fields_none(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_v2_full_ops_digest_renders_all_tokens(monkeypatch, tmp_path):
+async def test_v2_full_ops_digest_renders_all_tokens(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write(
         tmp_path, "bt-2026-04-15-100000",
@@ -132,7 +132,7 @@ def test_v2_full_ops_digest_renders_all_tokens(monkeypatch, tmp_path):
         },
     )
     summary = lss.LastSessionSummary(tmp_path)
-    prompt = summary.format_for_prompt() or ""
+    prompt = await summary.format_for_prompt() or ""
     assert "apply=multi/4" in prompt
     assert "verify=20/20" in prompt
     # Hash truncated to 10 chars.
@@ -145,11 +145,11 @@ def test_v2_full_ops_digest_renders_all_tokens(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_v2_empty_ops_digest_renders_v1_line(monkeypatch, tmp_path):
+async def test_v2_empty_ops_digest_renders_v1_line(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write(tmp_path, "bt-2026-04-15-110000", ops_digest={})
     summary = lss.LastSessionSummary(tmp_path)
-    prompt = summary.format_for_prompt() or ""
+    prompt = await summary.format_for_prompt() or ""
     assert "apply=" not in prompt
     assert "verify=" not in prompt
     assert "commit=" not in prompt
@@ -162,7 +162,7 @@ def test_v2_empty_ops_digest_renders_v1_line(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_apply_mode_none_omits_from_render(monkeypatch, tmp_path):
+async def test_apply_mode_none_omits_from_render(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write(
         tmp_path, "bt-2026-04-15-120000",
@@ -172,7 +172,7 @@ def test_apply_mode_none_omits_from_render(monkeypatch, tmp_path):
         },
     )
     summary = lss.LastSessionSummary(tmp_path)
-    prompt = summary.format_for_prompt() or ""
+    prompt = await summary.format_for_prompt() or ""
     assert "apply=" not in prompt
 
 
@@ -181,7 +181,7 @@ def test_apply_mode_none_omits_from_render(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_partial_ops_digest_renders_only_present_tokens(monkeypatch, tmp_path):
+async def test_partial_ops_digest_renders_only_present_tokens(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write(
         tmp_path, "bt-2026-04-15-130000",
@@ -192,7 +192,7 @@ def test_partial_ops_digest_renders_only_present_tokens(monkeypatch, tmp_path):
         },
     )
     summary = lss.LastSessionSummary(tmp_path)
-    prompt = summary.format_for_prompt() or ""
+    prompt = await summary.format_for_prompt() or ""
     assert "apply=single/1" in prompt
     assert "verify=" not in prompt
     assert "commit=" not in prompt
@@ -203,7 +203,7 @@ def test_partial_ops_digest_renders_only_present_tokens(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_commit_hash_truncated_to_ten_chars(monkeypatch, tmp_path):
+async def test_commit_hash_truncated_to_ten_chars(monkeypatch, tmp_path):
     _enable(monkeypatch)
     full_hash = "abcdef0123456789abcdef0123456789abcdef01"  # 40-char SHA-1
     _write(
@@ -211,11 +211,11 @@ def test_commit_hash_truncated_to_ten_chars(monkeypatch, tmp_path):
         ops_digest={"last_commit_hash": full_hash},
     )
     summary = lss.LastSessionSummary(tmp_path)
-    records = summary.load()
+    records = await summary.load()
     # Full hash retained in SessionRecord.
     assert records[0].last_commit_hash == full_hash
     # Only 10 chars in prompt render.
-    prompt = summary.format_for_prompt() or ""
+    prompt = await summary.format_for_prompt() or ""
     assert "commit=abcdef0123 " in prompt or "commit=abcdef0123\n" in prompt or prompt.endswith("commit=abcdef0123")
     assert full_hash not in prompt
 
@@ -225,14 +225,14 @@ def test_commit_hash_truncated_to_ten_chars(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_malformed_ops_digest_not_a_dict(monkeypatch, tmp_path):
+async def test_malformed_ops_digest_not_a_dict(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write(
         tmp_path, "bt-2026-04-15-150000",
         ops_digest="this should be a dict, not a string",  # type: ignore[arg-type]
     )
     summary = lss.LastSessionSummary(tmp_path)
-    records = summary.load()
+    records = await summary.load()
     assert len(records) == 1
     r = records[0]
     # All v1.1a fields fall back to absent/None.
@@ -245,7 +245,7 @@ def test_malformed_ops_digest_not_a_dict(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_bad_field_types_degrade_gracefully(monkeypatch, tmp_path):
+async def test_bad_field_types_degrade_gracefully(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write(
         tmp_path, "bt-2026-04-15-160000",
@@ -258,14 +258,14 @@ def test_bad_field_types_degrade_gracefully(monkeypatch, tmp_path):
         },
     )
     summary = lss.LastSessionSummary(tmp_path)
-    records = summary.load()
+    records = await summary.load()
     r = records[0]
     assert r.last_apply_mode == "multi"   # good field survives
     assert r.last_apply_files is None     # bad int → None
     assert r.last_verify_tests_passed is None
     assert r.last_verify_tests_total is None
     # Render: apply requires files → omitted without files; verify missing both → omitted.
-    prompt = summary.format_for_prompt() or ""
+    prompt = await summary.format_for_prompt() or ""
     assert "apply=" not in prompt
     assert "verify=" not in prompt
 
@@ -275,7 +275,7 @@ def test_bad_field_types_degrade_gracefully(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_verify_total_zero_omits_token(monkeypatch, tmp_path):
+async def test_verify_total_zero_omits_token(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write(
         tmp_path, "bt-2026-04-15-170000",
@@ -285,7 +285,7 @@ def test_verify_total_zero_omits_token(monkeypatch, tmp_path):
         },
     )
     summary = lss.LastSessionSummary(tmp_path)
-    prompt = summary.format_for_prompt() or ""
+    prompt = await summary.format_for_prompt() or ""
     assert "verify=" not in prompt
 
 
@@ -294,7 +294,7 @@ def test_verify_total_zero_omits_token(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_apply_mode_rejected(monkeypatch, tmp_path):
+async def test_unknown_apply_mode_rejected(monkeypatch, tmp_path):
     _enable(monkeypatch)
     _write(
         tmp_path, "bt-2026-04-15-180000",
@@ -304,9 +304,9 @@ def test_unknown_apply_mode_rejected(monkeypatch, tmp_path):
         },
     )
     summary = lss.LastSessionSummary(tmp_path)
-    records = summary.load()
+    records = await summary.load()
     assert records[0].last_apply_mode is None  # unknown → None
-    prompt = summary.format_for_prompt() or ""
+    prompt = await summary.format_for_prompt() or ""
     assert "apply=" not in prompt
 
 
@@ -497,7 +497,7 @@ def test_orchestrator_has_three_observer_call_sites():
     )
 
 
-def test_integration_recorder_to_summary_round_trip(monkeypatch, tmp_path):
+async def test_integration_recorder_to_summary_round_trip(monkeypatch, tmp_path):
     """Full v1.1a loop: record → write summary.json → LSS parses → renders."""
     _enable(monkeypatch)
 
@@ -530,7 +530,7 @@ def test_integration_recorder_to_summary_round_trip(monkeypatch, tmp_path):
 
     # Now LSS reads from that same tmp_path root.
     summary = lss.LastSessionSummary(tmp_path)
-    records = summary.load()
+    records = await summary.load()
     assert len(records) == 1
     r = records[0]
     assert r.last_apply_mode == "multi"
@@ -539,7 +539,7 @@ def test_integration_recorder_to_summary_round_trip(monkeypatch, tmp_path):
     assert r.last_verify_tests_total == 20
     assert r.last_commit_hash == "0890a7b6f09876543210abcd"
 
-    prompt = summary.format_for_prompt() or ""
+    prompt = await summary.format_for_prompt() or ""
     assert "apply=multi/4" in prompt
     assert "verify=18/20" in prompt
     assert "commit=0890a7b6f0" in prompt

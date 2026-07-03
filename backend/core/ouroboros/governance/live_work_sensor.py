@@ -55,6 +55,35 @@ def is_enabled() -> bool:
     return _ENABLED
 
 
+def _find_ide_lock_worker(parent_str: str, target_name: str) -> Optional[str]:
+    """Module-level worker for :meth:`LiveWorkSensor._find_ide_lock`.
+
+    Dispatched into the shared ``advisor-blast`` thread pool via
+    ``cooperative_fs_io.offload`` (fs-hot-tier Batch 3, row 23). Lifted
+    to module level so the offload trampoline doesn't capture any
+    caller-local state. NEVER raises — an ``OSError`` during the scan
+    (permission, race) degrades to ``None`` (no lock found).
+    """
+    parent = Path(parent_str)
+    try:
+        for entry in parent.iterdir():
+            name = entry.name
+            # vim swap: .target.swp / .target.swo / .target.swn
+            if name.startswith(f".{target_name}.") and (
+                name.endswith(".swp") or name.endswith(".swo") or name.endswith(".swn")
+            ):
+                return name
+            # emacs lock: .#target
+            if name == f".#{target_name}":
+                return name
+            # backup files: target~
+            if name == f"{target_name}~":
+                return name
+    except OSError:
+        return None
+    return None
+
+
 class LiveWorkSensor:
     """Detect whether a file is currently being touched by a human.
 
@@ -79,7 +108,7 @@ class LiveWorkSensor:
     # Public API
     # ------------------------------------------------------------------
 
-    def is_human_active(self, rel_path: str) -> Tuple[bool, Optional[str]]:
+    async def is_human_active(self, rel_path: str) -> Tuple[bool, Optional[str]]:
         """Return ``(active, reason)`` for a candidate file.
 
         ``rel_path`` is interpreted relative to ``repo_root``. ``reason``
@@ -115,7 +144,7 @@ class LiveWorkSensor:
 
         # 3. IDE lock / swap file artefacts next to target.
         try:
-            lock = self._find_ide_lock(abs_path)
+            lock = await self._find_ide_lock(abs_path)
             if lock is not None:
                 return True, f"ide-lock: {lock}"
         except OSError as exc:
@@ -186,27 +215,35 @@ class LiveWorkSensor:
         self._git_cache_at = now
         return dirty
 
-    def _find_ide_lock(self, abs_path: Path) -> Optional[str]:
+    async def _find_ide_lock(self, abs_path: Path) -> Optional[str]:
         """Scan the target file's parent directory for IDE lock artefacts.
 
         Only checked if ``abs_path`` has an existing parent — avoids
         touching paths that don't belong to the repo.
+
+        fs-hot-tier Batch 3 (row 23): the single-directory iterdir scan
+        is dispatched off the asyncio loop via
+        ``cooperative_fs_io.offload(cpu_bound=False)`` — thread pool
+        (iterdir over one directory is cheap and IO-bound). Fail-soft:
+        an ``OffloadError`` degrades to ``None`` — the same "no lock
+        found" result an empty/missing directory gives.
         """
         parent = abs_path.parent
         if not parent.exists() or not parent.is_dir():
             return None
-        target_name = abs_path.name
-        for entry in parent.iterdir():
-            name = entry.name
-            # vim swap: .target.swp / .target.swo / .target.swn
-            if name.startswith(f".{target_name}.") and (
-                name.endswith(".swp") or name.endswith(".swo") or name.endswith(".swn")
-            ):
-                return name
-            # emacs lock: .#target
-            if name == f".#{target_name}":
-                return name
-            # backup files: target~
-            if name == f"{target_name}~":
-                return name
-        return None
+
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+        result = await offload(
+            _find_ide_lock_worker, str(parent), abs_path.name,
+            cpu_bound=False,
+        )
+        if is_offload_error(result):
+            logger.debug(
+                "[LiveWork] _find_ide_lock offload failed for %s — "
+                "degrading to None", abs_path,
+            )
+            return None
+        return result

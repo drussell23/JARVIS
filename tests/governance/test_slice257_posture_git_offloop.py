@@ -102,7 +102,12 @@ def test_commit_ratios_async_does_not_fork_on_loop() -> None:
     assert "create_subprocess_exec(" not in src
     assert "_git_head_async(" not in src
     assert "_git_subjects_async(" not in src
-    assert "run_in_executor(" in src
+    # Tier-2b — converged onto the unified cooperative_fs_io.offload
+    # substrate (via the module ``_offload_signal`` helper) instead of the
+    # killed bespoke ``fs_signal_executor`` + ``run_in_executor``. The git
+    # work still runs off the loop (proven by
+    # ``test_git_work_runs_off_the_event_loop``).
+    assert "_offload_signal(" in src
 
 
 if __name__ == "__main__":  # pragma: no cover

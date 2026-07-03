@@ -677,7 +677,7 @@ class TestGraduation_F_FullRevertMatrix:
 
         # ---- GRADUATED state (master=true by default) ----
         # Surface 1: prompt injection active
-        assert "Current Strategic Posture" in svc.format_for_prompt()
+        assert "Current Strategic Posture" in await svc.format_for_prompt()
         # Surface 2: REPL status returns reading
         r_status = dispatch_posture_command("/posture status")
         assert r_status.ok and "EXPLORE" in r_status.text
@@ -693,7 +693,7 @@ class TestGraduation_F_FullRevertMatrix:
         # ---- REVERT: single env flip, all four surfaces go dark ----
         monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "false")
         # Surface 1: prompt injection gone
-        out_after = svc.format_for_prompt()
+        out_after = await svc.format_for_prompt()
         assert "Current Strategic Posture" not in out_after
         # Surface 2: REPL rejects status
         r_after = dispatch_posture_command("/posture status")

@@ -246,7 +246,10 @@ def _check_lss_carryover(
         )
     try:
         lss = LastSessionSummary(project_root=project_root)
-        records = lss.load(n_sessions=10)
+        # fs-hot-tier Batch 3 (row 18): load() is now async (offloaded
+        # rglob) — this graduation harness stays synchronous;
+        # load_sync() bridges via asyncio.run(), fail-soft.
+        records = lss.load_sync(n_sessions=10)
     except Exception as exc:  # noqa: BLE001
         return PrimitiveResult(
             primitive_name="last_session_summary",
@@ -381,7 +384,11 @@ def _check_lss_prompt_render_carryover(
         )
     try:
         lss = LastSessionSummary(project_root=project_root)
-        prompt_text = lss.format_for_prompt()
+        # fs-hot-tier Batch 3 (row 18): format_for_prompt() is now async
+        # (offloaded rglob via load()) — this graduation harness stays
+        # synchronous; format_for_prompt_sync() bridges via
+        # asyncio.run(), fail-soft.
+        prompt_text = lss.format_for_prompt_sync()
     except Exception as exc:  # noqa: BLE001
         return PrimitiveResult(
             primitive_name="lss_prompt_render",

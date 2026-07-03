@@ -511,6 +511,241 @@ _A1TRACE_RE = re.compile(r"\[A1Trace\]\s+(?P<hop>\w+)\s+goal=(?P<goal>\S+)")
 _A1TRACE_TARGETS_RE = re.compile(r"target_files=(?P<files>\S+)")
 # Op id embedded in a free log line: 'op=op-abc' / 'op_id=op-abc'.
 _LOG_OP_ID_RE = re.compile(r"\bop(?:_id)?=(?P<op>[\w.:-]+)")
+# Fallback: a bare 'op-<hex>-<hex>-<hex>-...' token with NO '=' prefix (e.g.
+# "Generation attempt 1/2 failed for op-019f2532-95b8-...-cau: ..."). Requires
+# >= 2 hyphen-separated hex-ish groups after 'op-' so we don't false-positive
+# on unrelated 'op-' prefixed English words.
+_LOG_BARE_OP_ID_RE = re.compile(
+    r"\b(op-[0-9a-f]{4,}(?:-[0-9a-z]{2,}){2,})\b", re.IGNORECASE
+)
+
+# ---------------------------------------------------------------------------
+# Log-replay evidence bridges (Fix: multi-session lineage-aware audit)
+# ---------------------------------------------------------------------------
+# ``fsm_phase_changed`` and ``operation_terminal`` are SSE-only event types --
+# a ``--log-file``-only static replay (no ``--base`` SSE connection, e.g. an
+# auditor run against an ALREADY-FINISHED session) never receives them, so
+# ``fsm_phases_seen`` / ``state_applied`` stayed permanently empty under
+# static replay regardless of how much log evidence existed. These regexes
+# bridge the SAME facts from their textual log-line equivalents so log-only
+# replay can prove what a live SSE audit would have proven.
+
+# '[A1Trace] accept goal=<op> phase=<phase>' -- the op's FSM-accept phase
+# (always CLASSIFY in production; textual twin of the (never log-emitted)
+# fsm_phase_changed SSE event for the loop's ENTRY phase).
+_A1TRACE_ACCEPT_PHASE_RE = re.compile(
+    r"\[A1Trace\]\s+accept\s+goal=(?P<goal>\S+)\s+phase=(?P<phase>\S+)"
+)
+# '[CommProtocol] HEARTBEAT op=<op> seq=N payload={'phase': 'generate', ...}'
+# -- the Python-dict-repr HEARTBEAT payload's 'phase' key; textual twin of
+# fsm_phase_changed for every mid-loop phase transition CommProtocol observes.
+_COMM_HEARTBEAT_PHASE_RE = re.compile(
+    r"\[CommProtocol\]\s+HEARTBEAT\s+op=(?P<op>\S+).*?['\"]phase['\"]\s*:\s*"
+    r"['\"](?P<phase>[a-zA-Z_]+)['\"]"
+)
+# '[Slice74Probe] LEDGER_TERMINAL op_id=<op> state=<state> written=<bool>' --
+# textual twin of the operation_terminal SSE event's state=applied signal.
+_LEDGER_TERMINAL_RE = re.compile(
+    r"LEDGER_TERMINAL\s+op_id=(?P<op>\S+)\s+state=(?P<state>\w+)\s+written=(?P<written>\w+)"
+)
+# 'op=<op> is_noop=True (...) terminal_reason_code=<code> ... skipping APPLY'
+# -- a legitimate, BY-DESIGN FSM branch: a read-only/no-op op structurally
+# SKIPS the literal APPLY phase yet still reaches a genuine autonomous
+# terminal completion (LEDGER_TERMINAL state=applied). Counted as
+# APPLY-equivalent evidence (labelled distinctly -- never silently relabeled
+# as a literal "APPLY" phase observation) so a no-op autonomous completion is
+# not wrongly reported as "never reached APPLY".
+_NOOP_SKIP_APPLY_RE = re.compile(
+    r"is_noop=True.*?terminal_reason_code=\S+.*?skipping APPLY"
+)
+# '[HYDRATION-HANDSHAKE] HMAC-SHA256 VERIFIED op=<op> phase=<phase> digest=<hex>...'
+# -- fsm_checkpoint.list_pending() emits this ONLY after its own _verify()
+# call (HMAC over the checkpoint payload) succeeds; its presence in the log
+# IS the checkpoint's cryptographic verification (reused, not reimplemented).
+_HYDRATION_HANDSHAKE_VERIFIED_RE = re.compile(
+    r"\[HYDRATION-HANDSHAKE\]\s+HMAC-SHA256\s+VERIFIED\s+op=(?P<op>\S+)\s+"
+    r"phase=(?P<phase>\S+)\s+digest=(?P<digest>[0-9a-fA-F]+)"
+)
+# '[A1Trace] emit goal=<op> source=<src> lineage=resumed original_emit_wall=<ts>'
+# -- an op that was suspended (FSM checkpoint) in a PRIOR session and re-armed
+# in THIS one. The op_id is the cryptographic correlation key across sessions.
+_A1TRACE_EMIT_RESUMED_RE = re.compile(
+    r"\[A1Trace\]\s+emit\s+goal=(?P<goal>\S+)\s+source=(?P<source>\S+)\s+"
+    r"lineage=resumed\s+original_emit_wall=(?P<wall>\S+)"
+)
+
+
+def parse_hydration_handshake_verified(line: str) -> Optional[Tuple[str, str, str]]:
+    """Parse a ``[HYDRATION-HANDSHAKE] HMAC-SHA256 VERIFIED`` line ->
+    ``(op_id, phase, digest)``, or None. NEVER raises."""
+    try:
+        m = _HYDRATION_HANDSHAKE_VERIFIED_RE.search(line)
+        if not m:
+            return None
+        return m.group("op"), m.group("phase"), m.group("digest")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def parse_a1trace_emit_resumed(line: str) -> Optional[Tuple[str, str, str]]:
+    """Parse an ``[A1Trace] emit ... lineage=resumed original_emit_wall=..``
+    line -> ``(op_id, source, original_emit_wall)``, or None. NEVER raises."""
+    try:
+        m = _A1TRACE_EMIT_RESUMED_RE.search(line)
+        if not m:
+            return None
+        return m.group("goal"), m.group("source"), m.group("wall")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Cross-session ancestor discovery (Fix: multi-session lineage-aware audit)
+# ---------------------------------------------------------------------------
+# NO hardcoded session paths/names: the op_id is the correlation key. Given
+# the CURRENT session's log file, dynamically scan sibling session dirs under
+# the SAME ``.ouroboros/sessions/`` root for any ``debug.log`` whose content
+# references the op_id, older than the current session. Bounded (max_sessions
+# + an explicit visited-set) so a lineage pointer cycle can never hang.
+
+
+def _session_order_key(log_path: str, name: str) -> float:
+    """Best-effort chronological ordering key for a session: the embedded
+    epoch in the session dir name (``bt-iso-<epoch>`` / ``bt-<epoch>``) if
+    present, else the debug.log's mtime. NEVER raises."""
+    try:
+        m = re.search(r"(\d{9,})", name)
+        if m:
+            return float(m.group(1))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return os.path.getmtime(log_path)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _log_file_contains(path: str, needle: str) -> bool:
+    """True iff *path* contains *needle* on some line. Corrupted / undecodable
+    lines are skipped (never abort the scan). NEVER raises."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                try:
+                    if needle in line:
+                        return True
+                except Exception:  # noqa: BLE001 -- corrupted line, skip it
+                    continue
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def find_ancestor_session_logs(
+    current_log_path: str,
+    op_id: str,
+    *,
+    visited: Optional[set] = None,
+    max_sessions: int = 8,
+) -> List[str]:
+    """Dynamically discover ancestor ``debug.log`` path(s) (oldest first) that
+    reference *op_id*, excluding the current session and anything already in
+    *visited* (cycle guard). NO hardcoded session names -- op_id (the
+    cryptographic correlation key) is the sole match criterion. Fail-soft:
+    returns [] on any error (missing sessions root, unreadable dirs, ...) --
+    NEVER raises, NEVER hangs (bounded by max_sessions + the visited-set)."""
+    try:
+        if not current_log_path or not op_id:
+            return []
+        current_log_path = os.path.abspath(current_log_path)
+        session_dir = os.path.dirname(current_log_path)
+        sessions_root = os.path.dirname(session_dir)
+        current_name = os.path.basename(session_dir)
+        visited = visited if visited is not None else set()
+        if not os.path.isdir(sessions_root):
+            return []
+        cur_key = _session_order_key(current_log_path, current_name)
+        candidates: List[Tuple[float, str]] = []
+        try:
+            names = sorted(os.listdir(sessions_root))
+        except Exception:  # noqa: BLE001
+            return []
+        for name in names:
+            if name == current_name or name in visited:
+                continue
+            cand_dir = os.path.join(sessions_root, name)
+            cand_log = os.path.join(cand_dir, "debug.log")
+            if not os.path.isfile(cand_log):
+                continue
+            if not _log_file_contains(cand_log, op_id):
+                continue
+            key = _session_order_key(cand_log, name)
+            if key < cur_key:
+                candidates.append((key, cand_log))
+        candidates.sort(key=lambda t: t[0])
+        return [p for (_k, p) in candidates[:max_sessions]]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+# ---------------------------------------------------------------------------
+# HMAC-anchored resume-splice verification (reuses fsm_checkpoint -- never
+# reimplements its signature/parsing logic)
+# ---------------------------------------------------------------------------
+
+
+def _import_fsm_checkpoint_module() -> Any:
+    """Import ``backend.core.ouroboros.governance.fsm_checkpoint`` (mirrors the
+    sys.path bootstrap already used by :func:`load_audit_flags`). Returns None
+    on failure -- NEVER raises."""
+    try:
+        import importlib
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        backend = os.path.join(repo_root, "backend")
+        for entry in (backend, repo_root):
+            if entry not in sys.path:
+                sys.path.insert(0, entry)
+        for mod_path in (
+            "backend.core.ouroboros.governance.fsm_checkpoint",
+            "core.ouroboros.governance.fsm_checkpoint",
+        ):
+            try:
+                return importlib.import_module(mod_path)
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def verify_pending_checkpoint(op_id: str, *, base_dir: Optional[str] = None) -> bool:
+    """True iff a STILL-PENDING (not yet consumed) checkpoint for *op_id*
+    exists and its HMAC verifies. Reuses ``fsm_checkpoint``'s OWN
+    ``_checkpoint_key`` / ``_verify`` primitives -- does not reimplement the
+    signature logic. A successfully-resumed op's checkpoint is normally
+    already consumed (deleted) by the time an audit runs after the fact --
+    that is the expected common case, not a failure; the HYDRATION-HANDSHAKE
+    log record is the primary verification path for THAT case (see
+    :func:`parse_hydration_handshake_verified`). NEVER raises."""
+    try:
+        fc = _import_fsm_checkpoint_module()
+        if fc is None or not op_id:
+            return False
+        d = fc.checkpoint_dir(base_dir)
+        path = os.path.join(d, "%s.json" % op_id)
+        if not os.path.isfile(path):
+            return False
+        with open(path, "r", encoding="utf-8") as fh:
+            wrapper = json.loads(fh.read())
+        payload_json = wrapper.get("payload") if isinstance(wrapper, dict) else None
+        sig = wrapper.get("hmac") if isinstance(wrapper, dict) else None
+        if not isinstance(payload_json, str):
+            return False
+        key = fc._checkpoint_key(base_dir)  # noqa: SLF001 -- explicit reuse, not reimpl
+        return bool(fc._verify(payload_json, sig or "", key))  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def parse_a1trace_line(line: str) -> Optional[Tuple[str, str]]:
@@ -839,6 +1074,9 @@ class A1GraduationAuditor:
         strict: bool = True,
         chaos_manifest_path: Optional[str] = _SENTINEL,
         lineage_scoping_enabled: Optional[bool] = None,
+        replay: bool = False,
+        current_log_path: Optional[str] = None,
+        checkpoint_base_dir: Optional[str] = None,
     ) -> None:
         flag_list = list(flags) if flags is not None else load_audit_flags()
         self.strict = strict
@@ -883,6 +1121,40 @@ class A1GraduationAuditor:
         # identity). Fail-CLOSED: these surface UNVERIFIABLE_LINEAGE in the
         # verdict -- never a fake-pass, never a false-throw.
         self.unverifiable_lineage_gates: List[str] = []
+        # Reject-family markers on an op OUTSIDE the audited scope (chaos
+        # lineage OR resumed-op set) -- logged for transparency, never a
+        # false-positive REJECTED flag (mirrors observed_unrelated_gates).
+        self.observed_unrelated_flag_rejects: List[str] = []
+
+        # --- multi-session lineage-aware audit (Fix: resumed ops) ----------- #
+        self.replay: bool = bool(replay)
+        self.current_log_path: Optional[str] = current_log_path
+        self.checkpoint_base_dir: Optional[str] = checkpoint_base_dir
+        # op_id -> {"source": ..., "original_emit_wall": ...} for every op
+        # observed with an `[A1Trace] emit ... lineage=resumed` breadcrumb.
+        # This is the resume-lineage's audited-op-set (parallel to, and
+        # usable in place of, the chaos-manifest lineage root above).
+        self.resumed_ops: Dict[str, Dict[str, str]] = {}
+        # op_id -> digest prefix, from HYDRATION-HANDSHAKE VERIFIED log lines
+        # (proof fsm_checkpoint's OWN _verify() succeeded at resume time).
+        self.hydration_verified: Dict[str, str] = {}
+        # Resumed ops whose suspend/resume splice could NOT be HMAC-anchored
+        # (neither a live pending-checkpoint verify nor a HYDRATION-HANDSHAKE
+        # record). Fail-CLOSED, never a fake-pass.
+        self.unverifiable_resume_lineage: List[str] = []
+        # Ancestor debug.log paths successfully stitched in (observability).
+        self.stitched_ancestor_logs: List[str] = []
+        # Fail-soft reasons a resumed op's ancestor evidence could NOT be
+        # stitched (missing ancestor log, discovery error, ...) -- clear,
+        # never a crash.
+        self.lineage_stitch_failures: List[str] = []
+        # Cycle-safe bounded traversal guards for ancestor stitching.
+        self._stitched_ops: set = set()
+        self._stitched_sessions: set = set()
+        # Flags whose honest UNVERIFIABLE verdict was downgraded to a WARN
+        # under --replay (log-only static replay cannot observe live-SSE-only
+        # signal families). REJECTED flags are NEVER downgraded.
+        self.replay_downgraded_unverifiable: List[str] = []
 
     # ----- intervention-lock primitive -------------------------------------
 
@@ -945,24 +1217,39 @@ class A1GraduationAuditor:
                     "no_op_id:%s:%s" % (gate_label, marker_text[:80])
                 )
                 return
-            if not self.lineage.has_chaos_target():
-                # We have an op id but no chaos target to scope against -> we
-                # cannot prove this gate IS (or is NOT) the chaos op.
-                # Fail-CLOSED: UNVERIFIABLE_LINEAGE, never a silent pass.
+            if self.lineage.has_chaos_target():
+                if not self.lineage.in_chaos_lineage(op_id):
+                    # Outside the chaos subtree -- the safety system working
+                    # as designed. Logged for transparency, NOT a failure.
+                    self.observed_unrelated_gates.append(
+                        "%s:op=%s (outside chaos lineage -- safety guard, ignored)"
+                        % (gate_label, op_id)
+                    )
+                    return
+                # In the chaos lineage -> the lock fires (autonomy not proven).
+                gate_label = "%s:op=%s" % (gate_label, op_id)
+            elif self.resumed_ops:
+                # No chaos manifest, but resumed-lineage roots ARE known
+                # (multi-session lineage-aware audit): scope against the
+                # resumed op set instead of failing closed on "no_manifest".
+                # A pure roadmap soak (no chaos-injection harness) has no
+                # chaos manifest by design -- that must not, by itself, make
+                # every unrelated op's gate an unknowable-lineage failure.
+                if op_id not in self.resumed_ops:
+                    self.observed_unrelated_gates.append(
+                        "%s:op=%s (outside resumed lineage -- safety guard, ignored)"
+                        % (gate_label, op_id)
+                    )
+                    return
+                gate_label = "%s:op=%s" % (gate_label, op_id)
+            else:
+                # Neither a chaos manifest nor any resumed-lineage roots --
+                # lineage is genuinely unknowable (legacy fail-closed
+                # behavior, byte-identical to pre-fix for non-resume audits).
                 self.unverifiable_lineage_gates.append(
                     "no_manifest:%s:op=%s" % (gate_label, op_id)
                 )
                 return
-            if not self.lineage.in_chaos_lineage(op_id):
-                # Outside the chaos subtree -- the safety system working as
-                # designed. Logged for transparency, NOT a failure.
-                self.observed_unrelated_gates.append(
-                    "%s:op=%s (outside chaos lineage -- safety guard, ignored)"
-                    % (gate_label, op_id)
-                )
-                return
-            # In the chaos lineage -> the lock fires (autonomy not proven).
-            gate_label = "%s:op=%s" % (gate_label, op_id)
 
         exc = GraduationFailedException(
             "FAILURE LOCUS: intervention_lock -- mid-loop human gate "
@@ -993,6 +1280,10 @@ class A1GraduationAuditor:
             # Strip trailing punctuation (e.g. 'op=op-x:' / 'op=op-x.' from
             # 'ask_human op=op-x: clarify?') so the id matches the graph node.
             return m.group("op").rstrip(":.-")
+        # Fallback: a bare 'op-<hex>-...' token with no '=' prefix.
+        m2 = _LOG_BARE_OP_ID_RE.search(marker_text or "")
+        if m2:
+            return m2.group(1).rstrip(":.-")
         return ""
 
     def _record_op_lineage_from_payload(self, payload: Dict[str, Any]) -> None:
@@ -1021,6 +1312,74 @@ class A1GraduationAuditor:
         self.lineage.observe_op(
             op_id, target_files=target_files or None, parents=parents or None
         )
+
+    # ----- cross-session lineage stitching (multi-session lineage-aware) --
+
+    def _stitch_ancestor_lineage(self, op_id: str) -> None:
+        """Discover + splice ancestor-session evidence for a resumed *op_id*.
+
+        Recursive by construction: feeding an ancestor log's lines back
+        through :meth:`ingest_log_line` will itself trigger further stitching
+        if THAT ancestor log carries its own `lineage=resumed` breadcrumb (a
+        multi-hop resume chain) -- bounded by ``_stitched_ops`` /
+        ``_stitched_sessions`` (visited-sets), so a lineage pointer cycle
+        (op A's ancestor search revisiting a session already stitched) can
+        never hang. Fail-soft: any error is recorded in
+        ``lineage_stitch_failures`` with a clear reason, NEVER raised
+        (except a genuine :class:`GraduationFailedException` from an in-scope
+        gate encountered while replaying ancestor evidence -- that IS a real
+        finding and must propagate)."""
+        if not self.current_log_path or op_id in self._stitched_ops:
+            return  # no log context to root the search from, or cycle guard
+        self._stitched_ops.add(op_id)
+        try:
+            ancestor_logs = find_ancestor_session_logs(
+                self.current_log_path, op_id, visited=self._stitched_sessions,
+            )
+        except Exception:  # noqa: BLE001
+            self.lineage_stitch_failures.append("discovery_error:op=%s" % op_id)
+            return
+        if not ancestor_logs:
+            self.lineage_stitch_failures.append("no_ancestor_log:op=%s" % op_id)
+            return
+        for path in ancestor_logs:
+            self._stitched_sessions.add(os.path.dirname(path))
+            self.stitched_ancestor_logs.append(path)
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                    for raw_line in fh:
+                        line = raw_line.rstrip("\n")
+                        try:
+                            self.ingest_log_line(line)
+                        except GraduationFailedException:
+                            raise
+                        except Exception:  # noqa: BLE001 -- corrupted line, keep going
+                            continue
+            except GraduationFailedException:
+                raise
+            except Exception:  # noqa: BLE001
+                self.lineage_stitch_failures.append("ancestor_read_error:%s" % path)
+                continue
+
+    def _resume_lineage_verified(self) -> bool:
+        """True iff every resumed op's suspend/resume splice is HMAC-anchored:
+        the HYDRATION-HANDSHAKE VERIFIED record was observed for that op (the
+        common case -- fsm_checkpoint only emits it after its own HMAC verify
+        succeeds), OR a still-pending checkpoint for it verifies directly.
+        Vacuously true when no resumed ops were observed (nothing to verify).
+        Fail-CLOSED, never a fake-pass."""
+        if not self.resumed_ops:
+            return True
+        ok = True
+        for op_id in self.resumed_ops:
+            if op_id in self.hydration_verified:
+                continue
+            if verify_pending_checkpoint(op_id, base_dir=self.checkpoint_base_dir):
+                continue
+            if op_id not in self.unverifiable_resume_lineage:
+                self.unverifiable_resume_lineage.append(op_id)
+            ok = False
+        return ok
 
     # ----- ingest ----------------------------------------------------------
 
@@ -1066,8 +1425,10 @@ class A1GraduationAuditor:
         if self._is_pr_signal(event_type, payload, blob):
             self.pr_signal_observed = True
 
-        # Flag-family signal correlation.
-        self._correlate_flag_signal(blob)
+        # Flag-family signal correlation (op-scoped -- see _correlate_flag_signal).
+        self._correlate_flag_signal(
+            blob, op_id=self._extract_op_id(event_type, payload, blob)
+        )
 
     def ingest_log_line(self, line: str) -> None:
         """Ingest one raw log line -- A1Trace hops + gate-telemetry markers
@@ -1116,14 +1477,65 @@ class A1GraduationAuditor:
             if tm:
                 files = [f for f in tm.group("files").split(",") if f.strip()]
                 self.lineage.observe_op(goal, target_files=files or None)
+            if hop == "accept":
+                # Log-replay bridge: the op's FSM-accept phase (textual twin
+                # of the SSE-only fsm_phase_changed event's entry phase).
+                pm = _A1TRACE_ACCEPT_PHASE_RE.search(line)
+                if pm:
+                    phase = pm.group("phase").strip()
+                    if phase:
+                        self.fsm_phases_seen.append(phase)
+                        self._last_fsm_phase = phase
+            elif hop == "emit":
+                # Multi-session lineage: this op was suspended + resumed
+                # across an ignition boundary. Record it as a resume-lineage
+                # root and stitch the ancestor session's evidence in.
+                resumed = parse_a1trace_emit_resumed(line)
+                if resumed is not None:
+                    r_goal, r_source, r_wall = resumed
+                    self.resumed_ops[r_goal] = {
+                        "source": r_source, "original_emit_wall": r_wall,
+                    }
+                    self._stitch_ancestor_lineage(r_goal)
             return
+
+        # Log-replay bridges for SSE-only phase/terminal signals (never
+        # returns early -- these markers still flow through the gate-check +
+        # flag-correlation + PR-signal paths below like any other line).
+
+        # CommProtocol HEARTBEAT phase (textual twin of fsm_phase_changed).
+        hb = _COMM_HEARTBEAT_PHASE_RE.search(line)
+        if hb is not None:
+            phase = hb.group("phase").strip()
+            if phase:
+                self.fsm_phases_seen.append(phase.upper())
+                self._last_fsm_phase = phase.upper()
+
+        # LEDGER_TERMINAL state=applied (textual twin of operation_terminal).
+        lt = _LEDGER_TERMINAL_RE.search(line)
+        if lt is not None:
+            state = lt.group("state").strip().lower()
+            if state in _TERMINAL_APPLIED_STATES:
+                self.state_applied = True
+
+        # A no-op/read-only op that structurally SKIPS the literal APPLY
+        # phase yet still reaches a genuine autonomous completion -- counted
+        # as APPLY-equivalent (see _NOOP_SKIP_APPLY_RE docstring above).
+        if _NOOP_SKIP_APPLY_RE.search(line) is not None:
+            self.fsm_phases_seen.append("APPLY_SKIPPED_NOOP")
+
+        # HMAC-anchored resume-splice authentication record.
+        hh = parse_hydration_handshake_verified(line)
+        if hh is not None:
+            hh_op, _hh_phase, hh_digest = hh
+            self.hydration_verified[hh_op] = hh_digest
+
         # Intervention-lock on log-surfaced gates (ask_human etc.) -- may raise.
         # The op id is parsed from the line ('op=op-abc') for scoped correlation.
-        self._check_human_gate(
-            line, "", {}, gate_op_id=self._extract_op_id("", {}, line)
-        )
-        # Flag-family signal correlation from log markers.
-        self._correlate_flag_signal(line)
+        _gate_op_id = self._extract_op_id("", {}, line)
+        self._check_human_gate(line, "", {}, gate_op_id=_gate_op_id)
+        # Flag-family signal correlation from log markers (op-scoped).
+        self._correlate_flag_signal(line, op_id=_gate_op_id)
         # PR / commit signal in a log line.
         if self._is_pr_signal("", {}, line):
             self.pr_signal_observed = True
@@ -1141,9 +1553,23 @@ class A1GraduationAuditor:
         )
         return any(m in blob for m in markers)
 
-    def _correlate_flag_signal(self, text: str) -> None:
+    def _correlate_flag_signal(self, text: str, *, op_id: Optional[str] = None) -> None:
         """For each family, credit observed-evaluated OR mark false-reject if a
-        rejection marker appears."""
+        rejection marker appears.
+
+        Lineage-aware reject scoping (multi-session fix, same principle as
+        the run #13 intervention-lock fix): a REJECTED verdict is meant to
+        prove FLAG X's own gate misfired on the op(s) this audit is actually
+        proving out. Before this fix, ANY op's legitimate gate rejection
+        ANYWHERE in a multi-op session (e.g. an unrelated backlog op
+        correctly hitting Iron Gate's exploration floor) globally poisoned
+        the flag to REJECTED -- even when the audited (resumed) op's OWN
+        gates never misfired. When we have a known resumed-op scope, a
+        reject marker on an op OUTSIDE it is logged as an unrelated-but-
+        observed signal (the gate working correctly elsewhere), not a
+        poisoning REJECT. With no resumed-op scope (legacy / non-resume
+        audits) behavior is UNCHANGED -- global correlation, exactly as
+        before."""
         for family, states in self._by_family.items():
             sig = _FAMILY_SIGNALS.get(family)
             if not sig:
@@ -1153,6 +1579,11 @@ class A1GraduationAuditor:
             hit_reject = any(m and m in text for m in rejected_markers)
             hit_eval = any(m and m in text for m in evaluated_markers)
             if hit_reject:
+                if self.resumed_ops and op_id and op_id not in self.resumed_ops:
+                    self.observed_unrelated_flag_rejects.append(
+                        "%s:op=%s" % (family, op_id)
+                    )
+                    continue
                 for st in states:
                     st.false_positive_rejected = True
                     st.evidence.append("REJECT:%s" % (text[:120],))
@@ -1165,12 +1596,25 @@ class A1GraduationAuditor:
 
     def _flag_audit_passed(self) -> Tuple[bool, str]:
         """Returns (passed, locus). Strict: any UNVERIFIABLE or REJECTED fails.
-        Lenient: only REJECTED fails (UNVERIFIABLE warns)."""
+        Lenient: only REJECTED fails (UNVERIFIABLE warns).
+
+        ``--replay`` (log-only static replay of an ALREADY-FINISHED session,
+        no live SSE connection possible) downgrades ONLY an honest
+        UNVERIFIABLE (no [A1FlagAudit] boot-eval AND no family log marker --
+        i.e. a flag whose ONLY possible evidence is a live-SSE-only signal
+        this replay fundamentally cannot observe) to a WARN. REJECTED ALWAYS
+        fails, in replay or not -- this is a principled, narrow downgrade of
+        the SSE-liveness requirement to log-evidence, never a blanket lenient
+        mode."""
         for st in self.flags.values():
             v = st.verdict()
             if v == FlagVerdict.REJECTED:
                 return False, "flag_audit:rejected:%s" % (st.flag,)
             if v == FlagVerdict.UNVERIFIABLE and self.strict:
+                if self.replay:
+                    if st.flag not in self.replay_downgraded_unverifiable:
+                        self.replay_downgraded_unverifiable.append(st.flag)
+                    continue
                 return False, "flag_audit:unverifiable:%s" % (st.flag,)
         return True, ""
 
@@ -1193,7 +1637,12 @@ class A1GraduationAuditor:
         # Fail-CLOSED: any gate whose lineage could not be determined is an
         # honest non-pass (UNVERIFIABLE_LINEAGE) -- we neither fake-pass nor
         # false-fail; the run simply isn't proven until lineage is knowable.
-        lineage_ok = not self.unverifiable_lineage_gates
+        # Multi-session fix: ALSO require every resumed op's suspend/resume
+        # splice to be HMAC-anchored (checkpoint verify passes, or the
+        # HYDRATION-HANDSHAKE VERIFIED record was observed for that op).
+        lineage_ok = (
+            not self.unverifiable_lineage_gates and self._resume_lineage_verified()
+        )
 
         criteria = {
             "a1trace_5_hops_in_order": trace_ok,
@@ -1214,10 +1663,15 @@ class A1GraduationAuditor:
                     if self.tripped_exception else "intervention_lock"
                 )
             elif not lineage_ok:
-                locus = "UNVERIFIABLE_LINEAGE:%s" % (
-                    self.unverifiable_lineage_gates[0]
-                    if self.unverifiable_lineage_gates else "unknown",
-                )
+                if self.unverifiable_lineage_gates:
+                    locus = "UNVERIFIABLE_LINEAGE:%s" % (
+                        self.unverifiable_lineage_gates[0],
+                    )
+                else:
+                    locus = "UNVERIFIABLE_RESUME_LINEAGE:op=%s" % (
+                        self.unverifiable_resume_lineage[0]
+                        if self.unverifiable_resume_lineage else "unknown",
+                    )
             elif not trace_ok:
                 missing = self._missing_hops()
                 locus = "a1trace:missing_or_out_of_order:%s" % (",".join(missing) or "order",)
@@ -1242,6 +1696,18 @@ class A1GraduationAuditor:
                 "chaos_target_files": list(self.chaos_target_files),
                 "observed_unrelated_gates": list(self.observed_unrelated_gates),
                 "unverifiable_lineage_gates": list(self.unverifiable_lineage_gates),
+                "observed_unrelated_flag_rejects": list(
+                    self.observed_unrelated_flag_rejects
+                ),
+                "resumed_ops": dict(self.resumed_ops),
+                "stitched_ancestor_logs": list(self.stitched_ancestor_logs),
+                "lineage_stitch_failures": list(self.lineage_stitch_failures),
+                "hydration_verified_ops": sorted(self.hydration_verified.keys()),
+                "unverifiable_resume_lineage": list(self.unverifiable_resume_lineage),
+                "replay_mode": self.replay,
+                "replay_downgraded_unverifiable_flags": list(
+                    self.replay_downgraded_unverifiable
+                ),
             },
         )
 
@@ -1672,8 +2138,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--no-lineage-scoping", dest="lineage_scoping", action="store_false",
         help="Legacy global-lock: ANY mid-loop human gate trips the lock.",
     )
+    ap.add_argument(
+        "--replay", action="store_true", default=False,
+        help="Log-only static replay of an ALREADY-FINISHED session (no live "
+             "SSE possible). Downgrades ONLY an honest UNVERIFIABLE flag "
+             "(no [A1FlagAudit] boot-eval AND no log-family marker -- a "
+             "live-SSE-only signal this replay cannot observe) to a WARN. "
+             "REJECTED flags still ALWAYS fail. Also enables cross-session "
+             "ancestor-log stitching for lineage=resumed ops.",
+    )
     args = ap.parse_args(argv)
 
+    resolved_log = _resolve_log_file(args.log_file)
     try:
         auditor = A1GraduationAuditor(
             strict=args.strict,
@@ -1681,6 +2157,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.chaos_manifest if args.chaos_manifest is not None else _SENTINEL
             ),
             lineage_scoping_enabled=args.lineage_scoping,
+            replay=args.replay,
+            current_log_path=resolved_log,
         )
     except GraduationFailedException as exc:
         print("[A1Auditor] %s" % (str(exc),))
@@ -1704,7 +2182,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             run_watch(
                 auditor,
                 base=args.base,
-                log_file=_resolve_log_file(args.log_file),
+                log_file=resolved_log,
                 timeout_s=args.timeout,
             )
         )

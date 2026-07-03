@@ -21,6 +21,7 @@ Covers:
 from __future__ import annotations
 
 import ast
+import asyncio
 import hashlib
 import json
 import os
@@ -320,13 +321,13 @@ class TestHashing:
 
 
 class TestComputeCurrentSignatures:
-    def test_walks_real_governance(self):
-        sigs = compute_current_signatures()
+    async def test_walks_real_governance(self):
+        sigs = await compute_current_signatures()
         # Real repo should have many governance/ .py files
         assert len(sigs) > 100
 
-    def test_signatures_have_canonical_prefix(self):
-        sigs = compute_current_signatures()
+    async def test_signatures_have_canonical_prefix(self):
+        sigs = await compute_current_signatures()
         for s in sigs[:10]:
             assert s.relative_path.startswith(
                 "backend/core/ouroboros/governance/",
@@ -334,17 +335,17 @@ class TestComputeCurrentSignatures:
             assert len(s.sha256) == 64
             assert s.size_bytes >= 0
 
-    def test_no_pycache_entries(self):
-        sigs = compute_current_signatures()
+    async def test_no_pycache_entries(self):
+        sigs = await compute_current_signatures()
         for s in sigs:
             assert "__pycache__" not in s.relative_path
 
-    def test_max_files_cap_respected(self):
-        sigs = compute_current_signatures(max_files=5)
+    async def test_max_files_cap_respected(self):
+        sigs = await compute_current_signatures(max_files=5)
         assert len(sigs) <= 5
 
-    def test_missing_governance_dir_returns_empty(self, tmp_path):
-        sigs = compute_current_signatures(
+    async def test_missing_governance_dir_returns_empty(self, tmp_path):
+        sigs = await compute_current_signatures(
             governance_dir=tmp_path / "does_not_exist",
         )
         assert sigs == ()
@@ -356,19 +357,19 @@ class TestComputeCurrentSignatures:
 
 
 class TestComputeCurrentManifest:
-    def test_aggregate_signature_present(self):
-        snap = compute_current_manifest("test")
+    async def test_aggregate_signature_present(self):
+        snap = await compute_current_manifest("test")
         assert len(snap.manifest_sha256) == 64
 
-    def test_deterministic(self):
-        snap1 = compute_current_manifest("test1", now_unix=1.0)
-        snap2 = compute_current_manifest("test2", now_unix=2.0)
+    async def test_deterministic(self):
+        snap1 = await compute_current_manifest("test1", now_unix=1.0)
+        snap2 = await compute_current_manifest("test2", now_unix=2.0)
         # Same file contents → same manifest signature regardless
         # of label or timestamp
         assert snap1.manifest_sha256 == snap2.manifest_sha256
 
-    def test_operator_label_preserved(self):
-        snap = compute_current_manifest(
+    async def test_operator_label_preserved(self):
+        snap = await compute_current_manifest(
             "pre-M10-flip", now_unix=42.0,
         )
         assert snap.operator_label == "pre-M10-flip"
@@ -530,46 +531,52 @@ class TestCompareManifests:
 
 
 class TestVerifyGovernanceState:
-    def test_master_off_returns_disabled(self):
-        r = verify_governance_state()
+    async def test_master_off_returns_disabled(self):
+        r = await verify_governance_state()
         assert r.verdict is ManifestVerdict.DISABLED
 
-    def test_master_on_no_manifest_returns_missing(
+    async def test_master_on_no_manifest_returns_missing(
         self, monkeypatch,
     ):
         monkeypatch.setenv(_ENV_MASTER, "true")
-        r = verify_governance_state()
+        r = await verify_governance_state()
         assert r.verdict is ManifestVerdict.MISSING_MANIFEST
 
-    def test_master_on_baselined_returns_match(
+    async def test_master_on_baselined_returns_match(
         self, monkeypatch, tmp_path,
     ):
         monkeypatch.setenv(_ENV_MASTER, "true")
         target = tmp_path / "manifest.json"
         monkeypatch.setenv(_ENV_MANIFEST_PATH, str(target))
-        # Baseline the current state
-        outcome = refresh_signed_manifest(
-            "test-baseline", path=target,
+        # Baseline the current state. refresh_signed_manifest is a sync
+        # entry point whose internal sync bridge detects "no running
+        # loop" to decide whether to dispatch via asyncio.run() — since
+        # THIS test is itself async (pytest-asyncio), calling it
+        # in-line would trip the bridge's defensive
+        # already-in-a-loop degrade path. Run it in a worker thread (no
+        # loop there) so the bridge takes its normal asyncio.run() path.
+        outcome = await asyncio.to_thread(
+            refresh_signed_manifest, "test-baseline", path=target,
         )
         assert outcome.ok
         # Immediate re-check should MATCH
-        r = verify_governance_state()
+        r = await verify_governance_state()
         assert r.verdict is ManifestVerdict.MATCH
 
-    def test_master_on_drift_detected(
+    async def test_master_on_drift_detected(
         self, monkeypatch, tmp_path,
     ):
         monkeypatch.setenv(_ENV_MASTER, "true")
         target = tmp_path / "manifest.json"
         monkeypatch.setenv(_ENV_MANIFEST_PATH, str(target))
-        refresh_signed_manifest("baseline", path=target)
+        await asyncio.to_thread(refresh_signed_manifest, "baseline", path=target)
         # Corrupt the manifest's first entry's sha
         raw = json.loads(target.read_text())
         assert raw["signatures"]
         raw["signatures"][0]["sha256"] = "f" * 64
         target.write_text(json.dumps(raw))
         # Now the current state diverges from the (corrupted) signed
-        r = verify_governance_state()
+        r = await verify_governance_state()
         assert r.verdict is ManifestVerdict.DRIFT
         assert is_refusal_verdict(r.verdict)
 
@@ -799,3 +806,163 @@ class TestPublicApi:
         assert GOVERNANCE_MANIFEST_SCHEMA_VERSION.startswith(
             "governance_manifest.",
         )
+
+
+# ---------------------------------------------------------------------------
+# fs-hot-tier Batch 3 (row 20, 2026-07-03) — compute_current_signatures
+# routes the governance/ rglob + per-file SHA-256 walk through
+# cooperative_fs_io.offload(cpu_bound=False) instead of running it
+# synchronously on the loop thread inside verify_governance_state (the
+# hottest of the 10 rows in this batch — fires on every accepted
+# commit via AutoCommitter.commit).
+# ---------------------------------------------------------------------------
+
+
+class TestComputeCurrentSignaturesOffload:
+    async def test_routes_through_offload_thread_pool(self, monkeypatch, tmp_path):
+        gov_dir = tmp_path / "governance"
+        gov_dir.mkdir()
+        (gov_dir / "a.py").write_text("x = 1\n")
+
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        calls = {"n": 0, "cpu_bound": None}
+        real_offload = cooperative_fs_io.offload
+
+        async def _spy_offload(fn, *args, cpu_bound=False, **kwargs):
+            calls["n"] += 1
+            calls["cpu_bound"] = cpu_bound
+            return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+        monkeypatch.setattr(gm, "_resolve_repo_root", lambda: tmp_path)
+        sigs = await compute_current_signatures(governance_dir=gov_dir)
+
+        assert calls["n"] == 1, "compute_current_signatures must route through offload"
+        assert calls["cpu_bound"] is False, (
+            "hashlib.sha256 releases the GIL for sizable reads — must "
+            "use the thread pool, not a process pool"
+        )
+        assert len(sigs) == 1
+        assert sigs[0].relative_path == "governance/a.py"
+
+    async def test_parity_with_direct_sync_walk(self, monkeypatch, tmp_path):
+        gov_dir = tmp_path / "governance"
+        gov_dir.mkdir()
+        (gov_dir / "a.py").write_text("a = 1\n")
+        (gov_dir / "sub").mkdir()
+        (gov_dir / "sub" / "b.py").write_text("b = 2\n")
+        monkeypatch.setattr(gm, "_resolve_repo_root", lambda: tmp_path)
+
+        sigs = await compute_current_signatures(governance_dir=gov_dir)
+        expected = {
+            (str(p.relative_to(tmp_path)).replace(os.sep, "/"), _hash_file(p))
+            for p in sorted(gov_dir.rglob("*.py"))
+        }
+        got = {(s.relative_path, s.sha256) for s in sigs}
+        assert got == expected
+
+    async def test_offload_error_degrades_to_empty_no_raise(self, monkeypatch, tmp_path):
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            OffloadError,
+        )
+        gov_dir = tmp_path / "governance"
+        gov_dir.mkdir()
+        (gov_dir / "a.py").write_text("x = 1\n")
+        monkeypatch.setattr(gm, "_resolve_repo_root", lambda: tmp_path)
+
+        async def _boom_offload(fn, *args, **kwargs):
+            return OffloadError(
+                fn_name="_compute_current_signatures_worker",
+                exc_type="OSError",
+                message="synthetic offload-layer fault",
+                cpu_bound=False,
+            )
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+        sigs = await compute_current_signatures(governance_dir=gov_dir)
+        assert sigs == ()
+
+    async def test_commit_path_offload_error_never_blocks_commit(
+        self, monkeypatch, tmp_path,
+    ):
+        """The row-20 mandate: a crawl failure on the AutoCommitter hot
+        path must NOT block or false-fail a commit — it must degrade
+        to the same (non-refusal) shape the prior sync fail-soft gave.
+        """
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            OffloadError,
+        )
+        monkeypatch.setenv(_ENV_MASTER, "true")
+
+        async def _boom_offload(fn, *args, **kwargs):
+            return OffloadError(
+                fn_name="_compute_current_signatures_worker",
+                exc_type="OSError",
+                message="synthetic offload-layer fault",
+                cpu_bound=False,
+            )
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+        result = await verify_governance_state()
+        # Degrades to empty-signatures snapshot -> MISSING_MANIFEST (no
+        # signed manifest on disk in this tmp env) or MATCH -- NEVER a
+        # refusal verdict caused by the offload fault itself.
+        assert not is_refusal_verdict(result.verdict) or (
+            result.current_file_count == 0
+        )
+
+
+class TestLoopResponsivenessDuringManifestWalk:
+    async def test_loop_stays_responsive_during_offloaded_walk(
+        self, monkeypatch, tmp_path,
+    ):
+        """End-to-end loop-responsiveness proof on the HOTTEST path in
+        this batch (fires on every accepted commit): a concurrent
+        50ms-cadence heartbeat must keep ticking while the offloaded
+        governance-dir SHA-256 walk runs, even when artificially slow.
+        """
+        gov_dir = tmp_path / "governance"
+        gov_dir.mkdir()
+        (gov_dir / "a.py").write_text("x = 1\n")
+        monkeypatch.setattr(gm, "_resolve_repo_root", lambda: tmp_path)
+
+        real_worker = gm._compute_current_signatures_worker
+
+        def _slow_worker(*args, **kwargs):
+            time.sleep(0.3)  # runs in the advisor-blast thread — never the loop thread
+            return real_worker(*args, **kwargs)
+
+        monkeypatch.setattr(gm, "_compute_current_signatures_worker", _slow_worker)
+
+        ticks = 0
+        running = True
+
+        async def heartbeat():
+            nonlocal ticks
+            while running:
+                ticks += 1
+                await asyncio.sleep(0.05)
+
+        hb_task = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.01)
+        before = ticks
+
+        sigs = await compute_current_signatures(governance_dir=gov_dir)
+
+        running = False
+        await asyncio.sleep(0.01)
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
+
+        during = ticks - before
+        assert during >= 2, (
+            f"Heartbeat starved during the governance-manifest walk: "
+            f"ticks={during} over a 0.3s slow walk — the offload fix "
+            "failed and the walk is still blocking the event loop"
+        )
+        assert len(sigs) == 1

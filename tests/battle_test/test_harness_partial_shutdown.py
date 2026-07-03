@@ -217,7 +217,7 @@ def test_atexit_fallback_creates_missing_session_dir(tmp_harness):
 # ---------------------------------------------------------------------------
 
 
-def test_partial_summary_is_lss_parseable(tmp_harness):
+async def test_partial_summary_is_lss_parseable(tmp_harness):
     """The whole point of the fix: partial summaries must be readable
     by LastSessionSummary at the next session's CONTEXT_EXPANSION.
     Without this, the partial dir is still noise even after the fix."""
@@ -235,13 +235,13 @@ def test_partial_summary_is_lss_parseable(tmp_harness):
     os.environ["JARVIS_LAST_SESSION_SUMMARY_ENABLED"] = "true"
     try:
         summary = lss.LastSessionSummary(tmp_harness._config.repo_path)
-        records = summary.load()
+        records = await summary.load()
         assert len(records) == 1
         rec = records[0]
         assert rec.session_id == tmp_harness._session_id
         # Rendered output must include stop_reason context from the
         # partial summary (proves LSS didn't silently drop it).
-        prompt = summary.format_for_prompt() or ""
+        prompt = await summary.format_for_prompt() or ""
         assert tmp_harness._session_id in prompt
         # Zero-op note path fires because stats.attempted == 0.
         assert "zero attempted ops" in prompt

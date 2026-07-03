@@ -140,7 +140,11 @@ def _patch_await(monkeypatch, verdicts):
     seq = list(verdicts)
     n = {"i": 0}
 
-    async def _fake(self, project, zone, op_name, token):
+    # ``**kwargs`` swallows the KEEP-verify re-check's ``cap_s=`` override so a
+    # single scripted list stays valid whether or not the KEEP branch issues a
+    # SECOND call to _await_insert_operation (see the KEEP-reverify tests below,
+    # which supply a second list entry for that call explicitly).
+    async def _fake(self, project, zone, op_name, token, **kwargs):
         v = seq[min(n["i"], len(seq) - 1)]
         n["i"] += 1
         return v
@@ -579,3 +583,158 @@ async def test_spot_default_unchanged(monkeypatch):
     assert verdict == "created"
     assert "mode=SPOT" in detail              # legacy Spot-first pinned
     assert http.posts == 1
+
+
+# ---------------------------------------------------------------------------
+# KEEP-on-MATERIALIZING is NOT a commit point (run bt-iso-1783021468).
+#
+# GCP held an on-demand L4 insert op PENDING for ~7 minutes with the instance
+# visible in STAGING the whole time, then terminally FAILED the op with
+# ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS. The old KEEP branch returned
+# 'created' the moment the Keep-Confirmation Window closed with the node
+# still materializing -- it never looked at the insert op again, so a late
+# terminal failure stranded the awaken path on a doomed node with 9 unreached
+# zones in the fallback chain. The fix re-verifies the SAME insert op (via
+# the SAME _await_insert_operation poll helper, real -- not mocked -- HTTP
+# here) with a generous KEEP-verify budget before committing to the KEEP.
+#
+# These tests exercise the REAL _await_insert_operation (unlike the rest of
+# this file, which mocks it out) so the two-phase poll -- initial 90s-style
+# verify window, then the KEEP-verify re-check -- is proven end-to-end
+# against a single scripted operations.get response queue.
+# ---------------------------------------------------------------------------
+
+
+class _KeepReverifyHTTP:
+    """POST instances -> 200 + op name. GET instances/<node> -> constant
+    ``inst_status``. GET operations/<op> -> consumes the next scripted
+    (status, error) pair in order; the last entry repeats once exhausted."""
+
+    def __init__(self, op_states, inst_status="STAGING", inst_http=200):
+        self.op_states = list(op_states)
+        self.inst_status = inst_status
+        self.inst_http = inst_http
+        self.posts = 0
+        self.op_gets = 0
+        self.status_gets = 0
+
+    async def __call__(self, url, *, method="GET", headers=None, body=None, timeout_s=10.0):
+        if method == "POST":
+            self.posts += 1
+            return (200, json.dumps({"name": "op-insert"}))
+        if method == "GET" and "/operations/" in url:
+            st, err = self.op_states[min(self.op_gets, len(self.op_states) - 1)]
+            self.op_gets += 1
+            doc = {"status": st}
+            if err is not None:
+                doc["error"] = err
+            return (200, json.dumps(doc))
+        if method == "GET" and "/instances/" in url:
+            self.status_gets += 1
+            return (self.inst_http, json.dumps({"status": self.inst_status}))
+        return (0, "[unrouted]")
+
+
+def _keep_reverify_envs(monkeypatch, *, keep_budget_s):
+    # Tiny initial-verify cap/interval so the FIRST _await_insert_operation
+    # call reaches 'unknown' fast (4 GETs at cap=0.02/interval=0.005); the
+    # KEEP-verify call reuses the SAME interval with its own budget.
+    monkeypatch.setenv("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false")
+    monkeypatch.setenv("JARVIS_KEEP_CONFIRM_WINDOW_S", "0")  # instant materializing fate
+    monkeypatch.setenv("JARVIS_INSERT_OP_POLL_CAP_S", "0.02")
+    monkeypatch.setenv("JARVIS_INSERT_OP_POLL_INTERVAL_S", "0.005")
+    monkeypatch.setenv("JARVIS_FAILOVER_KEEP_VERIFY_BUDGET_S", str(keep_budget_s))
+    monkeypatch.setenv("JARVIS_REAP_CONFIRM_SETTLE_S", "0.001")
+    _stub_identity(monkeypatch)
+
+
+async def test_keep_reverify_late_stockout_reaps_remnant_and_rolls_next_zone(monkeypatch):
+    # (a) insert unverified -> STAGING -> KEEP -> op later DONE+error(stockout)
+    # -> remnant delete issued + roll continues to the next zone (proven at
+    # the create_instance level so "next zone succeeds" is observable).
+    _keep_reverify_envs(monkeypatch, keep_budget_s=1.0)
+    monkeypatch.setenv("JARVIS_GCP_ZONE_FALLBACK", "us-central1-a,us-central1-b")
+
+    async def _tok(self):
+        return "ya29.FAKE"
+
+    async def _zone(self):
+        return "us-central1-a"
+
+    async def _proj(self):
+        return "my-project"
+
+    monkeypatch.setattr(GCPComputeRest, "access_token", _tok)
+    monkeypatch.setattr(GCPComputeRest, "zone", _zone)
+    monkeypatch.setattr(GCPComputeRest, "project", _proj)
+
+    # First 4 GETs (initial verify window) stay RUNNING -> 'unknown'; the 5th
+    # GET (the KEEP-verify re-check) is a terminal DONE+stockout -- mirrors
+    # GCP holding the op PENDING/STAGING then terminally failing it late.
+    zone_a_http = _KeepReverifyHTTP(
+        op_states=[("RUNNING", None)] * 4 + [("DONE", _STOCKOUT_ERR)],
+        inst_status="STAGING",
+    )
+    # zone-b: a clean, promptly-DONE insert op -> 'ok' -> 'created' straight
+    # away (no state-inspection detour needed for this leg of the test).
+    zone_b_http = _KeepReverifyHTTP(op_states=[("DONE", None)], inst_status="RUNNING")
+
+    async def _routed_http(url, **kw):
+        # zone-a HTTP for the doomed insert; zone-b HTTP for the retry, keyed
+        # off the zone segment of the URL (both fakes are call-recording).
+        if "/zones/us-central1-a/" in url:
+            return await zone_a_http(url, **kw)
+        return await zone_b_http(url, **kw)
+
+    monkeypatch.setattr(gr, "_http_request", _routed_http)
+    reaped = _patch_reap(monkeypatch)
+
+    ok, detail = await GCPComputeRest().create_instance(startup_script="#!/bin/bash\ntrue\n")
+
+    assert ok is True
+    assert "created" in detail
+    assert "us-central1-b" in detail
+    assert ("jarvis-prime-failover", "us-central1-a") in reaped   # remnant reaped
+    assert zone_b_http.posts >= 1                                  # roll reached zone-b
+
+
+async def test_keep_reverify_terminal_ok_keeps_node_no_reap_no_roll(monkeypatch):
+    # (b) insert unverified -> STAGING -> KEEP -> op later DONE clean -> no
+    # delete, no roll, node kept.
+    _keep_reverify_envs(monkeypatch, keep_budget_s=1.0)
+    http = _KeepReverifyHTTP(
+        op_states=[("RUNNING", None)] * 4 + [("DONE", None)],
+        inst_status="STAGING",
+    )
+    monkeypatch.setattr(gr, "_http_request", http)
+    reaped = _patch_reap(monkeypatch)
+
+    verdict, detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "created"
+    assert "materializing" in detail
+    assert reaped == []               # no delete issued
+    assert http.posts == 1            # no roll -- only the one insert
+
+
+async def test_keep_reverify_budget_expiry_fails_open_and_warns(monkeypatch, caplog):
+    # (c) budget expiry with the op still pending -> node kept (fail-open),
+    # WARNING logged.
+    _keep_reverify_envs(monkeypatch, keep_budget_s=0.02)  # tiny -- also ceilings
+    http = _KeepReverifyHTTP(
+        op_states=[("RUNNING", None)] * 40,   # never reaches DONE
+        inst_status="STAGING",
+    )
+    monkeypatch.setattr(gr, "_http_request", http)
+    reaped = _patch_reap(monkeypatch)
+
+    with caplog.at_level("WARNING", logger="backend.core.ouroboros.governance.gcp_compute_rest"):
+        verdict, detail = await GCPComputeRest()._insert_in_zone(**_INSERT_KW)
+
+    assert verdict == "created"
+    assert "materializing" in detail
+    assert reaped == []
+    assert any(
+        "KEEP-verify budget" in rec.message and "STILL PENDING" in rec.message
+        for rec in caplog.records
+    )

@@ -426,7 +426,7 @@ class CrossSessionDiff:
         }
 
 
-def aggregate_cross_session_diff() -> CrossSessionDiff:
+async def aggregate_cross_session_diff() -> CrossSessionDiff:
     """Compose canonical
     :class:`LastSessionSummary` to load the previous session
     summary. Pure read; NEVER raises.
@@ -447,7 +447,7 @@ def aggregate_cross_session_diff() -> CrossSessionDiff:
             return CrossSessionDiff()
         try:
             summary = get_default_summary()
-            records = summary.load(n_sessions=1) or []
+            records = await summary.load(n_sessions=1) or []
         except Exception:  # noqa: BLE001 — defensive
             return CrossSessionDiff()
         if not records:
@@ -486,7 +486,7 @@ def aggregate_cross_session_diff() -> CrossSessionDiff:
         return CrossSessionDiff()
 
 
-def format_cross_session_diff(
+async def format_cross_session_diff(
     diff: Optional[CrossSessionDiff] = None,
 ) -> str:
     """Render the cross-session memory diff as a single line.
@@ -507,7 +507,7 @@ def format_cross_session_diff(
         d = (
             diff
             if diff is not None
-            else aggregate_cross_session_diff()
+            else await aggregate_cross_session_diff()
         )
         if not d.has_previous:
             return ""
@@ -555,14 +555,14 @@ def format_cross_session_diff(
 # ---------------------------------------------------------------------------
 
 
-def format_session_continuity_panel() -> str:
+async def format_session_continuity_panel() -> str:
     """Render both surfaces as a single multi-line panel.
     NEVER raises. Empty when master flag off."""
     try:
         if not master_enabled():
             return ""
         parts: List[str] = []
-        diff_line = format_cross_session_diff()
+        diff_line = await format_cross_session_diff()
         if diff_line:
             parts.append(diff_line)
         ticker_block = format_graduation_ticker()

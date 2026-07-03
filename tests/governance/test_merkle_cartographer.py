@@ -564,6 +564,66 @@ async def test_walker_skips_symlinks(
 
 
 # ===========================================================================
+# §7b — Tier-2 batch 1 row 9: cooperative_fs_io offload of _walk_dir's
+# per-directory iterdir (per-file read_bytes was already offloaded).
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_walk_dir_routes_iterdir_through_offload(
+    repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(a) Spy: the recursive per-dir iterdir must route through
+    cooperative_fs_io.offload — not a raw synchronous iterdir()."""
+    import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+    monkeypatch.setenv("JARVIS_MERKLE_STATE_DIR", str(repo))
+    calls = []
+    real_offload = fsio.offload
+
+    async def _spy_offload(fn, *a, **k):
+        calls.append(1)
+        return await real_offload(fn, *a, **k)
+
+    monkeypatch.setattr(fsio, "offload", _spy_offload)
+    c = MerkleCartographer(repo_root=repo)
+    changed = await c.update_full()
+    assert "backend/foo.py" in changed
+    # At least one call per directory descended (backend/, backend/core/,
+    # tests/, docs/ = 4 included dirs).
+    assert len(calls) >= 4, (
+        "_walk_dir did not route its iterdir through "
+        "cooperative_fs_io.offload"
+    )
+
+
+@pytest.mark.asyncio
+async def test_walk_dir_fail_soft_on_offload_error(
+    repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(c) Fail-soft: an OffloadError for one directory degrades that
+    subtree to an empty, stably-hashed node — same shape as the
+    original ``except OSError`` — never raises into the walker."""
+    import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+    monkeypatch.setenv("JARVIS_MERKLE_STATE_DIR", str(repo))
+
+    async def _boom_offload(fn, *a, **k):
+        return fsio.OffloadError(
+            fn_name="iterdir", exc_type="OSError",
+            message="simulated", cpu_bound=False,
+        )
+
+    monkeypatch.setattr(fsio, "offload", _boom_offload)
+    c = MerkleCartographer(repo_root=repo)
+    # Must not raise — every directory degrades to an empty node.
+    changed = await c.update_full()
+    assert changed == set()
+    snap = c.snapshot()
+    assert snap["leaf_count"] == 0
+
+
+# ===========================================================================
 # §8 — Boot-loop protection (the marquee correctness pin)
 # ===========================================================================
 

@@ -158,21 +158,26 @@ def configure_silent_boot(
     *,
     terminal_threshold: Optional[int] = None,
     log_filename_override: Optional[str] = None,
-) -> Optional[logging.FileHandler]:
+) -> Optional[logging.Handler]:
     """Reconfigure the root logger so boot-time INFO/DEBUG goes to
     ``session_dir/debug.log`` and only WARNING+ surfaces on terminal.
 
-    Returns the installed :class:`FileHandler` so callers (the
+    Returns the installed session-sink handler so callers (the
     harness) can retain a reference for explicit close on shutdown.
-    Returns ``None`` when disabled, when setup fails, or when an
-    existing :func:`configure_silent_boot` call has already
-    installed the handler (idempotency).
+    The returned handler is a non-blocking rotating pipeline
+    (:class:`headless_telemetry.NonBlockingQueueHandler`) by default,
+    or a legacy :class:`logging.FileHandler` when the headless
+    telemetry flag is off or the pipeline fails to build (fail-soft).
+    Either way it exposes ``.baseFilename`` and ``.close()``. Returns
+    ``None`` when disabled, when setup fails, or when an existing
+    :func:`configure_silent_boot` call has already installed the
+    handler (idempotency).
 
     Defensive contract:
       * Master flag off → returns None, root logger untouched.
       * session_dir creation failure → returns None, root logger
         untouched.
-      * Existing installed file handler with our marker → returns
+      * Existing installed session sink with our marker → returns
         the existing handler (no-op).
       * Per-handler removal failure → swallowed; we proceed with
         whatever handlers remain.
@@ -204,7 +209,7 @@ def _configure_locked(
     session_dir: Any,
     terminal_threshold: Optional[int],
     log_filename_override: Optional[str],
-) -> Optional[logging.FileHandler]:
+) -> Optional[logging.Handler]:
     """Internal — actual configuration logic, runs under the module
     lock. Same defensive contract as the public wrapper."""
     root = logging.getLogger()
@@ -213,8 +218,8 @@ def _configure_locked(
     # return it. Caller may have called us a second time during a
     # re-entrant boot; no-op + return the existing handle.
     for h in root.handlers:
-        if getattr(h, _HANDLER_MARKER, False) and isinstance(
-            h, logging.FileHandler,
+        if getattr(h, _HANDLER_MARKER, False) and hasattr(
+            h, "baseFilename",
         ):
             return h
 
@@ -236,25 +241,43 @@ def _configure_locked(
     )
     log_path = sdir / fname
 
-    # Install file handler at DEBUG level — full fidelity in the file.
+    # Install the session sink at DEBUG level — full fidelity in the
+    # file. Preferred: non-blocking rotating pipeline (headless
+    # telemetry). Fallback: legacy blocking FileHandler — byte-identical
+    # to the pre-telemetry behavior — on flag-off or ANY build failure.
+    _formatter = logging.Formatter(
+        "%(asctime)s [%(name)s] %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    file_handler = None
     try:
-        file_handler = logging.FileHandler(
-            str(log_path), encoding="utf-8",
-        )
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(name)s] %(levelname)s %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S",
-        ))
-        # Mark so future re-calls skip re-install.
-        setattr(file_handler, _HANDLER_MARKER, True)
-        root.addHandler(file_handler)
-    except Exception:  # noqa: BLE001 — defensive
+        from backend.core.ouroboros.governance import headless_telemetry as _ht
+        if _ht.is_enabled():
+            file_handler = _ht.build_nonblocking_handler(
+                log_path, _formatter, logging.DEBUG,
+            )
+    except Exception:  # noqa: BLE001 — fail-soft to legacy
         logger.debug(
-            "[silent_boot] file handler install failed",
+            "[silent_boot] non-blocking pipeline failed; legacy fallback",
             exc_info=True,
         )
-        return None
+        file_handler = None
+    if file_handler is None:
+        try:
+            file_handler = logging.FileHandler(
+                str(log_path), encoding="utf-8",
+            )
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(_formatter)
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[silent_boot] file handler install failed",
+                exc_info=True,
+            )
+            return None
+    # Mark so future re-calls skip re-install.
+    setattr(file_handler, _HANDLER_MARKER, True)
+    root.addHandler(file_handler)
 
     # Remove all OTHER stream handlers from root (the noisy ones
     # that dump INFO chatter to terminal). We keep our file handler.
@@ -294,6 +317,24 @@ def _configure_locked(
     except Exception:  # noqa: BLE001 — defensive
         logger.debug(
             "[silent_boot] terminal handler install failed",
+            exc_info=True,
+        )
+
+    # Heartbeat — the ONLY liveness surface on the terminal. Single
+    # updating line, rate-limited, TTY-only. Eliminates the scrollback
+    # bloat that OOM-killed bt-iso-1782987919 (67 GB Terminal).
+    try:
+        from backend.core.ouroboros.governance.headless_telemetry import (
+            HeartbeatConsoleHandler as _HB,
+            is_enabled as _ht_enabled,
+        )
+        if _ht_enabled():
+            _hb = _HB()
+            setattr(_hb, _HANDLER_MARKER, True)
+            root.addHandler(_hb)
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[silent_boot] heartbeat handler install failed",
             exc_info=True,
         )
 

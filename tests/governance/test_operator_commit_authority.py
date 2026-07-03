@@ -500,7 +500,7 @@ class TestGovernanceGate:
             verdict = gm.ManifestVerdict.DRIFT
 
         monkeypatch.setattr(
-            gm, "verify_governance_state", lambda **k: _Cmp()
+            gm, "verify_governance_state_sync", lambda **k: _Cmp()
         )
         oca.issue_grant(
             channel="ide",
@@ -536,7 +536,7 @@ class TestGovernanceGate:
             verdict = gm.ManifestVerdict.DRIFT
 
         monkeypatch.setattr(
-            gm, "verify_governance_state", lambda **k: _Cmp()
+            gm, "verify_governance_state_sync", lambda **k: _Cmp()
         )
         oca.issue_grant(
             channel="ide",

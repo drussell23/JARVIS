@@ -132,17 +132,59 @@ class RustAdapter:
                                  test_count=1, failure_count=1, duration_s=time.monotonic() - t0, adapter_name="rust")
 
 
+def _go_resolve_test_dirs_worker(
+    changed_files: List[str], repo_root_str: str,
+) -> List[str]:
+    """Module-level worker for :meth:`GoAdapter.resolve`.
+
+    Dispatched into the shared ``advisor-blast`` thread pool via
+    ``cooperative_fs_io.offload`` (fs-hot-tier Batch 3, row 22). Lifted
+    to module level so the offload trampoline doesn't capture any
+    caller-local state. NEVER raises — a per-directory ``iterdir``
+    fault (permission, race) is skipped rather than propagated.
+    """
+    repo_root = Path(repo_root_str)
+    test_dirs: set[str] = set()
+    for f in changed_files:
+        if not f.endswith(".go"):
+            continue
+        d = repo_root / Path(f).parent
+        try:
+            if d.exists() and any(
+                tf.name.endswith("_test.go")
+                for tf in d.iterdir() if tf.is_file()
+            ):
+                test_dirs.add(str(d))
+        except OSError:
+            continue
+    return sorted(test_dirs)
+
+
 class GoAdapter:
     """Go test adapter (go test). Argv-based, no shell."""
 
     async def resolve(self, changed_files: List[str], repo_root: Path) -> Tuple[Path, ...]:
-        test_dirs: set[Path] = set()
-        for f in changed_files:
-            if not f.endswith(".go"): continue
-            d = repo_root / Path(f).parent
-            if d.exists() and any(tf.name.endswith("_test.go") for tf in d.iterdir() if tf.is_file()):
-                test_dirs.add(d)
-        return tuple(test_dirs)
+        # fs-hot-tier Batch 3 (row 22): the per-directory iterdir scan
+        # (narrow — only fires for non-Python .go changed files during
+        # VALIDATE) is dispatched off the asyncio loop via
+        # cooperative_fs_io.offload(cpu_bound=False) — thread pool
+        # (iterdir is IO-bound). Fail-soft: an OffloadError degrades
+        # to () — the same empty result "no .go test dirs found" gives.
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+        result = await offload(
+            _go_resolve_test_dirs_worker,
+            list(changed_files), str(repo_root),
+            cpu_bound=False,
+        )
+        if is_offload_error(result):
+            logger.debug(
+                "[GoAdapter] resolve offload failed — degrading to ()",
+            )
+            return ()
+        return tuple(Path(p) for p in result)
 
     async def run(self, test_files: Tuple[Path, ...], sandbox_dir: Path, timeout_s: float, op_id: str = "") -> AdapterResult:
         t0 = time.monotonic()

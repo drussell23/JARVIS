@@ -976,7 +976,7 @@ class VisionSensor:
         self.stats.frames_retained += 1
         return str(target)
 
-    def _purge_expired_frames(self, *, now: Optional[float] = None) -> int:
+    async def _purge_expired_frames(self, *, now: Optional[float] = None) -> int:
         """Unlink retained frames older than ``_frame_ttl_s``.
 
         Uses file mtime (wall clock) for age comparison. Retention is a
@@ -992,10 +992,17 @@ class VisionSensor:
             return 0
         ref_wall = now if now is not None else time.time()
         removed = 0
-        try:
-            entries = list(self._session_retention_dir.iterdir())
-        except OSError:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error,
+            offload,
+        )
+        retention_dir = self._session_retention_dir
+        entries_result = await offload(
+            lambda: list(retention_dir.iterdir()),
+        )
+        if is_offload_error(entries_result):
             return 0
+        entries = entries_result
         for entry in entries:
             try:
                 if not entry.is_file():
@@ -1832,13 +1839,13 @@ class VisionSensor:
             except Exception:
                 logger.exception("[VisionSensor] poll error")
             self._adjust_adaptive_interval()
-            self._maybe_ttl_purge()
+            await self._maybe_ttl_purge()
             try:
                 await asyncio.sleep(self._current_poll_interval_s)
             except asyncio.CancelledError:
                 break
 
-    def _maybe_ttl_purge(self) -> None:
+    async def _maybe_ttl_purge(self) -> None:
         """Trigger a TTL purge at most once per ``_TTL_PURGE_INTERVAL_S``.
 
         Called from the poll loop after every scan. Keeps disk usage
@@ -1854,7 +1861,7 @@ class VisionSensor:
             return
         self._last_ttl_purge_monotonic = now
         try:
-            self._purge_expired_frames()
+            await self._purge_expired_frames()
         except Exception:  # noqa: BLE001
             logger.debug("[VisionSensor] TTL purge raised", exc_info=True)
 

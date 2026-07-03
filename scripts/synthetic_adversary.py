@@ -275,6 +275,13 @@ _2B1_SCHEMA_RE: re.Pattern = re.compile(
     re.IGNORECASE,
 )
 
+# Marker ``_build_codegen_prompt`` (providers.py) always emits ahead of the
+# source snapshot for every real generation request (RT or batch, chaos or
+# generic) -- e.g. ``"## File: backend/foo.py [SHA-256: abc123]"``. Used to
+# recover the target file path for the batch-passthrough generic-2b.1
+# fallback below (bt-iso-1783036735).
+_FILE_MARKER_RE: re.Pattern = re.compile(r"## File:\s+(\S+)")
+
 # Mapping: FailureSource value → nearest FaultType for FaultInjector registration.
 # Used only for the FaultInjector boundary-dispatch record; HTTP behaviour is
 # driven by the original FailureSource string.
@@ -494,6 +501,39 @@ def _prompt_is_2b1(prompt: str) -> bool:
     quotes/colons/whitespace separators).  Thread-safe (no mutable state).
     """
     return bool(_2B1_SCHEMA_RE.search(prompt))
+
+
+def _extract_target_file_from_prompt(prompt: str) -> str:
+    """Best-effort extraction of the target file path from a codegen prompt.
+
+    ``_build_codegen_prompt`` (providers.py) emits a ``## File: <path>
+    [...]`` marker ahead of the source snapshot for every real generation
+    request -- RT and batch alike. Pure function; returns "" when no marker
+    is found (e.g. a synthetic non-codegen probe payload).
+    """
+    m = _FILE_MARKER_RE.search(prompt)
+    return m.group(1) if m else ""
+
+
+def _read_repo_file_safe(rel_path: str) -> str:
+    """Best-effort read of ``rel_path`` under the repo root. Never raises.
+
+    Returns "" when ``rel_path`` is empty, escapes the repo root, or cannot
+    be read (new file / bad path) -- callers must supply their own fallback.
+    """
+    if not rel_path:
+        return ""
+    try:
+        abs_path = os.path.realpath(os.path.join(_REPO_ROOT, rel_path))
+        _repo_root_real = os.path.realpath(_REPO_ROOT)
+        if os.path.commonpath([abs_path, _repo_root_real]) != _repo_root_real:
+            return ""  # path escapes the repo root -- never read outside it
+        if not os.path.isfile(abs_path):
+            return ""
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:  # noqa: BLE001 -- generic fallback must never raise
+        return ""
 
 
 def _count_prior_tool_results(messages: List[Dict[str, Any]]) -> int:
@@ -763,6 +803,108 @@ def _build_forced_tool_call_sse_chunks(target_file: str, model: str) -> List[byt
     ]
 
 
+# ── Genuine passthrough (fault=none, no chaos-manifest match) helpers ────── #
+# bt-iso-1783050603: a live full-autonomy run with the Venom tool loop fully
+# wired produced ZERO tool executions across 10+ ops. Root cause: the RT
+# handler's non-repair fallback (the "Normal healthy path (probe)" branch of
+# _handle_v1_chat) ignored `tools` entirely and always returned the static
+# _HEALTHY_CHAT_CONTENT stub — the SAME "manifest-gating structural shape" as
+# the pre-19ad2b52d1 batch bug, where only a chaos-manifest match got a
+# schema-valid response and every generic request got a bare stub. DW's REAL
+# parser only ever recognises tool calls embedded in `message.content` as
+# "2b.2-tool" JSON (doubleword_provider._parse_tool_call_response,
+# providers._parse_tool_call_response) — it never reads native OpenAI-compat
+# delta.tool_calls / message.tool_calls (the RT streaming/non-streaming
+# consume loops in doubleword_provider.py read delta.get("content") /
+# message.get("content") only) — so a content-only stub silently discards
+# every tool call and Venom's parse_fn returns None -> treated as a final
+# answer -> loop exits at round 0, for every request that isn't a chaos-
+# manifest match (the overwhelming majority in a real run).
+#
+# These two helpers are schema-agnostic and manifest-free: they never
+# hardcode a tool name or special-case on manifest content -- they derive
+# the tool call(s) purely from the CALLER's own `tools` array, and reuse the
+# SAME generic-target-file recovery the batch-path fix (19ad2b52d1) already
+# introduced (_extract_target_file_from_prompt + _read_repo_file_safe) for
+# the identical "no manifest match" finalize shape.
+
+def build_passthrough_tool_call_content(tools: List[Dict[str, Any]]) -> str:
+    """Build a genuine ``2b.2-tool`` tool-call response for a GENERIC
+    passthrough request (fault=none, no chaos-manifest match) that carries a
+    non-empty ``tools`` array.
+
+    Schema-agnostic: the tool name(s) come from the CALLER's own ``tools``
+    array — never an adversary-hardcoded name — so this works for any tool
+    schema the request happens to carry. Emits ``tool_calls`` (plural) when
+    2+ tools are offered (genuine parallel tool-call relay), otherwise the
+    singular ``tool_call`` form — matching exactly what
+    ``providers._parse_tool_call_response`` /
+    ``doubleword_provider._parse_tool_call_response`` (the REAL downstream
+    consumers) expect.
+
+    Accepts both the OpenAI-compat nested ``{"type": "function", "function":
+    {"name": ...}}`` shape and a flat ``{"name": ...}`` shape.
+
+    Returns "" when no tool in ``tools`` has a resolvable name (caller falls
+    back to the legacy healthy stub — e.g. a probe request with an
+    empty/garbage tools array).  Pure function: no I/O, no shared mutable
+    state.  Thread-safe.
+    """
+    names: List[str] = []
+    for _t in tools or []:
+        if not isinstance(_t, dict):
+            continue
+        _fn = _t.get("function", _t)
+        _name = _fn.get("name", "") if isinstance(_fn, dict) else ""
+        if _name:
+            names.append(_name)
+    if not names:
+        return ""
+    if len(names) == 1:
+        return json.dumps({
+            "schema_version": _DW_TOOL_SCHEMA_VERSION,
+            "tool_call": {"name": names[0], "arguments": {}},
+        })
+    return json.dumps({
+        "schema_version": _DW_TOOL_SCHEMA_VERSION,
+        "tool_calls": [{"name": n, "arguments": {}} for n in names],
+    })
+
+
+def build_passthrough_candidate_content(prompt: str) -> str:
+    """Build a schema-conformant ``2b.1`` candidate response for a GENERIC
+    passthrough request (no chaos-manifest match) — either a trivial
+    single-completion op (2b.1 schema instruction present in the prompt) or
+    the finalize step after a genuine tool-call round in the generic
+    passthrough branch of ``_handle_v1_chat``.
+
+    Reuses the SAME generic-target-file recovery helpers the batch-path fix
+    (19ad2b52d1) introduced for the identical "no manifest match" shape
+    (``_extract_target_file_from_prompt`` + ``_read_repo_file_safe``) — no
+    second parallel parser/schema definition.
+
+    Pure function (beyond a best-effort read-only repo file read that never
+    raises).  Thread-safe.
+    """
+    target = _extract_target_file_from_prompt(prompt)
+    content = _read_repo_file_safe(target)
+    return json.dumps({
+        "schema_version": _DW_CANDIDATES_SCHEMA_VERSION,
+        "candidates": [
+            {
+                "candidate_id": "c1",
+                "file_path": target or "adversary_generic_stub.py",
+                "full_content": content or "# adversary generic stub\n",
+                "rationale": (
+                    "Synthetic generic passthrough response (no chaos-"
+                    "manifest match) -- infrastructure fidelity, not model "
+                    "correctness."
+                ),
+            }
+        ],
+    })
+
+
 def build_batch_output_line(
     custom_id: str,
     input_line_json: str,
@@ -817,6 +959,36 @@ def build_batch_output_line(
             has_tools=False,
             simulate_zero_shot=simulate_zero_shot,
         )
+    elif _prompt_is_2b1(input_line_json):
+        # Batch-Passthrough contract parity (bt-iso-1783036735). A real DW
+        # batch worker ALWAYS returns a schema-valid 2b.1 response for a
+        # 2b.1-instructed request -- regardless of whether this particular
+        # op happens to target the active chaos-manifest file (or whether a
+        # chaos manifest is even loaded). The bare "adversary batch stub"
+        # string below is not valid JSON at all: it broke
+        # doubleword_provider._parse_generation_response
+        # (doubleword_schema_invalid:json_parse_error) for every GENERIC
+        # (non-chaos) batch op -- exactly the "fake mirrors only part of the
+        # real collaborator's contract" failure class. Echo the target
+        # file's own on-disk content back as a syntactically-valid, schema-
+        # conformant no-op candidate; when the file can't be resolved, fall
+        # back to a minimal-but-valid stub payload.
+        _generic_target = _extract_target_file_from_prompt(input_line_json)
+        _generic_content = _read_repo_file_safe(_generic_target)
+        content = json.dumps({
+            "schema_version": _DW_CANDIDATES_SCHEMA_VERSION,
+            "candidates": [
+                {
+                    "candidate_id": "c1",
+                    "file_path": _generic_target or "adversary_generic_stub.py",
+                    "full_content": _generic_content or "# adversary generic stub\n",
+                    "rationale": (
+                        "Synthetic generic batch response (no chaos-manifest "
+                        "match) -- infrastructure fidelity, not model correctness."
+                    ),
+                }
+            ],
+        })
     else:
         content = "adversary batch stub"
 
@@ -1437,11 +1609,36 @@ class SyntheticAdversary:
             )
             await asyncio.sleep(latency_s)
 
-        # Parse the request body
+        # Parse the request body.  A malformed body is NOT swallowed into an
+        # empty dict + fake-healthy 200 -- a real DW endpoint returns 400 for
+        # invalid JSON, and genuine passthrough means relaying that failure
+        # verbatim rather than manufacturing a false-healthy response.
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001
-            body = {}
+        except Exception as _parse_exc:  # noqa: BLE001
+            _log_adversary_request(
+                path="/v1/chat/completions",
+                state=state_str,
+                has_tools=False,
+                manifest_present=False,
+                is_repair=False,
+                is_2b1=False,
+                target_file="",
+                prompt_len=0,
+                prompt_head="",
+                response_kind="malformed_request",
+            )
+            return aiohttp.web.Response(  # type: ignore[return-value]
+                status=400,
+                content_type="application/json",
+                text=json.dumps({
+                    "error": {
+                        "message": f"Malformed request body: {_parse_exc}",
+                        "type": "invalid_request_error",
+                        "code": "invalid_json",
+                    }
+                }),
+            )
         stream = body.get("stream", True)
         model = body.get("model", _HEALTHY_MODEL_ID)
         messages: List[Dict[str, Any]] = body.get("messages", [])
@@ -1460,11 +1657,31 @@ class SyntheticAdversary:
         has_tools = bool(body.get("tools"))
         _manifest = _load_chaos_manifest()
         manifest_present = _manifest is not None
-        prompt_str = ""
-        prompt_len = 0
-        prompt_head = ""
+
+        # Concatenate all message content strings to build the full prompt
+        # (mirrors what the DW provider does: all history is in one user msg).
+        # Computed UNCONDITIONALLY (not just when a chaos manifest is loaded)
+        # -- the generic passthrough branch below needs it too regardless of
+        # manifest presence (bt-iso-1783050603 follow-up: passthrough must be
+        # schema-conformant for ANY chat request, not just chaos-manifest
+        # matches).  Pure string work; harmless for the legacy probe path.
+        _parts: List[str] = []
+        for _msg in messages:
+            _c = _msg.get("content", "")
+            if isinstance(_c, str):
+                _parts.append(_c)
+            elif isinstance(_c, list):
+                for _blk in _c:
+                    if isinstance(_blk, dict):
+                        _t = _blk.get("text", "")
+                        if isinstance(_t, str):
+                            _parts.append(_t)
+        prompt_str = " ".join(_parts)
+        prompt_len = len(prompt_str)
+        prompt_head = repr(prompt_str[:200])
+        is_2b1 = _prompt_is_2b1(prompt_str)
+
         is_repair = False
-        is_2b1 = False
         target_file = ""
 
         # ── Chaos-repair scripted Venom tool loop (Isomorphic Sandbox Task 3b) ── #
@@ -1473,24 +1690,7 @@ class SyntheticAdversary:
         # Probe (preflight) requests have short prompts without REPAIR markers
         # and fall through to the generic HEALTHY path unchanged.
         if _manifest is not None:
-            # Concatenate all message content strings to build the full prompt
-            # (mirrors what the DW provider does: all history is in one user msg).
-            _parts: List[str] = []
-            for _msg in messages:
-                _c = _msg.get("content", "")
-                if isinstance(_c, str):
-                    _parts.append(_c)
-                elif isinstance(_c, list):
-                    for _blk in _c:
-                        if isinstance(_blk, dict):
-                            _t = _blk.get("text", "")
-                            if isinstance(_t, str):
-                                _parts.append(_t)
-            prompt_str = " ".join(_parts)
-            prompt_len = len(prompt_str)
-            prompt_head = repr(prompt_str[:200])
             is_repair = _is_repair_prompt(prompt_str, _manifest)
-            is_2b1 = _prompt_is_2b1(prompt_str)
             target_file = _manifest.get("target_file", "")
 
             if is_repair:
@@ -1635,6 +1835,97 @@ class SyntheticAdversary:
                 await _repair_resp.write_eof()
                 return _repair_resp
         # ── End chaos-repair branch; probe path falls through unchanged ────────── #
+
+        # ── Genuine passthrough (transport fidelity, fault=none) ────────────────── #
+        # Reached whenever this request is NOT a chaos-manifest repair match: no
+        # manifest loaded at all, OR a manifest is loaded but this particular op
+        # doesn't target it (the generic/passthrough case -- by far the common
+        # case in a real autonomous run).  isomorphic_a1_local.py's own CLI help
+        # calls this "transparent passthrough" (--adversary-fault default: none).
+        #
+        # bt-iso-1783050603: this branch used to not exist -- the fallthrough
+        # went straight to the static "Normal healthy path (probe)" stub below,
+        # which ignores `tools`/`messages` entirely and always returns the same
+        # canned content.  Since DW's REAL parser only recognises tool calls
+        # embedded in content as "2b.2-tool" JSON, that stub silently dropped
+        # every tool call -- Venom's parse_fn saw a plain "final answer" on
+        # round 0 and the entire run logged ZERO tool executions.
+        #
+        # Schema-agnostic + manifest-free: first round with tools present ->
+        # genuine tool_call(s) derived from the CALLER's own `tools` array
+        # (build_passthrough_tool_call_content); once a round has completed
+        # (or the prompt carries the 2b.1 trivial-mode instruction), finalize
+        # with a schema-conformant 2b.1 candidate (build_passthrough_candidate_
+        # content) reusing the same generic-target-file recovery the batch fix
+        # (19ad2b52d1) already introduced.  Genuine PROBE requests (no tools,
+        # no 2b.1 marker -- dw_heavy_probe's preflight check) resolve neither
+        # branch and fall through to the legacy static stub, unchanged.
+        _prior_generic = _count_prior_tool_results(messages) if has_tools else 0
+        _passthrough_content = ""
+        _passthrough_kind = ""
+
+        if has_tools and _prior_generic == 0:
+            _passthrough_content = build_passthrough_tool_call_content(
+                body.get("tools") or []
+            )
+            if _passthrough_content:
+                _passthrough_kind = "passthrough_tool_call"
+
+        if not _passthrough_content and (is_2b1 or (has_tools and _prior_generic > 0)):
+            _passthrough_content = build_passthrough_candidate_content(prompt_str)
+            _passthrough_kind = "passthrough_candidates_2b1"
+
+        if _passthrough_content:
+            _log_adversary_request(
+                path="/v1/chat/completions",
+                state=state_str,
+                has_tools=has_tools,
+                manifest_present=manifest_present,
+                is_repair=False,
+                is_2b1=is_2b1,
+                target_file=target_file,
+                prompt_len=prompt_len,
+                prompt_head=prompt_head,
+                response_kind=_passthrough_kind,
+            )
+            if not stream:
+                return aiohttp.web.Response(  # type: ignore[return-value]
+                    status=200,
+                    content_type="application/json",
+                    text=json.dumps({
+                        "id": "adv-passthrough",
+                        "object": "chat.completion",
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": _passthrough_content,
+                            },
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    }),
+                )
+            _pt_resp = aiohttp.web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                }
+            )
+            await _pt_resp.prepare(request)
+            for _chunk_bytes in _build_repair_sse_chunks(_passthrough_content, model):
+                await _pt_resp.write(_chunk_bytes)
+            await _pt_resp.write_eof()
+            return _pt_resp
+        # ── End genuine passthrough branch ──────────────────────────────────────── #
 
         # Normal healthy path (probe)
         response_kind = "probe_ok"

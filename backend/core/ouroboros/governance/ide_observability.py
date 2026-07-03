@@ -948,7 +948,7 @@ class IDEObservabilityRouter:
             get_default_session_browser,
         )
         browser = get_default_session_browser()
-        browser.index.scan()
+        await browser.index.scan_async()
         if filters:
             records = browser.index.filter(**filters)
         else:

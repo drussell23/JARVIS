@@ -50,6 +50,7 @@ from backend.core.ouroboros.governance.agentic_plan_subagent import (
     AgenticPlanSubagent,
     build_default_plan_factory,
 )
+import backend.core.ouroboros.governance.cooperative_fs_io as fsio
 from backend.core.ouroboros.governance.dag_validator import (
     DagValidationResult,
     validate_plan_dag,
@@ -429,6 +430,91 @@ async def test_plan_cost_is_zero_deterministic(tmp_path: Path) -> None:
     result = await planner.plan(ctx)
     assert result.cost_usd == 0.0
     assert result.provider_used == "deterministic"
+
+
+# ---------------------------------------------------------------------------
+# Tier-2 batch 2 row 14 — _discover_acceptance_tests routes through
+# cooperative_fs_io.offload instead of a raw synchronous tests_dir.rglob.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_discover_acceptance_tests_routes_through_offload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(a) Spy: PLAN's per-unit acceptance-test discovery must dispatch
+    through cooperative_fs_io.offload — not a bare synchronous rglob."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_widget.py").write_text("def test_it(): pass\n")
+
+    calls = []
+    real_offload = fsio.offload
+
+    async def _spy_offload(fn, *a, **k):
+        calls.append(1)
+        return await real_offload(fn, *a, **k)
+
+    monkeypatch.setattr(fsio, "offload", _spy_offload)
+
+    planner = AgenticPlanSubagent(project_root=tmp_path)
+    ctx = _make_plan_ctx(target_files=("src/widget.py",), tmp_path=tmp_path)
+    result = await planner.plan(ctx)
+
+    assert result.status == SubagentStatus.COMPLETED
+    assert len(calls) == 1, (
+        "_discover_acceptance_tests did not route through "
+        "cooperative_fs_io.offload"
+    )
+
+
+@pytest.mark.asyncio
+async def test_discover_acceptance_tests_offload_parity_with_sync(
+    tmp_path: Path,
+) -> None:
+    """(b) Parity: the offloaded discovery finds the same test file the
+    direct synchronous call would find."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_widget.py").write_text("def test_it(): pass\n")
+
+    planner = AgenticPlanSubagent(project_root=tmp_path)
+    direct = await planner._discover_acceptance_tests("src/widget.py")
+
+    ctx = _make_plan_ctx(target_files=("src/widget.py",), tmp_path=tmp_path)
+    result = await planner.plan(ctx)
+    payload = dict(result.type_payload)
+    first_unit = dict(payload["dag_units"][0])
+
+    assert direct == ("tests/test_widget.py",)
+    assert first_unit["acceptance_tests"] == direct
+
+
+@pytest.mark.asyncio
+async def test_discover_acceptance_tests_fail_soft_on_offload_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(c) Fail-soft: an OffloadError degrades to the same empty tuple the
+    sync path's except clause produced — the PLAN unit falls back to
+    no_test_rationale instead of raising."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_widget.py").write_text("def test_it(): pass\n")
+
+    async def _boom_offload(fn, *a, **k):
+        return fsio.OffloadError(
+            fn_name="_discover_acceptance_tests", exc_type="OSError",
+            message="simulated", cpu_bound=False,
+        )
+
+    monkeypatch.setattr(fsio, "offload", _boom_offload)
+
+    planner = AgenticPlanSubagent(project_root=tmp_path)
+    ctx = _make_plan_ctx(target_files=("src/widget.py",), tmp_path=tmp_path)
+    result = await planner.plan(ctx)
+
+    assert result.status == SubagentStatus.COMPLETED
+    payload = dict(result.type_payload)
+    first_unit = dict(payload["dag_units"][0])
+    assert first_unit["acceptance_tests"] == ()
+    assert first_unit.get("no_test_rationale", "") != ""
 
 
 # ---------------------------------------------------------------------------

@@ -472,6 +472,168 @@ class TestClaudeProvider:
         provider._maybe_reset_daily_budget()
         assert provider._daily_spend == 0.0
 
+    # -----------------------------------------------------------------
+    # fs-hot-tier Phase 2 (audit row 4, 2026-07-02) — _build_codegen_
+    # prompt (which reaches _find_context_files's uncached
+    # tests_dir.rglob("test_*.py") on EVERY GENERATE) is offloaded off
+    # the loop via cooperative_fs_io.offload at this ClaudeProvider
+    # ._generate_impl call site. _build_codegen_prompt's own sync
+    # contract is untouched (100+ existing tests call it directly and
+    # synchronously) -- only this call site changed.
+    # -----------------------------------------------------------------
+
+    async def _mocked_provider(self):
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        valid_response = json.dumps({
+            "schema_version": "2b.1",
+            "candidates": [
+                {
+                    "candidate_id": "c1",
+                    "file_path": "tests/test_foo.py",
+                    "full_content": "def test_foo():\n    assert True\n",
+                    "rationale": "Added test",
+                }
+            ],
+            "provider_metadata": {"model_id": "claude-sonnet"},
+        })
+        mock_message = MagicMock()
+        mock_message.content = [MagicMock(text=valid_response)]
+        mock_message.usage = MagicMock(input_tokens=100, output_tokens=200)
+        mock_message.model = "claude-sonnet-4-20250514"
+
+        provider = ClaudeProvider(api_key="test-key")
+        mock_client = AsyncMock()
+        mock_client.messages = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_message)
+        provider._client = mock_client
+        return provider, mock_client
+
+    async def test_generate_routes_build_codegen_prompt_through_offload(
+        self, monkeypatch,
+    ) -> None:
+        from datetime import timedelta
+
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance import providers as prov_mod
+
+        # Isolate from the (default-on) on-disk ProviderResponseCache
+        # so a cache HIT from a prior test/run can't short-circuit
+        # this op before _assemble_codegen_prompt ever runs.
+        monkeypatch.setenv("JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED", "false")
+
+        provider, mock_client = await self._mocked_provider()
+
+        calls = {"n": 0}
+        real_offload = cooperative_fs_io.offload
+
+        async def _spy_offload(fn, *args, **kwargs):
+            if fn is prov_mod._build_codegen_prompt:
+                calls["n"] += 1
+            return await real_offload(fn, *args, **kwargs)
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+        ctx = _make_context(op_id="op-offload-route-001")
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=30)
+        result = await provider.generate(ctx, deadline)
+
+        assert calls["n"] == 1, (
+            "_build_codegen_prompt must route through "
+            "cooperative_fs_io.offload on every GENERATE"
+        )
+        assert len(result.candidates) == 1
+
+    async def test_generate_offloaded_prompt_matches_sync_build(
+        self, monkeypatch,
+    ) -> None:
+        """Correctness: the prompt sent to the model via the
+        offloaded path must be byte-identical to what
+        _build_codegen_prompt would produce when called directly and
+        synchronously with the same args."""
+        from datetime import timedelta
+
+        from backend.core.ouroboros.governance import providers as prov_mod
+
+        monkeypatch.setenv("JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED", "false")
+
+        provider, mock_client = await self._mocked_provider()
+        ctx = _make_context(op_id="op-offload-parity-002")
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=30)
+        await provider.generate(ctx, deadline)
+
+        sent_prompt = mock_client.messages.create.call_args.kwargs.get(
+            "messages",
+        )[0]["content"]
+
+        direct_prompt = prov_mod._build_codegen_prompt(
+            ctx,
+            repo_root=provider._repo_root,
+            repo_roots=provider._repo_roots,
+            tools_enabled=provider._tools_enabled,
+            force_full_content=True,
+            repair_context=None,
+            mcp_tools=None,
+            provider_route="",
+        )
+        assert sent_prompt == direct_prompt
+
+    async def test_generate_offload_error_falls_back_no_crash(
+        self, monkeypatch,
+    ) -> None:
+        """Fail-soft: an OffloadError from the substrate must NOT
+        propagate — the call site retries the identical
+        _build_codegen_prompt call inline synchronously and
+        generation still succeeds."""
+        from datetime import timedelta
+
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            OffloadError,
+        )
+
+        monkeypatch.setenv("JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED", "false")
+
+        provider, mock_client = await self._mocked_provider()
+
+        async def _boom_offload(fn, *args, **kwargs):
+            return OffloadError(
+                fn_name="_build_codegen_prompt",
+                exc_type="RuntimeError",
+                message="synthetic offload-layer fault",
+                cpu_bound=False,
+            )
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+        ctx = _make_context(op_id="op-offload-failsoft-003")
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=30)
+        result = await provider.generate(ctx, deadline)
+
+        assert len(result.candidates) == 1
+        mock_client.messages.create.assert_awaited_once()
+
+    async def test_generate_business_exception_still_propagates(
+        self, monkeypatch,
+    ) -> None:
+        """A genuine business exception raised INSIDE
+        _build_codegen_prompt (e.g. prompt_too_large) must still
+        propagate to the caller — the offload retry-on-error path
+        must not silently swallow it as a mere "degraded crawl"."""
+        from datetime import timedelta
+
+        from backend.core.ouroboros.governance import providers as prov_mod
+
+        monkeypatch.setenv("JARVIS_PROVIDER_RESPONSE_CACHE_ENABLED", "false")
+
+        provider, _mock_client = await self._mocked_provider()
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("prompt_too_large:synthetic_test")
+
+        monkeypatch.setattr(prov_mod, "_build_codegen_prompt", _boom)
+        ctx = _make_context(op_id="op-offload-raise-004")
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=30)
+        with pytest.raises(RuntimeError, match="prompt_too_large"):
+            await provider.generate(ctx, deadline)
+
     async def test_health_probe_returns_true_with_valid_key(self) -> None:
         from backend.core.ouroboros.governance.providers import ClaudeProvider
         provider = ClaudeProvider(api_key="test-key")

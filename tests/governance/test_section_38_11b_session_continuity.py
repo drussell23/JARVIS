@@ -254,15 +254,15 @@ def test_format_ticker_backed_off(monkeypatch):
 # CrossSessionDiff
 
 
-def test_aggregate_diff_master_off_empty():
+async def test_aggregate_diff_master_off_empty():
     from backend.core.ouroboros.governance.session_continuity import (
         aggregate_cross_session_diff,
     )
-    diff = aggregate_cross_session_diff()
+    diff = await aggregate_cross_session_diff()
     assert diff.has_previous is False
 
 
-def test_aggregate_diff_with_real_repo_state(monkeypatch):
+async def test_aggregate_diff_with_real_repo_state(monkeypatch):
     """Master-on integration with real LSS — accept either
     outcome (env may have prior bt-* dirs); assert shape
     invariants on the artifact instead of exact values."""
@@ -275,7 +275,7 @@ def test_aggregate_diff_with_real_repo_state(monkeypatch):
     from backend.core.ouroboros.governance.session_continuity import (
         aggregate_cross_session_diff, CrossSessionDiff,
     )
-    diff = aggregate_cross_session_diff()
+    diff = await aggregate_cross_session_diff()
     assert isinstance(diff, CrossSessionDiff)
     if diff.has_previous:
         assert diff.previous_session_id
@@ -283,15 +283,15 @@ def test_aggregate_diff_with_real_repo_state(monkeypatch):
         assert diff.previous_cost_total >= 0.0
 
 
-def test_format_diff_no_previous_returns_empty():
+async def test_format_diff_no_previous_returns_empty():
     from backend.core.ouroboros.governance.session_continuity import (
         format_cross_session_diff, CrossSessionDiff,
     )
     d = CrossSessionDiff(has_previous=False)
-    assert format_cross_session_diff(d) == ""
+    assert await format_cross_session_diff(d) == ""
 
 
-def test_format_diff_with_previous(monkeypatch):
+async def test_format_diff_with_previous(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_SESSION_CONTINUITY_ENABLED", "true",
     )
@@ -308,7 +308,7 @@ def test_format_diff_with_previous(monkeypatch):
         previous_duration_s=2400.0,
         previous_stop_reason="idle_timeout",
     )
-    out = format_cross_session_diff(d)
+    out = await format_cross_session_diff(d)
     assert "Since last session" in out
     assert "23 ops attempted" in out
     assert "20 completed" in out
@@ -320,11 +320,11 @@ def test_format_diff_with_previous(monkeypatch):
 # Composite panel
 
 
-def test_composite_panel_master_off():
+async def test_composite_panel_master_off():
     from backend.core.ouroboros.governance.session_continuity import (
         format_session_continuity_panel,
     )
-    assert format_session_continuity_panel() == ""
+    assert await format_session_continuity_panel() == ""
 
 
 # Sub-flag granularity
@@ -344,7 +344,7 @@ def test_sub_flag_disables_ticker(monkeypatch):
     assert format_graduation_ticker() == ""
 
 
-def test_sub_flag_disables_diff(monkeypatch):
+async def test_sub_flag_disables_diff(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_SESSION_CONTINUITY_ENABLED", "true",
     )
@@ -355,104 +355,104 @@ def test_sub_flag_disables_diff(monkeypatch):
     from backend.core.ouroboros.governance.session_continuity import (
         aggregate_cross_session_diff, format_cross_session_diff,
     )
-    d = aggregate_cross_session_diff()
+    d = await aggregate_cross_session_diff()
     assert d.has_previous is False
-    assert format_cross_session_diff(d) == ""
+    assert await format_cross_session_diff(d) == ""
 
 
 # /continuity REPL
 
 
-def test_continuity_repl_unmatched():
+async def test_continuity_repl_unmatched():
     from backend.core.ouroboros.governance.continuity_repl import (
         dispatch_continuity_command,
     )
-    r = dispatch_continuity_command("/something_else")
+    r = await dispatch_continuity_command("/something_else")
     assert r.matched is False
 
 
-def test_continuity_repl_help_master_off():
+async def test_continuity_repl_help_master_off():
     from backend.core.ouroboros.governance.continuity_repl import (
         dispatch_continuity_command,
     )
-    r = dispatch_continuity_command("/continuity help")
+    r = await dispatch_continuity_command("/continuity help")
     assert r.ok is True
     assert "session continuity" in r.text.lower()
 
 
-def test_continuity_repl_panel_master_off_blocks():
+async def test_continuity_repl_panel_master_off_blocks():
     from backend.core.ouroboros.governance.continuity_repl import (
         dispatch_continuity_command,
     )
-    r = dispatch_continuity_command("/continuity panel")
+    r = await dispatch_continuity_command("/continuity panel")
     assert r.ok is False
     assert "disabled" in r.text.lower()
 
 
-def test_continuity_repl_panel_master_on(monkeypatch):
+async def test_continuity_repl_panel_master_on(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_SESSION_CONTINUITY_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.continuity_repl import (
         dispatch_continuity_command,
     )
-    r = dispatch_continuity_command("/continuity panel")
+    r = await dispatch_continuity_command("/continuity panel")
     assert r.ok is True
 
 
-def test_continuity_repl_diff(monkeypatch):
+async def test_continuity_repl_diff(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_SESSION_CONTINUITY_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.continuity_repl import (
         dispatch_continuity_command,
     )
-    r = dispatch_continuity_command("/continuity diff")
+    r = await dispatch_continuity_command("/continuity diff")
     assert r.ok is True
 
 
-def test_continuity_repl_ticker(monkeypatch):
+async def test_continuity_repl_ticker(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_SESSION_CONTINUITY_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.continuity_repl import (
         dispatch_continuity_command,
     )
-    r = dispatch_continuity_command("/continuity ticker")
+    r = await dispatch_continuity_command("/continuity ticker")
     assert r.ok is True
 
 
-def test_continuity_repl_history(monkeypatch):
+async def test_continuity_repl_history(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_SESSION_CONTINUITY_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.continuity_repl import (
         dispatch_continuity_command,
     )
-    r = dispatch_continuity_command("/continuity history 5")
+    r = await dispatch_continuity_command("/continuity history 5")
     assert r.ok is True
 
 
-def test_continuity_repl_status(monkeypatch):
+async def test_continuity_repl_status(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_SESSION_CONTINUITY_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.continuity_repl import (
         dispatch_continuity_command,
     )
-    r = dispatch_continuity_command("/continuity status")
+    r = await dispatch_continuity_command("/continuity status")
     assert r.ok is True
     assert "master_enabled" in r.text
 
 
-def test_continuity_repl_unknown_subcommand(monkeypatch):
+async def test_continuity_repl_unknown_subcommand(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_SESSION_CONTINUITY_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.continuity_repl import (
         dispatch_continuity_command,
     )
-    r = dispatch_continuity_command("/continuity gibberish")
+    r = await dispatch_continuity_command("/continuity gibberish")
     assert r.ok is False
 
 

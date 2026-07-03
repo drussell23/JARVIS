@@ -151,7 +151,13 @@ class TestSessionIdResolution:
         assert sid.startswith("ephemeral-")
 
     def test_resolves_from_session_manager(self):
-        """When SessionManager has an active session, use its id."""
+        """When SessionManager has an active session, use its id.
+
+        fs-hot-tier Phase 2 (audit row 6, 2026-07-02): the observer
+        now calls ``list_active_cached()`` (the TTL-cached, off-loop
+        variant) instead of ``list_active()`` directly, so the fake
+        manager must provide that method too.
+        """
         from backend.core.ouroboros.governance.conversation_ledger_observer import (  # noqa: E501
             ConversationLedgerObserver,
         )
@@ -159,6 +165,7 @@ class TestSessionIdResolution:
         fake_session = SimpleNamespace(session_id="mgr-uuid-123")
         fake_mgr = SimpleNamespace(
             list_active=lambda: [fake_session],
+            list_active_cached=lambda: [fake_session],
         )
 
         with mock.patch(

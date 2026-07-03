@@ -1379,6 +1379,17 @@ class GovernedLoopService:
             except Exception as _wipe_exc:  # noqa: BLE001
                 logger.debug("[GovernedLoop] DW ledger wipe swallowed: %r", _wipe_exc)
 
+            # Task 5 -- boot-time READ path for the bi-directional cognitive
+            # persistence organ. Fail-soft; disabled -> no-op, no PIM touch.
+            try:
+                from backend.core.ouroboros.governance import cognitive_persistence as _cogp
+                if _cogp.is_enabled():
+                    await _cogp.hydrate_prior_knowledge()
+            except Exception as _e:  # noqa: BLE001
+                logger.debug(
+                    "[GLS] cognitive prior-knowledge hydration skipped (fail-soft): %s", _e
+                )
+
             await self._build_components()
 
             # Task 9 -- async Docker pre-flight (only when A1 is armed -> byte-identical OFF)
@@ -7211,7 +7222,22 @@ class GovernedLoopService:
         """Process new JSON files in event_dir. Extracted for testability."""
         if self._event_dir is None:
             return
-        for path in sorted(self._event_dir.glob("*.json")):
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error,
+            offload,
+        )
+        event_dir = self._event_dir
+        paths_result = await offload(
+            lambda: sorted(event_dir.glob("*.json")),
+        )
+        if is_offload_error(paths_result):
+            logger.debug(
+                "[GovernedLoop] _handle_event_files: offloaded glob "
+                "failed (%s) — treating as empty this tick",
+                paths_result.message,
+            )
+            return
+        for path in paths_result:
             if path.name in seen:
                 continue
             seen.add(path.name)

@@ -273,46 +273,46 @@ def loaded_service(tmp_path, monkeypatch):
     return svc
 
 
-def test_format_for_prompt_byte_identical_without_slice2_kwargs(
+async def test_format_for_prompt_byte_identical_without_slice2_kwargs(
     loaded_service,
 ):
     """Existing callers that don't pass session_id / record_id
     should get pre-Slice-2 byte-identical output."""
-    out_a = loaded_service.format_for_prompt()
-    out_b = loaded_service.format_for_prompt()
+    out_a = await loaded_service.format_for_prompt()
+    out_b = await loaded_service.format_for_prompt()
     # No causal-lineage section appended
     assert "## Recent Causal Lineage" not in out_a
     assert out_a == out_b
 
 
-def test_format_for_prompt_silent_when_session_id_missing(
+async def test_format_for_prompt_silent_when_session_id_missing(
     loaded_service,
 ):
-    out = loaded_service.format_for_prompt(record_id="some-id")
+    out = await loaded_service.format_for_prompt(record_id="some-id")
     assert "## Recent Causal Lineage" not in out
 
 
-def test_format_for_prompt_silent_when_record_id_missing(
+async def test_format_for_prompt_silent_when_record_id_missing(
     loaded_service,
 ):
-    out = loaded_service.format_for_prompt(session_id="some-sid")
+    out = await loaded_service.format_for_prompt(session_id="some-sid")
     assert "## Recent Causal Lineage" not in out
 
 
-def test_format_for_prompt_silent_when_substrate_disabled(
+async def test_format_for_prompt_silent_when_substrate_disabled(
     loaded_service, monkeypatch,
 ):
     """Master flag off → causal-lineage section silent."""
     monkeypatch.delenv(
         "JARVIS_CAUSAL_DECISION_CONSUMER_ENABLED", raising=False,
     )
-    out = loaded_service.format_for_prompt(
+    out = await loaded_service.format_for_prompt(
         session_id="s", record_id="r",
     )
     assert "## Recent Causal Lineage" not in out
 
 
-def test_format_for_prompt_renders_section_when_features_present(
+async def test_format_for_prompt_renders_section_when_features_present(
     loaded_service, monkeypatch,
 ):
     """When features come back non-empty, the section appears
@@ -338,14 +338,14 @@ def test_format_for_prompt_renders_section_when_features_present(
         "compute_op_causal_features",
         return_value=fake_features,
     ):
-        out = loaded_service.format_for_prompt(
+        out = await loaded_service.format_for_prompt(
             session_id="s", record_id="r",
         )
     assert "## Recent Causal Lineage" in out
     assert "Recurrence pattern detected" in out
 
 
-def test_format_for_prompt_section_position_is_last(
+async def test_format_for_prompt_section_position_is_last(
     loaded_service, monkeypatch,
 ):
     """Causal-lineage block must appear AFTER action-outcomes
@@ -371,7 +371,7 @@ def test_format_for_prompt_section_position_is_last(
         "compute_op_causal_features",
         return_value=f,
     ):
-        out = loaded_service.format_for_prompt(
+        out = await loaded_service.format_for_prompt(
             session_id="s", record_id="r",
         )
     causal_idx = out.find("## Recent Causal Lineage")
@@ -383,7 +383,7 @@ def test_format_for_prompt_section_position_is_last(
         assert causal_idx > action_idx
 
 
-def test_render_method_fail_silent_on_substrate_unavailable(
+async def test_render_method_fail_silent_on_substrate_unavailable(
     loaded_service, monkeypatch,
 ):
     """If the lazy import of causality_consumer fails (rollback
@@ -399,13 +399,13 @@ def test_render_method_fail_silent_on_substrate_unavailable(
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr("builtins.__import__", _block)
-    out = loaded_service.format_for_prompt(
+    out = await loaded_service.format_for_prompt(
         session_id="s", record_id="r",
     )
     assert "## Recent Causal Lineage" not in out
 
 
-def test_render_method_fail_silent_on_compute_exception(
+async def test_render_method_fail_silent_on_compute_exception(
     loaded_service, monkeypatch,
 ):
     monkeypatch.setenv(
@@ -420,7 +420,7 @@ def test_render_method_fail_silent_on_compute_exception(
         "compute_op_causal_features",
         side_effect=_broken,
     ):
-        out = loaded_service.format_for_prompt(
+        out = await loaded_service.format_for_prompt(
             session_id="s", record_id="r",
         )
     # Doesn't break the prompt
@@ -434,7 +434,7 @@ def test_render_method_fail_silent_on_compute_exception(
 # ---------------------------------------------------------------------------
 
 
-def test_section_carries_authority_disclaimer(
+async def test_section_carries_authority_disclaimer(
     loaded_service, monkeypatch,
 ):
     monkeypatch.setenv(
@@ -458,7 +458,7 @@ def test_section_carries_authority_disclaimer(
         "compute_op_causal_features",
         return_value=f,
     ):
-        out = loaded_service.format_for_prompt(
+        out = await loaded_service.format_for_prompt(
             session_id="s", record_id="r",
         )
     causal_section_start = out.find("## Recent Causal Lineage")

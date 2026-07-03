@@ -721,6 +721,27 @@ def _phase_runner_gate_extracted() -> bool:
     )
 
 
+def _discover_tests_for_gate_worker(
+    tests_dir_str: str, stem: str,
+) -> List[str]:
+    """Module-level worker for :meth:`Orchestrator._discover_tests_for_gate`.
+
+    Dispatched into the shared ``advisor-blast`` thread pool via
+    ``cooperative_fs_io.offload`` (fs-hot-tier Batch 3, row 15). Lifted
+    out to module level so the offload trampoline doesn't capture any
+    caller-local state, mirroring the pattern used by
+    ``cooperative_fs_io._read_text_worker``. Returns path strings
+    (not ``Path`` objects) — pickle-agnostic and cheap over the
+    thread-pool boundary.
+    """
+    tests_dir = Path(tests_dir_str)
+    found: List[str] = []
+    for candidate in tests_dir.rglob(f"test_{stem}*.py"):
+        if candidate.is_file():
+            found.append(str(candidate))
+    return sorted(found)
+
+
 def _phase_runner_validate_extracted() -> bool:
     """Slice 4a.1 of Wave 2 (5) — VALIDATE phase extraction gate.
 
@@ -881,7 +902,7 @@ def _phase_runner_classify_extracted() -> bool:
     )
 
 
-def _inject_last_session_summary_impl(
+async def _inject_last_session_summary_impl(
     project_root: Path,
     ctx: OperationContext,
 ) -> OperationContext:
@@ -905,10 +926,10 @@ def _inject_last_session_summary_impl(
         )
         _lss = get_default_summary(project_root)
         _lss_enabled, _lss_n, _lss_sid, _lss_chars, _lss_hash8 = (
-            _lss.inject_metrics()
+            await _lss.inject_metrics()
         )
         if _lss_enabled:
-            _lss_prompt = _lss.format_for_prompt()
+            _lss_prompt = await _lss.format_for_prompt()
             if _lss_prompt:
                 _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
                 ctx = ctx.with_strategic_memory_context(
@@ -940,6 +961,64 @@ def _inject_last_session_summary_impl(
     return ctx
 
 
+def _inject_prior_knowledge_impl(ctx: OperationContext) -> OperationContext:
+    """Inject Prior Ephemeral Knowledge into ``ctx.strategic_memory_prompt``.
+
+    Extracted at module scope (mirrors ``_inject_last_session_summary_impl`` /
+    ``_inject_postmortem_recall_impl``). Reads the boot-hydrated
+    ``PriorKnowledgeCache`` singleton and renders up to
+    ``JARVIS_COGNITIVE_INJECT_TOP_K`` cross-session experiences into the
+    prompt via ``format_for_prompt``. Footprint resolution is best-effort:
+    ``OperationContext`` does not carry resolved model/context-window
+    attributes at CONTEXT_EXPANSION time (generation hasn't run yet), so
+    ``footprint`` stays ``None`` in the default path and ``select()``
+    degrades to the cross-footprint global top-K — this is the designed
+    degradation, not an error.
+
+    Authority invariant per PRD §12.2: read-only, best-effort, never blocks
+    the FSM. Fail-soft — any exception is swallowed with a DEBUG breadcrumb
+    and ``ctx`` is returned unchanged.
+    """
+    try:
+        from backend.core.ouroboros.governance import cognitive_persistence as _cogp
+        cache = _cogp.get_prior_knowledge_cache()
+        footprint = None
+        try:
+            _model = getattr(ctx, "resolved_model_name", None)
+            _num_ctx = getattr(ctx, "resolved_num_ctx", None)
+            if _model:
+                footprint = _cogp.cognitive_footprint(_model, _num_ctx)
+        except Exception:
+            footprint = None
+        section = _cogp.format_for_prompt(cache, footprint)
+        if not section:
+            logger.debug(
+                "[CognitivePersistence] op=%s inject_site=context_expansion "
+                "section=empty",
+                ctx.op_id,
+            )
+            return ctx
+        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+        ctx = ctx.with_strategic_memory_context(
+            strategic_intent_id=ctx.strategic_intent_id or "prior-knowledge-v1",
+            strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+            strategic_memory_prompt=(
+                _existing + "\n\n" + section if _existing else section
+            ),
+            strategic_memory_digest=ctx.strategic_memory_digest,
+        )
+        logger.info(
+            "[CognitivePersistence] op=%s injected prior knowledge: %d chars "
+            "footprint=%s inject_site=context_expansion",
+            ctx.op_id, len(section), footprint or "any",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(
+            "[CognitivePersistence] injection skipped (fail-soft): %s", e,
+        )
+    return ctx
+
+
 class _PreloadedExplorationRecord:
     """Synthetic exploration record for files the lean prompt builder inlined.
 
@@ -966,7 +1045,7 @@ class _PreloadedExplorationRecord:
         self.status = "success"
 
 
-def _inject_postmortem_recall_impl(
+async def _inject_postmortem_recall_impl(
     ctx: OperationContext,
 ) -> OperationContext:
     """Inject prior-op POSTMORTEM lessons into ``ctx.strategic_memory_prompt``.
@@ -1011,7 +1090,7 @@ def _inject_postmortem_recall_impl(
                 f"description={(ctx.description or '')[:200]} | "
                 f"files={_pm_target_files}"
             )
-            _pm_matches = _pm_svc.recall_for_op(_pm_op_signature)
+            _pm_matches = await _pm_svc.recall_for_op(_pm_op_signature)
             _pm_section = _render_pm_recall(_pm_matches)
             if _pm_section:
                 _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
@@ -3398,7 +3477,7 @@ class GovernedOrchestrator:
                 and not _should_insulate_prompt(getattr(ctx, "signal_source", ""))
             ):
                 try:
-                    _strat_prompt = _strategic_svc.format_for_prompt(
+                    _strat_prompt = await _strategic_svc.format_for_prompt(
                         op_id=getattr(ctx, "op_id", None),
                     )
                     if _strat_prompt:
@@ -3495,7 +3574,14 @@ class GovernedOrchestrator:
             # Layer 3 reachability supplement, W3(6) precedent). Body lives at
             # module scope as `_inject_postmortem_recall_impl`. ConversationBridge
             # → PostmortemRecall → SemanticIndex ordering preserved.
-            ctx = _inject_postmortem_recall_impl(ctx)
+            ctx = await _inject_postmortem_recall_impl(ctx)
+
+            # ---- Task 6 Prior Ephemeral Knowledge: cross-session experiences ----
+            # Helper extraction mirrors LSS/PostmortemRecall pattern. Body lives
+            # at module scope as `_inject_prior_knowledge_impl`. Trust ordering:
+            # Strategic → ConversationBridge → PostmortemRecall → PriorKnowledge
+            # → SemanticIndex → Goals → UserPreferences.
+            ctx = _inject_prior_knowledge_impl(ctx)
 
             # ---- Phase 4 P3 Cognitive Metrics: Oracle pre-score ----
             # Best-effort observability — calls OraclePreScorer via the
@@ -3716,7 +3802,7 @@ class GovernedOrchestrator:
             # Strategic → Bridge → Semantic → LastSession → Goals → UserPrefs.
             # Helper extracted for integration-test coverage of the composed
             # CONTEXT_EXPANSION prompt (see test_last_session_summary_composition).
-            ctx = _inject_last_session_summary_impl(self._config.project_root, ctx)
+            ctx = await _inject_last_session_summary_impl(self._config.project_root, ctx)
 
             # ---- P2.4 + Week 2: Goal-directed context injection ----
             # Append the *most relevant* active user goals to the strategic
@@ -4368,7 +4454,7 @@ class GovernedOrchestrator:
                     )
                     if _mr_enabled():
                         _mr_router = _MR(self._config.project_root)
-                        _mr_result = _mr_router.route(
+                        _mr_result = await _mr_router.route(
                             list(ctx.target_files),
                             ctx.description,
                         )
@@ -9055,7 +9141,7 @@ class GovernedOrchestrator:
                                 # Caller supplies tests — a path-correlated
                                 # discovery helper keeps the wiring minimal
                                 # (Session W style: tests/test_<stem>*.py).
-                                _tests = self._discover_tests_for_gate(_sp)
+                                _tests = await self._discover_tests_for_gate(_sp)
                                 _verdicts.append(
                                     _mg.evaluate_file(_abs_sp, _tests)
                                 )
@@ -9931,7 +10017,7 @@ class GovernedOrchestrator:
                         if _cf:
                             _scan_targets.add(_cf)
                     for _tf in sorted(_scan_targets):
-                        _is_active, _reason = _lws.is_human_active(str(_tf))
+                        _is_active, _reason = await _lws.is_human_active(str(_tf))
                         if _is_active:
                             _active_hit = (str(_tf), _reason or "human active")
                             break
@@ -12749,23 +12835,40 @@ class GovernedOrchestrator:
             write_root=self._swe_bench_write_root(ctx),
         )
 
-    def _discover_tests_for_gate(self, sut_path: Path) -> List[Path]:
+    async def _discover_tests_for_gate(self, sut_path: Path) -> List[Path]:
         """Discover pytest files scoped to one SUT for the MutationGate.
 
         Matches Session-W style fan-out (``tests/test_<stem>*.py``) via
         rglob under the project root's ``tests/`` dir. Returned paths
         are absolute so the mutation runner sees stable targets even
         when the gate is called from a non-project cwd.
+
+        fs-hot-tier Batch 3 (row 15): the rglob scan is dispatched off
+        the asyncio loop via ``cooperative_fs_io.offload`` (thread pool
+        — a scoped ``tests/`` rglob is IO-bound/syscall-dominated, not
+        CPU-after-scan). Fail-soft: an ``OffloadError`` degrades to the
+        same ``[]`` the prior synchronous fail-soft implicitly gave for
+        a missing/unreadable tree — never raises into the GATE phase.
         """
         stem = sut_path.stem
         tests_dir = self._config.project_root / "tests"
         if not tests_dir.is_dir():
             return []
-        found: List[Path] = []
-        for candidate in tests_dir.rglob(f"test_{stem}*.py"):
-            if candidate.is_file():
-                found.append(candidate)
-        return sorted(found)
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+        result = await offload(
+            _discover_tests_for_gate_worker, str(tests_dir), stem,
+        )
+        if is_offload_error(result):
+            logger.debug(
+                "[Orchestrator] _discover_tests_for_gate offload failed "
+                "for stem=%s — degrading to empty list",
+                stem,
+            )
+            return []
+        return [Path(p) for p in result]
 
     async def _apply_multi_file_candidate(
         self,
@@ -13267,6 +13370,82 @@ class GovernedOrchestrator:
                 )
         except Exception:  # noqa: BLE001
             pass
+        # ── Task 4 — Cognitive Persistence terminal-time recorder ──
+        # Distills this op's tool-execution failures (+ the terminal
+        # failure reason, when any) into cross-session CognitiveExperience
+        # rows via the write-side of the Bi-Directional Cognitive
+        # Persistence arc. Piggybacks on the Slice74Probe terminal-state
+        # classification (_s74_sv) above — this IS the single chokepoint
+        # every terminal ledger write passes through. In practice this
+        # fires on applied/failed/blocked: OperationState.ROLLED_BACK
+        # never reaches _record_ledger (rollback rows are appended
+        # directly in change_engine.py's own ledger.append call) — the
+        # "rolled_back" branch below stays in the state guard purely as
+        # a future-proofing no-op. Gated on `written` (computed above)
+        # to match the SessionRecorder dedup semantics a few lines up —
+        # a replayed/deduped ledger write must never double-count
+        # experience occurrences. Fully self-contained try/except: NEVER
+        # raises into _record_ledger, DEBUG-logs and continues.
+        # Fire-and-forget background write, capped at 20 experiences/op
+        # inside the recorder. Authority-free — never influences
+        # GATE/APPLY. No-op when JARVIS_COGNITIVE_PERSISTENCE_ENABLED is
+        # unset (default False).
+        try:
+            from backend.core.ouroboros.governance import (
+                cognitive_persistence as _cogp,
+            )
+            if _cogp.is_enabled() and written:
+                _cogp_sv = str(getattr(state, "value", state)).lower()
+                if _cogp_sv in ("applied", "rolled_back", "failed", "blocked"):
+                    _cogp_gen = getattr(ctx, "generation", None)
+                    # No resolved model-config object (model_name + num_ctx)
+                    # is threaded this far up the FSM — the closest in-scope
+                    # signal is the provider's reported model_id off the
+                    # op's own GenerationResult. Never hardcoded; falls back
+                    # to the documented "unknown" footprint when absent.
+                    _cogp_model = getattr(_cogp_gen, "model_id", "") or "unknown"
+                    _cogp_footprint = _cogp.cognitive_footprint(_cogp_model, None)
+                    _cogp_records = list(
+                        getattr(_cogp_gen, "tool_execution_records", ()) or ()
+                    )
+                    _cogp_reason = None
+                    if _cogp_sv != "applied":
+                        _cogp_reason = (
+                            str(getattr(ctx, "terminal_reason_code", "") or "")
+                            or str((data or {}).get("reason", "") or "")
+                            or str((data or {}).get("reason_code", "") or "")
+                            or _cogp_sv
+                        )
+                    # Most terminal paths have already advanced ctx.phase to
+                    # POSTMORTEM/CANCELLED by the time _record_ledger runs —
+                    # ctx.phase.name mislabels the originating phase. The
+                    # codebase-wide convention (10+ call sites) for the true
+                    # originating phase is data["entry_phase"]; prefer it and
+                    # only fall back to ctx.phase.name when it's absent.
+                    _cogp_phase = ""
+                    try:
+                        _cogp_phase = (
+                            str((data or {}).get("entry_phase") or "")
+                            if isinstance(data, dict) else ""
+                        )
+                    except Exception:
+                        _cogp_phase = ""
+                    if not _cogp_phase:
+                        _cogp_phase = (
+                            getattr(getattr(ctx, "phase", None), "name", None)
+                            or str(getattr(ctx, "phase", "") or "")
+                        )
+                    _cogp.record_terminal_experiences_fire_and_forget(
+                        _cogp_records,
+                        footprint=_cogp_footprint,
+                        terminal_reason=_cogp_reason,
+                        phase=_cogp_phase,
+                        op_id=str(getattr(ctx, "op_id", "") or "?"),
+                    )
+        except Exception as _cogp_exc:  # noqa: BLE001 — never disturb the FSM
+            logger.debug(
+                "[CognitivePersistence] terminal hook skipped: %s", _cogp_exc,
+            )
         # Slice 74 — Immutable Lifecycle Boundary: the terminal SSE broadcast is
         # DECOUPLED from the ledger's physical-write dedup. A definitive terminal
         # state MUST notify the system (the autoscore eval rendezvous + IDE

@@ -147,7 +147,7 @@ class AgenticPlanSubagent:
 
         try:
             # Step 1: deterministic partition.
-            units = self._partition_deterministic(
+            units = await self._partition_deterministic(
                 target_files=target_files,
                 op_description=op_description,
             )
@@ -261,7 +261,7 @@ class AgenticPlanSubagent:
     # Step-1 deterministic partition strategy
     # ------------------------------------------------------------------
 
-    def _partition_deterministic(
+    async def _partition_deterministic(
         self,
         *,
         target_files: Tuple[str, ...],
@@ -280,12 +280,17 @@ class AgenticPlanSubagent:
 
         This is the minimum correct DAG for multi-file ops. LLM-driven
         refinement replaces THIS METHOD without touching anything else.
+
+        Tier-2 batch 2 row 14 — ``_discover_acceptance_tests`` is
+        awaited per target file so its ``tests_dir.rglob`` crawl is
+        routed through the cooperative_fs_io substrate rather than
+        running synchronously on the loop for every unit in the DAG.
         """
         units: List[Dict[str, Any]] = []
         for idx, path in enumerate(target_files):
             stem = Path(path).stem
             unit_id = f"unit_{idx:02d}_{_sanitize_id(stem)}"
-            tests = self._discover_acceptance_tests(path)
+            tests = await self._discover_acceptance_tests(path)
             unit: Dict[str, Any] = {
                 "unit_id": unit_id,
                 "dependency_ids": (),
@@ -301,12 +306,20 @@ class AgenticPlanSubagent:
             units.append(unit)
         return units
 
-    def _discover_acceptance_tests(self, target_file: str) -> Tuple[str, ...]:
+    async def _discover_acceptance_tests(
+        self, target_file: str,
+    ) -> Tuple[str, ...]:
         """Glob the tests/ tree for test files matching the target file stem.
 
         Heuristic — looks for ``tests/**/test_{stem}.py``. If the target
         file is already a test file (stem starts with ``test_``), returns
         the file itself as its own acceptance test.
+
+        Tier-2 batch 2 row 14 — the ``tests_dir.rglob`` crawl is routed
+        through the ``cooperative_fs_io`` substrate's shared advisor-blast
+        thread pool. Fail-soft: an ``OffloadError`` (or the sync
+        OSError/ValueError it wraps) degrades to the same empty tuple the
+        original synchronous ``except`` clause returned — never raises.
         """
         stem = Path(target_file).stem
         if stem.startswith("test_"):
@@ -314,13 +327,22 @@ class AgenticPlanSubagent:
         tests_dir = self._root / "tests"
         if not tests_dir.is_dir():
             return ()
-        try:
-            matches = [
+
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error,
+            offload,
+        )
+
+        def _crawl(d: Path = tests_dir, s: str = stem) -> List[str]:
+            return [
                 str(p.relative_to(self._root))
-                for p in tests_dir.rglob(f"test_{stem}.py")
+                for p in d.rglob(f"test_{s}.py")
             ]
-        except (OSError, ValueError):
+
+        result = await offload(_crawl)
+        if is_offload_error(result):
             return ()
+        matches = result
         # Cap at 5 to keep type_payload tight.
         return tuple(sorted(matches)[:5])
 

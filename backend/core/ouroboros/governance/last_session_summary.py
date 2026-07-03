@@ -430,6 +430,38 @@ def _render_session(record: SessionRecord) -> str:
     return main
 
 
+def _lex_max_session_dirs_worker(
+    sessions_root_str: str, active: Optional[str], n: int,
+) -> List[str]:
+    """Module-level worker for
+    :meth:`LastSessionSummary._lex_max_session_dirs`.
+
+    Dispatched into the shared ``advisor-blast`` thread pool via
+    ``cooperative_fs_io.offload`` (fs-hot-tier Batch 3, row 18). Lifted
+    to module level so the offload trampoline doesn't capture any
+    caller-local state. Preserves the original self-skip-by-id +
+    summary-exists filter semantics exactly.
+    """
+    sessions_root = Path(sessions_root_str)
+    candidates: List[Path] = [
+        p for p in sessions_root.iterdir()
+        if p.is_dir() and p.name.startswith("bt-")
+    ]
+    if not candidates:
+        return []
+    candidates.sort(key=lambda p: p.name, reverse=True)
+
+    filtered: List[str] = []
+    for p in candidates:
+        if active and p.name == active:
+            continue
+        if not (p / "summary.json").is_file():
+            continue
+        filtered.append(str(p))
+
+    return filtered[:n]
+
+
 # ---------------------------------------------------------------------------
 # LastSessionSummary
 # ---------------------------------------------------------------------------
@@ -458,7 +490,7 @@ class LastSessionSummary:
     def _sessions_dir(self) -> Path:
         return self._root / self._SESSIONS_DIR_NAME
 
-    def _lex_max_session_dirs(self, n: int) -> List[Path]:
+    async def _lex_max_session_dirs(self, n: int) -> List[Path]:
         """Return up to ``n`` bt-* directories, lex-max first (newest first).
 
         Pure directory scan — no mtime, no subprocess. Lexicographic order
@@ -477,35 +509,35 @@ class LastSessionSummary:
         Either filter alone suffices; both provide belt-and-suspenders
         protection against adjacent failure modes (harness forgot to call
         the hook / stale lock dir with no summary yet).
+
+        fs-hot-tier Batch 3 (row 18): the directory scan is dispatched
+        off the asyncio loop via ``cooperative_fs_io.offload`` (thread
+        pool — a single-level iterdir over a small ``.ouroboros/sessions``
+        dir is IO-bound). Fail-soft: an ``OffloadError`` degrades to
+        ``[]`` — the same result an empty/missing sessions dir gives.
         """
         sessions_root = self._sessions_dir()
         if not sessions_root.exists() or not sessions_root.is_dir():
             return []
-        candidates: List[Path] = [
-            p for p in sessions_root.iterdir()
-            if p.is_dir() and p.name.startswith("bt-")
-        ]
-        if not candidates:
-            return []
-        candidates.sort(key=lambda p: p.name, reverse=True)
-
         active = get_active_session_id()
-        filtered: List[Path] = []
-        for p in candidates:
-            if active and p.name == active:
-                # Self-skip by id.
-                continue
-            if not (p / "summary.json").is_file():
-                # Self-skip by absence — session still in flight, no summary
-                # written yet, so the candidate can't contribute. Equivalent
-                # guard for when the harness hasn't called
-                # set_active_session_id.
-                continue
-            filtered.append(p)
 
-        return filtered[:max(0, n)]
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+        result = await offload(
+            _lex_max_session_dirs_worker,
+            str(sessions_root), active, max(0, n),
+        )
+        if is_offload_error(result):
+            logger.debug(
+                "[LastSessionSummary] _lex_max_session_dirs offload "
+                "failed — degrading to empty list",
+            )
+            return []
+        return [Path(p) for p in result]
 
-    def load(self, n_sessions: Optional[int] = None) -> List[SessionRecord]:
+    async def load(self, n_sessions: Optional[int] = None) -> List[SessionRecord]:
         """Load up to ``n_sessions`` most-recent session summaries.
 
         Returns an empty list when disabled, when no prior ``bt-*`` dir
@@ -519,7 +551,7 @@ class LastSessionSummary:
             return []
         target_n = min(target_n, _HARD_MAX_SESSIONS)
 
-        dirs = self._lex_max_session_dirs(target_n)
+        dirs = await self._lex_max_session_dirs(target_n)
         if not dirs:
             return []
 
@@ -552,11 +584,43 @@ class LastSessionSummary:
                 )
         return records
 
+    def load_sync(
+        self, n_sessions: Optional[int] = None,
+    ) -> List[SessionRecord]:
+        """Synchronous bridge to :meth:`load` for the small set of
+        non-async legacy consumers OUTSIDE the audited CONTEXT_EXPANSION
+        hot path (cross-session digest/coherence/graduation utilities —
+        ``cross_session_harness.py``, ``cross_session_coherence_rig.py``,
+        ``session_story.py``, ``graduation/cross_session_coherence.py``).
+
+        Those call sites have long-standing synchronous public APIs with
+        broad existing test coverage; forcing them async would cascade
+        far outside this fix's scope. This bridge runs :meth:`load` to
+        completion on a fresh event loop via ``asyncio.run`` when the
+        calling thread has none running (the normal case for these
+        callers). If a loop IS somehow already running in this thread
+        (unexpected for these callers), degrades to ``[]`` rather than
+        raising ``RuntimeError: asyncio.run() cannot be called from a
+        running event loop`` — NEVER raises, matching every other
+        LastSessionSummary contract.
+        """
+        import asyncio as _asyncio
+        try:
+            _asyncio.get_running_loop()
+        except RuntimeError:
+            return _asyncio.run(self.load(n_sessions))
+        logger.debug(
+            "[LastSessionSummary] load_sync called from within a "
+            "running event loop — degrading to [] (use the async "
+            "load() directly instead)",
+        )
+        return []
+
     # ------------------------------------------------------------------
     # Render for prompt
     # ------------------------------------------------------------------
 
-    def format_for_prompt(self) -> Optional[str]:
+    async def format_for_prompt(self) -> Optional[str]:
         """Return the prompt section, or ``None`` when nothing to inject.
 
         ``None`` signals the orchestrator to emit the DEBUG "disabled /
@@ -564,7 +628,7 @@ class LastSessionSummary:
         """
         if not _is_enabled() or not _prompt_injection_enabled():
             return None
-        records = self.load()
+        records = await self.load()
         if not records:
             return None
 
@@ -595,21 +659,39 @@ class LastSessionSummary:
             self._stats.sessions_rendered += len(records)
         return rendered
 
+    def format_for_prompt_sync(self) -> Optional[str]:
+        """Synchronous bridge to :meth:`format_for_prompt` — see
+        :meth:`load_sync` for the full rationale (non-async legacy
+        consumers outside the audited CONTEXT_EXPANSION hot path).
+        NEVER raises; degrades to ``None`` if called from within an
+        already-running event loop in this thread.
+        """
+        import asyncio as _asyncio
+        try:
+            _asyncio.get_running_loop()
+        except RuntimeError:
+            return _asyncio.run(self.format_for_prompt())
+        logger.debug(
+            "[LastSessionSummary] format_for_prompt_sync called from "
+            "within a running event loop — degrading to None",
+        )
+        return None
+
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 
-    def inject_metrics(self) -> Tuple:
+    async def inject_metrics(self) -> Tuple:
         """Return ``(enabled, n_sessions, latest_session_id, chars_out, hash8)``.
 
         Used by orchestrator for the §8 INFO log without leaking content.
         """
         if not _is_enabled():
             return (False, 0, "", 0, "")
-        records = self.load()
+        records = await self.load()
         if not records:
             return (True, 0, "", 0, "")
-        prompt = self.format_for_prompt() or ""
+        prompt = await self.format_for_prompt() or ""
         hash8 = ""
         if prompt:
             hash8 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8]

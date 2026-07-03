@@ -101,11 +101,11 @@ def test_graph_non_match_returns_unmatched():
     assert r.matched is False
 
 
-def test_graph_auto_discovered():
+async def test_graph_auto_discovered():
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch,
     )
-    r = try_dispatch("/graph help")
+    r = await try_dispatch("/graph help")
     assert r.matched is True
     assert r.ok is True
 
@@ -279,11 +279,11 @@ def test_monitor_unknown_subcommand():
     assert r.ok is False
 
 
-def test_monitor_auto_discovered():
+async def test_monitor_auto_discovered():
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch,
     )
-    r = try_dispatch("/monitor help")
+    r = await try_dispatch("/monitor help")
     assert r.matched is True
     assert r.ok is True
 

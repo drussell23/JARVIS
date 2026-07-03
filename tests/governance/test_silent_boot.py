@@ -42,11 +42,39 @@ import logging
 import pathlib
 import sys
 import threading
+import time
 from typing import Any
 
 import pytest
 
 from backend.core.ouroboros.governance import silent_boot as sb
+
+
+def _wait_for_log_content(
+    path: pathlib.Path, needle: str, timeout: float = 5.0,
+) -> str:
+    """Poll for ``needle`` in ``path`` up to ``timeout`` seconds.
+
+    Task L2 default session sink is the non-blocking rotating
+    pipeline (queue -> daemon listener thread -> disk); records are
+    no longer guaranteed on disk the instant the logging call
+    returns (mirrors the deadline-poll pattern proven in
+    test_headless_telemetry.py::test_records_drain_to_file_off_thread).
+    Returns the last-read content (possibly not containing needle)
+    if the deadline elapses.
+    """
+    deadline = time.time() + timeout
+    content = ""
+    while time.time() < deadline:
+        if path.exists():
+            try:
+                content = path.read_text(encoding="utf-8")
+            except Exception:  # noqa: BLE001 — best-effort poll
+                content = ""
+            if needle in content:
+                return content
+        time.sleep(0.02)
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +120,12 @@ class TestMasterFlagGate:
     ):
         handler = sb.configure_silent_boot(session_dir)
         assert handler is not None
-        assert isinstance(handler, logging.FileHandler)
+        # Widened for Task L2: the default session sink is now the
+        # non-blocking rotating pipeline (NonBlockingQueueHandler),
+        # not a bare FileHandler. The contract is baseFilename+close,
+        # not a specific handler class (legacy FileHandler remains
+        # the fail-soft fallback and also satisfies this contract).
+        assert hasattr(handler, "baseFilename")
 
     def test_explicit_false_no_op(
         self, monkeypatch: pytest.MonkeyPatch, fresh_registry, session_dir,
@@ -213,8 +246,9 @@ class TestIdempotency:
             h for h in root.handlers
             if getattr(h, sb._HANDLER_MARKER, False)
         ]
-        # Exactly 2 marked handlers: file + stream
-        assert len(marked) == 2
+        # Exactly 3 marked handlers: session sink + terminal stream +
+        # heartbeat (Task L2 adds the heartbeat handler).
+        assert len(marked) == 3
 
     def test_concurrent_configure_thread_safe(
         self, fresh_registry, session_dir,
@@ -252,8 +286,10 @@ class TestDefensivePaths:
         bad_path = "\x00invalid_path"
         result = sb.configure_silent_boot(bad_path)
         # Either returns None gracefully OR succeeds in some envs;
-        # critical contract is "never raises"
-        assert result is None or isinstance(result, logging.FileHandler)
+        # critical contract is "never raises". Widened for Task L2:
+        # the session sink may be the non-blocking pipeline handler,
+        # not strictly a FileHandler — contract is baseFilename+close.
+        assert result is None or hasattr(result, "baseFilename")
 
     def test_none_session_dir_returns_none_safely(self, fresh_registry):
         # Path(None) raises in __init__; configure_silent_boot wraps
@@ -327,9 +363,9 @@ class TestRestoreLegacy:
             1 for h in root.handlers
             if getattr(h, sb._HANDLER_MARKER, False)
         )
-        assert before == 2  # file + stream
+        assert before == 3  # session sink + stream + heartbeat
         removed = sb.restore_legacy_terminal_logging()
-        assert removed == 2
+        assert removed == 3
         after = sum(
             1 for h in root.handlers
             if getattr(h, sb._HANDLER_MARKER, False)
@@ -507,10 +543,14 @@ class TestEndToEndBehavior:
         captured = capsys.readouterr()
         # Terminal (stderr) should NOT contain the INFO message
         assert "noisy_boot_info" not in captured.err
-        # File SHOULD contain it
+        # File SHOULD contain it. Widened for Task L2: the session
+        # sink is the non-blocking rotating pipeline — the record
+        # drains to disk on a daemon thread, not synchronously, so
+        # poll with a bounded deadline instead of reading immediately.
         log_path = session_dir / "debug.log"
-        assert log_path.exists()
-        content = log_path.read_text(encoding="utf-8")
+        content = _wait_for_log_content(
+            log_path, "noisy_boot_info_should_not_appear_on_terminal",
+        )
         assert "noisy_boot_info_should_not_appear_on_terminal" in content
 
     def test_warning_logged_after_configure_goes_to_both(
@@ -526,6 +566,10 @@ class TestEndToEndBehavior:
                 pass
         captured = capsys.readouterr()
         assert "warn_should_appear_on_terminal_AND_file" in captured.err
+        # Widened for Task L2 (see comment above) — bounded poll for
+        # the async drain instead of an immediate synchronous read.
         log_path = session_dir / "debug.log"
-        content = log_path.read_text(encoding="utf-8")
+        content = _wait_for_log_content(
+            log_path, "warn_should_appear_on_terminal_AND_file",
+        )
         assert "warn_should_appear_on_terminal_AND_file" in content

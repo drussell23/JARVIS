@@ -72,3 +72,56 @@ class TestFromEnvUsesResolver:
         cfg = HarnessConfig.from_env()
         assert cfg.repo_path == _REAL_REPO.resolve()
         assert cfg.repo_path.is_dir()
+
+
+class TestPostInitRejectsStaleIsomorphicContainerPath:
+    """Pins run bt-iso-1783024759: ``[ledger_sovereignty] auto-commit worktree
+    create failed: PermissionError(13, 'Permission denied')``.
+
+    Root cause (NOT a UID/GID container-identity mismatch — the isomorphic
+    ``--mode container`` driver never actually launches the O+V soak inside
+    Docker; ``a1_live_fire_chaos_harness.SoakRunner.launch`` always
+    ``subprocess.Popen``s it on the HOST): ``IsomorphicEnv._enter_container``
+    exports ``JARVIS_REPO_PATH=/opt/trinity/jarvis`` (the live-node shape)
+    without ever materializing that path on the host filesystem, AND forces
+    cwd to a disjoint tmp dir. The CLI (``scripts/ouroboros_battle_test.py``)
+    default-sources ``--repo-path`` from that same stale env var and passes
+    it straight into ``HarnessConfig(repo_path=...)``. ``__post_init__``'s
+    fallback re-anchor called ``_resolve_runtime_repo_root(start=raw)`` —
+    reusing the SAME bogus, nonexistent path as the ``.git``-walk-up anchor,
+    which can never find a repo, so ``resolve_repo_root`` fell back to
+    ``_safe_cwd()`` (the disjoint tmp dir, no ``.git`` either) and the whole
+    resolution raised, leaving ``self.repo_path`` at the raw, nonexistent,
+    unwritable ``/opt/trinity/jarvis`` value. ``WorktreeManager.create()``
+    then tried ``mkdir(parents=True)`` under that path, hitting
+    ``/opt`` (root-owned, unwritable) -> ``PermissionError(13)``.
+
+    The fix must fall back to the code-location-only resolver (no ``start``
+    override -> anchors on this module's own ``Path(__file__)``, which is
+    ALWAYS a real, valid location for the runtime executing it) whenever the
+    raw/env-derived value cannot be re-anchored at all.
+    """
+
+    def test_stale_container_path_with_disjoint_cwd_resolves_to_real_repo(
+        self, monkeypatch, tmp_path,
+    ):
+        from backend.core.ouroboros.battle_test.harness import HarnessConfig
+
+        # Reproduce IsomorphicEnv._enter_container() + the disjoint cwd it
+        # forces: JARVIS_REPO_PATH points at the live-node shape (does NOT
+        # exist on this host) and cwd is a sibling tmp dir with no .git.
+        monkeypatch.setenv("JARVIS_REPO_PATH", "/opt/trinity/jarvis")
+        disjoint_cwd = tmp_path / "app"
+        disjoint_cwd.mkdir()
+        monkeypatch.chdir(disjoint_cwd)
+
+        cfg = HarnessConfig(repo_path=Path("/opt/trinity/jarvis"))
+
+        assert cfg.repo_path == _REAL_REPO.resolve(), (
+            "HarnessConfig must never keep a nonexistent stale repo_path "
+            f"({cfg.repo_path!r}) that WorktreeManager would mkdir(parents=True) "
+            "into -- that is exactly the /opt PermissionError from "
+            "bt-iso-1783024759."
+        )
+        assert cfg.repo_path.is_dir()
+        assert (cfg.repo_path / "backend" / "core" / "ouroboros").is_dir()

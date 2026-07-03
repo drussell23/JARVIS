@@ -96,6 +96,14 @@ def http(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     # Tight poll so the never-RUNNING timeout test is fast.
     monkeypatch.setenv("JARVIS_FAILOVER_RUNNING_POLL_S", "0.1")
+    # This FakeHTTP scripts POST responses via a single SHARED, non-zone-aware
+    # index (see insert_responses above) -- it assumes the legacy strictly-
+    # linear one-zone-at-a-time chain. Pin the scatter-gather width to 1 (the
+    # explicit byte-equivalent rollback path, see gcp_compute_rest._scatter_width)
+    # so concurrent multi-zone racing never interleaves calls against this
+    # single script. Multi-zone racing itself is covered by
+    # test_gcp_compute_rest_scatter_gather.py's zone-aware fake.
+    monkeypatch.setenv("JARVIS_FAILOVER_SCATTER_WIDTH", "1")
     return fake
 
 
@@ -191,6 +199,44 @@ async def test_create_instance_builds_correct_payload_and_url(http, monkeypatch)
     # startup-script is in the metadata items.
     items = payload["metadata"]["items"]
     assert any(it["key"] == "startup-script" and "echo hi" in it["value"] for it in items)
+
+
+async def test_create_instance_boot_disk_type_defaults_to_faster_pd_ssd(http, monkeypatch):
+    # Cold-start remediation: the awakened node reads baked-in weights off its
+    # boot disk -- default it to pd-ssd (faster than GCE-default pd-standard).
+    monkeypatch.delenv("JARVIS_FAILOVER_BOOT_DISK_TYPE", raising=False)
+    c = GCPComputeRest()
+    ok, _ = await c.create_instance(startup_script="x")
+    assert ok is True
+    post = [call for call in http.calls if call["method"] == "POST"][0]
+    payload = json.loads(post["body"].decode("utf-8"))
+    # dynamic zonal diskType URL (zone from metadata = us-west2-b), never hardcoded.
+    assert payload["disks"][0]["initializeParams"]["diskType"] == (
+        "zones/us-west2-b/diskTypes/pd-ssd"
+    )
+
+
+async def test_create_instance_boot_disk_type_is_env_overridable(http, monkeypatch):
+    monkeypatch.setenv("JARVIS_FAILOVER_BOOT_DISK_TYPE", "hyperdisk-balanced")
+    c = GCPComputeRest()
+    ok, _ = await c.create_instance(startup_script="x")
+    assert ok is True
+    post = [call for call in http.calls if call["method"] == "POST"][0]
+    payload = json.loads(post["body"].decode("utf-8"))
+    assert payload["disks"][0]["initializeParams"]["diskType"] == (
+        "zones/us-west2-b/diskTypes/hyperdisk-balanced"
+    )
+
+
+async def test_create_instance_boot_disk_type_empty_omits_field(http, monkeypatch):
+    # Empty -> omit diskType so GCE applies its default (legacy pd-standard).
+    monkeypatch.setenv("JARVIS_FAILOVER_BOOT_DISK_TYPE", "")
+    c = GCPComputeRest()
+    ok, _ = await c.create_instance(startup_script="x")
+    assert ok is True
+    post = [call for call in http.calls if call["method"] == "POST"][0]
+    payload = json.loads(post["body"].decode("utf-8"))
+    assert "diskType" not in payload["disks"][0]["initializeParams"]
 
 
 async def test_create_instance_spot_fails_falls_back_to_on_demand(http):

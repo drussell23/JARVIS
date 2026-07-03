@@ -57,8 +57,13 @@ into auto-dispatch by exposing a module-level callable named
 ``dispatch_<verb>_command`` with signature::
 
     def dispatch_<verb>_command(line: str) -> DispatchResult: ...
+    # OR, equivalently:
+    async def dispatch_<verb>_command(line: str) -> DispatchResult: ...
 
-where ``DispatchResult`` is any object with ``.matched: bool``,
+:func:`try_dispatch` is itself ``async`` and awaits the result
+when the dispatcher is a coroutine function — callers MUST
+``await try_dispatch(line)`` (it always runs on a live event
+loop). ``DispatchResult`` is any object with ``.matched: bool``,
 ``.ok: bool``, and ``.text: str`` attributes.
 
 For files named ``<verb>_repl.py``, the verb is the basename
@@ -243,7 +248,14 @@ def _extract_verb_name(full_module_name: str) -> Optional[str]:
 
 def _validate_dispatch_signature(fn: Any) -> Optional[str]:
     """Validate that ``fn`` accepts a single positional ``line``
-    argument. Returns None on accept; reason string on reject."""
+    argument. Returns None on accept; reason string on reject.
+
+    Coroutine functions (``async def dispatch_<verb>_command``)
+    are first-class here — :func:`inspect.signature` reports the
+    same parameter shape for sync and async callables, so no
+    ``iscoroutinefunction`` branch is needed to accept them.
+    :func:`try_dispatch` is the seam that awaits an awaitable
+    result; this validator only cares about the call signature."""
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError) as exc:
@@ -430,7 +442,7 @@ def _matches_verb(line: str, verb: str) -> bool:
     )
 
 
-def try_dispatch(line: str) -> DispatchOutcome:
+async def try_dispatch(line: str) -> DispatchOutcome:
     """Attempt to dispatch ``line`` through the auto-discovered
     verb→dispatcher map. Returns ``DispatchOutcome(matched=False)``
     if no verb matches; otherwise returns the dispatcher's
@@ -439,7 +451,15 @@ def try_dispatch(line: str) -> DispatchOutcome:
     Master-flag-gated. Idempotently primes the registry on
     first call. NEVER raises out — dispatcher exceptions
     surface as ``DispatchOutcome(matched=True, ok=False,
-    text=<reason>)``."""
+    text=<reason>)``.
+
+    **async-aware** — ``dispatch_<verb>_command`` callables may
+    be plain functions OR coroutine functions. When the call
+    returns an awaitable (``inspect.isawaitable``), it is
+    awaited here before projecting the result. This is the ONE
+    seam where the registry bridges sync and async dispatchers;
+    callers of :func:`try_dispatch` MUST ``await`` it (it always
+    runs on a live event loop — the REPL's ``_loop`` coroutine)."""
     s = (line or "").strip()
     if not s:
         return DispatchOutcome(matched=False, ok=False, text="")
@@ -473,6 +493,8 @@ def try_dispatch(line: str) -> DispatchOutcome:
                 continue
             try:
                 result = fn(line)
+                if inspect.isawaitable(result):
+                    result = await result
             except Exception as exc:  # noqa: BLE001 — defensive
                 logger.debug(
                     "[ReplRegistry] dispatcher %r raised: %s",

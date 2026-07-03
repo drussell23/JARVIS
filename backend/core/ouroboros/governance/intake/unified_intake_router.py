@@ -517,6 +517,7 @@ def _compute_priority(
     *,
     repo_root: "Optional[Path]" = None,
     resurrected: bool = False,
+    semantic_boost_override: "Optional[int]" = None,
 ) -> Tuple[int, Optional[Any]]:
     """Compute cost-aware priority score + rich goal alignment for an envelope.
 
@@ -600,31 +601,41 @@ def _compute_priority(
     # is NEVER fed into UrgencyRouter, Iron Gate, risk tier, policy engine,
     # FORBIDDEN_PATH, or approval gating.
     semantic_boost = 0
-    try:
-        from backend.core.ouroboros.governance.semantic_index import (
-            get_default_index,
-        )
-        _si = get_default_index()
-        # Q3 Slice 3 — non-blocking build trigger. The hot intake path
-        # must not stall on git-log subprocesses + corpus assembly +
-        # bulk-embed. ``build_async`` returns immediately; ``boost_for``
-        # below scores against whichever centroid is currently loaded
-        # (empty on cold start → boost=0, no harm done).
-        _si.build_async()
-        semantic_boost = _si.boost_for(envelope.description or "")
-        if semantic_boost > 0 or _si.stats().built_at > 0:
-            # Stash in envelope evidence for observability. Score itself
-            # (the raw cosine) is useful for operators inspecting "why
-            # did this signal get boosted?" without exposing raw vectors.
-            try:
-                _sim_raw = _si.score(envelope.description or "")
-                if isinstance(envelope.evidence, dict):
-                    envelope.evidence["semantic_alignment"] = round(float(_sim_raw), 4)
-                    envelope.evidence["semantic_boost"] = int(semantic_boost)
-            except Exception:
-                pass
-    except Exception as exc:
-        logger.debug("[Router] semantic alignment scorer failed: %s", exc)
+    if semantic_boost_override is not None:
+        # Tier-2b — the caller (``_ingest_impl``) already computed the
+        # semantic boost OFF the asyncio loop via
+        # ``SemanticIndex.boost_and_score_offloaded`` (a single fastembed
+        # encode dispatched through ``cooperative_fs_io.offload``). Consume
+        # its result here; do NOT run the inline on-loop embed. The evidence
+        # stash (``semantic_alignment`` / ``semantic_boost``) is done by the
+        # caller alongside the offloaded score.
+        semantic_boost = max(0, int(semantic_boost_override))
+    else:
+        try:
+            from backend.core.ouroboros.governance.semantic_index import (
+                get_default_index,
+            )
+            _si = get_default_index()
+            # Q3 Slice 3 — non-blocking build trigger. The hot intake path
+            # must not stall on git-log subprocesses + corpus assembly +
+            # bulk-embed. ``build_async`` returns immediately; ``boost_for``
+            # below scores against whichever centroid is currently loaded
+            # (empty on cold start → boost=0, no harm done).
+            _si.build_async()
+            semantic_boost = _si.boost_for(envelope.description or "")
+            if semantic_boost > 0 or _si.stats().built_at > 0:
+                # Stash in envelope evidence for observability. Score itself
+                # (the raw cosine) is useful for operators inspecting "why
+                # did this signal get boosted?" without exposing raw vectors.
+                try:
+                    _sim_raw = _si.score(envelope.description or "")
+                    if isinstance(envelope.evidence, dict):
+                        envelope.evidence["semantic_alignment"] = round(float(_sim_raw), 4)
+                        envelope.evidence["semantic_boost"] = int(semantic_boost)
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.debug("[Router] semantic alignment scorer failed: %s", exc)
 
     # MissionInferrer Slice B — soft inferred-direction priority boost.
     # Reads the cached InferenceResult via get_current() (cache-only, no
@@ -993,6 +1004,18 @@ class UnifiedIntakeRouter:
                         "Router: FSM resume re-inject failed op=%s -- left pending",
                         getattr(_cp, "op_id", "?"),
                     )
+
+            # Task 5 -- checkpoint-resume re-hydration seam: a resumed window
+            # re-loads prior cognitive experience alongside the FSM checkpoint
+            # it just replayed. Idempotent (module cache is just refreshed).
+            try:
+                from backend.core.ouroboros.governance import cognitive_persistence as _cogp
+                if _cogp.is_enabled() and _cogp._env_bool(
+                    "JARVIS_COGNITIVE_HYDRATE_ON_CHECKPOINT_RESUME", True
+                ):
+                    await _cogp.hydrate_prior_knowledge()
+            except Exception as _e:  # noqa: BLE001
+                logger.debug("[IntakeRouter] cognitive re-hydration skipped (fail-soft): %s", _e)
         except Exception:  # noqa: BLE001
             logger.debug("Router: FSM checkpoint hydration skipped (fail-soft)", exc_info=True)
 
@@ -1186,9 +1209,46 @@ class UnifiedIntakeRouter:
             if _blocking_entry is not None:
                 _blocking_id, _ = _blocking_entry
                 _dep_credit += len(self._queued_behind.get(_blocking_id, []))
+        # Tier-2b — compute the SemanticIndex prior OFF the asyncio loop.
+        # The inline path (``_compute_priority``) previously ran two fastembed
+        # encodes (``boost_for`` + ``score``) synchronously on the loop
+        # (~3.5s / signal — the 2nd starvation tier). Here we fire the
+        # non-blocking build trigger and dispatch a single combined encode
+        # through ``cooperative_fs_io.offload`` (thread — fastembed releases
+        # the GIL), then hand the result to ``_compute_priority`` as an
+        # override so it skips the on-loop embed. Fail-soft: any fault →
+        # override stays None → legacy inline path (still correct).
+        _semantic_override: Optional[int] = None
+        try:
+            from backend.core.ouroboros.governance.semantic_index import (
+                get_default_index,
+            )
+            # Per-repo index keyed on the router's configured project_root
+            # (matches orchestrator / classify_runner CONTEXT_EXPANSION) — in
+            # production this resolves to the same singleton the legacy
+            # no-arg lookup did (cwd == project_root).
+            _si = get_default_index(self._config.project_root)
+            _si.build_async()  # non-blocking; schedules off-loop rebuild
+            _sem_boost, _sem_score = await _si.boost_and_score_offloaded(
+                envelope.description or "",
+            )
+            _semantic_override = int(_sem_boost)
+            if (_sem_boost > 0 or _si.stats().built_at > 0) and isinstance(
+                envelope.evidence, dict,
+            ):
+                envelope.evidence["semantic_alignment"] = round(
+                    float(_sem_score), 4,
+                )
+                envelope.evidence["semantic_boost"] = int(_sem_boost)
+        except Exception as _sem_exc:  # noqa: BLE001 — never break intake
+            logger.debug(
+                "[Router] offloaded semantic scorer skipped: %s", _sem_exc,
+            )
+            _semantic_override = None
         priority, alignment = _compute_priority(
             envelope, dependency_credit=_dep_credit,
             repo_root=self._config.project_root,
+            semantic_boost_override=_semantic_override,
         )
         # Stash goal-alignment diagnostics on the envelope so downstream
         # phases (orchestrator, SerpentFlow postmortems, dead-letter audit)

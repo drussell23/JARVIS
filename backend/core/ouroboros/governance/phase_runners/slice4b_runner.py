@@ -593,7 +593,7 @@ class Slice4bRunner(PhaseRunner):
                     if _cf:
                         _scan_targets.add(_cf)
                 for _tf in sorted(_scan_targets):
-                    _is_active, _reason = _lws.is_human_active(str(_tf))
+                    _is_active, _reason = await _lws.is_human_active(str(_tf))
                     if _is_active:
                         _active_hit = (str(_tf), _reason or "human active")
                         break

@@ -213,7 +213,7 @@ def test_pin_pre_score_call_after_postmortem_recall():
     PostmortemRecall hook so the prompt-injection ordering is preserved
     (Bridge → PostmortemRecall → CognitiveMetrics → SemanticIndex)."""
     src = _read("backend/core/ouroboros/governance/orchestrator.py")
-    pm_idx = src.rfind("ctx = _inject_postmortem_recall_impl(ctx)")
+    pm_idx = src.rfind("ctx = await _inject_postmortem_recall_impl(ctx)")
     cm_idx = src.rfind("_score_cognitive_metrics_pre_apply_impl(ctx)")
     assert pm_idx > 0 and cm_idx > 0
     assert pm_idx < cm_idx, (

@@ -276,7 +276,7 @@ def test_verb_auto_discovered_via_slice4_registry(monkeypatch):
         reset_registry_for_tests()
 
 
-def test_try_dispatch_routes_to_semantic_budget(
+async def test_try_dispatch_routes_to_semantic_budget(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setenv(
@@ -294,7 +294,7 @@ def test_try_dispatch_routes_to_semantic_budget(
     )
     reset_registry_for_tests()
     try:
-        out = try_dispatch("/semantic_budget help")
+        out = await try_dispatch("/semantic_budget help")
         assert out.matched is True
         assert out.ok is True
         assert out.verb == "semantic_budget"

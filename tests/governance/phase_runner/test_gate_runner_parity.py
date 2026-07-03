@@ -110,7 +110,7 @@ class _FakeOrchestrator:
     def _is_cancel_requested(self, op_id: str) -> bool:
         return self._cancel_requested
 
-    def _discover_tests_for_gate(self, path):
+    async def _discover_tests_for_gate(self, path):
         return []
 
 
@@ -527,6 +527,163 @@ async def test_artifacts_present_on_all_paths(ctx, tmp_path):
     result = await GATERunner(orch, None, _candidate(), RiskTier.SAFE_AUTO).run(ctx)
     assert "risk_tier" in result.artifacts
     assert "best_candidate" in result.artifacts
+
+
+# ---------------------------------------------------------------------------
+# fs-hot-tier Batch 3 (row 15, 2026-07-03) — Orchestrator._discover_tests_for_gate
+# routes MutationGate's ``tests_dir.rglob(...)`` scan through
+# cooperative_fs_io.offload(cpu_bound=False) instead of running the rglob
+# synchronously on the loop thread inside the GATE phase runner.
+# ---------------------------------------------------------------------------
+
+
+def _real_orchestrator_from_module():
+    """Import the real Orchestrator class (not the parity fake) so the
+    ``_discover_tests_for_gate`` method under test is the production
+    implementation."""
+    from backend.core.ouroboros.governance.orchestrator import Orchestrator
+    return Orchestrator
+
+
+class _MinimalRealConfig:
+    def __init__(self, project_root):
+        self.project_root = project_root
+
+
+class TestDiscoverTestsForGateOffload:
+    @pytest.mark.asyncio
+    async def test_routes_through_offload_thread_pool(self, tmp_path, monkeypatch):
+        """Spy on cooperative_fs_io.offload — the rglob scan must be
+        dispatched with cpu_bound=False (thread pool: scoped tests/
+        rglob is syscall-dominated, not CPU-after-scan)."""
+        Orchestrator = _real_orchestrator_from_module()
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._config = _MinimalRealConfig(project_root=tmp_path)
+
+        tests_dir = tmp_path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_foo_widget.py").write_text("def test_x(): pass\n")
+
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        calls = {"n": 0, "cpu_bound": None}
+        real_offload = cooperative_fs_io.offload
+
+        async def _spy_offload(fn, *args, cpu_bound=False, **kwargs):
+            calls["n"] += 1
+            calls["cpu_bound"] = cpu_bound
+            return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
+
+        result = await orch._discover_tests_for_gate(Path("foo_widget.py"))
+
+        assert calls["n"] == 1, "_discover_tests_for_gate must route through offload"
+        assert calls["cpu_bound"] is False, (
+            "scoped tests/ rglob is IO-bound (syscall-dominated) — must "
+            "use the thread pool, not a process pool"
+        )
+        assert [p.name for p in result] == ["test_foo_widget.py"]
+
+    @pytest.mark.asyncio
+    async def test_parity_matches_sync_rglob_on_planted_tree(self, tmp_path):
+        """The offloaded result must match what a direct synchronous
+        rglob('test_<stem>*.py') would produce on a planted tree."""
+        Orchestrator = _real_orchestrator_from_module()
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._config = _MinimalRealConfig(project_root=tmp_path)
+
+        tests_dir = tmp_path / "tests"
+        (tests_dir / "sub").mkdir(parents=True)
+        (tests_dir / "test_bar.py").write_text("pass\n")
+        (tests_dir / "sub" / "test_bar_extra.py").write_text("pass\n")
+        (tests_dir / "test_other.py").write_text("pass\n")
+
+        expected = sorted(tests_dir.rglob("test_bar*.py"))
+        result = await orch._discover_tests_for_gate(Path("bar.py"))
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_missing_tests_dir_returns_empty(self, tmp_path):
+        Orchestrator = _real_orchestrator_from_module()
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._config = _MinimalRealConfig(project_root=tmp_path)
+        result = await orch._discover_tests_for_gate(Path("nope.py"))
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_offload_error_degrades_to_empty_no_raise(self, tmp_path, monkeypatch):
+        """Fail-soft: an OffloadError from the substrate must degrade to
+        the same empty-list result the prior sync fail-soft gave —
+        never raise into the GATE phase runner."""
+        from backend.core.ouroboros.governance import cooperative_fs_io
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            OffloadError,
+        )
+
+        Orchestrator = _real_orchestrator_from_module()
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._config = _MinimalRealConfig(project_root=tmp_path)
+
+        tests_dir = tmp_path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_boom.py").write_text("pass\n")
+
+        async def _boom_offload(fn, *args, **kwargs):
+            return OffloadError(
+                fn_name="_discover_tests_for_gate_worker",
+                exc_type="OSError",
+                message="synthetic offload-layer fault",
+                cpu_bound=False,
+            )
+
+        monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
+        result = await orch._discover_tests_for_gate(Path("boom.py"))
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_gate_runner_await_site_awaits_discover_tests(self, ctx, tmp_path, monkeypatch):
+        """Await-guard: the GATERunner call site must actually await the
+        (now-async) _discover_tests_for_gate — proven end-to-end through
+        the MutationGate enforce-mode path with a real critical-path
+        candidate, not just a unit call."""
+        monkeypatch.setenv("JARVIS_MUTATION_GATE_ENABLED", "1")
+
+        _mock_verdict = MagicMock()
+        _mock_verdict.decision = "upgrade_to_approval"
+        _mock_verdict.score = 0.5
+        _mock_verdict.grade = "C"
+        _mock_verdict.caught = 5
+        _mock_verdict.total_mutants = 10
+        _mock_verdict.survivors = []
+        _mock_verdict.cache_hits = 0
+        _mock_verdict.cache_misses = 10
+        _mock_verdict.duration_s = 1.0
+
+        discover_calls = {"n": 0}
+
+        orch = _orch(tmp_path)
+
+        async def _tracking_discover(path):
+            discover_calls["n"] += 1
+            return []
+
+        orch._discover_tests_for_gate = _tracking_discover
+
+        with patch("backend.core.ouroboros.governance.mutation_gate.gate_enabled", return_value=True), \
+             patch("backend.core.ouroboros.governance.mutation_gate.load_allowlist", return_value={}), \
+             patch("backend.core.ouroboros.governance.mutation_gate.is_path_critical", return_value=True), \
+             patch("backend.core.ouroboros.governance.mutation_gate.evaluate_file", return_value=_mock_verdict), \
+             patch("backend.core.ouroboros.governance.mutation_gate.merge_verdicts", return_value=_mock_verdict), \
+             patch("backend.core.ouroboros.governance.mutation_gate.gate_mode", return_value="enforce"), \
+             patch("backend.core.ouroboros.governance.mutation_gate.MODE_ENFORCE", "enforce"), \
+             patch("backend.core.ouroboros.governance.mutation_gate.append_ledger"):
+            result = await GATERunner(orch, None, _candidate(), RiskTier.SAFE_AUTO).run(ctx)
+
+        assert discover_calls["n"] == 1, (
+            "GATERunner must call orch._discover_tests_for_gate on the "
+            "critical-path candidate"
+        )
+        assert result.artifacts["risk_tier"] is RiskTier.APPROVAL_REQUIRED
 
 
 __all__ = []

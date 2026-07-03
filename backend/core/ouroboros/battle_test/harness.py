@@ -275,6 +275,23 @@ class HarnessConfig:
         explicit, already-plausible repo root (e.g. a worktree or a hermetic
         fixture) is honored verbatim. NEVER raises -- fail-soft to the value
         the caller passed.
+
+        Run bt-iso-1783024759 fix: the ``start=raw`` re-anchor attempt below
+        reuses the SAME possibly-nonexistent value as the ``.git``-walk-up
+        anchor. When ``raw`` is a stale isomorphic-container path (e.g.
+        ``/opt/trinity/jarvis``, which ``IsomorphicEnv._enter_container``
+        exports via ``JARVIS_REPO_PATH`` without ever materializing it on
+        the host filesystem) and the process cwd is also disjoint from the
+        real repo (the isomorphic driver forces this), that walk-up can
+        never find a ``.git`` anchor and the whole resolution raises --
+        silently leaving ``self.repo_path`` at the raw, nonexistent,
+        unwritable value. Downstream, ``WorktreeManager.create()``
+        (``ledger_sovereignty`` boot) then attempts ``mkdir(parents=True)``
+        under that path, hitting a root-owned system directory (``/opt``)
+        -> ``PermissionError(13, 'Permission denied')``. If the first
+        re-anchor attempt fails, retry with NO ``start`` override so the
+        resolver anchors on this module's own ``Path(__file__)`` location,
+        which is always real for the runtime executing it.
         """
         try:
             raw = Path(self.repo_path)
@@ -292,6 +309,11 @@ class HarnessConfig:
             return
         try:
             self.repo_path = _resolve_runtime_repo_root(start=raw)
+            return
+        except Exception:  # noqa: BLE001 -- try the code-location fallback next
+            pass
+        try:
+            self.repo_path = _resolve_runtime_repo_root()
         except Exception:  # noqa: BLE001 -- fail-soft: keep caller value
             pass
 
@@ -827,7 +849,14 @@ class BattleTestHarness:
             if _silent_boot_handler is not None:
                 # Retain reference so the harness can close it
                 # explicitly on shutdown (Slice 7 follow-up #4 path).
-                self._log_file_path = _silent_boot_handler.baseFilename
+                # baseFilename is duck-typed (NonBlockingQueueHandler
+                # or legacy FileHandler both expose it per the
+                # configure_silent_boot contract) — getattr keeps
+                # this structurally honest under the widened
+                # Optional[logging.Handler] return type.
+                self._log_file_path = getattr(
+                    _silent_boot_handler, "baseFilename", None,
+                )
         except Exception:  # noqa: BLE001 — defensive
             logger.debug(
                 "[harness] silent_boot setup failed; falling back "
@@ -2146,6 +2175,14 @@ class BattleTestHarness:
                 )
                 self._serpent_flow.set_plan_review_mode(self._plan_before_execute)
 
+                # SerpentFlow owns the terminal (prompt_toolkit patch_stdout +
+                # bottom_toolbar). The telemetry heartbeat writes raw \r-lines
+                # to sys.__stdout__, bypassing that protection — suppress it
+                # for interactive sessions unless the operator explicitly
+                # opted in. Read per-emit, so this takes effect immediately.
+                if "JARVIS_CONSOLE_HEARTBEAT_ENABLED" not in os.environ:
+                    os.environ["JARVIS_CONSOLE_HEARTBEAT_ENABLED"] = "false"
+
                 # CC1 — operator-selectable per-op rendering. Default
                 # CLAUDE: terse one-line-per-op idiom matching Claude
                 # Code's tool-call visual model. Hot-revert via
@@ -2207,7 +2244,7 @@ class BattleTestHarness:
                     )
                     _sb_installed = any(
                         getattr(_h, _SB_MARKER, False)
-                        and isinstance(_h, logging.FileHandler)
+                        and hasattr(_h, "baseFilename")
                         for _h in _root.handlers
                     )
                     if _sb_installed:

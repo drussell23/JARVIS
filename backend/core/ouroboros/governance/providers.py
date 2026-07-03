@@ -2040,6 +2040,23 @@ def _build_communication_mode_block(ctx: "OperationContext") -> Optional[str]:
     )
 
 
+def prompt_cache_min_chars(
+    env_var: str = "JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS",
+    default: int = 0,
+) -> int:
+    """Shared cache-floor parse — clamp ``>= 0``, fail-soft to ``default``.
+
+    Single source of truth for the "don't mark a prefix below the cache floor"
+    logic (Phase 3a). Consumed by both :class:`ClaudeProvider` (its ``__init__``)
+    and :class:`DoublewordProvider` (DW prompt caching) so the two providers can
+    never drift on how the minimum-character threshold is read. NEVER raises.
+    """
+    try:
+        return max(0, int(os.environ.get(env_var, str(default))))
+    except (ValueError, TypeError):
+        return default
+
+
 def _prompt_prefix_cache_enabled() -> bool:
     """Slice 131 P2a — gate the tool-catalog prefix-cache inversion. Default-FALSE
     → OFF byte-identical (the stable tool catalog + output schema stay in the
@@ -2665,14 +2682,22 @@ def _build_lean_codegen_prompt(
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
     preloaded_out: Optional[List[str]] = None,
     stable_prefix_out: Optional[List[str]] = None,
+    force_prefix_split: bool = False,
 ) -> str:
     """Build a lean, tool-first generation prompt (~3-6K tokens).
 
     Slice 131 P2a: when ``stable_prefix_out`` is provided AND
-    ``JARVIS_PROMPT_PREFIX_CACHE_ENABLED`` is on, the STABLE tool catalog +
-    output schema are diverted into ``stable_prefix_out`` (for the caller to fold
-    into the cached system prefix) instead of the volatile user prompt. Default
-    (no sink / flag off) is byte-identical legacy behavior.
+    (``JARVIS_PROMPT_PREFIX_CACHE_ENABLED`` is on OR ``force_prefix_split`` is
+    True), the STABLE tool catalog + output schema are diverted into
+    ``stable_prefix_out`` (for the caller to fold into the cached system prefix)
+    instead of the volatile user prompt. Default (no sink / flag off) is
+    byte-identical legacy behavior.
+
+    ``force_prefix_split`` lets a provider that owns its OWN prompt-cache master
+    flag (DoubleWord: ``JARVIS_DW_PROMPT_CACHE_ENABLED``) request the split
+    without the operator also having to flip the global
+    ``JARVIS_PROMPT_PREFIX_CACHE_ENABLED``. Claude never passes it, so the
+    Claude path stays gated exactly as before.
 
     Unlike ``_build_codegen_prompt`` which front-loads full file contents,
     import context, test context, and expanded context into a single
@@ -2877,7 +2902,7 @@ Rules:
     # (byte-identical legacy: tool section then schema).
     _route_stable_tail(
         parts, stable_prefix_out, _tool_section, schema_instruction,
-        enabled=_prompt_prefix_cache_enabled(),
+        enabled=_prompt_prefix_cache_enabled() or bool(force_prefix_split),
     )
 
     # ── 8a. Slice 20 Phase 3 — DW zero-candidate prohibition ────────────
@@ -3085,6 +3110,7 @@ def _build_codegen_prompt(
     repair_context: Optional[Any] = None,
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
     provider_route: str = "",
+    preloaded_out: Optional[List[str]] = None,
 ) -> str:
     """Build an enriched codegen prompt with file contents, context, and schema.
 
@@ -3093,6 +3119,18 @@ def _build_codegen_prompt(
     strategic-memory block, and emits the appropriate output schema
     specification: schema_version 2b.1 for single-repo operations and
     schema_version 2c.1 for cross-repo operations.
+
+    ``preloaded_out`` (optional): when provided, every ``target_files`` entry
+    whose real on-disk content was actually embedded into ``file_sections``
+    (i.e. not a ``BlockedPathError`` skip and not a nonexistent/new file) is
+    appended to it. This mirrors ``_build_lean_codegen_prompt``'s
+    ``preloaded_out`` contract so callers on the full-prompt path (DW batch,
+    BACKGROUND/SPECULATIVE routes that never run the Venom tool loop) can
+    report genuine preloaded-prompt exploration credit — the model really did
+    see this file's content, it just arrived via the full builder instead of
+    the lean tool-first one. Without this, a route that structurally skips
+    the tool loop AND uses the full builder had no way to ever satisfy the
+    Iron Gate's exploration floor.
 
     Parameters
     ----------
@@ -3226,6 +3264,8 @@ def _build_codegen_prompt(
             )
 
         file_sections.append(f"{header}\n```\n{truncated}\n```")
+        if preloaded_out is not None and abs_path.is_file():
+            preloaded_out.append(str(raw_path))
 
     # ── 2. Discover surrounding context (import sources + tests) ────────
     context_parts: List[str] = []
@@ -5468,8 +5508,32 @@ class PrimeProvider:
                 len(prompt), len(prompt) // 4, len(_preloaded_files),
             )
         else:
-            prompt = _build_codegen_prompt(
-                context,
+            # fs-hot-tier Phase 2 (audit row 4, 2026-07-02):
+            # ``_build_codegen_prompt`` reaches
+            # ``_find_context_files``'s uncached
+            # ``tests_dir.rglob("test_*.py")`` on EVERY GENERATE for
+            # this provider — the confirmed "every-GENERATE" HOT
+            # caller chain. ``_build_codegen_prompt`` itself is used
+            # synchronously by 100+ existing tests and 5 other
+            # provider call sites (doubleword_provider.py), so its
+            # public sync contract is untouched (AST-identical body);
+            # only THIS call site is routed through the substrate —
+            # the whole sync call runs off the loop thread via the
+            # shared ``advisor-blast`` thread pool (syscall-bound:
+            # file reads + rglob, no need for a process pool). A
+            # genuine business exception raised inside
+            # ``_build_codegen_prompt`` (e.g. the deliberate
+            # ``prompt_too_large`` RuntimeError) is NOT a "crawl
+            # failure" the substrate should swallow — on
+            # ``OffloadError`` we retry the identical call inline
+            # synchronously so that exception propagates exactly as
+            # it did pre-Phase-2 (rare path; only fires on genuine
+            # failure, never on the common success path).
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
+            _prompt_kwargs = dict(
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
                 tools_enabled=self._tools_enabled,
@@ -5478,6 +5542,23 @@ class PrimeProvider:
                 mcp_tools=_mcp_tools,
                 provider_route=getattr(context, "provider_route", "") or "",
             )
+            _prompt_result = await offload(
+                _build_codegen_prompt,
+                context,
+                cpu_bound=False,
+                **_prompt_kwargs,
+            )
+            if is_offload_error(_prompt_result):
+                logger.debug(
+                    "[ClaudeProvider] _build_codegen_prompt offload "
+                    "degraded (%s: %s) — retrying inline "
+                    "synchronously so genuine business exceptions "
+                    "(e.g. prompt_too_large) still propagate",
+                    _prompt_result.exc_type, _prompt_result.message,
+                )
+                prompt = _build_codegen_prompt(context, **_prompt_kwargs)
+            else:
+                prompt = _prompt_result
         accumulated_chars = len(prompt)
         tool_rounds = 0
         start = time.monotonic()
@@ -6654,13 +6735,10 @@ class ClaudeProvider:
             os.environ.get("JARVIS_CLAUDE_PROMPT_CACHE_ENABLED", "true").lower()
             not in ("false", "0", "no", "off")
         )
-        try:
-            self._prompt_cache_min_chars = max(
-                0,
-                int(os.environ.get("JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS", "0")),
-            )
-        except ValueError:
-            self._prompt_cache_min_chars = 0
+        # DRY: shared floor-parse helper (also consumed by DoublewordProvider).
+        self._prompt_cache_min_chars = prompt_cache_min_chars(
+            "JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS", 0
+        )
 
         # Cumulative cache telemetry — surfaced via get_cache_stats() and
         # logged periodically so operators can verify the savings path is
@@ -9877,8 +9955,23 @@ class ClaudeProvider:
                 len(_preloaded_files),
             )
         else:
-            prompt_text = _build_codegen_prompt(
-                context,
+            # fs-hot-tier Phase 2 (audit row 4, 2026-07-02): THE
+            # confirmed "every GENERATE" caller chain
+            # (ClaudeProvider.generate -> _assemble_codegen_prompt ->
+            # _build_codegen_prompt -> _find_context_files's uncached
+            # tests_dir.rglob("test_*.py")). This method is already
+            # async (extracted for the S1 cache-key seam), so the
+            # substrate offload slots in directly — no signature
+            # changes needed here. ``_build_codegen_prompt`` itself
+            # stays untouched (100+ existing sync callers). A genuine
+            # business exception (e.g. prompt_too_large) must still
+            # propagate, so an OffloadError retries the identical
+            # call inline synchronously rather than being swallowed.
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
+            _prompt_kwargs = dict(
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
                 tools_enabled=self._tools_enabled,
@@ -9889,6 +9982,25 @@ class ClaudeProvider:
                     context, "provider_route", "",
                 ) or "",
             )
+            _prompt_result = await offload(
+                _build_codegen_prompt,
+                context,
+                cpu_bound=False,
+                **_prompt_kwargs,
+            )
+            if is_offload_error(_prompt_result):
+                logger.debug(
+                    "[ClaudeAPI] _build_codegen_prompt offload "
+                    "degraded (%s: %s) — retrying inline "
+                    "synchronously so genuine business exceptions "
+                    "(e.g. prompt_too_large) still propagate",
+                    _prompt_result.exc_type, _prompt_result.message,
+                )
+                prompt_text = _build_codegen_prompt(
+                    context, **_prompt_kwargs,
+                )
+            else:
+                prompt_text = _prompt_result
         return prompt_text, _mcp_tools, _preloaded_files
 
     def _finalize_codegen_result(

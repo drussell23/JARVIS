@@ -263,11 +263,28 @@ class ExplorationFleet:
         try:
             explorer = ExplorationSubagent(root)
 
-            # Find entry files in the scope
+            # Find entry files in the scope.
+            #
+            # Tier-2 batch 2 row 13 — this is exploration_fleet's OWN
+            # crawl (separate from ExplorationSubagent.explore's internal
+            # rglob, which row 12 already offloads). N of these fire
+            # concurrently via asyncio.create_task fan-out in deploy(),
+            # each against a distinct scope_dir and its own local
+            # entry_files list — no shared mutable buffer across fanned
+            # tasks, so no cross-contamination risk here. Routed through
+            # the shared advisor-blast thread pool; fail-soft on error.
             scope_dir = root / agent.scope
             entry_files = []
             if scope_dir.exists():
-                for py in scope_dir.glob("*.py"):
+                from backend.core.ouroboros.governance.cooperative_fs_io import (
+                    is_offload_error,
+                    offload,
+                )
+                result = await offload(
+                    lambda d=scope_dir: sorted(d.glob("*.py")),
+                )
+                scope_py_files = [] if is_offload_error(result) else result
+                for py in scope_py_files:
                     if py.name != "__init__.py":
                         entry_files.append(
                             str(py.relative_to(root))

@@ -164,7 +164,7 @@ class StrategicDirectionService:
     def is_loaded(self) -> bool:
         return self._loaded
 
-    def format_for_prompt(
+    async def format_for_prompt(
         self,
         *,
         target_files: Optional[Sequence[str]] = None,
@@ -174,6 +174,18 @@ class StrategicDirectionService:
         record_id: Optional[str] = None,
     ) -> str:
         """Format the digest for injection into strategic_memory_prompt.
+
+        Async (fs-hot-tier Phase 2, 2026-07-02): the dev-memory,
+        rust-subsystems, and action-outcomes sub-sections each
+        perform a synchronous filesystem crawl (``crawl_memory`` /
+        ``crawl_rust_subsystems`` / ``recall_for_region``). This was
+        the CONFIRMED per-op loop-thread stall (41s on
+        ``crawl_rust_subsystems`` alone) — every one of these three
+        sub-renderers now routes its crawl through the
+        ``cooperative_fs_io.offload`` substrate. The two production
+        callers (``classify_runner.run``, ``orchestrator._run_pipeline``)
+        were already ``async def`` one hop above this method, so this
+        is an await-insertion, not a chain rewrite.
 
         Appends the current ``StrategicPosture`` section when
         ``JARVIS_DIRECTION_INFERRER_ENABLED`` and
@@ -242,7 +254,7 @@ class StrategicDirectionService:
         # context sits closest to the model's first-attempt
         # generation point — recency-of-attention favors what
         # comes last in the prompt.
-        action_outcomes_block = self._render_action_outcomes_section(
+        action_outcomes_block = await self._render_action_outcomes_section(
             target_files=target_files,
         )
         if action_outcomes_block:
@@ -253,7 +265,7 @@ class StrategicDirectionService:
         # advisory-only discipline as the blocks above. Placed BEFORE
         # causal lineage so the decision-graph context remains closest
         # to the model's first-attempt generation point (per below).
-        dev_memory_block = self._render_dev_memory_section(op_id=op_id)
+        dev_memory_block = await self._render_dev_memory_section(op_id=op_id)
         if dev_memory_block:
             body = f"{body}\n\n{dev_memory_block}"
         # Priority-4 — Rust subsystem awareness map. Surfaces the
@@ -261,7 +273,7 @@ class StrategicDirectionService:
         # reaches for Venom tools on .rs. Placed AFTER dev-memory and
         # BEFORE causal lineage, preserving the recency design
         # (causal stays closest to the generation point).
-        rust_map_block = self._render_rust_subsystems_section(op_id=op_id)
+        rust_map_block = await self._render_rust_subsystems_section(op_id=op_id)
         if rust_map_block:
             body = f"{body}\n\n{rust_map_block}"
         # Slice 101 — Recently-Failing Areas (Adaptive Intelligence
@@ -374,7 +386,7 @@ class StrategicDirectionService:
         except Exception:  # noqa: BLE001 — advisory injection is best-effort
             return ""
 
-    def _render_dev_memory_section(
+    async def _render_dev_memory_section(
         self, op_id: Optional[str] = None,
     ) -> str:
         """Compose the optional ``## Recent Developer Memory`` block.
@@ -386,6 +398,18 @@ class StrategicDirectionService:
         — no glob duplication — then ranks fragments by ``mtime``
         (most recent first) and accumulates ``title`` + ``summary``
         under an env-tunable char + file-count budget.
+
+        fs-hot-tier Phase 2 (2026-07-02): ``crawl_memory`` does a
+        directory glob + per-file read + SHA-256 + title scan — CPU
+        work after the scan, not just syscalls — so the ENTIRE sync
+        crawl body is routed through
+        ``cooperative_fs_io.offload(crawl_memory, ..., cpu_bound=True)``
+        (a bounded ``ProcessPoolExecutor``, not a thread — a thread
+        would still hold the GIL for the SHA-256/title-scan CPU work).
+        ``crawl_memory`` itself is untouched (byte-identical body,
+        AST-pinned) — only the call site changes. An ``OffloadError``
+        degrades to the same empty-section result as "no fragments
+        found" (never raises into prompt composition).
 
         Discipline (mirrors the codebase-character / failure-mode
         additive sections, load-bearing):
@@ -413,6 +437,10 @@ class StrategicDirectionService:
             from backend.core.ouroboros.roadmap.source_crawlers import (
                 crawl_memory,
             )
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
         except ImportError:
             return ""
         try:
@@ -422,7 +450,17 @@ class StrategicDirectionService:
             max_files = int(os.environ.get(
                 "JARVIS_STRATEGIC_DEV_MEMORY_MAX_FILES", "8",
             ))
-            fragments = crawl_memory(self._root)
+            _crawl_result = await offload(
+                crawl_memory, self._root, cpu_bound=True,
+            )
+            if is_offload_error(_crawl_result):
+                logger.debug(
+                    "[Strategic] dev-memory crawl offload degraded "
+                    "(%s: %s) — degrading to empty section",
+                    _crawl_result.exc_type, _crawl_result.message,
+                )
+                return ""
+            fragments = _crawl_result
             if not fragments:
                 return ""
             # Recency-ranked: newest mtime first (the crawler already
@@ -475,7 +513,7 @@ class StrategicDirectionService:
             )
             return ""
 
-    def _render_rust_subsystems_section(
+    async def _render_rust_subsystems_section(
         self, op_id: Optional[str] = None,
     ) -> str:
         """Compose the optional ``## Rust Subsystems`` block.
@@ -490,6 +528,18 @@ class StrategicDirectionService:
         Explicitly does NOT change the Oracle: the structural graph
         stays Python-only. The block states that plainly so the model
         does not expect blast-radius / call-graph for ``.rs`` yet.
+
+        fs-hot-tier Phase 2 (2026-07-02) — THE #1 FIX. This was the
+        CONFIRMED 41s loop-thread blocker (``crawl_rust_subsystems``
+        walking the whole repo for ``Cargo.toml`` + parsing every
+        manifest/README). ``crawl_rust_subsystems``'s body (including
+        its load-bearing in-place ``dirnames[:]`` prune, preserved
+        byte-identically) is now routed ENTIRELY through
+        ``cooperative_fs_io.offload(..., cpu_bound=True)`` — a bounded
+        ``ProcessPoolExecutor``, because the walk is followed by
+        ``tomllib``/regex parsing (CPU work a thread wouldn't free the
+        GIL for). An ``OffloadError`` degrades to the same empty
+        section as "no crates found" — never raises into the prompt.
 
         Discipline (mirrors :meth:`_render_dev_memory_section`,
         load-bearing):
@@ -512,6 +562,10 @@ class StrategicDirectionService:
             from backend.core.ouroboros.roadmap.source_crawlers import (
                 crawl_rust_subsystems,
             )
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
         except ImportError:
             return ""
         try:
@@ -521,7 +575,17 @@ class StrategicDirectionService:
             max_crates = int(os.environ.get(
                 "JARVIS_STRATEGIC_RUST_MAX_CRATES", "12",
             ))
-            fragments = crawl_rust_subsystems(self._root)
+            _crawl_result = await offload(
+                crawl_rust_subsystems, self._root, cpu_bound=True,
+            )
+            if is_offload_error(_crawl_result):
+                logger.debug(
+                    "[Strategic] rust-map crawl offload degraded "
+                    "(%s: %s) — degrading to empty section",
+                    _crawl_result.exc_type, _crawl_result.message,
+                )
+                return ""
+            fragments = _crawl_result
             if not fragments:
                 return ""
             fragments = sorted(
@@ -651,12 +715,23 @@ class StrategicDirectionService:
             return ""
 
     @staticmethod
-    def _render_action_outcomes_section(
+    async def _render_action_outcomes_section(
         *,
         target_files: Optional[Sequence[str]],
     ) -> str:
         """Compose the optional ``## Recent Region Outcomes``
         block (M11 Slice 4 / PRD §30.5.3).
+
+        fs-hot-tier Phase 2 (2026-07-02): ``recall_for_region`` (and
+        the ``read_all_action_outcomes`` iterdir it falls back to
+        when no cluster resolves) is a syscall-dominated flat-dir
+        scan — the whole synchronous call is routed through
+        ``cooperative_fs_io.offload(..., cpu_bound=False)`` (the
+        shared thread pool). ``recall_for_region`` itself is
+        untouched (byte-identical, still directly callable
+        synchronously by its other callers) — only this call site
+        changes. An ``OffloadError`` degrades to the same empty
+        section as "no matches" — never raises into the prompt.
 
         Discipline (load-bearing — mirrors failure-modes / posture
         / codebase-character):
@@ -691,12 +766,26 @@ class StrategicDirectionService:
                 publish_action_outcome_recalled,
                 recall_for_region,
             )
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
         except ImportError:
             return ""
         try:
-            matches = recall_for_region(
+            _recall_result = await offload(
+                recall_for_region,
                 target_files=target_files,
+                cpu_bound=False,
             )
+            if is_offload_error(_recall_result):
+                logger.debug(
+                    "[Strategic] action-outcomes recall offload "
+                    "degraded (%s: %s) — degrading to empty section",
+                    _recall_result.exc_type, _recall_result.message,
+                )
+                return ""
+            matches = _recall_result
             if not matches:
                 return ""
             section = compose_action_outcomes_section(

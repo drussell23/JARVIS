@@ -61,6 +61,12 @@ Usage::
     python3 scripts/isomorphic_a1_local.py --stub-soak --mode container
     python3 scripts/isomorphic_a1_local.py                           # live soak
     python3 scripts/isomorphic_a1_local.py --enable-failover         # opt in to real GCE
+    python3 scripts/isomorphic_a1_local.py --dw-session-budget 0.50  # DW rehearsal mode:
+                                                                      # DW is a live generation
+                                                                      # lane for the APPLY tail
+                                                                      # instead of the default
+                                                                      # $0 multi-vector-awaken
+                                                                      # starve scenario.
 """
 from __future__ import annotations
 
@@ -535,7 +541,10 @@ def _expected_agentic_cycle_s() -> float:
 
 
 def _failover_soak_wall(enable_failover: bool) -> int:
-    """Return the soak-child wall-clock budget in seconds.
+    """Return the DOCUMENTED LEGACY soak-child wall-clock budget in seconds --
+    the fallback used ONLY when the composed env carries no explicit
+    ``OUROBOROS_BATTLE_MAX_WALL_SECONDS`` (see ``_composed_soak_wall_s``,
+    the single source of truth for the actual wall handed to SoakRunner).
 
     enable_failover=False -> 300 (byte-identical default).
     enable_failover=True  -> READY_BUDGET_S + _expected_agentic_cycle_s() --
@@ -547,6 +556,63 @@ def _failover_soak_wall(enable_failover: bool) -> int:
         return 300
     budget = _env_float("JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0)
     return int(budget + _expected_agentic_cycle_s())
+
+
+def _composed_soak_wall_s(env: Dict[str, str], enable_failover: bool) -> float:
+    """Single source of truth for the soak child's wall-clock budget
+    (bt-iso-1783036735): reads ``OUROBOROS_BATTLE_MAX_WALL_SECONDS`` back from
+    the ALREADY-COMPOSED ``env`` dict -- never re-parses ``os.environ``
+    directly, since ``compose_env()`` is the one place operator/ignition
+    inheritance happens (dict(os.environ) at its base). Every consumer that
+    needs this scenario's wall (``SoakRunner.wall_seconds``,
+    ``JARVIS_A1_ROUTER_READY_TIMEOUT_S`` derivation, operator-visible
+    logging) MUST call this one helper so they can never disagree.
+
+    Root cause this closes: the soak-child wall was previously computed
+    TWICE independently -- once here (correct, composed-env-aware) for the
+    router-readiness derivation, and once again at the SoakRunner
+    construction seam via a bare ``_failover_soak_wall(self.enable_failover)``
+    call that ignored the composed env entirely and silently collapsed
+    non-failover runs to the 300s legacy default regardless of an operator's
+    explicit ``--max-wall-seconds 5000`` (bt-iso-1783036735: soak child
+    SIGTERMed ~6min after boot despite a 5000s budget).
+
+    Malformed / zero / missing -> fail LOUD (never silent) + fall back to
+    the documented legacy default (``_failover_soak_wall``).
+    """
+    legacy_default = float(_failover_soak_wall(enable_failover))
+    raw = env.get("OUROBOROS_BATTLE_MAX_WALL_SECONDS", "").strip()
+    if not raw:
+        return legacy_default
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        _log(
+            "WARN OUROBOROS_BATTLE_MAX_WALL_SECONDS=%r is not numeric -- "
+            "falling back to legacy default %ds" % (raw, int(legacy_default))
+        )
+        return legacy_default
+    if parsed <= 0:
+        _log(
+            "WARN OUROBOROS_BATTLE_MAX_WALL_SECONDS=%r must be > 0 -- "
+            "falling back to legacy default %ds" % (raw, int(legacy_default))
+        )
+        return legacy_default
+    return parsed
+
+
+def _derive_router_ready_timeout_s(wall_seconds: float) -> float:
+    """Wall-Scaled Router-Readiness Cap (bt-iso-1783035104): the roadmap
+    daemon's intake-router readiness gate (``JARVIS_A1_ROUTER_READY_TIMEOUT_S``,
+    ``governed_loop_service.await_router_ready``) trips its circuit breaker when
+    intake-router boot exceeds the cap -- a flat 60s default is too tight for a
+    scenario whose composed wall legitimately needs a longer cold boot (e.g. a
+    large stale-checkpoint backlog before TTL expiry reaps it, or any other
+    boot-latency-inflating condition). The driver owns the scenario's physics,
+    so the cap SCALES with the scenario's wall (1/8th of it) rather than a
+    hardcoded constant -- floored at the legacy 60s default so short scenarios
+    are byte-identical."""
+    return max(60.0, float(wall_seconds) / 8.0)
 
 
 def _probe_api_tags(url: str) -> int:
@@ -916,6 +982,7 @@ class IsomorphicA1Driver:
         adversary_fault: Optional[str] = None,
         verbose: bool = False,
         enable_failover: bool = False,
+        dw_session_budget: float = 0.0,
         # Injection seam for tests: a zero-arg callable that returns an adversary
         # instance.  None -> use the real SyntheticAdversary from adversary_mod.
         _adversary_factory: Optional[Any] = None,
@@ -930,6 +997,16 @@ class IsomorphicA1Driver:
         self.adversary_fault: Optional[str] = adversary_fault
         self.verbose: bool = verbose
         self.enable_failover: bool = enable_failover
+        # DW rehearsal budget (root cause: scripts/isomorphic_a1_local.py hardcoded
+        # cost_cap=0.0 at the SoakRunner launch, which flows into the battle-test
+        # cost-cap env consumed by session_budget_authority.get_session_remaining_usd()
+        # (Tier 2), producing a $0 SessionBudgetPreflightRefused on every DW dispatch.
+        # That starve IS the intended multi-vector-awaken forcing function in failover
+        # runs -- but without --enable-failover it leaves the organism with ZERO live
+        # providers. Default 0.0 preserves that legacy starve scenario byte-identical;
+        # a nonzero value opts into DW as a live generation lane for the APPLY tail
+        # (the sanctioned DW-powered rehearsal mode).
+        self.dw_session_budget: float = dw_session_budget
         self._adversary_factory: Optional[Any] = _adversary_factory
 
     async def run(self) -> int:
@@ -995,6 +1072,23 @@ class IsomorphicA1Driver:
                 # CADENCE_POLICY) + adversary overrides.
                 env: Dict[str, str] = harness_mod.compose_env()
                 env.update(adversary.env_overrides())
+
+                # Wall-Scaled Router-Readiness Cap (bt-iso-1783035104): derive
+                # JARVIS_A1_ROUTER_READY_TIMEOUT_S from THIS scenario's composed
+                # wall rather than the flat 60s default -- the driver owns the
+                # scenario's physics. OUROBOROS_BATTLE_MAX_WALL_SECONDS may
+                # already be inherited from the operator's shell (compose_env()
+                # copies os.environ); otherwise fall back to the same wall this
+                # soak child is bound to (_failover_soak_wall). Operator env
+                # ALWAYS wins -- setdefault, never override. _composed_soak_wall_s
+                # is the SINGLE reader of this value (bt-iso-1783036735) -- the
+                # SoakRunner launch seam below reuses the SAME number, never a
+                # second independent computation.
+                _composed_wall_s = _composed_soak_wall_s(env, self.enable_failover)
+                env.setdefault(
+                    "JARVIS_A1_ROUTER_READY_TIMEOUT_S",
+                    str(_derive_router_ready_timeout_s(_composed_wall_s)),
+                )
 
                 # Safety pin: prevent a local fidelity run from triggering a real
                 # GCE awaken attempt.  The any-route outage window has no time-decay,
@@ -1168,16 +1262,28 @@ class IsomorphicA1Driver:
                     else:
                         _log("STEP soak: launching production O+V (pre-inject boot) "
                              "iso_cwd=%s" % iso_cwd)
+                        # bt-iso-1783036735: reuse the SAME _composed_wall_s computed
+                        # above for JARVIS_A1_ROUTER_READY_TIMEOUT_S -- do NOT call
+                        # _failover_soak_wall() again here. That second, independent
+                        # call ignored the composed OUROBOROS_BATTLE_MAX_WALL_SECONDS
+                        # entirely and silently collapsed every non-failover run to
+                        # the 300s legacy default regardless of an operator's
+                        # explicit --max-wall-seconds (the ~6min SIGTERM root cause).
+                        _soak_wall_s = int(_composed_wall_s)
                         if self.enable_failover:
                             _log("[HybridMesh] soak-child wall extended to %ds "
                                  "(32B cold-start: readiness %ds + margin)" % (
-                                     _failover_soak_wall(True),
+                                     _soak_wall_s,
                                      int(_env_float(
                                          "JARVIS_HYBRID_MESH_READY_BUDGET_S", 900.0))))
+                        else:
+                            _log("[Wall] soak-child wall = %ds (composed from "
+                                 "OUROBOROS_BATTLE_MAX_WALL_SECONDS, legacy "
+                                 "default 300s)" % (_soak_wall_s,))
                         soak_runner = harness_mod.SoakRunner(
                             repo_root=self.repo_root,
-                            cost_cap=0.0,
-                            wall_seconds=_failover_soak_wall(self.enable_failover),
+                            cost_cap=self.dw_session_budget,
+                            wall_seconds=_soak_wall_s,
                         )
                         # Register for process-group teardown (finally+atexit+signal)
                         # BEFORE launch so a crash mid-launch still reaps the group.
@@ -1238,6 +1344,47 @@ class IsomorphicA1Driver:
                         _log("[HybridMesh] L7 readiness gate -> %s"
                              % ("SERVING" if _served else "TIMEOUT"))
 
+                    # ── Bind the audit invocation to ACTUAL soak-child completion ──
+                    #
+                    # THE BUG: the audit used to fire on a fixed ~5min post-boot
+                    # ceiling (_a1_audit_ceiling_s) while the soak child was STILL
+                    # RUNNING (chains not yet complete) -- stale FAILED verdicts.
+                    # THE FIX: the driver already has the process handle it will
+                    # eventually SIGTERM-wait in teardown (SoakRunner.stop() /
+                    # _reap_soak_runners()) -- reuse that SAME existing primitive
+                    # (Popen.wait, a single bounded call, no sleep loop) HERE, so
+                    # the audit only ever sees a COMPLETE debug.log. Bounded by the
+                    # child's own wall-clock cap (+ grace) -- the harness's
+                    # watchdog thread (Watchdog Isolation Invariant, Slice 47)
+                    # guarantees the child exits by then, so this never hangs.
+                    # Offloaded to a thread (run_in_executor) so the blocking
+                    # Popen.wait() does NOT starve this driver's OWN event loop --
+                    # the co-located SyntheticAdversary aiohttp server runs on
+                    # that SAME loop and must keep serving the child's requests
+                    # throughout the wait.
+                    if soak_proc is not None:
+                        import subprocess as _subprocess_mod  # noqa: PLC0415
+                        _wait_budget_s = float(_soak_wall_s) + 30.0
+                        _log("STEP await soak-child exit (bind audit to ACTUAL "
+                             "completion, budget=%.0fs) -- no more stale FAILED "
+                             "verdicts from a fixed post-boot audit window"
+                             % _wait_budget_s)
+                        try:
+                            await asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: soak_proc.wait(timeout=_wait_budget_s),
+                            )
+                            _log("STEP soak-child exited (rc=%s)"
+                                 % (soak_proc.returncode,))
+                        except _subprocess_mod.TimeoutExpired:
+                            _log("WARN soak-child did not exit within "
+                                 "wall(%.0fs)+30s grace -- auditing whatever the "
+                                 "log currently holds (should not happen; the "
+                                 "child's own wall-clock watchdog guarantees "
+                                 "exit)" % (_soak_wall_s,))
+                        except Exception as exc:  # noqa: BLE001
+                            _log("soak-child wait warning: %r" % (exc,))
+
                     # ── Fast-Fail short-circuit: a global L4 capacity wall means the
                     # cognitive loop can NEVER reach APPLIED this run. Skip the audit
                     # ceiling entirely, emit a capacity verdict, and flow to teardown
@@ -1262,7 +1409,13 @@ class IsomorphicA1Driver:
                             aud_runner = harness_mod.StubAuditorRunner(
                                 strict=self.strict, goal_id="GOAL-ISO-A1")
                         else:
-                            aud_runner = harness_mod.AuditorRunner(strict=self.strict)
+                            # replay=True: we just waited for the soak-child to
+                            # ACTUALLY exit (above) -- this is now a static
+                            # replay of a COMPLETE, finished session log, not a
+                            # live concurrent audit.
+                            aud_runner = harness_mod.AuditorRunner(
+                                strict=self.strict, replay=True,
+                            )
 
                         verdict = aud_runner.watch(
                             base=self.sse_base,
@@ -1402,6 +1555,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "(default: JARVIS_FAILOVER_LIFECYCLE_ENABLED=false is pinned in "
              "child env to prevent accidental GCE spend).",
     )
+    p.add_argument(
+        "--dw-session-budget",
+        type=float,
+        default=float(os.environ.get("JARVIS_ISO_DW_SESSION_BUDGET_USD", "0.0")),
+        help="DW rehearsal mode: session budget in USD threaded into the soak "
+             "child's cost-cap (env: JARVIS_ISO_DW_SESSION_BUDGET_USD, default: "
+             "0.0). Default 0.0 preserves the legacy $0 multi-vector-awaken "
+             "starve scenario byte-identical; a nonzero value makes DW a live "
+             "generation lane for the APPLY tail (the sanctioned DW-powered "
+             "rehearsal mode) instead of a forced provider starve.",
+    )
     return p
 
 
@@ -1428,6 +1592,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
         verbose=args.verbose,
         enable_failover=args.enable_failover,
+        dw_session_budget=args.dw_session_budget,
     )
     return asyncio.run(driver.run())
 

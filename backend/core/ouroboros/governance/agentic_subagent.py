@@ -218,7 +218,7 @@ class AgenticExploreSubagent:
                 f"budget exhausted before start (remaining={timeout_s:.2f}s)"
             )
 
-        entry_files = self._resolve_entry_files(ctx)
+        entry_files = await self._resolve_entry_files(ctx)
 
         backbone = ExplorationSubagent(self._root)
 
@@ -237,7 +237,7 @@ class AgenticExploreSubagent:
                 f"deterministic exploration exceeded timeout={timeout_s:.2f}s"
             ) from e
 
-    def _resolve_entry_files(self, ctx: SubagentContext) -> tuple:
+    async def _resolve_entry_files(self, ctx: SubagentContext) -> tuple:
         """Return a non-empty entry-file tuple, guarding the backbone's bug.
 
         Resolution order:
@@ -249,15 +249,31 @@ class AgenticExploreSubagent:
 
         Step 3's LLM-driven mode will replace this with the model's own
         entry-file selection.
+
+        Tier-2 batch 2 row 11 — both filesystem crawls (``scope_dir.rglob``
+        and ``self._root.glob``) are routed through the
+        ``cooperative_fs_io`` substrate's shared advisor-blast thread pool
+        so this subagent-dispatch entry never rglobs the repo synchronously
+        on the asyncio main loop. Fail-soft: an ``OffloadError`` degrades
+        to the same empty-list result the synchronous path produced on
+        any error, never raises.
         """
         if ctx.request.target_files:
             return tuple(ctx.request.target_files)
+
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error,
+            offload,
+        )
 
         # Try scope_path directory listing.
         if ctx.scope_path:
             scope_dir = self._root / ctx.scope_path
             if scope_dir.is_dir():
-                py_files = sorted(scope_dir.rglob("*.py"))
+                result = await offload(
+                    lambda d=scope_dir: sorted(d.rglob("*.py")),
+                )
+                py_files = [] if is_offload_error(result) else result
                 if py_files:
                     # Return up to 5 relative paths so the BFS starts somewhere.
                     return tuple(
@@ -271,7 +287,11 @@ class AgenticExploreSubagent:
             return ("README.md",)
 
         # Last-ditch: first *.py found at the repo root.
-        for py in sorted(self._root.glob("*.py")):
+        result = await offload(
+            lambda r=self._root: sorted(r.glob("*.py")),
+        )
+        root_py_files = [] if is_offload_error(result) else result
+        for py in root_py_files:
             return (str(py.relative_to(self._root)),)
 
         return ()

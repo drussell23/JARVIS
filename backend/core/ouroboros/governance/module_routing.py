@@ -150,11 +150,20 @@ def _extract_title(content: str, path: Path) -> str:
     return path.stem.replace("_", " ").replace("-", " ").title()
 
 
-def _load_topic_fragments(topics_dir: Path, project_root: Path) -> List[TopicFragment]:
-    """Recursively load all ``.md`` files under *topics_dir* as TopicFragments.
+def _load_topic_fragments_worker(
+    topics_dir_str: str, project_root_str: str,
+) -> List[TopicFragment]:
+    """Module-level worker for :func:`_load_topic_fragments`.
 
-    Returns an empty list if the directory does not exist.  Never raises.
+    Dispatched into the shared ``advisor-blast`` thread pool via
+    ``cooperative_fs_io.offload`` (fs-hot-tier Batch 3, row 21). Lifted
+    to module level so the offload trampoline doesn't capture any
+    caller-local state. Returns ``[]`` if the directory does not
+    exist. NEVER raises — a single unreadable/malformed topic file is
+    skipped, matching the original per-file fail-soft semantics.
     """
+    topics_dir = Path(topics_dir_str)
+    project_root = Path(project_root_str)
     if not topics_dir.is_dir():
         return []
 
@@ -188,6 +197,42 @@ def _load_topic_fragments(topics_dir: Path, project_root: Path) -> List[TopicFra
             logger.debug("[ModuleRouter] skipping topic file %s (read error)", md_file, exc_info=True)
 
     return fragments
+
+
+async def _load_topic_fragments(
+    topics_dir: Path, project_root: Path,
+) -> List[TopicFragment]:
+    """Recursively load all ``.md`` files under *topics_dir* as TopicFragments.
+
+    Returns an empty list if the directory does not exist. NEVER
+    raises.
+
+    fs-hot-tier Batch 3 (row 21): the rglob + per-file read is
+    dispatched off the asyncio loop via
+    ``cooperative_fs_io.offload(cpu_bound=False)`` — thread pool (read
+    + light parse is IO-bound). Fail-soft: an ``OffloadError``
+    degrades to ``[]``, the same empty result a missing/empty topics
+    dir gives.
+    """
+    if not topics_dir.is_dir():
+        return []
+
+    from backend.core.ouroboros.governance.cooperative_fs_io import (
+        offload,
+        is_offload_error,
+    )
+    result = await offload(
+        _load_topic_fragments_worker,
+        str(topics_dir), str(project_root),
+        cpu_bound=False,
+    )
+    if is_offload_error(result):
+        logger.debug(
+            "[ModuleRouter] _load_topic_fragments offload failed — "
+            "degrading to empty list",
+        )
+        return []
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +609,7 @@ class ModuleContextRouter:
     # Public method
     # ------------------------------------------------------------------
 
-    def route(
+    async def route(
         self,
         target_files: List[str],
         query: str,
@@ -597,7 +642,7 @@ class ModuleContextRouter:
             return RoutedContext.empty()
 
         try:
-            return self._route_impl(target_files, query, max_topics, token_budget)
+            return await self._route_impl(target_files, query, max_topics, token_budget)
         except Exception:  # noqa: BLE001 — advisory path, never break pipeline
             logger.warning("[ModuleRouter] route() failed — returning empty context", exc_info=True)
             return RoutedContext.empty()
@@ -606,7 +651,7 @@ class ModuleContextRouter:
     # Internal implementation
     # ------------------------------------------------------------------
 
-    def _route_impl(
+    async def _route_impl(
         self,
         target_files: List[str],
         query: str,
@@ -614,7 +659,7 @@ class ModuleContextRouter:
         token_budget: int,
     ) -> RoutedContext:
         # 1. Load topic fragments
-        all_topics = _load_topic_fragments(self._topics_dir, self._project_root)
+        all_topics = await _load_topic_fragments(self._topics_dir, self._project_root)
         if not all_topics:
             return RoutedContext.empty()
 

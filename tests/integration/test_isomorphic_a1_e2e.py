@@ -71,6 +71,8 @@ OpLineageGraph = _auditor.OpLineageGraph
 _driver_mod = _load_script("isomorphic_a1_local")
 _touch_chaos_files = _driver_mod._touch_chaos_files
 _derive_scoped_test_targets = _driver_mod._derive_scoped_test_targets
+_derive_router_ready_timeout_s = _driver_mod._derive_router_ready_timeout_s
+_failover_soak_wall = _driver_mod._failover_soak_wall
 IsomorphicA1Driver = _driver_mod.IsomorphicA1Driver
 
 
@@ -941,6 +943,436 @@ class TestSubprocessIsomorphismPropagation:
             "JARVIS_ADVERSARY_SIMULATE_ZERO_SHOT=1 is set; got %r" % zs_calls
         )
 
+    # ------------------------------------------------------------------
+    # 4e2. Wall-Scaled Router-Readiness Cap (bt-iso-1783035104)
+    # ------------------------------------------------------------------
+
+    def test_router_ready_timeout_composed_when_unset(self, tmp_path: Path) -> None:
+        """When JARVIS_A1_ROUTER_READY_TIMEOUT_S is NOT already set by the
+        operator, the driver composes it as max(60, wall/8) from the scenario's
+        wall (_failover_soak_wall) -- the driver owns the scenario's physics,
+        not a flat 60s constant."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19997/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _CapturingChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _CapturingAuditor:
+            def watch(self, **kwargs: Any) -> Dict[str, Any]:
+                vpath = kwargs.get("verdict_out", "")
+                v: Dict[str, Any] = {"proven": False, "failure_locus": "test"}
+                if vpath:
+                    Path(vpath).parent.mkdir(parents=True, exist_ok=True)
+                    Path(vpath).write_text(json.dumps(v))
+                return v
+
+        original_compose = harness_mod.compose_env
+        env_ref: List[Dict[str, str]] = []
+
+        def _capturing_compose(**kwargs: Any) -> Dict[str, str]:
+            env = original_compose(**kwargs)
+            env.pop("JARVIS_A1_ROUTER_READY_TIMEOUT_S", None)  # ensure genuinely unset
+            env.pop("OUROBOROS_BATTLE_MAX_WALL_SECONDS", None)
+            env_ref.append(env)
+            return env
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=True,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,  # -> _failover_soak_wall(False) == 300
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        with (
+            patch(
+                "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                return_value=_NoopEnv(),
+            ),
+            patch.object(harness_mod, "compose_env", _capturing_compose),
+            patch.object(harness_mod, "ChaosController", lambda **kw: _CapturingChaos()),
+            patch.object(harness_mod, "StubAuditorRunner", lambda **kw: _CapturingAuditor()),
+        ):
+            import asyncio
+            asyncio.run(driver.run())
+
+        assert env_ref, "compose_env must have been called"
+        final_env = env_ref[0]
+        expected = _derive_router_ready_timeout_s(_failover_soak_wall(False))
+        assert float(final_env.get("JARVIS_A1_ROUTER_READY_TIMEOUT_S", "-1")) == expected, (
+            "Driver must compose JARVIS_A1_ROUTER_READY_TIMEOUT_S=max(60, wall/8) "
+            "when unset; got %r (expected %r)"
+            % (final_env.get("JARVIS_A1_ROUTER_READY_TIMEOUT_S"), expected)
+        )
+
+    def test_router_ready_timeout_respects_operator_override(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        """An operator-set JARVIS_A1_ROUTER_READY_TIMEOUT_S must survive
+        composition untouched (setdefault semantics, never override)."""
+        monkeypatch.setenv("JARVIS_A1_ROUTER_READY_TIMEOUT_S", "12345")
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19996/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _CapturingChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _CapturingAuditor:
+            def watch(self, **kwargs: Any) -> Dict[str, Any]:
+                vpath = kwargs.get("verdict_out", "")
+                v: Dict[str, Any] = {"proven": False, "failure_locus": "test"}
+                if vpath:
+                    Path(vpath).parent.mkdir(parents=True, exist_ok=True)
+                    Path(vpath).write_text(json.dumps(v))
+                return v
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=True,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        with (
+            patch(
+                "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                return_value=_NoopEnv(),
+            ),
+            patch.object(harness_mod, "ChaosController", lambda **kw: _CapturingChaos()),
+            patch.object(harness_mod, "StubAuditorRunner", lambda **kw: _CapturingAuditor()),
+        ):
+            import asyncio
+            asyncio.run(driver.run())
+
+        # The operator's value must ride through os.environ -> compose_env's
+        # dict(os.environ) base -> untouched by the driver's setdefault.
+        assert os.environ.get("JARVIS_A1_ROUTER_READY_TIMEOUT_S") == "12345"
+
+    def test_derive_router_ready_timeout_s_formula(self) -> None:
+        """Pure-function proof of the max(60, wall/8) formula."""
+        assert _derive_router_ready_timeout_s(300) == 60.0     # floored at legacy 60s
+        assert _derive_router_ready_timeout_s(480) == 60.0     # 480/8 == 60, boundary
+        assert _derive_router_ready_timeout_s(2400) == 300.0   # 2400/8 == 300
+        assert _derive_router_ready_timeout_s(4800) == 600.0
+
+    # ------------------------------------------------------------------
+    # 4f. --dw-session-budget default is 0.0 when env unset (legacy pin)
+    # ------------------------------------------------------------------
+
+    def test_dw_session_budget_default_zero_when_env_unset(
+        self, monkeypatch: Any,
+    ) -> None:
+        """With JARVIS_ISO_DW_SESSION_BUDGET_USD unset, --dw-session-budget
+        must default to 0.0 -- preserving the legacy $0 multi-vector-awaken
+        starve scenario byte-identical (root cause: run bt-iso-1783033231)."""
+        monkeypatch.delenv("JARVIS_ISO_DW_SESSION_BUDGET_USD", raising=False)
+        parser = _driver_mod.build_arg_parser()
+        args = parser.parse_args([])
+        assert args.dw_session_budget == 0.0, (
+            "Default --dw-session-budget must be 0.0 when "
+            "JARVIS_ISO_DW_SESSION_BUDGET_USD is unset; got %r"
+            % (args.dw_session_budget,)
+        )
+
+    # ------------------------------------------------------------------
+    # 4g. JARVIS_ISO_DW_SESSION_BUDGET_USD sets the --dw-session-budget default
+    # ------------------------------------------------------------------
+
+    def test_dw_session_budget_env_sets_default(self, monkeypatch: Any) -> None:
+        """JARVIS_ISO_DW_SESSION_BUDGET_USD=0.25 must become the
+        --dw-session-budget default when the flag is not passed on argv."""
+        monkeypatch.setenv("JARVIS_ISO_DW_SESSION_BUDGET_USD", "0.25")
+        parser = _driver_mod.build_arg_parser()
+        args = parser.parse_args([])
+        assert args.dw_session_budget == 0.25, (
+            "JARVIS_ISO_DW_SESSION_BUDGET_USD=0.25 must set the "
+            "--dw-session-budget default; got %r" % (args.dw_session_budget,)
+        )
+
+    # ------------------------------------------------------------------
+    # 4h. --dw-session-budget reaches the SoakRunner cost_cap launch seam
+    # ------------------------------------------------------------------
+
+    async def test_dw_session_budget_reaches_soak_runner_cost_cap(
+        self, tmp_path: Path,
+    ) -> None:
+        """--dw-session-budget 0.50 must flow all the way to
+        harness_mod.SoakRunner(cost_cap=0.50) -- the exact seam that fed the
+        hardcoded cost_cap=0.0 root cause (scripts/isomorphic_a1_local.py:1179,
+        pre-fix). Non-stub (stub_soak=False) is required to reach this seam."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        captured_kwargs: List[Dict[str, Any]] = []
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19997/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _CapturingChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _SpySoakRunner:
+            """Records the launch kwargs, then aborts before any real process
+            spawns -- the broad except at the orchestration try/except
+            (isomorphic_a1_local.py) swallows this and returns rc=1, so we
+            never need to mock the auditor or subprocess machinery."""
+            def __init__(self, **kwargs: Any) -> None:
+                captured_kwargs.append(kwargs)
+                raise RuntimeError("capture-only — abort before real soak launch")
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=False,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,
+            dw_session_budget=0.50,
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        with (
+            patch(
+                "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                return_value=_NoopEnv(),
+            ),
+            patch.object(harness_mod, "ChaosController", lambda **kw: _CapturingChaos()),
+            patch.object(harness_mod, "SoakRunner", _SpySoakRunner),
+        ):
+            rc = await driver.run()
+
+        assert rc == 1, "Spy-forced RuntimeError must surface as rc=1 (caught, not raised)"
+        assert captured_kwargs, "harness_mod.SoakRunner must have been constructed"
+        assert captured_kwargs[0].get("cost_cap") == 0.50, (
+            "--dw-session-budget 0.50 must reach SoakRunner(cost_cap=0.50); "
+            "got kwargs=%r" % (captured_kwargs[0],)
+        )
+
+    # ------------------------------------------------------------------
+    # 4i. Composed OUROBOROS_BATTLE_MAX_WALL_SECONDS reaches SoakRunner
+    #     (bt-iso-1783036735: soak child SIGTERMed ~6min despite
+    #     --max-wall-seconds 5000 -- the wall was computed TWICE
+    #     independently and the SoakRunner seam ignored the composed one)
+    # ------------------------------------------------------------------
+
+    def _run_soak_wall_scenario(
+        self,
+        tmp_path: Path,
+        harness_mod: Any,
+        wall_env_value: "Optional[str]",
+    ) -> Any:
+        """Shared driver-run scaffold for the composed-wall tests below.
+
+        Patches ``compose_env`` to inject ``wall_env_value`` for
+        ``OUROBOROS_BATTLE_MAX_WALL_SECONDS`` directly into the RETURNED
+        composed-env dict (bypassing the unrelated linux_prod overlay's own
+        static 3600s default, which env.update()-clobbers whatever the
+        process env carries -- a separate, pre-existing, intentional
+        precedence rule documented in compose_env()'s own docstring, not
+        part of this seam). ``None`` leaves the key genuinely absent.
+        Returns the list of kwargs SoakRunner was constructed with.
+        """
+        captured_kwargs: List[Dict[str, Any]] = []
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19997/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _CapturingChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _SpySoakRunner:
+            def __init__(self, **kwargs: Any) -> None:
+                captured_kwargs.append(kwargs)
+                raise RuntimeError("capture-only — abort before real soak launch")
+
+        original_compose = harness_mod.compose_env
+
+        def _compose_with_wall(**kwargs: Any) -> Dict[str, str]:
+            env = original_compose(**kwargs)
+            if wall_env_value is None:
+                env.pop("OUROBOROS_BATTLE_MAX_WALL_SECONDS", None)
+            else:
+                env["OUROBOROS_BATTLE_MAX_WALL_SECONDS"] = wall_env_value
+            return env
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=False,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        async def _drive() -> int:
+            with (
+                patch(
+                    "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                    return_value=_NoopEnv(),
+                ),
+                patch.object(harness_mod, "compose_env", _compose_with_wall),
+                patch.object(harness_mod, "ChaosController", lambda **kw: _CapturingChaos()),
+                patch.object(harness_mod, "SoakRunner", _SpySoakRunner),
+            ):
+                return await driver.run()
+
+        return _drive, captured_kwargs
+
+    async def test_composed_wall_reaches_soak_runner_non_failover(
+        self, tmp_path: Path,
+    ) -> None:
+        """An explicit OUROBOROS_BATTLE_MAX_WALL_SECONDS=5000 in the composed
+        env dict (the ONE compose_env() returns to the driver -- the single
+        source of truth the mandate names) MUST reach
+        harness_mod.SoakRunner(wall_seconds=5000) even in non-failover mode --
+        NOT silently collapse to the 300s legacy default."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        _drive, captured_kwargs = self._run_soak_wall_scenario(
+            tmp_path, harness_mod, "5000"
+        )
+        rc = await _drive()
+
+        assert rc == 1, "Spy-forced RuntimeError must surface as rc=1 (caught, not raised)"
+        assert captured_kwargs, "harness_mod.SoakRunner must have been constructed"
+        assert captured_kwargs[0].get("wall_seconds") == 5000, (
+            "OUROBOROS_BATTLE_MAX_WALL_SECONDS=5000 must reach "
+            "SoakRunner(wall_seconds=5000) in non-failover mode, not silently "
+            "collapse to the 300s legacy default; got kwargs=%r"
+            % (captured_kwargs[0],)
+        )
+
+    async def test_composed_wall_malformed_falls_back_loudly(
+        self, tmp_path: Path, capsys: Any,
+    ) -> None:
+        """A malformed OUROBOROS_BATTLE_MAX_WALL_SECONDS (non-numeric) must
+        NOT crash the driver and must NOT silently propagate -- it falls back
+        to the documented legacy default (300s, non-failover) with a loud
+        WARN log line."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        _drive, captured_kwargs = self._run_soak_wall_scenario(
+            tmp_path, harness_mod, "not-a-number"
+        )
+        rc = await _drive()
+
+        assert rc == 1
+        assert captured_kwargs, "harness_mod.SoakRunner must have been constructed"
+        assert captured_kwargs[0].get("wall_seconds") == 300, (
+            "Malformed OUROBOROS_BATTLE_MAX_WALL_SECONDS must fall back to "
+            "the 300s legacy default (non-failover); got kwargs=%r"
+            % (captured_kwargs[0],)
+        )
+        out = capsys.readouterr().out
+        assert "OUROBOROS_BATTLE_MAX_WALL_SECONDS" in out and "not-a-number" in out, (
+            "Malformed value must be logged LOUDLY (never silent); captured "
+            "stdout=%r" % (out,)
+        )
+
+    async def test_composed_wall_zero_falls_back_loudly(
+        self, tmp_path: Path, capsys: Any,
+    ) -> None:
+        """OUROBOROS_BATTLE_MAX_WALL_SECONDS=0 must NOT silently produce a
+        zero-second (instant-kill) soak wall -- it falls back to the
+        documented legacy default with a loud WARN log line."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        _drive, captured_kwargs = self._run_soak_wall_scenario(
+            tmp_path, harness_mod, "0"
+        )
+        rc = await _drive()
+
+        assert rc == 1
+        assert captured_kwargs, "harness_mod.SoakRunner must have been constructed"
+        assert captured_kwargs[0].get("wall_seconds") == 300, (
+            "OUROBOROS_BATTLE_MAX_WALL_SECONDS=0 must fall back to the 300s "
+            "legacy default (non-failover), never a 0s instant-kill wall; "
+            "got kwargs=%r" % (captured_kwargs[0],)
+        )
+        out = capsys.readouterr().out
+        assert "OUROBOROS_BATTLE_MAX_WALL_SECONDS" in out and "0" in out, (
+            "Zero value must be logged LOUDLY (never silent); captured "
+            "stdout=%r" % (out,)
+        )
+
 
 # ===========================================================================
 # Group 5 -- Script invocation (subprocess): catches unit-green/live-fails gap
@@ -1320,4 +1752,161 @@ class TestBootWaitEventLoopYield:
             "isomorphic_a1_local.py must not contain any time.sleep() calls. "
             "All waits in the adversary-serving window must use "
             "'await asyncio.sleep()' so the SyntheticAdversary keeps serving."
+        )
+
+
+# ===========================================================================
+# Group 8 -- Audit-at-teardown sequencing (STEP audit bound to soak-child exit)
+# ===========================================================================
+
+
+class TestAuditAtTeardownSequencing:
+    """The driver used to invoke STEP audit on a fixed ~5min post-boot
+    ceiling (_a1_audit_ceiling_s) while the soak child was STILL RUNNING --
+    stale FAILED verdicts, because the chain hadn't finished yet.
+
+    The fix: bind the audit invocation to the soak child's ACTUAL exit,
+    reusing the existing process-wait primitive (Popen.wait -- the SAME one
+    SoakRunner.stop()/_reap_soak_runners() already use in teardown), offloaded
+    via run_in_executor so it does not starve the co-located SyntheticAdversary
+    event loop. These tests prove: (1) the wait happens BEFORE the audit is
+    invoked, and (2) the completed-session audit runs in --replay mode.
+    """
+
+    def _scaffold(self, tmp_path: Path, harness_mod: Any):
+        """Build a full non-stub driver run that reaches the real STEP audit
+        invocation (unlike the existing SpySoakRunner tests, which abort
+        before the soak ever launches)."""
+        call_order: List[str] = []
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19997/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _CapturingChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _FakeProc:
+            """Fake Popen handle. .wait() records call order + a fake pid."""
+            def __init__(self) -> None:
+                self.pid = 4242
+                self.returncode: "Optional[int]" = None
+
+            def poll(self) -> "Optional[int]":
+                return self.returncode
+
+            def wait(self, timeout: "Optional[float]" = None) -> int:
+                call_order.append("proc.wait")
+                self.returncode = 0
+                return 0
+
+        debug_log = tmp_path / "session" / "debug.log"
+        debug_log.parent.mkdir(parents=True, exist_ok=True)
+        debug_log.write_text("boot complete\n", encoding="utf-8")
+        fake_proc = _FakeProc()
+
+        class _FakeSoakHandle:
+            def __init__(self) -> None:
+                self.debug_log = str(debug_log)
+                self.session_dir = str(debug_log.parent)
+                self.proc = fake_proc
+
+        class _FakeSoakRunner:
+            def __init__(self, **kwargs: Any) -> None:
+                pass
+            def launch(self, env: Dict[str, str], run_dir: str) -> Any:
+                return _FakeSoakHandle()
+            def stop(self) -> None:
+                pass
+
+        class _SpyAuditorRunner:
+            def __init__(self, **kwargs: Any) -> None:
+                self.kwargs = kwargs
+                _captured_auditor_kwargs.append(kwargs)
+            def watch(self, **kwargs: Any) -> Dict[str, Any]:
+                call_order.append("auditor.watch")
+                return {"proven": True, "criteria": {}}
+
+        _captured_auditor_kwargs: List[Dict[str, Any]] = []
+
+        async def _fake_await_soak_boot(proc: Any, log: str, timeout_s: float = 90.0) -> bool:
+            return True
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=False,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,
+            dw_session_budget=0.0,
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        patches = [
+            patch(
+                "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                return_value=_NoopEnv(),
+            ),
+            patch.object(harness_mod, "ChaosController", lambda **kw: _CapturingChaos()),
+            patch.object(harness_mod, "SoakRunner", _FakeSoakRunner),
+            patch.object(harness_mod, "AuditorRunner", _SpyAuditorRunner),
+            patch.object(_driver_mod, "_await_soak_boot", _fake_await_soak_boot),
+        ]
+        return driver, patches, call_order, _captured_auditor_kwargs, fake_proc
+
+    async def test_soak_proc_wait_happens_before_audit_invocation(
+        self, tmp_path: Path,
+    ) -> None:
+        """Popen.wait() must be called BEFORE AuditorRunner.watch() -- the
+        audit must never fire while the soak child could still be running."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        driver, patches, call_order, _auditor_kwargs, _proc = self._scaffold(
+            tmp_path, harness_mod,
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            rc = await driver.run()
+
+        assert "proc.wait" in call_order, "soak-child wait must have been invoked"
+        assert "auditor.watch" in call_order, "the auditor must still run"
+        assert call_order.index("proc.wait") < call_order.index("auditor.watch"), (
+            "audit must be invoked AFTER the soak child exits, not on a fixed "
+            "post-boot ceiling; got order=%r" % (call_order,)
+        )
+        assert rc == 0
+
+    async def test_audit_invoked_in_replay_mode_after_completion(
+        self, tmp_path: Path,
+    ) -> None:
+        """Once the driver waits for the ACTUAL soak-child completion, the
+        audit is a static replay of a finished session -- AuditorRunner must
+        be constructed with replay=True."""
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        driver, patches, _call_order, auditor_kwargs, _proc = self._scaffold(
+            tmp_path, harness_mod,
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            await driver.run()
+
+        assert auditor_kwargs, "AuditorRunner must have been constructed"
+        assert auditor_kwargs[0].get("replay") is True, (
+            "post-completion audit must run in --replay mode; got kwargs=%r"
+            % (auditor_kwargs[0],)
         )

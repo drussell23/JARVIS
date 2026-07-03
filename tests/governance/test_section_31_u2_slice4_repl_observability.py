@@ -122,14 +122,14 @@ def test_dispatch_does_not_raise_on_garbage():
 # ---------------------------------------------------------------------------
 
 
-def test_repl_dispatch_registry_routes_causal():
+async def test_repl_dispatch_registry_routes_causal():
     """§32.11 Slice 4 naming-cage: file ends `_repl.py` →
     verb `/causal` → routes WITHOUT any edit to
     repl_dispatch_registry.py."""
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch,
     )
-    r = try_dispatch("/causal help")
+    r = await try_dispatch("/causal help")
     assert r.matched is True
     assert r.ok is True
     assert "causal-lineage browser" in r.text

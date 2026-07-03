@@ -142,7 +142,7 @@ def _fresh_ctx(
 # ---------------------------------------------------------------------------
 
 
-def test_integration_real_postmortem_lands_in_composed_prompt(
+async def test_integration_real_postmortem_lands_in_composed_prompt(
     monkeypatch, tmp_path, caplog,
 ):
     """End-to-end: real ``_inject_postmortem_recall_impl`` against a real
@@ -159,7 +159,7 @@ def test_integration_real_postmortem_lands_in_composed_prompt(
     assert ctx_in.strategic_memory_prompt == ""  # pre-condition
 
     with caplog.at_level("INFO", logger="backend.core.ouroboros.governance.orchestrator"):
-        ctx_out = _inject_postmortem_recall_impl(ctx_in)
+        ctx_out = await _inject_postmortem_recall_impl(ctx_in)
 
     # Composition landed:
     assert ctx_out is not ctx_in, "frozen dataclass — rebind expected on match"
@@ -191,7 +191,7 @@ def test_integration_real_postmortem_lands_in_composed_prompt(
     assert rec.get("schema_version") == "postmortem_recall.1"
 
 
-def test_integration_no_postmortems_returns_ctx_unchanged(
+async def test_integration_no_postmortems_returns_ctx_unchanged(
     monkeypatch, tmp_path,
 ):
     """Empty sessions dir → recall returns []; helper short-circuits;
@@ -204,7 +204,7 @@ def test_integration_no_postmortems_returns_ctx_unchanged(
     _install_singleton_with_stub_embedder(sessions_dir, ledger_path)
 
     ctx_in = _fresh_ctx(existing_prompt="PRE_EXISTING")
-    ctx_out = _inject_postmortem_recall_impl(ctx_in)
+    ctx_out = await _inject_postmortem_recall_impl(ctx_in)
 
     assert ctx_out is ctx_in, "no matches → no rebind"
     assert ctx_out.strategic_memory_prompt == "PRE_EXISTING"
@@ -216,7 +216,7 @@ def test_integration_no_postmortems_returns_ctx_unchanged(
 # ---------------------------------------------------------------------------
 
 
-def _invoke_with_stubbed_section(
+async def _invoke_with_stubbed_section(
     monkeypatch,
     *,
     rendered_section: str,
@@ -227,7 +227,7 @@ def _invoke_with_stubbed_section(
     contract from the recall service's internals."""
 
     class _StubService:
-        def recall_for_op(self, _signature):
+        async def recall_for_op(self, _signature):
             return [object()]  # non-empty → triggers render
 
     def _stub_get_default_service():
@@ -247,36 +247,36 @@ def _invoke_with_stubbed_section(
         _stub_render,
     )
     ctx_in = _fresh_ctx(existing_prompt=existing_prompt)
-    return _inject_postmortem_recall_impl(ctx_in)
+    return await _inject_postmortem_recall_impl(ctx_in)
 
 
-def test_concat_contract_preserves_section_verbatim(monkeypatch):
+async def test_concat_contract_preserves_section_verbatim(monkeypatch):
     """Stub renders an exact section; concat keeps every byte."""
     section = (
         "## Lessons from prior similar ops\n"
         "- op=op-stub-001 phase=GENERATE root_cause=stub_cause\n"
         "  next_safe_action=stub_action"
     )
-    ctx_out = _invoke_with_stubbed_section(monkeypatch, rendered_section=section)
+    ctx_out = await _invoke_with_stubbed_section(monkeypatch, rendered_section=section)
     assert section in ctx_out.strategic_memory_prompt
     assert "op-stub-001" in ctx_out.strategic_memory_prompt
     assert "stub_cause" in ctx_out.strategic_memory_prompt
 
 
-def test_concat_contract_double_newline_when_existing_present(monkeypatch):
+async def test_concat_contract_double_newline_when_existing_present(monkeypatch):
     """Separator invariant: ``existing + "\\n\\n" + section``."""
     section = "## Lessons from prior similar ops\n- op=stub phase=APPLY"
-    ctx_out = _invoke_with_stubbed_section(
+    ctx_out = await _invoke_with_stubbed_section(
         monkeypatch, rendered_section=section, existing_prompt="PREV_BLOCK",
     )
     assert ctx_out.strategic_memory_prompt == f"PREV_BLOCK\n\n{section}"
 
 
-def test_concat_contract_no_separator_when_existing_empty(monkeypatch):
+async def test_concat_contract_no_separator_when_existing_empty(monkeypatch):
     """When existing is empty, section stands alone — no leading
     ``\\n\\n`` that would break subsequent composition (e.g. SemanticIndex)."""
     section = "## Lessons from prior similar ops\n- op=stub phase=APPLY"
-    ctx_out = _invoke_with_stubbed_section(
+    ctx_out = await _invoke_with_stubbed_section(
         monkeypatch, rendered_section=section, existing_prompt="",
     )
     assert ctx_out.strategic_memory_prompt == section
@@ -288,25 +288,25 @@ def test_concat_contract_no_separator_when_existing_empty(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_master_off_helper_returns_ctx_unchanged(monkeypatch, tmp_path):
+async def test_master_off_helper_returns_ctx_unchanged(monkeypatch, tmp_path):
     """``JARVIS_POSTMORTEM_RECALL_ENABLED`` unset → ``get_default_service``
     returns None → helper short-circuits → ctx returned unchanged."""
     monkeypatch.delenv("JARVIS_POSTMORTEM_RECALL_ENABLED", raising=False)
     reset_default_service()
 
     ctx_in = _fresh_ctx(existing_prompt="UNTOUCHED")
-    ctx_out = _inject_postmortem_recall_impl(ctx_in)
+    ctx_out = await _inject_postmortem_recall_impl(ctx_in)
 
     assert ctx_out is ctx_in
     assert ctx_out.strategic_memory_prompt == "UNTOUCHED"
 
 
-def test_helper_swallows_recall_service_exception(monkeypatch, caplog):
+async def test_helper_swallows_recall_service_exception(monkeypatch, caplog):
     """Helper must never raise: any exception inside the recall path is
     caught + logged DEBUG; ctx returned unchanged. Authority invariant
     per PRD §12.2: best-effort, never blocks FSM."""
     class _BoomService:
-        def recall_for_op(self, _signature):
+        async def recall_for_op(self, _signature):
             raise RuntimeError("intentional test boom")
 
     monkeypatch.setattr(
@@ -318,7 +318,7 @@ def test_helper_swallows_recall_service_exception(monkeypatch, caplog):
     # Root-level DEBUG capture — orchestrator helper logs at DEBUG which
     # caplog only catches when the root level is dropped.
     with caplog.at_level("DEBUG"):
-        ctx_out = _inject_postmortem_recall_impl(ctx_in)
+        ctx_out = await _inject_postmortem_recall_impl(ctx_in)
 
     # Authority invariant: helper never raises, never mutates ctx on error.
     assert ctx_out is ctx_in
@@ -371,6 +371,39 @@ def test_run_pipeline_calls_postmortem_recall_helper():
     )
 
 
+def test_run_pipeline_awaits_postmortem_recall_helper():
+    """fs-hot-tier Batch 3 (row 19) await-guard: the call site must be
+    an ``await`` expression — ``_inject_postmortem_recall_impl`` is now
+    ``async def`` (it internally awaits the offloaded gather+embed
+    call). A missed ``await`` would silently hand ``ctx`` a coroutine
+    object instead of the rebuilt OperationContext."""
+    tree = _orchestrator_ast()
+
+    run_pipeline_node = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_pipeline":
+            run_pipeline_node = node
+            break
+    assert run_pipeline_node is not None
+
+    found_awaited_call = False
+    for node in ast.walk(run_pipeline_node):
+        if not isinstance(node, ast.Await):
+            continue
+        inner = node.value
+        if (
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "_inject_postmortem_recall_impl"
+        ):
+            found_awaited_call = True
+            break
+    assert found_awaited_call, (
+        "_run_pipeline calls _inject_postmortem_recall_impl without "
+        "'await'."
+    )
+
+
 def test_helper_body_wires_pm_section_into_strategic_memory():
     """``_inject_postmortem_recall_impl`` body must contain a call to
     ``ctx.with_strategic_memory_context`` whose ``strategic_memory_prompt``
@@ -383,7 +416,7 @@ def test_helper_body_wires_pm_section_into_strategic_memory():
     helper_node = None
     for node in ast.walk(tree):
         if (
-            isinstance(node, ast.FunctionDef)
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name == "_inject_postmortem_recall_impl"
         ):
             helper_node = node

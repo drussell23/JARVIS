@@ -74,9 +74,15 @@ def _matches(line: str) -> bool:
     )
 
 
-def dispatch_story_command(
+async def dispatch_story_command(
     line: str,
 ) -> StoryReplDispatchResult:
+    """Parse and dispatch a ``/story`` line. ``async`` because
+    ``/story session`` awaits :func:`session_story.aggregate_session_story`
+    directly (fs-hot-tier Batch 3 made the underlying
+    ``LastSessionSummary.load`` async) — the registry
+    (``repl_dispatch_registry.try_dispatch``) awaits this
+    dispatcher on the REPL's live event loop. NEVER raises."""
     if not _matches(line):
         return StoryReplDispatchResult(
             ok=False, text="", matched=False,
@@ -101,7 +107,7 @@ def dispatch_story_command(
 
     try:
         if head == "session":
-            return _render_session(args[1:])
+            return await _render_session(args[1:])
         if head == "crystals":
             return _render_crystals(args[1:])
         return StoryReplDispatchResult(
@@ -131,7 +137,7 @@ def _parse_int(args: List[str], *, default: int) -> int:
         return default
 
 
-def _render_session(
+async def _render_session(
     args: List[str],
 ) -> StoryReplDispatchResult:
     try:
@@ -157,7 +163,7 @@ def _render_session(
             ),
         )
     n = _parse_int(args, default=1)
-    stories = aggregate_session_story(n_sessions=n)
+    stories = await aggregate_session_story(n_sessions=n)
     if not stories:
         return StoryReplDispatchResult(
             ok=True,

@@ -202,7 +202,7 @@ def _arc_weight(numerator: int, denominator: int) -> float:
     return max(0.0, min(1.0, numerator / denominator))
 
 
-def aggregate_session_story(
+async def aggregate_session_story(
     *,
     n_sessions: Optional[int] = None,
 ) -> List[SessionStory]:
@@ -213,6 +213,15 @@ def aggregate_session_story(
       * master flag off
       * no parseable session records
       * canonical substrate unavailable
+
+    fs-hot-tier Batch 3 (row 18) made ``LastSessionSummary.load``
+    async (offloaded rglob). This aggregator is awaited by its
+    ONE caller, ``story_repl.dispatch_story_command`` (itself
+    async, run on the REPL's live event loop) — so it awaits
+    ``load()`` directly rather than bridging through the
+    on-loop-degrading ``load_sync()``. ``load_sync()`` remains
+    available for genuinely off-loop callers (CLI / tests /
+    graduation rigs).
     """
     if not master_enabled():
         return []
@@ -237,7 +246,7 @@ def aggregate_session_story(
         return []
 
     try:
-        records = summary.load(n_sessions=n)
+        records = await summary.load(n_sessions=n)
     except Exception:  # noqa: BLE001
         logger.debug(
             "session_story: load failed", exc_info=True,

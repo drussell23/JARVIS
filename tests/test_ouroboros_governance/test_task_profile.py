@@ -286,3 +286,171 @@ async def test_prime_provider_no_telemetry_passes_none():
 
     assert captured
     assert captured[0].get("task_profile") is None
+
+
+# ---------------------------------------------------------------------------
+# Request-side prefix KV-cache reuse (keep_alive + stable-prefix + cache_prompt)
+# Self-hosted J-Prime analogue of DW prompt caching (prefill-latency win).
+# ---------------------------------------------------------------------------
+
+
+def test_build_payload_no_cache_fields_when_master_off(monkeypatch):
+    """Master OFF (default) → byte-identical legacy body: no keep_alive / cache_prompt."""
+    monkeypatch.delenv("JARVIS_JPRIME_PROMPT_CACHE_ENABLED", raising=False)
+    req = _make_prime_request(system_prompt="STABLE SYSTEM RULES")
+    payload = _build_payload(req)
+    assert "keep_alive" not in payload
+    assert "cache_prompt" not in payload
+
+
+def test_build_payload_master_off_byte_identical(monkeypatch):
+    """The master-OFF payload must equal the payload built with the flag machinery
+    completely absent (proves opt-in adds nothing when off)."""
+    monkeypatch.setenv("JARVIS_JPRIME_PROMPT_CACHE_ENABLED", "false")
+    req = _make_prime_request(system_prompt="S", task_profile=_sample_profile())
+    off = _build_payload(req)
+    assert "keep_alive" not in off and "cache_prompt" not in off
+    # Only the legacy keys are present.
+    assert set(off.keys()) <= {
+        "messages", "max_tokens", "temperature", "model", "metadata",
+        "stop", "task_profile",
+    }
+
+
+def test_build_payload_keep_alive_present_when_cache_enabled(monkeypatch):
+    """Master ON → keep_alive is present in the request body."""
+    monkeypatch.setenv("JARVIS_JPRIME_PROMPT_CACHE_ENABLED", "true")
+    monkeypatch.delenv("JARVIS_JPRIME_KEEP_ALIVE", raising=False)
+    req = _make_prime_request(system_prompt="S")
+    payload = _build_payload(req)
+    assert "keep_alive" in payload
+
+
+def test_build_payload_keep_alive_env_int(monkeypatch):
+    """A purely-numeric keep_alive env is coerced to int (strict int-typed servers)."""
+    monkeypatch.setenv("JARVIS_JPRIME_PROMPT_CACHE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_JPRIME_KEEP_ALIVE", "-1")
+    payload = _build_payload(_make_prime_request(system_prompt="S"))
+    assert payload["keep_alive"] == -1
+    assert isinstance(payload["keep_alive"], int)
+
+
+def test_build_payload_keep_alive_env_duration_string(monkeypatch):
+    """A duration-string keep_alive env is passed through verbatim (Ollama accepts it)."""
+    monkeypatch.setenv("JARVIS_JPRIME_PROMPT_CACHE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_JPRIME_KEEP_ALIVE", "30m")
+    payload = _build_payload(_make_prime_request(system_prompt="S"))
+    assert payload["keep_alive"] == "30m"
+
+
+def test_build_payload_cache_prompt_flag_on(monkeypatch):
+    """Explicit llama.cpp cache_prompt lever ON by default when master ON."""
+    monkeypatch.setenv("JARVIS_JPRIME_PROMPT_CACHE_ENABLED", "true")
+    monkeypatch.delenv("JARVIS_JPRIME_PREFIX_CACHE_ENABLED", raising=False)
+    payload = _build_payload(_make_prime_request(system_prompt="S"))
+    assert payload.get("cache_prompt") is True
+
+
+def test_build_payload_cache_prompt_flag_off_keeps_keepalive(monkeypatch):
+    """cache_prompt lever OFF drops only cache_prompt; keep_alive still present."""
+    monkeypatch.setenv("JARVIS_JPRIME_PROMPT_CACHE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_JPRIME_PREFIX_CACHE_ENABLED", "false")
+    payload = _build_payload(_make_prime_request(system_prompt="S"))
+    assert "cache_prompt" not in payload
+    assert "keep_alive" in payload
+
+
+def test_stable_prefix_first_and_identical_across_volatile(monkeypatch):
+    """The STABLE system prefix is FIRST and byte-identical across two requests
+    whose VOLATILE user content differs (incl. a git-momentum digest). The
+    git-momentum text must NOT leak into the stable system prefix."""
+    monkeypatch.setenv("JARVIS_JPRIME_PROMPT_CACHE_ENABLED", "true")
+    stable = "You are a precise code assistant. Iron-Gate rules. schema 2b.1."
+    momentum = "Recent Development Momentum: feat(a1) x12, fix(dw) x3"
+    p1 = _build_payload(PrimeRequest(
+        prompt="GOAL A\n\n" + momentum, system_prompt=stable))
+    p2 = _build_payload(PrimeRequest(
+        prompt="GOAL B (completely different volatile body)", system_prompt=stable))
+    # Stable prefix first + identical.
+    assert p1["messages"][0]["role"] == "system"
+    assert p1["messages"][0]["content"] == p2["messages"][0]["content"]
+    # Volatile trailing user content differs.
+    assert p1["messages"][-1]["role"] == "user"
+    assert p1["messages"][-1]["content"] != p2["messages"][-1]["content"]
+    # git-momentum digest rides in the volatile user message, NOT the stable prefix.
+    assert momentum not in p1["messages"][0]["content"]
+    assert momentum in p1["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_fail_soft_server_rejects_cache_field(monkeypatch):
+    """A server that REJECTS the cache fields must NOT break generation: the client
+    strips the opt-in fields and retries once with the legacy body."""
+    monkeypatch.setenv("JARVIS_JPRIME_PROMPT_CACHE_ENABLED", "true")
+    from backend.core.prime_client import (
+        PrimeClient, PrimeClientConfig, PrimeRequest,
+    )
+
+    posted_bodies: list[dict] = []
+
+    class _Resp:
+        def __init__(self, status, payload):
+            self.status = status
+            self._payload = payload
+            self.headers = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def text(self):
+            return "cache_prompt: extra fields not permitted"
+
+        async def json(self):
+            return self._payload
+
+    class _Session:
+        def post(self, url, json=None, headers=None):
+            posted_bodies.append(dict(json))
+            # Reject any body carrying the opt-in cache fields; accept legacy.
+            if "cache_prompt" in json or "keep_alive" in json:
+                return _Resp(422, {})
+            return _Resp(200, {"choices": [{"message": {"content": "OK"}}],
+                               "usage": {"total_tokens": 1}})
+
+    class _Pool:
+        def get_session(self):
+            sess = _Session()
+
+            class _CM:
+                async def __aenter__(self_inner):
+                    return sess
+
+                async def __aexit__(self_inner, *a):
+                    return False
+            return _CM()
+
+    class _Circuit:
+        async def record_success(self):
+            pass
+
+        async def record_failure(self):
+            pass
+
+    client = PrimeClient.__new__(PrimeClient)
+    client._config = PrimeClientConfig()
+    client._pool = _Pool()
+    client._circuit = _Circuit()
+    client._initialized = True
+    client._lifecycle = None
+
+    resp = await client._do_execute_request(
+        PrimeRequest(prompt="hi", system_prompt="S"))
+    assert resp.content == "OK"
+    # First POST carried cache fields (rejected); the retry stripped them.
+    assert any("cache_prompt" in b or "keep_alive" in b for b in posted_bodies)
+    assert any(
+        "cache_prompt" not in b and "keep_alive" not in b for b in posted_bodies
+    )

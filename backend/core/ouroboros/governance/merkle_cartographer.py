@@ -972,6 +972,15 @@ class MerkleCartographer:
     async def _walk_and_hash(self) -> MerkleNode:
         """Build the tree by walking ``self._repo_root`` constrained
         to ``self._included`` and ``self._excluded`` filters."""
+        # Local import (not top-level) — this module's authority
+        # posture is AST-pinned to stdlib-only top-level imports
+        # (test_module_top_level_imports_stdlib_only). Composes the
+        # Tier-2 substrate for the per-dir iterdir crawl instead of
+        # holding the loop synchronously.
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error,
+            offload,
+        )
         sem = asyncio.Semaphore(walk_concurrency())
 
         async def _hash_file(abs_path: Path, relpath: str) -> Tuple[str, MerkleNode]:
@@ -1004,12 +1013,17 @@ class MerkleCartographer:
         ) -> MerkleNode:
             children: Dict[str, MerkleNode] = {}
             file_tasks: List[Any] = []
-            try:
-                entries = sorted(abs_dir.iterdir(), key=lambda p: p.name)
-            except OSError:
+            entries_result = await offload(
+                lambda d=abs_dir: sorted(d.iterdir(), key=lambda p: p.name),
+            )
+            if is_offload_error(entries_result):
+                # Same fail-soft shape as the original ``except OSError``
+                # — a vanished/unreadable dir contributes an empty,
+                # stably-hashed node rather than raising.
                 return MerkleNode(
                     relpath=relpath, is_dir=True, hash="",
                 )
+            entries = entries_result
             sub_dirs: List[Tuple[str, Path]] = []
             for entry in entries:
                 if self._is_excluded(entry.name):

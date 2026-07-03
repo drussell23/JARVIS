@@ -98,13 +98,24 @@ class ConversationLedgerObserver:
     def _resolve_session_id() -> str:
         """Resolve the active session_id from SessionManager.
         Falls back to the process-epoch UUID if no session is
-        active or SessionManager is unavailable. NEVER raises."""
+        active or SessionManager is unavailable. NEVER raises.
+
+        fs-hot-tier Phase 2 (audit row 6, 2026-07-02): this observer
+        fires synchronously on EVERY conversation turn (the bridge's
+        observer contract is explicitly sync). Uses
+        ``list_active_cached()`` — a TTL-cached, off-loop-refreshed
+        view — instead of ``list_active()`` directly, so this
+        unconditional per-turn call never runs a synchronous
+        directory scan on the asyncio loop thread. See
+        ``session_manager.py``'s module header for the full
+        rationale.
+        """
         try:
             from backend.core.ouroboros.governance.session_manager import (  # noqa: E501
                 get_session_manager,
             )
             mgr = get_session_manager()
-            active = mgr.list_active()
+            active = mgr.list_active_cached()
             if active:
                 return active[0].session_id
         except Exception:  # noqa: BLE001 — defensive

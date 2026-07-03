@@ -359,7 +359,7 @@ class TestDigestOutcomes:
 
 
 class TestFormatForPromptIntegration:
-    def test_master_off_byte_stable_against_pre_slice_2(
+    async def test_master_off_byte_stable_against_pre_slice_2(
         self, monkeypatch,
     ):
         # When master is off, format_for_prompt output must be
@@ -378,12 +378,12 @@ class TestFormatForPromptIntegration:
                 ._render_codebase_character_section
             ),
         ) as spy:
-            body = svc.format_for_prompt()
+            body = await svc.format_for_prompt()
         # Method called (Slice 2 wired it in) but returned "".
         assert spy.called
         assert "## Codebase Character" not in body
 
-    def test_master_on_with_ready_snapshot_appends_section(
+    async def test_master_on_with_ready_snapshot_appends_section(
         self, monkeypatch,
     ):
         monkeypatch.setenv(
@@ -407,7 +407,7 @@ class TestFormatForPromptIntegration:
             "backend.core.ouroboros.governance.semantic_index.get_default_index",  # noqa: E501
             return_value=fake,
         ):
-            body = svc.format_for_prompt()
+            body = await svc.format_for_prompt()
         assert "## Codebase Character" in body
         # Original sections preserved.
         assert "## Strategic Direction (Manifesto v4)" in body
@@ -420,7 +420,7 @@ class TestFormatForPromptIntegration:
         idx_codebase = body.find("## Codebase Character")
         assert idx_strategic < idx_codebase
 
-    def test_no_digest_short_circuits_no_prompt_path(
+    async def test_no_digest_short_circuits_no_prompt_path(
         self, monkeypatch,
     ):
         # If _digest is empty, format_for_prompt returns "" — never
@@ -433,7 +433,7 @@ class TestFormatForPromptIntegration:
             StrategicDirectionService,
             "_render_codebase_character_section",
         ) as spy:
-            body = svc.format_for_prompt()
+            body = await svc.format_for_prompt()
         assert body == ""
         assert spy.called is False
 

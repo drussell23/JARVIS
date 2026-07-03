@@ -195,6 +195,39 @@ class SessionIndex:
         )
         return self.all_records()
 
+    async def scan_async(self, *, force: bool = False) -> List[SessionRecord]:
+        """Cooperative wrapper around :meth:`scan`.
+
+        Offloads the ENTIRE synchronous scan body (root ``iterdir`` +
+        any per-child ``parse_session_dir`` re-parse, which itself
+        walks each session directory for ``_dir_size`` — see
+        ``session_record.py``) to the shared substrate thread pool via
+        ``cooperative_fs_io.offload``, so an HTTP handler (Tier-2 row
+        26 — ``ide_observability._handle_session_list``) never blocks
+        the asyncio loop on this crawl.
+
+        Fail-soft: an :class:`OffloadError` degrades to an empty list
+        — the same "nothing to show yet" shape a missing/unreadable
+        root already produces synchronously. Never raises.
+
+        The synchronous :meth:`scan` is left untouched for REPL
+        callers (``dispatch_session_command`` and friends), which are
+        plain ``def`` and out of scope for this offload.
+        """
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error,
+            offload,
+        )
+        result = await offload(self.scan, force=force)
+        if is_offload_error(result):
+            logger.debug(
+                "[SessionIndex] scan_async: offload failed (%s) — "
+                "returning empty (degraded) result",
+                result.message,
+            )
+            return []
+        return result
+
     # --- queries --------------------------------------------------------
 
     def get(self, session_id: str) -> Optional[SessionRecord]:

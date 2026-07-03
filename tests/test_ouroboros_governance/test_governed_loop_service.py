@@ -534,6 +534,122 @@ class TestBackgroundTaskLifecycle:
             seen: set[str] = set()
             await service._handle_event_files(seen)  # must not raise
 
+    async def test_handle_event_files_routes_glob_through_offload(self):
+        """(a) Spy: the event-dir glob must route through the Tier-2
+        cooperative_fs_io substrate, not a raw synchronous glob."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import AsyncMock
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopService, GovernedLoopConfig,
+        )
+        import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+        with tempfile.TemporaryDirectory() as ev_dir:
+            ev = Path(ev_dir)
+            config = GovernedLoopConfig(curriculum_enabled=True)
+            service = GovernedLoopService(config=config)
+            service._event_dir = ev
+            service._model_attribution_recorder = AsyncMock()
+
+            calls: list = []
+            real_offload = fsio.offload
+
+            async def _spy_offload(fn, *a, **k):
+                calls.append(1)
+                return await real_offload(fn, *a, **k)
+
+            with patch.object(fsio, "offload", _spy_offload):
+                await service._handle_event_files(set())
+            assert calls, (
+                "_handle_event_files did not route the glob through "
+                "cooperative_fs_io.offload"
+            )
+
+    async def test_handle_event_files_fail_soft_on_offload_error(self):
+        """(c) Fail-soft: an OffloadError degrades to 'no files this
+        tick' instead of raising into the reactor loop."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import AsyncMock
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopService, GovernedLoopConfig,
+        )
+        import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+        with tempfile.TemporaryDirectory() as ev_dir:
+            ev = Path(ev_dir)
+            config = GovernedLoopConfig(curriculum_enabled=True)
+            service = GovernedLoopService(config=config)
+            service._event_dir = ev
+            service._model_attribution_recorder = AsyncMock()
+
+            async def _boom_offload(fn, *a, **k):
+                return fsio.OffloadError(
+                    fn_name="glob", exc_type="OSError",
+                    message="simulated", cpu_bound=False,
+                )
+
+            with patch.object(fsio, "offload", _boom_offload):
+                await service._handle_event_files(set())  # must not raise
+
+    async def test_reactor_event_loop_heartbeat_keeps_ticking_during_slow_glob(self):
+        """Loop-responsiveness: a slow offloaded glob must not stall a
+        concurrently-scheduled heartbeat coroutine — proves the crawl
+        actually left the loop (thread pool), rather than blocking it
+        synchronously inline."""
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest.mock import AsyncMock
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopService, GovernedLoopConfig,
+        )
+        import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+        with tempfile.TemporaryDirectory() as ev_dir:
+            ev = Path(ev_dir)
+            config = GovernedLoopConfig(curriculum_enabled=True)
+            service = GovernedLoopService(config=config)
+            service._event_dir = ev
+            service._model_attribution_recorder = AsyncMock()
+
+            def _slow_glob():
+                time.sleep(0.4)
+                return sorted(ev.glob("*.json"))
+
+            real_offload = fsio.offload
+
+            async def _patched_offload(fn, *a, **k):
+                # Force the glob work itself to be slow (0.4s), while
+                # still routing through the REAL offload() dispatch —
+                # proves the crawl leaves the loop via the substrate's
+                # thread pool rather than blocking inline.
+                return await real_offload(_slow_glob)
+
+            start = time.monotonic()
+            heartbeats: list = []
+
+            async def _heartbeat_task():
+                for _ in range(6):
+                    heartbeats.append(time.monotonic() - start)
+                    await asyncio.sleep(0.05)
+
+            with patch.object(fsio, "offload", _patched_offload):
+                hb_task = asyncio.create_task(_heartbeat_task())
+                await service._handle_event_files(set())
+                await hb_task
+
+            # If the 0.4s glob had blocked the loop synchronously, no
+            # heartbeat tick could land before ~0.4s elapsed. Proving
+            # several heartbeats landed WHILE the offloaded glob was
+            # still in flight demonstrates the loop kept ticking
+            # concurrently (thread-pool offload, not an inline block).
+            early_heartbeats = [t for t in heartbeats if t < 0.35]
+            assert len(early_heartbeats) >= 3, (
+                f"heartbeat starved while glob offloaded: {heartbeats}"
+            )
+
 
 class TestGovernedLoopIntakeRegistryWiring:
     """GovernedLoopService resolves RepoRegistry and exposes it on _repo_registry."""

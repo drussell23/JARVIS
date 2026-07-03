@@ -61,6 +61,87 @@ def test_startup_script_sentinel_uses_custom_model(bake):
 
 
 # --------------------------------------------------------------------------- #
+# Cold-start remediation: keep-alive + hydration-before-sentinel + phase echoes.
+# --------------------------------------------------------------------------- #
+def test_startup_script_sets_ollama_keep_alive_default_minus_one(bake):
+    script = bake.build_startup_script("qwen2.5-coder:7b")
+    # Exported for the nohup path AND baked into the systemd unit for the image.
+    assert "OLLAMA_KEEP_ALIVE=-1" in script
+    assert "ollama.service.d/10-jarvis-keepalive.conf" in script
+    assert 'Environment="OLLAMA_KEEP_ALIVE=-1"' in script
+
+
+def test_startup_script_keep_alive_is_parameterized(bake):
+    script = bake.build_startup_script("qwen2.5-coder:7b", keep_alive="30m")
+    assert "OLLAMA_KEEP_ALIVE=30m" in script
+    assert "OLLAMA_KEEP_ALIVE=-1" not in script  # not hardcoded
+
+
+def test_startup_script_hydrates_with_dummy_generate(bake):
+    script = bake.build_startup_script("qwen2.5-coder:7b")
+    # A real 1-token generate call against the ollama endpoint.
+    assert "/api/generate" in script
+    assert "num_predict" in script
+    # model is substituted into the hydration payload (not hardcoded).
+    assert "qwen2.5-coder:7b" in script
+
+
+def test_startup_script_sentinel_written_after_hydration(bake):
+    """The readiness sentinel MUST be written strictly AFTER the hydration call
+    (never after a bare pull) -- the ordering is the load-bearing invariant."""
+    script = bake.build_startup_script("qwen2.5-coder:7b")
+    hydration_idx = script.index("phase=hydration-start")
+    generate_idx = script.index("/api/generate")
+    # the sentinel write is the redirect of the 'ready ...' line into the path.
+    sentinel_write_idx = script.index("> /var/run/jprime_bake_ready")
+    assert hydration_idx < generate_idx < sentinel_write_idx, (
+        "sentinel must be written after the hydration generate call"
+    )
+    # A failed hydration must NOT write the sentinel (fail-loud, exit 1).
+    assert "hydration generate failed -- NOT writing sentinel" in script
+
+
+def test_startup_script_emits_phase_timestamps(bake):
+    script = bake.build_startup_script("qwen2.5-coder:7b")
+    for phase in (
+        "phase=ollama-serve-up",
+        "phase=pull-start",
+        "phase=pull-done",
+        "phase=hydration-start",
+        "phase=hydration-done",
+        "phase=sentinel-written",
+    ):
+        assert phase in script, f"missing phase instrumentation: {phase}"
+    # millisecond ISO timestamp helper present.
+    assert "date -u +%FT%T.%3NZ" in script
+
+
+def test_startup_script_stays_ascii(bake):
+    bake.build_startup_script("qwen2.5-coder:7b").encode("ascii")
+
+
+# --------------------------------------------------------------------------- #
+# Faster boot disk (arg-driven; default upgraded off pd-balanced).
+# --------------------------------------------------------------------------- #
+def test_create_node_cmd_boot_disk_type_is_arg_driven(bake):
+    args = bake.build_parser().parse_args(
+        ["--project", "p", "--zone", "z", "--boot-disk-type", "hyperdisk-balanced"]
+    )
+    cmd = bake._create_node_cmd(args, "bake-node", "/tmp/sp.sh")
+    assert "--boot-disk-type=hyperdisk-balanced" in cmd
+    # legacy hardcoded pd-balanced must be gone.
+    assert "--boot-disk-type=pd-balanced" not in cmd
+
+
+def test_create_node_cmd_default_boot_disk_is_faster_than_pd_balanced(bake):
+    args = bake.build_parser().parse_args(["--project", "p", "--zone", "z"])
+    cmd = bake._create_node_cmd(args, "bake-node", "/tmp/sp.sh")
+    # default is the faster pd-ssd, NOT the legacy pd-balanced.
+    assert "--boot-disk-type=pd-ssd" in cmd
+    assert "--boot-disk-type=pd-balanced" not in cmd
+
+
+# --------------------------------------------------------------------------- #
 # Validation-verdict parser (the load-bearing lock).
 # --------------------------------------------------------------------------- #
 def test_validation_pass_on_200_with_def(bake):

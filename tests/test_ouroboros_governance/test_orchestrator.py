@@ -122,6 +122,17 @@ def _mock_stack(
     # without an explicit return_value a bare MagicMock is truthy and every
     # pipeline cancels immediately. Force a bool so the cancel check is a no-op.
     stack.governed_loop_service.is_cancel_requested.return_value = False
+    # W3(7) Slice 2 — PhaseDispatcher.dispatch() reads
+    # orchestrator._cancel_token_registry (proxied from
+    # stack.governed_loop_service._cancel_token_registry). Left as a bare
+    # MagicMock, the registry itself AND cancel_token.is_cancelled (another
+    # unconfigured MagicMock attribute) are both truthy, so every dispatched
+    # phase is misdetected as pre-cancelled and short-circuits straight to
+    # POSTMORTEM before GATE/APPLY ever runs. Explicit None matches the
+    # established stub-GLS pattern elsewhere in the suite (e.g.
+    # test_cancel_propagation_slice2.py, test_universal_terminal_postmortem.py)
+    # and keeps this file's pipeline tests exercising the real dispatch path.
+    stack.governed_loop_service._cancel_token_registry = None
     # _publish_outcome() awaits learning_bridge.publish; MagicMock's default
     # return is not awaitable and raises TypeError in POSTMORTEM path.
     stack.learning_bridge = MagicMock()
@@ -772,6 +783,9 @@ class TestContextExpansionPhaseWiring:
         ))
         stack.learning_bridge = None
         stack.canary.record_operation = MagicMock()
+        stack.governed_loop_service.is_cancel_requested.return_value = False
+        # See _mock_stack() above for why this is required post-W3(7) Slice 2.
+        stack.governed_loop_service._cancel_token_registry = None
 
         mock_gen = MagicMock()
         mock_gen.generate = AsyncMock(return_value=GenerationResult(

@@ -353,7 +353,13 @@ class AutoCommitter:
             _root, _branch = _oca.resolve_repo_root_and_branch(
                 self._effective_repo_root()
             )
-            _verdict = _oca.verify_pre_commit(
+            # fs-hot-tier Batch 3 (row 20): commit() is async (runs on
+            # a live event loop) — use the async twin so the governance
+            # hash-cap check awaits the offloaded SHA-256 walk directly
+            # instead of routing through verify_pre_commit's sync
+            # asyncio.run() bridge (which would silently degrade to
+            # DISABLED every time when called from a running loop).
+            _verdict = await _oca.verify_pre_commit_async(
                 _oca.CommitAuthorityContext(
                     channel="autonomous",
                     repo_root=str(
@@ -440,7 +446,7 @@ class AutoCommitter:
                 is_refusal_verdict,
                 verify_governance_state,
             )
-            _manifest_verdict = verify_governance_state(
+            _manifest_verdict = await verify_governance_state(
                 target_files=target_files,
             )
             if is_refusal_verdict(_manifest_verdict.verdict):

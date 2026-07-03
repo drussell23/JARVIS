@@ -52,6 +52,9 @@ Env knobs
   JARVIS_FAILOVER_REST_TIMEOUT_S      default 30.0
   JARVIS_FAILOVER_RUNNING_TIMEOUT_S   default 180.0  (await_running_ip budget)
   JARVIS_FAILOVER_RUNNING_POLL_S      default 5.0    (await_running_ip cadence)
+  JARVIS_FAILOVER_KEEP_VERIFY_BUDGET_S default 600.0 (KEEP-on-MATERIALIZING
+                                       insert-op re-verify budget -- a late
+                                       terminal stockout still rolls the zone)
   GCP_PROJECT_ID / GOOGLE_CLOUD_PROJECT  optional project override (else metadata)
   GCP_ZONE                            optional zone override (else metadata)
 """
@@ -216,10 +219,19 @@ _ENV_META_TIMEOUT = "JARVIS_FAILOVER_METADATA_TIMEOUT_S"
 _ENV_REST_TIMEOUT = "JARVIS_FAILOVER_REST_TIMEOUT_S"
 _ENV_RUNNING_TIMEOUT = "JARVIS_FAILOVER_RUNNING_TIMEOUT_S"
 _ENV_RUNNING_POLL = "JARVIS_FAILOVER_RUNNING_POLL_S"
+_ENV_BOOT_DISK_TYPE = "JARVIS_FAILOVER_BOOT_DISK_TYPE"
 
 _DEFAULT_IMAGE_FAMILY = "jarvis-prime-coder"
 _DEFAULT_NODE_NAME = "jarvis-prime-failover"
 _DEFAULT_MACHINE_TYPE = "e2-highmem-2"
+# Cold-start remediation: the awakened node reads the (baked-in, never re-pulled)
+# model bytes off its boot disk into RAM/VRAM -- that disk-load is the 108-710s
+# tail. Default the awaken boot disk to pd-ssd (far higher sequential throughput
+# than the GCE-default pd-standard). Env-overridable; empty string -> omit the
+# field (legacy GCE default). The node is ephemeral so the per-GB/mo premium is
+# moot. Local SSD is deliberately NOT used here: it is ephemeral and cannot carry
+# a baked image, so a boot-disk upgrade is the simpler high-ROI lever.
+_DEFAULT_BOOT_DISK_TYPE = "pd-ssd"
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +249,18 @@ def _env_float(name: str, default: float, lo: float = 0.1, hi: float = 86400.0) 
     except (TypeError, ValueError):
         v = default
     return max(lo, min(v, hi))
+
+
+def _boot_disk_type() -> str:
+    """Boot-disk type for the awakened node (faster read = faster model load).
+
+    Env-overridable via JARVIS_FAILOVER_BOOT_DISK_TYPE; unset -> pd-ssd default;
+    explicitly empty ("") -> omit the field (legacy GCE-default pd-standard).
+    Read raw (NOT _env_str, which collapses "" back to the default). Never raises."""
+    raw = os.environ.get(_ENV_BOOT_DISK_TYPE)
+    if raw is None:
+        return _DEFAULT_BOOT_DISK_TYPE
+    return raw.strip()
 
 
 def _meta_timeout() -> float:
@@ -288,6 +312,21 @@ def _reap_confirm_clean_streak() -> int:
     return int(_env_float("JARVIS_REAP_CONFIRM_CLEAN_STREAK", 2, lo=1.0, hi=10.0))
 
 
+def _keep_verify_budget_s() -> float:
+    """Re-verification budget (seconds) for a KEEP-on-MATERIALIZING decision.
+
+    KEEP-on-MATERIALIZING is NOT a commit point: GCP can hold an insert op
+    PENDING well past the 90s ``_insert_op_poll_cap_s`` window while the
+    instance already shows STAGING, then terminally FAIL it (live:
+    bt-iso-1783021468 -- op held PENDING ~7min, instance STAGING throughout,
+    then DONE with ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS after our KEEP
+    branch had already stopped the zone-fallback roll). This is a MUCH more
+    generous budget than the initial verify window so a late-arriving
+    terminal failure is caught and the roll can still continue to the next
+    zone instead of wedging the L7 gate on a doomed node."""
+    return _env_float("JARVIS_FAILOVER_KEEP_VERIFY_BUDGET_S", 600.0, lo=0.0, hi=3600.0)
+
+
 def _running_timeout() -> float:
     return _env_float(_ENV_RUNNING_TIMEOUT, 180.0, lo=1.0, hi=3600.0)
 
@@ -314,6 +353,23 @@ def _ondemand_on_stockout_enabled() -> bool:
     capacity in a quota'd region). Default OFF -> Spot-only across zones (prod
     failover stays cheap)."""
     return os.environ.get("JARVIS_FAILOVER_ONDEMAND_ON_STOCKOUT", "false").strip().lower() in ("1", "true", "yes")
+
+
+def _scatter_width() -> int:
+    """Concurrent-wave width for the scatter-gather multi-zone awaken
+    (``JARVIS_FAILOVER_SCATTER_WIDTH``, default 3). The zone chain is consumed W
+    zones at a time; every zone in a wave races concurrently (see
+    ``GCPComputeRest._race_wave``). ``W=1`` is the ROLLBACK path -- it collapses
+    the wave loop in ``create_instance`` to a sequence of single-element waves,
+    each fully awaited before the next is launched, which is byte-equivalent to
+    the legacy one-zone-at-a-time linear chain. Clamped to >=1 (a width of 0
+    would produce an empty wave and busy-loop)."""
+    raw = os.environ.get("JARVIS_FAILOVER_SCATTER_WIDTH", "3")
+    try:
+        width = int(str(raw).strip())
+    except (TypeError, ValueError):
+        width = 3
+    return max(1, width)
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +672,18 @@ class GCPComputeRest:
         project from metadata; sourceImage = the golden-image family; Spot
         scheduling (provisioningModel=SPOT + instanceTerminationAction=DELETE)
         when spot=True, on-demand otherwise; the project default network."""
+        # Faster boot disk = faster model-bytes -> RAM/VRAM load (the cold-start
+        # tail). Dynamic zonal diskType URL (never hardcoded); empty -> omit so
+        # GCE applies its default (pd-standard), the legacy behaviour.
+        init_params: Dict[str, Any] = {
+            # Golden image by family -- never a hardcoded image name.
+            "sourceImage": "projects/{}/global/images/family/{}".format(
+                project, image_family
+            ),
+        }
+        disk_type = _boot_disk_type()
+        if disk_type:
+            init_params["diskType"] = "zones/{}/diskTypes/{}".format(zone, disk_type)
         payload: Dict[str, Any] = {
             "name": name,
             "machineType": "zones/{}/machineTypes/{}".format(zone, machine_type),
@@ -623,12 +691,7 @@ class GCPComputeRest:
                 {
                     "boot": True,
                     "autoDelete": True,
-                    "initializeParams": {
-                        # Golden image by family -- never a hardcoded image name.
-                        "sourceImage": "projects/{}/global/images/family/{}".format(
-                            project, image_family
-                        ),
-                    },
+                    "initializeParams": init_params,
                 }
             ],
             "networkInterfaces": [
@@ -693,6 +756,24 @@ class GCPComputeRest:
         (ok, detail). Dynamic zone/project from metadata. Fail-CLOSED: a missing
         token / unresolved zone-or-project / HTTP error -> (False, "<LOCUS>:..").
         NEVER raises.
+
+        SCATTER-GATHER multi-zone awaken (Async Scatter-Gather Failover): the
+        zone_fallback_chain is consumed ``W`` zones at a time
+        (``JARVIS_FAILOVER_SCATTER_WIDTH``, default 3) -- see ``_scatter_width``.
+        Each wave races its zones CONCURRENTLY via ``_race_wave`` instead of the
+        old strictly-linear one-zone-at-a-time roll (which left most of a 9-zone
+        chain untried inside a single failover window). ``W=1`` is the rollback
+        path: it degenerates to a sequence of single-element waves, each fully
+        awaited before the next, reproducing the legacy linear sequence exactly.
+
+        Deliberate race-level scope (avoids tripling GPU cold-start spend): the
+        winner is the FIRST zone whose insert VERIFIES as created at the
+        create/RUNNING level -- ``_insert_in_zone`` returning 'created' (either a
+        clean DONE op or the KEEP-confirmed-materializing path), NOT the first
+        zone to clear the downstream L7 serving gate. That single serving gate
+        (unchanged, in ``await_running_ip`` / the readiness check upstream) takes
+        the winner from here; racing all the way to full serving would mean
+        paying for GPU boot on every zone in the wave simultaneously.
         """
         token = await self.access_token()
         if not token:
@@ -721,9 +802,12 @@ class GCPComputeRest:
         )
         chain = zone_fallback_chain(zone)
         last = ""
-        for z in chain:
-            verdict, detail = await self._insert_in_zone(
-                zone=z, project=project, token=token, headers=headers, node=node,
+        width = _scatter_width()
+        idx = 0
+        while idx < len(chain):
+            wave = chain[idx:idx + width]
+            verdict, detail = await self._race_wave(
+                wave, project=project, token=token, headers=headers, node=node,
                 machine=machine, family=family, startup_script=startup_script,
                 accelerator_type=accelerator_type, accelerator_count=accelerator_count,
             )
@@ -731,7 +815,11 @@ class GCPComputeRest:
             if verdict == "created":
                 return (True, "created:{}".format(detail))
             if verdict == "stockout":
-                logger.warning("[GCPComputeRest] STOCKOUT zone=%s -> failover to next zone", z)
+                logger.warning(
+                    "[GCPComputeRest] WAVE STOCKOUT zones=%s -> failover to next wave",
+                    wave,
+                )
+                idx += width
                 continue
             return (False, "INSERT_FAILED:{}".format(detail))  # non-stockout -> stop
         # The ENTIRE cross-region matrix stocked out -> a genuine global L4 capacity
@@ -824,15 +912,58 @@ class GCPComputeRest:
                             if spot and _ondemand_on_stockout_enabled():
                                 continue  # escalate to on-demand same zone first
                             return ("stockout", "zone={}:kept_node_evaporated".format(zone))
-                        # 'live' or still-materializing at window end: KEEP, do NOT
-                        # reap, do NOT advance -> route to AWAKENING and hand patience
-                        # to the L7 readiness gate/racer (the right owner of "wait
-                        # for SERVING"). Resolves strict-reap-vs-slow-op tension.
+                        # 'live' or still-materializing at window end: candidate KEEP.
+                        # But KEEP-on-MATERIALIZING is NOT a commit point -- GCP can
+                        # (and did, bt-iso-1783021468: op held PENDING ~7min with the
+                        # instance STAGING throughout, then DONE with
+                        # ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS) still terminally
+                        # FAIL the underlying insert op AFTER the node showed
+                        # materializing. Re-verify the SAME op (reusing the SAME poll
+                        # helper, a much more generous budget) BEFORE handing the node
+                        # to the L7 readiness gate -- catches a late stockout and lets
+                        # the zone roll continue instead of wedging on a doomed node.
+                        _keep_budget = _keep_verify_budget_s()
                         logger.info(
                             "[GCPComputeRest] insert op unverified BUT node MATERIALIZING "
-                            "(status=%s confirm=%s) zone=%s mode=%s -> KEEP + hand to "
-                            "L7 readiness gate", inst_status, _fate, zone, mode,
+                            "(status=%s confirm=%s) zone=%s mode=%s -> re-verifying insert "
+                            "op (budget=%.0fs) before KEEP", inst_status, _fate, zone, mode,
+                            _keep_budget,
                         )
+                        _keep_verdict = await self._await_insert_operation(
+                            project, zone, op, token, cap_s=_keep_budget,
+                        )
+                        if _keep_verdict in ("stockout", "error"):
+                            # The op RENEGED after materializing: the same failure
+                            # class as an immediate stockout -- reap the STAGING
+                            # remnant and CONTINUE the zone roll via the SAME
+                            # continue path (never a new/parallel loop).
+                            logger.warning(
+                                "[GCPComputeRest] KEEP-verify: insert op TERMINALLY "
+                                "FAILED after materializing (status=%s zone=%s mode=%s "
+                                "op_verdict=%s) -> confirmed-reap + roll next zone",
+                                inst_status, zone, mode, _keep_verdict,
+                            )
+                            await self._reap_zone_confirmed(node, zone)
+                            if spot and _ondemand_on_stockout_enabled():
+                                continue  # escalate to on-demand same zone first
+                            return ("stockout", "zone={}:kept_node_late_failed_{}".format(
+                                zone, _keep_verdict))
+                        if _keep_verdict == "unknown":
+                            # Budget expired with the op STILL pending -- fail-open to
+                            # the legacy KEEP semantics (the L7 gate has its own
+                            # budget), but make the extended uncertainty visible.
+                            logger.warning(
+                                "[GCPComputeRest] KEEP-verify budget (%.0fs) expired "
+                                "with insert op STILL PENDING zone=%s mode=%s -> "
+                                "fail-open KEEP (L7 gate owns further patience)",
+                                _keep_budget, zone, mode,
+                            )
+                        else:
+                            logger.info(
+                                "[GCPComputeRest] KEEP-verify: insert op confirmed DONE "
+                                "clean zone=%s mode=%s -> KEEP + hand to L7 readiness gate",
+                                zone, mode,
+                            )
                         return (
                             "created",
                             "zone={}:mode={}:materializing_{}".format(
@@ -868,7 +999,120 @@ class GCPComputeRest:
                            mode, zone, status, (text or "")[-200:])
         return ("failed", "zone={}:spot_and_on_demand_rejected".format(zone))
 
-    async def _await_insert_operation(self, project, zone, op_name, token) -> str:
+    async def _race_wave(
+        self, wave, *, project, token, headers, node, machine, family,
+        startup_script, accelerator_type, accelerator_count,
+    ) -> Tuple[str, str]:
+        """Scatter-gather ONE wave: launch ``_insert_in_zone`` (UNCHANGED --
+        Spot->on-demand escalation + KEEP-re-verify all reused as-is) CONCURRENTLY
+        for every zone in ``wave``, then gather via a ``asyncio.wait(...,
+        return_when=FIRST_COMPLETED)`` loop so the first VERIFIED create can
+        short-circuit the rest instead of waiting for the whole wave.
+
+        Returns a wave-level verdict in the SAME vocabulary ``_insert_in_zone``
+        uses, so ``create_instance``'s wave loop reads identically to the old
+        per-zone loop:
+          'created'  -- a zone won the race; detail identifies the winner.
+          'stockout' -- every zone in the wave stocked out; caller advances to
+                        the next W-zone wave.
+          'failed'   -- a non-stockout hard rejection surfaced (from a zone OR
+                        from an unexpected racer exception) and no zone won;
+                        mirrors the legacy per-zone contract by stopping the
+                        ENTIRE chain rather than rolling to the next wave.
+
+        Winner teardown (billing-critical): the moment a winner is decided,
+        every still-pending sibling racer is cancelled, and an async
+        best-effort delete is issued for EVERY OTHER zone in the wave --
+        UNCONDITIONALLY, regardless of that zone's own reported verdict --
+        because a cancelled racer may already have POSTed its own
+        instances.insert before cancellation landed. See ``_sweep_losers``.
+        NEVER raises."""
+        tasks = {
+            asyncio.ensure_future(self._insert_in_zone(
+                zone=z, project=project, token=token, headers=headers, node=node,
+                machine=machine, family=family, startup_script=startup_script,
+                accelerator_type=accelerator_type, accelerator_count=accelerator_count,
+            )): z
+            for z in wave
+        }
+        pending = set(tasks.keys())
+        results: Dict[str, Tuple[str, str]] = {}
+        winner: Optional[Tuple[str, str]] = None
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for fut in done:
+                z = tasks[fut]
+                try:
+                    verdict, detail = fut.result()
+                except asyncio.CancelledError:
+                    continue
+                except Exception as exc:  # noqa: BLE001 -- a racer must NEVER blow up the wave
+                    verdict, detail = ("failed", "zone={}:racer_exception:{}".format(z, exc))
+                results[z] = (verdict, detail)
+                if verdict == "created" and winner is None:
+                    winner = (z, detail)
+            if winner is not None:
+                break
+
+        if winner is not None:
+            for fut in pending:
+                fut.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            losers = [z for z in wave if z != winner[0]]
+            await self._sweep_losers(node, losers)
+            logger.info(
+                "[GCPComputeRest] scatter-gather WINNER zone=%s wave=%s -> %d loser(s) reaped",
+                winner[0], wave, len(losers),
+            )
+            return ("created", winner[1])
+
+        # No winner: every zone in the wave terminated on its own (or never
+        # completed -- treated as a racer failure below). A hard (non-stockout)
+        # failure mirrors the legacy per-zone contract and stops the entire
+        # chain instead of rolling to the next wave.
+        for z in wave:
+            verdict, detail = results.get(z, ("failed", "zone={}:racer_no_result".format(z)))
+            if verdict == "failed":
+                return ("failed", detail)
+        last_zone = wave[-1] if wave else "?"
+        last_detail = results.get(
+            last_zone, ("stockout", "zone={}:wave_exhausted".format(last_zone))
+        )[1]
+        return ("stockout", last_detail)
+
+    async def _sweep_losers(self, node: str, loser_zones) -> None:
+        """Fire-and-forget, best-effort instance delete for every LOSING zone in
+        a decided scatter-gather wave. Billing-critical: a racer cancelled after
+        a winner was chosen may already have POSTed its own instances.insert, so
+        the sweep is UNCONDITIONAL across every wave member except the winner --
+        it does not consult that zone's own reported verdict.
+
+        Reuses ``delete_instance`` unchanged (already 404-tolerant/idempotent-OK
+        and internally bounded by ``_rest_timeout``); wrapped in an outer
+        ``asyncio.wait_for`` as a second bound + a broad except so a stuck or
+        raising delete can NEVER wedge or blow up the caller. Exactly one
+        WARNING is logged per loser zone. NEVER raises."""
+        if not loser_zones:
+            return
+
+        async def _reap_one(z: str) -> None:
+            try:
+                ok, detail = await asyncio.wait_for(
+                    self.delete_instance(node, zone=z), timeout=_rest_timeout() + 5.0,
+                )
+            except Exception as exc:  # noqa: BLE001 -- the sweep must NEVER raise
+                ok, detail = (False, "sweep_exc:{}".format(exc))
+            logger.warning(
+                "[GCPComputeRest] scatter-gather LOSER reap zone=%s node=%s ok=%s detail=%s",
+                z, node, ok, detail,
+            )
+
+        await asyncio.gather(*(_reap_one(z) for z in loser_zones), return_exceptions=True)
+
+    async def _await_insert_operation(
+        self, project, zone, op_name, token, *, cap_s: Optional[float] = None,
+    ) -> str:
         """Poll a zonal insert operation to a TERMINAL state. FAIL-CLOSED.
 
         Returns:
@@ -882,12 +1126,17 @@ class GCPComputeRest:
                         must assume a phantom node may exist (reap) and roll over.
                         NEVER an optimistic 'ok'.
 
+        ``cap_s`` overrides the default ``_insert_op_poll_cap_s()`` ceiling --
+        used by the KEEP-on-MATERIALIZING re-verify call (a MUCH more generous
+        budget, see ``_keep_verify_budget_s``) so the SAME poll helper is reused
+        rather than duplicated with a second bespoke loop.
+
         NEVER raises."""
         from backend.core.ouroboros.governance.zone_fallback import (  # noqa: PLC0415
             is_stockout_error,
         )
         url = "{}/projects/{}/zones/{}/operations/{}".format(_COMPUTE_BASE, project, zone, op_name)
-        cap = _insert_op_poll_cap_s()
+        cap = cap_s if cap_s is not None else _insert_op_poll_cap_s()
         interval = _insert_op_poll_interval_s()
         waited = 0.0
         while waited < cap:

@@ -210,7 +210,7 @@ class ContextExpansionRunner(PhaseRunner):
             )
             if routing_enabled():
                 _mr_router = ModuleContextRouter(orch._config.project_root)
-                _mr_result = _mr_router.route(
+                _mr_result = await _mr_router.route(
                     list(ctx.target_files),
                     ctx.description,
                 )

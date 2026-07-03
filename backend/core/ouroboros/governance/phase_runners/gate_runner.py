@@ -527,7 +527,7 @@ class GATERunner(PhaseRunner):
                                 orch._config.project_root / _sp
                                 if not _sp.is_absolute() else _sp
                             )
-                            _tests = orch._discover_tests_for_gate(_sp)
+                            _tests = await orch._discover_tests_for_gate(_sp)
                             _verdicts.append(
                                 _mg.evaluate_file(_abs_sp, _tests)
                             )
