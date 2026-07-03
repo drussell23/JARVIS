@@ -134,6 +134,20 @@ def override_max_h() -> int:
     return _env_int("JARVIS_POSTURE_OVERRIDE_MAX_H", 24, minimum=1)
 
 
+def wholesale_offload_enabled() -> bool:
+    """3rd starvation tier (Fix 2) — master switch for wholesale
+    off-loop cycle execution. Default TRUE: the ENTIRE ``run_one_cycle``
+    runs synchronously inside the shared ``cooperative_fs_io.offload``
+    thread pool so the whole cadence tick is decoupled from the primary
+    event loop in ONE dispatch. FALSE degrades to the legacy per-signal
+    chunked-async path (``build_bundle_async`` → ``_offload_signal``,
+    Tier-2b) for byte-identical-shape rollback."""
+    raw = os.environ.get("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 _CONV_COMMIT_RE = re.compile(
     r"^(?P<type>feat|fix|refactor|test|docs|chore|perf|style|build|ci|revert)"
     r"(?:\([^)]+\))?!?:",
@@ -225,6 +239,16 @@ class SignalCollector:
         # 100-commit ``git log`` whenever HEAD has not advanced (the
         # common case). ``None`` until first computation.
         self._commit_ratios_cache: Optional[Tuple[str, int, Dict[str, float]]] = None
+        # 3rd starvation tier (Fix 1) — memoized cost-burn read keyed by
+        # the cost_state.json stat identity ``(st_mtime_ns, st_size)``.
+        # The 300s cadence re-read + re-parsed this file EVERY cycle; if
+        # the file grows into a rolling cost ledger, ``json.loads`` is
+        # O(filesize) pure-Python CPU holding the GIL. Memoizing on stat
+        # identity collapses the steady state to a single ``stat()``
+        # (microseconds) whenever the file has not changed. ``None`` until
+        # first read; reset to ``None`` on a missing/unreadable file so a
+        # stale value can't be pinned.
+        self._cost_burn_cache: Optional[Tuple[Tuple[int, int], float]] = None
 
     def _git_subjects(self, n: int) -> List[str]:
         """Legacy sync entry — retained for backwards compat with the
@@ -582,9 +606,29 @@ class SignalCollector:
         return min(1.0, max(0.0, count / 16.0))
 
     def cost_burn_normalized(self) -> float:
+        """Fraction of today's cost cap consumed — a **bounded** read.
+
+        3rd starvation tier (Fix 1): the daily cost state is a single
+        JSON record, but the 300s cadence previously re-read + fully
+        re-parsed it on EVERY cycle. When ``cost_state.json`` grows (a
+        rolling ledger), ``json.loads`` is O(filesize) pure-Python CPU
+        holding the GIL — the pathological scan. The fix reads the file's
+        ``(st_mtime_ns, st_size)`` stat identity first (microseconds, no
+        read) and returns the memoized value whenever the file is
+        unchanged — so the steady-state cost is a single ``stat()``,
+        never a re-parse. A real write (mtime/size change) invalidates
+        the cache and re-parses exactly once. NEVER raises."""
         path = self._root / ".jarvis" / "cost_state.json"
-        if not path.exists():
+        try:
+            st = path.stat()
+        except OSError:
+            # Missing / unreadable — drop any stale memo, documented 0.0.
+            self._cost_burn_cache = None
             return 0.0
+        stat_key = (st.st_mtime_ns, st.st_size)
+        cached = self._cost_burn_cache
+        if cached is not None and cached[0] == stat_key:
+            return cached[1]
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -595,8 +639,11 @@ class SignalCollector:
         except (TypeError, ValueError):
             return 0.0
         if cap <= 0.0:
-            return 0.0
-        return min(1.0, max(0.0, spent / cap))
+            value = 0.0
+        else:
+            value = min(1.0, max(0.0, spent / cap))
+        self._cost_burn_cache = (stat_key, value)
+        return value
 
     def worktree_orphan_count(self) -> int:
         base = os.environ.get("JARVIS_WORKTREE_BASE")
@@ -979,6 +1026,21 @@ class PostureObserver:
         except Exception:
             return ""
 
+    def _read_lss_one_liner_sync(self) -> str:
+        """Synchronous sibling of :meth:`_read_lss_one_liner` for the
+        wholesale-offload path (Fix 2), which runs entirely inside a
+        worker thread with no event loop. Uses LSS's sync formatter.
+        Never raises — arc-context is a bounded best-effort nudge."""
+        try:
+            from backend.core.ouroboros.governance.last_session_summary import (
+                get_default_summary,
+            )
+            lss = get_default_summary(self._root)
+            line = lss.format_for_prompt_sync() or ""
+            return str(line)
+        except Exception:
+            return ""
+
     # ---- main loop --------------------------------------------------------
 
     async def _run_forever(self) -> None:
@@ -1020,18 +1082,107 @@ class PostureObserver:
             sink_async as _ls_sink_async,
         )
         async with _ls_sink_async("posture_observer.run_one_cycle"):
+            if wholesale_offload_enabled():
+                return await self._run_one_cycle_offloaded()
             return await self._run_one_cycle_impl()
 
+    # ---- Fix 2 — wholesale off-loop cycle -------------------------------
+
+    async def _run_one_cycle_offloaded(self) -> Optional[PostureReading]:
+        """Run the ENTIRE cadence tick off the primary event loop.
+
+        3rd starvation tier (Fix 2): the whole synchronous cycle
+        (``_run_one_cycle_sync`` — collect + arc-context + infer +
+        hysteresis + persist) is dispatched in ONE call through the
+        shared ``cooperative_fs_io.offload`` substrate. THREAD pool
+        (``cpu_bound=False``) — NOT a process pool — because the cycle
+        touches live in-memory state a separate process could neither
+        read nor marshal mutations back from: the injected
+        ``open_ops_provider`` callable, the ``_commit_ratios_cache`` /
+        ``_cost_burn_cache`` memos, the ``PostureStore`` (its
+        ``threading.Lock`` + atomic temp+rename writer), the
+        ``DirectionInferrer``, the ``OverrideState`` and the
+        ``on_change`` orchestrator callback. Fix 1 removes the GIL-hold
+        pathology, so the thread path genuinely frees the loop.
+
+        RACES: the cycle's only externally-visible effect — the flip of
+        ``current`` — lands via ``PostureStore.write_current`` under the
+        store's lock + atomic ``os.replace``. A concurrent reader
+        (``load_current``) takes the same lock and reads an atomically
+        renamed file, so it always sees a prior-or-complete immutable
+        ``PostureReading``, never a partial bundle. The offloaded thread
+        never re-acquires a lock the caller holds (the loop holds none of
+        the store's locks), so no deadlock.
+
+        FAIL-SOFT: ``offload`` traps any runtime raise and returns an
+        ``OffloadError`` (never re-raised); a wall-clock timeout leaves
+        the prior bundle untouched. Either way we bump ``cycles_failed``,
+        keep the prior posture, and return ``None`` — never raising into
+        the cadence loop or the orchestrator.
+        """
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload as _offload,
+            is_offload_error as _is_offload_error,
+        )
+        try:
+            result = await asyncio.wait_for(
+                _offload(self._run_one_cycle_sync, cpu_bound=False),
+                timeout=collector_timeout_s(),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[PostureObserver] offloaded cycle timeout after %.1fs",
+                collector_timeout_s(),
+            )
+            self._cycles_failed += 1
+            return None
+        if _is_offload_error(result):
+            logger.debug(
+                "[PostureObserver] offloaded cycle fail-soft: %r", result,
+            )
+            self._cycles_failed += 1
+            return None
+        return result
+
+    def _run_one_cycle_sync(self) -> Optional[PostureReading]:
+        """Fully synchronous cadence tick — runs inside the offload
+        worker thread (Fix 2). Uses the legacy sync ``build_bundle``
+        (each collector's own subprocess/fs timeouts bound the work) and
+        shares the ``_process_bundle`` tail with the async path. NEVER
+        called on the event loop directly; blocking here blocks a worker
+        thread, never the loop."""
+        bundle = self._collector.build_bundle()
+        if bundle is None:
+            return None
+        lss_one_liner = self._read_lss_one_liner_sync()
+        return self._process_bundle(bundle, lss_one_liner=lss_one_liner)
+
     async def _run_one_cycle_impl(self) -> Optional[PostureReading]:
+        """Legacy async cadence tick (master-off rollback). Per-signal
+        chunked-async collect via ``build_bundle_async`` (Tier-2b
+        ``_offload_signal``), then the shared sync ``_process_bundle``
+        tail."""
         bundle = await self._collect_with_timeout()
         if bundle is None:
             return None
+        lss_one_liner = await self._read_lss_one_liner()
+        return self._process_bundle(bundle, lss_one_liner=lss_one_liner)
+
+    def _process_bundle(
+        self, bundle: SignalBundle, *, lss_one_liner: str = "",
+    ) -> Optional[PostureReading]:
+        """Shared SYNC tail — arc-context, infer, hysteresis, persist.
+
+        Purely synchronous: called either off-loop inside the offload
+        worker thread (Fix 2 default path) or inline after the legacy
+        async collect. All shared-state mutation happens here under the
+        ``PostureStore`` lock + atomic writes (see
+        ``_run_one_cycle_offloaded`` for the race/atomicity contract)."""
         # P0.5 Slice 2 — build arc-context (best-effort, never raises) and
         # pass to inferrer. Helper is observability-only by default; score
         # adjustment fires only when JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED=true.
         arc_ctx = None
         try:
-            lss_one_liner = await self._read_lss_one_liner()
             arc_ctx = build_arc_context(self._root, lss_one_liner=lss_one_liner)
         except Exception:
             logger.debug("[PostureObserver] arc_context build skipped", exc_info=True)
@@ -1231,4 +1382,5 @@ __all__ = [
     "postmortem_window_h",
     "reset_default_observer",
     "reset_default_store",
+    "wholesale_offload_enabled",
 ]

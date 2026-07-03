@@ -342,6 +342,60 @@ class TestSignalCollector:
         collector = SignalCollector(tmp_path)
         assert collector.cost_burn_normalized() == 0.0
 
+    def test_cost_burn_bounded_memoized_no_reparse(self, tmp_path: Path, monkeypatch):
+        """Fix 1 — the 300s cadence must NOT re-parse an unchanged
+        cost_state.json every cycle. A growing ledger is parsed AT MOST
+        ONCE (memoized on stat identity), regardless of how many reads.
+        RED against the old path (json.loads on every call → O(cycles*N))."""
+        import backend.core.ouroboros.governance.posture_observer as po
+
+        cost_path = tmp_path / ".jarvis" / "cost_state.json"
+        cost_path.parent.mkdir(parents=True)
+        # Simulate an unbounded growing cost ledger — only the two daily
+        # scalars are load-bearing; ``history`` stands in for the growth
+        # that made a full json.loads pathologically slow.
+        big_history = [{"op": i, "usd": 0.0001 * i} for i in range(50_000)]
+        cost_path.write_text(json.dumps({
+            "daily_spent_usd": 0.4, "daily_cap_usd": 1.0, "history": big_history,
+        }))
+
+        calls = {"n": 0}
+        _real_loads = po.json.loads
+
+        def _counting_loads(*a, **k):
+            calls["n"] += 1
+            return _real_loads(*a, **k)
+
+        monkeypatch.setattr(po.json, "loads", _counting_loads)
+
+        collector = SignalCollector(tmp_path)
+        vals = [collector.cost_burn_normalized() for _ in range(20)]
+
+        assert all(v == pytest.approx(0.4) for v in vals)
+        # Bounded: exactly one parse across 20 reads of the unchanged file.
+        assert calls["n"] == 1
+
+    def test_cost_burn_reparse_on_file_change(self, tmp_path: Path):
+        """Fix 1 — the memoized read invalidates on a real write
+        (stat identity change), so a fresh daily value is picked up."""
+        import os as _os
+
+        cost_path = tmp_path / ".jarvis" / "cost_state.json"
+        cost_path.parent.mkdir(parents=True)
+        cost_path.write_text(json.dumps({
+            "daily_spent_usd": 0.2, "daily_cap_usd": 1.0,
+        }))
+        collector = SignalCollector(tmp_path)
+        assert collector.cost_burn_normalized() == pytest.approx(0.2)
+
+        # Rewrite with a new value + force a distinct mtime.
+        new_mtime = cost_path.stat().st_mtime + 10.0
+        cost_path.write_text(json.dumps({
+            "daily_spent_usd": 0.8, "daily_cap_usd": 1.0,
+        }))
+        _os.utime(cost_path, (new_mtime, new_mtime))
+        assert collector.cost_burn_normalized() == pytest.approx(0.8)
+
     def test_build_bundle_is_well_formed_schema(self, tmp_path: Path):
         collector = SignalCollector(tmp_path)
         bundle = collector.build_bundle()
@@ -497,14 +551,19 @@ class TestPostureObserverCycle:
         assert observer.stats()["cycles_failed"] == 1
 
     @pytest.mark.asyncio
-    async def test_collector_exception_captured_by_outer_loop(
+    async def test_collector_exception_is_fail_soft(
         self, tmp_store: PostureStore,
     ):
+        # Fix 2 — the wholesale offload substrate is fail-soft: a raising
+        # collector NEVER propagates into the cadence loop. run_one_cycle
+        # returns None and bumps cycles_failed (superseding the pre-fix
+        # "raise propagates to outer loop" contract).
         observer = PostureObserver(
             Path("."), tmp_store, collector=_RaisingCollector(),
         )
-        with pytest.raises(RuntimeError):
-            await observer.run_one_cycle()
+        result = await observer.run_one_cycle()
+        assert result is None
+        assert observer.stats()["cycles_failed"] == 1
 
     @pytest.mark.asyncio
     async def test_same_posture_refreshes_current(self, tmp_store: PostureStore):
@@ -592,6 +651,148 @@ class TestPostureObserverCycle:
         assert "cycles_failed" in stats
         assert "interval_s" in stats
         assert "hysteresis_window_s" in stats
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — wholesale run_one_cycle off-loop via cooperative_fs_io.offload()
+# ---------------------------------------------------------------------------
+
+
+class _DualCollector:
+    """Implements BOTH the sync (offloaded) and legacy async collect
+    surfaces so a single fixture can prove which routing path fired."""
+
+    def __init__(self, bundle: SignalBundle) -> None:
+        self.bundle = bundle
+        self.sync_calls = 0
+        self.async_calls = 0
+
+    def build_bundle(self) -> SignalBundle:
+        self.sync_calls += 1
+        return self.bundle
+
+    async def build_bundle_async(self) -> SignalBundle:
+        self.async_calls += 1
+        return self.bundle
+
+
+class TestPostureObserverWholesaleOffload:
+
+    @pytest.mark.asyncio
+    async def test_default_on_routes_through_sync_offloaded_cycle(
+        self, tmp_store: PostureStore,
+    ):
+        dual = _DualCollector(_explore_bundle())
+        observer = PostureObserver(Path("."), tmp_store, collector=dual)
+        reading = await observer.run_one_cycle()
+        assert reading is not None
+        # Wholesale offload uses the SYNC build_bundle in a worker thread.
+        assert dual.sync_calls == 1
+        assert dual.async_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_master_off_falls_back_to_legacy_async_path(
+        self, tmp_store: PostureStore, monkeypatch,
+    ):
+        monkeypatch.setenv("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED", "false")
+        dual = _DualCollector(_explore_bundle())
+        observer = PostureObserver(Path("."), tmp_store, collector=dual)
+        reading = await observer.run_one_cycle()
+        assert reading is not None
+        # Rollback: the legacy per-signal async collect path fires instead.
+        assert dual.async_calls == 1
+        assert dual.sync_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_loop_stays_responsive_during_offloaded_cycle(
+        self, tmp_store: PostureStore,
+    ):
+        """A heartbeat coroutine keeps ticking while a slow cycle runs —
+        proving the whole cadence tick is off the primary loop. Were the
+        0.3s sync collect running ON the loop, the heartbeat would freeze
+        (near-zero ticks)."""
+        ticks = {"n": 0}
+        stop = asyncio.Event()
+
+        async def _heartbeat():
+            while not stop.is_set():
+                ticks["n"] += 1
+                await asyncio.sleep(0.005)
+
+        hb = asyncio.create_task(_heartbeat())
+        observer = PostureObserver(
+            Path("."), tmp_store,
+            collector=_SlowCollector(delay=0.3, bundle=_explore_bundle()),
+        )
+        reading = await observer.run_one_cycle()
+        stop.set()
+        await hb
+
+        assert reading is not None  # cycle completed off-loop
+        # 0.3s / 5ms ≈ 60 potential ticks; require a robust floor.
+        assert ticks["n"] >= 15
+
+    @pytest.mark.asyncio
+    async def test_concurrent_reader_never_sees_partial_bundle(
+        self, tmp_store: PostureStore, monkeypatch,
+    ):
+        """Race: while an offloaded cycle atomically flips ``current``,
+        a concurrent reader hammering load_current always observes a
+        fully-valid prior-or-complete reading, never a torn write."""
+        monkeypatch.setenv("JARVIS_POSTURE_HIGH_CONFIDENCE_BYPASS", "0.0")
+        observer = PostureObserver(
+            Path("."), tmp_store, collector=_StubCollector(_explore_bundle()),
+        )
+        await observer.run_one_cycle()  # seed EXPLORE
+
+        observer._collector = _SlowCollector(  # type: ignore[attr-defined]
+            delay=0.2, bundle=_harden_bundle(),
+        )
+        seen = []
+        stop = asyncio.Event()
+
+        async def _reader():
+            while not stop.is_set():
+                seen.append(tmp_store.load_current())
+                await asyncio.sleep(0.002)
+
+        r = asyncio.create_task(_reader())
+        await observer.run_one_cycle()
+        stop.set()
+        await r
+
+        valid = {
+            Posture.EXPLORE, Posture.HARDEN,
+            Posture.CONSOLIDATE, Posture.MAINTAIN,
+        }
+        assert len(seen) > 0
+        for cur in seen:
+            # Prior bundle is always present + structurally complete.
+            assert cur is not None
+            assert cur.posture in valid
+            assert isinstance(cur.confidence, float)
+
+    @pytest.mark.asyncio
+    async def test_offload_failure_keeps_prior_bundle_fail_soft(
+        self, tmp_store: PostureStore,
+    ):
+        observer = PostureObserver(
+            Path("."), tmp_store, collector=_StubCollector(_explore_bundle()),
+        )
+        await observer.run_one_cycle()
+        prior = tmp_store.load_current()
+        assert prior is not None and prior.posture is Posture.EXPLORE
+        failed_before = observer.stats()["cycles_failed"]
+
+        # Swap in a raising collector — the offloaded cycle fails.
+        observer._collector = _RaisingCollector()  # type: ignore[attr-defined]
+        result = await observer.run_one_cycle()
+
+        # Fail-soft: no raise, prior bundle preserved (no partial mutation).
+        assert result is None
+        still = tmp_store.load_current()
+        assert still is not None and still.posture is Posture.EXPLORE
+        assert observer.stats()["cycles_failed"] == failed_before + 1
 
 
 # ---------------------------------------------------------------------------
