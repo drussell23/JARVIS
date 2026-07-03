@@ -198,6 +198,20 @@ def test_ast_pin_strategic_injection_site_threads_op_id_and_logs_info(src_path):
         f"exist — soak #1 fired with op= empty because this site "
         f"called format_for_prompt() bare"
     )
+    # Await-guard pin (Fix 2, fs-hot-tier Phase 2 review): a dropped
+    # ``await`` here would silently leave a bare coroutine object
+    # instead of the rendered prompt string — swallowed by the
+    # enclosing ``except Exception: logger.debug(...)`` with zero red
+    # signal, killing ALL Strategic Direction injection. Assert the
+    # format_for_prompt(op_id=...) call is the direct child of an
+    # ``ast.Await`` node.
+    awaited_call_ids = {id(a.value) for a in ast.walk(tree) if isinstance(a, ast.Await)}
+    assert any(id(c) in awaited_call_ids for c in strat_fp), (
+        f"{src_path.name}: format_for_prompt(op_id=...) MUST be "
+        f"awaited — a dropped 'await' is silently swallowed by the "
+        f"enclosing except Exception: logger.debug(...) block, "
+        f"killing all Strategic Direction injection with no red test"
+    )
     # The success log for this injection must be logger.info, never
     # logger.debug (graduation greps must not depend on DEBUG).
     info_msgs = [

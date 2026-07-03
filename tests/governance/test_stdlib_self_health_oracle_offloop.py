@@ -326,8 +326,8 @@ class TestSubstrateConvergence:
 
         signals = await oracle.query_signals()
         assert isinstance(signals, tuple)
-        assert len(signals) == 3
-        assert signals[0].verdict.value == "insufficient_data"
+        assert len(signals) == 1
+        assert signals[0].verdict.value == "disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -373,20 +373,21 @@ class TestFailSoft:
         propagate the exception to the caller (adapter contract).
 
         fs-hot-tier Phase 2 convergence (2026-07-02): the dispatch
-        now routes through ``cooperative_fs_io.offload`` instead of
-        an ad-hoc ``loop.run_in_executor(None, ...)``. The substrate
+        routes through ``cooperative_fs_io.offload`` instead of an
+        ad-hoc ``loop.run_in_executor(None, ...)``. The substrate
         catches the scan's exception INSIDE the executor and returns
-        an ``OffloadError`` (never re-raised) — ``query_signals``
-        degrades this to an empty ``summaries`` tuple BEFORE it ever
-        reaches the outer ``except Exception`` handler. Empty
-        summaries is the SAME "no data" shape
-        ``_load_recent_summaries`` already produces on its own
-        internal failures (see ``TestFailSoft`` above) and correctly
-        renders as ``INSUFFICIENT_DATA`` (the documented empty-input
-        verdict in ``_completion_signal``/``_cost_signal``/
-        ``_stop_reason_signal``) rather than a coarse blanket
-        DISABLED — strictly more informative, still fail-soft, still
-        never raises.
+        an ``OffloadError`` (never re-raised).
+
+        Fix 3 revert (Phase 2 review, 2026-07-03): a genuine
+        substrate-level scan failure is a "the oracle couldn't do its
+        job" event, not a "no sessions yet" empty input. Per
+        ``production_oracle.py:235-239``, ``DISABLED`` is filtered
+        out of the informative set while ``INSUFFICIENT_DATA`` stays
+        in and falls through to ``HEALTHY`` in single-oracle
+        deployments — silently reclassifying a real scan failure as
+        healthy. ``query_signals`` restores the pre-Phase-2
+        ``DISABLED`` verdict for this case while keeping the
+        offload-substrate dispatch itself (Phase 2's actual goal).
         """
         oracle = StdlibSelfHealthOracle(project_root=tmp_path)
 
@@ -399,8 +400,8 @@ class TestFailSoft:
         assert isinstance(signals, tuple)
         assert len(signals) >= 1
         # Adapter contract: on internal scan failure it degrades to
-        # the "no data" verdict, never raises.
-        assert signals[0].verdict.value == "insufficient_data"
+        # the DISABLED verdict, never raises.
+        assert signals[0].verdict.value == "disabled"
 
     def test_unparseable_summary_json_skipped_not_raised(
         self, tmp_path,

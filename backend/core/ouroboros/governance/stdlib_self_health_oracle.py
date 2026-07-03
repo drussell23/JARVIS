@@ -452,10 +452,36 @@ class StdlibSelfHealthOracle:
                 max_scan_sessions(),
                 cpu_bound=False,
             )
-            summaries = (
-                () if is_offload_error(_summaries_result)
-                else _summaries_result
-            )
+            if is_offload_error(_summaries_result):
+                # Fix 3 revert (fs-hot-tier Phase 2 review,
+                # 2026-07-03): a genuine substrate-level scan failure
+                # is a "the oracle couldn't do its job" event, not a
+                # "no sessions yet" empty input -- degrading it to an
+                # empty summaries tuple silently reclassified the
+                # verdict from DISABLED to INSUFFICIENT_DATA. Per
+                # production_oracle.py:235-239, DISABLED is filtered
+                # out of the informative set while INSUFFICIENT_DATA
+                # stays in and falls through to HEALTHY in
+                # single-oracle deployments -- flipping a real scan
+                # failure into a reported-healthy result. Restore the
+                # pre-Phase-2 DISABLED verdict here while keeping the
+                # offload-substrate dispatch (Phase 2's actual goal).
+                logger.debug(
+                    "[StdlibSelfHealthOracle] summaries offload "
+                    "degraded (%s: %s)",
+                    _summaries_result.exc_type,
+                    _summaries_result.message,
+                )
+                return (OracleSignal(
+                    oracle_name=_ORACLE_NAME,
+                    kind=OracleKind.HEALTHCHECK,
+                    verdict=OracleVerdict.DISABLED,
+                    observed_at_ts=time.time(),
+                    summary="oracle internal failure",
+                    payload={"reason": "query_signals_exception"},
+                    severity=0.0,
+                ),)
+            summaries = _summaries_result
             now = time.time()
             return (
                 _completion_signal(summaries, now),

@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -812,6 +813,61 @@ async def test_bg_tier_skip_offload_error_falls_back_no_crash(
     result = await CLASSIFYRunner(orch, None).run(ctx)
     assert result.status == "ok"
     assert result.artifacts.get("advisory") is not None
+
+
+# ---------------------------------------------------------------------------
+# fs-hot-tier Phase 2 review (Fix 2) — Strategic Direction await-guard.
+#
+# ``classify_runner.py:761`` does
+# ``_strat_prompt = await _strategic_svc.format_for_prompt(op_id=...)``.
+# A dropped ``await`` would leave a bare (unawaited) coroutine object
+# bound to ``_strat_prompt`` instead of the rendered prompt string. A
+# coroutine is truthy, so the ``if _strat_prompt:`` guard would still
+# pass, but the subsequent ``_strat_prompt + "\n\n" + _existing``
+# string concatenation raises ``TypeError`` -- silently swallowed by
+# the enclosing ``except Exception: logger.debug(...)`` with zero red
+# signal. This drives the REAL ``CLASSIFYRunner.run()`` seam with a
+# real ``async def format_for_prompt`` stub and asserts the known
+# marker string actually lands in ``ctx.strategic_memory_prompt`` --
+# a missed await would leave the section empty/garbage and this test
+# would fail.
+# ---------------------------------------------------------------------------
+
+
+class _FakeStrategicService:
+    def __init__(self, prompt: str = "STRATEGIC_AWAIT_GUARD_MARKER") -> None:
+        self.is_loaded = True
+        self.principles: List[str] = ["p1", "p2"]
+        self.digest = "d" * 600
+        self._prompt = prompt
+        self.calls: List[Optional[str]] = []
+
+    async def format_for_prompt(self, op_id: Optional[str] = None) -> str:
+        self.calls.append(op_id)
+        return self._prompt
+
+
+@pytest.mark.asyncio
+async def test_strategic_direction_format_for_prompt_is_awaited(ctx, tmp_path):
+    orch = _orch(tmp_path)
+    fake_svc = _FakeStrategicService()
+    orch._stack.governed_loop_service = SimpleNamespace(
+        _strategic_direction=fake_svc,
+        _goal_memory_bridge=None,
+    )
+
+    result = await CLASSIFYRunner(orch, None).run(ctx)
+
+    assert result.status == "ok"
+    # The real async coroutine ran to completion and was called with
+    # the op_id (proving it was awaited, not just constructed).
+    assert fake_svc.calls == [ctx.op_id]
+    # The rendered marker string -- not a coroutine repr, not garbage
+    # from a failed string-concat -- is present in the composed
+    # strategic prompt.
+    assert "STRATEGIC_AWAIT_GUARD_MARKER" in (
+        result.next_ctx.strategic_memory_prompt or ""
+    )
 
 
 __all__ = []

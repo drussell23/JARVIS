@@ -20,6 +20,7 @@ this is a new regression spine.
 from __future__ import annotations
 
 import asyncio
+import gc
 import time
 
 import pytest
@@ -251,3 +252,45 @@ class TestTTL:
         mgr.list_active_cached()
         await asyncio.sleep(0.05)
         assert calls["count"] == 1, "stale cache must trigger a refresh"
+
+
+# ---------------------------------------------------------------------------
+# GC safety -- the fire-and-forget refresh task must be strongly
+# referenced so it survives an eager gc.collect() (harness.py calls
+# gc.collect() during boot; a weakly-referenced task can be reaped
+# before its ``finally`` clears ``_active_cache_refresh_inflight``,
+# permanently disabling cache refresh for the process lifetime).
+# ---------------------------------------------------------------------------
+
+
+class TestGCSafety:
+    @pytest.mark.asyncio
+    async def test_refresh_task_survives_gc_collect(self, tmp_path):
+        mgr = _mgr(tmp_path)
+        _seed_active_session(mgr, "goal-a")
+
+        # Cold cache -> schedules the fire-and-forget refresh task.
+        mgr.list_active_cached()
+
+        # The task must be strongly referenced by the manager itself
+        # (not just held by the event loop's internal bookkeeping),
+        # so it survives an aggressive collection cycle.
+        assert len(mgr._active_cache_refresh_tasks) == 1
+
+        # Force a GC pass immediately, before the task has had a
+        # chance to run its first step. Without a strong reference
+        # held by SessionManager, this could reap the task object.
+        gc.collect()
+
+        # Give the (surviving) task a chance to run to completion.
+        await asyncio.sleep(0.05)
+
+        # The task must have completed and cleared the in-flight
+        # flag -- if it was GC'd mid-flight, this would stay True
+        # forever and list_active_cached() would degrade permanently.
+        assert mgr._active_cache_refresh_inflight is False
+        # The done-callback must have discarded it from the strong-ref
+        # set once it finished.
+        assert len(mgr._active_cache_refresh_tasks) == 0
+        # And the cache must have actually converged.
+        assert len(mgr.list_active_cached()) == 1

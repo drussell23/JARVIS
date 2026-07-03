@@ -34,7 +34,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger("Ouroboros.SessionManager")
 
@@ -203,6 +203,15 @@ class SessionManager:
         self._active_cache: Optional[List[Session]] = None
         self._active_cache_ts: float = 0.0
         self._active_cache_refresh_inflight: bool = False
+        # Strong references for fire-and-forget refresh tasks -- without
+        # this the task object can be garbage-collected before its
+        # ``finally`` block runs (asyncio only holds a weak ref via the
+        # event loop), permanently stranding
+        # ``_active_cache_refresh_inflight`` at True. See
+        # dw_discovery_runner.py's ``_REFRESH_TASK`` /
+        # background_agent_pool.py's ``_workers`` for the established
+        # pattern.
+        self._active_cache_refresh_tasks: Set["asyncio.Task[None]"] = set()
         logger.info("SessionManager initialised (dir=%s)", self._dir)
 
     # -- private helpers ----------------------------------------------------
@@ -420,7 +429,15 @@ class SessionManager:
                 self._active_cache_refresh_inflight = False
             return False
 
-        def _log_refresh_failure(t: "asyncio.Task[None]") -> None:
+        # Hold a strong reference until the task completes -- asyncio's
+        # event loop only keeps a weak reference, so an unreferenced
+        # task can be garbage-collected mid-flight (before its
+        # ``finally`` clears ``_active_cache_refresh_inflight``),
+        # permanently disabling cache refresh for the process lifetime.
+        self._active_cache_refresh_tasks.add(task)
+
+        def _on_refresh_done(t: "asyncio.Task[None]") -> None:
+            self._active_cache_refresh_tasks.discard(t)
             if t.cancelled():
                 return
             exc = t.exception()
@@ -430,7 +447,7 @@ class SessionManager:
                     "refresh task raised", exc_info=exc,
                 )
 
-        task.add_done_callback(_log_refresh_failure)
+        task.add_done_callback(_on_refresh_done)
         return True
 
     async def _refresh_active_cache_async(self) -> None:
