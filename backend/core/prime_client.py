@@ -117,6 +117,88 @@ def _get_env_bool(key: str, default: bool) -> bool:
     return val in ("true", "1", "yes", "on")
 
 
+# =============================================================================
+# Request-side prefix KV-cache reuse — self-hosted J-Prime analogue of DW
+# prompt caching (a PREFILL-LATENCY win, not a token-billing one).
+#
+# J-Prime is self-hosted (heavy GCE tier = llama-cpp-python; light local tier
+# = Ollama), billed by VM-time not tokens — so DW's ``cache_control`` (90%-off
+# CACHED tokens) does NOT apply. The win here is KV-cache PREFIX REUSE: when
+# consecutive requests share a stable prompt prefix AND the model stays
+# resident, the engine skips re-running *prefill* on that prefix (the
+# compute-expensive part). The mechanism (measured, not guessed):
+#
+#   1. Stable-prefix structuring is the guaranteed, FLAG-FREE win. The STABLE
+#      system message (Iron-Gate rules / output schema — byte-identical across
+#      ops; see providers.py::_CODEGEN_SYSTEM_PROMPT) is emitted FIRST; the
+#      VOLATILE per-op content (goal, target files, git-momentum digest) rides
+#      in the trailing USER message. A resident engine reuses the KV cache for
+#      the unchanged prefix. ``_build_payload`` already emits system→context→
+#      user, so the ordering is already correct; the split is preserved here.
+#   2. ``cache_prompt: true`` is llama.cpp-server's EXPLICIT prefix-reuse lever
+#      (env ``JARVIS_JPRIME_PREFIX_CACHE_ENABLED``, default on). Harmless to a
+#      stack that ignores unknown OpenAI fields; a stack that REJECTS it is
+#      caught by the fail-soft retry in ``_do_execute_request``.
+#   3. ``keep_alive`` is Ollama's model-residency lever (the light local tier
+#      already sets it). Forwarded for Ollama-served J-Prime deployments so the
+#      model stays resident between O+V ops → the KV cache survives → prefix
+#      reuse works. llama-cpp-python ignores the unknown field.
+#
+# All gated behind ``JARVIS_JPRIME_PROMPT_CACHE_ENABLED`` (default OFF) → a
+# byte-identical legacy request body when off. NO hardcoding: every value is
+# env-resolved. These fields are metadata-only — they never alter prompt
+# SEMANTICS (same text, only prefix stability + residency).
+# =============================================================================
+
+_JPRIME_CACHE_FIELD_KEYS = ("keep_alive", "cache_prompt")
+
+
+def _jprime_prompt_cache_enabled() -> bool:
+    """Master gate for request-side J-Prime prefix KV-cache reuse (default OFF)."""
+    return _get_env_bool("JARVIS_JPRIME_PROMPT_CACHE_ENABLED", False)
+
+
+def _jprime_keep_alive_value() -> Any:
+    """Resolve the ``keep_alive`` value for the J-Prime request body.
+
+    Ollama accepts either a duration STRING ("1h", "30m", "-1") or an INTEGER
+    number of seconds. We pass the raw env string through, but coerce a
+    purely-numeric value to ``int`` so strict int-typed servers accept it.
+    Env: ``JARVIS_JPRIME_KEEP_ALIVE`` (default "1h"). NO hardcoding.
+    """
+    raw = (os.getenv("JARVIS_JPRIME_KEEP_ALIVE", "1h") or "1h").strip()
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return raw
+
+
+def _jprime_prefix_cache_flag_enabled() -> bool:
+    """Explicit llama.cpp ``cache_prompt`` lever (default ON when master ON)."""
+    return _get_env_bool("JARVIS_JPRIME_PREFIX_CACHE_ENABLED", True)
+
+
+def _jprime_cache_fields() -> Dict[str, Any]:
+    """Compute the opt-in cache/keep-alive fields for the request body.
+
+    Returns an empty dict when the master gate is OFF (→ byte-identical legacy
+    body). NEVER raises — a bad env value fails soft to no fields.
+    """
+    if not _jprime_prompt_cache_enabled():
+        return {}
+    fields: Dict[str, Any] = {}
+    try:
+        fields["keep_alive"] = _jprime_keep_alive_value()
+    except Exception:  # noqa: BLE001 -- opt-in caching must never break generation
+        pass
+    try:
+        if _jprime_prefix_cache_flag_enabled():
+            fields["cache_prompt"] = True
+    except Exception:  # noqa: BLE001
+        pass
+    return fields
+
+
 def _resolve_prime_host() -> str:
     """
     Resolve JARVIS Prime host with intelligent priority order.
@@ -1383,19 +1465,30 @@ class PrimeClient:
 
                 # aiohttp.ClientSession - use context manager for response
                 try:
-                    async with session.post(url, json=payload, headers=_req_headers or None) as resp:
-                        if resp.status != 200:
-                            text = await resp.text()
-                            raise RuntimeError(f"Prime returned {resp.status}: {text}")
-                        data = await resp.json()
-                        response_headers = dict(resp.headers)
-                except TypeError:
-                    # Fallback for httpx style (no context manager on response)
-                    resp = await session.post(url, json=payload, headers=_req_headers or None)
-                    if resp.status_code != 200:
-                        raise RuntimeError(f"Prime returned {resp.status_code}: {resp.text}")
-                    data = resp.json()
-                    response_headers = dict(resp.headers)
+                    data, response_headers = await self._post_inference(
+                        session, url, payload, _req_headers,
+                    )
+                except Exception as post_exc:
+                    # Fail-soft (bulletproof mandate): a request-side cache field
+                    # the server REJECTS (e.g. a strict Pydantic 422 on the
+                    # unknown ``cache_prompt``/``keep_alive`` key) must NOT break
+                    # generation. Strip ONLY the opt-in cache fields and retry
+                    # ONCE with the byte-identical legacy body. If no cache fields
+                    # were present, or the legacy retry also fails, the error
+                    # propagates unchanged (no masking of a genuine outage).
+                    _legacy = {
+                        k: v for k, v in payload.items()
+                        if k not in _JPRIME_CACHE_FIELD_KEYS
+                    }
+                    if len(_legacy) == len(payload):
+                        raise
+                    logger.debug(
+                        "[PrimeClient] request-side cache fields rejected (%s); "
+                        "retrying with legacy body", post_exc,
+                    )
+                    data, response_headers = await self._post_inference(
+                        session, url, _legacy, _req_headers,
+                    )
 
                 # v276.0: Extract incoming trace context from Prime response
                 if _TRACE_HTTP_AVAILABLE and _extract_trace_from_response:
@@ -1604,6 +1697,37 @@ class PrimeClient:
             logger.error(f"[PrimeClient] Cloud fallback failed: {e}")
             raise RuntimeError(f"Both Prime and cloud fallback failed: {e}")
 
+    async def _post_inference(
+        self,
+        session: Any,
+        url: str,
+        payload: Dict[str, Any],
+        req_headers: Dict[str, str],
+    ) -> "tuple[Dict[str, Any], Dict[str, Any]]":
+        """POST one inference ``payload``; return ``(data, response_headers)``.
+
+        Raises ``RuntimeError`` on a non-200. Handles both aiohttp (async
+        context-manager response) and httpx (plain awaitable) session styles —
+        the exact behavior the inline block had before, extracted so the
+        fail-soft retry in ``_do_execute_request`` can re-issue with a stripped
+        body without duplicating the transport logic.
+        """
+        try:
+            async with session.post(
+                url, json=payload, headers=req_headers or None,
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"Prime returned {resp.status}: {text}")
+                data = await resp.json()
+                return data, dict(resp.headers)
+        except TypeError:
+            # Fallback for httpx style (no context manager on response)
+            resp = await session.post(url, json=payload, headers=req_headers or None)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Prime returned {resp.status_code}: {resp.text}")
+            return resp.json(), dict(resp.headers)
+
     def _build_payload(self, request: PrimeRequest) -> Dict[str, Any]:
         """Build request payload for Prime API (OpenAI-compatible format)."""
         # Build messages list in OpenAI format
@@ -1654,6 +1778,12 @@ class PrimeClient:
         # Task 3: forward task_profile so J-Prime can dispatch the right GGUF
         if request.task_profile is not None:
             payload["task_profile"] = request.task_profile.as_dict()
+
+        # Request-side prefix KV-cache reuse (opt-in, default OFF → legacy body).
+        # Merged LAST so the stable(system)→volatile(user) message ordering above
+        # is the KV-prefix the resident engine reuses. Metadata-only: never alters
+        # prompt SEMANTICS. Empty dict when the master gate is OFF.
+        payload.update(_jprime_cache_fields())
 
         return payload
 
