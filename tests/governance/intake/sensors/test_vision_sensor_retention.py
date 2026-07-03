@@ -248,7 +248,7 @@ async def test_memory_only_mode_also_skips_ttl_purge(tmp_path, traceback_ocr):
     sensor._session_retention_dir.mkdir(parents=True, exist_ok=True)
     stale = sensor._session_retention_dir / "old.jpg"
     stale.write_bytes(b"ancient")
-    removed = sensor._purge_expired_frames()
+    removed = await sensor._purge_expired_frames()
     assert removed == 0
     assert stale.exists()
 
@@ -277,7 +277,8 @@ async def test_retain_missing_source_falls_back_to_volatile_path(tmp_path, trace
 # ---------------------------------------------------------------------------
 
 
-def test_ttl_purge_removes_files_older_than_ttl(tmp_path):
+@pytest.mark.asyncio
+async def test_ttl_purge_removes_files_older_than_ttl(tmp_path):
     sensor = _make_sensor(tmp_path, frame_ttl_s=5.0)
     sensor._session_retention_dir.mkdir(parents=True, exist_ok=True)
     f = sensor._session_retention_dir / "aaaa0000.jpg"
@@ -285,51 +286,107 @@ def test_ttl_purge_removes_files_older_than_ttl(tmp_path):
     # Backdate the mtime well past the 5s TTL.
     past = time.time() - 60.0
     os.utime(f, (past, past))
-    removed = sensor._purge_expired_frames()
+    removed = await sensor._purge_expired_frames()
     assert removed == 1
     assert not f.exists()
     assert sensor.stats.frames_purged_ttl == 1
 
 
-def test_ttl_purge_preserves_fresh_files(tmp_path):
+@pytest.mark.asyncio
+async def test_ttl_purge_preserves_fresh_files(tmp_path):
     sensor = _make_sensor(tmp_path, frame_ttl_s=600.0)
     sensor._session_retention_dir.mkdir(parents=True, exist_ok=True)
     f = sensor._session_retention_dir / "fresh0001.jpg"
     f.write_bytes(b"x")
     # Current mtime — well inside TTL window.
-    removed = sensor._purge_expired_frames()
+    removed = await sensor._purge_expired_frames()
     assert removed == 0
     assert f.exists()
 
 
-def test_ttl_purge_tolerates_missing_directory(tmp_path):
+@pytest.mark.asyncio
+async def test_ttl_purge_tolerates_missing_directory(tmp_path):
     sensor = _make_sensor(tmp_path, frame_ttl_s=600.0)
     # Directory never created — purge is a no-op, never raises.
-    assert sensor._purge_expired_frames() == 0
+    assert await sensor._purge_expired_frames() == 0
 
 
-def test_ttl_purge_rate_limited_by_interval(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_ttl_purge_rate_limited_by_interval(tmp_path, monkeypatch):
     """``_maybe_ttl_purge`` respects the 60s inter-purge window — two
     back-to-back calls within the window only run the purge once."""
     sensor = _make_sensor(tmp_path, frame_ttl_s=60.0)
     calls: List[int] = []
-    monkeypatch.setattr(
-        sensor, "_purge_expired_frames",
-        lambda *a, **k: (calls.append(1), 0)[1],
-    )
-    sensor._maybe_ttl_purge()   # first call — purges
-    sensor._maybe_ttl_purge()   # within window — skipped
-    sensor._maybe_ttl_purge()   # still within — skipped
+
+    async def _fake_purge(*a, **k):
+        calls.append(1)
+        return 0
+
+    monkeypatch.setattr(sensor, "_purge_expired_frames", _fake_purge)
+    await sensor._maybe_ttl_purge()   # first call — purges
+    await sensor._maybe_ttl_purge()   # within window — skipped
+    await sensor._maybe_ttl_purge()   # still within — skipped
     assert len(calls) == 1
 
 
-def test_ttl_purge_skipped_in_memory_only_mode(tmp_path):
+@pytest.mark.asyncio
+async def test_ttl_purge_skipped_in_memory_only_mode(tmp_path):
     sensor = _make_sensor(tmp_path, frame_ttl_s=0.0)
     # Even with the interval elapsed, the memory-only check short-
     # circuits the purge attempt entirely.
-    sensor._maybe_ttl_purge()
+    await sensor._maybe_ttl_purge()
     # Nothing to assert beyond "did not crash". State untouched.
     assert sensor.stats.frames_purged_ttl == 0
+
+
+@pytest.mark.asyncio
+async def test_ttl_purge_routes_through_cooperative_fs_io_offload(
+    tmp_path, monkeypatch,
+):
+    """(a) Spy: the dir-scan for the purge must route through the
+    Tier-2 substrate's ``offload`` — not a raw ``iterdir()`` on the
+    loop, not a new ``asyncio.to_thread``/``run_in_executor``."""
+    import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+    sensor = _make_sensor(tmp_path, frame_ttl_s=5.0)
+    sensor._session_retention_dir.mkdir(parents=True, exist_ok=True)
+    f = sensor._session_retention_dir / "spy0000.jpg"
+    f.write_bytes(b"x")
+    past = time.time() - 60.0
+    os.utime(f, (past, past))
+
+    calls: List[int] = []
+    real_offload = fsio.offload
+
+    async def _spy_offload(fn, *a, **k):
+        calls.append(1)
+        return await real_offload(fn, *a, **k)
+
+    monkeypatch.setattr(fsio, "offload", _spy_offload)
+    removed = await sensor._purge_expired_frames()
+    assert removed == 1
+    assert calls, "purge did not route through cooperative_fs_io.offload"
+
+
+@pytest.mark.asyncio
+async def test_ttl_purge_fail_soft_on_offload_error(tmp_path, monkeypatch):
+    """(c) Fail-soft: when the substrate reports an ``OffloadError``,
+    the purge degrades to 0-removed instead of raising."""
+    import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+    sensor = _make_sensor(tmp_path, frame_ttl_s=5.0)
+    sensor._session_retention_dir.mkdir(parents=True, exist_ok=True)
+    (sensor._session_retention_dir / "wontsee.jpg").write_bytes(b"x")
+
+    async def _boom_offload(fn, *a, **k):
+        return fsio.OffloadError(
+            fn_name="iterdir", exc_type="OSError",
+            message="simulated", cpu_bound=False,
+        )
+
+    monkeypatch.setattr(fsio, "offload", _boom_offload)
+    removed = await sensor._purge_expired_frames()
+    assert removed == 0
 
 
 # ---------------------------------------------------------------------------

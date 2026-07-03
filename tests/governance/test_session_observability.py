@@ -142,6 +142,57 @@ async def test_sessions_list_empty(router, browser):
     assert body["sessions"] == []
 
 
+async def test_sessions_list_routes_scan_through_offload(router, browser, sessions_root):
+    """Tier-2 batch 1 row 26 — the /observability/sessions handler
+    must call ``scan_async`` (cooperative_fs_io.offload), not the
+    synchronous ``scan()``, so the crawl never blocks the shared
+    aiohttp event loop."""
+    import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+    _mk_session(sessions_root, "bt-off-1")
+    _mk_session(sessions_root, "bt-off-2")
+
+    calls = []
+    real_offload = fsio.offload
+
+    async def _spy_offload(fn, *a, **k):
+        calls.append(1)
+        return await real_offload(fn, *a, **k)
+
+    import unittest.mock as mock
+    with mock.patch.object(fsio, "offload", _spy_offload):
+        resp = await router._handle_session_list(
+            _mock_request("/observability/sessions"),
+        )
+    body = await _body(resp)
+    assert calls, "_handle_session_list did not route scan through offload()"
+    assert body["count"] == 2
+
+
+async def test_sessions_list_fail_soft_on_offload_error(router, browser, sessions_root):
+    """Fail-soft: an OffloadError degrades the session list to empty
+    (same shape as an empty/missing sessions root) instead of a 500."""
+    import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+    _mk_session(sessions_root, "bt-unseen")
+
+    async def _boom_offload(fn, *a, **k):
+        return fsio.OffloadError(
+            fn_name="scan", exc_type="OSError",
+            message="simulated", cpu_bound=False,
+        )
+
+    import unittest.mock as mock
+    with mock.patch.object(fsio, "offload", _boom_offload):
+        resp = await router._handle_session_list(
+            _mock_request("/observability/sessions"),
+        )
+    body = await _body(resp)
+    assert resp.status == 200
+    assert body["count"] == 0
+    assert body["sessions"] == []
+
+
 async def test_sessions_list_happy_path(router, browser, sessions_root):
     _mk_session(sessions_root, "bt-a", ops_total=3, cost=0.10)
     _mk_session(sessions_root, "bt-b", ops_total=5, cost=0.20)

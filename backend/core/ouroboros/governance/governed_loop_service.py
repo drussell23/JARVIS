@@ -7222,7 +7222,22 @@ class GovernedLoopService:
         """Process new JSON files in event_dir. Extracted for testability."""
         if self._event_dir is None:
             return
-        for path in sorted(self._event_dir.glob("*.json")):
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error,
+            offload,
+        )
+        event_dir = self._event_dir
+        paths_result = await offload(
+            lambda: sorted(event_dir.glob("*.json")),
+        )
+        if is_offload_error(paths_result):
+            logger.debug(
+                "[GovernedLoop] _handle_event_files: offloaded glob "
+                "failed (%s) — treating as empty this tick",
+                paths_result.message,
+            )
+            return
+        for path in paths_result:
             if path.name in seen:
                 continue
             seen.add(path.name)

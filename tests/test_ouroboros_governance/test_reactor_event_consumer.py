@@ -235,3 +235,72 @@ class TestReactorEventConsumerHealth:
         assert health["events_processed"] == 0
         assert health["events_failed"] == 0
         assert health["inbox_dir"] == str(inbox_dir)
+
+
+class TestReactorEventConsumerOffload:
+    """Tier-2 batch 1 row 8 — the pending-dir glob in ``_poll_loop``
+    routes through the ``cooperative_fs_io`` substrate."""
+
+    @pytest.mark.asyncio
+    async def test_poll_loop_routes_glob_through_offload(
+        self, consumer, mock_event_bus, inbox_dir,
+    ):
+        """(a) Spy: the pending glob must route through offload()."""
+        import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+        calls = []
+        real_offload = fsio.offload
+
+        async def _spy_offload(fn, *a, **k):
+            calls.append(1)
+            return await real_offload(fn, *a, **k)
+
+        with patch(
+            "backend.core.ouroboros.governance.cooperative_fs_io.offload",
+            side_effect=_spy_offload,
+        ):
+            await consumer.start()
+            await asyncio.sleep(0.05)
+
+            pending = inbox_dir / "pending"
+            event_data = _make_event_dict(event_id="spy_evt")
+            (pending / "spy_evt.json").write_text(json.dumps(event_data))
+
+            await asyncio.sleep(0.3)
+            await consumer.stop()
+
+        assert calls, "_poll_loop did not route the glob through offload()"
+        assert mock_event_bus.emit.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_poll_loop_fail_soft_on_offload_error(
+        self, consumer, mock_event_bus, inbox_dir,
+    ):
+        """(c) Fail-soft: OffloadError degrades to an empty pending
+        list for that cycle — the poll loop must not crash/exit."""
+        import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+        async def _boom_offload(fn, *a, **k):
+            return fsio.OffloadError(
+                fn_name="glob", exc_type="OSError",
+                message="simulated", cpu_bound=False,
+            )
+
+        with patch(
+            "backend.core.ouroboros.governance.cooperative_fs_io.offload",
+            side_effect=_boom_offload,
+        ):
+            await consumer.start()
+            await asyncio.sleep(0.05)
+
+            pending = inbox_dir / "pending"
+            event_data = _make_event_dict(event_id="unseen_evt")
+            (pending / "unseen_evt.json").write_text(json.dumps(event_data))
+
+            await asyncio.sleep(0.3)
+            assert consumer._running is True  # loop survived the fault
+            await consumer.stop()
+
+        # Degraded — nothing was ever seen because the glob always
+        # failed soft to an empty list.
+        mock_event_bus.emit.assert_not_awaited()

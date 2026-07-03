@@ -197,12 +197,21 @@ class RemoteStatusAPI:
             from backend.core.ouroboros.governance.agent_team import (
                 AgentTeamCoordinator,
             )
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
             # Check for active teams
             import glob
             from pathlib import Path
             teams_dir = Path.home() / ".jarvis" / "ouroboros" / "teams"
             if teams_dir.exists():
-                team_names = [d.name for d in teams_dir.iterdir() if d.is_dir()]
+                team_names_result = await offload(
+                    lambda: [d.name for d in teams_dir.iterdir() if d.is_dir()],
+                )
+                if is_offload_error(team_names_result):
+                    return web.json_response({"teams": []})
+                team_names = team_names_result
                 teams = []
                 for name in team_names[:5]:
                     team = AgentTeamCoordinator(name)

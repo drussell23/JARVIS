@@ -89,8 +89,22 @@ class ReactorEventConsumer:
         """Main poll loop -- reads pending events from reactor inbox."""
         while self._running:
             try:
+                from backend.core.ouroboros.governance.cooperative_fs_io import (
+                    is_offload_error,
+                    offload,
+                )
                 pending_dir = self._inbox / "pending"
-                for event_file in sorted(pending_dir.glob("*.json")):
+                files_result = await offload(
+                    lambda: sorted(pending_dir.glob("*.json")),
+                )
+                if is_offload_error(files_result):
+                    logger.error(
+                        "Reactor inbox poll: offloaded glob failed (%s) "
+                        "— treating as empty this cycle",
+                        files_result.message,
+                    )
+                    files_result = []
+                for event_file in files_result:
                     await self._process_event(event_file)
                 await asyncio.sleep(self._poll_interval)
             except asyncio.CancelledError:

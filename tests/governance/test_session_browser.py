@@ -213,6 +213,79 @@ def test_scan_includes_corrupt_with_marker(tmp_path: Path):
 
 
 # ===========================================================================
+# SessionIndex.scan_async — Tier-2 batch 1 row 26
+# ===========================================================================
+
+
+async def test_scan_async_routes_through_offload(tmp_path: Path):
+    """(a) Spy: scan_async must route through cooperative_fs_io.offload."""
+    import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+    _make_session(tmp_path, "bt-a")
+    _make_session(tmp_path, "bt-b")
+    idx = SessionIndex(root=tmp_path)
+
+    calls = []
+    real_offload = fsio.offload
+
+    async def _spy_offload(fn, *a, **k):
+        calls.append(1)
+        return await real_offload(fn, *a, **k)
+
+    import unittest.mock as mock
+    with mock.patch.object(fsio, "offload", _spy_offload):
+        records = await idx.scan_async()
+
+    assert calls, "scan_async did not route through cooperative_fs_io.offload"
+    assert {r.session_id for r in records} == {"bt-a", "bt-b"}
+
+
+async def test_scan_async_parity_with_sync_scan(tmp_path: Path):
+    """(b) Correctness parity: scan_async and scan() discover the
+    exact same records on an identical tree."""
+    _make_session(tmp_path, "bt-x", ops_total=4)
+    _make_session(tmp_path, "bt-y", ops_total=9)
+
+    idx_sync = SessionIndex(root=tmp_path)
+    sync_records = idx_sync.scan()
+
+    idx_async = SessionIndex(root=tmp_path)
+    async_records = await idx_async.scan_async()
+
+    assert {r.session_id for r in sync_records} == {
+        r.session_id for r in async_records
+    }
+    assert {r.ops_total for r in sync_records} == {
+        r.ops_total for r in async_records
+    }
+
+
+async def test_scan_async_fail_soft_on_offload_error(tmp_path: Path):
+    """(c) Fail-soft: an OffloadError degrades scan_async to an empty
+    list — never raises."""
+    import backend.core.ouroboros.governance.cooperative_fs_io as fsio
+
+    _make_session(tmp_path, "bt-unseen")
+    idx = SessionIndex(root=tmp_path)
+
+    async def _boom_offload(fn, *a, **k):
+        return fsio.OffloadError(
+            fn_name="scan", exc_type="OSError",
+            message="simulated", cpu_bound=False,
+        )
+
+    import unittest.mock as mock
+    with mock.patch.object(fsio, "offload", _boom_offload):
+        records = await idx.scan_async()
+    assert records == []
+
+
+async def test_scan_async_empty_root(tmp_path: Path):
+    idx = SessionIndex(root=tmp_path)
+    assert await idx.scan_async() == []
+
+
+# ===========================================================================
 # SessionIndex — filtering
 # ===========================================================================
 
