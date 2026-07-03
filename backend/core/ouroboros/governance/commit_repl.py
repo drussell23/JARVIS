@@ -136,9 +136,17 @@ def _parse_opts(args: List[str]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def dispatch_commit_command(line: str) -> CommitDispatchResult:
+async def dispatch_commit_command(line: str) -> CommitDispatchResult:
     """Parse a ``/commit`` line and dispatch. ``matched=False``
-    short-circuit lets the registry fall through. NEVER raises."""
+    short-circuit lets the registry fall through. NEVER raises.
+
+    ``async`` because ``/commit status`` awaits
+    :func:`operator_commit_authority.verify_pre_commit_async`
+    directly (fs-hot-tier Batch 3 made the underlying governance
+    hash-cap verifier async) — the registry
+    (``repl_dispatch_registry.try_dispatch``) awaits this
+    dispatcher on the REPL's live event loop. NEVER routes through
+    the on-loop-degrading sync bridge on this path."""
     if not _matches(line):
         return CommitDispatchResult(ok=False, text="", matched=False)
     try:
@@ -149,7 +157,7 @@ def dispatch_commit_command(line: str) -> CommitDispatchResult:
         )
     args = tokens[1:]
     if not args:
-        return _render_status()
+        return await _render_status()
     sub = args[0].lower()
     if sub not in _VALID_SUBCOMMANDS:
         return CommitDispatchResult(
@@ -164,7 +172,7 @@ def dispatch_commit_command(line: str) -> CommitDispatchResult:
         if sub == "help":
             return _render_help()
         if sub == "status":
-            return _render_status()
+            return await _render_status()
         if sub == "grant":
             return _handle_grant(rest)
         if sub == "revoke":
@@ -218,7 +226,7 @@ def _oca():
         return None
 
 
-def _render_status() -> CommitDispatchResult:
+async def _render_status() -> CommitDispatchResult:
     oca = _oca()
     if oca is None:
         return CommitDispatchResult(
@@ -235,7 +243,12 @@ def _render_status() -> CommitDispatchResult:
             repo_root=root,
             branch=branch,
         )
-        verdict = oca.verify_pre_commit(ctx)
+        # fs-hot-tier Batch 3 fallout fix: this dispatcher runs on the
+        # REPL's live event loop, so it awaits the async verifier
+        # directly rather than the sync verify_pre_commit(), whose
+        # governance-gate step degrades to DISABLED whenever called
+        # from a running loop.
+        verdict = await oca.verify_pre_commit_async(ctx)
     except Exception as exc:  # noqa: BLE001
         return CommitDispatchResult(
             ok=False, text=f"/commit status: read failed: {exc}",

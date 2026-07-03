@@ -117,14 +117,14 @@ def test_story_artifact_to_dict():
     assert d["schema_version"] == SESSION_STORY_SCHEMA_VERSION
 
 
-def test_aggregate_master_off_empty():
+async def test_aggregate_master_off_empty():
     from backend.core.ouroboros.governance.session_story import (
         aggregate_session_story,
     )
-    assert aggregate_session_story() == []
+    assert await aggregate_session_story() == []
 
 
-def test_aggregate_master_on_real_lss(monkeypatch):
+async def test_aggregate_master_on_real_lss(monkeypatch):
     """Real LSS may or may not have records; smoke against
     canonical substrate."""
     monkeypatch.setenv(
@@ -136,7 +136,7 @@ def test_aggregate_master_on_real_lss(monkeypatch):
     from backend.core.ouroboros.governance.session_story import (
         aggregate_session_story,
     )
-    stories = aggregate_session_story()
+    stories = await aggregate_session_story()
     assert isinstance(stories, list)
     for s in stories:
         # Each story has at least DOMINANT_ACTIVITY beat
@@ -679,76 +679,76 @@ def test_crystal_register_flags_count():
 # ============================================ /story REPL
 
 
-def test_repl_unmatched():
+async def test_repl_unmatched():
     from backend.core.ouroboros.governance.story_repl import (
         dispatch_story_command,
     )
-    r = dispatch_story_command("/something")
+    r = await dispatch_story_command("/something")
     assert r.matched is False
 
 
-def test_repl_help():
+async def test_repl_help():
     from backend.core.ouroboros.governance.story_repl import (
         dispatch_story_command,
     )
-    r = dispatch_story_command("/story help")
+    r = await dispatch_story_command("/story help")
     assert r.ok is True
     assert "session" in r.text.lower()
     assert "crystals" in r.text.lower()
 
 
-def test_repl_status():
+async def test_repl_status():
     from backend.core.ouroboros.governance.story_repl import (
         dispatch_story_command,
     )
-    r = dispatch_story_command("/story status")
+    r = await dispatch_story_command("/story status")
     assert r.ok is True
 
 
-def test_repl_session_master_off():
+async def test_repl_session_master_off():
     from backend.core.ouroboros.governance.story_repl import (
         dispatch_story_command,
     )
-    r = dispatch_story_command("/story session")
+    r = await dispatch_story_command("/story session")
     assert r.ok is False
     assert "disabled" in r.text.lower()
 
 
-def test_repl_session_master_on(monkeypatch):
+async def test_repl_session_master_on(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_SESSION_STORY_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.story_repl import (
         dispatch_story_command,
     )
-    r = dispatch_story_command("/story session")
+    r = await dispatch_story_command("/story session")
     assert r.ok is True
 
 
-def test_repl_crystals_master_off():
+async def test_repl_crystals_master_off():
     from backend.core.ouroboros.governance.story_repl import (
         dispatch_story_command,
     )
-    r = dispatch_story_command("/story crystals")
+    r = await dispatch_story_command("/story crystals")
     assert r.ok is False
 
 
-def test_repl_crystals_master_on(monkeypatch):
+async def test_repl_crystals_master_on(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_MEMORY_CRYSTALLIZATION_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.story_repl import (
         dispatch_story_command,
     )
-    r = dispatch_story_command("/story crystals 3")
+    r = await dispatch_story_command("/story crystals 3")
     assert r.ok is True
 
 
-def test_repl_unknown():
+async def test_repl_unknown():
     from backend.core.ouroboros.governance.story_repl import (
         dispatch_story_command,
     )
-    r = dispatch_story_command("/story bogus")
+    r = await dispatch_story_command("/story bogus")
     assert r.ok is False
 
 

@@ -42,51 +42,53 @@ def _isolate(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_non_commit_line_falls_through():
-    r = cr.dispatch_commit_command("/mode status")
+async def test_non_commit_line_falls_through():
+    r = await cr.dispatch_commit_command("/mode status")
     assert r.matched is False and r.ok is False
 
 
-def test_bare_and_help_match():
-    assert cr.dispatch_commit_command("/commit").matched is True
-    h = cr.dispatch_commit_command("/commit help")
+async def test_bare_and_help_match():
+    assert (await cr.dispatch_commit_command("/commit")).matched is True
+    h = await cr.dispatch_commit_command("/commit help")
     assert h.ok and "Operator Commit Authority" in h.text
 
 
-def test_unknown_subcommand():
-    r = cr.dispatch_commit_command("/commit frobnicate")
+async def test_unknown_subcommand():
+    r = await cr.dispatch_commit_command("/commit frobnicate")
     assert r.matched is True and r.ok is False
     assert "unknown subcommand" in r.text
 
 
-def test_status_never_raises_and_reports():
-    r = cr.dispatch_commit_command("/commit status")
+async def test_status_never_raises_and_reports():
+    r = await cr.dispatch_commit_command("/commit status")
     assert r.matched is True
     assert "master_enabled" in r.text or "unavailable" in r.text
 
 
-def test_grant_refuses_empty_branch(monkeypatch):
+async def test_grant_refuses_empty_branch(monkeypatch):
     # Force branch resolution to fail → must refuse, not issue a
     # whole-repo grant.
     monkeypatch.setattr(cr, "_current_branch", lambda _r: "")
-    r = cr.dispatch_commit_command("/commit grant")
+    r = await cr.dispatch_commit_command("/commit grant")
     assert r.ok is False
     assert "Refusing an empty whole-repo grant" in r.text
 
 
-def test_grant_bad_minutes(monkeypatch):
+async def test_grant_bad_minutes(monkeypatch):
     monkeypatch.setattr(cr, "_current_branch", lambda _r: "feat")
-    r = cr.dispatch_commit_command("/commit grant --minutes abc")
+    r = await cr.dispatch_commit_command("/commit grant --minutes abc")
     assert r.ok is False and "bad --minutes" in r.text
 
 
-def test_revoke_requires_target():
-    r = cr.dispatch_commit_command("/commit revoke")
+async def test_revoke_requires_target():
+    r = await cr.dispatch_commit_command("/commit revoke")
     assert r.ok is False and "--id" in r.text
 
 
-def test_parse_error_is_graceful():
-    r = cr.dispatch_commit_command('/commit grant --label "unterminated')
+async def test_parse_error_is_graceful():
+    r = await cr.dispatch_commit_command(
+        '/commit grant --label "unterminated',
+    )
     assert r.matched is True and r.ok is False
     assert "parse error" in r.text
 
@@ -161,8 +163,10 @@ def test_ast_pin_repl_naming_cage():
     src = Path(cr.__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
     # file commit_repl.py → verb /commit → dispatch_commit_command
+    # (async def since fs-hot-tier Batch 3 fallout fix — the registry
+    # awaits dispatchers now, so AsyncFunctionDef is first-class)
     assert any(
-        isinstance(n, ast.FunctionDef)
+        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         and n.name == "dispatch_commit_command"
         for n in ast.walk(tree)
     ), "naming-cage: dispatch_commit_command must exist"

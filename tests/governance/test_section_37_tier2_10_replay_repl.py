@@ -263,14 +263,14 @@ def test_register_verbs_is_idempotent_in_shape():
     assert "RELEVANT" in reg.calls[0]["posture_relevance"]
 
 
-def test_repl_dispatch_registry_routes_replay():
+async def test_repl_dispatch_registry_routes_replay():
     """Auto-discovery: §32.11 Slice 4 naming-cage means the
     canonical dispatcher routes `/replay ...` without any edits
     to repl_dispatch_registry.py."""
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (
         try_dispatch,
     )
-    r = try_dispatch("/replay help")
+    r = await try_dispatch("/replay help")
     assert r.matched is True
     assert r.ok is True
     assert "deterministic-replay browser" in r.text

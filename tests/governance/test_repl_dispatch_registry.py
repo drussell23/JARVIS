@@ -75,14 +75,14 @@ def test_master_flag_default_true(monkeypatch):
     assert repl_dispatch_autodiscovery_enabled() is True
 
 
-def test_master_off_returns_no_match(monkeypatch):
+async def test_master_off_returns_no_match(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_REPL_DISPATCH_AUTODISCOVERY_ENABLED", "false",
     )
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch,
     )
-    out = try_dispatch("/m10 help")
+    out = await try_dispatch("/m10 help")
     assert out.matched is False
     assert out.ok is False
 
@@ -145,50 +145,50 @@ def test_prime_registry_idempotent():
 # ---------------------------------------------------------------------------
 
 
-def test_try_dispatch_matches_known_verb():
+async def test_try_dispatch_matches_known_verb():
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch,
     )
-    out = try_dispatch("/m10 help")
+    out = await try_dispatch("/m10 help")
     assert out.matched is True
     assert out.ok is True
     assert out.verb == "m10"
     assert len(out.text) > 0
 
 
-def test_try_dispatch_returns_no_match_on_unknown_verb():
+async def test_try_dispatch_returns_no_match_on_unknown_verb():
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch,
     )
-    out = try_dispatch("/totally_fake_verb_xyz")
+    out = await try_dispatch("/totally_fake_verb_xyz")
     assert out.matched is False
 
 
-def test_try_dispatch_no_match_on_excluded_verb():
+async def test_try_dispatch_no_match_on_excluded_verb():
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch,
     )
     # /budget is excluded — registry returns matched=False so
     # serpent_flow's _handle_budget retains authority.
-    out = try_dispatch("/budget 1.00")
+    out = await try_dispatch("/budget 1.00")
     assert out.matched is False
 
 
-def test_try_dispatch_handles_bare_verb_form():
+async def test_try_dispatch_handles_bare_verb_form():
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch,
     )
-    out = try_dispatch("decisions help")
+    out = await try_dispatch("decisions help")
     assert out.matched is True
     assert out.verb == "decisions"
 
 
-def test_try_dispatch_empty_line_no_match():
+async def test_try_dispatch_empty_line_no_match():
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch,
     )
-    assert try_dispatch("").matched is False
-    assert try_dispatch("   ").matched is False
+    assert (await try_dispatch("")).matched is False
+    assert (await try_dispatch("   ")).matched is False
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +217,7 @@ def test_verb_name_extraction(module_name, expected):
 # ---------------------------------------------------------------------------
 
 
-def test_signature_rejection_synthetic_module(
+async def test_signature_rejection_synthetic_module(
     tmp_path, monkeypatch,
 ):
     pkg = tmp_path / "synth_repl_pkg"
@@ -257,7 +257,7 @@ def test_signature_rejection_synthetic_module(
     verbs = list_verbs()
     assert "good" in verbs
     assert "bad" not in verbs
-    out = try_dispatch("/good")
+    out = await try_dispatch("/good")
     assert out.matched is True
     assert out.ok is True
     assert out.text == "good!"
@@ -268,7 +268,7 @@ def test_signature_rejection_synthetic_module(
 # ---------------------------------------------------------------------------
 
 
-def test_dispatcher_exception_isolation(tmp_path, monkeypatch):
+async def test_dispatcher_exception_isolation(tmp_path, monkeypatch):
     pkg = tmp_path / "synth_boom_pkg"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("", encoding="utf-8")
@@ -291,7 +291,7 @@ def test_dispatcher_exception_isolation(tmp_path, monkeypatch):
         excluded_verbs=[],
         force=True,
     )
-    out = try_dispatch("/boom")
+    out = await try_dispatch("/boom")
     assert out.matched is True
     assert out.ok is False
     assert "RuntimeError" in out.text or "boom" in out.text

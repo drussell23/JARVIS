@@ -242,11 +242,11 @@ def test_events_non_match_returns_unmatched():
     assert r.matched is False
 
 
-def test_events_auto_discovered():
+async def test_events_auto_discovered():
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch,
     )
-    r = try_dispatch("/events help")
+    r = await try_dispatch("/events help")
     assert r.matched is True
     assert r.ok is True
 
@@ -478,11 +478,11 @@ def test_bus_non_match_returns_unmatched():
     assert r.matched is False
 
 
-def test_bus_auto_discovered():
+async def test_bus_auto_discovered():
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch,
     )
-    r = try_dispatch("/bus help")
+    r = await try_dispatch("/bus help")
     assert r.matched is True
     assert r.ok is True
 

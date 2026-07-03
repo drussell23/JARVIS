@@ -1495,6 +1495,34 @@ def verify_pre_commit(
         return sov
 
     # Operator channels (repl/cli/ide/daemon): require a valid grant.
+    result = _resolve_operator_grant(ctx, channel, repo_root)
+    if isinstance(result, CommitAuthorityVerdictResult):
+        return result
+    matched = result
+
+    gov = _governance_gate(ctx, matched)
+    if gov is not None:
+        return gov
+
+    return _authorized_verdict(channel, matched)
+
+
+def _resolve_operator_grant(
+    ctx: CommitAuthorityContext,
+    channel: "CommitChannel",
+    repo_root: Path,
+):
+    """Operator-channel (repl/cli/ide/daemon) grant resolution —
+    shared by :func:`verify_pre_commit` and
+    :func:`verify_pre_commit_async`. Returns a
+    ``CommitAuthorityVerdictResult`` early-denial verdict, or the
+    matched :class:`CommitGrant` on success.
+
+    Pure ledger read (JSON file) + constant-time HMAC verify — no
+    event-loop-sensitive I/O, so it is safe to call from either a
+    sync or async context without a separate async twin (unlike
+    :func:`_governance_gate` / :func:`_governance_gate_async`,
+    whose sync bridge degrades on a running loop)."""
     secret = _read_secret()
     if not secret:
         return _verdict(
@@ -1588,11 +1616,12 @@ def verify_pre_commit(
             "repo/branch/channel — issue one via /commit grant "
             "or commit_authority_cli",
         )
+    return matched
 
-    gov = _governance_gate(ctx, matched)
-    if gov is not None:
-        return gov
 
+def _authorized_verdict(
+    channel: "CommitChannel", matched: CommitGrant,
+) -> CommitAuthorityVerdictResult:
     return _verdict(
         CommitAuthorityVerdict.AUTHORIZED,
         channel.value,
@@ -1606,11 +1635,11 @@ async def verify_pre_commit_async(
     ctx: CommitAuthorityContext,
 ) -> CommitAuthorityVerdictResult:
     """Async twin of :func:`verify_pre_commit` for callers that
-    already run on an event loop — today, exclusively
-    ``AutoCommitter.commit`` (``async def``) on the AUTONOMOUS channel.
+    already run on an event loop.
 
-    fs-hot-tier Batch 3 (row 20): mirrors ``verify_pre_commit``'s
-    AUTONOMOUS branch exactly, but awaits
+    fs-hot-tier Batch 3 (row 20) introduced the AUTONOMOUS branch,
+    exclusively ``AutoCommitter.commit`` (``async def``): it mirrors
+    ``verify_pre_commit``'s AUTONOMOUS branch exactly, but awaits
     :func:`_governance_gate_async` (which itself awaits
     ``governance_manifest.verify_governance_state`` directly) instead
     of routing through the synchronous ``asyncio.run()`` bridge —
@@ -1619,9 +1648,17 @@ async def verify_pre_commit_async(
     silently degrade to a DISABLED comparison on *every* autonomous
     commit, permanently blinding the governance hash-cap gate.
 
-    Non-AUTONOMOUS channels have no known async caller today; they
-    fall through to the synchronous :func:`verify_pre_commit` (its
-    sync bridge is safe there — no loop is running in that thread).
+    Batch-3-fallout fix: non-AUTONOMOUS (operator repl/cli/ide/daemon)
+    channels previously fell through to the fully-synchronous
+    :func:`verify_pre_commit`, whose ``_governance_gate`` step degrades
+    to a DISABLED comparison whenever called from a running loop —
+    e.g. ``/commit status`` dispatched on SerpentFlow's REPL loop
+    always reported the gate as disabled even when enabled. This
+    branch now composes the same operator-grant resolution
+    (:func:`_resolve_operator_grant` — pure ledger read + HMAC verify,
+    safe sync or async) but awaits :func:`_governance_gate_async` for
+    the governance step, exactly mirroring the AUTONOMOUS branch's
+    sync/async twin pattern.
     """
     if not master_enabled():
         return _verdict(
@@ -1640,13 +1677,20 @@ async def verify_pre_commit_async(
             "closed (known: repl/cli/ide/daemon/autonomous)",
         )
 
-    if channel is not CommitChannel.AUTONOMOUS:
-        return verify_pre_commit(ctx)
-
     try:
         repo_root = Path(ctx.repo_root).resolve()
     except Exception:  # noqa: BLE001
         repo_root = Path(ctx.repo_root or ".")
+
+    if channel is not CommitChannel.AUTONOMOUS:
+        result = _resolve_operator_grant(ctx, channel, repo_root)
+        if isinstance(result, CommitAuthorityVerdictResult):
+            return result
+        matched = result
+        gov = await _governance_gate_async(ctx, matched)
+        if gov is not None:
+            return gov
+        return _authorized_verdict(channel, matched)
 
     boundary = _execution_boundary_verdict(ctx, repo_root)
     if boundary is not None:

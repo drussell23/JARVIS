@@ -813,13 +813,13 @@ class TestNamingCageAutoDiscovery:
         verbs = rdr.list_verbs()
         assert "doll_metric" in verbs
 
-    def test_dispatcher_routes_via_registry(self):
+    async def test_dispatcher_routes_via_registry(self):
         from backend.core.ouroboros.battle_test import (
             repl_dispatch_registry as rdr,
         )
         rdr.reset_registry_for_tests()
         rdr.prime_registry()
-        outcome = rdr.try_dispatch("/doll_metric help")
+        outcome = await rdr.try_dispatch("/doll_metric help")
         assert outcome.matched is True
         assert outcome.ok is True
 

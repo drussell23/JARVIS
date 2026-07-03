@@ -241,13 +241,13 @@ def test_slice4_all_legacy_verbs_auto_discovered():
     reset_registry_for_tests()
 
 
-def test_slice4_all_newly_unlocked_verbs_route():
+async def test_slice4_all_newly_unlocked_verbs_route():
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch, reset_registry_for_tests,
     )
     reset_registry_for_tests()
     for verb in _EXPECTED_NEWLY_UNLOCKED_VERBS:
-        out = try_dispatch(f"/{verb} help")
+        out = await try_dispatch(f"/{verb} help")
         assert out.matched is True, (
             f"newly-unlocked verb {verb!r} did not match"
         )
@@ -259,7 +259,7 @@ def test_slice4_all_newly_unlocked_verbs_route():
     reset_registry_for_tests()
 
 
-def test_slice4_excluded_verbs_no_match():
+async def test_slice4_excluded_verbs_no_match():
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
         try_dispatch, reset_registry_for_tests,
     )
@@ -275,7 +275,7 @@ def test_slice4_excluded_verbs_no_match():
         )
     # try_dispatch on excluded verb returns no-match so legacy
     # custom handler retains authority.
-    out = try_dispatch("/budget 1.00")
+    out = await try_dispatch("/budget 1.00")
     assert out.matched is False
     reset_registry_for_tests()
 

@@ -5274,7 +5274,7 @@ class SerpentREPL:
                         from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
                             try_dispatch as _try_dispatch,
                         )
-                        _outcome = _try_dispatch(line)
+                        _outcome = await _try_dispatch(line)
                     except Exception:  # noqa: BLE001 — defensive
                         _outcome = None
                     if _outcome is not None and _outcome.matched:
