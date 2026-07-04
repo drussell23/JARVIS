@@ -1219,6 +1219,26 @@ class IsomorphicA1Driver:
                 # and container mode (the real bind-mount path).
                 env["JARVIS_DURABLE_REROOT_FROM"] = str(env_ctx.root)
 
+                # ---- Loop Deadman, armed structurally (durability-substrate
+                # fix, Task 5) ----
+                # compose_env() (a1_live_fire_chaos_harness.py) copies
+                # os.environ FIRST, then layers overlay files + derived
+                # cognitive flags + apply_manifest() -- none of which
+                # mention JARVIS_LOOP_DEADMAN_* (verified: absent from both
+                # deploy/ouroboros_linux_prod.env and
+                # deploy/ouroboros_omni_prod.env, and apply_manifest()'s
+                # fixed key set), so an operator-set value already sitting
+                # in os.environ survives untouched into `env`. setdefault
+                # here therefore has correct override semantics -- unlike
+                # the JARVIS_BG_POOL_SIZE case (#69824) where the compose
+                # manifest itself later stomped the key, a plain
+                # env[...] = default would have been wrong THERE but is
+                # unnecessary caution HERE. Armed so any future silent-stop
+                # (the op-944c class) yields a faulthandler stack dump
+                # instead of an open-ended investigation.
+                env.setdefault("JARVIS_LOOP_DEADMAN_TIMEOUT_S", "8")
+                env.setdefault("JARVIS_LOOP_DEADMAN_STACK_DUMP", "true")
+
                 # ---- Deterministic Synthetic Roadmap (A1 emit-hop provenance) ----
                 # compose_env arms the orchestrator + A1Trace flags but NOT the
                 # roadmap READER, and no signed roadmap exists -> the strategic-GOAL

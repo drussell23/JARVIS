@@ -204,3 +204,70 @@ async def test_durable_reroot_from_equals_driver_own_overlay_root(
             "never a literal; got %r for overlay_root=%r"
             % (final_env.get("JARVIS_DURABLE_REROOT_FROM"), overlay_root)
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 5 -- Loop Deadman armed structurally in the iso driver's env compose.
+#
+# compose_env() (a1_live_fire_chaos_harness.py:227) starts from
+# ``dict(os.environ)`` (inherits operator overrides) then layers overlay
+# files + derived cognitive flags + apply_manifest() -- none of which
+# mention JARVIS_LOOP_DEADMAN_* (grepped: not in ouroboros_linux_prod.env,
+# ouroboros_omni_prod.env, or apply_manifest's fixed key set), so nothing
+# inside compose_env() re-touches these two keys after the driver assigns
+# them. That is the SAME precondition the Task-3 durable-reroot pair above
+# relies on -- direct post-compose_env mutation on the returned dict
+# reference is proven (by this file's own capturing-compose_env harness) to
+# survive to the organism subprocess.
+# ---------------------------------------------------------------------------
+
+
+async def test_composed_env_carries_loop_deadman_defaults(
+    tmp_path: Path,
+) -> None:
+    """Both Loop Deadman keys must land in the composed env with the iso
+    soak's fast-feedback defaults (8s timeout, stack dump on) when the
+    operator did not already set them."""
+    overlay_root = tmp_path / "opt" / "trinity" / "jarvis"
+    overlay_root.mkdir(parents=True, exist_ok=True)
+
+    for _k in ("JARVIS_LOOP_DEADMAN_TIMEOUT_S", "JARVIS_LOOP_DEADMAN_STACK_DUMP"):
+        os.environ.pop(_k, None)
+
+    final_env = await _run_driver_and_capture_env(tmp_path, overlay_root)
+
+    assert final_env.get("JARVIS_LOOP_DEADMAN_TIMEOUT_S") == "8", (
+        "JARVIS_LOOP_DEADMAN_TIMEOUT_S must default to the iso soak's fast "
+        "8s ceiling -- got %r" % final_env.get("JARVIS_LOOP_DEADMAN_TIMEOUT_S")
+    )
+    assert final_env.get("JARVIS_LOOP_DEADMAN_STACK_DUMP") == "true", (
+        "JARVIS_LOOP_DEADMAN_STACK_DUMP must default to true so a fired "
+        "deadman yields a faulthandler stack -- got %r"
+        % final_env.get("JARVIS_LOOP_DEADMAN_STACK_DUMP")
+    )
+
+
+async def test_operator_loop_deadman_override_wins(tmp_path: Path) -> None:
+    """An operator-preseeded value in os.environ (which compose_env() copies
+    into the composed dict BEFORE the driver's post-compose assignment)
+    must be preserved -- never clobbered by the driver's defaults."""
+    overlay_root = tmp_path / "opt" / "trinity" / "jarvis"
+    overlay_root.mkdir(parents=True, exist_ok=True)
+
+    with patch.dict(
+        os.environ,
+        {
+            "JARVIS_LOOP_DEADMAN_TIMEOUT_S": "45",
+            "JARVIS_LOOP_DEADMAN_STACK_DUMP": "false",
+        },
+    ):
+        final_env = await _run_driver_and_capture_env(tmp_path, overlay_root)
+
+    assert final_env["JARVIS_LOOP_DEADMAN_TIMEOUT_S"] == "45", (
+        "operator override must win over the driver's '8' default -- got %r"
+        % final_env.get("JARVIS_LOOP_DEADMAN_TIMEOUT_S")
+    )
+    assert final_env["JARVIS_LOOP_DEADMAN_STACK_DUMP"] == "false", (
+        "operator override must win over the driver's 'true' default -- got %r"
+        % final_env.get("JARVIS_LOOP_DEADMAN_STACK_DUMP")
+    )
