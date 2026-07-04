@@ -196,6 +196,129 @@ def deadman_tombstone_to_logger_enabled() -> bool:
 
 
 # ============================================================================
+# Tombstone dump ordering (fix/watch-budget-deadman-dump)
+# ============================================================================
+#
+# bt-iso-1783137488 surfaced that a 34.9s wedge dumped 76 thread
+# tombstones but the MainThread tombstone was MISSING -- os._exit(75)
+# cut the dump off before it reached the MainThread frame. The
+# MainThread stack IS the diagnostic payload (it names the loop's exact
+# block location); losing it defeats the instrument's entire purpose.
+#
+# Fix: the MainThread frame is now identified + dumped FIRST, the
+# logging handlers are explicitly flushed, THEN the remaining threads
+# are dumped, flushed again, and only then does os._exit(75) fire.
+# ``_dump_tombstones`` is factored out as a pure, injectable helper so
+# the ordering + defensive per-thread isolation can be unit-tested
+# directly (see tests/governance/test_loop_deadman_dump_order.py).
+
+
+def _emit_tombstone(tid: int, frame, is_main: bool) -> None:
+    """Format + log a single thread's tombstone frame. ``is_main`` tags
+    the MainThread line distinctly (``[LoopDeadman.TOMBSTONE.MAIN]``) so
+    operators can grep for the diagnostic payload directly instead of
+    scanning 70+ worker tombstones for it. May raise (frame extraction
+    can fail on an exotic frame); callers MUST wrap per-thread."""
+    import traceback as _tb
+    _stack = _tb.extract_stack(frame)
+    _stack_str = "".join(_tb.format_list(_stack))
+    _tag = "[LoopDeadman.TOMBSTONE.MAIN]" if is_main else "[LoopDeadman.TOMBSTONE]"
+    logger.critical(
+        "%s thread_id=%d\n%s",
+        _tag, tid, _stack_str,
+    )
+
+
+def _flush_all_logging() -> None:
+    """Best-effort flush of every logging handler reachable from the
+    root logger + this module's logger, plus ``sys.stderr``. NEVER
+    raises. Called immediately after the MainThread tombstone is
+    written (and again after the remainder) so buffered handler I/O
+    reaches disk before ``os._exit(75)`` can cut it off mid-write --
+    the exact failure mode that lost the MainThread tombstone in
+    bt-iso-1783137488."""
+    try:
+        for _h in logging.getLogger().handlers:
+            try:
+                _h.flush()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for _h in logger.handlers:
+            try:
+                _h.flush()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _dump_tombstones(frames, main_ident, emit=_emit_tombstone, flush=None) -> None:
+    """Dump every thread's tombstone with the MainThread FIRST.
+
+    Order: MainThread (if present in ``frames``) -> ``flush()`` ->
+    remaining threads in ``frames`` order -> ``flush()``. Per-thread
+    dumps (and the optional ``flush``) are individually wrapped in
+    try/except so one bad frame -- or a raising flush -- NEVER skips
+    the rest of the dump. This function itself must NEVER raise; it
+    runs on the wedge-exit path immediately before ``os._exit(75)``.
+
+    ``frames`` is a mapping of ``{thread_id: frame}`` (the shape
+    ``sys._current_frames()`` returns). ``emit(tid, frame, is_main)``
+    performs the actual per-thread formatting/logging. ``flush`` is an
+    optional zero-arg callable invoked before AND after the remainder
+    dump.
+    """
+    try:
+        items = list(frames.items())
+    except Exception:  # noqa: BLE001
+        items = []
+
+    # 1) MainThread first -- the diagnostic payload.
+    _main_frame = None
+    for _tid, _frame in items:
+        if _tid == main_ident:
+            _main_frame = _frame
+            break
+    if _main_frame is not None:
+        try:
+            emit(main_ident, _main_frame, True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 2) Flush -- get the MainThread tombstone to disk before anything
+    #    else can wedge or the process can exit.
+    if flush is not None:
+        try:
+            flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 3) Remaining threads -- unchanged tombstone format, one bad frame
+    #    never aborts the rest.
+    for _tid, _frame in items:
+        if _tid == main_ident:
+            continue
+        try:
+            emit(_tid, _frame, False)
+        except Exception:  # noqa: BLE001
+            continue
+
+    # 4) Flush again -- the remainder's I/O must also land before exit.
+    if flush is not None:
+        try:
+            flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ============================================================================
 # LoopDeadman
 # ============================================================================
 
@@ -530,27 +653,23 @@ class LoopDeadman:
             # (3) per-thread frame dump via the logger — lands in
             # debug.log via the harness's file handler, no stderr
             # plumbing required. ``sys._current_frames()`` returns
-            # a dict {thread_id: frame}; we walk each frame's
-            # f_back chain to produce a compact traceback.
+            # a dict {thread_id: frame}.
+            #
+            # fix/watch-budget-deadman-dump: the MainThread frame is
+            # dumped FIRST and FLUSHED before the remaining ~70+
+            # worker tombstones are dumped, so a hard os._exit(75)
+            # arriving mid-dump can never cut off the diagnostic
+            # payload (bt-iso-1783137488 lost exactly this frame).
             try:
                 if deadman_tombstone_to_logger_enabled():
-                    import traceback as _tb
                     _frames = sys._current_frames()
-                    for _tid, _frame in _frames.items():
-                        try:
-                            _stack = _tb.extract_stack(_frame)
-                            _stack_str = "".join(
-                                _tb.format_list(_stack)
-                            )
-                            logger.critical(
-                                "[LoopDeadman.TOMBSTONE] thread_id=%d\n%s",
-                                _tid, _stack_str,
-                            )
-                        except Exception:  # noqa: BLE001
-                            # Per-thread failure — keep walking
-                            # the rest; never abort the dump for
-                            # one bad frame.
-                            continue
+                    _main_ident = threading.main_thread().ident
+                    _dump_tombstones(
+                        _frames,
+                        main_ident=_main_ident,
+                        emit=_emit_tombstone,
+                        flush=_flush_all_logging,
+                    )
             except Exception:  # noqa: BLE001
                 pass
 
