@@ -516,6 +516,7 @@ def compute_tool_loop_suppressed(
     is_bg_terminal_worker: bool,
     has_repair_context: bool,
     gate_enabled: object = None,
+    is_read_only: bool = True,
 ) -> bool:
     """Unified Venom-tool-loop suppression decision (Slice 226).
 
@@ -532,6 +533,19 @@ def compute_tool_loop_suppressed(
     exploration for this complexity, the COMPLEXITY-based skip is lifted (the
     ROUTE-based skip is preserved — BACKGROUND keeps its preload-credit path).
     Gated by ``gate_alignment_enabled()``; OFF = byte-identical legacy.
+
+    PLUS the write-intent lift (2026-07-04): a BACKGROUND op that intends a
+    real mutation (``is_read_only=False``) and faces a gate-demanding
+    complexity gets its ROUTE-based skip lifted too -- generating a mutation
+    blind behind preload-credit is the empty-mutation machine (53 read-only
+    sessions). SPECULATIVE keeps its skip unconditionally (fire-and-forget
+    precompute never mutates). Read-only BACKGROUND keeps the legacy
+    preload-credit path. The complexity-based skip and the L2 repair skip
+    below are untouched by this lift. ``is_read_only`` defaults to ``True``
+    so every existing caller (which does not pass it) gets the legacy
+    decision, byte-identical. Gated by
+    ``JARVIS_VENOM_WRITE_INTENT_LIFT_ENABLED`` (default true); OFF reverts
+    byte-identical.
     NEVER raises — fail-closed to the legacy decision on any error."""
     try:
         from backend.core.ouroboros.governance.route_predicates import (
@@ -543,6 +557,17 @@ def compute_tool_loop_suppressed(
             suppressed = (c == "trivial")
         else:
             route_skip = should_skip_venom_for_route(r)
+            _write_lift_on = os.environ.get(
+                "JARVIS_VENOM_WRITE_INTENT_LIFT_ENABLED", "true",
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if (
+                _write_lift_on
+                and route_skip
+                and r == "background"
+                and not is_read_only
+                and exploration_gate_demands_tools(c, gate_enabled=gate_enabled)
+            ):
+                route_skip = False
             suppressed = (c in ("trivial", "simple")) or route_skip
             if (
                 gate_alignment_enabled()
