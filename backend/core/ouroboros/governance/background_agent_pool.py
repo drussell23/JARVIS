@@ -897,6 +897,20 @@ class BackgroundAgentPool:
         """
         return self._queue.qsize()
 
+    def has_capacity(self) -> bool:
+        """True when the queue has a free slot (``submit`` would not raise
+        :class:`QueueFullError`).
+
+        Consumed by the no-loss submit boundary: the intake router gates its
+        capacity-deferred WAL replay on this so parked envelopes are re-drained
+        only once a slot actually frees — never a hot re-submit spin against a
+        saturated pool. NEVER raises (fail-open to ``True`` so a probe fault can
+        never wedge the drain path)."""
+        try:
+            return self._queue.qsize() < self._queue_size
+        except Exception:  # noqa: BLE001
+            return True
+
     def _clear_resume_mark(self, ctx_op_id: str) -> None:
         """Drop the resume mark.  Called by the worker loop's finally
         block AFTER a resumed dispatch reaches terminal.

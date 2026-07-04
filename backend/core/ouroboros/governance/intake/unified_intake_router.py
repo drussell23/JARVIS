@@ -845,6 +845,20 @@ class UnifiedIntakeRouter:
         )
         self._dedup: Dict[str, float] = {}
         self._retry_count: Dict[str, int] = {}
+        # No-loss submit boundary: set True whenever a dispatch is deferred by
+        # a background-pool QueueFullError (the envelope stays a pending WAL
+        # row — durably parked). The dispatch loop's idle branch consults this
+        # cheap flag to decide whether to re-drain the parked rows via
+        # _replay_wal once the pool reports capacity. Self-clearing after a
+        # drain; re-set by any subsequent capacity deferral.
+        self._capacity_deferred_pending: bool = False
+        # Single-flight guard for _drain_capacity_deferred: the drain's WAL
+        # read is offloaded through cooperative_fs_io (a real suspension
+        # point), which makes reentry possible if a second caller reaches the
+        # drain while the first is parked on the thread hop. True while a
+        # drain cycle is in flight; overlapping callers return immediately
+        # (the in-flight cycle covers them).
+        self._capacity_drain_in_flight: bool = False
         self._pending_ack = PendingAckStore()
         self._dead_letter: List[IntentEnvelope] = []
         self._dispatch_task: Optional[asyncio.Task] = None
@@ -1748,6 +1762,9 @@ class UnifiedIntakeRouter:
                     except asyncio.CancelledError:
                         break
                     await self._flush_expired_coalesce_buffers()
+                    # No-loss submit boundary: re-drain capacity-parked WAL rows
+                    # now the queue is idle and (maybe) the pool freed a slot.
+                    await self._drain_capacity_deferred()
                     continue
                 envelope = decision.envelope
                 # Drain the matching entry from the legacy queue so
@@ -1778,6 +1795,9 @@ class UnifiedIntakeRouter:
                 except asyncio.TimeoutError:
                     # Flush any expired coalescing buffers
                     await self._flush_expired_coalesce_buffers()
+                    # No-loss submit boundary: re-drain capacity-parked WAL rows
+                    # now the queue is idle and (maybe) the pool freed a slot.
+                    await self._drain_capacity_deferred()
                     continue
                 except asyncio.CancelledError:
                     break
@@ -1896,6 +1916,14 @@ class UnifiedIntakeRouter:
         no code-change signals), dispatch to RuntimeTaskOrchestrator.
         Otherwise, dispatch to GovernedLoopService for code changes.
         """
+        # No-loss submit boundary — the background pool's capacity-rejection
+        # class. Handled distinctly from genuine dispatch failures below (park
+        # durably in the WAL, never dead-letter). Local import keeps the
+        # module import graph flat.
+        from backend.core.ouroboros.governance.background_agent_pool import (
+            QueueFullError,
+        )
+
         ikey = envelope.idempotency_key
 
         # A1-T4 — hop 3/5 (dequeue): the dispatch loop has pulled this
@@ -2144,6 +2172,23 @@ class UnifiedIntakeRouter:
                 )
             self._wal.update_status(envelope.lease_id, "acked")
             self._retry_count.pop(ikey, None)
+        except QueueFullError:
+            # NO-LOSS SUBMIT BOUNDARY. The background pool is at capacity. This
+            # is NOT a dispatch failure — do NOT increment the retry counter and
+            # do NOT dead-letter (either would eventually LOSE the op). The WAL
+            # already holds this envelope as a status="pending" row (durable
+            # park); we simply decline to ack it. It is re-drained by
+            # _drain_capacity_deferred() -> _replay_wal() once the pool reports
+            # free capacity. The dispatcher stays fully async — no sync-inline
+            # execution serializes the queue (the live bt-iso-1783144982 defect).
+            self._capacity_deferred_pending = True
+            logger.info(
+                "[Router] bg_submit_deferred lease_id=%s source=%s "
+                "reason=pool_capacity_full wal=pending (durably parked, no loss)",
+                envelope.lease_id,
+                envelope.source,
+            )
+            return
         except Exception as exc:
             retries = self._retry_count.get(ikey, 0) + 1
             self._retry_count[ikey] = retries
@@ -2187,12 +2232,112 @@ class UnifiedIntakeRouter:
                     self._retry_count.pop(ikey, None)
 
     # ------------------------------------------------------------------
+    # No-loss submit boundary — capacity-deferred WAL drain
+    # ------------------------------------------------------------------
+
+    async def _drain_capacity_deferred(self) -> None:
+        """Re-drain envelopes parked by a background-pool ``QueueFullError``.
+
+        The no-loss submit boundary keeps a capacity-rejected envelope as a
+        ``status="pending"`` WAL row (durable park) instead of running it
+        synchronously inline. This method re-enqueues those parked rows for
+        another dispatch attempt — reusing the EXISTING replay machinery
+        (:meth:`_replay_wal`); no new queue, no custom retry loop.
+
+        Called from the dispatch loop's idle branch, so it is the natural
+        drain cadence with zero extra tasks. Guarded three ways to guarantee
+        no double-dispatch and no hot spin:
+
+        * ``_capacity_deferred_pending`` — cheap flag; skip the full WAL read
+          entirely when nothing is parked.
+        * ``_capacity_drain_in_flight`` — single-flight: the offloaded WAL
+          read is a real suspension point, so a concurrent second drain call
+          is possible; it returns immediately (the in-flight cycle covers it).
+        * pool capacity — only replay when the pool reports a free slot
+          (``has_background_capacity``); otherwise the parked rows sit idle
+          in the WAL (no re-submit spin against a saturated pool).
+        * in-memory queue + coalesce buffers empty — checked BEFORE the
+          offloaded read and RE-CHECKED after it resolves (an ``ingest()``
+          on another coroutine may have enqueued a fresh — and WAL-pending —
+          envelope during the thread hop; replaying then would double-enqueue
+          it). The re-enqueue itself runs on-loop with no true suspension
+          point after the re-check, so it is atomic w.r.t. other coroutines.
+
+        The WAL read (whole-file read + JSON parse) is routed through the
+        ``cooperative_fs_io.offload`` substrate — this method runs on the
+        dispatch loop's idle branch repeatedly, and a synchronous
+        ``pending_entries()`` here would be a new instance of the
+        sync-FS-on-loop class. Fail-soft: an OffloadError skips this cycle
+        (flag stays set → retried next idle tick).
+
+        NEVER raises.
+        """
+        if not self._capacity_deferred_pending:
+            return
+        if self._capacity_drain_in_flight:
+            return
+        # Capacity gate — fail-open (drain) if the GLS can't be probed.
+        try:
+            probe = getattr(self._gls, "has_background_capacity", None)
+            if callable(probe) and not probe():
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        # Only drain when nothing pending is already in flight (see docstring).
+        if self._queue.qsize() > 0 or self._coalesce_buffer:
+            return
+        self._capacity_drain_in_flight = True
+        try:
+            # Sync-FS-on-loop guard: the whole-WAL read + JSON parse happens
+            # on the shared cooperative_fs_io thread pool, not the loop.
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
+
+            pending = await offload(self._wal.pending_entries, cpu_bound=False)
+            if is_offload_error(pending):
+                # Flag stays set — retried on the next idle tick.
+                logger.debug(
+                    "[Router] capacity-deferred drain skipped (OffloadError): %r",
+                    pending,
+                )
+                return
+            # Re-check the idle gate: ingest() may have enqueued a fresh
+            # (WAL-pending) envelope while we were parked on the thread hop.
+            # Replaying now would double-enqueue it — defer to the next tick.
+            if self._queue.qsize() > 0 or self._coalesce_buffer:
+                return
+            # Cleared optimistically; any row that hits QueueFullError again
+            # on the re-dispatch re-sets the flag, so a partial drain
+            # self-continues.
+            self._capacity_deferred_pending = False
+            if pending:
+                # Reuse the existing replay machinery for the re-enqueue
+                # (on-loop, cheap — the expensive read already happened).
+                await self._replay_wal(pending=pending)
+        except Exception:  # noqa: BLE001 — the drain must never kill the loop
+            logger.exception("[Router] capacity-deferred drain failed")
+        finally:
+            self._capacity_drain_in_flight = False
+
+    # ------------------------------------------------------------------
     # WAL crash recovery
     # ------------------------------------------------------------------
 
-    async def _replay_wal(self) -> None:
-        """Re-enqueue all pending WAL entries from a previous run."""
-        pending = self._wal.pending_entries()
+    async def _replay_wal(
+        self, pending: Optional[List[WALEntry]] = None
+    ) -> None:
+        """Re-enqueue all pending WAL entries from a previous run.
+
+        ``pending`` (no-loss submit boundary): pre-fetched entries from an
+        already-offloaded ``pending_entries()`` read — the capacity-deferred
+        drain passes these so the whole-WAL file read + JSON parse never runs
+        synchronously on the dispatch loop. ``None`` (the once-at-``start()``
+        crash-recovery call) preserves the legacy inline read.
+        """
+        if pending is None:
+            pending = self._wal.pending_entries()
         if not pending:
             return
         logger.info("Router: replaying %d pending WAL entries", len(pending))
@@ -2215,6 +2360,14 @@ class UnifiedIntakeRouter:
                         envelope,
                     )
                 )
+                # F1 mirror — same guard as the ingest site: in primary mode
+                # the IntakePriorityQueue is the dispatch source of truth, so
+                # a replayed row that only lands on the legacy _queue would
+                # never dequeue. Mirror-enqueue exactly like ingest step 6.
+                # None when both F1 flags are off → default-off behavior is
+                # byte-identical.
+                if self._priority_queue is not None:
+                    self._priority_queue.enqueue(envelope)
                 logger.debug(
                     "Router: replayed lease_id=%s source=%s",
                     entry.lease_id,
