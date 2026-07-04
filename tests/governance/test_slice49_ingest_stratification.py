@@ -35,16 +35,34 @@ def _mk(root: Path, rel: str, lines: int, *, covered: bool) -> str:
     return rel
 
 
+def _install_index(root: Path) -> None:
+    """Build + install the coverage index synchronously (test-only shortcut).
+
+    ``file_has_test_coverage`` is index-backed (fix/coverage-sync-inline-ast):
+    COLD degrades neutral (every file treated covered → penalty 0), so any pin
+    that needs a real uncovered verdict must warm the index first. Mirrors the
+    slice48 helper. (``ts`` is the module import below — resolved at call time.)
+    """
+    idx = ts._build_coverage_index_sync(
+        ts._resolve_scan_root(root),
+        ts._strat_test_dir_names(),
+    )
+    with ts._COVERAGE_IDX_LOCK:
+        ts._coverage_index[ts._resolve_scan_root(root)] = idx
+
+
 # ── §1 ─────────────────────────────────────────────────────────────────
 def test_no_files_or_covered_is_zero(tmp_path: Path) -> None:
     assert ingest_priority_penalty([], tmp_path) == 0
     rel = _mk(tmp_path, "backend/big.py", 5000, covered=True)
+    _install_index(tmp_path)  # warm so "covered → 0" is a real verdict
     assert ingest_priority_penalty([rel], tmp_path) == 0
 
 
 # ── §2 ─────────────────────────────────────────────────────────────────
 def test_huge_uncovered_gets_penalty(tmp_path: Path) -> None:
     rel = _mk(tmp_path, "backend/huge.py", 5000, covered=False)
+    _install_index(tmp_path)  # cold degrades neutral (penalty 0) by design
     assert ingest_priority_penalty([rel], tmp_path) > 0
 
 
@@ -57,6 +75,7 @@ def test_suppress_escape_hatch(tmp_path: Path) -> None:
 # ── §4 ─────────────────────────────────────────────────────────────────
 def test_penalty_is_bounded(tmp_path: Path) -> None:
     rels = [_mk(tmp_path, f"backend/h{i}.py", 9000, covered=False) for i in range(5)]
+    _install_index(tmp_path)  # cold degrades neutral (penalty 0) by design
     pen = ingest_priority_penalty(rels, tmp_path)
     assert 0 < pen <= 5  # bounded — cannot swamp base priorities (1..99)
 
@@ -70,6 +89,7 @@ def test_compute_priority_deprioritizes_huge_uncovered(tmp_path: Path) -> None:
 
     huge = _mk(tmp_path, "backend/huge.py", 5000, covered=False)
     small = _mk(tmp_path, "backend/small.py", 40, covered=True)
+    _install_index(tmp_path)  # cold degrades neutral → both would rank equal
 
     common = dict(
         source="ai_miner",
