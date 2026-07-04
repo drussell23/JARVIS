@@ -67,6 +67,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1479,6 +1480,64 @@ class GCPComputeRest:
         except Exception as exc:  # noqa: BLE001
             logger.debug("[GCPComputeRest] get_node_endpoints fail-soft err=%r", exc)
             return (None, None)
+
+    async def list_instances_by_label(
+        self, *, label_key: str, label_value: str,
+    ) -> List[Dict[str, Any]]:
+        """aggregatedList instances filtered to
+        ``labels.<label_key>=<label_value>`` across ALL zones -- the Stage-1
+        Brain discovery seam (Task 3). Returns the raw instance dicts (each with
+        ``name`` / ``status`` / ``zone`` / ``networkInterfaces`` / ``labels``)
+        for every match, or ``[]`` on any failure.
+
+        The server-side ``filter=`` is re-checked client-side (defense in depth
+        -- a caller must NEVER act on a mis-labelled node). Paginates via
+        ``nextPageToken``. Reuses the SAME token-mint + ``_COMPUTE_BASE`` REST
+        bridge + ``_http_request`` contract as every other method here.
+        NEVER raises."""
+        try:
+            token = await self.access_token()
+            project = await self.project()
+            if not token or not project:
+                return []
+            filt = urllib.parse.quote(
+                "labels.{}={}".format(label_key, label_value)
+            )
+            base = "{}/projects/{}/aggregated/instances?filter={}".format(
+                _COMPUTE_BASE, project, filt,
+            )
+            headers = {"Authorization": "Bearer {}".format(token)}
+            out: List[Dict[str, Any]] = []
+            page_token = ""
+            while True:
+                url = base
+                if page_token:
+                    url = "{}&pageToken={}".format(
+                        base, urllib.parse.quote(page_token)
+                    )
+                status, text = await _http_request(
+                    url, method="GET", headers=headers, timeout_s=_rest_timeout(),
+                )
+                if not (200 <= status < 300 and text):
+                    break
+                try:
+                    doc = json.loads(text)
+                except Exception:  # noqa: BLE001 -- malformed body -> stop
+                    break
+                for scope in (doc.get("items") or {}).values():
+                    for inst in (scope or {}).get("instances") or []:
+                        labels = inst.get("labels") or {}
+                        if labels.get(label_key) == label_value:
+                            out.append(inst)
+                page_token = doc.get("nextPageToken") or ""
+                if not page_token:
+                    break
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[GCPComputeRest] list_instances_by_label fail-soft err=%r", exc,
+            )
+            return []
 
     # -- delete (delete-to-snapshot keeps the golden image untouched) ----
 

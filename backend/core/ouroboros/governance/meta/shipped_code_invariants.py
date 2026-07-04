@@ -5087,6 +5087,24 @@ def _register_seed_invariants() -> None:
             validate=_validate_transport_no_hardcoded_endpoints,
         ),
     )
+    # Stage-1 Task 3: dynamic Brain discovery must resolve every endpoint
+    # from GCE aggregatedList + env -- NO baked IPv4 / ws:// / wss:// literals
+    # (same no-hardcoding pin as transport_config, sibling target).
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="brain_discovery_no_hardcoded_endpoints",
+            target_file=(
+                "backend/core/ouroboros/governance/brain_discovery.py"
+            ),
+            description=(
+                "brain_discovery must resolve every endpoint dynamically "
+                "(GCE label list + Reachability Racer + env) -- no baked "
+                "IPv4 or ws:// / wss:// literals (Stage-1 no-hardcoding "
+                "invariant)."
+            ),
+            validate=_validate_transport_no_hardcoded_endpoints,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
