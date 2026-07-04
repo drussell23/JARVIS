@@ -495,6 +495,39 @@ def file_has_test_coverage(
 
     Non-``.py`` and ``test_*`` inputs are treated as covered (no penalty).
 
+    **Index-backed, off-loop by construction (sixth starvation-class kill).**
+    This function is STRUCTURALLY incapable of walking or ``ast.parse``-ing
+    on the caller's thread — the trap that wedged the asyncio loop for 30.1 s
+    in session bt-iso-1783142866 (OpportunityMiner.scan_once → this function
+    → inline ``_strat_build_ast_map`` over ~3000 test files, GIL-held). It
+    answers only from the pre-built off-loop :class:`_CoverageIndex`:
+
+      * **WARM** (index present for the scan root) — Strategy 1 collapses to a
+        set lookup + one bisect prefix probe, Strategy 2 to a dict lookup. NO
+        filesystem traversal; today's exact matching semantics are preserved.
+      * **COLD** (no warm index) — fire the single-flight, idempotent
+        :func:`trigger_coverage_index_build` (which self-gates: builds off the
+        loop via ``cooperative_fs_io.offload`` when a loop is running, else
+        returns a no-op sentinel) and return the **NEUTRAL degrade** ``True``
+        (treated-as-covered = zero penalty). This mirrors the Tier-4 ingest
+        cold convention exactly (``unified_intake_router.py``: "cold → PROCEED
+        DEGRADED (override 0 — no penalty, no evidence)"): a covered answer
+        feeds ``stratification_penalty_multiplier``/``ingest_priority_penalty``
+        as zero penalty, so ops flow unbiased while the index warms — the
+        advisory prior is priority-ordering only, never authority.
+
+    Consumer consistency while cold: ``dw_transport_hedge.resolve_hedge_arm``
+    already gates on ``coverage_index_ready() and not file_has_test_coverage``
+    → cold (not ready) short-circuits, so returning ``True`` here keeps
+    ``+uncovered_target`` un-appended; ``OperationAdvisor._compute_test_coverage``
+    and the OpportunityMiner get a neutral 1.0 ratio while cold — exactly the
+    Tier-4 ingest semantics. The inline directory walk and inline
+    ``_strat_build_ast_map`` cold fallback are DELETED from this path; the
+    builder remains worker-only (invoked solely inside the off-loop index
+    build). Disabling the index (``JARVIS_STRATIFICATION_INDEX_ENABLED=false``)
+    therefore leaves sync callers permanently neutral (no walk) — the signal
+    is advisory, so this is a safe opt-out, not a regression.
+
     ``repo_root`` is automatically translated via
     :func:`execution_context.authoritative_repo_root` so that a
     ``.worktrees/<name>/`` path (an L3 isolation worktree that may be empty
@@ -502,37 +535,50 @@ def file_has_test_coverage(
     where test files actually live. READS stay authoritative; WRITES still
     target the worktree.
     """
-    # Defense-in-depth: translate .worktrees/<name> paths to the real repo
-    # root so coverage detection never returns 0 due to an empty worktree.
-    try:
-        from backend.core.ouroboros.governance.execution_context import (
-            authoritative_repo_root as _auth_root,
-        )
+    # LoopSink instrumentation — proves this callsite no longer blocks the
+    # asyncio thread (the whole point of the fix). Cheap + fail-soft; a no-op
+    # when JARVIS_LOOP_SINK_ENABLED is off.
+    from backend.core.ouroboros.telemetry.loop_sink import (
+        sink_sync as _ls_sink_sync,
+    )
 
-        _scan_root = _auth_root(Path(repo_root))
-    except Exception:  # noqa: BLE001 — fail-soft, never breaks coverage
-        _scan_root = Path(repo_root)
+    with _ls_sink_sync("target_stratification.file_has_test_coverage"):
+        # Defense-in-depth: translate .worktrees/<name> paths to the real repo
+        # root so coverage detection never returns 0 due to an empty worktree.
+        try:
+            from backend.core.ouroboros.governance.execution_context import (
+                authoritative_repo_root as _auth_root,
+            )
 
-    name = Path(file_path).name
-    if not name.endswith(".py") or "test_" in name:
-        return True
-    stem = Path(file_path).stem
-    dir_names = _strat_test_dir_names()
-    exact_name = f"test_{stem}.py"
-    suffix_prefix = f"test_{stem}_"
+            _scan_root = _auth_root(Path(repo_root))
+        except Exception:  # noqa: BLE001 — fail-soft, never breaks coverage
+            _scan_root = Path(repo_root)
 
-    # Tier-4 fast path — when the off-loop coverage index is warm, answer
-    # from memory: Strategy 1 collapses to a set lookup + one bisect prefix
-    # probe, Strategy 2 to a dict lookup. NO filesystem traversal. This is
-    # what makes the function safe to call from latency-sensitive contexts
-    # once the index is built (the intake hot path additionally never calls
-    # it on the loop at all — see UnifiedIntakeRouter._ingest_impl).
-    try:
-        _idx_key = _scan_root.resolve()
-    except OSError:  # noqa: PERF203 — circular symlink, keep syntactic form
-        _idx_key = _scan_root
-    _idx = _coverage_index_lookup(_idx_key)
-    if _idx is not None:
+        name = Path(file_path).name
+        if not name.endswith(".py") or "test_" in name:
+            return True
+        stem = Path(file_path).stem
+        exact_name = f"test_{stem}.py"
+        suffix_prefix = f"test_{stem}_"
+
+        try:
+            _idx_key = _scan_root.resolve()
+        except OSError:  # circular symlink, keep syntactic form
+            _idx_key = _scan_root
+        _idx = _coverage_index_lookup(_idx_key)
+
+        if _idx is None:
+            # COLD — NEVER walk/parse on the caller's thread. Request the
+            # single-flight off-loop build (idempotent; self-gates on the
+            # "building" set / TTL / failure cooldown / no-loop) and return
+            # the neutral degrade (treated-as-covered = zero penalty).
+            trigger_coverage_index_build(_scan_root)
+            return True
+
+        # WARM — answer both strategies from the in-memory index.
+        # Strategy 1: suffix-aware name match (set lookup + bisect prefix probe;
+        # subsumes the old exact-match). Strategy 2: AST-import dict lookup,
+        # env-opt-out. Preserves today's exact matching semantics.
         if exact_name in _idx.names_set:
             return True
         _i = bisect.bisect_left(_idx.names_sorted, suffix_prefix)
@@ -551,43 +597,6 @@ def file_has_test_coverage(
             except Exception:  # noqa: BLE001 — fail-soft, mirror Strategy 2
                 pass
         return False
-
-    # Strategy 1: suffix-aware recursive search across all test roots.
-    # Finds test_<stem>.py (exact) AND test_<stem>_*.py (suffix variants).
-    # This subsumes the old single-path tests/test_{stem}.py existence check.
-    # Uses _scan_root (translated from .worktrees/<name> to the real repo root
-    # via authoritative_repo_root) so coverage detection never returns 0 due
-    # to an empty isolation worktree.
-    for tdn in sorted(dir_names):
-        top = _scan_root / tdn
-        if not top.is_dir():
-            continue
-        for match in sorted(top.rglob("test_*.py")):
-            if not match.is_file():
-                continue
-            mname = match.name
-            if mname == exact_name or (mname.startswith(suffix_prefix) and mname.endswith(".py")):
-                return True
-
-    # Strategy 2: AST-import scan (lazy cached per _scan_root, env-opt-out).
-    # Uses _scan_root (authoritative repo root) so the import map is built
-    # from real test files, never from an empty isolation worktree.
-    if _strat_ast_import_enabled():
-        try:
-            fp = Path(file_path)
-            if not fp.is_absolute():
-                fp = _scan_root / fp
-            module_path = _strat_path_to_module(fp, _scan_root)
-            if module_path:
-                resolved_root = _scan_root.resolve()
-                if resolved_root not in _strat_ast_cache:
-                    _strat_ast_cache[resolved_root] = _strat_build_ast_map(resolved_root, dir_names)
-                if _strat_ast_cache[resolved_root].get(module_path):
-                    return True
-        except Exception:  # noqa: BLE001 — fail-soft, never raises
-            pass
-
-    return False
 
 
 def stratification_penalty_multiplier(
