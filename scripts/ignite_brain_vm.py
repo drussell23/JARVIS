@@ -104,6 +104,55 @@ _ENV_READY_BUDGET_S = "JARVIS_BRAIN_READY_BUDGET_S"
 _ENV_READY_BASE_S = "JARVIS_BRAIN_READY_BASE_S"
 _ENV_READY_CAP_S = "JARVIS_BRAIN_READY_CAP_S"
 _ENV_EXCHANGE_N = "JARVIS_BRAIN_EXCHANGE_N"
+_ENV_MTLS_DIR = "JARVIS_BRAIN_MTLS_DIR"
+
+# The server-side TLS material travels from the Mac (gen_brain_mtls.py output)
+# to the node as instance metadata; the runtime startup script writes it to
+# these node-local paths BEFORE the units start, and brain.env points at them.
+_NODE_TLS_DIR = "/etc/jarvis/tls"
+_TLS_META_KEYS = {
+    "server_cert": ("brain-tls-server-cert", "server-cert.pem"),
+    "server_key": ("brain-tls-server-key", "server-key.pem"),
+    "ca": ("brain-tls-ca", "ca.pem"),
+}
+
+
+class TLSMaterialError(RuntimeError):
+    """TLS is enabled but the server material is absent/incomplete. Raised in the
+    driver preflight BEFORE any GCP call (fail-closed, $0)."""
+
+
+def _tls_material() -> Optional[Dict[str, str]]:
+    """Load the SERVER PEM material (server cert/key + CA) from
+    ``JARVIS_BRAIN_MTLS_DIR`` (the gen_brain_mtls.py output dir). Returns None
+    when TLS is disabled; raises ``TLSMaterialError`` when TLS is enabled and any
+    piece is missing -- the ignition must never spend on a node that can only
+    fail its mTLS probe."""
+    if not _truthy(os.environ.get("JARVIS_BRAIN_WS_TLS_ENABLED", "true")):
+        return None
+    raw_dir = (os.environ.get(_ENV_MTLS_DIR, "") or "").strip()
+    if not raw_dir:
+        raise TLSMaterialError(
+            "TLS enabled but %s is unset -- run scripts/gen_brain_mtls.py and "
+            "export the material dir" % _ENV_MTLS_DIR)
+    mat: Dict[str, str] = {}
+    for part, (_meta_key, filename) in _TLS_META_KEYS.items():
+        path = os.path.join(raw_dir, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                mat[part] = fh.read()
+        except OSError as exc:
+            raise TLSMaterialError(
+                "TLS enabled but %s is missing/unreadable (%s) -- aborting "
+                "BEFORE any GCP spend" % (path, exc)) from exc
+    return mat
+
+
+def _tls_extra_metadata(mat: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Map the loaded PEM material onto its instance-metadata keys."""
+    if not mat:
+        return {}
+    return {meta_key: mat[part] for part, (meta_key, _fn) in _TLS_META_KEYS.items()}
 
 
 def _persistent() -> bool:
@@ -529,6 +578,10 @@ class _LiveMacEndpoint:
         self._broker = broker
         self._client_getter = client_getter
         self._observed: List[Tuple[str, str]] = []
+        # Task-9 wiring: (op -> our minted event_id) for the echo mapping, and
+        # the full observed stream (type/op/eid/payload) for protocol parsing.
+        self._published: Dict[str, str] = {}
+        self._observed_full: List[Tuple[str, str, str, Dict[str, Any]]] = []
         self._sub = None
         self._task: Optional[asyncio.Task] = None
 
@@ -544,7 +597,17 @@ class _LiveMacEndpoint:
                     eid = getattr(ev, "event_id", "") or ""
                     op = getattr(ev, "op_id", "") or ""
                     if eid:
-                        self._observed.append((op, eid))
+                        etype = getattr(ev, "event_type", "") or ""
+                        payload = dict(getattr(ev, "payload", None) or {})
+                        self._observed_full.append((etype, op, eid, payload))
+                        # Brain-origin nonce events surface AS their nonce so the
+                        # exchange's expected-id matching sees what brain.publish
+                        # returned (the nonce IS the cross-host correlation id).
+                        parsed = _xp().parse_observed(etype, op, payload)
+                        if parsed and parsed[0] == "nonce":
+                            self._observed.append((op, parsed[1]))
+                        else:
+                            self._observed.append((op, eid))
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -562,7 +625,10 @@ class _LiveMacEndpoint:
             self._task = None
 
     def publish(self, event_type: str, op_id: str, payload: Dict[str, Any]) -> str:
-        return self._bus.publish(event_type, op_id, payload) or ""
+        eid = self._bus.publish(event_type, op_id, payload) or ""
+        if eid:
+            self._published[op_id] = eid
+        return eid
 
     def observed(self) -> List[Tuple[str, str]]:
         return list(self._observed)
@@ -571,6 +637,48 @@ class _LiveMacEndpoint:
     def last_event_id(self) -> Optional[str]:
         client = self._client_getter()
         return getattr(client, "last_event_id", None) if client else None
+
+
+def _xp():
+    """Lazy exchange-protocol import (keeps module import light for --help)."""
+    import backend.core.ouroboros.governance.transport.exchange_protocol as xp
+    return xp
+
+
+class _LiveBrainEndpoint:
+    """The BRAIN endpoint as seen FROM the Mac (Task-9 un-loopback).
+
+    ``publish()`` asks the Brain to publish: a nonce'd command crosses the
+    bridge, the Brain's echo responder answers with a BRAIN-ORIGIN event
+    carrying the nonce -- so the returned "event id" (the nonce) is observed on
+    the Mac iff the Brain really published across the wire.
+
+    ``observed()`` is what the Brain has PROVEN to observe: its echoes, mapped
+    back to the Mac-side event ids of the original ops (an echo for op X arrived
+    <=> the Brain saw the event the Mac minted for op X)."""
+
+    def __init__(self, mac: "_LiveMacEndpoint") -> None:
+        self.name = "brain"
+        self._mac = mac
+        self._pub_seq = 0
+
+    def publish(self, event_type: str, op_id: str, payload: Dict[str, Any]) -> str:
+        self._pub_seq += 1
+        nonce = "bn-%s-%d" % (op_id, self._pub_seq)
+        self._mac.publish(event_type, op_id, _xp().make_publish_cmd(nonce))
+        return nonce
+
+    def observed(self) -> List[Tuple[str, str]]:
+        xp = _xp()
+        out: List[Tuple[str, str]] = []
+        for etype, op, _eid, payload in self._mac._observed_full:
+            parsed = xp.parse_observed(etype, op, payload)
+            if parsed and parsed[0] == "echo":
+                orig_op = parsed[1]
+                mac_eid = self._mac._published.get(orig_op)
+                if mac_eid:
+                    out.append((orig_op, mac_eid))
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +745,10 @@ class BrainIgnitionDriver:
         )
 
         brain_env = _compose_brain_env(self._brain_env_values())
+        extra = {_BRAIN_ENV_METADATA_KEY: brain_env}
+        # Ship the SERVER PEM material as metadata; the runtime startup script
+        # writes it to /etc/jarvis/tls/* before the units start.
+        extra.update(_tls_extra_metadata(_tls_material()))
         return await get_compute_rest().create_instance(
             startup_script=_brain_runtime_startup_script(),
             name=self.node_name,
@@ -645,14 +757,19 @@ class BrainIgnitionDriver:
             accelerator_type="",
             accelerator_count=0,
             labels={_BRAIN_ROLE_LABEL_KEY: _BRAIN_ROLE_LABEL_VALUE},
-            extra_metadata={_BRAIN_ENV_METADATA_KEY: brain_env},
+            extra_metadata=extra,
         )
 
     def _brain_env_values(self) -> Dict[str, str]:
         """Fold the Task-4 ignition values into the brain-env metadata: the WS
         port/path + TLS material references + the session cost cap, all
         env-resolved (Mandate 2). The idle-shutdown seconds are added by
-        ``_compose_brain_env`` itself."""
+        ``_compose_brain_env`` itself.
+
+        TLS paths: when server material is shipped (TLS enabled), the node's
+        brain.env is OVERRIDDEN to the node-local /etc/jarvis/tls/* paths the
+        runtime startup script writes -- the Mac-side env holds the Mac's OWN
+        (client) paths, which must never leak into the node's config."""
         vals: Dict[str, str] = {}
         for key in (
             "JARVIS_BRAIN_WS_PORT", "JARVIS_BRAIN_WS_PATH", "JARVIS_BRAIN_WS_TLS_ENABLED",
@@ -662,6 +779,13 @@ class BrainIgnitionDriver:
             v = os.environ.get(key)
             if v is not None and v != "":
                 vals[key] = v
+        if _tls_material() is not None:
+            vals["JARVIS_BRAIN_WS_TLS_CERT"] = "%s/%s" % (
+                _NODE_TLS_DIR, _TLS_META_KEYS["server_cert"][1])
+            vals["JARVIS_BRAIN_WS_TLS_KEY"] = "%s/%s" % (
+                _NODE_TLS_DIR, _TLS_META_KEYS["server_key"][1])
+            vals["JARVIS_BRAIN_WS_TLS_CA"] = "%s/%s" % (
+                _NODE_TLS_DIR, _TLS_META_KEYS["ca"][1])
         return vals
 
     async def _do_discover(self) -> Optional[str]:
@@ -753,14 +877,14 @@ class BrainIgnitionDriver:
             _live_tasks.append(new_task)
             return mac
 
-        # LOUD LOOPBACK GUARD (Fix 3): with no Brain-side echo subscriber (Task 5),
-        # the Brain observation endpoint is the SAME local broker as the Mac -- the
-        # bidirectional exchange is a LOCAL LOOPBACK, not a cross-host round-trip.
-        # ValidationExchange gates ``proven=False`` in this mode; make it visible.
-        _log("[BrainIgnite] bidirectional exchange is LOOPBACK (brain echo "
-             "subscriber not wired) -- cross-host round-trip UNPROVEN until Stage 2")
+        # Task-9 un-loopback: the Brain endpoint is REAL -- publish() commands the
+        # Brain's echo responder over the wire, observed() reads its echoes. The
+        # loopback guard clears (mac is not brain) and ``proven`` is reachable.
+        brain = _LiveBrainEndpoint(mac)
+        _log("[BrainIgnite] cross-host exchange armed (echo responder protocol; "
+             "loopback mode retired)")
         exchange = ValidationExchange(
-            mac=mac, brain=mac, reconnect=_reconnect, sever=_sever,
+            mac=mac, brain=brain, reconnect=_reconnect, sever=_sever,
             settle_s=_env_float("JARVIS_BRAIN_EXCHANGE_SETTLE_S", 1.0),
             observe_timeout_s=_env_float("JARVIS_BRAIN_EXCHANGE_OBSERVE_S", 15.0),
         )
@@ -791,6 +915,14 @@ class BrainIgnitionDriver:
                  "(persistent=%s) -- no GCP touched" % (self.fw_rule_name,
                                                         self.node_name, self.persistent))
             return 0
+
+        # 0. TLS PREFLIGHT -- fail-closed BEFORE any GCP call: a node that cannot
+        #    pass its own mTLS probe must never be paid for.
+        try:
+            _tls_material()
+        except TLSMaterialError as exc:
+            _log("TLS preflight FAILED ($0, nothing provisioned): %s" % exc)
+            return 4
 
         proven = False
         try:
@@ -881,16 +1013,53 @@ def _brain_runtime_startup_script() -> str:
     /run/jarvis exists + touches the liveness marker so the idle-check never nukes
     a freshly-booted node, and (c) restarts the unit to apply the fresh env.
     ASCII-only. Kept tiny + idempotent (Mandate 3: no new provisioning framework)."""
+    meta_base = "http://metadata.google.internal/computeMetadata/v1/instance/attributes"
+    tls_fetch = "".join(
+        "curl -fsS -H 'Metadata-Flavor: Google' '%s/%s' -o %s/%s || true\n"
+        % (meta_base, meta_key, _NODE_TLS_DIR, filename)
+        for meta_key, filename in _TLS_META_KEYS.values()
+    )
     return (
         "#!/usr/bin/env bash\n"
         "set -uo pipefail\n"
-        "mkdir -p /etc/jarvis /run/jarvis\n"
-        "curl -fsS -H 'Metadata-Flavor: Google' "
-        "'http://metadata.google.internal/computeMetadata/v1/instance/attributes/brain-env' "
-        "-o /etc/jarvis/brain.env || : > /etc/jarvis/brain.env\n"
-        "touch /run/jarvis/brain_liveness\n"
+        "mkdir -p /etc/jarvis /run/jarvis %s\n" % _NODE_TLS_DIR
+        + "curl -fsS -H 'Metadata-Flavor: Google' "
+        "'%s/brain-env' " % meta_base
+        + "-o /etc/jarvis/brain.env || : > /etc/jarvis/brain.env\n"
+        # SERVER TLS material (shipped as metadata by the driver) -> node files,
+        # BEFORE any unit starts. Fail-soft per file: TLS-disabled ignitions have
+        # no such metadata and must still boot.
+        + tls_fetch
+        + "chmod 600 %s/%s 2>/dev/null || true\n" % (
+            _NODE_TLS_DIR, _TLS_META_KEYS["server_key"][1])
+        # Refresh the baked clone (fail-soft): the golden image tracks main at
+        # ignition, so driver-shipped scripts (e.g. the bus sidecar) that landed
+        # AFTER the bake are present without a re-bake.
+        + "git -C /opt/trinity/jarvis pull --ff-only || true\n"
+        # Stage-0 bus + acceptance echo responder SIDECAR: the Brain-side WS
+        # server the cross-host acceptance connects to. Same venv as the soak.
+        + "cat > /etc/systemd/system/jarvis-brain-bus.service <<'UNIT'\n"
+        "[Unit]\n"
+        "Description=JARVIS Brain Stage-0 bus + acceptance echo responder\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "WorkingDirectory=/opt/trinity/jarvis\n"
+        "EnvironmentFile=/etc/jarvis/brain.env\n"
+        "RuntimeDirectory=jarvis\n"
+        "ExecStart=/opt/trinity/venv/bin/python scripts/brain_bus_echo_server.py\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+        "UNIT\n"
+        + "touch /run/jarvis/brain_liveness\n"
         "systemctl daemon-reload || true\n"
         "systemctl restart jarvis-brain.service || systemctl start jarvis-brain.service || true\n"
+        "systemctl restart jarvis-brain-bus.service || systemctl start jarvis-brain-bus.service || true\n"
         "systemctl start jarvis-brain-idle.timer || true\n"
     )
 

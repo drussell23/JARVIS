@@ -54,6 +54,11 @@ class BusBridgeClient:
         self._session_factory = session_factory
         self._stopped = False
         self._last_event_id: Optional[str] = None
+        # Outbound replay cursor: the last local event actually SENT to the peer.
+        # A reconnect re-subscribes from here so events published while severed
+        # cross client->server via broker replay (the server dedups overlaps).
+        # None = first connect (live-only, legacy behavior).
+        self._last_sent_id: Optional[str] = None
         self._high_water: int = 0
         self._degraded = False
         self._missed_hb = 0
@@ -129,9 +134,15 @@ class BusBridgeClient:
         ssl_ctx = build_client_ssl_context(self._cfg)
         session = (self._session_factory() if self._session_factory
                    else aiohttp.ClientSession())
+        # When discovery dialed a raw IP, the server cert's SAN is the DNS
+        # identity (e.g. jarvis-brain) -- verify against it explicitly. None
+        # preserves the legacy call shape (verify against the dialed host).
+        connect_kwargs: dict = {}
+        if self._cfg.tls_server_hostname:
+            connect_kwargs["server_hostname"] = self._cfg.tls_server_hostname
         try:
             async with session.ws_connect(
-                self._resolve_url(), ssl=ssl_ctx, heartbeat=None,
+                self._resolve_url(), ssl=ssl_ctx, heartbeat=None, **connect_kwargs,
             ) as ws:
                 await ws.send_bytes(
                     bf.hello_frame(self._cfg.source_id, self._last_event_id).encode()
@@ -155,7 +166,7 @@ class BusBridgeClient:
         StreamEventBroker.subscribe()/stream_iter() -- this method
         only filters broker-internal control events and translates
         StreamEvent -> BusFrame, writing bytes to the socket."""
-        sub = self._broker.subscribe(op_id_filter=None, last_event_id=None)
+        sub = self._broker.subscribe(op_id_filter=None, last_event_id=self._last_sent_id)
         if sub is None:
             return
         try:
@@ -170,6 +181,7 @@ class BusBridgeClient:
                     continue
                 frame = bf.event_frame(event, source_id=self._cfg.source_id)
                 await ws.send_bytes(frame.encode())
+                self._last_sent_id = event.event_id
         except (asyncio.CancelledError, ConnectionResetError):
             raise
         except Exception:  # noqa: BLE001
