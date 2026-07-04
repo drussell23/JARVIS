@@ -257,11 +257,18 @@ _SCHEDULE_GROUP_KIND_COALESCED = "nested_venv_split_coalesced"
 # so the ONLY sub-cap collapse is a single ``(watch_dir, True)`` root
 # — the "in the limit: one recursive root schedule of the watch root"
 # the operator binding authorises ("fewer observer schedules beats
-# perfect nested-dir exclusion"). The legacy ``ignore_patterns``
-# post-event filter still drops the re-included excluded-subtree
-# (venv/cache) events; one slow-but-alive poll thread strictly beats
-# N GIL-contending ones. This kind is a TERMINAL collapse target — it
-# is never itself coalesced further.
+# perfect nested-dir exclusion"). Safety comes from THREAD-COUNT, not
+# event filtering: ONE poll thread releases the GIL on every
+# scandir/stat syscall and cannot aggregate-GIL-wedge the loop the
+# way 51 contending walkers did. Re-included subtrees (venv/cache) DO
+# emit events — ``ignore_patterns`` fnmatches BASENAME only against
+# *.tmp/*.swp/*.bak/*~ and does NOT drop venv/.../foo.py; downstream
+# dedup + debounce absorb them — and ARE walked by the single poller:
+# an accepted operator-authorized tradeoff (12J binding: fewer
+# schedules beats perfect exclusion). The catastrophic 56K-file SWE
+# worktree stays pattern-descent-protected (never collapsed). This
+# kind is a TERMINAL collapse target — it is never itself coalesced
+# further.
 #
 # ABSOLUTE CONSTRAINT: a ``watch_dir`` root is created ONLY when NO
 # ``_SCHEDULE_GROUP_KIND_PATTERN_DESCENT`` group is present. A
@@ -270,7 +277,10 @@ _SCHEDULE_GROUP_KIND_COALESCED = "nested_venv_split_coalesced"
 # clone) back into the poll walk and resurrect the exact wedge Slice
 # 12I closed. When pattern-descent groups exist the cap is FLOORED —
 # we honour 12I over the 12J/12K cap and WARN (never violate 12I to
-# satisfy 12J).
+# satisfy 12J). Documented mixed-case gap: when pattern-descent
+# groups coexist with many irreducible siblings the cap floors to
+# warn-only (schedule_budget_floored_by_pattern_descent) — follow-up
+# slice required before SWE-bench-worktree soaks.
 _SCHEDULE_GROUP_KIND_HARD_COALESCED = "hard_coalesced_root"
 
 
@@ -911,10 +921,16 @@ class FileWatchGuard:
         # alone could not fit the cap, so the collapsible depth-1
         # siblings were folded into a single recursive watch-root
         # schedule). This is a stronger signal than the venv-tier
-        # WARNING: per-subtree event granularity is gone; the whole
-        # watch root is now one poll thread and ignore_patterns is the
-        # only excluded-subtree filter. It is still strictly better
-        # than the polling-thread storm that wedged the loop.
+        # WARNING: per-subtree schedule granularity is gone. Safety
+        # comes from THREAD-COUNT, not event filtering — ONE poll
+        # thread releases the GIL on every scandir/stat syscall and
+        # cannot aggregate-GIL-wedge the loop the way 51 contending
+        # walkers did. Re-included subtrees DO emit events (deduped
+        # downstream; ignore_patterns only fnmatches basenames like
+        # *.tmp) and ARE walked by the single poller — the accepted
+        # operator-authorized tradeoff (12J binding: fewer schedules
+        # beats perfect exclusion). The 56K-file SWE worktree stays
+        # pattern-descent-protected (never collapsed).
         if hard_coalesced_count > 0:
             logger.warning(
                 "[FileWatchGuard] schedule_budget_hard_coalesced "
@@ -922,8 +938,9 @@ class FileWatchGuard:
                 "venv-split coalescing was insufficient; %d collapsible "
                 "depth-1 group(s) folded into a single recursive watch-root "
                 "schedule to stay under the polling-thread budget "
-                "(bt-iso-1783137488 class: 51>30 loop-wedge). Excluded "
-                "subtrees still drop events via ignore_patterns; "
+                "(bt-iso-1783137488 class: 51>30 loop-wedge). Re-included "
+                "subtrees are walked by the single poller and DO emit "
+                "events (deduped downstream) — accepted 12J tradeoff; "
                 "pattern-descent groups (Slice 12I) are never folded.",
                 candidate_count, len(scheduled_ok),
                 max_scheduled_roots, hard_coalesced_count,
@@ -1489,10 +1506,18 @@ class FileWatchGuard:
         recursive ancestor, so the only sub-cap collapse is a SINGLE
         ``(watch_dir, True)`` root — the "in the limit: one recursive
         root schedule of the watch root" the operator binding
-        authorises. The legacy ``ignore_patterns`` post-event filter
-        still drops the re-included excluded-subtree (venv/cache)
-        events; per the LoopDeadman evidence one slow-but-alive poll
-        thread strictly beats N GIL-contending ones.
+        authorises. Safety comes from THREAD-COUNT, not event
+        filtering: ONE poll thread releases the GIL on every
+        scandir/stat syscall and cannot aggregate-GIL-wedge the loop
+        the way 51 contending walkers did (the LoopDeadman evidence).
+        Re-included subtrees (venv/cache) DO emit events —
+        ``ignore_patterns`` fnmatches BASENAME only against
+        *.tmp/*.swp/*.bak/*~, so venv/.../foo.py is NOT dropped;
+        downstream dedup + debounce absorb them — and ARE walked by
+        the single poller: an accepted operator-authorized tradeoff
+        (12J binding: fewer schedules beats perfect exclusion). The
+        catastrophic 56K-file SWE worktree stays pattern-descent-
+        protected (never collapsed).
 
         ABSOLUTE CONSTRAINT (Slice 12I): ``PATTERN_DESCENT`` groups are
         NEVER folded, AND we never create a ``watch_dir`` root while
