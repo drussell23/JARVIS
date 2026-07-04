@@ -390,6 +390,7 @@ class ValidationExchange:
         mac: Any,
         brain: Any,
         reconnect: Callable[[], Awaitable[Any]],
+        sever: Optional[Callable[[], Awaitable[Any]]] = None,
         settle_s: float = 0.25,
         observe_timeout_s: float = 10.0,
         event_type: str = _EXCHANGE_EVENT_TYPE,
@@ -397,9 +398,16 @@ class ValidationExchange:
         self._mac = mac
         self._brain = brain
         self._reconnect = reconnect
+        self._sever = sever
         self._settle_s = max(0.0, settle_s)
         self._observe_timeout_s = max(0.0, observe_timeout_s)
         self._event_type = event_type
+        # LOOPBACK GUARD (Fix 3): when the Mac and Brain observation endpoints are
+        # the SAME object, the bidirectional "cross-host" proof is really a local
+        # loopback (no Brain echo subscriber) -- it proves nothing across the host
+        # boundary. Recorded so ``run_all`` can gate the ``proven`` flag: a
+        # loopback run can NEVER report cross-host-proven.
+        self._loopback = mac is brain
 
     async def _await_observed(
         self, endpoint: Any, expected_ids: List[str],
@@ -455,19 +463,27 @@ class ValidationExchange:
                 "ok": bool(m2b["ok"] and b2m["ok"])}
 
     async def run_reconnect_replay(self, n: int) -> Dict[str, Any]:
-        """Publish ``n`` Brain->Mac, record the Mac's last acked id, SEVER +
-        stateless re-discover/reconnect, publish ``n`` more, and assert the Mac
-        observes the exact contiguous span with zero gap / zero dup (Last-Event-ID
-        replay across a real reconnect)."""
+        """Prove Last-Event-ID replay is LOAD-BEARING: publish ``n`` Brain->Mac
+        live, record the Mac's last acked id, SEVER the link, publish ``n`` more
+        events WHILE SEVERED (buffered at the source -- NOT delivered live), then
+        stateless re-discover/reconnect so the reconnect's Last-Event-ID replay is
+        the ONLY delivery route for the severed span. Assert the Mac observes the
+        exact contiguous pre+post span with zero gap / zero dup."""
         _ops, pre_ids = await self._publish_batch(self._brain, n, "pre")
         await self._await_observed(self._mac, pre_ids)
         last_id = self._mac.last_event_id
 
-        # Sever + re-discover + reconnect (stateless -- the caller re-resolves the
-        # endpoint from scratch). The reconnected Mac endpoint replaces ours.
+        # SEVER before publishing the post span so those events cannot deliver
+        # live -- they can only arrive via the reconnect's Last-Event-ID replay.
+        if self._sever is not None:
+            await self._sever()
+        _ops2, post_ids = await self._publish_batch(self._brain, n, "post")
+
+        # Re-discover + reconnect (stateless -- the caller re-resolves the endpoint
+        # from scratch). The hello-frame's Last-Event-ID triggers the replay of the
+        # severed span. The reconnected Mac endpoint replaces ours.
         self._mac = await self._reconnect()
 
-        _ops2, post_ids = await self._publish_batch(self._brain, n, "post")
         expected = pre_ids + post_ids
         observed = await self._await_observed(self._mac, expected)
         gap, dup = _gap_dup(expected, observed)
@@ -483,8 +499,13 @@ class ValidationExchange:
     async def run_all(self, n: int) -> Dict[str, Any]:
         bidi = await self.run_bidirectional(n)
         replay = await self.run_reconnect_replay(n)
+        logic_ok = bool(bidi["ok"] and replay["ok"])
+        # Fix 3: a loopback run (mac is brain, no Brain echo) can NEVER be read as
+        # cross-host-proven. Gate ``proven`` on NOT loopback; surface loopback_only.
         return {
-            "proven": bool(bidi["ok"] and replay["ok"]),
+            "proven": bool(logic_ok and not self._loopback),
+            "loopback_only": self._loopback,
+            "logic_ok": logic_ok,
             "bidirectional": bidi,
             "reconnect_replay": replay,
         }
@@ -712,21 +733,34 @@ class BrainIgnitionDriver:
         mac = _LiveMacEndpoint(bus, broker, _client_getter)
         await mac.start()
 
+        _live_tasks: List[asyncio.Task] = [client_task]
+
+        async def _sever() -> Any:
+            # Drop the WS: stop the client bridge so events published next buffer in
+            # the local broker history and can only reach the peer via the reconnect
+            # hello-frame's Last-Event-ID replay.
+            try:
+                await bus.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
         async def _reconnect() -> Any:
-            # Stateless re-discovery: stop the client, re-resolve the endpoint from
-            # scratch (a Brain that moved is re-found), reconnect a fresh client.
-            await bus.stop()
+            # Stateless re-discovery: re-resolve the endpoint from scratch (a Brain
+            # that moved is re-found), reconnect a fresh client -> Last-Event-ID
+            # replay fills the severed span.
             new_url = await self._do_discover() or url
             new_task = asyncio.ensure_future(bus.start_client(new_url))
             _live_tasks.append(new_task)
             return mac
 
-        _live_tasks: List[asyncio.Task] = [client_task]
-        # In the live run the "brain" observation endpoint is the same local broker
-        # (Brain echoes flow back as inbound republishes). The exchange LOGIC is
-        # identical to the unit-proven path.
+        # LOUD LOOPBACK GUARD (Fix 3): with no Brain-side echo subscriber (Task 5),
+        # the Brain observation endpoint is the SAME local broker as the Mac -- the
+        # bidirectional exchange is a LOCAL LOOPBACK, not a cross-host round-trip.
+        # ValidationExchange gates ``proven=False`` in this mode; make it visible.
+        _log("[BrainIgnite] bidirectional exchange is LOOPBACK (brain echo "
+             "subscriber not wired) -- cross-host round-trip UNPROVEN until Stage 2")
         exchange = ValidationExchange(
-            mac=mac, brain=mac, reconnect=_reconnect,
+            mac=mac, brain=mac, reconnect=_reconnect, sever=_sever,
             settle_s=_env_float("JARVIS_BRAIN_EXCHANGE_SETTLE_S", 1.0),
             observe_timeout_s=_env_float("JARVIS_BRAIN_EXCHANGE_OBSERVE_S", 15.0),
         )
@@ -801,7 +835,13 @@ class BrainIgnitionDriver:
             else:
                 result = await self._default_run_exchange(url)
             proven = bool(result.get("proven"))
-            _log("ACCEPTANCE %s: %r" % ("PROVEN" if proven else "NOT PROVEN", result))
+            if result.get("loopback_only"):
+                _log("ACCEPTANCE NOT PROVEN (LOOPBACK_ONLY) -- exchange logic_ok=%r "
+                     "but cross-host round-trip requires the Brain echo (Task 5): %r"
+                     % (result.get("logic_ok"), result))
+            else:
+                _log("ACCEPTANCE %s: %r"
+                     % ("PROVEN" if proven else "NOT PROVEN", result))
             return 0 if proven else 4
 
         except Exception as exc:  # noqa: BLE001

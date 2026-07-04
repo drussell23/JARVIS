@@ -148,44 +148,232 @@ def test_exchange_bidirectional_observes_both_directions() -> None:
 
 
 def test_exchange_reconnect_replay_exact_zero_gap_zero_dup() -> None:
+    """Replay is LOAD-BEARING here: the post span is published WHILE SEVERED
+    (``connected=False`` -> buffered at the source, never delivered live), so the
+    only way those events reach the Mac is the reconnect's Last-Event-ID replay.
+    A no-op reconnect stub would leave a gap and fail (proven by the sibling
+    negative control below)."""
     mac, brain, wire = _make_wire_pair()
 
+    async def _sever() -> Any:
+        wire.connected = False  # drop the link BEFORE the post span is published
+
     async def _reconnect() -> Any:
-        # Stateless re-discovery: sever, then replay the missed span from the
-        # last acked id (exactly what a real reconnect's ``hello`` frame does).
-        wire.connected = False
-        last = mac.last_event_id
-        # Events published while severed are buffered in the wire log; the
-        # reconnect replays exactly the contiguous span > last acked id.
-        wire.connected = True
-        mac.replay_from(last)
+        # Stateless reconnect: replay exactly the contiguous span > last acked id
+        # (what a real reconnect's ``hello`` Last-Event-ID frame does). The link
+        # stays down for live delivery -- replay is the ONLY delivery route.
+        mac.replay_from(mac.last_event_id)
         return mac
 
     exchange = ign.ValidationExchange(mac=mac, brain=brain, reconnect=_reconnect,
-                                      settle_s=0.0)
+                                      sever=_sever, settle_s=0.0)
     result = asyncio.run(exchange.run_reconnect_replay(n=3))
 
     assert result["ok"] is True, result
+    assert result["observed"] == 6, "replay must deliver all pre+post: %r" % (result,)
     assert result["gap"] == [], "replay left a gap: %r" % (result,)
     assert result["dup"] == [], "replay duplicated an event: %r" % (result,)
 
 
 def test_exchange_reconnect_replay_detects_a_dropped_event() -> None:
-    """Negative control: if the wire silently drops an event across the sever
-    (no replay), the exchange MUST report a gap (proves the check has teeth)."""
+    """Negative control -- proves replay is the delivery route: the post span is
+    published WHILE SEVERED, and the reconnect does NOT replay. The buffered span
+    is therefore never delivered -> the exchange MUST report a gap (a no-op replay
+    stub cannot pass the positive test above)."""
     mac, brain, wire = _make_wire_pair()
 
-    async def _reconnect() -> Any:
-        # Sever and DO NOT restore/replay: the post-sever span is delivered onto a
-        # dead link and never replayed -> a real gap the exchange must catch.
+    async def _sever() -> Any:
         wire.connected = False
+
+    async def _reconnect() -> Any:
+        wire.connected = True  # link back up, but NO replay -> severed span is lost
         return mac
 
     exchange = ign.ValidationExchange(mac=mac, brain=brain, reconnect=_reconnect,
-                                      settle_s=0.0)
+                                      sever=_sever, settle_s=0.0)
     result = asyncio.run(exchange.run_reconnect_replay(n=3))
     assert result["ok"] is False
     assert result["gap"], "a dropped span must surface as a gap"
+
+
+def test_gap_dup_dup_side_has_teeth() -> None:
+    """The ``_gap_dup`` dup detector must flag a repeated event id (so a broken
+    replay that double-delivers cannot masquerade as success)."""
+    gap, dup = ign._gap_dup(["a", "b", "c"], ["a", "b", "b", "c"])
+    assert gap == []
+    assert dup == ["b"], "a repeated observed id must surface as a dup"
+
+
+def test_replay_dedup_drops_reoffered_already_seen_span() -> None:
+    """DUP negative control: re-offering an already-observed span (a redundant
+    replay) MUST be dropped by the endpoint's high-water / already-seen dedup --
+    zero duplicates surface. Proves the dedup logic has teeth, not just the
+    detector."""
+    mac, brain, _wire = _make_wire_pair()
+    eid = brain.publish("task_started", "op-dup-1", {})  # delivered live to mac
+    baseline = mac.observed()
+    assert baseline == [("op-dup-1", eid)]
+    # Re-offer the SAME logged span from the very start -> dedup drops it.
+    mac.replay_from(None)
+    mac.replay_from(None)
+    assert mac.observed() == baseline, "re-offered already-seen events must be dropped"
+    _gap, dup = ign._gap_dup([eid], [e for _op, e in mac.observed()])
+    assert dup == [], "dedup must prevent any duplicate observation"
+
+
+# ---------------------------------------------------------------------------
+# (Fix 3) Loopback guard: mac IS brain -> proven gated False, loopback_only True.
+# ---------------------------------------------------------------------------
+
+
+class _LoopbackEndpoint:
+    """A single endpoint that observes its OWN publishes -- mirrors the live
+    ``_LiveMacEndpoint`` whose local broker fans published events back to its own
+    subscription when no Brain echo subscriber exists. This is the exact 'proves
+    nothing cross-host' trap Fix 3 guards against."""
+
+    def __init__(self) -> None:
+        self.name = "mac"
+        self._observed: List[Tuple[str, str]] = []
+        self._last: Optional[str] = None
+        self._seq = 0
+        self._log: List[Tuple[str, str]] = []
+        self.connected = True
+
+    def publish(self, event_type: str, op_id: str, payload: Dict[str, Any]) -> str:
+        self._seq += 1
+        eid = format(self._seq, "012x")
+        self._log.append((eid, op_id))
+        if self.connected:
+            self._deliver(eid, op_id)
+        return eid
+
+    def _deliver(self, eid: str, op_id: str) -> None:
+        self._observed.append((op_id, eid))
+        self._last = eid
+
+    @property
+    def last_event_id(self) -> Optional[str]:
+        return self._last
+
+    def observed(self) -> List[Tuple[str, str]]:
+        return list(self._observed)
+
+    def replay_from(self, last_event_id: Optional[str]) -> None:
+        floor = int(last_event_id, 16) if last_event_id else 0
+        for eid, op_id in self._log:
+            if int(eid, 16) <= floor:
+                continue
+            if any(e == eid for _o, e in self._observed):
+                continue
+            self._deliver(eid, op_id)
+
+
+def test_exchange_loopback_cannot_report_cross_host_proven() -> None:
+    ep = _LoopbackEndpoint()
+
+    async def _sever() -> Any:
+        ep.connected = False
+
+    async def _reconnect() -> Any:
+        ep.replay_from(ep.last_event_id)
+        return ep
+
+    exchange = ign.ValidationExchange(mac=ep, brain=ep, reconnect=_reconnect,
+                                      sever=_sever, settle_s=0.0)
+    result = asyncio.run(exchange.run_all(n=2))
+    assert result["loopback_only"] is True
+    assert result["logic_ok"] is True, "self-observation still exercises the logic"
+    assert result["proven"] is False, "loopback can NEVER report cross-host-proven"
+
+
+def test_exchange_distinct_endpoints_are_not_loopback() -> None:
+    """The real bidirectional path (distinct mac/brain) is NOT loopback and CAN
+    report proven -- so the guard is specific to the same-endpoint trap."""
+    mac, brain, wire = _make_wire_pair()
+
+    async def _sever() -> Any:
+        wire.connected = False
+
+    async def _reconnect() -> Any:
+        mac.replay_from(mac.last_event_id)
+        return mac
+
+    exchange = ign.ValidationExchange(mac=mac, brain=brain, reconnect=_reconnect,
+                                      sever=_sever, settle_s=0.0)
+    result = asyncio.run(exchange.run_all(n=2))
+    assert result["loopback_only"] is False
+    assert result["proven"] is True, "distinct cross-host endpoints prove acceptance"
+
+
+# ---------------------------------------------------------------------------
+# (Fix 2) mTLS is REQUIRED (not merely accepted): a certless client is rejected
+# by the Brain WS server. Mirrors Stage-0 test_two_process_loopback.py's negative
+# branch -- the SAME build_*_ssl_context builders brain_discovery wraps.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_brain_ws_requires_mtls_certless_client_rejected() -> None:
+    ssl = pytest.importorskip("ssl")
+    aiohttp = pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from backend.core.ouroboros.governance.transport import transport_security as ts
+    from backend.core.ouroboros.governance.transport.transport_config import (
+        TransportConfig,
+    )
+    from backend.core.ouroboros.governance.transport.bus_bridge_server import (
+        BusBridgeServer,
+    )
+    from backend.core.ouroboros.governance.transport.transport_security import (
+        build_server_ssl_context,
+        build_client_ssl_context,
+    )
+    from backend.core.ouroboros.governance.ide_observability_stream import (
+        StreamEventBroker,
+    )
+
+    # Shared ephemeral material stands in for a shared CA on loopback (same shape
+    # brain_discovery.build_brain_{client,server}_ssl_context resolve from env).
+    cert, key = ts.generate_ephemeral_material()
+    cfg = TransportConfig(
+        host="127.0.0.1", port=0, path="/ws/trinity-bus", heartbeat_s=0.0,
+        reconnect_base_s=0.05, reconnect_max_s=0.5, reconnect_jitter=0.0,
+        queue_maxsize=256, history_maxlen=1024, degrade_after_missed_hb=2,
+        tls_enabled=True, tls_cert=cert, tls_key=key, tls_ca=cert,
+        tls_ephemeral=False, source_id="brain",
+    )
+
+    broker = StreamEventBroker(history_maxlen=100)
+    app = web.Application()
+    BusBridgeServer(broker, cfg).register_routes(app)
+    tserver = TestServer(app)
+    await tserver.start_server(ssl=build_server_ssl_context(cfg))
+    host, port = tserver.host, tserver.port
+    ws_url = "wss://%s:%d/ws/trinity-bus" % (host, port)
+    try:
+        # (a) A proper mTLS client (our cert) is ACCEPTED.
+        client_ssl = build_client_ssl_context(cfg)
+        async with aiohttp.ClientSession() as s:
+            async with s.ws_connect(ws_url, ssl=client_ssl) as ws:
+                assert not ws.closed
+
+        # (b) A CERTLESS client (CERT_NONE, no client cert loaded) is REJECTED --
+        #     the server's CERT_REQUIRED expectation makes mTLS REQUIRED, not
+        #     merely accepted. This is the required-rejection proof Fix 2 demands.
+        with pytest.raises((aiohttp.ClientConnectorError, ssl.SSLError,
+                            aiohttp.ClientError, ConnectionResetError,
+                            aiohttp.WSServerHandshakeError)):
+            no_cert = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            no_cert.check_hostname = False
+            no_cert.verify_mode = ssl.CERT_NONE
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(ws_url, ssl=no_cert) as ws:
+                    await ws.receive()
+    finally:
+        await tserver.close()
 
 
 # ---------------------------------------------------------------------------
