@@ -475,13 +475,16 @@ class TestAuthorityInvariants:
         assert "LOCK_UN" in source
 
     def test_public_api_exported(self):
+        # Synced 2026-07-03: added async_flock_critical_section + stale_lock_age_s (pre-existing drift, predates durability branch)
         expected = {
             "CROSS_PROCESS_JSONL_SCHEMA_VERSION",
+            "async_flock_critical_section",
             "fcntl_available",
             "flock_append_line",
             "flock_append_lines",
             "flock_critical_section",
             "lock_timeout_s",
+            "stale_lock_age_s",
         }
         assert set(cpj.__all__) == expected
 
