@@ -366,6 +366,10 @@ def flock_append_line(
     ``\\n``. Caller is responsible for ensuring ``line`` does not
     already contain newlines (the JSONL contract — one record per
     line)."""
+    from backend.core.ouroboros.governance.workspace_resolver import (
+        resolve_durable_path,
+    )
+    path = resolve_durable_path(path)
     # Slice 33 Arc 0 — diagnostic only. v26 saw 12 CrossProcessJSONL
     # WARNs (stale-lock detection); under contention this can block.
     from backend.core.ouroboros.telemetry.loop_sink import (
@@ -399,6 +403,10 @@ def flock_critical_section(
     inside the block, the caller handles it (defensive contract is
     caller-owned)."""
     try:
+        from backend.core.ouroboros.governance.workspace_resolver import (
+            resolve_durable_path,
+        )
+        path = resolve_durable_path(path)
         target = Path(path)
         lock_path = target.with_suffix(target.suffix + ".lock")
         try:
@@ -437,6 +445,10 @@ def flock_append_lines(
     cannot interleave. Cheaper than calling ``flock_append_line``
     in a loop when batching."""
     try:
+        from backend.core.ouroboros.governance.workspace_resolver import (
+            resolve_durable_path,
+        )
+        path = resolve_durable_path(path)
         target = Path(path)
         lock_path = target.with_suffix(target.suffix + ".lock")
         try:
@@ -530,6 +542,10 @@ async def async_flock_critical_section(
         flock'd JSONL Persistence pattern across awaitable
         operations.
     """
+    from backend.core.ouroboros.governance.workspace_resolver import (
+        resolve_durable_path,
+    )
+    path = resolve_durable_path(path)
     # Use a sync ExitStack — we drive it from worker threads
     # via asyncio.to_thread on enter + exit. The sync CM's fd
     # persists across the async yield because the stack holds

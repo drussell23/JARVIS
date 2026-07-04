@@ -1206,6 +1206,39 @@ class IsomorphicA1Driver:
                 os.makedirs(_trinity_root, exist_ok=True)
                 env["JARVIS_TRINITY_ROOT"] = _trinity_root
 
+                # ---- Durable re-root overlay pair (durability-substrate fix,
+                # Task 3) ----
+                # workspace_resolver.resolve_durable_path() (Task 1) re-anchors
+                # any path an organism component computes under the overlay
+                # root onto JARVIS_TRINITY_ROOT above. The FROM side of that
+                # pair MUST be the driver's OWN overlay-root variable --
+                # env_ctx.root IS the IsomorphicEnv's live-shaped path (the
+                # symlink the organism believes is its literal
+                # /opt/trinity/jarvis) -- never a hardcoded literal, so this
+                # stays correct under both process mode (tmp-rooted symlink)
+                # and container mode (the real bind-mount path).
+                env["JARVIS_DURABLE_REROOT_FROM"] = str(env_ctx.root)
+
+                # ---- Loop Deadman, armed structurally (durability-substrate
+                # fix, Task 5) ----
+                # compose_env() (a1_live_fire_chaos_harness.py) copies
+                # os.environ FIRST, then layers overlay files + derived
+                # cognitive flags + apply_manifest() -- none of which
+                # mention JARVIS_LOOP_DEADMAN_* (verified: absent from both
+                # deploy/ouroboros_linux_prod.env and
+                # deploy/ouroboros_omni_prod.env, and apply_manifest()'s
+                # fixed key set), so an operator-set value already sitting
+                # in os.environ survives untouched into `env`. setdefault
+                # here therefore has correct override semantics -- unlike
+                # the JARVIS_BG_POOL_SIZE case (#69824) where the compose
+                # manifest itself later stomped the key, a plain
+                # env[...] = default would have been wrong THERE but is
+                # unnecessary caution HERE. Armed so any future silent-stop
+                # (the op-944c class) yields a faulthandler stack dump
+                # instead of an open-ended investigation.
+                env.setdefault("JARVIS_LOOP_DEADMAN_TIMEOUT_S", "8")
+                env.setdefault("JARVIS_LOOP_DEADMAN_STACK_DUMP", "true")
+
                 # ---- Deterministic Synthetic Roadmap (A1 emit-hop provenance) ----
                 # compose_env arms the orchestrator + A1Trace flags but NOT the
                 # roadmap READER, and no signed roadmap exists -> the strategic-GOAL
