@@ -379,6 +379,31 @@ def _module_path() -> Path:
 
 
 class TestAuthorityInvariants:
+    # NARROW SELF-SEALING ALLOWLIST (durable-reroot fix, 2026-07-04).
+    #
+    # cross_process_jsonl may import EXACTLY ONE governance module:
+    # workspace_resolver. Rationale:
+    #
+    #   * workspace_resolver is the repo's single-source-of-truth path
+    #     resolver -- stdlib-only, pure path algebra, zero authority
+    #     (no orchestrator/policy/iron_gate coupling, never raises).
+    #   * The durable-reroot fix requires the flock substrate itself to
+    #     resolve durable paths via resolve_durable_path() so overlay-
+    #     rooted ledger/WAL/audit writes land in the durable root
+    #     instead of silently returning written=False (op-944c shape).
+    #   * Env-driven resolution at the chokepoint is the ONLY mechanism
+    #     that inherits correctly into subprocess pool workers -- a
+    #     boot-injected hook would NOT propagate cross-process.
+    #
+    # The allowance is EXACT-MATCH (not prefix/substring): every other
+    # governance.* import stays banned, and the companion test below
+    # (test_workspace_resolver_stays_stdlib_only) pins the resolver to
+    # a stdlib-only import surface so this allowlist can never become
+    # an authority tunnel.
+    _ALLOWED_GOVERNANCE_IMPORTS = (
+        "backend.core.ouroboros.governance.workspace_resolver",
+    )
+
     def test_no_governance_imports(self):
         path = _module_path()
         source = path.read_text(encoding="utf-8")
@@ -389,6 +414,8 @@ class TestAuthorityInvariants:
                 for alias in node.names:
                     if alias.name.startswith(
                         "backend.core.ouroboros.governance",
+                    ) and alias.name not in (
+                        self._ALLOWED_GOVERNANCE_IMPORTS
                     ):
                         offenders.append(alias.name)
                     for fb in _FORBIDDEN_GOVERNANCE_SUBSTRINGS:
@@ -398,11 +425,43 @@ class TestAuthorityInvariants:
                 mod = node.module or ""
                 if mod.startswith(
                     "backend.core.ouroboros.governance",
-                ):
+                ) and mod not in self._ALLOWED_GOVERNANCE_IMPORTS:
                     offenders.append(mod)
         assert offenders == [], (
             f"cross_process_jsonl imports forbidden modules: "
             f"{offenders}"
+        )
+
+    def test_workspace_resolver_stays_stdlib_only(self):
+        # SELF-SEALING COMPANION to the allowlist above: the ONLY
+        # governance module cross_process_jsonl may import must itself
+        # import stdlib only. Any future governance / third-party
+        # import inside workspace_resolver re-fails the invariant
+        # suite loudly, so the exact-match allowance can never become
+        # an authority tunnel into the flock substrate.
+        allowed_stdlib = {"os", "threading", "pathlib", "typing", "__future__"}
+        resolver_path = (
+            _module_path().parent / "workspace_resolver.py"
+        )
+        source = resolver_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(resolver_path))
+        offenders = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top not in allowed_stdlib:
+                        offenders.append(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                top = mod.split(".")[0]
+                if top not in allowed_stdlib:
+                    offenders.append(mod)
+        assert offenders == [], (
+            f"workspace_resolver must stay stdlib-only "
+            f"(allowed: {sorted(allowed_stdlib)}); found forbidden "
+            f"imports: {offenders} -- the cross_process_jsonl "
+            f"allowlist depends on this purity"
         )
 
     def test_uses_fcntl_for_cross_process_lock(self):
