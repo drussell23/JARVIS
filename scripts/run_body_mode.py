@@ -170,7 +170,7 @@ class BodyModeDriver:
             from backend.core.ouroboros.governance.intake.sensors.voice_command_sensor import (  # noqa: PLC0415
                 VoiceCommandSensor,
             )
-            # Construction pattern: intake_layer_service.py:563-566 --
+            # Construction pattern: intake_layer_service.py:578-583 --
             # event-driven, no start/stop lifecycle; store as attribute only.
             return VoiceCommandSensor(router=shim, repo="jarvis")
         except Exception as exc:  # noqa: BLE001
@@ -201,9 +201,16 @@ class BodyModeDriver:
             # source: ``cadence_synthetic`` is the whitelisted honest-source
             # token for synthetic test-workload injection (intent_envelope.py
             # _VALID_SOURCES, 2026-05-05 precedent -- synthetic traffic MUST
-            # NOT masquerade as a production source; routes BACKGROUND, never
-            # burns Claude budget). The Body-mode identity travels in
-            # ``evidence.origin`` for downstream filtering.
+            # NOT masquerade as a production source). Routing truth: the
+            # token is in NEITHER _BACKGROUND_SOURCES nor _SPECULATIVE_SOURCES
+            # (urgency_router.py:134-146), so with urgency="low" and default
+            # moderate complexity these envelopes fall through to the
+            # Priority-5 default = ProviderRoute.STANDARD
+            # (urgency_router.py:731-734): DW primary WITH Claude fallback --
+            # a small residual Claude-fallback cost is possible if DW is
+            # degraded during acceptance, bounded by the run's cost cap. The
+            # Body-mode identity travels in ``evidence.origin`` for
+            # downstream filtering.
             out.append(make_envelope(
                 source="cadence_synthetic",
                 description="stage2 acceptance signal %d" % i,
