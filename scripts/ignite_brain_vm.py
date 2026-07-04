@@ -775,6 +775,7 @@ class BrainIgnitionDriver:
             "JARVIS_BRAIN_WS_PORT", "JARVIS_BRAIN_WS_PATH", "JARVIS_BRAIN_WS_TLS_ENABLED",
             "JARVIS_BRAIN_WS_TLS_CERT", "JARVIS_BRAIN_WS_TLS_KEY", "JARVIS_BRAIN_WS_TLS_CA",
             "JARVIS_BRAIN_COST_CAP", "JARVIS_DISTRIBUTED_BUS_ENABLED",
+            "JARVIS_BRAIN_BUS_SIDECAR_ENABLED", "JARVIS_BRAIN_OUTBOUND_TOPICS",
         ):
             v = os.environ.get(key)
             if v is not None and v != "":
