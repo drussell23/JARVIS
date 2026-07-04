@@ -1,0 +1,47 @@
+# backend/requirements-brain.txt -- the Brain-VM (CPU orchestrator) runtime set.
+#
+# Consumed by scripts/bake_brain_golden_image.py: installed into /opt/trinity/venv
+# on the golden image (Debian 12 system pip is PEP 668 externally-managed; the
+# bake never uses system pip).
+#
+# SCOPE (design Non-Goals, docs/superpowers/specs/2026-07-03-gcp-orchestrator-
+# relocation-design.md): the Brain is a CPU orchestrator that calls DW/J-Prime
+# over the network. It must NEVER carry the Mac Body's voice/vision/local-ML
+# stack (torch, torchaudio, whisper, PyAudio, llama-cpp, ...) -- installing that
+# on bare debian-12 is what failed live-fire attempt 1 (2026-07-04).
+#
+# DERIVATION (empirical, debian:12 container, 2026-07-04):
+# - HARD deps: iterative import-probe over the service entry surface (transport
+#   sentinel, battle_test.harness, governed_loop_service, orchestrator,
+#   event_channel, providers, doubleword_provider, candidate_generator,
+#   gcp_compute_rest, brain_discovery, tool_executor, test_runner, serpent_flow,
+#   oracle) until green.
+# - ARMED deps: the codebase import-guards most third-party libs (fail-soft) --
+#   a missing lib silently disables the feature instead of crashing. These are
+#   the guarded libs whose features the Brain soak MUST have live, found by
+#   import-site census over backend/core/ouroboros + resilience.
+# Pins follow root requirements.txt where present.
+
+# --- HARD: import-proven required by the service entry surface ---------------
+aiohttp==3.13.2
+psutil==7.1.3
+uuid6==2025.0.1          # NOT pinned in root requirements.txt (Mac had it out-of-band)
+rich==14.2.0             # serpent_flow/TUI render layer (headless still imports)
+pytest>=9.0,<10          # TestRunner VERIFY phase runs pytest subprocesses
+
+# --- ARMED: import-guarded features the Brain must have live -----------------
+anthropic==0.75.0        # Tier-1 provider (Claude) -- silent-degrade without it
+httpx==0.28.1            # DW provider / HTTP clients
+PyYAML==6.0.3            # brain_selection_policy.yaml -- zero hardcoded models
+python-dotenv==1.2.1
+cryptography>=42.0.0     # mTLS chain (Stage 1) + Ed25519 roadmap authority
+prompt_toolkit>=3.0.43   # REPL (headless-safe)
+watchdog==6.0.0          # FileWatchGuard / fs sensors (Slice 12K budget runs on it)
+numpy>=1.26.4,<2.5       # semantic index / oracle math
+fastembed>=0.3.0         # Oracle LITE embeddings (graduated default-ON); pulls onnxruntime (CPU)
+aiosqlite==0.19.0        # Oracle SQLite persistence
+aiofiles==23.2.1
+pytest-timeout==2.4.0
+redis>=4.2.0             # cost_tracker streaming (inert without a server)
+fastapi==0.124.2         # MCP HTTP transport (guarded)
+uvicorn==0.38.0          # telemetry broker (guarded)

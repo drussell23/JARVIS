@@ -140,7 +140,86 @@ def test_idle_shutdown_timeout_is_env_driven(bake):
 
 
 # --------------------------------------------------------------------------- #
-# (g) whole startup script is ASCII-only.
+# (g) PEP 668: Debian 12 system pip is externally-managed and refuses installs
+#     outright (live-fire attempt 1, 2026-07-04). ALL pip must run inside the
+#     venv; the service and the sentinel proof must use the SAME interpreter
+#     the deps were installed into.
+# --------------------------------------------------------------------------- #
+def test_pip_runs_in_venv_never_system_pip(bake):
+    script = bake.build_startup_script("https://example.invalid/repo.git")
+    assert "python3.11 -m venv /opt/trinity/venv" in script
+    assert "/opt/trinity/venv/bin/pip install" in script
+    # No system-pip install may remain anywhere (PEP 668 refuses it on debian-12).
+    assert "python3.11 -m pip install" not in script
+    assert "python3.11 -m ensurepip" not in script
+
+
+def test_pip_installs_brain_scoped_requirements_not_full_stack(bake):
+    """The Brain is a CPU orchestrator (design Non-Goals): it must install the
+    brain-scoped subset, never the root requirements.txt Mac/voice/ML stack."""
+    script = bake.build_startup_script("https://example.invalid/repo.git")
+    assert "backend/requirements-brain.txt" in script
+    assert "-r requirements.txt" not in script
+
+
+def test_apt_installs_build_prereqs_before_pip(bake):
+    script = bake.build_startup_script("https://example.invalid/repo.git")
+    assert "build-essential" in script
+    assert "python3.11-dev" in script
+    apt_idx = script.index("build-essential")
+    pip_idx = script.index("/opt/trinity/venv/bin/pip install")
+    assert apt_idx < pip_idx, "build prereqs must be installed before pip runs"
+
+
+def test_execstart_uses_venv_python(bake):
+    script = bake.build_startup_script("https://example.invalid/repo.git")
+    assert (
+        "ExecStart=/opt/trinity/venv/bin/python scripts/ouroboros_battle_test.py"
+        in script
+    )
+    assert "ExecStart=/usr/bin/python3.11" not in script
+
+
+def test_sentinel_proof_uses_venv_python(bake):
+    """The readiness proof must import under the venv interpreter -- proving the
+    system python imports would validate a DIFFERENT runtime than the service."""
+    script = bake.build_startup_script("https://example.invalid/repo.git")
+    assert (
+        '/opt/trinity/venv/bin/python -c "import backend.core.ouroboros.governance.transport"'
+        in script
+    )
+
+
+def test_brain_requirements_file_excludes_ml_voice_stack():
+    """backend/requirements-brain.txt is the lean CPU-orchestrator set: no local
+    inference, no voice I/O, no training stack (design Non-Goals)."""
+    req_path = _SCRIPT.parents[1] / "backend" / "requirements-brain.txt"
+    assert req_path.exists(), "backend/requirements-brain.txt must exist"
+    # Check requirement LINES only (comments may name the excluded stack).
+    req = "\n".join(
+        line.split("#", 1)[0].strip()
+        for line in req_path.read_text(encoding="utf-8").splitlines()
+        if line.split("#", 1)[0].strip()
+    ).lower()
+    for forbidden in (
+        "torch",  # also catches torchaudio
+        "whisper",
+        "pyaudio",
+        "llama-cpp",
+        "speechbrain",
+        "librosa",
+        "pvporcupine",
+        "webrtcvad",
+        "sounddevice",
+        "coremltools",
+        "transformers",
+        "bitsandbytes",
+    ):
+        assert forbidden not in req, f"brain requirements must not carry {forbidden!r}"
+
+
+# --------------------------------------------------------------------------- #
+# (h) whole startup script is ASCII-only.
 # --------------------------------------------------------------------------- #
 def test_startup_script_is_ascii(bake):
     bake.build_startup_script("https://example.invalid/repo.git").encode("ascii")

@@ -18,7 +18,9 @@ J-Prime code-model image:
     image + python3.11 + git.
   * Clones the repo to ``/opt/trinity/jarvis`` (URL + ref env-resolved at bake
     time -- ``JARVIS_BRAIN_REPO_URL`` / ``JARVIS_BRAIN_REPO_REF``).
-  * ``pip install`` of the repo requirements.
+  * venv ``pip install`` of the brain-scoped requirements
+    (``backend/requirements-brain.txt`` -- Debian 12 system pip is PEP 668
+    externally-managed, and the Brain never carries the Mac voice/ML stack).
   * Bakes a systemd unit ``jarvis-brain.service`` (headless warm-standby soak)
     + an idle self-shutdown timer.
   * ``/etc/jarvis/brain.env`` is written AT BOOT from instance metadata (tokens /
@@ -136,12 +138,14 @@ def build_startup_script(
     """Return the metadata startup-script that bakes the Brain VM image.
 
     Steps (each with an ISO phase-timestamp echo for measurable per-phase time):
-      1. Install base deps: python3.11 + pip + git (NO Ollama / NO NVIDIA).
+      1. Install base deps: python3.11 + dev headers + build-essential + pip +
+         git (NO Ollama / NO NVIDIA).
       2. Populate ``/etc/jarvis/brain.env`` FROM INSTANCE METADATA (the J-Prime
          metadata pattern) -- BEFORE any unit is enabled, so per-instance
          tokens / cost-cap / endpoints are never baked into the image.
       3. Clone the repo to ``/opt/trinity/jarvis`` (the IsomorphicEnv path).
-      4. ``pip install -r requirements.txt``.
+      4. venv at ``/opt/trinity/venv`` (PEP 668) + ``pip install -r
+         backend/requirements-brain.txt`` (brain-scoped, no torch/voice/ML).
       5. Write + enable the ``jarvis-brain.service`` warm-standby unit
          (headless battle-test soak, ``--max-wall-seconds 0`` = no wall) and the
          ``jarvis-brain-idle`` self-shutdown timer.
@@ -182,7 +186,7 @@ rm -f {sentinel_q} || true
 echo "[brain-bake] phase=deps-start ts=$(_ts)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y python3.11 python3.11-venv python3-pip git curl ca-certificates
+apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip git curl ca-certificates build-essential
 echo "[brain-bake] phase=deps-done ts=$(_ts)"
 
 # 2. Populate {brain_env_path} FROM INSTANCE METADATA -- BEFORE any unit is
@@ -210,12 +214,21 @@ else
     exit 1
 fi
 
-# 4. Install the repo requirements.
+# 4. Install the BRAIN-SCOPED requirements into a venv.
+#    - venv, never system pip: Debian 12 pip is PEP 668 externally-managed and
+#      refuses system-wide installs outright (live-fire attempt 1, 2026-07-04).
+#    - backend/requirements-brain.txt, never the root requirements.txt: the
+#      Brain is a CPU orchestrator (design Non-Goals) -- torch/voice/local-ML
+#      belong to the Mac Body / J-Prime, not this image.
+#    - The venv lives OUTSIDE the repo path (the clone step rm -rf's the repo).
 echo "[brain-bake] phase=pip-start ts=$(_ts)"
 cd {_REPO_PATH}
-python3.11 -m ensurepip --upgrade || true
-python3.11 -m pip install --upgrade pip || true
-if python3.11 -m pip install -r requirements.txt; then
+if ! python3.11 -m venv /opt/trinity/venv; then
+    echo "[brain-bake] ERROR: venv creation failed -- NOT writing sentinel"
+    exit 1
+fi
+/opt/trinity/venv/bin/pip install --upgrade pip || true
+if /opt/trinity/venv/bin/pip install -r backend/requirements-brain.txt; then
     echo "[brain-bake] phase=pip-done ts=$(_ts)"
 else
     echo "[brain-bake] ERROR: pip install failed -- NOT writing sentinel"
@@ -241,7 +254,7 @@ EnvironmentFile={brain_env_path}
 # nukes a freshly-booted node during the soak's boot window.
 RuntimeDirectory=jarvis
 ExecStartPre=/bin/touch /run/jarvis/brain_liveness
-ExecStart=/usr/bin/python3.11 scripts/ouroboros_battle_test.py --production-soak --headless --cost-cap ${{JARVIS_BRAIN_COST_CAP}} --max-wall-seconds 0
+ExecStart=/opt/trinity/venv/bin/python scripts/ouroboros_battle_test.py --production-soak --headless --cost-cap ${{JARVIS_BRAIN_COST_CAP}} --max-wall-seconds 0
 Restart=on-failure
 RestartSec=10
 
@@ -308,7 +321,7 @@ systemctl enable jarvis-brain-idle.timer || true
 #    Never a fixed sleep. Either fails -> no sentinel -> reaper rolls the node.
 echo "[brain-bake] phase=readiness-proof-start ts=$(_ts)"
 if [ -d {_REPO_PATH}/.git ] && \\
-   ( cd {_REPO_PATH} && python3.11 -c "import backend.core.ouroboros.governance.transport" ); then
+   ( cd {_REPO_PATH} && /opt/trinity/venv/bin/python -c "import backend.core.ouroboros.governance.transport" ); then
     echo "ready repo={repo_ref_q} path={_REPO_PATH} ts=$(_ts)" > {sentinel_q}
     echo "[brain-bake] phase=sentinel-written ts=$(_ts)"
     echo "[brain-bake] startup-script done $(_ts)"
@@ -580,8 +593,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "One-time bake of the CPU Brain-VM golden image (provision -> "
-            "install python3.11+git -> clone /opt/trinity/jarvis -> pip install "
-            "-> systemd units -> git+transport readiness proof -> snapshot -> "
+            "install python3.11+build-essential+git -> clone /opt/trinity/jarvis "
+            "-> venv pip install backend/requirements-brain.txt -> systemd units "
+            "-> git+transport readiness proof -> snapshot -> "
             "delete-to-snapshot). Default is --dry-run."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
