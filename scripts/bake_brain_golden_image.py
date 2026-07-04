@@ -226,6 +226,12 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory={_REPO_PATH}
 EnvironmentFile={brain_env_path}
+# RuntimeDirectory creates /run/jarvis (tmpfs, correct perms) -- the dir the idle
+# self-shutdown check reads its liveness marker from (Task-4 coupling: the brain
+# unit is the toucher). ExecStartPre seeds the marker so the idle timer never
+# nukes a freshly-booted node during the soak's boot window.
+RuntimeDirectory=jarvis
+ExecStartPre=/bin/touch /run/jarvis/brain_liveness
 ExecStart=/usr/bin/python3.11 scripts/ouroboros_battle_test.py --production-soak --headless --cost-cap ${{JARVIS_BRAIN_COST_CAP}} --max-wall-seconds 0
 Restart=on-failure
 RestartSec=10
