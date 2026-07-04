@@ -1206,6 +1206,19 @@ class IsomorphicA1Driver:
                 os.makedirs(_trinity_root, exist_ok=True)
                 env["JARVIS_TRINITY_ROOT"] = _trinity_root
 
+                # ---- Durable re-root overlay pair (durability-substrate fix,
+                # Task 3) ----
+                # workspace_resolver.resolve_durable_path() (Task 1) re-anchors
+                # any path an organism component computes under the overlay
+                # root onto JARVIS_TRINITY_ROOT above. The FROM side of that
+                # pair MUST be the driver's OWN overlay-root variable --
+                # env_ctx.root IS the IsomorphicEnv's live-shaped path (the
+                # symlink the organism believes is its literal
+                # /opt/trinity/jarvis) -- never a hardcoded literal, so this
+                # stays correct under both process mode (tmp-rooted symlink)
+                # and container mode (the real bind-mount path).
+                env["JARVIS_DURABLE_REROOT_FROM"] = str(env_ctx.root)
+
                 # ---- Deterministic Synthetic Roadmap (A1 emit-hop provenance) ----
                 # compose_env arms the orchestrator + A1Trace flags but NOT the
                 # roadmap READER, and no signed roadmap exists -> the strategic-GOAL
