@@ -1098,8 +1098,14 @@ class IntakeLayerService:
                     "JARVIS_DISTRIBUTED_BUS_ENABLED is off",
                 )
                 return
-            # ``router`` is reserved for Task 3 (remote intake signal
-            # ingestion); passing it now keeps the Task-3 wiring additive.
+            # Task 3 (live): the host wires this router into a
+            # RemoteIntakeBridge so Body signals arriving over the bus land
+            # in the local intake pipeline. ``self._router`` is ALWAYS
+            # non-None here -- _build_components constructs it before this
+            # seam runs. Pinned by test_organism_bus_host.py::
+            # test_intake_layer_seam_passes_its_router_to_the_host so a
+            # refactor cannot silently revert to router=None (the
+            # wired-but-inert class).
             host = OrganismBusHost(router=self._router)
             if await host.start():
                 self._organism_bus_host = host

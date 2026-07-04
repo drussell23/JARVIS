@@ -210,6 +210,47 @@ def test_live_publish_crosses_to_stage0_client(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Task 3 boot seam: IntakeLayerService passes its REAL router to the host
+# --------------------------------------------------------------------------- #
+def test_intake_layer_seam_passes_its_router_to_the_host(monkeypatch):
+    """Pin the router pass-through so a refactor cannot silently revert to
+    ``OrganismBusHost(router=None)`` -- the wired-but-inert class. The seam
+    lazy-imports OrganismBusHost from its module, so patching the module
+    attribute intercepts construction."""
+    import backend.core.ouroboros.governance.transport.organism_bus_host as obh
+    from backend.core.ouroboros.governance.intake.intake_layer_service import (
+        IntakeLayerService,
+    )
+
+    recorded: dict = {}
+
+    class _RecordingHost:
+        def __init__(self, router: Any = None) -> None:
+            recorded["router"] = router
+
+        async def start(self) -> bool:
+            return True
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(obh, "OrganismBusHost", _RecordingHost)
+    monkeypatch.setattr(obh, "bus_host_enabled", lambda: True)
+
+    svc = IntakeLayerService.__new__(IntakeLayerService)  # seam-only slice
+    svc._router = object()  # stands in for the layer's UnifiedIntakeRouter
+    svc._organism_bus_host = None
+    _run(svc._maybe_start_organism_bus_host())
+
+    assert "router" in recorded, "seam never constructed the host"
+    assert recorded["router"] is svc._router, (
+        "the host must receive the layer's OWN router instance, got %r"
+        % (recorded["router"],))
+    assert recorded["router"] is not None
+    assert isinstance(svc._organism_bus_host, _RecordingHost)
+
+
+# --------------------------------------------------------------------------- #
 # (c) sidecar handoff
 # --------------------------------------------------------------------------- #
 def _load_sidecar():
