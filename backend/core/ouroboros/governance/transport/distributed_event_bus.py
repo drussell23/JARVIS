@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+from aiohttp import web
+
+from backend.core.ouroboros.governance.ide_observability_stream import StreamEventBroker
+from backend.core.ouroboros.governance.transport.transport_config import TransportConfig
+from backend.core.ouroboros.governance.transport.bus_bridge_server import BusBridgeServer
+from backend.core.ouroboros.governance.transport.bus_bridge_client import BusBridgeClient
+
+logger = logging.getLogger(__name__)
+
+
+class DistributedEventBus:
+    """The publish()-here-subscribers-there seam. Wraps a local
+    StreamEventBroker; a server- or client-role bridge propagates events
+    across the socket. TrinityEventBus callers are unchanged -- they still
+    publish/subscribe on the local broker."""
+
+    def __init__(self, broker: StreamEventBroker, cfg: TransportConfig, *, role: str) -> None:
+        if role not in ("server", "client"):
+            raise ValueError(f"role must be server|client, got {role!r}")
+        self._broker = broker
+        self._cfg = cfg
+        self._role = role
+        self._server: Optional[BusBridgeServer] = None
+        self._client: Optional[BusBridgeClient] = None
+
+    def publish(self, event_type: str, op_id: str, payload: dict) -> Optional[str]:
+        return self._broker.publish(event_type, op_id, payload)
+
+    def register_server_routes(self, app: web.Application) -> None:
+        if self._role != "server":
+            raise RuntimeError("register_server_routes requires role=server")
+        # Inbound peer events republish into the local broker so local
+        # subscribers see them (idempotent -- server dedups by qualified id).
+        self._server = BusBridgeServer(
+            self._broker, self._cfg,
+            on_inbound=lambda ev: self._broker.publish(
+                ev.event_type, ev.op_id, dict(ev.payload)
+            ),
+        )
+        self._server.register_routes(app)
+
+    async def start_client(self, url: Optional[str] = None) -> None:
+        if self._role != "client":
+            raise RuntimeError("start_client requires role=client")
+        self._client = BusBridgeClient(self._broker, self._cfg, url=url)
+        await self._client.run()
+
+    async def stop(self) -> None:
+        if self._client is not None:
+            await self._client.stop()
