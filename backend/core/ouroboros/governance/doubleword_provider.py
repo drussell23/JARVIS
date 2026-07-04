@@ -3027,17 +3027,39 @@ class DoublewordProvider:
                 from backend.core.ouroboros.governance.dw_transport_hedge import (
                     hedge_gate_aware_enabled as _s227_governor_on,
                 )
+                from types import SimpleNamespace as _S227NS
                 _s227_prefer_fast = False
+                _arm_policy = _S227NS(
+                    prefer_fast=False, defer_stable=False, reason="governor_off",
+                )
                 if _s227_governor_on():
                     try:
-                        from backend.core.ouroboros.governance.exploration_engine import (  # noqa: E501
-                            exploration_gate_demands_tools as _s227_gate_demands,
+                        from backend.core.ouroboros.governance.dw_transport_hedge import (
+                            resolve_hedge_arm_policy as _policy_resolve,
                         )
-                        _s227_prefer_fast = _s227_gate_demands(
-                            str(getattr(context, "task_complexity", "")),
+                        _arm_policy = _policy_resolve(
+                            complexity=str(getattr(context, "task_complexity", "") or ""),
+                            route=str(getattr(context, "provider_route", "") or ""),
+                            is_read_only=bool(getattr(context, "is_read_only", False)),
+                            target_files=tuple(getattr(context, "target_files", ()) or ()),
+                            repo_root=(
+                                str(getattr(context, "repo_root", "") or "")
+                                or (str(self._repo_root) if self._repo_root else "")
+                            ) or None,
+                        )
+                        _s227_prefer_fast = _arm_policy.prefer_fast
+                        logger.info(
+                            "[Cortex] hedge policy op=%s prefer_fast=%s defer=%s reason=%s",
+                            (getattr(context, "op_id", "?") or "?")[:16],
+                            _arm_policy.prefer_fast,
+                            _arm_policy.defer_stable,
+                            _arm_policy.reason,
                         )
                     except Exception:  # noqa: BLE001 — fail-open to legacy race
                         _s227_prefer_fast = False
+                        _arm_policy = _S227NS(
+                            prefer_fast=False, defer_stable=False, reason="fail_soft_legacy",
+                        )
                 if _s227_prefer_fast:
                     # INFO: a routine, by-design per-op routing decision (the hedge
                     # governor preferring the RT/tool-loop arm for an Iron-Gate
@@ -3045,8 +3067,11 @@ class DoublewordProvider:
                     logger.info(
                         "[Cortex] ⚡ HEDGE GOVERNOR: op needs Iron-Gate "
                         "exploration — batch arm held speculative, RT arm (tool "
-                        "loop) gets the slot unless it ruptures (op=%s)",
+                        "loop) gets the slot unless it ruptures (op=%s) "
+                        "reason=%s defer=%s",
                         (getattr(context, "op_id", "?") or "?")[:16],
+                        _arm_policy.reason,
+                        _arm_policy.defer_stable,
                     )
                 return await hedged_race(
                     lambda: self._generate_realtime(
@@ -3061,6 +3086,7 @@ class DoublewordProvider:
                     on_outcome=_s190_hedge_outcome,
                     on_abandoned=_s194_on_abandoned,
                     prefer_fast=_s227_prefer_fast,
+                    defer_stable=_arm_policy.defer_stable,
                 )
             try:
                 # Slice 9.1 — thread repair_context for L2 single-shot
@@ -3501,6 +3527,7 @@ class DoublewordProvider:
             route=str(_route),
             is_bg_terminal_worker=_s226_is_bg_tw,
             has_repair_context=False,
+            is_read_only=bool(getattr(context, "is_read_only", False)),
         )
         _will_skip_tools = _base_skip
         # Slice 226 observability (operator pref: escalate capability anomalies
