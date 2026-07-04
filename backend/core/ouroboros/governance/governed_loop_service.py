@@ -3021,6 +3021,12 @@ class GovernedLoopService:
             )
 
         if self._bg_pool is not None:
+            # Import the capacity-rejection class locally to keep the module
+            # import graph flat (background_agent_pool imports op_context; a
+            # top-level import here risks a cycle).
+            from backend.core.ouroboros.governance.background_agent_pool import (
+                QueueFullError,
+            )
             try:
                 op_id = await self._bg_pool.submit(ctx)
                 logger.info(
@@ -3028,13 +3034,53 @@ class GovernedLoopService:
                     op_id, trigger_source,
                 )
                 return op_id
-            except Exception as exc:
-                logger.warning(
-                    "[GovernedLoop] Background submit failed, falling back to sync: %s", exc
+            except QueueFullError:
+                # NO-LOSS SUBMIT BOUNDARY. A capacity rejection is NOT a broken
+                # pool — it is transient backpressure. The legacy behavior ran
+                # ``await self.submit(ctx)`` here: a ~2-minute op executed
+                # SYNCHRONOUSLY INLINE on the dispatch path, serializing the
+                # UnifiedIntakeRouter's dequeue loop so low-priority write-intent
+                # signals never drained for 60+ min (live bt-iso-1783144982, 45x).
+                # Instead we RE-RAISE: the router's intake WAL already holds this
+                # envelope as a ``status="pending"`` row, so declining to ack it
+                # parks it durably. The router catches QueueFullError, keeps the
+                # WAL row pending, and re-drains it via _replay_wal once the pool
+                # reports free capacity. The dispatcher stays fully async.
+                logger.info(
+                    "[GovernedLoop] Background submit deferred (capacity) — "
+                    "parking in intake WAL: op=%s (trigger=%s)",
+                    getattr(ctx, "op_id", "") or "?", trigger_source,
                 )
-        # Fallback: run synchronously
+                raise
+            except Exception as exc:
+                # Genuinely broken pool (not-started, worker crash, etc.) — the
+                # legacy sync fallback still applies. This is a real failure, not
+                # backpressure, so serializing one op inline is acceptable.
+                logger.warning(
+                    "[GovernedLoop] Background submit failed (non-capacity), "
+                    "falling back to sync: %s", exc
+                )
+        # Fallback: run synchronously (no pool, or a non-capacity pool fault).
         result = await self.submit(ctx, trigger_source)
         return result.op_id
+
+    def has_background_capacity(self) -> bool:
+        """True when the background pool can accept a submit without raising
+        ``QueueFullError`` (or when there is no pool — nothing to gate on).
+
+        Consumed by the intake router's capacity-deferred WAL drain: parked
+        envelopes are replayed only when a slot is actually free. NEVER raises
+        (fail-open to ``True``)."""
+        pool = self._bg_pool
+        if pool is None:
+            return True
+        try:
+            probe = getattr(pool, "has_capacity", None)
+            if callable(probe):
+                return bool(probe())
+        except Exception:  # noqa: BLE001
+            pass
+        return True
 
     def get_background_result(self, op_id: str) -> Any:
         """Poll for a background operation result. Returns None if not ready."""

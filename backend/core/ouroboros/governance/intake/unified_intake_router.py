@@ -845,6 +845,13 @@ class UnifiedIntakeRouter:
         )
         self._dedup: Dict[str, float] = {}
         self._retry_count: Dict[str, int] = {}
+        # No-loss submit boundary: set True whenever a dispatch is deferred by
+        # a background-pool QueueFullError (the envelope stays a pending WAL
+        # row — durably parked). The dispatch loop's idle branch consults this
+        # cheap flag to decide whether to re-drain the parked rows via
+        # _replay_wal once the pool reports capacity. Self-clearing after a
+        # drain; re-set by any subsequent capacity deferral.
+        self._capacity_deferred_pending: bool = False
         self._pending_ack = PendingAckStore()
         self._dead_letter: List[IntentEnvelope] = []
         self._dispatch_task: Optional[asyncio.Task] = None
@@ -1748,6 +1755,9 @@ class UnifiedIntakeRouter:
                     except asyncio.CancelledError:
                         break
                     await self._flush_expired_coalesce_buffers()
+                    # No-loss submit boundary: re-drain capacity-parked WAL rows
+                    # now the queue is idle and (maybe) the pool freed a slot.
+                    await self._drain_capacity_deferred()
                     continue
                 envelope = decision.envelope
                 # Drain the matching entry from the legacy queue so
@@ -1778,6 +1788,9 @@ class UnifiedIntakeRouter:
                 except asyncio.TimeoutError:
                     # Flush any expired coalescing buffers
                     await self._flush_expired_coalesce_buffers()
+                    # No-loss submit boundary: re-drain capacity-parked WAL rows
+                    # now the queue is idle and (maybe) the pool freed a slot.
+                    await self._drain_capacity_deferred()
                     continue
                 except asyncio.CancelledError:
                     break
@@ -1896,6 +1909,14 @@ class UnifiedIntakeRouter:
         no code-change signals), dispatch to RuntimeTaskOrchestrator.
         Otherwise, dispatch to GovernedLoopService for code changes.
         """
+        # No-loss submit boundary — the background pool's capacity-rejection
+        # class. Handled distinctly from genuine dispatch failures below (park
+        # durably in the WAL, never dead-letter). Local import keeps the
+        # module import graph flat.
+        from backend.core.ouroboros.governance.background_agent_pool import (
+            QueueFullError,
+        )
+
         ikey = envelope.idempotency_key
 
         # A1-T4 — hop 3/5 (dequeue): the dispatch loop has pulled this
@@ -2144,6 +2165,23 @@ class UnifiedIntakeRouter:
                 )
             self._wal.update_status(envelope.lease_id, "acked")
             self._retry_count.pop(ikey, None)
+        except QueueFullError:
+            # NO-LOSS SUBMIT BOUNDARY. The background pool is at capacity. This
+            # is NOT a dispatch failure — do NOT increment the retry counter and
+            # do NOT dead-letter (either would eventually LOSE the op). The WAL
+            # already holds this envelope as a status="pending" row (durable
+            # park); we simply decline to ack it. It is re-drained by
+            # _drain_capacity_deferred() -> _replay_wal() once the pool reports
+            # free capacity. The dispatcher stays fully async — no sync-inline
+            # execution serializes the queue (the live bt-iso-1783144982 defect).
+            self._capacity_deferred_pending = True
+            logger.info(
+                "[Router] bg_submit_deferred lease_id=%s source=%s "
+                "reason=pool_capacity_full wal=pending (durably parked, no loss)",
+                envelope.lease_id,
+                envelope.source,
+            )
+            return
         except Exception as exc:
             retries = self._retry_count.get(ikey, 0) + 1
             self._retry_count[ikey] = retries
@@ -2185,6 +2223,53 @@ class UnifiedIntakeRouter:
                     self._wal.update_status(envelope.lease_id, "dead_letter")
                     self._dead_letter.append(envelope)
                     self._retry_count.pop(ikey, None)
+
+    # ------------------------------------------------------------------
+    # No-loss submit boundary — capacity-deferred WAL drain
+    # ------------------------------------------------------------------
+
+    async def _drain_capacity_deferred(self) -> None:
+        """Re-drain envelopes parked by a background-pool ``QueueFullError``.
+
+        The no-loss submit boundary keeps a capacity-rejected envelope as a
+        ``status="pending"`` WAL row (durable park) instead of running it
+        synchronously inline. This method re-enqueues those parked rows for
+        another dispatch attempt — reusing the EXISTING replay machinery
+        (:meth:`_replay_wal`); no new queue, no custom retry loop.
+
+        Called from the dispatch loop's idle branch, so it is the natural
+        drain cadence with zero extra tasks. Guarded three ways to guarantee
+        no double-dispatch and no hot spin:
+
+        * ``_capacity_deferred_pending`` — cheap flag; skip the full WAL read
+          entirely when nothing is parked.
+        * pool capacity — only replay when the pool reports a free slot
+          (``has_background_capacity``); otherwise the parked rows sit idle
+          in the WAL (no re-submit spin against a saturated pool).
+        * in-memory queue + coalesce buffers empty — the dispatch loop is a
+          single coroutine, so when both are empty NO pending envelope is
+          already in flight; re-enqueuing the pending WAL rows therefore
+          cannot double-enqueue one that is still queued/buffered.
+
+        NEVER raises.
+        """
+        if not self._capacity_deferred_pending:
+            return
+        # Capacity gate — fail-open (drain) if the GLS can't be probed.
+        try:
+            probe = getattr(self._gls, "has_background_capacity", None)
+            if callable(probe) and not probe():
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        # Only drain when nothing pending is already in flight (see docstring).
+        if self._queue.qsize() > 0 or self._coalesce_buffer:
+            return
+        # Reuse the existing pending-WAL replay to re-enqueue the parked rows.
+        await self._replay_wal()
+        # Cleared optimistically; any row that hits QueueFullError again on the
+        # re-dispatch re-sets the flag, so a partial drain self-continues.
+        self._capacity_deferred_pending = False
 
     # ------------------------------------------------------------------
     # WAL crash recovery
