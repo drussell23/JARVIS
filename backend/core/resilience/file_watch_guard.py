@@ -240,6 +240,39 @@ _SCHEDULE_GROUP_KIND_NESTED_VENV_SPLIT = "nested_venv_split"
 _SCHEDULE_GROUP_KIND_PATTERN_DESCENT = "pattern_descent"
 _SCHEDULE_GROUP_KIND_COALESCED = "nested_venv_split_coalesced"
 
+# Slice 12K (2026-07-03) — the UNCONDITIONALLY hard tier of the
+# schedule budget. Emitted when Slice 12J's venv-split coalescing
+# (``_SCHEDULE_GROUP_KIND_COALESCED``) is NOT enough to fit
+# ``max_scheduled_roots`` — i.e. the plan is dominated by distinct
+# depth-1 recursive schedules (SIMPLE_RECURSIVE + already-coalesced
+# venv splits) rather than by a few fat venv splits. That was the
+# live failure in bt-iso-1783137488: ``candidate_roots=168
+# scheduled_roots=51 max_scheduled_roots=30`` — Slice 12J collapsed
+# every venv split but still landed 70% OVER cap because it had no
+# lever for the ~45 plain depth-1 siblings, and 51 PollingObserver
+# snapshot-walk threads aggregate-GIL-wedged the loop (34.9s
+# starvation → LoopDeadman kill).
+#
+# Depth-1 siblings share only ``watch_dir`` as a recursive ancestor,
+# so the ONLY sub-cap collapse is a single ``(watch_dir, True)`` root
+# — the "in the limit: one recursive root schedule of the watch root"
+# the operator binding authorises ("fewer observer schedules beats
+# perfect nested-dir exclusion"). The legacy ``ignore_patterns``
+# post-event filter still drops the re-included excluded-subtree
+# (venv/cache) events; one slow-but-alive poll thread strictly beats
+# N GIL-contending ones. This kind is a TERMINAL collapse target — it
+# is never itself coalesced further.
+#
+# ABSOLUTE CONSTRAINT: a ``watch_dir`` root is created ONLY when NO
+# ``_SCHEDULE_GROUP_KIND_PATTERN_DESCENT`` group is present. A
+# recursive watch-root schedule would drag the protected
+# ``.jarvis/swe_bench_pro/worktrees`` subtree (56K-file element-web
+# clone) back into the poll walk and resurrect the exact wedge Slice
+# 12I closed. When pattern-descent groups exist the cap is FLOORED —
+# we honour 12I over the 12J/12K cap and WARN (never violate 12I to
+# satisfy 12J).
+_SCHEDULE_GROUP_KIND_HARD_COALESCED = "hard_coalesced_root"
+
 
 class _ScheduleGroup(NamedTuple):
     """Slice 12J — schedule group emitted by ``_resolve_watch_paths``.
@@ -271,6 +304,14 @@ class _ResolvedSchedule(NamedTuple):
     skipped_by_pattern: int
     candidate_count: int  # Schedules BEFORE budget enforcement.
     coalesced_count: int  # Groups collapsed back to recursive parent.
+    # Slice 12K — collapsible groups folded into the single hard
+    # ``(watch_dir, True)`` root when venv-coalescing alone could not
+    # fit the budget. ``0`` when the hard tier never engaged (either
+    # venv-coalescing sufficed, the plan was already within budget, or
+    # a pattern-descent group floored the cap and blocked the collapse).
+    # Trailing default keeps the legacy early-return construction sites
+    # (missing root / iterdir failure) source-compatible.
+    hard_coalesced_count: int = 0
 
 
 class GlobalWatchRegistry:
@@ -782,6 +823,7 @@ class FileWatchGuard:
         skipped_by_pattern = resolved.skipped_by_pattern
         candidate_count = resolved.candidate_count
         coalesced_count = resolved.coalesced_count
+        hard_coalesced_count = resolved.hard_coalesced_count
 
         scheduled_ok: List[Tuple[Path, bool]] = []
         for path, recursive in scheduled_paths:
@@ -828,6 +870,7 @@ class FileWatchGuard:
             "[FileWatchGuard] Observer backend: %s (polling_fallback=%s), "
             "candidate_roots=%d scheduled_roots=%d "
             "max_scheduled_roots=%s coalesced_roots=%d "
+            "hard_coalesced_roots=%d "
             "(recursive=%d, non_recursive=%d, "
             "excluded_top_level=%s, "
             "excluded_path_patterns=%s, "
@@ -838,6 +881,7 @@ class FileWatchGuard:
             len(scheduled_ok),
             max_scheduled_roots if max_scheduled_roots > 0 else "unbounded",
             coalesced_count,
+            hard_coalesced_count,
             recursive_count,
             len(scheduled_ok) - recursive_count,
             sorted(excluded) if excluded else "(none)",
@@ -860,6 +904,30 @@ class FileWatchGuard:
                 "SWE worktree exclusions) were preserved.",
                 candidate_count, len(scheduled_ok),
                 max_scheduled_roots, coalesced_count, coalesced_count,
+            )
+
+        # Slice 12K — schedule_budget_hard_coalesced WARNING. Surface
+        # ONCE per boot when the HARD tier engaged (venv-coalescing
+        # alone could not fit the cap, so the collapsible depth-1
+        # siblings were folded into a single recursive watch-root
+        # schedule). This is a stronger signal than the venv-tier
+        # WARNING: per-subtree event granularity is gone; the whole
+        # watch root is now one poll thread and ignore_patterns is the
+        # only excluded-subtree filter. It is still strictly better
+        # than the polling-thread storm that wedged the loop.
+        if hard_coalesced_count > 0:
+            logger.warning(
+                "[FileWatchGuard] schedule_budget_hard_coalesced "
+                "candidate=%d scheduled=%d cap=%d hard_coalesced_groups=%d — "
+                "venv-split coalescing was insufficient; %d collapsible "
+                "depth-1 group(s) folded into a single recursive watch-root "
+                "schedule to stay under the polling-thread budget "
+                "(bt-iso-1783137488 class: 51>30 loop-wedge). Excluded "
+                "subtrees still drop events via ignore_patterns; "
+                "pattern-descent groups (Slice 12I) are never folded.",
+                candidate_count, len(scheduled_ok),
+                max_scheduled_roots, hard_coalesced_count,
+                hard_coalesced_count,
             )
 
         # Slice 12I — runaway-watching early warning (preserved).
@@ -1153,6 +1221,22 @@ class FileWatchGuard:
         NamedTuple so the boot log can surface candidate /
         scheduled / coalesced telemetry to the operator.
 
+        Slice 12K addition (2026-07-03): venv-split coalescing is a
+        SOFT budget — it only shrinks fat ``NESTED_VENV_SPLIT`` groups
+        and has no lever for a plan dominated by many distinct depth-1
+        recursive schedules. bt-iso-1783137488 landed 51>30 (70% over)
+        after every venv split was collapsed, and 51 PollingObserver
+        snapshot threads GIL-wedged the loop into a LoopDeadman kill.
+        ``_hard_coalesce_schedule`` makes the budget UNCONDITIONALLY
+        hard: when venv-coalescing is insufficient, the collapsible
+        depth-1 siblings are folded into a single ``(watch_dir, True)``
+        recursive root (their only common ancestor). Pattern-descent
+        groups are NEVER folded and BLOCK the watch-root collapse when
+        present (a recursive root would re-walk the protected 56K-file
+        subtree) — in that case the cap is floored + a WARNING fires,
+        honouring Slice 12I over the 12J/12K cap. ``hard_coalesced_count``
+        surfaces the fold to the boot log.
+
         Missing root → empty schedule (caller's observer.start()
         still succeeds; health loop will notice and recreate).
         """
@@ -1325,12 +1409,13 @@ class FileWatchGuard:
                     kind=_SCHEDULE_GROUP_KIND_SIMPLE_RECURSIVE,
                 ))
 
-        # Slice 12J — Phase 2: enforce schedule budget by coalescing
+        # Slice 12J — Phase 2a: enforce schedule budget by coalescing
         # NESTED_VENV_SPLIT groups (largest savings first). The
         # candidate count is fixed BEFORE coalescing for telemetry;
         # ``current`` tracks the live count as we coalesce.
         candidate_count = sum(len(g.entries) for g in groups)
         coalesced_count = 0
+        hard_coalesced_count = 0
         # ``max_scheduled_roots <= 0`` is the operator escape hatch
         # (legacy unbounded behavior; opt-out of the cap entirely).
         if max_scheduled_roots > 0 and candidate_count > max_scheduled_roots:
@@ -1361,6 +1446,20 @@ class FileWatchGuard:
                 current -= savings
                 coalesced_count += 1
 
+            # Slice 12K — Phase 2b: the UNCONDITIONALLY hard tier.
+            # Venv-coalescing only shrinks fat NESTED_VENV_SPLIT
+            # groups; it has no lever for a plan dominated by many
+            # distinct depth-1 recursive schedules (the live
+            # bt-iso-1783137488 failure: 51 > 30 after every venv
+            # split was collapsed). If we are STILL over budget,
+            # collapse the collapsible siblings into a single
+            # ``(watch_dir, True)`` root — never touching the
+            # PATTERN_DESCENT groups (Slice 12I). Runs at most once.
+            if current > max_scheduled_roots:
+                groups, hard_coalesced_count = self._hard_coalesce_schedule(
+                    groups, max_scheduled_roots, current,
+                )
+
         # Slice 12J — Phase 3: flatten groups into the final
         # ``observer.schedule()`` plan, preserving depth-1 order so
         # operator log lines stay alphabetical.
@@ -1373,7 +1472,93 @@ class FileWatchGuard:
             skipped_by_pattern=skipped_by_pattern,
             candidate_count=candidate_count,
             coalesced_count=coalesced_count,
+            hard_coalesced_count=hard_coalesced_count,
         )
+
+    def _hard_coalesce_schedule(
+        self,
+        groups: List["_ScheduleGroup"],
+        max_scheduled_roots: int,
+        current: int,
+    ) -> Tuple[List["_ScheduleGroup"], int]:
+        """Slice 12K — the UNCONDITIONALLY hard tier of the schedule
+        budget. Called only when Slice 12J venv-coalescing left the
+        plan over ``max_scheduled_roots``.
+
+        Depth-1 siblings share only ``watch_dir`` as a common
+        recursive ancestor, so the only sub-cap collapse is a SINGLE
+        ``(watch_dir, True)`` root — the "in the limit: one recursive
+        root schedule of the watch root" the operator binding
+        authorises. The legacy ``ignore_patterns`` post-event filter
+        still drops the re-included excluded-subtree (venv/cache)
+        events; per the LoopDeadman evidence one slow-but-alive poll
+        thread strictly beats N GIL-contending ones.
+
+        ABSOLUTE CONSTRAINT (Slice 12I): ``PATTERN_DESCENT`` groups are
+        NEVER folded, AND we never create a ``watch_dir`` root while
+        one is present — a recursive watch-root schedule would drag
+        the protected ``.jarvis/swe_bench_pro/worktrees`` subtree (56K
+        -file element-web clone) back into the poll walk and resurrect
+        the exact wedge Slice 12I closed. When pattern-descent groups
+        exist the collapsible depth-1 siblings are already one
+        schedule each and have no safe common ancestor, so the cap is
+        FLOORED: we return the groups UNCHANGED (pattern-descent +
+        irreducible siblings) and WARN. We honour 12I over the 12J/12K
+        cap ("never violate 12I to satisfy 12J").
+
+        Returns ``(new_groups, hard_coalesced_count)`` where
+        ``hard_coalesced_count`` is the number of collapsible groups
+        folded into the hard root (``0`` when the cap was floored or
+        the plan was already a single root).
+        """
+        pattern_groups = [
+            g for g in groups
+            if g.kind == _SCHEDULE_GROUP_KIND_PATTERN_DESCENT
+        ]
+        collapsible = [
+            g for g in groups
+            if g.kind != _SCHEDULE_GROUP_KIND_PATTERN_DESCENT
+        ]
+
+        if pattern_groups:
+            # Cap floored by the pattern-descent count + irreducible
+            # siblings. Collapsing to a watch-root would re-include the
+            # protected 56K-file subtree — forbidden. Honour 12I, warn,
+            # leave the plan as-is.
+            pattern_entry_count = sum(len(g.entries) for g in pattern_groups)
+            logger.warning(
+                "[FileWatchGuard] schedule_budget_floored_by_pattern_descent "
+                "cap=%d pattern_descent_schedules=%d collapsible_groups=%d "
+                "scheduled=%d — collapsible depth-1 siblings share only the "
+                "watch root as a recursive ancestor, and a recursive "
+                "watch-root schedule would re-include the protected "
+                ".jarvis/swe_bench_pro/worktrees subtree (Slice 12I). "
+                "Honouring 12I over the 12J/12K cap: pattern-descent "
+                "schedules kept, no watch-root collapse. Reduce "
+                "candidate roots via exclude_top_level_dirs / "
+                "exclude_path_patterns to lower the floor.",
+                max_scheduled_roots, pattern_entry_count,
+                len(collapsible), current,
+            )
+            return groups, 0
+
+        # No protected subtree — safe to collapse ALL collapsible
+        # groups into a single recursive watch-root schedule. (With no
+        # pattern-descent groups present, ``collapsible`` == ``groups``.)
+        watch_root_entry: Tuple[Path, bool] = (self.watch_dir, True)
+        already_single_root = (
+            len(collapsible) == 1
+            and collapsible[0].entries == (watch_root_entry,)
+        )
+        if not collapsible or already_single_root:
+            return groups, 0
+
+        hard_group = _ScheduleGroup(
+            parent=self.watch_dir,
+            entries=(watch_root_entry,),
+            kind=_SCHEDULE_GROUP_KIND_HARD_COALESCED,
+        )
+        return [hard_group], len(collapsible)
 
     # ---- Slice 12A — loop-thread enqueue wrapper -----------------
     #

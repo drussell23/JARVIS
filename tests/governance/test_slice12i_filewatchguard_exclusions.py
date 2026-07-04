@@ -549,14 +549,15 @@ def test_path_pattern_empty_patterns_returns_false(tmp_path: Path) -> None:
 def test_resolve_watch_paths_returns_resolved_schedule_named_tuple(
     tmp_path: Path,
 ) -> None:
-    """Slice 12J: ``_resolve_watch_paths`` now returns a
-    ``_ResolvedSchedule`` NamedTuple with 4 fields:
+    """Slice 12J/12K: ``_resolve_watch_paths`` returns a
+    ``_ResolvedSchedule`` NamedTuple with 5 fields:
     ``paths`` / ``skipped_by_pattern`` / ``candidate_count`` /
-    ``coalesced_count``. NamedTuples are tuples (positional access
-    works) AND carry field names (``.paths`` etc.). The Slice 12I
-    field ``skipped_by_pattern`` remains semantically identical;
-    candidate_count + coalesced_count are Slice 12J additions for
-    budget telemetry.
+    ``coalesced_count`` / ``hard_coalesced_count``. NamedTuples are
+    tuples (positional access works) AND carry field names
+    (``.paths`` etc.). The Slice 12I field ``skipped_by_pattern``
+    remains semantically identical; candidate_count + coalesced_count
+    are Slice 12J additions and hard_coalesced_count is the Slice 12K
+    addition for budget telemetry.
     """
     _make_worktree_layout(tmp_path)
     guard = _build_guard(tmp_path)
@@ -566,12 +567,13 @@ def test_resolve_watch_paths_returns_resolved_schedule_named_tuple(
     )
     # NamedTuple is a tuple
     assert isinstance(result, tuple)
-    assert len(result) == 4
-    # Named field access (Slice 12J surface)
+    assert len(result) == 5
+    # Named field access (Slice 12J/12K surface)
     assert isinstance(result.paths, list)
     assert isinstance(result.skipped_by_pattern, int)
     assert isinstance(result.candidate_count, int)
     assert isinstance(result.coalesced_count, int)
+    assert isinstance(result.hard_coalesced_count, int)
     # Slice 12I semantic preserved: pattern hits counted
     assert result.skipped_by_pattern >= 1
     # Slice 12J invariant: candidate_count >= len(paths)
