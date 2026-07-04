@@ -17,6 +17,13 @@ It is the piece that makes the cross-host acceptance REAL:
 Config is 100% env-resolved (``/etc/jarvis/brain.env`` via systemd
 ``EnvironmentFile``): the ``JARVIS_BRAIN_WS_*`` family. No baked endpoints, no
 literals. SIGTERM/SIGINT -> clean shutdown.
+
+STAGE-2 HANDOFF: on Stage-2 nodes the Brain ORGANISM hosts this bus itself
+(``backend/core/ouroboros/governance/transport/organism_bus_host.py`` --
+``OrganismBusHost``), so this standalone sidecar must stand down there. Set
+``JARVIS_BRAIN_BUS_SIDECAR_ENABLED=false`` in ``brain.env`` and ``main()``
+early-exits with rc=0 (systemd sees a clean one-shot). Default ``true``
+keeps Stage-1 nodes byte-identical.
 """
 from __future__ import annotations
 
@@ -131,6 +138,19 @@ async def amain() -> int:
 
 
 def main() -> int:
+    # Stage-2 handoff: the organism's OrganismBusHost owns the bus on
+    # Stage-2 nodes -- the sidecar stands down cleanly (rc=0) when disabled.
+    if os.environ.get("JARVIS_BRAIN_BUS_SIDECAR_ENABLED", "true").strip().lower() in (
+        "0", "false", "no", "off",
+    ):
+        logging.basicConfig(
+            level=os.environ.get("JARVIS_BRAIN_BUS_LOG_LEVEL", "INFO"),
+            format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        )
+        logger.info(
+            "JARVIS_BRAIN_BUS_SIDECAR_ENABLED=false -- Stage-2 node: the "
+            "organism's OrganismBusHost owns the bus; sidecar standing down")
+        return 0
     logging.basicConfig(
         level=os.environ.get("JARVIS_BRAIN_BUS_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
