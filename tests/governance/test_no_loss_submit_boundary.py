@@ -126,10 +126,13 @@ class _StubGLS:
         return _R()
 
 
-def _make_router(tmp_path, pool, monkeypatch):
+def _make_router(tmp_path, pool, monkeypatch, f1_master: bool = False):
     # Keep intake side-channels quiet + deterministic.
     monkeypatch.setenv("JARVIS_SEMANTIC_INFERENCE_ENABLED", "false")
-    monkeypatch.setenv("JARVIS_INTAKE_PRIORITY_SCHEDULER_ENABLED", "false")
+    monkeypatch.setenv(
+        "JARVIS_INTAKE_PRIORITY_SCHEDULER_ENABLED",
+        "true" if f1_master else "false",
+    )
     monkeypatch.setenv("JARVIS_INTAKE_PRIORITY_SCHEDULER_SHADOW", "false")
     cfg = IntakeRouterConfig(
         project_root=tmp_path,
@@ -362,3 +365,163 @@ async def test_non_capacity_exception_still_takes_sync_fallback(
     assert deferred_logs == []
     # The op ran (sync) → acked, not parked.
     assert router._wal.pending_entries() == []
+
+
+# ---------------------------------------------------------------------------
+# Sync-FS-on-loop guard — the drain's WAL read runs via cooperative_fs_io
+# offload (off the event-loop thread), never synchronously on the loop.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_drain_wal_read_routed_through_offload_substrate(
+    tmp_path, monkeypatch
+):
+    import threading
+
+    import backend.core.ouroboros.governance.cooperative_fs_io as cfs
+
+    monkeypatch.setenv("JARVIS_COOPERATIVE_FS_IO_ENABLED", "true")
+    pool = _GatedPool(capacity=16)
+    router, _ = _make_router(tmp_path, pool, monkeypatch)
+
+    envs = [_lease_and_wal(router, e) for e in _envelopes(20)]
+    for env in envs:
+        await router._dispatch_one(env)
+    assert router._capacity_deferred_pending
+
+    # Spy 1 — every offload() call records the fn it was handed.
+    real_offload = cfs.offload
+    offloaded_fns: list = []
+
+    async def spy_offload(fn, *args, **kwargs):
+        offloaded_fns.append(fn)
+        return await real_offload(fn, *args, **kwargs)
+
+    monkeypatch.setattr(cfs, "offload", spy_offload)
+
+    # Spy 2 — pending_entries records the thread it executes on, and RAISES
+    # if it ever runs on the event-loop thread during the drain.
+    loop_thread = threading.current_thread()
+    real_pending = router._wal.pending_entries
+    read_threads: list = []
+
+    def spy_pending():
+        read_threads.append(threading.current_thread())
+        if threading.current_thread() is loop_thread:
+            raise AssertionError(
+                "sync-FS-on-loop: pending_entries ran ON the event-loop "
+                "thread during the drain path"
+            )
+        return real_pending()
+
+    monkeypatch.setattr(router._wal, "pending_entries", spy_pending)
+
+    while pool.queue_depth() > 0:
+        pool.release_one()
+    await router._drain_capacity_deferred()
+
+    # The WAL read went through the offload substrate...
+    assert spy_pending in offloaded_fns, (
+        "drain did not route the WAL read through cooperative_fs_io.offload"
+    )
+    # ...and actually executed off the loop thread.
+    assert read_threads, "pending_entries never ran"
+    assert all(t is not loop_thread for t in read_threads)
+    # And the drain still worked: parked rows were re-enqueued.
+    assert router._queue.qsize() == 4  # 20 - 16 accepted
+
+
+# ---------------------------------------------------------------------------
+# Single-flight — overlapping drain calls perform exactly ONE WAL read.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_overlapping_drains_are_single_flight(tmp_path, monkeypatch):
+    import asyncio as _asyncio
+
+    import backend.core.ouroboros.governance.cooperative_fs_io as cfs
+
+    pool = _GatedPool(capacity=16)
+    router, _ = _make_router(tmp_path, pool, monkeypatch)
+
+    envs = [_lease_and_wal(router, e) for e in _envelopes(20)]
+    for env in envs:
+        await router._dispatch_one(env)
+    assert router._capacity_deferred_pending
+    while pool.queue_depth() > 0:
+        pool.release_one()
+
+    # Slow offload: first drain parks on `release`; reads are counted.
+    read_count = 0
+    first_read_started = _asyncio.Event()
+    release = _asyncio.Event()
+
+    async def slow_offload(fn, *args, **kwargs):
+        nonlocal read_count
+        kwargs.pop("cpu_bound", None)  # offload-only kwarg, not fn's
+        read_count += 1
+        first_read_started.set()
+        await release.wait()
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(cfs, "offload", slow_offload)
+
+    t1 = _asyncio.create_task(router._drain_capacity_deferred())
+    await first_read_started.wait()
+    # Second drain while the first is suspended mid-offload: must return
+    # immediately WITHOUT a second WAL read (single-flight guard).
+    await router._drain_capacity_deferred()
+    assert read_count == 1, "overlapping drain performed a second WAL read"
+
+    release.set()
+    await t1
+    assert read_count == 1
+    # The single in-flight drain completed the re-enqueue.
+    assert router._queue.qsize() == 4  # 20 - 16 accepted
+    assert router._capacity_drain_in_flight is False
+
+
+# ---------------------------------------------------------------------------
+# F1 mirror — replayed rows land in the IntakePriorityQueue when the
+# scheduler master flag is on; default-off behavior is byte-identical.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_replay_mirror_enqueues_priority_queue_when_f1_on(
+    tmp_path, monkeypatch
+):
+    pool = _GatedPool(capacity=16)
+    router, _ = _make_router(tmp_path, pool, monkeypatch, f1_master=True)
+    assert router._priority_queue is not None  # F1 primary mode wired
+
+    # Park 5 rows durably (pending WAL rows, nothing in the queues).
+    for env in _envelopes(5):
+        _lease_and_wal(router, env)
+    router._capacity_deferred_pending = True
+
+    await router._drain_capacity_deferred()
+
+    # Replayed rows land on BOTH queues — the priority queue is the dispatch
+    # source of truth in F1 primary mode, so missing the mirror means the
+    # replayed rows would never dequeue.
+    assert router._queue.qsize() == 5
+    assert len(router._priority_queue) == 5
+
+
+@pytest.mark.asyncio
+async def test_replay_no_priority_queue_when_f1_off(tmp_path, monkeypatch):
+    pool = _GatedPool(capacity=16)
+    router, _ = _make_router(tmp_path, pool, monkeypatch, f1_master=False)
+    assert router._priority_queue is None  # default-off: no mirror target
+
+    for env in _envelopes(5):
+        _lease_and_wal(router, env)
+    router._capacity_deferred_pending = True
+
+    await router._drain_capacity_deferred()
+
+    # Byte-identical default-off behavior: legacy queue only, no errors.
+    assert router._queue.qsize() == 5
