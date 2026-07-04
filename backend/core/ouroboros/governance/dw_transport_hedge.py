@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Awaitable, Callable, Optional
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Optional, Tuple
 
 
 def transport_hedge_enabled() -> bool:
@@ -63,6 +64,100 @@ def should_skip_race_for_storm(storm_probability: float) -> bool:
         return float(storm_probability) >= _storm_threshold()
     except Exception:  # noqa: BLE001
         return False
+
+
+def hedge_policy_resolver_enabled() -> bool:
+    """Master for the dynamic arm-policy resolver (supersedes the inline
+    complexity-only s227 predicate). Default TRUE. OFF -> byte-identical
+    legacy s227 behavior. NEVER raises."""
+    return os.environ.get(
+        "JARVIS_HEDGE_POLICY_RESOLVER_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def hedge_defer_stable_enabled() -> bool:
+    """Master for deferred-ignition of the stable arm when the fast arm is
+    prioritized (structural double-billing kill). Default TRUE. OFF -> the
+    s227 eager-buffer mode. NEVER raises."""
+    return os.environ.get(
+        "JARVIS_HEDGE_DEFER_STABLE_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass(frozen=True)
+class HedgeArmPolicy:
+    """Resolved per-op hedge routing decision. prefer_fast: hold/defer the
+    stable arm so the tool-loop RT arm gets the slot. defer_stable: do not
+    even FIRE the stable arm unless RT terminally fails (zero double-spend).
+    reason: telemetry string for the decision audit trail."""
+
+    prefer_fast: bool
+    defer_stable: bool
+    reason: str
+
+
+def resolve_hedge_arm_policy(
+    *,
+    complexity: str,
+    route: str,
+    is_read_only: bool,
+    target_files: "Tuple[str, ...]",
+    repo_root: "Optional[str]",
+) -> HedgeArmPolicy:
+    """Dynamic hedge arm policy: workload complexity + write-intent +
+    target-stratification metrics at runtime. Zero hardcoded routing.
+    NEVER raises -- any error degrades to the legacy s227 decision."""
+    def _legacy() -> HedgeArmPolicy:
+        try:
+            from backend.core.ouroboros.governance.exploration_engine import (
+                exploration_gate_demands_tools,
+            )
+            pf = exploration_gate_demands_tools(str(complexity or ""))
+        except Exception:  # noqa: BLE001
+            pf = False
+        return HedgeArmPolicy(prefer_fast=pf, defer_stable=False, reason="legacy_s227")
+
+    try:
+        if not hedge_policy_resolver_enabled():
+            return _legacy()
+        from backend.core.ouroboros.governance.exploration_engine import (
+            exploration_gate_demands_tools,
+        )
+        reason_parts = []
+        targets = tuple(target_files or ())
+        write_intent = (not bool(is_read_only)) and bool(targets)
+        if write_intent:
+            # Fail-SAFE toward the tool arm for mutations: an unknown/empty
+            # complexity must not starve a write op of exploration (the
+            # exact fail-closed hole behind "hedge WON by batch").
+            reason_parts.append("write_intent")
+        if exploration_gate_demands_tools(str(complexity or "")):
+            reason_parts.append("gate_demands")
+        # Stratification refinement -- consulted ONLY when the Tier-4 index
+        # is already warm (never triggers a build on the dispatch hot path).
+        if write_intent and repo_root:
+            try:
+                from pathlib import Path
+                from backend.core.ouroboros.governance.target_stratification import (
+                    coverage_index_ready,
+                    file_has_test_coverage,
+                )
+                if coverage_index_ready(repo_root) and not file_has_test_coverage(
+                    targets[0], Path(repo_root),
+                ):
+                    reason_parts.append("uncovered_target")
+            except Exception:  # noqa: BLE001 -- refinement only, never decisive
+                pass
+        prefer_fast = bool(reason_parts)
+        defer = prefer_fast and hedge_defer_stable_enabled()
+        return HedgeArmPolicy(
+            prefer_fast=prefer_fast,
+            defer_stable=defer,
+            reason="+".join(reason_parts) if reason_parts else "no_signal",
+        )
+    except Exception:  # noqa: BLE001 -- fail-soft to legacy, never raise
+        p = _legacy()
+        return HedgeArmPolicy(p.prefer_fast, False, "fail_soft_legacy")
 
 
 async def hedged_race(
