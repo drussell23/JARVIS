@@ -33,6 +33,7 @@ Both ``alpha`` and ``max_lines`` are env-tunable (no hardcoding):
   * ``JARVIS_STRATIFICATION_AST_IMPORT_ENABLED`` (default "true") — enable
     Strategy 3 AST-import scan (cached per repo_root per process).
 """
+
 from __future__ import annotations
 
 import ast as _ast
@@ -90,6 +91,7 @@ def _env_int(name: str, default: int) -> int:
 # AST-aware coverage resolver helpers
 # ---------------------------------------------------------------------------
 
+
 def _strat_test_dir_names() -> FrozenSet[str]:
     """Return the configured test-root directory names (read from env at call time)."""
     return frozenset(os.environ.get("JARVIS_TEST_DIR_NAMES", "tests,test").split(","))
@@ -97,7 +99,8 @@ def _strat_test_dir_names() -> FrozenSet[str]:
 
 def _strat_ast_import_enabled() -> bool:
     return os.environ.get(
-        "JARVIS_STRATIFICATION_AST_IMPORT_ENABLED", "true",
+        "JARVIS_STRATIFICATION_AST_IMPORT_ENABLED",
+        "true",
     ).strip().lower() not in ("0", "false", "no")
 
 
@@ -152,7 +155,7 @@ _strat_ast_cache: Dict[Path, Dict[str, List[Path]]] = {}
 class _CoverageIndex(NamedTuple):
     """Immutable per-repo test-coverage index (atomic-swap unit)."""
 
-    names_set: FrozenSet[str]      # every test_*.py basename (exact match)
+    names_set: FrozenSet[str]  # every test_*.py basename (exact match)
     names_sorted: Tuple[str, ...]  # same names, sorted (prefix bisect)
     ast_map: Dict[str, List[Path]]
     built_at: float
@@ -167,7 +170,8 @@ _COVERAGE_IDX_LOCK = threading.Lock()
 
 def _coverage_index_enabled() -> bool:
     return os.environ.get(
-        "JARVIS_STRATIFICATION_INDEX_ENABLED", "true",
+        "JARVIS_STRATIFICATION_INDEX_ENABLED",
+        "true",
     ).strip().lower() not in ("0", "false", "no", "off")
 
 
@@ -190,6 +194,7 @@ def _resolve_scan_root(repo_root: Union[str, Path]) -> Path:
         from backend.core.ouroboros.governance.execution_context import (
             authoritative_repo_root as _auth_root,
         )
+
         root = _auth_root(Path(repo_root))
     except Exception:  # noqa: BLE001 — fail-soft, never breaks coverage
         root = Path(repo_root)
@@ -266,9 +271,12 @@ async def _coverage_index_build_task(scan_root: Path) -> None:
         except Exception:  # noqa: BLE001 — substrate import fault
             # Still keep the multi-second build off the loop (bare thread).
             import asyncio as _aio
+
             try:
                 idx = await _aio.to_thread(
-                    _build_coverage_index_sync, scan_root, dir_names,
+                    _build_coverage_index_sync,
+                    scan_root,
+                    dir_names,
                 )
             except Exception:  # noqa: BLE001
                 idx = None
@@ -287,7 +295,9 @@ async def _coverage_index_build_task(scan_root: Path) -> None:
             # the outer except is belt-and-suspenders — a failed build leaves
             # callers degraded, never raises into intake.
             result = await offload(
-                _build_coverage_index_sync, scan_root, dir_names,
+                _build_coverage_index_sync,
+                scan_root,
+                dir_names,
                 cpu_bound=True,
             )
             idx = None if is_offload_error(result) else result
@@ -295,7 +305,8 @@ async def _coverage_index_build_task(scan_root: Path) -> None:
         idx = None
         logger.debug(
             "[Stratification] coverage index build raised root=%s",
-            scan_root, exc_info=True,
+            scan_root,
+            exc_info=True,
         )
     finally:
         with _COVERAGE_IDX_LOCK:
@@ -310,9 +321,10 @@ async def _coverage_index_build_task(scan_root: Path) -> None:
             # (miner scan_once, Advisor coverage) skip their cold build.
             _strat_ast_cache[scan_root] = idx.ast_map
             logger.info(
-                "[Stratification] coverage index built root=%s "
-                "test_files=%d ast_modules=%d",
-                scan_root, len(idx.names_set), len(idx.ast_map),
+                "[Stratification] coverage index built root=%s " "test_files=%d ast_modules=%d",
+                scan_root,
+                len(idx.names_set),
+                len(idx.ast_map),
             )
         else:
             logger.debug(
@@ -350,6 +362,7 @@ def trigger_coverage_index_build(repo_root: Union[str, Path]) -> str:
             return "skipped_failed_cooldown"
         _coverage_index_building.add(scan_root)
     import asyncio as _aio
+
     try:
         loop = _aio.get_running_loop()
     except RuntimeError:
@@ -368,7 +381,8 @@ def trigger_coverage_index_build(repo_root: Union[str, Path]) -> str:
         logger.debug(
             "[Stratification] coverage index build task scheduling failed "
             "root=%s (flag released, will retry on next trigger)",
-            scan_root, exc_info=True,
+            scan_root,
+            exc_info=True,
         )
         return "skipped_no_loop"
     _coverage_index_tasks.add(task)
@@ -409,10 +423,7 @@ def _strat_build_ast_map(
     its file list instead of paying a second full traversal.
     """
     import_map: Dict[str, List[Path]] = {}
-    for test_file in (
-        files if files is not None
-        else _iter_test_files(repo_root, dir_names)
-    ):
+    for test_file in (files if files is not None else _iter_test_files(repo_root, dir_names)):
         try:
             source = test_file.read_text(encoding="utf-8", errors="replace")
             tree = _ast.parse(source, filename=str(test_file))
@@ -497,6 +508,7 @@ def file_has_test_coverage(
         from backend.core.ouroboros.governance.execution_context import (
             authoritative_repo_root as _auth_root,
         )
+
         _scan_root = _auth_root(Path(repo_root))
     except Exception:  # noqa: BLE001 — fail-soft, never breaks coverage
         _scan_root = Path(repo_root)
@@ -554,9 +566,7 @@ def file_has_test_coverage(
             if not match.is_file():
                 continue
             mname = match.name
-            if mname == exact_name or (
-                mname.startswith(suffix_prefix) and mname.endswith(".py")
-            ):
+            if mname == exact_name or (mname.startswith(suffix_prefix) and mname.endswith(".py")):
                 return True
 
     # Strategy 2: AST-import scan (lazy cached per _scan_root, env-opt-out).
@@ -571,14 +581,11 @@ def file_has_test_coverage(
             if module_path:
                 resolved_root = _scan_root.resolve()
                 if resolved_root not in _strat_ast_cache:
-                    _strat_ast_cache[resolved_root] = _strat_build_ast_map(
-                        resolved_root, dir_names
-                    )
+                    _strat_ast_cache[resolved_root] = _strat_build_ast_map(resolved_root, dir_names)
                 if _strat_ast_cache[resolved_root].get(module_path):
                     return True
         except Exception:  # noqa: BLE001 — fail-soft, never raises
             pass
-
 
     return False
 
@@ -669,7 +676,10 @@ def ingest_priority_penalty(
         if lines <= 0:
             continue
         mult = stratification_penalty_multiplier(
-            lines, has_test_coverage=False, alpha=a, max_lines=max_lines,
+            lines,
+            has_test_coverage=False,
+            alpha=a,
+            max_lines=max_lines,
         )
         worst = max(worst, 1.0 - mult)  # 0..alpha
 

@@ -13,6 +13,7 @@ Pins:
   §4  penalty is bounded (cannot dominate the whole priority scale)
   §5  _compute_priority: huge-uncovered envelope ranks WORSE than small-covered
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -71,8 +72,13 @@ def test_compute_priority_deprioritizes_huge_uncovered(tmp_path: Path) -> None:
     small = _mk(tmp_path, "backend/small.py", 40, covered=True)
 
     common = dict(
-        source="ai_miner", description="improve", repo="jarvis",
-        confidence=0.5, urgency="normal", evidence={}, requires_human_ack=True,
+        source="ai_miner",
+        description="improve",
+        repo="jarvis",
+        confidence=0.5,
+        urgency="normal",
+        evidence={},
+        requires_human_ack=True,
     )
     env_huge = make_envelope(target_files=(huge,), **common)
     env_small = make_envelope(target_files=(small,), **common)
@@ -138,6 +144,7 @@ def _patch_inproc_offload(monkeypatch: pytest.MonkeyPatch, seen: dict) -> None:
     ``test_warm_index_restores_penalty_with_evidence`` (real-pool E2E) and
     ``test_offload_cpu_bound_frees_loop_during_gil_build`` (Fix 2).
     """
+
     async def _fake_offload(fn, *args, cpu_bound=False, **kwargs):
         # Record cpu_bound ONLY for the coverage-index build dispatch (the
         # intake path issues other cpu_bound=False offloads that would
@@ -247,7 +254,8 @@ async def _hb_gaps(run_coro, cadence: float = 0.02):
 # ── RED §6: the coverage scan must not execute on the loop thread ───────
 @pytest.mark.asyncio
 async def test_ingest_never_runs_coverage_scan_on_loop_thread(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rel = _mk(tmp_path, "backend/huge.py", 3000, covered=False)
     router = _mk_router(tmp_path)
@@ -271,15 +279,16 @@ async def test_ingest_never_runs_coverage_scan_on_loop_thread(
         f"coverage scan executed {on_loop_calls['n']}x on the event-loop "
         "thread inside ingest (Tier-4 starvation mechanism)"
     )
-    assert gaps and max(gaps) < 0.3, (
-        f"event loop starved during ingest: max heartbeat gap {max(gaps):.3f}s"
-    )
+    assert (
+        gaps and max(gaps) < 0.3
+    ), f"event loop starved during ingest: max heartbeat gap {max(gaps):.3f}s"
 
 
 # ── §7: heartbeat keeps ticking while the FIRST-ingest index build runs ──
 @pytest.mark.asyncio
 async def test_loop_responsive_while_first_ingest_index_builds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rel = _mk(tmp_path, "backend/huge.py", 3000, covered=False)
     router = _mk_router(tmp_path)
@@ -303,9 +312,9 @@ async def test_loop_responsive_while_first_ingest_index_builds(
     assert result == "enqueued"
     # Degraded-proceed: ingest must NOT wait for the cold build.
     assert ingest_wall < 0.45, f"ingest blocked on cold index build: {ingest_wall:.3f}s"
-    assert gaps and max(gaps) < 0.3, (
-        f"event loop starved while index built: max gap {max(gaps):.3f}s"
-    )
+    assert (
+        gaps and max(gaps) < 0.3
+    ), f"event loop starved while index built: max gap {max(gaps):.3f}s"
     # Build was actually triggered off-loop (single-flight, fire-and-forget).
     deadline = time.monotonic() + 3.0
     while builds["n"] == 0 and time.monotonic() < deadline:
@@ -318,7 +327,8 @@ async def test_loop_responsive_while_first_ingest_index_builds(
 # ── §8: N concurrent first-ingests → exactly ONE build, no deadlock ─────
 @pytest.mark.asyncio
 async def test_concurrent_first_ingests_single_flight_build(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rels = [_mk(tmp_path, f"backend/mod{i}.py", 3000, covered=False) for i in range(6)]
     router = _mk_router(tmp_path)
@@ -358,7 +368,8 @@ async def test_concurrent_first_ingests_single_flight_build(
 # ── §9: warm index → penalty parity with the legacy inline path ─────────
 @pytest.mark.asyncio
 async def test_warm_index_restores_penalty_with_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _require_process_pool()  # real cpu_bound=True pool (sandbox → skip)
     rel = _mk(tmp_path, "backend/huge.py", 5000, covered=False)
@@ -386,7 +397,8 @@ async def test_warm_index_restores_penalty_with_evidence(
 # ── §10: builder failure is fail-soft — ingest still enqueues ────────────
 @pytest.mark.asyncio
 async def test_index_build_failure_is_fail_soft(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rel = _mk(tmp_path, "backend/huge.py", 3000, covered=False)
     router = _mk_router(tmp_path)
@@ -452,9 +464,9 @@ async def test_offload_cpu_bound_frees_loop_during_gil_build(
         await hb
 
     assert not _cfsio.is_offload_error(result), result
-    assert elapsed >= spin_s * 0.8, (
-        f"busy-spin returned too fast ({elapsed:.3f}s) — did it actually run?"
-    )
+    assert (
+        elapsed >= spin_s * 0.8
+    ), f"busy-spin returned too fast ({elapsed:.3f}s) — did it actually run?"
     # ~spin_s / 0.02s ≈ 25 ideal ticks; a thread offload would yield ~0.
     # Assert a healthy fraction to stay robust to scheduler jitter.
     assert ticks["n"] >= 10, (

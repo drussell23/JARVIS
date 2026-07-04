@@ -8,6 +8,7 @@ Pipeline: schema_validate → normalize → dedup → priority_arbitration →
 Dispatch loop runs as a background asyncio.Task.
 File advisory lock prevents two router instances on the same project root.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -119,6 +120,7 @@ async def await_router_ready(bus: Any, timeout_s: float) -> bool:
     """
     woke = asyncio.Event()
     if bus is not None:
+
         async def _on_ready(_ev: Any) -> None:
             woke.set()
 
@@ -218,10 +220,16 @@ def _intake_priority_scheduler_shadow_enabled() -> bool:
     Shadow is inert when the master flag is on (primary mode dominates).
     Default off.
     """
-    raw = os.environ.get(
-        "JARVIS_INTAKE_PRIORITY_SCHEDULER_SHADOW", "",
-    ).strip().lower()
+    raw = (
+        os.environ.get(
+            "JARVIS_INTAKE_PRIORITY_SCHEDULER_SHADOW",
+            "",
+        )
+        .strip()
+        .lower()
+    )
     return raw in {"1", "true", "yes", "on"}
+
 
 # ---------------------------------------------------------------------------
 # Priority map — lower int = higher priority
@@ -261,21 +269,23 @@ _PRIORITY_MAP: Dict[str, int] = {
 # `tests/governance/test_unified_intake_router_priority_map.py`
 # catches drift.  Migration removes entries here as their tiers are
 # assigned.
-_PRIORITY_MAP_DEFERRED: frozenset = frozenset({
-    "auto_proposed",
-    "cadence_synthetic",
-    "cross_repo_drift",
-    "doc_staleness",
-    "github_issue",
-    "intent_discovery",
-    "meta_dormancy_alarm",
-    "performance_regression",
-    "security_advisory",
-    "test_coverage",  # Slice 239 — decoupled background test-gen (deferred tier)
-    "todo_scanner",
-    "vision_sensor",
-    "web_intelligence",
-})
+_PRIORITY_MAP_DEFERRED: frozenset = frozenset(
+    {
+        "auto_proposed",
+        "cadence_synthetic",
+        "cross_repo_drift",
+        "doc_staleness",
+        "github_issue",
+        "intent_discovery",
+        "meta_dormancy_alarm",
+        "performance_regression",
+        "security_advisory",
+        "test_coverage",  # Slice 239 — decoupled background test-gen (deferred tier)
+        "todo_scanner",
+        "vision_sensor",
+        "web_intelligence",
+    }
+)
 
 # Urgency → priority boost (subtracted from base, so lower = higher priority)
 _URGENCY_BOOST: Dict[str, int] = {
@@ -350,9 +360,9 @@ _SOURCE_TO_GOVERNOR_SENSOR: Dict[str, str] = {
 # (adds SPECULATIVE which isn't currently produced by sensors).
 _URGENCY_STR_TO_GOVERNOR: Dict[str, str] = {
     "critical": "immediate",  # 2.0x multiplier
-    "high": "standard",       # 1.0x multiplier
-    "normal": "complex",      # 0.8x multiplier
-    "low": "background",      # 0.5x multiplier
+    "high": "standard",  # 1.0x multiplier
+    "normal": "complex",  # 0.8x multiplier
+    "low": "background",  # 0.5x multiplier
 }
 
 
@@ -384,9 +394,14 @@ def _intake_cognitive_shed_mode() -> str:
     DISABLED verdict until explicitly enabled, so ``shadow`` is inert by
     default. ``enforce`` sheds ONLY the lowest-urgency deferrable signals.
     """
-    raw = os.environ.get(
-        "JARVIS_INTAKE_COGNITIVE_SHED_MODE", "shadow",
-    ).strip().lower()
+    raw = (
+        os.environ.get(
+            "JARVIS_INTAKE_COGNITIVE_SHED_MODE",
+            "shadow",
+        )
+        .strip()
+        .lower()
+    )
     if raw in ("off", "shadow", "enforce"):
         return raw
     return "shadow"
@@ -405,9 +420,14 @@ def _allow_log_mode() -> str:
     INFO noise is unacceptable. Default is ``off``; ``summary`` rate-limits
     to 1/N; ``debug`` requires explicit verbose opt-in.
     """
-    raw = os.environ.get(
-        "JARVIS_INTAKE_GOVERNOR_ALLOW_LOG", "off",
-    ).strip().lower()
+    raw = (
+        os.environ.get(
+            "JARVIS_INTAKE_GOVERNOR_ALLOW_LOG",
+            "off",
+        )
+        .strip()
+        .lower()
+    )
     if raw in ("off", "summary", "debug"):
         return raw
     return "off"
@@ -424,6 +444,7 @@ def _allow_log_interval() -> int:
     except (TypeError, ValueError):
         return 100
     return max(1, min(10000, v))
+
 
 # P2.4: Module-level GoalTracker reference.  Set by UnifiedIntakeRouter on
 # init so _compute_priority can apply goal-alignment boost without changing
@@ -452,7 +473,8 @@ def _ingest_stratification_enabled() -> bool:
     """Slice 49 master switch (default ON). Off → byte-identical pre-Slice-49
     priority (no penalty, no file reads in the hot intake path)."""
     return os.environ.get(
-        "JARVIS_INGEST_STRATIFICATION_ENABLED", "true",
+        "JARVIS_INGEST_STRATIFICATION_ENABLED",
+        "true",
     ).strip().lower() not in ("false", "0", "no", "off")
 
 
@@ -576,7 +598,8 @@ def _compute_priority(
     if _active_goal_tracker is not None:
         try:
             alignment = _active_goal_tracker.alignment_context(
-                envelope.description, envelope.target_files,
+                envelope.description,
+                envelope.target_files,
             )
             goal_boost = int(getattr(alignment, "boost", 0) or 0)
         except Exception as exc:
@@ -586,12 +609,14 @@ def _compute_priority(
                 logger.warning(
                     "[Router] goal alignment scorer failed (first occurrence, "
                     "subsequent failures will log at DEBUG): %s",
-                    exc, exc_info=True,
+                    exc,
+                    exc_info=True,
                 )
             else:
                 logger.debug(
                     "[Router] goal alignment scorer failed (total=%d): %s",
-                    _goal_alignment_failures, exc,
+                    _goal_alignment_failures,
+                    exc,
                 )
 
     # SemanticIndex v0.1: soft semantic prior capped at BOOST_MAX (default 1)
@@ -616,6 +641,7 @@ def _compute_priority(
             from backend.core.ouroboros.governance.semantic_index import (
                 get_default_index,
             )
+
             _si = get_default_index()
             # Q3 Slice 3 — non-blocking build trigger. The hot intake path
             # must not stall on git-log subprocesses + corpus assembly +
@@ -656,6 +682,7 @@ def _compute_priority(
             inference_enabled,
             priority_boost_for_signal,
         )
+
         if inference_enabled():
             _engine = get_default_engine()
             if _engine is not None:
@@ -675,21 +702,18 @@ def _compute_priority(
                     # value above so operators set the FLOAT ceiling
                     # and the INT projection follows naturally.
                     import math as _math
-                    inferred_direction_boost = (
-                        int(_math.ceil(_raw)) if _raw > 0.0 else 0
-                    )
+
+                    inferred_direction_boost = int(_math.ceil(_raw)) if _raw > 0.0 else 0
                     if inferred_direction_boost > 0 and isinstance(
-                        envelope.evidence, dict,
+                        envelope.evidence,
+                        dict,
                     ):
-                        envelope.evidence["inferred_direction_boost"] = (
-                            inferred_direction_boost
-                        )
-                        envelope.evidence[
-                            "inferred_direction_raw"
-                        ] = round(float(_raw), 3)
+                        envelope.evidence["inferred_direction_boost"] = inferred_direction_boost
+                        envelope.evidence["inferred_direction_raw"] = round(float(_raw), 3)
     except Exception as exc:  # noqa: BLE001 -- defensive fail-soft
         logger.debug(
-            "[Router] inferred-direction boost skipped: %s", exc,
+            "[Router] inferred-direction boost skipped: %s",
+            exc,
         )
 
     # Slice 49 — universal ingestion stratification (SOFT). Add a bounded
@@ -713,6 +737,7 @@ def _compute_priority(
             from backend.core.ouroboros.governance.target_stratification import (
                 ingest_priority_penalty,
             )
+
             stratification_penalty = ingest_priority_penalty(
                 envelope.target_files or (),
                 repo_root,
@@ -724,8 +749,13 @@ def _compute_priority(
             logger.debug("[Router] ingest stratification skipped: %s", exc)
 
     priority = (
-        base - urgency + cost_penalty - confidence_bonus
-        - dep_bonus - goal_boost - semantic_boost
+        base
+        - urgency
+        + cost_penalty
+        - confidence_bonus
+        - dep_bonus
+        - goal_boost
+        - semantic_boost
         - inferred_direction_boost
         + stratification_penalty
     )
@@ -797,7 +827,9 @@ class UnifiedIntakeRouter:
     - Dead-letter queue after max retries are exhausted
     """
 
-    def __init__(self, gls: Any, config: IntakeRouterConfig, runtime_orchestrator: Any = None) -> None:
+    def __init__(
+        self, gls: Any, config: IntakeRouterConfig, runtime_orchestrator: Any = None
+    ) -> None:
         global _active_goal_tracker
         self._gls = gls
         self._runtime_orchestrator = runtime_orchestrator
@@ -808,9 +840,7 @@ class UnifiedIntakeRouter:
         # through to envelope comparison — see _HEAP_TIE_SEQ module
         # docstring + the dedicated regression spine at
         # tests/governance/intake/test_unified_intake_router_heap_tiebreak.py
-        self._queue: asyncio.PriorityQueue[
-            Tuple[int, float, int, IntentEnvelope]
-        ] = (
+        self._queue: asyncio.PriorityQueue[Tuple[int, float, int, IntentEnvelope]] = (
             asyncio.PriorityQueue(maxsize=config.max_queue_size)
         )
         self._dedup: Dict[str, float] = {}
@@ -833,6 +863,7 @@ class UnifiedIntakeRouter:
         # Sets the module-level reference so _compute_priority can use it.
         try:
             from backend.core.ouroboros.governance.strategic_direction import GoalTracker
+
             self._goal_tracker = GoalTracker(config.project_root)
             _active_goal_tracker = self._goal_tracker
         except Exception:
@@ -864,20 +895,18 @@ class UnifiedIntakeRouter:
         # is *identity-equivalent* before deletion. A concurrent
         # write that overwrote the entry between capture and
         # re-verify causes the CAS to abort the delete.
-        self._active_file_ops: Dict[str, Tuple[str, float]] = {}  # file_path -> (op_id, time.monotonic())
+        self._active_file_ops: Dict[str, Tuple[str, float]] = (
+            {}
+        )  # file_path -> (op_id, time.monotonic())
         self._active_file_ops_lock: threading.Lock = threading.Lock()
         self._queued_behind: Dict[str, List[IntentEnvelope]] = {}  # op_id -> [envelopes]
-        self._file_lock_ttl_s: float = float(
-            os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300")
-        )
+        self._file_lock_ttl_s: float = float(os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300"))
 
         # ── Signal coalescing buffer ──
         # Envelopes targeting overlapping files within a window are merged into
         # a single multi-goal operation before dispatch (reduces cost by N×).
         # HIGH urgency signals bypass coalescing and dispatch immediately.
-        self._coalesce_window_s: float = float(
-            os.environ.get("JARVIS_COALESCE_WINDOW_S", "30")
-        )
+        self._coalesce_window_s: float = float(os.environ.get("JARVIS_COALESCE_WINDOW_S", "30"))
         # Maps frozenset(target_files) key -> (first_arrival_monotonic, [envelopes])
         self._coalesce_buffer: Dict[str, List[IntentEnvelope]] = {}
         self._coalesce_timestamps: Dict[str, float] = {}  # key -> first arrival
@@ -937,8 +966,8 @@ class UnifiedIntakeRouter:
             set_default_intake_router(self)
         except Exception as exc:  # noqa: BLE001
             logger.debug(
-                "[UnifiedIntakeRouter] auto-register-default "
-                "degraded: %s", exc,
+                "[UnifiedIntakeRouter] auto-register-default " "degraded: %s",
+                exc,
             )
 
     # ------------------------------------------------------------------
@@ -951,9 +980,7 @@ class UnifiedIntakeRouter:
             return
         self._acquire_lock()
         self._running = True
-        self._dispatch_task = asyncio.create_task(
-            self._dispatch_loop(), name="intake_dispatch"
-        )
+        self._dispatch_task = asyncio.create_task(self._dispatch_loop(), name="intake_dispatch")
         await self._replay_wal()
         await self._hydrate_fsm_checkpoints()
 
@@ -963,7 +990,12 @@ class UnifiedIntakeRouter:
         exploration context, so the DAG fast-forwards instead of re-exploring.
         Gated by ``JARVIS_FSM_RESUME_ENABLED`` (default on). Fully fail-soft --
         NEVER blocks boot. Rejected (unverified) checkpoints fall back to clean boot."""
-        if os.environ.get("JARVIS_FSM_RESUME_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+        if os.environ.get("JARVIS_FSM_RESUME_ENABLED", "true").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
             return
         try:
             from backend.core.ouroboros.governance import fsm_checkpoint as _ckpt  # noqa: PLC0415
@@ -986,6 +1018,7 @@ class UnifiedIntakeRouter:
                         from backend.core.ouroboros.governance import (  # noqa: PLC0415
                             a1_trace as _a1t,
                         )
+
                         _a1t.restore_emit_record(
                             _kw["causal_id"],
                             source=str(_lin["emit_source"]),
@@ -1006,7 +1039,9 @@ class UnifiedIntakeRouter:
                     logger.info(
                         "Router: RESUMED suspended op=%s phase=%s (%d exploration "
                         "records preserved -> Venom fast-forward)",
-                        _cp.op_id, _cp.phase, len(_cp.exploration_records),
+                        _cp.op_id,
+                        _cp.phase,
+                        len(_cp.exploration_records),
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning(
@@ -1019,6 +1054,7 @@ class UnifiedIntakeRouter:
             # it just replayed. Idempotent (module cache is just refreshed).
             try:
                 from backend.core.ouroboros.governance import cognitive_persistence as _cogp
+
                 if _cogp.is_enabled() and _cogp._env_bool(
                     "JARVIS_COGNITIVE_HYDRATE_ON_CHECKPOINT_RESUME", True
                 ):
@@ -1057,6 +1093,7 @@ class UnifiedIntakeRouter:
         from backend.core.ouroboros.telemetry.loop_sink import (
             sink_async as _ls_sink_async,
         )
+
         async with _ls_sink_async("intake.UnifiedIntakeRouter.ingest"):
             return await self._ingest_impl(envelope)
 
@@ -1067,6 +1104,7 @@ class UnifiedIntakeRouter:
                 a1trace as _a1trace,
                 probe_ingest_order as _probe_ingest_order,
             )
+
             _a1trace("ingest", envelope.causal_id, router="attached")
             # Deep emit-hop telemetry (Run #17): emit the order-assertion vs
             # this goal's prior emit (MISSING if none -- the Run-#17 mode).
@@ -1084,6 +1122,7 @@ class UnifiedIntakeRouter:
             from backend.core.ouroboros.governance.provenance_ledger import (  # noqa: PLC0415
                 stamp_provenance as _stamp_provenance,
             )
+
             # Trace Lineage: a resumed op stamps its ORIGINAL origin (from
             # HMAC-verified checkpoint lineage), not the resume transport.
             _stamp_provenance(envelope.causal_id, _provenance_origin_for(envelope))
@@ -1131,18 +1170,22 @@ class UnifiedIntakeRouter:
                     logger.info(
                         "[Router] governor ENFORCE deny: "
                         "sensor=%s urgency=%s reason=%s cap=%d count=%d",
-                        envelope.source, envelope.urgency,
+                        envelope.source,
+                        envelope.urgency,
                         gov_decision.reason_code,
-                        gov_decision.weighted_cap, gov_decision.current_count,
+                        gov_decision.weighted_cap,
+                        gov_decision.current_count,
                     )
                     return "governor_throttled"
                 # shadow: would have denied but allow through
                 logger.info(
                     "[Router] governor SHADOW deny (would have thrown): "
                     "sensor=%s urgency=%s reason=%s cap=%d count=%d",
-                    envelope.source, envelope.urgency,
+                    envelope.source,
+                    envelope.urgency,
                     gov_decision.reason_code,
-                    gov_decision.weighted_cap, gov_decision.current_count,
+                    gov_decision.weighted_cap,
+                    gov_decision.current_count,
                 )
             elif gov_decision is not None and gov_decision.allowed:
                 # Follow-up #1 — visibility into "governor allowed this"
@@ -1157,18 +1200,24 @@ class UnifiedIntakeRouter:
         # critical/high/normal intake. The substrate master keeps it inert by
         # default. NEVER raises into intake.
         shed_mode = _intake_cognitive_shed_mode()
-        if shed_mode != "off" and str(
-            getattr(envelope, "urgency", ""),
-        ) in _SHEDDABLE_URGENCIES:
+        if (
+            shed_mode != "off"
+            and str(
+                getattr(envelope, "urgency", ""),
+            )
+            in _SHEDDABLE_URGENCIES
+        ):
             try:
                 from backend.core.ouroboros.governance.cognitive_load_shedding import (  # noqa: E501
                     LoadVerdict,
                     ShedKind,
                     evaluate_cognitive_load,
                 )
+
                 _load = evaluate_cognitive_load()
                 _should_shed = _load.verdict in (
-                    LoadVerdict.ELEVATED, LoadVerdict.OVERLOADED,
+                    LoadVerdict.ELEVATED,
+                    LoadVerdict.OVERLOADED,
                 ) and _load.shed_kind in (
                     ShedKind.SPECULATIVE_SHED,
                     ShedKind.BACKGROUND_SHED,
@@ -1179,16 +1228,20 @@ class UnifiedIntakeRouter:
                         logger.info(
                             "[Router] cognitive-shed ENFORCE: source=%s "
                             "urgency=%s verdict=%s shed=%s load=%.3f",
-                            envelope.source, envelope.urgency,
-                            _load.verdict.value, _load.shed_kind.value,
+                            envelope.source,
+                            envelope.urgency,
+                            _load.verdict.value,
+                            _load.shed_kind.value,
                             _load.load_score,
                         )
                         return "cognitive_shed"
                     logger.info(
                         "[Router] cognitive-shed SHADOW (would shed): "
                         "source=%s urgency=%s verdict=%s shed=%s load=%.3f",
-                        envelope.source, envelope.urgency,
-                        _load.verdict.value, _load.shed_kind.value,
+                        envelope.source,
+                        envelope.urgency,
+                        _load.verdict.value,
+                        _load.shed_kind.value,
                         _load.load_score,
                     )
             except Exception:  # noqa: BLE001 — never break intake
@@ -1197,13 +1250,15 @@ class UnifiedIntakeRouter:
         # 4. WAL enqueue — durable before placing on in-memory queue
         lease_id = generate_operation_id("lse")
         envelope = envelope.with_lease(lease_id)
-        self._wal.append(WALEntry(
-            lease_id=lease_id,
-            envelope_dict=envelope.to_dict(),
-            status="pending",
-            ts_monotonic=time.monotonic(),
-            ts_utc=datetime.now(timezone.utc).isoformat(),
-        ))
+        self._wal.append(
+            WALEntry(
+                lease_id=lease_id,
+                envelope_dict=envelope.to_dict(),
+                status="pending",
+                ts_monotonic=time.monotonic(),
+                ts_utc=datetime.now(timezone.utc).isoformat(),
+            )
+        )
 
         # 5. Register dedup key now so subsequent duplicates are caught
         self._register_dedup(envelope)
@@ -1213,7 +1268,7 @@ class UnifiedIntakeRouter:
         # Dependency credit: count how many signals are queued behind files
         # this op would touch — completing it unblocks them.
         _dep_credit = 0
-        for _fpath in (envelope.target_files or ()):
+        for _fpath in envelope.target_files or ():
             _blocking_entry = self._active_file_ops.get(_fpath)
             if _blocking_entry is not None:
                 _blocking_id, _ = _blocking_entry
@@ -1232,6 +1287,7 @@ class UnifiedIntakeRouter:
             from backend.core.ouroboros.governance.semantic_index import (
                 get_default_index,
             )
+
             # Per-repo index keyed on the router's configured project_root
             # (matches orchestrator / classify_runner CONTEXT_EXPANSION) — in
             # production this resolves to the same singleton the legacy
@@ -1243,15 +1299,18 @@ class UnifiedIntakeRouter:
             )
             _semantic_override = int(_sem_boost)
             if (_sem_boost > 0 or _si.stats().built_at > 0) and isinstance(
-                envelope.evidence, dict,
+                envelope.evidence,
+                dict,
             ):
                 envelope.evidence["semantic_alignment"] = round(
-                    float(_sem_score), 4,
+                    float(_sem_score),
+                    4,
                 )
                 envelope.evidence["semantic_boost"] = int(_sem_boost)
         except Exception as _sem_exc:  # noqa: BLE001 — never break intake
             logger.debug(
-                "[Router] offloaded semantic scorer skipped: %s", _sem_exc,
+                "[Router] offloaded semantic scorer skipped: %s",
+                _sem_exc,
             )
             _semantic_override = None
         # Tier-4 — stratification coverage penalty OFF the asyncio loop.
@@ -1281,6 +1340,7 @@ class UnifiedIntakeRouter:
                     ingest_priority_penalty,
                     trigger_coverage_index_build,
                 )
+
                 _idx_ready = coverage_index_ready(self._config.project_root)
                 # Always fire the trigger — it self-gates (single-flight
                 # "building" set, TTL freshness, failure cooldown) and
@@ -1291,6 +1351,7 @@ class UnifiedIntakeRouter:
                         is_offload_error,
                         offload,
                     )
+
                     _pen = await offload(
                         ingest_priority_penalty,
                         envelope.target_files,
@@ -1301,18 +1362,18 @@ class UnifiedIntakeRouter:
                     if not is_offload_error(_pen):
                         _strat_override = max(0, int(_pen))
                         if _strat_override > 0 and isinstance(
-                            envelope.evidence, dict,
+                            envelope.evidence,
+                            dict,
                         ):
-                            envelope.evidence["stratification_penalty"] = (
-                                _strat_override
-                            )
+                            envelope.evidence["stratification_penalty"] = _strat_override
             except Exception as _strat_exc:  # noqa: BLE001 — never break intake
                 logger.debug(
                     "[Router] offloaded stratification skipped (degraded): %s",
                     _strat_exc,
                 )
         priority, alignment = _compute_priority(
-            envelope, dependency_credit=_dep_credit,
+            envelope,
+            dependency_credit=_dep_credit,
             repo_root=self._config.project_root,
             semantic_boost_override=_semantic_override,
             stratification_penalty_override=_strat_override,
@@ -1371,13 +1432,17 @@ class UnifiedIntakeRouter:
         """
         try:
             from backend.core.ouroboros.governance.sensor_governor import (
-                Urgency as GovernorUrgency, ensure_seeded,
+                Urgency as GovernorUrgency,
+                ensure_seeded,
             )
+
             sensor_name = _SOURCE_TO_GOVERNOR_SENSOR.get(
-                envelope.source, envelope.source,
+                envelope.source,
+                envelope.source,
             )
             urgency_str = _URGENCY_STR_TO_GOVERNOR.get(
-                envelope.urgency, "standard",
+                envelope.urgency,
+                "standard",
             )
             urgency = GovernorUrgency(urgency_str)
             governor = ensure_seeded()
@@ -1390,7 +1455,9 @@ class UnifiedIntakeRouter:
             return None
 
     def _note_governor_allow(
-        self, envelope: IntentEnvelope, decision: Any,
+        self,
+        envelope: IntentEnvelope,
+        decision: Any,
     ) -> None:
         """Follow-up #1 — rate-limited / opt-in visibility for governor allows.
 
@@ -1410,18 +1477,17 @@ class UnifiedIntakeRouter:
             sensor = envelope.source
             if mode == "debug":
                 logger.debug(
-                    "[Router] governor allow: sensor=%s urgency=%s "
-                    "cap=%d count=%d remaining=%d",
-                    sensor, envelope.urgency,
-                    decision.weighted_cap, decision.current_count,
+                    "[Router] governor allow: sensor=%s urgency=%s " "cap=%d count=%d remaining=%d",
+                    sensor,
+                    envelope.urgency,
+                    decision.weighted_cap,
+                    decision.current_count,
                     decision.remaining,
                 )
                 return
             # summary: accumulate and emit one structured line per N allows
             self._gov_allow_total += 1
-            self._gov_allow_by_sensor[sensor] = (
-                self._gov_allow_by_sensor.get(sensor, 0) + 1
-            )
+            self._gov_allow_by_sensor[sensor] = self._gov_allow_by_sensor.get(sensor, 0) + 1
             interval = _allow_log_interval()
             if self._gov_allow_total >= interval:
                 top5 = sorted(
@@ -1430,9 +1496,10 @@ class UnifiedIntakeRouter:
                 )[:5]
                 pairs = " ".join(f"{k}={v}" for k, v in top5)
                 logger.info(
-                    "[Router] governor allow rollup: total=%d window=%d "
-                    "top_sensors=[%s]",
-                    self._gov_allow_total, interval, pairs,
+                    "[Router] governor allow rollup: total=%d window=%d " "top_sensors=[%s]",
+                    self._gov_allow_total,
+                    interval,
+                    pairs,
                 )
                 self._gov_allow_total = 0
                 self._gov_allow_by_sensor.clear()
@@ -1446,13 +1513,17 @@ class UnifiedIntakeRouter:
         """Record emission in the rolling-window counter. Never raises."""
         try:
             from backend.core.ouroboros.governance.sensor_governor import (
-                Urgency as GovernorUrgency, ensure_seeded,
+                Urgency as GovernorUrgency,
+                ensure_seeded,
             )
+
             sensor_name = _SOURCE_TO_GOVERNOR_SENSOR.get(
-                envelope.source, envelope.source,
+                envelope.source,
+                envelope.source,
             )
             urgency_str = _URGENCY_STR_TO_GOVERNOR.get(
-                envelope.urgency, "standard",
+                envelope.urgency,
+                "standard",
             )
             urgency = GovernorUrgency(urgency_str)
             ensure_seeded().record_emission(sensor_name, urgency)
@@ -1499,6 +1570,7 @@ class UnifiedIntakeRouter:
                 return None
             # Reverse URGENCY_RANK lookup (small dict; O(4)).
             from .intake_priority_queue import URGENCY_RANK as _RANK
+
             for urgency_str, r in _RANK.items():
                 if r == rank:
                     return urgency_str
@@ -1538,6 +1610,7 @@ class UnifiedIntakeRouter:
         if envelope is None:
             return False
         from .intent_envelope import make_envelope
+
         merged_evidence = dict(envelope.evidence)
         if extra_evidence:
             merged_evidence.update(extra_evidence)
@@ -1580,9 +1653,7 @@ class UnifiedIntakeRouter:
             return "|".join(sorted(envelope.target_files))
         _sig = ""
         try:
-            _sig = str(
-                (envelope.evidence or {}).get("signature", "")
-            ).strip()
+            _sig = str((envelope.evidence or {}).get("signature", "")).strip()
         except Exception:  # noqa: BLE001 — never raise in dispatch hot path
             _sig = ""
         if _sig:
@@ -1614,7 +1685,8 @@ class UnifiedIntakeRouter:
         _merged_desc = " | ".join(_descs)
         logger.info(
             "[Router] Coalesced %d signals targeting %s into single operation",
-            len(envelopes), list(_merged_files)[:3],
+            len(envelopes),
+            list(_merged_files)[:3],
         )
         # Use the first envelope as base, replace merged fields
         base = envelopes[0]
@@ -1622,8 +1694,10 @@ class UnifiedIntakeRouter:
             try:
                 self._wal.update_status(_absorbed.lease_id, "acked")
             except Exception:  # noqa: BLE001 — ack is best-effort; never block the flush
-                logger.warning("[Intake] absorbed-lease ack failed lease=%s",
-                               getattr(_absorbed, "lease_id", "?"))
+                logger.warning(
+                    "[Intake] absorbed-lease ack failed lease=%s",
+                    getattr(_absorbed, "lease_id", "?"),
+                )
         return IntentEnvelope(
             schema_version=base.schema_version,
             source=base.source,
@@ -1689,8 +1763,11 @@ class UnifiedIntakeRouter:
                 logger.debug(
                     "[IntakePriority] primary dequeue urgency=%s source=%s "
                     "waited_s=%.2f mode=%s depth=%d",
-                    decision.urgency, decision.source, decision.waited_s,
-                    decision.dequeue_mode, len(self._priority_queue),
+                    decision.urgency,
+                    decision.source,
+                    decision.waited_s,
+                    decision.dequeue_mode,
+                    len(self._priority_queue),
                 )
             else:
                 # Legacy path (byte-identical to pre-F1).
@@ -1720,8 +1797,10 @@ class UnifiedIntakeRouter:
                                 "[IntakePriority shadow_delta] "
                                 "legacy_popped=%s:%s shadow_would_pop=%s:%s "
                                 "(mode=%s waited_s=%.2f)",
-                                envelope.source, envelope.urgency,
-                                shadow_decision.source, shadow_decision.urgency,
+                                envelope.source,
+                                envelope.urgency,
+                                shadow_decision.source,
+                                shadow_decision.urgency,
                                 shadow_decision.dequeue_mode,
                                 shadow_decision.waited_s,
                             )
@@ -1739,9 +1818,7 @@ class UnifiedIntakeRouter:
                 except asyncio.CancelledError:
                     break
                 except Exception:
-                    logger.exception(
-                        "Router: dispatch error for lease_id=%s", envelope.lease_id
-                    )
+                    logger.exception("Router: dispatch error for lease_id=%s", envelope.lease_id)
                 finally:
                     if _legacy_task_done_owed:
                         self._queue.task_done()
@@ -1763,8 +1840,7 @@ class UnifiedIntakeRouter:
         """Dispatch any coalescing buffers whose window has expired."""
         _now = time.monotonic()
         _expired_keys = [
-            k for k, ts in self._coalesce_timestamps.items()
-            if _now - ts >= self._coalesce_window_s
+            k for k, ts in self._coalesce_timestamps.items() if _now - ts >= self._coalesce_window_s
         ]
         for _key in _expired_keys:
             merged = self._flush_coalesced(_key)
@@ -1772,9 +1848,7 @@ class UnifiedIntakeRouter:
                 try:
                     await self._dispatch_one(merged)
                 except Exception:
-                    logger.exception(
-                        "Router: dispatch error for coalesced key=%s", _key[:50]
-                    )
+                    logger.exception("Router: dispatch error for coalesced key=%s", _key[:50])
 
     @staticmethod
     def _is_runtime_task(envelope: IntentEnvelope) -> bool:
@@ -1791,9 +1865,21 @@ class UnifiedIntakeRouter:
         desc = envelope.description.lower()
         # Code change indicators — if present, route to GLS
         _CODE_SIGNALS = (
-            "fix bug", "implement", "refactor", "add feature", "update code",
-            "write function", "create module", "modify file", "change the code",
-            "add test", "fix the", "patch", "debug", "commit", "merge",
+            "fix bug",
+            "implement",
+            "refactor",
+            "add feature",
+            "update code",
+            "write function",
+            "create module",
+            "modify file",
+            "change the code",
+            "add test",
+            "fix the",
+            "patch",
+            "debug",
+            "commit",
+            "merge",
         )
         if any(signal in desc for signal in _CODE_SIGNALS):
             return False
@@ -1818,6 +1904,7 @@ class UnifiedIntakeRouter:
             from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
                 a1trace as _a1trace,
             )
+
             _a1trace("dequeue", envelope.causal_id)
         except Exception:  # noqa: BLE001
             pass
@@ -1847,7 +1934,8 @@ class UnifiedIntakeRouter:
                 return
             except Exception as exc:
                 logger.warning(
-                    "[Router] Runtime dispatch failed, falling back to GLS: %s", exc,
+                    "[Router] Runtime dispatch failed, falling back to GLS: %s",
+                    exc,
                 )
                 # Fall through to GLS as fallback
 
@@ -1869,9 +1957,7 @@ class UnifiedIntakeRouter:
         # op.context.is_read_only is already True by the time the pool sees
         # the op, so the 900s read-only ceiling branch at
         # background_agent_pool.py:~691 fires correctly.
-        _is_read_only_at_intake = bool(infer_read_only_intent(
-            envelope.description or ""
-        ))
+        _is_read_only_at_intake = bool(infer_read_only_intent(envelope.description or ""))
         # F2 Slice 2: when the envelope carries a non-empty
         # routing_override (set by a sensor that emitted a valid
         # routing_hint under the F2 master flag), stamp ctx.provider_route
@@ -1881,11 +1967,7 @@ class UnifiedIntakeRouter:
         # normally via UrgencyRouter.classify source-type mapping).
         _env_routing = getattr(envelope, "routing_override", "") or ""
         _pre_route = _env_routing if _env_routing else ""
-        _pre_route_reason = (
-            f"envelope_routing_override:{_env_routing}"
-            if _env_routing
-            else ""
-        )
+        _pre_route_reason = f"envelope_routing_override:{_env_routing}" if _env_routing else ""
         # A1-T3 — stamp intake-origin DAG weight onto evidence BEFORE the
         # snapshot below, so a heavy multi-file GOAL's heaviness rides the
         # existing intake_evidence_json side-channel onto ctx (observable to
@@ -1903,11 +1985,14 @@ class UnifiedIntakeRouter:
         # "corrupt signal".
         try:
             import json as _json_local
+
             _intake_evidence_json = (
                 _json_local.dumps(
-                    dict(envelope.evidence or {}), sort_keys=True,
+                    dict(envelope.evidence or {}),
+                    sort_keys=True,
                 )
-                if envelope.evidence else ""
+                if envelope.evidence
+                else ""
             )
         except (TypeError, ValueError):
             _intake_evidence_json = ""
@@ -1945,6 +2030,7 @@ class UnifiedIntakeRouter:
             from backend.core.ouroboros.governance.complexity_classifier import (  # noqa: E501
                 _COMPLEX_FLOOR_SOURCES,
             )
+
             if envelope.source in _COMPLEX_FLOOR_SOURCES:
                 object.__setattr__(ctx, "task_complexity", "complex")
         except Exception:  # noqa: BLE001 — floor is best-effort; never block intake
@@ -1978,6 +2064,7 @@ class UnifiedIntakeRouter:
             from backend.core.ouroboros.governance.op_context import (
                 Attachment,
             )
+
             _hoisted: List[Any] = []
 
             # (1) VisionSensor autonomous path.
@@ -1995,8 +2082,11 @@ class UnifiedIntakeRouter:
                     logger.info(
                         "[IntakeRouter] attachments_hoisted op=%s kind=sensor_frame "
                         "hash8=%s mime=%s app_id=%s source=%s",
-                        envelope.causal_id, _att.hash8, _att.mime_type,
-                        (_app_id or "-"), envelope.source,
+                        envelope.causal_id,
+                        _att.hash8,
+                        _att.mime_type,
+                        (_app_id or "-"),
+                        envelope.source,
                     )
 
             # (2) Operator-initiated /attach path.
@@ -2013,8 +2103,11 @@ class UnifiedIntakeRouter:
                     logger.info(
                         "[IntakeRouter] attachments_hoisted op=%s kind=user_provided "
                         "hash8=%s mime=%s basename=%s source=%s",
-                        envelope.causal_id, _att.hash8, _att.mime_type,
-                        os.path.basename(_p), envelope.source,
+                        envelope.causal_id,
+                        _att.hash8,
+                        _att.mime_type,
+                        os.path.basename(_p),
+                        envelope.source,
                     )
 
             if _hoisted:
@@ -2024,7 +2117,8 @@ class UnifiedIntakeRouter:
             # text-only. Log at DEBUG so a stale frame_path doesn't spam.
             logger.debug(
                 "[IntakeRouter] attachment hoist skipped op=%s: %s",
-                envelope.causal_id, _exc,
+                envelope.causal_id,
+                _exc,
             )
         # A1-T4 — hop 4/5 (submit): the envelope's OperationContext is handed
         # to the GovernedLoopService (the FSM entry). goal id == ctx.op_id.
@@ -2032,6 +2126,7 @@ class UnifiedIntakeRouter:
             from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
                 a1trace as _a1trace,
             )
+
             _a1trace("submit", ctx.op_id, target="GLS")
         except Exception:  # noqa: BLE001
             pass
@@ -2074,12 +2169,14 @@ class UnifiedIntakeRouter:
                 # If the queue is full, dead-letter immediately rather than stall.
                 priority, _alignment = _compute_priority(envelope)
                 try:
-                    self._queue.put_nowait((
-                        priority,
-                        envelope.submitted_at,
-                        next(_HEAP_TIE_SEQ),
-                        envelope,
-                    ))
+                    self._queue.put_nowait(
+                        (
+                            priority,
+                            envelope.submitted_at,
+                            next(_HEAP_TIE_SEQ),
+                            envelope,
+                        )
+                    )
                 except asyncio.QueueFull:
                     logger.error(
                         "Router: queue full during retry — dead-lettering lease_id=%s",
@@ -2100,6 +2197,7 @@ class UnifiedIntakeRouter:
             return
         logger.info("Router: replaying %d pending WAL entries", len(pending))
         from .intent_envelope import IntentEnvelope as IE
+
         for entry in pending:
             try:
                 envelope = IE.from_dict(entry.envelope_dict)
@@ -2109,21 +2207,21 @@ class UnifiedIntakeRouter:
                 # with a second round of scorer failures if the tracker
                 # happens to be broken at replay time.
                 priority, _alignment = _compute_priority(envelope)
-                await self._queue.put((
-                    priority,
-                    envelope.submitted_at,
-                    next(_HEAP_TIE_SEQ),
-                    envelope,
-                ))
+                await self._queue.put(
+                    (
+                        priority,
+                        envelope.submitted_at,
+                        next(_HEAP_TIE_SEQ),
+                        envelope,
+                    )
+                )
                 logger.debug(
                     "Router: replayed lease_id=%s source=%s",
                     entry.lease_id,
                     envelope.source,
                 )
             except Exception:
-                logger.exception(
-                    "Router: WAL replay failed for lease_id=%s", entry.lease_id
-                )
+                logger.exception("Router: WAL replay failed for lease_id=%s", entry.lease_id)
 
     # ------------------------------------------------------------------
     # Operation dependency tracking (DAG-based signal merging)
@@ -2140,7 +2238,7 @@ class UnifiedIntakeRouter:
         is never silently clobbered.
         """
         _now = time.monotonic()
-        for fpath in (envelope.target_files or []):
+        for fpath in envelope.target_files or []:
             with self._active_file_ops_lock:
                 entry = self._active_file_ops.get(fpath)
                 if entry is None:
@@ -2154,19 +2252,22 @@ class UnifiedIntakeRouter:
                     # the identity check fails and we abort the delete.
                     current = self._active_file_ops.get(fpath)
                     if current is not None and (
-                        current[0] == _op_id
-                        and current[1] == _registered_at
+                        current[0] == _op_id and current[1] == _registered_at
                     ):
                         logger.warning(
                             "[Router] Force-releasing stale file lock: %s held by %s for %.0fs (TTL %ds)",
-                            fpath, _op_id[:12], age, self._file_lock_ttl_s,
+                            fpath,
+                            _op_id[:12],
+                            age,
+                            self._file_lock_ttl_s,
                         )
                         del self._active_file_ops[fpath]
                     else:
                         logger.debug(
                             "[Router] CAS aborted stale-release on %s: "
                             "entry mutated under us (was %s, now %s)",
-                            fpath, _op_id[:12],
+                            fpath,
+                            _op_id[:12],
                             current[0][:12] if current else "(absent)",
                         )
                     continue
@@ -2200,10 +2301,7 @@ class UnifiedIntakeRouter:
         # under the lock so we never delete a key that was already
         # rewritten to a different op_id by a concurrent registrant.
         with self._active_file_ops_lock:
-            stale_keys = [
-                k for k, v in self._active_file_ops.items()
-                if v[0] == op_id
-            ]
+            stale_keys = [k for k, v in self._active_file_ops.items() if v[0] == op_id]
             for k in stale_keys:
                 # Re-verify identity under the same lock — defends
                 # against a concurrent register_active_op that
@@ -2218,7 +2316,8 @@ class UnifiedIntakeRouter:
         for envelope in queued:
             logger.info(
                 "[Router] Re-ingesting signal queued behind completed op %s: %s",
-                op_id[:12], envelope.description[:50],
+                op_id[:12],
+                envelope.description[:50],
             )
             await self.ingest(envelope)
 
@@ -2292,6 +2391,7 @@ class UnifiedIntakeRouter:
         self._lock_fd = fd
         try:
             import json as _json
+
             _prior_pid: Optional[int] = None
             _prior_age_s: Optional[float] = None
             try:
@@ -2315,27 +2415,28 @@ class UnifiedIntakeRouter:
             #   * session_id — links lock to the session dir on disk
             # Old readers continue to work (they read pid + ts only).
             from datetime import datetime, timezone
+
             _session_id = os.environ.get("OUROBOROS_SESSION_ID", "")
-            _meta = _json.dumps({
-                "pid": os.getpid(),
-                "ts": time.time(),
-                "monotonic_ts": time.monotonic(),
-                "wall_iso": datetime.now(tz=timezone.utc).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                ),
-                "session_id": _session_id,
-            })
+            _meta = _json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "ts": time.time(),
+                    "monotonic_ts": time.monotonic(),
+                    "wall_iso": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "session_id": _session_id,
+                }
+            )
             os.write(fd, _meta.encode())
             os.fsync(fd)
 
             if _prior_pid and _prior_pid != os.getpid():
-                _age_str = (
-                    f"{_prior_age_s:.0f}s" if _prior_age_s is not None else "?s"
-                )
+                _age_str = f"{_prior_age_s:.0f}s" if _prior_age_s is not None else "?s"
                 logger.info(
                     "[IntakeRouter] Overwrote stale lock metadata "
                     "(prior_pid=%d prior_age=%s new_pid=%d)",
-                    _prior_pid, _age_str, os.getpid(),
+                    _prior_pid,
+                    _age_str,
+                    os.getpid(),
                 )
         except OSError:
             pass  # Lock is held — metadata is advisory
@@ -2357,6 +2458,7 @@ class UnifiedIntakeRouter:
         """
         try:
             import json as _json
+
             data = _json.loads(lock_path.read_text())
             pid = data.get("pid", 0)
             ts = float(data.get("ts", 0.0)) if data.get("ts") else 0.0
@@ -2367,14 +2469,16 @@ class UnifiedIntakeRouter:
                 except ProcessLookupError:
                     lock_path.unlink(missing_ok=True)
                     logger.warning(
-                        "[IntakeRouter] Removed stale lock (dead PID %d)", pid,
+                        "[IntakeRouter] Removed stale lock (dead PID %d)",
+                        pid,
                     )
                     return True
                 except PermissionError:
                     pass  # PID alive, different user — fall through to TTL check
                 # (2) Wedged-but-alive TTL check (Slice 2)
                 _stale_ttl_raw = os.environ.get(
-                    "JARVIS_INTAKE_LOCK_STALE_TTL_S", "7200",
+                    "JARVIS_INTAKE_LOCK_STALE_TTL_S",
+                    "7200",
                 )
                 try:
                     _stale_ttl = float(_stale_ttl_raw)
@@ -2387,7 +2491,9 @@ class UnifiedIntakeRouter:
                         "[IntakeRouter] Removed wedged-but-alive stale lock "
                         "(PID=%d alive, age=%.0fs > TTL=%.0fs — treating as "
                         "Py_FinalizeEx-class zombie)",
-                        pid, _age_s, _stale_ttl,
+                        pid,
+                        _age_s,
+                        _stale_ttl,
                     )
                     return True
         except (ValueError, OSError, KeyError):
@@ -2438,8 +2544,8 @@ def set_default_intake_router(router: "UnifiedIntakeRouter") -> None:
             _DEFAULT_INTAKE_ROUTER = router
     except Exception as exc:  # noqa: BLE001 — defensive
         logger.debug(
-            "[UnifiedIntakeRouter] set_default_intake_router "
-            "degraded: %s", exc,
+            "[UnifiedIntakeRouter] set_default_intake_router " "degraded: %s",
+            exc,
         )
 
 
@@ -2474,10 +2580,9 @@ def _stamp_resume_pipeline_deadline(ctx: Any, source: str) -> Any:
         if str(source or "") != "fsm_resume":
             return ctx
         from datetime import datetime, timedelta, timezone  # noqa: PLC0415
-        _pt_s = max(1.0, float(os.environ.get(
-            "JARVIS_PIPELINE_TIMEOUT_S", "600") or 600))
-        return ctx.with_pipeline_deadline(
-            datetime.now(tz=timezone.utc) + timedelta(seconds=_pt_s))
+
+        _pt_s = max(1.0, float(os.environ.get("JARVIS_PIPELINE_TIMEOUT_S", "600") or 600))
+        return ctx.with_pipeline_deadline(datetime.now(tz=timezone.utc) + timedelta(seconds=_pt_s))
     except Exception:  # noqa: BLE001 -- hydration hygiene, never fatal
         return ctx
 
@@ -2493,13 +2598,15 @@ def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
     import json as _rj  # noqa: PLC0415
 
     _lineage = dict(env.get("trace_lineage") or {})
-    _ev_json = _rj.dumps({
-        "resume": True,
-        "resume_phase": env.get("resume_phase", ""),
-        "partial_completion": env.get("partial_completion", ""),
-        "resumed_op_id": env.get("op_id", ""),
-        "trace_lineage": _lineage,
-    })
+    _ev_json = _rj.dumps(
+        {
+            "resume": True,
+            "resume_phase": env.get("resume_phase", ""),
+            "partial_completion": env.get("partial_completion", ""),
+            "resumed_op_id": env.get("op_id", ""),
+            "trace_lineage": _lineage,
+        }
+    )
     _ev = {
         "resume": True,
         "resume_phase": env.get("resume_phase", ""),
