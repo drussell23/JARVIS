@@ -1,5 +1,14 @@
 """Slice 48 — Semantic Target Stratification regression spine.
 
+Contract update (fix/coverage-sync-inline-ast — sixth starvation class):
+``file_has_test_coverage`` is INDEX-BACKED — the inline legacy scan (rglob
+walk + cold ``_strat_build_ast_map``) was retired because it wedged the
+asyncio loop 30.1 s (bt-iso-1783142866). COLD now degrades NEUTRAL (True,
+zero penalty, fires the single-flight off-loop build); real verdicts require
+a WARM index. All §1 detection/negative pins below therefore warm the index
+via ``_install_index`` first. The cold never-walk/neutral guarantees are
+pinned in ``test_coverage_sync_index_backed.py``.
+
 Pins (shared scoring substrate + OpportunityMiner wiring):
   §1  file_has_test_coverage — global AST-aware resolver (suffix + AST-import)
   §1a  exact test_<stem>.py still detected
@@ -36,16 +45,18 @@ from backend.core.ouroboros.governance.target_stratification import (
 )
 
 
-# ── §1a exact test_<stem>.py detected (unchanged behavior) ──────────────
+# ── §1a exact test_<stem>.py detected (warm index) ──────────────────────
 def test_file_has_test_coverage_detects_test_file(tmp_path: Path) -> None:
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_widget.py").write_text("def test_x(): pass\n")
+    _install_index(tmp_path)
     assert file_has_test_coverage("backend/core/widget.py", tmp_path) is True
 
 
-# ── §1e genuinely-untested file → False ─────────────────────────────────
+# ── §1e genuinely-untested file → False (warm index) ────────────────────
 def test_file_has_test_coverage_false_when_absent(tmp_path: Path) -> None:
     (tmp_path / "tests").mkdir()
+    _install_index(tmp_path)  # cold would degrade neutral (True) by design
     assert file_has_test_coverage("backend/core/widget.py", tmp_path) is False
 
 
@@ -59,6 +70,7 @@ def test_file_has_test_coverage_suffix_variant(
     (tmp_path / "tests" / "battle_test" / "test_repl_input_polish_slice4.py").write_text(
         "def test_x(): pass\n"
     )
+    _install_index(tmp_path)
     assert (
         file_has_test_coverage("backend/core/ouroboros/battle_test/repl_input_polish.py", tmp_path)
         is True
@@ -75,6 +87,7 @@ def test_file_has_test_coverage_nested_subdir(
     (tmp_path / "tests" / "governance" / "autonomy" / "test_widget.py").write_text(
         "def test_y(): pass\n"
     )
+    _install_index(tmp_path)
     assert file_has_test_coverage("backend/core/widget.py", tmp_path) is True
 
 
@@ -92,11 +105,9 @@ def test_file_has_test_coverage_ast_import_detects(
         "def test_it(): assert some_func() is not None\n"
     )
     (tmp_path / "tests" / "test_integration_suite.py").write_text(test_content)
-    # Clear cache for this tmp_path so Strategy 2 rebuilds fresh.
-    _strat_ast_cache.pop(tmp_path.resolve(), None)
-    result = file_has_test_coverage("backend/core/special_util.py", tmp_path)
-    _strat_ast_cache.pop(tmp_path.resolve(), None)  # cleanup
-    assert result is True
+    # Index-backed: Strategy 2's AST map lives inside the warm index.
+    _install_index(tmp_path)
+    assert file_has_test_coverage("backend/core/special_util.py", tmp_path) is True
 
 
 # ── §1e genuinely-untested file → False (explicit named case) ───────────
@@ -110,10 +121,8 @@ def test_file_has_test_coverage_genuinely_untested(
     (tmp_path / "tests" / "test_other.py").write_text(
         "from backend.core.other import foo\ndef test_foo(): pass\n"
     )
-    _strat_ast_cache.pop(tmp_path.resolve(), None)
-    result = file_has_test_coverage("backend/core/orphan.py", tmp_path)
-    _strat_ast_cache.pop(tmp_path.resolve(), None)  # cleanup
-    assert result is False
+    _install_index(tmp_path)  # cold would degrade neutral (True) by design
+    assert file_has_test_coverage("backend/core/orphan.py", tmp_path) is False
 
 
 # ── §1f Advisor _compute_test_coverage returns 1.0 for suffix-tested file ─
@@ -129,6 +138,7 @@ def test_advisor_compute_coverage_suffix_variant(
     (tmp_path / "tests" / "battle_test" / "test_repl_input_polish_slice4.py").write_text(
         "def test_x(): pass\n"
     )
+    _install_index(tmp_path)
     adv = OperationAdvisor.__new__(OperationAdvisor)
     adv._project_root = tmp_path  # type: ignore[attr-defined]
     cov = adv._compute_test_coverage(
@@ -226,6 +236,7 @@ def test_advisor_coverage_matches_shared_definition(tmp_path: Path) -> None:
 
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_covered.py").write_text("def test_x(): pass\n")
+    _install_index(tmp_path)  # warm — cold degrades every file to covered
     adv = OperationAdvisor.__new__(OperationAdvisor)  # avoid heavy __init__
     adv._project_root = tmp_path  # type: ignore[attr-defined]
     cov = adv._compute_test_coverage(("covered.py", "uncovered.py"), root=tmp_path)
@@ -276,6 +287,7 @@ def test_analyze_file_stamps_coverage(tmp_path: Path) -> None:
     tree = _ast.parse(src)
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_thing.py").write_text("def test_x(): pass\n")
+    _install_index(tmp_path)  # warm — cold stamps every file covered (neutral)
     covered = _analyze_file("pkg/thing.py", src, tree, repo_root=tmp_path)
     uncovered = _analyze_file("pkg/other.py", src, tree, repo_root=tmp_path)
     none_root = _analyze_file("pkg/thing.py", src, tree)  # repo_root None → safe
@@ -285,10 +297,11 @@ def test_analyze_file_stamps_coverage(tmp_path: Path) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Tier-4 — off-loop coverage index (warm fast path parity + lifecycle).
+# Tier-4 — off-loop coverage index (warm correctness + lifecycle).
 # The index answers Strategy 1 via set/bisect lookups and Strategy 2 via
-# the prebuilt AST map — it must be semantically identical to the legacy
-# filesystem scan for every case above.
+# the prebuilt AST map. It is the ONLY answer path for the sync API now —
+# the legacy inline filesystem scan was retired by the loop-wedge fix
+# (fix/coverage-sync-inline-ast); cold degrades neutral (True).
 # ═══════════════════════════════════════════════════════════════════════
 import time as _time
 
@@ -315,11 +328,15 @@ def _install_index(root: Path) -> None:
 
 
 @pytest.mark.parametrize("covered_case", ["exact", "suffix", "ast", "none"])
-def test_warm_index_parity_with_legacy_scan(
+def test_warm_index_correctness_per_strategy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     covered_case: str,
 ) -> None:
+    """Formerly ``test_warm_index_parity_with_legacy_scan`` — the legacy
+    cold-scan leg is retired (there is no inline scan to be at parity with;
+    cold now degrades neutral True). The warm index remains pinned to the
+    ground-truth verdict for every strategy case."""
     monkeypatch.setenv("JARVIS_STRATIFICATION_AST_IMPORT_ENABLED", "true")
     src = tmp_path / "backend" / "core" / "widget.py"
     src.parent.mkdir(parents=True)
@@ -335,13 +352,13 @@ def test_warm_index_parity_with_legacy_scan(
             "def test_it(): assert some_func() is not None\n"
         )
 
-    legacy = file_has_test_coverage("backend/core/widget.py", tmp_path)
-    _strat_ast_cache.clear()  # legacy run may have warmed it — isolate
+    # COLD — neutral degrade for every case (never walks, never False).
+    assert file_has_test_coverage("backend/core/widget.py", tmp_path) is True
 
     _install_index(tmp_path)
     warm = file_has_test_coverage("backend/core/widget.py", tmp_path)
 
-    assert warm == legacy == (covered_case != "none")
+    assert warm == (covered_case != "none")
 
 
 def test_warm_index_answers_without_filesystem_scan(
@@ -364,18 +381,23 @@ def test_warm_index_answers_without_filesystem_scan(
     assert file_has_test_coverage("backend/core/nope.py", tmp_path) is False
 
 
-def test_index_master_switch_off_restores_legacy_path(
+def test_index_master_switch_off_sync_stays_neutral(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Formerly ``test_index_master_switch_off_restores_legacy_path`` — the
+    legacy scan no longer exists. Master off → lookup always None → the sync
+    API stays permanently NEUTRAL (True, zero penalty), and it must still
+    never walk (the signal is advisory, so this is a safe opt-out)."""
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_widget.py").write_text("def test_x(): pass\n")
     _install_index(tmp_path)
     monkeypatch.setenv("JARVIS_STRATIFICATION_INDEX_ENABLED", "false")
-    # Index ignored (lookup returns None) → legacy scan still answers.
     assert _ts.coverage_index_ready(tmp_path) is False
     assert _ts.trigger_coverage_index_build(tmp_path) == "skipped_disabled"
+    # Neutral for covered AND uncovered alike — a degrade, not a scan verdict.
     assert file_has_test_coverage("backend/core/widget.py", tmp_path) is True
+    assert file_has_test_coverage("backend/core/orphan.py", tmp_path) is True
 
 
 def test_trigger_sentinels_lifecycle(tmp_path: Path) -> None:
