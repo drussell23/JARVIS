@@ -67,6 +67,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -345,6 +346,84 @@ def _node_name() -> str:
 
 def _machine_type() -> str:
     return _env_str(_ENV_MACHINE_TYPE, _DEFAULT_MACHINE_TYPE)
+
+
+# ---------------------------------------------------------------------------
+# Stage-1 CPU Brain-VM knobs (relocation design item 1). The Brain node is a
+# SPEC VARIANT of the J-Prime insert -- CPU-only, env-resolved, labelled for
+# dynamic discovery. These do NOT touch the L4/J-Prime env names above; every
+# value is read at CALL time (Mandate 2 -- Architectural Purity).
+# ---------------------------------------------------------------------------
+
+_ENV_BRAIN_MACHINE_TYPE = "JARVIS_BRAIN_VM_MACHINE_TYPE"
+_ENV_BRAIN_IMAGE_FAMILY = "JARVIS_BRAIN_VM_IMAGE_FAMILY"
+_ENV_BRAIN_PERSISTENT = "JARVIS_BRAIN_VM_PERSISTENT"
+_ENV_BRAIN_IDLE_SHUTDOWN_S = "JARVIS_BRAIN_VM_IDLE_SHUTDOWN_S"
+_ENV_BRAIN_SPOT = "JARVIS_BRAIN_VM_SPOT"
+
+_DEFAULT_BRAIN_MACHINE_TYPE = "e2-highmem-4"
+# The Task-1 golden-image family (scripts/bake_brain_golden_image.py bakes
+# jarvis-brain-golden-<stamp> into this family).
+_DEFAULT_BRAIN_IMAGE_FAMILY = "jarvis-brain-golden"
+_DEFAULT_BRAIN_IDLE_SHUTDOWN_S = 1800
+
+# The Stage-1 discovery label (Task 3 filters instances.list on this) and the
+# instance-metadata key the Task-1 bake reads into /etc/jarvis/brain.env
+# (matches bake_brain_golden_image.py::_BRAIN_ENV_METADATA_KEY).
+_BRAIN_ROLE_LABEL_KEY = "jarvis-role"
+_BRAIN_ROLE_LABEL_VALUE = "brain"
+_BRAIN_ENV_METADATA_KEY = "brain-env"
+
+
+def _brain_machine_type() -> str:
+    return _env_str(_ENV_BRAIN_MACHINE_TYPE, _DEFAULT_BRAIN_MACHINE_TYPE)
+
+
+def _brain_image_family() -> str:
+    return _env_str(_ENV_BRAIN_IMAGE_FAMILY, _DEFAULT_BRAIN_IMAGE_FAMILY)
+
+
+def _brain_persistent() -> bool:
+    """ON-DEMAND-PER-SESSION default (False): the Brain VM is torn down at
+    session end. Opt-in ``JARVIS_BRAIN_VM_PERSISTENT=true`` keeps it as a warm
+    standby (Task 4 owns the teardown branch). Read at call time. NEVER raises."""
+    return (os.environ.get(_ENV_BRAIN_PERSISTENT, "false") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _brain_idle_shutdown_s() -> int:
+    """Idle self-shutdown threshold (seconds) delivered to the VM via the
+    ``brain-env`` metadata body; the VM-side systemd idle check (Task 1) reads it
+    from /etc/jarvis/brain.env. Env-tunable, default 1800. NEVER raises."""
+    return int(_env_float(
+        _ENV_BRAIN_IDLE_SHUTDOWN_S, float(_DEFAULT_BRAIN_IDLE_SHUTDOWN_S),
+        lo=0.0, hi=86400.0,
+    ))
+
+
+def _brain_spot() -> bool:
+    """Spot-first for the Brain VM by default (Spot is cheap; the on-demand
+    fallback is Task 4's concern via the existing ``_ondemand_on_stockout``
+    lever). ``JARVIS_BRAIN_VM_SPOT=false`` forces on-demand. Read at call time."""
+    return (os.environ.get(_ENV_BRAIN_SPOT, "true") or "").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _compose_brain_env(values: Optional[Dict[str, str]] = None) -> str:
+    """Compose the ``brain-env`` metadata body (a shell env-file) the Task-1 bake
+    curls into /etc/jarvis/brain.env at boot. Carries the idle-shutdown seconds
+    (env-resolved) plus any Task-4 ignition values (tokens / WS endpoint) folded
+    in via ``values``. Deterministic ordering (idle-shutdown first) so the spec
+    is stable. NEVER raises."""
+    lines = [
+        "# JARVIS Stage-1 Brain VM env -- written to /etc/jarvis/brain.env at boot.",
+        "{}={}".format(_ENV_BRAIN_IDLE_SHUTDOWN_S, _brain_idle_shutdown_s()),
+    ]
+    for k, v in (values or {}).items():
+        lines.append("{}={}".format(k, v))
+    return "\n".join(lines) + "\n"
 
 
 def _ondemand_on_stockout_enabled() -> bool:
@@ -667,11 +746,20 @@ class GCPComputeRest:
         spot: bool,
         accelerator_type: str = "",
         accelerator_count: int = 0,
+        labels: Optional[Dict[str, str]] = None,
+        extra_metadata: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Construct the EXACT instances.insert JSON payload. Dynamic zone +
         project from metadata; sourceImage = the golden-image family; Spot
         scheduling (provisioningModel=SPOT + instanceTerminationAction=DELETE)
-        when spot=True, on-demand otherwise; the project default network."""
+        when spot=True, on-demand otherwise; the project default network.
+
+        ``labels`` (Stage-1 Brain-VM) emits a top-level ``labels`` object ONLY
+        when provided; ``extra_metadata`` appends ``{key,value}`` items alongside
+        the startup-script item (the Brain reads /etc/jarvis/brain.env from its
+        ``brain-env`` metadata item). Both default None -> the payload is
+        BYTE-IDENTICAL to the pre-Brain output, so every existing L4/J-Prime
+        caller is unchanged."""
         # Faster boot disk = faster model-bytes -> RAM/VRAM load (the cold-start
         # tail). Dynamic zonal diskType URL (never hardcoded); empty -> omit so
         # GCE applies its default (pd-standard), the legacy behaviour.
@@ -715,6 +803,14 @@ class GCPComputeRest:
                 ]
             },
         }
+        # Stage-1 Brain-VM additive fields -- emitted ONLY when provided so the
+        # legacy (None-path) payload stays byte-identical.
+        if labels:
+            payload["labels"] = dict(labels)
+        if extra_metadata:
+            items = payload["metadata"]["items"]
+            for k, v in extra_metadata.items():
+                items.append({"key": str(k), "value": str(v)})
         if spot:
             payload["scheduling"] = {
                 "provisioningModel": "SPOT",
@@ -740,6 +836,45 @@ class GCPComputeRest:
             sched.setdefault("automaticRestart", False)
         return payload
 
+    def build_brain_insert_payload(
+        self,
+        *,
+        name: str,
+        zone: str,
+        project: str,
+        startup_script: str = "",
+        brain_env_values: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Construct the Stage-1 CPU Brain-VM instances.insert payload -- a SPEC
+        VARIANT of the J-Prime insert, NOT a parallel provisioning path. Reuses
+        ``_build_insert_payload`` verbatim with:
+
+          * env-resolved machine type (``JARVIS_BRAIN_VM_MACHINE_TYPE``) +
+            golden-image family (``JARVIS_BRAIN_VM_IMAGE_FAMILY``),
+          * CPU-only: ``accelerator_type="" / accelerator_count=0`` so the payload
+            carries NO ``guestAccelerators`` (Mandate 4 -- no accidental GPU spend),
+          * Spot per ``JARVIS_BRAIN_VM_SPOT`` (default true),
+          * ``labels={jarvis-role: brain}`` for the Task-3 discovery filter,
+          * a ``brain-env`` metadata item carrying the idle-shutdown seconds +
+            any Task-4 ignition values (tokens / WS endpoint) folded via
+            ``brain_env_values`` (the Task-1 startup script reads it into
+            /etc/jarvis/brain.env).
+
+        Every value resolved at call time (Mandate 2). NEVER raises."""
+        return self._build_insert_payload(
+            name=name,
+            zone=zone,
+            project=project,
+            machine_type=_brain_machine_type(),
+            image_family=_brain_image_family(),
+            startup_script=startup_script,
+            spot=_brain_spot(),
+            accelerator_type="",
+            accelerator_count=0,
+            labels={_BRAIN_ROLE_LABEL_KEY: _BRAIN_ROLE_LABEL_VALUE},
+            extra_metadata={_BRAIN_ENV_METADATA_KEY: _compose_brain_env(brain_env_values)},
+        )
+
     async def create_instance(
         self,
         *,
@@ -749,6 +884,8 @@ class GCPComputeRest:
         image_family: Optional[str] = None,
         accelerator_type: str = "",
         accelerator_count: int = 0,
+        labels: Optional[Dict[str, str]] = None,
+        extra_metadata: Optional[Dict[str, str]] = None,
     ) -> Tuple[bool, str]:
         """Async REST bootstrapper: launch the golden image via instances.insert.
 
@@ -810,6 +947,7 @@ class GCPComputeRest:
                 wave, project=project, token=token, headers=headers, node=node,
                 machine=machine, family=family, startup_script=startup_script,
                 accelerator_type=accelerator_type, accelerator_count=accelerator_count,
+                labels=labels, extra_metadata=extra_metadata,
             )
             last = detail
             if verdict == "created":
@@ -843,6 +981,7 @@ class GCPComputeRest:
     async def _insert_in_zone(
         self, *, zone, project, token, headers, node, machine, family,
         startup_script, accelerator_type, accelerator_count,
+        labels=None, extra_metadata=None,
     ) -> Tuple[str, str]:
         """Insert in ONE zone (Spot-first, on-demand fallback). Returns a verdict:
         'created' | 'stockout' (retry next zone) | 'failed' (stop). NEVER raises."""
@@ -861,6 +1000,7 @@ class GCPComputeRest:
                 name=node, zone=zone, project=project, machine_type=machine,
                 image_family=family, startup_script=startup_script, spot=spot,
                 accelerator_type=accelerator_type, accelerator_count=accelerator_count,
+                labels=labels, extra_metadata=extra_metadata,
             )
             status, text = await _http_request(
                 url, method="POST", headers=headers,
@@ -1002,6 +1142,7 @@ class GCPComputeRest:
     async def _race_wave(
         self, wave, *, project, token, headers, node, machine, family,
         startup_script, accelerator_type, accelerator_count,
+        labels=None, extra_metadata=None,
     ) -> Tuple[str, str]:
         """Scatter-gather ONE wave: launch ``_insert_in_zone`` (UNCHANGED --
         Spot->on-demand escalation + KEEP-re-verify all reused as-is) CONCURRENTLY
@@ -1032,6 +1173,7 @@ class GCPComputeRest:
                 zone=z, project=project, token=token, headers=headers, node=node,
                 machine=machine, family=family, startup_script=startup_script,
                 accelerator_type=accelerator_type, accelerator_count=accelerator_count,
+                labels=labels, extra_metadata=extra_metadata,
             )): z
             for z in wave
         }
@@ -1338,6 +1480,64 @@ class GCPComputeRest:
         except Exception as exc:  # noqa: BLE001
             logger.debug("[GCPComputeRest] get_node_endpoints fail-soft err=%r", exc)
             return (None, None)
+
+    async def list_instances_by_label(
+        self, *, label_key: str, label_value: str,
+    ) -> List[Dict[str, Any]]:
+        """aggregatedList instances filtered to
+        ``labels.<label_key>=<label_value>`` across ALL zones -- the Stage-1
+        Brain discovery seam (Task 3). Returns the raw instance dicts (each with
+        ``name`` / ``status`` / ``zone`` / ``networkInterfaces`` / ``labels``)
+        for every match, or ``[]`` on any failure.
+
+        The server-side ``filter=`` is re-checked client-side (defense in depth
+        -- a caller must NEVER act on a mis-labelled node). Paginates via
+        ``nextPageToken``. Reuses the SAME token-mint + ``_COMPUTE_BASE`` REST
+        bridge + ``_http_request`` contract as every other method here.
+        NEVER raises."""
+        try:
+            token = await self.access_token()
+            project = await self.project()
+            if not token or not project:
+                return []
+            filt = urllib.parse.quote(
+                "labels.{}={}".format(label_key, label_value)
+            )
+            base = "{}/projects/{}/aggregated/instances?filter={}".format(
+                _COMPUTE_BASE, project, filt,
+            )
+            headers = {"Authorization": "Bearer {}".format(token)}
+            out: List[Dict[str, Any]] = []
+            page_token = ""
+            while True:
+                url = base
+                if page_token:
+                    url = "{}&pageToken={}".format(
+                        base, urllib.parse.quote(page_token)
+                    )
+                status, text = await _http_request(
+                    url, method="GET", headers=headers, timeout_s=_rest_timeout(),
+                )
+                if not (200 <= status < 300 and text):
+                    break
+                try:
+                    doc = json.loads(text)
+                except Exception:  # noqa: BLE001 -- malformed body -> stop
+                    break
+                for scope in (doc.get("items") or {}).values():
+                    for inst in (scope or {}).get("instances") or []:
+                        labels = inst.get("labels") or {}
+                        if labels.get(label_key) == label_value:
+                            out.append(inst)
+                page_token = doc.get("nextPageToken") or ""
+                if not page_token:
+                    break
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[GCPComputeRest] list_instances_by_label fail-soft err=%r", exc,
+            )
+            return []
 
     # -- delete (delete-to-snapshot keeps the golden image untouched) ----
 
