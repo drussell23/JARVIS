@@ -411,3 +411,158 @@ async def test_identity_is_fully_dynamic_from_metadata(http):
     post = [call for call in http.calls if call["method"] == "POST"][0]
     assert "asia-northeast1-c" in post["url"]
     assert "another-project" in post["url"]
+
+
+# ---------------------------------------------------------------------------
+# list_instances_by_label -- the Stage-1 Brain discovery seam (Task 3).
+# Direct coverage of the real REST method (pagination, filter URL, client-side
+# label re-check, fail-soft) mocking _http_request per the file convention.
+# ---------------------------------------------------------------------------
+
+
+def _adc_off(monkeypatch):
+    """Campaign convention: force metadata identity, no ADC / SA credential
+    resolution leaking real cloud auth into the unit test."""
+    monkeypatch.setenv("JARVIS_FAILOVER_USE_ADC", "false")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    for var in ("GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCP_ZONE"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _brain_agg_fake(pages):
+    """Route metadata token/project + serve scripted aggregatedList pages in
+    order. Records every aggregated/instances URL seen. `pages` is a list of
+    (status, text) returned on successive aggregatedList GETs."""
+    seen = {"urls": []}
+
+    async def fake(url, *, method="GET", headers=None, body=None, timeout_s=10.0):
+        if "metadata.google.internal" in url:
+            if url.endswith("/token"):
+                return (200, json.dumps({"access_token": "ya29.FAKE", "expires_in": 3599}))
+            if url.endswith("project/project-id"):
+                return (200, "my-test-project")
+            if url.endswith("/scopes"):
+                return (200, "https://www.googleapis.com/auth/cloud-platform")
+            if url.endswith("instance/zone"):
+                return (200, "projects/9/zones/us-west2-b")
+            return (404, "")
+        if "aggregated/instances" in url:
+            seen["urls"].append(url)
+            idx = len(seen["urls"]) - 1
+            return pages[min(idx, len(pages) - 1)]
+        return (0, "[unrouted]")
+
+    return fake, seen
+
+
+async def test_list_instances_by_label_paginates(monkeypatch):
+    _adc_off(monkeypatch)
+    page1 = (200, json.dumps({
+        "items": {"zones/us-west2-b": {"instances": [
+            {"name": "brain-1", "status": "RUNNING", "labels": {"jarvis-role": "brain"}},
+        ]}},
+        "nextPageToken": "TOKEN_ABC",
+    }))
+    page2 = (200, json.dumps({
+        "items": {"zones/us-east1-c": {"instances": [
+            {"name": "brain-2", "status": "RUNNING", "labels": {"jarvis-role": "brain"}},
+        ]}},
+        # no nextPageToken -> terminal
+    }))
+    fake, seen = _brain_agg_fake([page1, page2])
+    monkeypatch.setattr(gr, "_http_request", fake)
+
+    c = GCPComputeRest()
+    out = await c.list_instances_by_label(label_key="jarvis-role", label_value="brain")
+
+    # BOTH pages' instances collected.
+    assert sorted(i["name"] for i in out) == ["brain-1", "brain-2"]
+    # Exactly two aggregatedList calls (the nextPageToken loop).
+    assert len(seen["urls"]) == 2
+    # Token threaded into the 2nd URL only.
+    assert "pageToken" not in seen["urls"][0]
+    assert "pageToken=TOKEN_ABC" in seen["urls"][1]
+
+
+async def test_list_instances_by_label_client_side_label_recheck(monkeypatch):
+    _adc_off(monkeypatch)
+    # Server filter "bypassed" (stale/mislabelled rows returned): the client-side
+    # labels.get(key)==value re-check must EXCLUDE the non-brain + label-less rows.
+    page = (200, json.dumps({
+        "items": {"zones/us-west2-b": {"instances": [
+            {"name": "brain-ok", "status": "RUNNING", "labels": {"jarvis-role": "brain"}},
+            {"name": "stale-jprime", "status": "RUNNING", "labels": {"jarvis-role": "l4-jprime"}},
+            {"name": "nolabels", "status": "RUNNING"},
+        ]}},
+    }))
+    fake, seen = _brain_agg_fake([page])
+    monkeypatch.setattr(gr, "_http_request", fake)
+
+    c = GCPComputeRest()
+    out = await c.list_instances_by_label(label_key="jarvis-role", label_value="brain")
+
+    assert [i["name"] for i in out] == ["brain-ok"]
+
+
+async def test_list_instances_by_label_filter_url_encoding(monkeypatch):
+    _adc_off(monkeypatch)
+    fake, seen = _brain_agg_fake([(200, json.dumps({"items": {}}))])
+    monkeypatch.setattr(gr, "_http_request", fake)
+
+    c = GCPComputeRest()
+    out = await c.list_instances_by_label(label_key="jarvis-role", label_value="brain")
+
+    assert out == []  # empty items -> empty result
+    assert len(seen["urls"]) == 1
+    url = seen["urls"][0]
+    assert "aggregated/instances" in url
+    assert "my-test-project" in url  # project from metadata (no hardcoding)
+    assert "filter=" in url
+    # labels.<key>=<value> encoded correctly (= -> %3D under urllib.parse.quote).
+    from urllib.parse import unquote
+    assert "labels.jarvis-role=brain" in unquote(url)
+
+
+async def test_list_instances_by_label_failsoft_on_raise(monkeypatch):
+    _adc_off(monkeypatch)
+
+    async def fake(url, *, method="GET", headers=None, body=None, timeout_s=10.0):
+        if "metadata.google.internal" in url:
+            if url.endswith("/token"):
+                return (200, json.dumps({"access_token": "ya29.FAKE", "expires_in": 3599}))
+            if url.endswith("project/project-id"):
+                return (200, "my-test-project")
+            return (404, "")
+        if "aggregated/instances" in url:
+            raise RuntimeError("network down")
+        return (0, "")
+
+    monkeypatch.setattr(gr, "_http_request", fake)
+    c = GCPComputeRest()
+    out = await c.list_instances_by_label(label_key="jarvis-role", label_value="brain")
+    assert out == []  # raise absorbed -> [], never propagated
+
+
+async def test_list_instances_by_label_failsoft_on_non_200(monkeypatch):
+    _adc_off(monkeypatch)
+    fake, seen = _brain_agg_fake([(503, "backend error")])
+    monkeypatch.setattr(gr, "_http_request", fake)
+
+    c = GCPComputeRest()
+    out = await c.list_instances_by_label(label_key="jarvis-role", label_value="brain")
+    assert out == []  # non-2xx -> break -> []
+    assert len(seen["urls"]) == 1
+
+
+async def test_list_instances_by_label_no_token_fails_soft(monkeypatch):
+    _adc_off(monkeypatch)
+
+    async def no_token(url, *, method="GET", headers=None, body=None, timeout_s=10.0):
+        if "metadata.google.internal" in url:
+            return (0, "")  # token + project unresolved
+        return (0, "")
+
+    monkeypatch.setattr(gr, "_http_request", no_token)
+    c = GCPComputeRest()
+    out = await c.list_instances_by_label(label_key="jarvis-role", label_value="brain")
+    assert out == []  # no auth -> [] before any aggregatedList call
