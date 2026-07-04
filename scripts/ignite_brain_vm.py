@@ -854,8 +854,26 @@ class BrainIgnitionDriver:
         def _client_getter() -> Any:
             return getattr(bus, "_client", None)
 
+        async def _await_connected(budget_s: float) -> bool:
+            # CONNECT GATE (live-fire attempt 2): events published before the
+            # first successful connect are live-only-lost. Never start the
+            # exchange on a dark link.
+            deadline = time.monotonic() + budget_s
+            while time.monotonic() < deadline:
+                client = _client_getter()
+                if client is not None and getattr(client, "connected", False):
+                    return True
+                await asyncio.sleep(0.1)
+            return False
+
         mac = _LiveMacEndpoint(bus, broker, _client_getter)
         await mac.start()
+        if not await _await_connected(_env_float("JARVIS_BRAIN_CONNECT_GATE_S", 30.0)):
+            _log("[BrainIgnite] connect gate TIMEOUT -- WS client never established")
+            await mac.stop()
+            client_task.cancel()
+            return {"proven": False, "logic_ok": False,
+                    "error": "connect_gate_timeout"}
 
         _live_tasks: List[asyncio.Task] = [client_task]
 
@@ -871,10 +889,12 @@ class BrainIgnitionDriver:
         async def _reconnect() -> Any:
             # Stateless re-discovery: re-resolve the endpoint from scratch (a Brain
             # that moved is re-found), reconnect a fresh client -> Last-Event-ID
-            # replay fills the severed span.
+            # replay fills the severed span (the bus carries the outbound cursor
+            # across client instances).
             new_url = await self._do_discover() or url
             new_task = asyncio.ensure_future(bus.start_client(new_url))
             _live_tasks.append(new_task)
+            await _await_connected(_env_float("JARVIS_BRAIN_CONNECT_GATE_S", 30.0))
             return mac
 
         # Task-9 un-loopback: the Brain endpoint is REAL -- publish() commands the

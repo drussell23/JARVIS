@@ -27,6 +27,10 @@ class DistributedEventBus:
         self._role = role
         self._server: Optional[BusBridgeServer] = None
         self._client: Optional[BusBridgeClient] = None
+        # Outbound last-sent cursor carried ACROSS client instances: stop() +
+        # start_client() builds a NEW BusBridgeClient, and without the carry
+        # the severed span is silently lost (live-fire 2026-07-04).
+        self._last_sent_cursor: Optional[str] = None
 
     def publish(self, event_type: str, op_id: str, payload: dict) -> Optional[str]:
         return self._broker.publish(event_type, op_id, payload)
@@ -47,9 +51,15 @@ class DistributedEventBus:
     async def start_client(self, url: Optional[str] = None) -> None:
         if self._role != "client":
             raise RuntimeError("start_client requires role=client")
-        self._client = BusBridgeClient(self._broker, self._cfg, url=url)
+        self._client = BusBridgeClient(
+            self._broker, self._cfg, url=url,
+            initial_last_sent_id=self._last_sent_cursor,
+        )
         await self._client.run()
 
     async def stop(self) -> None:
         if self._client is not None:
+            self._last_sent_cursor = (
+                getattr(self._client, "_last_sent_id", None) or self._last_sent_cursor
+            )
             await self._client.stop()

@@ -47,6 +47,7 @@ class BusBridgeClient:
         *,
         url: Optional[str] = None,
         session_factory: Optional[Callable[[], aiohttp.ClientSession]] = None,
+        initial_last_sent_id: Optional[str] = None,
     ) -> None:
         self._broker = broker
         self._cfg = cfg
@@ -57,12 +58,31 @@ class BusBridgeClient:
         # Outbound replay cursor: the last local event actually SENT to the peer.
         # A reconnect re-subscribes from here so events published while severed
         # cross client->server via broker replay (the server dedups overlaps).
-        # None = first connect (live-only, legacy behavior).
-        self._last_sent_id: Optional[str] = None
+        # None = first connect (live-only, legacy behavior). A recreated client
+        # (DistributedEventBus.start_client after stop) inherits the previous
+        # instance's cursor via ``initial_last_sent_id`` -- otherwise the
+        # severed span is silently lost (live-fire attempt 2, 2026-07-04).
+        self._last_sent_id: Optional[str] = initial_last_sent_id
         self._high_water: int = 0
         self._degraded = False
         self._missed_hb = 0
+        self._connected = False
+        self._active_ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._seen: "OrderedDict[str, None]" = OrderedDict()
+        # Local event ids WE minted by republishing peer events. The outbound
+        # pump must skip these or they bounce back with fresh ids forever
+        # (reflection storm: 408x amplification observed live).
+        self._republished: "OrderedDict[str, None]" = OrderedDict()
+
+    @property
+    def connected(self) -> bool:
+        """True while a WS link is established (hello sent, pumps running)."""
+        return self._connected
+
+    def _mark_republished(self, eid: str) -> None:
+        self._republished[eid] = None
+        if len(self._republished) > _DEDUP_MAX:
+            self._republished.popitem(last=False)
 
     @property
     def last_event_id(self) -> Optional[str]:
@@ -112,7 +132,17 @@ class BusBridgeClient:
         return f"{scheme}://{host}:{self._cfg.port}{self._cfg.path}"
 
     async def stop(self) -> None:
+        """Stop AND sever promptly: close the live WS so the pumps end now --
+        a flag-only stop leaves the link flushing until the next receive
+        timeout, which is not a sever (live-fire honesty gate, 2026-07-04)."""
         self._stopped = True
+        ws = self._active_ws
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._connected = False
 
     async def run(self) -> None:
         attempt = 0
@@ -147,10 +177,14 @@ class BusBridgeClient:
                 await ws.send_bytes(
                     bf.hello_frame(self._cfg.source_id, self._last_event_id).encode()
                 )
+                self._connected = True
+                self._active_ws = ws
                 out_task = asyncio.ensure_future(self._pump_outbound(ws))
                 try:
                     await self._pump_inbound(ws)
                 finally:
+                    self._connected = False
+                    self._active_ws = None
                     out_task.cancel()
                     try:
                         await out_task
@@ -178,6 +212,11 @@ class BusBridgeClient:
                     continue  # broker-internal replay/lag bookkeeping, not on-wire
                 if event.event_type == EVENT_TYPE_HEARTBEAT:
                     await ws.send_bytes(bf.heartbeat_frame(self._cfg.source_id).encode())
+                    continue
+                if event.event_id in self._republished:
+                    # An event WE republished from the peer -- sending it back
+                    # would re-mint ids on their side forever (reflection storm).
+                    self._last_sent_id = event.event_id
                     continue
                 frame = bf.event_frame(event, source_id=self._cfg.source_id)
                 await ws.send_bytes(frame.encode())
@@ -226,11 +265,13 @@ class BusBridgeClient:
             self._advance_contiguous(event_id)
             return
         try:
-            self._broker.publish(
+            local_eid = self._broker.publish(
                 ev_dict.get("event_type", ""),
                 ev_dict.get("op_id", ""),
                 ev_dict.get("payload", {}) or {},
             )
+            if local_eid:
+                self._mark_republished(local_eid)
         except Exception:  # noqa: BLE001
             logger.debug("[BusBridgeClient] local republish failed", exc_info=True)
         self._advance_contiguous(event_id)

@@ -48,9 +48,18 @@ class BusBridgeServer:
         self._cfg = cfg
         self._on_inbound = on_inbound
         self._seen: "OrderedDict[str, None]" = OrderedDict()
+        # Local event ids minted by the inbound republish (on_inbound returns the
+        # broker.publish id). The outbound pump must skip them or peer events
+        # bounce back with fresh ids forever (reflection storm, live-fire 2026-07-04).
+        self._republished: "OrderedDict[str, None]" = OrderedDict()
 
     def seen_count(self) -> int:
         return len(self._seen)
+
+    def _mark_republished(self, eid: str) -> None:
+        self._republished[eid] = None
+        if len(self._republished) > _DEDUP_MAX:
+            self._republished.popitem(last=False)
 
     def register_routes(self, app: web.Application) -> None:
         app.router.add_get(self._cfg.path, self._handle_ws)
@@ -79,7 +88,11 @@ class BusBridgeServer:
         )
         try:
             if self._on_inbound is not None:
-                self._on_inbound(ev)
+                local_eid = self._on_inbound(ev)
+                # DistributedEventBus's on_inbound returns the republish's local
+                # event id -- record it so the outbound pump never reflects it.
+                if isinstance(local_eid, str) and local_eid:
+                    self._mark_republished(local_eid)
         except Exception:  # noqa: BLE001 -- never crash the WS loop
             logger.debug("[BusBridgeServer] on_inbound raised", exc_info=True)
 
@@ -102,6 +115,8 @@ class BusBridgeServer:
                 if event.event_type == EVENT_TYPE_HEARTBEAT:
                     await ws.send_bytes(bf.heartbeat_frame(self._cfg.source_id).encode())
                     continue
+                if event.event_id in self._republished:
+                    continue  # never reflect a peer's own event back at it
                 frame = bf.event_frame(event, source_id=self._cfg.source_id)
                 await ws.send_bytes(frame.encode())
         except (asyncio.CancelledError, ConnectionResetError):
