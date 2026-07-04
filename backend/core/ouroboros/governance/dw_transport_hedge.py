@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Awaitable, Callable, Optional
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Optional, Tuple
 
 
 def transport_hedge_enabled() -> bool:
@@ -65,6 +66,100 @@ def should_skip_race_for_storm(storm_probability: float) -> bool:
         return False
 
 
+def hedge_policy_resolver_enabled() -> bool:
+    """Master for the dynamic arm-policy resolver (supersedes the inline
+    complexity-only s227 predicate). Default TRUE. OFF -> byte-identical
+    legacy s227 behavior. NEVER raises."""
+    return os.environ.get(
+        "JARVIS_HEDGE_POLICY_RESOLVER_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def hedge_defer_stable_enabled() -> bool:
+    """Master for deferred-ignition of the stable arm when the fast arm is
+    prioritized (structural double-billing kill). Default TRUE. OFF -> the
+    s227 eager-buffer mode. NEVER raises."""
+    return os.environ.get(
+        "JARVIS_HEDGE_DEFER_STABLE_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass(frozen=True)
+class HedgeArmPolicy:
+    """Resolved per-op hedge routing decision. prefer_fast: hold/defer the
+    stable arm so the tool-loop RT arm gets the slot. defer_stable: do not
+    even FIRE the stable arm unless RT terminally fails (zero double-spend).
+    reason: telemetry string for the decision audit trail."""
+
+    prefer_fast: bool
+    defer_stable: bool
+    reason: str
+
+
+def resolve_hedge_arm_policy(
+    *,
+    complexity: str,
+    route: str,
+    is_read_only: bool,
+    target_files: "Tuple[str, ...]",
+    repo_root: "Optional[str]",
+) -> HedgeArmPolicy:
+    """Dynamic hedge arm policy: workload complexity + write-intent +
+    target-stratification metrics at runtime. Zero hardcoded routing.
+    NEVER raises -- any error degrades to the legacy s227 decision."""
+    def _legacy() -> HedgeArmPolicy:
+        try:
+            from backend.core.ouroboros.governance.exploration_engine import (
+                exploration_gate_demands_tools,
+            )
+            pf = exploration_gate_demands_tools(str(complexity or ""))
+        except Exception:  # noqa: BLE001
+            pf = False
+        return HedgeArmPolicy(prefer_fast=pf, defer_stable=False, reason="legacy_s227")
+
+    try:
+        if not hedge_policy_resolver_enabled():
+            return _legacy()
+        from backend.core.ouroboros.governance.exploration_engine import (
+            exploration_gate_demands_tools,
+        )
+        reason_parts = []
+        targets = tuple(target_files or ())
+        write_intent = (not bool(is_read_only)) and bool(targets)
+        if write_intent:
+            # Fail-SAFE toward the tool arm for mutations: an unknown/empty
+            # complexity must not starve a write op of exploration (the
+            # exact fail-closed hole behind "hedge WON by batch").
+            reason_parts.append("write_intent")
+        if exploration_gate_demands_tools(str(complexity or "")):
+            reason_parts.append("gate_demands")
+        # Stratification refinement -- consulted ONLY when the Tier-4 index
+        # is already warm (never triggers a build on the dispatch hot path).
+        if write_intent and repo_root:
+            try:
+                from pathlib import Path
+                from backend.core.ouroboros.governance.target_stratification import (
+                    coverage_index_ready,
+                    file_has_test_coverage,
+                )
+                if coverage_index_ready(repo_root) and not file_has_test_coverage(
+                    targets[0], Path(repo_root),
+                ):
+                    reason_parts.append("uncovered_target")
+            except Exception:  # noqa: BLE001 -- refinement only, never decisive
+                pass
+        prefer_fast = bool(reason_parts)
+        defer = prefer_fast and hedge_defer_stable_enabled()
+        return HedgeArmPolicy(
+            prefer_fast=prefer_fast,
+            defer_stable=defer,
+            reason="+".join(reason_parts) if reason_parts else "no_signal",
+        )
+    except Exception:  # noqa: BLE001 -- fail-soft to legacy, never raise
+        p = _legacy()
+        return HedgeArmPolicy(p.prefer_fast, False, "fail_soft_legacy")
+
+
 async def hedged_race(
     fast: Callable[[], Awaitable[Any]],
     stable: Callable[[], Awaitable[Any]],
@@ -77,6 +172,7 @@ async def hedged_race(
         Callable[[Optional[BaseException], Optional[BaseException]], None]
     ] = None,
     prefer_fast: bool = False,
+    defer_stable: bool = False,
 ) -> Any:
     """Race ``fast`` (RT) against ``stable`` (batch). Return the FIRST successful result; cancel
     the loser aggressively. A ``fast`` failure that ``is_rupture`` returns True for is swallowed so
@@ -101,11 +197,27 @@ async def hedged_race(
     arrives first would fail the Iron Gate's exploration floor (the live GOAL-001::file-00 layer-3
     bug). The buffered batch is used ONLY if the RT arm then ruptures / fails / yields no success,
     so the hedge's rupture-protection guarantee is fully preserved. ``prefer_fast=False`` (default)
-    is byte-identical to the legacy FIRST_COMPLETED race."""
+    is byte-identical to the legacy FIRST_COMPLETED race.
+
+    ``defer_stable`` (Task 2, the structural double-spend kill): when True AND
+    ``prefer_fast`` is True, the stable (batch) arm is NOT fired at race start
+    at all -- it ignites event-driven, exactly once, ONLY if the fast (RT) arm
+    terminally fails. If the fast arm succeeds first, ``stable`` is never
+    called -- zero speculative batch spend, structurally impossible to
+    double-bill. ``defer_stable=False`` (default) preserves both the legacy
+    race and the eager-buffer ``prefer_fast`` mode byte-identically."""
     loop = asyncio.get_event_loop()
     t_fast = loop.create_task(fast())
-    t_stable = loop.create_task(stable())
-    pending = {t_fast, t_stable}
+    # Deferred-ignition (Task 2): when the RT/tool arm is prioritized, the
+    # stable arm is NOT fired at race start -- it ignites event-driven on RT
+    # terminal failure only. Structurally zero double-spend; the deferred arm
+    # inherits the remaining op deadline (same profile as the legacy
+    # sequential RT->batch fallback). No sleeps, no padding.
+    _defer = bool(defer_stable and prefer_fast)
+    t_stable: "Optional[asyncio.Task]" = (
+        None if _defer else loop.create_task(stable())
+    )
+    pending = {t_fast} if t_stable is None else {t_fast, t_stable}
     last_exc: Optional[BaseException] = None
     fast_exc: Optional[BaseException] = None
     stable_exc: Optional[BaseException] = None
@@ -157,6 +269,12 @@ async def hedged_race(
                         # the rupture/failure fallback the hedge exists for.
                         if buffered_stable is not _UNSET:
                             return await _claim(buffered_stable, stable_label)
+                        if _defer and t_stable is None:
+                            # IGNITE the deferred stable arm now -- the RT arm
+                            # terminally failed; this is the rupture fallback
+                            # the hedge exists for (event-driven, not timed).
+                            t_stable = loop.create_task(stable())
+                            pending = pending | {t_stable}
                         # otherwise wait for the stable arm (still pending)
                         continue
                     else:
@@ -200,5 +318,5 @@ async def hedged_race(
         raise RuntimeError("hedged_race: both transports resolved without a result")
     finally:
         for t in (t_fast, t_stable):
-            if not t.done():
+            if t is not None and not t.done():
                 t.cancel()
