@@ -65,14 +65,15 @@ class OrganismBusHost:
     """
 
     def __init__(self, router: Any = None) -> None:
-        # ``router`` is the UnifiedIntakeRouter handle, reserved for Task 3
-        # (remote intake signals arriving over this bus get ingested into
-        # the local intake pipeline). Stored but deliberately unused in
-        # Task 2 so the Task-3 wiring lands without a constructor change.
+        # ``router`` is the UnifiedIntakeRouter handle (Task 3): remote
+        # intake signals arriving over this bus get ingested into the local
+        # intake pipeline via a RemoteIntakeBridge. None skips the wiring
+        # (Task-2 behavior, byte-identical).
         self._router = router
         self._broker: Optional[Any] = None
         self._bus: Optional[Any] = None  # DistributedEventBus (server role)
         self._bridge: Optional[Any] = None  # TrinityBusBridge
+        self._intake_bridge: Optional[Any] = None  # RemoteIntakeBridge (Task 3)
         self._runner: Optional[Any] = None  # aiohttp AppRunner
         self._site: Optional[Any] = None  # aiohttp TCPSite
         self._started = False
@@ -154,6 +155,18 @@ class OrganismBusHost:
                 source_id=cfg.source_id,
             )
             await self._bridge.start()
+
+            if self._router is not None:
+                # Task 3: land remote Body signals into the local intake
+                # pipeline. Lazy import keeps the router=None path (and
+                # master-OFF) free of any intake-package import cost.
+                from backend.core.ouroboros.governance.intake.remote_intake import (
+                    RemoteIntakeBridge,
+                )
+
+                self._intake_bridge = RemoteIntakeBridge(
+                    trinity_bus, self._router)
+                await self._intake_bridge.start()
         except Exception as exc:  # noqa: BLE001 -- fail-soft: unwind + dark
             logger.warning(
                 "[OrganismBusHost] start failed (staying dark): %s", exc,
@@ -175,6 +188,13 @@ class OrganismBusHost:
         """Unwind in reverse order. Never raises (fail-soft teardown);
         no-op on a never-started host."""
         self._started = False
+        if self._intake_bridge is not None:
+            try:
+                await self._intake_bridge.stop()
+            except Exception:  # noqa: BLE001
+                logger.debug("[OrganismBusHost] intake bridge stop failed",
+                             exc_info=True)
+            self._intake_bridge = None
         if self._bridge is not None:
             try:
                 await self._bridge.stop()
