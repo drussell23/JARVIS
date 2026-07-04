@@ -188,3 +188,29 @@ def test_parse_validation_verdict_is_the_shared_jprime_function(bake):
     assert bake._run is jprime._run
     assert bake._log is jprime._log
     assert bake._now_stamp is jprime._now_stamp
+
+
+def test_bake_family_matches_provisioner_single_source_of_truth(monkeypatch):
+    """Cross-component pin: the bake MUST create the exact image family the
+    Task-2 provisioner (_brain_image_family) provisions FROM, else Task-5
+    ignition finds no image. Both must read JARVIS_BRAIN_VM_IMAGE_FAMILY and
+    share a default. Regression guard for the drift caught pre-live-fire
+    (bake was JARVIS_BRAIN_IMAGE_FAMILY/jarvis-brain vs provisioner
+    JARVIS_BRAIN_VM_IMAGE_FAMILY/jarvis-brain-golden)."""
+    import importlib.util as _u
+    monkeypatch.delenv("JARVIS_BRAIN_VM_IMAGE_FAMILY", raising=False)
+    monkeypatch.delenv("JARVIS_BRAIN_IMAGE_FAMILY", raising=False)
+    _s = _u.spec_from_file_location("_bb_pin", "scripts/bake_brain_golden_image.py")
+    _m = _u.module_from_spec(_s)
+    _s.loader.exec_module(_m)
+    from backend.core.ouroboros.governance.gcp_compute_rest import _brain_image_family
+    assert _m._DEFAULT_IMAGE_FAMILY == _brain_image_family(), (
+        "bake image family must match the provisioner's -- Task 5 provisions "
+        "from _brain_image_family(); a mismatch means no image found"
+    )
+    # And the shared env var drives BOTH:
+    monkeypatch.setenv("JARVIS_BRAIN_VM_IMAGE_FAMILY", "jarvis-brain-custom-fam")
+    _m2 = _u.module_from_spec(_s)
+    _s.loader.exec_module(_m2)
+    assert _m2._DEFAULT_IMAGE_FAMILY == "jarvis-brain-custom-fam"
+    assert _brain_image_family() == "jarvis-brain-custom-fam"

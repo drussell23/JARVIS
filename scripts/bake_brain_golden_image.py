@@ -80,7 +80,16 @@ _DEFAULT_ZONE = (os.environ.get("JARVIS_BRAIN_VM_ZONES", "").split(",")[0]).stri
 _DEFAULT_MACHINE = os.environ.get("JARVIS_BRAIN_BAKE_MACHINE", "e2-standard-4")
 _DEFAULT_REPO_URL = os.environ.get("JARVIS_BRAIN_REPO_URL", "")
 _DEFAULT_REPO_REF = os.environ.get("JARVIS_BRAIN_REPO_REF", "main")
-_DEFAULT_IMAGE_FAMILY = os.environ.get("JARVIS_BRAIN_IMAGE_FAMILY", "jarvis-brain")
+# SINGLE SOURCE OF TRUTH with the provisioner: the bake MUST create the same
+# image family that gcp_compute_rest._brain_image_family() provisions FROM,
+# or Task-5 ignition finds no image. Both read JARVIS_BRAIN_VM_IMAGE_FAMILY and
+# default to "jarvis-brain-golden" -- structurally coupled, cannot drift.
+# (The legacy JARVIS_BRAIN_IMAGE_FAMILY name is honored as a fallback so an
+# operator who set the old var is not silently ignored.)
+_DEFAULT_IMAGE_FAMILY = os.environ.get(
+    "JARVIS_BRAIN_VM_IMAGE_FAMILY",
+    os.environ.get("JARVIS_BRAIN_IMAGE_FAMILY", "jarvis-brain-golden"),
+)
 _DEFAULT_BOOT_DISK = os.environ.get("JARVIS_BRAIN_BAKE_BOOT_DISK_SIZE", "30GB")
 _DEFAULT_BOOT_DISK_TYPE = os.environ.get("JARVIS_BRAIN_BAKE_BOOT_DISK_TYPE", "pd-ssd")
 _DEFAULT_BAKE_TIMEOUT_S = int(os.environ.get("JARVIS_BRAIN_BAKE_TIMEOUT_S", "1800"))
