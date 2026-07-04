@@ -51,12 +51,18 @@ import threading
 from pathlib import Path
 from typing import Dict, Optional
 
-__all__ = ["resolve_repo_root", "clear_cache"]
+__all__ = ["resolve_repo_root", "clear_cache", "resolve_durable_path"]
 
 # Operator override env var — the SAME one the existing TestWatcher /
 # TestFailureSensor already read, so this resolver is a drop-in single source
 # of truth rather than a competing convention.
 _ENV_REPO_PATH = "JARVIS_REPO_PATH"
+
+# Durable-path re-anchor env keys (isomorphic harness overlay fix). See
+# resolve_durable_path() below for the full contract.
+_ENV_REROOT_ENABLED = "JARVIS_DURABLE_REROOT_ENABLED"
+_ENV_REROOT_FROM = "JARVIS_DURABLE_REROOT_FROM"
+_ENV_DURABLE_ROOT = "JARVIS_TRINITY_ROOT"
 
 # Cache: resolved-start-path -> resolved repo root. Bounded by the number of
 # distinct start anchors (effectively 1-2 in production: the module path and
@@ -196,3 +202,37 @@ def clear_cache() -> None:
     """Drop the memoized resolutions (test isolation / env-flip support)."""
     with _CACHE_LOCK:
         _CACHE.clear()
+
+
+def resolve_durable_path(path):
+    """Re-anchor a DURABLE-state write path from a declared workspace
+    overlay root onto the harness-provided durable root.
+
+    Pure path algebra, env-driven at call time, identity when the
+    overlay pair is not declared (real node / plain local). The
+    harness that OWNS the overlay declares both ends:
+
+        JARVIS_DURABLE_REROOT_FROM=/opt/trinity/jarvis   (overlay root)
+        JARVIS_TRINITY_ROOT=<writable per-run durable root>
+
+    No host detection, no permission probing, no literal paths.
+    NEVER raises -- any error returns the input unchanged."""
+    try:
+        p = Path(path)
+        raw = os.environ.get(_ENV_REROOT_ENABLED, "true").strip().lower()
+        if raw not in ("1", "true", "yes", "on"):
+            return p
+        src = os.environ.get(_ENV_REROOT_FROM, "").strip()
+        dst = os.environ.get(_ENV_DURABLE_ROOT, "").strip()
+        if not src or not dst:
+            return p
+        try:
+            rel = p.relative_to(src)
+        except ValueError:
+            return p  # not under the overlay root -- untouched
+        return Path(dst) / rel
+    except Exception:  # noqa: BLE001 -- module contract: never raises
+        try:
+            return Path(path)
+        except Exception:  # noqa: BLE001
+            return Path(".")

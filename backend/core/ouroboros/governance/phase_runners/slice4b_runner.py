@@ -950,678 +950,707 @@ class Slice4bRunner(PhaseRunner):
             {"op_id": ctx.op_id},
         )
 
-        # ---- Phase 8a: Scoped post-apply test run ----
-        _verify_test_passed = True
-        _verify_test_total = 0
-        _verify_test_failures = 0
-        _verify_failed_names: Tuple[str, ...] = ()
-
-        if orch._validation_runner is not None and ctx.target_files:
-            _changed = tuple(
-                orch._config.project_root / f for f in ctx.target_files
-            )
-            _files_str = ", ".join(str(f) for f in list(ctx.target_files)[:3])
-
-            try:
-                await orch._stack.comm.emit_heartbeat(
-                    op_id=ctx.op_id, phase="verify",
-                    verify_test_starting=True,
-                    verify_target_files=list(ctx.target_files),
-                )
-            except Exception:
-                pass
-
-            _verify_budget_s = min(
-                60.0,
-                float(os.environ.get("JARVIS_VERIFY_TIMEOUT_S", "60")),
-            )
-            try:
-                _multi = await asyncio.wait_for(
-                    orch._validation_runner.run(
-                        changed_files=_changed,
-                        sandbox_dir=None,
-                        timeout_budget_s=_verify_budget_s,
-                        op_id=ctx.op_id,
-                    ),
-                    timeout=_verify_budget_s + 5.0,
-                )
-                _verify_test_passed = _multi.passed
-                for _ar in _multi.adapter_results:
-                    _verify_test_total += _ar.test_result.total
-                    _verify_test_failures += _ar.test_result.failed
-                    _verify_failed_names += _ar.test_result.failed_tests
-                if _verify_test_total == 0 and _verify_test_failures == 0:
-                    _verify_test_passed = True
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                logger.warning("[Orchestrator] Verify scoped test timed out [%s]", ctx.op_id)
-                _verify_test_passed = False
-                _verify_test_failures = 1
-            except BlockedPathError:
-                pass
-            except Exception as exc:
-                logger.debug("[Orchestrator] Verify scoped test error: %s", exc)
-
-            try:
-                await orch._stack.comm.emit_heartbeat(
-                    op_id=ctx.op_id, phase="verify",
-                    verify_test_passed=_verify_test_passed,
-                    verify_test_total=_verify_test_total,
-                    verify_test_failures=_verify_test_failures,
-                    verify_target_files=list(ctx.target_files),
-                )
-            except Exception:
-                pass
-
-            try:
-                from backend.core.ouroboros.governance.ops_digest_observer import (
-                    get_ops_digest_observer,
-                )
-                _verify_passed_count = max(
-                    0, _verify_test_total - _verify_test_failures,
-                )
-                get_ops_digest_observer().on_verify_completed(
-                    op_id=ctx.op_id,
-                    passed=_verify_passed_count,
-                    total=_verify_test_total,
-                    scoped_to_applied_op=True,
-                )
-            except Exception:
-                logger.debug(
-                    "[Orchestrator] on_verify_completed observer call failed",
-                    exc_info=True,
-                )
-
-            # On failure: L2 repair before rollback
-            if not _verify_test_passed and orch._config.repair_engine is not None:
-                logger.info(
-                    "[Orchestrator] VERIFY test failed (%d/%d) — routing to L2 repair [%s]",
-                    _verify_test_failures, _verify_test_total, ctx.op_id,
-                )
-                _pl_deadline = ctx.pipeline_deadline or (
-                    datetime.now(timezone.utc) + timedelta(seconds=60)
-                )
-                _synth_val = ValidationResult(
-                    passed=False,
-                    best_candidate=best_candidate,
-                    validation_duration_s=0.0,
-                    error=f"post-apply verify: {_verify_test_failures}/{_verify_test_total} failing",
-                    failure_class="test",
-                    short_summary=f"verify: {', '.join(_verify_failed_names[:3])}",
-                    adapter_names_run=(),
-                )
-                try:
-                    directive = await orch._l2_hook(ctx, _synth_val, _pl_deadline)
-                    if directive[0] == "break":
-                        _l2_candidate = directive[1]
-                        _l2_change = orch._build_change_request(ctx, _l2_candidate)
-                        try:
-                            # Anti-Venom C2 — shield L2 VERIFY repair apply.
-                            _l2_result = await asyncio.shield(
-                                orch._stack.change_engine.execute(_l2_change)
-                            )
-                            if _l2_result.success:
-                                _verify_test_passed = True
-                                _verify_test_failures = 0
-                                logger.info(
-                                    "[Orchestrator] L2 repair applied in VERIFY phase [%s]",
-                                    ctx.op_id,
-                                )
-                            else:
-                                logger.warning(
-                                    "[Orchestrator] L2 repair candidate failed to apply [%s]",
-                                    ctx.op_id,
-                                )
-                        except Exception as _apply_exc:
-                            logger.debug("[Orchestrator] L2 repair apply error: %s", _apply_exc)
-                    elif directive[0] in ("cancel", "fatal"):
-                        ctx = directive[1]
-                        logger.info(
-                            "[Orchestrator] L2 escaped VERIFY phase — "
-                            "op ctx advanced to %s [%s]",
-                            ctx.phase.name, ctx.op_id,
-                        )
-                        return PhaseResult(
-                            next_ctx=ctx, next_phase=None, status="fail",
-                            reason=ctx.terminal_reason_code or "l2_escape_verify",
-                            artifacts={"t_apply": _t_apply},
-                        )
-                except Exception as _l2_exc:
-                    logger.debug(
-                        "[Orchestrator] L2 repair in VERIFY failed: %s: %s",
-                        type(_l2_exc).__name__, _l2_exc,
-                    )
-
-        ctx = await orch._run_benchmark(ctx, [])
-
-        # ---- Verify Gate: enforce regression thresholds ----
-        _verify_error = None
+        # Transactional-lifecycle guard (Task 4, durability substrate):
+        # the APPLIED ledger row is now written and the file mutation is on
+        # disk. From here the ONLY legitimate exits are Phase 8b (auto-commit)
+        # or a governed rollback/gate-failure that CLOSES the transaction. A
+        # silent exit in between (the op-944c defect) must be made LOUD.
+        from backend.core.ouroboros.governance.transaction_lifecycle import (
+            TransactionLifecycleError,
+            txn_lifecycle_guard_enabled,
+        )
+        _txn_commit_stage_reached = False
         try:
-            from backend.core.ouroboros.governance.verify_gate import (
-                enforce_verify_thresholds,
-                rollback_files,
-            )
-            _br = getattr(ctx, "benchmark_result", None)
-            if _br is not None:
-                _baseline_cov = None
-                _snapshots = getattr(ctx, "pre_apply_snapshots", {})
-                if isinstance(_snapshots, dict):
-                    _baseline_cov = _snapshots.get("_coverage_baseline")
-                _verify_error = enforce_verify_thresholds(_br, baseline_coverage=_baseline_cov)
-        except Exception as exc:
-            logger.debug("[Orchestrator] Verify gate skipped: %s", exc)
+            # ---- Phase 8a: Scoped post-apply test run ----
+            _verify_test_passed = True
+            _verify_test_total = 0
+            _verify_test_failures = 0
+            _verify_failed_names: Tuple[str, ...] = ()
 
-        if _verify_error is None and not _verify_test_passed:
-            _verify_error = f"scoped verify: {_verify_test_failures}/{_verify_test_total} tests failing"
-
-        # Slice 67 — swe_bench_pro VERIFY regression gate is advisory (LIVE
-        # extracted-runner path; mirrors the inline orchestrator block). The
-        # repo tests can't run without the container env; the held-out
-        # container scoring (Slice 65) is authoritative. Clearing the error
-        # keeps the patch applied (no rollback) so the autoscore layer captures
-        # it. Lazy import avoids a runner↔orchestrator module cycle.
-        try:
-            from backend.core.ouroboros.governance.orchestrator import (
-                _swe_bench_verify_advisory,
-            )
-            _verify_error = _swe_bench_verify_advisory(
-                getattr(ctx, "signal_source", "") or "", _verify_error, ctx.op_id,
-            )
-        except Exception:  # noqa: BLE001 — advisory must never break VERIFY
-            pass
-
-        if _verify_error is not None:
-            logger.warning(
-                "[Orchestrator] VERIFY regression gate fired: %s [%s]",
-                _verify_error, ctx.op_id,
-            )
-            try:
-                await orch._stack.comm.emit_postmortem(
-                    op_id=ctx.op_id,
-                    root_cause=f"verify_regression: {_verify_error}",
-                    failed_phase="VERIFY",
-                    target_files=list(ctx.target_files),
+            if orch._validation_runner is not None and ctx.target_files:
+                _changed = tuple(
+                    orch._config.project_root / f for f in ctx.target_files
                 )
-            except Exception:
-                pass
-            try:
-                _snapshots = getattr(ctx, "pre_apply_snapshots", {})
-                if _snapshots:
-                    from backend.core.ouroboros.governance.verify_gate import (
-                        rollback_files as _rollback_files,
-                    )
-                    _rollback_files(
-                        pre_apply_snapshots=_snapshots,
-                        target_files=list(ctx.target_files),
-                        repo_root=orch._config.project_root,
-                    )
-            except Exception as exc:
-                logger.error("[Orchestrator] Verify rollback failed: %s", exc)
+                _files_str = ", ".join(str(f) for f in list(ctx.target_files)[:3])
 
-            if _checkpoint is not None and _ckpt_mgr is not None:
-                try:
-                    await _ckpt_mgr.restore_checkpoint(_checkpoint.checkpoint_id)
-                    logger.info(
-                        "[Orchestrator] Git checkpoint restored: %s [%s]",
-                        _checkpoint.checkpoint_id, ctx.op_id,
-                    )
-                except Exception:
-                    logger.debug("[Orchestrator] Checkpoint restore failed", exc_info=True)
-
-            if _serpent: _serpent.update_phase("POSTMORTEM")
-            ctx = ctx.advance(
-                OperationPhase.POSTMORTEM,
-                terminal_reason_code="verify_regression",
-                rollback_occurred=True,
-            )
-            await orch._record_ledger(
-                ctx,
-                OperationState.FAILED,
-                {"reason": "verify_regression", "detail": _verify_error, "rollback_occurred": True},
-            )
-            orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply, rolled_back=True)
-            await orch._publish_outcome(ctx, OperationState.FAILED, "verify_regression")
-            return PhaseResult(
-                next_ctx=ctx, next_phase=None, status="fail",
-                reason="verify_regression",
-                artifacts={"t_apply": _t_apply},
-            )
-
-        # ---- Gate 2: Cryptographic Blast-Radius Verification ----
-        # Runs AFTER the scoped Phase-8a verify gate cleared (only reached
-        # when those tests passed) and BEFORE Phase 8b auto-commit. Chains
-        # onto Gate 1's sandbox_token: if Gate 1 didn't run there is no token
-        # to chain, so Gate 2 is skipped rather than broken.
-        # Default-OFF: JARVIS_A1_BLAST_RADIUS_ENABLED controls activation.
-        # Inline env check + all imports INSIDE the guard so the OFF path
-        # imports NOTHING (byte-identical to pre-Gate-2 behavior — Task 4 lesson).
-        _blast_armed = os.environ.get("JARVIS_A1_BLAST_RADIUS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
-        if _blast_armed:
-            if getattr(ctx, "sandbox_token", None) is None:
-                logger.warning(
-                    "[Gate2] op=%s armed but no sandbox_token (Gate 1 disabled?) -- skipping",
-                    ctx.op_id,
-                )
-        if (_blast_armed
-                and getattr(ctx, "sandbox_token", None) is not None
-                and getattr(ctx, "proof_chain", None) is not None):
-            from ..blast_radius_verify import (
-                acquire_blast_radius_token,
-                BlastRadiusBreach,
-                BlastRadiusGraphFailure,
-            )
-            from ..reverse_dep_resolver import resolve_reverse_dependency_tests
-            from .. import intake_dlq as _g2_dlq
-            from ..test_runner import TestRunner as _G2TestRunner
-
-            _g2_root = orch._config.project_root  # Path
-            _g2_scope = sorted(
-                set(ctx.target_files)
-                | {cf for cf, _ in orch._iter_candidate_files(best_candidate) if cf}
-            )
-            # Reuse the APPLY-start checkpoint's content TREE SHA as the pre-op anchor.
-            # stash_ref is a timestamped COMMIT sha; ^{tree} is content-addressed and
-            # deterministic — identical content produces identical tree SHA.
-            _g2_pre_sha = await _ckpt_mgr.tree_sha_for_ref(
-                getattr(_checkpoint, "stash_ref", "") if _checkpoint is not None else ""
-            )
-
-            async def _g2_graph_fn(files):
-                return await resolve_reverse_dependency_tests(
-                    files, repo_root=str(_g2_root), oracle=None,
-                )
-
-            async def _g2_test_fn(tests):
-                if not tests:
-                    return {"failed": [], "total": 0}
-                _paths = tuple((_g2_root / t) for t in tests)
-                _runner = _G2TestRunner(repo_root=_g2_root)
-                _tr = await _runner.run(test_files=_paths, sandbox_dir=None)
-                return {"failed": list(_tr.failed_tests), "total": _tr.total}
-
-            async def _g2_rollback(_sha):
-                # Non-destructive restore via the existing APPLY-start checkpoint.
-                if _checkpoint is not None and _ckpt_mgr is not None:
-                    await _ckpt_mgr.restore_checkpoint(_checkpoint.checkpoint_id)
-
-            async def _g2_tree_sha():
-                if _ckpt_mgr is None:
-                    return ""
-                return await _ckpt_mgr.working_tree_content_sha()
-
-            def _g2_dlq_fn(reason):
-                _g2_dlq.append_dlq({"op_id": ctx.op_id, "phase": "blast_radius"}, reason=reason)
-
-            try:
-                _blast_tok = await acquire_blast_radius_token(
-                    op_id=ctx.op_id,
-                    scope_files=_g2_scope,
-                    pre_op_tree_sha=_g2_pre_sha,
-                    chain=ctx.proof_chain,
-                    prev_token=ctx.sandbox_token,
-                    graph_fn=_g2_graph_fn,
-                    test_fn=_g2_test_fn,
-                    current_tree_sha_fn=_g2_tree_sha,
-                    rollback_fn=_g2_rollback,
-                    dlq_fn=_g2_dlq_fn,
-                )
-            except BlastRadiusGraphFailure:
-                logger.warning("[Gate2] op=%s blast_radius_graph_failure", ctx.op_id)
-                if _serpent: _serpent.update_phase("POSTMORTEM")
-                ctx = ctx.advance(
-                    OperationPhase.POSTMORTEM,
-                    terminal_reason_code="blast_radius_graph_failure",
-                    rollback_occurred=True,
-                )
-                await orch._record_ledger(
-                    ctx,
-                    OperationState.FAILED,
-                    {"reason": "blast_radius_graph_failure", "rollback_occurred": True},
-                )
-                orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply, rolled_back=True)
-                await orch._publish_outcome(ctx, OperationState.FAILED, "blast_radius_graph_failure")
-                return PhaseResult(
-                    next_ctx=ctx, next_phase=None, status="fail",
-                    reason="blast_radius_graph_failure",
-                    artifacts={"t_apply": _t_apply},
-                )
-            except BlastRadiusBreach:
-                logger.warning("[Gate2] op=%s blast_radius_breach", ctx.op_id)
-                if _serpent: _serpent.update_phase("POSTMORTEM")
-                ctx = ctx.advance(
-                    OperationPhase.POSTMORTEM,
-                    terminal_reason_code="blast_radius_breach",
-                    rollback_occurred=True,
-                )
-                await orch._record_ledger(
-                    ctx,
-                    OperationState.FAILED,
-                    {"reason": "blast_radius_breach", "rollback_occurred": True},
-                )
-                orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply, rolled_back=True)
-                await orch._publish_outcome(ctx, OperationState.FAILED, "blast_radius_breach")
-                return PhaseResult(
-                    next_ctx=ctx, next_phase=None, status="fail",
-                    reason="blast_radius_breach",
-                    artifacts={"t_apply": _t_apply},
-                )
-            ctx = dataclasses.replace(ctx, blast_token=_blast_tok)
-
-        # ---- Phase 8b: Auto-commit ----
-        _committed_hash: Optional[str] = None
-        try:
-            from backend.core.ouroboros.governance.auto_committer import AutoCommitter
-            _committer = AutoCommitter(repo_root=orch._config.project_root)
-            _gen = ctx.generation
-            _provider = getattr(_gen, "provider_name", "") if _gen else ""
-            _cost = 0.0
-            if _gen:
-                _in_tok = getattr(_gen, "total_input_tokens", 0) or 0
-                _out_tok = getattr(_gen, "total_output_tokens", 0) or 0
-                _cost = (_in_tok * 0.0000001 + _out_tok * 0.0000004)
-            _commit_result = await asyncio.wait_for(
-                _committer.commit(
-                    op_id=ctx.op_id,
-                    description=ctx.description,
-                    target_files=ctx.target_files,
-                    risk_tier=ctx.risk_tier,
-                    provider_name=_provider,
-                    generation_cost=_cost,
-                    signal_source=getattr(ctx, "signal_source", ""),
-                    signal_urgency=getattr(ctx, "signal_urgency", ""),
-                    rationale=ctx.description,
-                ),
-                timeout=30.0,
-            )
-            if _commit_result.committed:
-                _committed_hash = _commit_result.commit_hash
                 try:
                     await orch._stack.comm.emit_heartbeat(
-                        op_id=ctx.op_id, phase="commit",
-                        progress_pct=98.0,
-                        commit_hash=_commit_result.commit_hash,
-                        commit_pushed=_commit_result.pushed,
-                        commit_branch=_commit_result.push_branch,
+                        op_id=ctx.op_id, phase="verify",
+                        verify_test_starting=True,
+                        verify_target_files=list(ctx.target_files),
                     )
                 except Exception:
                     pass
-                logger.info(
-                    "[Orchestrator] Auto-committed %s for op=%s",
-                    _commit_result.commit_hash, ctx.op_id,
+
+                _verify_budget_s = min(
+                    60.0,
+                    float(os.environ.get("JARVIS_VERIFY_TIMEOUT_S", "60")),
                 )
+                try:
+                    _multi = await asyncio.wait_for(
+                        orch._validation_runner.run(
+                            changed_files=_changed,
+                            sandbox_dir=None,
+                            timeout_budget_s=_verify_budget_s,
+                            op_id=ctx.op_id,
+                        ),
+                        timeout=_verify_budget_s + 5.0,
+                    )
+                    _verify_test_passed = _multi.passed
+                    for _ar in _multi.adapter_results:
+                        _verify_test_total += _ar.test_result.total
+                        _verify_test_failures += _ar.test_result.failed
+                        _verify_failed_names += _ar.test_result.failed_tests
+                    if _verify_test_total == 0 and _verify_test_failures == 0:
+                        _verify_test_passed = True
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    logger.warning("[Orchestrator] Verify scoped test timed out [%s]", ctx.op_id)
+                    _verify_test_passed = False
+                    _verify_test_failures = 1
+                except BlockedPathError:
+                    pass
+                except Exception as exc:
+                    logger.debug("[Orchestrator] Verify scoped test error: %s", exc)
+
+                try:
+                    await orch._stack.comm.emit_heartbeat(
+                        op_id=ctx.op_id, phase="verify",
+                        verify_test_passed=_verify_test_passed,
+                        verify_test_total=_verify_test_total,
+                        verify_test_failures=_verify_test_failures,
+                        verify_target_files=list(ctx.target_files),
+                    )
+                except Exception:
+                    pass
 
                 try:
                     from backend.core.ouroboros.governance.ops_digest_observer import (
                         get_ops_digest_observer,
                     )
-                    get_ops_digest_observer().on_commit_succeeded(
+                    _verify_passed_count = max(
+                        0, _verify_test_total - _verify_test_failures,
+                    )
+                    get_ops_digest_observer().on_verify_completed(
                         op_id=ctx.op_id,
-                        commit_hash=_commit_result.commit_hash or "",
+                        passed=_verify_passed_count,
+                        total=_verify_test_total,
+                        scoped_to_applied_op=True,
                     )
                 except Exception:
                     logger.debug(
-                        "[Orchestrator] on_commit_succeeded observer call failed",
+                        "[Orchestrator] on_verify_completed observer call failed",
                         exc_info=True,
                     )
-            elif _commit_result.skipped_reason:
-                logger.debug(
-                    "[Orchestrator] Auto-commit skipped: %s",
-                    _commit_result.skipped_reason,
-                )
-        except ImportError:
-            logger.debug("[Orchestrator] AutoCommitter not available")
-        except Exception as exc:
-            logger.warning(
-                "[Orchestrator] Auto-commit failed for op=%s: %s; "
-                "change is applied but not committed",
-                ctx.op_id, exc,
-            )
 
-        # ---- Phase 8b2: In-process hot-reload ----
-        if orch._hot_reloader is not None:
-            try:
-                _hr_batch = orch._hot_reloader.reload_for_op(
-                    op_id=ctx.op_id,
-                    target_files=ctx.target_files,
-                )
-                if _hr_batch.overall_status == "success":
-                    _reloaded_names = [
-                        o.module_name.rsplit(".", 1)[-1]
-                        for o in _hr_batch.outcomes
-                        if o.status == "reloaded"
-                    ]
+                # On failure: L2 repair before rollback
+                if not _verify_test_passed and orch._config.repair_engine is not None:
                     logger.info(
-                        "[Orchestrator] Hot-reloaded %d module(s) for op=%s: %s",
-                        len(_reloaded_names), ctx.op_id, _reloaded_names,
+                        "[Orchestrator] VERIFY test failed (%d/%d) — routing to L2 repair [%s]",
+                        _verify_test_failures, _verify_test_total, ctx.op_id,
+                    )
+                    _pl_deadline = ctx.pipeline_deadline or (
+                        datetime.now(timezone.utc) + timedelta(seconds=60)
+                    )
+                    _synth_val = ValidationResult(
+                        passed=False,
+                        best_candidate=best_candidate,
+                        validation_duration_s=0.0,
+                        error=f"post-apply verify: {_verify_test_failures}/{_verify_test_total} failing",
+                        failure_class="test",
+                        short_summary=f"verify: {', '.join(_verify_failed_names[:3])}",
+                        adapter_names_run=(),
                     )
                     try:
-                        await orch._stack.comm.emit_heartbeat(
-                            op_id=ctx.op_id, phase="hot_reload",
-                            progress_pct=99.0,
-                            reloaded_modules=_reloaded_names,
-                            reload_count=orch._hot_reloader.reload_count,
+                        directive = await orch._l2_hook(ctx, _synth_val, _pl_deadline)
+                        if directive[0] == "break":
+                            _l2_candidate = directive[1]
+                            _l2_change = orch._build_change_request(ctx, _l2_candidate)
+                            try:
+                                # Anti-Venom C2 — shield L2 VERIFY repair apply.
+                                _l2_result = await asyncio.shield(
+                                    orch._stack.change_engine.execute(_l2_change)
+                                )
+                                if _l2_result.success:
+                                    _verify_test_passed = True
+                                    _verify_test_failures = 0
+                                    logger.info(
+                                        "[Orchestrator] L2 repair applied in VERIFY phase [%s]",
+                                        ctx.op_id,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "[Orchestrator] L2 repair candidate failed to apply [%s]",
+                                        ctx.op_id,
+                                    )
+                            except Exception as _apply_exc:
+                                logger.debug("[Orchestrator] L2 repair apply error: %s", _apply_exc)
+                        elif directive[0] in ("cancel", "fatal"):
+                            ctx = directive[1]
+                            logger.info(
+                                "[Orchestrator] L2 escaped VERIFY phase — "
+                                "op ctx advanced to %s [%s]",
+                                ctx.phase.name, ctx.op_id,
+                            )
+                            _txn_commit_stage_reached = True
+                            return PhaseResult(
+                                next_ctx=ctx, next_phase=None, status="fail",
+                                reason=ctx.terminal_reason_code or "l2_escape_verify",
+                                artifacts={"t_apply": _t_apply},
+                            )
+                    except Exception as _l2_exc:
+                        logger.debug(
+                            "[Orchestrator] L2 repair in VERIFY failed: %s: %s",
+                            type(_l2_exc).__name__, _l2_exc,
+                        )
+
+            ctx = await orch._run_benchmark(ctx, [])
+
+            # ---- Verify Gate: enforce regression thresholds ----
+            _verify_error = None
+            try:
+                from backend.core.ouroboros.governance.verify_gate import (
+                    enforce_verify_thresholds,
+                    rollback_files,
+                )
+                _br = getattr(ctx, "benchmark_result", None)
+                if _br is not None:
+                    _baseline_cov = None
+                    _snapshots = getattr(ctx, "pre_apply_snapshots", {})
+                    if isinstance(_snapshots, dict):
+                        _baseline_cov = _snapshots.get("_coverage_baseline")
+                    _verify_error = enforce_verify_thresholds(_br, baseline_coverage=_baseline_cov)
+            except Exception as exc:
+                logger.debug("[Orchestrator] Verify gate skipped: %s", exc)
+
+            if _verify_error is None and not _verify_test_passed:
+                _verify_error = f"scoped verify: {_verify_test_failures}/{_verify_test_total} tests failing"
+
+            # Slice 67 — swe_bench_pro VERIFY regression gate is advisory (LIVE
+            # extracted-runner path; mirrors the inline orchestrator block). The
+            # repo tests can't run without the container env; the held-out
+            # container scoring (Slice 65) is authoritative. Clearing the error
+            # keeps the patch applied (no rollback) so the autoscore layer captures
+            # it. Lazy import avoids a runner↔orchestrator module cycle.
+            try:
+                from backend.core.ouroboros.governance.orchestrator import (
+                    _swe_bench_verify_advisory,
+                )
+                _verify_error = _swe_bench_verify_advisory(
+                    getattr(ctx, "signal_source", "") or "", _verify_error, ctx.op_id,
+                )
+            except Exception:  # noqa: BLE001 — advisory must never break VERIFY
+                pass
+
+            if _verify_error is not None:
+                logger.warning(
+                    "[Orchestrator] VERIFY regression gate fired: %s [%s]",
+                    _verify_error, ctx.op_id,
+                )
+                try:
+                    await orch._stack.comm.emit_postmortem(
+                        op_id=ctx.op_id,
+                        root_cause=f"verify_regression: {_verify_error}",
+                        failed_phase="VERIFY",
+                        target_files=list(ctx.target_files),
+                    )
+                except Exception:
+                    pass
+                try:
+                    _snapshots = getattr(ctx, "pre_apply_snapshots", {})
+                    if _snapshots:
+                        from backend.core.ouroboros.governance.verify_gate import (
+                            rollback_files as _rollback_files,
+                        )
+                        _rollback_files(
+                            pre_apply_snapshots=_snapshots,
+                            target_files=list(ctx.target_files),
+                            repo_root=orch._config.project_root,
+                        )
+                except Exception as exc:
+                    logger.error("[Orchestrator] Verify rollback failed: %s", exc)
+
+                if _checkpoint is not None and _ckpt_mgr is not None:
+                    try:
+                        await _ckpt_mgr.restore_checkpoint(_checkpoint.checkpoint_id)
+                        logger.info(
+                            "[Orchestrator] Git checkpoint restored: %s [%s]",
+                            _checkpoint.checkpoint_id, ctx.op_id,
                         )
                     except Exception:
-                        pass
-                elif _hr_batch.overall_status in ("reload_failed", "preflight_failed"):
-                    logger.warning(
-                        "[Orchestrator] Hot-reload failed for op=%s: %s; "
-                        "restart will be queued",
-                        ctx.op_id, _hr_batch.restart_reason,
-                    )
-                elif _hr_batch.restart_required:
-                    logger.info(
-                        "[Orchestrator] Hot-reload deferred to restart for op=%s: %s",
-                        ctx.op_id, _hr_batch.restart_reason,
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "[Orchestrator] Hot-reload hook raised for op=%s: %s",
-                    ctx.op_id, exc,
+                        logger.debug("[Orchestrator] Checkpoint restore failed", exc_info=True)
+
+                if _serpent: _serpent.update_phase("POSTMORTEM")
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code="verify_regression",
+                    rollback_occurred=True,
+                )
+                await orch._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {"reason": "verify_regression", "detail": _verify_error, "rollback_occurred": True},
+                )
+                orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply, rolled_back=True)
+                await orch._publish_outcome(ctx, OperationState.FAILED, "verify_regression")
+                _txn_commit_stage_reached = True
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason="verify_regression",
+                    artifacts={"t_apply": _t_apply},
                 )
 
-        # ---- Phase 8c: Self-critique ----
-        if orch._critique_engine is not None:
+            # ---- Gate 2: Cryptographic Blast-Radius Verification ----
+            # Runs AFTER the scoped Phase-8a verify gate cleared (only reached
+            # when those tests passed) and BEFORE Phase 8b auto-commit. Chains
+            # onto Gate 1's sandbox_token: if Gate 1 didn't run there is no token
+            # to chain, so Gate 2 is skipped rather than broken.
+            # Default-OFF: JARVIS_A1_BLAST_RADIUS_ENABLED controls activation.
+            # Inline env check + all imports INSIDE the guard so the OFF path
+            # imports NOTHING (byte-identical to pre-Gate-2 behavior — Task 4 lesson).
+            _blast_armed = os.environ.get("JARVIS_A1_BLAST_RADIUS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+            if _blast_armed:
+                if getattr(ctx, "sandbox_token", None) is None:
+                    logger.warning(
+                        "[Gate2] op=%s armed but no sandbox_token (Gate 1 disabled?) -- skipping",
+                        ctx.op_id,
+                    )
+            if (_blast_armed
+                    and getattr(ctx, "sandbox_token", None) is not None
+                    and getattr(ctx, "proof_chain", None) is not None):
+                from ..blast_radius_verify import (
+                    acquire_blast_radius_token,
+                    BlastRadiusBreach,
+                    BlastRadiusGraphFailure,
+                )
+                from ..reverse_dep_resolver import resolve_reverse_dependency_tests
+                from .. import intake_dlq as _g2_dlq
+                from ..test_runner import TestRunner as _G2TestRunner
+
+                _g2_root = orch._config.project_root  # Path
+                _g2_scope = sorted(
+                    set(ctx.target_files)
+                    | {cf for cf, _ in orch._iter_candidate_files(best_candidate) if cf}
+                )
+                # Reuse the APPLY-start checkpoint's content TREE SHA as the pre-op anchor.
+                # stash_ref is a timestamped COMMIT sha; ^{tree} is content-addressed and
+                # deterministic — identical content produces identical tree SHA.
+                _g2_pre_sha = await _ckpt_mgr.tree_sha_for_ref(
+                    getattr(_checkpoint, "stash_ref", "") if _checkpoint is not None else ""
+                )
+
+                async def _g2_graph_fn(files):
+                    return await resolve_reverse_dependency_tests(
+                        files, repo_root=str(_g2_root), oracle=None,
+                    )
+
+                async def _g2_test_fn(tests):
+                    if not tests:
+                        return {"failed": [], "total": 0}
+                    _paths = tuple((_g2_root / t) for t in tests)
+                    _runner = _G2TestRunner(repo_root=_g2_root)
+                    _tr = await _runner.run(test_files=_paths, sandbox_dir=None)
+                    return {"failed": list(_tr.failed_tests), "total": _tr.total}
+
+                async def _g2_rollback(_sha):
+                    # Non-destructive restore via the existing APPLY-start checkpoint.
+                    if _checkpoint is not None and _ckpt_mgr is not None:
+                        await _ckpt_mgr.restore_checkpoint(_checkpoint.checkpoint_id)
+
+                async def _g2_tree_sha():
+                    if _ckpt_mgr is None:
+                        return ""
+                    return await _ckpt_mgr.working_tree_content_sha()
+
+                def _g2_dlq_fn(reason):
+                    _g2_dlq.append_dlq({"op_id": ctx.op_id, "phase": "blast_radius"}, reason=reason)
+
+                try:
+                    _blast_tok = await acquire_blast_radius_token(
+                        op_id=ctx.op_id,
+                        scope_files=_g2_scope,
+                        pre_op_tree_sha=_g2_pre_sha,
+                        chain=ctx.proof_chain,
+                        prev_token=ctx.sandbox_token,
+                        graph_fn=_g2_graph_fn,
+                        test_fn=_g2_test_fn,
+                        current_tree_sha_fn=_g2_tree_sha,
+                        rollback_fn=_g2_rollback,
+                        dlq_fn=_g2_dlq_fn,
+                    )
+                except BlastRadiusGraphFailure:
+                    logger.warning("[Gate2] op=%s blast_radius_graph_failure", ctx.op_id)
+                    if _serpent: _serpent.update_phase("POSTMORTEM")
+                    ctx = ctx.advance(
+                        OperationPhase.POSTMORTEM,
+                        terminal_reason_code="blast_radius_graph_failure",
+                        rollback_occurred=True,
+                    )
+                    await orch._record_ledger(
+                        ctx,
+                        OperationState.FAILED,
+                        {"reason": "blast_radius_graph_failure", "rollback_occurred": True},
+                    )
+                    orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply, rolled_back=True)
+                    await orch._publish_outcome(ctx, OperationState.FAILED, "blast_radius_graph_failure")
+                    _txn_commit_stage_reached = True
+                    return PhaseResult(
+                        next_ctx=ctx, next_phase=None, status="fail",
+                        reason="blast_radius_graph_failure",
+                        artifacts={"t_apply": _t_apply},
+                    )
+                except BlastRadiusBreach:
+                    logger.warning("[Gate2] op=%s blast_radius_breach", ctx.op_id)
+                    if _serpent: _serpent.update_phase("POSTMORTEM")
+                    ctx = ctx.advance(
+                        OperationPhase.POSTMORTEM,
+                        terminal_reason_code="blast_radius_breach",
+                        rollback_occurred=True,
+                    )
+                    await orch._record_ledger(
+                        ctx,
+                        OperationState.FAILED,
+                        {"reason": "blast_radius_breach", "rollback_occurred": True},
+                    )
+                    orch._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply, rolled_back=True)
+                    await orch._publish_outcome(ctx, OperationState.FAILED, "blast_radius_breach")
+                    _txn_commit_stage_reached = True
+                    return PhaseResult(
+                        next_ctx=ctx, next_phase=None, status="fail",
+                        reason="blast_radius_breach",
+                        artifacts={"t_apply": _t_apply},
+                    )
+                ctx = dataclasses.replace(ctx, blast_token=_blast_tok)
+
+            # ---- Phase 8b: Auto-commit ----
+            _txn_commit_stage_reached = True
+            _committed_hash: Optional[str] = None
             try:
-                _test_summary = "(no test summary captured)"
-                _vr = ctx.validation
-                if _vr is not None:
-                    _passed = getattr(_vr, "tests_passed", 0) or 0
-                    _total = getattr(_vr, "tests_total", 0) or 0
-                    if _total:
-                        _test_summary = f"{_passed}/{_total} tests passed"
-                    elif _passed:
-                        _test_summary = f"{_passed} tests passed"
-                _critique_result = await asyncio.wait_for(
-                    orch._critique_engine.critique_op(
+                from backend.core.ouroboros.governance.auto_committer import AutoCommitter
+                _committer = AutoCommitter(repo_root=orch._config.project_root)
+                _gen = ctx.generation
+                _provider = getattr(_gen, "provider_name", "") if _gen else ""
+                _cost = 0.0
+                if _gen:
+                    _in_tok = getattr(_gen, "total_input_tokens", 0) or 0
+                    _out_tok = getattr(_gen, "total_output_tokens", 0) or 0
+                    _cost = (_in_tok * 0.0000001 + _out_tok * 0.0000004)
+                _commit_result = await asyncio.wait_for(
+                    _committer.commit(
                         op_id=ctx.op_id,
                         description=ctx.description,
                         target_files=ctx.target_files,
                         risk_tier=ctx.risk_tier,
-                        commit_hash=_committed_hash,
-                        test_summary=_test_summary,
+                        provider_name=_provider,
+                        generation_cost=_cost,
+                        signal_source=getattr(ctx, "signal_source", ""),
+                        signal_urgency=getattr(ctx, "signal_urgency", ""),
+                        rationale=ctx.description,
                     ),
-                    timeout=float(os.environ.get("JARVIS_CRITIQUE_TIMEOUT_S", "30")) + 5.0,
+                    timeout=30.0,
                 )
-                try:
-                    await orch._stack.comm.emit_heartbeat(
-                        op_id=ctx.op_id,
-                        phase="critique",
-                        progress_pct=99.0,
-                        critique_rating=int(getattr(_critique_result, "rating", 0)),
-                        critique_matches_goal=bool(
-                            getattr(_critique_result, "matches_goal", True)
-                        ),
-                        critique_rationale=str(
-                            getattr(_critique_result, "rationale", "")
-                        )[:200],
-                        critique_provider=str(
-                            getattr(_critique_result, "provider_name", "")
-                        ),
-                        critique_parse_ok=bool(
-                            getattr(_critique_result, "parse_ok", True)
-                        ),
+                if _commit_result.committed:
+                    _committed_hash = _commit_result.commit_hash
+                    try:
+                        await orch._stack.comm.emit_heartbeat(
+                            op_id=ctx.op_id, phase="commit",
+                            progress_pct=98.0,
+                            commit_hash=_commit_result.commit_hash,
+                            commit_pushed=_commit_result.pushed,
+                            commit_branch=_commit_result.push_branch,
+                        )
+                    except Exception:
+                        pass
+                    logger.info(
+                        "[Orchestrator] Auto-committed %s for op=%s",
+                        _commit_result.commit_hash, ctx.op_id,
                     )
-                except Exception:
-                    pass
-                if (
-                    getattr(_critique_result, "parse_ok", False)
-                    and getattr(_critique_result, "is_poor", False)
-                ):
-                    _files_short = ", ".join(
-                        p.rsplit("/", 1)[-1] for p in ctx.target_files[:3]
+
+                    try:
+                        from backend.core.ouroboros.governance.ops_digest_observer import (
+                            get_ops_digest_observer,
+                        )
+                        get_ops_digest_observer().on_commit_succeeded(
+                            op_id=ctx.op_id,
+                            commit_hash=_commit_result.commit_hash or "",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "[Orchestrator] on_commit_succeeded observer call failed",
+                            exc_info=True,
+                        )
+                elif _commit_result.skipped_reason:
+                    logger.debug(
+                        "[Orchestrator] Auto-commit skipped: %s",
+                        _commit_result.skipped_reason,
                     )
-                    orch._add_session_lesson(
-                        "code",
-                        f"[CRITIQUE POOR {getattr(_critique_result, 'rating', '?')}/5] "
-                        f"{ctx.description[:60]} ({_files_short}): "
-                        f"{str(getattr(_critique_result, 'rationale', ''))[:120]}",
-                        op_id=ctx.op_id,
-                    )
-            except asyncio.TimeoutError:
-                logger.info(
-                    "[Orchestrator] Self-critique timed out for op=%s — "
-                    "non-blocking, continuing to COMPLETE",
-                    ctx.op_id,
-                )
+            except ImportError:
+                logger.debug("[Orchestrator] AutoCommitter not available")
             except Exception as exc:
-                logger.debug(
-                    "[Orchestrator] Self-critique failed for op=%s: %s",
+                logger.warning(
+                    "[Orchestrator] Auto-commit failed for op=%s: %s; "
+                    "change is applied but not committed",
                     ctx.op_id, exc,
                 )
 
-        # ---- Phase 8d: Visual VERIFY ----
-        try:
-            from backend.core.ouroboros.governance.visual_verify import (
-                run_post_verify,
-            )
-            _vv_outcome = run_post_verify(
-                target_files=ctx.target_files,
-                attachments=ctx.attachments,
-                op_id=ctx.op_id,
-                op_description=ctx.description,
-                plan_ui_affected=False,
-                test_targets_resolved=(
-                    ctx.validation.adapter_names_run if ctx.validation else None
-                ),
-                risk_tier=(
-                    ctx.risk_tier.name.lower() if ctx.risk_tier else ""
-                ),
-                test_runner_result="passed",
-            )
-            if _vv_outcome.ran:
-                _vv_verdict = (
-                    _vv_outcome.result.verdict if _vv_outcome.result else "?"
-                )
-                logger.info(
-                    "[Orchestrator] Visual VERIFY outcome=%s "
-                    "l2_triggered=%s [%s] %s",
-                    _vv_verdict, _vv_outcome.l2_triggered,
-                    ctx.op_id, _vv_outcome.reasoning,
-                )
+            # ---- Phase 8b2: In-process hot-reload ----
+            if orch._hot_reloader is not None:
                 try:
-                    ctx = ctx.advance(OperationPhase.VISUAL_VERIFY)
-                except ValueError as _adv_exc:
-                    logger.debug(
-                        "[Orchestrator] VISUAL_VERIFY advance rejected "
-                        "(ctx at %s): %s", ctx.phase.name, _adv_exc,
+                    _hr_batch = orch._hot_reloader.reload_for_op(
+                        op_id=ctx.op_id,
+                        target_files=ctx.target_files,
+                    )
+                    if _hr_batch.overall_status == "success":
+                        _reloaded_names = [
+                            o.module_name.rsplit(".", 1)[-1]
+                            for o in _hr_batch.outcomes
+                            if o.status == "reloaded"
+                        ]
+                        logger.info(
+                            "[Orchestrator] Hot-reloaded %d module(s) for op=%s: %s",
+                            len(_reloaded_names), ctx.op_id, _reloaded_names,
+                        )
+                        try:
+                            await orch._stack.comm.emit_heartbeat(
+                                op_id=ctx.op_id, phase="hot_reload",
+                                progress_pct=99.0,
+                                reloaded_modules=_reloaded_names,
+                                reload_count=orch._hot_reloader.reload_count,
+                            )
+                        except Exception:
+                            pass
+                    elif _hr_batch.overall_status in ("reload_failed", "preflight_failed"):
+                        logger.warning(
+                            "[Orchestrator] Hot-reload failed for op=%s: %s; "
+                            "restart will be queued",
+                            ctx.op_id, _hr_batch.restart_reason,
+                        )
+                    elif _hr_batch.restart_required:
+                        logger.info(
+                            "[Orchestrator] Hot-reload deferred to restart for op=%s: %s",
+                            ctx.op_id, _hr_batch.restart_reason,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[Orchestrator] Hot-reload hook raised for op=%s: %s",
+                        ctx.op_id, exc,
                     )
 
-                _vv_fail = (
-                    _vv_outcome.l2_triggered
-                    or (
-                        _vv_outcome.result is not None
-                        and _vv_outcome.result.verdict == "fail"
-                    )
-                )
-                if _vv_fail and orch._config.repair_engine is not None:
-                    logger.info(
-                        "[Orchestrator] Visual VERIFY fail/advisory — "
-                        "routing to L2 repair [%s]", ctx.op_id,
-                    )
-                    _vv_deadline = ctx.pipeline_deadline or (
-                        datetime.now(timezone.utc) + timedelta(seconds=60)
-                    )
-                    _vv_synth_val = ValidationResult(
-                        passed=False,
-                        best_candidate=best_candidate,
-                        validation_duration_s=0.0,
-                        error=f"visual_verify: {_vv_outcome.reasoning}",
-                        failure_class="test",
-                        short_summary=(
-                            f"visual_verify: "
-                            f"{_vv_outcome.result.check if _vv_outcome.result else 'advisory'}"
+            # ---- Phase 8c: Self-critique ----
+            if orch._critique_engine is not None:
+                try:
+                    _test_summary = "(no test summary captured)"
+                    _vr = ctx.validation
+                    if _vr is not None:
+                        _passed = getattr(_vr, "tests_passed", 0) or 0
+                        _total = getattr(_vr, "tests_total", 0) or 0
+                        if _total:
+                            _test_summary = f"{_passed}/{_total} tests passed"
+                        elif _passed:
+                            _test_summary = f"{_passed} tests passed"
+                    _critique_result = await asyncio.wait_for(
+                        orch._critique_engine.critique_op(
+                            op_id=ctx.op_id,
+                            description=ctx.description,
+                            target_files=ctx.target_files,
+                            risk_tier=ctx.risk_tier,
+                            commit_hash=_committed_hash,
+                            test_summary=_test_summary,
                         ),
-                        adapter_names_run=(),
+                        timeout=float(os.environ.get("JARVIS_CRITIQUE_TIMEOUT_S", "30")) + 5.0,
                     )
                     try:
-                        _vv_directive = await orch._l2_hook(
-                            ctx, _vv_synth_val, _vv_deadline,
+                        await orch._stack.comm.emit_heartbeat(
+                            op_id=ctx.op_id,
+                            phase="critique",
+                            progress_pct=99.0,
+                            critique_rating=int(getattr(_critique_result, "rating", 0)),
+                            critique_matches_goal=bool(
+                                getattr(_critique_result, "matches_goal", True)
+                            ),
+                            critique_rationale=str(
+                                getattr(_critique_result, "rationale", "")
+                            )[:200],
+                            critique_provider=str(
+                                getattr(_critique_result, "provider_name", "")
+                            ),
+                            critique_parse_ok=bool(
+                                getattr(_critique_result, "parse_ok", True)
+                            ),
                         )
-                        if _vv_directive[0] == "break":
-                            _vv_l2_candidate = _vv_directive[1]
-                            _vv_l2_change = orch._build_change_request(
-                                ctx, _vv_l2_candidate,
-                            )
-                            try:
-                                # Anti-Venom C2 — shield Visual VERIFY L2
-                                # repair apply (cancel-safe, same as
-                                # primary apply + VERIFY L2 above).
-                                _vv_l2_result = await asyncio.shield(
-                                    orch._stack.change_engine.execute(
-                                        _vv_l2_change
-                                    )
-                                )
-                                if _vv_l2_result.success:
-                                    logger.info(
-                                        "[Orchestrator] Visual VERIFY L2 "
-                                        "repair applied [%s]", ctx.op_id,
-                                    )
-                                else:
-                                    logger.warning(
-                                        "[Orchestrator] Visual VERIFY L2 "
-                                        "repair candidate failed to apply [%s]",
-                                        ctx.op_id,
-                                    )
-                            except Exception as _vv_apply_exc:
-                                logger.debug(
-                                    "[Orchestrator] Visual VERIFY L2 apply "
-                                    "error: %s", _vv_apply_exc,
-                                )
-                        elif _vv_directive[0] in ("cancel", "fatal"):
-                            ctx = _vv_directive[1]
-                            logger.info(
-                                "[Orchestrator] L2 escaped Visual VERIFY — "
-                                "op ctx advanced to %s [%s]",
-                                ctx.phase.name, ctx.op_id,
-                            )
-                            return PhaseResult(
-                                next_ctx=ctx, next_phase=None, status="fail",
-                                reason=ctx.terminal_reason_code or "l2_escape_visual_verify",
-                                artifacts={"t_apply": _t_apply},
-                            )
-                    except Exception as _vv_l2_exc:
-                        logger.debug(
-                            "[Orchestrator] Visual VERIFY L2 failed: "
-                            "%s: %s",
-                            type(_vv_l2_exc).__name__, _vv_l2_exc,
+                    except Exception:
+                        pass
+                    if (
+                        getattr(_critique_result, "parse_ok", False)
+                        and getattr(_critique_result, "is_poor", False)
+                    ):
+                        _files_short = ", ".join(
+                            p.rsplit("/", 1)[-1] for p in ctx.target_files[:3]
                         )
-        except Exception as _vv_exc:
-            logger.debug(
-                "[Orchestrator] Visual VERIFY dispatch error: %s: %s",
-                type(_vv_exc).__name__, _vv_exc,
-            )
-        # ---- end verbatim transcription ----
+                        orch._add_session_lesson(
+                            "code",
+                            f"[CRITIQUE POOR {getattr(_critique_result, 'rating', '?')}/5] "
+                            f"{ctx.description[:60]} ({_files_short}): "
+                            f"{str(getattr(_critique_result, 'rationale', ''))[:120]}",
+                            op_id=ctx.op_id,
+                        )
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "[Orchestrator] Self-critique timed out for op=%s — "
+                        "non-blocking, continuing to COMPLETE",
+                        ctx.op_id,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[Orchestrator] Self-critique failed for op=%s: %s",
+                        ctx.op_id, exc,
+                    )
 
-        # Success — hand off to COMPLETE via COMPLETERunner-equivalent.
-        # The orchestrator hook at this point will either call
-        # COMPLETERunner (if slice 1 flag on) or inline COMPLETE code.
-        return PhaseResult(
-            next_ctx=ctx,
-            next_phase=OperationPhase.COMPLETE,
-            status="ok",
-            reason="applied_and_verified",
-            artifacts={"t_apply": _t_apply},
-        )
+            # ---- Phase 8d: Visual VERIFY ----
+            try:
+                from backend.core.ouroboros.governance.visual_verify import (
+                    run_post_verify,
+                )
+                _vv_outcome = run_post_verify(
+                    target_files=ctx.target_files,
+                    attachments=ctx.attachments,
+                    op_id=ctx.op_id,
+                    op_description=ctx.description,
+                    plan_ui_affected=False,
+                    test_targets_resolved=(
+                        ctx.validation.adapter_names_run if ctx.validation else None
+                    ),
+                    risk_tier=(
+                        ctx.risk_tier.name.lower() if ctx.risk_tier else ""
+                    ),
+                    test_runner_result="passed",
+                )
+                if _vv_outcome.ran:
+                    _vv_verdict = (
+                        _vv_outcome.result.verdict if _vv_outcome.result else "?"
+                    )
+                    logger.info(
+                        "[Orchestrator] Visual VERIFY outcome=%s "
+                        "l2_triggered=%s [%s] %s",
+                        _vv_verdict, _vv_outcome.l2_triggered,
+                        ctx.op_id, _vv_outcome.reasoning,
+                    )
+                    try:
+                        ctx = ctx.advance(OperationPhase.VISUAL_VERIFY)
+                    except ValueError as _adv_exc:
+                        logger.debug(
+                            "[Orchestrator] VISUAL_VERIFY advance rejected "
+                            "(ctx at %s): %s", ctx.phase.name, _adv_exc,
+                        )
+
+                    _vv_fail = (
+                        _vv_outcome.l2_triggered
+                        or (
+                            _vv_outcome.result is not None
+                            and _vv_outcome.result.verdict == "fail"
+                        )
+                    )
+                    if _vv_fail and orch._config.repair_engine is not None:
+                        logger.info(
+                            "[Orchestrator] Visual VERIFY fail/advisory — "
+                            "routing to L2 repair [%s]", ctx.op_id,
+                        )
+                        _vv_deadline = ctx.pipeline_deadline or (
+                            datetime.now(timezone.utc) + timedelta(seconds=60)
+                        )
+                        _vv_synth_val = ValidationResult(
+                            passed=False,
+                            best_candidate=best_candidate,
+                            validation_duration_s=0.0,
+                            error=f"visual_verify: {_vv_outcome.reasoning}",
+                            failure_class="test",
+                            short_summary=(
+                                f"visual_verify: "
+                                f"{_vv_outcome.result.check if _vv_outcome.result else 'advisory'}"
+                            ),
+                            adapter_names_run=(),
+                        )
+                        try:
+                            _vv_directive = await orch._l2_hook(
+                                ctx, _vv_synth_val, _vv_deadline,
+                            )
+                            if _vv_directive[0] == "break":
+                                _vv_l2_candidate = _vv_directive[1]
+                                _vv_l2_change = orch._build_change_request(
+                                    ctx, _vv_l2_candidate,
+                                )
+                                try:
+                                    # Anti-Venom C2 — shield Visual VERIFY L2
+                                    # repair apply (cancel-safe, same as
+                                    # primary apply + VERIFY L2 above).
+                                    _vv_l2_result = await asyncio.shield(
+                                        orch._stack.change_engine.execute(
+                                            _vv_l2_change
+                                        )
+                                    )
+                                    if _vv_l2_result.success:
+                                        logger.info(
+                                            "[Orchestrator] Visual VERIFY L2 "
+                                            "repair applied [%s]", ctx.op_id,
+                                        )
+                                    else:
+                                        logger.warning(
+                                            "[Orchestrator] Visual VERIFY L2 "
+                                            "repair candidate failed to apply [%s]",
+                                            ctx.op_id,
+                                        )
+                                except Exception as _vv_apply_exc:
+                                    logger.debug(
+                                        "[Orchestrator] Visual VERIFY L2 apply "
+                                        "error: %s", _vv_apply_exc,
+                                    )
+                            elif _vv_directive[0] in ("cancel", "fatal"):
+                                ctx = _vv_directive[1]
+                                logger.info(
+                                    "[Orchestrator] L2 escaped Visual VERIFY — "
+                                    "op ctx advanced to %s [%s]",
+                                    ctx.phase.name, ctx.op_id,
+                                )
+                                return PhaseResult(
+                                    next_ctx=ctx, next_phase=None, status="fail",
+                                    reason=ctx.terminal_reason_code or "l2_escape_visual_verify",
+                                    artifacts={"t_apply": _t_apply},
+                                )
+                        except Exception as _vv_l2_exc:
+                            logger.debug(
+                                "[Orchestrator] Visual VERIFY L2 failed: "
+                                "%s: %s",
+                                type(_vv_l2_exc).__name__, _vv_l2_exc,
+                            )
+            except Exception as _vv_exc:
+                logger.debug(
+                    "[Orchestrator] Visual VERIFY dispatch error: %s: %s",
+                    type(_vv_exc).__name__, _vv_exc,
+                )
+            # ---- end verbatim transcription ----
+
+            # Success — hand off to COMPLETE via COMPLETERunner-equivalent.
+            # The orchestrator hook at this point will either call
+            # COMPLETERunner (if slice 1 flag on) or inline COMPLETE code.
+            return PhaseResult(
+                next_ctx=ctx,
+                next_phase=OperationPhase.COMPLETE,
+                status="ok",
+                reason="applied_and_verified",
+                artifacts={"t_apply": _t_apply},
+            )
+        finally:
+            if not _txn_commit_stage_reached and txn_lifecycle_guard_enabled():
+                logger.critical(
+                    "[TxnLifecycle] op=%s recorded APPLIED but NEVER reached "
+                    "the auto-commit stage -- transactional boundary breached",
+                    ctx.op_id,
+                )
+                # Any exception already in flight (incl. asyncio.CancelledError)
+                # must propagate UNCONVERTED -- finally does not swallow it, and
+                # we only synthesize the error on the SILENT exit path.
+                import sys as _sys
+                if _sys.exc_info()[0] is None:
+                    raise TransactionLifecycleError(ctx.op_id, "phase_8b_auto_commit")
 
 
 __all__ = ["Slice4bRunner"]

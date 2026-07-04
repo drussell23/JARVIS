@@ -106,6 +106,31 @@ async def test_autonomous_route_unifies_commit_workspace_env(
     assert os.environ["JARVIS_AUTO_COMMIT_WORKSPACE"] == str(out)
 
 
+async def test_autonomous_route_does_not_clobber_operator_override(
+    tmp_path, monkeypatch,
+):
+    """Task 3 (durability substrate): this is the SINGLE canonical
+    materialization seam for JARVIS_AUTO_COMMIT_WORKSPACE (Ledger-Sovereignty
+    reuses it via its own already-set check). An operator-supplied value MUST
+    win -- setdefault semantics, not unconditional overwrite -- otherwise a
+    deliberately pinned workspace gets silently clobbered by whatever
+    worktree this call happens to create."""
+    import os
+    from backend.core.ouroboros.governance import autonomous_workspace as aw
+    monkeypatch.setenv("JARVIS_FILE_ISOLATION_ENABLED", "true")
+    monkeypatch.setattr(ec, "is_autonomous", lambda *a, **k: True)
+    operator_pin = str(tmp_path / "operator-pinned-workspace")
+    monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", operator_pin)
+    mgr = _FakeMgr(tmp_path)
+    out = await aw.resolve_loop_project_root(
+        tmp_path, session_id="bt-1", worktree_manager=mgr,
+    )
+    # A worktree IS still created (routing still happens)...
+    assert out != tmp_path
+    # ...but the operator's pin survives untouched in the env.
+    assert os.environ["JARVIS_AUTO_COMMIT_WORKSPACE"] == operator_pin
+
+
 async def test_create_failure_falls_back_to_repo_root(tmp_path, monkeypatch):
     from backend.core.ouroboros.governance import autonomous_workspace as aw
     monkeypatch.setenv("JARVIS_FILE_ISOLATION_ENABLED", "true")

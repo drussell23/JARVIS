@@ -193,7 +193,13 @@ async def resolve_loop_project_root(
     # the Ledger-Sovereignty phase sets) so AutoCommitter + ChangeEngine +
     # the orchestrator all converge on this one worktree. This is the
     # established workspace-handoff env, NOT process-cwd mutation.
-    os.environ[_ENV_COMMIT_WORKSPACE] = str(wt_path)
+    #
+    # This is the SINGLE canonical materialization seam for
+    # JARVIS_AUTO_COMMIT_WORKSPACE (the Ledger-Sovereignty boot phase in
+    # harness.py reuses whatever lands here via its own already-set check).
+    # setdefault, NOT unconditional assignment: an operator-pinned workspace
+    # must survive this call untouched (durability-substrate Task 3).
+    os.environ.setdefault(_ENV_COMMIT_WORKSPACE, str(wt_path))
     os.environ.setdefault(_ENV_SESSION_ID, str(session_id))
     # §7 absolute observability — emit a grep-stable marker so a soak can
     # verify the redirect fired and identify the quarantine zone.
