@@ -172,6 +172,7 @@ async def hedged_race(
         Callable[[Optional[BaseException], Optional[BaseException]], None]
     ] = None,
     prefer_fast: bool = False,
+    defer_stable: bool = False,
 ) -> Any:
     """Race ``fast`` (RT) against ``stable`` (batch). Return the FIRST successful result; cancel
     the loser aggressively. A ``fast`` failure that ``is_rupture`` returns True for is swallowed so
@@ -196,11 +197,27 @@ async def hedged_race(
     arrives first would fail the Iron Gate's exploration floor (the live GOAL-001::file-00 layer-3
     bug). The buffered batch is used ONLY if the RT arm then ruptures / fails / yields no success,
     so the hedge's rupture-protection guarantee is fully preserved. ``prefer_fast=False`` (default)
-    is byte-identical to the legacy FIRST_COMPLETED race."""
+    is byte-identical to the legacy FIRST_COMPLETED race.
+
+    ``defer_stable`` (Task 2, the structural double-spend kill): when True AND
+    ``prefer_fast`` is True, the stable (batch) arm is NOT fired at race start
+    at all -- it ignites event-driven, exactly once, ONLY if the fast (RT) arm
+    terminally fails. If the fast arm succeeds first, ``stable`` is never
+    called -- zero speculative batch spend, structurally impossible to
+    double-bill. ``defer_stable=False`` (default) preserves both the legacy
+    race and the eager-buffer ``prefer_fast`` mode byte-identically."""
     loop = asyncio.get_event_loop()
     t_fast = loop.create_task(fast())
-    t_stable = loop.create_task(stable())
-    pending = {t_fast, t_stable}
+    # Deferred-ignition (Task 2): when the RT/tool arm is prioritized, the
+    # stable arm is NOT fired at race start -- it ignites event-driven on RT
+    # terminal failure only. Structurally zero double-spend; the deferred arm
+    # inherits the remaining op deadline (same profile as the legacy
+    # sequential RT->batch fallback). No sleeps, no padding.
+    _defer = bool(defer_stable and prefer_fast)
+    t_stable: "Optional[asyncio.Task]" = (
+        None if _defer else loop.create_task(stable())
+    )
+    pending = {t_fast} if t_stable is None else {t_fast, t_stable}
     last_exc: Optional[BaseException] = None
     fast_exc: Optional[BaseException] = None
     stable_exc: Optional[BaseException] = None
@@ -252,6 +269,12 @@ async def hedged_race(
                         # the rupture/failure fallback the hedge exists for.
                         if buffered_stable is not _UNSET:
                             return await _claim(buffered_stable, stable_label)
+                        if _defer and t_stable is None:
+                            # IGNITE the deferred stable arm now -- the RT arm
+                            # terminally failed; this is the rupture fallback
+                            # the hedge exists for (event-driven, not timed).
+                            t_stable = loop.create_task(stable())
+                            pending = pending | {t_stable}
                         # otherwise wait for the stable arm (still pending)
                         continue
                     else:
@@ -295,5 +318,5 @@ async def hedged_race(
         raise RuntimeError("hedged_race: both transports resolved without a result")
     finally:
         for t in (t_fast, t_stable):
-            if not t.done():
+            if t is not None and not t.done():
                 t.cancel()
