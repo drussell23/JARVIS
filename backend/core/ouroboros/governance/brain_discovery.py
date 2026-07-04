@@ -215,7 +215,14 @@ async def _default_ws_health_probe(url: str) -> bool:
     host, port = parsed
     try:
         ctx = build_brain_client_ssl_context()
-        conn = asyncio.open_connection(host=host, port=port, ssl=ctx)
+        # The server cert's SAN is the DNS identity (jarvis-brain), but discovery
+        # dials the raw instance IP -- verify against the configured identity or
+        # the handshake can never succeed on the CA path.
+        kwargs: Dict[str, Any] = {}
+        sni = os.environ.get("JARVIS_BRAIN_WS_TLS_SERVER_HOSTNAME", "").strip()
+        if sni:
+            kwargs["server_hostname"] = sni
+        conn = asyncio.open_connection(host=host, port=port, ssl=ctx, **kwargs)
         reader, writer = await asyncio.wait_for(conn, timeout=_probe_timeout_s())
         try:
             writer.close()

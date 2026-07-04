@@ -51,6 +51,19 @@ def _load_driver() -> Any:
 ign = _load_driver()
 
 
+@pytest.fixture(autouse=True)
+def _tls_material_env(tmp_path, monkeypatch):
+    """The driver's TLS preflight is fail-closed BEFORE any GCP call (Task-5
+    wiring, 2026-07-04). These unit runs declare their TLS posture explicitly:
+    a real (tmp) server-material dir, so the preflight itself is exercised on
+    every run() path."""
+    d = tmp_path / "mtls"
+    d.mkdir()
+    for fn in ("server-cert.pem", "server-key.pem", "ca.pem"):
+        (d / fn).write_text("PEM-TEST-%s" % fn)
+    monkeypatch.setenv("JARVIS_BRAIN_MTLS_DIR", str(d))
+
+
 # ---------------------------------------------------------------------------
 # Fake in-proc bidirectional bus wire for the exchange-logic tests.
 # ---------------------------------------------------------------------------

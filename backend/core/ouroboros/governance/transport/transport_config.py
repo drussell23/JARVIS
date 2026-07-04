@@ -62,6 +62,10 @@ class TransportConfig:
     tls_ca: Optional[str]
     tls_ephemeral: bool
     source_id: str
+    # The DNS identity to verify the server cert against (its SAN), for clients
+    # that dial a raw IP (GCE discovery). None = verify against the dialed host
+    # (legacy loopback behavior).
+    tls_server_hostname: Optional[str] = None
 
     @classmethod
     def from_env(cls, *, role: str) -> "TransportConfig":
@@ -86,4 +90,5 @@ class TransportConfig:
             tls_ca=_env_str("JARVIS_BRAIN_WS_TLS_CA", None),
             tls_ephemeral=_env_bool("JARVIS_BRAIN_WS_TLS_EPHEMERAL", False),
             source_id=default_source or f"{role}-unknown",
+            tls_server_hostname=_env_str("JARVIS_BRAIN_WS_TLS_SERVER_HOSTNAME", None),
         )
