@@ -443,3 +443,136 @@ def test_resurrected_missed_probe_rearms_absence_window(
     # The driver's own discovery feed finds the new node -> healthy.
     keeper.note_discovery_result("wss://10.0.0.9:8443/ws")
     assert asyncio.run(keeper.tick()) == "healthy"
+
+
+# ---------------------------------------------------------------------------
+# Review fix IMPORTANT-1: the ENTIRE read-count-decide-append of try_take
+# runs inside ONE flock_critical_section acquisition (no cross-process
+# TOCTOU), and a lock that cannot be acquired REFUSES (fail-closed).
+# ---------------------------------------------------------------------------
+
+
+def test_try_take_decides_and_appends_under_the_lock(
+        bucket_path, monkeypatch) -> None:
+    """Recording monkeypatch of flock_critical_section: EVERY try_take
+    (grants AND refusals) acquires the section, and the grant's journal
+    append happens strictly BETWEEN enter and exit -- i.e. while the real
+    lock is held (an unlocked decide + locked append is the TOCTOU the
+    review flagged)."""
+    from contextlib import contextmanager
+
+    from backend.core.ouroboros.governance import cross_process_jsonl as cpj
+
+    monkeypatch.setenv("JARVIS_BRAIN_RESURRECT_MAX_PER_H", "1")
+    real_section = cpj.flock_critical_section
+    events: List[Dict[str, Any]] = []
+
+    def _lines() -> int:
+        return len(_journal_lines(bucket_path))
+
+    @contextmanager
+    def recording_section(path, **kwargs):
+        entry = {"path": str(path), "lines_at_enter": _lines()}
+        with real_section(path, **kwargs) as acquired:
+            yield acquired
+            # Still INSIDE the real lock: the caller's decide+append body
+            # has run by now (contextmanager resumes after the with-body).
+            entry["lines_before_exit"] = _lines()
+        events.append(entry)
+
+    monkeypatch.setattr(cpj, "flock_critical_section", recording_section)
+    bucket = bk.PersistentTokenBucket()
+
+    assert bucket.try_take(gen=1) is True
+    assert bucket.try_take(gen=2) is False    # refusal path
+    assert len(events) == 2, (
+        "EVERY take decision (grant and refusal) must run under the section")
+    for e in events:
+        assert str(bucket_path) in e["path"]
+    grant, refusal = events[0], events[1]
+    assert grant["lines_at_enter"] == 0 and grant["lines_before_exit"] == 1, (
+        "the grant append must land INSIDE the held section")
+    assert refusal["lines_at_enter"] == 1 and refusal["lines_before_exit"] == 1, (
+        "a refusal must append NOTHING inside the section")
+
+
+def test_try_take_fail_closed_when_lock_unavailable(
+        bucket_path, monkeypatch, caplog) -> None:
+    """A take that cannot acquire the lock REFUSES and appends nothing --
+    a billing guard that cannot prove capacity must never spend."""
+    from contextlib import contextmanager
+
+    from backend.core.ouroboros.governance import cross_process_jsonl as cpj
+
+    @contextmanager
+    def never_acquires(path, **kwargs):
+        yield False
+
+    monkeypatch.setattr(cpj, "flock_critical_section", never_acquires)
+    bucket = bk.PersistentTokenBucket()
+    with caplog.at_level(logging.ERROR):
+        assert bucket.try_take(gen=1) is False
+    assert _journal_lines(bucket_path) == [], "no lock -> no trace"
+    assert any("fail-closed" in r.getMessage() for r in caplog.records), (
+        "the refused-by-lock path must be LOUD")
+
+
+def test_try_take_concurrent_instances_never_exceed_capacity(
+        bucket_path, monkeypatch) -> None:
+    """Two bucket INSTANCES (the zombie-driver-overlapping-fresh-driver
+    shape, serialized here by the section's in-process lock tier) racing
+    try_take on one journal: exactly ONE grant at capacity 1, exactly one
+    journal line -- the decide can never run against a stale count."""
+    import threading
+
+    monkeypatch.setenv("JARVIS_BRAIN_RESURRECT_MAX_PER_H", "1")
+    b1 = bk.PersistentTokenBucket()
+    b2 = bk.PersistentTokenBucket()
+    barrier = threading.Barrier(2)
+    results: List[bool] = []
+    lock = threading.Lock()
+
+    def race(bucket: Any, gen: int) -> None:
+        barrier.wait()
+        got = bucket.try_take(gen=gen)
+        with lock:
+            results.append(got)
+
+    t1 = threading.Thread(target=race, args=(b1, 1))
+    t2 = threading.Thread(target=race, args=(b2, 2))
+    t1.start(); t2.start(); t1.join(timeout=30); t2.join(timeout=30)
+
+    assert sorted(results) == [False, True], (
+        "exactly one racer may win the last token: %r" % results)
+    assert len(_journal_lines(bucket_path)) == 1, (
+        "the cap must never be exceeded by a race")
+
+
+# ---------------------------------------------------------------------------
+# Review fix IMPORTANT-2: grep-enforced gen-minter uniqueness invariant.
+# ---------------------------------------------------------------------------
+
+
+def test_gen_minter_uniqueness_invariant() -> None:
+    """Exactly ONE shipped source file may mint generations
+    (``max_gen() + 1``), and it must be brain_keeper.py. Two independent
+    minters racing the same manifest could stamp duplicate generation
+    numbers -- the gen sequence is only monotonic because there is a
+    single minter."""
+    import re
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    pattern = re.compile(r"max_gen\(\)\s*\+\s*1")
+    hits: List[str] = []
+    for base in ("backend", "scripts"):
+        for py in sorted((repo_root / base).rglob("*.py")):
+            try:
+                text = py.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if pattern.search(text):
+                hits.append(str(py.relative_to(repo_root)))
+    assert hits == [
+        "backend/core/ouroboros/governance/brain_keeper.py",
+    ], "gen minting must have exactly ONE home: %r" % hits

@@ -115,14 +115,26 @@ class PersistentTokenBucket:
     """Flock-journaled rate cap for Brain resurrections.
 
     Each successful take appends one JSONL record
-    ``{"ts_utc": ..., "ts_wall": <time.time()>, "gen": N}`` through the SAME
-    intake-WAL ``_write_line`` substrate ``ResourceManifest`` reuses (flock
-    cross-process append -- imported, never copied). ``try_take`` replays the
-    journal fresh on every call: takes whose ``ts_wall`` falls inside the
-    rolling window count against the capacity; at/over capacity the take is
-    REFUSED WITHOUT APPENDING. Deterministic across process restarts
-    (Mandate 1) -- and deliberately free of sleeps/retries/backoff: rate
-    POLICY lives in the keeper's terminal state, not here.
+    ``{"ts_utc": ..., "ts_wall": <time.time()>, "gen": N}``. ``try_take``
+    replays the journal fresh on every call: takes whose ``ts_wall`` falls
+    inside the rolling window count against the capacity; at/over capacity
+    the take is REFUSED WITHOUT APPENDING. Deterministic across process
+    restarts (Mandate 1) -- and deliberately free of sleeps/retries/backoff:
+    rate POLICY lives in the keeper's terminal state, not here.
+
+    Atomicity (review fix, IMPORTANT-1): the ENTIRE read-count-decide-append
+    runs inside ONE ``flock_critical_section`` acquisition (the canonical
+    ``cross_process_jsonl`` read-modify-write helper, the InvariantDriftStore
+    precedent -- never hand-rolled locking). An unlocked decide followed by a
+    locked append is a cross-process TOCTOU: two racing processes (a zombie
+    driver overlapping a fresh one) could both count capacity-1 and both
+    append, exceeding the cap by one. The append inside the section is
+    caller-owned direct I/O per that helper's documented contract -- the lock
+    is NON-reentrant (in-process ``threading.Lock`` + ``LOCK_NB`` poll), so
+    nesting ``flock_append_line`` (the intake-WAL ``_write_line`` path) inside
+    it would self-deadlock until timeout. Fail-CLOSED: a take that cannot
+    acquire the lock is REFUSED -- a billing guard that cannot prove capacity
+    must never spend.
 
     Wall clock (``time.time()``) is intentional -- see the module docstring.
     """
@@ -134,23 +146,37 @@ class PersistentTokenBucket:
             raw = (os.environ.get(_ENV_BUCKET_PATH, "") or "").strip()
             resolved = Path(raw) if raw else _default_bucket_path()
         self._path = resolved
-        # REUSE the intake-WAL primitives exactly as ResourceManifest does:
-        # WAL.__init__ mkdirs parents; WAL._write_line is the flock append.
-        from backend.core.ouroboros.governance.intake.wal import WAL  # noqa: PLC0415
-
-        self._wal = WAL(self._path)
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # fail-soft: flock_critical_section re-mkdirs on the take path
 
     @property
     def path(self) -> Path:
         return self._path
 
+    def _durable_path(self) -> Path:
+        """The overlay-rerooted journal path (identity on plain hosts) --
+        resolved at CALL time so replay reads and the locked append always
+        target the SAME file ``flock_critical_section`` locks. Fail-soft to
+        the raw path."""
+        try:
+            from backend.core.ouroboros.governance.workspace_resolver import (  # noqa: PLC0415
+                resolve_durable_path,
+            )
+
+            return Path(resolve_durable_path(self._path))
+        except Exception:  # noqa: BLE001
+            return self._path
+
     def _replay(self) -> List[Dict[str, Any]]:
         """Tolerant journal replay (WAL semantics: corrupt lines skipped)."""
         records: List[Dict[str, Any]] = []
-        if not self._path.exists():
+        journal = self._durable_path()
+        if not journal.exists():
             return records
         try:
-            with self._path.open("r", encoding="utf-8") as fh:
+            with journal.open("r", encoding="utf-8") as fh:
                 for line_no, line in enumerate(fh, 1):
                     line = line.strip()
                     if not line:
@@ -189,19 +215,56 @@ class PersistentTokenBucket:
     def try_take(self, gen: Optional[int] = None) -> bool:
         """Spend one resurrection token, or refuse.
 
-        Replays the journal, counts in-window takes; at/over capacity the
-        refusal appends NOTHING (a refused caller must leave no trace). On a
-        grant, appends the take record and returns True. No sleeps, no
-        retries, no backoff -- ever (Mandate 1)."""
-        now = time.time()
-        if self.taken_in_window(now) >= self.capacity():
-            return False
+        The WHOLE read-count-decide-append runs under one
+        ``flock_critical_section`` acquisition (no cross-process TOCTOU --
+        see the class docstring). At/over capacity the refusal appends
+        NOTHING (a refused caller must leave no trace); a lock that cannot
+        be acquired REFUSES (fail-closed billing guard). On a grant, the
+        take record is appended inside the held section (caller-owned
+        direct I/O -- the lock is non-reentrant) and True is returned.
+        No sleeps, no retries, no backoff -- ever (Mandate 1)."""
         record: Dict[str, Any] = {
             "ts_utc": datetime.now(timezone.utc).isoformat(),
-            "ts_wall": now,
+            "ts_wall": time.time(),
             "gen": gen,
         }
-        self._wal._write_line(record)  # noqa: SLF001 -- private-but-stable WAL substrate
+        try:
+            line = json.dumps(record, default=str)
+        except (TypeError, ValueError):
+            return False
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: PLC0415
+                flock_critical_section,
+            )
+        except Exception as exc:  # noqa: BLE001 -- fail-CLOSED, loudly
+            logger.error(
+                "[ResurrectBucket] locking substrate unavailable (%r) -- "
+                "REFUSING take (fail-closed billing guard)", exc,
+            )
+            return False
+        with flock_critical_section(self._path) as locked:
+            if not locked:
+                logger.error(
+                    "[ResurrectBucket] could not acquire the bucket lock for "
+                    "%s -- REFUSING take (fail-closed: cannot prove capacity)",
+                    self._path,
+                )
+                return False
+            if self.taken_in_window(float(record["ts_wall"])) >= self.capacity():
+                return False
+            try:
+                journal = self._durable_path()
+                journal.parent.mkdir(parents=True, exist_ok=True)
+                with journal.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except OSError as exc:
+                logger.error(
+                    "[ResurrectBucket] take append failed (%r) -- REFUSING "
+                    "(no journal record, no grant)", exc,
+                )
+                return False
         return True
 
 
