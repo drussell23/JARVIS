@@ -575,11 +575,19 @@ class DurableOutbound:
             ts_utc=datetime.now(timezone.utc).isoformat(),
         )
         result = await offload(self._wal.append, entry)
-        if is_offload_error(result):
+        if is_offload_error(result) or not bool(result):
             # Durability honesty (review CRITICAL): the append did NOT
-            # land -- the event must NOT masquerade as pending-durable.
-            # Park it at-risk (memory-only), surface loudly ONCE per
-            # episode, retry on subsequent journal cycles.
+            # land -- either the offload itself errored, OR the REAL WAL
+            # write path completed and returned an honest False (wal.py's
+            # ``append``/``_write_line`` never raise; a lock-timeout or
+            # OSError is caught internally and surfaced as a plain bool).
+            # is_offload_error(False) is False -- a bare bool is not an
+            # OffloadError instance -- so both must be checked. Either way
+            # the event must NOT masquerade as pending-durable. Park it
+            # at-risk (memory-only), surface loudly ONCE per episode,
+            # retry on subsequent journal cycles. Append lands durably
+            # iff is_offload_error(result) is False AND bool(result) is
+            # True.
             self._at_risk[event_id] = entry
             if not self._journal_fail_warned:
                 self._journal_fail_warned = True
@@ -611,7 +619,13 @@ class DurableOutbound:
             # journaled entry then rides pending()/WAL replay, and server
             # dedup makes any duplicate delivery safe.
             result = await offload(self._wal.append, entry)
-            if is_offload_error(result):
+            if is_offload_error(result) or not bool(result):
+                # Same durability-honesty check as the initial append
+                # (review CRITICAL follow-up): an honest False from the
+                # real WAL write path is treated identically to an
+                # OffloadError -- append lands durably iff
+                # is_offload_error(result) is False AND bool(result) is
+                # True.
                 continue  # still failing -- next cycle retries again
             self._at_risk.pop(event_id, None)
             self._pending[event_id] = entry

@@ -365,6 +365,105 @@ def test_journal_append_failure_not_falsely_durable_then_retried(
 
 
 # --------------------------------------------------------------------------- #
+# (f2) review CRITICAL follow-up: a WAL.append that returns a plain ``False``
+#      (no exception -- e.g. wal.py's honest-durability contract: a lock
+#      timeout / OSError is caught INSIDE flock_append_line and surfaced as
+#      a bool, never raised) must be treated identically to an OffloadError.
+#      ``is_offload_error(False)`` is False -- a bare bool is not an
+#      OffloadError instance -- so BOTH ``self._wal.append`` call sites must
+#      also check ``not bool(result)``. Force the REAL WAL write path to
+#      return an honest False by monkeypatching
+#      ``cross_process_jsonl.flock_append_line`` (wal.py's ``_write_line``
+#      imports it fresh on every call), mirroring the causal ingestor's
+#      regression test for the same durability contract.
+# --------------------------------------------------------------------------- #
+def test_append_false_parks_at_risk_not_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_BODY_WAL_PROBE_INTERVAL_S", "0")
+    wal_path = str(tmp_path / "body_wal.jsonl")
+
+    import backend.core.ouroboros.governance.cross_process_jsonl as cpj
+
+    async def scenario():
+        broker = StreamEventBroker(history_maxlen=64)
+        outbound = DurableOutbound(broker, wal_path=wal_path)
+        await outbound.start()
+        try:
+            # Real write-failure through the true durability path -- no
+            # exception, just an honest False (nothing landed on disk).
+            monkeypatch.setattr(cpj, "flock_append_line",
+                                 lambda *a, **k: False)
+            eid = broker.publish(_EVENT_TYPE, _PREFIX + "false-0", {"i": 0})
+            assert eid
+            await _wait_for(lambda: outbound.journal_failures == 1)
+
+            assert eid not in _pending_ids(outbound), (
+                "a plain False append result must NOT masquerade as "
+                "pending-durable")
+            assert outbound._journal_fail_warned is True
+            probe = DurableOutbound(
+                StreamEventBroker(history_maxlen=4), wal_path=wal_path)
+            assert probe.pending_count() == 0, (
+                "disk must agree: a False-returning append never landed")
+        finally:
+            await outbound.stop()
+
+    _run(scenario())
+
+
+def test_retry_stays_at_risk_while_append_false(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_BODY_WAL_PROBE_INTERVAL_S", "0")
+    wal_path = str(tmp_path / "body_wal.jsonl")
+
+    import time
+    from datetime import datetime, timezone
+
+    import backend.core.ouroboros.governance.cross_process_jsonl as cpj
+    from backend.core.ouroboros.governance.intake.wal import WALEntry
+
+    async def scenario():
+        broker = StreamEventBroker(history_maxlen=64)
+        outbound = DurableOutbound(broker, wal_path=wal_path)
+        await outbound.start()
+        try:
+            entry = WALEntry(
+                lease_id="at-risk-0",
+                envelope_dict={"event_id": "at-risk-0"},
+                status="pending",
+                ts_monotonic=time.monotonic(),
+                ts_utc=datetime.now(timezone.utc).isoformat(),
+            )
+            outbound._at_risk["at-risk-0"] = entry
+            outbound._journal_fail_warned = True
+
+            fault = {"on": True}
+            real_flock = cpj.flock_append_line
+
+            def _flaky_flock(path, line):
+                if fault["on"]:
+                    return False
+                return real_flock(path, line)
+
+            monkeypatch.setattr(cpj, "flock_append_line", _flaky_flock)
+
+            # Still failing -- the entry must remain at-risk, never pending.
+            await outbound._retry_at_risk()
+            assert "at-risk-0" in outbound._at_risk
+            assert "at-risk-0" not in outbound._pending
+            assert outbound._journal_fail_warned is True
+
+            # Fault clears -- the next retry cycle lands it durably.
+            fault["on"] = False
+            await outbound._retry_at_risk()
+            assert "at-risk-0" not in outbound._at_risk
+            assert "at-risk-0" in outbound._pending
+            assert outbound._journal_fail_warned is False
+        finally:
+            await outbound.stop()
+
+    _run(scenario())
+
+
+# --------------------------------------------------------------------------- #
 # (g) review IMPORTANT-1: ack tombstone write failure must not produce the
 #     live-says-acked / disk-says-pending split silently -- the lease stays
 #     parked for retry, ONE distinguishing warning per episode, and the
