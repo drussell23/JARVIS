@@ -309,6 +309,83 @@ async def test_default_delete_uses_native_rest_zero_gcloud(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Stage-4 CRITICAL-1: failover child record-at-birth + LABEL_OWNER on labels.
+# ---------------------------------------------------------------------------
+
+
+async def test_failover_child_recorded_at_birth_with_owner(monkeypatch, tmp_path):
+    """A failover awaken that runs ON a labeled Brain node (lineage env present)
+    records the grandchild into the SHARED manifest with LABEL_OWNER=keeper_id
+    -- so it is IN the family walk AND flagged by the keeper-keyed drift
+    detector (the orphan class Stage 4 exists to kill)."""
+    import backend.core.ouroboros.governance.gcp_compute_rest as gr
+    from backend.core.ouroboros.governance import brain_lifecycle as bl
+
+    manifest_path = tmp_path / "manifests" / "resource_manifest.jsonl"
+    monkeypatch.setenv("JARVIS_RESOURCE_MANIFEST_PATH", str(manifest_path))
+    # Lineage env: THIS failover controller runs on a gen-2 Brain node.
+    monkeypatch.setenv("JARVIS_KEEPER_ID", "mac-body-keeper")
+    monkeypatch.setenv("JARVIS_BRAIN_PARENT_NODE", "jarvis-brain-gen2-xyz")
+    monkeypatch.setenv("JARVIS_BRAIN_GENERATION", "2")
+    monkeypatch.setenv("JARVIS_FAILOVER_NODE_NAME", "jarvis-prime-failover")
+
+    class FakeRest:
+        async def verify_compute_scopes(self):
+            return (True, "compute_scope_present")
+
+        async def create_instance(self, *, startup_script, labels=None, **kw):
+            # The lineage labels MUST carry the owner (CRITICAL-1(b)).
+            assert labels is not None
+            assert labels.get(bl.LABEL_OWNER) == "mac-body-keeper"
+            return (True, "created:SPOT:200")
+
+    monkeypatch.setattr(gr, "get_compute_rest", lambda: FakeRest())
+    ok = await fl._default_vm_awaken_fn(startup_script="#!/bin/bash\n")
+    assert ok is True
+
+    # The grandchild is now IN the manifest family walk, keyed under its
+    # PARENT (the Brain node it was born on) -- so a teardown_family walk of
+    # the parent's subtree reaps it. Before CRITICAL-1 there was NO record at
+    # all (nor a LABEL_OWNER for the keeper-keyed drift detector).
+    manifest = bl.ResourceManifest()
+    fam = [r["name"] for r in manifest.live_family("jarvis-brain-gen2-xyz")]
+    assert "jarvis-prime-failover" in fam, (
+        "the failover child must be recorded at birth under its parent node")
+    rec = next(r for r in manifest.live_family("jarvis-brain-gen2-xyz")
+               if r["name"] == "jarvis-prime-failover")
+    assert rec["labels"].get(bl.LABEL_OWNER) == "mac-body-keeper"
+    assert rec["parent"] == "jarvis-brain-gen2-xyz"
+    assert rec["gen"] == 2
+    assert rec["keeper_id"] == "mac-body-keeper"
+
+
+async def test_failover_child_no_manifest_write_when_env_absent(monkeypatch, tmp_path):
+    """Env-absent (a plain failover run, NOT on a Brain node) -> the manifest
+    is never touched (byte-identical pre-Stage-4 behavior)."""
+    import backend.core.ouroboros.governance.gcp_compute_rest as gr
+
+    manifest_path = tmp_path / "manifests" / "resource_manifest.jsonl"
+    monkeypatch.setenv("JARVIS_RESOURCE_MANIFEST_PATH", str(manifest_path))
+    monkeypatch.delenv("JARVIS_KEEPER_ID", raising=False)
+    monkeypatch.delenv("JARVIS_BRAIN_PARENT_NODE", raising=False)
+    monkeypatch.delenv("JARVIS_BRAIN_GENERATION", raising=False)
+
+    class FakeRest:
+        async def verify_compute_scopes(self):
+            return (True, "compute_scope_present")
+
+        async def create_instance(self, *, startup_script, labels=None, **kw):
+            assert labels is None  # no lineage -> byte-identical payload
+            return (True, "created:SPOT:200")
+
+    monkeypatch.setattr(gr, "get_compute_rest", lambda: FakeRest())
+    ok = await fl._default_vm_awaken_fn(startup_script="x")
+    assert ok is True
+    assert not manifest_path.exists(), (
+        "a non-Brain-node failover run must never touch the manifest")
+
+
+# ---------------------------------------------------------------------------
 # AWAKENING -> SERVING gated by observed ensure-ready probe
 # ---------------------------------------------------------------------------
 

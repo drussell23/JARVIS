@@ -292,6 +292,63 @@ def test_drift_detector_absent_by_default(manifest) -> None:
     assert result["drift"] == []
 
 
+def test_teardown_owner_id_keys_drift_query_to_the_owner_label(
+        manifest, caplog) -> None:
+    """Stage-4 IMPORTANT-4: the family walk keys on ``root_name`` (the
+    parent-chain root, here the Brain NODE), but the keeper stamps
+    ``LABEL_OWNER=keeper_id``. ``owner_id`` re-keys ONLY the drift query so
+    the detector actually matches the family's owner label -- WITHOUT it the
+    query used the node name and matched nothing (inert detector)."""
+    _create(manifest, "brain-node")
+    _create(manifest, "child-1", parent="brain-node")
+    fake = _FakeDeleter()
+    query_calls: List[Dict[str, Any]] = []
+
+    async def label_query(**kwargs: Any) -> List[Dict[str, Any]]:
+        query_calls.append(kwargs)
+        return [
+            {"name": "child-1"},                             # known -> no drift
+            {"name": "jarvis-prime-failover-orphan"},        # unrecorded -> drift
+        ]
+
+    with caplog.at_level(logging.WARNING):
+        result = asyncio.run(bl.teardown_family(
+            "brain-node", manifest=manifest,
+            delete_instance_fn=fake.delete_instance,
+            label_query_fn=label_query,
+            owner_id="mac-body-keeper",
+        ))
+
+    # The drift query keyed on the KEEPER-owner label, NOT the walk root.
+    assert query_calls == [
+        {"label_key": bl.LABEL_OWNER, "label_value": "mac-body-keeper"},
+    ]
+    assert [d["name"] for d in result["drift"]] == [
+        "jarvis-prime-failover-orphan"]
+    # Never a deletion source: the drifted orphan is not deleted.
+    assert "jarvis-prime-failover-orphan" not in [n for n, _z in fake.calls]
+
+
+def test_teardown_owner_id_none_defaults_to_root_name(manifest) -> None:
+    """``owner_id=None`` -> the drift query defaults to ``root_name``
+    (byte-identical legacy behavior)."""
+    _create(manifest, "root")
+    fake = _FakeDeleter()
+    query_calls: List[Dict[str, Any]] = []
+
+    async def label_query(**kwargs: Any) -> List[Dict[str, Any]]:
+        query_calls.append(kwargs)
+        return []
+
+    asyncio.run(bl.teardown_family(
+        "root", manifest=manifest, delete_instance_fn=fake.delete_instance,
+        label_query_fn=label_query,
+    ))
+    assert query_calls == [
+        {"label_key": bl.LABEL_OWNER, "label_value": "root"},
+    ]
+
+
 def test_manifest_walk_only_invariant_marker_present() -> None:
     """Grep-enforceable structural invariant: the teardown must be marked as
     manifest-walk-only (no list-style discovery as a deletion source)."""

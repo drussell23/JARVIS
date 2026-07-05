@@ -680,3 +680,69 @@ def test_keeperless_run_publishes_no_heartbeat_and_survives_plain_fake_bus(
     driver = bm.BodyModeDriver(duration_s=0.05, **kwargs)
     rc = asyncio.run(driver.run())
     assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Stage-4 IMPORTANT-3: keeper master flag (JARVIS_BRAIN_KEEPER_ENABLED) + CLI.
+# ---------------------------------------------------------------------------
+
+
+def test_keeper_master_off_by_default_no_keeper(monkeypatch):
+    """Env unset -> master defaults FALSE -> no keeper is armed on the live
+    default path (pre-Stage-4 degrade-and-wait, byte-identical)."""
+    monkeypatch.delenv("JARVIS_BRAIN_KEEPER_ENABLED", raising=False)
+    driver = bm.BodyModeDriver()  # no seams -> live default path
+    assert driver._do_keeper() is None
+
+
+def test_keeper_master_on_arms_the_live_keeper(monkeypatch, tmp_path):
+    """Env on -> the live default keeper is built (no injected seams)."""
+    monkeypatch.setenv("JARVIS_BRAIN_KEEPER_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_RESOURCE_MANIFEST_PATH",
+                       str(tmp_path / "manifest.jsonl"))
+    monkeypatch.setenv("JARVIS_RESURRECT_BUCKET_PATH",
+                       str(tmp_path / "bucket.jsonl"))
+    from backend.core.ouroboros.governance.brain_keeper import BrainKeeper
+    driver = bm.BodyModeDriver()
+    keeper = driver._do_keeper()
+    assert isinstance(keeper, BrainKeeper), "master ON must arm the real keeper"
+
+
+def test_no_keeper_flag_wins_over_injected_factory(monkeypatch):
+    """--no-keeper (keeper_mode False) wins over EVERYTHING -- even an
+    explicitly injected keeper_factory."""
+    monkeypatch.setenv("JARVIS_BRAIN_KEEPER_ENABLED", "true")
+    sentinel = object()
+    driver = bm.BodyModeDriver(
+        keeper_mode=False, keeper_factory=lambda: sentinel)
+    assert driver._do_keeper() is None
+
+
+def test_keeper_flag_forces_on_despite_env_off(monkeypatch, tmp_path):
+    """--keeper (keeper_mode True) forces the keeper on even when the env
+    master is off."""
+    monkeypatch.setenv("JARVIS_BRAIN_KEEPER_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_RESOURCE_MANIFEST_PATH",
+                       str(tmp_path / "manifest.jsonl"))
+    monkeypatch.setenv("JARVIS_RESURRECT_BUCKET_PATH",
+                       str(tmp_path / "bucket.jsonl"))
+    from backend.core.ouroboros.governance.brain_keeper import BrainKeeper
+    driver = bm.BodyModeDriver(keeper_mode=True)
+    assert isinstance(driver._do_keeper(), BrainKeeper)
+
+
+def test_keeper_cli_flags_parse():
+    """--keeper -> True, --no-keeper -> False, neither -> None."""
+    p = bm.build_arg_parser()
+    assert p.parse_args([]).keeper is None
+    assert p.parse_args(["--keeper"]).keeper is True
+    assert p.parse_args(["--no-keeper"]).keeper is False
+
+
+def test_injected_factory_still_armed_when_mode_none(monkeypatch):
+    """Byte-identical seam path: keeper_mode None + injected factory -> the
+    factory is used (master flag not consulted for an explicit seam)."""
+    monkeypatch.delenv("JARVIS_BRAIN_KEEPER_ENABLED", raising=False)
+    sentinel = object()
+    driver = bm.BodyModeDriver(keeper_factory=lambda: sentinel)
+    assert driver._do_keeper() is sentinel

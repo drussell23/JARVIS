@@ -540,6 +540,7 @@ async def teardown_family(
     delete_instance_fn: Callable[..., Awaitable[Any]],
     delete_firewall_fn: Optional[Callable[..., Awaitable[Any]]] = None,
     label_query_fn: Optional[Callable[..., Awaitable[Any]]] = None,
+    owner_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Tear down every live resource owned (transitively) by ``root_name``.
 
@@ -551,6 +552,15 @@ async def teardown_family(
     did not know is LOUD-warned and returned as ``drift`` (a structural
     invariant violation: something was born unrecorded), never silently
     deleted.
+
+    ``owner_id`` (Stage-4 Task-4 re-review, IMPORTANT-4): the value the drift
+    detector queries the ``LABEL_OWNER`` label for. The FAMILY WALK still keys
+    on ``root_name`` (the parent-chain root), but the keeper stamps the
+    ``LABEL_OWNER`` label with its KEEPER ID -- which is NOT the family-walk
+    root (a child's ``parent`` is its node/keeper). Without this the drift
+    query for a keeper-owned family used ``root_name`` and matched nothing
+    (inert detector). ``None`` -> the value defaults to ``root_name``
+    (byte-identical legacy behavior for callers that own by root name).
 
     Fail-soft per item: one failing delete is recorded in ``failed`` and the
     walk continues (a wedged child must not orphan its siblings). Successful
@@ -603,10 +613,11 @@ async def teardown_family(
             for rec in manifest._replay_records()  # noqa: SLF001 -- own module
             if rec.get("op") == "create" and rec.get("name")
         }
+        drift_owner = sanitize_label_value(owner_id if owner_id else root_name)
         try:
             found = await label_query_fn(
                 label_key=LABEL_OWNER,
-                label_value=sanitize_label_value(root_name),
+                label_value=drift_owner,
             )
             for item in found or []:
                 item_name = str((item or {}).get("name") or "")
@@ -617,7 +628,7 @@ async def teardown_family(
                         "%s=%s but the manifest never recorded it -- a resource "
                         "was born OUTSIDE the ownership substrate (structural "
                         "invariant violation; NOT auto-deleted)",
-                        item_name, LABEL_OWNER, sanitize_label_value(root_name),
+                        item_name, LABEL_OWNER, drift_owner,
                     )
         except Exception as exc:  # noqa: BLE001 -- detector is advisory
             logger.warning(

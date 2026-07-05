@@ -576,3 +576,180 @@ def test_gen_minter_uniqueness_invariant() -> None:
     assert hits == [
         "backend/core/ouroboros/governance/brain_keeper.py",
     ], "gen minting must have exactly ONE home: %r" % hits
+
+
+# ---------------------------------------------------------------------------
+# Stage-4 Task-4 (IMPORTANT-2/4): keeper-delivered fence supersession + reap.
+# ---------------------------------------------------------------------------
+
+
+def _record_gen_node(manifest: Any, keeper_id: str, gen: int) -> str:
+    """Record a live Brain node owned by the keeper (parent=keeper_id), as
+    _resurrect's record-at-birth does."""
+    name = "jarvis-brain-gen%d-node" % gen
+    manifest.record_create(
+        kind="instance", name=name,
+        labels={bl.LABEL_OWNER: keeper_id, bl.LABEL_GEN: str(gen)},
+        parent=keeper_id, gen=gen, keeper_id=keeper_id,
+    )
+    return name
+
+
+def test_supersede_delivers_fence_then_reaps_lower_gens(manifest) -> None:
+    """After a new gen N, the keeper delivers console.keeper_heartbeat{gen:N}
+    to every LIVE node with gen < N (its self-fence + capture_inflight window),
+    then reaps it. The just-minted gen N is NOT superseded."""
+    kid = "mac-body-keeper"
+    g1 = _record_gen_node(manifest, kid, 1)
+    g2 = _record_gen_node(manifest, kid, 2)
+    g3 = _record_gen_node(manifest, kid, 3)  # the NEW gen -- must NOT be reaped
+
+    delivered: List[Tuple[str, int]] = []
+    reaped: List[str] = []
+
+    async def fake_deliver(node_name: str, gen: int) -> bool:
+        delivered.append((node_name, gen))
+        return True
+
+    async def fake_delete(name: str, *, zone: Any = None) -> Tuple[bool, str]:
+        reaped.append(name)
+        return (True, "deleted:200")
+
+    keeper = bk.BrainKeeper(
+        discover_fn=_no_brain,
+        provision_fn=_FakeProvisioner(),
+        manifest=manifest, bucket=bk.PersistentTokenBucket(),
+        keeper_id=kid,
+        fence_deliver_fn=fake_deliver,
+        delete_instance_fn=fake_delete,
+        fence_grace_s=0.0,  # no real sleep in tests
+    )
+
+    result = asyncio.run(keeper.supersede_old_generations(3))
+
+    assert set(result["superseded"]) == {g1, g2}
+    assert g3 not in result["superseded"], "the new gen must never self-reap"
+    # The fence heartbeat carries the NEW gen so the old node observes gen>own.
+    assert set(delivered) == {(g1, 3), (g2, 3)}
+    # Both old nodes reaped after the grace.
+    assert set(reaped) == {g1, g2}
+    # Manifest converged: the reaped nodes are tombstoned, only g3 remains live.
+    live = {r["name"] for r in manifest.live_family(kid)}
+    assert live == {g3}
+
+
+def test_supersede_delivery_failure_falls_through_to_reap(manifest) -> None:
+    """An unreachable node (delivery raises/False) MUST still be reaped -- the
+    reap is the backstop; delivery never blocks it."""
+    kid = "mac-body-keeper"
+    g1 = _record_gen_node(manifest, kid, 1)
+    _record_gen_node(manifest, kid, 2)  # new gen
+
+    reaped: List[str] = []
+
+    async def failing_deliver(node_name: str, gen: int) -> bool:
+        raise RuntimeError("node unreachable")
+
+    async def fake_delete(name: str, *, zone: Any = None) -> Tuple[bool, str]:
+        reaped.append(name)
+        return (True, "deleted:200")
+
+    keeper = bk.BrainKeeper(
+        discover_fn=_no_brain, provision_fn=_FakeProvisioner(),
+        manifest=manifest, bucket=bk.PersistentTokenBucket(), keeper_id=kid,
+        fence_deliver_fn=failing_deliver, delete_instance_fn=fake_delete,
+        fence_grace_s=0.0,
+    )
+
+    result = asyncio.run(keeper.supersede_old_generations(2))
+    assert result["delivered"] == {g1: False}
+    assert reaped == [g1], "a failed delivery must still fall through to reap"
+
+
+def test_reap_generation_passes_owner_id_for_drift_query(manifest) -> None:
+    """IMPORTANT-4 wiring: reap_generation calls teardown_family with
+    owner_id=keeper_id so the drift detector queries the keeper-owner label."""
+    kid = "mac-body-keeper"
+    node = _record_gen_node(manifest, kid, 1)
+    query_calls: List[Dict[str, Any]] = []
+
+    async def fake_delete(name: str, *, zone: Any = None) -> Tuple[bool, str]:
+        return (True, "deleted:200")
+
+    async def label_query(**kwargs: Any) -> List[Dict[str, Any]]:
+        query_calls.append(kwargs)
+        return []
+
+    keeper = bk.BrainKeeper(
+        discover_fn=_no_brain, provision_fn=_FakeProvisioner(),
+        manifest=manifest, bucket=bk.PersistentTokenBucket(), keeper_id=kid,
+        delete_instance_fn=fake_delete, label_query_fn=label_query,
+    )
+
+    result = asyncio.run(keeper.reap_generation(node))
+    assert node in result["deleted"]
+    assert query_calls == [
+        {"label_key": bl.LABEL_OWNER, "label_value": kid},
+    ], "the drift query must key on the keeper-owner label, not the node name"
+
+
+def test_reap_generation_drift_flags_unowned_grandchild(manifest) -> None:
+    """The failover grandchild -- now carrying LABEL_OWNER=keeper -- shows up
+    in the keeper-keyed drift query. If the local manifest never recorded it
+    (cross-host birth), it is flagged as drift (NOT auto-deleted)."""
+    kid = "mac-body-keeper"
+    node = _record_gen_node(manifest, kid, 1)
+
+    async def fake_delete(name: str, *, zone: Any = None) -> Tuple[bool, str]:
+        return (True, "deleted:200")
+
+    async def label_query(**kwargs: Any) -> List[Dict[str, Any]]:
+        return [{"name": "jarvis-prime-failover"}]  # owner=keeper, unrecorded here
+
+    keeper = bk.BrainKeeper(
+        discover_fn=_no_brain, provision_fn=_FakeProvisioner(),
+        manifest=manifest, bucket=bk.PersistentTokenBucket(), keeper_id=kid,
+        delete_instance_fn=fake_delete, label_query_fn=label_query,
+    )
+    result = asyncio.run(keeper.reap_generation(node))
+    assert [d["name"] for d in result["drift"]] == ["jarvis-prime-failover"]
+
+
+def test_resurrect_success_triggers_supersession(manifest, bucket_path,
+                                                  monkeypatch) -> None:
+    """End-to-end: a successful resurrection to gen N supersedes the prior
+    live gen (delivers the fence + reaps). Proves supersede is wired into
+    _resurrect's success branch."""
+    monkeypatch.setenv("JARVIS_BRAIN_RESURRECT_MAX_PER_H", "5")
+    kid = "mac-body-keeper"
+    # A prior live gen-1 node exists on the manifest.
+    g1 = _record_gen_node(manifest, kid, 1)
+
+    delivered: List[Tuple[str, int]] = []
+    reaped: List[str] = []
+
+    async def fake_deliver(node_name: str, gen: int) -> bool:
+        delivered.append((node_name, gen))
+        return True
+
+    async def fake_delete(name: str, *, zone: Any = None) -> Tuple[bool, str]:
+        reaped.append(name)
+        return (True, "deleted:200")
+
+    clock = _FakeClock()
+    keeper = bk.BrainKeeper(
+        discover_fn=_no_brain, provision_fn=_FakeProvisioner(ok=True),
+        manifest=manifest, bucket=bk.PersistentTokenBucket(),
+        resurrect_after_s=900.0, keeper_id=kid, clock=clock,
+        fence_deliver_fn=fake_deliver, delete_instance_fn=fake_delete,
+        fence_grace_s=0.0,
+    )
+    # Drive the FSM into sustained absence -> resurrection (gen 2).
+    keeper.note_discovery_result(None)  # window starts
+    clock.advance(901.0)                # exceed resurrect_after_s
+    state = asyncio.run(keeper.tick())
+
+    assert state == "resurrected"
+    # gen 2 was minted (max_gen was 1) and the old gen-1 node was superseded.
+    assert delivered == [(g1, 2)]
+    assert reaped == [g1]

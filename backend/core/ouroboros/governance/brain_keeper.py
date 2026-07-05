@@ -50,6 +50,7 @@ Env knobs (all resolved at call time -- zero baked assumptions):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -82,6 +83,13 @@ _ENV_RESURRECT_AFTER_S = "JARVIS_BRAIN_RESURRECT_AFTER_S"
 _DEFAULT_RESURRECT_AFTER_S = 900.0
 _ENV_KEEPER_ID = "JARVIS_KEEPER_ID"
 _DEFAULT_KEEPER_ID = "mac-body-keeper"
+# Stage-4 Task-4 (IMPORTANT-2): the bounded grace between DELIVERING the fence
+# heartbeat to a superseded node (its deterministic self-fence + capture_inflight
+# window) and REAPING it. Env-tunable; the keeper never blocks past this.
+_ENV_FENCE_GRACE_S = "JARVIS_BRAIN_FENCE_GRACE_S"
+_DEFAULT_FENCE_GRACE_S = 20.0
+_ENV_FENCE_DELIVER_TIMEOUT_S = "JARVIS_BRAIN_FENCE_DELIVER_TIMEOUT_S"
+_DEFAULT_FENCE_DELIVER_TIMEOUT_S = 15.0
 
 
 def _default_bucket_path() -> Path:
@@ -279,6 +287,98 @@ _STATE_RESURRECTED = "resurrected"
 _STATE_CAP_EXHAUSTED = "cap_exhausted"  # TERMINAL
 
 
+# ---------------------------------------------------------------------------
+# Live-default fence delivery (IMPORTANT-2). The keeper ACTIVELY delivers the
+# fence heartbeat to a known superseded node -- a single-bridge Body only binds
+# the newest gen, so the old node would otherwise never receive the signal that
+# triggers its deterministic self-fence + capture_inflight.
+# ---------------------------------------------------------------------------
+
+
+async def _fence_deliver_impl(node_name: str, gen: int) -> bool:
+    """Open a SHORT-LIVED heartbeat-only client to the old node's bus and
+    publish ``console.keeper_heartbeat{gen}`` -- the run_body_mode idiom
+    (DistributedEventBus client role + TrinityBusBridge outbound ``console.*``)
+    but pointed at ONE known endpoint. Returns True iff the publish was issued."""
+    from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+        get_compute_rest,
+    )
+    from backend.core.ouroboros.governance.transport.transport_config import (  # noqa: PLC0415
+        TransportConfig,
+    )
+    from backend.core.ouroboros.governance.transport.distributed_event_bus import (  # noqa: PLC0415
+        DistributedEventBus,
+    )
+    from backend.core.ouroboros.governance.transport.trinity_bus_bridge import (  # noqa: PLC0415
+        TrinityBusBridge,
+    )
+    from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: PLC0415
+        StreamEventBroker,
+    )
+    from backend.core.trinity_event_bus import get_trinity_event_bus  # noqa: PLC0415
+
+    internal_ip, external_ip = await get_compute_rest().get_node_endpoints(
+        node_name)
+    host = external_ip or internal_ip
+    if not host:
+        return False
+    cfg = TransportConfig.from_env(role="mac-body")
+    scheme = "wss" if getattr(cfg, "tls_enabled", False) else "ws"
+    url = "%s://%s:%d%s" % (scheme, host, cfg.port, cfg.path)
+    trinity_bus = await get_trinity_event_bus()
+    broker = StreamEventBroker()
+    dist = DistributedEventBus(broker, cfg, role="client")
+    bridge = TrinityBusBridge(
+        trinity_bus, broker, outbound_topics=["console.*"],
+        source_id="mac-body-keeper",
+    )
+    task = asyncio.ensure_future(dist.start_client(url))
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            client = getattr(dist, "_client", None)
+            if client is not None and getattr(client, "connected", False):
+                break
+            await asyncio.sleep(0.1)
+        await bridge.start()
+        await trinity_bus.publish_raw(
+            "console.keeper_heartbeat", {"gen": int(gen)}, persist=False)
+        # Let the frame flush + the old node observe it and self-fence.
+        await asyncio.sleep(1.0)
+        return True
+    finally:
+        try:
+            await bridge.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await dist.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+
+
+async def _default_fence_deliver_fn(node_name: str, gen: int) -> bool:
+    """Bounded, fail-soft wrapper: deliver the fence heartbeat under a hard
+    timeout so an unreachable node can NEVER block the keeper. On any failure
+    the caller falls through to the reap backstop after the grace."""
+    import asyncio as _asyncio  # noqa: PLC0415
+    budget = _env_float(_ENV_FENCE_DELIVER_TIMEOUT_S, _DEFAULT_FENCE_DELIVER_TIMEOUT_S)
+    try:
+        return bool(await _asyncio.wait_for(
+            _fence_deliver_impl(node_name, gen), timeout=budget))
+    except Exception as exc:  # noqa: BLE001 -- delivery is best-effort; reap backstops
+        logger.warning(
+            "[BrainKeeper] fence delivery to %s fail-soft (falling through to "
+            "reap): %r", node_name, exc,
+        )
+        return False
+
+
 class BrainKeeper:
     """Detect sustained Brain absence; resurrect a new generation, capped.
 
@@ -309,11 +409,27 @@ class BrainKeeper:
         resurrect_after_s: Optional[float] = None,
         keeper_id: Optional[str] = None,
         clock: Callable[[], float] = time.monotonic,
+        # Stage-4 Task-4 (IMPORTANT-2/4): fence-supersession seams. All None ->
+        # the live defaults (real fence delivery + real GCP reap) resolve
+        # lazily; tests inject recorders.
+        fence_deliver_fn: Optional[Callable[[str, int], Awaitable[bool]]] = None,
+        delete_instance_fn: Optional[Callable[..., Awaitable[Any]]] = None,
+        delete_firewall_fn: Optional[Callable[..., Awaitable[Any]]] = None,
+        label_query_fn: Optional[Callable[..., Awaitable[Any]]] = None,
+        fence_grace_s: Optional[float] = None,
     ) -> None:
         self._discover_fn = discover_fn
         self._provision_fn = provision_fn
         self._manifest = manifest
         self._bucket = bucket
+        self._fence_deliver_fn = fence_deliver_fn
+        self._delete_instance_fn = delete_instance_fn
+        self._delete_firewall_fn = delete_firewall_fn
+        self._label_query_fn = label_query_fn
+        self._fence_grace_s = (
+            float(fence_grace_s) if fence_grace_s is not None
+            else _env_float(_ENV_FENCE_GRACE_S, _DEFAULT_FENCE_GRACE_S)
+        )
         self._resurrect_after_s = (
             float(resurrect_after_s) if resurrect_after_s is not None
             else _env_float(_ENV_RESURRECT_AFTER_S, _DEFAULT_RESURRECT_AFTER_S)
@@ -420,6 +536,13 @@ class BrainKeeper:
         extra_env = {
             "JARVIS_BRAIN_GENERATION": str(gen),
             "JARVIS_BRAIN_PARENT_NODE": node_name,
+            # Stage-4 CRITICAL-1: ship the keeper id onto the Brain so any
+            # node ITS failover path awakens (the grandchild) can stamp the
+            # LABEL_OWNER=keeper_id family label + record-at-birth into the
+            # manifest -- otherwise the grandchild is invisible to both the
+            # family walk (teardown_family) AND the keeper-keyed drift
+            # detector (the orphan class Stage 4 exists to kill).
+            "JARVIS_KEEPER_ID": self._keeper_id,
         }
         # RECORD-AT-BIRTH (Task-1 concern #3): append BEFORE the provision
         # await, so a keeper death mid-provision still leaves the child on the
@@ -448,6 +571,17 @@ class BrainKeeper:
                 "[BrainKeeper] resurrection SUCCEEDED gen=%d node=%s",
                 gen, node_name,
             )
+            # Stage-4 IMPORTANT-2: a NEW generation is now live -- actively
+            # deliver the fence signal to every OLDER live node (its
+            # self-fence + capture_inflight window), then reap it. Fail-soft:
+            # supersession must never undo a successful resurrection.
+            try:
+                await self.supersede_old_generations(gen)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[BrainKeeper] supersession fail-soft (resurrection stands): "
+                    "%r", exc,
+                )
         else:
             # The token is SPENT by design (VM-factory guard: attempts that
             # can spend money count against the cap, refunds would let a
@@ -460,3 +594,136 @@ class BrainKeeper:
                 "(token spent by design)", gen, node_name, detail,
             )
         return self._state
+
+    # -- fence supersession (Stage-4 Task-4, IMPORTANT-2/4) -------------------
+
+    def _resolve_fence_deliver(self) -> Callable[[str, int], Awaitable[bool]]:
+        return self._fence_deliver_fn or _default_fence_deliver_fn
+
+    def _resolve_delete_instance(self) -> Callable[..., Awaitable[Any]]:
+        if self._delete_instance_fn is not None:
+            return self._delete_instance_fn
+
+        async def _live(name: str, *, zone: Optional[str] = None) -> Any:
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                get_compute_rest,
+            )
+            return await get_compute_rest().delete_instance(name, zone=zone)
+
+        return _live
+
+    def _resolve_delete_firewall(self) -> Callable[..., Awaitable[Any]]:
+        if self._delete_firewall_fn is not None:
+            return self._delete_firewall_fn
+
+        async def _live(*, rule_name: str) -> Any:
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                get_compute_rest,
+            )
+            return await get_compute_rest().delete_firewall_rule(rule_name)
+
+        return _live
+
+    def _resolve_label_query(self) -> Callable[..., Awaitable[Any]]:
+        if self._label_query_fn is not None:
+            return self._label_query_fn
+
+        async def _live(*, label_key: str, label_value: str) -> Any:
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                get_compute_rest,
+            )
+            return await get_compute_rest().list_instances_by_label(
+                label_key=label_key, label_value=label_value)
+
+        return _live
+
+    async def supersede_old_generations(self, current_gen: int) -> Dict[str, Any]:
+        """Deliver the fence signal to every LIVE node older than
+        ``current_gen``, then (after the bounded grace) reap it.
+
+        The keeper OWNS the family (every resurrected node is recorded with
+        ``parent=keeper_id``), so ``live_family(keeper_id)`` is the complete
+        live set. For each ``gen < current_gen`` node: deliver
+        ``console.keeper_heartbeat{gen:current_gen}`` to its endpoint (its
+        deterministic self-fence + capture_inflight window). After ALL
+        deliveries, sleep the bounded grace ONCE, then reap each old node via
+        :meth:`reap_generation`. Delivery is best-effort -- an unreachable node
+        falls through to the reap backstop (never blocks). Fail-soft
+        throughout: returns a structured summary, never raises."""
+        try:
+            live = self._manifest.live_family(self._keeper_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[BrainKeeper] supersede: live_family failed: %r", exc)
+            return {"superseded": [], "delivered": {}, "reaped": {}}
+
+        old_nodes: List[str] = []
+        for rec in live:
+            if str(rec.get("kind") or "instance") != "instance":
+                continue
+            g = rec.get("gen")
+            try:
+                g_int = int(g)
+            except (TypeError, ValueError):
+                continue
+            if g_int >= int(current_gen):
+                continue  # the new gen (and any equal/higher) is not superseded
+            name = str(rec.get("name") or "")
+            if name:
+                old_nodes.append(name)
+
+        if not old_nodes:
+            return {"superseded": [], "delivered": {}, "reaped": {}}
+
+        logger.warning(
+            "[BrainKeeper] SUPERSEDING %d old generation(s) after gen=%d: %s",
+            len(old_nodes), current_gen, ", ".join(old_nodes),
+        )
+        deliver = self._resolve_fence_deliver()
+        delivered: Dict[str, bool] = {}
+        for name in old_nodes:
+            try:
+                delivered[name] = bool(await deliver(name, int(current_gen)))
+            except Exception as exc:  # noqa: BLE001 -- delivery never blocks reap
+                logger.warning(
+                    "[BrainKeeper] fence delivery raised for %s (reap backstops): "
+                    "%r", name, exc,
+                )
+                delivered[name] = False
+
+        # ONE bounded grace: each delivered node gets its self-fence +
+        # capture_inflight window before the reap. Then reap regardless of
+        # delivery outcome (reap is the backstop).
+        if self._fence_grace_s > 0:
+            await asyncio.sleep(self._fence_grace_s)
+
+        reaped: Dict[str, Any] = {}
+        for name in old_nodes:
+            reaped[name] = await self.reap_generation(name)
+
+        return {
+            "superseded": old_nodes,
+            "delivered": delivered,
+            "reaped": reaped,
+        }
+
+    async def reap_generation(self, node_name: str) -> Dict[str, Any]:
+        """Reap a superseded node's family via the manifest walk. Passes
+        ``owner_id=keeper_id`` so the drift detector queries the label the
+        keeper actually stamps (``LABEL_OWNER=keeper_id``) -- IMPORTANT-4.
+        Fail-soft: any failure returns an ``error`` dict, never raises."""
+        try:
+            from backend.core.ouroboros.governance.brain_lifecycle import (  # noqa: PLC0415
+                teardown_family,
+            )
+            return await teardown_family(
+                node_name,
+                manifest=self._manifest,
+                owner_id=self._keeper_id,
+                delete_instance_fn=self._resolve_delete_instance(),
+                delete_firewall_fn=self._resolve_delete_firewall(),
+                label_query_fn=self._resolve_label_query(),
+            )
+        except Exception as exc:  # noqa: BLE001 -- reap is fail-soft
+            logger.warning(
+                "[BrainKeeper] reap_generation(%s) fail-soft: %r", node_name, exc)
+            return {"root": node_name, "error": repr(exc)}

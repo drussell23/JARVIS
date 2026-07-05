@@ -134,6 +134,10 @@ class BodyModeDriver:
         duration_s: Optional[float] = None,
         dry_run: bool = False,
         require_brain: bool = False,
+        # Stage-4 IMPORTANT-3: keeper master. None -> consult
+        # JARVIS_BRAIN_KEEPER_ENABLED (default false); True -> force on
+        # (--keeper); False -> force off (--no-keeper, wins over everything).
+        keeper_mode: Optional[bool] = None,
         # Injectable seams (live defaults resolved lazily inside run()).
         discover_fn: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
         bus_factory: Optional[Callable[[], Awaitable[Tuple[Any, Any, Any]]]] = None,
@@ -148,6 +152,7 @@ class BodyModeDriver:
         self.duration_s = duration_s
         self.dry_run = dry_run
         self.require_brain = require_brain
+        self.keeper_mode = keeper_mode
 
         self._discover = discover_fn
         self._bus_factory = bus_factory
@@ -191,6 +196,19 @@ class BodyModeDriver:
                 pass
         return url
 
+    def _keeper_enabled(self) -> bool:
+        """Stage-4 IMPORTANT-3 master resolution. ``--no-keeper`` (keeper_mode
+        False) wins over everything; ``--keeper`` (True) forces on; None ->
+        consult ``JARVIS_BRAIN_KEEPER_ENABLED`` (default FALSE -- SAFE default:
+        the drill / live runs opt in explicitly, pre-Stage-4 degrade-and-wait
+        is byte-identical)."""
+        if self.keeper_mode is False:
+            return False
+        if self.keeper_mode is True:
+            return True
+        return (os.environ.get("JARVIS_BRAIN_KEEPER_ENABLED", "false")
+                or "").strip().lower() in ("1", "true", "yes", "on")
+
     def _do_keeper(self) -> Optional[Any]:
         """Resolve the Brain-keeper seam (Stage-4 Task 3).
 
@@ -204,6 +222,10 @@ class BodyModeDriver:
         precedent: injected-seam tests must never touch the real repo
         ledger). Fail-soft: a keeper that cannot be built degrades to
         the keeper-less census rather than killing the driver."""
+        # Stage-4 IMPORTANT-3: --no-keeper wins over an injected factory too.
+        if self.keeper_mode is False:
+            _log("brain keeper disabled (--no-keeper)")
+            return None
         if self._keeper_factory is not None:
             try:
                 return self._keeper_factory()
@@ -211,6 +233,10 @@ class BodyModeDriver:
                 _log("brain keeper unavailable (fail-soft): %s" % exc)
                 return None
         if self._bus_factory is not None:
+            return None
+        if not self._keeper_enabled():
+            _log("brain keeper disabled (JARVIS_BRAIN_KEEPER_ENABLED=false) "
+                 "-- pre-Stage-4 degrade-and-wait")
             return None
         try:
             from backend.core.ouroboros.governance import brain_lifecycle  # noqa: PLC0415
@@ -748,6 +774,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true",
         help="Print the Body-mode plan and exit -- touches no network.",
     )
+    # Stage-4 IMPORTANT-3: keeper master flag overrides. dest defaults to None
+    # (neither given -> consult JARVIS_BRAIN_KEEPER_ENABLED, default false).
+    p.add_argument(
+        "--keeper", dest="keeper", action="store_true", default=None,
+        help="Force-arm the Brain KEEPER (overrides "
+             "JARVIS_BRAIN_KEEPER_ENABLED). Default: consult the env flag "
+             "(off).",
+    )
+    p.add_argument(
+        "--no-keeper", dest="keeper", action="store_false",
+        help="Force the keeper OFF (wins over env + --keeper): pre-Stage-4 "
+             "degrade-and-wait behavior.",
+    )
     return p
 
 
@@ -759,6 +798,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         duration_s=args.duration_s,
         dry_run=args.dry_run,
         require_brain=args.require_brain,
+        keeper_mode=args.keeper,
     )
     try:
         return asyncio.run(driver.run())

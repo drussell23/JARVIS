@@ -555,24 +555,33 @@ def _gcloud_run(cmd: List[str], *, timeout_s: float = 180.0):
 
 def _lineage_labels() -> Optional[Dict[str, str]]:
     """Stage-4 hierarchical ownership: when THIS process runs ON a Brain node
-    (brain-env ships ``JARVIS_BRAIN_PARENT_NODE`` / ``JARVIS_BRAIN_GENERATION``),
-    every node ITS awaken path creates is labeled with its parent + generation
-    at BIRTH -- so an orphan whose controller died is still owned (findable by
-    the manifest/label family walk, never an ad-hoc listing).
+    (brain-env ships ``JARVIS_BRAIN_PARENT_NODE`` / ``JARVIS_BRAIN_GENERATION``
+    / ``JARVIS_KEEPER_ID``), every node ITS awaken path creates is labeled with
+    its owner + parent + generation at BIRTH -- so an orphan whose controller
+    died is still owned (findable by the manifest/label family walk AND the
+    keeper-keyed drift detector, never an ad-hoc listing).
+
+    CRITICAL-1 fix: also folds ``LABEL_OWNER`` from ``JARVIS_KEEPER_ID`` --
+    without it the grandchild carried only PARENT+GEN, so the keeper-keyed
+    drift detector (which queries ``LABEL_OWNER=keeper_id``) never flagged it.
 
     Additive: env absent -> None -> the create_instance payload is
     byte-identical to the pre-Stage-4 behavior. Fail-soft, never raises."""
     try:
         parent = (os.environ.get("JARVIS_BRAIN_PARENT_NODE", "") or "").strip()
         gen = (os.environ.get("JARVIS_BRAIN_GENERATION", "") or "").strip()
-        if not parent and not gen:
+        owner = (os.environ.get("JARVIS_KEEPER_ID", "") or "").strip()
+        if not parent and not gen and not owner:
             return None
         from backend.core.ouroboros.governance.brain_lifecycle import (  # noqa: PLC0415
             LABEL_GEN,
+            LABEL_OWNER,
             LABEL_PARENT,
             sanitize_label_value,
         )
         labels: Dict[str, str] = {}
+        if owner:
+            labels[LABEL_OWNER] = sanitize_label_value(owner)
         if parent:
             labels[LABEL_PARENT] = sanitize_label_value(parent)
         if gen:
@@ -580,6 +589,48 @@ def _lineage_labels() -> Optional[Dict[str, str]]:
         return labels or None
     except Exception:  # noqa: BLE001 -- lineage stamping must never block awaken
         return None
+
+
+def _record_failover_child(node_name: str, *, kind: str = "instance") -> None:
+    """Stage-4 CRITICAL-1: record-at-birth for a failover child (the
+    grandchild). When THIS process runs ON a Brain node (lineage env present),
+    every node its awaken path creates is appended to the SHARED
+    ``ResourceManifest`` -- so the grandchild is in ``live_family`` (reaped by
+    ``teardown_family``) AND carries the owner label the drift detector keys on.
+
+    Env-absent (``_lineage_labels()`` is None -> not on a labeled Brain node) ->
+    no-op (byte-identical: a plain failover run never touches the manifest).
+
+    Fail-soft: a manifest write failure MUST NOT break failover -- log +
+    continue. Same default-path env resolution ``brain_lifecycle`` uses."""
+    labels = _lineage_labels()
+    if not labels:
+        return  # not on a labeled Brain node -> byte-identical no-op
+    try:
+        from backend.core.ouroboros.governance.brain_lifecycle import (  # noqa: PLC0415
+            ResourceManifest,
+        )
+        parent = (os.environ.get("JARVIS_BRAIN_PARENT_NODE", "") or "").strip() or None
+        keeper = (os.environ.get("JARVIS_KEEPER_ID", "") or "").strip() or None
+        gen_raw = (os.environ.get("JARVIS_BRAIN_GENERATION", "") or "").strip()
+        try:
+            gen: Optional[int] = int(gen_raw) if gen_raw else None
+        except ValueError:
+            gen = None
+        ResourceManifest().record_create(
+            kind=kind, name=node_name, labels=dict(labels),
+            parent=parent, gen=gen, keeper_id=keeper,
+        )
+        logger.info(
+            "[FailoverLifecycle] record-at-birth: failover child %s recorded "
+            "into the manifest (parent=%s gen=%s keeper=%s)",
+            node_name, parent, gen, keeper,
+        )
+    except Exception as exc:  # noqa: BLE001 -- a manifest miss must NOT block failover
+        logger.warning(
+            "[FailoverLifecycle] record-at-birth failed for %s (continuing): %r",
+            node_name, exc,
+        )
 
 
 async def _default_vm_awaken_fn(*, startup_script: str) -> bool:
@@ -646,6 +697,12 @@ async def _default_vm_awaken_fn(*, startup_script: str) -> bool:
             labels=_lineage_labels(),
         )
         if ok_create:
+            # Stage-4 CRITICAL-1: record the grandchild at birth (no-op unless
+            # running on a labeled Brain node). Fail-soft -- never blocks awaken.
+            from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
+                _node_name as _failover_node_name,
+            )
+            _record_failover_child(_failover_node_name())
             logger.info(
                 "[FailoverLifecycle] awaken: %s-tier node created via native "
                 "Compute REST (%s, model=%s, gpu=%s) -- zero gcloud",
@@ -1125,6 +1182,9 @@ class FailoverLifecycleController:
             if not ok:
                 logger.warning("[FailoverLifecycle] GPU provision insert failed: %s", detail)
                 return None
+            # Stage-4 CRITICAL-1: record the grandchild at birth (no-op unless
+            # running on a labeled Brain node). Fail-soft -- never blocks awaken.
+            _record_failover_child(gpu_vm)
             # Own /32 firewall rule (crypto-namespaced -> no collision with cpu).
             if _ephemeral_fw_enabled():
                 ip = await resolve_local_public_ip()
