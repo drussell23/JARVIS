@@ -423,3 +423,60 @@ def test_ack_tombstone_failure_parks_lease_for_retry(
     assert len(warnings) == 1, (
         "exactly ONE ack-tombstone-failure warning per episode, got %d"
         % len(warnings))
+
+
+# --------------------------------------------------------------------------- #
+# (h) Task-3 carry-forward (re-review): a cumulative ack for Y must NOT
+#     purge an at-risk entry X <= Y -- the ack proves the server's ingest
+#     cursor reached Y, not that it ever RECEIVED the gap X (X was never
+#     durably journaled; if the process dies now, X is lost forever).
+#     Retention costs only a duplicate send, which server-side qualified-id
+#     dedup makes safe. The entry must keep retrying until it lands in the
+#     WAL, and then surface via pending() for replay.
+# --------------------------------------------------------------------------- #
+def test_ack_past_at_risk_entry_retains_it_until_journaled(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_BODY_WAL_PROBE_INTERVAL_S", "0")
+    wal_path = str(tmp_path / "body_wal.jsonl")
+
+    async def scenario():
+        broker = StreamEventBroker(history_maxlen=64)
+        outbound = DurableOutbound(broker, wal_path=wal_path)
+        await outbound.start()
+        try:
+            real_append = outbound._wal.append
+            fault = {"on": True}
+
+            def _flaky_append(entry):
+                if fault["on"]:
+                    raise OSError(28, "No space left on device")
+                return real_append(entry)
+
+            monkeypatch.setattr(outbound._wal, "append", _flaky_append)
+
+            e1 = broker.publish(_EVENT_TYPE, _PREFIX + "risk-0", {"i": 0})
+            await _wait_for(lambda: outbound.journal_failures == 1)
+
+            # A cumulative ack that passes e1 arrives while e1 is at risk.
+            outbound.on_ack(e1)
+            await asyncio.sleep(0.1)
+            assert outbound.journal_failures == 1, (
+                "an ack for Y must NOT purge the at-risk gap X<=Y -- the "
+                "ack cannot prove X was received")
+
+            # Fault clears -> the next journal cycle lands e1 durably.
+            fault["on"] = False
+            e2 = broker.publish(_EVENT_TYPE, _PREFIX + "risk-1", {"i": 1})
+            await _wait_for(lambda: (outbound.journal_failures == 0
+                                     and outbound.pending_count() == 2))
+            assert _pending_ids(outbound) == sorted([e1, e2]), (
+                "the retained entry must land in the WAL and surface via "
+                "pending() for replay")
+            return [e1, e2]
+        finally:
+            await outbound.stop()
+
+    ids = _run(scenario())
+    fresh = DurableOutbound(StreamEventBroker(history_maxlen=4), wal_path=wal_path)
+    assert _pending_ids(fresh) == sorted(ids), (
+        "disk truth must retain the once-at-risk entry after the fault clears")

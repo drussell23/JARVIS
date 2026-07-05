@@ -25,7 +25,9 @@ Durability honesty (review round): an append that FAILS is NEVER
 reported as pending-durable. The event moves to an in-memory at-risk
 set -- surfaced via :attr:`DurableOutbound.journal_failures` plus one
 loud warning per episode -- and is re-attempted on every subsequent
-journal cycle until it lands (or the far side acks past it). Likewise
+journal cycle until it lands (a cumulative ack past it does NOT purge
+it: the ack cannot prove the gap was received; server dedup makes the
+resulting duplicate safe). Likewise
 a failed ack tombstone keeps its lease parked for retry on later
 flushes: redelivery after a crash is SAFE downstream (server dedup);
 a silent live-acked/disk-pending split-brain is not.
@@ -222,16 +224,21 @@ class DurableOutbound:
 
         Reflects acked-in-memory IMMEDIATELY: entries whose ack tombstone
         is still in flight to disk are already excluded.
+
+        Iterates a SNAPSHOT of the pending dict (Task-3 carry-forward):
+        the ack flush pops entries from an offload THREAD, and iterating
+        the live dict here races that mutation (RuntimeError: dict
+        changed size during iteration).
         """
         self._ensure_loaded()
-        live = [(lid, entry) for lid, entry in self._pending.items()
+        live = [(lid, entry) for lid, entry in list(self._pending.items())
                 if lid not in self._ack_inflight]
         live.sort(key=lambda pair: pair[0])
         return [dict(entry.envelope_dict) for _, entry in live]
 
     def pending_count(self) -> int:
         self._ensure_loaded()
-        return sum(1 for lid in self._pending
+        return sum(1 for lid in list(self._pending)
                    if lid not in self._ack_inflight)
 
     @property
@@ -261,11 +268,16 @@ class DurableOutbound:
                 return
             if self._ack_cursor is None or acked_event_id > self._ack_cursor:
                 self._ack_cursor = acked_event_id
-            # An acked at-risk event no longer needs journaling at all.
-            for lid in [l for l in self._at_risk if l <= acked_event_id]:
-                self._at_risk.pop(lid, None)
+            # Task-3 carry-forward (re-review): at-risk entries are NOT
+            # purged by the ack cursor. The server acks its last-ingested
+            # id -- a cumulative ack for Y cannot prove it ever RECEIVED
+            # an earlier gap X (X may be exactly what the failed append
+            # lost). Retention costs only a duplicate send, which the
+            # server's qualified-id dedup absorbs; a purge here loses X
+            # forever if the process dies before it lands in the WAL.
+            # _retry_at_risk keeps re-attempting until the append lands.
             ids = sorted(
-                lid for lid in self._pending
+                lid for lid in list(self._pending)
                 if lid <= acked_event_id and lid not in self._ack_inflight)
             if not ids and not self._ack_retry:
                 return
@@ -344,10 +356,11 @@ class DurableOutbound:
             entry = self._at_risk.get(event_id)
             if entry is None:
                 continue
-            if self._ack_cursor is not None and event_id <= self._ack_cursor:
-                # The far side acked past it -- journaling is moot.
-                self._at_risk.pop(event_id, None)
-                continue
+            # Task-3 carry-forward: no ack-cursor short-circuit here -- a
+            # cumulative ack past this id does not prove the far side
+            # received it (see on_ack). Retry until the append LANDS; the
+            # journaled entry then rides pending()/WAL replay, and server
+            # dedup makes any duplicate delivery safe.
             result = await offload(self._wal.append, entry)
             if is_offload_error(result):
                 continue  # still failing -- next cycle retries again
@@ -405,7 +418,7 @@ class DurableOutbound:
                 "cleared")
 
     def _drop_oldest_pending(self) -> None:
-        live = sorted(lid for lid in self._pending
+        live = sorted(lid for lid in list(self._pending)
                       if lid not in self._ack_inflight)
         if not live:
             return
