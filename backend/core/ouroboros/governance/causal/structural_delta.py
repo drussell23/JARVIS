@@ -14,9 +14,14 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
+import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from backend.core.ouroboros.oracle import (
     CodeStructureVisitor,
@@ -319,3 +324,197 @@ def compute_file_delta(
     before = extract_symbol_set(repo, file_path, before_source)
     after = extract_symbol_set(repo, file_path, after_source)
     return diff_symbol_sets(before, after)
+
+
+# =============================================================================
+# LINEAGE (Task 2) -- durable per-source emit sequence + publish envelope.
+# =============================================================================
+
+_EMIT_SEQ_PATH_ENV = "JARVIS_CAUSAL_EMIT_SEQ_PATH"
+
+
+def _default_emit_seq_path() -> Path:
+    """<repo_root>/.jarvis/causal_emit_seq. repo_root is derived from this
+    file's location: structural_delta.py -> causal -> governance -> ouroboros
+    -> core -> backend -> <repo_root> (parents[5])."""
+    repo_root = Path(__file__).resolve().parents[5]
+    return repo_root / ".jarvis" / "causal_emit_seq"
+
+
+@dataclass(frozen=True)
+class DeltaLineage:
+    """Publish-ready provenance for one structural delta. NO source content --
+    only SHAs, a repo id, and the monotonic emit sequence.
+
+    ``merge_base`` is stamped by the caller (a Staging-1 sensor reads git);
+    Staging 0 accepts whatever it is handed.
+    """
+
+    repo: str
+    head_sha: str
+    parent_sha: str
+    merge_base: str
+    emit_seq: int
+
+
+class EmitSequence:
+    """Durable, cross-process monotonic counter -- one strictly increasing
+    Lamport sequence PER source repo.
+
+    The journal IS the state: every ``next(repo)`` appends one JSONL record
+    ``{"repo": R, "seq": N}``; ``next`` replays the journal, takes the max
+    ``seq`` seen for ``repo`` (0 if none), increments, and appends the new
+    record. Deterministic across process restarts (a fresh instance on the
+    same path resumes from the persisted max, not from memory), and repos are
+    independent (each maxes over its own records only).
+
+    Atomicity (the ``PersistentTokenBucket`` precedent): the ENTIRE
+    read-max-increment-append runs inside ONE ``flock_critical_section``
+    acquisition (the canonical ``cross_process_jsonl`` read-modify-write
+    helper -- never hand-rolled locking). An unlocked read-max followed by a
+    locked append is a cross-process TOCTOU: two racing Body processes could
+    both read the same stale max and both mint N+1. The append inside the
+    section is caller-owned direct I/O per that helper's contract -- the lock
+    is NON-reentrant, so nesting a locking helper inside would self-deadlock.
+
+    Fail-CLOSED (the ONE exception to this module's fail-soft posture): a
+    ``next`` that cannot acquire the lock -- or cannot even import the locking
+    substrate -- RAISES. A monotonic-uniqueness guarantee that cannot lock
+    must never silently hand out a possibly-duplicate seq (mirrors the
+    bucket's billing-guard posture: a guard that cannot prove its invariant
+    must never proceed).
+    """
+
+    def __init__(self, path: Optional[str] = None) -> None:
+        if path is not None:
+            resolved = Path(path)
+        else:
+            raw = (os.environ.get(_EMIT_SEQ_PATH_ENV, "") or "").strip()
+            resolved = Path(raw) if raw else _default_emit_seq_path()
+        self._path = resolved
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # fail-soft: flock_critical_section re-mkdirs on the take path
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def _durable_path(self) -> Path:
+        """The overlay-rerooted journal path (identity on plain hosts),
+        resolved at CALL time so the replay read and the locked append always
+        target the SAME file ``flock_critical_section`` locks. Fail-soft to
+        the raw path."""
+        try:
+            from backend.core.ouroboros.governance.workspace_resolver import (  # noqa: PLC0415
+                resolve_durable_path,
+            )
+
+            return Path(resolve_durable_path(self._path))
+        except Exception:  # noqa: BLE001
+            return self._path
+
+    def _max_seq_for(self, repo: str) -> int:
+        """Tolerant journal replay (WAL semantics: corrupt lines skipped).
+        Returns the max ``seq`` recorded for ``repo``, or 0 if none."""
+        journal = self._durable_path()
+        if not journal.exists():
+            return 0
+        best = 0
+        try:
+            with journal.open("r", encoding="utf-8") as fh:
+                for line_no, line in enumerate(fh, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "[EmitSequence] corrupt line %d in %s -- skipping",
+                            line_no, self._path,
+                        )
+                        continue
+                    if not isinstance(rec, dict) or rec.get("repo") != repo:
+                        continue
+                    try:
+                        seq = int(rec.get("seq"))
+                    except (TypeError, ValueError):
+                        continue
+                    if seq > best:
+                        best = seq
+        except OSError as exc:
+            logger.warning(
+                "[EmitSequence] read failed (%r) -- treating as empty", exc)
+            return 0
+        return best
+
+    def next(self, repo: str) -> int:
+        """Mint the next strictly-increasing seq for ``repo``.
+
+        The WHOLE read-max-increment-append runs under one
+        ``flock_critical_section`` acquisition (no cross-process TOCTOU -- see
+        the class docstring). Fail-CLOSED: if the locking substrate cannot be
+        imported OR the lock cannot be acquired, RAISE -- a uniqueness counter
+        must never guess. On success the new record is appended inside the
+        held section (caller-owned direct I/O -- the lock is non-reentrant).
+        """
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: PLC0415
+                flock_critical_section,
+            )
+        except Exception as exc:  # noqa: BLE001 -- fail-CLOSED, loudly
+            logger.error(
+                "[EmitSequence] locking substrate unavailable (%r) -- "
+                "REFUSING to mint (fail-closed uniqueness guard)", exc,
+            )
+            raise RuntimeError(
+                "EmitSequence: locking substrate unavailable -- cannot mint a "
+                "unique seq (fail-closed)"
+            ) from exc
+
+        with flock_critical_section(self._path) as locked:
+            if not locked:
+                logger.error(
+                    "[EmitSequence] could not acquire the emit-seq lock for "
+                    "%s -- REFUSING to mint (fail-closed: cannot prove "
+                    "monotonicity)", self._path,
+                )
+                raise RuntimeError(
+                    "EmitSequence: could not acquire lock for %s -- cannot "
+                    "guarantee a unique seq (fail-closed)" % self._path
+                )
+            new_seq = self._max_seq_for(repo) + 1
+            record = {"repo": repo, "seq": new_seq}
+            try:
+                line = json.dumps(record, default=str)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "EmitSequence: could not serialize record %r" % record
+                ) from exc
+            try:
+                journal = self._durable_path()
+                journal.parent.mkdir(parents=True, exist_ok=True)
+                with journal.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except OSError as exc:
+                logger.error(
+                    "[EmitSequence] append failed (%r) -- REFUSING (no record, "
+                    "no grant)", exc,
+                )
+                raise RuntimeError(
+                    "EmitSequence: append failed -- seq not persisted "
+                    "(fail-closed)"
+                ) from exc
+        return new_seq
+
+
+def stamp_delta(delta: StructuralDelta, lineage: DeltaLineage) -> Dict[str, Any]:
+    """The publish-ready envelope Staging 1 will ``publish_raw`` on
+    ``causal.delta.<repo>``: ``{"delta": delta.to_dict(), "lineage":
+    asdict(lineage)}``. Still NO content -- consumes the Task 1
+    content-free ``to_dict()`` verbatim."""
+    return {"delta": delta.to_dict(), "lineage": asdict(lineage)}
