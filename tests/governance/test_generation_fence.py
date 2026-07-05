@@ -16,9 +16,15 @@ Contract under proof:
   (f) organism_bus_host wiring: JARVIS_BRAIN_GENERATION set (>0) -> a fence
       is constructed with own_gen and started (and stopped in stop());
       env absent/invalid -> nothing constructed (byte-identical).
+  (g) CHOKEPOINT INTEGRATION (review Critical fix): a REAL fence trip
+      (real-bus heartbeat) sets the process-global latch, after which the
+      REAL ``ChangeEngine.execute`` refuses a tmp-file mutation with
+      ``POLICY_DENIED reason=generation_fenced`` and the REAL
+      ``AutoCommitter.commit`` skips with ``generation_fenced`` -- and an
+      unfenced (reset) engine mutates normally.
 
-(a)-(d) run against a REAL TrinityEventBus (the fence's subscribe path is
-real); TRINITY_MULTICAST_ENABLED=false suppresses the in-process UDP
+(a)-(d),(g) run against a REAL TrinityEventBus (the fence's subscribe path
+is real); TRINITY_MULTICAST_ENABLED=false suppresses the in-process UDP
 shortcut (precedent: test_trinity_bus_bridge.py::_mk_bus). Delivery waits
 poll ``bus._metrics.events_delivered`` -- incremented only AFTER every
 matching handler completed (trinity_event_bus._process_queue), so the
@@ -30,13 +36,26 @@ from __future__ import annotations
 import ast
 import asyncio
 import os
+from pathlib import Path
 from typing import Any, List
 
+import pytest
+
+import backend.core.ouroboros.governance.generation_fence as gf
 from backend.core.ouroboros.governance.generation_fence import (
     HEARTBEAT_TOPIC,
     GenerationFence,
 )
 from backend.core.trinity_event_bus import RepoType, TrinityEventBus
+
+
+@pytest.fixture(autouse=True)
+def _clean_latch():
+    """The chokepoint latch is process-global (one-way in production) --
+    every test starts and ends unfenced so a trip never leaks across tests."""
+    gf._reset_for_tests()
+    yield
+    gf._reset_for_tests()
 
 _FENCE_SOURCE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -104,6 +123,10 @@ def test_higher_gen_fences_all_four_arms_in_order_exactly_once():
                 HEARTBEAT_TOPIC, {"gen": 3}, persist=False)
             await _await_delivered(bus, 1)
             assert fence.fenced is True
+            # Arm 0 -- the process-global chokepoint latch -- is intrinsic:
+            # it fires even with all four graceful arms injected.
+            assert gf.is_fenced() is True
+            assert gf.fence_reason() == "generation_fenced"
 
             # Second higher-gen observation (distinct payload -- the bus
             # dedups identical fingerprints) MUST no-op: idempotent latch.
@@ -138,6 +161,8 @@ def test_equal_and_lower_gen_never_fence():
                 HEARTBEAT_TOPIC, {"gen": 1}, persist=False)  # lower
             await _await_delivered(bus, 2)
             assert fence.fenced is False
+            assert gf.is_fenced() is False, (
+                "equal/lower gen must never set the chokepoint latch")
             await fence.stop()
             return order
         finally:
@@ -292,5 +317,98 @@ def test_host_stays_dark_when_generation_env_absent_or_invalid(monkeypatch):
                 "env %r must not arm a fence" % (value,))
         assert _RecordingFence.instances == [], (
             "no fence may be constructed without a positive generation")
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# (g) chokepoint integration: a REAL trip denies the REAL mutation surfaces
+# --------------------------------------------------------------------------- #
+def test_real_fence_trip_denies_change_engine_and_auto_committer(
+        tmp_path, monkeypatch):
+    """The test the review demanded: after a REAL fence trip (real-bus
+    heartbeat -> arm-0 latch), the REAL ChangeEngine refuses an APPLY write
+    and the REAL AutoCommitter refuses a commit -- proving the fence
+    structurally terminates the mutation pathways for a CURRENT process,
+    mid-flight ops included (Mandate 2). Reset -> the same engine mutates
+    normally (zero behavior change unfenced)."""
+    from backend.core.ouroboros.governance.auto_committer import AutoCommitter
+    from backend.core.ouroboros.governance.change_engine import (
+        ChangeEngine,
+        ChangeRequest,
+    )
+    from backend.core.ouroboros.governance.ledger import OperationLedger
+    from backend.core.ouroboros.governance.risk_engine import (
+        ChangeType,
+        OperationProfile,
+    )
+
+    # Writes must land under tmp_path, not a leaked harness workspace.
+    monkeypatch.delenv("JARVIS_AUTO_COMMIT_WORKSPACE", raising=False)
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src" / "app.py"
+
+    def _request(op_id: str) -> ChangeRequest:
+        # SAFE_AUTO profile so an UNfenced op reaches the APPLY write
+        # (the test_change_engine_chokepoint.py construction precedent).
+        return ChangeRequest(
+            goal="generation fence chokepoint integration",
+            target_file=target,
+            proposed_content="x = 1\n",
+            profile=OperationProfile(
+                files_affected=[target],
+                change_type=ChangeType.MODIFY,
+                blast_radius=1,
+                crosses_repo_boundary=False,
+                touches_security_surface=False,
+                touches_supervisor=False,
+                test_scope_confidence=1.0,
+            ),
+            op_id=op_id,
+        )
+
+    async def scenario() -> None:
+        # 1. REAL fence trip: real bus, real subscribe path, real heartbeat.
+        bus = await _mk_bus()
+        try:
+            order: List[str] = []
+            fence = GenerationFence(bus, 1, **_recorders(order))
+            await fence.start()
+            await bus.publish_raw(HEARTBEAT_TOPIC, {"gen": 2}, persist=False)
+            await _await_delivered(bus, 1)
+            assert gf.is_fenced() is True, "the trip must set the arm-0 latch"
+            await fence.stop()
+        finally:
+            await bus.stop()
+
+        # 2. REAL ChangeEngine refuses the mutation at its chokepoint.
+        engine = ChangeEngine(
+            project_root=tmp_path,
+            ledger=OperationLedger(storage_dir=tmp_path / "ledger"),
+        )
+        res = await engine.execute(_request("op-fenced"))
+        assert res.success is False
+        assert res.error == "POLICY_DENIED reason=generation_fenced"
+        assert not target.exists(), "a fenced APPLY must never touch disk"
+
+        # 3. REAL AutoCommitter refuses at its entry -- FIRST, even before
+        #    the no_target_files / disabled guards (gate precedence pin).
+        committer = AutoCommitter(tmp_path)
+        cres = await committer.commit(
+            op_id="op-fenced", description="fenced", target_files=())
+        assert cres.committed is False
+        assert cres.skipped_reason == "generation_fenced"
+
+        # 4. Unfenced (latch reset) -> the SAME engine mutates normally.
+        gf._reset_for_tests()
+        res2 = await engine.execute(_request("op-ok"))
+        assert res2.success is True, res2.error
+        assert target.exists() and "x = 1" in target.read_text()
+        # ... and the commit gate is passed cleanly: the NEXT guard answers
+        # (env-dependent disabled/no-files), never the fence denial.
+        cres2 = await committer.commit(
+            op_id="op-ok", description="unfenced", target_files=())
+        assert cres2.skipped_reason in (
+            "auto_commit_disabled", "no_target_files")
 
     asyncio.run(scenario())

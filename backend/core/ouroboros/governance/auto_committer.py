@@ -321,6 +321,35 @@ class AutoCommitter:
 
         Returns a :class:`CommitResult`. Never raises.
         """
+        # Stage-4 GenerationFence chokepoint (split-brain defense). FAIL-CLOSED
+        # and FIRST: a process that observed a HIGHER Brain generation is a
+        # superseded twin -- its commits must never land, mid-flight ops
+        # included. Sibling gate to the one at ChangeEngine.execute (the two
+        # universal mutation chokepoints). This method's contract is "never
+        # raises", so an unreadable latch REFUSES the commit (fail-closed:
+        # cannot prove unfenced -> do not commit) instead of raising or
+        # silently proceeding.
+        _fenced = True
+        try:
+            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                generation_fence as _generation_fence,
+            )
+            _fenced = bool(_generation_fence.is_fenced())
+        except Exception:  # noqa: BLE001 -- fail-closed, never raises
+            logger.error(
+                "[GenerationFence] latch unavailable at AutoCommitter -- "
+                "refusing commit (fail-closed) op=%s", op_id, exc_info=True,
+            )
+        if _fenced:
+            logger.warning(
+                "[GenerationFence] commit DENIED at AutoCommitter "
+                "(generation_fenced) op=%s", op_id,
+            )
+            return CommitResult(
+                committed=False,
+                skipped_reason="generation_fenced",
+            )
+
         if not _ENABLED:
             return CommitResult(
                 committed=False,

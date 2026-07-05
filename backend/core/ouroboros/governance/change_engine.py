@@ -703,6 +703,31 @@ class ChangeEngine:
         """
         op_id = request.op_id or generate_operation_id(repo_origin="jarvis")
 
+        # Stage-4 GenerationFence chokepoint (split-brain defense). FAIL-CLOSED:
+        # once this process observed a HIGHER Brain generation on the bus, it is
+        # a superseded twin and MUST NOT mutate -- including ops already
+        # mid-flight past GENERATE. This is the universal mutation chokepoint
+        # (every governed disk write funnels through execute -- the anti-venom
+        # _pre_write_gate doctrine), so the single boolean here structurally
+        # terminates the APPLY pathway. Deliberately NOT wrapped in try/except:
+        # generation_fence is stdlib-only + colocated; a broken import must
+        # fail the mutation loudly, never silently proceed unfenced.
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            generation_fence as _generation_fence,
+        )
+        if _generation_fence.is_fenced():
+            logger.warning(
+                "[GenerationFence] mutation DENIED at ChangeEngine "
+                "(generation_fenced) op=%s target=%s",
+                op_id, request.target_file,
+            )
+            return ChangeResult(
+                op_id=op_id,
+                success=False,
+                phase_reached=ChangePhase.PLAN,
+                error="POLICY_DENIED reason=generation_fenced",
+            )
+
         try:
             # Phase 1: PLAN -- classify risk, record in ledger
             classification = self._risk_engine.classify(request.profile)

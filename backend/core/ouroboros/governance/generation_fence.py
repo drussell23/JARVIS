@@ -11,36 +11,49 @@ node's mutation pathways -- deterministically, pure code, no LLM.
 
 Operator Mandate 2 (verbatim): the transition "must not just set an
 ``is_fenced=True`` flag; it must structurally terminate the mutation execution
-pathways." We COMPOSE the existing, proven termination machinery rather than
-inventing a new one:
+pathways." The LOAD-BEARING terminators (review-corrected, 2026-07-04):
 
-  1. BOUNDARY ARM -- ``autonomous_workspace._arm_boundary_flags()`` (the LR-A
-     deterministic-lock force-arm of the Async Yield Matrix Sovereign Execution
-     Boundary, PRD s51.11.35 / PR #69638). It arms the flag PAIR
-     ``JARVIS_FILE_ISOLATION_ENABLED`` + ``JARVIS_EXECUTION_BOUNDARY_ENABLED``
-     in-process -- exactly the way its own regression spine arms it
-     (``tests/governance/test_deterministic_isolation_lock.py``) -- so Stage A
-     (commit denial: AutoCommit refuses the primary checkout) and Stage B
-     (file isolation: APPLY routes to a quarantine worktree, never the shared
-     tree) both read armed EVEN IF the flags were explicitly false. This is the
-     physical decoupling of the AutoCommit and APPLY pathways.
-  2. SHUTDOWN REQUEST -- ``cooperative_shutdown.request()``: the process-global
+  0. CHOKEPOINT LATCH (arm 0 -- the hard gate, set FIRST, before the graceful
+     arms): the process-global :func:`is_fenced` latch, consumed FAIL-CLOSED
+     at the two universal mutation chokepoints -- ``ChangeEngine.execute``
+     (every governed disk write funnels through it; the anti-venom
+     ``_pre_write_gate`` chokepoint doctrine) and ``AutoCommitter.commit``
+     (every autonomous commit). A fenced process therefore CANNOT complete an
+     APPLY write or a commit -- including ops already mid-flight past
+     GENERATE, the gap the flag-arm alone left open.
+  1. SHUTDOWN REQUEST -- ``cooperative_shutdown.request()``: the process-global
      wind-down signal the harness itself uses at graceful shutdown. In-flight
      coroutines yield at their next safe boundary; no new work starts.
+
+Composed defense-in-depth (real machinery, but NOT load-bearing for the
+current process in default config -- review finding Important-2):
+
+  2. BOUNDARY ARM -- ``autonomous_workspace._arm_boundary_flags()`` (the LR-A
+     deterministic-lock force-arm of the Async Yield Matrix Sovereign Execution
+     Boundary, PRD s51.11.35 / PR #69638). Arms the flag PAIR
+     ``JARVIS_FILE_ISOLATION_ENABLED`` + ``JARVIS_EXECUTION_BOUNDARY_ENABLED``
+     in-process, exactly the way its own regression spine arms it
+     (``tests/governance/test_deterministic_isolation_lock.py``). CAVEAT: the
+     Stage-B file-isolation consult is BOOT-TIME only
+     (``resolve_loop_project_root`` runs at harness config-construction), and
+     Stage-A commit denial is gated behind
+     ``JARVIS_OPERATOR_COMMIT_AUTHORITY_ENABLED`` (default false) and scopes
+     primary/main -- so on an already-booted default-config node the pair
+     hardens the NEXT boot and OCA-armed setups; arms 0-1 fence the CURRENT
+     process.
   3. CHECKPOINT CAPTURE -- ``fsm_checkpoint.capture_inflight(reason=
      "generation_fenced")``: SUSPEND every in-flight op into a signed
      checkpoint so the SUCCESSOR generation resumes the thought (Mandate 3:
      crypto/payload untouched -- only a new reason STRING flows through the
      existing signer).
-  4. IDLE TOUCH -- ``stream_heartbeat.pulse()``: best-effort beat on the
-     idle fast-path marker (the Move-2-v4 staleness watchdog input, with an
-     optional cross-process file mirror) so the idle machinery observes the
-     fence transition as fresh activity at a deterministic timestamp instead
-     of misreading the wind-down as a stall.
+  4. IDLE TOUCH -- deliberate no-op by default (Minor-4: the only simple idle
+     marker, ``stream_heartbeat.pulse()``, marks FRESH activity -- arguably
+     DELAYING idle-kill of a superseded node; the keeper reaps by manifest
+     regardless). The seam stays injectable for a future genuine surface.
 
 Each step is fail-soft INDIVIDUALLY (one failing arm never stops the others)
-but the transition is deterministic: all four are ALWAYS attempted, in order,
-exactly once per process (idempotent -- a second higher-gen observation
+but the transition is deterministic: latch first, then all four attempted, in
+order, exactly once per process (idempotent -- a second higher-gen observation
 no-ops). Structured evidence line::
 
     [GenerationFence] FENCED own_gen=%d observed_gen=%d arms=...
@@ -54,6 +67,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import threading
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -65,6 +79,48 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_TOPIC = "console.keeper_heartbeat"
 
 _FENCE_REASON = "generation_fenced"
+
+
+# --------------------------------------------------------------------------- #
+# Process-global chokepoint latch (arm 0 -- the hard gate).
+#
+# Module-level, thread-safe, ZERO asyncio dependency (the cooperative_shutdown
+# idiom): consumable from any thread/loop, including the synchronous top of
+# ChangeEngine.execute and AutoCommitter.commit. One-way in production; tests
+# reset via _reset_for_tests().
+# --------------------------------------------------------------------------- #
+_latch_lock = threading.Lock()
+_latch_fenced: bool = False
+_latch_reason: str = ""
+
+
+def _mark_fenced(reason: str = _FENCE_REASON) -> None:
+    """Set the process-global fence latch. Idempotent; first reason sticks."""
+    global _latch_fenced, _latch_reason
+    with _latch_lock:
+        if not _latch_fenced:
+            _latch_reason = str(reason or _FENCE_REASON)
+        _latch_fenced = True
+
+
+def is_fenced() -> bool:
+    """True once this process observed a higher Brain generation. Consumed
+    FAIL-CLOSED at the mutation chokepoints (ChangeEngine / AutoCommitter)."""
+    with _latch_lock:
+        return _latch_fenced
+
+
+def fence_reason() -> str:
+    with _latch_lock:
+        return _latch_reason
+
+
+def _reset_for_tests() -> None:
+    """Test hook -- clear the latch (production never unfences a process)."""
+    global _latch_fenced, _latch_reason
+    with _latch_lock:
+        _latch_fenced = False
+        _latch_reason = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -98,28 +154,33 @@ def _default_capture() -> None:
 
 
 def _default_idle_touch() -> None:
-    """Best-effort touch of the idle fast-path marker.
+    """Deliberate no-op (Minor-4, review-corrected).
 
-    ``stream_heartbeat.pulse()`` is the simple existing marker: it stamps the
-    idle/staleness watchdog input (plus the optional cross-process mirror
-    file) so the fence transition itself is the last recorded activity."""
-    from backend.core.ouroboros.governance import stream_heartbeat  # noqa: PLC0415
-    stream_heartbeat.pulse()
+    The only simple idle fast-path marker is ``stream_heartbeat.pulse()``,
+    but pulsing marks FRESH activity -- which arguably DELAYS the idle-kill
+    of a node we want gone. No existing marker accelerates idle-kill, and
+    the keeper reaps superseded nodes by manifest regardless, so the
+    truthful default is: do nothing. The ``idle_touch_fn`` seam stays
+    injectable should a genuine surface appear."""
+    return None
 
 
 class GenerationFence:
     """Subscribe to keeper heartbeats; fence on a higher observed generation.
 
-    All four action seams are injectable (tests use recorders); ``None``
-    resolves to the live default lazily AT FENCE TIME (never at construction).
+    All four graceful action seams are injectable (tests use recorders);
+    ``None`` resolves to the live default lazily AT FENCE TIME (never at
+    construction). Arm 0 -- the process-global chokepoint latch
+    (:func:`is_fenced`) -- is intrinsic, not a seam: it fires first on every
+    fence transition regardless of injected arms.
 
     Args:
         bus: the organism's ``TrinityEventBus`` (``subscribe``/``unsubscribe``).
         own_gen: THIS Brain's minted generation (``JARVIS_BRAIN_GENERATION``).
-        boundary_arm_fn: seam for step 1 (Sovereign Execution Boundary arm).
-        shutdown_fn: seam for step 2 (cooperative shutdown request).
-        capture_fn: seam for step 3 (in-flight checkpoint capture).
-        idle_touch_fn: seam for step 4 (idle fast-path marker touch).
+        boundary_arm_fn: seam for the Sovereign Execution Boundary arm.
+        shutdown_fn: seam for the cooperative shutdown request.
+        capture_fn: seam for the in-flight checkpoint capture.
+        idle_touch_fn: seam for the idle touch (default: truthful no-op).
     """
 
     def __init__(
@@ -192,8 +253,14 @@ class GenerationFence:
     async def _fence(self, observed_gen: int) -> None:
         """The deterministic ordered transition -- see the module docstring.
 
-        Each step is fail-soft individually, but ALL are attempted, in order.
+        Arm 0 (the hard gate) fires FIRST: the process-global chokepoint
+        latch, pure assignment, cannot fail. Then the four graceful arms,
+        each fail-soft individually, ALL attempted, in order.
         """
+        # Arm 0 -- the chokepoint latch. From this line on, ChangeEngine
+        # refuses every APPLY write and AutoCommitter refuses every commit
+        # in this process, mid-flight ops included.
+        _mark_fenced(_FENCE_REASON)
         steps = (
             ("boundary", self._boundary_arm_fn or _default_boundary_arm),
             ("shutdown", self._shutdown_fn or _default_shutdown),
@@ -215,11 +282,17 @@ class GenerationFence:
                 )
             results.append((name, ok))
         logger.warning(
-            "[GenerationFence] FENCED own_gen=%d observed_gen=%d arms=%s",
+            "[GenerationFence] FENCED own_gen=%d observed_gen=%d "
+            "latch=True arms=%s",
             self._own_gen,
             observed_gen,
             ",".join("%s=%s" % (n, o) for n, o in results),
         )
 
 
-__all__ = ["GenerationFence", "HEARTBEAT_TOPIC"]
+__all__ = [
+    "GenerationFence",
+    "HEARTBEAT_TOPIC",
+    "fence_reason",
+    "is_fenced",
+]
