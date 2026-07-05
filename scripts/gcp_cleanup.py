@@ -68,6 +68,36 @@ def print_info(msg: str):
     print(f"{Colors.BLUE}  ℹ {msg}{Colors.ENDC}")
 
 
+def _orphan_instance_filter() -> str:
+    """Return the gcloud --filter= predicate for orphaned JARVIS GCE instances.
+
+    Root-logic fix (A1 Brain $0 mandate): Brain VMs are labelled
+    ``jarvis-role=brain`` ONLY (see gcp_compute_rest._BRAIN_ROLE_LABEL_KEY /
+    _BRAIN_ROLE_LABEL_VALUE) -- they carry neither ``created-by=jarvis`` nor
+    ``app=jarvis``. Without the third predicate below, an orphaned Brain VM
+    (e.g. left behind by a SIGKILL'd ignition driver) was invisible to this
+    sweep. Extracted into a pure helper so the query logic is unit-testable
+    without shelling out to real gcloud.
+    """
+    try:
+        # Prefer the canonical label constants from the Compute REST client
+        # (zero hardcoding of the label value) -- import is stdlib-only and
+        # side-effect-free at module scope (see gcp_compute_rest.py docstring).
+        from backend.core.ouroboros.governance.gcp_compute_rest import (
+            _BRAIN_ROLE_LABEL_KEY,
+            _BRAIN_ROLE_LABEL_VALUE,
+        )
+
+        brain_predicate = f"labels.{_BRAIN_ROLE_LABEL_KEY}={_BRAIN_ROLE_LABEL_VALUE}"
+    except Exception:
+        # Fallback literal citing the canonical source, in case the import
+        # path is unavailable in this execution context (e.g. run as a bare
+        # script outside the repo root).
+        brain_predicate = "labels.jarvis-role=brain"  # gcp_compute_rest._BRAIN_ROLE_LABEL_KEY/_VALUE
+
+    return f"labels.created-by=jarvis OR labels.app=jarvis OR {brain_predicate}"
+
+
 @dataclass
 class GCPConfig:
     """GCP configuration from environment."""
@@ -233,7 +263,7 @@ class GCPCleanup:
                 [
                     "gcloud", "compute", "instances", "list",
                     f"--project={self.config.project_id}",
-                    "--filter=labels.created-by=jarvis OR labels.app=jarvis",
+                    f"--filter={_orphan_instance_filter()}",
                     "--format=json(name,zone,status,creationTimestamp)",
                 ],
                 capture_output=True,
