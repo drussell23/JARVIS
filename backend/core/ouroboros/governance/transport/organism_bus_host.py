@@ -34,6 +34,26 @@ logger = logging.getLogger(__name__)
 
 _ENV_OUTBOUND_TOPICS = "JARVIS_BRAIN_OUTBOUND_TOPICS"
 _DEFAULT_OUTBOUND_TOPICS = "actuation.*,telemetry.posture.*"
+_ENV_BRAIN_GENERATION = "JARVIS_BRAIN_GENERATION"
+
+
+def _brain_generation() -> int:
+    """This Brain's minted generation (Stage-4 Task 4).
+
+    ``JARVIS_BRAIN_GENERATION`` is folded onto the node by the keeper's
+    provision path (``brain_keeper.py`` extra_env -> ``brain_lifecycle.
+    brain_env_values``). Unset / blank / unparseable / <=0 -> 0 (no fence
+    -- byte-identical pre-Stage-4 behavior)."""
+    raw = (os.environ.get(_ENV_BRAIN_GENERATION) or "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "[OrganismBusHost] unparseable %s=%r -- generation fence stays "
+            "dark", _ENV_BRAIN_GENERATION, raw)
+        return 0
 
 
 def bus_host_enabled() -> bool:
@@ -74,6 +94,7 @@ class OrganismBusHost:
         self._bus: Optional[Any] = None  # DistributedEventBus (server role)
         self._bridge: Optional[Any] = None  # TrinityBusBridge
         self._intake_bridge: Optional[Any] = None  # RemoteIntakeBridge (Task 3)
+        self._generation_fence: Optional[Any] = None  # GenerationFence (Stage-4 Task 4)
         self._runner: Optional[Any] = None  # aiohttp AppRunner
         self._site: Optional[Any] = None  # aiohttp TCPSite
         self._started = False
@@ -167,6 +188,11 @@ class OrganismBusHost:
                 self._intake_bridge = RemoteIntakeBridge(
                     trinity_bus, self._router)
                 await self._intake_bridge.start()
+
+            # Stage-4 Task 4: the Brain-side ACTIVE fence. Only on nodes
+            # the keeper stamped with a generation (env absent -> byte-
+            # identical, no import).
+            await self._maybe_start_generation_fence(trinity_bus)
         except Exception as exc:  # noqa: BLE001 -- fail-soft: unwind + dark
             logger.warning(
                 "[OrganismBusHost] start failed (staying dark): %s", exc,
@@ -184,10 +210,31 @@ class OrganismBusHost:
         )
         return True
 
+    async def _maybe_start_generation_fence(self, trinity_bus: Any) -> None:
+        """Construct + start the split-brain GenerationFence (Stage-4 Task 4)
+        when ``JARVIS_BRAIN_GENERATION`` is set (>0). Env absent/invalid ->
+        nothing constructed, nothing imported (byte-identical -- the file's
+        established lazy-import-inside-guard pattern)."""
+        own_gen = _brain_generation()
+        if own_gen <= 0:
+            return
+        from backend.core.ouroboros.governance import generation_fence  # noqa: PLC0415
+
+        self._generation_fence = generation_fence.GenerationFence(
+            trinity_bus, own_gen)
+        await self._generation_fence.start()
+
     async def stop(self) -> None:
         """Unwind in reverse order. Never raises (fail-soft teardown);
         no-op on a never-started host."""
         self._started = False
+        if self._generation_fence is not None:
+            try:
+                await self._generation_fence.stop()
+            except Exception:  # noqa: BLE001
+                logger.debug("[OrganismBusHost] generation fence stop failed",
+                             exc_info=True)
+            self._generation_fence = None
         if self._intake_bridge is not None:
             try:
                 await self._intake_bridge.stop()

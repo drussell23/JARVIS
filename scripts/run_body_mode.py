@@ -258,6 +258,34 @@ class BodyModeDriver:
             return None
         return (state, self._export_current_gen())
 
+    async def _publish_keeper_heartbeat(
+        self, trinity_bus: Any, keeper_info: Optional[Tuple[str, int]],
+    ) -> None:
+        """Stage-4 Task 4 (split-brain fence, Body side): publish the keeper's
+        CURRENT generation as ``console.keeper_heartbeat`` on the local trinity
+        bus every census tick. ``console.*`` is already on the mac-side
+        TrinityBusBridge outbound allowlist (``_do_bridge``), so the beat
+        transits the WS link onto the Brain organism's bus, where a superseded
+        twin's GenerationFence observes a HIGHER gen and structurally fences
+        itself. Gen 0 (nothing ever minted) is never published -- it would say
+        nothing a fence could act on. ``persist=False``: a ~10s liveness beat
+        must not accrete in the event store WAL. Fail-soft: a bus that cannot
+        publish (or lacks publish_raw -- injected fakes) never kills the
+        census."""
+        if keeper_info is None:
+            return
+        _state, gen = keeper_info
+        if gen < 1:
+            return
+        publish_raw = getattr(trinity_bus, "publish_raw", None)
+        if publish_raw is None:
+            return
+        try:
+            await publish_raw(
+                "console.keeper_heartbeat", {"gen": int(gen)}, persist=False)
+        except Exception as exc:  # noqa: BLE001 -- fail-soft
+            _log("keeper heartbeat publish failed (fail-soft): %s" % exc)
+
     async def _do_bus_stack(self) -> Tuple[Any, Any, Any]:
         if self._bus_factory is not None:
             return await self._bus_factory()
@@ -641,13 +669,16 @@ class BodyModeDriver:
                     await asyncio.sleep(census_s)
                 connected = _connected()
                 self._update_link_state(connected)
-                self._census_tick(watchdog, connected,
-                                  await self._keeper_tick())
+                keeper_info = await self._keeper_tick()
+                await self._publish_keeper_heartbeat(trinity_bus, keeper_info)
+                self._census_tick(watchdog, connected, keeper_info)
 
             # 6. Clean stop -> summary -> exit 0.
             connected = _connected()
             self._update_link_state(connected)
-            self._census_tick(watchdog, connected, await self._keeper_tick())
+            keeper_info = await self._keeper_tick()
+            await self._publish_keeper_heartbeat(trinity_bus, keeper_info)
+            self._census_tick(watchdog, connected, keeper_info)
             return 0
         finally:
             lag_events = int(getattr(watchdog, "lag_event_count", 0)) \

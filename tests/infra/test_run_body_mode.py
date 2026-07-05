@@ -596,3 +596,87 @@ def test_keeper_factory_failure_is_fail_soft(capsys, monkeypatch):
     assert rc == 0, "a keeper that cannot be built must not kill the driver"
     assert "brain keeper unavailable (fail-soft)" in out
     assert " keeper=" not in out
+
+
+# ---------------------------------------------------------------------------
+# Stage-4 Task 4: keeper-heartbeat publish (the split-brain fence, Body side).
+# ---------------------------------------------------------------------------
+
+
+class _RecordingTrinityBus(_FakeTrinityBus):
+    """_FakeTrinityBus + a publish_raw recorder (the driver's heartbeat
+    surface)."""
+
+    def __init__(self) -> None:
+        self.published: List[Any] = []
+
+    async def publish_raw(self, topic: str, data: Any, **kwargs: Any) -> str:
+        self.published.append((topic, data, kwargs))
+        return "ev-%d" % len(self.published)
+
+
+def test_census_tick_publishes_keeper_heartbeat_with_gen(capsys, monkeypatch):
+    """Every census tick with a keeper holding gen >= 1 publishes
+    ``console.keeper_heartbeat`` carrying that gen on the LOCAL trinity bus
+    (``console.*`` is on the mac-side bridge outbound allowlist, so the beat
+    transits to the Brain organism's GenerationFence). persist=False: a ~10s
+    liveness beat must never accrete in the event-store WAL."""
+    monkeypatch.setenv("JARVIS_BRAIN_CONNECT_GATE_S", "2")
+    monkeypatch.setenv("JARVIS_BODY_MODE_CENSUS_S", "0.01")
+    monkeypatch.setenv("JARVIS_BRAIN_CURRENT_GEN", "")
+    keeper = _FakeKeeper(gen=3, state="healthy")
+    bus = _RecordingTrinityBus()
+    kwargs, ns = _seams()
+
+    async def _bus_factory():
+        return bus, _FakeBroker(), ns.dist
+
+    kwargs["bus_factory"] = _bus_factory
+    kwargs["keeper_factory"] = lambda: keeper
+    driver = bm.BodyModeDriver(duration_s=0.05, **kwargs)
+    rc = asyncio.run(driver.run())
+
+    assert rc == 0
+    assert keeper.ticks >= 1
+    assert bus.published, "the census loop must publish the keeper heartbeat"
+    for topic, data, pub_kwargs in bus.published:
+        assert topic == "console.keeper_heartbeat"
+        assert data == {"gen": 3}
+        assert pub_kwargs.get("persist") is False, (
+            "heartbeats must not persist to the event store")
+    # One heartbeat per keeper tick (the census cadence).
+    assert len(bus.published) == keeper.ticks
+
+
+def test_keeper_gen_zero_publishes_no_heartbeat(capsys, monkeypatch):
+    """Gen 0 (nothing ever minted) says nothing a fence could act on --
+    it must never be published (symmetric with the gen-filter export)."""
+    monkeypatch.setenv("JARVIS_BRAIN_CONNECT_GATE_S", "2")
+    monkeypatch.setenv("JARVIS_BODY_MODE_CENSUS_S", "0.01")
+    monkeypatch.delenv("JARVIS_BRAIN_CURRENT_GEN", raising=False)
+    keeper = _FakeKeeper(gen=0, state="healthy")
+    bus = _RecordingTrinityBus()
+    kwargs, ns = _seams()
+
+    async def _bus_factory():
+        return bus, _FakeBroker(), ns.dist
+
+    kwargs["bus_factory"] = _bus_factory
+    kwargs["keeper_factory"] = lambda: keeper
+    driver = bm.BodyModeDriver(duration_s=0.05, **kwargs)
+    rc = asyncio.run(driver.run())
+    assert rc == 0
+    assert bus.published == [], "gen 0 must never be broadcast"
+
+
+def test_keeperless_run_publishes_no_heartbeat_and_survives_plain_fake_bus(
+        capsys, monkeypatch):
+    """Keeper-less: no heartbeat. Also pins the fail-soft contract for a
+    bus without publish_raw (the pre-existing _FakeTrinityBus): the census
+    must not die on the heartbeat surface."""
+    monkeypatch.setenv("JARVIS_BRAIN_CONNECT_GATE_S", "2")
+    monkeypatch.setenv("JARVIS_BODY_MODE_CENSUS_S", "0.01")
+    kwargs, ns = _seams()  # plain _FakeTrinityBus, no keeper seam
+    driver = bm.BodyModeDriver(duration_s=0.05, **kwargs)
+    rc = asyncio.run(driver.run())
+    assert rc == 0
