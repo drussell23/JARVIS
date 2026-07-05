@@ -787,6 +787,17 @@ class BrainIgnitionDriver:
                 _NODE_TLS_DIR, _TLS_META_KEYS["server_key"][1])
             vals["JARVIS_BRAIN_WS_TLS_CA"] = "%s/%s" % (
                 _NODE_TLS_DIR, _TLS_META_KEYS["ca"][1])
+        # Opt-in provider-key fold (live-fire 2026-07-04 Stage-2 acceptance: the
+        # soak crash-looped 54x with "No API keys set" because these were never
+        # shipped). Keys travel as instance metadata (project-scoped
+        # visibility) -- the established J-Prime pattern per the relocation
+        # design's open risk #4. Opt-in so default ignitions never ship
+        # secrets.
+        if _truthy(os.environ.get("JARVIS_BRAIN_SHIP_PROVIDER_KEYS")):
+            for key in ("DOUBLEWORD_API_KEY", "ANTHROPIC_API_KEY"):
+                v = os.environ.get(key)
+                if v is not None and v != "":
+                    vals[key] = v
         return vals
 
     async def _do_discover(self) -> Optional[str]:

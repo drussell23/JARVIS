@@ -171,3 +171,37 @@ def test_brain_env_values_fold_stage2_bus_host_keys(ign, mtls_dir, monkeypatch):
     vals = driver._brain_env_values()
     assert vals["JARVIS_BRAIN_BUS_SIDECAR_ENABLED"] == "false"
     assert vals["JARVIS_BRAIN_OUTBOUND_TOPICS"] == "actuation.*,telemetry.posture.*"
+
+
+# --------------------------------------------------------------------------- #
+# (f) opt-in provider-key fold (live-fire 2026-07-04: soak crash-looped 54x
+#     with "No API keys set" -- the keys were never shipped to the node).
+# --------------------------------------------------------------------------- #
+def test_brain_env_values_provider_keys_not_folded_by_default(ign, mtls_dir, monkeypatch):
+    monkeypatch.delenv("JARVIS_BRAIN_SHIP_PROVIDER_KEYS", raising=False)
+    monkeypatch.setenv("DOUBLEWORD_API_KEY", "test-dw-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    driver = ign.BrainIgnitionDriver(dry_run=True)
+    vals = driver._brain_env_values()
+    assert "DOUBLEWORD_API_KEY" not in vals
+    assert "ANTHROPIC_API_KEY" not in vals
+
+
+def test_brain_env_values_provider_keys_folded_when_opted_in(ign, mtls_dir, monkeypatch):
+    monkeypatch.setenv("JARVIS_BRAIN_SHIP_PROVIDER_KEYS", "true")
+    monkeypatch.setenv("DOUBLEWORD_API_KEY", "test-dw-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    driver = ign.BrainIgnitionDriver(dry_run=True)
+    vals = driver._brain_env_values()
+    assert vals["DOUBLEWORD_API_KEY"] == "test-dw-key"
+    assert vals["ANTHROPIC_API_KEY"] == "test-anthropic-key"
+
+
+def test_brain_env_values_provider_keys_empty_skipped_when_opted_in(ign, mtls_dir, monkeypatch):
+    monkeypatch.setenv("JARVIS_BRAIN_SHIP_PROVIDER_KEYS", "true")
+    monkeypatch.setenv("DOUBLEWORD_API_KEY", "")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    driver = ign.BrainIgnitionDriver(dry_run=True)
+    vals = driver._brain_env_values()
+    assert "DOUBLEWORD_API_KEY" not in vals
+    assert "ANTHROPIC_API_KEY" not in vals
