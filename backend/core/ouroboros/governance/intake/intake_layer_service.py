@@ -258,6 +258,11 @@ class IntakeLayerService:
         # Slice 6 — PerformanceRegressionSensor handle for CI webhook route.
         self._performance_regression_sensor: Optional[Any] = None
         self._event_channel_server: Optional[Any] = None
+        # Stage-2 Task 2 -- organism-owned mTLS WS bus host. Populated in
+        # ``_maybe_start_organism_bus_host`` only when the
+        # JARVIS_DISTRIBUTED_BUS_ENABLED master flag is on; master-OFF the
+        # transport package is never imported (lazy import inside the guard).
+        self._organism_bus_host: Optional[Any] = None
 
     @property
     def state(self) -> IntakeServiceState:
@@ -312,6 +317,16 @@ class IntakeLayerService:
             except Exception as exc:
                 logger.warning("[IntakeLayer] EventChannelServer stop error: %s", exc)
             self._event_channel_server = None
+
+        # Stage-2 Task 2 -- stop the organism bus host (fail-soft, its own
+        # stop() never raises but guard anyway; never blocks intake stop).
+        if self._organism_bus_host is not None:
+            try:
+                await self._organism_bus_host.stop()
+                logger.info("[IntakeLayer] OrganismBusHost stopped")
+            except Exception as exc:
+                logger.warning("[IntakeLayer] OrganismBusHost stop error: %s", exc)
+            self._organism_bus_host = None
 
         # Stop reactor consumer
         if hasattr(self, "_reactor_consumer") and self._reactor_consumer is not None:
@@ -1044,6 +1059,75 @@ class IntakeLayerService:
         # activation failure is logged and the intake layer continues
         # operating in poll-only mode (same behavior as before the slice).
         await self._maybe_start_event_channel_server()
+
+        # Stage-2 Task 2 -- organism-owned mTLS WS bus host (replaces the
+        # Stage-1 standalone sidecar on Stage-2 nodes). Same fail-soft
+        # ownership style as the EventChannelServer block above.
+        await self._maybe_start_organism_bus_host()
+
+    async def _maybe_start_organism_bus_host(self) -> None:
+        """Start the ``OrganismBusHost`` when the distributed bus is on.
+
+        Stage-2 Task 2: makes the organism's own TrinityEventBus reachable
+        across hosts (Stage-0 ``DistributedEventBus`` server + Task-1
+        ``TrinityBusBridge``) without the standalone sidecar process.
+
+        Master flag ``JARVIS_DISTRIBUTED_BUS_ENABLED`` (default false):
+        the import is LAZY inside this guard, so master-OFF adds zero
+        imports to the intake hot path -- byte-identical boot. Any failure
+        (missing aiohttp, port in use, TLS material unresolvable) is logged
+        and intake continues; the cross-host bus is a reach upgrade, not a
+        correctness invariant, so failure-to-start must never take the
+        intake layer down.
+        """
+        try:
+            try:
+                from backend.core.ouroboros.governance.transport.organism_bus_host import (  # noqa: E501
+                    OrganismBusHost,
+                    bus_host_enabled,
+                )
+            except ImportError as exc:
+                logger.debug(
+                    "[IntakeLayer] OrganismBusHost skipped -- import failed: %s",
+                    exc,
+                )
+                return
+            if not bus_host_enabled():
+                logger.debug(
+                    "[IntakeLayer] OrganismBusHost skipped -- "
+                    "JARVIS_DISTRIBUTED_BUS_ENABLED is off",
+                )
+                return
+            # Task 3 (live): the host wires this router into a
+            # RemoteIntakeBridge so Body signals arriving over the bus land
+            # in the local intake pipeline. ``self._router`` is ALWAYS
+            # non-None here -- _build_components constructs it before this
+            # seam runs. Pinned by test_organism_bus_host.py::
+            # test_intake_layer_seam_passes_its_router_to_the_host so a
+            # refactor cannot silently revert to router=None (the
+            # wired-but-inert class).
+            host = OrganismBusHost(router=self._router)
+            if await host.start():
+                self._organism_bus_host = host
+                logger.info(
+                    "[IntakeLayer] OrganismBusHost activated -- organism "
+                    "trinity bus is now reachable over the distributed bus",
+                )
+            else:
+                # start() stayed dark (port 0 / plaintext refusal / failed
+                # setup already unwound) -- log at INFO so operators can see
+                # why the flag-on host did not serve.
+                logger.info(
+                    "[IntakeLayer] OrganismBusHost declined to start "
+                    "(port unset, TLS material missing, or setup failed -- "
+                    "see [OrganismBusHost] lines above)",
+                )
+        except Exception as exc:
+            # Never crash intake because the bus host failed to start.
+            logger.warning(
+                "[IntakeLayer] OrganismBusHost activation failed "
+                "(intake continues without cross-host bus): %s", exc,
+            )
 
     async def _maybe_start_event_channel_server(self) -> None:
         """Start the ``EventChannelServer`` when webhook-primary mode is on.

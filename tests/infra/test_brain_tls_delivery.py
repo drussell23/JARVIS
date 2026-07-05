@@ -162,3 +162,12 @@ def test_runtime_startup_script_writes_and_starts_bus_sidecar(ign):
     assert script.index("/etc/jarvis/tls/ca.pem") < script.index(
         "systemctl restart jarvis-brain-bus.service")
     script.encode("ascii")
+
+
+def test_brain_env_values_fold_stage2_bus_host_keys(ign, mtls_dir, monkeypatch):
+    monkeypatch.setenv("JARVIS_BRAIN_BUS_SIDECAR_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_BRAIN_OUTBOUND_TOPICS", "actuation.*,telemetry.posture.*")
+    driver = ign.BrainIgnitionDriver(dry_run=True)
+    vals = driver._brain_env_values()
+    assert vals["JARVIS_BRAIN_BUS_SIDECAR_ENABLED"] == "false"
+    assert vals["JARVIS_BRAIN_OUTBOUND_TOPICS"] == "actuation.*,telemetry.posture.*"
