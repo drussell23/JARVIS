@@ -298,3 +298,109 @@ def test_legacy_shape_no_durable_no_resolver(monkeypatch):
             await runner.cleanup()
 
     assert _run(scenario()) is True
+
+
+# --------------------------------------------------------------------------- #
+# (d) Stage-4 Task 2: PRIORITY-ordered WAL replay + send-order-cumulative
+#     trim, against a REAL localhost pair. A mixed-urgency backlog (2x
+#     IMMEDIATE / 2x STANDARD / 2x SPECULATIVE, interleaved publish order)
+#     is journaled during a partition (no server). On reconnect the server
+#     must receive the IMMEDIATE entries FIRST (arrival-order prefix) and
+#     the FULL set exactly once; the server's per-connection acks must
+#     trim the entire backlog (send-order-cumulative on the client +
+#     exact-set on the durable) -- end state pending_count()==0 via
+#     condition poll. Deliberate out-of-id-order sending (that is what
+#     priority replay IS) must not over-trim: set-equality + drain-to-0
+#     prove it live; the exact-set unit pin covers it structurally.
+# --------------------------------------------------------------------------- #
+def test_priority_replay_immediate_first_and_full_trim(tmp_path, monkeypatch):
+    from backend.core.ouroboros.governance.intake.intent_envelope import (
+        make_envelope,
+    )
+
+    monkeypatch.setenv("JARVIS_BODY_WAL_PROBE_INTERVAL_S", "0")
+    monkeypatch.setenv("JARVIS_BUS_ACK_EVERY_N", "1")
+    monkeypatch.setenv("JARVIS_BUS_ACK_INTERVAL_S", "0.2")
+    wal_path = str(tmp_path / "body_wal.jsonl")
+
+    # Interleaved publish order: STD, SPEC, IMM, STD, SPEC, IMM.
+    specs = [("std-0", "normal", "capability_gap"),
+             ("spec-0", "low", "intent_discovery"),
+             ("imm-0", "critical", "test_failure"),
+             ("std-1", "normal", "capability_gap"),
+             ("spec-1", "low", "intent_discovery"),
+             ("imm-1", "critical", "test_failure")]
+    ops = ["trinity:s4-%s" % name for name, _, _ in specs]
+
+    def _payload(name: str, urgency: str, source: str) -> Dict[str, Any]:
+        env = make_envelope(
+            source=source,
+            description="stage4 task2 live fixture %s" % name,
+            target_files=("README.md",),
+            repo="jarvis",
+            confidence=0.9,
+            urgency=urgency,
+            evidence={"signature": "s4t2-%s" % name},
+            requires_human_ack=False,
+        )
+        return {"topic": "intake.remote_signal.body",
+                "data": env.to_dict(),
+                "origin": "mac-body"}
+
+    async def scenario():
+        port = _free_port()
+        server_cfg = _cfg(monkeypatch, port, "server")
+        client_cfg = _cfg(monkeypatch, port, "client")
+
+        client_broker = StreamEventBroker(history_maxlen=64)
+        server_broker = StreamEventBroker(history_maxlen=64)
+        durable = DurableOutbound(client_broker, wal_path=wal_path)
+        await durable.start()
+
+        # Journal the whole mixed-urgency backlog while NO server exists.
+        for (name, urgency, source), op in zip(specs, ops):
+            eid = client_broker.publish(
+                "task_started", op, _payload(name, urgency, source))
+            assert eid
+        await _wait_for(lambda: durable.pending_count() == 6)
+
+        runner = await _start_server(server_broker, server_cfg, port)
+        client_bus = DistributedEventBus(
+            client_broker, client_cfg, role="client", durable_outbound=durable)
+        url = "ws://127.0.0.1:%d%s" % (port, client_cfg.path)
+        task = asyncio.ensure_future(client_bus.start_client(url))
+        try:
+            await _await_connected(client_bus)
+
+            op_set = set(ops)
+
+            def _arrivals() -> List[str]:
+                return [ev.op_id
+                        for ev in server_broker.recent_history(limit=200)
+                        if ev.op_id in op_set]
+
+            await _wait_for(lambda: len(set(_arrivals())) == 6)
+            await asyncio.sleep(0.6)  # settle: let any duplicate land
+            arrivals = _arrivals()
+
+            # Send-order-cumulative acks must drain the WHOLE backlog --
+            # including the numerically-lowest ids that were sent LAST.
+            await _wait_for(lambda: durable.pending_count() == 0)
+        finally:
+            await _stop_client(client_bus, task)
+            await durable.stop()
+            await runner.cleanup()
+        return arrivals
+
+    arrivals = _run(scenario())
+    # Full set-equality, exactly once each.
+    assert sorted(arrivals) == sorted(ops), (
+        "server must hold ALL 6 exactly once, got %r" % (arrivals,))
+    # IMMEDIATE entries arrive FIRST, id-ordered within the class; then
+    # STANDARD, then SPECULATIVE (the (urgency_rank, event_id) sort).
+    want_order = ["trinity:s4-imm-0", "trinity:s4-imm-1",
+                  "trinity:s4-std-0", "trinity:s4-std-1",
+                  "trinity:s4-spec-0", "trinity:s4-spec-1"]
+    assert arrivals == want_order, (
+        "priority replay must deliver IMMEDIATE first: got %r want %r"
+        % (arrivals, want_order))

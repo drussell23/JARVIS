@@ -13,10 +13,21 @@ bounded history ring (512 default) is merely a hot cache.
 
 Trim is ack-driven: Task 1 armed the ack lane (``BusBridgeClient``'s
 ``on_ack`` constructor kwarg); wiring that callback to
-:meth:`DurableOutbound.on_ack` tombstones every journaled entry with
-``lease_id <= acked_event_id`` (event ids are zero-padded 012x hex, so
-plain string comparison is correct) and compacts the file every
-``JARVIS_BODY_WAL_COMPACT_EVERY_N`` acks.
+:meth:`DurableOutbound.on_ack` tombstones journaled entries and compacts
+the file every ``JARVIS_BODY_WAL_COMPACT_EVERY_N`` acks.
+
+Stage-4 Task 2 -- EXACT-SET trim + priority replay. Replay is now
+PRIORITY-ordered (:meth:`pending_prioritized` /
+``pending(order="priority")``, sorted by ``(urgency_rank, event_id)``
+with ranks imported from the UrgencyRouter vocabulary -- never
+re-declared here), which breaks the Stage-3 id-order assumption that
+made a cumulative ``lease_id <= acked_event_id`` sweep correct: an ack
+for a high IMMEDIATE id sent FIRST must not sweep numerically-lower ids
+that were never sent. :meth:`on_ack` therefore trims EXACTLY the acked
+id (idempotent against replays of the same id); cumulation moved to the
+CLIENT, whose send-order-cumulative ``_apply_ack`` fires ``on_ack`` once
+per confirmed id in send order. This also retires the Stage-3 strand
+class where an ack racing an offloaded append could sweep unsent ids.
 
 Durability heavy-lifting is the intake WAL, reused verbatim (operator
 DRY mandate): flock-serialized append per line (fsync happens on
@@ -65,15 +76,101 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from backend.core.ouroboros.governance.background_agent_pool import (
+    _ROUTE_PRIORITY,
+)
 from backend.core.ouroboros.governance.cooperative_fs_io import (
     is_offload_error,
     offload,
 )
 from backend.core.ouroboros.governance.intake.wal import WAL, WALEntry
+from backend.core.ouroboros.governance.urgency_router import (
+    ProviderRoute,
+    _BACKGROUND_SOURCES,
+    _BACKGROUND_URGENCIES,
+    _IMMEDIATE_SOURCES,
+    _IMMEDIATE_URGENCIES,
+    _SPECULATIVE_SOURCES,
+)
 
 logger = logging.getLogger(__name__)
 
 _HEX_DIGITS = frozenset("0123456789abcdef")
+
+# ---------------------------------------------------------------------------
+# Stage-4 Task 2: urgency -> replay rank, derived ENTIRELY from the
+# UrgencyRouter vocabulary (operator mandate: no re-declared rank table).
+# The priority ints come from the pool's canonical _ROUTE_PRIORITY map
+# (IMMEDIATE=1 ... SPECULATIVE=7, keyed by ProviderRoute values); the
+# urgency/source affinity sets are the router's own frozensets.
+# ---------------------------------------------------------------------------
+
+_STANDARD_RANK = _ROUTE_PRIORITY[ProviderRoute.STANDARD.value]
+
+
+def _route_rank(route: ProviderRoute) -> int:
+    """Priority int for a route, from the imported canonical table.
+    Routes absent from the table (INFORMATIONAL / WIRING_VALIDATION)
+    rank STANDARD -- the default cascade."""
+    return _ROUTE_PRIORITY.get(route.value, _STANDARD_RANK)
+
+
+def urgency_rank(envelope_dict: Dict[str, Any]) -> int:
+    """Replay rank for a journaled WAL entry's StreamEvent dict.
+
+    Trinity-bridged intake signals carry the IntentEnvelope at
+    ``envelope_dict["payload"]["data"]`` (RemoteIntakeSubmitter publishes
+    ``envelope.to_dict()`` as the TrinityEvent payload;
+    ``TrinityBusBridge._on_outbound`` wraps it as
+    ``{"topic": ..., "data": <envelope dict>, "origin": ...}``). The
+    envelope's ``urgency`` (critical/high/normal/low) plus ``source``
+    map onto the UrgencyRouter's Priority 1-3 matrix (the deterministic
+    subset a WAL entry can know -- complexity/file-count classification
+    needs the live ROUTE phase and is unavailable here):
+
+      * urgency in _IMMEDIATE_URGENCIES            -> IMMEDIATE
+      * urgency == "high" + source immediate-class -> IMMEDIATE
+      * source speculative-class + low/normal      -> SPECULATIVE
+      * low urgency + source background-class      -> BACKGROUND
+      * everything else / missing / garbage        -> STANDARD
+
+    Tolerant by mandate: any shape violation ranks STANDARD. NEVER
+    raises. Lower rank replays first.
+    """
+    try:
+        payload = envelope_dict.get("payload") if isinstance(
+            envelope_dict, dict) else None
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return _STANDARD_RANK
+        urgency_raw = data.get("urgency")
+        source_raw = data.get("source")
+        urgency = urgency_raw.strip().lower() if isinstance(
+            urgency_raw, str) else ""
+        source = source_raw.strip().lower() if isinstance(
+            source_raw, str) else ""
+        if urgency in _IMMEDIATE_URGENCIES:
+            return _route_rank(ProviderRoute.IMMEDIATE)
+        if urgency == "high" and source in _IMMEDIATE_SOURCES:
+            return _route_rank(ProviderRoute.IMMEDIATE)
+        if source in _SPECULATIVE_SOURCES and urgency in ("low", "normal"):
+            return _route_rank(ProviderRoute.SPECULATIVE)
+        if urgency in _BACKGROUND_URGENCIES and source in _BACKGROUND_SOURCES:
+            return _route_rank(ProviderRoute.BACKGROUND)
+        return _STANDARD_RANK
+    except Exception:  # noqa: BLE001 -- shape tolerance is the contract
+        return _STANDARD_RANK
+
+
+def _sorted_priority_envelopes(
+    snapshot: List[Tuple[str, WALEntry]],
+) -> List[Dict[str, Any]]:
+    """Sync sort worker for :meth:`DurableOutbound.pending_prioritized`
+    -- ALWAYS dispatched off-loop via ``offload`` (operator mandate: no
+    blocking sort of a large backlog on the event loop)."""
+    snapshot.sort(
+        key=lambda pair: (urgency_rank(pair[1].envelope_dict), pair[0]))
+    return [dict(entry.envelope_dict) for _, entry in snapshot]
 
 
 def _repo_root() -> Path:
@@ -294,8 +391,11 @@ class DurableOutbound:
 
     # --- public read surface -------------------------------------------------
 
-    def pending(self) -> List[Dict[str, Any]]:
-        """Pending envelopes ordered by event_id (monotonic hex).
+    def pending(self, order: str = "id") -> List[Dict[str, Any]]:
+        """Pending envelopes, ordered by event_id (monotonic hex) by
+        default. ``order="priority"`` (Stage-4 Task 2) sorts by
+        ``(urgency_rank(entry), event_id)`` instead -- IMMEDIATE-class
+        entries first, id-ordered within each class.
 
         Reflects acked-in-memory IMMEDIATELY: entries whose ack tombstone
         is still in flight to disk are already excluded.
@@ -304,12 +404,47 @@ class DurableOutbound:
         the ack flush pops entries from an offload THREAD, and iterating
         the live dict here races that mutation (RuntimeError: dict
         changed size during iteration).
+
+        SYNC api -- legacy callers unchanged. Async callers replaying a
+        large backlog should use :meth:`pending_prioritized`, which
+        computes the sort off-loop.
         """
         self._ensure_loaded()
         live = [(lid, entry) for lid, entry in list(self._pending.items())
                 if lid not in self._ack_inflight]
+        if order == "priority":
+            return _sorted_priority_envelopes(live)
         live.sort(key=lambda pair: pair[0])
         return [dict(entry.envelope_dict) for _, entry in live]
+
+    async def pending_prioritized(self) -> List[Dict[str, Any]]:
+        """Priority-ordered pending snapshot with the sort computed
+        OFF-LOOP (Stage-4 Task 2 operator mandate: ``_replay_durable``
+        is async and must never block the event loop sorting a large
+        backlog). The snapshot itself is a cheap on-loop list copy; the
+        ``(urgency_rank, event_id)`` sort + envelope materialization run
+        through the offload substrate. A broken offload fails soft to
+        the legacy id-ordered snapshot (same cost class as the sync
+        :meth:`pending` every legacy caller already pays)."""
+        if not self._loaded:
+            self._loaded = True
+            entries = await offload(self._wal.pending_entries)
+            if is_offload_error(entries):
+                logger.debug(
+                    "[DurableOutbound] WAL recovery read failed: %s", entries)
+            else:
+                for entry in entries:
+                    self._pending.setdefault(entry.lease_id, entry)
+        snapshot = [(lid, entry) for lid, entry in list(self._pending.items())
+                    if lid not in self._ack_inflight]
+        result = await offload(_sorted_priority_envelopes, snapshot)
+        if is_offload_error(result):
+            logger.debug(
+                "[DurableOutbound] offloaded priority sort failed: %s -- "
+                "falling back to id order", result)
+            snapshot.sort(key=lambda pair: pair[0])
+            return [dict(entry.envelope_dict) for _, entry in snapshot]
+        return result
 
     def pending_count(self) -> int:
         self._ensure_loaded()
@@ -330,30 +465,43 @@ class DurableOutbound:
     # --- ack lane (Task-1 hook target) ---------------------------------------
 
     def on_ack(self, acked_event_id: str) -> None:
-        """Cumulative-cursor trim. Cheap + non-blocking -- safe to call
-        straight from BusBridgeClient's inbound loop.
+        """EXACT-SET trim (Stage-4 Task 2). Cheap + non-blocking -- safe
+        to call straight from BusBridgeClient's inbound loop.
 
-        Marks every pending entry with ``lease_id <= acked_event_id``
-        acked in memory immediately, then fires the disk tombstone work
-        through the offload substrate (fail-soft, fire-and-forget).
-        Never raises.
+        Trims EXACTLY ``acked_event_id`` -- never a ``<=`` sweep. Replay
+        is priority-ordered now, so an ack for a high IMMEDIATE id sent
+        FIRST proves nothing about numerically-lower ids that may never
+        have been sent (the Stage-3 over-trim strand class; it also
+        covered an ack racing an offloaded append). Cumulation is the
+        CLIENT's job: its send-order-cumulative ``_apply_ack`` calls
+        this once per confirmed id, in send order.
+
+        Idempotent against replays of the same id (already trimmed /
+        already in-flight -> no-op, modulo draining any parked ack
+        retries). Marks the entry acked in memory immediately, then
+        fires the disk tombstone work through the offload substrate
+        (fail-soft, fire-and-forget). Never raises.
         """
         try:
             if not acked_event_id:
                 return
+            # Observability cursor: highest id ever exact-acked. No longer
+            # a cumulative sweep boundary -- see _journal_event for why the
+            # <= duplicate-guard there remains sound (broker ids are
+            # strictly monotonic within a lifetime).
             if self._ack_cursor is None or acked_event_id > self._ack_cursor:
                 self._ack_cursor = acked_event_id
-            # Task-3 carry-forward (re-review): at-risk entries are NOT
-            # purged by the ack cursor. The server acks its last-ingested
-            # id -- a cumulative ack for Y cannot prove it ever RECEIVED
-            # an earlier gap X (X may be exactly what the failed append
-            # lost). Retention costs only a duplicate send, which the
-            # server's qualified-id dedup absorbs; a purge here loses X
-            # forever if the process dies before it lands in the WAL.
-            # _retry_at_risk keeps re-attempting until the append lands.
-            ids = sorted(
-                lid for lid in list(self._pending)
-                if lid <= acked_event_id and lid not in self._ack_inflight)
+            # Task-3 carry-forward (re-review): an at-risk entry (failed
+            # append, memory-only) is NOT purged by its ack -- the ack
+            # proves the server INGESTED the live send, not that the entry
+            # is durably journaled; purging it here loses it forever if
+            # the process dies before the append lands. _retry_at_risk
+            # keeps re-attempting; the eventual duplicate delivery is
+            # absorbed by server-side qualified-id dedup.
+            ids: List[str] = []
+            if (acked_event_id in self._pending
+                    and acked_event_id not in self._ack_inflight):
+                ids.append(acked_event_id)
             if not ids and not self._ack_retry:
                 return
             self._ack_inflight.update(ids)
@@ -408,7 +556,13 @@ class DurableOutbound:
                 or event_id in self._at_risk):
             return
         if self._ack_cursor is not None and event_id <= self._ack_cursor:
-            return  # the far side already acked past this id
+            # Duplicate guard, still sound under exact-set acks (Stage-4
+            # Task 2): broker ids are strictly monotonic within a
+            # lifetime and _consume sees publishes in id order, so any
+            # id at-or-below the highest EXACT-acked id can only be a
+            # replay of a publish this journal already processed --
+            # never a fresh event.
+            return
         await self._enforce_capacity()
         # Bounded at-risk retry: each journal cycle re-attempts every
         # previously-failed append exactly once (review CRITICAL).

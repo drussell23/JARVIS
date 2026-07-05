@@ -39,6 +39,8 @@ Env knobs (all resolved at call time -- zero baked assumptions):
     JARVIS_BRAIN_WS_*               Stage-0 transport client family
     JARVIS_BRAIN_MTLS_DIR           client mTLS material (Stage-1 conventions)
     JARVIS_BODY_WAL_*               DurableOutbound family (durable_outbound.py)
+    JARVIS_BRAIN_RESURRECT_*        BrainKeeper family (brain_keeper.py, Stage-4)
+    JARVIS_KEEPER_ID                keeper identity (default mac-body-keeper)
 
 Usage::
 
@@ -120,6 +122,9 @@ class BodyModeDriver:
         sensor_factory     -> ``(shim) -> Optional[sensor]`` (fail-soft)
         watchdog_factory   -> ``() -> ControlPlaneWatchdog``
         durable_factory    -> ``(broker) -> DurableOutbound`` (Stage-3 WAL)
+        keeper_factory     -> ``() -> BrainKeeper`` (Stage-4 resurrection;
+                              live default arms the real keeper with
+                              provision_brain imported IN-PROCESS)
     """
 
     def __init__(
@@ -129,6 +134,10 @@ class BodyModeDriver:
         duration_s: Optional[float] = None,
         dry_run: bool = False,
         require_brain: bool = False,
+        # Stage-4 IMPORTANT-3: keeper master. None -> consult
+        # JARVIS_BRAIN_KEEPER_ENABLED (default false); True -> force on
+        # (--keeper); False -> force off (--no-keeper, wins over everything).
+        keeper_mode: Optional[bool] = None,
         # Injectable seams (live defaults resolved lazily inside run()).
         discover_fn: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
         bus_factory: Optional[Callable[[], Awaitable[Tuple[Any, Any, Any]]]] = None,
@@ -137,11 +146,13 @@ class BodyModeDriver:
         sensor_factory: Optional[Callable[[Any], Any]] = None,
         watchdog_factory: Optional[Callable[[], Any]] = None,
         durable_factory: Optional[Callable[[Any], Any]] = None,
+        keeper_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.inject_test_signals = max(0, int(inject_test_signals))
         self.duration_s = duration_s
         self.dry_run = dry_run
         self.require_brain = require_brain
+        self.keeper_mode = keeper_mode
 
         self._discover = discover_fn
         self._bus_factory = bus_factory
@@ -150,11 +161,15 @@ class BodyModeDriver:
         self._sensor_factory = sensor_factory
         self._watchdog_factory = watchdog_factory
         self._durable_factory = durable_factory
+        self._keeper_factory = keeper_factory
 
         self._signals_sent = 0
         self._worst_lag_ms = 0.0
         self._durable: Optional[Any] = None
         self._durable_built = False
+        # Stage-4 Task 3: the Brain KEEPER (sustained-absence resurrection).
+        self._keeper: Optional[Any] = None
+        self._exported_gen: Optional[int] = None
         # Deterministic degrade surfacing (operator mandate): the link
         # state derives ONLY from the client's `connected` property.
         # None = not yet observed; edge transitions log exactly once.
@@ -163,12 +178,139 @@ class BodyModeDriver:
     # -- lazy live default resolvers ---------------------------------------
 
     async def _do_discover(self) -> Optional[str]:
+        """Discovery seam, WRAPPED so every result also feeds the keeper
+        (Stage-4 Task 3): the initial discovery, every url_resolver
+        reconnect re-race, and the keeper's own confirmation probe all
+        flow through here -- one honest wiring, no second census path."""
         if self._discover is not None:
-            return await self._discover()
-        from backend.core.ouroboros.governance.brain_discovery import (  # noqa: PLC0415
-            discover_brain_endpoint,
-        )
-        return await discover_brain_endpoint()
+            url = await self._discover()
+        else:
+            from backend.core.ouroboros.governance.brain_discovery import (  # noqa: PLC0415
+                discover_brain_endpoint,
+            )
+            url = await discover_brain_endpoint()
+        if self._keeper is not None:
+            try:
+                self._keeper.note_discovery_result(url)
+            except Exception:  # noqa: BLE001 -- keeper feed is fail-soft
+                pass
+        return url
+
+    def _keeper_enabled(self) -> bool:
+        """Stage-4 IMPORTANT-3 master resolution. ``--no-keeper`` (keeper_mode
+        False) wins over everything; ``--keeper`` (True) forces on; None ->
+        consult ``JARVIS_BRAIN_KEEPER_ENABLED`` (default FALSE -- SAFE default:
+        the drill / live runs opt in explicitly, pre-Stage-4 degrade-and-wait
+        is byte-identical)."""
+        if self.keeper_mode is False:
+            return False
+        if self.keeper_mode is True:
+            return True
+        return (os.environ.get("JARVIS_BRAIN_KEEPER_ENABLED", "false")
+                or "").strip().lower() in ("1", "true", "yes", "on")
+
+    def _do_keeper(self) -> Optional[Any]:
+        """Resolve the Brain-keeper seam (Stage-4 Task 3).
+
+        Live default (no injected bus stack) ARMS the keeper:
+        ``provision_fn`` is ``brain_lifecycle.provision_brain`` imported
+        IN-PROCESS (the resource ledger and the provisioner share one
+        process -- never a shell-out per resurrect), the manifest is the
+        live ``ResourceManifest``, and the bucket is the persistent
+        flock-journaled ``PersistentTokenBucket``. An injected bus stack
+        WITHOUT a keeper seam stays keeper-less (the ``_build_durable``
+        precedent: injected-seam tests must never touch the real repo
+        ledger). Fail-soft: a keeper that cannot be built degrades to
+        the keeper-less census rather than killing the driver."""
+        # Stage-4 IMPORTANT-3: --no-keeper wins over an injected factory too.
+        if self.keeper_mode is False:
+            _log("brain keeper disabled (--no-keeper)")
+            return None
+        if self._keeper_factory is not None:
+            try:
+                return self._keeper_factory()
+            except Exception as exc:  # noqa: BLE001
+                _log("brain keeper unavailable (fail-soft): %s" % exc)
+                return None
+        if self._bus_factory is not None:
+            return None
+        if not self._keeper_enabled():
+            _log("brain keeper disabled (JARVIS_BRAIN_KEEPER_ENABLED=false) "
+                 "-- pre-Stage-4 degrade-and-wait")
+            return None
+        try:
+            from backend.core.ouroboros.governance import brain_lifecycle  # noqa: PLC0415
+            from backend.core.ouroboros.governance.brain_keeper import (  # noqa: PLC0415
+                BrainKeeper,
+                PersistentTokenBucket,
+            )
+            return BrainKeeper(
+                discover_fn=self._do_discover,
+                provision_fn=brain_lifecycle.provision_brain,
+                manifest=brain_lifecycle.ResourceManifest(),
+                bucket=PersistentTokenBucket(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log("brain keeper unavailable (fail-soft): %s" % exc)
+            return None
+
+    def _export_current_gen(self) -> int:
+        """Export ``JARVIS_BRAIN_CURRENT_GEN`` for the discovery gen-filter
+        (set at keeper construction + refreshed after each tick, which
+        covers every resurrection). Gen 0 (no generation ever minted) is
+        NOT exported -- exporting it would arm the filter and exclude a
+        pre-Stage-4 unlabeled Brain before this keeper has minted
+        anything. Returns the current gen (0 on any failure)."""
+        if self._keeper is None:
+            return 0
+        try:
+            gen = int(self._keeper.current_gen())
+        except Exception:  # noqa: BLE001 -- fail-soft
+            return self._exported_gen or 0
+        if gen >= 1 and gen != self._exported_gen:
+            os.environ["JARVIS_BRAIN_CURRENT_GEN"] = str(gen)
+            self._exported_gen = gen
+        return gen
+
+    async def _keeper_tick(self) -> Optional[Tuple[str, int]]:
+        """One keeper advance per census tick -> ``(state, gen)`` for the
+        census line, or None (keeper-less / failed tick). Fail-soft."""
+        if self._keeper is None:
+            return None
+        try:
+            state = str(await self._keeper.tick())
+        except Exception as exc:  # noqa: BLE001
+            _log("keeper tick failed (fail-soft): %s" % exc)
+            return None
+        return (state, self._export_current_gen())
+
+    async def _publish_keeper_heartbeat(
+        self, trinity_bus: Any, keeper_info: Optional[Tuple[str, int]],
+    ) -> None:
+        """Stage-4 Task 4 (split-brain fence, Body side): publish the keeper's
+        CURRENT generation as ``console.keeper_heartbeat`` on the local trinity
+        bus every census tick. ``console.*`` is already on the mac-side
+        TrinityBusBridge outbound allowlist (``_do_bridge``), so the beat
+        transits the WS link onto the Brain organism's bus, where a superseded
+        twin's GenerationFence observes a HIGHER gen and structurally fences
+        itself. Gen 0 (nothing ever minted) is never published -- it would say
+        nothing a fence could act on. ``persist=False``: a ~10s liveness beat
+        must not accrete in the event store WAL. Fail-soft: a bus that cannot
+        publish (or lacks publish_raw -- injected fakes) never kills the
+        census."""
+        if keeper_info is None:
+            return
+        _state, gen = keeper_info
+        if gen < 1:
+            return
+        publish_raw = getattr(trinity_bus, "publish_raw", None)
+        if publish_raw is None:
+            return
+        try:
+            await publish_raw(
+                "console.keeper_heartbeat", {"gen": int(gen)}, persist=False)
+        except Exception as exc:  # noqa: BLE001 -- fail-soft
+            _log("keeper heartbeat publish failed (fail-soft): %s" % exc)
 
     async def _do_bus_stack(self) -> Tuple[Any, Any, Any]:
         if self._bus_factory is not None:
@@ -412,7 +554,8 @@ class BodyModeDriver:
             _log("Brain offline -- %d signals queued (durable)"
                  % self._queued())
 
-    def _census_tick(self, watchdog: Any, connected: bool) -> None:
+    def _census_tick(self, watchdog: Any, connected: bool,
+                     keeper_info: Optional[Tuple[str, int]] = None) -> None:
         lag_events = int(getattr(watchdog, "lag_event_count", 0))
         try:
             records = watchdog.recent_lag_records()
@@ -421,8 +564,13 @@ class BodyModeDriver:
         for r in records:
             self._worst_lag_ms = max(
                 self._worst_lag_ms, float(getattr(r, "lag_ms", 0.0)))
-        _log("lag_events=%d worst_ms=%.1f connected=%s queued=%d"
-             % (lag_events, self._worst_lag_ms, connected, self._queued()))
+        keeper_part = ""
+        if keeper_info is not None:
+            state, gen = keeper_info
+            keeper_part = " gen=%d keeper=%s" % (gen, state)
+        _log("lag_events=%d worst_ms=%.1f connected=%s queued=%d%s"
+             % (lag_events, self._worst_lag_ms, connected, self._queued(),
+                keeper_part))
 
     # -- the run FSM ---------------------------------------------------------
 
@@ -435,6 +583,13 @@ class BodyModeDriver:
                  "run the starvation census -- no network touched"
                  % self.inject_test_signals)
             return 0
+
+        # 0. Brain KEEPER (Stage-4 Task 3) -- built BEFORE the first
+        #    discovery so the initial result already feeds its absence
+        #    window, and the discovery gen-filter env is exported from
+        #    the persisted manifest at construction.
+        self._keeper = self._do_keeper()
+        self._export_current_gen()
 
         # 1. DISCOVER (stateless; fail-soft returns None). With the
         #    durable WAL armed (Stage 3), discovery failure DEGRADES
@@ -540,12 +695,16 @@ class BodyModeDriver:
                     await asyncio.sleep(census_s)
                 connected = _connected()
                 self._update_link_state(connected)
-                self._census_tick(watchdog, connected)
+                keeper_info = await self._keeper_tick()
+                await self._publish_keeper_heartbeat(trinity_bus, keeper_info)
+                self._census_tick(watchdog, connected, keeper_info)
 
             # 6. Clean stop -> summary -> exit 0.
             connected = _connected()
             self._update_link_state(connected)
-            self._census_tick(watchdog, connected)
+            keeper_info = await self._keeper_tick()
+            await self._publish_keeper_heartbeat(trinity_bus, keeper_info)
+            self._census_tick(watchdog, connected, keeper_info)
             return 0
         finally:
             lag_events = int(getattr(watchdog, "lag_event_count", 0)) \
@@ -615,6 +774,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true",
         help="Print the Body-mode plan and exit -- touches no network.",
     )
+    # Stage-4 IMPORTANT-3: keeper master flag overrides. dest defaults to None
+    # (neither given -> consult JARVIS_BRAIN_KEEPER_ENABLED, default false).
+    p.add_argument(
+        "--keeper", dest="keeper", action="store_true", default=None,
+        help="Force-arm the Brain KEEPER (overrides "
+             "JARVIS_BRAIN_KEEPER_ENABLED). Default: consult the env flag "
+             "(off).",
+    )
+    p.add_argument(
+        "--no-keeper", dest="keeper", action="store_false",
+        help="Force the keeper OFF (wins over env + --keeper): pre-Stage-4 "
+             "degrade-and-wait behavior.",
+    )
     return p
 
 
@@ -626,6 +798,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         duration_s=args.duration_s,
         dry_run=args.dry_run,
         require_brain=args.require_brain,
+        keeper_mode=args.keeper,
     )
     try:
         return asyncio.run(driver.run())

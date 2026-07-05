@@ -138,6 +138,74 @@ def build_brain_server_ssl_context(cfg: Optional[Any] = None) -> Optional[Any]:
 
 
 # ---------------------------------------------------------------------------
+# Generation filter (Stage-4 Task 3).
+# ---------------------------------------------------------------------------
+
+_ENV_CURRENT_GEN = "JARVIS_BRAIN_CURRENT_GEN"
+
+
+def _current_gen_floor() -> int:
+    """The keeper-exported generation floor, or 0 when the filter is inactive.
+
+    BACKWARD COMPAT (load-bearing): unset / empty / malformed / non-positive
+    values all resolve to 0 = ZERO behavior change -- discovery stays exactly
+    the pre-Stage-4 role-label-only path."""
+    raw = (os.environ.get(_ENV_CURRENT_GEN, "") or "").strip()
+    if not raw:
+        return 0
+    try:
+        val = int(raw)
+    except ValueError:
+        return 0
+    return val if val > 0 else 0
+
+
+def _filter_stale_generations(
+    instances: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Exclude candidates from generations OLDER than the keeper's current one,
+    BEFORE any probe is attempted.
+
+    When ``JARVIS_BRAIN_CURRENT_GEN`` is set (the Body driver exports it from
+    ``BrainKeeper.current_gen()``), a role-labelled instance whose
+    ``jarvis-brain-gen`` label is < current is a superseded generation --
+    never probed, never raced. An instance LACKING the gen label is excluded
+    too: an unlabeled brain is pre-Stage-4 = obsolete by definition when a
+    gen'd keeper runs (it predates the ownership substrate, so the keeper
+    cannot reason about it). Equal/higher generations pass through.
+
+    Fail-soft: with the env unset (or the lineage constants unimportable) the
+    input list is returned unchanged -- zero behavior change."""
+    floor = _current_gen_floor()
+    if floor <= 0:
+        return list(instances or [])
+    try:
+        from backend.core.ouroboros.governance.brain_lifecycle import (  # noqa: PLC0415
+            LABEL_GEN,
+        )
+    except Exception as exc:  # noqa: BLE001 -- fail-soft: no filter, no break
+        logger.debug("[BrainDiscovery] gen filter unavailable err=%r", exc)
+        return list(instances or [])
+    out: List[Dict[str, Any]] = []
+    for inst in instances or []:
+        raw_gen: Any = None
+        try:
+            raw_gen = (inst.get("labels") or {}).get(LABEL_GEN)
+            gen: Optional[int] = int(str(raw_gen).strip())
+        except (TypeError, ValueError, AttributeError):
+            gen = None
+        if gen is None or gen < floor:
+            logger.info(
+                "[BrainDiscovery] excluding stale-generation candidate "
+                "name=%s gen=%s current_gen=%d (never probed)",
+                (inst or {}).get("name"), raw_gen, floor,
+            )
+            continue
+        out.append(inst)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Candidate endpoint construction.
 # ---------------------------------------------------------------------------
 
@@ -309,6 +377,10 @@ async def discover_brain_endpoint(
             return None
         list_fn = list_instances_fn or _default_list_brain_instances
         instances = await list_fn()
+        # Stage-4 gen filter: superseded generations (and pre-Stage-4
+        # unlabeled brains) never become candidates when the keeper has
+        # exported JARVIS_BRAIN_CURRENT_GEN; env unset = zero change.
+        instances = _filter_stale_generations(instances or [])
         candidates = _candidate_urls(instances or [], cfg)
         if not candidates:
             logger.info(

@@ -12,14 +12,17 @@ from backend.core.ouroboros.governance import brain_discovery
 # ---------------------------------------------------------------------------
 
 
-def _brain_instance(*, name, external, internal, status="RUNNING"):
+def _brain_instance(*, name, external, internal, status="RUNNING", gen=None):
     nics = [{"networkIP": internal}]
     if external:
         nics[0]["accessConfigs"] = [{"natIP": external}]
+    labels = {"jarvis-role": "brain"}
+    if gen is not None:
+        labels["jarvis-brain-gen"] = str(gen)
     return {
         "name": name,
         "status": status,
-        "labels": {"jarvis-role": "brain"},
+        "labels": labels,
         "networkInterfaces": nics,
     }
 
@@ -165,6 +168,78 @@ def test_discover_failsoft_when_list_raises(monkeypatch):
 
     # Must NOT propagate into the caller.
     assert _run(brain_discovery.discover_brain_endpoint(list_instances_fn=boom_list)) is None
+
+
+# ---------------------------------------------------------------------------
+# (d2) Stage-4 Task 3: generation filter (JARVIS_BRAIN_CURRENT_GEN).
+# ---------------------------------------------------------------------------
+
+
+def test_gen_filter_env_unset_zero_behavior_change(monkeypatch):
+    monkeypatch.delenv("JARVIS_BRAIN_CURRENT_GEN", raising=False)
+    mixed = [
+        _brain_instance(name="brain-old", external="203.0.113.40", internal="10.0.0.40"),
+        _brain_instance(name="brain-g1", external="203.0.113.41", internal="10.0.0.41", gen=1),
+    ]
+    out = brain_discovery._filter_stale_generations(mixed)
+    assert out == mixed, "env unset: the filter must be a byte-level no-op"
+
+
+def test_gen_filter_malformed_or_zero_env_is_inactive(monkeypatch):
+    mixed = [_brain_instance(name="brain-old", external="203.0.113.40", internal="10.0.0.40")]
+    for raw in ("not-a-number", "0", "-3", "  "):
+        monkeypatch.setenv("JARVIS_BRAIN_CURRENT_GEN", raw)
+        assert brain_discovery._filter_stale_generations(mixed) == mixed, (
+            "malformed/non-positive env must stay fail-soft inactive: %r" % raw)
+
+
+def test_gen_filter_excludes_lower_and_unlabeled_keeps_equal_higher(monkeypatch):
+    monkeypatch.setenv("JARVIS_BRAIN_CURRENT_GEN", "2")
+    instances = [
+        _brain_instance(name="brain-g1", external="203.0.113.51", internal="10.0.0.51", gen=1),
+        _brain_instance(name="brain-g2", external="203.0.113.52", internal="10.0.0.52", gen=2),
+        _brain_instance(name="brain-g3", external="203.0.113.53", internal="10.0.0.53", gen=3),
+        # Pre-Stage-4 unlabeled brain: obsolete by definition once a gen'd
+        # keeper runs.
+        _brain_instance(name="brain-prestage4", external="203.0.113.54", internal="10.0.0.54"),
+    ]
+    out = brain_discovery._filter_stale_generations(instances)
+    assert [i["name"] for i in out] == ["brain-g2", "brain-g3"]
+
+
+def test_gen_filter_applies_before_probing(monkeypatch):
+    """End-to-end through discover_brain_endpoint: excluded generations never
+    become candidates -- they are never probed, never raced."""
+    monkeypatch.setenv("JARVIS_BRAIN_WS_PORT", "8443")
+    monkeypatch.setenv("JARVIS_BRAIN_WS_PATH", "/ws/trinity-bus")
+    monkeypatch.setenv("JARVIS_BRAIN_CURRENT_GEN", "2")
+
+    async def fake_list():
+        return [
+            _brain_instance(name="brain-g1", external="203.0.113.61", internal="10.0.0.61", gen=1),
+            _brain_instance(name="brain-old", external="203.0.113.62", internal="10.0.0.62"),
+            _brain_instance(name="brain-g2", external="203.0.113.63", internal="10.0.0.63", gen=2),
+        ]
+
+    seen = {"candidates": None, "probed": []}
+
+    async def probe(url):
+        seen["probed"].append(url)
+        return True
+
+    async def fake_race(candidates, probe_fn):
+        seen["candidates"] = list(candidates)
+        for u in candidates:
+            await probe_fn(u)
+        return candidates[0]
+
+    url = _run(brain_discovery.discover_brain_endpoint(
+        list_instances_fn=fake_list, probe_fn=probe, race_fn=fake_race))
+
+    assert url == "wss://203.0.113.63:8443/ws/trinity-bus"
+    joined = " ".join(seen["candidates"]) + " " + " ".join(seen["probed"])
+    assert "203.0.113.61" not in joined, "lower gen excluded PRE-probe"
+    assert "203.0.113.62" not in joined, "unlabeled excluded PRE-probe"
 
 
 # ---------------------------------------------------------------------------
