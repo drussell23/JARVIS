@@ -239,6 +239,101 @@ def test_two_orderings_same_fingerprint():
 
 
 # ---------------------------------------------------------------------------
+# (f2) order-independence WITH removes, re-adds, tombstones (Task 1 review)
+# ---------------------------------------------------------------------------
+
+def _tombstone_envelopes():
+    # Every symbol's TERMINAL (highest-seq) op is a FULL write (add or remove),
+    # so the fold is provably commutative under any permutation -- including
+    # remove-before-add and a resignature interleaved mid-history.
+    return [
+        # A: add@1 then remove@3  -> terminal remove -> ABSENT, hwm 3
+        _env(_delta("brain", "a.py", added=(_sym("brain:a.py:A", "class", "a1"),)), "brain", 1),
+        _env(_delta("brain", "a.py", removed=(_sym("brain:a.py:A", "class", "a1"),)), "brain", 3),
+        # B: add@2, resignature@5, re-add@8 -> terminal full add@8 -> PRESENT s8, hwm 8
+        _env(_delta("prime", "b.py", added=(_sym("prime:b.py:B", "function", "b2"),)), "prime", 2),
+        _env(_delta("prime", "b.py", resig=(("prime:b.py:B", "b2", "b5"),)), "prime", 5),
+        _env(_delta("prime", "b.py", added=(_sym("prime:b.py:B", "function", "b8"),)), "prime", 8),
+        # C: remove@4 with a STALE add@2 -> terminal remove -> ABSENT, hwm 4 (no resurrection)
+        _env(_delta("reactor", "c.py", removed=(_sym("reactor:c.py:C", "method", "c0"),)), "reactor", 4),
+        _env(_delta("reactor", "c.py", added=(_sym("reactor:c.py:C", "method", "c2"),)), "reactor", 2),
+        # D: lone add@6 -> PRESENT, hwm 6
+        _env(_delta("brain", "d.py", added=(_sym("brain:d.py:D", "class", "d6"),)), "brain", 6),
+    ]
+
+
+def test_order_independence_with_removes_and_tombstones():
+    import random
+
+    envs = _tombstone_envelopes()
+
+    def _fold(order):
+        g = CausalGraph()
+        for e in order:
+            g.apply_delta(e)
+        return g
+
+    base = _fold(envs)
+
+    for seed in (1, 7, 42, 2026):
+        shuffled = list(envs)
+        random.Random(seed).shuffle(shuffled)
+        g = _fold(shuffled)
+        assert g.state_fingerprint() == base.state_fingerprint(), f"seed={seed}"
+
+    # the converged truth
+    assert base.node("brain:a.py:A") is None          # removed
+    assert base.node("reactor:c.py:C") is None         # stale add never resurrected
+    b = base.node("prime:b.py:B")
+    assert b is not None and b.signature_hash == "b8" and b.last_emit_seq == 8
+    assert base.node("brain:d.py:D") is not None
+    assert base.node_count() == 2
+
+
+# ---------------------------------------------------------------------------
+# remove-before-add: the tombstone blocks resurrection (Task 1 review)
+# ---------------------------------------------------------------------------
+
+def test_out_of_order_remove_before_add_no_resurrection():
+    # out-of-order: remove(3) before add(1)  vs  in-order: add(1) then remove(3).
+    # Both must converge to ABSENT with an identical fingerprint (hwm[X]=3 both).
+    ooo = CausalGraph()
+    ooo.apply_delta(_env(_delta("brain", "x.py", removed=(_sym("brain:x.py:X", "class", "hx"),)), "brain", 3))
+    ooo.apply_delta(_env(_delta("brain", "x.py", added=(_sym("brain:x.py:X", "class", "hx1"),)), "brain", 1))
+
+    ordered = CausalGraph()
+    ordered.apply_delta(_env(_delta("brain", "x.py", added=(_sym("brain:x.py:X", "class", "hx1"),)), "brain", 1))
+    ordered.apply_delta(_env(_delta("brain", "x.py", removed=(_sym("brain:x.py:X", "class", "hx"),)), "brain", 3))
+
+    assert ooo.node("brain:x.py:X") is None
+    assert ordered.node("brain:x.py:X") is None
+    assert ooo.state_fingerprint() == ordered.state_fingerprint()
+
+    g = CausalGraph()
+
+    # a remove arrives for a symbol never yet seen -> records the tombstone hwm
+    n = g.apply_delta(_env(_delta("brain", "x.py", removed=(_sym("brain:x.py:X", "class", "hx"),)), "brain", 3))
+    assert n == 0                       # no node existed to delete
+    assert g.node("brain:x.py:X") is None
+
+    # a STALE lower-seq add must NOT resurrect the symbol
+    n = g.apply_delta(_env(_delta("brain", "x.py", added=(_sym("brain:x.py:X", "class", "hx1"),)), "brain", 1))
+    assert n == 0
+    assert g.node("brain:x.py:X") is None
+
+    # equal-seq add is also stale -> still absent
+    assert g.apply_delta(_env(_delta("brain", "x.py", added=(_sym("brain:x.py:X", "class", "hx3"),)), "brain", 3)) == 0
+    assert g.node("brain:x.py:X") is None
+
+    # a genuinely NEWER add (seq > tombstone) DOES resurrect it -- the guard is
+    # monotonic, not a permanent gravestone
+    n = g.apply_delta(_env(_delta("brain", "x.py", added=(_sym("brain:x.py:X", "class", "hx9"),)), "brain", 9))
+    assert n == 1
+    x = g.node("brain:x.py:X")
+    assert x is not None and x.signature_hash == "hx9" and x.last_emit_seq == 9
+
+
+# ---------------------------------------------------------------------------
 # import edges fold onto the src node
 # ---------------------------------------------------------------------------
 
@@ -267,6 +362,45 @@ def test_import_edges_update_src_node_imports():
         _env(_delta("brain", "mod.py", imp_removed=(ImportEdge("brain:mod.py:mod", "sys", "imports"),)), "brain", 3)
     )
     assert g.node("brain:mod.py:mod").imports == frozenset({"os.path"})
+
+
+# ---------------------------------------------------------------------------
+# snapshot / fingerprint carry the FULL hwm map (live + tombstoned) -- review
+# ---------------------------------------------------------------------------
+
+def test_snapshot_includes_hwm():
+    # (1) same LIVE node-set reached two ways, SAME hwm -> identical fingerprint.
+    gc = CausalGraph()  # added -> removed -> re-added at higher seq
+    gc.apply_delta(_env(_delta("brain", "m.py", added=(_sym("brain:m.py:X", "class", "s1"),)), "brain", 1))
+    gc.apply_delta(_env(_delta("brain", "m.py", removed=(_sym("brain:m.py:X", "class", "s1"),)), "brain", 3))
+    gc.apply_delta(_env(_delta("brain", "m.py", added=(_sym("brain:m.py:X", "class", "s5"),)), "brain", 5))
+
+    gd = CausalGraph()  # direct add at seq 5
+    gd.apply_delta(_env(_delta("brain", "m.py", added=(_sym("brain:m.py:X", "class", "s5"),)), "brain", 5))
+
+    assert gc.node("brain:m.py:X") == gd.node("brain:m.py:X")
+    assert gc.snapshot()["seq_hwm"] == gd.snapshot()["seq_hwm"] == {"brain:m.py:X": 5}
+    assert gc.state_fingerprint() == gd.state_fingerprint()
+
+    # (2) IDENTICAL live node-set (empty) but DIFFERENT hwm -> fingerprints DIFFER,
+    # proving the tombstone hwm is part of the equality witness.
+    ge = CausalGraph()  # add then remove -> empty live, hwm[Y]=3 tombstone
+    ge.apply_delta(_env(_delta("brain", "n.py", added=(_sym("brain:n.py:Y", "class", "y1"),)), "brain", 1))
+    ge.apply_delta(_env(_delta("brain", "n.py", removed=(_sym("brain:n.py:Y", "class", "y1"),)), "brain", 3))
+    gf = CausalGraph()  # empty, no hwm
+
+    assert ge.node_count() == gf.node_count() == 0
+    assert ge.snapshot()["seq_hwm"] == {"brain:n.py:Y": 3}
+    assert gf.snapshot()["seq_hwm"] == {}
+    assert ge.state_fingerprint() != gf.state_fingerprint()
+
+    # (3) roundtrip is stable WITH a tombstoned (removed) symbol in the hwm.
+    rebuilt = CausalGraph.from_snapshot(ge.snapshot())
+    assert rebuilt.state_fingerprint() == ge.state_fingerprint()
+    assert rebuilt.snapshot()["seq_hwm"] == {"brain:n.py:Y": 3}
+    # the tombstone survives the roundtrip: a stale add still cannot resurrect Y
+    assert rebuilt.apply_delta(_env(_delta("brain", "n.py", added=(_sym("brain:n.py:Y", "class", "y2"),)), "brain", 2)) == 0
+    assert rebuilt.node("brain:n.py:Y") is None
 
 
 # ---------------------------------------------------------------------------

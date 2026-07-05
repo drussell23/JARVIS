@@ -70,6 +70,13 @@ class CausalGraph:
         self._nodes: Dict[str, CausalNode] = {}
         self._by_repo: Dict[str, Set[str]] = {}
         self._by_file: Dict[Tuple[str, str], Set[str]] = {}
+        # Per-symbol Lamport high-water mark: the highest emit_seq EVER applied
+        # to a symbol_id via add / resignature / remove. It OUTLIVES the node
+        # (an event-sourced tombstone) so a stale, later-arriving lower-seq add
+        # cannot resurrect a removed symbol -- making the fold fully commutative
+        # regardless of WAL append vs live-ingest order (Task 3 offloads appends,
+        # so those orders can diverge under concurrency).
+        self._seq_hwm: Dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # read surface
@@ -145,21 +152,25 @@ class CausalGraph:
         repo = delta.repo
         file_path = delta.file_path
 
-        # Pre-delta emit_seq per node captured lazily on first touch, so every
-        # operation in THIS delta is authorized against the node's state BEFORE
-        # the delta started -- keeps a multi-touch delta internally consistent
-        # and the whole fold order-independent.
-        pre_seq: Dict[str, Optional[int]] = {}
+        # Per-symbol Lamport high-water captured lazily at its PRE-delta value on
+        # first touch, so every operation in THIS delta is authorized against the
+        # symbol's watermark BEFORE the delta started -- a multi-touch delta stays
+        # internally consistent AND the whole fold is order-independent (max over
+        # emit_seq is commutative; the tombstone watermark blocks stale resurrection).
+        pre_hwm: Dict[str, int] = {}
 
-        def _prev(symbol_id: str) -> Optional[int]:
-            if symbol_id not in pre_seq:
-                node = self._nodes.get(symbol_id)
-                pre_seq[symbol_id] = node.last_emit_seq if node is not None else None
-            return pre_seq[symbol_id]
+        def _hwm_before(symbol_id: str) -> int:
+            if symbol_id not in pre_hwm:
+                pre_hwm[symbol_id] = self._seq_hwm.get(symbol_id, -1)
+            return pre_hwm[symbol_id]
 
         def _wins(symbol_id: str) -> bool:
-            prev = _prev(symbol_id)
-            return prev is None or emit_seq > prev
+            return emit_seq > _hwm_before(symbol_id)
+
+        def _bump_hwm(symbol_id: str) -> None:
+            cur = self._seq_hwm.get(symbol_id, -1)
+            if emit_seq > cur:
+                self._seq_hwm[symbol_id] = emit_seq
 
         mutated: Set[str] = set()
 
@@ -182,18 +193,21 @@ class CausalGraph:
                     last_head_sha=head_sha,
                 )
             )
+            _bump_hwm(sid)
             mutated.add(sid)
 
         # --- symbols_resignatured: signature-only update on an existing node -
-        # No kind travels with a resignature; if the node is unknown (an
-        # out-of-order resignature that precedes its add) we skip -- the
-        # highest-seq full add remains the authority, preserving determinism.
+        # No kind travels with a resignature. We still advance the watermark
+        # when we win (so a later lower-seq op is correctly skipped), but if the
+        # node is unknown (an out-of-order resignature preceding its add) there
+        # is no kind to materialize -> record the watermark, mutate no node.
         for entry in delta.symbols_resignatured:
             sid, _old_h, new_h = entry
+            if not _wins(sid):
+                continue
+            _bump_hwm(sid)
             existing = self._nodes.get(sid)
             if existing is None:
-                continue
-            if not _wins(sid):
                 continue
             self._put(
                 CausalNode(
@@ -209,13 +223,15 @@ class CausalGraph:
             )
             mutated.add(sid)
 
-        # --- symbols_removed: remove only if present AND newer ---------------
+        # --- symbols_removed: tombstone the watermark (EVEN IF the node is not
+        # present yet) so a later-arriving stale lower-seq add cannot resurrect
+        # the symbol; delete the node if it exists. This is the event-sourced
+        # tombstone that makes remove-before-add order-independent.
         for rec in delta.symbols_removed:
             sid = rec.symbol_id
-            if self._nodes.get(sid) is None:
-                continue
             if not _wins(sid):
                 continue
+            _bump_hwm(sid)
             if self._delete(sid):
                 mutated.add(sid)
 
@@ -247,6 +263,7 @@ class CausalGraph:
                     last_head_sha=head_sha,
                 )
             )
+            _bump_hwm(src_id)
             mutated.add(src_id)
 
         # --- file_level_churn: coarse lineage bump, THIS file's nodes only ---
@@ -255,7 +272,7 @@ class CausalGraph:
                 node = self._nodes.get(sid)
                 if node is None:
                     continue
-                if emit_seq <= node.last_emit_seq:
+                if not _wins(sid):
                     continue
                 self._put(
                     CausalNode(
@@ -269,6 +286,7 @@ class CausalGraph:
                         last_head_sha=head_sha,
                     )
                 )
+                _bump_hwm(sid)
                 mutated.add(sid)
 
         return len(mutated)
@@ -278,7 +296,9 @@ class CausalGraph:
     # ------------------------------------------------------------------ #
     def snapshot(self) -> dict:
         """Fully deterministic canonical serialization: every node with every
-        field, node list sorted by ``symbol_id``, imports as sorted lists."""
+        field, node list sorted by ``symbol_id``, imports as sorted lists, plus
+        the FULL per-symbol Lamport high-water map (live AND tombstoned symbols)
+        so crash-recovery / compaction preserves the monotonic guard."""
         nodes = []
         for sid in sorted(self._nodes):
             n = self._nodes[sid]
@@ -294,7 +314,8 @@ class CausalGraph:
                     "last_head_sha": n.last_head_sha,
                 }
             )
-        return {"version": _SNAPSHOT_VERSION, "nodes": nodes}
+        seq_hwm = {sid: self._seq_hwm[sid] for sid in sorted(self._seq_hwm)}
+        return {"version": _SNAPSHOT_VERSION, "nodes": nodes, "seq_hwm": seq_hwm}
 
     @classmethod
     def from_snapshot(cls, snap: dict) -> "CausalGraph":
@@ -312,6 +333,10 @@ class CausalGraph:
             )
             graph._nodes[node.symbol_id] = node
             graph._index_add(node)
+        graph._seq_hwm = {
+            str(sid): int(seq)
+            for sid, seq in (snap or {}).get("seq_hwm", {}).items()
+        }
         return graph
 
     def state_fingerprint(self) -> str:
