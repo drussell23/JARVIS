@@ -422,7 +422,7 @@ class BodyModeDriver:
         )
         return TrinityBusBridge(
             trinity_bus, broker,
-            outbound_topics=["intake.remote_signal.*", "console.*"],
+            outbound_topics=["intake.remote_signal.*", "console.*", "causal.delta.*"],
             source_id="mac-body",
         )
 

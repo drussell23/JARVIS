@@ -94,6 +94,7 @@ class OrganismBusHost:
         self._bus: Optional[Any] = None  # DistributedEventBus (server role)
         self._bridge: Optional[Any] = None  # TrinityBusBridge
         self._intake_bridge: Optional[Any] = None  # RemoteIntakeBridge (Task 3)
+        self._causal_subscriber: Optional[Any] = None  # CausalDeltaSubscriber (D1S1 Task 2)
         self._generation_fence: Optional[Any] = None  # GenerationFence (Stage-4 Task 4)
         self._runner: Optional[Any] = None  # aiohttp AppRunner
         self._site: Optional[Any] = None  # aiohttp TCPSite
@@ -189,6 +190,12 @@ class OrganismBusHost:
                     trinity_bus, self._router)
                 await self._intake_bridge.start()
 
+            # Domain-1 Staging-1 Task 2: the Brain-side RECEIVER. Records
+            # causal.delta.<repo> deltas in causal order (reflective RepoType;
+            # the bus's own fingerprint dedup fires first). Lazy import keeps
+            # master-OFF free of the causal-package import cost.
+            await self._start_causal_subscriber(trinity_bus)
+
             # Stage-4 Task 4: the Brain-side ACTIVE fence. Only on nodes
             # the keeper stamped with a generation (env absent -> byte-
             # identical, no import).
@@ -209,6 +216,17 @@ class OrganismBusHost:
             ",".join(resolve_outbound_topics()), cfg.source_id,
         )
         return True
+
+    async def _start_causal_subscriber(self, trinity_bus: Any) -> None:
+        """Construct + start the Domain-1 Staging-1 CausalDeltaSubscriber
+        (Brain receiver). Lazy import inside the start-guard keeps master-OFF
+        byte-identical (no causal-package import cost)."""
+        from backend.core.ouroboros.governance.causal.causal_delta_subscriber import (  # noqa: PLC0415
+            CausalDeltaSubscriber,
+        )
+
+        self._causal_subscriber = CausalDeltaSubscriber(trinity_bus)
+        await self._causal_subscriber.start()
 
     async def _maybe_start_generation_fence(self, trinity_bus: Any) -> None:
         """Construct + start the split-brain GenerationFence (Stage-4 Task 4)
@@ -235,6 +253,13 @@ class OrganismBusHost:
                 logger.debug("[OrganismBusHost] generation fence stop failed",
                              exc_info=True)
             self._generation_fence = None
+        if self._causal_subscriber is not None:
+            try:
+                await self._causal_subscriber.stop()
+            except Exception:  # noqa: BLE001
+                logger.debug("[OrganismBusHost] causal subscriber stop failed",
+                             exc_info=True)
+            self._causal_subscriber = None
         if self._intake_bridge is not None:
             try:
                 await self._intake_bridge.stop()
