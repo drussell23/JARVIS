@@ -11,10 +11,16 @@ causality DAG -- is Staging 2 (single-writer; no graph is built here).
 
 Design commitments:
 
-* **Reflective source.** The origin repo is read from ``event.source`` (a
-  ``RepoType``), never parsed from ``event.topic``. A non-``RepoType`` source,
-  or ``RepoType.BROADCAST`` (a TARGET semantic, never a valid causal origin),
-  is logged and dropped -- a causal delta must name ONE concrete source.
+* **Reflective source (Mandate 2 -- in-payload identity).** The origin repo is
+  read from the IN-PAYLOAD ``lineage.repo`` via ``RepoType(...)`` reflection,
+  never from ``event.source`` and never parsed from ``event.topic``. Mandate 2
+  rides the RepoType as reflective metadata INSIDE the data payload, not typed
+  on the transport -- and this is the identity that survives the cross-host WS
+  hop verbatim (the generic ``TrinityBusBridge`` re-mints ``event.source`` to
+  the receiver bus's ``local_repo``, so it MUST NOT be trusted). A
+  non-``RepoType`` ``lineage.repo``, or ``RepoType.BROADCAST`` (a TARGET
+  semantic, never a valid causal origin), is logged and dropped -- a causal
+  delta must name ONE concrete source.
 * **No new dedup.** The bus's OWN 60s fingerprint dedup
   (``TrinityEvent.fingerprint``) drops exact duplicates BEFORE the handler
   fires. The subscriber adds NO dedup algorithm; its ``(repo, emit_seq,
@@ -100,14 +106,6 @@ class CausalDeltaSubscriber:
         """Record one causal delta. NEVER raises into the bus (fail-soft) and
         is a fast append (non-blocking -- no sleeps, no heavy work)."""
         try:
-            # Reflective source: the enum IS the repo. Never parse the topic.
-            repo = getattr(event, "source", None)
-            if not isinstance(repo, RepoType) or repo == RepoType.BROADCAST:
-                logger.debug(
-                    "[CausalDeltaSubscriber] dropping delta with non-concrete "
-                    "source %r (topic=%s)", repo, getattr(event, "topic", None))
-                return
-
             payload = getattr(event, "payload", None)
             if not isinstance(payload, dict):
                 logger.debug("[CausalDeltaSubscriber] dropping non-dict payload")
@@ -122,6 +120,29 @@ class CausalDeltaSubscriber:
             ):
                 logger.debug("[CausalDeltaSubscriber] dropping envelope with "
                              "missing/malformed lineage: %r", lineage)
+                return
+
+            # Reflective source read from the IN-PAYLOAD lineage.repo (Mandate 2:
+            # the RepoType rides as reflective metadata INSIDE the data payload,
+            # never typed on the transport). This is the identity that survives
+            # the WS hop verbatim -- ``event.source`` is re-minted to the
+            # receiver bus's local_repo by the generic bridge and MUST NOT be
+            # trusted here. ``RepoType(...)`` reflection IS the validation (no
+            # string-matching / if-chain, no topic parsing); an unknown repo
+            # raises -> log-and-drop. BROADCAST is a TARGET semantic, never a
+            # valid causal origin, so it is dropped too.
+            try:
+                repo = RepoType(lineage["repo"])
+            except (ValueError, TypeError):
+                logger.debug(
+                    "[CausalDeltaSubscriber] dropping delta with non-RepoType "
+                    "lineage.repo %r (topic=%s)", lineage.get("repo"),
+                    getattr(event, "topic", None))
+                return
+            if repo == RepoType.BROADCAST:
+                logger.debug(
+                    "[CausalDeltaSubscriber] dropping delta with BROADCAST "
+                    "lineage.repo (a causal delta needs a concrete source)")
                 return
 
             try:

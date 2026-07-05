@@ -6,16 +6,19 @@ Proves the five brief contracts against a REAL ``TrinityEventBus``
 precedent: tests/governance/transport/test_trinity_bus_bridge.py::_mk_bus):
 
   (a) three deltas (jarvis/prime/reactor) are observed, and the source repo is
-      read REFLECTIVELY from ``event.source`` -- an event whose TOPIC says
-      ``causal.delta.jarvis`` but whose SOURCE enum is ``RepoType.PRIME`` is
-      recorded as PRIME (no topic-string routing);
+      read REFLECTIVELY from the IN-PAYLOAD ``lineage.repo`` (Mandate 2: the
+      RepoType rides as reflective metadata inside the data payload, NOT typed
+      on the transport) -- an event whose TOPIC says ``causal.delta.jarvis`` AND
+      whose ``event.source`` enum is ``RepoType.REACTOR`` but whose payload
+      ``lineage.repo`` is ``"prime"`` is recorded as PRIME (payload is
+      authoritative; neither topic-string nor event.source routing);
   (b) the SAME delta published twice within the 60s window is observed once
       (the bus's own fingerprint dedup -- the subscriber adds no dedup algo);
   (c) out-of-order ``emit_seq`` within one repo -> ``observed()`` for that repo
       is in ``emit_seq`` order (the Lamport guarantee);
   (d) a malformed envelope (missing lineage) is dropped, no raise into the bus;
-      a BROADCAST-sourced delta is dropped (a causal delta needs a concrete
-      source);
+      a delta whose in-payload ``lineage.repo`` is BROADCAST is dropped (a
+      causal delta needs a concrete source);
   (e) organism_bus_host constructs + starts the subscriber when the host serves
       (recording fake via monkeypatched lazy import) and is byte-identical
       (subscriber never constructed) when the master flag is off.
@@ -116,14 +119,16 @@ def test_three_deltas_observed_repo_read_reflectively():
         sub = CausalDeltaSubscriber(bus)
         await sub.start()
         try:
-            # jarvis + reactor: honest topic/source.
+            # jarvis + reactor: honest topic/source/payload.
             await _publish(bus, "causal.delta.jarvis", RepoType.JARVIS,
                            _envelope("jarvis", 1, head_sha="jh"))
             await _publish(bus, "causal.delta.reactor", RepoType.REACTOR,
                            _envelope("reactor", 1, head_sha="rh"))
-            # LIE: topic says jarvis, but source enum says PRIME. The SOURCE
-            # wins -> recorded as prime. Proves no topic-string routing.
-            await _publish(bus, "causal.delta.jarvis", RepoType.PRIME,
+            # DOUBLE LIE: topic says jarvis AND event.source says REACTOR, but
+            # the in-payload lineage.repo says "prime". The PAYLOAD wins ->
+            # recorded as prime. Proves neither topic-string nor event.source
+            # routing -- Mandate-2 in-payload identity is authoritative.
+            await _publish(bus, "causal.delta.jarvis", RepoType.REACTOR,
                            _envelope("prime", 1, head_sha="ph"))
             await _settle(sub, 3)
             return sub.observed()
@@ -134,7 +139,7 @@ def test_three_deltas_observed_repo_read_reflectively():
     observed = _run(scenario())
     repos = {repo for (repo, _seq, _sha) in observed}
     assert repos == {"jarvis", "prime", "reactor"}, observed
-    # the lying-topic event is recorded under its SOURCE repo (prime), and its
+    # the double-lying event is recorded under its PAYLOAD repo (prime), and its
     # head_sha proves it is the same event.
     prime = [rec for rec in observed if rec[0] == "prime"]
     assert prime == [("prime", 1, "ph")], observed
@@ -225,9 +230,14 @@ def test_malformed_and_broadcast_dropped_no_raise():
             # lineage present but missing required keys
             await _publish(bus, "causal.delta.jarvis", RepoType.JARVIS,
                            {"delta": {}, "lineage": {"repo": "jarvis"}})
-            # BROADCAST is a TARGET semantic, never a valid causal SOURCE
-            await _publish(bus, "causal.delta.jarvis", RepoType.BROADCAST,
-                           _envelope("jarvis", 3))
+            # in-payload lineage.repo == BROADCAST: a TARGET semantic, never a
+            # valid causal SOURCE (concrete event.source is irrelevant now --
+            # the payload is authoritative).
+            await _publish(bus, "causal.delta.jarvis", RepoType.JARVIS,
+                           _envelope(RepoType.BROADCAST.value, 3))
+            # in-payload lineage.repo not a RepoType at all -> reflection drops
+            await _publish(bus, "causal.delta.jarvis", RepoType.JARVIS,
+                           _envelope("not-a-trinity-repo", 4))
             # a good one to prove the bus + handler are still alive after drops
             await _publish(bus, "causal.delta.reactor", RepoType.REACTOR,
                            _envelope("reactor", 1, head_sha="ok"))
@@ -257,11 +267,12 @@ def test_handler_never_raises_on_garbage_payload():
         bad["lineage"]["emit_seq"] = "not-an-int"
         await sub._on_delta(TrinityEvent(topic="causal.delta.jarvis",
                                          source=RepoType.JARVIS, payload=bad))
-        # source not a RepoType at all
-        ev = TrinityEvent(topic="causal.delta.jarvis", source=RepoType.JARVIS,
-                          payload=_envelope("jarvis", 1))
-        ev.source = "jarvis"  # type: ignore[assignment]
-        await sub._on_delta(ev)
+        # in-payload lineage.repo not a RepoType at all -> reflection drops it
+        # (event.source is a perfectly valid RepoType.JARVIS -- irrelevant now)
+        bad_repo = _envelope("jarvis", 1)
+        bad_repo["lineage"]["repo"] = 12345  # non-str, non-RepoType
+        await sub._on_delta(TrinityEvent(topic="causal.delta.jarvis",
+                                         source=RepoType.JARVIS, payload=bad_repo))
         return sub.observed_count()
 
     assert _run(scenario()) == 0

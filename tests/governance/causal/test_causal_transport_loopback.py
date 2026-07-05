@@ -11,38 +11,31 @@ DISTINCT deltas simultaneously via ``asyncio.gather``, with a fraction re-emitte
 as EXACT duplicates, while a concurrent ticker proves the Brain loop never
 starved.
 
-WHAT SURVIVES THE HOP (empirically pinned, see the two identity surfaces below):
+MANDATE-2 IN-PAYLOAD IDENTITY (the design this test proves survives the hop):
 
-* The bridge (``TrinityBusBridge``) carries ``{topic, data, origin}`` across the
-  WS -- it does NOT carry the ``TrinityEvent.source`` enum. So on the Brain side
-  ``event.source`` COLLAPSES to the receiver bus's ``local_repo`` for every
-  delta (a real property of the Stage-2 generic bridge, not a bug this test
-  hides). The AUTHORITATIVE origin repo survives faithfully in the envelope
-  (``payload["lineage"]["repo"]`` == ``delta["repo"]``) and in the topic
-  (``causal.delta.<repo>``). This test therefore keys per-origin identity off
-  the transport-carried ENVELOPE (via the subscriber's ``on_delta`` sink) and
-  off a repo-encoding ``head_sha`` -- never off the collapsed ``event.source``.
-
-* Because ``event.source`` collapses to a single ``local_repo``, the
-  subscriber's ``observed()`` places all deltas in ONE per-repo bucket and
-  returns them GLOBALLY ordered by ``(emit_seq, head_sha)``. Filtering that
-  global order to one origin (by the repo-encoding ``head_sha``) yields that
-  origin's ``emit_seq`` subsequence -- which MUST be the strict ascending
-  ``1..N`` if causal order was preserved end-to-end across the WS.
+* The RepoType origin rides as REFLECTIVE METADATA INSIDE the data payload
+  (``payload["lineage"]["repo"]`` == ``delta["repo"]``), NOT typed on the
+  transport. The generic ``TrinityBusBridge`` carries ``{topic, data, origin}``
+  verbatim across the WS but re-mints ``TrinityEvent.source`` to the receiver
+  bus's ``local_repo`` -- so ``event.source`` is NOT a reliable origin over a
+  cross-host hop and is deliberately never read. The Brain
+  ``CausalDeltaSubscriber`` reflects the origin from the surviving in-payload
+  ``lineage.repo`` (``RepoType(...)``), so its ``observed()`` carries the TRUE
+  per-repo identity end-to-end. This test asserts MANDATE-4 DIRECTLY against
+  ``observed()`` -- no head_sha / event.source workaround.
 
 The MANDATE-4 assertions (all condition-polled to a bounded deadline; NO bare
 sleep-as-sync):
 
   1. ``observed_count() == 3*N`` -- every distinct delta crossed; duplicates
-     dropped. The faithful envelope set ``{(lineage.repo, emit_seq, head_sha)}``
-     captured on the Brain side has exactly ``3*N`` unique tuples.
+     dropped. ``set(observed())`` has exactly ``3*N`` unique
+     ``(repo, emit_seq, head_sha)`` tuples with the CORRECT (in-payload) repo.
   2. The BODY bus's ``events_deduplicated`` advanced by EXACTLY the injected
      duplicate count (same topic+source+payload within the 60s fingerprint
      window collided and was dropped at publish -- the dups never left the Body).
-  3. For EACH origin repo, the ``emit_seq`` subsequence (recovered from the
-     Brain's ``observed()`` via the repo-encoding ``head_sha``) is the strict
-     ascending ``1..N`` -- causal chronological order within source, preserved
-     end-to-end.
+  3. For EACH origin repo, the ``emit_seq`` subsequence of ``observed()``
+     filtered to that repo is the strict ascending ``1..N`` -- causal
+     chronological order within source, preserved end-to-end.
   4. NON-BLOCKING: a concurrent ~5ms ticker task kept ticking THROUGH the storm;
      its tick count sits within a band tied to the measured wall-clock -- the
      Brain ingest never starved the loop.
@@ -52,9 +45,9 @@ Run 3x consecutively for flake-immunity.
 Isolation notes: ``TRINITY_MULTICAST_ENABLED=false`` suppresses the in-process
 UDP shortcut (precedent: test_trinity_bus_bridge.py::_mk_bus). The disk file-sync
 transport (``CrossRepoTransport._file_sync_loop``, 1s poll) would otherwise
-double-deliver (and, via the on-disk ``to_dict``, resurrect ``source``) and bleed
-state across iterations, so each bus's ``_sync_dir`` is repointed to a UNIQUE
-temp dir -- the WS is then the ONLY cross-bus path, which is the hop under test.
+double-deliver and bleed state across iterations, so each bus's ``_sync_dir`` is
+repointed to a UNIQUE temp dir -- the WS is then the ONLY cross-bus path, which is
+the hop under test.
 """
 from __future__ import annotations
 
@@ -222,18 +215,6 @@ async def _one_iteration(iteration: int) -> str:
     runner = None
     ticker = _Ticker()
 
-    # Faithful origin identity, captured off the transport-carried ENVELOPE
-    # (NOT event.source, which collapses across the bridge).
-    captured_env: List[Tuple[str, int, str]] = []
-
-    def _on_delta(payload: Dict[str, Any]) -> None:
-        lineage = payload.get("lineage") or {}
-        captured_env.append((
-            str(lineage.get("repo")),
-            int(lineage.get("emit_seq")),
-            str(lineage.get("head_sha")),
-        ))
-
     try:
         # -- buses (repoint sync dirs to isolated temp dirs: WS-only crossing) -
         body_bus = await TrinityEventBus.create(local_repo=RepoType.JARVIS)
@@ -259,8 +240,8 @@ async def _one_iteration(iteration: int) -> str:
         await body_bridge.start()
         await brain_bridge.start()
 
-        # -- Brain subscriber ---------------------------------------------- #
-        sub = CausalDeltaSubscriber(brain_bus, on_delta=_on_delta)
+        # -- Brain subscriber (reads the in-payload lineage.repo identity) -- #
+        sub = CausalDeltaSubscriber(brain_bus)
         await sub.start()
 
         # -- real localhost WS server + client ----------------------------- #
@@ -332,21 +313,18 @@ async def _one_iteration(iteration: int) -> str:
         dedup_after = body_bus._metrics.events_deduplicated
 
         # ================= MANDATE-4 ASSERTIONS ========================= #
-        # (1) exactly 3*N distinct crossed; dups dropped.
+        # (1) exactly 3*N distinct crossed; dups dropped. observed() carries the
+        #     TRUE in-payload (repo, emit_seq, head_sha) identity.
         assert sub.observed_count() == 3 * N, (
             "iter %d: observed_count %d != %d"
             % (iteration, sub.observed_count(), 3 * N))
-        expected_env = {
+        expected = {
             (repo, i, "%ssha%d" % (repo, i))
             for repo in REPOS for i in range(1, N + 1)
         }
-        assert len(captured_env) == 3 * N, (
-            "iter %d: envelope sink saw %d, expected %d"
-            % (iteration, len(captured_env), 3 * N))
-        assert set(captured_env) == expected_env, (
-            "iter %d: faithful envelope set mismatch (lost/extra deltas)"
-            % iteration)
-        # observed() tuples are unique across the collapsed bucket (head_sha).
+        assert set(observed) == expected, (
+            "iter %d: observed() identity set mismatch (lost/extra deltas or "
+            "wrong repo): %r" % (iteration, sorted(set(observed) ^ expected)))
         assert len(set(observed)) == 3 * N, (
             "iter %d: observed() has non-unique tuples: %r"
             % (iteration, observed))
@@ -360,14 +338,11 @@ async def _one_iteration(iteration: int) -> str:
             "iter %d: brain deduped %d (expected 0)"
             % (iteration, brain_bus._metrics.events_deduplicated))
 
-        # (3) per-origin causal order preserved end-to-end: filter the Brain's
-        #     globally-ordered observed() to each origin (by repo-encoding
-        #     head_sha) -> strict ascending 1..N.
+        # (3) per-origin causal order preserved end-to-end: filter observed() to
+        #     each origin repo (the TRUE in-payload identity) -> strict
+        #     ascending 1..N.
         for repo in REPOS:
-            seqs = [
-                seq for (_r, seq, sha) in observed
-                if sha.startswith("%ssha" % repo)
-            ]
+            seqs = [seq for (r, seq, _sha) in observed if r == repo]
             assert seqs == list(range(1, N + 1)), (
                 "iter %d: repo %s emit_seq order %r != %r"
                 % (iteration, repo, seqs, list(range(1, N + 1))))
