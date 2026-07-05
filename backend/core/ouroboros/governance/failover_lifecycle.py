@@ -553,6 +553,35 @@ def _gcloud_run(cmd: List[str], *, timeout_s: float = 180.0):
         return 1, "[gcloud run failed: {!r}]".format(exc)
 
 
+def _lineage_labels() -> Optional[Dict[str, str]]:
+    """Stage-4 hierarchical ownership: when THIS process runs ON a Brain node
+    (brain-env ships ``JARVIS_BRAIN_PARENT_NODE`` / ``JARVIS_BRAIN_GENERATION``),
+    every node ITS awaken path creates is labeled with its parent + generation
+    at BIRTH -- so an orphan whose controller died is still owned (findable by
+    the manifest/label family walk, never an ad-hoc listing).
+
+    Additive: env absent -> None -> the create_instance payload is
+    byte-identical to the pre-Stage-4 behavior. Fail-soft, never raises."""
+    try:
+        parent = (os.environ.get("JARVIS_BRAIN_PARENT_NODE", "") or "").strip()
+        gen = (os.environ.get("JARVIS_BRAIN_GENERATION", "") or "").strip()
+        if not parent and not gen:
+            return None
+        from backend.core.ouroboros.governance.brain_lifecycle import (  # noqa: PLC0415
+            LABEL_GEN,
+            LABEL_PARENT,
+            sanitize_label_value,
+        )
+        labels: Dict[str, str] = {}
+        if parent:
+            labels[LABEL_PARENT] = sanitize_label_value(parent)
+        if gen:
+            labels[LABEL_GEN] = sanitize_label_value(gen)
+        return labels or None
+    except Exception:  # noqa: BLE001 -- lineage stamping must never block awaken
+        return None
+
+
 async def _default_vm_awaken_fn(*, startup_script: str) -> bool:
     """Create the J-Prime failover node from the golden image (Spot-first).
 
@@ -612,6 +641,9 @@ async def _default_vm_awaken_fn(*, startup_script: str) -> bool:
             image_family=_tier.image_family,
             accelerator_type=_tier.accelerator_type,
             accelerator_count=_tier.accelerator_count,
+            # Stage-4 lineage: parent/gen labels when running ON a Brain node
+            # (env-absent -> None -> byte-identical payload).
+            labels=_lineage_labels(),
         )
         if ok_create:
             logger.info(
@@ -1086,6 +1118,9 @@ class FailoverLifecycleController:
                 image_family=tier.image_family,
                 accelerator_type=tier.accelerator_type,
                 accelerator_count=tier.accelerator_count,
+                # Stage-4 lineage: parent/gen labels when running ON a Brain
+                # node (env-absent -> None -> byte-identical payload).
+                labels=_lineage_labels(),
             )
             if not ok:
                 logger.warning("[FailoverLifecycle] GPU provision insert failed: %s", detail)

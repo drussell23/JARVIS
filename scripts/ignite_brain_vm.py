@@ -69,6 +69,22 @@ _REPO_ROOT: str = os.path.dirname(_SCRIPTS_DIR)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+# Stage-4 Task 1: the provisioning core (brain-env compose, TLS metadata
+# delivery, runtime startup script, create composition) is EXTRACTED into the
+# reusable ``brain_lifecycle`` module; this driver consumes it. The helpers are
+# re-exported here so existing consumers/tests keep importing them from the
+# driver (back-compat surface, byte-equivalent behavior).
+from backend.core.ouroboros.governance.brain_lifecycle import (  # noqa: E402
+    _NODE_TLS_DIR,
+    _TLS_META_KEYS,
+    TLSMaterialError,
+    _brain_runtime_startup_script,
+    _tls_extra_metadata,
+    _tls_material,
+    brain_env_values,
+    provision_brain,
+)
+
 
 def _log(msg: str) -> None:
     print("[BrainIgnite] %s" % (msg,), flush=True)
@@ -106,53 +122,10 @@ _ENV_READY_CAP_S = "JARVIS_BRAIN_READY_CAP_S"
 _ENV_EXCHANGE_N = "JARVIS_BRAIN_EXCHANGE_N"
 _ENV_MTLS_DIR = "JARVIS_BRAIN_MTLS_DIR"
 
-# The server-side TLS material travels from the Mac (gen_brain_mtls.py output)
-# to the node as instance metadata; the runtime startup script writes it to
-# these node-local paths BEFORE the units start, and brain.env points at them.
-_NODE_TLS_DIR = "/etc/jarvis/tls"
-_TLS_META_KEYS = {
-    "server_cert": ("brain-tls-server-cert", "server-cert.pem"),
-    "server_key": ("brain-tls-server-key", "server-key.pem"),
-    "ca": ("brain-tls-ca", "ca.pem"),
-}
-
-
-class TLSMaterialError(RuntimeError):
-    """TLS is enabled but the server material is absent/incomplete. Raised in the
-    driver preflight BEFORE any GCP call (fail-closed, $0)."""
-
-
-def _tls_material() -> Optional[Dict[str, str]]:
-    """Load the SERVER PEM material (server cert/key + CA) from
-    ``JARVIS_BRAIN_MTLS_DIR`` (the gen_brain_mtls.py output dir). Returns None
-    when TLS is disabled; raises ``TLSMaterialError`` when TLS is enabled and any
-    piece is missing -- the ignition must never spend on a node that can only
-    fail its mTLS probe."""
-    if not _truthy(os.environ.get("JARVIS_BRAIN_WS_TLS_ENABLED", "true")):
-        return None
-    raw_dir = (os.environ.get(_ENV_MTLS_DIR, "") or "").strip()
-    if not raw_dir:
-        raise TLSMaterialError(
-            "TLS enabled but %s is unset -- run scripts/gen_brain_mtls.py and "
-            "export the material dir" % _ENV_MTLS_DIR)
-    mat: Dict[str, str] = {}
-    for part, (_meta_key, filename) in _TLS_META_KEYS.items():
-        path = os.path.join(raw_dir, filename)
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                mat[part] = fh.read()
-        except OSError as exc:
-            raise TLSMaterialError(
-                "TLS enabled but %s is missing/unreadable (%s) -- aborting "
-                "BEFORE any GCP spend" % (path, exc)) from exc
-    return mat
-
-
-def _tls_extra_metadata(mat: Optional[Dict[str, str]]) -> Dict[str, str]:
-    """Map the loaded PEM material onto its instance-metadata keys."""
-    if not mat:
-        return {}
-    return {meta_key: mat[part] for part, (meta_key, _fn) in _TLS_META_KEYS.items()}
+# TLS material delivery (``TLSMaterialError`` / ``_tls_material`` /
+# ``_tls_extra_metadata`` / ``_NODE_TLS_DIR`` / ``_TLS_META_KEYS``) is EXTRACTED
+# into ``backend.core.ouroboros.governance.brain_lifecycle`` (Stage-4 Task 1)
+# and re-exported at the top of this module -- byte-equivalent behavior.
 
 
 def _persistent() -> bool:
@@ -734,71 +707,15 @@ class BrainIgnitionDriver:
     async def _do_create_instance(self) -> Tuple[bool, str]:
         if self._create_instance is not None:
             return await self._create_instance(name=self.node_name)
-        from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
-            _BRAIN_ENV_METADATA_KEY,
-            _BRAIN_ROLE_LABEL_KEY,
-            _BRAIN_ROLE_LABEL_VALUE,
-            _brain_image_family,
-            _brain_machine_type,
-            _compose_brain_env,
-            get_compute_rest,
-        )
-
-        brain_env = _compose_brain_env(self._brain_env_values())
-        extra = {_BRAIN_ENV_METADATA_KEY: brain_env}
-        # Ship the SERVER PEM material as metadata; the runtime startup script
-        # writes it to /etc/jarvis/tls/* before the units start.
-        extra.update(_tls_extra_metadata(_tls_material()))
-        return await get_compute_rest().create_instance(
-            startup_script=_brain_runtime_startup_script(),
-            name=self.node_name,
-            machine_type=_brain_machine_type(),
-            image_family=_brain_image_family(),
-            accelerator_type="",
-            accelerator_count=0,
-            labels={_BRAIN_ROLE_LABEL_KEY: _BRAIN_ROLE_LABEL_VALUE},
-            extra_metadata=extra,
-        )
+        # Live default: the EXTRACTED provisioning core (brain_lifecycle,
+        # Stage-4 Task 1) -- byte-equivalent create composition.
+        return await provision_brain(node_name=self.node_name)
 
     def _brain_env_values(self) -> Dict[str, str]:
-        """Fold the Task-4 ignition values into the brain-env metadata: the WS
-        port/path + TLS material references + the session cost cap, all
-        env-resolved (Mandate 2). The idle-shutdown seconds are added by
-        ``_compose_brain_env`` itself.
-
-        TLS paths: when server material is shipped (TLS enabled), the node's
-        brain.env is OVERRIDDEN to the node-local /etc/jarvis/tls/* paths the
-        runtime startup script writes -- the Mac-side env holds the Mac's OWN
-        (client) paths, which must never leak into the node's config."""
-        vals: Dict[str, str] = {}
-        for key in (
-            "JARVIS_BRAIN_WS_PORT", "JARVIS_BRAIN_WS_PATH", "JARVIS_BRAIN_WS_TLS_ENABLED",
-            "JARVIS_BRAIN_WS_TLS_CERT", "JARVIS_BRAIN_WS_TLS_KEY", "JARVIS_BRAIN_WS_TLS_CA",
-            "JARVIS_BRAIN_COST_CAP", "JARVIS_DISTRIBUTED_BUS_ENABLED",
-            "JARVIS_BRAIN_BUS_SIDECAR_ENABLED", "JARVIS_BRAIN_OUTBOUND_TOPICS",
-        ):
-            v = os.environ.get(key)
-            if v is not None and v != "":
-                vals[key] = v
-        if _tls_material() is not None:
-            vals["JARVIS_BRAIN_WS_TLS_CERT"] = "%s/%s" % (
-                _NODE_TLS_DIR, _TLS_META_KEYS["server_cert"][1])
-            vals["JARVIS_BRAIN_WS_TLS_KEY"] = "%s/%s" % (
-                _NODE_TLS_DIR, _TLS_META_KEYS["server_key"][1])
-            vals["JARVIS_BRAIN_WS_TLS_CA"] = "%s/%s" % (
-                _NODE_TLS_DIR, _TLS_META_KEYS["ca"][1])
-        # Opt-in provider-key fold (live-fire 2026-07-04 Stage-2 acceptance: the
-        # soak crash-looped 54x with "No API keys set" because these were never
-        # shipped). Keys travel as instance metadata (project-scoped
-        # visibility) -- the established J-Prime pattern per the relocation
-        # design's open risk #4. Opt-in so default ignitions never ship
-        # secrets.
-        if _truthy(os.environ.get("JARVIS_BRAIN_SHIP_PROVIDER_KEYS")):
-            for key in ("DOUBLEWORD_API_KEY", "ANTHROPIC_API_KEY"):
-                v = os.environ.get(key)
-                if v is not None and v != "":
-                    vals[key] = v
-        return vals
+        """Fold the Task-4 ignition values into the brain-env metadata.
+        EXTRACTED to ``brain_lifecycle.brain_env_values`` (Stage-4 Task 1);
+        this method delegates -- byte-equivalent composition."""
+        return brain_env_values()
 
     async def _do_discover(self) -> Optional[str]:
         if self._discover is not None:
@@ -1031,69 +948,10 @@ class BrainIgnitionDriver:
 
 
 # ---------------------------------------------------------------------------
-# Runtime startup script (thin provisioning glue Task 4 owns): repopulate
-# /etc/jarvis/brain.env from THIS instance's metadata, create the /run/jarvis
-# runtime dir + liveness marker (the deferred Task-1 coupling), and (re)start the
-# baked brain unit so it picks up the fresh env.
+# Runtime startup script: EXTRACTED to ``brain_lifecycle._brain_runtime_
+# startup_script`` (Stage-4 Task 1) and re-exported at the top of this module
+# -- byte-equivalent script body.
 # ---------------------------------------------------------------------------
-
-
-def _brain_runtime_startup_script() -> str:
-    """Minimal boot glue for the golden-image runtime boot. The image already has
-    the ``jarvis-brain.service`` units baked+enabled; this only (a) writes
-    /etc/jarvis/brain.env from the runtime ``brain-env`` metadata, (b) ensures
-    /run/jarvis exists + touches the liveness marker so the idle-check never nukes
-    a freshly-booted node, and (c) restarts the unit to apply the fresh env.
-    ASCII-only. Kept tiny + idempotent (Mandate 3: no new provisioning framework)."""
-    meta_base = "http://metadata.google.internal/computeMetadata/v1/instance/attributes"
-    tls_fetch = "".join(
-        "curl -fsS -H 'Metadata-Flavor: Google' '%s/%s' -o %s/%s || true\n"
-        % (meta_base, meta_key, _NODE_TLS_DIR, filename)
-        for meta_key, filename in _TLS_META_KEYS.values()
-    )
-    return (
-        "#!/usr/bin/env bash\n"
-        "set -uo pipefail\n"
-        "mkdir -p /etc/jarvis /run/jarvis %s\n" % _NODE_TLS_DIR
-        + "curl -fsS -H 'Metadata-Flavor: Google' "
-        "'%s/brain-env' " % meta_base
-        + "-o /etc/jarvis/brain.env || : > /etc/jarvis/brain.env\n"
-        # SERVER TLS material (shipped as metadata by the driver) -> node files,
-        # BEFORE any unit starts. Fail-soft per file: TLS-disabled ignitions have
-        # no such metadata and must still boot.
-        + tls_fetch
-        + "chmod 600 %s/%s 2>/dev/null || true\n" % (
-            _NODE_TLS_DIR, _TLS_META_KEYS["server_key"][1])
-        # Refresh the baked clone (fail-soft): the golden image tracks main at
-        # ignition, so driver-shipped scripts (e.g. the bus sidecar) that landed
-        # AFTER the bake are present without a re-bake.
-        + "git -C /opt/trinity/jarvis pull --ff-only || true\n"
-        # Stage-0 bus + acceptance echo responder SIDECAR: the Brain-side WS
-        # server the cross-host acceptance connects to. Same venv as the soak.
-        + "cat > /etc/systemd/system/jarvis-brain-bus.service <<'UNIT'\n"
-        "[Unit]\n"
-        "Description=JARVIS Brain Stage-0 bus + acceptance echo responder\n"
-        "After=network-online.target\n"
-        "Wants=network-online.target\n"
-        "\n"
-        "[Service]\n"
-        "Type=simple\n"
-        "WorkingDirectory=/opt/trinity/jarvis\n"
-        "EnvironmentFile=/etc/jarvis/brain.env\n"
-        "RuntimeDirectory=jarvis\n"
-        "ExecStart=/opt/trinity/venv/bin/python scripts/brain_bus_echo_server.py\n"
-        "Restart=on-failure\n"
-        "RestartSec=5\n"
-        "\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n"
-        "UNIT\n"
-        + "touch /run/jarvis/brain_liveness\n"
-        "systemctl daemon-reload || true\n"
-        "systemctl restart jarvis-brain.service || systemctl start jarvis-brain.service || true\n"
-        "systemctl restart jarvis-brain-bus.service || systemctl start jarvis-brain-bus.service || true\n"
-        "systemctl start jarvis-brain-idle.timer || true\n"
-    )
 
 
 # ---------------------------------------------------------------------------
