@@ -4,7 +4,8 @@ import asyncio
 import logging
 import random
 from collections import OrderedDict
-from typing import Callable, Optional
+from dataclasses import fields as dataclass_fields
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import aiohttp
 
@@ -13,6 +14,7 @@ from backend.core.ouroboros.governance.ide_observability_stream import (
     EVENT_TYPE_REPLAY_END,
     EVENT_TYPE_REPLAY_START,
     EVENT_TYPE_STREAM_LAG,
+    StreamEvent,
     StreamEventBroker,
 )
 from backend.core.ouroboros.governance.transport.transport_config import TransportConfig
@@ -34,6 +36,32 @@ _DEDUP_MAX = 8192  # bounded seen-id memory (mirrors bus_bridge_server.py)
 # heartbeat frame kind rather than forwarded as a generic event.
 _CONTROL_EVENT_TYPES = frozenset({EVENT_TYPE_REPLAY_START, EVENT_TYPE_REPLAY_END, EVENT_TYPE_STREAM_LAG})
 
+# StreamEvent constructor surface, computed once. WAL envelopes are
+# StreamEvent.to_dict() outputs (whose keys match the dataclass fields
+# exactly today) -- the filter is defensive against a future to_dict()
+# gaining extra serialization-only keys.
+_STREAM_EVENT_FIELDS = frozenset(f.name for f in dataclass_fields(StreamEvent))
+
+
+def _rebuild_stream_event(envelope: Dict[str, Any]) -> Optional[StreamEvent]:
+    """Rebuild a StreamEvent from a journaled ``to_dict()`` envelope.
+
+    Extra keys are stripped defensively; a malformed envelope (missing
+    required fields, wrong types) returns None -- the caller skips it
+    (fail-soft per entry, Stage 3 Task 3)."""
+    try:
+        kwargs = {k: v for k, v in dict(envelope).items()
+                  if k in _STREAM_EVENT_FIELDS}
+        ev = StreamEvent(**kwargs)
+    except Exception:  # noqa: BLE001 -- malformed journal entry
+        logger.debug(
+            "[BusBridgeClient] malformed WAL envelope skipped: %r",
+            envelope, exc_info=True)
+        return None
+    if not ev.event_id or not ev.event_type:
+        return None
+    return ev
+
 
 class BusBridgeClient:
     """Connects to a BusBridgeServer, resumes via Last-Event-ID, and
@@ -48,6 +76,9 @@ class BusBridgeClient:
         url: Optional[str] = None,
         session_factory: Optional[Callable[[], aiohttp.ClientSession]] = None,
         initial_last_sent_id: Optional[str] = None,
+        on_ack: Optional[Callable[[str], None]] = None,
+        url_resolver: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+        durable: Optional[Any] = None,
     ) -> None:
         self._broker = broker
         self._cfg = cfg
@@ -63,6 +94,16 @@ class BusBridgeClient:
         # instance's cursor via ``initial_last_sent_id`` -- otherwise the
         # severed span is silently lost (live-fire attempt 2, 2026-07-04).
         self._last_sent_id: Optional[str] = initial_last_sent_id
+        self._on_ack = on_ack
+        # Stage 3 WAL-trim cursor: the last event_id the SERVER has
+        # confirmed ingesting on this connection. Monotonic -- only ever
+        # advances, so a stray regressive/duplicate ack (out-of-order
+        # delivery, replay) cannot rewind a later trim decision.
+        self._last_acked_id: Optional[str] = None
+        # Stage 3 Task 3: per-attempt discovery re-race + WAL-seeded replay.
+        # Both default None = Stage-2-identical behavior.
+        self._url_resolver = url_resolver
+        self._durable = durable
         self._high_water: int = 0
         self._degraded = False
         self._missed_hb = 0
@@ -87,6 +128,12 @@ class BusBridgeClient:
     @property
     def last_event_id(self) -> Optional[str]:
         return self._last_event_id
+
+    @property
+    def last_acked_id(self) -> Optional[str]:
+        """The last event_id the server has confirmed ingesting on this
+        connection (Stage 3 WAL-trim cursor). None until the first ack."""
+        return self._last_acked_id
 
     @property
     def degraded(self) -> bool:
@@ -144,11 +191,29 @@ class BusBridgeClient:
                 pass
         self._connected = False
 
+    async def _resolve_attempt_url(self) -> str:
+        """Per-attempt discovery re-race (Stage 3 Task 3): consult the
+        resolver on EVERY connect attempt -- a peer that came back on a
+        different address is found without restarting the client. A
+        resolver failure (or a None/empty answer) fails soft to the
+        static url; no resolver = legacy static behavior."""
+        if self._url_resolver is not None:
+            try:
+                resolved = await self._url_resolver()
+            except Exception:  # noqa: BLE001 -- discovery down != loop down
+                logger.debug(
+                    "[BusBridgeClient] url_resolver failed; falling back "
+                    "to static url", exc_info=True)
+                resolved = None
+            if resolved:
+                return resolved
+        return self._resolve_url()
+
     async def run(self) -> None:
         attempt = 0
         while not self._stopped:
             try:
-                await self._connect_once()
+                await self._connect_once(await self._resolve_attempt_url())
                 attempt = 0  # clean disconnect resets backoff
             except asyncio.CancelledError:
                 raise
@@ -160,7 +225,7 @@ class BusBridgeClient:
             attempt += 1
             await asyncio.sleep(delay)
 
-    async def _connect_once(self) -> None:
+    async def _connect_once(self, url: Optional[str] = None) -> None:
         ssl_ctx = build_client_ssl_context(self._cfg)
         session = (self._session_factory() if self._session_factory
                    else aiohttp.ClientSession())
@@ -172,13 +237,17 @@ class BusBridgeClient:
             connect_kwargs["server_hostname"] = self._cfg.tls_server_hostname
         try:
             async with session.ws_connect(
-                self._resolve_url(), ssl=ssl_ctx, heartbeat=None, **connect_kwargs,
+                url or self._resolve_url(), ssl=ssl_ctx, heartbeat=None, **connect_kwargs,
             ) as ws:
                 await ws.send_bytes(
                     bf.hello_frame(self._cfg.source_id, self._last_event_id).encode()
                 )
                 self._connected = True
                 self._active_ws = ws
+                # WAL-seeded replay FIRST (the oldest truth), then the live
+                # pump's broker-cursor replay -- overlap dedup is the
+                # SERVER's job (qualified-id _mark_seen).
+                await self._replay_durable(ws)
                 out_task = asyncio.ensure_future(self._pump_outbound(ws))
                 try:
                     await self._pump_inbound(ws)
@@ -192,6 +261,41 @@ class BusBridgeClient:
                         pass
         finally:
             await session.close()
+
+    async def _replay_durable(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """WAL-seeded replay (Stage 3 Task 3): send every pending journal
+        entry (already id-ordered by ``durable.pending()``) BEFORE the live
+        outbound pump starts. The WAL outlives the broker's bounded history
+        ring, so this recovers spans the broker-cursor replay physically
+        cannot.
+
+        No trim on send -- trim is exclusively ack-driven (Task 1 ack lane
+        -> Task 2 ``on_ack``); an entry stays journaled until the server
+        confirms ingesting past it, so a mid-replay drop just resends on
+        the next attempt. Malformed entries are skipped per-entry
+        (fail-soft); a dead socket propagates to the reconnect loop."""
+        if self._durable is None:
+            return
+        try:
+            entries = self._durable.pending()
+        except Exception:  # noqa: BLE001 -- a broken WAL must not block connect
+            logger.debug(
+                "[BusBridgeClient] durable.pending() failed; skipping "
+                "WAL replay", exc_info=True)
+            return
+        if not entries:
+            return
+        sent = 0
+        for envelope in entries:
+            ev = _rebuild_stream_event(envelope)
+            if ev is None:
+                continue  # malformed journal entry -- skip, keep replaying
+            await ws.send_bytes(
+                bf.event_frame(ev, source_id=self._cfg.source_id).encode())
+            sent += 1
+        logger.debug(
+            "[BusBridgeClient] WAL replay: sent %d/%d pending entries",
+            sent, len(entries))
 
     async def _pump_outbound(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Subscribe to the local broker and stream events (with
@@ -245,9 +349,33 @@ class BusBridgeClient:
             self._missed_hb = 0
             self._degraded = False
             frame = bf.BusFrame.decode(msg.data)
-            if frame is None or frame.kind != bf.FRAME_EVENT:
+            if frame is None:
+                continue
+            if frame.kind == bf.FRAME_ACK:
+                self._apply_ack(frame)
+                continue
+            if frame.kind != bf.FRAME_EVENT:
                 continue
             self._apply_inbound(frame)
+
+    def _apply_ack(self, frame: bf.BusFrame) -> None:
+        """Advance the ack cursor monotonically. Zero-padded hex event ids
+        compare correctly as strings, so a plain ``<=`` comparison is the
+        regressive/duplicate guard -- no int parsing needed. Fail-soft: an
+        ``on_ack`` callback that raises must never take down the inbound
+        pump."""
+        new_id = frame.last_event_id
+        if not new_id:
+            return
+        current = self._last_acked_id
+        if current is not None and new_id <= current:
+            return  # regressive or duplicate -- ignored
+        self._last_acked_id = new_id
+        if self._on_ack is not None:
+            try:
+                self._on_ack(new_id)
+            except Exception:  # noqa: BLE001 -- fail-soft, never crash the pump
+                logger.debug("[BusBridgeClient] on_ack callback raised", exc_info=True)
 
     def _apply_inbound(self, frame: bf.BusFrame) -> None:
         ev_dict = frame.event or {}

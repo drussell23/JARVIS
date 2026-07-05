@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from aiohttp import web
 
@@ -19,12 +19,26 @@ class DistributedEventBus:
     across the socket. TrinityEventBus callers are unchanged -- they still
     publish/subscribe on the local broker."""
 
-    def __init__(self, broker: StreamEventBroker, cfg: TransportConfig, *, role: str) -> None:
+    def __init__(
+        self,
+        broker: StreamEventBroker,
+        cfg: TransportConfig,
+        *,
+        role: str,
+        durable_outbound: Optional[Any] = None,
+        url_resolver: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+    ) -> None:
         if role not in ("server", "client"):
             raise ValueError(f"role must be server|client, got {role!r}")
         self._broker = broker
         self._cfg = cfg
         self._role = role
+        # Stage 3 Task 3 passthroughs (client role). Defaults None =
+        # Stage-2-identical. The durable's on_ack is re-wired at EVERY
+        # client construction so acks keep trimming the WAL across
+        # client recreation (start_client builds a new instance per call).
+        self._durable_outbound = durable_outbound
+        self._url_resolver = url_resolver
         self._server: Optional[BusBridgeServer] = None
         self._client: Optional[BusBridgeClient] = None
         # Outbound last-sent cursor carried ACROSS client instances: stop() +
@@ -51,9 +65,16 @@ class DistributedEventBus:
     async def start_client(self, url: Optional[str] = None) -> None:
         if self._role != "client":
             raise RuntimeError("start_client requires role=client")
+        kwargs: dict = {}
+        if self._durable_outbound is not None:
+            kwargs["durable"] = self._durable_outbound
+            kwargs["on_ack"] = self._durable_outbound.on_ack
+        if self._url_resolver is not None:
+            kwargs["url_resolver"] = self._url_resolver
         self._client = BusBridgeClient(
             self._broker, self._cfg, url=url,
             initial_last_sent_id=self._last_sent_cursor,
+            **kwargs,
         )
         await self._client.run()
 

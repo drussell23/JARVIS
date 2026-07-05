@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from collections import OrderedDict
 from typing import Callable, Optional
 
@@ -21,6 +23,27 @@ from backend.core.ouroboros.governance.transport import bus_frame as bf
 logger = logging.getLogger(__name__)
 
 _DEDUP_MAX = 8192  # bounded seen-id memory
+
+
+def _ack_every_n() -> int:
+    """Env-resolved ack cadence (event count). Read at call time, never
+    baked -- Stage 3 WAL trim tuning must not require a restart."""
+    raw = os.environ.get("JARVIS_BUS_ACK_EVERY_N", "")
+    try:
+        return int(raw.strip())
+    except (ValueError, AttributeError):
+        return 16
+
+
+def _ack_interval_s() -> float:
+    """Env-resolved ack cadence (wall-clock seconds). Whichever of this or
+    ``_ack_every_n`` trips first fires the ack."""
+    raw = os.environ.get("JARVIS_BUS_ACK_INTERVAL_S", "")
+    try:
+        return float(raw.strip())
+    except (ValueError, AttributeError):
+        return 5.0
+
 
 # Broker-internal bookkeeping event types. These are produced by
 # StreamEventBroker.subscribe()/stream_iter() for SSE-side replay
@@ -128,6 +151,13 @@ class BusBridgeServer:
         ws = web.WebSocketResponse(heartbeat=None)
         await ws.prepare(request)
         pump_task: Optional[asyncio.Task] = None
+        # Per-connection ingest cursor (Stage 3 Task 1): the id of the last
+        # EVENT frame ingested on THIS connection, plus the cadence state
+        # that decides when to ack it back to the peer. Reset implicitly on
+        # every new connection since these are locals, not instance state.
+        conn_last_eid: Optional[str] = None
+        ack_pending = 0
+        ack_deadline = time.monotonic() + _ack_interval_s()
         try:
             async for msg in ws:
                 if msg.type != WSMsgType.BINARY and msg.type != WSMsgType.TEXT:
@@ -143,9 +173,25 @@ class BusBridgeServer:
                     )
                 elif frame.kind == bf.FRAME_EVENT:
                     self._ingest(frame)
+                    event_id = (frame.event or {}).get("event_id")
+                    if event_id:
+                        conn_last_eid = event_id
+                        ack_pending += 1
+                        now = time.monotonic()
+                        if ack_pending >= _ack_every_n() or now >= ack_deadline:
+                            try:
+                                await ws.send_bytes(
+                                    bf.ack_frame(self._cfg.source_id, conn_last_eid).encode()
+                                )
+                            except Exception:  # noqa: BLE001 -- a failed ack send must never kill the WS loop
+                                logger.debug("[BusBridgeServer] ack send failed", exc_info=True)
+                            ack_pending = 0
+                            ack_deadline = now + _ack_interval_s()
                 elif frame.kind == bf.FRAME_HEARTBEAT:
                     await ws.send_bytes(bf.heartbeat_frame(self._cfg.source_id).encode())
-                # FRAME_ACK is plumbed for Stage 3 WAL trim; no-op here.
+                # FRAME_ACK: the server only EMITS acks (above); it does not
+                # consume inbound acks from the peer in Stage 3 Task 1 -- a
+                # symmetric client->server ack lane is not part of this arc.
         finally:
             if pump_task is not None:
                 pump_task.cancel()
