@@ -116,9 +116,10 @@ def test_ingest_folds_graph_and_appends_wal(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# (b) NON-BLOCKING: ingest returns immediately, offloaded write lands
+# (b) NON-BLOCKING + WRITE-AHEAD: ingest returns immediately; the durable
+#     append lands FIRST, and the graph fold is DEFERRED until after it.
 # --------------------------------------------------------------------------- #
-def test_ingest_is_non_blocking_and_write_lands(tmp_path):
+def test_ingest_is_non_blocking_and_fold_is_deferred_write_ahead(tmp_path):
     wal_path, snap_path = _paths(tmp_path)
 
     async def scenario():
@@ -130,14 +131,19 @@ def test_ingest_is_non_blocking_and_write_lands(tmp_path):
             t0 = time.monotonic()
             ing.ingest(_add_env("brain", "f", 1))
             elapsed = time.monotonic() - t0
-            # ingest itself does not block on the durable write
-            assert elapsed < 0.25, "ingest blocked on the offloaded append"
-            # graph is folded synchronously (immediately)
-            assert graph.node("brain:mod.py:f") is not None
-            # the durable write lands asynchronously (condition-poll)
+            # ingest itself does not block: it is a pure enqueue.
+            assert elapsed < 0.25, "ingest blocked (should be a pure enqueue)"
+            # WRITE-AHEAD: the fold is DEFERRED to the append worker (runs only
+            # after the durable append lands). No await has occurred since
+            # ingest returned, so the worker has NOT yet folded -> graph empty.
+            assert graph.node("brain:mod.py:f") is None, (
+                "fold must be deferred until AFTER the durable append "
+                "(write-ahead), not applied inside ingest")
+            # Both the durable append AND the deferred fold land asynchronously.
             landed = await _poll_until(
-                lambda: len(WAL(tmp_path / "wal.jsonl").pending_entries()) == 1)
-            assert landed
+                lambda: len(WAL(tmp_path / "wal.jsonl").pending_entries()) == 1
+                and graph.node("brain:mod.py:f") is not None)
+            assert landed, "the durable append + deferred fold must both land"
         finally:
             await ing.stop()
 

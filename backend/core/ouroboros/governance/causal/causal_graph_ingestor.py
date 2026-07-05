@@ -1,9 +1,26 @@
 """Domain-1 Staging-2 Task 3 -- the EVENT-SOURCED graph ingestor.
 
 The sink for the Staging-1 ``CausalDeltaSubscriber.on_delta`` callback. One
-stamped structural-delta envelope arrives, is folded into the in-memory
-``CausalGraph`` (Task 1, O(1) synchronous fold), and is durably appended to an
-intake WAL so the graph is deterministically RE-FOLDABLE after a Brain crash.
+stamped structural-delta envelope arrives; it is durably appended to an intake
+WAL FIRST, and only AFTER that append lands is it folded into the in-memory
+``CausalGraph`` (Task 1, O(1) fold). This is a genuine write-AHEAD log: the
+live graph never reflects a delta that is not already on disk, so the graph is
+deterministically RE-FOLDABLE after a Brain crash with ``recovered == live``.
+
+*** WRITE-AHEAD ORDERING (append-before-fold) -- the durability contract ***
+
+``ingest`` is a PURE non-blocking enqueue: it validates the envelope and pushes
+it onto the single ordered queue -- it does NOT fold. The SINGLE append worker
+then, per envelope, IN THIS ORDER: (a) ``await offload(WAL.append)`` -- DURABLE
+first; (b) only if that append succeeded, ``graph.apply_delta`` -- fold into the
+live graph. If the append FAILS, the delta is NOT folded (a non-durable delta
+must never enter the live graph) -- logged loudly, worker continues (fail-soft).
+
+Consequence: the WAL on disk is ALWAYS a superset-or-equal of the live graph.
+The live graph is EVENTUALLY-consistent with ingest -- it lags by the worker's
+append latency -- which is correct for an advisory graph (a reader only ever
+observes durable state). At quiescence (queue drained, worker idle): live graph
+== fold(WAL). ``flush()`` awaits that quiescence.
 
 Two durability surfaces compose into a loss-free, deterministic recovery:
 
@@ -38,13 +55,15 @@ commute); only the per-repo subsequence order is load-bearing.
 
 Determinism note: the fold depends ONLY on envelope content + ``emit_seq``,
 NEVER on the WAL's ``ts_monotonic`` / ``ts_utc`` metadata (those are wall-clock
-bookkeeping and do not touch graph state). The ``emit_seq``-monotonic guard
-makes re-folding the WAL tail after a snapshot idempotent, so the periodic
-compaction is loss-free even when the snapshot captured envelopes still queued
-(not yet appended) at compaction time.
+bookkeeping and do not touch graph state). Because the worker folds ONLY what
+it has already appended, ``graph.snapshot()`` at compaction time == the durable
+log state exactly (no queued-ahead divergence); the ``emit_seq``-monotonic
+guard additionally makes any WAL-tail re-fold after a snapshot idempotent, so
+compaction is loss-free across a crash.
 
 Fail-soft throughout: ``ingest`` never raises into the bus loop, a malformed
-envelope is dropped (touching neither graph nor WAL), and every offloaded
+envelope is dropped (never enqueued -> never appended, never folded), a failed
+append drops its delta from the live graph (non-durable), and every offloaded
 filesystem op degrades to a logged no-op rather than propagating.
 """
 from __future__ import annotations
@@ -253,26 +272,26 @@ class CausalGraphIngestor:
     # the sink -- CausalDeltaSubscriber.on_delta target
     # ------------------------------------------------------------------ #
     def ingest(self, envelope: dict) -> None:
-        """Fold ``envelope`` into the graph (O(1), synchronous, in-memory) and
-        enqueue it for the SINGLE ordered offloaded WAL append. NON-BLOCKING:
-        returns immediately -- the durable write happens on the append worker.
-        Malformed envelopes are dropped (graph + WAL untouched). NEVER raises
-        (this runs inside the bus delivery loop)."""
+        """PURE non-blocking enqueue onto the SINGLE ordered append queue -- the
+        write-AHEAD contract. ingest does NOT fold: the durable WAL append AND
+        the subsequent graph fold both happen on the append worker (append
+        FIRST, then fold), so a delta enters the live graph ONLY AFTER it is
+        durable on disk. Malformed envelopes are dropped (never enqueued ->
+        never appended, never folded). NEVER blocks, NEVER raises (this runs
+        inside the bus delivery loop)."""
         if not _looks_valid(envelope):
             logger.debug("[CausalGraphIngestor] dropping malformed envelope")
             return
-        try:
-            self.graph.apply_delta(envelope)
-        except Exception:  # noqa: BLE001 -- apply_delta is fail-soft; belt+braces
-            logger.debug("[CausalGraphIngestor] apply_delta raised (swallowed)",
-                         exc_info=True)
         # Push onto the single ordered queue. put_nowait on an unbounded queue
-        # is non-blocking; FIFO ordering + the single worker preserve per-repo
-        # emit_seq order in the WAL (the binding invariant).
+        # is non-blocking; FIFO ordering + the single worker's append-then-fold
+        # discipline preserve per-repo emit_seq order in the WAL (the binding
+        # invariant) AND the write-ahead guarantee.
         q = self._queue
         if q is None:
+            # Not started -> no durable path -> we MUST NOT fold (write-ahead:
+            # nothing enters the graph that isn't durable). Drop it.
             logger.debug("[CausalGraphIngestor] ingest before start() -- "
-                         "envelope folded but not durably logged")
+                         "envelope dropped (no durable path, not folded)")
             return
         try:
             q.put_nowait(envelope)
@@ -284,12 +303,15 @@ class CausalGraphIngestor:
     # the single ordered append worker (the serialization pin)
     # ------------------------------------------------------------------ #
     async def _append_worker(self) -> None:
-        """Drain the ordered queue, appending each envelope to the WAL in FIFO
-        order -- ONE at a time (``await`` each append before the next). This
-        single-flight discipline is what preserves per-repo emit_seq order in
-        the WAL. Every ``JARVIS_CAUSAL_SNAPSHOT_EVERY_N`` appends OR after
-        ``JARVIS_CAUSAL_SNAPSHOT_IDLE_S`` idle, folds to a snapshot + truncates
-        the WAL."""
+        """Drain the ordered queue ONE envelope at a time (``await`` each item's
+        durable append before pulling the next). Per envelope, in ORDER:
+        (a) durably append to the WAL; (b) ONLY if the append landed, fold into
+        the live graph via ``apply_delta`` (write-AHEAD -- a non-durable delta
+        never enters the graph). This single-flight, append-then-fold discipline
+        preserves per-repo emit_seq order in the WAL AND the durability
+        contract. Every ``JARVIS_CAUSAL_SNAPSHOT_EVERY_N`` durable folds OR
+        after ``JARVIS_CAUSAL_SNAPSHOT_IDLE_S`` idle, folds to a snapshot +
+        truncates the WAL."""
         idle_timeout: Optional[float] = (
             float(self._snapshot_idle_s) if self._snapshot_idle_s > 0 else None
         )
@@ -311,36 +333,56 @@ class CausalGraphIngestor:
             except asyncio.CancelledError:
                 raise
             try:
-                await self._append_one(envelope)
-                self._appends_since_snapshot += 1
-                if self._appends_since_snapshot >= self._snapshot_every_n:
-                    await self._compact()
+                durable = await self._append_one(envelope)
+                if durable:
+                    # WRITE-AHEAD: fold ONLY after the append landed durably.
+                    try:
+                        self.graph.apply_delta(envelope)
+                    except Exception:  # noqa: BLE001 -- apply_delta is fail-soft
+                        logger.debug(
+                            "[CausalGraphIngestor] apply_delta raised "
+                            "(swallowed)", exc_info=True)
+                    self._appends_since_snapshot += 1
+                    if self._appends_since_snapshot >= self._snapshot_every_n:
+                        await self._compact()
+                # not durable -> NOT folded (already logged loudly in _append_one)
             except Exception:  # noqa: BLE001 -- fail-soft per item
                 logger.warning(
-                    "[CausalGraphIngestor] append/compact failed (swallowed)",
-                    exc_info=True,
-                )
+                    "[CausalGraphIngestor] append/fold/compact failed "
+                    "(swallowed)", exc_info=True)
             finally:
                 q.task_done()
 
-    async def _append_one(self, envelope: dict) -> None:
-        """Offload ONE WAL append under the file lock. The lock only prevents
-        byte-interleave with an out-of-band snapshot_now(); ordering is already
-        pinned by the single FIFO worker. ``lease_id`` is a unique uuid (never
-        updated -> the entry stays 'pending' -> replay reads the full ordered
-        log); ``ts_*`` are metadata only and do NOT affect the fold."""
-        entry = WALEntry(
-            lease_id=uuid.uuid4().hex,
-            envelope_dict=envelope,
-            status="pending",
-            ts_monotonic=time.monotonic(),
-            ts_utc=datetime.now(timezone.utc).isoformat(),
-        )
-        async with self._file_lock:
-            res = await offload(self._wal.append, entry)
+    async def _append_one(self, envelope: dict) -> bool:
+        """Offload ONE WAL append under the file lock. Returns True iff the
+        append landed durably (the worker folds ONLY on True -- the write-ahead
+        gate). The lock only prevents byte-interleave with an out-of-band
+        snapshot_now(); ordering is already pinned by the single FIFO worker.
+        ``lease_id`` is a unique uuid (never updated -> the entry stays
+        'pending' -> replay reads the full ordered log); ``ts_*`` are metadata
+        only and do NOT affect the fold. A failed append is logged loudly and
+        returns False so the non-durable delta is dropped from the live graph."""
+        try:
+            entry = WALEntry(
+                lease_id=uuid.uuid4().hex,
+                envelope_dict=envelope,
+                status="pending",
+                ts_monotonic=time.monotonic(),
+                ts_utc=datetime.now(timezone.utc).isoformat(),
+            )
+            async with self._file_lock:
+                res = await offload(self._wal.append, entry)
+        except Exception as exc:  # noqa: BLE001 -- never fold a non-durable delta
+            logger.error(
+                "[CausalGraphIngestor] WAL append raised (%s) -- delta NOT "
+                "folded (non-durable)", exc, exc_info=True)
+            return False
         if is_offload_error(res):
-            logger.warning(
-                "[CausalGraphIngestor] WAL append offload failed: %s", res)
+            logger.error(
+                "[CausalGraphIngestor] WAL append failed (%s) -- delta NOT "
+                "folded (non-durable, dropped from live graph)", res)
+            return False
+        return True
 
     async def snapshot_now(self) -> None:
         """Force a fold-to-snapshot + WAL truncation now (deterministic
@@ -349,13 +391,15 @@ class CausalGraphIngestor:
 
     async def _compact(self) -> None:
         """Deterministic fold-to-snapshot (spec Q4): write ``graph.snapshot()``
-        durably, THEN truncate the WAL. The snapshot is computed synchronously
-        on the loop (a detached dict -- no shared mutable state) and only its
-        serialization/write is offloaded, so it never races a concurrent fold.
-        Truncation happens ONLY after the snapshot lands durably -- a failed
-        snapshot leaves the WAL intact (no data loss). Re-folding the WAL tail
-        after replay is idempotent (emit_seq guard), so a snapshot that
-        captured still-queued envelopes stays loss-free."""
+        durably, THEN truncate the WAL. Under write-ahead the worker folds ONLY
+        what it has already appended, so the live graph at this point == the
+        durable log exactly -- the snapshot IS the durable state (no queued-ahead
+        divergence). The snapshot is computed synchronously on the loop (a
+        detached dict -- no shared mutable state) and only its serialization/
+        write is offloaded, so it never races a concurrent fold. Truncation
+        happens ONLY after the snapshot lands durably -- a failed snapshot leaves
+        the WAL intact (no data loss); any WAL-tail re-fold after replay is
+        idempotent (emit_seq guard)."""
         try:
             snap = self.graph.snapshot()
         except Exception:  # noqa: BLE001

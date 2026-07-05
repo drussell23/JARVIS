@@ -7,6 +7,17 @@ ALL in-memory state.
 
     live_fingerprint  ==  WAL/snapshot-reconstructed fingerprint
 
+WHY THIS IS A TRUE-CRASH PROOF (write-ahead): the ingestor is append-BEFORE-fold
+-- the single worker durably appends each envelope to the WAL FIRST and folds it
+into the live graph ONLY after that append lands. So the live graph reflects
+ONLY durably-appended deltas: at quiescence (``flush()`` drained) the WAL on disk
+is exactly ``fold(WAL) == live graph``. Therefore capturing ``live_fp`` at
+quiescence and then annihilating all in-memory state loses NOTHING that isn't
+already on disk -- ``recovered == live`` is a genuine crash-determinism result,
+not an artifact of a graceful pre-crash flush. (Under the old write-BEHIND design
+a delta could be folded-but-not-yet-appended, so a true crash would yield
+recovered != live; append-before-fold closes that gap.)
+
 The equality witness is ``graph.state_fingerprint()`` (sha256 over the canonical
 snapshot: every node field + the full per-symbol Lamport high-water map),
 cross-checked by a second independent witness ``graph.snapshot() == ...``.
@@ -218,13 +229,18 @@ def test_teardown_spinup_fold_determinism(tmp_path, seed):
         live_order = _interleave(streams, random.Random(seed * 31 + 1))
         for env in live_order:
             ing.ingest(env)
-        await ing.flush()                     # all durable appends land
+        await ing.flush()                     # quiesce: append-then-fold drained
+        # write-AHEAD invariant: at quiescence the live graph reflects ONLY
+        # durably-appended deltas, so fold(WAL) == this live graph exactly.
         live_fp = graph.state_fingerprint()
         live_snap = graph.snapshot()
 
         # -- SIMULATE BRAIN VM CRASH -------------------------------------------
-        # Flush/drain the queue so the WAL on disk is the durable truth, THEN
-        # annihilate ALL in-memory state. Nothing but the WAL file survives.
+        # Quiesce reached above => the WAL on disk is the durable truth and is
+        # byte-equal to the live graph. Annihilate ALL in-memory state. stop()
+        # here only unwinds the (already-idle) worker task cleanly; it adds NO
+        # durability a hard kill wouldn't have -- everything folded was already
+        # appended (write-ahead). Nothing but the WAL/snapshot files survive.
         await ing.stop()
         del ing, graph                        # no in-memory state survives
 
