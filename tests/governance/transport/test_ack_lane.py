@@ -150,6 +150,69 @@ def test_ack_cursor_advances_to_last_ingested_event(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# (a2) Stage 3 Task 7, live-fire finding B (ack starvation): a burst BELOW
+#      the counter cadence followed by silence never re-enters the
+#      FRAME_EVENT branch, so the interval cadence never fired and the
+#      client's WAL never trimmed. The fix evaluates the same interval
+#      check in the FRAME_HEARTBEAT branch -- heartbeats flow continuously
+#      on the client's heartbeat_s cadence, so an idle-after-burst
+#      connection acks within ~JARVIS_BUS_ACK_INTERVAL_S. WITHOUT the fix
+#      this test times out: at most one interval ack can fire inside the
+#      3-event burst itself, and it can never cover the 3rd id.
+# --------------------------------------------------------------------------- #
+def test_heartbeat_drives_interval_ack_after_idle_burst(monkeypatch):
+    monkeypatch.setenv("JARVIS_BUS_ACK_EVERY_N", "16")  # burst of 3 << 16
+    monkeypatch.setenv("JARVIS_BUS_ACK_INTERVAL_S", "0.3")
+
+    async def scenario():
+        harness = _ServerHarness()
+        await harness.start()
+
+        client_broker = StreamEventBroker(history_maxlen=1024)
+        acked: List[str] = []
+        client = BusBridgeClient(
+            client_broker,
+            # Small client heartbeat cadence: the client's idle outbound
+            # pump keeps sending FRAME_HEARTBEATs, which now carry the
+            # server's interval-cadence ack evaluation.
+            _cfg(port=harness.port, heartbeat_s=0.1),
+            url=harness.url, on_ack=acked.append,
+        )
+        run_task = asyncio.ensure_future(client.run())
+        try:
+            await _await_connected(client)
+
+            event_ids = []
+            for i in range(3):  # burst-then-idle: NO further events
+                eid = client_broker.publish(
+                    xp.EXCHANGE_EVENT_TYPE, OP + f"-hb-{i}", {"i": i})
+                assert eid
+                event_ids.append(eid)
+
+            # Bounded condition-poll: the 3rd id must be acked with NO
+            # further event traffic -- heartbeats alone must trip the
+            # interval cadence.
+            deadline = asyncio.get_event_loop().time() + 3.0
+            while (asyncio.get_event_loop().time() < deadline
+                   and client.last_acked_id != event_ids[-1]):
+                await asyncio.sleep(0.05)
+
+            last_acked = client.last_acked_id
+        finally:
+            await _stop_client(client, run_task)
+            await harness.stop()
+        return last_acked, list(acked), event_ids
+
+    last_acked, acked, event_ids = asyncio.get_event_loop().run_until_complete(scenario())
+    assert last_acked == event_ids[-1], (
+        f"burst-then-idle must still ack the last ingested id via the "
+        f"heartbeat-driven interval cadence: got {last_acked!r}, "
+        f"want {event_ids[-1]!r}")
+    assert len(acked) >= 1, "on_ack must fire without any post-burst events"
+    assert acked == sorted(acked), f"ack ids must stay monotonic: {acked!r}"
+
+
+# --------------------------------------------------------------------------- #
 # (b) monotonic guard: a regressive/duplicate ack must not move the cursor
 #     or re-fire on_ack. Unit-level -- hand-deliver ack frames straight into
 #     _apply_ack, no network needed for this half of the contract.

@@ -184,7 +184,18 @@ class BodyModeDriver:
             TransportConfig,
         )
         trinity_bus = await get_trinity_event_bus()
-        broker = StreamEventBroker()
+        # Stage-3 Task 7 (cross-lifetime identity, live-fire finding A):
+        # resolve the WAL path FIRST and seed the broker's event-id
+        # sequence at the WAL high-water mark, so a restarted Body never
+        # re-mints an id a previous lifetime already journaled (re-minted
+        # ids were skipped as already-pending -- published-but-unjournaled
+        # signals were silently lost during a partition, and the far
+        # side's qualified-id dedup would drop the new events as
+        # replays). Scan runs OFF-loop through the cooperative_fs_io
+        # substrate; a broken offload falls back to the one-time inline
+        # boot read (wal_high_water is itself fail-soft -> 0).
+        broker = StreamEventBroker(
+            initial_event_seq=await self._wal_high_water_seed())
         # Stage-3: build the durable WAL FIRST so the client constructor
         # receives it (WAL-seeded replay + on_ack trim, Task 3), and
         # thread the discovery re-race resolver (per-attempt).
@@ -197,6 +208,38 @@ class BodyModeDriver:
             url_resolver=self._do_discover,
         )
         return trinity_bus, broker, dist_bus
+
+    async def _wal_high_water_seed(self) -> int:
+        """Live-default broker seed (Stage-3 Task 7): the max event id
+        EVER journaled into the durable outbound WAL -- tombstoned
+        entries included. Resolves the SAME default WAL path the live
+        DurableOutbound uses (``_default_wal_path``), so the seed and
+        the journal always agree. Fail-soft: any failure degrades to 0
+        (the legacy in-memory seed) rather than killing the driver."""
+        try:
+            from backend.core.ouroboros.governance.transport.durable_outbound import (  # noqa: PLC0415
+                _default_wal_path,
+                wal_high_water,
+            )
+        except Exception as exc:  # noqa: BLE001 -- fail-soft
+            _log("WAL high-water seed unavailable (fail-soft): %s" % exc)
+            return 0
+        wal_path = _default_wal_path()
+        try:
+            from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: PLC0415
+                is_offload_error,
+                offload,
+            )
+            result = await offload(wal_high_water, str(wal_path))
+            seed = wal_high_water(wal_path) if is_offload_error(result) \
+                else int(result)
+        except Exception:  # noqa: BLE001 -- offload substrate unavailable:
+            # one-time bounded boot read inline (wal_high_water never raises)
+            seed = wal_high_water(wal_path)
+        if seed:
+            _log("broker event-seq seeded at %d (WAL high-water -- "
+                 "cross-lifetime identity)" % seed)
+        return seed
 
     def _wal_arming_intended(self) -> bool:
         """Structural arming intent, decided BEFORE anything is built:

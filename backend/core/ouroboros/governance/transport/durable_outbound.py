@@ -56,6 +56,7 @@ Env knobs:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -101,6 +102,63 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def wal_high_water(wal_path: Any) -> int:
+    """Highest event-id sequence EVER journaled into the WAL at ``wal_path``.
+
+    Stage-3 Task 7 (cross-lifetime identity, live-fire finding A): the
+    broker's event-id sequence is in-memory and restarts at 0 every
+    process lifetime, while the WAL (and the far side's qualified-id
+    dedup) remember ids across lifetimes. A restarted Body re-minted ids
+    a previous lifetime had already journaled -- new publishes were
+    skipped by ``_journal_event`` as already-pending (published but
+    UNJOURNALED: silent loss during a partition). Seeding
+    ``StreamEventBroker(initial_event_seq=wal_high_water(path))`` makes
+    every new lifetime mint ids strictly above every id ever journaled.
+
+    Scans ALL records regardless of status -- acked / dead_letter
+    tombstones included: an id that was EVER minted must never be minted
+    again, trimmed or not. Parses ``lease_id`` as base-16 (event ids are
+    zero-padded 012x hex). Tolerant line-by-line parse mirroring
+    ``WAL.pending_entries``: blank / corrupt / non-hex lines are skipped.
+    Returns 0 for a missing or empty file. NEVER raises (fail-soft:
+    an unreadable WAL degrades to the legacy 0 seed).
+    """
+    high = 0
+    try:
+        path = Path(wal_path)
+        if not path.exists():
+            return 0
+        with path.open("r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.debug(
+                        "[wal_high_water] corrupt entry at line %d, "
+                        "skipping", line_no)
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                lease_id = record.get("lease_id", "")
+                if not isinstance(lease_id, str) or not lease_id:
+                    continue
+                if not set(lease_id) <= _HEX_DIGITS:
+                    continue  # non-hex control ids never seed the broker
+                try:
+                    value = int(lease_id, 16)
+                except ValueError:
+                    continue
+                if value > high:
+                    high = value
+    except Exception:  # noqa: BLE001 -- fail-soft: seed degrades to 0
+        logger.debug("[wal_high_water] scan failed for %r", wal_path,
+                     exc_info=True)
+    return high
 
 
 def _probe_disk(wal_path_str: str) -> Tuple[Optional[int], int]:

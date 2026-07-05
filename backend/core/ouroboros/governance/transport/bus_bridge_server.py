@@ -189,6 +189,27 @@ class BusBridgeServer:
                             ack_deadline = now + _ack_interval_s()
                 elif frame.kind == bf.FRAME_HEARTBEAT:
                     await ws.send_bytes(bf.heartbeat_frame(self._cfg.source_id).encode())
+                    # Stage-3 Task 7, live-fire finding B (ack starvation):
+                    # the interval cadence used to be evaluated ONLY in the
+                    # FRAME_EVENT branch -- a burst below EVERY_N followed by
+                    # silence never re-entered that branch, so the pending
+                    # ack never fired and the peer's durable WAL never
+                    # trimmed. Heartbeats flow continuously (the client sends
+                    # them on its heartbeat_s cadence), so evaluating the
+                    # SAME interval check here bounds ack latency to
+                    # ~JARVIS_BUS_ACK_INTERVAL_S even on an idle-after-burst
+                    # connection. Fires ONLY when un-acked ingest state
+                    # exists (cursor set + events pending since last ack).
+                    if (conn_last_eid and ack_pending
+                            and time.monotonic() >= ack_deadline):
+                        try:
+                            await ws.send_bytes(
+                                bf.ack_frame(self._cfg.source_id, conn_last_eid).encode()
+                            )
+                        except Exception:  # noqa: BLE001 -- a failed ack send must never kill the WS loop
+                            logger.debug("[BusBridgeServer] ack send failed", exc_info=True)
+                        ack_pending = 0
+                        ack_deadline = time.monotonic() + _ack_interval_s()
                 # FRAME_ACK: the server only EMITS acks (above); it does not
                 # consume inbound acks from the peer in Stage 3 Task 1 -- a
                 # symmetric client->server ack lane is not part of this arc.
