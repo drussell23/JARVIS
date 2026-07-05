@@ -1445,6 +1445,32 @@ class BattleTestHarness:
                 os.environ["OUROBOROS_BATTLE_WALL_DEADLINE_MONOTONIC"] = (
                     repr(time.monotonic() + float(_wall_cap))
                 )
+                # Cross-process deadline seam (A1 exit-wait coordination,
+                # bt-iso-1783144982). The env var above is per-process; an
+                # OUT-OF-PROCESS supervisor (the isomorphic A1 driver's
+                # exit-wait) needs the child's TRUE wall anchor to size its
+                # wait, instead of GUESSING a boot ceiling — the observed
+                # boot→arm skew was 168s, not the assumed 90s (a ~72s
+                # ShippedCodeInvariants boot validation on this monolith armed
+                # the watchdog long after boot-READY). So ALSO publish the
+                # absolute WALL deadline to a session-dir file the parent can
+                # read. Wall-clock (not monotonic) so it is comparable across
+                # processes; Principle #7 (absolute observability). Best-effort
+                # — a write failure never breaks boot.
+                try:
+                    import json as _json_wd  # noqa: PLC0415
+                    _now_wall = time.time()
+                    (self._session_dir / "wall_deadline.json").write_text(
+                        _json_wd.dumps({
+                            "armed_wall": _now_wall,
+                            "cap_s": float(_wall_cap),
+                            "deadline_wall": _now_wall + float(_wall_cap),
+                        })
+                    )
+                except Exception:  # noqa: BLE001 -- observability seam; never break boot
+                    logger.debug(
+                        "[WallClockWatchdog] wall_deadline.json publish failed "
+                        "(non-fatal)", exc_info=True)
                 # Defect #1 Slice B (2026-05-03) — thread-based safety
                 # net immune to asyncio starvation. The asyncio task
                 # above is the primary path (handles normal termination
