@@ -85,7 +85,8 @@ class CausalDeltaSubscriber:
 
     async def start(self) -> None:
         """Subscribe ``causal.delta.*``. The bus fingerprint-dedups before the
-        handler fires; ``event.source`` carries the authoritative repo."""
+        handler fires; the authoritative repo is the in-payload ``lineage.repo``
+        (``event.source`` collapses over the bridge -- never read here)."""
         self._sid = await self._bus.subscribe(CAUSAL_DELTA_PATTERN, self._on_delta)
 
     async def stop(self) -> None:
