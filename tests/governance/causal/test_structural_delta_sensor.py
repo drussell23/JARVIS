@@ -168,6 +168,14 @@ def test_unknown_repo_refuses_construction():
         StructuralDeltaSensor(bus, repo="not-a-trinity-repo")
 
 
+def test_broadcast_repo_refuses_construction():
+    # BROADCAST is a TARGET semantic, not a valid SOURCE identity -- a causal
+    # delta must originate from ONE concrete repo.
+    bus = _FakeBus()
+    with pytest.raises(ValueError):
+        StructuralDeltaSensor(bus, repo="broadcast")
+
+
 # ---------------------------------------------------------------------------
 # (e) durability inheritance: a causal-delta trinity event passes the Body's
 #     _journal_local_origin_only filter, so DurableOutbound WILL journal it.

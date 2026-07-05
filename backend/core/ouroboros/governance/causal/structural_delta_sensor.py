@@ -92,6 +92,15 @@ class StructuralDeltaSensor:
                 "repo %r (not a RepoType)" % (repo,)
             ) from exc
 
+        # BROADCAST is a TARGET semantic, not a valid SOURCE identity: a causal
+        # delta must originate from ONE concrete repo. Reflective enum-member
+        # check (no hardcoded string set).
+        if self._repo_enum == RepoType.BROADCAST:
+            raise ValueError(
+                "StructuralDeltaSensor requires a concrete source repo, not "
+                "BROADCAST"
+            )
+
         self._bus = trinity_bus
         self._repo = repo
         self._emit_seq = emit_seq
