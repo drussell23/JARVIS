@@ -25,6 +25,11 @@ Suite map (task brief + review round):
   (g) review IMPORTANT-1: a failed ack tombstone keeps the lease parked
       for retry (no live-acked/disk-pending split-brain loss), ONE
       warning per episode, drains once the fault clears
+  (h) Task-4 carry-in (Task-3 review): ``journal_filter`` -- when
+      provided, only events the filter accepts are journaled.
+      Peer-republished events (payload origin != local source_id)
+      carry client-local event ids the server has never seen;
+      replaying them defeats qualified-id dedup and duplicates events
 """
 from __future__ import annotations
 
@@ -480,3 +485,52 @@ def test_ack_past_at_risk_entry_retains_it_until_journaled(
     fresh = DurableOutbound(StreamEventBroker(history_maxlen=4), wal_path=wal_path)
     assert _pending_ids(fresh) == sorted(ids), (
         "disk truth must retain the once-at-risk entry after the fault clears")
+
+
+# --------------------------------------------------------------------------- #
+# (h) journal_filter: peer-origin events are NOT journaled; locally-
+#     originated events (and origin-less events -- fail-open durability
+#     bias) are. The driver's live default excludes peer republications:
+#     they carry client-local event ids the server has never seen, so
+#     replaying them at reconnect defeats qualified-id dedup.
+# --------------------------------------------------------------------------- #
+def test_journal_filter_excludes_peer_origin(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_BODY_WAL_PROBE_INTERVAL_S", "0")
+    wal_path = str(tmp_path / "body_wal.jsonl")
+    local_source = "mac-body"
+
+    def _local_only(event: Any) -> bool:
+        return (getattr(event, "payload", None) or {}).get(
+            "origin") in (None, "", local_source)
+
+    async def scenario():
+        broker = StreamEventBroker(history_maxlen=64)
+        outbound = DurableOutbound(
+            broker, wal_path=wal_path, journal_filter=_local_only)
+        await outbound.start()
+        try:
+            local_id = broker.publish(
+                _EVENT_TYPE, _PREFIX + "topic-a",
+                {"origin": local_source, "i": 0})
+            peer_id = broker.publish(
+                _EVENT_TYPE, _PREFIX + "topic-b",
+                {"origin": "gcp-brain", "i": 1})
+            bare_id = broker.publish(
+                _EVENT_TYPE, _PREFIX + "topic-c", {"i": 2})
+            assert local_id and peer_id and bare_id
+            await _wait_for(lambda: outbound.pending_count() >= 2)
+            await asyncio.sleep(0.1)  # settle: catch a late (wrong) journal
+            return local_id, peer_id, bare_id, _pending_ids(outbound)
+        finally:
+            await outbound.stop()
+
+    local_id, peer_id, bare_id, got = _run(scenario())
+    assert got == sorted([local_id, bare_id]), (
+        "local-origin + origin-less events must journal; got %r" % (got,))
+    assert peer_id not in got, (
+        "peer-republished (origin=gcp-brain) event must NOT be journaled")
+
+    # Disk truth agrees: a fresh instance recovers exactly the two.
+    fresh = DurableOutbound(
+        StreamEventBroker(history_maxlen=4), wal_path=wal_path)
+    assert _pending_ids(fresh) == sorted([local_id, bare_id])

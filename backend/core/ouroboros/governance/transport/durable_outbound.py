@@ -2,8 +2,11 @@
 """DurableOutbound -- Stage-3 Task 2: the Body-side durable outbound WAL.
 
 Journals every bridgeable StreamEventBroker event (op_id matching
-``op_prefix``, default ``trinity:``) into a flock-journaled write-ahead
-log AT PUBLISH TIME -- upstream of any connection state. A network
+``op_prefix``, default ``trinity:``; optionally narrowed further by the
+``journal_filter`` predicate -- the Body driver uses it to exclude
+peer-republished events whose client-local ids the server never issued)
+into a flock-journaled write-ahead log AT PUBLISH TIME -- upstream of
+any connection state. A network
 partition or a Body crash can therefore never lose a signal that
 ``publish()`` accepted: the WAL is the durable truth, the broker's
 bounded history ring (512 default) is merely a hot cache.
@@ -135,9 +138,19 @@ class DurableOutbound:
         *,
         wal_path: Optional[str] = None,
         op_prefix: str = "trinity:",
+        journal_filter: Optional[Callable[[Any], bool]] = None,
     ) -> None:
         self._broker = broker
         self._op_prefix = op_prefix
+        # Task-4 (Task-3 review carry-in): optional publish-side filter.
+        # When provided, only events where journal_filter(event) is True
+        # are journaled. The driver's live default excludes PEER-
+        # republished events (payload origin != local source_id): those
+        # carry client-local event ids the server has never seen --
+        # replaying them at reconnect defeats the server's qualified-id
+        # dedup and duplicates events. A filter that RAISES fails open
+        # (journal anyway): durability bias over filtering precision.
+        self._journal_filter = journal_filter
         self._wal_path = Path(wal_path) if wal_path else _default_wal_path()
         self._wal = WAL(
             self._wal_path,
@@ -309,6 +322,13 @@ class DurableOutbound:
         # non-hex ids -- only real 012x-hex publishes are journaled.
         if not event_id or not set(event_id) <= _HEX_DIGITS:
             return
+        if self._journal_filter is not None:
+            try:
+                keep = bool(self._journal_filter(event))
+            except Exception:  # noqa: BLE001 -- fail OPEN: durability bias
+                keep = True
+            if not keep:
+                return
         if (event_id in self._pending or event_id in self._ack_inflight
                 or event_id in self._at_risk):
             return

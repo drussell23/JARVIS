@@ -13,21 +13,38 @@ scripts/ignite_brain_vm.py); the live defaults are resolved lazily inside
 ``run()`` so the unit tests (tests/infra/test_run_body_mode.py) stay pure-logic
 with zero sockets.
 
+Stage-3 Task 4 -- durable degrade: the live default arms a ``DurableOutbound``
+WAL on the broker (journal-at-publish; peer-republished events excluded via
+``journal_filter``) and threads it plus ``url_resolver=discover_brain_endpoint``
+into the ``DistributedEventBus`` client, so a partition never loses a signal
+and reconnect re-races discovery per attempt. With the WAL armed, discovery
+failure at start NO LONGER exits 2 -- the driver degrades: signals journal
+durably, the client re-races forever with backoff, and the census surfaces
+``connected=False queued=N``. ``--require-brain`` restores the strict Stage-2
+exit-2 / exit-3 contract (acceptance runs). The "Brain offline" /
+"Brain reconnected" lines are DETERMINISTIC edge transitions derived ONLY from
+the bus client's ``connected`` property (set/cleared exactly at WS
+establishment/teardown -- the transport closure), polled once per census tick.
+No exception-driven state, no heartbeat-timeout heuristics (operator mandate).
+
 Exit codes:
     0  acceptance-clean (duration elapsed, clean stop)
-    2  discovery failed ("Brain offline")
-    3  connect-gate timeout (WS client never established)
+    2  discovery failed ("Brain offline") -- STRICT contract only
+       (--require-brain, or no durable WAL armed)
+    3  connect-gate timeout (WS client never established) -- strict contract
 
 Env knobs (all resolved at call time -- zero baked assumptions):
     JARVIS_BRAIN_CONNECT_GATE_S     connect-gate budget (default 30)
     JARVIS_BODY_MODE_CENSUS_S       census log cadence (default 10)
     JARVIS_BRAIN_WS_*               Stage-0 transport client family
     JARVIS_BRAIN_MTLS_DIR           client mTLS material (Stage-1 conventions)
+    JARVIS_BODY_WAL_*               DurableOutbound family (durable_outbound.py)
 
 Usage::
 
     python3 scripts/run_body_mode.py                       # run until signal
     python3 scripts/run_body_mode.py --inject-test-signal 5 --duration-s 60
+    python3 scripts/run_body_mode.py --require-brain       # strict exit 2/3
     python3 scripts/run_body_mode.py --dry-run             # plan only, no network
 """
 from __future__ import annotations
@@ -59,6 +76,30 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# The Body's bus-bridge identity -- MUST match the TrinityBusBridge
+# source_id (``_do_bridge``): the durable journal_filter keys on it.
+_SOURCE_ID = "mac-body"
+
+
+def _journal_local_origin_only(event: Any) -> bool:
+    """DurableOutbound journal_filter (live default): journal ONLY
+    locally-originated bridgeable events.
+
+    Peer-republished events -- imported off the wire and reflected onto
+    the local broker -- carry client-local event ids the server has
+    never seen; replaying them at reconnect defeats the server's
+    qualified-id dedup and duplicates events on the far side.
+    TrinityBusBridge stamps every outbound payload with
+    ``origin=<source_id>``; peer imports carry the peer's id. An absent
+    or empty origin journals anyway (fail OPEN: durability bias).
+    """
+    try:
+        origin = (getattr(event, "payload", None) or {}).get("origin")
+    except Exception:  # noqa: BLE001 -- fail OPEN
+        return True
+    return origin in (None, "", _SOURCE_ID)
+
+
 # ---------------------------------------------------------------------------
 # The Body-mode driver.
 # ---------------------------------------------------------------------------
@@ -78,6 +119,7 @@ class BodyModeDriver:
         shim_factory       -> ``(trinity_bus) -> RemoteIntakeRouter``
         sensor_factory     -> ``(shim) -> Optional[sensor]`` (fail-soft)
         watchdog_factory   -> ``() -> ControlPlaneWatchdog``
+        durable_factory    -> ``(broker) -> DurableOutbound`` (Stage-3 WAL)
     """
 
     def __init__(
@@ -86,6 +128,7 @@ class BodyModeDriver:
         inject_test_signals: int = 0,
         duration_s: Optional[float] = None,
         dry_run: bool = False,
+        require_brain: bool = False,
         # Injectable seams (live defaults resolved lazily inside run()).
         discover_fn: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
         bus_factory: Optional[Callable[[], Awaitable[Tuple[Any, Any, Any]]]] = None,
@@ -93,10 +136,12 @@ class BodyModeDriver:
         shim_factory: Optional[Callable[[Any], Any]] = None,
         sensor_factory: Optional[Callable[[Any], Any]] = None,
         watchdog_factory: Optional[Callable[[], Any]] = None,
+        durable_factory: Optional[Callable[[Any], Any]] = None,
     ) -> None:
         self.inject_test_signals = max(0, int(inject_test_signals))
         self.duration_s = duration_s
         self.dry_run = dry_run
+        self.require_brain = require_brain
 
         self._discover = discover_fn
         self._bus_factory = bus_factory
@@ -104,9 +149,16 @@ class BodyModeDriver:
         self._shim_factory = shim_factory
         self._sensor_factory = sensor_factory
         self._watchdog_factory = watchdog_factory
+        self._durable_factory = durable_factory
 
         self._signals_sent = 0
         self._worst_lag_ms = 0.0
+        self._durable: Optional[Any] = None
+        self._durable_built = False
+        # Deterministic degrade surfacing (operator mandate): the link
+        # state derives ONLY from the client's `connected` property.
+        # None = not yet observed; edge transitions log exactly once.
+        self._link_up: Optional[bool] = None
 
     # -- lazy live default resolvers ---------------------------------------
 
@@ -133,9 +185,49 @@ class BodyModeDriver:
         )
         trinity_bus = await get_trinity_event_bus()
         broker = StreamEventBroker()
+        # Stage-3: build the durable WAL FIRST so the client constructor
+        # receives it (WAL-seeded replay + on_ack trim, Task 3), and
+        # thread the discovery re-race resolver (per-attempt).
+        self._durable = self._build_durable(broker)
+        self._durable_built = True
         cfg = TransportConfig.from_env(role="mac-body")
-        dist_bus = DistributedEventBus(broker, cfg, role="client")
+        dist_bus = DistributedEventBus(
+            broker, cfg, role="client",
+            durable_outbound=self._durable,
+            url_resolver=self._do_discover,
+        )
         return trinity_bus, broker, dist_bus
+
+    def _wal_arming_intended(self) -> bool:
+        """Structural arming intent, decided BEFORE anything is built:
+        an injected durable_factory arms the WAL; the live default (no
+        injected bus stack) always arms it; an injected bus stack
+        WITHOUT a durable seam stays on the strict Stage-2 contract."""
+        return self._durable_factory is not None or self._bus_factory is None
+
+    def _build_durable(self, broker: Any) -> Optional[Any]:
+        """Resolve the durable WAL seam. Fail-soft: a durable that
+        cannot be built degrades to the strict (unarmed) behavior
+        rather than killing the driver."""
+        if self._durable_factory is not None:
+            try:
+                return self._durable_factory(broker)
+            except Exception as exc:  # noqa: BLE001
+                _log("durable outbound unavailable (fail-soft): %s" % exc)
+                return None
+        if self._bus_factory is not None:
+            # Injected bus stack without a durable seam: the live
+            # DurableOutbound needs a real broker -- stay unarmed.
+            return None
+        try:
+            from backend.core.ouroboros.governance.transport.durable_outbound import (  # noqa: PLC0415
+                DurableOutbound,
+            )
+            return DurableOutbound(
+                broker, journal_filter=_journal_local_origin_only)
+        except Exception as exc:  # noqa: BLE001
+            _log("durable outbound unavailable (fail-soft): %s" % exc)
+            return None
 
     def _do_bridge(self, trinity_bus: Any, broker: Any) -> Any:
         if self._bridge_factory is not None:
@@ -240,7 +332,42 @@ class BodyModeDriver:
             _log("injected dedup_key=%s verdict=%s"
                  % (envelope.dedup_key, verdict))
 
-    # -- census -------------------------------------------------------------
+    # -- census + deterministic degrade surfacing ----------------------------
+
+    def _queued(self) -> int:
+        """Durable queue depth (0 when the WAL is unarmed). Fail-soft."""
+        if self._durable is None:
+            return 0
+        try:
+            return int(self._durable.pending_count())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _update_link_state(self, connected: bool) -> None:
+        """EDGE-triggered degrade surfacing (operator mandate): the UI
+        state derives ONLY from the bus client's ``connected`` property
+        -- set/cleared exactly at WS establishment/teardown inside
+        ``_connect_once`` (the transport closure). Polled once per
+        census tick; each episode transition logs exactly once. NO
+        generalized try/except state, NO heartbeat-timeout heuristics.
+        """
+        if self._link_up is None:
+            # First observation. A run that BEGINS dark is an offline
+            # episode and must surface; a run that begins connected is
+            # the quiet steady state.
+            self._link_up = connected
+            if not connected:
+                _log("Brain offline -- %d signals queued (durable)"
+                     % self._queued())
+            return
+        if connected == self._link_up:
+            return  # steady state -- never repeat the episode line
+        self._link_up = connected
+        if connected:
+            _log("Brain reconnected -- draining %d queued" % self._queued())
+        else:
+            _log("Brain offline -- %d signals queued (durable)"
+                 % self._queued())
 
     def _census_tick(self, watchdog: Any, connected: bool) -> None:
         lag_events = int(getattr(watchdog, "lag_event_count", 0))
@@ -251,8 +378,8 @@ class BodyModeDriver:
         for r in records:
             self._worst_lag_ms = max(
                 self._worst_lag_ms, float(getattr(r, "lag_ms", 0.0)))
-        _log("lag_events=%d worst_ms=%.1f connected=%s"
-             % (lag_events, self._worst_lag_ms, connected))
+        _log("lag_events=%d worst_ms=%.1f connected=%s queued=%d"
+             % (lag_events, self._worst_lag_ms, connected, self._queued()))
 
     # -- the run FSM ---------------------------------------------------------
 
@@ -266,17 +393,36 @@ class BodyModeDriver:
                  % self.inject_test_signals)
             return 0
 
-        # 1. DISCOVER (stateless; fail-soft returns None).
+        # 1. DISCOVER (stateless; fail-soft returns None). With the
+        #    durable WAL armed (Stage 3), discovery failure DEGRADES
+        #    instead of exiting: signals journal durably and the client
+        #    re-races discovery per attempt. --require-brain (or an
+        #    unarmed WAL) keeps the strict Stage-2 exit-2 contract.
         url = await self._do_discover()
+        strict = self.require_brain or not self._wal_arming_intended()
         if not url:
-            _log("Brain offline -- discovery returned no endpoint (exit 2)")
-            return 2
-        _log("Brain discovered at %s" % url)
+            if strict:
+                _log("Brain offline -- discovery returned no endpoint "
+                     "(exit 2)")
+                return 2
+            _log("discovery returned no endpoint -- degrading durably "
+                 "(WAL armed, reconnect re-racing)")
+        else:
+            _log("Brain discovered at %s" % url)
 
-        # 2. Bus stack + connect gate (Stage-1 proven pattern: events published
-        #    before the first successful connect are live-only-lost -- never
-        #    proceed on a dark link).
+        # 2. Bus stack + durable WAL. The WAL arms BEFORE the client so
+        #    journal-at-publish covers every event from the first
+        #    publish (a partition can never lose an accepted signal).
         trinity_bus, broker, dist_bus = await self._do_bus_stack()
+        if not self._durable_built:
+            self._durable = self._build_durable(broker)
+            self._durable_built = True
+        if self._durable is not None:
+            try:
+                await self._durable.start()
+            except Exception as exc:  # noqa: BLE001 -- fail-soft
+                _log("durable WAL failed to arm (fail-soft): %s" % exc)
+                self._durable = None
         client_task = asyncio.ensure_future(dist_bus.start_client(url))
 
         def _client_getter() -> Any:
@@ -298,12 +444,27 @@ class BodyModeDriver:
         bridge = None
         watchdog = None
         try:
-            if not await _await_connected(
-                    _env_float("JARVIS_BRAIN_CONNECT_GATE_S", 30.0)):
-                _log("connect gate TIMEOUT -- WS client never established "
-                     "(exit 3)")
-                return 3
-            _log("bus client connected")
+            # Connect gate (Stage-1 proven pattern). Strict contract:
+            # never proceed on a dark link (exit 3). Degrade contract:
+            # a dark link is an OFFLINE EPISODE, not an exit -- the WAL
+            # is the sink and the client keeps re-racing. With no url at
+            # all there is nothing to gate on; skip straight to the
+            # degraded census.
+            if url:
+                if await _await_connected(
+                        _env_float("JARVIS_BRAIN_CONNECT_GATE_S", 30.0)):
+                    _log("bus client connected")
+                elif strict:
+                    _log("connect gate TIMEOUT -- WS client never "
+                         "established (exit 3)")
+                    return 3
+                else:
+                    _log("connect gate timeout -- degrading durably "
+                         "(WAL armed, reconnect re-racing)")
+
+            # Initial link-state observation: a run that begins dark
+            # surfaces the canonical offline line exactly once here.
+            self._update_link_state(_connected())
 
             # 3. Bridge the local trinity bus onto the wire.
             bridge = self._do_bridge(trinity_bus, broker)
@@ -318,6 +479,9 @@ class BodyModeDriver:
                 await self._inject_signals(shim)
 
             # 5. Starvation census (the Stage-2 payoff measurement).
+            #    Determinism contract: `connected` is polled EXACTLY once
+            #    per tick; that single read feeds BOTH the edge machine
+            #    and the census line (no re-read skew).
             watchdog = self._do_watchdog()
             watchdog.start()
             census_s = _env_float("JARVIS_BODY_MODE_CENSUS_S", 10.0)
@@ -331,14 +495,19 @@ class BodyModeDriver:
                     await asyncio.sleep(min(census_s, remaining))
                 else:
                     await asyncio.sleep(census_s)
-                self._census_tick(watchdog, _connected())
+                connected = _connected()
+                self._update_link_state(connected)
+                self._census_tick(watchdog, connected)
 
             # 6. Clean stop -> summary -> exit 0.
-            self._census_tick(watchdog, _connected())
+            connected = _connected()
+            self._update_link_state(connected)
+            self._census_tick(watchdog, connected)
             return 0
         finally:
             lag_events = int(getattr(watchdog, "lag_event_count", 0)) \
                 if watchdog is not None else 0
+            queued_at_exit = self._queued()
             if watchdog is not None:
                 try:
                     await watchdog.stop()
@@ -347,6 +516,11 @@ class BodyModeDriver:
             if bridge is not None:
                 try:
                     await bridge.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._durable is not None:
+                try:
+                    await self._durable.stop()
                 except Exception:  # noqa: BLE001
                     pass
             try:
@@ -358,8 +532,10 @@ class BodyModeDriver:
                 await client_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-            _log("SUMMARY lag_events=%d worst_ms=%.1f signals_sent=%d"
-                 % (lag_events, self._worst_lag_ms, self._signals_sent))
+            _log("SUMMARY lag_events=%d worst_ms=%.1f signals_sent=%d "
+                 "queued_at_exit=%d"
+                 % (lag_events, self._worst_lag_ms, self._signals_sent,
+                    queued_at_exit))
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +562,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run for S seconds then stop cleanly (default: until signal).",
     )
     p.add_argument(
+        "--require-brain", action="store_true",
+        help="Strict Stage-2 contract: exit 2 when discovery fails and "
+             "exit 3 on connect-gate timeout, even with the durable WAL "
+             "armed (acceptance runs). Default: degrade durably -- journal "
+             "signals to the WAL and keep re-racing discovery.",
+    )
+    p.add_argument(
         "--dry-run", action="store_true",
         help="Print the Body-mode plan and exit -- touches no network.",
     )
@@ -399,6 +582,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         inject_test_signals=args.inject_test_signal,
         duration_s=args.duration_s,
         dry_run=args.dry_run,
+        require_brain=args.require_brain,
     )
     try:
         return asyncio.run(driver.run())
