@@ -98,13 +98,32 @@ def test_delegation_pin_calls_get_blast_radius_with_exact_symbol() -> None:
     assert oracle.calls == ["jarvis:mod.py:target_symbol"]
 
 
-def test_default_oracle_fn_is_get_oracle() -> None:
-    # When no oracle_fn injected, the default resolver is oracle.get_oracle.
-    from backend.core.ouroboros import oracle as oracle_mod
+def test_default_resolver_calls_get_oracle() -> None:
+    # When no oracle_fn is injected, the intra_repo path must resolve the
+    # per-repo Oracle via ``blast_radius_oracle.get_oracle`` (the module-level
+    # import the code actually calls). Patch that symbol with a recording fake
+    # and assert the default path invoked it -- a real behavioral pin, not the
+    # tautological ``_oracle_fn is None`` identity check it replaces.
+    import backend.core.ouroboros.governance.causal.blast_radius_oracle as mod
 
-    graph = CausalGraph()
-    bro = BlastRadiusOracle(graph)
-    assert bro._oracle_fn is None or bro._oracle_fn is oracle_mod.get_oracle
+    called = {"n": 0}
+    recording = _RecordingOracle(_FakeBlastRadius([], [], "low"))
+
+    def _fake_get_oracle():
+        called["n"] += 1
+        return recording
+
+    orig = mod.get_oracle
+    mod.get_oracle = _fake_get_oracle
+    try:
+        graph = CausalGraph()
+        bro = BlastRadiusOracle(graph)  # no oracle_fn -> default resolver
+        asyncio.run(bro.intra_repo("jarvis:mod.py:sym"))
+    finally:
+        mod.get_oracle = orig
+
+    assert called["n"] == 1, "default path must call blast_radius_oracle.get_oracle"
+    assert recording.calls == ["jarvis:mod.py:sym"]
 
 
 # --------------------------------------------------------------------------

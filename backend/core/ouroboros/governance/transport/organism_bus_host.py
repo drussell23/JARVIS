@@ -95,6 +95,7 @@ class OrganismBusHost:
         self._bridge: Optional[Any] = None  # TrinityBusBridge
         self._intake_bridge: Optional[Any] = None  # RemoteIntakeBridge (Task 3)
         self._causal_subscriber: Optional[Any] = None  # CausalDeltaSubscriber (D1S1 Task 2)
+        self._causal_ingestor: Optional[Any] = None  # CausalGraphIngestor (D1S2 Task 3)
         self._generation_fence: Optional[Any] = None  # GenerationFence (Stage-4 Task 4)
         self._runner: Optional[Any] = None  # aiohttp AppRunner
         self._site: Optional[Any] = None  # aiohttp TCPSite
@@ -218,14 +219,31 @@ class OrganismBusHost:
         return True
 
     async def _start_causal_subscriber(self, trinity_bus: Any) -> None:
-        """Construct + start the Domain-1 Staging-1 CausalDeltaSubscriber
-        (Brain receiver). Lazy import inside the start-guard keeps master-OFF
+        """Construct + start the Domain-1 Staging-2 causal fold pipeline: an
+        in-memory ``CausalGraph`` + the event-sourced ``CausalGraphIngestor``
+        (Task 3), then the Staging-1 ``CausalDeltaSubscriber`` wired so its
+        ``on_delta`` sink IS ``ingestor.ingest`` (folds each delta into the
+        graph + durably logs it to the ordered WAL). The ingestor is started
+        FIRST (replay_from_wal + arm the ordered append worker) so it is a live
+        sink before any delta can arrive; teardown stops in reverse (subscriber
+        then ingestor). Lazy import inside the start-guard keeps master-OFF
         byte-identical (no causal-package import cost)."""
         from backend.core.ouroboros.governance.causal.causal_delta_subscriber import (  # noqa: PLC0415
             CausalDeltaSubscriber,
         )
+        from backend.core.ouroboros.governance.causal.causal_graph import (  # noqa: PLC0415
+            CausalGraph,
+        )
+        from backend.core.ouroboros.governance.causal.causal_graph_ingestor import (  # noqa: PLC0415
+            CausalGraphIngestor,
+        )
 
-        self._causal_subscriber = CausalDeltaSubscriber(trinity_bus)
+        graph = CausalGraph()
+        self._causal_ingestor = CausalGraphIngestor(graph)
+        await self._causal_ingestor.start()
+
+        self._causal_subscriber = CausalDeltaSubscriber(
+            trinity_bus, on_delta=self._causal_ingestor.ingest)
         await self._causal_subscriber.start()
 
     async def _maybe_start_generation_fence(self, trinity_bus: Any) -> None:
@@ -260,6 +278,16 @@ class OrganismBusHost:
                 logger.debug("[OrganismBusHost] causal subscriber stop failed",
                              exc_info=True)
             self._causal_subscriber = None
+        if self._causal_ingestor is not None:
+            # Reverse order: the subscriber (delta source) is already stopped,
+            # so flushing the ingestor's ordered append worker cannot race a
+            # late ingest. Fail-soft.
+            try:
+                await self._causal_ingestor.stop()
+            except Exception:  # noqa: BLE001
+                logger.debug("[OrganismBusHost] causal ingestor stop failed",
+                             exc_info=True)
+            self._causal_ingestor = None
         if self._intake_bridge is not None:
             try:
                 await self._intake_bridge.stop()
