@@ -478,3 +478,121 @@ def test_edge_transitions_log_exactly_once_per_episode(capsys, monkeypatch):
         "exactly one reconnected line per episode: %r" % out)
     # Both census states were surfaced during the run.
     assert "connected=False" in out and "connected=True" in out
+
+
+# ---------------------------------------------------------------------------
+# (i) Stage-4 Task 3: the BrainKeeper seam. A fake keeper injected via
+#     keeper_factory receives every discovery result (the wrapped discover
+#     seam), is ticked once per census tick, surfaces `gen=/keeper=` on the
+#     census line, and its current_gen is exported as
+#     JARVIS_BRAIN_CURRENT_GEN for the discovery gen-filter.
+# ---------------------------------------------------------------------------
+
+
+class _FakeKeeper:
+    def __init__(self, gen: int = 3, state: str = "healthy") -> None:
+        self.notes: List[Any] = []
+        self.ticks = 0
+        self._gen = gen
+        self._state = state
+
+    def note_discovery_result(self, url: Any) -> None:
+        self.notes.append(url)
+
+    async def tick(self) -> str:
+        self.ticks += 1
+        return self._state
+
+    def current_gen(self) -> int:
+        return self._gen
+
+
+def test_keeper_seam_receives_discovery_ticks_and_census(capsys, monkeypatch):
+    monkeypatch.setenv("JARVIS_BRAIN_CONNECT_GATE_S", "2")
+    monkeypatch.setenv("JARVIS_BODY_MODE_CENSUS_S", "0.01")
+    # Pre-seed so monkeypatch restores the var after the driver mutates it.
+    monkeypatch.setenv("JARVIS_BRAIN_CURRENT_GEN", "")
+    keeper = _FakeKeeper(gen=3, state="healthy")
+    kwargs, ns = _seams()
+    kwargs["keeper_factory"] = lambda: keeper
+    driver = bm.BodyModeDriver(duration_s=0.05, **kwargs)
+    rc = asyncio.run(driver.run())
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    # The wrapped discover seam feeds the keeper the initial discovery result.
+    assert keeper.notes == ["wss://10.0.0.5:8770/ws/trinity-bus"], (
+        "every discovery outcome must feed the keeper: %r" % keeper.notes)
+    assert keeper.ticks >= 1, "the census loop must tick the keeper"
+    # Census line gains ` gen=%d keeper=%s`.
+    assert "gen=3 keeper=healthy" in out, out
+    # The gen-filter export: set at keeper construction (current_gen >= 1).
+    assert os.environ.get("JARVIS_BRAIN_CURRENT_GEN") == "3"
+
+
+def test_keeper_seam_offline_discovery_feeds_none(capsys, monkeypatch):
+    monkeypatch.setenv("JARVIS_BODY_MODE_CENSUS_S", "0.01")
+    monkeypatch.setenv("JARVIS_BRAIN_CURRENT_GEN", "")
+    keeper = _FakeKeeper(gen=2, state="absent")
+    durable = _FakeDurable()
+    kwargs, ns = _seams(url=None, connect=False, durable=durable)
+    kwargs["keeper_factory"] = lambda: keeper
+    driver = bm.BodyModeDriver(duration_s=0.05, **kwargs)
+    rc = asyncio.run(driver.run())
+    out = capsys.readouterr().out
+
+    assert rc == 0, "WAL armed: degrade, not exit 2"
+    assert keeper.notes == [None], "a failed discovery feeds the keeper falsy"
+    assert keeper.ticks >= 1
+    assert "gen=2 keeper=absent" in out, out
+
+
+def test_keeper_gen_zero_is_not_exported(capsys, monkeypatch):
+    """A keeper that has never minted a generation (gen 0) must NOT arm the
+    discovery gen-filter -- exporting 0 would exclude a pre-Stage-4
+    unlabeled Brain before the keeper has ever resurrected anything."""
+    monkeypatch.setenv("JARVIS_BRAIN_CONNECT_GATE_S", "2")
+    monkeypatch.setenv("JARVIS_BODY_MODE_CENSUS_S", "0.01")
+    monkeypatch.delenv("JARVIS_BRAIN_CURRENT_GEN", raising=False)
+    keeper = _FakeKeeper(gen=0, state="healthy")
+    kwargs, ns = _seams()
+    kwargs["keeper_factory"] = lambda: keeper
+    driver = bm.BodyModeDriver(duration_s=0.05, **kwargs)
+    rc = asyncio.run(driver.run())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert os.environ.get("JARVIS_BRAIN_CURRENT_GEN") is None, (
+        "gen 0 must never arm the discovery filter")
+    assert "gen=0 keeper=healthy" in out, "census still surfaces the state"
+
+
+def test_no_keeper_seam_with_injected_stack_stays_keeperless(capsys, monkeypatch):
+    """Back-compat: an injected bus stack WITHOUT a keeper seam must stay
+    keeper-less (the _build_durable precedent) -- no gen=/keeper= census
+    fields, no real ResourceManifest/bucket touched."""
+    monkeypatch.setenv("JARVIS_BRAIN_CONNECT_GATE_S", "2")
+    monkeypatch.setenv("JARVIS_BODY_MODE_CENSUS_S", "0.01")
+    kwargs, ns = _seams()
+    driver = bm.BodyModeDriver(duration_s=0.05, **kwargs)
+    rc = asyncio.run(driver.run())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert " keeper=" not in out and " gen=" not in out, (
+        "keeper-less runs must keep the census line byte-compatible")
+
+
+def test_keeper_factory_failure_is_fail_soft(capsys, monkeypatch):
+    monkeypatch.setenv("JARVIS_BRAIN_CONNECT_GATE_S", "2")
+    monkeypatch.setenv("JARVIS_BODY_MODE_CENSUS_S", "0.01")
+
+    def boom_factory():
+        raise RuntimeError("keeper exploded at build")
+
+    kwargs, ns = _seams()
+    kwargs["keeper_factory"] = boom_factory
+    driver = bm.BodyModeDriver(duration_s=0.05, **kwargs)
+    rc = asyncio.run(driver.run())
+    out = capsys.readouterr().out
+    assert rc == 0, "a keeper that cannot be built must not kill the driver"
+    assert "brain keeper unavailable (fail-soft)" in out
+    assert " keeper=" not in out

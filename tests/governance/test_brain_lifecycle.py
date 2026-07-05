@@ -133,6 +133,26 @@ def test_live_family_empty_for_unknown_root(manifest) -> None:
     assert manifest.live_family("never-recorded") == []
 
 
+def test_live_family_terminates_on_parent_cycle(manifest) -> None:
+    """Cycle-safety pin (Task-3 fold-in from the Task-1 review): a 2-node
+    parent CYCLE (a->b->a) must terminate, return both nodes, and never hang.
+    Bounded by a hard deadline -- a regression that reintroduces an unbounded
+    walk fails the test instead of wedging the suite."""
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+    _create(manifest, "node-a", parent="node-b")
+    _create(manifest, "node-b", parent="node-a")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        # .result(timeout=...) is the bounded deadline: raises TimeoutError
+        # instead of hanging if the BFS cycle guard ever regresses.
+        fam = pool.submit(manifest.live_family, "node-a").result(timeout=10)
+
+    names = [r["name"] for r in fam]
+    assert set(names) == {"node-a", "node-b"}, "both cycle members returned"
+    assert names[-1] == "node-a", "the root still comes last (children first)"
+
+
 # ---------------------------------------------------------------------------
 # (c) teardown_family: order + tombstones + fail-soft per item.
 # ---------------------------------------------------------------------------
