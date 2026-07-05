@@ -334,6 +334,70 @@ def test_out_of_order_remove_before_add_no_resurrection():
 
 
 # ---------------------------------------------------------------------------
+# partial-write fields are deterministic under per-repo emit_seq order, and the
+# boundary (arbitrary same-repo reorder) is PINNED as a known divergence -- review
+# ---------------------------------------------------------------------------
+
+def test_partial_write_deterministic_under_per_repo_order():
+    # A single source repo emits its deltas in emit_seq order (emit_seq is that
+    # repo's Lamport clock). Folded in emit_seq order, the partial-write fields
+    # (resignature-sig, import-merge) converge deterministically.
+    seq_ordered = [
+        _env(_delta("brain", "m.py", added=(_sym("brain:m.py:X", "function", "a"),)), "brain", 1),
+        _env(_delta("brain", "m.py", imp_added=(ImportEdge("brain:m.py:X", "os", "imports"),)), "brain", 2),
+        _env(_delta("brain", "m.py", resig=(("brain:m.py:X", "a", "b"),)), "brain", 3),
+        _env(_delta("brain", "m.py", removed=(_sym("brain:m.py:X", "function", "b"),)), "brain", 4),
+        _env(_delta("brain", "m.py", added=(_sym("brain:m.py:X", "function", "c"),)), "brain", 5),
+    ]
+
+    def _fold(order):
+        g = CausalGraph()
+        for e in order:
+            g.apply_delta(e)
+        return g
+
+    # The ingestor delivers per-repo-ordered; two independent emit_seq-ordered
+    # replays are identical (determinism the WAL reconstruction relies on).
+    g1 = _fold(seq_ordered)
+    g2 = _fold(list(seq_ordered))
+    assert g1.state_fingerprint() == g2.state_fingerprint()
+
+    # converged truth: terminal full add@5 -> X present, sig=c, imports dropped
+    # by the remove@4 tombstone/re-add. hwm[X]=5.
+    x = g1.node("brain:m.py:X")
+    assert x is not None and x.signature_hash == "c" and x.last_emit_seq == 5
+    assert x.imports == frozenset()
+    assert g1.snapshot()["seq_hwm"] == {"brain:m.py:X": 5}
+
+    # BOUNDARY PIN (honest): swapping an import-only delta BEFORE the add that
+    # creates its node violates per-repo emit_seq order -- an ingest the event
+    # model never produces (one repo emits in emit_seq order; the WAL preserves
+    # it). Under that illegal shuffle the import fact lands on no node (the add
+    # hasn't run yet) and is lost, so the fold DIVERGES. We assert the divergence
+    # to document the boundary rather than hide it; per-field CRDT clocks would
+    # be over-engineering for a shuffle that cannot occur.
+    imp_pair = [
+        _env(_delta("brain", "p.py", added=(_sym("brain:p.py:Z", "function", "z"),)), "brain", 1),
+        _env(_delta("brain", "p.py", imp_added=(ImportEdge("brain:p.py:Z", "sys", "imports"),)), "brain", 2),
+    ]
+    good_imp = _fold(imp_pair)                          # per-repo order: Z imports={sys}
+    bad_imp = _fold(list(reversed(imp_pair)))           # illegal: import@2 before add@1
+    assert good_imp.node("brain:p.py:Z").imports == frozenset({"sys"})
+    assert bad_imp.node("brain:p.py:Z").imports == frozenset()          # fact lost
+    assert good_imp.state_fingerprint() != bad_imp.state_fingerprint()  # KNOWN, pinned
+
+    # Same boundary via a resignature-terminal partial write:
+    resig_terminal = [
+        _env(_delta("brain", "n.py", added=(_sym("brain:n.py:Y", "function", "p"),)), "brain", 1),
+        _env(_delta("brain", "n.py", resig=(("brain:n.py:Y", "p", "q"),)), "brain", 2),
+    ]
+    good = _fold(resig_terminal)                       # per-repo order: Y sig=q
+    bad = _fold(list(reversed(resig_terminal)))        # illegal reorder: resig before add
+    assert good.node("brain:n.py:Y").signature_hash == "q"
+    assert good.state_fingerprint() != bad.state_fingerprint()  # KNOWN, pinned boundary
+
+
+# ---------------------------------------------------------------------------
 # import edges fold onto the src node
 # ---------------------------------------------------------------------------
 

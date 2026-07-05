@@ -134,8 +134,19 @@ class CausalGraph:
     # ------------------------------------------------------------------ #
     def apply_delta(self, envelope: dict) -> int:
         """Fold one stamped delta envelope. Returns the count of nodes actually
-        mutated. O(1) in the delta's symbol count; emit_seq-monotonic per
-        symbol; NEVER raises (malformed -> 0, logged)."""
+        mutated. O(1) in the delta's symbol count; NEVER raises (malformed -> 0,
+        logged).
+
+        emit_seq-monotonic per symbol. FULL-WRITE ops (symbols_added,
+        symbols_removed) are fully order-independent (verified: any-order shuffle
+        converges). PARTIAL-WRITE fields -- a resignature-only signature update,
+        or an import-only edge fold (and the `imports` MERGE that symbols_added
+        performs) -- are last-writer-wins by emit_seq PER FIELD-SOURCE and are
+        order-independent ONLY under per-repo emit_seq order. This is guaranteed
+        by the event model (emit_seq is a per-repo Lamport clock; one source repo
+        emits its deltas in emit_seq order) and preserved by the ingestor's
+        per-repo-ordered WAL append (Task 3 binding invariant). Cross-repo folds
+        always commute (disjoint symbol_ids)."""
         try:
             if not isinstance(envelope, dict):
                 raise TypeError("envelope is not a dict")
@@ -152,11 +163,18 @@ class CausalGraph:
         repo = delta.repo
         file_path = delta.file_path
 
+        # INVARIANT: per-repo emit_seq order preserved by the ingestor (Task 3).
+        # emit_seq is a per-repo Lamport clock and one source repo emits its
+        # deltas in emit_seq order; the WAL append is per-repo-ordered. FULL-WRITE
+        # ops (add/remove) commute under ANY shuffle; PARTIAL-WRITE fields
+        # (resignature-only signature, import-only edge merge) are last-writer-wins
+        # per field-source and converge ONLY under that per-repo order. See the
+        # apply_delta docstring for the precise model.
+        #
         # Per-symbol Lamport high-water captured lazily at its PRE-delta value on
         # first touch, so every operation in THIS delta is authorized against the
         # symbol's watermark BEFORE the delta started -- a multi-touch delta stays
-        # internally consistent AND the whole fold is order-independent (max over
-        # emit_seq is commutative; the tombstone watermark blocks stale resurrection).
+        # internally consistent; the tombstone watermark blocks stale resurrection.
         pre_hwm: Dict[str, int] = {}
 
         def _hwm_before(symbol_id: str) -> int:
@@ -174,7 +192,11 @@ class CausalGraph:
 
         mutated: Set[str] = set()
 
-        # --- symbols_added: full upsert (merge any existing imports) ---------
+        # --- symbols_added: upsert. NOTE this is a FULL write for kind/signature
+        # but a PARTIAL write for `imports` -- it MERGES the node's existing
+        # imports (an import-only delta may have folded facts onto the node
+        # first). That merge is last-writer-wins per field-source and so is only
+        # order-independent under per-repo emit_seq order (see docstring). -------
         for rec in delta.symbols_added:
             sid = rec.symbol_id
             if not _wins(sid):
