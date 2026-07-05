@@ -1819,6 +1819,7 @@ class StreamEventBroker:
         history_maxlen: Optional[int] = None,
         max_subscribers: Optional[int] = None,
         queue_maxsize: Optional[int] = None,
+        initial_event_seq: int = 0,
     ) -> None:
         self._history_maxlen = history_maxlen or _history_maxlen()
         self._max_subscribers = max_subscribers or _max_subscribers()
@@ -1828,7 +1829,20 @@ class StreamEventBroker:
         self._history: Deque[StreamEvent] = deque(maxlen=self._history_maxlen)
         self._subscribers: Dict[int, _Subscriber] = {}
         self._next_sub_id: int = 0
-        self._next_event_seq: int = 0
+        # Stage-3 Task 7 (cross-lifetime identity, live-fire finding A):
+        # a fresh broker in a restarted process minted the SAME 012x ids
+        # a previous lifetime already journaled into the durable outbound
+        # WAL -- new publishes were skipped as already-pending (silent
+        # loss during a partition) and would poison the far side's
+        # qualified-id dedup. Callers that persist event ids across
+        # lifetimes seed this with the WAL high-water mark
+        # (durable_outbound.wal_high_water) so every new lifetime mints
+        # strictly-greater ids. Purely additive: default 0 is the
+        # legacy in-memory behavior; non-int / negative fails soft to 0.
+        try:
+            self._next_event_seq: int = max(0, int(initial_event_seq))
+        except (TypeError, ValueError):
+            self._next_event_seq = 0
         self._lock = threading.Lock()
         self._published_count: int = 0
         self._dropped_count: int = 0
