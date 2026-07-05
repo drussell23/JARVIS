@@ -48,6 +48,7 @@ class BusBridgeClient:
         url: Optional[str] = None,
         session_factory: Optional[Callable[[], aiohttp.ClientSession]] = None,
         initial_last_sent_id: Optional[str] = None,
+        on_ack: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._broker = broker
         self._cfg = cfg
@@ -63,6 +64,12 @@ class BusBridgeClient:
         # instance's cursor via ``initial_last_sent_id`` -- otherwise the
         # severed span is silently lost (live-fire attempt 2, 2026-07-04).
         self._last_sent_id: Optional[str] = initial_last_sent_id
+        self._on_ack = on_ack
+        # Stage 3 WAL-trim cursor: the last event_id the SERVER has
+        # confirmed ingesting on this connection. Monotonic -- only ever
+        # advances, so a stray regressive/duplicate ack (out-of-order
+        # delivery, replay) cannot rewind a later trim decision.
+        self._last_acked_id: Optional[str] = None
         self._high_water: int = 0
         self._degraded = False
         self._missed_hb = 0
@@ -87,6 +94,12 @@ class BusBridgeClient:
     @property
     def last_event_id(self) -> Optional[str]:
         return self._last_event_id
+
+    @property
+    def last_acked_id(self) -> Optional[str]:
+        """The last event_id the server has confirmed ingesting on this
+        connection (Stage 3 WAL-trim cursor). None until the first ack."""
+        return self._last_acked_id
 
     @property
     def degraded(self) -> bool:
@@ -245,9 +258,33 @@ class BusBridgeClient:
             self._missed_hb = 0
             self._degraded = False
             frame = bf.BusFrame.decode(msg.data)
-            if frame is None or frame.kind != bf.FRAME_EVENT:
+            if frame is None:
+                continue
+            if frame.kind == bf.FRAME_ACK:
+                self._apply_ack(frame)
+                continue
+            if frame.kind != bf.FRAME_EVENT:
                 continue
             self._apply_inbound(frame)
+
+    def _apply_ack(self, frame: bf.BusFrame) -> None:
+        """Advance the ack cursor monotonically. Zero-padded hex event ids
+        compare correctly as strings, so a plain ``<=`` comparison is the
+        regressive/duplicate guard -- no int parsing needed. Fail-soft: an
+        ``on_ack`` callback that raises must never take down the inbound
+        pump."""
+        new_id = frame.last_event_id
+        if not new_id:
+            return
+        current = self._last_acked_id
+        if current is not None and new_id <= current:
+            return  # regressive or duplicate -- ignored
+        self._last_acked_id = new_id
+        if self._on_ack is not None:
+            try:
+                self._on_ack(new_id)
+            except Exception:  # noqa: BLE001 -- fail-soft, never crash the pump
+                logger.debug("[BusBridgeClient] on_ack callback raised", exc_info=True)
 
     def _apply_inbound(self, frame: bf.BusFrame) -> None:
         ev_dict = frame.event or {}
