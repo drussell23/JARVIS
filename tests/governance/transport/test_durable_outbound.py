@@ -11,8 +11,10 @@ Suite map (task brief + review round):
   (a) journal-at-publish: only op_prefix events land, ordered by event_id
   (b) crash-survival: a fresh instance on the same wal_path recovers the
       pending set from journaled disk truth, not memory
-  (c) ack-trim: on_ack(<eid>) trims every pending id <= eid, in memory
-      immediately and on disk durably (fresh instance agrees)
+  (c) ack-trim (Stage-4 Task 2 redefinition): on_ack(<eid>) trims EXACTLY
+      that id -- cumulation is now the CLIENT's job (send-order-cumulative
+      _apply_ack fires on_ack per confirmed id). In memory immediately and
+      on disk durably (fresh instance agrees)
   (d) dynamic capacity: tiny disk free -> degraded_capacity flips True,
       oldest pending dropped (dead_letter), exactly ONE warning per
       episode, newest survives; restored disk clears the flag; compact
@@ -139,8 +141,10 @@ def test_crash_survival_fresh_instance_recovers_from_disk(tmp_path, monkeypatch)
 
 
 # --------------------------------------------------------------------------- #
-# (c) ack-trim: on_ack(<3rd id>) trims ids 1..3 -> pending_count()==2,
-#     immediately in memory and durably on disk (fresh instance agrees).
+# (c) ack-trim: exact-set semantics (Stage-4 Task 2) -- one on_ack per
+#     confirmed id (the client's send-order-cumulative _apply_ack drives
+#     the fan-out). Trimmed immediately in memory and durably on disk
+#     (fresh instance agrees).
 # --------------------------------------------------------------------------- #
 def test_ack_trim_immediate_and_durable(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_BODY_WAL_PROBE_INTERVAL_S", "0")
@@ -155,7 +159,10 @@ def test_ack_trim_immediate_and_durable(tmp_path, monkeypatch):
                    for i in range(5)]
             await _wait_for(lambda: outbound.pending_count() == 5)
 
-            outbound.on_ack(ids[2])  # cumulative cursor: acks ids[0..2]
+            # The client confirms ids[0..2] one by one (send-order-
+            # cumulative _apply_ack fires on_ack per confirmed id).
+            for eid in sorted(ids)[:3]:
+                outbound.on_ack(eid)
             # IMMEDIATE in-memory effect -- before any disk tombstone lands.
             assert outbound.pending_count() == 2
             assert _pending_ids(outbound) == sorted(ids)[3:]
@@ -388,7 +395,8 @@ def test_ack_tombstone_failure_parks_lease_for_retry(
 
             monkeypatch.setattr(outbound._wal, "update_status", _flaky_update)
 
-            outbound.on_ack(ids[1])  # acks ids[0..1]
+            for eid in sorted(ids)[:2]:  # exact-set: one ack per id
+                outbound.on_ack(eid)
             # Immediate in-memory ack semantics still hold (redelivery is
             # SAFE downstream -- server dedup)...
             assert outbound.pending_count() == 1
@@ -601,3 +609,220 @@ def test_journal_filter_failure_warns_once_and_fails_open(
             await outbound.stop()
 
     _run(scenario())
+
+
+# =========================================================================== #
+# Stage-4 Task 2: priority-aware replay + exact-set trim.
+#
+#   (i) urgency_rank: extracts the intake envelope's urgency from a WAL
+#       entry's StreamEvent dict (trinity-bridged shape:
+#       payload.data.urgency) and maps it to the UrgencyRouter's route
+#       priority ints (imported, never re-declared). Tolerant: missing /
+#       garbage shapes rank STANDARD.
+#   (j) pending("priority") + pending_prioritized(): entries sorted by
+#       (urgency_rank, event_id); default pending() stays id-ordered;
+#       the async variant computes the sort OFF-LOOP (offload substrate).
+#   (k) exact-set on_ack: ack for id X trims ONLY X -- an unsent lower id
+#       SURVIVES (the Stage-3 over-trim strand class, regression-pinned).
+# =========================================================================== #
+
+from backend.core.ouroboros.governance.background_agent_pool import (  # noqa: E402
+    _ROUTE_PRIORITY,
+)
+from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: E402
+    make_envelope,
+)
+from backend.core.ouroboros.governance.urgency_router import (  # noqa: E402
+    ProviderRoute,
+)
+from backend.core.ouroboros.governance.transport.durable_outbound import (  # noqa: E402
+    urgency_rank,
+)
+
+_RANK_IMMEDIATE = _ROUTE_PRIORITY[ProviderRoute.IMMEDIATE.value]
+_RANK_STANDARD = _ROUTE_PRIORITY[ProviderRoute.STANDARD.value]
+_RANK_SPECULATIVE = _ROUTE_PRIORITY[ProviderRoute.SPECULATIVE.value]
+
+
+def _trinity_payload(urgency: str, source: str = "capability_gap") -> dict:
+    """The REAL trinity-bridged broker payload shape: RemoteIntakeSubmitter
+    publishes envelope.to_dict() as a TrinityEvent payload, and
+    TrinityBusBridge._on_outbound wraps it as
+    {"topic": ..., "data": <envelope dict>, "origin": <source_id>}."""
+    env = make_envelope(
+        source=source,
+        description="stage4 task2 fixture",
+        target_files=("README.md",),
+        repo="jarvis",
+        confidence=0.9,
+        urgency=urgency,
+        evidence={"signature": "s4t2-%s-%s" % (urgency, source)},
+        requires_human_ack=False,
+    )
+    return {"topic": "intake.remote_signal.body",
+            "data": env.to_dict(),
+            "origin": "mac-body"}
+
+
+def _envelope_dict(urgency: str, source: str = "capability_gap") -> dict:
+    """A full journaled envelope_dict (StreamEvent.to_dict shape)."""
+    return {
+        "schema_version": "1.0",
+        "event_id": "000000000001",
+        "event_type": _EVENT_TYPE,
+        "op_id": _PREFIX + "intake.remote_signal.body",
+        "timestamp": "2026-07-04T00:00:00+00:00",
+        "payload": _trinity_payload(urgency, source),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# (i) urgency_rank: real trinity-encoded envelope + shape tolerance.
+# --------------------------------------------------------------------------- #
+def test_urgency_rank_real_trinity_shape():
+    assert urgency_rank(_envelope_dict("critical", "test_failure")) == _RANK_IMMEDIATE
+    assert urgency_rank(_envelope_dict("high", "test_failure")) == _RANK_IMMEDIATE
+    assert urgency_rank(_envelope_dict("normal")) == _RANK_STANDARD
+    assert urgency_rank(
+        _envelope_dict("low", "intent_discovery")) == _RANK_SPECULATIVE
+    # Rank ordering sanity straight from the imported router table.
+    assert _RANK_IMMEDIATE < _RANK_STANDARD < _RANK_SPECULATIVE
+
+
+def test_urgency_rank_tolerates_missing_and_garbage():
+    # Missing urgency key -> STANDARD.
+    d = _envelope_dict("normal")
+    del d["payload"]["data"]["urgency"]
+    assert urgency_rank(d) == _RANK_STANDARD
+    # Unknown urgency vocabulary -> STANDARD.
+    d2 = _envelope_dict("normal")
+    d2["payload"]["data"]["urgency"] = "warp-speed"
+    assert urgency_rank(d2) == _RANK_STANDARD
+    # Garbage shapes -> STANDARD, never raises.
+    assert urgency_rank({}) == _RANK_STANDARD
+    assert urgency_rank({"payload": None}) == _RANK_STANDARD
+    assert urgency_rank({"payload": "nope"}) == _RANK_STANDARD
+    assert urgency_rank({"payload": {"data": None}}) == _RANK_STANDARD
+    assert urgency_rank({"payload": {"data": {"urgency": 42}}}) == _RANK_STANDARD
+    assert urgency_rank({"payload": {"data": []}}) == _RANK_STANDARD
+    assert urgency_rank(None) == _RANK_STANDARD  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- #
+# (j) priority ordering: mixed IMMEDIATE/STANDARD/SPECULATIVE x2, published
+#     interleaved -> pending("priority") and pending_prioritized() return
+#     the IMMEDIATE pair first (by id within class), then STANDARD, then
+#     SPECULATIVE. Default pending() stays id-ordered (legacy untouched).
+#     The async variant's sort runs through the offload substrate.
+# --------------------------------------------------------------------------- #
+def test_pending_priority_order_and_offloaded_sort(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_BODY_WAL_PROBE_INTERVAL_S", "0")
+    wal_path = str(tmp_path / "body_wal.jsonl")
+
+    import backend.core.ouroboros.governance.transport.durable_outbound as dob
+
+    async def scenario():
+        broker = StreamEventBroker(history_maxlen=64)
+        outbound = DurableOutbound(broker, wal_path=wal_path)
+        await outbound.start()
+        try:
+            # Interleaved publish order: STD, SPEC, IMM, STD, SPEC, IMM.
+            specs = [("normal", "capability_gap"),
+                     ("low", "intent_discovery"),
+                     ("critical", "test_failure"),
+                     ("normal", "capability_gap"),
+                     ("low", "intent_discovery"),
+                     ("critical", "test_failure")]
+            ids = []
+            for urgency, source in specs:
+                eid = broker.publish(
+                    _EVENT_TYPE, _PREFIX + "intake.remote_signal.body",
+                    _trinity_payload(urgency, source))
+                assert eid
+                ids.append(eid)
+            await _wait_for(lambda: outbound.pending_count() == 6)
+
+            want_priority = [ids[2], ids[5],  # IMMEDIATE pair, id-ordered
+                             ids[0], ids[3],  # STANDARD pair
+                             ids[1], ids[4]]  # SPECULATIVE pair
+
+            # Legacy default stays byte-identical: id order.
+            assert _pending_ids(outbound) == sorted(ids)
+            # Sync priority order.
+            got_sync = [d["event_id"] for d in outbound.pending("priority")]
+            assert got_sync == want_priority, (
+                "pending('priority') must sort by (urgency_rank, event_id): "
+                "got %r want %r" % (got_sync, want_priority))
+
+            # Async variant: same order, sort dispatched via offload.
+            real_offload = dob.offload
+            offload_calls = {"n": 0}
+
+            async def _counting_offload(fn, *args, **kwargs):
+                offload_calls["n"] += 1
+                return await real_offload(fn, *args, **kwargs)
+
+            monkeypatch.setattr(dob, "offload", _counting_offload)
+            try:
+                got_async = [d["event_id"]
+                             for d in await outbound.pending_prioritized()]
+            finally:
+                monkeypatch.setattr(dob, "offload", real_offload)
+            assert got_async == want_priority
+            assert offload_calls["n"] >= 1, (
+                "pending_prioritized must compute the sort through the "
+                "offload substrate, not on the event loop")
+        finally:
+            await outbound.stop()
+
+    _run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# (k) exact-set on_ack: ack for id X trims ONLY X. An UNSENT lower id
+#     survives -- the Stage-3 strand class (priority replay sends a high
+#     IMMEDIATE id first; its ack must not sweep unsent lower ids).
+# --------------------------------------------------------------------------- #
+def test_exact_set_ack_trims_only_the_acked_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_BODY_WAL_PROBE_INTERVAL_S", "0")
+    wal_path = str(tmp_path / "body_wal.jsonl")
+
+    async def scenario():
+        broker = StreamEventBroker(history_maxlen=64)
+        outbound = DurableOutbound(broker, wal_path=wal_path)
+        await outbound.start()
+        try:
+            ids = sorted(
+                broker.publish(_EVENT_TYPE, _PREFIX + "x-%d" % i, {"i": i})
+                for i in range(3))
+            await _wait_for(lambda: outbound.pending_count() == 3)
+
+            # Priority replay sent the HIGHEST id first; the server acks it.
+            outbound.on_ack(ids[2])
+            assert _pending_ids(outbound) == ids[:2], (
+                "exact-set trim: ONLY the acked id may be trimmed -- the "
+                "unsent lower ids must survive (over-trim regression)")
+
+            # Replay of the SAME ack id is an idempotent no-op.
+            outbound.on_ack(ids[2])
+            assert _pending_ids(outbound) == ids[:2]
+
+            # Disk truth agrees once the tombstone lands.
+            def _disk_agrees() -> bool:
+                probe = DurableOutbound(
+                    StreamEventBroker(history_maxlen=4), wal_path=wal_path)
+                return _pending_ids(probe) == ids[:2]
+            await _wait_for(_disk_agrees)
+
+            # The remaining ids drain only via their OWN acks.
+            outbound.on_ack(ids[0])
+            outbound.on_ack(ids[1])
+            assert outbound.pending_count() == 0
+            return ids
+        finally:
+            await outbound.stop()
+
+    ids = _run(scenario())
+    fresh = DurableOutbound(StreamEventBroker(history_maxlen=4), wal_path=wal_path)
+    assert fresh.pending_count() == 0, (
+        "disk truth must drain to 0 after per-id exact-set acks")

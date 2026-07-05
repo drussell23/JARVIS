@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import fields as dataclass_fields
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -96,10 +96,34 @@ class BusBridgeClient:
         self._last_sent_id: Optional[str] = initial_last_sent_id
         self._on_ack = on_ack
         # Stage 3 WAL-trim cursor: the last event_id the SERVER has
-        # confirmed ingesting on this connection. Monotonic -- only ever
-        # advances, so a stray regressive/duplicate ack (out-of-order
-        # delivery, replay) cannot rewind a later trim decision.
+        # confirmed ingesting on this connection. Stage-4 Task 2:
+        # monotonicity is tracked by SEND-SEQUENCE POSITION (below), not
+        # numeric id -- priority replay sends ids out of numeric order,
+        # so a numerically-lower id acked LATER is forward progress.
         self._last_acked_id: Optional[str] = None
+        # Stage-4 Task 2: per-connection SEND SEQUENCE -- event ids in
+        # the order actually sent (WAL-seeded replay first, then the
+        # live pump). The server's ack names its last-INGESTED id on
+        # this TCP-ordered connection; locating it in this sequence
+        # confirms EVERY id sent at or before that position
+        # (send-order-cumulative). Reset on every new connection.
+        #   _send_index: id -> FIRST-send position (conservative when a
+        #       replay/live overlap re-sends an id: mapping the ack to
+        #       the earliest position can only under-confirm, never
+        #       over-confirm -- a later ack or the idle-flush catches
+        #       the tail).
+        #   _send_unconfirmed: (position, id) FIFO of not-yet-confirmed
+        #       sends; confirmation always consumes a send-order prefix.
+        #   _acked_pos: high-water confirmed position (send-space
+        #       monotonic guard).
+        # Bounded: past _DEDUP_MAX unconfirmed sends the oldest entry is
+        # evicted; its eventual ack degrades to the exact-single-id
+        # fallback path in _apply_ack (safe: the durable trim is
+        # exact-set).
+        self._send_index: Dict[str, int] = {}
+        self._send_unconfirmed: Deque[Tuple[int, str]] = deque()
+        self._send_count = 0
+        self._acked_pos = -1
         # Stage 3 Task 3: per-attempt discovery re-race + WAL-seeded replay.
         # Both default None = Stage-2-identical behavior.
         self._url_resolver = url_resolver
@@ -124,6 +148,48 @@ class BusBridgeClient:
         self._republished[eid] = None
         if len(self._republished) > _DEDUP_MAX:
             self._republished.popitem(last=False)
+
+    # --- Stage-4 Task 2: per-connection send sequence ----------------------
+
+    def _reset_send_sequence(self) -> None:
+        """New connection = new send sequence. The server's ingest cursor
+        (and therefore its acks) is per-connection state; positions from
+        a previous link must never confirm sends on this one."""
+        self._send_index = {}
+        self._send_unconfirmed = deque()
+        self._send_count = 0
+        self._acked_pos = -1
+
+    def _record_sent(self, event_id: str) -> None:
+        """Record an event frame actually WRITTEN to the socket, in send
+        order. First-send position wins for duplicates (see __init__
+        comment: conservative -- under-confirmation is safe, over-
+        confirmation is the over-trim class)."""
+        if not event_id or event_id in self._send_index:
+            return
+        pos = self._send_count
+        self._send_count += 1
+        self._send_index[event_id] = pos
+        self._send_unconfirmed.append((pos, event_id))
+        if len(self._send_unconfirmed) > _DEDUP_MAX:
+            old_pos, old_id = self._send_unconfirmed.popleft()
+            self._send_index.pop(old_id, None)
+            logger.debug(
+                "[BusBridgeClient] send-sequence bound reached; evicted "
+                "oldest unconfirmed send pos=%d id=%s (its ack degrades "
+                "to exact-single-id confirmation)", old_pos, old_id)
+
+    def _fire_on_ack(self, event_id: str) -> None:
+        """Invoke the on_ack callback fail-soft -- a raising callback
+        must never take down the inbound pump (nor abort the remaining
+        ids of a cumulative confirmation)."""
+        if self._on_ack is None:
+            return
+        try:
+            self._on_ack(event_id)
+        except Exception:  # noqa: BLE001 -- fail-soft, never crash the pump
+            logger.debug(
+                "[BusBridgeClient] on_ack callback raised", exc_info=True)
 
     @property
     def last_event_id(self) -> Optional[str]:
@@ -244,6 +310,10 @@ class BusBridgeClient:
                 )
                 self._connected = True
                 self._active_ws = ws
+                # Fresh connection -> fresh send sequence (Stage-4 Task 2):
+                # ack positions are only meaningful against the sends of
+                # THIS link.
+                self._reset_send_sequence()
                 # WAL-seeded replay FIRST (the oldest truth), then the live
                 # pump's broker-cursor replay -- overlap dedup is the
                 # SERVER's job (qualified-id _mark_seen).
@@ -263,24 +333,34 @@ class BusBridgeClient:
             await session.close()
 
     async def _replay_durable(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        """WAL-seeded replay (Stage 3 Task 3): send every pending journal
-        entry (already id-ordered by ``durable.pending()``) BEFORE the live
+        """WAL-seeded replay (Stage 3 Task 3; PRIORITY-ordered by Stage-4
+        Task 2): send every pending journal entry BEFORE the live
         outbound pump starts. The WAL outlives the broker's bounded history
         ring, so this recovers spans the broker-cursor replay physically
-        cannot.
+        cannot. When the durable exposes ``pending_prioritized`` the
+        backlog is replayed in ``(urgency_rank, event_id)`` order --
+        IMMEDIATE-class signals cross the reborn link first -- with the
+        sort computed off-loop; older durables fall back to the
+        id-ordered ``pending()`` (backward compatible).
 
         No trim on send -- trim is exclusively ack-driven (Task 1 ack lane
-        -> Task 2 ``on_ack``); an entry stays journaled until the server
-        confirms ingesting past it, so a mid-replay drop just resends on
-        the next attempt. Malformed entries are skipped per-entry
+        -> exact-set ``on_ack``); an entry stays journaled until the server
+        confirms ingesting it, so a mid-replay drop just resends on
+        the next attempt. Every sent id is recorded in the per-connection
+        send sequence, which is what makes the server's acks cumulative
+        in SEND order. Malformed entries are skipped per-entry
         (fail-soft); a dead socket propagates to the reconnect loop."""
         if self._durable is None:
             return
         try:
-            entries = self._durable.pending()
+            prioritized = getattr(self._durable, "pending_prioritized", None)
+            if prioritized is not None:
+                entries = await prioritized()
+            else:
+                entries = self._durable.pending()
         except Exception:  # noqa: BLE001 -- a broken WAL must not block connect
             logger.debug(
-                "[BusBridgeClient] durable.pending() failed; skipping "
+                "[BusBridgeClient] durable pending read failed; skipping "
                 "WAL replay", exc_info=True)
             return
         if not entries:
@@ -292,10 +372,12 @@ class BusBridgeClient:
                 continue  # malformed journal entry -- skip, keep replaying
             await ws.send_bytes(
                 bf.event_frame(ev, source_id=self._cfg.source_id).encode())
+            self._record_sent(ev.event_id)
             sent += 1
         logger.debug(
-            "[BusBridgeClient] WAL replay: sent %d/%d pending entries",
-            sent, len(entries))
+            "[BusBridgeClient] WAL replay: sent %d/%d pending entries "
+            "(priority order: %s)", sent, len(entries),
+            prioritized is not None)
 
     async def _pump_outbound(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Subscribe to the local broker and stream events (with
@@ -324,6 +406,7 @@ class BusBridgeClient:
                     continue
                 frame = bf.event_frame(event, source_id=self._cfg.source_id)
                 await ws.send_bytes(frame.encode())
+                self._record_sent(event.event_id)
                 self._last_sent_id = event.event_id
         except (asyncio.CancelledError, ConnectionResetError):
             raise
@@ -359,23 +442,51 @@ class BusBridgeClient:
             self._apply_inbound(frame)
 
     def _apply_ack(self, frame: bf.BusFrame) -> None:
-        """Advance the ack cursor monotonically. Zero-padded hex event ids
-        compare correctly as strings, so a plain ``<=`` comparison is the
-        regressive/duplicate guard -- no int parsing needed. Fail-soft: an
-        ``on_ack`` callback that raises must never take down the inbound
-        pump."""
+        """SEND-ORDER-CUMULATIVE ack application (Stage-4 Task 2).
+
+        The server acks the last event id it INGESTED on this connection
+        (unchanged, TCP-ordered). Replay is priority-ordered now, so the
+        old numeric-id cumulation is wrong: an ack for a high IMMEDIATE
+        id sent FIRST must not imply anything about numerically-lower
+        ids that were never sent. New interpretation: locate the acked
+        id in this connection's SEND sequence -- TCP ordering guarantees
+        every frame sent at or before that position was received -- and
+        confirm each not-yet-confirmed id in that prefix, in send order,
+        via ``on_ack`` (fail-soft per id; the durable's trim is
+        exact-set). ``last_acked_id`` monotonicity is positional
+        (send-space), not numeric.
+
+        An acked id NOT in this connection's send sequence (nothing was
+        sent on this link yet, a pre-reconnect ack raced the sever, or
+        the bounded index evicted it) never expands cumulatively --
+        that would be the over-trim class. It degrades to a SINGLE
+        exact-id confirmation under the legacy numeric-monotonic guard,
+        which is safe by construction: the server attested ingesting
+        exactly that id, and the durable's exact-set ``on_ack`` trims
+        only it."""
         new_id = frame.last_event_id
         if not new_id:
             return
-        current = self._last_acked_id
-        if current is not None and new_id <= current:
-            return  # regressive or duplicate -- ignored
+        pos = self._send_index.get(new_id)
+        if pos is None:
+            current = self._last_acked_id
+            if current is not None and new_id <= current:
+                return  # regressive or duplicate -- ignored
+            logger.debug(
+                "[BusBridgeClient] ack for id outside this connection's "
+                "send sequence: %s -- exact-single-id confirmation only",
+                new_id)
+            self._last_acked_id = new_id
+            self._fire_on_ack(new_id)
+            return
+        if pos <= self._acked_pos:
+            return  # regressive or duplicate in send-space -- ignored
+        self._acked_pos = pos
         self._last_acked_id = new_id
-        if self._on_ack is not None:
-            try:
-                self._on_ack(new_id)
-            except Exception:  # noqa: BLE001 -- fail-soft, never crash the pump
-                logger.debug("[BusBridgeClient] on_ack callback raised", exc_info=True)
+        while self._send_unconfirmed and self._send_unconfirmed[0][0] <= pos:
+            _, eid = self._send_unconfirmed.popleft()
+            self._send_index.pop(eid, None)
+            self._fire_on_ack(eid)
 
     def _apply_inbound(self, frame: bf.BusFrame) -> None:
         ev_dict = frame.event or {}
