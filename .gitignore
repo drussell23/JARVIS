@@ -430,3 +430,17 @@ proof_telemetry/
 .hypervisor_state.json
 A1_LAUNCH_MANIFEST.json
 autopsy_reports/
+
+# Session/run artifacts (2026-07-04 hygiene pass) -- never commit run logs or local run dirs
+logs/
+a1_iso_runs/
+
+# Ouroboros local runtime state incl. the HMAC checkpoint key (SECRET -- never commit)
+.ouroboros/checkpoint_key
+.ouroboros/checkpoints/
+.ouroboros/stream_heartbeat.epoch
+
+# Personal documents (operator-local, not project files)
+*_resume.html
+*resume*.html
+Derek J. Russell - Resume*.pdf
