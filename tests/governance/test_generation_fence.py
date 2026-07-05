@@ -412,3 +412,103 @@ def test_real_fence_trip_denies_change_engine_and_auto_committer(
             "auto_commit_disabled", "no_target_files")
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# (h) saga: fenced -> forward-write refused, compensation still succeeds
+# --------------------------------------------------------------------------- #
+def test_fenced_saga_forward_write_refused_but_compensation_exempt(tmp_path):
+    """Re-review Important-1: the saga's raw write_bytes forward-writes
+    (cross_repo path) must consult the latch; compensation/ROLLBACK writes
+    MUST stay exempt -- a fenced node may still restore preimages."""
+    from backend.core.ouroboros.governance.saga.saga_apply_strategy import (
+        SagaApplyStrategy,
+    )
+    from backend.core.ouroboros.governance.saga.saga_types import (
+        FileOp,
+        PatchedFile,
+        RepoPatch,
+    )
+
+    import subprocess
+
+    # A real git repo so the unfenced apply's `git add` succeeds (the
+    # tests/governance/saga/test_saga_apply_strategy.py precedent).
+    subprocess.run(["git", "init"], cwd=tmp_path,
+                   capture_output=True, check=True)
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src" / "mod.py"
+    target.write_bytes(b"old = 1\n")
+
+    patch_obj = RepoPatch(
+        repo="jarvis",
+        files=(PatchedFile(
+            path="src/mod.py", op=FileOp.MODIFY, preimage=b"old = 1\n"),),
+        new_content=(("src/mod.py", b"new = 2\n"),),
+    )
+    strategy = SagaApplyStrategy(
+        repo_roots={"jarvis": tmp_path}, ledger=None)
+
+    async def scenario() -> None:
+        gf._mark_fenced()
+
+        # FORWARD write: refused via the saga's own failure pattern (raise
+        # out of _apply_patch -> Phase B failure -> compensation), file
+        # untouched.
+        with pytest.raises(RuntimeError, match="generation_fenced"):
+            await strategy._apply_patch("jarvis", patch_obj)
+        assert target.read_bytes() == b"old = 1\n", (
+            "a fenced saga forward-write must never touch disk")
+
+        # COMPENSATION write: exempt -- preimage restore still lands.
+        target.write_bytes(b"half-applied garbage")
+        await strategy._compensate_patch("jarvis", patch_obj)
+        assert target.read_bytes() == b"old = 1\n", (
+            "a fenced node must still be able to roll back (compensation "
+            "writes are fence-exempt)")
+
+        # Unfenced: the same forward write applies normally.
+        gf._reset_for_tests()
+        await strategy._apply_patch("jarvis", patch_obj)
+        assert target.read_bytes() == b"new = 2\n"
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# (i) venom tool loop: fenced -> write_file / edit_file refuse
+# --------------------------------------------------------------------------- #
+def test_fenced_tool_executor_write_and_edit_refused(tmp_path):
+    """Re-review Important-2: write_file/edit_file mutate disk directly
+    during GENERATE -- the post-fence window before arm-1 shutdown bites
+    must be closed at the handler top (the handlers' established
+    error-string denial shape)."""
+    import backend.core.ouroboros.governance.tool_executor as te_mod
+
+    te = te_mod.ToolExecutor(tmp_path)
+    existing = tmp_path / "mod.py"
+    existing.write_text("x = 1\n", encoding="utf-8")
+    te._files_read.add("mod.py")  # bypass must-have-read (test precedent)
+
+    gf._mark_fenced()
+
+    res_w = te._write_file({"path": "newfile.py", "content": "y = 2\n"})
+    assert "POLICY_DENIED reason=generation_fenced" in res_w, res_w
+    assert not (tmp_path / "newfile.py").exists(), (
+        "a fenced write_file must never touch disk")
+
+    res_e = te._edit_file(
+        {"path": "mod.py", "old_text": "x = 1\n", "new_text": "x = 3\n"})
+    assert "POLICY_DENIED reason=generation_fenced" in res_e, res_e
+    assert existing.read_text(encoding="utf-8") == "x = 1\n", (
+        "a fenced edit_file must never touch disk")
+
+    # Unfenced: both handlers work normally (zero change).
+    gf._reset_for_tests()
+    res_w2 = te._write_file({"path": "newfile.py", "content": "y = 2\n"})
+    assert "POLICY_DENIED" not in res_w2, res_w2
+    assert (tmp_path / "newfile.py").exists()
+    res_e2 = te._edit_file(
+        {"path": "mod.py", "old_text": "x = 1\n", "new_text": "x = 3\n"})
+    assert "POLICY_DENIED" not in res_e2, res_e2
+    assert existing.read_text(encoding="utf-8") == "x = 3\n"

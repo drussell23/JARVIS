@@ -66,14 +66,39 @@ except ImportError:
     _ANTI_VENOM_GATE_AVAILABLE = False
 
 
-def _gate_path(full_path: Path, repo_root: Path) -> None:
+def _gate_path(full_path: Path, repo_root: Path, *, forward: bool = True) -> None:
     """Anti-Venom pre-write gate for saga write sites. FAIL-CLOSED.
 
     Calls :func:`assert_write_path_allowed` (containment + immutable-
     governance + protected-path) before any raw ``write_bytes`` in a saga
     apply or compensation step.  Raises ``RuntimeError`` if the gate module
     is unavailable so that an import failure never silently opens the gate.
+
+    ``forward`` (Stage-4 GenerationFence, Task-4 re-review): FORWARD writes
+    (apply-phase CREATE/MODIFY/DELETE -- the cross_repo mutation path) also
+    consult the process-global :func:`generation_fence.is_fenced` latch and
+    are DENIED on a fenced node (a superseded twin must not mutate any repo).
+    Compensation/ROLLBACK writes pass ``forward=False`` and are EXEMPT --
+    a fenced node may still restore preimages (rolling back is how it
+    honors the fence, not a violation of it). The fence import is
+    deliberately unguarded: this gate's doctrine is that an import failure
+    never silently opens it. ``forward`` defaults to True so any FUTURE
+    call site is fence-covered unless it explicitly claims the
+    compensation exemption.
     """
+    if forward:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            generation_fence as _generation_fence,
+        )
+        if _generation_fence.is_fenced():
+            logger.warning(
+                "[GenerationFence] saga forward-write DENIED "
+                "(generation_fenced) path=%s", full_path,
+            )
+            raise RuntimeError(
+                "POLICY_DENIED reason=generation_fenced -- saga forward-write "
+                f"refused on a fenced node: {full_path}"
+            )
     if not _ANTI_VENOM_GATE_AVAILABLE or _assert_write_path_allowed is None:
         raise RuntimeError(
             f"Anti-Venom gate unavailable — fail-closed write to {full_path}"
@@ -509,12 +534,14 @@ class SagaApplyStrategy:
             full_path = repo_root / pf.path
             if pf.op == FileOp.CREATE:
                 if full_path.exists():
-                    _gate_path(full_path, repo_root)  # Anti-Venom: gate compensation unlink — phantom-file deletion vector
+                    # forward=False: ROLLBACK is exempt from the GenerationFence
+                    # (a fenced node may still restore preimages).
+                    _gate_path(full_path, repo_root, forward=False)  # Anti-Venom: gate compensation unlink -- phantom-file deletion vector
                     full_path.unlink()
             elif pf.op in (FileOp.MODIFY, FileOp.DELETE):
                 # preimage is guaranteed non-None for MODIFY/DELETE by PatchedFile.__post_init__
                 full_path.parent.mkdir(parents=True, exist_ok=True)
-                _gate_path(full_path, repo_root)  # Anti-Venom: gate compensation write too
+                _gate_path(full_path, repo_root, forward=False)  # Anti-Venom: gate compensation write too (fence-exempt: rollback)
                 full_path.write_bytes(pf.preimage)  # type: ignore[arg-type]
             to_unstage.append(pf.path)
 

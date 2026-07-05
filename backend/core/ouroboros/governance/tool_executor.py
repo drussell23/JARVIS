@@ -1680,6 +1680,41 @@ def _maybe_observe_tool_confidence(
         )
 
 
+def _generation_fence_denial(tool_name: str, path: object) -> Optional[str]:
+    """Stage-4 GenerationFence chokepoint for the venom tool-loop write
+    surface (Task-4 re-review Important-2).
+
+    ``write_file``/``edit_file`` mutate disk DIRECTLY during GENERATE, so a
+    heartbeat that fences the node mid-tool-loop could otherwise land writes
+    in the window before the arm-1 cooperative shutdown bites. FAIL-CLOSED:
+    an unreadable latch DENIES the write (cannot prove unfenced -> do not
+    mutate); handlers never raise, so the denial is the handlers' established
+    error-string shape. Returns None when unfenced (zero behavior change).
+    """
+    fenced = True
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            generation_fence as _generation_fence,
+        )
+        fenced = bool(_generation_fence.is_fenced())
+    except Exception:  # noqa: BLE001 -- fail-closed, never raises
+        logger.error(
+            "[GenerationFence] latch unavailable at tool_executor -- "
+            "refusing %s (fail-closed)", tool_name, exc_info=True,
+        )
+    if not fenced:
+        return None
+    logger.warning(
+        "[GenerationFence] tool write DENIED at tool_executor "
+        "(generation_fenced) tool=%s path=%s", tool_name, path,
+    )
+    return (
+        "(%s: POLICY_DENIED reason=generation_fenced -- this node observed "
+        "a higher Brain generation; its mutation pathways are structurally "
+        "fenced. Do not retry writes.)" % tool_name
+    )
+
+
 class ToolExecutor:
     """Dispatch ToolCall objects to read-only introspection handlers.
 
@@ -2506,6 +2541,11 @@ class ToolExecutor:
             BEFORE disk write — failures never reach the filesystem.
           * Post-write hash mismatch triggers automatic rollback.
         """
+        # --- Layer 0: GenerationFence (Stage-4 split-brain) -----------
+        _fence_denial = _generation_fence_denial("edit_file", args.get("path"))
+        if _fence_denial is not None:
+            return _fence_denial
+
         path_str: str = args["path"]
         old_text: str = args["old_text"]
         new_text: str = args["new_text"]
@@ -2699,6 +2739,11 @@ class ToolExecutor:
           * Post-write hash mismatch triggers rollback (restore snapshot
             for overwrites, unlink for new files).
         """
+        # --- Layer 0: GenerationFence (Stage-4 split-brain) -----------
+        _fence_denial = _generation_fence_denial("write_file", args.get("path"))
+        if _fence_denial is not None:
+            return _fence_denial
+
         path_str: str = args["path"]
         file_content: str = args["content"]
 
