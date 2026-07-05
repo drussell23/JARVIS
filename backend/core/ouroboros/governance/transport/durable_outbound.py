@@ -2,11 +2,11 @@
 """DurableOutbound -- Stage-3 Task 2: the Body-side durable outbound WAL.
 
 Journals every bridgeable StreamEventBroker event (op_id matching
-``op_prefix``, default ``trinity:``) into an fsync'd write-ahead log AT
-PUBLISH TIME -- upstream of any connection state. A network partition or
-a Body crash can therefore never lose a signal that ``publish()``
-accepted: the WAL is the durable truth, the broker's bounded history
-ring (512 default) is merely a hot cache.
+``op_prefix``, default ``trinity:``) into a flock-journaled write-ahead
+log AT PUBLISH TIME -- upstream of any connection state. A network
+partition or a Body crash can therefore never lose a signal that
+``publish()`` accepted: the WAL is the durable truth, the broker's
+bounded history ring (512 default) is merely a hot cache.
 
 Trim is ack-driven: Task 1 armed the ack lane (``BusBridgeClient``'s
 ``on_ack`` constructor kwarg); wiring that callback to
@@ -16,18 +16,30 @@ plain string comparison is correct) and compacts the file every
 ``JARVIS_BODY_WAL_COMPACT_EVERY_N`` acks.
 
 Durability heavy-lifting is the intake WAL, reused verbatim (operator
-DRY mandate): flock+fsync per line, tombstone-applied crash recovery,
-atomic tmp+fsync+replace compaction.
+DRY mandate): flock-serialized append per line (fsync happens on
+compaction and on the no-flock fallback path -- the hot path is
+flock+flush), tombstone-applied crash recovery, atomic
+tmp+fsync+replace compaction.
+
+Durability honesty (review round): an append that FAILS is NEVER
+reported as pending-durable. The event moves to an in-memory at-risk
+set -- surfaced via :attr:`DurableOutbound.journal_failures` plus one
+loud warning per episode -- and is re-attempted on every subsequent
+journal cycle until it lands (or the far side acks past it). Likewise
+a failed ack tombstone keeps its lease parked for retry on later
+flushes: redelivery after a crash is SAFE downstream (server dedup);
+a silent live-acked/disk-pending split-brain is not.
 
 Capacity is DYNAMIC -- no hardcoded byte caps anywhere. The WAL file may
 occupy at most ``JARVIS_BODY_WAL_DISK_FRACTION`` (default 0.05) of the
 CURRENT free bytes on the WAL's filesystem, probed off-loop through the
 cooperative_fs_io offload substrate and cached for
 ``JARVIS_BODY_WAL_PROBE_INTERVAL_S`` between appends. Over budget ->
-compact first; still over -> ``degraded_capacity`` episode: drop the
-OLDEST pending entry (dead_letter tombstone) per append with exactly ONE
-``logger.warning`` per episode (mirroring the broker's ``stream_lag``
-single-signal pattern). Never raises, never blocks the event loop.
+compact ONCE at episode onset; still over -> ``degraded_capacity``
+episode: drop the OLDEST pending entry (dead_letter tombstone) per
+append with exactly ONE ``logger.warning`` per episode (mirroring the
+broker's ``stream_lag`` single-signal pattern). Never raises, never
+blocks the event loop.
 
 Env knobs:
     JARVIS_BODY_WAL_PATH             (default <repo>/.jarvis/body_outbound_wal.jsonl)
@@ -142,6 +154,16 @@ class DurableOutbound:
         self._degraded = False
         self._loaded = False
         self._probe_cache: Optional[Tuple[float, Optional[int], int]] = None
+        # Review CRITICAL: events whose WAL append FAILED -- accepted but
+        # NOT durable. Never counted as pending; retried each journal
+        # cycle until they land or the ack cursor passes them.
+        self._at_risk: Dict[str, WALEntry] = {}
+        self._journal_fail_warned = False
+        # Review IMPORTANT-1: leases whose ack tombstone write FAILED --
+        # kept in _ack_inflight (so pending() stays trimmed) and retried
+        # on every later flush until the tombstone lands.
+        self._ack_retry: Set[str] = set()
+        self._ack_fail_warned = False
 
         self._sub: Any = None
         self._consumer_task: Optional[asyncio.Task] = None
@@ -216,6 +238,13 @@ class DurableOutbound:
     def degraded_capacity(self) -> bool:
         return self._degraded
 
+    @property
+    def journal_failures(self) -> int:
+        """Count of accepted events currently at risk (memory-only --
+        their WAL append failed and has not yet been retried to
+        success). Zero means every accepted publish is on disk."""
+        return len(self._at_risk)
+
     # --- ack lane (Task-1 hook target) ---------------------------------------
 
     def on_ack(self, acked_event_id: str) -> None:
@@ -232,10 +261,13 @@ class DurableOutbound:
                 return
             if self._ack_cursor is None or acked_event_id > self._ack_cursor:
                 self._ack_cursor = acked_event_id
+            # An acked at-risk event no longer needs journaling at all.
+            for lid in [l for l in self._at_risk if l <= acked_event_id]:
+                self._at_risk.pop(lid, None)
             ids = sorted(
                 lid for lid in self._pending
                 if lid <= acked_event_id and lid not in self._ack_inflight)
-            if not ids:
+            if not ids and not self._ack_retry:
                 return
             self._ack_inflight.update(ids)
             self._fire_and_forget(self._flush_acks_sync, ids)
@@ -265,11 +297,15 @@ class DurableOutbound:
         # non-hex ids -- only real 012x-hex publishes are journaled.
         if not event_id or not set(event_id) <= _HEX_DIGITS:
             return
-        if event_id in self._pending or event_id in self._ack_inflight:
+        if (event_id in self._pending or event_id in self._ack_inflight
+                or event_id in self._at_risk):
             return
         if self._ack_cursor is not None and event_id <= self._ack_cursor:
             return  # the far side already acked past this id
         await self._enforce_capacity()
+        # Bounded at-risk retry: each journal cycle re-attempts every
+        # previously-failed append exactly once (review CRITICAL).
+        await self._retry_at_risk()
         entry = WALEntry(
             lease_id=event_id,
             envelope_dict=event.to_dict(),
@@ -279,12 +315,49 @@ class DurableOutbound:
         )
         result = await offload(self._wal.append, entry)
         if is_offload_error(result):
-            logger.debug(
-                "[DurableOutbound] WAL append failed (kept in memory): %s",
-                result)
-        # In-memory view tracks the accepted publish regardless -- the WAL
-        # append path itself never raises, so this is belt-and-braces.
+            # Durability honesty (review CRITICAL): the append did NOT
+            # land -- the event must NOT masquerade as pending-durable.
+            # Park it at-risk (memory-only), surface loudly ONCE per
+            # episode, retry on subsequent journal cycles.
+            self._at_risk[event_id] = entry
+            if not self._journal_fail_warned:
+                self._journal_fail_warned = True
+                logger.warning(
+                    "[DurableOutbound] journal append FAILED -- %d event(s) "
+                    "at risk (memory-only, NOT durable; will retry on "
+                    "subsequent journal cycles): %s",
+                    len(self._at_risk), result)
+            return
         self._pending[event_id] = entry
+
+    async def _retry_at_risk(self) -> None:
+        """Re-attempt every at-risk append once. Clears the failure
+        episode (and says so) when the at-risk set drains."""
+        if not self._at_risk:
+            if self._journal_fail_warned:
+                self._journal_fail_warned = False
+                logger.info(
+                    "[DurableOutbound] journal append recovered -- no "
+                    "events remain at risk")
+            return
+        for event_id in sorted(self._at_risk):
+            entry = self._at_risk.get(event_id)
+            if entry is None:
+                continue
+            if self._ack_cursor is not None and event_id <= self._ack_cursor:
+                # The far side acked past it -- journaling is moot.
+                self._at_risk.pop(event_id, None)
+                continue
+            result = await offload(self._wal.append, entry)
+            if is_offload_error(result):
+                continue  # still failing -- next cycle retries again
+            self._at_risk.pop(event_id, None)
+            self._pending[event_id] = entry
+        if not self._at_risk and self._journal_fail_warned:
+            self._journal_fail_warned = False
+            logger.info(
+                "[DurableOutbound] journal append recovered -- all at-risk "
+                "events landed durably")
 
     # --- internal: dynamic capacity ------------------------------------------
 
@@ -297,17 +370,20 @@ class DurableOutbound:
             if size <= self._disk_fraction * free:
                 self._clear_degraded()
                 return
-            # Over budget: compact first (drops aged terminal entries).
-            result = await offload(self._wal.compact)
-            if is_offload_error(result):
-                logger.debug(
-                    "[DurableOutbound] capacity compact failed: %s", result)
-            free, size = await self._probe(force=True)
-            if free is None or size <= self._disk_fraction * free:
-                self._clear_degraded()
-                return
-            # STILL over: degraded episode -- one warning, drop oldest.
             if not self._degraded:
+                # Episode ONSET only (review IMPORTANT-2): compact once
+                # (drops aged terminal entries), re-probe; only if STILL
+                # over does the degraded episode begin. While degraded,
+                # subsequent over-budget appends drop-oldest WITHOUT
+                # re-running a full compaction each time.
+                result = await offload(self._wal.compact)
+                if is_offload_error(result):
+                    logger.debug(
+                        "[DurableOutbound] capacity compact failed: %s",
+                        result)
+                free, size = await self._probe(force=True)
+                if free is None or size <= self._disk_fraction * free:
+                    return  # compact bought back the budget -- no episode
                 self._degraded = True
                 logger.warning(
                     "[DurableOutbound] degraded_capacity: wal_size=%d over "
@@ -356,10 +432,29 @@ class DurableOutbound:
     # --- internal: recovery + offload plumbing --------------------------------
 
     def _ensure_loaded(self) -> None:
-        """One-time lazy recovery read for never-started instances."""
+        """One-time lazy recovery read for never-started instances.
+
+        GUARD (review Minor-b): this is a SYNCHRONOUS disk read. It is
+        intended ONLY for never-started instances queried from sync
+        contexts (crash-recovery / replay callers); started instances
+        recover through the offloaded read in :meth:`start`. If a
+        running event loop is detected we still proceed -- it is a
+        one-time bounded read and pending()/pending_count() are sync
+        APIs -- but we flag the architectural-purity violation loudly
+        so the caller can switch to ``await start()`` first.
+        """
         if self._loaded:
             return
         self._loaded = True
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass  # no loop -- the intended sync-context caller
+        else:
+            logger.warning(
+                "[DurableOutbound] _ensure_loaded performing a sync WAL "
+                "read ON a running event loop -- call 'await start()' "
+                "before pending()/pending_count() to keep the loop clean")
         try:
             for entry in self._wal.pending_entries():
                 self._pending.setdefault(entry.lease_id, entry)
@@ -368,20 +463,47 @@ class DurableOutbound:
                 "[DurableOutbound] lazy WAL recovery failed", exc_info=True)
 
     def _flush_acks_sync(self, ids: List[str]) -> None:
-        """Tombstone acked ids + cadence compaction. Runs OFF the event
-        loop (offload thread) or inline in the no-loop fallback -- the
-        WAL substrate is flock-safe either way."""
-        for lease_id in ids:
+        """Tombstone acked ids (plus any leases parked for retry) +
+        cadence compaction. Runs OFF the event loop (offload thread) or
+        inline in the no-loop fallback -- the WAL substrate is
+        flock-safe either way.
+
+        Review IMPORTANT-1: a tombstone write that fails must NOT be
+        forgotten (that would leave live-says-acked / disk-says-pending
+        split-brain silently). The lease stays in ``_ack_inflight`` (so
+        pending() remains trimmed) and is parked in ``_ack_retry`` for
+        the next flush; ONE distinguishing warning per episode.
+        Redelivery after a crash is SAFE downstream (server dedup)."""
+        to_flush = list(dict.fromkeys(list(ids) + sorted(self._ack_retry)))
+        landed = 0
+        failed = False
+        for lease_id in to_flush:
             try:
                 self._wal.update_status(lease_id, "acked")
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 -- park for retry
+                failed = True
+                self._ack_retry.add(lease_id)
                 logger.debug(
-                    "[DurableOutbound] ack tombstone failed lease=%s",
-                    lease_id, exc_info=True)
+                    "[DurableOutbound] ack tombstone failed lease=%s "
+                    "(parked for retry)", lease_id, exc_info=True)
+                continue
+            self._ack_retry.discard(lease_id)
             self._pending.pop(lease_id, None)
             self._ack_inflight.discard(lease_id)
-        self._acks_since_compact += len(ids)
-        if self._acks_since_compact >= self._compact_every_n:
+            landed += 1
+        if failed and not self._ack_fail_warned:
+            self._ack_fail_warned = True
+            logger.warning(
+                "[DurableOutbound] ack tombstone write failing -- "
+                "redelivery possible after crash (%d lease(s) parked "
+                "for retry)", len(self._ack_retry))
+        if not self._ack_retry and self._ack_fail_warned:
+            self._ack_fail_warned = False
+            logger.info(
+                "[DurableOutbound] ack tombstone writes recovered -- "
+                "retry park drained")
+        self._acks_since_compact += landed
+        if landed and self._acks_since_compact >= self._compact_every_n:
             self._acks_since_compact = 0
             try:
                 self._wal.compact()

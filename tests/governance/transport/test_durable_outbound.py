@@ -7,17 +7,24 @@ crash can never lose a publish() the broker accepted. Trims on ack
 (Task 1's BusBridgeClient on_ack hook target), with a dynamic
 disk-fraction capacity guard (no hardcoded byte caps).
 
-Suite map (per the task brief):
+Suite map (task brief + review round):
   (a) journal-at-publish: only op_prefix events land, ordered by event_id
   (b) crash-survival: a fresh instance on the same wal_path recovers the
-      pending set from fsync'd disk truth, not memory
+      pending set from journaled disk truth, not memory
   (c) ack-trim: on_ack(<eid>) trims every pending id <= eid, in memory
       immediately and on disk durably (fresh instance agrees)
   (d) dynamic capacity: tiny disk free -> degraded_capacity flips True,
       oldest pending dropped (dead_letter), exactly ONE warning per
-      episode, newest survives; restored disk clears the flag
+      episode, newest survives; restored disk clears the flag; compact
+      fires ONLY at episode onset (review IMPORTANT-2)
   (e) zero hardcoded caps: module source contains no byte-size literals;
       JARVIS_BODY_WAL_DISK_FRACTION is the only capacity knob
+  (f) review CRITICAL: a failed WAL append is NEVER reported as
+      pending-durable -- surfaced via journal_failures, ONE warning per
+      episode, retried on later journal cycles, lands when fault clears
+  (g) review IMPORTANT-1: a failed ack tombstone keeps the lease parked
+      for retry (no live-acked/disk-pending split-brain loss), ONE
+      warning per episode, drains once the fault clears
 """
 from __future__ import annotations
 
@@ -119,7 +126,7 @@ def test_crash_survival_fresh_instance_recovers_from_disk(tmp_path, monkeypatch)
     ids = _run(scenario())
 
     # A NEW instance -- new broker, no start(), no shared memory -- must see
-    # the same 5 pending entries purely from the fsync'd WAL file.
+    # the same 5 pending entries purely from the flock-journaled WAL file.
     fresh = DurableOutbound(StreamEventBroker(history_maxlen=4), wal_path=wal_path)
     assert fresh.pending_count() == 5
     assert _pending_ids(fresh) == sorted(ids), (
@@ -185,9 +192,22 @@ def test_dynamic_capacity_degrades_and_recovers(tmp_path, monkeypatch, caplog):
 
     logger_name = "backend.core.ouroboros.governance.transport.durable_outbound"
 
+    # Review IMPORTANT-2: compact must fire ONLY at episode onset, not on
+    # every over-budget append while already degraded.
+    compact_calls = {"n": 0}
+
     async def scenario():
         broker = StreamEventBroker(history_maxlen=64)
         outbound = DurableOutbound(broker, wal_path=wal_path)
+
+        real_compact = outbound._wal.compact
+
+        def _counting_compact():
+            compact_calls["n"] += 1
+            return real_compact()
+
+        monkeypatch.setattr(outbound._wal, "compact", _counting_compact)
+
         await outbound.start()
         try:
             ids = [broker.publish(_EVENT_TYPE, _PREFIX + "t-%d" % i, {"i": i})
@@ -219,6 +239,10 @@ def test_dynamic_capacity_degrades_and_recovers(tmp_path, monkeypatch, caplog):
 
     with caplog.at_level(logging.WARNING, logger=logger_name):
         ids, final_ids = _run(scenario())
+
+    assert compact_calls["n"] == 1, (
+        "compact must run ONLY at degraded-episode onset, ran %d times"
+        % compact_calls["n"])
 
     warnings = [r for r in caplog.records
                 if r.name == logger_name and r.levelno == logging.WARNING
@@ -260,3 +284,142 @@ def test_no_hardcoded_byte_caps_in_module_source():
     assert capacity_knobs == {"JARVIS_BODY_WAL_DISK_FRACTION"}, (
         "JARVIS_BODY_WAL_DISK_FRACTION must be the ONLY capacity knob: %r"
         % capacity_knobs)
+
+
+# --------------------------------------------------------------------------- #
+# (f) review CRITICAL: WAL.append failure (the ENOSPC class this module
+#     exists to survive) must NOT be reported as pending-durable. The event
+#     is surfaced as at-risk (journal_failures), warned ONCE per episode,
+#     retried on subsequent journal cycles, and lands when the fault clears.
+# --------------------------------------------------------------------------- #
+def test_journal_append_failure_not_falsely_durable_then_retried(
+        tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("JARVIS_BODY_WAL_PROBE_INTERVAL_S", "0")
+    wal_path = str(tmp_path / "body_wal.jsonl")
+    logger_name = "backend.core.ouroboros.governance.transport.durable_outbound"
+
+    async def scenario():
+        broker = StreamEventBroker(history_maxlen=64)
+        outbound = DurableOutbound(broker, wal_path=wal_path)
+        await outbound.start()
+        try:
+            real_append = outbound._wal.append
+            fault = {"on": True}
+
+            def _flaky_append(entry):
+                if fault["on"]:
+                    raise OSError(28, "No space left on device")
+                return real_append(entry)
+
+            monkeypatch.setattr(outbound._wal, "append", _flaky_append)
+
+            e1 = broker.publish(_EVENT_TYPE, _PREFIX + "t-0", {"i": 0})
+            e2 = broker.publish(_EVENT_TYPE, _PREFIX + "t-1", {"i": 1})
+            await _wait_for(lambda: outbound.journal_failures == 2)
+
+            # The durability claim must be HONEST: nothing landed on disk,
+            # so nothing may be reported as pending-durable.
+            assert outbound.pending_count() == 0, (
+                "a failed append must NOT surface as pending-durable")
+            probe = DurableOutbound(
+                StreamEventBroker(history_maxlen=4), wal_path=wal_path)
+            assert probe.pending_count() == 0, (
+                "disk must agree: nothing was journaled")
+
+            # Fault clears -> the next journal cycle retries the at-risk
+            # entries, then journals the new event. All three land.
+            fault["on"] = False
+            e3 = broker.publish(_EVENT_TYPE, _PREFIX + "t-2", {"i": 2})
+            await _wait_for(lambda: (outbound.pending_count() == 3
+                                     and outbound.journal_failures == 0))
+            assert _pending_ids(outbound) == sorted([e1, e2, e3])
+            return [e1, e2, e3]
+        finally:
+            await outbound.stop()
+
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        ids = _run(scenario())
+
+    fresh = DurableOutbound(StreamEventBroker(history_maxlen=4), wal_path=wal_path)
+    assert _pending_ids(fresh) == sorted(ids), (
+        "retried at-risk events must be durably journaled once the fault clears")
+
+    warnings = [r for r in caplog.records
+                if r.name == logger_name and r.levelno == logging.WARNING
+                and "journal append FAILED" in r.getMessage()]
+    assert len(warnings) == 1, (
+        "exactly ONE journal-failure warning per episode, got %d"
+        % len(warnings))
+
+
+# --------------------------------------------------------------------------- #
+# (g) review IMPORTANT-1: ack tombstone write failure must not produce the
+#     live-says-acked / disk-says-pending split silently -- the lease stays
+#     parked for retry, ONE distinguishing warning per episode, and the
+#     tombstones land once the fault clears.
+# --------------------------------------------------------------------------- #
+def test_ack_tombstone_failure_parks_lease_for_retry(
+        tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("JARVIS_BODY_WAL_PROBE_INTERVAL_S", "0")
+    wal_path = str(tmp_path / "body_wal.jsonl")
+    logger_name = "backend.core.ouroboros.governance.transport.durable_outbound"
+
+    async def scenario():
+        broker = StreamEventBroker(history_maxlen=64)
+        outbound = DurableOutbound(broker, wal_path=wal_path)
+        await outbound.start()
+        try:
+            ids = [broker.publish(_EVENT_TYPE, _PREFIX + "t-%d" % i, {"i": i})
+                   for i in range(3)]
+            await _wait_for(lambda: outbound.pending_count() == 3)
+
+            real_update = outbound._wal.update_status
+            fault = {"on": True}
+
+            def _flaky_update(lease_id, status):
+                if fault["on"] and status == "acked":
+                    raise OSError(5, "injected tombstone write failure")
+                return real_update(lease_id, status)
+
+            monkeypatch.setattr(outbound._wal, "update_status", _flaky_update)
+
+            outbound.on_ack(ids[1])  # acks ids[0..1]
+            # Immediate in-memory ack semantics still hold (redelivery is
+            # SAFE downstream -- server dedup)...
+            assert outbound.pending_count() == 1
+
+            # ...but the failed tombstones park the leases for retry.
+            await _wait_for(lambda: len(outbound._ack_retry) == 2)
+            probe = DurableOutbound(
+                StreamEventBroker(history_maxlen=4), wal_path=wal_path)
+            assert probe.pending_count() == 3, (
+                "disk truth must still show 3 pending -- no tombstone landed")
+
+            # Fault clears -> a later flush retries the parked leases.
+            fault["on"] = False
+            outbound.on_ack(ids[1])  # no new ids; drains the retry park
+            await _wait_for(lambda: not outbound._ack_retry)
+
+            def _disk_agrees() -> bool:
+                p = DurableOutbound(
+                    StreamEventBroker(history_maxlen=4), wal_path=wal_path)
+                return p.pending_count() == 1
+            await _wait_for(_disk_agrees)
+            assert outbound.pending_count() == 1
+            return ids
+        finally:
+            await outbound.stop()
+
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        ids = _run(scenario())
+
+    fresh = DurableOutbound(StreamEventBroker(history_maxlen=4), wal_path=wal_path)
+    assert _pending_ids(fresh) == [sorted(ids)[2]], (
+        "acked leases must be durably tombstoned once the fault clears")
+
+    warnings = [r for r in caplog.records
+                if r.name == logger_name and r.levelno == logging.WARNING
+                and "ack tombstone" in r.getMessage()]
+    assert len(warnings) == 1, (
+        "exactly ONE ack-tombstone-failure warning per episode, got %d"
+        % len(warnings))
