@@ -261,16 +261,51 @@ def _resolve_lifetime_s(
     (+ margins) so the two budgets can never drift apart. `explicit` (an
     operator-supplied `--lifetime-s` or `JARVIS_A1_BRAIN_LIFETIME_S`) is
     still honored as an escape hatch -- but the default path is always
-    derived, never independent."""
+    derived, never independent.
+
+    Re-review fix (safety-critical): an explicit lifetime BELOW the
+    coordination floor (`soak_wall_s + boot_offset_s +
+    verdict_pull_margin_s`) used to be honored VERBATIM -- e.g.
+    `--soak-wall-s 2400 --lifetime-s 1800` armed the node's Piece D
+    self-destruct at 1800s while the on-node soak's own wall
+    (`OUROBOROS_BATTLE_MAX_WALL_SECONDS=soak_wall_s`) didn't fire until
+    2400s, so the node could be $0-killed BEFORE the soak's own wall even
+    fires, mid-verdict. An explicit-but-too-short lifetime is now CLAMPED
+    UP to the floor -- never silently honored (that hides the danger),
+    never rejected/crashed (the run should still proceed safely) -- with a
+    LOUD warning so the operator knows their value was overridden. This
+    keeps the ordering invariant `soak_wall_s < monitor_stop < lifetime_s`
+    true after resolution in every case. An explicit lifetime >= the floor
+    is honored as-is (an operator may deliberately extend it further)."""
+    floor = int(soak_wall_s) + int(boot_offset_s) + int(verdict_pull_margin_s)
+
+    def _clamp_to_floor(value: int, *, source: str) -> int:
+        if value >= floor:
+            return value
+        _log(
+            "WARN %s=%ds is BELOW the coordination floor=%ds "
+            "(soak_wall_s=%ds + boot_offset_s=%ds + verdict_pull_margin_s=%ds) "
+            "-- honoring it verbatim would let the node self-destruct BEFORE "
+            "the soak's own wall fires, killing the run mid-verdict. "
+            "CLAMPING lifetime_s UP to %ds to keep "
+            "soak_wall_s < monitor_stop < lifetime_s. Pass --lifetime-s >= "
+            "%ds (or a smaller --soak-wall-s) to silence this."
+            % (source, value, floor, soak_wall_s, boot_offset_s,
+               verdict_pull_margin_s, floor, floor)
+        )
+        return floor
+
     if explicit is not None:
-        return int(explicit)
+        return _clamp_to_floor(int(explicit), source="--lifetime-s")
     env_raw = (os.environ.get("JARVIS_A1_BRAIN_LIFETIME_S", "") or "").strip()
     if env_raw:
         try:
-            return int(float(env_raw))
+            return _clamp_to_floor(
+                int(float(env_raw)), source="JARVIS_A1_BRAIN_LIFETIME_S"
+            )
         except (TypeError, ValueError):
             pass
-    return int(soak_wall_s) + int(boot_offset_s) + int(verdict_pull_margin_s)
+    return floor
 
 
 # ---------------------------------------------------------------------------

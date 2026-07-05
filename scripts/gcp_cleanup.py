@@ -105,121 +105,78 @@ def _orphan_instance_filter() -> str:
 # `_orphan_instance_filter()` above ORs in `labels.jarvis-role=brain` so a
 # genuinely-orphaned Brain VM is no longer invisible to this sweep. But a
 # brain-labelled VM can ALSO be a LIVE, running Stage-2/3/4 production
-# organism -- unlike the ephemeral `created-by=jarvis`/`app=jarvis` nodes,
-# it must NEVER be deleted just for matching the label. The guard below
-# requires a brain-ONLY match to also be genuinely orphaned: either already
-# TERMINATED, or RUNNING but old enough (JARVIS_BRAIN_ORPHAN_MAX_AGE_S) that
-# it cannot plausibly be an in-flight soak.
+# organism that stays up for days/weeks -- unlike the ephemeral
+# `created-by=jarvis`/`app=jarvis` nodes, it must NEVER be deleted just for
+# matching the label.
+#
+# Re-review fix (safety-critical): the original guard ALSO reaped a
+# brain-only VM once it was merely RUNNING past an age threshold
+# (JARVIS_BRAIN_ORPHAN_MAX_AGE_S, default 2h). A persistent production Brain
+# is *always* older than 2h, so `--all` (non-interactive) would eventually
+# delete a LIVE production Brain -- exactly the collateral this guard exists
+# to prevent. The age branch is removed entirely: a brain-labelled VM is
+# reaped ONLY when it is already ``status == "TERMINATED"``. A RUNNING brain
+# (production or an in-flight A1 soak) is NEVER touched by this sweep,
+# regardless of age.
 #
 # Composition with brain_lifecycle.py Piece D (node-side absolute
-# self-destruct): `shutdown -h now` transitions a halted Brain node to
-# TERMINATED (stops compute billing -- the $0 part) but does NOT delete the
-# instance/disk. This guard is what lets THIS sweep finish that job -- a
-# TERMINATED brain-only VM is reaped unconditionally by the guard below,
-# regardless of age.
+# self-destruct): an orphaned RUNNING brain is halted by the node's own
+# dead-man (`shutdown -h now` -> TERMINATED, stops compute billing -- the $0
+# part) but that does NOT delete the instance/disk. THIS sweep is what
+# finishes the job -- a TERMINATED brain-only VM is reaped unconditionally,
+# but only after the node has already halted itself.
 # ---------------------------------------------------------------------------
-
-_ENV_BRAIN_ORPHAN_MAX_AGE_S = "JARVIS_BRAIN_ORPHAN_MAX_AGE_S"
-_DEFAULT_BRAIN_ORPHAN_MAX_AGE_S = 7200  # 2h -- generous vs the ~850-1300s A1
-# happy-path and the ~2400s graduation-soak wall (CLAUDE.md), while still
-# reaping a genuinely abandoned node in a reasonable window.
-
-
-def _brain_orphan_max_age_s() -> int:
-    """Env-tunable RUNNING-age threshold (seconds) before a brain-only-matched
-    orphan is considered abandoned rather than a live soak. Fail-soft: any
-    unset/blank/non-numeric/non-positive value falls back to the default."""
-    raw = (os.environ.get(_ENV_BRAIN_ORPHAN_MAX_AGE_S, "") or "").strip()
-    if not raw:
-        return _DEFAULT_BRAIN_ORPHAN_MAX_AGE_S
-    try:
-        val = int(float(raw))
-    except (TypeError, ValueError):
-        return _DEFAULT_BRAIN_ORPHAN_MAX_AGE_S
-    return val if val > 0 else _DEFAULT_BRAIN_ORPHAN_MAX_AGE_S
 
 
 def _vm_label_match_class(labels: Optional[Dict[str, Any]]) -> str:
     """Classify which orphan predicate matched a VM's labels, so the reap
     guard can tell "ephemeral jarvis node" (unconditional reap, unchanged)
-    apart from "brain-only" (guarded reap). Fails CLOSED ("unknown", not
-    reaped) if neither predicate is actually present -- should not happen
-    given the OR-filter that selected this VM in the first place, but a
-    label field that gcloud omits/renames must never silently unlock an
-    unconditional delete."""
+    apart from "brain" (guarded, TERMINATED-only reap).
+
+    Re-review fix (safety-critical): a VM can carry BOTH
+    ``created-by=jarvis``/``app=jarvis`` AND ``jarvis-role=brain`` (e.g. a
+    Brain VM provisioned through the same jarvis tooling that stamps the
+    ephemeral labels). The brain label MUST win any such ambiguity -- for a
+    safety-critical guard, "could be a live Brain" always outranks "looks
+    like an ephemeral node". ``has_brain`` is therefore checked FIRST.
+
+    Fails CLOSED ("unknown", not reaped) if neither predicate is present --
+    should not happen given the OR-filter that selected this VM in the first
+    place, but a label field that gcloud omits/renames must never silently
+    unlock an unconditional delete.
+    """
     labels = labels or {}
     has_jarvis = labels.get("created-by") == "jarvis" or labels.get("app") == "jarvis"
     has_brain = labels.get("jarvis-role") == "brain"
+    if has_brain:
+        return "brain"
     if has_jarvis:
         return "jarvis"
-    if has_brain:
-        return "brain_only"
     return "unknown"
-
-
-def _parse_gcp_timestamp(ts: str) -> Optional[datetime]:
-    """Parse a GCE ``creationTimestamp`` (e.g.
-    ``2026-07-04T12:34:56.789-07:00``) into a timezone-aware datetime.
-    Fail-soft: returns None on any parse error."""
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(ts)
-    except ValueError:
-        pass
-    # Python 3.9/3.10's fromisoformat is stricter about fractional-second
-    # digit counts than 3.11+ -- normalize to microseconds (6 digits) and
-    # retry rather than requiring a newer interpreter.
-    try:
-        m = re.match(
-            r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2}|Z)?$",
-            ts.strip(),
-        )
-        if not m:
-            return None
-        base, frac, offset = m.groups()
-        frac_digits = ((frac or ".0")[1:] + "000000")[:6]
-        offset = "+00:00" if (not offset or offset == "Z") else offset
-        return datetime.fromisoformat(f"{base}.{frac_digits}{offset}")
-    except Exception:
-        return None
-
-
-def _vm_age_seconds(creation_timestamp: str, *, now: Optional[datetime] = None) -> Optional[float]:
-    """Age of a VM (seconds) derived from its ``creationTimestamp``. Returns
-    None when the timestamp cannot be parsed (guard treats that as
-    "cannot prove age" -> fails toward NOT reaping)."""
-    created = _parse_gcp_timestamp(creation_timestamp or "")
-    if created is None:
-        return None
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    now = now or datetime.now(timezone.utc)
-    return (now - created).total_seconds()
 
 
 def _should_reap_orphan_vm(vm: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
     """Decide whether an orphan-filter-matched VM is safe to delete.
 
-    - Matched by ``created-by=jarvis``/``app=jarvis``: UNCONDITIONAL reap,
-      byte-identical to today's behavior for these ephemeral nodes.
-    - Matched ONLY by ``jarvis-role=brain``: reaped ONLY when genuinely
-      orphaned -- ``status == "TERMINATED"`` OR RUNNING-age exceeds
-      ``JARVIS_BRAIN_ORPHAN_MAX_AGE_S``. A live/young Brain VM is never
-      touched by this sweep.
+    - Matched by ``created-by=jarvis``/``app=jarvis`` (and NOT also
+      brain-labelled): UNCONDITIONAL reap, byte-identical to today's
+      behavior for these ephemeral nodes.
+    - Matched by ``jarvis-role=brain`` (alone or combined with the jarvis
+      labels -- brain always wins classification, see
+      ``_vm_label_match_class``): reaped ONLY when ``status == "TERMINATED"``.
+      A RUNNING brain VM -- live production or an in-flight A1 soak -- is
+      NEVER reaped by this sweep, no matter its age.
     - Anything matching neither predicate class fails CLOSED (not reaped).
+
+    ``now`` is accepted for backward-compatible call signatures but is
+    unused now that the age-based branch has been removed.
     """
     match_class = _vm_label_match_class(vm.get("labels"))
     if match_class == "jarvis":
         return True
-    if match_class != "brain_only":
+    if match_class != "brain":
         return False
-    if str(vm.get("status") or "").upper() == "TERMINATED":
-        return True
-    age_s = _vm_age_seconds(vm.get("created") or "", now=now)
-    if age_s is None:
-        return False
-    return age_s > _brain_orphan_max_age_s()
+    return str(vm.get("status") or "").upper() == "TERMINATED"
 
 
 @dataclass
@@ -661,13 +618,14 @@ class GCPCleanup:
     async def cleanup_orphaned_vms(self) -> Dict[str, Any]:
         """Delete orphaned VMs.
 
-        Brain-labelled VMs (``jarvis-role=brain`` and NOT also
-        ``created-by=jarvis``/``app=jarvis``) can be LIVE production
+        Brain-labelled VMs (``jarvis-role=brain``, which always wins
+        classification even if ``created-by=jarvis``/``app=jarvis`` is ALSO
+        present -- see ``_vm_label_match_class``) can be LIVE production
         Stage-2/3/4 organisms -- ``_should_reap_orphan_vm`` guards them so
-        only a genuinely orphaned brain VM (TERMINATED, or RUNNING past
-        ``JARVIS_BRAIN_ORPHAN_MAX_AGE_S``) is deleted. Ephemeral
-        ``created-by=jarvis``/``app=jarvis`` VMs keep today's unconditional
-        behavior.
+        only a genuinely orphaned brain VM (``status == "TERMINATED"``) is
+        deleted. A RUNNING brain VM is never reaped by this sweep, no matter
+        its age. Ephemeral ``created-by=jarvis``/``app=jarvis``-only VMs keep
+        today's unconditional behavior.
         """
         results = {"deleted": [], "errors": [], "skipped": []}
 
@@ -686,9 +644,9 @@ class GCPCleanup:
             if not _should_reap_orphan_vm(vm):
                 results["skipped"].append(vm_name)
                 print_warning(
-                    f"Skipping {vm_name}: brain-labelled, status={vm.get('status')}, "
-                    f"not older than {_brain_orphan_max_age_s()}s -- may be a LIVE "
-                    "Brain organism, not a genuine orphan"
+                    f"Skipping {vm_name}: brain-labelled, status={vm.get('status')} "
+                    "(not TERMINATED) -- may be a LIVE Brain organism, not a "
+                    "genuine orphan"
                 )
                 continue
 

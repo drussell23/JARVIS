@@ -15,9 +15,20 @@ that also matches `labels.jarvis-role=brain`, and use it in
 Second bug (whole-branch review, destructive collateral): once brain VMs
 became visible to this filter, `cleanup_orphaned_vms()` deleted EVERY match
 unconditionally -- including a LIVE, RUNNING Stage-2/3/4 Brain organism.
-Fix: `_should_reap_orphan_vm()` guards brain-ONLY matches (TERMINATED, or
-RUNNING past `JARVIS_BRAIN_ORPHAN_MAX_AGE_S`); `created-by=jarvis`/`app=jarvis`
-matches keep the existing unconditional-reap behavior.
+Fix: `_should_reap_orphan_vm()` guards brain matches to `status ==
+"TERMINATED"` only; `created-by=jarvis`/`app=jarvis`-only matches keep the
+existing unconditional-reap behavior.
+
+Re-review fix #1 (safety-critical): the guard's original age-based branch
+(RUNNING past `JARVIS_BRAIN_ORPHAN_MAX_AGE_S`, default 2h) reaped a LIVE
+production Brain -- a persistent Stage-2/3/4 organism is always older than
+2h. That branch has been removed entirely: a brain-labelled VM is reaped
+ONLY when already `TERMINATED`, regardless of age.
+
+Re-review fix #2 (safety-critical): `_vm_label_match_class` used to check
+`created-by=jarvis`/`app=jarvis` BEFORE `jarvis-role=brain`, so a VM
+carrying BOTH labels classified as unconditional-reap `"jarvis"`, bypassing
+the brain guard entirely. The brain label now wins any such ambiguity.
 
 Zero real gcloud calls -- subprocess.run is monkeypatched.
 """
@@ -200,12 +211,14 @@ async def test_terminated_brain_only_vm_is_deleted(C, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_aged_running_brain_only_vm_is_deleted(C, monkeypatch):
-    """A RUNNING brain-only VM older than JARVIS_BRAIN_ORPHAN_MAX_AGE_S IS
-    reaped -- abandoned long enough it cannot plausibly be an in-flight
-    soak."""
+async def test_aged_running_brain_only_vm_is_not_deleted(C, monkeypatch):
+    """SAFETY-CRITICAL (re-review): a RUNNING brain-only VM must NOT be
+    reaped no matter how old it is -- a real production Brain is a
+    persistent organism that runs for days/weeks, so any age-based RUNNING
+    reap eventually deletes a LIVE production Brain. The age branch has
+    been removed entirely; only ``status == "TERMINATED"`` triggers reap."""
     vm = {
-        "name": "brain-abandoned",
+        "name": "brain-old-but-alive",
         "zone": "projects/p/zones/us-central1-a",
         "status": "RUNNING",
         "creationTimestamp": _aged_timestamp(20000),
@@ -225,9 +238,71 @@ async def test_aged_running_brain_only_vm_is_deleted(C, monkeypatch):
     result = await cleanup.cleanup_orphaned_vms()
 
     delete_calls = [c for c in calls if "delete" in c]
-    assert len(delete_calls) == 1
-    assert "brain-abandoned" in delete_calls[0]
-    assert result["deleted"] == ["brain-abandoned"]
+    assert delete_calls == []
+    assert result["deleted"] == []
+    assert "brain-old-but-alive" in result["skipped"]
+
+
+@pytest.mark.asyncio
+async def test_brain_label_wins_when_both_labels_present(C, monkeypatch):
+    """SAFETY-CRITICAL (re-review): a VM carrying BOTH
+    ``created-by=jarvis`` AND ``jarvis-role=brain`` must classify as
+    brain-guarded (NOT unconditional-reap `"jarvis"`) -- the brain label
+    wins any ambiguity. RUNNING is skipped; TERMINATED is reaped."""
+    running_vm = {
+        "name": "brain-and-jarvis-running",
+        "zone": "projects/p/zones/us-central1-a",
+        "status": "RUNNING",
+        "creationTimestamp": _recent_timestamp(),
+        "labels": {"created-by": "jarvis", "jarvis-role": "brain"},
+    }
+    calls: List[List[str]] = []
+
+    def _fake_run_running(cmd: List[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(cmd)
+        if "list" in cmd:
+            return _FakeCompletedProcess(stdout=json.dumps([running_vm]))
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(C.subprocess, "run", _fake_run_running)
+    cleanup = C.GCPCleanup(config=C.GCPConfig(project_id="fake-project"))
+
+    result = await cleanup.cleanup_orphaned_vms()
+
+    delete_calls = [c for c in calls if "delete" in c]
+    assert delete_calls == []
+    assert result["deleted"] == []
+    assert "brain-and-jarvis-running" in result["skipped"]
+
+    # Same VM, TERMINATED -- now reaped (brain-guard rule, not jarvis-rule).
+    terminated_vm = {**running_vm, "status": "TERMINATED", "name": "brain-and-jarvis-halted"}
+    calls2: List[List[str]] = []
+
+    def _fake_run_terminated(cmd: List[str], **kwargs: Any) -> _FakeCompletedProcess:
+        calls2.append(cmd)
+        if "list" in cmd:
+            return _FakeCompletedProcess(stdout=json.dumps([terminated_vm]))
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(C.subprocess, "run", _fake_run_terminated)
+    result2 = await cleanup.cleanup_orphaned_vms()
+
+    delete_calls2 = [c for c in calls2 if "delete" in c]
+    assert len(delete_calls2) == 1
+    assert "brain-and-jarvis-halted" in delete_calls2[0]
+    assert result2["deleted"] == ["brain-and-jarvis-halted"]
+
+
+def test_vm_label_match_class_brain_wins_over_jarvis(C):
+    """Direct unit check on the classifier: brain label wins regardless of
+    label dict ordering."""
+    assert C._vm_label_match_class({"created-by": "jarvis", "jarvis-role": "brain"}) == "brain"
+    assert C._vm_label_match_class({"jarvis-role": "brain", "app": "jarvis"}) == "brain"
+    assert C._vm_label_match_class({"jarvis-role": "brain"}) == "brain"
+    assert C._vm_label_match_class({"created-by": "jarvis"}) == "jarvis"
+    assert C._vm_label_match_class({"app": "jarvis"}) == "jarvis"
+    assert C._vm_label_match_class({"some-other-label": "x"}) == "unknown"
+    assert C._vm_label_match_class(None) == "unknown"
 
 
 @pytest.mark.asyncio
@@ -273,12 +348,23 @@ def test_should_reap_orphan_vm_fails_closed_on_unknown_label_class(C):
     assert C._should_reap_orphan_vm(vm) is False
 
 
-def test_brain_orphan_max_age_s_env_tunable(C, monkeypatch):
-    monkeypatch.setenv("JARVIS_BRAIN_ORPHAN_MAX_AGE_S", "60")
-    assert C._brain_orphan_max_age_s() == 60
+def test_should_reap_orphan_vm_brain_ignores_age_entirely(C):
+    """Re-review regression pin: the age-based RUNNING-reap branch (and its
+    supporting helpers/env var) must be gone. A brain-only VM's reap
+    decision depends ONLY on ``status``, never on age -- verified directly
+    via ``_should_reap_orphan_vm`` with an arbitrarily old creation time."""
+    ancient_running = {
+        "name": "brain-ancient",
+        "status": "RUNNING",
+        "created": _aged_timestamp(365 * 24 * 3600),  # 1 year old
+        "labels": {"jarvis-role": "brain"},
+    }
+    assert C._should_reap_orphan_vm(ancient_running) is False
 
-    monkeypatch.setenv("JARVIS_BRAIN_ORPHAN_MAX_AGE_S", "not-a-number")
-    assert C._brain_orphan_max_age_s() == C._DEFAULT_BRAIN_ORPHAN_MAX_AGE_S
+    ancient_terminated = {**ancient_running, "status": "TERMINATED"}
+    assert C._should_reap_orphan_vm(ancient_terminated) is True
 
-    monkeypatch.delenv("JARVIS_BRAIN_ORPHAN_MAX_AGE_S", raising=False)
-    assert C._brain_orphan_max_age_s() == C._DEFAULT_BRAIN_ORPHAN_MAX_AGE_S
+    # The age-threshold config surface must no longer exist on the module.
+    assert not hasattr(C, "_brain_orphan_max_age_s")
+    assert not hasattr(C, "_vm_age_seconds")
+    assert not hasattr(C, "_DEFAULT_BRAIN_ORPHAN_MAX_AGE_S")

@@ -15,6 +15,12 @@ calls, zero dollars, no network. Proves:
      positive JARVIS_BRAIN_ABSOLUTE_LIFETIME_S while provision_fn runs.
   6. The up-front reaper registry is idempotent and never raises when drained
      twice.
+  7. Re-review fix: an explicit --lifetime-s/JARVIS_A1_BRAIN_LIFETIME_S BELOW
+     the coordination floor (soak_wall_s + boot_offset_s +
+     verdict_pull_margin_s) is CLAMPED UP to the floor (with a loud warning,
+     never silently honored, never rejected/crashed) -- proven regression
+     for the exact reported failure: `--soak-wall-s 2400 --lifetime-s 1800`
+     used to yield lifetime_s=1800 < wall=2400 ($0-killed mid-verdict).
 """
 from __future__ import annotations
 
@@ -181,7 +187,12 @@ def _make_ignition(**overrides: Any):
         node_name="a1-brain-test",
         project="",
         zone="",
-        lifetime_s=1800,
+        # Comfortably above the coordination floor implied by the default
+        # soak_wall_s (1800) + default boot_offset_s (180) + default
+        # verdict_pull_margin_s (180) = 2160 -- so this fixture's default
+        # explicit lifetime is honored as-is (not clamped) unless a test
+        # deliberately overrides soak_wall_s/lifetime_s to probe the clamp.
+        lifetime_s=3600,
         seed=3,
         remote_run_dir="/opt/trinity/jarvis/a1_iso_runs/a1-brain-test",
         local_out_root="/tmp/a1_brain_test_out",
@@ -325,12 +336,100 @@ def test_monitor_stop_leaves_verdict_pull_headroom_before_lifetime():
 
 
 def test_resolve_lifetime_s_helper_direct():
+    """Derived (no-explicit) path: unchanged by the clamp fix."""
     assert ignite._resolve_lifetime_s(
         explicit=None, soak_wall_s=500, boot_offset_s=100, verdict_pull_margin_s=50,
     ) == 650
-    assert ignite._resolve_lifetime_s(
+
+
+# ===========================================================================
+# 2c. Re-review fix: explicit lifetime_s below the coordination floor is
+#     CLAMPED UP (never silently honored, never rejected/crashed) --
+#     `soak_wall_s < monitor_stop < lifetime_s` must hold after resolution.
+# ===========================================================================
+
+
+def test_resolve_lifetime_s_below_floor_is_clamped_up_with_warning(capsys):
+    """The exact reported failure class, at the pure-function level: an
+    explicit lifetime below soak_wall_s + boot_offset_s +
+    verdict_pull_margin_s (== 650 here) must be clamped UP to that floor,
+    not honored verbatim -- and a loud warning must be emitted (never a
+    silent override)."""
+    result = ignite._resolve_lifetime_s(
         explicit=42, soak_wall_s=500, boot_offset_s=100, verdict_pull_margin_s=50,
-    ) == 42
+    )
+    assert result == 650  # clamped to the floor, NOT the explicit 42
+    out = capsys.readouterr().out
+    assert "WARN" in out
+    assert "--lifetime-s" in out
+    assert "650" in out
+
+
+def test_resolve_lifetime_s_above_floor_is_honored(capsys):
+    """An explicit lifetime AT or ABOVE the floor is honored as-is (an
+    operator may deliberately extend it) -- and no clamp warning fires."""
+    result = ignite._resolve_lifetime_s(
+        explicit=9999, soak_wall_s=500, boot_offset_s=100, verdict_pull_margin_s=50,
+    )
+    assert result == 9999
+    out = capsys.readouterr().out
+    assert "WARN" not in out
+
+    # Exactly AT the floor is also honored (not clamped past itself).
+    at_floor = ignite._resolve_lifetime_s(
+        explicit=650, soak_wall_s=500, boot_offset_s=100, verdict_pull_margin_s=50,
+    )
+    assert at_floor == 650
+
+
+def test_resolve_lifetime_s_env_var_below_floor_is_clamped(monkeypatch, capsys):
+    """The env-var path (JARVIS_A1_BRAIN_LIFETIME_S) gets the same clamp
+    treatment as the explicit --lifetime-s CLI path."""
+    monkeypatch.setenv("JARVIS_A1_BRAIN_LIFETIME_S", "10")
+    result = ignite._resolve_lifetime_s(
+        explicit=None, soak_wall_s=500, boot_offset_s=100, verdict_pull_margin_s=50,
+    )
+    assert result == 650
+    out = capsys.readouterr().out
+    assert "WARN" in out
+    assert "JARVIS_A1_BRAIN_LIFETIME_S" in out
+
+
+def test_ignition_clamps_reported_regression_case(capsys):
+    """End-to-end regression pin for the EXACT reported failure:
+    `--soak-wall-s 2400 --lifetime-s 1800` used to yield lifetime_s=1800 <
+    wall=2400 -- a $0-kill mid-verdict. It must now clamp lifetime_s up to
+    the floor (2400 + 180 + 180 = 2760) and the full ordering invariant
+    (soak_wall_s < monitor_stop < lifetime_s) must hold."""
+    ignition = _make_ignition(
+        dry_run=True, project="p", zone="z", soak_wall_s=2400, lifetime_s=1800,
+        monitor_max_s=None,  # let monitor_max_s DERIVE from lifetime_s (fixture
+        # default overrides it to a tiny test value otherwise, which would
+        # trivially satisfy any ordering check).
+    )
+    expected_floor = 2400 + ignition.boot_offset_s + ignition.verdict_pull_margin_s
+    assert expected_floor == 2760
+    assert ignition.lifetime_s == expected_floor
+    assert ignition.lifetime_s >= 2400  # never $0-killed before the soak wall
+
+    out = capsys.readouterr().out
+    assert "WARN" in out
+
+    # Full ordering invariant, same shape as
+    # test_monitor_stop_leaves_verdict_pull_headroom_before_lifetime.
+    assert ignition.soak_wall_s < ignition._monitor_max_s < ignition.lifetime_s
+    assert ignition._monitor_max_s + ignition.verdict_pull_margin_s <= ignition.lifetime_s
+
+
+def test_ignition_honors_explicit_lifetime_above_floor():
+    """An explicit lifetime comfortably above the floor is honored as-is at
+    the A1BrainIgnition level too (operator deliberately extending it)."""
+    ignition = _make_ignition(
+        dry_run=True, project="p", zone="z", soak_wall_s=100, lifetime_s=9999,
+        monitor_max_s=None,  # derive, see comment above
+    )
+    assert ignition.lifetime_s == 9999
+    assert ignition.soak_wall_s < ignition._monitor_max_s < ignition.lifetime_s
 
 
 # ===========================================================================
@@ -449,7 +548,11 @@ def test_provision_env_carries_persistent_and_lifetime(monkeypatch):
         captured["lifetime"] = os.environ.get("JARVIS_BRAIN_ABSOLUTE_LIFETIME_S", "")
         return True, "ok"
 
-    ignition = _make_ignition(lifetime_s=900, provision_fn=_capture_provision_fn)
+    # soak_wall_s=100 keeps floor (100+180+180=460) below the explicit 900
+    # so this test's lifetime_s stays un-clamped -- its purpose is proving
+    # the env-var wiring, not the clamp (see the dedicated clamp tests).
+    ignition = _make_ignition(
+        lifetime_s=900, soak_wall_s=100, provision_fn=_capture_provision_fn)
     ok, detail = asyncio.run(ignition.provision())
 
     assert ok is True
