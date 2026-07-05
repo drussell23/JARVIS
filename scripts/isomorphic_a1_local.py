@@ -463,6 +463,172 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# ---------------------------------------------------------------------------
+# Soak-child termination coordination (root cause bt-iso-1783144982)
+# ---------------------------------------------------------------------------
+# The parent must wait for the soak child's OWN guaranteed self-termination
+# before it audits debug.log -- else it audits a TRUNCATED log and scores a
+# spurious FAILED (the incident: 5/6 real autonomy criteria had passed; the
+# child's watchdog heartbeat read remaining=53s at audit time).
+#
+# The child dies at ``wall_anchor + cap + max_kill_margin``. The DEFEATED
+# approaches both tried to GUESS ``wall_anchor``:
+#   * v1: flat ``cap + 30`` anchored at exit-wait START (missed the whole
+#     kill ladder AND the boot skew).
+#   * v2: ``launch + boot_ceiling(90) + cap + max_margin`` -- but the boot->arm
+#     skew is NOT bounded by 90s: the observed skew was 168s (a ~72s
+#     ShippedCodeInvariants boot validation armed the watchdog long after
+#     boot-READY). ``_await_soak_boot`` never enforces its poll ceiling -- it
+#     just stops polling -- so nothing bounds the anchor.
+#
+# ROOT-CAUSE FIX: stop guessing. The harness PUBLISHES its absolute wall
+# deadline to ``<session_dir>/wall_deadline.json`` at arm time (Principle #7 --
+# absolute observability); the parent CONSUMES it. Fully adaptive to any boot
+# duration -- the anchor is the child's OWN published deadline, not an
+# assumption. All margins still come from the harness's own env knobs (single
+# source of truth; no hardcoding).
+
+# How long the parent polls debug.log for the boot-READY marker before it
+# proceeds to inject chaos. This is the boot-READY poll ONLY -- it does NOT (and
+# never did) bound the child's wall anchor; the published deadline does.
+_SOAK_BOOT_READY_POLL_S: float = 90.0
+
+
+def _child_hard_deadline_grace_s() -> float:
+    """The child harness WallClockHardDeadlineThread's graceful-fire grace
+    (``JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S``; floor 5, ceiling 600, default
+    30) -- read from the SAME env knob the harness reads so parent and child
+    share ONE source of truth for the escalation ladder. NEVER raises."""
+    raw = os.environ.get("JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S", "").strip()
+    try:
+        return max(5.0, min(600.0, float(raw) if raw else 30.0))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _child_hard_kill_margin_s() -> float:
+    """The child harness's resource-zero SIGKILL margin
+    (``JARVIS_WALL_CLOCK_HARD_KILL_MARGIN_S``; floor 5, ceiling 300, default
+    30) -- the bounded window after the graceful nudge before the unblockable
+    ``os._exit(137)`` fires. Read from the harness's own knob. NEVER raises."""
+    raw = os.environ.get("JARVIS_WALL_CLOCK_HARD_KILL_MARGIN_S", "").strip()
+    try:
+        return max(5.0, min(300.0, float(raw) if raw else 30.0))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _child_external_watchdog_margin_s() -> float:
+    """The child harness's Slice-49 external subprocess watchdog margin
+    (``JARVIS_EXTERNAL_WATCHDOG_MARGIN_S``; floor 30, default 90). The
+    out-of-process, GIL-immune sentinel SIGKILLs the child WALL-authoritatively
+    at ``cap + this margin`` (``evaluate_kill`` fires unconditionally once
+    ``now - armed >= budget``), so it is the child's LATEST guaranteed
+    self-termination layer -- it exists precisely because the in-process
+    resource-zero thread was proven GIL-starvable (v44: 73min > 40min cap,
+    never fired). Returns 0.0 when the sentinel is disabled
+    (``JARVIS_EXTERNAL_WATCHDOG_ENABLED=false``) -- MUST mirror
+    ``harness._arm_external_watchdog`` exactly. NEVER raises."""
+    if os.environ.get(
+        "JARVIS_EXTERNAL_WATCHDOG_ENABLED", "true",
+    ).strip().lower() in ("false", "0", "no", "off"):
+        return 0.0
+    raw = os.environ.get("JARVIS_EXTERNAL_WATCHDOG_MARGIN_S", "").strip()
+    try:
+        return max(30.0, float(raw) if raw else 90.0)
+    except (TypeError, ValueError):
+        return 90.0
+
+
+def _child_max_kill_margin_s() -> float:
+    """The child's LATEST terminal margin AFTER its wall cap: the MAX of the two
+    independent terminal layers, so the parent waits for whichever kills the
+    child LAST -- the in-process ladder (``grace + margin``) OR the external
+    sentinel (``external_margin``, wall-authoritative + GIL-immune, which
+    dominates under default knobs: 90 > 30+30). All from the harness's OWN env
+    knobs (single source of truth). NEVER raises."""
+    return max(
+        _child_hard_deadline_grace_s() + _child_hard_kill_margin_s(),
+        _child_external_watchdog_margin_s(),
+    )
+
+
+def _parent_exit_deadline_wall(child_deadline_wall: float) -> float:
+    """Absolute WALL time (epoch seconds) the parent must wait until for the
+    child's GUARANTEED self-termination, given the child's OWN published
+    wall-cap deadline (``wall_deadline.json`` ``deadline_wall``). The child dies
+    by ``child_deadline_wall + max_kill_margin`` (whichever terminal layer fires
+    last); ``slack`` (``JARVIS_A1_SOAK_EXIT_SLACK_S``, default 15, floor 5)
+    covers the sentinel's 1s poll + the in-process <=5s poll + IPC latency. This
+    is anchored to the child's OWN published deadline, so it is correct for ANY
+    boot duration -- no boot-ceiling assumption. NEVER raises."""
+    slack = max(5.0, _env_float("JARVIS_A1_SOAK_EXIT_SLACK_S", 15.0))
+    return float(child_deadline_wall) + _child_max_kill_margin_s() + slack
+
+
+def _read_published_wall_deadline(session_dir: str) -> "Optional[float]":
+    """Read the child harness's published absolute wall deadline
+    (``<session_dir>/wall_deadline.json`` ``deadline_wall``, epoch seconds).
+    Returns ``None`` until the child has armed its wall watchdog (the file
+    appears at arm time -- the TRUE anchor, whenever boot actually finishes) or
+    on any read/parse error. NEVER raises."""
+    try:
+        import json as _json_rd  # noqa: PLC0415
+        with open(os.path.join(session_dir, "wall_deadline.json")) as f:
+            data = _json_rd.load(f)
+        dl = data.get("deadline_wall")
+        return float(dl) if dl is not None else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+async def _await_soak_child_termination(
+    soak_proc: "Any",
+    debug_log: str,
+    launch_monotonic: "Optional[float]",
+) -> str:
+    """Wait for the soak child's ACTUAL termination, coordinated to its OWN
+    published wall deadline -- adaptive to any boot duration, not a guessed
+    ceiling. Returns ``"exited"`` (the child self-terminated cleanly; audit will
+    see a COMPLETE log) or ``"force_reaped"`` (pathological -- the child
+    outlived its own guaranteed self-kill, or never armed; caller reaps).
+
+    Condition-based (Principle: no arbitrary fixed timeout): the loop's exit
+    conditions are the child's real exit OR its own published deadline elapsing,
+    NOT a magic number. Every blocking read is off-loop (``run_in_executor``) so
+    the co-located SyntheticAdversary aiohttp server keeps serving the child's
+    provider requests throughout. NEVER raises."""
+    loop = asyncio.get_event_loop()
+    session_dir = os.path.dirname(os.path.abspath(debug_log))
+    # Bounds ONLY a genuine pre-arm boot hang (the child never published a
+    # deadline at all). Generous + env-tunable; it is NOT the anchor bound.
+    arm_ceiling_s = max(120.0, _env_float("JARVIS_A1_SOAK_ARM_CEILING_S", 600.0))
+    poll_s = max(1.0, _env_float("JARVIS_A1_SOAK_TERM_POLL_S", 5.0))
+    deadline_wall: "Optional[float]" = None
+    while True:
+        if soak_proc.poll() is not None:
+            return "exited"
+        if deadline_wall is None:
+            deadline_wall = await loop.run_in_executor(
+                None, _read_published_wall_deadline, session_dir)
+            if deadline_wall is None:
+                # Not armed yet -> boot still in progress. Bounded ONLY by the
+                # generous arm ceiling; fires solely on a real pre-arm hang.
+                if launch_monotonic is not None and (
+                        time.monotonic() - launch_monotonic) > arm_ceiling_s:
+                    _log("WARN soak-child never published a wall deadline "
+                         "within arm ceiling (%.0fs) -- pre-arm boot hang; "
+                         "force-reaping" % arm_ceiling_s)
+                    return "force_reaped"
+        else:
+            if time.time() >= _parent_exit_deadline_wall(deadline_wall):
+                _log("WARN soak-child outlived its OWN published wall deadline "
+                     "+ kill margins (deadline_wall=%.0f) -- force-reaping "
+                     "(zero-orphan)" % deadline_wall)
+                return "force_reaped"
+        await asyncio.sleep(poll_s)
+
+
 def _a1_audit_ceiling_s(debug_log: "Optional[str]" = None) -> float:
     """Dynamic Global Audit Ceiling (no hardcoded window). The auditor early-exits
     the moment the verdict is proven; this is the SAFETY ceiling.
@@ -1292,6 +1458,7 @@ class IsomorphicA1Driver:
                         harness_mod.write_stub_soak_log(
                             debug_log, goal_id="GOAL-ISO-A1")
                         soak_proc = None
+                        _soak_launch_monotonic = None
                     else:
                         _log("STEP soak: launching production O+V (pre-inject boot) "
                              "iso_cwd=%s" % iso_cwd)
@@ -1328,8 +1495,14 @@ class IsomorphicA1Driver:
                         handle = _launch_iso_soak(soak_runner, env, run_dir, iso_cwd)
                         debug_log = handle.debug_log
                         soak_proc = handle.proc
+                        # Record launch time for the pre-arm-hang ceiling in
+                        # _await_soak_child_termination (NOT an anchor guess --
+                        # the child publishes its true wall deadline).
+                        _soak_launch_monotonic = time.monotonic()
                         _log("STEP await boot READY (TestWatcher fs.changed.* sub)")
-                        _await_soak_boot(soak_proc, debug_log, timeout_s=90.0)
+                        _await_soak_boot(
+                            soak_proc, debug_log,
+                            timeout_s=_SOAK_BOOT_READY_POLL_S)
 
                     _log("STEP soak boot OK: debug_log=%s" % debug_log)
 
@@ -1395,28 +1568,58 @@ class IsomorphicA1Driver:
                     # the co-located SyntheticAdversary aiohttp server runs on
                     # that SAME loop and must keep serving the child's requests
                     # throughout the wait.
+                    _soak_force_reaped = False
                     if soak_proc is not None:
-                        import subprocess as _subprocess_mod  # noqa: PLC0415
-                        _wait_budget_s = float(_soak_wall_s) + 30.0
-                        _log("STEP await soak-child exit (bind audit to ACTUAL "
-                             "completion, budget=%.0fs) -- no more stale FAILED "
-                             "verdicts from a fixed post-boot audit window"
-                             % _wait_budget_s)
+                        # Wait for the child's ACTUAL termination, coordinated
+                        # to its OWN published wall deadline (wall_deadline.json)
+                        # -- adaptive to any boot duration, so the audit only
+                        # ever sees a COMPLETE debug.log. Replaces the pre-fix
+                        # boot-ceiling GUESS that expired before the child's
+                        # self-kill and audited a truncated log
+                        # (bt-iso-1783144982).
+                        _log("STEP await soak-child termination (coordinated to "
+                             "the child's published wall deadline -- adaptive, "
+                             "no boot-ceiling guess) so the audit sees a "
+                             "COMPLETE log")
                         try:
-                            await asyncio.get_event_loop().run_in_executor(
-                                None,
-                                lambda: soak_proc.wait(timeout=_wait_budget_s),
-                            )
+                            _term_status = await _await_soak_child_termination(
+                                soak_proc, debug_log, _soak_launch_monotonic)
+                        except Exception as exc:  # noqa: BLE001 -- never block audit
+                            _term_status = "exited"
+                            _log("soak-child termination-wait warning: %r "
+                                 "(proceeding to audit)" % (exc,))
+                        if _term_status == "exited":
                             _log("STEP soak-child exited (rc=%s)"
                                  % (soak_proc.returncode,))
-                        except _subprocess_mod.TimeoutExpired:
-                            _log("WARN soak-child did not exit within "
-                                 "wall(%.0fs)+30s grace -- auditing whatever the "
-                                 "log currently holds (should not happen; the "
-                                 "child's own wall-clock watchdog guarantees "
-                                 "exit)" % (_soak_wall_s,))
-                        except Exception as exc:  # noqa: BLE001
-                            _log("soak-child wait warning: %r" % (exc,))
+                        else:
+                            # PATHOLOGICAL: the child outlived its OWN published
+                            # deadline + all kill margins (near-impossible), or
+                            # never armed. Do NOT audit a truncated log as if
+                            # complete: deterministically reap the whole process
+                            # GROUP (SIGTERM->SIGKILL cascade via the existing
+                            # runner primitive -- DRY, off-loop so the adversary
+                            # keeps serving) + waitpid so zero orphans/zombies
+                            # survive, and flag the verdict truncated so it is
+                            # never mistaken for a genuine cognitive FAILED.
+                            _soak_force_reaped = True
+                            _reap_join_s = max(
+                                5.0, _env_float("JARVIS_A1_SOAK_REAP_JOIN_S", 30.0))
+                            _log("WARN soak-child force-reap: process-group "
+                                 "SIGTERM->SIGKILL + waitpid (zero-orphan) "
+                                 "before audit; verdict will be marked truncated")
+                            _loop = asyncio.get_event_loop()
+                            try:
+                                await _loop.run_in_executor(None, _reap_soak_runners)
+                                await _loop.run_in_executor(
+                                    None,
+                                    lambda: soak_proc.wait(timeout=_reap_join_s),
+                                )
+                                _log("STEP soak-child force-reaped (rc=%s)"
+                                     % (soak_proc.returncode,))
+                            except Exception:  # noqa: BLE001 -- best-effort join
+                                _log("WARN soak-child still unreaped after force "
+                                     "cascade -- atexit process-group kill is "
+                                     "the final backstop")
 
                     # ── Fast-Fail short-circuit: a global L4 capacity wall means the
                     # cognitive loop can NEVER reach APPLIED this run. Skip the audit
@@ -1458,8 +1661,19 @@ class IsomorphicA1Driver:
                         )
 
                         proven = bool(verdict.get("proven"))
-                        _log("STEP audit VERDICT: %s"
-                             % ("A1_DISPATCH_PROVEN" if proven else "FAILED"))
+                        # A force-reaped child means the audit ran on a log the
+                        # child never got to finish flushing -- tag it so a
+                        # truncated FAILED is never read as a genuine cognitive
+                        # failure (the child outlived its own resource-zero
+                        # envelope, an infra pathology, not an autonomy verdict).
+                        if _soak_force_reaped and isinstance(verdict, dict):
+                            verdict["soak_child_force_reaped"] = True
+                            verdict.setdefault(
+                                "audit_log_truncated", not proven)
+                        _log("STEP audit VERDICT: %s%s"
+                             % ("A1_DISPATCH_PROVEN" if proven else "FAILED",
+                                " (log truncated: child force-reaped)"
+                                if _soak_force_reaped else ""))
 
                     # ── f. FAILURE PATH: T5 telemetry + local autopsy ────────
                     if not proven:
