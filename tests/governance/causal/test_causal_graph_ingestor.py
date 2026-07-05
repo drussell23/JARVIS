@@ -151,6 +151,76 @@ def test_ingest_is_non_blocking_and_fold_is_deferred_write_ahead(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# (b2) WRITE-AHEAD honesty: a REAL WAL write-failure (flock_append_line -> False,
+#      the true durability layer) must NOT fold the delta -- it is non-durable.
+# --------------------------------------------------------------------------- #
+def test_append_failure_does_not_fold(tmp_path, monkeypatch):
+    """The write-ahead gate must trust an HONEST durability signal. Force a real
+    WAL write-failure at the TRUE layer: monkeypatch
+    ``cross_process_jsonl.flock_append_line`` to return False (lock timeout /
+    write error -- nothing lands on disk). The worker must skip the fold, leave
+    the graph empty, and a fresh replay must find nothing (never durable)."""
+    import backend.core.ouroboros.governance.cross_process_jsonl as cpj
+    wal_path, snap_path = _paths(tmp_path)
+
+    async def scenario():
+        graph = CausalGraph()
+        ing = CausalGraphIngestor(
+            graph, wal_path=wal_path, snapshot_path=snap_path)
+        await ing.start()
+        try:
+            # Real write-failure through the true durability path.
+            monkeypatch.setattr(cpj, "flock_append_line",
+                                lambda *a, **k: False)
+            ing.ingest(_add_env("brain", "f", 1))
+            await ing.flush()
+            # NON-DURABLE -> must NOT be folded into the live graph.
+            assert graph.node("brain:mod.py:f") is None, (
+                "a non-durable delta (WAL write failed) must never fold")
+        finally:
+            await ing.stop()
+
+        # And it is absent from a fresh reconstruction (never hit disk).
+        fresh = CausalGraph()
+        ing2 = CausalGraphIngestor(
+            fresh, wal_path=wal_path, snapshot_path=snap_path)
+        await ing2.replay_from_wal()
+        return ing2.graph.node("brain:mod.py:f")
+
+    recovered_node = asyncio.run(scenario())
+    assert recovered_node is None, (
+        "a non-durable delta must be absent from a fresh replay")
+
+
+def test_append_success_folds_positive_control(tmp_path):
+    """Positive control: with the real (unpatched) durable path, the same delta
+    IS folded and IS present on replay -- proving the failure test above isolates
+    the durability signal, not some unrelated drop."""
+    wal_path, snap_path = _paths(tmp_path)
+
+    async def scenario():
+        graph = CausalGraph()
+        ing = CausalGraphIngestor(
+            graph, wal_path=wal_path, snapshot_path=snap_path)
+        await ing.start()
+        try:
+            ing.ingest(_add_env("brain", "f", 1))
+            await ing.flush()
+            assert graph.node("brain:mod.py:f") is not None
+        finally:
+            await ing.stop()
+
+        fresh = CausalGraph()
+        ing2 = CausalGraphIngestor(
+            fresh, wal_path=wal_path, snapshot_path=snap_path)
+        await ing2.replay_from_wal()
+        return ing2.graph.node("brain:mod.py:f")
+
+    recovered_node = asyncio.run(scenario())
+    assert recovered_node is not None, "a durable delta must survive replay"
+
+
+# --------------------------------------------------------------------------- #
 # (c) PER-REPO-ORDER invariant (the load-bearing pin)
 # --------------------------------------------------------------------------- #
 def test_wal_preserves_per_repo_emit_seq_order(tmp_path):

@@ -50,8 +50,17 @@ class WAL:
         self._max_age_days = max_age_days
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    def append(self, entry: WALEntry) -> None:
-        """Append an entry and fsync."""
+    def append(self, entry: WALEntry) -> bool:
+        """Append an entry and fsync. Returns True iff the line was durably
+        written to disk, False on any write failure (lock timeout, OSError,
+        serialization failure). NEVER raises -- the intake WAL's fail-soft
+        contract holds for every consumer.
+
+        The bool return is an HONEST durability signal (a False means nothing
+        landed on disk). Existing callers that write ``wal.append(x)`` as a
+        statement are unaffected (None -> bool is transparent); durability-
+        sensitive callers (the CausalGraphIngestor's write-ahead gate) inspect
+        it and MUST NOT treat a False as durable."""
         record = {
             "v": _WAL_VERSION,
             "lease_id": entry.lease_id,
@@ -60,7 +69,7 @@ class WAL:
             "ts_monotonic": entry.ts_monotonic,
             "ts_utc": entry.ts_utc,
         }
-        self._write_line(record)
+        return self._write_line(record)
 
     def update_status(self, lease_id: str, status: str) -> None:
         """Append a status-update tombstone for the given lease_id."""
@@ -207,16 +216,24 @@ class WAL:
     # Internal
     # ------------------------------------------------------------------
 
-    def _write_line(self, record: Dict[str, Any]) -> None:
+    def _write_line(self, record: Dict[str, Any]) -> bool:
         """Append one WAL line cross-process safe via the canonical
         ``cross_process_jsonl.flock_append_line`` substrate
         (Wave 3 v2.26). Multiple sensors may concurrently append to
         the same WAL during a session — without flock, two processes
-        could interleave bytes mid-line. NEVER raises."""
+        could interleave bytes mid-line. NEVER raises.
+
+        Returns an HONEST durability bool: True iff the line landed on
+        disk, False on any failure. ``flock_append_line`` already returns
+        True/False (lock timeout / write error / fcntl unavailable) — that
+        signal used to be DISCARDED here, letting a lock-timeout look like a
+        success. It is now propagated so the write-ahead ingestor never folds
+        a non-durable delta. The ImportError fallback path returns True on a
+        clean fsync and False on any OSError (caught, never raised)."""
         try:
             line = json.dumps(record, default=str)
         except (TypeError, ValueError):
-            return
+            return False
         try:
             from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
                 flock_append_line,
@@ -224,10 +241,15 @@ class WAL:
         except ImportError:
             # Substrate-unavailable rollback — preserve legacy
             # within-process behavior; cross-process race remains
-            # but never raises into caller.
-            with self._path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            return
-        flock_append_line(self._path, line)
+            # but never raises into caller. Report honest durability.
+            try:
+                with self._path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                return True
+            except OSError:
+                logger.warning("WAL: fallback append failed", exc_info=True)
+                return False
+        # Propagate flock_append_line's honest success/failure bool.
+        return bool(flock_append_line(self._path, line))

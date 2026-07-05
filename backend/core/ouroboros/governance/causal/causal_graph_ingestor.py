@@ -361,7 +361,13 @@ class CausalGraphIngestor:
         ``lease_id`` is a unique uuid (never updated -> the entry stays
         'pending' -> replay reads the full ordered log); ``ts_*`` are metadata
         only and do NOT affect the fold. A failed append is logged loudly and
-        returns False so the non-durable delta is dropped from the live graph."""
+        returns False so the non-durable delta is dropped from the live graph.
+
+        Durability is gated on ``WAL.append``'s HONEST bool return, NOT merely
+        on the absence of an exception: ``flock_append_line`` returns False on
+        lock-timeout / write-error (no bytes on disk) while still returning
+        normally, so a falsy return must be treated as NOT durable:
+        ``durable = (not is_offload_error(res)) and bool(res)``."""
         try:
             entry = WALEntry(
                 lease_id=uuid.uuid4().hex,
@@ -379,8 +385,16 @@ class CausalGraphIngestor:
             return False
         if is_offload_error(res):
             logger.error(
-                "[CausalGraphIngestor] WAL append failed (%s) -- delta NOT "
-                "folded (non-durable, dropped from live graph)", res)
+                "[CausalGraphIngestor] WAL append offload failed (%s) -- delta "
+                "NOT folded (non-durable, dropped from live graph)", res)
+            return False
+        # WAL.append returns True iff bytes durably landed on disk. A False
+        # (lock timeout / OSError inside flock_append_line) returns normally
+        # but is a NON-DURABLE write -- it must NOT be folded.
+        if not bool(res):
+            logger.error(
+                "[CausalGraphIngestor] WAL append reported NOT durable "
+                "(write failed) -- delta NOT folded (dropped from live graph)")
             return False
         return True
 
