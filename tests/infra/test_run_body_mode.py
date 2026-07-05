@@ -423,6 +423,26 @@ def test_require_brain_restores_exit_2(capsys):
     assert not durable.started, "strict exit precedes WAL arming"
 
 
+def test_require_brain_restores_exit_3_on_gate_timeout(capsys, monkeypatch):
+    """Symmetric strict pin (review round): WAL armed + --require-brain +
+    a never-connecting client -> the connect-gate timeout still exits 3
+    (no durable degrade)."""
+    monkeypatch.setenv("JARVIS_BRAIN_CONNECT_GATE_S", "0.2")
+    durable = _FakeDurable()
+    kwargs, ns = _seams(connect=False, durable=durable)  # _client never appears
+    driver = bm.BodyModeDriver(
+        require_brain=True, inject_test_signals=1, duration_s=0.05, **kwargs)
+    rc = asyncio.run(driver.run())
+    out = capsys.readouterr().out
+    assert rc == 3
+    assert "(exit 3)" in out
+    assert ns.shim.envelopes == [], "no signals on a dark link"
+    assert not ns.bridge.started, "bridge must not start on a dark link"
+    # The WAL arms before the gate (journal-at-publish coverage) and is
+    # disarmed on the exit-3 teardown path.
+    assert durable.started and durable.stopped
+
+
 def test_require_brain_cli_flag_parses():
     parser = bm.build_arg_parser()
     assert parser.parse_args(["--require-brain"]).require_brain is True

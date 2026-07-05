@@ -534,3 +534,70 @@ def test_journal_filter_excludes_peer_origin(tmp_path, monkeypatch):
     fresh = DurableOutbound(
         StreamEventBroker(history_maxlen=4), wal_path=wal_path)
     assert _pending_ids(fresh) == sorted([local_id, bare_id])
+
+
+# --------------------------------------------------------------------------- #
+# (h2) review round: a RAISING journal_filter fails OPEN (journals anyway --
+#      durability over dedup) but must NOT be silent: one warning per
+#      episode, episode reset when the filter succeeds again (the file's
+#      established warn-once pattern: WAL append / ack tombstone / capacity).
+# --------------------------------------------------------------------------- #
+def test_journal_filter_failure_warns_once_and_fails_open(
+        tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("JARVIS_BODY_WAL_PROBE_INTERVAL_S", "0")
+    wal_path = str(tmp_path / "body_wal.jsonl")
+    fault = {"on": True}
+
+    def _flaky_filter(event: Any) -> bool:
+        if fault["on"]:
+            raise RuntimeError("filter boom")
+        return (getattr(event, "payload", None) or {}).get(
+            "origin") != "peer"
+
+    def _filter_warnings() -> List[Any]:
+        return [r for r in caplog.records
+                if r.levelno == logging.WARNING
+                and "journal_filter" in r.getMessage()]
+
+    async def scenario():
+        broker = StreamEventBroker(history_maxlen=64)
+        outbound = DurableOutbound(
+            broker, wal_path=wal_path, journal_filter=_flaky_filter)
+        await outbound.start()
+        try:
+            with caplog.at_level(logging.INFO):
+                # Episode 1: two raising evaluations -> BOTH events still
+                # journal (fail open) but exactly ONE warning fires.
+                e1 = broker.publish(
+                    _EVENT_TYPE, _PREFIX + "f-0", {"origin": "peer"})
+                e2 = broker.publish(
+                    _EVENT_TYPE, _PREFIX + "f-1", {"origin": "peer"})
+                await _wait_for(lambda: outbound.pending_count() == 2)
+                assert _pending_ids(outbound) == sorted([e1, e2]), (
+                    "fail-open: a raising filter must journal anyway")
+                assert len(_filter_warnings()) == 1, (
+                    "exactly one warning per failure episode")
+
+                # Recovery: the filter works again -> episode resets and
+                # peer exclusion is back in force.
+                fault["on"] = False
+                e3 = broker.publish(
+                    _EVENT_TYPE, _PREFIX + "f-2", {"origin": "peer"})
+                e4 = broker.publish(
+                    _EVENT_TYPE, _PREFIX + "f-3", {"origin": "local"})
+                await _wait_for(lambda: outbound.pending_count() == 3)
+                got = _pending_ids(outbound)
+                assert e3 not in got, "recovered filter excludes peer again"
+                assert e4 in got
+
+                # Episode 2: a NEW fault warns again (episode was reset).
+                fault["on"] = True
+                broker.publish(
+                    _EVENT_TYPE, _PREFIX + "f-4", {"origin": "peer"})
+                await _wait_for(lambda: outbound.pending_count() == 4)
+                assert len(_filter_warnings()) == 2, (
+                    "a fresh failure episode must warn again")
+        finally:
+            await outbound.stop()
+
+    _run(scenario())

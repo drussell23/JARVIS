@@ -151,6 +151,10 @@ class DurableOutbound:
         # dedup and duplicates events. A filter that RAISES fails open
         # (journal anyway): durability bias over filtering precision.
         self._journal_filter = journal_filter
+        # Review round: fail-open must not be SILENT -- one warning per
+        # failure episode (the file's established warn-once pattern),
+        # reset when the filter evaluates cleanly again.
+        self._filter_fail_warned = False
         self._wal_path = Path(wal_path) if wal_path else _default_wal_path()
         self._wal = WAL(
             self._wal_path,
@@ -325,8 +329,21 @@ class DurableOutbound:
         if self._journal_filter is not None:
             try:
                 keep = bool(self._journal_filter(event))
-            except Exception:  # noqa: BLE001 -- fail OPEN: durability bias
+            except Exception as exc:  # noqa: BLE001 -- fail OPEN: durability bias
                 keep = True
+                if not self._filter_fail_warned:
+                    self._filter_fail_warned = True
+                    logger.warning(
+                        "[DurableOutbound] journal_filter raising -- "
+                        "peer-exclusion degraded to fail-open (journaling "
+                        "everything; duplicates absorbed by server dedup): "
+                        "%s", exc)
+            else:
+                if self._filter_fail_warned:
+                    self._filter_fail_warned = False
+                    logger.info(
+                        "[DurableOutbound] journal_filter recovered -- "
+                        "peer-exclusion back in force")
             if not keep:
                 return
         if (event_id in self._pending or event_id in self._ack_inflight
