@@ -40,6 +40,13 @@ Piece D (node-side absolute self-destruct) is armed by setting
 unconditional ``nohup bash -c 'sleep N; shutdown -h now' &`` dead-man
 independent of this Mac, the brain process, and the idle-liveness marker.
 
+Coordinated soak-wall <-> node-lifetime budget (review fix): ``N`` above
+(``lifetime_s``) is DERIVED from ``soak_wall_s`` (also baked into the remote
+command as ``OUROBOROS_BATTLE_MAX_WALL_SECONDS``) plus env-tunable boot/
+verdict-pull margins -- see ``_resolve_lifetime_s`` -- instead of being an
+independent knob that could silently disagree with the on-node soak's own
+wall. Ordering invariant: ``soak_wall_s < monitor_stop < lifetime_s``.
+
 Teardown defense-in-depth (mandate 4, $0 even on total Mac network loss)
 -------------------------------------------------------------------------
   1. This script's own explicit ``get_compute_rest().delete_instance()`` on
@@ -211,25 +218,90 @@ def _default_remote_run_dir(node_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Coordinated soak-wall <-> node-lifetime budget (review fix, same class as
+# the "wall_deadline single-source-of-truth" lesson).
+#
+# Bug: the node self-destruct (Piece D, `sleep lifetime_s; shutdown -h now`)
+# starts at BOOT, but nothing told the on-node soak what ITS wall was -- it
+# fell back to isomorphic_a1_local.py's own legacy default, which could
+# disagree with `lifetime_s`. A long/graduation run could get $0-killed
+# mid-verdict, or a short `lifetime_s` could leave almost no time for
+# `retrieve_verdict()` after the soak's own wall fired.
+#
+# Fix: ONE coordinated budget, derived (not independent):
+#   lifetime_s = soak_wall_s + boot_offset_s + verdict_pull_margin_s
+# and the on-node soak's OWN wall (OUROBOROS_BATTLE_MAX_WALL_SECONDS) is set
+# to the SAME soak_wall_s baked into the remote command, so the node and this
+# driver agree. Ordering invariant (documented + asserted in tests):
+#   soak_wall_s < monitor_stop (monitor_max_s) < lifetime_s
+# i.e. the soak's own hard wall fires first; this driver's monitor loop stops
+# well before the node's self-destruct so retrieve_verdict() has real
+# headroom (>= verdict_pull_margin_s); Piece D's dead-man is the final,
+# unconditional backstop if everything else wedges.
+# ---------------------------------------------------------------------------
+_ENV_SOAK_WALL_S = "JARVIS_A1_BRAIN_SOAK_WALL_S"
+_DEFAULT_SOAK_WALL_S = 1800  # matches the CLAUDE.md A1 happy-path (~850-1300s)
+_ENV_BOOT_OFFSET_S = "JARVIS_A1_BRAIN_BOOT_OFFSET_S"
+_DEFAULT_BOOT_OFFSET_S = 180  # observed ~168s cold boot, rounded up w/ margin
+_ENV_VERDICT_PULL_MARGIN_S = "JARVIS_A1_BRAIN_VERDICT_PULL_MARGIN_S"
+_DEFAULT_VERDICT_PULL_MARGIN_S = 180  # headroom for the checksum-gated pull
+
+
+def _resolve_soak_wall_s(explicit: Optional[int]) -> int:
+    if explicit is not None:
+        return int(explicit)
+    return _env_int(_ENV_SOAK_WALL_S, _DEFAULT_SOAK_WALL_S)
+
+
+def _resolve_lifetime_s(
+    *, explicit: Optional[int], soak_wall_s: int, boot_offset_s: int,
+    verdict_pull_margin_s: int,
+) -> int:
+    """DERIVE the node's absolute lifetime from the coordinated soak wall
+    (+ margins) so the two budgets can never drift apart. `explicit` (an
+    operator-supplied `--lifetime-s` or `JARVIS_A1_BRAIN_LIFETIME_S`) is
+    still honored as an escape hatch -- but the default path is always
+    derived, never independent."""
+    if explicit is not None:
+        return int(explicit)
+    env_raw = (os.environ.get("JARVIS_A1_BRAIN_LIFETIME_S", "") or "").strip()
+    if env_raw:
+        try:
+            return int(float(env_raw))
+        except (TypeError, ValueError):
+            pass
+    return int(soak_wall_s) + int(boot_offset_s) + int(verdict_pull_margin_s)
+
+
+# ---------------------------------------------------------------------------
 # Remote command composition (Piece B config baked in; Piece C dispatch).
 # ---------------------------------------------------------------------------
-def _compose_remote_command(*, remote_run_dir: str, seed: int, verbose: bool) -> str:
+def _compose_remote_command(
+    *, remote_run_dir: str, seed: int, verbose: bool, soak_wall_s: int,
+) -> str:
     """The actual isomorphic_a1_local.py invocation that runs ON the node.
     Co-located (parent driver's SSH session + the soak child it launches share
     the same host) so wall_deadline.json IPC stays same-host -- unchanged from
-    the local isomorphic-fidelity design."""
+    the local isomorphic-fidelity design.
+
+    `OUROBOROS_BATTLE_MAX_WALL_SECONDS=soak_wall_s` is the coordinated soak
+    wall (review fix): the SAME value this driver derives `lifetime_s` from,
+    so the node-side soak's hard wall and the node-side self-destruct
+    (Piece D) never disagree."""
     verbose_flag = " --verbose" if verbose else ""
     return (
         "cd %s && "
         "JARVIS_CHAOS_TARGET_DIRS=%s "
         "JARVIS_BRAIN_OUTBOUND_TOPICS=%s "
         "OUROBOROS_BATTLE_HEADLESS=1 "
+        "OUROBOROS_BATTLE_MAX_WALL_SECONDS=%d "
         "python3 scripts/isomorphic_a1_local.py --mode process --run-root %s "
         "--seed %d%s"
         % (
             _REMOTE_REPO_ROOT,
             _DEFAULT_CHAOS_TARGET_DIRS,
             _DEFAULT_OUTBOUND_TOPICS,
+            int(soak_wall_s),
             remote_run_dir,
             seed,
             verbose_flag,
@@ -359,6 +431,7 @@ class IgnitionPlan:
     project: str
     zone: str
     lifetime_s: int
+    soak_wall_s: int
     seed: int
     remote_run_dir: str
     remote_cmd: str
@@ -385,6 +458,7 @@ class A1BrainIgnition:
         project: Optional[str] = None,
         zone: Optional[str] = None,
         lifetime_s: Optional[int] = None,
+        soak_wall_s: Optional[int] = None,
         seed: int = 0,
         remote_run_dir: Optional[str] = None,
         local_out_root: Optional[str] = None,
@@ -401,9 +475,20 @@ class A1BrainIgnition:
         self.node_name = node_name or _default_node_name()
         self.project = (project or "").strip()
         self.zone = (zone or "").strip()
-        self.lifetime_s = int(
-            lifetime_s if lifetime_s is not None
-            else _env_int("JARVIS_A1_BRAIN_LIFETIME_S", 1800)
+
+        # Coordinated soak-wall <-> node-lifetime budget (review fix): the
+        # on-node soak wall and the node's absolute self-destruct lifetime
+        # are derived from ONE source instead of drifting independently.
+        # Ordering invariant: soak_wall_s < monitor_stop < lifetime_s.
+        self.boot_offset_s = int(_env_int(_ENV_BOOT_OFFSET_S, _DEFAULT_BOOT_OFFSET_S))
+        self.verdict_pull_margin_s = int(
+            _env_int(_ENV_VERDICT_PULL_MARGIN_S, _DEFAULT_VERDICT_PULL_MARGIN_S))
+        self.soak_wall_s = _resolve_soak_wall_s(soak_wall_s)
+        self.lifetime_s = _resolve_lifetime_s(
+            explicit=lifetime_s,
+            soak_wall_s=self.soak_wall_s,
+            boot_offset_s=self.boot_offset_s,
+            verdict_pull_margin_s=self.verdict_pull_margin_s,
         )
         self.seed = int(seed)
         self.remote_run_dir = remote_run_dir or _default_remote_run_dir(self.node_name)
@@ -422,10 +507,14 @@ class A1BrainIgnition:
         self._monitor_poll_s = float(
             monitor_poll_s if monitor_poll_s is not None
             else _env_float("JARVIS_A1_BRAIN_MONITOR_POLL_S", 20.0))
+        # Default leaves >= verdict_pull_margin_s of headroom before
+        # lifetime_s (the node's self-destruct) so retrieve_verdict() -- the
+        # checksum-gated Black Box pull + a1_verdict.json fetch -- runs
+        # BEFORE the node halts, not after.
         self._monitor_max_s = float(
             monitor_max_s if monitor_max_s is not None
             else _env_float("JARVIS_A1_BRAIN_MONITOR_MAX_S",
-                             max(60.0, self.lifetime_s - 120.0)))
+                             max(60.0, self.lifetime_s - self.verdict_pull_margin_s)))
 
         self._hyper_mod: Optional[Any] = None
 
@@ -471,7 +560,8 @@ class A1BrainIgnition:
         project = self.project or _resolve_project_for_plan()
         zone = self.zone or _resolve_zone_for_plan()
         remote_cmd = _compose_remote_command(
-            remote_run_dir=self.remote_run_dir, seed=self.seed, verbose=self.verbose)
+            remote_run_dir=self.remote_run_dir, seed=self.seed, verbose=self.verbose,
+            soak_wall_s=self.soak_wall_s)
         dispatch_wrapper = _compose_dispatch_wrapper(remote_cmd, self.remote_run_dir)
         ns = argparse.Namespace(project=project, zone=zone)
 
@@ -502,6 +592,7 @@ class A1BrainIgnition:
             project=project,
             zone=zone,
             lifetime_s=self.lifetime_s,
+            soak_wall_s=self.soak_wall_s,
             seed=self.seed,
             remote_run_dir=self.remote_run_dir,
             remote_cmd=remote_cmd,
@@ -523,8 +614,12 @@ class A1BrainIgnition:
         print("  project           : %s" % plan.project)
         print("  zone (pre-create) : %s  (actual zone resolved post-create via "
               "list_instances_by_label)" % plan.zone)
+        print("  soak_wall_s       : %d  (-> OUROBOROS_BATTLE_MAX_WALL_SECONDS, "
+              "on-node soak hard wall)" % plan.soak_wall_s)
         print("  lifetime_s        : %d  (-> JARVIS_BRAIN_ABSOLUTE_LIFETIME_S, "
-              "Piece D self-destruct)" % plan.lifetime_s)
+              "Piece D self-destruct; DERIVED = soak_wall_s + boot_offset_s + "
+              "verdict_pull_margin_s -- ordering invariant: soak_wall_s < "
+              "monitor_stop < lifetime_s)" % plan.lifetime_s)
         print("  seed              : %d" % plan.seed)
         print("  remote_run_dir    : %s" % plan.remote_run_dir)
         print("-" * 78)
@@ -650,7 +745,8 @@ class A1BrainIgnition:
 
     async def dispatch(self) -> bool:
         remote = _compose_remote_command(
-            remote_run_dir=self.remote_run_dir, seed=self.seed, verbose=self.verbose)
+            remote_run_dir=self.remote_run_dir, seed=self.seed, verbose=self.verbose,
+            soak_wall_s=self.soak_wall_s)
         wrapper = _compose_dispatch_wrapper(remote, self.remote_run_dir)
         rc, out = await self._ssh_exec_async(
             wrapper, timeout_s=_env_float("JARVIS_A1_BRAIN_DISPATCH_TIMEOUT_S", 60.0))
@@ -799,6 +895,36 @@ class A1BrainIgnition:
             instances = await rest2.list_instances_by_label(
                 label_key=_BRAIN_ROLE_LABEL_KEY, label_value=_BRAIN_ROLE_LABEL_VALUE)
             leaked = [i for i in (instances or []) if i.get("name") == self.node_name]
+
+            if leaked:
+                # The explicit delete above targeted `self.zone`, which may be
+                # STALE or never resolved (e.g. resolve_actual_zone() failed,
+                # or the node otherwise moved zones) -- this all-zone
+                # label-based list is authoritative post-facto. RE-ISSUE the
+                # delete with the zone discovered HERE instead of just
+                # logging LEAK. Fail-soft: a second miss still just logs LEAK
+                # (gcp_cleanup.py's sweep + Piece D remain the deeper
+                # backstops).
+                still_leaked = []
+                for inst in leaked:
+                    raw_zone = str(inst.get("zone") or "")
+                    discovered_zone = raw_zone.rsplit("/", 1)[-1] if raw_zone else None
+                    if not discovered_zone:
+                        still_leaked.append(inst)
+                        continue
+                    try:
+                        ok2, detail2 = await rest2.delete_instance(
+                            self.node_name, zone=discovered_zone)
+                        _log("[Teardown] zone-mismatch re-delete node=%s zone=%s "
+                             "-> ok=%s detail=%s"
+                             % (self.node_name, discovered_zone, ok2, detail2))
+                        if not ok2:
+                            still_leaked.append(inst)
+                    except Exception as exc:  # noqa: BLE001 -- fail-soft retry
+                        _log("[Teardown] WARN zone-mismatch re-delete error: %r" % (exc,))
+                        still_leaked.append(inst)
+                leaked = still_leaked
+
             result["zero_cost"] = not leaked
             _log("[Teardown] $0 verify: %s"
                  % ("CONFIRMED (no matching instance)" if not leaked
@@ -858,9 +984,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int,
                     default=int(os.environ.get("JARVIS_A1_CHAOS_SEED", "0")),
                     help="Chaos injector seed passed to isomorphic_a1_local.py.")
+    p.add_argument("--soak-wall-s", type=int, default=None,
+                    help="On-node soak hard wall-clock cap in seconds, set as "
+                         "OUROBOROS_BATTLE_MAX_WALL_SECONDS on the remote command "
+                         "(default: env JARVIS_A1_BRAIN_SOAK_WALL_S or 1800). "
+                         "--lifetime-s is DERIVED from this (+ boot/verdict-pull "
+                         "margins) unless --lifetime-s/JARVIS_A1_BRAIN_LIFETIME_S "
+                         "is set explicitly -- bumping this grows lifetime_s too, "
+                         "so the two budgets never drift apart.")
     p.add_argument("--lifetime-s", type=int, default=None,
-                    help="Absolute node lifetime in seconds (default: env "
-                         "JARVIS_A1_BRAIN_LIFETIME_S or 1800). Arms the node-side "
+                    help="Absolute node lifetime in seconds (default: DERIVED as "
+                         "soak_wall_s + boot_offset_s + verdict_pull_margin_s; "
+                         "env JARVIS_A1_BRAIN_LIFETIME_S or an explicit value here "
+                         "overrides the derivation). Arms the node-side "
                          "unconditional self-destruct (Piece D).")
     p.add_argument("--remote-run-dir", default=None,
                     help="Run-root on the node passed to isomorphic_a1_local.py's "
@@ -882,6 +1018,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         node_name=args.node_name,
         seed=args.seed,
         lifetime_s=args.lifetime_s,
+        soak_wall_s=args.soak_wall_s,
         remote_run_dir=args.remote_run_dir,
         local_out_root=args.out_dir,
         verbose=args.verbose,

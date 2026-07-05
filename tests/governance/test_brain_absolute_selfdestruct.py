@@ -3,12 +3,19 @@ node-side ABSOLUTE self-destruct dead-man's switch, armed only when
 ``JARVIS_BRAIN_ABSOLUTE_LIFETIME_S`` is a positive int. Drives the REAL
 ``_brain_runtime_startup_script`` generator (pure string builder, no I/O) --
 no mocking of the function under test.
+
+Review MINOR #5 hardened the dead-man from a bare ``shutdown -h now`` to a
+PATH-independent belt-and-braces chain:
+``/sbin/shutdown -h now || shutdown -h now || /sbin/poweroff || poweroff``.
 """
 from __future__ import annotations
 
 from backend.core.ouroboros.governance import brain_lifecycle as bl
 
 _SELFDESTRUCT_MARKER = "shutdown -h now"
+_HARDENED_CHAIN = (
+    "/sbin/shutdown -h now || shutdown -h now || /sbin/poweroff || poweroff"
+)
 
 
 def test_armed_when_lifetime_env_set(monkeypatch) -> None:
@@ -25,6 +32,27 @@ def test_armed_when_lifetime_env_set(monkeypatch) -> None:
     )
     assert selfdestruct_line.rstrip().endswith("&")
     assert "nohup" in selfdestruct_line
+
+
+def test_armed_uses_hardened_path_independent_shutdown_chain(monkeypatch) -> None:
+    """MINOR #5: the dead-man must be PATH-independent belt-and-braces --
+    /sbin/shutdown -> shutdown -> /sbin/poweroff -> poweroff -- not a bare
+    `shutdown -h now`."""
+    monkeypatch.setenv("JARVIS_BRAIN_ABSOLUTE_LIFETIME_S", "1800")
+
+    script = bl._brain_runtime_startup_script()
+
+    assert _HARDENED_CHAIN in script
+    selfdestruct_line = next(
+        line for line in script.splitlines() if _HARDENED_CHAIN in line
+    )
+    assert "sleep 1800" in selfdestruct_line
+    assert selfdestruct_line.strip().startswith("nohup bash -c")
+    assert selfdestruct_line.rstrip().endswith("&")
+    # every verb in the fallback chain is present, in order
+    assert "/sbin/shutdown -h now" in selfdestruct_line
+    assert "/sbin/poweroff" in selfdestruct_line
+    assert "poweroff" in selfdestruct_line
 
 
 def test_disarmed_when_lifetime_env_unset(monkeypatch) -> None:

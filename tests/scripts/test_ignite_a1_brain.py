@@ -102,8 +102,24 @@ class FakeComputeRest:
         return list(self._instances)
 
     async def delete_instance(self, name: Optional[str] = None, *, zone: Optional[str] = None) -> Tuple[bool, str]:
+        """Zone-aware fake: only "deletes" (removes from `self._instances`,
+        so a subsequent `list_instances_by_label` no longer reports it) when
+        `zone` matches the instance's actual zone (or is None) -- mirrors
+        real GCE semantics well enough to exercise the zone-mismatch
+        re-delete path (MINOR #4) without a real API."""
         self.delete_calls.append((name or "", zone))
-        return (True, "deleted:200")
+        remaining = []
+        matched = False
+        for inst in self._instances:
+            inst_zone = str(inst.get("zone") or "").rsplit("/", 1)[-1]
+            if inst.get("name") == name and (zone is None or zone == inst_zone):
+                matched = True
+                continue
+            remaining.append(inst)
+        self._instances = remaining
+        if matched:
+            return (True, "deleted:200")
+        return (False, "not_found:404")
 
 
 class FakeBlackboxTransport:
@@ -235,7 +251,8 @@ def test_dry_run_via_main_never_calls_asyncio_run(monkeypatch, capsys):
 
 def test_remote_command_contains_piece_b_and_c_config():
     remote_cmd = ignite._compose_remote_command(
-        remote_run_dir="/opt/trinity/jarvis/a1_iso_runs/x", seed=0, verbose=True)
+        remote_run_dir="/opt/trinity/jarvis/a1_iso_runs/x", seed=0, verbose=True,
+        soak_wall_s=1800)
 
     assert "JARVIS_CHAOS_TARGET_DIRS=backend/core/ouroboros/a1_ignition_vector" in remote_cmd
     assert "autonomy.*" in remote_cmd
@@ -245,16 +262,75 @@ def test_remote_command_contains_piece_b_and_c_config():
     assert "isomorphic_a1_local.py" in remote_cmd
     assert "--mode process" in remote_cmd
     assert "OUROBOROS_BATTLE_HEADLESS=1" in remote_cmd
+    assert "OUROBOROS_BATTLE_MAX_WALL_SECONDS=1800" in remote_cmd
 
 
 def test_plan_remote_cmd_matches_composer():
     ignition = _make_ignition(dry_run=True, project="p", zone="z")
     plan = ignition.build_plan()
     expected = ignite._compose_remote_command(
-        remote_run_dir=ignition.remote_run_dir, seed=ignition.seed, verbose=ignition.verbose)
+        remote_run_dir=ignition.remote_run_dir, seed=ignition.seed, verbose=ignition.verbose,
+        soak_wall_s=ignition.soak_wall_s)
     assert plan.remote_cmd == expected
     assert "autonomy.*" in plan.remote_cmd
     assert "backend/core/ouroboros/a1_ignition_vector" in plan.remote_cmd
+
+
+# ===========================================================================
+# 2b. Coordinated soak-wall <-> node-lifetime budget (review fix, IMPORTANT #2).
+# ===========================================================================
+
+
+def test_remote_command_carries_coordinated_wall_seconds():
+    ignition = _make_ignition(dry_run=True, project="p", zone="z", soak_wall_s=900)
+    plan = ignition.build_plan()
+    assert "OUROBOROS_BATTLE_MAX_WALL_SECONDS=900" in plan.remote_cmd
+    assert plan.soak_wall_s == 900
+
+
+def test_lifetime_is_derived_from_soak_wall_plus_margins():
+    ignition = _make_ignition(
+        dry_run=True, project="p", zone="z",
+        soak_wall_s=1000, lifetime_s=None,
+    )
+    assert ignition.lifetime_s == 1000 + ignition.boot_offset_s + ignition.verdict_pull_margin_s
+    assert ignition.lifetime_s >= (
+        ignition.soak_wall_s + ignition.boot_offset_s + ignition.verdict_pull_margin_s
+    )
+
+
+def test_bumping_soak_wall_grows_lifetime_no_drift():
+    small = _make_ignition(dry_run=True, project="p", zone="z", soak_wall_s=600, lifetime_s=None)
+    large = _make_ignition(dry_run=True, project="p", zone="z", soak_wall_s=2400, lifetime_s=None)
+    assert large.lifetime_s > small.lifetime_s
+    assert large.lifetime_s - small.lifetime_s == 2400 - 600
+
+
+def test_explicit_lifetime_s_still_overrides_derivation():
+    ignition = _make_ignition(
+        dry_run=True, project="p", zone="z", soak_wall_s=100, lifetime_s=9999)
+    assert ignition.lifetime_s == 9999
+
+
+def test_monitor_stop_leaves_verdict_pull_headroom_before_lifetime():
+    """monitor_max_s (the default monitor-stop deadline) must leave >=
+    verdict_pull_margin_s of headroom before lifetime_s -- i.e.
+    monitor_max_s + verdict_pull_margin_s <= lifetime_s."""
+    ignition = _make_ignition(
+        dry_run=True, project="p", zone="z", soak_wall_s=1800, lifetime_s=None,
+        monitor_max_s=None,
+    )
+    assert ignition._monitor_max_s + ignition.verdict_pull_margin_s <= ignition.lifetime_s
+    assert ignition.soak_wall_s < ignition._monitor_max_s < ignition.lifetime_s
+
+
+def test_resolve_lifetime_s_helper_direct():
+    assert ignite._resolve_lifetime_s(
+        explicit=None, soak_wall_s=500, boot_offset_s=100, verdict_pull_margin_s=50,
+    ) == 650
+    assert ignite._resolve_lifetime_s(
+        explicit=42, soak_wall_s=500, boot_offset_s=100, verdict_pull_margin_s=50,
+    ) == 42
 
 
 # ===========================================================================
@@ -310,6 +386,38 @@ def test_teardown_deletes_resolved_node_and_zone():
 
     assert result["deleted"] is True
     assert rest.delete_calls == [("a1-brain-test", "us-east1-b")]
+
+
+def test_teardown_reissues_delete_on_zone_mismatch():
+    """MINOR #4: when the all-zone label-based verify list detects the node
+    LEAKED in a DIFFERENT zone than the one the explicit delete targeted
+    (zone mismatch), teardown() must RE-ISSUE delete_instance with the
+    discovered zone rather than just logging LEAK."""
+    rest = FakeComputeRest(
+        instances=[{"name": "a1-brain-test", "zone": "projects/p/zones/us-east1-b"}])
+    ignition = _make_ignition(compute_rest_factory=lambda: rest, zone="us-central1-a")
+
+    result = asyncio.run(ignition.teardown())
+
+    # First call: the explicit delete, targeting the (wrong) pre-set zone.
+    assert rest.delete_calls[0] == ("a1-brain-test", "us-central1-a")
+    # Second call: the zone-mismatch re-delete, targeting the zone DISCOVERED
+    # from the verify list.
+    assert rest.delete_calls[-1] == ("a1-brain-test", "us-east1-b")
+    assert len(rest.delete_calls) == 2
+    # Re-delete succeeded (FakeComputeRest always returns ok=True) -> no leak.
+    assert result["zero_cost"] is True
+
+
+def test_teardown_no_reissue_when_verify_list_clean():
+    """No leaked instance in the verify list -> no re-delete is issued."""
+    rest = FakeComputeRest(instances=[])
+    ignition = _make_ignition(compute_rest_factory=lambda: rest, zone="us-central1-a")
+
+    result = asyncio.run(ignition.teardown())
+
+    assert len(rest.delete_calls) == 1  # only the explicit delete
+    assert result["zero_cost"] is True
 
 
 def test_teardown_argv_preview_targets_node_and_zone():
