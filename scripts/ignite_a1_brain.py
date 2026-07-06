@@ -63,15 +63,22 @@ wall. Ordering invariant: ``soak_wall_s < monitor_stop < lifetime_s``.
 
 Teardown defense-in-depth (mandate 4, $0 even on total Mac network loss)
 -------------------------------------------------------------------------
-  1. This script's own explicit ``get_compute_rest().delete_instance()`` on
-     clean finish (fastest).
+  1. This script's own explicit ``get_compute_rest().delete_instance()`` sweep
+     ACROSS THE FULL CANDIDATE ZONE CHAIN (``_candidate_teardown_zones`` --
+     mirrors ``zone_fallback_chain``) on clean finish (fastest). Live-fire fix:
+     scatter-gather can land the winner in ANY zone in the chain, so this no
+     longer trusts a single (possibly stale/wrong) resolved zone.
   2. An up-front-registered atexit/SIGINT/SIGTERM reaper (drains
-     ``_ACTIVE_IGNITIONS``) -- bypassed only by SIGKILL.
-  3. The node-side absolute self-destruct (Piece D) -- survives Mac SIGKILL /
+     ``_ACTIVE_IGNITIONS``, itself now an all-zone sweep for the SAME reason)
+     -- bypassed only by SIGKILL.
+  3. A post-sweep ``list_instances_by_label`` $0-verify: if the node is STILL
+     found (a zone outside the matrix, or an outright REST failure), re-delete
+     it at the zone the verify list actually discovered.
+  4. The node-side absolute self-destruct (Piece D) -- survives Mac SIGKILL /
      total network partition.
-  4. ``scripts/gcp_cleanup.py`` (Piece A, already extended to match
+  5. ``scripts/gcp_cleanup.py`` (Piece A, already extended to match
      ``jarvis-role=brain``) -- Mac-side sweep once network returns.
-  5. The existing idle-shutdown timer (clean-idle backstop).
+  6. The existing idle-shutdown timer (clean-idle backstop).
 
 ``--dry-run`` prints the FULL plan (provision params, remote command, SSH argv,
 Black-Box pull argv preview, teardown argv preview, absolute-lifetime) and
@@ -90,6 +97,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import base64
 import importlib.util
 import json
 import os
@@ -389,6 +397,116 @@ def _compose_dispatch_wrapper(remote_cmd: str, remote_run_dir: str) -> str:
     )
 
 
+def _compose_verify_head_command() -> str:
+    """The remote HEAD-verification script. `/opt/trinity/jarvis` is ROOT-owned
+    (golden-image bake; the boot-time git-pull runs as root), so the SSH
+    OS-Login user hits `fatal: detected dubious ownership` on a bare
+    `git rev-parse` -- the `safe.directory` exception is required BEFORE the
+    rev-parse, and (since we run the whole thing root-wrapped via
+    `_wrap_as_root`) both lines execute as root, matching the tree's owner."""
+    quoted_root = shlex.quote(_REMOTE_REPO_ROOT)
+    return (
+        "git config --global --add safe.directory %s >/dev/null 2>&1; "
+        "git -C %s rev-parse HEAD" % (quoted_root, quoted_root)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 (live-fire): root-wrapped remote exec. `/opt/trinity/jarvis` is
+# ROOT-owned (golden-image bake) -- the SSH OS-Login user can neither
+# `git rev-parse` (dubious ownership) nor `mkdir`/write under it directly. GCE
+# OS Login admins get passwordless sudo, so every node-side command that
+# touches that tree runs as root via a SINGLE base64 | sudo bash pipe instead
+# of nesting `sudo bash -c '...'` around already-quoted payloads (the nested
+# quoting is what makes the complex nohup dispatch wrapper unmanageable) --
+# one clean layer of quoting, the whole script runs as root (so any
+# background/disowned child it forks inherits root too, which is what lets
+# the detached soak keep writing under the root-owned tree after the SSH
+# session that dispatched it closes).
+# ---------------------------------------------------------------------------
+def _wrap_as_root(remote_cmd: str) -> str:
+    """Root-wrap `remote_cmd` for a single clean layer of quoting: base64-encode
+    the whole script locally, and have the remote shell decode + execute it
+    under `sudo bash`. NEVER raises (base64-encoding a str is infallible)."""
+    encoded = base64.b64encode(remote_cmd.encode("utf-8")).decode("ascii")
+    return "printf %%s %s | base64 -d | sudo bash" % (shlex.quote(encoded),)
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 (live-fire, MONEY-CRITICAL): the full cross-region candidate zone
+# chain teardown must sweep. Scatter-gather provisioning can land the WINNER
+# in any zone in this chain (`gcp_compute_rest.create_instance` races
+# `zone_fallback_chain(...)` waves) -- a leak happens when teardown only
+# tries the ONE zone a (possibly-wrong) resolution picked. Mirrors
+# ignite_brain_vm.py's `_reap_brain_resources_async` reap-across-chain
+# pattern: EVERY exit path sweeps EVERY candidate zone, unconditionally.
+# ---------------------------------------------------------------------------
+def _candidate_teardown_zones(preferred: Optional[str] = None) -> List[str]:
+    """The full ordered zone chain teardown must attempt `delete_instance` in.
+    `preferred` (the pre-create/operator zone) leads the chain but the WHOLE
+    matrix (all regions) is always included -- so a scatter-gather winner
+    landing in ANY candidate zone still gets swept. Falls back to
+    `GCP_ZONE` env (the same preferred `create_instance` itself races from)
+    when `preferred` is not given. Fail-soft: any import/lookup error
+    degrades to a single-zone list (never raises, never blocks teardown)."""
+    pref = (preferred or os.environ.get("GCP_ZONE", "") or "").strip() or None
+    try:
+        from backend.core.ouroboros.governance.zone_fallback import (  # noqa: PLC0415
+            zone_fallback_chain,
+        )
+
+        chain = zone_fallback_chain(pref)
+        if chain:
+            return chain
+    except Exception as exc:  # noqa: BLE001 -- must never block teardown
+        _log("WARN zone_fallback_chain unavailable (%r) -- degrading to a "
+             "single-zone teardown sweep" % (exc,))
+    return [pref] if pref else [None]
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 (live-fire): resolve_actual_zone must pick the RUNNING winner, not a
+# being-deleted loser. Under scatter-gather, multiple same-named instances
+# can briefly coexist (winner RUNNING in one zone, losers STOPPING/
+# TERMINATED elsewhere mid-reap) -- a naive first-match pick can grab a loser.
+# ---------------------------------------------------------------------------
+_ZONE_STATUS_RANK: Dict[str, int] = {
+    "RUNNING": 0,
+    "PROVISIONING": 1,
+    "STAGING": 1,
+    "REPAIRING": 2,
+    "SUSPENDING": 3,
+    "SUSPENDED": 3,
+    "STOPPING": 4,
+    "TERMINATED": 5,
+}
+
+
+def _status_rank(status: Optional[str]) -> int:
+    """Lower is better (more likely the live winner). Unknown/missing status
+    ranks in the middle -- neither preferred over a confirmed RUNNING match
+    nor penalized below a confirmed STOPPING/TERMINATED one. NEVER raises."""
+    return _ZONE_STATUS_RANK.get(str(status or "").strip().upper(), 2)
+
+
+# Parses the AUTHORITATIVE winner zone out of provision_brain's detail string.
+# gcp_compute_rest.create_instance's scatter-gather winner reports
+# "created:zone=<z>:mode=<m>" (see GCPComputeRest._insert_in_zone) -- this is
+# the real create-time zone, straight from the REST call that materialized
+# the node, and is preferred over re-listing (which can observe a transient
+# multi-instance race).
+_PROVISION_ZONE_RE = re.compile(r"zone=([a-zA-Z0-9-]+)")
+
+
+def _parse_provision_zone(detail: str) -> Optional[str]:
+    """Parse the winner zone out of provision()'s `(ok, detail)` detail
+    string. Fail-soft -- returns None on any non-match, NEVER raises."""
+    if not detail:
+        return None
+    m = _PROVISION_ZONE_RE.search(str(detail))
+    return m.group(1) if m else None
+
+
 # ---------------------------------------------------------------------------
 # Up-front teardown registry -- mirrors ignite_brain_vm.py's
 # _ACTIVE_BRAIN_RESOURCES / _reap_brain_resources pattern (idempotent, NEVER
@@ -401,17 +519,29 @@ _SIGNAL_HANDLERS_INSTALLED = False
 
 
 def _register_ignition(
-    *, node: str, zone: Optional[str], compute_rest_factory: Callable[[], Any]
+    *, node: str, zones: Sequence[Optional[str]], compute_rest_factory: Callable[[], Any]
 ) -> None:
     """Register a Brain node for teardown UP FRONT (before/at create) so a
-    crash mid-provision still reaps it."""
+    crash mid-provision still reaps it. `zones` is the FULL candidate zone
+    chain (Bug 1) -- NOT a single (possibly-wrong) resolved zone -- so the
+    reaper always sweeps every zone the scatter-gather winner could have
+    landed in, regardless of which zone later resolution picks."""
     _ACTIVE_IGNITIONS.append(
-        {"node": node, "zone": zone, "compute_rest_factory": compute_rest_factory}
+        {
+            "node": node,
+            "zones": list(zones) if zones else [None],
+            "confirmed_zone": None,  # informational only; never gates teardown
+            "compute_rest_factory": compute_rest_factory,
+        }
     )
 
 
 async def _reap_ignitions_async() -> None:
-    """Drain the registry: delete every registered node. Idempotent (the
+    """Drain the registry: for every registered node, attempt
+    `delete_instance` across EVERY zone in its candidate chain (Bug 1) --
+    unconditionally, not stopping at the first success, since idempotent
+    404-is-success semantics mean sweeping the whole chain is cheap and
+    guarantees the node is gone wherever it actually landed. Idempotent (the
     registry is cleared before the loop runs, so re-entrant/second calls are a
     no-op) + fail-soft (NEVER raises -- teardown must always complete)."""
     if not _ACTIVE_IGNITIONS:
@@ -420,17 +550,22 @@ async def _reap_ignitions_async() -> None:
     _ACTIVE_IGNITIONS.clear()
     for entry in entries:
         node = entry.get("node")
-        zone = entry.get("zone")
+        zones = entry.get("zones") or [entry.get("zone")]  # tolerate legacy shape
         factory = entry.get("compute_rest_factory") or _default_compute_rest_factory
         if not node:
             continue
         try:
             rest = factory()
-            ok, detail = await rest.delete_instance(node, zone=zone)
-            _log("[Reap] delete_instance node=%s zone=%s -> ok=%s detail=%s"
-                 % (node, zone, ok, detail))
         except Exception as exc:  # noqa: BLE001 -- reap must NEVER raise
-            _log("[Reap] warning node=%s: %r" % (node, exc))
+            _log("[Reap] factory error node=%s: %r" % (node, exc))
+            continue
+        for zone in zones:
+            try:
+                ok, detail = await rest.delete_instance(node, zone=zone)
+                _log("[Reap] delete_instance node=%s zone=%s -> ok=%s detail=%s"
+                     % (node, zone, ok, detail))
+            except Exception as exc:  # noqa: BLE001 -- reap must NEVER raise
+                _log("[Reap] warning node=%s zone=%s: %r" % (node, zone, exc))
 
 
 def _reap_ignitions() -> None:
@@ -500,6 +635,9 @@ class IgnitionPlan:
     remote_run_dir: str
     remote_cmd: str
     dispatch_wrapper_cmd: str
+    dispatch_wrapper_root_cmd: str = ""
+    verify_head_cmd: str = ""
+    teardown_zones: List[str] = field(default_factory=list)
     ssh_argv: List[str] = field(default_factory=list)
     pull_argv: List[str] = field(default_factory=list)
     teardown_argv: List[str] = field(default_factory=list)
@@ -539,6 +677,16 @@ class A1BrainIgnition:
         self.node_name = node_name or _default_node_name()
         self.project = (project or "").strip()
         self.zone = (zone or "").strip()
+        # Bug 2: the AUTHORITATIVE winner zone parsed from provision()'s
+        # "created:zone=<z>:mode=<m>" detail string -- set by provision(),
+        # preferred by resolve_actual_zone() over re-listing (avoids a
+        # scatter-gather race where a same-named LOSER is briefly visible).
+        self._provision_zone: Optional[str] = None
+        # Bug 1: the full candidate zone chain teardown sweeps -- set by
+        # provision() (up front, before create); computed fresh from
+        # self.zone if teardown() is ever reached without provision() having
+        # run (e.g. a direct test call).
+        self._teardown_zones: List[str] = []
 
         # Coordinated soak-wall <-> node-lifetime budget (review fix): the
         # on-node soak wall and the node's absolute self-destruct lifetime
@@ -618,6 +766,35 @@ class A1BrainIgnition:
         return await loop.run_in_executor(
             None, lambda: self._ssh_exec(remote, timeout_s=timeout_s))
 
+    async def _await_ssh_ready(self) -> bool:
+        """Poll SSH-over-IAP until the freshly-provisioned node ANSWERS, before
+        verify_head/dispatch. A new node needs ~30-90s to reach RUNNING + boot
+        sshd + establish the IAP tunnel; the pre-readiness-gate driver SSHed
+        immediately after provision and got rc=255 (ssh exit 255 = tunnel/host
+        not ready). Bounded + backoff, off-loop, fail-soft. Budget env
+        ``JARVIS_A1_BRAIN_SSH_READY_BUDGET_S`` (default 300, floor 60). Returns
+        True once a trivial `echo` round-trips; False if the budget elapses."""
+        budget_s = max(60.0, _env_float("JARVIS_A1_BRAIN_SSH_READY_BUDGET_S", 300.0))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + budget_s
+        attempt = 0
+        delay = 5.0
+        while loop.time() < deadline:
+            attempt += 1
+            rc, out = await self._ssh_exec_async(
+                "echo A1_SSH_READY", timeout_s=30.0)
+            if rc == 0 and "A1_SSH_READY" in (out or ""):
+                _log("[IgniteA1Brain] SSH-over-IAP ready after %d attempt(s)"
+                     % (attempt,))
+                return True
+            _log("[IgniteA1Brain] SSH not ready yet (attempt %d rc=%d) -- "
+                 "retry in %.0fs" % (attempt, rc, delay))
+            await asyncio.sleep(delay)
+            delay = min(30.0, delay * 1.5)
+        _log("[IgniteA1Brain] WARN SSH-over-IAP not ready within %.0fs budget"
+             % (budget_s,))
+        return False
+
     # -- plan (pure, dry-run-safe) --------------------------------------------
 
     def build_plan(self) -> IgnitionPlan:
@@ -627,13 +804,17 @@ class A1BrainIgnition:
             remote_run_dir=self.remote_run_dir, seed=self.seed, verbose=self.verbose,
             soak_wall_s=self.soak_wall_s)
         dispatch_wrapper = _compose_dispatch_wrapper(remote_cmd, self.remote_run_dir)
+        # Bug 3: the command actually sent over SSH is root-wrapped (single
+        # base64 | sudo bash pipe) -- /opt/trinity/jarvis is root-owned.
+        dispatch_wrapper_root = _wrap_as_root(dispatch_wrapper)
+        verify_head_cmd = _wrap_as_root(_compose_verify_head_command())
         ns = argparse.Namespace(project=project, zone=zone)
 
         ssh_argv: List[str] = []
         teardown_argv: List[str] = []
         try:
             hyper = self._hyper()
-            ssh_argv = hyper._ssh_cmd(ns, self.node_name, dispatch_wrapper)
+            ssh_argv = hyper._ssh_cmd(ns, self.node_name, dispatch_wrapper_root)
             teardown_argv = hyper._delete_node_cmd(ns, self.node_name)
         except Exception as exc:  # noqa: BLE001 -- planning must never raise
             _log("WARN plan preview: hypervisor argv builders unavailable: %r" % (exc,))
@@ -651,6 +832,10 @@ class A1BrainIgnition:
             "JARVIS_BRAIN_VM_PERSISTENT": "true",
             "JARVIS_BRAIN_ABSOLUTE_LIFETIME_S": str(self.lifetime_s),
         }
+        # Bug 1: the FULL candidate zone chain teardown will sweep -- shown so
+        # --dry-run makes the $0 guarantee legible (not just the pre-create
+        # zone, which scatter-gather may not even land in).
+        teardown_zones = _candidate_teardown_zones(zone or None)
         return IgnitionPlan(
             node_name=self.node_name,
             project=project,
@@ -661,6 +846,9 @@ class A1BrainIgnition:
             remote_run_dir=self.remote_run_dir,
             remote_cmd=remote_cmd,
             dispatch_wrapper_cmd=dispatch_wrapper,
+            dispatch_wrapper_root_cmd=dispatch_wrapper_root,
+            verify_head_cmd=verify_head_cmd,
+            teardown_zones=teardown_zones,
             ssh_argv=ssh_argv,
             pull_argv=pull_argv,
             teardown_argv=teardown_argv,
@@ -676,8 +864,9 @@ class A1BrainIgnition:
         print("=" * 78)
         print("  node_name         : %s" % plan.node_name)
         print("  project           : %s" % plan.project)
-        print("  zone (pre-create) : %s  (actual zone resolved post-create via "
-              "list_instances_by_label)" % plan.zone)
+        print("  zone (pre-create) : %s  (actual zone resolved post-create -- "
+              "PREFERS the provision-reported winner zone, falls back to a "
+              "RUNNING-preferring list_instances_by_label match)" % plan.zone)
         print("  soak_wall_s       : %d  (-> OUROBOROS_BATTLE_MAX_WALL_SECONDS, "
               "on-node soak hard wall)" % plan.soak_wall_s)
         print("  lifetime_s        : %d  (-> JARVIS_BRAIN_ABSOLUTE_LIFETIME_S, "
@@ -694,10 +883,17 @@ class A1BrainIgnition:
         print("REMOTE COMMAND (isomorphic_a1_local.py, co-located ON the node):")
         print("  " + plan.remote_cmd)
         print("-" * 78)
-        print("DISPATCH WRAPPER (detached nohup; monitor() polls the done-file):")
-        print("  " + plan.dispatch_wrapper_cmd)
+        print("VERIFY-HEAD COMMAND (root-wrapped: safe.directory + git rev-parse AS ROOT):")
+        print("  " + plan.verify_head_cmd)
         print("-" * 78)
-        print("SSH ARGV (reused sovereign_iac_hypervisor._ssh_cmd):")
+        print("DISPATCH WRAPPER, raw (detached nohup; monitor() polls the done-file):")
+        print("  " + plan.dispatch_wrapper_cmd)
+        print("DISPATCH WRAPPER, root-wrapped (what is ACTUALLY sent over SSH --"
+              " /opt/trinity/jarvis is root-owned):")
+        print("  " + plan.dispatch_wrapper_root_cmd)
+        print("-" * 78)
+        print("SSH ARGV (reused sovereign_iac_hypervisor._ssh_cmd; --command carries "
+              "the root-wrapped dispatch wrapper above):")
         print("  " + _argv(plan.ssh_argv))
         print("-" * 78)
         print("BLACK-BOX PULL ARGV preview (reused IapBlackBoxTransport._scp_pull_cmd):")
@@ -707,6 +903,12 @@ class A1BrainIgnition:
         print("  " + _argv(plan.teardown_argv))
         print("  (the REAL teardown executes get_compute_rest().delete_instance("
               "node, zone=...) directly -- this argv is informational only)")
+        print("-" * 78)
+        print("TEARDOWN ALL-ZONE SWEEP (Bug 1 fix -- every exit path, incl. the "
+              "SIGINT/SIGTERM reaper, deletes the node NAME across EVERY zone "
+              "below, idempotent + fail-soft, so the $0 guarantee does not "
+              "depend on which zone got resolved):")
+        print(("  " + ", ".join(plan.teardown_zones)) if plan.teardown_zones else "  <none>")
         print("=" * 78)
         print("DRY RUN: zero network / subprocess side effects. Exiting 0.")
 
@@ -714,9 +916,13 @@ class A1BrainIgnition:
 
     async def provision(self) -> Tuple[bool, str]:
         _install_signal_handlers()
-        # Register UP FRONT (before create) so a crash mid-provision still reaps.
+        # Bug 1: register UP FRONT (before create) with the FULL candidate
+        # zone chain -- NOT a single (possibly pre-create, possibly wrong)
+        # zone -- so a crash mid-provision (or a later SIGINT/SIGTERM) still
+        # reaps the node wherever the scatter-gather winner actually landed.
+        self._teardown_zones = _candidate_teardown_zones(self.zone or None)
         _register_ignition(
-            node=self.node_name, zone=self.zone or None,
+            node=self.node_name, zones=self._teardown_zones,
             compute_rest_factory=self._compute_rest_factory)
 
         prev_persistent = os.environ.get("JARVIS_BRAIN_VM_PERSISTENT")
@@ -739,6 +945,13 @@ class A1BrainIgnition:
             else:
                 os.environ["JARVIS_BRAIN_ABSOLUTE_LIFETIME_S"] = prev_lifetime
 
+        # Bug 2: capture the AUTHORITATIVE winner zone straight out of the
+        # create-time detail string ("created:zone=<z>:mode=<m>") -- this is
+        # the real create-time zone, preferred by resolve_actual_zone() over
+        # a post-hoc list_instances_by_label query that can observe a
+        # transient scatter-gather multi-instance race.
+        self._provision_zone = _parse_provision_zone(detail) if ok else None
+
         _log("provision -> ok=%s detail=%s" % (ok, detail))
         return ok, detail
 
@@ -760,7 +973,33 @@ class A1BrainIgnition:
              "downstream will be missing --project")
         return None
 
+    def _mark_confirmed_zone(self, zone: str) -> None:
+        """Record the confirmed SSH-target zone for logging/introspection
+        ONLY -- teardown no longer depends on this being right (Bug 1 sweeps
+        the whole candidate chain unconditionally); this just tells the
+        reaper log which zone to expect the node in."""
+        self.zone = zone
+        for entry in _ACTIVE_IGNITIONS:
+            if entry.get("node") == self.node_name:
+                entry["confirmed_zone"] = zone
+
     async def resolve_actual_zone(self) -> Optional[str]:
+        """Bug 2: prefer the AUTHORITATIVE zone provision() parsed straight
+        out of the create-time detail string over re-listing (the real
+        create-time zone the REST call materialized the node in). Only when
+        that isn't available does this fall back to list_instances_by_label
+        -- and even then, prefer a RUNNING/PROVISIONING/STAGING match over a
+        STOPPING/TERMINATED one, since scatter-gather can leave a same-named
+        LOSER briefly visible mid-reap in a different zone (the exact live-fire
+        bug: a STOPPING loser in zone A got picked over the RUNNING winner in
+        zone B). This zone feeds the SSH target (verify_head/dispatch/
+        monitor) -- teardown's $0 guarantee no longer depends on it (Bug 1)."""
+        if self._provision_zone:
+            self._mark_confirmed_zone(self._provision_zone)
+            _log("resolved actual zone=%s for node=%s (source=provision_detail)"
+                 % (self._provision_zone, self.node_name))
+            return self._provision_zone
+
         try:
             from backend.core.ouroboros.governance.gcp_compute_rest import (  # noqa: PLC0415
                 _BRAIN_ROLE_LABEL_KEY,
@@ -773,25 +1012,37 @@ class A1BrainIgnition:
         except Exception as exc:  # noqa: BLE001
             _log("WARN zone resolution error (continuing, fail-soft): %r" % (exc,))
             return None
-        for inst in instances or []:
-            if inst.get("name") == self.node_name:
-                raw_zone = str(inst.get("zone") or "")
-                zone = raw_zone.rsplit("/", 1)[-1] if raw_zone else None
-                if zone:
-                    self.zone = zone
-                    for entry in _ACTIVE_IGNITIONS:
-                        if entry.get("node") == self.node_name:
-                            entry["zone"] = zone
-                    _log("resolved actual zone=%s for node=%s" % (zone, self.node_name))
-                    return zone
-        _log("WARN could not find node=%s via list_instances_by_label -- zone "
-             "remains unresolved" % (self.node_name,))
+
+        matches = [inst for inst in (instances or []) if inst.get("name") == self.node_name]
+        if not matches:
+            _log("WARN could not find node=%s via list_instances_by_label -- zone "
+                 "remains unresolved" % (self.node_name,))
+            return None
+
+        # RUNNING-preferring pick: sort is STABLE, so ties keep the original
+        # (API) order -- only a strictly better status jumps the queue.
+        best = sorted(matches, key=lambda inst: _status_rank(inst.get("status")))[0]
+        raw_zone = str(best.get("zone") or "")
+        zone = raw_zone.rsplit("/", 1)[-1] if raw_zone else None
+        if zone:
+            self._mark_confirmed_zone(zone)
+            _log("resolved actual zone=%s status=%s for node=%s "
+                 "(source=list_running_preferred, %d match(es))"
+                 % (zone, best.get("status"), self.node_name, len(matches)))
+            return zone
+        _log("WARN matched instance(s) for node=%s but zone field was empty"
+             % (self.node_name,))
         return None
 
     # -- phase 3: verify HEAD ---------------------------------------------------
 
     async def verify_head(self) -> Optional[str]:
-        remote = "git -C %s rev-parse HEAD" % (_REMOTE_REPO_ROOT,)
+        # Bug 3: /opt/trinity/jarvis is ROOT-owned (golden-image bake; the
+        # boot-time git-pull runs as root) -- a bare `git rev-parse` as the
+        # SSH OS-Login user fails with "dubious ownership". Root-wrap the
+        # whole thing (safe.directory exception + rev-parse) via a single
+        # base64 | sudo bash pipe.
+        remote = _wrap_as_root(_compose_verify_head_command())
         rc, out = await self._ssh_exec_async(
             remote, timeout_s=_env_float("JARVIS_A1_BRAIN_SSH_TIMEOUT_S", 60.0))
         text = (out or "").strip()
@@ -812,8 +1063,13 @@ class A1BrainIgnition:
             remote_run_dir=self.remote_run_dir, seed=self.seed, verbose=self.verbose,
             soak_wall_s=self.soak_wall_s)
         wrapper = _compose_dispatch_wrapper(remote, self.remote_run_dir)
+        # Bug 3: the mkdir + nohup + isomorphic_a1_local.py invocation all
+        # write under the root-owned /opt/trinity/jarvis tree -- root-wrap the
+        # WHOLE detached wrapper so the disowned child it forks inherits root
+        # too (it keeps writing after this SSH session closes).
+        root_wrapper = _wrap_as_root(wrapper)
         rc, out = await self._ssh_exec_async(
-            wrapper, timeout_s=_env_float("JARVIS_A1_BRAIN_DISPATCH_TIMEOUT_S", 60.0))
+            root_wrapper, timeout_s=_env_float("JARVIS_A1_BRAIN_DISPATCH_TIMEOUT_S", 60.0))
         ok = rc == 0 and "DISPATCH_STARTED" in (out or "")
         _log("dispatch -> rc=%d ok=%s out=%r" % (rc, ok, (out or "")[-300:]))
         return ok
@@ -824,12 +1080,15 @@ class A1BrainIgnition:
         deadline = time.monotonic() + self._monitor_max_s
         tail_lines = _env_int("JARVIS_A1_BRAIN_MONITOR_TAIL_LINES", 40)
         last_tail = ""
-        remote = (
+        inner = (
             "if [ -f %s ]; then echo __IGNITE_DONE__; cat %s; else "
             "tail -n %d %s 2>/dev/null || true; fi"
             % (shlex.quote(self._done_file()), shlex.quote(self._done_file()),
                tail_lines, shlex.quote(self._log_file()))
         )
+        # Bug 3: the done-file/log-file live under the root-owned run dir --
+        # the SSH user may not have read access, so poll AS ROOT too.
+        remote = _wrap_as_root(inner)
         while time.monotonic() < deadline:
             rc, out = await self._ssh_exec_async(
                 remote, timeout_s=_env_float("JARVIS_A1_BRAIN_MONITOR_SSH_TIMEOUT_S", 30.0))
@@ -849,10 +1108,14 @@ class A1BrainIgnition:
     # -- phase 6: retrieve verdict (authoritative) --------------------------------
 
     def _discover_verdict_path(self) -> Optional[str]:
-        remote = (
+        # Bug 3: the verdict lives under the root-owned run dir -- `find` as
+        # the plain SSH user can hit permission-denied on root-owned
+        # subdirectories, so this runs AS ROOT too.
+        inner = (
             "find %s -maxdepth 2 -name a1_verdict.json 2>/dev/null | sort | tail -n1"
             % (shlex.quote(self.remote_run_dir),)
         )
+        remote = _wrap_as_root(inner)
         rc, out = self._ssh_exec(remote, timeout_s=30.0)
         if rc != 0 or not out:
             return None
@@ -860,10 +1123,12 @@ class A1BrainIgnition:
         return lines[-1] if lines else None
 
     def _fetch_verdict_json(self, path: str) -> Optional[Dict[str, Any]]:
-        """NON-AUTHORITATIVE fallback fetch: direct SSH ``cat`` of the verdict
-        path discovered by ``_discover_verdict_path``. Only reached when the
+        """NON-AUTHORITATIVE fallback fetch: direct SSH ``cat`` (root-wrapped
+        -- Bug 3, the verdict file is root-owned) of the verdict path
+        discovered by ``_discover_verdict_path``. Only reached when the
         checksum-gated Black-Box channel produced no verdict at all."""
-        rc, out = self._ssh_exec("cat %s" % (shlex.quote(path),), timeout_s=30.0)
+        remote = _wrap_as_root("cat %s" % (shlex.quote(path),))
+        rc, out = self._ssh_exec(remote, timeout_s=30.0)
         if rc != 0 or not out:
             return None
         text = out.strip()
@@ -1018,19 +1283,38 @@ class A1BrainIgnition:
     # -- phase 7: teardown ($0) ---------------------------------------------------
 
     async def teardown(self) -> Dict[str, Any]:
+        """Defense-in-depth layer 1: an explicit, zone-agnostic sweep. Bug 1
+        (MONEY-CRITICAL, live-fire): scatter-gather can land the winner in ANY
+        zone in the candidate chain, and whichever zone got resolved for SSH
+        purposes (``self.zone``) is NOT trusted here -- this deletes the node
+        NAME across EVERY zone in the chain, unconditionally, idempotent
+        (404/not-found counts as success at the REST layer) + fail-soft (a
+        single zone's error never aborts the sweep)."""
         result: Dict[str, Any] = {"deleted": False, "detail": "", "zero_cost": False}
+        zones = self._teardown_zones or _candidate_teardown_zones(self.zone or None)
         try:
             rest = self._compute_rest_factory()
-            ok, detail = await rest.delete_instance(self.node_name, zone=self.zone or None)
-            result["deleted"] = ok
-            result["detail"] = detail
-            _log("[Teardown] delete_instance node=%s zone=%s -> ok=%s detail=%s"
-                 % (self.node_name, self.zone, ok, detail))
+            any_ok = False
+            details: List[str] = []
+            for zone in zones:
+                try:
+                    ok, detail = await rest.delete_instance(self.node_name, zone=zone)
+                except Exception as exc:  # noqa: BLE001 -- one zone's error never aborts the sweep
+                    ok, detail = False, "EXC:%r" % (exc,)
+                    _log("[Teardown] WARN delete_instance error zone=%s (continuing "
+                         "sweep): %r" % (zone, exc))
+                any_ok = any_ok or ok
+                details.append("zone=%s:ok=%s:%s" % (zone, ok, detail))
+                _log("[Teardown] delete_instance node=%s zone=%s -> ok=%s detail=%s"
+                     % (self.node_name, zone, ok, detail))
+            result["deleted"] = any_ok
+            result["detail"] = "; ".join(details)
         except Exception as exc:  # noqa: BLE001 -- teardown must never raise
-            _log("[Teardown] WARN delete_instance error (continuing to reaper): %r"
+            _log("[Teardown] WARN all-zone sweep error (continuing to reaper): %r"
                  % (exc,))
 
-        # Defense-in-depth layer 2: drain the up-front reaper registry. Run off
+        # Defense-in-depth layer 2: drain the up-front reaper registry (itself
+        # now an all-zone sweep, Bug 1 -- see _reap_ignitions_async). Run off
         # the event loop -- the sync reaper may block on a thread-join.
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _reap_ignitions)
@@ -1097,6 +1381,10 @@ class A1BrainIgnition:
                 _log("ABORT: provision failed (%s)" % (detail,))
                 return 1
             await self.resolve_actual_zone()
+            if not await self._await_ssh_ready():
+                _log("ABORT: node SSH-over-IAP not reachable within budget "
+                     "(teardown will $0 the node)")
+                return 1
             await self.verify_head()
             dispatched = await self.dispatch()
             if not dispatched:
