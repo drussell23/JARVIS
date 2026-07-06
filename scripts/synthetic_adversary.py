@@ -1676,7 +1676,7 @@ class SyntheticAdversary:
             for _msg in messages:
                 _c = _msg.get("content", "")
                 _cs = _c if isinstance(_c, str) else str(_c)
-                if "## TOOLS" in _cs or "2b.2-tool" in _cs:
+                if "## TOOLS" in _cs or "2b.2-tool" in _cs or "schema_version" in _cs:
                     has_tools = True
                     break
         # A1-DIAG: stateless wire-side tool-coercion telemetry.
