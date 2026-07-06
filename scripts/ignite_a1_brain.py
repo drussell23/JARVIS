@@ -368,8 +368,24 @@ def _compose_remote_command(
     so the node-side soak's hard wall and the node-side self-destruct
     (Piece D) never disagree."""
     verbose_flag = " --verbose" if verbose else ""
+    # Re-sync the golden-image venv to the GIT-PULLED (versioned, signed-commit
+    # lineage) requirements before the soak: the lean bake carries pytest but
+    # NOT the pytest.ini-required plugins (pytest-asyncio/json-report/metadata/
+    # anyio), so the A1 chaos-injector's RED-verification pytest collects 0
+    # tests (rc=5) and a real bug reads as "not RED" (live-fire
+    # a1-brain-20260705-173831). Idempotent + fast (already-satisfied deps are
+    # a no-op; only the few new pure-python plugins install). NOT an un-versioned
+    # patch (mandate 1) -- it installs exactly the committed, pinned
+    # requirements-brain.txt the node just pulled. Env-gated for override.
+    pip_sync = ""
+    if _truthy(os.environ.get("JARVIS_A1_BRAIN_PIP_SYNC", "1")):
+        pip_sync = (
+            "%s -m pip install -q -r backend/requirements-brain.txt && "
+            % (_REMOTE_PYTHON,)
+        )
     return (
         "cd %s && "
+        "%s"
         "JARVIS_CHAOS_TARGET_DIRS=%s "
         "JARVIS_BRAIN_OUTBOUND_TOPICS=%s "
         "OUROBOROS_BATTLE_HEADLESS=1 "
@@ -378,6 +394,7 @@ def _compose_remote_command(
         "--seed %d%s"
         % (
             _REMOTE_REPO_ROOT,
+            pip_sync,
             _DEFAULT_CHAOS_TARGET_DIRS,
             _DEFAULT_OUTBOUND_TOPICS,
             int(soak_wall_s),
