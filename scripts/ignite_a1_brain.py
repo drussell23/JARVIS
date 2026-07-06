@@ -22,6 +22,20 @@ reason) and reuses:
   * ``a1_live_fire_chaos_harness.IapBlackBoxTransport``   -- the checksum-gated
     Black-Box pull (``bundle_on_node`` + ``pull_archive``), loaded the SAME way.
 
+Mandate 3 (verdict retrieval is 100% via IapBlackBoxTransport): ``a1_verdict.json``
+is now bundled INTO the node-side Black Box archive by ``a1_black_box.py`` (it is
+part of the audit trail). ``retrieve_verdict()`` is AUTHORITATIVE via the
+checksum-verified pulled tarball: it EXTRACTS ``a1_verdict.json`` from the local
+archive only after ``pull_archive()`` confirms the local sha256 matches the
+node-emitted sha256 -- no separate SSH ``find``/``cat`` is used for the
+authoritative path. A direct-SSH fallback (``_discover_verdict_path`` /
+``_fetch_verdict_json``) is retained ONLY as an explicit, clearly-logged
+FAIL-SOFT path for when the Black-Box bundle/pull fails entirely -- it is
+gated behind ``JARVIS_A1_BRAIN_VERDICT_SSH_FALLBACK_ENABLED`` (default
+``true``) and every result carries ``verdict_source`` (``"blackbox"`` /
+``"ssh_fallback"`` / ``"none"``) so a fallback read is never mistaken for the
+authoritative one.
+
 Provisioning composes ``backend.core.ouroboros.governance.brain_lifecycle.provision_brain``
 directly (NOT ``ignite_brain_vm.BrainIgnitionDriver.run()``, which runs a full
 acceptance+teardown cycle we don't want here -- we HOLD the node for the A1 run).
@@ -83,6 +97,7 @@ import re
 import shlex
 import signal
 import sys
+import tarfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -108,6 +123,20 @@ _DEFAULT_OUTBOUND_TOPICS = "actuation.*,telemetry.posture.*,autonomy.*"
 # The node-side Black Box bundler's default staging dir (matches a1_black_box.py /
 # a1_live_fire_chaos_harness.py's JARVIS_A1_BLACKBOX_NODE_OUT default).
 _BLACK_BOX_NODE_OUT = os.environ.get("JARVIS_A1_BLACKBOX_NODE_OUT", "/tmp/a1_black_box")
+
+# The stable in-archive arcname a1_black_box.py bundles a1_verdict.json at.
+# Mandate 3: the AUTHORITATIVE verdict retrieval path parses this member out
+# of the checksum-verified pulled tarball -- MUST match
+# a1_black_box.py::_A1_VERDICT_ARCNAME.
+_A1_VERDICT_ARCNAME = "a1_verdict.json"
+
+# Fail-soft SSH-fallback gate: the AUTHORITATIVE path is IapBlackBoxTransport
+# (checksum-gated bundle+pull) ONLY. When that channel produces no verdict at
+# all (bundle/pull/extract all failed), a direct SSH find+cat is used as a
+# clearly-logged, NON-AUTHORITATIVE fallback so a Black-Box bundling failure
+# doesn't lose all verdict visibility. Default-on (fail-soft over silence);
+# set to false to make IapBlackBoxTransport the ONLY verdict source, full stop.
+_ENV_VERDICT_SSH_FALLBACK_ENABLED = "JARVIS_A1_BRAIN_VERDICT_SSH_FALLBACK_ENABLED"
 
 
 def _log(msg: str) -> None:
@@ -831,6 +860,9 @@ class A1BrainIgnition:
         return lines[-1] if lines else None
 
     def _fetch_verdict_json(self, path: str) -> Optional[Dict[str, Any]]:
+        """NON-AUTHORITATIVE fallback fetch: direct SSH ``cat`` of the verdict
+        path discovered by ``_discover_verdict_path``. Only reached when the
+        checksum-gated Black-Box channel produced no verdict at all."""
         rc, out = self._ssh_exec("cat %s" % (shlex.quote(path),), timeout_s=30.0)
         if rc != 0 or not out:
             return None
@@ -841,23 +873,63 @@ class A1BrainIgnition:
         try:
             return json.loads(text[start:])
         except Exception as exc:  # noqa: BLE001 -- malformed verdict must not crash
-            _log("WARN verdict JSON parse error: %r" % (exc,))
+            _log("[VerdictFallback] WARN verdict JSON parse error: %r" % (exc,))
+            return None
+
+    def _extract_verdict_from_archive(self, archive_path: str) -> Optional[Dict[str, Any]]:
+        """AUTHORITATIVE extraction (mandate 3): parse ``a1_verdict.json`` out
+        of the LOCAL, checksum-verified Black-Box tarball. Fail-soft -- any
+        error (missing member, bad tar, malformed JSON) returns None and is
+        logged; it never raises (a corrupt/absent verdict member must not
+        crash the driver -- the caller falls back to SSH if fully absent)."""
+        try:
+            with tarfile.open(archive_path, "r:*") as tf:
+                try:
+                    member = tf.getmember(_A1_VERDICT_ARCNAME)
+                except KeyError:
+                    _log("[BlackBox] a1_verdict.json NOT present in the pulled archive "
+                         "(the node-side bundler noted it absent -- see the archive's "
+                         "own MANIFEST.txt)")
+                    return None
+                fh = tf.extractfile(member)
+                if fh is None:
+                    return None
+                text = fh.read().decode("utf-8", errors="ignore").strip()
+        except Exception as exc:  # noqa: BLE001 -- archive extraction must never crash
+            _log("[BlackBox] WARN archive extraction error: %r" % (exc,))
+            return None
+        start = text.find("{")
+        if start == -1:
+            return None
+        try:
+            return json.loads(text[start:])
+        except Exception as exc:  # noqa: BLE001 -- malformed verdict must not crash
+            _log("[BlackBox] WARN verdict JSON parse error: %r" % (exc,))
             return None
 
     async def retrieve_verdict(self) -> Dict[str, Any]:
-        loop = asyncio.get_running_loop()
-        verdict_path = await loop.run_in_executor(None, self._discover_verdict_path)
-        verdict: Optional[Dict[str, Any]] = None
-        if verdict_path:
-            verdict = await loop.run_in_executor(
-                None, self._fetch_verdict_json, verdict_path)
-        else:
-            _log("WARN could not discover a1_verdict.json under %s"
-                 % (self.remote_run_dir,))
+        """Mandate 3: verdict retrieval is 100% via ``IapBlackBoxTransport``.
 
-        # Checksum-gated Black Box pull -- supplementary diagnostic bundle
-        # (debug.log + session context), reused as-is (no reimplementation).
+        AUTHORITATIVE path: ``bundle_on_node`` (node-side ``a1_black_box.py``
+        now bundles ``a1_verdict.json`` INTO the archive) -> ``pull_archive``
+        (checksum-gated scp pull, local sha256 recompute) -> on a CONFIRMED
+        match, extract + parse ``a1_verdict.json`` straight out of the local
+        tarball. No SSH ``find``/``cat`` is used on this path.
+
+        FAIL-SOFT fallback: only when the Black-Box channel produces NO
+        verdict at all (bundle failed, pull/checksum failed, or the archive
+        didn't contain the member), a direct SSH ``find``+``cat`` is used --
+        clearly logged as non-authoritative -- gated by
+        ``JARVIS_A1_BRAIN_VERDICT_SSH_FALLBACK_ENABLED`` (default true)."""
+        loop = asyncio.get_running_loop()
+        verdict: Optional[Dict[str, Any]] = None
+        verdict_source = "none"
+        verdict_path: Optional[str] = None
+
+        # -- AUTHORITATIVE: checksum-gated Black Box bundle + pull, then
+        # extract a1_verdict.json from the LOCAL verified tarball. --
         blackbox: Dict[str, Any] = {"pulled": False}
+        local_archive: Optional[str] = None
         try:
             transport = self._blackbox_transport_factory(
                 node=self.node_name, hypervisor_args=self._ns())
@@ -877,28 +949,71 @@ class A1BrainIgnition:
                     ),
                 )
                 if local_sha and local_sha == bundle.get("sha256"):
-                    blackbox = {"pulled": True, "local_dir": local_dir, "sha256": local_sha}
+                    local_archive = os.path.join(
+                        local_dir, os.path.basename(bundle["archive"]))
+                    blackbox = {
+                        "pulled": True, "local_dir": local_dir, "sha256": local_sha,
+                        "archive": local_archive,
+                    }
                     _log("[BlackBox] confirmed sha256=%s -> %s" % (local_sha[:16], local_dir))
                 else:
                     _log("[BlackBox] WARN pull/checksum unresolved (node_sha=%s "
-                         "local_sha=%s) -- diagnostic bundle NOT confirmed (the "
-                         "direct SSH verdict fetch above is unaffected)"
+                         "local_sha=%s) -- diagnostic bundle NOT confirmed"
                          % (bundle.get("sha256"), local_sha))
             else:
                 _log("[BlackBox] WARN node-side bundle failed -- no diagnostic archive")
-        except Exception as exc:  # noqa: BLE001 -- Black Box is supplementary, never fatal
-            _log("[BlackBox] WARN bundling/pull error (continuing, fail-soft): %r" % (exc,))
+        except Exception as exc:  # noqa: BLE001 -- bundling/pull must never crash the driver
+            _log("[BlackBox] WARN bundling/pull error: %r" % (exc,))
+
+        if local_archive:
+            verdict = await loop.run_in_executor(
+                None, self._extract_verdict_from_archive, local_archive)
+            if verdict is not None:
+                verdict_source = "blackbox"
+                verdict_path = "%s!%s" % (local_archive, _A1_VERDICT_ARCNAME)
+                _log("[BlackBox] A1 verdict parsed from the checksum-verified "
+                     "archive (AUTHORITATIVE)")
+            else:
+                _log("[BlackBox] WARN checksum-verified archive did not yield a "
+                     "parseable a1_verdict.json")
+
+        # -- FAIL-SOFT, NON-AUTHORITATIVE fallback: only when the Black-Box
+        # channel produced NO verdict at all. --
+        if verdict is None:
+            if _truthy(os.environ.get(_ENV_VERDICT_SSH_FALLBACK_ENABLED, "true")):
+                _log("[VerdictFallback] Black-Box channel produced no verdict -- "
+                     "falling back to a direct SSH find+cat. This is a "
+                     "NON-AUTHORITATIVE fallback (Black-Box channel unavailable); "
+                     "the mandate-3 authoritative path is IapBlackBoxTransport-only.")
+                verdict_path = await loop.run_in_executor(None, self._discover_verdict_path)
+                if verdict_path:
+                    verdict = await loop.run_in_executor(
+                        None, self._fetch_verdict_json, verdict_path)
+                    if verdict is not None:
+                        verdict_source = "ssh_fallback"
+                else:
+                    _log("[VerdictFallback] WARN could not discover a1_verdict.json "
+                         "under %s" % (self.remote_run_dir,))
+            else:
+                _log("[VerdictFallback] SSH fallback disabled (%s=false) -- verdict "
+                     "remains UNAVAILABLE rather than falling back to a "
+                     "non-authoritative source" % (_ENV_VERDICT_SSH_FALLBACK_ENABLED,))
 
         if verdict is not None:
             criteria = verdict.get("criteria", {}) or {}
-            _log("A1 VERDICT proven=%s" % (verdict.get("proven"),))
+            _log("A1 VERDICT proven=%s (verdict_source=%s)"
+                 % (verdict.get("proven"), verdict_source))
             for name, ok in criteria.items():
                 _log("  criterion %-32s %s" % (name, "PASS" if ok else "FAIL"))
         else:
-            _log("A1 VERDICT: UNAVAILABLE (could not retrieve a1_verdict.json "
-                 "from the node)")
+            _log("A1 VERDICT: UNAVAILABLE (verdict_source=%s)" % (verdict_source,))
 
-        return {"verdict": verdict, "verdict_path": verdict_path, "blackbox": blackbox}
+        return {
+            "verdict": verdict,
+            "verdict_path": verdict_path,
+            "verdict_source": verdict_source,
+            "blackbox": blackbox,
+        }
 
     # -- phase 7: teardown ($0) ---------------------------------------------------
 

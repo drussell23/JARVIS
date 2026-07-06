@@ -27,8 +27,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.util
+import io
+import json
+import os
 import pathlib
 import sys
+import tarfile
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pytest
@@ -162,6 +166,70 @@ class FakeBlackboxTransport:
 
     def teardown(self, *, node: str) -> bool:
         return True
+
+
+class FakeBlackboxTransportWithArchive:
+    """Stands in for IapBlackBoxTransport where `pull_archive()` copies a REAL
+    prebuilt tar.gz into `local_dir` -- so `retrieve_verdict()`'s extraction
+    path has an actual tarball to open (still zero real scp/ssh; the "pull" is
+    a local file copy)."""
+
+    def __init__(
+        self, *, node: str, hypervisor_args: Any, archive_src: str,
+        sha256: str = "deadbeef", pull_should_succeed: bool = True,
+    ) -> None:
+        self.node = node
+        self.args = hypervisor_args
+        self._archive_src = str(archive_src)
+        self._sha256 = sha256
+        self._pull_should_succeed = pull_should_succeed
+        self.bundle_calls: List[Dict[str, Any]] = []
+        self.pull_calls: List[Dict[str, Any]] = []
+
+    def bundle_on_node(self, *, run_id: str, out_dir: str) -> Optional[Dict[str, str]]:
+        self.bundle_calls.append({"run_id": run_id, "out_dir": out_dir})
+        return {
+            "archive": "%s/black_box_%s.tar.gz" % (out_dir, run_id),
+            "sha256": self._sha256,
+            "sha_path": "%s/black_box_%s.tar.gz.sha256" % (out_dir, run_id),
+        }
+
+    def pull_archive(self, *, node_archive: str, node_sha_path: str, local_dir: str) -> Optional[str]:
+        self.pull_calls.append(
+            {"node_archive": node_archive, "node_sha_path": node_sha_path, "local_dir": local_dir}
+        )
+        if not self._pull_should_succeed:
+            return None
+        os.makedirs(local_dir, exist_ok=True)
+        import shutil  # noqa: PLC0415 -- test-only, avoids a module-level import for one use
+
+        local_archive = os.path.join(local_dir, os.path.basename(node_archive))
+        shutil.copyfile(self._archive_src, local_archive)
+        return self._sha256
+
+    def _scp_pull_cmd(self, node_src: str, local_dir: str) -> List[str]:
+        return ["gcloud", "compute", "scp", node_src, local_dir]
+
+    def teardown(self, *, node: str) -> bool:
+        return True
+
+
+def _make_verdict_tarball(path: pathlib.Path, *, verdict: Dict[str, Any],
+                           include_verdict: bool = True) -> pathlib.Path:
+    """Build a REAL tiny tar.gz at `path` containing `a1_verdict.json` (unless
+    `include_verdict` is False, mirroring a1_black_box.py's fail-soft-absent
+    case) -- no real subprocess/network."""
+    with tarfile.open(path, "w:gz") as tf:
+        if include_verdict:
+            data = json.dumps(verdict).encode("utf-8")
+            info = tarfile.TarInfo(name="a1_verdict.json")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        filler = b"MANIFEST placeholder\n"
+        info2 = tarfile.TarInfo(name="MANIFEST.txt")
+        info2.size = len(filler)
+        tf.addfile(info2, io.BytesIO(filler))
+    return path
 
 
 def _real_hypervisor_loader():
@@ -648,6 +716,154 @@ def test_plan_includes_absolute_lifetime_and_provision_env():
     assert plan.lifetime_s == 2400
     assert plan.provision_env["JARVIS_BRAIN_VM_PERSISTENT"] == "true"
     assert plan.provision_env["JARVIS_BRAIN_ABSOLUTE_LIFETIME_S"] == "2400"
+
+
+# ===========================================================================
+# 7. Mandate 3 -- retrieve_verdict() is 100% via IapBlackBoxTransport.
+#
+#    AUTHORITATIVE: a checksum-verified Black-Box pull whose local tarball
+#    contains a1_verdict.json -> parsed straight from the archive, no SSH
+#    find/cat. FAIL-SOFT fallback: only when the Black-Box channel produces
+#    no verdict at all (pull/checksum failure) does a direct SSH find+cat
+#    kick in, clearly demoted via verdict_source=="ssh_fallback". The env
+#    flag JARVIS_A1_BRAIN_VERDICT_SSH_FALLBACK_ENABLED can disable that
+#    fallback entirely, keeping IapBlackBoxTransport the ONLY verdict source.
+# ===========================================================================
+
+
+def test_retrieve_verdict_authoritative_from_blackbox_bundle(tmp_path, monkeypatch):
+    monkeypatch.delenv("JARVIS_A1_BRAIN_VERDICT_SSH_FALLBACK_ENABLED", raising=False)
+    archive_src = _make_verdict_tarball(
+        tmp_path / "src_black_box.tar.gz",
+        verdict={"proven": True, "criteria": {"cycle_completed": True}},
+    )
+    exploding_runner = RecordingRunner()  # any call here fails the test below.
+
+    ignition = _make_ignition(
+        local_out_root=str(tmp_path / "brain_out"),
+        blackbox_transport_factory=lambda *, node, hypervisor_args: FakeBlackboxTransportWithArchive(
+            node=node, hypervisor_args=hypervisor_args, archive_src=str(archive_src),
+            sha256="cafebabe",
+        ),
+        runner=exploding_runner,
+    )
+
+    result = asyncio.run(ignition.retrieve_verdict())
+
+    assert result["verdict_source"] == "blackbox"
+    assert result["verdict"] == {"proven": True, "criteria": {"cycle_completed": True}}
+    assert result["blackbox"]["pulled"] is True
+    assert result["blackbox"]["sha256"] == "cafebabe"
+    # The AUTHORITATIVE path never shells out via SSH at all (no find/cat).
+    assert exploding_runner.calls == []
+
+
+def test_retrieve_verdict_falls_back_to_ssh_when_blackbox_pull_fails(tmp_path, monkeypatch):
+    monkeypatch.delenv("JARVIS_A1_BRAIN_VERDICT_SSH_FALLBACK_ENABLED", raising=False)
+    verdict_remote_path = (
+        "/opt/trinity/jarvis/a1_iso_runs/a1-brain-test/iso-a1-20260624-010101/a1_verdict.json"
+    )
+    fallback_verdict = {"proven": False, "criteria": {"cycle_completed": False}}
+    runner = RecordingRunner(responses=[
+        (0, verdict_remote_path + "\n"),          # _discover_verdict_path (find)
+        (0, json.dumps(fallback_verdict)),         # _fetch_verdict_json (cat)
+    ])
+
+    ignition = _make_ignition(
+        local_out_root=str(tmp_path / "brain_out"),
+        blackbox_transport_factory=lambda *, node, hypervisor_args: FakeBlackboxTransportWithArchive(
+            node=node, hypervisor_args=hypervisor_args, archive_src="/nonexistent.tar.gz",
+            pull_should_succeed=False,  # simulates a checksum/pull failure
+        ),
+        runner=runner,
+    )
+
+    result = asyncio.run(ignition.retrieve_verdict())
+
+    assert result["verdict_source"] == "ssh_fallback"
+    assert result["verdict"] == fallback_verdict
+    assert result["blackbox"]["pulled"] is False
+    # Exactly the two fallback SSH calls (find, then cat) -- nothing more.
+    assert len(runner.calls) == 2
+
+
+def test_retrieve_verdict_ssh_fallback_disabled_by_env(tmp_path, monkeypatch):
+    """When the operator disables the SSH fallback, a Black-Box pull failure
+    must leave the verdict UNAVAILABLE rather than silently reaching for a
+    non-authoritative source."""
+    monkeypatch.setenv("JARVIS_A1_BRAIN_VERDICT_SSH_FALLBACK_ENABLED", "false")
+    runner = RecordingRunner()
+
+    ignition = _make_ignition(
+        local_out_root=str(tmp_path / "brain_out"),
+        blackbox_transport_factory=lambda *, node, hypervisor_args: FakeBlackboxTransportWithArchive(
+            node=node, hypervisor_args=hypervisor_args, archive_src="/nonexistent.tar.gz",
+            pull_should_succeed=False,
+        ),
+        runner=runner,
+    )
+
+    result = asyncio.run(ignition.retrieve_verdict())
+
+    assert result["verdict"] is None
+    assert result["verdict_source"] == "none"
+    # No SSH calls at all -- the fallback path was never entered.
+    assert runner.calls == []
+
+
+def test_retrieve_verdict_bundle_without_verdict_member_falls_back(tmp_path, monkeypatch):
+    """A checksum-verified archive that simply doesn't CONTAIN a1_verdict.json
+    (the node-side bundler's fail-soft-absent case) must be treated the same
+    as a pull failure -- fall through to the SSH fallback, not crash."""
+    monkeypatch.delenv("JARVIS_A1_BRAIN_VERDICT_SSH_FALLBACK_ENABLED", raising=False)
+    archive_src = _make_verdict_tarball(
+        tmp_path / "src_black_box_no_verdict.tar.gz",
+        verdict={}, include_verdict=False,
+    )
+    verdict_remote_path = (
+        "/opt/trinity/jarvis/a1_iso_runs/a1-brain-test/iso-a1-20260624-010101/a1_verdict.json"
+    )
+    fallback_verdict = {"proven": True, "criteria": {}}
+    runner = RecordingRunner(responses=[
+        (0, verdict_remote_path + "\n"),
+        (0, json.dumps(fallback_verdict)),
+    ])
+
+    ignition = _make_ignition(
+        local_out_root=str(tmp_path / "brain_out"),
+        blackbox_transport_factory=lambda *, node, hypervisor_args: FakeBlackboxTransportWithArchive(
+            node=node, hypervisor_args=hypervisor_args, archive_src=str(archive_src),
+        ),
+        runner=runner,
+    )
+
+    result = asyncio.run(ignition.retrieve_verdict())
+
+    assert result["blackbox"]["pulled"] is True  # the archive itself pulled fine
+    assert result["verdict_source"] == "ssh_fallback"
+    assert result["verdict"] == fallback_verdict
+
+
+def test_dry_run_still_zero_side_effect_with_new_verdict_path(capsys):
+    """Re-confirms the --dry-run zero-side-effect guarantee holds after the
+    mandate-3 retrieve_verdict() rewrite (retrieve_verdict is never reached
+    on the dry-run path)."""
+    exploding_rest = ExplodingComputeRest()
+    runner = RecordingRunner()
+
+    ignition = _make_ignition(
+        dry_run=True, project="demo-project", zone="us-central1-a",
+        compute_rest_factory=lambda: exploding_rest,
+        provision_fn=_exploding_provision_fn,
+        runner=runner,
+    )
+
+    rc = asyncio.run(ignition.run())
+
+    assert rc == 0
+    assert runner.calls == []
+    out = capsys.readouterr().out
+    assert "DRY RUN: zero network" in out
 
 
 if __name__ == "__main__":
