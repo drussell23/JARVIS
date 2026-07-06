@@ -12180,6 +12180,15 @@ class GovernedOrchestrator:
                 "max_iterations_exhausted",
                 "max_validation_runs_exhausted",
                 "deadline_budget_exhausted",
+                # a1-brain-20260705-233225 storm root cause: a per-class
+                # retry exhaustion IS "genuinely exhausted" by this
+                # taxonomy's own definition, but was absent here →
+                # classified SOFT → futilely re-dispatched — 120/120
+                # identical class_retries_exhausted:env re-dispatches,
+                # each burning a fresh 120s timebox. The engine's
+                # per-run counter re-derives the same deterministic
+                # failure every dispatch.
+                "class_retries_exhausted",
             )
             _stop_reason_str = l2_result.stop_reason or ""
             _is_hard_stop = any(

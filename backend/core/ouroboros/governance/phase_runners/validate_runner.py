@@ -93,6 +93,60 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
 
+# ---------------------------------------------------------------------------
+# L2 storm breaker (run a1-brain-20260705-233225): 60 background-route ops
+# each re-dispatched L2 on the IDENTICAL sticky stop reason
+# (class_retries_exhausted:env, 120/120 uniform), burning a fresh 120s
+# timebox per futile dispatch until the wall clock died. Two structural
+# guards, no sensor names, no global disables:
+#
+#   * resolve_l2_dispatch_budget — route-aware dispatch cap. BACKGROUND /
+#     SPECULATIVE routes default to a single dispatch (no re-dispatch),
+#     composing with the existing route-gating cost philosophy (the Venom
+#     tool loop is already skipped for those routes). Strictest-wins
+#     against the global knob, same composing philosophy as
+#     risk_tier_floor.
+#   * is_sticky_soft_stop — a re-dispatch that reproduces the identical
+#     stop reason has empirically falsified the SOFT premise ("transient
+#     — fresh dispatch could converge"); the failure is deterministic and
+#     further dispatches are storm fuel. Generic across ANY reason.
+# ---------------------------------------------------------------------------
+
+# The two cost-optimized provider routes (closed UrgencyRouter vocabulary).
+_L2_BG_ROUTES = frozenset({"background", "speculative"})
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        raw = os.environ.get(name, "").strip()
+        return int(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
+def resolve_l2_dispatch_budget(provider_route: Optional[str]) -> int:
+    """Max total L2 dispatches (1 initial + N re-dispatches) for this op.
+
+    Global: ``JARVIS_L2_DISPATCH_RETRIES`` (default 1 → 2 dispatches).
+    BACKGROUND/SPECULATIVE routes: ``JARVIS_L2_DISPATCH_RETRIES_BACKGROUND``
+    (default 0 → single dispatch), never exceeding the global cap.
+    """
+    base = _env_int("JARVIS_L2_DISPATCH_RETRIES", 1) + 1
+    route = (provider_route or "").strip().lower()
+    if route in _L2_BG_ROUTES:
+        bg = _env_int("JARVIS_L2_DISPATCH_RETRIES_BACKGROUND", 0) + 1
+        return min(base, bg)
+    return base
+
+
+def is_sticky_soft_stop(
+    prev_reason: Optional[str], new_reason: str
+) -> bool:
+    """True when a re-dispatch reproduced the identical soft-stop reason —
+    deterministic failure; re-dispatching again is definitionally futile."""
+    return bool(prev_reason) and prev_reason == new_reason
+
+
 class VALIDATERunner(PhaseRunner):
     """Verbatim transcription of orchestrator.py VALIDATE block (~4693-5440)."""
 
@@ -399,9 +453,11 @@ class VALIDATERunner(PhaseRunner):
                 # ADDITIONAL L2 dispatches after the first.
                 # ──────────────────────────────────────────────────
                 if orch._config.repair_engine is not None and best_validation is not None:
-                    _l2_max_dispatches = int(
-                        os.environ.get("JARVIS_L2_DISPATCH_RETRIES", "1"),
-                    ) + 1
+                    # Route-aware budget: BACKGROUND/SPECULATIVE default to a
+                    # single dispatch (storm breaker — see module docstring).
+                    _l2_max_dispatches = resolve_l2_dispatch_budget(
+                        getattr(ctx, "provider_route", ""),
+                    )
                 else:
                     _l2_max_dispatches = 0
                 _l2_dispatch_idx = 0
@@ -469,9 +525,54 @@ class VALIDATERunner(PhaseRunner):
                         break  # inner Slice 6 retry loop
                     elif directive[0] == "l2_retry":
                         # Slice 6 — re-dispatch L2 with fresh budget
-                        _l2_soft_stop_history.append(
+                        _new_stop_reason = (
                             directive[2] if len(directive) > 2 else "unknown"
                         )
+                        _prev_stop_reason = (
+                            _l2_soft_stop_history[-1]
+                            if _l2_soft_stop_history else None
+                        )
+                        _l2_soft_stop_history.append(_new_stop_reason)
+                        if is_sticky_soft_stop(
+                            _prev_stop_reason, _new_stop_reason
+                        ):
+                            # Storm breaker: the re-dispatch reproduced the
+                            # IDENTICAL stop reason — deterministic failure,
+                            # the SOFT premise is empirically falsified.
+                            # Burning another timebox is storm fuel
+                            # (a1-brain-20260705-233225: 120/120 identical
+                            # class_retries_exhausted:env re-dispatches).
+                            logger.info(
+                                "[Orchestrator] L2 sticky soft-stop op=%s "
+                                "reason=%s repeated identically — "
+                                "converting to cancel terminal "
+                                "(no-progress breaker)",
+                                ctx.op_id,
+                                _new_stop_reason,
+                            )
+                            ctx = ctx.advance(
+                                OperationPhase.CANCELLED,
+                                terminal_reason_code=(
+                                    f"l2_sticky_soft_stop:{_new_stop_reason}"
+                                ),
+                            )
+                            await orch._record_ledger(
+                                ctx,
+                                OperationState.FAILED,
+                                {
+                                    "reason": "l2_sticky_soft_stop",
+                                    "stop_reason": _new_stop_reason,
+                                    "attempts": _l2_dispatch_idx,
+                                    "soft_stop_history": _l2_soft_stop_history,
+                                },
+                            )
+                            _fsm_log(
+                                "l2_sticky_soft_stop",
+                                f"reason={_new_stop_reason} "
+                                f"attempts={_l2_dispatch_idx}",
+                            )
+                            _l2_retries_exhausted_ctx = ctx
+                            break  # inner Slice 6 retry loop
                         if _l2_dispatch_idx >= _l2_max_dispatches:
                             # Out of retries — convert soft stop to cancel.
                             logger.info(
