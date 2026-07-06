@@ -251,6 +251,11 @@ class TestWatcher:
                 proc = await asyncio.create_subprocess_exec(
                     "git", *args,
                     cwd=str(self.repo_path),
+                    # Slice 8 pipe discipline: every spawn in this module
+                    # carries stdin=DEVNULL (AST-pinned by
+                    # test_slice8_subprocess_pipe_discipline.py) — the
+                    # boot-hydration git spawn landed without it.
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -495,6 +500,24 @@ class TestWatcher:
         output, exit_code = await self.run_pytest(target_paths=target_paths)
         if exit_code == -1:
             return []  # timeout -- skip cycle, preserve streaks
+        # NO-INFORMATION exit codes (pytest: 2=interrupted, 3=INTERNALERROR,
+        # 4=usage error, 5=no tests collected): the run carries no evidence
+        # about ANY test, so the cycle is skipped exactly like the timeout
+        # guard above — streaks preserved. Before this guard an aborted
+        # sweep RESET every streak (absence-by-abort read as passing):
+        # a1-brain-20260706-014931 live-fire, where a diagnostic script
+        # sys.exit'ing at import made every full-suite run die rc=3 and
+        # the injected vector's streak could never reach the stability
+        # gate. rc=0 (genuine green) and rc=1 (genuine failures) remain
+        # the only streak-mutating outcomes.
+        if exit_code in (2, 3, 4, 5):
+            logger.warning(
+                "pytest run aborted (rc=%d) — no-information cycle, "
+                "streaks preserved (%d bytes of output)",
+                exit_code,
+                len(output),
+            )
+            return []
         failures = self.parse_pytest_output(output, exit_code)
         # Repair Context Bridge (Slice 1): non-blocking AST traceback enrichment
         # (gated, fail-soft) — populates f.traceback_evidence before signal build.
