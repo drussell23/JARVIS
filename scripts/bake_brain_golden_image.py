@@ -154,6 +154,19 @@ def build_startup_script(
          sentinel -> the reaper rolls the node (J-Prime failure contract).
     """
     repo_url_q = shlex.quote(repo_url)
+    # Mandate 2 (no static keys on the snapshot): if the clone URL carries an
+    # inline credential (``https://x-access-token:TOKEN@github.com/...``), the
+    # token would persist in ``.git/config`` on the baked image. Compute the
+    # token-free URL; the startup-script resets the remote to it right after the
+    # clone, so the snapshot never carries the token. The runtime does not need
+    # to pull (the image is immutable + current at bake) -- a boot-time fetch
+    # that cannot auth simply no-ops.
+    if "://" in repo_url and "@" in repo_url.split("://", 1)[1]:
+        _scheme, _rest = repo_url.split("://", 1)
+        repo_url_clean = _scheme + "://" + _rest.split("@", 1)[1]
+    else:
+        repo_url_clean = repo_url
+    repo_url_clean_q = shlex.quote(repo_url_clean)
     repo_ref_q = shlex.quote(repo_ref)
     sentinel_q = shlex.quote(sentinel_path)
     brain_env_q = shlex.quote(brain_env_path)
@@ -204,7 +217,7 @@ echo "[brain-bake] phase=brain-env-done ts=$(_ts)"
 
 # 3. Clone the repo to the IsomorphicEnv canonical path (the REAL primary
 #    runtime). URL + ref are bake-time values (env-resolved), never literals.
-echo "[brain-bake] phase=clone-start repo={repo_url_q} ref={repo_ref_q} ts=$(_ts)"
+echo "[brain-bake] phase=clone-start repo={repo_url_clean_q} ref={repo_ref_q} ts=$(_ts)"
 mkdir -p /opt/trinity
 rm -rf {_REPO_PATH}
 # FULL clone (no --depth 1): a shallow clone cannot reliably `git pull
@@ -215,6 +228,11 @@ rm -rf {_REPO_PATH}
 # repo the IsomorphicEnv + chaos injector actually exercise.
 if git clone --branch {repo_ref_q} {repo_url_q} {_REPO_PATH}; then
     echo "[brain-bake] phase=clone-done ts=$(_ts)"
+    # Mandate 2: scrub the clone credential so it NEVER lands on the snapshot.
+    git -C {_REPO_PATH} remote set-url origin {repo_url_clean_q} 2>/dev/null || true
+    rm -f /root/.git-credentials 2>/dev/null || true
+    git config --global --remove-section credential 2>/dev/null || true
+    echo "[brain-bake] phase=token-scrubbed remote=$(git -C {_REPO_PATH} remote get-url origin 2>/dev/null) ts=$(_ts)"
 else
     echo "[brain-bake] ERROR: git clone failed -- NOT writing sentinel"
     exit 1
