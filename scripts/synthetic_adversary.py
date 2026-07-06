@@ -1666,6 +1666,29 @@ class SyntheticAdversary:
 
         # Early diagnostic fields for logging
         has_tools = bool(body.get("tools"))
+        # A1-DIAG: stateless wire-side tool-coercion telemetry.
+        # Detects the prompt-embedded Venom tool catalog (the DW-proprietary
+        # 2b.2-tool format) independently of body["tools"] (the OpenAI-compat
+        # field). Decisive signal for separating H1 from H2.
+        if os.environ.get("JARVIS_A1_DIAG_TOOL_SEAM", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            _diag_prompt_has_venom_tools = False
+            for _dm in messages:
+                _dc = _dm.get("content", "")
+                _dc_str = _dc if isinstance(_dc, str) else str(_dc)
+                if "## TOOLS" in _dc_str or "2b.2-tool" in _dc_str or "schema_version" in _dc_str:
+                    _diag_prompt_has_venom_tools = True
+                    break
+            logger.warning(
+                "[A1-DIAG-ADV-TOOL-SEAM] has_tools=%s "
+                "prompt_has_venom_tools=%s body_keys=%s "
+                "msg_count=%d tool_choice=%s",
+                has_tools, _diag_prompt_has_venom_tools,
+                sorted(body.keys()),
+                len(messages),
+                body.get("tool_choice", "<absent>"),
+            )
         _manifest = _load_chaos_manifest()
         manifest_present = _manifest is not None
 

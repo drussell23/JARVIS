@@ -3568,6 +3568,26 @@ class DoublewordProvider:
             )
             _will_skip_tools = True
         _tools_available = self._tool_loop is not None and not _will_skip_tools
+        # A1-DIAG: stateless tool-seam telemetry (env-gated, zero side-effects).
+        # Captures the decisive tool-availability decision at the provider/wire
+        # boundary so the black-box bundle can separate H1 (tools stripped at
+        # dispatch) from H2 (adversary fixture misreads tools presence).
+        if os.environ.get("JARVIS_A1_DIAG_TOOL_SEAM", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            logger.warning(
+                "[A1-DIAG-TOOL-SEAM] op=%s route=%s complexity=%s "
+                "is_read_only=%s _will_skip_tools=%s _tools_available=%s "
+                "tool_loop_present=%s _s226_gate_demands=%s "
+                "native_tool_forcing=%s",
+                (getattr(context, "op_id", "?") or "?")[:24],
+                _route, _complexity,
+                getattr(context, "is_read_only", "?"),
+                _will_skip_tools, _tools_available,
+                self._tool_loop is not None,
+                _s226_gate_demands(str(_complexity)),
+                _dw_native_tool_forcing_enabled(),
+            )
         _preloaded_files: List[str] = []
         # DW prompt caching (Slice-131 split): when the master flag is on, divert
         # the STABLE tool catalog + output schema into this sink so ONLY they are

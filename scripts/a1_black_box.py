@@ -93,7 +93,8 @@ _LEDGER_FILES = [
         "JARVIS_A1_BLACKBOX_LEDGERS",
         "intake_dlq.jsonl,graduation_ledger.jsonl,decision_trace.jsonl,"
         "op_ledger.jsonl,intake_router.lock,posture_current.jsonl,"
-        "dw_surface_health.json,provider_quarantine.json,chaos_manifest.json",
+        "dw_surface_health.json,provider_quarantine.json,chaos_manifest.json,"
+        "adversary_requests.log",
     ).split(",") if f.strip()
 ]
 
@@ -106,11 +107,11 @@ _LEDGER_DIRS = [
 ]
 
 # Per-file capture ceiling (bytes) -- keep the bundle bounded. Default 64 MiB.
-_MAX_FILE_BYTES = int(os.environ.get("JARVIS_A1_BLACKBOX_MAX_FILE_BYTES", str(64 * 1024 * 1024)))
+_MAX_FILE_BYTES = int(os.environ.get("JARVIS_A1_BLACKBOX_MAX_FILE_BYTES", str(256 * 1024 * 1024)))
 # Per-dir capture ceiling (bytes) -- bounded wholesale dir capture. Default 128 MiB.
 _MAX_DIR_BYTES = int(os.environ.get("JARVIS_A1_BLACKBOX_MAX_DIR_BYTES", str(128 * 1024 * 1024)))
 # debug.log tail line cap when the file is huge (keep the recent failure window).
-_DEBUG_LOG_TAIL_LINES = int(os.environ.get("JARVIS_A1_BLACKBOX_DEBUG_TAIL_LINES", "20000"))
+_DEBUG_LOG_TAIL_LINES = int(os.environ.get("JARVIS_A1_BLACKBOX_DEBUG_TAIL_LINES", "80000"))
 
 # The A1 verdict (mandate 3): stable in-archive arcname the orchestrator's
 # `IapBlackBoxTransport` pull parses -- NEVER change this without updating
