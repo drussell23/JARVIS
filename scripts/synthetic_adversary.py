@@ -442,6 +442,17 @@ def _build_env_overrides(port: int) -> Dict[str, str]:
         "JARVIS_PRIME_URL": f"{base}/prime",
         "JARVIS_REACTOR_URL": f"{base}/reactor",
         "REACTOR_CORE_API_URL": f"{base}/reactor",
+        # The adversary IS the DoubleWord provider (it owns DOUBLEWORD_BASE_URL),
+        # so it must ALSO supply the key that the production-soak boot gate
+        # requires (ouroboros_battle_test.py: exits 1 if neither DOUBLEWORD_API_KEY
+        # nor ANTHROPIC_API_KEY is set). This makes the drill SELF-CONTAINED on
+        # ANY host -- no dependence on the operator's real shell key (the exact
+        # gap that failed the GCP node, whose env has no key while a dev laptop
+        # does). The mock never validates the key; setdefault-style callers
+        # (env.update(env_overrides())) let a real operator key still win if they
+        # set one, since env_overrides is applied over the composed base env.
+        "DOUBLEWORD_API_KEY": os.environ.get(
+            "JARVIS_ADVERSARY_SYNTHETIC_API_KEY", "synthetic-adversary-dw-key"),
     }
 
 

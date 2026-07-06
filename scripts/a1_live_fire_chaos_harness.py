@@ -224,12 +224,36 @@ def _parse_env_overlay(path: str) -> Dict[str, str]:
     return out
 
 
+# Keys whose operator/ignition-supplied value is AUTHORITATIVE over the static
+# overlay default -- the overlay provides a FALLBACK for these, never an
+# override. The soak-child wall is coordination-critical: ignite_a1_brain.py
+# sizes the node's absolute lifetime + the monitor budget from --soak-wall-s and
+# bakes the SAME value into the remote command as OUROBOROS_BATTLE_MAX_WALL_SECONDS
+# (ordering invariant: soak_wall_s < monitor_stop < lifetime_s). If the overlay's
+# static 3600 clobbers that explicit value, the soak child outlives the outer
+# budget -- the node self-destructs / the monitor gives up mid-soak and no verdict
+# is ever produced (live-fire a1-brain-20260705-213419). This is the SAME
+# "operator env ALWAYS wins" invariant that _composed_soak_wall_s
+# (isomorphic_a1_local.py, bt-iso-1783036735) documents one layer down; the fix
+# there never fired because compose_env overwrote the operator value BEFORE
+# _composed_soak_wall_s could read it.
+_OPERATOR_AUTHORITATIVE_KEYS = frozenset({"OUROBOROS_BATTLE_MAX_WALL_SECONDS"})
+
+
 def compose_env(*, base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Compose the soak env: the derived cognitive flags ON + the orchestration
     flags + the Linux production overlay. The result is printed for audit by the
-    caller. Precedence (lowest->highest): process env -> linux overlay -> derived
-    cognitive flags -> orchestration-required flags."""
+    caller. Precedence (lowest->highest): linux overlay -> derived cognitive
+    flags -> orchestration-required flags -> operator-authoritative process env
+    (``_OPERATOR_AUTHORITATIVE_KEYS`` -- explicit operator values win over every
+    static default for coordination-critical keys)."""
     env: Dict[str, str] = dict(base_env if base_env is not None else os.environ)
+    # Snapshot operator-explicit authoritative values BEFORE any overlay/manifest
+    # layering so a static default can never clobber an explicit operator value.
+    # Re-asserted as the LAST step below so they win over EVERYTHING composed here.
+    _operator_pins = {
+        k: env[k] for k in _OPERATOR_AUTHORITATIVE_KEYS if k in env
+    }
     # 1. Production overlay. Always layer the linux base FIRST (pytest caps, AST
     #    pool, Claude-disabled autarky) -- the omni env `source`s it in bash, which
     #    the line-based parser cannot follow, so we compose the inheritance here.
@@ -280,6 +304,9 @@ def compose_env(*, base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         file_isolation=False,
     )
     apply_manifest(_a1_manifest, env)
+    # 6. Operator-authoritative process env wins over every static default above.
+    #    (Empty when the operator pinned nothing -> overlay default stands.)
+    env.update(_operator_pins)
     return env
 
 

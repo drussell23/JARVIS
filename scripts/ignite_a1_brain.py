@@ -134,6 +134,17 @@ _REMOTE_PYTHON = os.environ.get(
 # Piece C / B config baked into the remote command (facts-file authoritative values).
 _DEFAULT_CHAOS_TARGET_DIRS = "backend/core/ouroboros/a1_ignition_vector"
 _DEFAULT_OUTBOUND_TOPICS = "actuation.*,telemetry.posture.*,autonomy.*"
+# The O+V production-soak boot HARD-GATES on a provider key (ouroboros_battle_
+# test.py: exits 1 if neither DOUBLEWORD_API_KEY nor ANTHROPIC_API_KEY is set).
+# The A1 drill runs against the SYNTHETIC ADVERSARY (which owns DOUBLEWORD_BASE_
+# URL), so a synthetic key satisfies the gate while the adversary stubs every
+# request. Locally the gate passes only because a dev shell already exports a
+# key; the GCP node's env has none -> the organism died rc=1 (live-fire
+# a1-brain-20260705-194856). Setting it in the dispatch env makes the drill
+# self-contained on the immutable node WITHOUT a re-bake (the durable twin is
+# synthetic_adversary._build_env_overrides, which now also emits this key).
+_SYNTHETIC_DW_API_KEY = os.environ.get(
+    "JARVIS_ADVERSARY_SYNTHETIC_API_KEY", "synthetic-adversary-dw-key")
 
 # The node-side Black Box bundler's default staging dir (matches a1_black_box.py /
 # a1_live_fire_chaos_harness.py's JARVIS_A1_BLACKBOX_NODE_OUT default).
@@ -289,6 +300,16 @@ _ENV_BOOT_OFFSET_S = "JARVIS_A1_BRAIN_BOOT_OFFSET_S"
 _DEFAULT_BOOT_OFFSET_S = 180  # observed ~168s cold boot, rounded up w/ margin
 _ENV_VERDICT_PULL_MARGIN_S = "JARVIS_A1_BRAIN_VERDICT_PULL_MARGIN_S"
 _DEFAULT_VERDICT_PULL_MARGIN_S = 180  # headroom for the checksum-gated pull
+# Time the isomorphic run needs AFTER the soak_wall fires, before its done-file
+# lands: the organism's own wall-clock kill ladder (grace + margin + the
+# external sentinel ~90-150s) + the isomorphic driver's audit (~30-60s). WITHOUT
+# this, monitor_max_s (= lifetime - verdict_pull_margin = boot+soak_wall) gives
+# up ~120s BEFORE the done-file appears (live-fire a1-brain-20260705-204359:
+# "monitor budget exhausted (1980s) without a done-file" while the soak was
+# mid-kill-ladder). Folded into lifetime so the monitor waits long enough AND
+# the verdict pull still finishes before Piece D's self-destruct.
+_ENV_POST_WALL_MARGIN_S = "JARVIS_A1_BRAIN_POST_WALL_MARGIN_S"
+_DEFAULT_POST_WALL_MARGIN_S = 300
 
 
 def _resolve_soak_wall_s(explicit: Optional[int]) -> int:
@@ -299,7 +320,7 @@ def _resolve_soak_wall_s(explicit: Optional[int]) -> int:
 
 def _resolve_lifetime_s(
     *, explicit: Optional[int], soak_wall_s: int, boot_offset_s: int,
-    verdict_pull_margin_s: int,
+    verdict_pull_margin_s: int, post_wall_margin_s: int = 0,
 ) -> int:
     """DERIVE the node's absolute lifetime from the coordinated soak wall
     (+ margins) so the two budgets can never drift apart. `explicit` (an
@@ -321,7 +342,8 @@ def _resolve_lifetime_s(
     keeps the ordering invariant `soak_wall_s < monitor_stop < lifetime_s`
     true after resolution in every case. An explicit lifetime >= the floor
     is honored as-is (an operator may deliberately extend it further)."""
-    floor = int(soak_wall_s) + int(boot_offset_s) + int(verdict_pull_margin_s)
+    floor = (int(soak_wall_s) + int(boot_offset_s) + int(post_wall_margin_s)
+             + int(verdict_pull_margin_s))
 
     def _clamp_to_floor(value: int, *, source: str) -> int:
         if value >= floor:
@@ -420,6 +442,7 @@ def _compose_remote_command(
         "%s"
         "JARVIS_CHAOS_TARGET_DIRS=%s "
         "JARVIS_BRAIN_OUTBOUND_TOPICS=%s "
+        "DOUBLEWORD_API_KEY=%s "
         "OUROBOROS_BATTLE_HEADLESS=1 "
         "OUROBOROS_BATTLE_MAX_WALL_SECONDS=%d "
         "%s scripts/isomorphic_a1_local.py --mode process --run-root %s "
@@ -429,6 +452,7 @@ def _compose_remote_command(
             pip_sync,
             _DEFAULT_CHAOS_TARGET_DIRS,
             _DEFAULT_OUTBOUND_TOPICS,
+            _SYNTHETIC_DW_API_KEY,
             int(soak_wall_s),
             _REMOTE_PYTHON,
             remote_run_dir,
@@ -773,12 +797,15 @@ class A1BrainIgnition:
         self.boot_offset_s = int(_env_int(_ENV_BOOT_OFFSET_S, _DEFAULT_BOOT_OFFSET_S))
         self.verdict_pull_margin_s = int(
             _env_int(_ENV_VERDICT_PULL_MARGIN_S, _DEFAULT_VERDICT_PULL_MARGIN_S))
+        self.post_wall_margin_s = int(
+            _env_int(_ENV_POST_WALL_MARGIN_S, _DEFAULT_POST_WALL_MARGIN_S))
         self.soak_wall_s = _resolve_soak_wall_s(soak_wall_s)
         self.lifetime_s = _resolve_lifetime_s(
             explicit=lifetime_s,
             soak_wall_s=self.soak_wall_s,
             boot_offset_s=self.boot_offset_s,
             verdict_pull_margin_s=self.verdict_pull_margin_s,
+            post_wall_margin_s=self.post_wall_margin_s,
         )
         self.seed = int(seed)
         self.remote_run_dir = remote_run_dir or _default_remote_run_dir(self.node_name)

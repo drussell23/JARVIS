@@ -385,9 +385,12 @@ def test_lifetime_is_derived_from_soak_wall_plus_margins():
         dry_run=True, project="p", zone="z",
         soak_wall_s=1000, lifetime_s=None,
     )
-    assert ignition.lifetime_s == 1000 + ignition.boot_offset_s + ignition.verdict_pull_margin_s
+    assert ignition.lifetime_s == (
+        1000 + ignition.boot_offset_s + ignition.post_wall_margin_s
+        + ignition.verdict_pull_margin_s)
     assert ignition.lifetime_s >= (
-        ignition.soak_wall_s + ignition.boot_offset_s + ignition.verdict_pull_margin_s
+        ignition.soak_wall_s + ignition.boot_offset_s
+        + ignition.post_wall_margin_s + ignition.verdict_pull_margin_s
     )
 
 
@@ -480,16 +483,17 @@ def test_ignition_clamps_reported_regression_case(capsys):
     """End-to-end regression pin for the EXACT reported failure:
     `--soak-wall-s 2400 --lifetime-s 1800` used to yield lifetime_s=1800 <
     wall=2400 -- a $0-kill mid-verdict. It must now clamp lifetime_s up to
-    the floor (2400 + 180 + 180 = 2760) and the full ordering invariant
-    (soak_wall_s < monitor_stop < lifetime_s) must hold."""
+    the floor (2400 + boot 180 + post_wall 300 + verdict 180 = 3060) and the
+    full ordering invariant (soak_wall_s < monitor_stop < lifetime_s) must hold."""
     ignition = _make_ignition(
         dry_run=True, project="p", zone="z", soak_wall_s=2400, lifetime_s=1800,
         monitor_max_s=None,  # let monitor_max_s DERIVE from lifetime_s (fixture
         # default overrides it to a tiny test value otherwise, which would
         # trivially satisfy any ordering check).
     )
-    expected_floor = 2400 + ignition.boot_offset_s + ignition.verdict_pull_margin_s
-    assert expected_floor == 2760
+    expected_floor = (2400 + ignition.boot_offset_s
+                      + ignition.post_wall_margin_s + ignition.verdict_pull_margin_s)
+    assert expected_floor == 3060
     assert ignition.lifetime_s == expected_floor
     assert ignition.lifetime_s >= 2400  # never $0-killed before the soak wall
 
@@ -1109,11 +1113,13 @@ def test_reap_sync_wrapper_idempotent_and_never_raises():
 
 
 def test_plan_includes_absolute_lifetime_and_provision_env():
-    ignition = _make_ignition(dry_run=True, lifetime_s=2400, project="p", zone="z")
+    # Explicit lifetime ABOVE the coordination floor (soak_wall 1800 + boot 180 +
+    # post_wall 300 + verdict 180 = 2460) so it is honored as-is, not clamped up.
+    ignition = _make_ignition(dry_run=True, lifetime_s=3000, project="p", zone="z")
     plan = ignition.build_plan()
-    assert plan.lifetime_s == 2400
+    assert plan.lifetime_s == 3000
     assert plan.provision_env["JARVIS_BRAIN_VM_PERSISTENT"] == "true"
-    assert plan.provision_env["JARVIS_BRAIN_ABSOLUTE_LIFETIME_S"] == "2400"
+    assert plan.provision_env["JARVIS_BRAIN_ABSOLUTE_LIFETIME_S"] == "3000"
 
 
 # ===========================================================================
