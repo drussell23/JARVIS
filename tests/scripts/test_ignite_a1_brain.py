@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import importlib.util
 import io
 import json
@@ -248,6 +249,18 @@ def _real_hypervisor_loader():
 
 async def _exploding_provision_fn(*, node_name: str) -> Tuple[bool, str]:
     raise AssertionError("provision_fn was called -- --dry-run must never provision")
+
+
+def _extract_root_wrapped_payload(remote: str) -> str:
+    """Decode the base64 payload out of a `_wrap_as_root`-composed remote
+    command string (`printf %s <b64> | base64 -d | sudo bash`) -- used to
+    prove the ROOT-WRAPPED command actually carries the intended inner
+    script, not just that it LOOKS root-wrapped."""
+    prefix, suffix = "printf %s ", " | base64 -d | sudo bash"
+    assert remote.startswith(prefix), remote
+    assert remote.endswith(suffix), remote
+    encoded = remote[len(prefix): -len(suffix)]
+    return base64.b64decode(encoded.encode("ascii")).decode("utf-8")
 
 
 def _make_ignition(**overrides: Any):
@@ -516,9 +529,14 @@ def test_ssh_argv_built_by_reused_hypervisor_ssh_cmd():
     assert "--zone=us-central1-a" in argv
     assert "--tunnel-through-iap" in argv
     assert argv[-2] == "--command"
-    # The remote payload is the detached dispatch wrapper, which embeds the
-    # real isomorphic_a1_local.py invocation.
-    assert "isomorphic_a1_local.py" in argv[-1]
+    # Bug 3: the remote payload is now ROOT-WRAPPED (base64 | sudo bash) --
+    # decode it to confirm the real isomorphic_a1_local.py invocation (the
+    # detached dispatch wrapper) survives the round trip.
+    remote = argv[-1]
+    assert "sudo bash" in remote
+    assert "base64 -d" in remote
+    decoded = _extract_root_wrapped_payload(remote)
+    assert "isomorphic_a1_local.py" in decoded
 
 
 def test_ssh_exec_uses_ssh_cmd_and_injected_runner():
@@ -538,11 +556,274 @@ def test_ssh_exec_uses_ssh_cmd_and_injected_runner():
 
 
 # ===========================================================================
+# Bug 2 (live-fire): resolve_actual_zone must pick the RUNNING winner, not a
+# being-deleted loser -- and must PREFER the zone provision() parsed straight
+# out of the create-time detail string over re-listing at all.
+# ===========================================================================
+
+
+def test_status_rank_orders_running_before_stopping_and_terminated():
+    assert ignite._status_rank("RUNNING") < ignite._status_rank("STOPPING")
+    assert ignite._status_rank("RUNNING") < ignite._status_rank("TERMINATED")
+    assert ignite._status_rank("PROVISIONING") < ignite._status_rank("STOPPING")
+    # Unknown/missing status never raises and ranks in the middle (neither
+    # preferred over a confirmed RUNNING match nor penalized below a
+    # confirmed STOPPING/TERMINATED one).
+    assert ignite._status_rank(None) == ignite._status_rank("")
+    assert ignite._status_rank("RUNNING") < ignite._status_rank(None)
+    assert ignite._status_rank(None) < ignite._status_rank("TERMINATED")
+
+
+def test_parse_provision_zone_extracts_zone_from_create_instance_detail():
+    """gcp_compute_rest.GCPComputeRest._insert_in_zone's winner reports
+    "created:zone=<z>:mode=<m>" -- provision_brain forwards that detail
+    string verbatim as the (ok, detail) return."""
+    assert ignite._parse_provision_zone(
+        "created:zone=us-central1-b:mode=spot") == "us-central1-b"
+    assert ignite._parse_provision_zone(
+        "created:zone=us-east4-a:mode=on_demand") == "us-east4-a"
+    assert ignite._parse_provision_zone("ok") is None
+    assert ignite._parse_provision_zone("") is None
+    assert ignite._parse_provision_zone(None) is None  # fail-soft, never raises
+
+
+def test_resolve_actual_zone_prefers_provision_reported_zone_over_relisting():
+    """Bug 2 (primary source of truth): when provision() already parsed an
+    authoritative zone out of the create-time detail string,
+    resolve_actual_zone() must use it DIRECTLY -- list_instances_by_label is
+    never called at all."""
+    ignite._ACTIVE_IGNITIONS.clear()
+    rest = FakeComputeRest(instances=[
+        # A STOPPING same-named loser sitting in a DIFFERENT zone than the
+        # real winner -- proves the provision-zone path never even consults
+        # this list (a naive list-based resolver could still pick this).
+        {"name": "a1-brain-test", "zone": "projects/p/zones/us-central1-a", "status": "STOPPING"},
+    ])
+
+    async def _provision_fn(*, node_name: str) -> Tuple[bool, str]:
+        return True, "created:zone=us-central1-b:mode=spot"
+
+    ignition = _make_ignition(
+        compute_rest_factory=lambda: rest, zone="", provision_fn=_provision_fn)
+    asyncio.run(ignition.provision())
+
+    zone = asyncio.run(ignition.resolve_actual_zone())
+
+    assert zone == "us-central1-b"
+    assert ignition.zone == "us-central1-b"
+    assert rest.list_calls == 0  # never re-listed
+    ignite._ACTIVE_IGNITIONS.clear()
+
+
+def test_resolve_actual_zone_prefers_running_over_stopping_without_provision_zone():
+    """Bug 2 (fallback path): without a provision-reported zone, the exact
+    live-fire race -- a scatter-gather LOSER (STOPPING, mid-reap) in zone A
+    briefly coexists with the RUNNING winner in zone B -- must resolve to
+    the RUNNING zone, even though the STOPPING entry is listed FIRST (proves
+    rank-based selection, not first-match)."""
+    rest = FakeComputeRest(instances=[
+        {"name": "a1-brain-test", "zone": "projects/p/zones/us-central1-a", "status": "STOPPING"},
+        {"name": "a1-brain-test", "zone": "projects/p/zones/us-central1-b", "status": "RUNNING"},
+    ])
+    ignition = _make_ignition(compute_rest_factory=lambda: rest, zone="")
+    assert ignition._provision_zone is None  # exercises the list-fallback path
+
+    zone = asyncio.run(ignition.resolve_actual_zone())
+
+    assert zone == "us-central1-b"
+    assert ignition.zone == "us-central1-b"
+    assert rest.list_calls == 1
+
+
+def test_resolve_actual_zone_handles_missing_status_field_without_raising():
+    rest = FakeComputeRest(instances=[
+        {"name": "a1-brain-test", "zone": "projects/p/zones/us-central1-a"},  # no status key
+    ])
+    ignition = _make_ignition(compute_rest_factory=lambda: rest, zone="")
+
+    zone = asyncio.run(ignition.resolve_actual_zone())
+
+    assert zone == "us-central1-a"
+
+
+# ===========================================================================
+# Bug 3 (live-fire): remote commands must run as ROOT. /opt/trinity/jarvis is
+# ROOT-owned (golden-image bake; the boot-time git-pull runs as root) -- the
+# SSH OS-Login user can neither `git rev-parse` (dubious ownership) nor
+# `mkdir`/write under it. Every node-side command routes through
+# `_wrap_as_root` (base64 | sudo bash -- one clean layer of quoting).
+# ===========================================================================
+
+
+def test_wrap_as_root_round_trips_the_inner_command():
+    inner = "echo hello; mkdir -p /opt/trinity/jarvis/x && echo done"
+    wrapped = ignite._wrap_as_root(inner)
+
+    assert wrapped.startswith("printf %s ")
+    assert "sudo bash" in wrapped
+    assert "base64 -d" in wrapped
+    assert _extract_root_wrapped_payload(wrapped) == inner
+
+
+def test_wrap_as_root_handles_quotes_and_pipes_in_the_inner_command():
+    """The whole point of the base64 pattern is avoiding nested-quote hell --
+    prove a payload FULL of quotes/pipes/ampersands survives the round trip
+    byte-for-byte."""
+    inner = (
+        "mkdir -p '/opt/trinity/jarvis/a b' && nohup bash -c 'echo \"hi\" | cat' "
+        "> /tmp/x.log 2>&1 < /dev/null & disown; echo DISPATCH_STARTED"
+    )
+    wrapped = ignite._wrap_as_root(inner)
+    assert _extract_root_wrapped_payload(wrapped) == inner
+
+
+def test_compose_verify_head_command_adds_safe_directory_exception():
+    inner = ignite._compose_verify_head_command()
+    assert "safe.directory" in inner
+    assert "/opt/trinity/jarvis" in inner
+    assert "git -C /opt/trinity/jarvis rev-parse HEAD" in inner
+
+
+def test_verify_head_sends_root_wrapped_command():
+    runner = RecordingRunner(responses=[(0, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n")])
+    ignition = _make_ignition(project="p", zone="z", runner=runner)
+
+    sha = asyncio.run(ignition.verify_head())
+
+    assert sha == "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    assert len(runner.calls) == 1
+    argv, _timeout_s = runner.calls[0]
+    remote = argv[-1]
+    assert "sudo bash" in remote
+    decoded = _extract_root_wrapped_payload(remote)
+    assert "safe.directory" in decoded
+    assert "git -C /opt/trinity/jarvis rev-parse HEAD" in decoded
+
+
+def test_dispatch_sends_root_wrapped_command():
+    runner = RecordingRunner(responses=[(0, "DISPATCH_STARTED\n")])
+    ignition = _make_ignition(project="p", zone="z", runner=runner)
+
+    ok = asyncio.run(ignition.dispatch())
+
+    assert ok is True
+    assert len(runner.calls) == 1
+    argv, _timeout_s = runner.calls[0]
+    remote = argv[-1]
+    assert "sudo bash" in remote
+    decoded = _extract_root_wrapped_payload(remote)
+    assert "mkdir -p" in decoded
+    assert "isomorphic_a1_local.py" in decoded
+    assert "DISPATCH_STARTED" in decoded
+
+
+def test_monitor_poll_command_is_root_wrapped():
+    """The done-file/log-file live under the root-owned run dir -- the poll
+    command must ALSO run as root (the SSH user may lack read access)."""
+    runner = RecordingRunner(responses=[(0, "__IGNITE_DONE__\nDONE_RC=0\n")])
+    ignition = _make_ignition(project="p", zone="z", runner=runner,
+                              monitor_poll_s=0.01, monitor_max_s=5.0)
+
+    result = asyncio.run(ignition.monitor())
+
+    assert result["completed"] is True
+    assert len(runner.calls) == 1
+    argv, _timeout_s = runner.calls[0]
+    remote = argv[-1]
+    assert "sudo bash" in remote
+    decoded = _extract_root_wrapped_payload(remote)
+    assert "ignite_dispatch.done" in decoded
+
+
+def test_discover_verdict_path_is_root_wrapped():
+    runner = RecordingRunner(responses=[
+        (0, "/opt/trinity/jarvis/a1_iso_runs/a1-brain-test/run1/a1_verdict.json\n"),
+    ])
+    ignition = _make_ignition(project="p", zone="z", runner=runner)
+
+    path = ignition._discover_verdict_path()
+
+    assert path == "/opt/trinity/jarvis/a1_iso_runs/a1-brain-test/run1/a1_verdict.json"
+    argv, _timeout_s = runner.calls[0]
+    remote = argv[-1]
+    assert "sudo bash" in remote
+    decoded = _extract_root_wrapped_payload(remote)
+    assert "find" in decoded
+    assert "a1_verdict.json" in decoded
+
+
+def test_fetch_verdict_json_is_root_wrapped():
+    verdict = {"proven": True, "criteria": {}}
+    runner = RecordingRunner(responses=[(0, json.dumps(verdict))])
+    ignition = _make_ignition(project="p", zone="z", runner=runner)
+
+    result = ignition._fetch_verdict_json("/opt/trinity/jarvis/x/a1_verdict.json")
+
+    assert result == verdict
+    argv, _timeout_s = runner.calls[0]
+    remote = argv[-1]
+    assert "sudo bash" in remote
+    decoded = _extract_root_wrapped_payload(remote)
+    assert decoded == "cat /opt/trinity/jarvis/x/a1_verdict.json"
+
+
+def test_dry_run_plan_shows_root_wrapped_commands_and_all_zone_sweep(capsys):
+    """--dry-run must show the ROOT-WRAPPED commands (Bug 3) and confirm the
+    all-zone teardown sweep (Bug 1) -- both fixes must be legible in the plan
+    preview, not just in the live-path code."""
+    ignition = _make_ignition(dry_run=True, project="demo-project", zone="us-central1-a")
+    plan = ignition.build_plan()
+    ignition.print_plan(plan)
+    out = capsys.readouterr().out
+
+    assert "root-wrapped" in out.lower()
+    assert "sudo bash" in out
+    assert "base64 -d" in out
+    assert "ALL-ZONE SWEEP" in out
+    assert "us-central1-a" in out  # the pre-create zone leads the printed chain
+
+    # The plan dataclass itself carries the root-wrapped forms + zone list.
+    assert plan.verify_head_cmd.startswith("printf %s ")
+    assert _extract_root_wrapped_payload(plan.verify_head_cmd) == (
+        ignite._compose_verify_head_command())
+    assert plan.dispatch_wrapper_root_cmd.startswith("printf %s ")
+    assert plan.teardown_zones  # non-empty
+    assert plan.teardown_zones[0] == "us-central1-a"
+
+
+def test_dry_run_still_zero_side_effect_with_root_wrapped_commands(capsys):
+    """Re-confirms the --dry-run zero-side-effect guarantee holds after the
+    Bug 3 root-wrapping rewrite (no SSH/subprocess call is ever made on the
+    dry-run path -- only the plan STRING preview changed)."""
+    exploding_rest = ExplodingComputeRest()
+    runner = RecordingRunner()
+
+    ignition = _make_ignition(
+        dry_run=True, project="demo-project", zone="us-central1-a",
+        compute_rest_factory=lambda: exploding_rest,
+        provision_fn=_exploding_provision_fn,
+        runner=runner,
+    )
+
+    rc = asyncio.run(ignition.run())
+
+    assert rc == 0
+    assert runner.calls == []
+    out = capsys.readouterr().out
+    assert "DRY RUN: zero network" in out
+
+
+# ===========================================================================
 # 4. Teardown targets the resolved node + zone.
 # ===========================================================================
 
 
-def test_teardown_deletes_resolved_node_and_zone():
+def test_teardown_deletes_resolved_node_and_zone(monkeypatch):
+    """Bug 1 (live-fire): teardown's explicit layer-1 delete sweeps EVERY zone
+    in the candidate chain -- not just the one zone resolve_actual_zone()
+    picked. Constrain the chain to a small deterministic pair via the env
+    override so the assertion doesn't depend on the full default matrix."""
+    monkeypatch.setenv("JARVIS_GCP_ZONE_FALLBACK", "us-east1-b,us-central1-a")
     rest = FakeComputeRest(instances=[{"name": "a1-brain-test", "zone": "projects/p/zones/us-east1-b"}])
     ignition = _make_ignition(compute_rest_factory=lambda: rest, zone="")
 
@@ -552,39 +833,145 @@ def test_teardown_deletes_resolved_node_and_zone():
     result = asyncio.run(ignition.teardown())
 
     assert result["deleted"] is True
-    assert rest.delete_calls == [("a1-brain-test", "us-east1-b")]
+    # Every zone in the (constrained) chain was attempted, in order.
+    assert rest.delete_calls == [
+        ("a1-brain-test", "us-east1-b"),
+        ("a1-brain-test", "us-central1-a"),
+    ]
+    assert result["zero_cost"] is True
 
 
-def test_teardown_reissues_delete_on_zone_mismatch():
-    """MINOR #4: when the all-zone label-based verify list detects the node
-    LEAKED in a DIFFERENT zone than the one the explicit delete targeted
-    (zone mismatch), teardown() must RE-ISSUE delete_instance with the
-    discovered zone rather than just logging LEAK."""
+def test_teardown_reissues_delete_on_zone_mismatch(monkeypatch):
+    """MINOR #4 (retained under Bug 1): when the all-zone label-based verify
+    list detects the node LEAKED in a zone OUTSIDE the swept candidate chain
+    (zone mismatch/drift), teardown() must RE-ISSUE delete_instance with the
+    discovered zone rather than just logging LEAK -- the $0-verify is the
+    final backstop for a zone the chain sweep didn't cover."""
+    monkeypatch.setenv("JARVIS_GCP_ZONE_FALLBACK", "us-central1-a,us-central1-b")
     rest = FakeComputeRest(
         instances=[{"name": "a1-brain-test", "zone": "projects/p/zones/us-east1-b"}])
     ignition = _make_ignition(compute_rest_factory=lambda: rest, zone="us-central1-a")
 
     result = asyncio.run(ignition.teardown())
 
-    # First call: the explicit delete, targeting the (wrong) pre-set zone.
+    # The chain sweep tried both configured zones -- neither matches the
+    # instance's real zone (us-east1-b), so both come back not_found.
     assert rest.delete_calls[0] == ("a1-brain-test", "us-central1-a")
-    # Second call: the zone-mismatch re-delete, targeting the zone DISCOVERED
-    # from the verify list.
+    assert rest.delete_calls[1] == ("a1-brain-test", "us-central1-b")
+    # The $0-verify then discovers the real zone and RE-ISSUES the delete.
     assert rest.delete_calls[-1] == ("a1-brain-test", "us-east1-b")
-    assert len(rest.delete_calls) == 2
+    assert len(rest.delete_calls) == 3
     # Re-delete succeeded (FakeComputeRest always returns ok=True) -> no leak.
     assert result["zero_cost"] is True
 
 
-def test_teardown_no_reissue_when_verify_list_clean():
-    """No leaked instance in the verify list -> no re-delete is issued."""
+def test_teardown_no_reissue_when_verify_list_clean(monkeypatch):
+    """No leaked instance in the verify list -> no re-delete is issued (but
+    the full constrained chain is still swept)."""
+    monkeypatch.setenv("JARVIS_GCP_ZONE_FALLBACK", "us-central1-a,us-central1-b")
     rest = FakeComputeRest(instances=[])
     ignition = _make_ignition(compute_rest_factory=lambda: rest, zone="us-central1-a")
 
     result = asyncio.run(ignition.teardown())
 
-    assert len(rest.delete_calls) == 1  # only the explicit delete
+    assert len(rest.delete_calls) == 2  # the full (constrained) chain sweep
     assert result["zero_cost"] is True
+
+
+# ===========================================================================
+# Bug 1 (live-fire, MONEY-CRITICAL): teardown + the signal-path reaper must
+# both sweep EVERY zone in the candidate chain, unconditionally, idempotent +
+# never-raising -- proven directly against `_reap_ignitions_async` /
+# `_reap_ignitions` (the sync wrapper the SIGINT/SIGTERM handler drains) and
+# against `A1BrainIgnition.teardown()`'s explicit layer-1 sweep.
+# ===========================================================================
+
+
+def test_teardown_sweeps_full_candidate_zone_chain_before_any_match(monkeypatch):
+    """Even when NOTHING matches in ANY swept zone, every zone in the chain
+    is still attempted (idempotent 404s) -- the sweep never short-circuits
+    early just because earlier zones came back not-found."""
+    monkeypatch.setenv(
+        "JARVIS_GCP_ZONE_FALLBACK", "us-central1-a,us-central1-b,us-central1-c")
+    rest = FakeComputeRest(instances=[])
+    ignition = _make_ignition(compute_rest_factory=lambda: rest, zone="us-central1-a")
+
+    result = asyncio.run(ignition.teardown())
+
+    assert rest.delete_calls == [
+        ("a1-brain-test", "us-central1-a"),
+        ("a1-brain-test", "us-central1-b"),
+        ("a1-brain-test", "us-central1-c"),
+    ]
+    assert result["deleted"] is False  # nothing actually matched anywhere
+    assert result["zero_cost"] is True  # but the $0-verify still confirms clean
+
+
+def test_reap_ignitions_sweeps_full_zone_chain_for_registered_node():
+    """`_register_ignition` now takes the FULL candidate chain (as
+    `provision()` computes it up front) -- draining the registry must issue
+    `delete_instance` for the node across EVERY zone in that chain."""
+    ignite._ACTIVE_IGNITIONS.clear()
+    rest = FakeComputeRest()
+    chain = ["us-central1-b", "us-central1-a", "us-central1-c", "us-central1-f"]
+    ignite._register_ignition(node="a1-brain-chain-test", zones=chain,
+                              compute_rest_factory=lambda: rest)
+
+    asyncio.run(ignite._reap_ignitions_async())
+
+    assert ignite._ACTIVE_IGNITIONS == []
+    assert rest.delete_calls == [("a1-brain-chain-test", z) for z in chain]
+
+
+def test_reap_ignitions_never_raises_when_one_zone_explodes():
+    """A single zone's delete_instance raising must NOT abort the sweep of
+    the remaining zones in the chain -- proves the per-zone try/except."""
+    ignite._ACTIVE_IGNITIONS.clear()
+
+    class HalfBoomComputeRest:
+        def __init__(self) -> None:
+            self.delete_calls: List[Tuple[str, Optional[str]]] = []
+
+        async def delete_instance(self, name: Optional[str] = None, *, zone: Optional[str] = None):
+            self.delete_calls.append((name or "", zone))
+            if zone == "us-central1-b":
+                raise RuntimeError("simulated GCP failure in this zone only")
+            return (True, "deleted:404")
+
+    rest = HalfBoomComputeRest()
+    chain = ["us-central1-a", "us-central1-b", "us-central1-c"]
+    ignite._register_ignition(node="a1-brain-half-boom", zones=chain,
+                              compute_rest_factory=lambda: rest)
+
+    asyncio.run(ignite._reap_ignitions_async())
+
+    assert ignite._ACTIVE_IGNITIONS == []
+    # ALL three zones were attempted despite the middle one raising.
+    assert rest.delete_calls == [
+        ("a1-brain-half-boom", "us-central1-a"),
+        ("a1-brain-half-boom", "us-central1-b"),
+        ("a1-brain-half-boom", "us-central1-c"),
+    ]
+
+
+def test_signal_path_sync_reaper_sweeps_full_zone_chain():
+    """The SYNC reaper (`_reap_ignitions`) is what the SIGINT/SIGTERM
+    `_handler` and `atexit` actually drain -- this is the exact live-fire
+    regression: the signal path must ALSO sweep every zone in the chain, not
+    just whichever single zone resolve_actual_zone() happened to pick."""
+    ignite._ACTIVE_IGNITIONS.clear()
+    rest = FakeComputeRest()
+    chain = ["us-central1-b", "us-central1-a"]
+    ignite._register_ignition(node="a1-brain-signal-test", zones=chain,
+                              compute_rest_factory=lambda: rest)
+
+    ignite._reap_ignitions()  # the sync path the signal handler calls
+
+    assert ignite._ACTIVE_IGNITIONS == []
+    assert rest.delete_calls == [
+        ("a1-brain-signal-test", "us-central1-b"),
+        ("a1-brain-signal-test", "us-central1-a"),
+    ]
 
 
 def test_teardown_argv_preview_targets_node_and_zone():
@@ -633,46 +1020,57 @@ def test_provision_env_carries_persistent_and_lifetime(monkeypatch):
     assert os.environ.get("JARVIS_BRAIN_ABSOLUTE_LIFETIME_S") is None
 
 
-def test_provision_registers_node_up_front_for_teardown():
+def test_provision_registers_node_up_front_for_teardown(monkeypatch):
+    """Bug 1: provision() registers with the FULL candidate zone chain, not a
+    single zone -- proven by constraining the chain via env override and
+    checking the registered entry's `zones` list matches it exactly."""
+    monkeypatch.setenv("JARVIS_GCP_ZONE_FALLBACK", "us-central1-b,us-central1-a")
     ignite._ACTIVE_IGNITIONS.clear()
 
     async def _ok_provision_fn(*, node_name: str) -> Tuple[bool, str]:
-        # Assert the registration already happened BEFORE the "create" call.
-        assert any(e["node"] == node_name for e in ignite._ACTIVE_IGNITIONS)
-        return True, "ok"
+        # Assert the registration already happened BEFORE the "create" call,
+        # and that it carries the FULL chain (not a single zone).
+        entry = next((e for e in ignite._ACTIVE_IGNITIONS if e["node"] == node_name), None)
+        assert entry is not None
+        assert entry["zones"] == ["us-central1-b", "us-central1-a"]
+        return True, "created:zone=us-central1-b:mode=spot"
 
     ignition = _make_ignition(node_name="a1-brain-upfront", provision_fn=_ok_provision_fn)
     ok, _ = asyncio.run(ignition.provision())
     assert ok is True
-    assert any(e["node"] == "a1-brain-upfront" for e in ignite._ACTIVE_IGNITIONS)
+    entry = next(e for e in ignite._ACTIVE_IGNITIONS if e["node"] == "a1-brain-upfront")
+    assert entry["zones"] == ["us-central1-b", "us-central1-a"]
     ignite._ACTIVE_IGNITIONS.clear()
 
 
 # ===========================================================================
-# 6. Reaper registry: idempotent + never raises when drained twice.
+# 6. Reaper registry: idempotent + never raises when drained twice. Bug 1:
+#    registration now carries the FULL candidate zone chain (`zones=[...]`),
+#    and draining sweeps EVERY zone for each registered node.
 # ===========================================================================
 
 
 def test_reap_registry_idempotent_and_never_raises():
     ignite._ACTIVE_IGNITIONS.clear()
     rest = FakeComputeRest()
-    ignite._register_ignition(node="a1-brain-reap-1", zone="us-central1-a",
+    ignite._register_ignition(node="a1-brain-reap-1", zones=["us-central1-a", "us-central1-b"],
                               compute_rest_factory=lambda: rest)
-    ignite._register_ignition(node="a1-brain-reap-2", zone=None,
+    ignite._register_ignition(node="a1-brain-reap-2", zones=[None],
                               compute_rest_factory=lambda: rest)
     assert len(ignite._ACTIVE_IGNITIONS) == 2
 
     asyncio.run(ignite._reap_ignitions_async())
     assert ignite._ACTIVE_IGNITIONS == []
-    assert sorted(rest.delete_calls) == [
+    assert sorted(rest.delete_calls) == sorted([
         ("a1-brain-reap-1", "us-central1-a"),
+        ("a1-brain-reap-1", "us-central1-b"),
         ("a1-brain-reap-2", None),
-    ]
+    ])
 
     # Second drain: registry already empty -- must be a silent no-op, no raise.
     asyncio.run(ignite._reap_ignitions_async())
     assert ignite._ACTIVE_IGNITIONS == []
-    assert len(rest.delete_calls) == 2  # unchanged -- nothing re-deleted
+    assert len(rest.delete_calls) == 3  # unchanged -- nothing re-deleted
 
 
 def test_reap_registry_never_raises_on_deleter_exception():
@@ -682,10 +1080,10 @@ def test_reap_registry_never_raises_on_deleter_exception():
         async def delete_instance(self, name: Optional[str] = None, *, zone: Optional[str] = None):
             raise RuntimeError("simulated GCP failure")
 
-    ignite._register_ignition(node="a1-brain-boom", zone=None,
+    ignite._register_ignition(node="a1-brain-boom", zones=[None, "us-central1-a"],
                               compute_rest_factory=lambda: BoomComputeRest())
 
-    # Must not raise, despite the deleter blowing up.
+    # Must not raise, despite the deleter blowing up on EVERY zone.
     asyncio.run(ignite._reap_ignitions_async())
     assert ignite._ACTIVE_IGNITIONS == []
 
@@ -693,7 +1091,7 @@ def test_reap_registry_never_raises_on_deleter_exception():
 def test_reap_sync_wrapper_idempotent_and_never_raises():
     ignite._ACTIVE_IGNITIONS.clear()
     rest = FakeComputeRest()
-    ignite._register_ignition(node="a1-brain-sync-reap", zone="us-central1-a",
+    ignite._register_ignition(node="a1-brain-sync-reap", zones=["us-central1-a"],
                               compute_rest_factory=lambda: rest)
 
     ignite._reap_ignitions()  # drains via the sync path (no running loop here)
@@ -807,8 +1205,14 @@ def test_retrieve_verdict_ssh_fallback_disabled_by_env(tmp_path, monkeypatch):
 
     assert result["verdict"] is None
     assert result["verdict_source"] == "none"
-    # No SSH calls at all -- the fallback path was never entered.
-    assert runner.calls == []
+    # The SSH VERDICT FALLBACK was never entered -- no a1_verdict.json find/cat
+    # over SSH (mandate 3: authoritative retrieval is IapBlackBoxTransport-only,
+    # and the fallback is disabled). A diagnostic ignite_dispatch.log tail on the
+    # UNAVAILABLE branch is NOT verdict retrieval and is permitted.
+    assert not any(
+        "a1_verdict.json" in " ".join(str(a) for a in call[0])
+        for call in runner.calls), (
+        "the SSH verdict fallback must not run when disabled: %r" % (runner.calls,))
 
 
 def test_retrieve_verdict_bundle_without_verdict_member_falls_back(tmp_path, monkeypatch):
