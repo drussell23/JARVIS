@@ -2901,6 +2901,36 @@ class DoublewordProvider:
         if not _slice36_force_batch and self._s189_storm_forces_batch(context):
             _slice36_force_batch = True
 
+        # A1-DIAG: dispatch-level topology diagnostic (env-gated, preemption-proof).
+        # Captures the RT vs batch branch decision BEFORE it executes, so a SPOT
+        # preemption cannot lose the decisive H3a/H3b/H3c signal. Writes to stderr
+        # with immediate flush — the monitor's SSH stream captures it in real time.
+        if os.environ.get("JARVIS_A1_DIAG_TOOL_SEAM", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            _diag_dispatch_path = (
+                "BATCH(force)" if _slice36_force_batch
+                else "RT" if self._realtime_enabled
+                else "BATCH(rt_disabled)"
+            )
+            _diag_msg = (
+                "[A1-DIAG-DISPATCH] op=%s route=%s complexity=%s "
+                "force_batch=%s rt_enabled=%s tool_loop_present=%s "
+                "dispatch_path=%s repair_context=%s"
+                % (
+                    (getattr(context, "op_id", "?") or "?")[:24],
+                    getattr(context, "provider_route", "?"),
+                    getattr(context, "task_complexity", "?"),
+                    _slice36_force_batch, self._realtime_enabled,
+                    self._tool_loop is not None,
+                    _diag_dispatch_path,
+                    repair_context is not None,
+                )
+            )
+            logger.warning(_diag_msg)
+            import sys as _diag_sys
+            print(_diag_msg, file=_diag_sys.stderr, flush=True)
+
         # Real-time mode: /v1/chat/completions with SSE streaming + Venom tool loop
         # On 429/503, fall back to batch within DW (stay cheap) instead of
         # cascading to the 150x more expensive Claude fallback.
@@ -3575,19 +3605,24 @@ class DoublewordProvider:
         if os.environ.get("JARVIS_A1_DIAG_TOOL_SEAM", "").strip().lower() in (
             "1", "true", "yes", "on",
         ):
-            logger.warning(
+            _diag_rt_msg = (
                 "[A1-DIAG-TOOL-SEAM] op=%s route=%s complexity=%s "
                 "is_read_only=%s _will_skip_tools=%s _tools_available=%s "
                 "tool_loop_present=%s _s226_gate_demands=%s "
-                "native_tool_forcing=%s",
-                (getattr(context, "op_id", "?") or "?")[:24],
-                _route, _complexity,
-                getattr(context, "is_read_only", "?"),
-                _will_skip_tools, _tools_available,
-                self._tool_loop is not None,
-                _s226_gate_demands(str(_complexity)),
-                _dw_native_tool_forcing_enabled(),
+                "native_tool_forcing=%s"
+                % (
+                    (getattr(context, "op_id", "?") or "?")[:24],
+                    _route, _complexity,
+                    getattr(context, "is_read_only", "?"),
+                    _will_skip_tools, _tools_available,
+                    self._tool_loop is not None,
+                    _s226_gate_demands(str(_complexity)),
+                    _dw_native_tool_forcing_enabled(),
+                )
             )
+            logger.warning(_diag_rt_msg)
+            import sys as _diag_sys
+            print(_diag_rt_msg, file=_diag_sys.stderr, flush=True)
         _preloaded_files: List[str] = []
         # DW prompt caching (Slice-131 split): when the master flag is on, divert
         # the STABLE tool catalog + output schema into this sink so ONLY they are
