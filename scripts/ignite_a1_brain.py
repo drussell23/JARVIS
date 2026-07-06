@@ -439,24 +439,39 @@ def _compose_remote_command(
 
 
 def _compose_dispatch_wrapper(remote_cmd: str, remote_run_dir: str) -> str:
-    """Wrap the remote command in a detached (nohup + disown) shell so the SSH
-    session returns immediately while the soak keeps running on the node. A
-    done-file (with the child's exit code) is the completion signal `monitor()`
-    polls for -- so verdict retrieval binds to ACTUAL completion, not a guessed
-    ceiling."""
+    """Launch the soak as a transient systemd unit (`systemd-run`) so the SSH
+    session returns IMMEDIATELY while the soak runs independently on the node.
+
+    Root cause this fixes (live-fire, probed directly): over
+    `gcloud compute ssh --tunnel-through-iap`, `nohup <cmd> & disown` does NOT
+    release the SSH channel -- the session blocks until the backgrounded process
+    exits (dispatch 60/120s timeout on the fresh image). `systemd-run` returns
+    in ~3s ("Running as unit: ...") because the unit runs in its OWN
+    cgroup/session, fully severed from the SSH channel. `--collect` reaps the
+    unit after it exits; the unit's stdout/stderr append to the dispatch log
+    (which monitor()/retrieve pull); the inner writes the done-file (with the
+    child's exit code) that monitor() polls for ACTUAL completion.
+
+    This whole wrapper is root-wrapped by `dispatch()` via `_wrap_as_root`
+    (base64 | sudo bash), so `systemd-run`/`systemctl` run as root."""
     done_file = remote_run_dir.rstrip("/") + "/ignite_dispatch.done"
     log_file = remote_run_dir.rstrip("/") + "/ignite_dispatch.log"
+    # Deterministic, valid, unique unit name from the run dir basename.
+    unit = "a1soak-" + os.path.basename(remote_run_dir.rstrip("/"))
     inner = "%s; echo DONE_RC=$? > %s" % (remote_cmd, shlex.quote(done_file))
-    # `setsid` starts the soak in a NEW session (fully severed from the SSH
-    # session's process group + controlling terminal), so `sudo bash` returns
-    # immediately and the dispatch SSH command cannot hang on an inherited fd
-    # held open by pip/pytest subprocesses (run8/9: nohup+disown alone left the
-    # SSH channel open -> 60s dispatch timeout). All fds are redirected
-    # (>log 2>&1 </dev/null) and it is backgrounded (&) + disowned.
     return (
-        "mkdir -p %s && setsid nohup bash -c %s > %s 2>&1 < /dev/null & disown; "
-        "echo DISPATCH_STARTED"
-        % (shlex.quote(remote_run_dir), shlex.quote(inner), shlex.quote(log_file))
+        "mkdir -p %s && "
+        "systemd-run --unit=%s --collect "
+        "--property=StandardOutput=append:%s "
+        "--property=StandardError=append:%s "
+        "/bin/bash -c %s; echo DISPATCH_STARTED"
+        % (
+            shlex.quote(remote_run_dir),
+            shlex.quote(unit),
+            shlex.quote(log_file),
+            shlex.quote(log_file),
+            shlex.quote(inner),
+        )
     )
 
 
@@ -857,6 +872,24 @@ class A1BrainIgnition:
         _log("[IgniteA1Brain] WARN SSH-over-IAP not ready within %.0fs budget"
              % (budget_s,))
         return False
+
+    async def _quiesce_production_service(self) -> None:
+        """Stop the baked ``jarvis-brain.service`` (production warm-standby
+        organism) BEFORE the A1 drill. On the full-clone image its Oracle
+        cold-index over the whole repo loads the node enough to starve the
+        dispatch SSH (`sudo bash` could not return in 60s on the fresh image;
+        the shallow image indexed fewer files). The A1 drill runs its OWN
+        isomorphic soak and must not compete with the production organism.
+        Root-wrapped (via _ssh_exec) + fail-soft: a node without the unit still
+        proceeds. Env-gated JARVIS_A1_BRAIN_QUIESCE_SERVICE (default on)."""
+        if not _truthy(os.environ.get("JARVIS_A1_BRAIN_QUIESCE_SERVICE", "1")):
+            return
+        rc, _out = await self._ssh_exec_async(
+            "systemctl stop jarvis-brain.service 2>/dev/null || true; "
+            "systemctl stop jarvis-brain-idle.timer 2>/dev/null || true",
+            timeout_s=60.0)
+        _log("[IgniteA1Brain] quiesced production jarvis-brain.service "
+             "(rc=%d) so the A1 soak has the node to itself" % (rc,))
 
     # -- plan (pure, dry-run-safe) --------------------------------------------
 
@@ -1465,6 +1498,7 @@ class A1BrainIgnition:
                 _log("ABORT: node SSH-over-IAP not reachable within budget "
                      "(teardown will $0 the node)")
                 return 1
+            await self._quiesce_production_service()
             await self.verify_head()
             dispatched = await self.dispatch()
             if not dispatched:
