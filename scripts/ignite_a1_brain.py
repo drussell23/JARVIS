@@ -134,6 +134,17 @@ _REMOTE_PYTHON = os.environ.get(
 # Piece C / B config baked into the remote command (facts-file authoritative values).
 _DEFAULT_CHAOS_TARGET_DIRS = "backend/core/ouroboros/a1_ignition_vector"
 _DEFAULT_OUTBOUND_TOPICS = "actuation.*,telemetry.posture.*,autonomy.*"
+# The O+V production-soak boot HARD-GATES on a provider key (ouroboros_battle_
+# test.py: exits 1 if neither DOUBLEWORD_API_KEY nor ANTHROPIC_API_KEY is set).
+# The A1 drill runs against the SYNTHETIC ADVERSARY (which owns DOUBLEWORD_BASE_
+# URL), so a synthetic key satisfies the gate while the adversary stubs every
+# request. Locally the gate passes only because a dev shell already exports a
+# key; the GCP node's env has none -> the organism died rc=1 (live-fire
+# a1-brain-20260705-194856). Setting it in the dispatch env makes the drill
+# self-contained on the immutable node WITHOUT a re-bake (the durable twin is
+# synthetic_adversary._build_env_overrides, which now also emits this key).
+_SYNTHETIC_DW_API_KEY = os.environ.get(
+    "JARVIS_ADVERSARY_SYNTHETIC_API_KEY", "synthetic-adversary-dw-key")
 
 # The node-side Black Box bundler's default staging dir (matches a1_black_box.py /
 # a1_live_fire_chaos_harness.py's JARVIS_A1_BLACKBOX_NODE_OUT default).
@@ -420,6 +431,7 @@ def _compose_remote_command(
         "%s"
         "JARVIS_CHAOS_TARGET_DIRS=%s "
         "JARVIS_BRAIN_OUTBOUND_TOPICS=%s "
+        "DOUBLEWORD_API_KEY=%s "
         "OUROBOROS_BATTLE_HEADLESS=1 "
         "OUROBOROS_BATTLE_MAX_WALL_SECONDS=%d "
         "%s scripts/isomorphic_a1_local.py --mode process --run-root %s "
@@ -429,6 +441,7 @@ def _compose_remote_command(
             pip_sync,
             _DEFAULT_CHAOS_TARGET_DIRS,
             _DEFAULT_OUTBOUND_TOPICS,
+            _SYNTHETIC_DW_API_KEY,
             int(soak_wall_s),
             _REMOTE_PYTHON,
             remote_run_dir,
