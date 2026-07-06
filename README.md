@@ -19,14 +19,14 @@ A solo-built system. Every figure is `git`-tracked and reproducible (`git ls-fil
 | Metric | Value |
 |---|---|
 | **Total lines (tracked)** | **~4.29M** (3.19M Python) |
-| **Ouroboros + Venom (O+V)** — autonomous self-development engine | **~1.45M lines** |
-| &nbsp;&nbsp;↳ O+V breakdown | 734K engine · 646K test spine · 64K scripts & docs |
-| Python files | 5,961 |
+| **Ouroboros + Venom (O+V)** — autonomous self-development engine | **~1.61M lines** |
+| &nbsp;&nbsp;↳ O+V breakdown | 928K engine · 682K test spine · ~10K scripts & docs |
+| Python files | 6,593 |
 | Languages | Python · Swift · TypeScript · Rust · Shell |
-| Commits | **8,352 — ~99.8% solo-authored** |
-| Cadence | ~27 commits/day, Aug 2025 → present (~10 months) |
+| Commits | **9,231 — ~99.8% solo-authored** |
+| Cadence | ~28 commits/day, Aug 2025 → present (~11 months) |
 
-> O+V is roughly **half engine, half proof** — the 646K-line test spine exists to keep a self-modifying system honest.
+> O+V is roughly **half engine, half proof** — the 682K-line test spine exists to keep a self-modifying system honest.
 
 ---
 
@@ -269,7 +269,7 @@ The self-developing code pipeline — the organism's immune system and neuroplas
 
 **Status (2026-04-15):** The governed complex-route arc has closed end-to-end. Session `bt-2026-04-15-175547` (Session O of the April 14-15 Sessions A–O battle-test arc) produced the first autonomously-generated Python file to land on disk through the full enforcement pipeline: `tests/governance/intake/sensors/test_test_failure_sensor_dedup.py` (4,986 bytes), written by the ChangeEngine after the `ExplorationLedger` scored the retry at `would_pass=True (score=11.00, 4 categories)`, `GATE can_write=True`, approval auto-approved via headless bypass, `ChangeEngine.RollbackArtifact.capture()` handled the new-file creation path, VERIFY found test critiques, L2 Repair converged on iteration 1/5, and `DECISION outcome=applied reason_code=safe_auto_passed` with a clean `POSTMORTEM root_cause=none`. Full 15-session arc postmortem with quoted terminal logs is in [`docs/architecture/OUROBOROS.md`](docs/architecture/OUROBOROS.md#battle-test-breakthrough-log). The eight distinct failure modes surfaced during the arc (TTY-less approval crash, risk-engine `too_many_files` escalation, L3 `READ_ONLY_PLANNING` mode switch from ambient probe failures, new-file `RollbackArtifact.capture()` ENOENT, 900s pool ceiling, 180s fallback cap on 5-tool-round retries, intake WAL cross-session coalescing, and the one-file-of-four multi-file fan-out gap) are each documented in the breakthrough log with their fix commits and env overrides. The end-to-end enforcement loop is now empirically validated; multi-file coordinated APPLY fan-out is the next product item.
 
-**10-Phase Pipeline:**
+**11-Phase Pipeline:**
 
 | Phase | Component | Function |
 |---|---|---|
@@ -535,37 +535,21 @@ The primary interface is voice. Derek talks to JARVIS and JARVIS talks back — 
 2. **Slow/Fast Thinking Router** (SIADAFIX) — simple fixes get 0.5x tokens, complex get 2x + force Tier 0.
 3. **Documentation-Augmented Repair** (RepoRepair) — auto-generate docs via AST FIRST, use as repair context.
 
-### Battle Test Interfaces (LiveDashboard + SerpentFlow)
+### Battle Test Interfaces (SerpentFlow + 6 Graduated Subsystems)
 
-**`backend/core/ouroboros/battle_test/live_dashboard.py`** (1,233 lines) + **`serpent_flow.py`** (1,900+ lines)
+**`backend/core/ouroboros/battle_test/`** — 52 files, the TUI/CLI rendering surface.
 
-Two complementary terminal interfaces for watching Ouroboros operate autonomously:
+| Subsystem | Key Files | Lines | Graduated | Master Switch |
+|-----------|-----------|-------|-----------|---------------|
+| **SerpentFlow** | `serpent_flow.py` (355KB) | CC-style flowing CLI REPL with `Update(path)` blocks, numbered diffs, prompt_toolkit | Shipped | — |
+| **Presentation Restraint** | `presentation_restraint.py`, `repl_completion.py`, `repl_input_polish.py` | CC-style aesthetic, auto-discovered slash palette (27 verbs), FileHistory, @filepath mentions, Esc-to-cancel | 2026-05-04 | `JARVIS_PRESENTATION_RESTRAINT_ENABLED` |
+| **NarrativeChannel** | `narrative_channel.py`, `narrative_renderer.py` | 6-kind `NarrativeKind` taxonomy, `n-N` refs, intent 💭 + preamble 🗣 surfaces | 2026-05-04 | `JARVIS_NARRATIVE_INTENT_ENABLED` |
+| **ToolRenderRegistry** | `tool_render_registry.py`, `tool_render_policy.py`, `tool_render_view.py`, `tool_render_store.py` | Descriptor-driven adaptive rendering, `BoundedBodyStore` ring with `t-N` refs | 2026-05-04 | `JARVIS_TOOL_RENDER_REGISTRY_ENABLED` |
+| **Live Status + Op Collapse** | `live_status_line.py`, `op_block_buffer.py` | Persistent `PromptSession(bottom_toolbar=...)` status, `OpBlockBuffer` FIFO ring with `o-N` refs | 2026-05-04 | `JARVIS_LIVE_STATUS_LINE_ENABLED` |
+| **IDE ReviewBranch** | `diff_archive.py` + `governance/review_branch_manager.py`, `review_coordinator.py` | Non-destructive git preview branches (`hash-object`+`commit-tree`+`branch`), `d-N` refs, 300s auto-REJECT | 2026-05-04 | `JARVIS_REVIEW_BRANCH_ENABLED` |
+| **Stream Renderer** | `stream_renderer.py`, `ouroboros_tui.py`, `split_layout.py`, `layout_controller.py` | Rich `Live + Markdown` 16ms batched updates, 3-region Layout, flow/split/focus FSM | Shipped | — |
 
-- **LiveDashboard** -- Persistent in-place updating Rich TUI. Best for monitoring multiple operations in a fixed table layout. Uses `Live` + `Layout` + `Table` + `Panel`.
-- **SerpentFlow** -- Flowing Claude Code-style CLI. Best for detailed per-operation visibility with CC-style `Update(path)` blocks, numbered context diffs, and per-op reasoning. Uses `prompt_toolkit` + Rich `Console` with an interactive REPL. The default interface for the battle test runner.
-
-Both interfaces receive the same CommProtocol messages via their respective transports (`DashboardTransport` and `SerpentTransport`).
-
-The LiveDashboard renders an in-place updating table showing every pipeline operation's progress in real-time.
-
-**Display elements:**
-- **Operation table**: Phase progression (CLASSIFY → ROUTE → ... → COMPLETE) with color-coded status badges, elapsed time, provider name, tool call count, and L2 repair iteration count
-- **Streaming code output**: Character-by-character rendering of code as it is generated by DW 397B or Claude — printed above the pinned dashboard via `live.console.print()`
-- **Colored diffs**: Syntax-highlighted diffs showing what Ouroboros is applying to files
-- **Failure panels**: Red-bordered diagnostic panels on operation failure with error details and elapsed time
-- **Triage stats**: SemanticTriage NO_OP/REDIRECT/ENRICH/GENERATE classification counts
-
-**Terminal muting architecture** (`_mute_terminal_output`):
-
-The Rich Live widget tracks cursor position precisely; any rogue terminal output between refreshes corrupts the rendering and causes frames to stack instead of updating in-place. The dashboard silences three output channels on boot:
-
-1. **Logging StreamHandlers** — walks ALL loggers (root + every named logger in `logging.Logger.manager.loggerDict`), removes any `StreamHandler` writing to `sys.stdout` or `sys.stderr`, saves references for restoration
-2. **Python warnings** — replaces `warnings.showwarning` with a no-op lambda
-3. **stdout/stderr** — redirects both to `os.devnull`
-
-All three channels are restored on `stop()` via `_unmute_terminal_output`. The `OuroborosSerpent` background animation is also auto-suppressed when the dashboard is active.
-
-**Integration**: The `DashboardTransport` implements the CommProtocol transport interface, routing all 5-phase messages to the appropriate dashboard methods. HEARTBEAT messages with subsystem metadata (`target_file`, `streaming`, `token`) drive real-time updates.
+Terminal muting architecture: 3-channel muting throughout (`sys.stdout`, `sys.stderr`, Rich console) to prevent interleaving between the organism's output and the TUI's live updates.
 
 ### Trinity Consciousness (Zone 6.11 — Self-Awareness Layer)
 
@@ -622,6 +606,20 @@ All inference requests flow through `PrimeRouter` (`backend/core/prime_router.py
 
 Brain selection for interactive commands is handled by `InteractiveBrainRouter` (`backend/core/interactive_brain_router.py`), which reads `brain_selection_policy.yaml` and maps task types to complexity tiers at runtime. Both the interactive router and the Ouroboros `BrainSelector` share the same YAML policy file as their single source of truth.
 
+#### Urgency-Aware Provider Routing
+
+Deterministic routing based on signal urgency + source + task complexity. Stamped at ROUTE phase by `UrgencyRouter` (`urgency_router.py`). No LLM calls — pure code, <1ms.
+
+| Route | Strategy | Cost | When |
+|-------|----------|------|------|
+| IMMEDIATE | Codex direct, skip DW | ~$0.03/op | Critical urgency, voice commands, test failures, runtime health |
+| STANDARD | DW primary → Codex fallback | ~$0.005/op | Normal-priority moderate ops (default cascade) |
+| COMPLEX | Codex plans → DW executes | ~$0.015/op | heavy_code, multi-file architectural changes |
+| BACKGROUND | DW only, no Codex fallback | ~$0.002/op | OpportunityMiner, DocStaleness, TODOs, backlog |
+| SPECULATIVE | DW batch fire-and-forget | ~$0.001/op | IntentDiscovery, DreamEngine pre-computation |
+
+**Timeout enforcement (route-aware):** IMMEDIATE: 60s + 5s grace. STANDARD: 120s. COMPLEX/BACKGROUND: 180s. Fallback provider hard cap: 60s. DW poll interval: 5s.
+
 ---
 
 ## Quick Start
@@ -669,6 +667,13 @@ The supervisor auto-detects available components and starts what it can. GCP VM,
 ## Environment Variables
 
 Core configuration. All values have sensible defaults; only `ANTHROPIC_API_KEY` is required for basic operation.
+
+> **Architecture note:** JARVIS uses a 3-layer environment injection topology:
+> 1. **FlagRegistry** (`flag_registry.py` + `flag_registry_seed.py`) — 282 typed `JARVIS_*` flags with category, source_file, and posture-relevance metadata. Typo detection via bounded Levenshtein distance.
+> 2. **IsomorphicEnv** (`isomorphic_env.py`) — Context manager that dynamically overlays operator-authoritative keys (e.g., `JARVIS_IAC_REMOTE_ROOT`, sandbox prefixes, Trinity capability flags) to ensure local/GCP fidelity parity across 4 conditions: live absolute root, cwd≠repo_root, sandbox-prefix policy, and node env vars.
+> 3. **Operator `.env`** — The operator-authoritative source for credentials and cost knobs. All other flags have sensible defaults and are discoverable via `/help flags` in the REPL.
+>
+> The table below lists the **operator-facing subset**. For the full registry, run `/help flags` or query `GET /observability/flags`.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -739,56 +744,71 @@ JARVIS-AI-Agent/
 |   |   |-- distributed_lock_manager.py  # DLM v3.2 (Redis + file fallback)
 |   |   |-- telemetry_emitter.py   # Observability event pipeline
 |   |   `-- ouroboros/              # Self-developing governance engine
-|   |       |-- governance/
-|   |       |   |-- governed_loop_service.py  # Main autonomous loop (Zone 6.8)
-|   |       |   |-- orchestrator.py           # 11-phase FSM pipeline (180s generation timeout)
+|   |       |-- governance/                 # O+V pipeline engine (808 files, 22 subdirs, 775K lines)
+|   |       |   |-- orchestrator.py          # 11-phase pipeline (13,607 lines)
+|   |       |   |-- tool_executor.py          # Venom: 16+ tools, multi-turn agentic loop
+|   |       |   |-- candidate_generator.py    # 3-tier provider chain code generation
+|   |       |   |-- providers.py              # DoubleWord + Codex + J-Prime providers
+|   |       |   |-- repair_engine.py          # L2 iterative self-repair FSM
+|   |       |   |-- plan_generator.py         # Model-reasoned planning (schema plan.1)
+|   |       |   |-- semantic_triage.py        # Pre-generation filter
+|   |       |   |-- semantic_guardian.py      # 10-pattern AST/regex pre-APPLY detector
+|   |       |   |-- semantic_firewall.py      # 11 injection detectors + credential shapes
+|   |       |   |-- urgency_router.py         # 5-route deterministic routing
+|   |       |   |-- auto_committer.py         # Structured git commits with O+V signature
+|   |       |   |-- risk_tier_floor.py        # 3 composing env knobs, DST-correct TZ math
+|   |       |   |-- direction_inferrer.py     # 4-value posture (EXPLORE/CONSOLIDATE/HARDEN/MAINTAIN)
+|   |       |   |-- sensor_governor.py        # Global op-emission cap, posture weighting
+|   |       |   |-- flag_registry.py          # 282+ typed JARVIS_* flags, Levenshtein typo detect
+|   |       |   |-- worktree_manager.py       # L3 git worktree isolation
+|   |       |   |-- ide_observability.py      # REST routes for health/tasks
+|   |       |   |-- ide_observability_stream.py # SSE streaming, 10 event types
+|   |       |   |-- user_preference_memory.py  # 6-kind typed persistent memory
+|   |       |   |-- strategic_direction.py    # Manifesto + git momentum injection
 |   |       |   |-- brain_selector.py         # Model selection + boot handshake
 |   |       |   |-- brain_selection_policy.yaml  # Single source of truth for all model routing
-|   |       |   |-- providers.py              # PrimeProvider + ClaudeProvider (asyncio.wait_for streaming)
-|   |       |   |-- doubleword_provider.py    # Tier 0: DW 397B batch + real-time (16384 max_tokens, 5s poll)
-|   |       |   |-- candidate_generator.py    # 3-tier failback: DW -> J-Prime -> Claude (60s fallback cap)
-|   |       |   |-- semantic_triage.py        # Pre-generation NO_OP/REDIRECT/ENRICH/GENERATE classification
+|   |       |   |-- governed_loop_service.py  # Main autonomous loop (Zone 6.8)
 |   |       |   |-- comm_protocol.py          # 5-phase observability (INTENT→PLAN→HEARTBEAT→DECISION→POSTMORTEM)
-|   |       |   |-- strategic_direction.py    # Manifesto injection into generation prompts
 |   |       |   |-- consciousness_bridge.py   # TrinityConsciousness ↔ governance pipeline bridge
 |   |       |   |-- entropy_calculator.py     # Shannon entropy composite ignorance measurement
 |   |       |   |-- infrastructure_applicator.py  # Deterministic post-APPLY hooks (pip, npm, env)
 |   |       |   |-- doc_fetcher.py            # Bounded external doc retrieval (asyncio.wait_for timeouts)
 |   |       |   |-- change_engine.py          # Transactional file writes with rollback
-|   |       |   |-- repair_engine.py          # L2 iterative self-repair FSM (5 iterations, 120s timebox)
 |   |       |   |-- test_runner.py            # Multi-adapter test validation (Python + C++)
-|   |       |   |-- tool_executor.py          # Venom ToolLoopCoordinator (multi-turn agentic tool use)
+|   |       |   |-- doubleword_provider.py    # Tier 0: DW 397B batch + real-time (16384 max_tokens, 5s poll)
 |   |       |   |-- serpent_animation.py      # ASCII Ouroboros animation (auto-suppressed by LiveDashboard)
 |   |       |   |-- graduation_orchestrator.py  # Ephemeral -> permanent agent via Git PR
+|   |       |   |-- causal/                   # Domain 1: cross-repo causal graph + WAL
 |   |       |   |-- saga/                     # Branch-isolated multi-repo patch application
-|   |       |   |-- autonomy/                 # L3 subagent scheduler + execution graphs
+|   |       |   |-- autonomy/                 # L3 subagent scheduler + safety net (42 files)
 |   |       |   |   |-- subagent_scheduler.py # Parallel work unit dispatch (DAG)
 |   |       |   |   |-- iteration_planner.py  # Goal -> ExecutionGraph decomposition
 |   |       |   |   `-- iteration_service.py  # 10-state autonomy FSM
 |   |       |   |-- intent/                   # Intent signal processing
 |   |       |   |   |-- signals.py            # IntentSignal dataclass
 |   |       |   |   `-- test_watcher.py       # Pytest polling + stable failure detection (30s timeout)
-|   |       |   `-- intake/                   # 16 autonomous sensors
-|   |       |       |-- intake_layer_service.py  # Sensor lifecycle (Zone 6.9)
-|   |       |       |-- unified_intake_router.py # Priority queue + dedup + WAL
-|   |       |       |-- fs_event_bridge.py    # FileWatchGuard → TrinityEventBus bridge
-|   |       |       `-- sensors/              # 16 sensors (5,400+ lines)
-|   |       |           |-- test_failure_sensor.py
-|   |       |           |-- voice_command_sensor.py
-|   |       |           |-- opportunity_miner_sensor.py
-|   |       |           |-- capability_gap_sensor.py
-|   |       |           |-- scheduled_sensor.py
-|   |       |           |-- backlog_sensor.py
-|   |       |           |-- runtime_health_sensor.py
-|   |       |           |-- web_intelligence_sensor.py
-|   |       |           |-- performance_regression_sensor.py
-|   |       |           |-- doc_staleness_sensor.py
-|   |       |           |-- github_issue_sensor.py       # Polls Trinity repos for bugs/features
-|   |       |           |-- cross_repo_drift_sensor.py   # API/contract drift detection
-|   |       |           |-- proactive_exploration_sensor.py  # Entropy-driven curiosity exploration
-|   |       |           |-- todo_scanner_sensor.py        # Codebase TODO/FIXME/HACK scanner
-|   |       |           |-- cu_execution_sensor.py        # Compute unit execution tracking
-|   |       |           `-- intent_discovery_sensor.py    # Manifesto-driven proactive improvement
+|   |       |   |-- intake/                   # UnifiedIntakeRouter + sensor bus
+|   |       |   |   |-- intake_layer_service.py  # Sensor lifecycle (Zone 6.9)
+|   |       |   |   |-- unified_intake_router.py # Priority queue + dedup + WAL
+|   |       |   |   |-- fs_event_bridge.py    # FileWatchGuard → TrinityEventBus bridge
+|   |       |   |   `-- sensors/              # 16 sensors (5,400+ lines)
+|   |       |   |       |-- test_failure_sensor.py
+|   |       |   |       |-- voice_command_sensor.py
+|   |       |   |       |-- opportunity_miner_sensor.py
+|   |       |   |       |-- capability_gap_sensor.py
+|   |       |   |       |-- scheduled_sensor.py
+|   |       |   |       |-- backlog_sensor.py
+|   |       |   |       |-- runtime_health_sensor.py
+|   |       |   |       |-- web_intelligence_sensor.py
+|   |       |   |       |-- performance_regression_sensor.py
+|   |       |   |       |-- doc_staleness_sensor.py
+|   |       |   |       |-- github_issue_sensor.py       # Polls Trinity repos for bugs/features
+|   |       |   |       |-- cross_repo_drift_sensor.py   # API/contract drift detection
+|   |       |   |       |-- proactive_exploration_sensor.py  # Entropy-driven curiosity exploration
+|   |       |   |       |-- todo_scanner_sensor.py        # Codebase TODO/FIXME/HACK scanner
+|   |       |   |       |-- cu_execution_sensor.py        # Compute unit execution tracking
+|   |       |   |       `-- intent_discovery_sensor.py    # Manifesto-driven proactive improvement
+|   |       |   `-- ...                      # 22 subdirectories total
 |   |       |-- consciousness/                # Zone 6.11: Trinity self-awareness layer
 |   |       |   |-- consciousness_service.py  # TrinityConsciousness orchestrator (371 lines)
 |   |       |   |-- health_cortex.py          # System health monitoring (668 lines)
@@ -800,10 +820,15 @@ JARVIS-AI-Agent/
 |   |       |   |-- unified_awareness.py      # CAI + SAI fusion (1,232 lines)
 |   |       |   |-- dream_metrics.py          # Speculative analysis budgets (175 lines)
 |   |       |   `-- types.py                  # Shared dataclasses (485 lines)
-|   |       |-- battle_test/                  # Ouroboros battle test harness
-|   |       |   |-- harness.py                # 6-layer stack boot + orchestration
-|   |       |   |-- serpent_flow.py           # SerpentFlow CLI: CC-style UX (1,900+ lines)
-|   |       |   `-- live_dashboard.py         # Persistent Rich TUI (1,233 lines)
+|   |       |-- battle_test/                  # TUI/CLI rendering surface (52 files)
+|   |       |   |-- serpent_flow.py           # CC-style flowing CLI (355KB)
+|   |       |   |-- harness.py                # Full test harness (372KB)
+|   |       |   |-- presentation_restraint.py # CC-style aesthetic restraint
+|   |       |   |-- narrative_channel.py      # 6-kind NarrativeKind taxonomy
+|   |       |   |-- tool_render_registry.py   # Adaptive tool-result rendering
+|   |       |   |-- stream_renderer.py        # Rich Live + Markdown 16ms batch
+|   |       |   |-- live_dashboard.py         # Persistent Rich TUI (1,233 lines)
+|   |       |   `-- ...                       # 52 files total, 6 graduated subsystems
 |   |       `-- oracle.py                     # Codebase semantic index
 |   |-- core_contexts/                # 5 Core Execution Contexts (Brain)
 |   |   |-- facade.py                 # Symbiotic Router: 3-tier dispatch
@@ -849,6 +874,11 @@ JARVIS-AI-Agent/
 |-- tests/                         # Test suites
 |-- config/                        # Runtime configuration files
 |-- scripts/                       # Utility and deployment scripts
+|-- extensions/
+|   |-- vscode-jarvis/              # VS Code / Cursor extension (TypeScript)
+|   |-- jetbrains-jarvis/           # JetBrains extension (Kotlin)
+|   |-- sublime-jarvis/             # Sublime Text extension (Python)
+|   `-- command-node/              # Command node integration
 `-- requirements.txt               # Python dependencies
 ```
 

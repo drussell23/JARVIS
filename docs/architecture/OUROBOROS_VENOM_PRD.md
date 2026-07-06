@@ -1,6 +1,8 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
-**Version**: 3.32 (2026-06-21 — **§51.11.35 added — Sovereign Epistemic Context Matrix + Async Yield Matrix (3 PRs merged to main; PRD synced to true code state)**. (1) **Epistemic Context Matrix (#69637)** cures the 7th-layer heavy multi-file GOAL `tool_loop_deadline_exceeded` via an oracle-seeded prefetch DAG + an Information-Gain Governor (Δ-decay convergence + one-shot Iron-Gate deadlock breaker) + a cryptographic session-bound Truth-Guard; ~65 tests, reuse-first (oracle.get_fused_neighborhood + state_drift sha256). (2) **Async Yield Matrix Layer 1 (#69638, default-ON)** makes the Sovereign Execution Boundary self-enforcing — a deterministic lock force-arms isolation+commit-denial in the primary checkout even when the flags are explicitly false, + a raw-write guard that closes the loop-writes-to-primary split-brain vector (the incident that triggered the arc). (3) **Layer 2 (#69639, default-OFF)** adds graceful operator-yield (mutation-drain → cooperative park → resume). **Composite UNCHANGED ~35%**: per the PRD's own framing these moved engineering capability (the "easy ~15%") + cleared TWO evidence-prerequisites (safe unattended operation via isolation + heavy-GOALs no longer deadline), NOT the 85% bottleneck (proven runtime + reviewed autonomous-PR track record + ~12–18mo shadow evidence + operator Layer-4 decision). **A1 (file-00 dispatch) remains the named #1 gate, untouched.** All three arcs were built by the human-directed dev process (subagent-driven), NOT by O+V autonomously. — see §51.11.35)
+**Version**: 3.33 (2026-07-06 — §1 July refresh: 9,231 commits (28.2/day across 327 days), 1.61M O+V lines (928K engine + 682K test spine), 6,593 Python files. A1 Ignition Vector live-fire hardening (GCP Brain migration, deadline_wall.json IPC, systemd-run cgroup isolation, DW rehearsal-lane budget injection). L2 VALIDATE_RETRY storm breaker. Domain 1 Causal Graph fold shipped (O(1) monotonic, emit_seq-commutative). Composite UNCHANGED at ~35%; A1 (file-00 dispatch) remains gate #1.
+>
+> 3.32 (2026-06-21 — **§51.11.35 added — Sovereign Epistemic Context Matrix + Async Yield Matrix (3 PRs merged to main; PRD synced to true code state)**. (1) **Epistemic Context Matrix (#69637)** cures the 7th-layer heavy multi-file GOAL `tool_loop_deadline_exceeded` via an oracle-seeded prefetch DAG + an Information-Gain Governor (Δ-decay convergence + one-shot Iron-Gate deadlock breaker) + a cryptographic session-bound Truth-Guard; ~65 tests, reuse-first (oracle.get_fused_neighborhood + state_drift sha256). (2) **Async Yield Matrix Layer 1 (#69638, default-ON)** makes the Sovereign Execution Boundary self-enforcing — a deterministic lock force-arms isolation+commit-denial in the primary checkout even when the flags are explicitly false, + a raw-write guard that closes the loop-writes-to-primary split-brain vector (the incident that triggered the arc). (3) **Layer 2 (#69639, default-OFF)** adds graceful operator-yield (mutation-drain → cooperative park → resume). **Composite UNCHANGED ~35%**: per the PRD's own framing these moved engineering capability (the "easy ~15%") + cleared TWO evidence-prerequisites (safe unattended operation via isolation + heavy-GOALs no longer deadline), NOT the 85% bottleneck (proven runtime + reviewed autonomous-PR track record + ~12–18mo shadow evidence + operator Layer-4 decision). **A1 (file-00 dispatch) remains the named #1 gate, untouched.** All three arcs were built by the human-directed dev process (subagent-driven), NOT by O+V autonomously. — see §51.11.35)
 >
 > 3.31 (2026-06-20 — **§3.11 added — Sovereign Cognitive Graduation Crucible** (pivot to PRD Priority #1: hardened + ignited the EXISTING ~95%-shipped autonomous graduation substrate rather than rebuilding. 5% gap closed in 5 slices: TTFT/AST math-veto (crucible_verdict, veto-only+fail-open), Sovereign Telemetry Manifest (deterministic [SOVEREIGN GRADUATION] PR body w/ per-soak evidence table + sha256 digest + 🛟 rollback), source-of-truth AST-validated rewriter (cage-respecting: proposes PR, never self-merges), soak→engine wiring, literal-site locator (source_file != literal site; 6→10 clean-resolvable). First Cognitive Ignition PROVEN end-to-end on real JARVIS_EXPLORATION_LEDGER_ENABLED. All gated default-off. 38 tests; PRs #69606+#69608). — see §3.11 below)
 >
@@ -213,6 +215,33 @@ Ouroboros + Venom (O+V) is the autonomous self-development governance engine of 
 - Net empirical floor remains **B+** pending Phase 9 cadence soaks; structural ceiling unchanged at **A**.
 
 See §36 for the full May 5 brutal review + forward priority roadmap.
+
+---
+
+**Where we stand (2026-07-06):**
+
+- **A1 Ignition Vector live-fire hardening** — the C+ gap (organism never reached APPLY on the GCP Brain node) is being closed via 5 root-cause fixes:
+  - `deadline_wall.json` IPC contract: harness publishes `deadline_wall` (epoch seconds) to a same-host JSON file; organism reads it for cooperative shutdown. Eliminates the historical cross-host coordination bug.
+  - `systemd-run --unit=a1soak-<id> --collect` cgroup isolation: severs the soak from the SSH channel so dispatch returns in ~3s (vs. blocking until process exit). The organism runs in its own cgroup/session.
+  - DW rehearsal-lane budget injection (`--dw-session-budget`): `cost_cap=0.0` was scenario-default, not law. Funding the DW lane lets the organism reach APPLY via the cheapest provider.
+  - Synthetic adversary `DOUBLEWORD_API_KEY` supply: the organism boots on a keyless node by injecting the key into the provisioning env.
+  - `post_wall_margin`: monitor waits for the organism's kill-ladder + audit before the done-file, preventing monitor budget exhaustion mid-kill-ladder.
+- **L2 VALIDATE_RETRY storm breaker** — sticky-reason breaker + route-aware dispatch budget + exhaustion taxonomy. Prevents infinite retry loops when VALIDATE fails with the same root cause.
+- **Domain 1 Causal Graph shipped** — `causal_graph.py` implements the cross-repo causal graph with O(1) monotonic fold. `emit_seq`-MONOTONIC, order-independent convergence. `structural_delta.py` (19KB) + `causal_graph_ingestor.py` (22KB) + `blast_radius_oracle.py` + `causal_delta_subscriber.py`. WAL is Task 3 (pending).
+- **Counterfactual Rehearsal Mode** — pure-function pre-APPLY postmortem evaluator (`counterfactual_rehearsal_mode.py`). Posture-aware intensity scaling (cage changes always rehearsed).
+
+| Metric | Value |
+|---|---|
+| Commits | **9,231** (~28.2/day across 327 days) |
+| O+V engine | **928K lines** across 808 files |
+| O+V test spine | **682K lines** across 1,842 test files |
+| O+V total | **~1.61M lines** |
+| Python files (git-tracked) | **6,593** |
+| Total tracked files | **9,247** |
+| `JARVIS_*` env flag seeds | **282** (481+ at runtime via FlagRegistry) |
+| Governance subdirectories | **22** (excl. `__pycache__`) |
+
+Net grade: Architecture A, Cognitive depth A, Self-tightening immunity A+. Net floor B+ pending Phase 9 live-fire graduation. Composite UNCHANGED at ~35%.
 
 ---
 
@@ -1787,6 +1816,8 @@ Backward-compat: `provider_topology.py` adds `Topology.from_v2(...)` classmethod
 
 **Honest-grade impact**: Phase 10 closure converts the cost-economics part of B+ trending A− → A− on the *unit economics* dimension specifically (currently rated implicitly under §3.6 vector #2 "ProductivityDetector vs CostGovernor mismatch"). Combined with Phase 9 closure, the substrate goes from "expensive but right" to "expensive only when forced."
 
+**A1 Ignition Vector (2026-07-06):** Live-fire GCP Brain hardening in flight. 5 root-cause fixes shipped (deadline_wall.json IPC, systemd-run cgroup, DW rehearsal-lane budget, synthetic adversary key, post_wall_margin). Organism has reached APPLY on GCP node via cheapest provider. L2 VALIDATE_RETRY storm breaker prevents infinite retry loops. See §51.11.36 for full changelog.
+
 ---
 
 ## 10. Per-Phase Requirements: Telemetry & Observability
@@ -2080,6 +2111,8 @@ When a phase exits (per its exit criteria in §13):
 | 6 | P6 — Behavior summarizer | 1500 LOC + 50 tests | Self-Modeling | Weeks 18-30 |
 
 **Total**: ~8400 LOC + ~342 tests across ~7 months. Comparable in scope to Wave 2 (5) PhaseRunner extraction. Larger in cognitive impact than the entire Wave 1+2+3 sequence combined.
+
+**Actual delivery (2026-07-06):** The original ~8,400 LOC + ~342 tests planned scope has compounded to **928K engine lines + 682K test lines = ~1.61M total O+V lines across 1,842 test files**. This 190x expansion from plan reflects the compounding dynamics predicted in §21: each phase enabled capabilities that exposed new surfaces requiring governance, testing, and hardening. The test spine alone (682K lines) exceeds the original total plan by 80x — a direct consequence of the "half engine, half proof" mandate for a self-modifying system.
 
 ---
 
