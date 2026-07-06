@@ -37,6 +37,15 @@ in-archive ``MANIFEST.txt``, never an abort):
     ``JARVIS_PROVIDER_CLAUDE_DISABLED`` values, so a DW throughput-collapse or an
     (should-be-NONE) Claude-fallback is visible.
 
+  * A1 VERDICT (mandate 3) -- the newest ``a1_verdict.json`` discovered under
+    the repo's iso-run tree (``<repo_root>/a1_iso_runs/**/iso-a1-*/a1_verdict.json``,
+    matching ``isomorphic_a1_local.py``'s ``--run-root``/``run_dir`` layout) is
+    added to the archive at the STABLE root arcname ``a1_verdict.json``. This
+    makes the checksum-gated Black-Box channel the sole, authoritative source
+    the orchestrator (``ignite_a1_brain.py::retrieve_verdict``) parses the A1
+    verdict from -- fail-soft: if none is found it is simply NOTED absent,
+    never an abort.
+
 Output: ``black_box_<run_id>.tar.gz`` + ``black_box_<run_id>.tar.gz.sha256`` in
 ``--out``. The archive path + sha256 are printed to stdout as structured
 ``BLACK_BOX_ARCHIVE=`` / ``BLACK_BOX_SHA256=`` lines the orchestrator parses.
@@ -47,6 +56,7 @@ stdlib, env-knob driven, no org mutation (read-only over the repo + ledgers).
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import io
 import json
@@ -92,6 +102,24 @@ _MAX_DIR_BYTES = int(os.environ.get("JARVIS_A1_BLACKBOX_MAX_DIR_BYTES", str(128 
 # debug.log tail line cap when the file is huge (keep the recent failure window).
 _DEBUG_LOG_TAIL_LINES = int(os.environ.get("JARVIS_A1_BLACKBOX_DEBUG_TAIL_LINES", "20000"))
 
+# The A1 verdict (mandate 3): stable in-archive arcname the orchestrator's
+# `IapBlackBoxTransport` pull parses -- NEVER change this without updating
+# `ignite_a1_brain.py::retrieve_verdict` in lockstep.
+_A1_VERDICT_ARCNAME = "a1_verdict.json"
+
+# Glob patterns (relative to repo_root, tried in order, newest-mtime wins)
+# used to auto-discover the newest a1_verdict.json under the repo's iso-run
+# tree. Mirrors isomorphic_a1_local.py's own layout:
+#   run_root (default "<cwd>/a1_iso_runs", or ignite_a1_brain.py's
+#   `<repo_root>/a1_iso_runs/<node_name>`) / iso-a1-<timestamp> / a1_verdict.json
+# Env-overridable comma list so the discovery globs are tunable, not frozen.
+_VERDICT_GLOB_PATTERNS = [
+    g.strip() for g in os.environ.get(
+        "JARVIS_A1_BLACKBOX_VERDICT_GLOBS",
+        "a1_iso_runs/**/iso-a1-*/a1_verdict.json,**/iso-a1-*/a1_verdict.json",
+    ).split(",") if g.strip()
+]
+
 # Provider-telemetry grep tokens (env-overridable, comma list).
 _PROVIDER_TOKENS = [
     t.strip() for t in os.environ.get(
@@ -120,6 +148,8 @@ class BundleConfig:
     repo_root: str = _REPO_ROOT_DEFAULT
     out_dir: str = "."
     session_dir: str = ""  # the .ouroboros/sessions/<id> dir (auto-discovered if "")
+    iso_run_root: str = ""  # the isomorphic run-root override (auto-discovered under
+    # repo_root via _VERDICT_GLOB_PATTERNS if ""); see _discover_verdict_path.
     git_diff_runner: Optional[Callable[[str], str]] = None
     env: Optional[Dict[str, str]] = None
 
@@ -156,6 +186,43 @@ def _discover_session_dir(repo_root: str) -> str:
             continue
     if not cand:
         return ""
+    cand.sort(reverse=True)
+    return cand[0][1]
+
+
+def _discover_verdict_path(repo_root: str, iso_run_root: str = "") -> Optional[str]:
+    """Best-effort newest ``a1_verdict.json`` under the repo's iso-run tree
+    (mandate 3: the A1 verdict is part of the audit trail -- it belongs in the
+    black box). Fail-soft (`None` on absence) -- mirrors `_discover_session_dir`.
+
+    If `iso_run_root` is given (an explicit run-root override), search ONLY
+    there; otherwise auto-discover via `_VERDICT_GLOB_PATTERNS` rooted at
+    `repo_root` (the DRY default, matching isomorphic_a1_local.py's own
+    run_root/iso-a1-<ts>/a1_verdict.json layout)."""
+    patterns: List[str]
+    if iso_run_root:
+        patterns = [os.path.join(iso_run_root, "**", "a1_verdict.json"),
+                    os.path.join(iso_run_root, "a1_verdict.json")]
+    else:
+        patterns = [os.path.join(repo_root, p) for p in _VERDICT_GLOB_PATTERNS]
+
+    cand: List[Tuple[float, str]] = []
+    seen = set()
+    for pattern in patterns:
+        try:
+            for hit in glob.glob(pattern, recursive=True):
+                if hit in seen:
+                    continue
+                seen.add(hit)
+                try:
+                    if os.path.isfile(hit):
+                        cand.append((os.path.getmtime(hit), hit))
+                except OSError:
+                    continue
+        except Exception:  # noqa: BLE001 -- discovery must never abort the bundle
+            continue
+    if not cand:
+        return None
     cand.sort(reverse=True)
     return cand[0][1]
 
@@ -399,7 +466,18 @@ def bundle(cfg: BundleConfig) -> BundleResult:
         _add_text(tf, "provider_telemetry.txt", prov_text)
         captured.append("provider_telemetry.txt")
 
-        # 6. MANIFEST.txt: what was captured + what was absent (loud, never silent).
+        # 6. A1 VERDICT (mandate 3) -- the newest a1_verdict.json under the
+        # repo's iso-run tree, at a STABLE root arcname. This is what makes
+        # the Black-Box pull the 100%-authoritative verdict channel.
+        verdict_path = _discover_verdict_path(cfg.repo_root, cfg.iso_run_root)
+        verdict_text = _read_text_bounded(verdict_path) if verdict_path else None
+        if verdict_text is not None:
+            _add_text(tf, _A1_VERDICT_ARCNAME, verdict_text)
+            captured.append(_A1_VERDICT_ARCNAME)
+        else:
+            absent.append(_A1_VERDICT_ARCNAME)
+
+        # 7. MANIFEST.txt: what was captured + what was absent (loud, never silent).
         manifest_lines = [
             "A1 BLACK BOX FLIGHT RECORDER -- MANIFEST",
             "run_id     : %s" % (cfg.run_id,),
@@ -459,6 +537,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Repo root (where .ouroboros + .jarvis live).")
     p.add_argument("--session-dir", default="",
                    help="The .ouroboros/sessions/<id> dir (auto-discovered if omitted).")
+    p.add_argument("--iso-run-root", default="",
+                   help="The isomorphic_a1_local.py run-root to search for the newest "
+                        "a1_verdict.json (auto-discovered under --repo-root via "
+                        "JARVIS_A1_BLACKBOX_VERDICT_GLOBS if omitted).")
     return p
 
 
@@ -485,6 +567,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         repo_root=args.repo_root,
         out_dir=args.out,
         session_dir=args.session_dir,
+        iso_run_root=args.iso_run_root,
         git_diff_runner=lambda _t: _git_diff_of_target(args.repo_root, target_rel),
         env=dict(os.environ),
     )

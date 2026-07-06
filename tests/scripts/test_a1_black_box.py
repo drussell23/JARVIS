@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -263,3 +264,99 @@ def test_help_runs(capsys):
     with pytest.raises(SystemExit) as ei:
         black_box.main(["--help"])
     assert ei.value.code == 0
+
+
+# ===========================================================================
+# 5. A1 verdict (mandate 3) -- the bundle INCLUDES a1_verdict.json when one
+#    exists under the repo's iso-run tree, at a stable arcname, and bundles
+#    cleanly (no crash, noted absent) when none exists.
+# ===========================================================================
+
+
+def _make_iso_run_tree(root: Path, *, verdict: dict, run_id="iso-a1-20260624-010101"):
+    run_dir = root / "a1_iso_runs" / "some-node" / run_id
+    run_dir.mkdir(parents=True)
+    verdict_path = run_dir / "a1_verdict.json"
+    verdict_path.write_text(json.dumps(verdict))
+    return verdict_path
+
+
+def test_bundle_includes_a1_verdict_when_present(tmp_path):
+    _make_session_tree(tmp_path)
+    _make_iso_run_tree(tmp_path, verdict={"proven": True, "criteria": {"c1": True}})
+    out = tmp_path / "out"
+    result = black_box.bundle(_make_args(tmp_path, out))
+
+    with tarfile.open(result.archive_path, "r:gz") as tf:
+        names = tf.getnames()
+    assert "a1_verdict.json" in names, "a1_verdict.json must land at a stable root arcname"
+
+    verdict_text = _extract_text(result.archive_path, "a1_verdict.json")
+    assert verdict_text is not None
+    parsed = json.loads(verdict_text)
+    assert parsed["proven"] is True
+    assert parsed["criteria"]["c1"] is True
+
+    manifest = _extract_text(result.archive_path, "MANIFEST.txt")
+    assert "a1_verdict.json" in manifest
+    assert result.absent_count == 0 or "a1_verdict.json" not in "\n".join(
+        [a for a in result.absent])
+
+
+def test_bundle_picks_newest_verdict_when_multiple_present(tmp_path):
+    _make_session_tree(tmp_path)
+    older = _make_iso_run_tree(
+        tmp_path, verdict={"proven": False, "run": "older"},
+        run_id="iso-a1-20260101-000000")
+    newer = _make_iso_run_tree(
+        tmp_path, verdict={"proven": True, "run": "newer"},
+        run_id="iso-a1-20260624-235959")
+    # Force an unambiguous mtime ordering regardless of filesystem write order.
+    now = time.time()
+    os.utime(older, (now - 1000, now - 1000))
+    os.utime(newer, (now, now))
+
+    out = tmp_path / "out"
+    result = black_box.bundle(_make_args(tmp_path, out))
+    verdict_text = _extract_text(result.archive_path, "a1_verdict.json")
+    parsed = json.loads(verdict_text)
+    assert parsed["run"] == "newer"
+
+
+def test_bundle_without_verdict_is_noted_absent_and_does_not_crash(tmp_path):
+    # No a1_iso_runs tree at all -> discovery finds nothing, bundle still succeeds.
+    _make_session_tree(tmp_path)
+    out = tmp_path / "out"
+    result = black_box.bundle(_make_args(tmp_path, out))
+
+    assert Path(result.archive_path).exists(), "bundle must still succeed without a verdict"
+    with tarfile.open(result.archive_path, "r:gz") as tf:
+        names = tf.getnames()
+    assert "a1_verdict.json" not in names
+    manifest = _extract_text(result.archive_path, "MANIFEST.txt")
+    assert "a1_verdict.json" in manifest  # noted absent, never silently dropped
+    assert "a1_verdict.json" in result.absent
+
+
+def test_iso_run_root_override_scopes_discovery(tmp_path):
+    """An explicit --iso-run-root searches ONLY that root (arg/knob escape
+    hatch), still landing at the stable arcname."""
+    _make_session_tree(tmp_path)
+    run_root = tmp_path / "custom_run_root"
+    verdict_dir = run_root / "iso-a1-20260624-010101"
+    verdict_dir.mkdir(parents=True)
+    (verdict_dir / "a1_verdict.json").write_text(json.dumps({"proven": True, "run": "custom"}))
+
+    cfg = black_box.BundleConfig(
+        run_id="run-custom",
+        repo_root=str(tmp_path),
+        out_dir=str(tmp_path / "out"),
+        session_dir=str(tmp_path / ".ouroboros" / "sessions" / "bt-20260624-000000"),
+        iso_run_root=str(run_root),
+        git_diff_runner=lambda target: "diff --git stub",
+        env={},
+    )
+    result = black_box.bundle(cfg)
+    verdict_text = _extract_text(result.archive_path, "a1_verdict.json")
+    assert verdict_text is not None
+    assert json.loads(verdict_text)["run"] == "custom"

@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -66,6 +67,116 @@ def print_error(msg: str):
 
 def print_info(msg: str):
     print(f"{Colors.BLUE}  ℹ {msg}{Colors.ENDC}")
+
+
+def _orphan_instance_filter() -> str:
+    """Return the gcloud --filter= predicate for orphaned JARVIS GCE instances.
+
+    Root-logic fix (A1 Brain $0 mandate): Brain VMs are labelled
+    ``jarvis-role=brain`` ONLY (see gcp_compute_rest._BRAIN_ROLE_LABEL_KEY /
+    _BRAIN_ROLE_LABEL_VALUE) -- they carry neither ``created-by=jarvis`` nor
+    ``app=jarvis``. Without the third predicate below, an orphaned Brain VM
+    (e.g. left behind by a SIGKILL'd ignition driver) was invisible to this
+    sweep. Extracted into a pure helper so the query logic is unit-testable
+    without shelling out to real gcloud.
+    """
+    try:
+        # Prefer the canonical label constants from the Compute REST client
+        # (zero hardcoding of the label value) -- import is stdlib-only and
+        # side-effect-free at module scope (see gcp_compute_rest.py docstring).
+        from backend.core.ouroboros.governance.gcp_compute_rest import (
+            _BRAIN_ROLE_LABEL_KEY,
+            _BRAIN_ROLE_LABEL_VALUE,
+        )
+
+        brain_predicate = f"labels.{_BRAIN_ROLE_LABEL_KEY}={_BRAIN_ROLE_LABEL_VALUE}"
+    except Exception:
+        # Fallback literal citing the canonical source, in case the import
+        # path is unavailable in this execution context (e.g. run as a bare
+        # script outside the repo root).
+        brain_predicate = "labels.jarvis-role=brain"  # gcp_compute_rest._BRAIN_ROLE_LABEL_KEY/_VALUE
+
+    return f"labels.created-by=jarvis OR labels.app=jarvis OR {brain_predicate}"
+
+
+# ---------------------------------------------------------------------------
+# Brain-VM reap guard (A1 mandate 1 -- destructive-collateral fix).
+#
+# `_orphan_instance_filter()` above ORs in `labels.jarvis-role=brain` so a
+# genuinely-orphaned Brain VM is no longer invisible to this sweep. But a
+# brain-labelled VM can ALSO be a LIVE, running Stage-2/3/4 production
+# organism that stays up for days/weeks -- unlike the ephemeral
+# `created-by=jarvis`/`app=jarvis` nodes, it must NEVER be deleted just for
+# matching the label.
+#
+# Re-review fix (safety-critical): the original guard ALSO reaped a
+# brain-only VM once it was merely RUNNING past an age threshold
+# (JARVIS_BRAIN_ORPHAN_MAX_AGE_S, default 2h). A persistent production Brain
+# is *always* older than 2h, so `--all` (non-interactive) would eventually
+# delete a LIVE production Brain -- exactly the collateral this guard exists
+# to prevent. The age branch is removed entirely: a brain-labelled VM is
+# reaped ONLY when it is already ``status == "TERMINATED"``. A RUNNING brain
+# (production or an in-flight A1 soak) is NEVER touched by this sweep,
+# regardless of age.
+#
+# Composition with brain_lifecycle.py Piece D (node-side absolute
+# self-destruct): an orphaned RUNNING brain is halted by the node's own
+# dead-man (`shutdown -h now` -> TERMINATED, stops compute billing -- the $0
+# part) but that does NOT delete the instance/disk. THIS sweep is what
+# finishes the job -- a TERMINATED brain-only VM is reaped unconditionally,
+# but only after the node has already halted itself.
+# ---------------------------------------------------------------------------
+
+
+def _vm_label_match_class(labels: Optional[Dict[str, Any]]) -> str:
+    """Classify which orphan predicate matched a VM's labels, so the reap
+    guard can tell "ephemeral jarvis node" (unconditional reap, unchanged)
+    apart from "brain" (guarded, TERMINATED-only reap).
+
+    Re-review fix (safety-critical): a VM can carry BOTH
+    ``created-by=jarvis``/``app=jarvis`` AND ``jarvis-role=brain`` (e.g. a
+    Brain VM provisioned through the same jarvis tooling that stamps the
+    ephemeral labels). The brain label MUST win any such ambiguity -- for a
+    safety-critical guard, "could be a live Brain" always outranks "looks
+    like an ephemeral node". ``has_brain`` is therefore checked FIRST.
+
+    Fails CLOSED ("unknown", not reaped) if neither predicate is present --
+    should not happen given the OR-filter that selected this VM in the first
+    place, but a label field that gcloud omits/renames must never silently
+    unlock an unconditional delete.
+    """
+    labels = labels or {}
+    has_jarvis = labels.get("created-by") == "jarvis" or labels.get("app") == "jarvis"
+    has_brain = labels.get("jarvis-role") == "brain"
+    if has_brain:
+        return "brain"
+    if has_jarvis:
+        return "jarvis"
+    return "unknown"
+
+
+def _should_reap_orphan_vm(vm: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
+    """Decide whether an orphan-filter-matched VM is safe to delete.
+
+    - Matched by ``created-by=jarvis``/``app=jarvis`` (and NOT also
+      brain-labelled): UNCONDITIONAL reap, byte-identical to today's
+      behavior for these ephemeral nodes.
+    - Matched by ``jarvis-role=brain`` (alone or combined with the jarvis
+      labels -- brain always wins classification, see
+      ``_vm_label_match_class``): reaped ONLY when ``status == "TERMINATED"``.
+      A RUNNING brain VM -- live production or an in-flight A1 soak -- is
+      NEVER reaped by this sweep, no matter its age.
+    - Anything matching neither predicate class fails CLOSED (not reaped).
+
+    ``now`` is accepted for backward-compatible call signatures but is
+    unused now that the age-based branch has been removed.
+    """
+    match_class = _vm_label_match_class(vm.get("labels"))
+    if match_class == "jarvis":
+        return True
+    if match_class != "brain":
+        return False
+    return str(vm.get("status") or "").upper() == "TERMINATED"
 
 
 @dataclass
@@ -224,7 +335,13 @@ class GCPCleanup:
         return info
 
     async def _find_orphaned_resources(self) -> List[Dict[str, Any]]:
-        """Find orphaned VMs."""
+        """Find orphaned VMs.
+
+        Requests ``labels`` alongside the existing fields so
+        ``cleanup_orphaned_vms()`` can classify each match (ephemeral
+        jarvis node vs. brain-only) and apply the brain-VM reap guard --
+        see ``_should_reap_orphan_vm``.
+        """
         orphans = []
 
         try:
@@ -233,8 +350,8 @@ class GCPCleanup:
                 [
                     "gcloud", "compute", "instances", "list",
                     f"--project={self.config.project_id}",
-                    "--filter=labels.created-by=jarvis OR labels.app=jarvis",
-                    "--format=json(name,zone,status,creationTimestamp)",
+                    f"--filter={_orphan_instance_filter()}",
+                    "--format=json(name,zone,status,creationTimestamp,labels)",
                 ],
                 capture_output=True,
                 text=True,
@@ -249,6 +366,7 @@ class GCPCleanup:
                         "zone": vm.get("zone", "").split("/")[-1],
                         "status": vm.get("status"),
                         "created": vm.get("creationTimestamp"),
+                        "labels": vm.get("labels") or {},
                     })
 
         except Exception as e:
@@ -498,8 +616,18 @@ class GCPCleanup:
             return False
 
     async def cleanup_orphaned_vms(self) -> Dict[str, Any]:
-        """Delete orphaned VMs."""
-        results = {"deleted": [], "errors": []}
+        """Delete orphaned VMs.
+
+        Brain-labelled VMs (``jarvis-role=brain``, which always wins
+        classification even if ``created-by=jarvis``/``app=jarvis`` is ALSO
+        present -- see ``_vm_label_match_class``) can be LIVE production
+        Stage-2/3/4 organisms -- ``_should_reap_orphan_vm`` guards them so
+        only a genuinely orphaned brain VM (``status == "TERMINATED"``) is
+        deleted. A RUNNING brain VM is never reaped by this sweep, no matter
+        its age. Ephemeral ``created-by=jarvis``/``app=jarvis``-only VMs keep
+        today's unconditional behavior.
+        """
+        results = {"deleted": [], "errors": [], "skipped": []}
 
         print_section("Cleaning Orphaned VMs")
 
@@ -512,6 +640,15 @@ class GCPCleanup:
         for vm in orphans:
             vm_name = vm["name"]
             zone = vm["zone"]
+
+            if not _should_reap_orphan_vm(vm):
+                results["skipped"].append(vm_name)
+                print_warning(
+                    f"Skipping {vm_name}: brain-labelled, status={vm.get('status')} "
+                    "(not TERMINATED) -- may be a LIVE Brain organism, not a "
+                    "genuine orphan"
+                )
+                continue
 
             if not self._dry_run:
                 try:

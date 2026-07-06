@@ -202,6 +202,27 @@ def brain_env_values(extra_env: Optional[Dict[str, str]] = None) -> Dict[str, st
 # and (re)start the baked brain unit so it picks up the fresh env).
 # ---------------------------------------------------------------------------
 
+# Stage-4 Mandate 4 ($0 even on total Mac network loss): an UNCONDITIONAL,
+# node-side absolute self-destruct, independent of the idle-liveness marker,
+# the brain process, and the control plane. Armed ONLY when this env is a
+# positive int -- unset/blank/non-numeric/<=0 all disarm it (fail-soft,
+# byte-identical-legacy startup script).
+_ENV_ABSOLUTE_LIFETIME_S = "JARVIS_BRAIN_ABSOLUTE_LIFETIME_S"
+
+
+def _resolve_absolute_lifetime_s() -> int:
+    """Resolve the absolute self-destruct lifetime (seconds). Fail-soft: any
+    unset/blank/non-numeric/non-positive value returns 0 (disarmed) -- this
+    seam must never raise and never block a boot."""
+    raw = (os.environ.get(_ENV_ABSOLUTE_LIFETIME_S, "") or "").strip()
+    if not raw:
+        return 0
+    try:
+        val = int(float(raw))
+    except (TypeError, ValueError):
+        return 0
+    return val if val > 0 else 0
+
 
 def _brain_runtime_startup_script() -> str:
     """Minimal boot glue for the golden-image runtime boot. The image already has
@@ -215,6 +236,39 @@ def _brain_runtime_startup_script() -> str:
         "curl -fsS -H 'Metadata-Flavor: Google' '%s/%s' -o %s/%s || true\n"
         % (meta_base, meta_key, _NODE_TLS_DIR, filename)
         for meta_key, filename in _TLS_META_KEYS.values()
+    )
+    lifetime_s = _resolve_absolute_lifetime_s()
+    selfdestruct = (
+        (
+            "# Absolute self-destruct dead-man (A1 $0 mandate): unconditional,\n"
+            "# hang-proof, independent of the idle marker / brain process / control\n"
+            "# plane. Survives a Mac SIGKILL or total network partition.\n"
+            "#\n"
+            "# PATH-independent verb chain (belt-and-braces, review MINOR #5):\n"
+            "# /sbin/shutdown is tried first (always present on the golden\n"
+            "# image's absolute path regardless of PATH state at this point in\n"
+            "# boot), falling back to a bare `shutdown` (PATH-resolved) and\n"
+            "# finally `poweroff` (absolute then PATH-resolved) in case the\n"
+            "# shutdown binary is ever missing/renamed. Any one succeeding halts\n"
+            "# the node; `||`-chained so a missing binary never aborts the chain.\n"
+            "#\n"
+            "# HALT vs DELETE (review MINOR #3, precise honesty): `shutdown -h`\n"
+            "# transitions the instance to TERMINATED, which stops COMPUTE\n"
+            "# BILLING -- that IS the $0 guarantee this dead-man exists to make.\n"
+            "# It does NOT delete the instance or its persistent disk; a\n"
+            "# TERMINATED brain VM + disk persists until an explicit\n"
+            "# `delete_instance` call (this driver's normal teardown path) or\n"
+            "# the gcp_cleanup.py sweep reaps it -- gcp_cleanup.py's brain-orphan\n"
+            "# guard (`_should_reap_orphan_vm`) reaps TERMINATED brain-labelled\n"
+            "# VMs unconditionally, so a node that reaches this dead-man is\n"
+            "# still fully cleaned up, just via a second, independent sweep.\n"
+            "nohup bash -c 'sleep %d; "
+            "/sbin/shutdown -h now || shutdown -h now || "
+            "/sbin/poweroff || poweroff' >/dev/null 2>&1 &\n"
+            % lifetime_s
+        )
+        if lifetime_s > 0
+        else ""
     )
     return (
         "#!/usr/bin/env bash\n"
@@ -258,6 +312,7 @@ def _brain_runtime_startup_script() -> str:
         "systemctl restart jarvis-brain.service || systemctl start jarvis-brain.service || true\n"
         "systemctl restart jarvis-brain-bus.service || systemctl start jarvis-brain-bus.service || true\n"
         "systemctl start jarvis-brain-idle.timer || true\n"
+        + selfdestruct
     )
 
 
