@@ -439,22 +439,39 @@ def _compose_remote_command(
 
 
 def _compose_dispatch_wrapper(remote_cmd: str, remote_run_dir: str) -> str:
-    """Wrap the remote command in a detached (nohup + disown) shell so the SSH
-    session returns immediately while the soak keeps running on the node. A
-    done-file (with the child's exit code) is the completion signal `monitor()`
-    polls for -- so verdict retrieval binds to ACTUAL completion, not a guessed
-    ceiling."""
+    """Launch the soak as a transient systemd unit (`systemd-run`) so the SSH
+    session returns IMMEDIATELY while the soak runs independently on the node.
+
+    Root cause this fixes (live-fire, probed directly): over
+    `gcloud compute ssh --tunnel-through-iap`, `nohup <cmd> & disown` does NOT
+    release the SSH channel -- the session blocks until the backgrounded process
+    exits (dispatch 60/120s timeout on the fresh image). `systemd-run` returns
+    in ~3s ("Running as unit: ...") because the unit runs in its OWN
+    cgroup/session, fully severed from the SSH channel. `--collect` reaps the
+    unit after it exits; the unit's stdout/stderr append to the dispatch log
+    (which monitor()/retrieve pull); the inner writes the done-file (with the
+    child's exit code) that monitor() polls for ACTUAL completion.
+
+    This whole wrapper is root-wrapped by `dispatch()` via `_wrap_as_root`
+    (base64 | sudo bash), so `systemd-run`/`systemctl` run as root."""
     done_file = remote_run_dir.rstrip("/") + "/ignite_dispatch.done"
     log_file = remote_run_dir.rstrip("/") + "/ignite_dispatch.log"
+    # Deterministic, valid, unique unit name from the run dir basename.
+    unit = "a1soak-" + os.path.basename(remote_run_dir.rstrip("/"))
     inner = "%s; echo DONE_RC=$? > %s" % (remote_cmd, shlex.quote(done_file))
-    # Detached background soak (the run-4..7 proven form): nohup + full fd
-    # redirect (>log 2>&1 </dev/null) + background (&) + disown, so the SSH
-    # `sudo bash` returns right after `echo DISPATCH_STARTED`. The monitor polls
-    # the done-file for ACTUAL completion.
     return (
-        "mkdir -p %s && nohup bash -c %s > %s 2>&1 < /dev/null & disown; "
-        "echo DISPATCH_STARTED"
-        % (shlex.quote(remote_run_dir), shlex.quote(inner), shlex.quote(log_file))
+        "mkdir -p %s && "
+        "systemd-run --unit=%s --collect "
+        "--property=StandardOutput=append:%s "
+        "--property=StandardError=append:%s "
+        "/bin/bash -c %s; echo DISPATCH_STARTED"
+        % (
+            shlex.quote(remote_run_dir),
+            shlex.quote(unit),
+            shlex.quote(log_file),
+            shlex.quote(log_file),
+            shlex.quote(inner),
+        )
     )
 
 
