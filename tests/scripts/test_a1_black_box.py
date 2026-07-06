@@ -338,6 +338,111 @@ def test_bundle_without_verdict_is_noted_absent_and_does_not_crash(tmp_path):
     assert "a1_verdict.json" in result.absent
 
 
+# ===========================================================================
+# 6. Soak-child stdout/stderr (rc=1 boot telemetry gap) -- mirrors the
+#    a1_verdict.json discovery/bundling tests exactly (5) above.
+# ===========================================================================
+
+
+def _make_iso_soak_stdout(root: Path, *, text: str, run_id="iso-a1-20260624-010101"):
+    run_dir = root / "a1_iso_runs" / "some-node" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_dir / "soak_stdout.log"
+    stdout_path.write_text(text)
+    return stdout_path
+
+
+def test_bundle_includes_soak_stdout_when_present(tmp_path):
+    _make_session_tree(tmp_path)
+    _make_iso_soak_stdout(
+        tmp_path, text="Traceback (most recent call last):\nZeroDivisionError: boot rc=1\n")
+    out = tmp_path / "out"
+    result = black_box.bundle(_make_args(tmp_path, out))
+
+    with tarfile.open(result.archive_path, "r:gz") as tf:
+        names = tf.getnames()
+    assert "soak_stdout.log" in names, "soak_stdout.log must land at a stable root arcname"
+
+    text = _extract_text(result.archive_path, "soak_stdout.log")
+    assert text is not None
+    assert "ZeroDivisionError" in text
+    assert "boot rc=1" in text
+
+    manifest = _extract_text(result.archive_path, "MANIFEST.txt")
+    assert "soak_stdout.log" in manifest
+
+
+def test_bundle_picks_newest_soak_stdout_when_multiple_present(tmp_path):
+    _make_session_tree(tmp_path)
+    older = _make_iso_soak_stdout(
+        tmp_path, text="older boot log", run_id="iso-a1-20260101-000000")
+    newer = _make_iso_soak_stdout(
+        tmp_path, text="newer boot log", run_id="iso-a1-20260624-235959")
+    now = time.time()
+    os.utime(older, (now - 1000, now - 1000))
+    os.utime(newer, (now, now))
+
+    out = tmp_path / "out"
+    result = black_box.bundle(_make_args(tmp_path, out))
+    text = _extract_text(result.archive_path, "soak_stdout.log")
+    assert text == "newer boot log"
+
+
+def test_bundle_without_soak_stdout_is_noted_absent_and_does_not_crash(tmp_path):
+    # No a1_iso_runs tree at all -> discovery finds nothing, bundle still succeeds.
+    _make_session_tree(tmp_path)
+    out = tmp_path / "out"
+    result = black_box.bundle(_make_args(tmp_path, out))
+
+    assert Path(result.archive_path).exists(), "bundle must still succeed without soak_stdout.log"
+    with tarfile.open(result.archive_path, "r:gz") as tf:
+        names = tf.getnames()
+    assert "soak_stdout.log" not in names
+    manifest = _extract_text(result.archive_path, "MANIFEST.txt")
+    assert "soak_stdout.log" in manifest  # noted absent, never silently dropped
+    assert "soak_stdout.log" in result.absent
+
+
+def test_soak_stdout_iso_run_root_override_scopes_discovery(tmp_path):
+    """An explicit --iso-run-root searches ONLY that root, same escape hatch
+    as the a1_verdict.json discovery."""
+    _make_session_tree(tmp_path)
+    run_root = tmp_path / "custom_run_root"
+    run_dir = run_root / "iso-a1-20260624-010101"
+    run_dir.mkdir(parents=True)
+    (run_dir / "soak_stdout.log").write_text("custom root boot log")
+
+    cfg = black_box.BundleConfig(
+        run_id="run-custom",
+        repo_root=str(tmp_path),
+        out_dir=str(tmp_path / "out"),
+        session_dir=str(tmp_path / ".ouroboros" / "sessions" / "bt-20260624-000000"),
+        iso_run_root=str(run_root),
+        git_diff_runner=lambda target: "diff --git stub",
+        env={},
+    )
+    result = black_box.bundle(cfg)
+    text = _extract_text(result.archive_path, "soak_stdout.log")
+    assert text == "custom root boot log"
+
+
+def test_discover_soak_stdout_env_glob_override(tmp_path, monkeypatch):
+    """The glob list is env-tunable, not a frozen bt-iso-*/iso-a1-* special
+    case -- an operator can point discovery at a differently-named run tree.
+    (Mirrors how _VERDICT_GLOB_PATTERNS is resolved once at import time --
+    patch the resolved module-level list directly, same as the env var would
+    on a fresh interpreter.)"""
+    weird_dir = tmp_path / "weird_run_layout" / "attempt-7"
+    weird_dir.mkdir(parents=True)
+    (weird_dir / "soak_stdout.log").write_text("weird layout boot log")
+    monkeypatch.setattr(
+        black_box, "_SOAK_STDOUT_GLOB_PATTERNS", ["weird_run_layout/**/soak_stdout.log"])
+    hit = black_box._discover_soak_stdout(str(tmp_path))
+    assert hit is not None
+    assert hit.endswith("soak_stdout.log")
+    assert Path(hit).read_text() == "weird layout boot log"
+
+
 def test_iso_run_root_override_scopes_discovery(tmp_path):
     """An explicit --iso-run-root searches ONLY that root (arg/knob escape
     hatch), still landing at the stable arcname."""

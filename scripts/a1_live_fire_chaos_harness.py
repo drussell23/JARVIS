@@ -431,6 +431,12 @@ class SoakRunner:
         self.cost_cap = cost_cap
         self.wall_seconds = wall_seconds
         self._proc: Optional[subprocess.Popen] = None
+        # The parent-owned soak_stdout.log fh (Popen's stdout=fh, stderr=STDOUT).
+        # Flushed+fsync'd+closed by flush_stdout() once the child has verifiably
+        # exited -- the durability barrier a fast-crashing (rc=1) child's boot
+        # traceback needs before any reader (audit, black-box bundler) opens the
+        # file. See flush_stdout()'s docstring for the full rationale.
+        self._stdout_fh: Optional[Any] = None
 
     def _sessions_root(self) -> str:
         return os.path.join(self.repo_root, ".ouroboros", "sessions")
@@ -467,6 +473,7 @@ class SoakRunner:
         stdout_path = os.path.join(run_dir, "soak_stdout.log")
         os.makedirs(run_dir, exist_ok=True)
         fh = open(stdout_path, "w", encoding="utf-8")
+        self._stdout_fh = fh
         self._proc = subprocess.Popen(
             argv, cwd=self.repo_root, env=env, stdout=fh, stderr=subprocess.STDOUT,
             # Process Group Leader Isolation: the organism becomes its OWN
@@ -501,47 +508,84 @@ class SoakRunner:
         # Fall back to a placeholder path under the sessions root.
         return os.path.join(root, "pending", "debug.log")
 
+    def flush_stdout(self) -> None:
+        """Durability barrier for the parent-owned ``soak_stdout.log`` fh
+        (rc=1 boot telemetry gap fix, 2026-07-05): ``flush()`` + ``os.fsync()``
+        + ``close()`` the fh this runner opened in ``launch()``, so a
+        fast-crashing child's traceback is guaranteed durably on disk BEFORE
+        any reader (the live audit in ``isomorphic_a1_local.py``, or the
+        node-side Black-Box bundler) opens the file. MUST be called only after
+        the child has verifiably exited (``proc.poll()``/``proc.wait()``
+        returned non-None) -- calling it while the child is still running
+        would race the child's own in-flight writes.
+
+        Idempotent (a `.closed` fh is a no-op) + fail-soft (NEVER raises) --
+        safe to call from multiple sites (the caller's post-termination step,
+        `stop()`'s own cascade, `_reap_soak_runners()`, atexit) without
+        double-close errors."""
+        fh = self._stdout_fh
+        if fh is None or fh.closed:
+            return
+        try:
+            fh.flush()
+            os.fsync(fh.fileno())
+        except (OSError, ValueError):  # noqa: BLE001 -- ValueError: closed fh race
+            pass
+        finally:
+            try:
+                fh.close()
+            except OSError:
+                pass
+
     def stop(self) -> None:
         """Autonomous SIGTERM cascade over the WHOLE process group -- guarantees
         zero orphaned multiprocessing workers. The organism was launched as its
         own session leader (start_new_session=True), so its pgid == its pid and
         the group holds the organism + every worker/resource_tracker it spawned.
         SIGTERM the group (lets atexit + pool.join cleanup run), wait a grace,
-        then escalate SIGKILL to the group. NEVER raises."""
-        proc = self._proc
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            grace = float(os.environ.get("JARVIS_A1_SOAK_STOP_GRACE_S", "15") or 15)
-        except (TypeError, ValueError):
-            grace = 15.0
-        try:
-            pgid = os.getpgid(proc.pid)
-        except Exception:  # noqa: BLE001
-            pgid = None
+        then escalate SIGKILL to the group. NEVER raises.
 
-        def _signal_group(sig: int) -> None:
+        The soak_stdout.log fh is ALWAYS flushed+fsync'd+closed before this
+        method returns (via `finally` -> `flush_stdout()`), on every exit path
+        -- including the common case where the child had already exited before
+        `stop()` was even called."""
+        proc = self._proc
+        try:
+            if proc is None or proc.poll() is not None:
+                return
             try:
-                if pgid is not None:
-                    os.killpg(pgid, sig)          # the ENTIRE group, not just parent
-                else:
-                    proc.send_signal(sig)         # fallback: parent only
-            except ProcessLookupError:
+                grace = float(os.environ.get("JARVIS_A1_SOAK_STOP_GRACE_S", "15") or 15)
+            except (TypeError, ValueError):
+                grace = 15.0
+            try:
+                pgid = os.getpgid(proc.pid)
+            except Exception:  # noqa: BLE001
+                pgid = None
+
+            def _signal_group(sig: int) -> None:
+                try:
+                    if pgid is not None:
+                        os.killpg(pgid, sig)          # the ENTIRE group, not just parent
+                    else:
+                        proc.send_signal(sig)         # fallback: parent only
+                except ProcessLookupError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+
+            _signal_group(signal.SIGTERM)
+            try:
+                proc.wait(timeout=grace)
+                return                                # group yielded gracefully
+            except Exception:  # noqa: BLE001 -- TimeoutExpired (or any) -> escalate
                 pass
+            _signal_group(signal.SIGKILL)             # workers refused to yield
+            try:
+                proc.wait(timeout=5)
             except Exception:  # noqa: BLE001
                 pass
-
-        _signal_group(signal.SIGTERM)
-        try:
-            proc.wait(timeout=grace)
-            return                                # group yielded gracefully
-        except Exception:  # noqa: BLE001 -- TimeoutExpired (or any) -> escalate
-            pass
-        _signal_group(signal.SIGKILL)             # workers refused to yield
-        try:
-            proc.wait(timeout=5)
-        except Exception:  # noqa: BLE001
-            pass
+        finally:
+            self.flush_stdout()
 
 
 # ===========================================================================
@@ -739,11 +783,28 @@ class IapBlackBoxTransport:
         return self._hyper
 
     def bundle_on_node(self, *, run_id: str, out_dir: str) -> Optional[Dict[str, str]]:
-        """SSH-exec the node-side bundler; parse BLACK_BOX_ARCHIVE/SHA256."""
+        """SSH-exec the node-side bundler; parse BLACK_BOX_ARCHIVE/SHA256.
+
+        ROOT-WRAPPED (rc=1 telemetry-gap fix, 2026-07-05): the organism runs
+        root-wrapped on the node, so its ``.ouroboros/sessions/bt-iso-*`` dir
+        AND the isomorphic soak-child's ``soak_stdout.log`` are ROOT-OWNED.
+        This transport, though, SSHes in as the OS-Login user -- a plain
+        `python3` invocation cannot even `os.listdir()` the root-owned session
+        dir, so a fast-crashing (rc=1) organism's boot traceback was silently
+        never captured. GCE OS-Login admins get passwordless sudo, so the
+        bundler itself now runs under `sudo` (root read access, same as the
+        tree it reads). The archive it writes lands ROOT-OWNED under
+        `out_dir` -- the subsequent `pull_archive()` scp (runs as the SSH
+        user, NOT root) could not otherwise read it, so a `sudo chmod -R a+r`
+        over `out_dir` is chained in the SAME SSH session, before control
+        returns to the (non-root) puller. This is a general correctness fix
+        (session dirs are commonly root-owned in remote soaks), not an
+        A1-only special case -- `a1_live_fire --remote` shares this class too."""
         hyper = self._hypervisor()
         remote = (
-            "cd %s && python3 scripts/a1_black_box.py --bundle --run-id %s --out %s"
-            % (_BLACK_BOX_REMOTE_REPO, run_id, out_dir)
+            "cd %s && sudo python3 scripts/a1_black_box.py --bundle --run-id %s --out %s "
+            "&& sudo chmod -R a+r %s"
+            % (_BLACK_BOX_REMOTE_REPO, run_id, out_dir, out_dir)
         )
         argv = hyper._ssh_cmd(self.args, self.node, remote)
         cp = self._run(argv)
