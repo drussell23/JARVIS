@@ -123,6 +123,13 @@ _CHAOS_HARNESS_SCRIPT = os.path.join(_SCRIPTS_DIR, "a1_live_fire_chaos_harness.p
 
 # The remote jarvis repo root on the node (matches the golden image / IaC sync target).
 _REMOTE_REPO_ROOT = os.environ.get("JARVIS_A1_BRAIN_REMOTE_REPO", "/opt/trinity/jarvis")
+# The organism's deps live in the golden-image venv (PEP-668; the same
+# interpreter jarvis-brain.service uses), NOT system python3 -- bare `python3`
+# on the node has none of the org deps and dies with ModuleNotFoundError before
+# a session is ever created (live-fire bt a1-brain-20260705-173210: soak exited
+# RC=1, session_dir '<not discovered>'). Env-tunable.
+_REMOTE_PYTHON = os.environ.get(
+    "JARVIS_A1_BRAIN_PYTHON", "/opt/trinity/venv/bin/python3")
 
 # Piece C / B config baked into the remote command (facts-file authoritative values).
 _DEFAULT_CHAOS_TARGET_DIRS = "backend/core/ouroboros/a1_ignition_vector"
@@ -367,13 +374,14 @@ def _compose_remote_command(
         "JARVIS_BRAIN_OUTBOUND_TOPICS=%s "
         "OUROBOROS_BATTLE_HEADLESS=1 "
         "OUROBOROS_BATTLE_MAX_WALL_SECONDS=%d "
-        "python3 scripts/isomorphic_a1_local.py --mode process --run-root %s "
+        "%s scripts/isomorphic_a1_local.py --mode process --run-root %s "
         "--seed %d%s"
         % (
             _REMOTE_REPO_ROOT,
             _DEFAULT_CHAOS_TARGET_DIRS,
             _DEFAULT_OUTBOUND_TOPICS,
             int(soak_wall_s),
+            _REMOTE_PYTHON,
             remote_run_dir,
             seed,
             verbose_flag,
@@ -1272,6 +1280,23 @@ class A1BrainIgnition:
                 _log("  criterion %-32s %s" % (name, "PASS" if ok else "FAIL"))
         else:
             _log("A1 VERDICT: UNAVAILABLE (verdict_source=%s)" % (verdict_source,))
+            # Remote-failure visibility: the node-side dispatch log carries the
+            # soak's stdout/stderr (e.g. an early ModuleNotFoundError before any
+            # session exists). SSH is root-wrapped, so it can read the
+            # root-owned log. Bounded tail, fail-soft -- essential for
+            # diagnosing a remote soak that died before producing a verdict.
+            try:
+                rc, tail = await self._ssh_exec_async(
+                    "tail -n 60 %s 2>/dev/null || true"
+                    % (shlex.quote(self._log_file()),),
+                    timeout_s=30.0)
+                if tail and tail.strip():
+                    _log("[IgniteA1Brain] --- node ignite_dispatch.log (tail) ---")
+                    for ln in tail.strip().splitlines()[-60:]:
+                        _log("[node] %s" % (ln,))
+                    _log("[IgniteA1Brain] --- end dispatch log ---")
+            except Exception as exc:  # noqa: BLE001 -- diagnostic, never fatal
+                _log("[IgniteA1Brain] WARN could not pull dispatch log: %r" % (exc,))
 
         return {
             "verdict": verdict,

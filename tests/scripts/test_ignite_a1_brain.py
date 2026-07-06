@@ -1205,8 +1205,14 @@ def test_retrieve_verdict_ssh_fallback_disabled_by_env(tmp_path, monkeypatch):
 
     assert result["verdict"] is None
     assert result["verdict_source"] == "none"
-    # No SSH calls at all -- the fallback path was never entered.
-    assert runner.calls == []
+    # The SSH VERDICT FALLBACK was never entered -- no a1_verdict.json find/cat
+    # over SSH (mandate 3: authoritative retrieval is IapBlackBoxTransport-only,
+    # and the fallback is disabled). A diagnostic ignite_dispatch.log tail on the
+    # UNAVAILABLE branch is NOT verdict retrieval and is permitted.
+    assert not any(
+        "a1_verdict.json" in " ".join(str(a) for a in call[0])
+        for call in runner.calls), (
+        "the SSH verdict fallback must not run when disabled: %r" % (runner.calls,))
 
 
 def test_retrieve_verdict_bundle_without_verdict_member_falls_back(tmp_path, monkeypatch):
