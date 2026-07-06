@@ -438,7 +438,11 @@ def test_run_watch_proven_via_injected_log(tmp_path):
             a.ingest_log_line("[SemanticGuard] findings=0")
             a.ingest_event("tool_exploration_start", {})
             a.ingest_event("decision_recorded", {})
-            a.ingest_event("operation_terminal", {"state": "applied"})
+            # op_id mirrors the real publisher contract —
+            # publish_operation_terminal refuses to publish without one.
+            a.ingest_event(
+                "operation_terminal", {"op_id": "op-watch", "state": "applied"}
+            )
             a.ingest_event("review_branch_created", {})
 
         writer = asyncio.ensure_future(_writer())
@@ -478,3 +482,122 @@ def test_run_watch_intervention_trips_and_fails(tmp_path):
     assert verdict.proven is False
     assert verdict.criteria["intervention_lock_clean"] is False
     assert "intervention_lock" in verdict.failure_locus
+
+
+# ===========================================================================
+# 10. Autonomous-mutation gate — noop/read-only completions MUST NOT satisfy
+#     fsm_classify_to_applied (run a1-brain-20260705-233225 false-positive:
+#     two is_noop=True read_only_complete ops flipped the criterion true
+#     with zero bytes written). written=True AND is_noop=False are absolute
+#     prerequisites for a PASS. Log lines below are byte-shaped on the real
+#     orchestrator output from that run's black-box bundle.
+# ===========================================================================
+
+
+def _feed_hops_and_classify(a, op="op-noop1"):
+    for hop in aud.A1TRACE_HOPS:
+        a.ingest_log_line(f"WARNING [A1Trace] {hop} goal=GOAL-N op={op}")
+    a.ingest_event("fsm_phase_changed", {"phase": "CLASSIFY", "op_id": op})
+    a.ingest_event("fsm_phase_changed", {"phase": "GENERATE", "op_id": op})
+
+
+def test_noop_read_only_applied_fails_mutation_gate():
+    """The exact live false-positive: noop skip-APPLY + LEDGER_TERMINAL
+    state=applied written=True for the SAME op -> criterion must be False."""
+    a = _make_auditor(strict=False)
+    _feed_hops_and_classify(a, op="op-noop1")
+    a.ingest_log_line(
+        "2026-07-06T06:35:20 [Ouroboros.Orchestrator] INFO [Orchestrator] "
+        "op=op-noop1 is_noop=True (provider=doubleword) "
+        "terminal_reason_code=read_only_complete — skipping APPLY"
+    )
+    a.ingest_log_line(
+        "2026-07-06T06:35:21 [Ouroboros.Orchestrator] INFO [Slice74Probe] "
+        "LEDGER_TERMINAL op_id=op-noop1 state=applied written=True"
+    )
+    v = a.verdict()
+    assert v.criteria["fsm_classify_to_applied"] is False
+    assert v.proven is False
+    assert "fsm" in v.failure_locus
+
+
+def test_ledger_terminal_written_false_fails_mutation_gate():
+    """state=applied with written=False is a deduped/phantom write -- not
+    mutation proof."""
+    a = _make_auditor(strict=False)
+    _feed_hops_and_classify(a, op="op-w0")
+    a.ingest_event("fsm_phase_changed", {"phase": "APPLY", "op_id": "op-w0"})
+    a.ingest_log_line(
+        "[Slice74Probe] LEDGER_TERMINAL op_id=op-w0 state=applied written=False"
+    )
+    v = a.verdict()
+    assert v.criteria["fsm_classify_to_applied"] is False
+
+
+def test_real_mutation_ledger_terminal_passes_log_only():
+    """A genuine APPLY phase + applied terminal written=True from a non-noop
+    op still passes (log-only path, no SSE)."""
+    a = _make_auditor(strict=False)
+    _feed_hops_and_classify(a, op="op-real")
+    a.ingest_event("fsm_phase_changed", {"phase": "APPLY", "op_id": "op-real"})
+    a.ingest_log_line(
+        "[Slice74Probe] LEDGER_TERMINAL op_id=op-real state=applied written=True"
+    )
+    v = a.verdict()
+    assert v.criteria["fsm_classify_to_applied"] is True
+
+
+def test_sse_applied_with_noop_reason_fails_mutation_gate():
+    """SSE operation_terminal carrying terminal_reason_code=read_only_complete
+    is a no-op completion, never mutation proof."""
+    a = _make_auditor(strict=False)
+    _feed_hops_and_classify(a, op="op-sse-noop")
+    a.ingest_event("fsm_phase_changed", {"phase": "APPLY", "op_id": "op-sse-noop"})
+    a.ingest_event(
+        "operation_terminal",
+        {
+            "op_id": "op-sse-noop",
+            "state": "applied",
+            "phase": "COMPLETE",
+            "terminal_reason_code": "read_only_complete",
+        },
+    )
+    v = a.verdict()
+    assert v.criteria["fsm_classify_to_applied"] is False
+
+
+def test_mixed_noop_and_real_mutation_passes():
+    """A noop completion alongside a genuine mutation: the real op carries
+    the gate."""
+    a = _make_auditor(strict=False)
+    _feed_hops_and_classify(a, op="op-mix")
+    a.ingest_log_line(
+        "[Orchestrator] op=op-mix-noop is_noop=True (provider=doubleword) "
+        "terminal_reason_code=read_only_complete — skipping APPLY"
+    )
+    a.ingest_log_line(
+        "[Slice74Probe] LEDGER_TERMINAL op_id=op-mix-noop state=applied written=True"
+    )
+    a.ingest_event("fsm_phase_changed", {"phase": "APPLY", "op_id": "op-mix"})
+    a.ingest_log_line(
+        "[Slice74Probe] LEDGER_TERMINAL op_id=op-mix state=applied written=True"
+    )
+    v = a.verdict()
+    assert v.criteria["fsm_classify_to_applied"] is True
+
+
+def test_noop_only_failure_locus_names_noop_class():
+    """When the ONLY applied evidence is noop read-only completions, the
+    failure locus must say so (diagnosable, not generic)."""
+    a = _make_auditor(strict=False)
+    _feed_hops_and_classify(a, op="op-noop2")
+    a.ingest_log_line(
+        "[Orchestrator] op=op-noop2 is_noop=True (provider=doubleword) "
+        "terminal_reason_code=read_only_complete — skipping APPLY"
+    )
+    a.ingest_log_line(
+        "[Slice74Probe] LEDGER_TERMINAL op_id=op-noop2 state=applied written=True"
+    )
+    v = a.verdict()
+    assert v.criteria["fsm_classify_to_applied"] is False
+    assert "noop" in v.failure_locus or "read_only" in v.failure_locus
