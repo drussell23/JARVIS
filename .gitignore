@@ -444,3 +444,6 @@ a1_iso_runs/
 *_resume.html
 *resume*.html
 Derek J. Russell - Resume*.pdf
+
+# Local AI-tool configs that may hold per-user credentials (never commit)
+.codex/
