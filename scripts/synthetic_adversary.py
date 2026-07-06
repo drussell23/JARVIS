@@ -1666,6 +1666,19 @@ class SyntheticAdversary:
 
         # Early diagnostic fields for logging
         has_tools = bool(body.get("tools"))
+        # H2 structural fix: the Venom tool loop embeds the tool catalog in
+        # the prompt text (DW-proprietary 2b.2-tool schema) on the final
+        # generation round — body["tools"] is only populated during explicit
+        # tool-loop rounds where tool_choice=required. Detect prompt-embedded
+        # tools so has_tools accurately reflects the payload state regardless
+        # of which Venom round this request represents.
+        if not has_tools:
+            for _msg in messages:
+                _c = _msg.get("content", "")
+                _cs = _c if isinstance(_c, str) else str(_c)
+                if "## TOOLS" in _cs or "2b.2-tool" in _cs:
+                    has_tools = True
+                    break
         # A1-DIAG: stateless wire-side tool-coercion telemetry.
         # Detects the prompt-embedded Venom tool catalog (the DW-proprietary
         # 2b.2-tool format) independently of body["tools"] (the OpenAI-compat
