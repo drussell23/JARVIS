@@ -132,6 +132,38 @@ def test_compose_env_sources_linux_overlay(monkeypatch):
     assert "OUROBOROS_BATTLE_MAX_WALL_SECONDS" in env
 
 
+def test_compose_env_operator_wall_wins_over_overlay(monkeypatch):
+    """The ignition/operator-supplied OUROBOROS_BATTLE_MAX_WALL_SECONDS is
+    AUTHORITATIVE over the linux_prod overlay's static default (3600).
+
+    Root cause (live-fire a1-brain-20260705-213419): ignite_a1_brain.py sizes the
+    node lifetime + monitor budget from --soak-wall-s and bakes the SAME value as
+    OUROBOROS_BATTLE_MAX_WALL_SECONDS in the remote command. compose_env layered
+    the overlay via env.update(), clobbering the baked 1200 with the overlay's
+    3600 -- so the soak child outlived the outer budget (node self-destructed /
+    monitor gave up mid-soak -> no verdict). The operator's explicit wall must
+    survive overlay layering (the SAME "operator env ALWAYS wins" invariant
+    _composed_soak_wall_s documents one layer down)."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_FLAGS", raising=False)
+    monkeypatch.setenv("OUROBOROS_BATTLE_MAX_WALL_SECONDS", "1200")
+    env = harness.compose_env()
+    assert env["OUROBOROS_BATTLE_MAX_WALL_SECONDS"] == "1200", (
+        "operator-explicit soak wall must win over the overlay's static 3600 default"
+    )
+
+
+def test_compose_env_overlay_wall_default_when_operator_unset(monkeypatch):
+    """When the operator does NOT pin the wall, the overlay default (3600) is
+    still sourced -- the fix preserves the fallback, it only stops the clobber
+    of an EXPLICIT operator value."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_FLAGS", raising=False)
+    monkeypatch.delenv("OUROBOROS_BATTLE_MAX_WALL_SECONDS", raising=False)
+    env = harness.compose_env()
+    assert env["OUROBOROS_BATTLE_MAX_WALL_SECONDS"] == "3600", (
+        "overlay default must still apply when the operator leaves the wall unset"
+    )
+
+
 # ===========================================================================
 # 1b. compose_env: A1-harness opt-in flags (Fix #1 + Fix #2 regression spine)
 # ===========================================================================
