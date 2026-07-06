@@ -447,14 +447,12 @@ def _compose_dispatch_wrapper(remote_cmd: str, remote_run_dir: str) -> str:
     done_file = remote_run_dir.rstrip("/") + "/ignite_dispatch.done"
     log_file = remote_run_dir.rstrip("/") + "/ignite_dispatch.log"
     inner = "%s; echo DONE_RC=$? > %s" % (remote_cmd, shlex.quote(done_file))
-    # `setsid` starts the soak in a NEW session (fully severed from the SSH
-    # session's process group + controlling terminal), so `sudo bash` returns
-    # immediately and the dispatch SSH command cannot hang on an inherited fd
-    # held open by pip/pytest subprocesses (run8/9: nohup+disown alone left the
-    # SSH channel open -> 60s dispatch timeout). All fds are redirected
-    # (>log 2>&1 </dev/null) and it is backgrounded (&) + disowned.
+    # Detached background soak (the run-4..7 proven form): nohup + full fd
+    # redirect (>log 2>&1 </dev/null) + background (&) + disown, so the SSH
+    # `sudo bash` returns right after `echo DISPATCH_STARTED`. The monitor polls
+    # the done-file for ACTUAL completion.
     return (
-        "mkdir -p %s && setsid nohup bash -c %s > %s 2>&1 < /dev/null & disown; "
+        "mkdir -p %s && nohup bash -c %s > %s 2>&1 < /dev/null & disown; "
         "echo DISPATCH_STARTED"
         % (shlex.quote(remote_run_dir), shlex.quote(inner), shlex.quote(log_file))
     )
