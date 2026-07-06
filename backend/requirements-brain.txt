@@ -30,7 +30,7 @@ rich==14.2.0             # serpent_flow/TUI render layer (headless still imports
 pytest>=9.0,<10          # TestRunner VERIFY phase runs pytest subprocesses
 
 # --- ARMED: import-guarded features the Brain must have live -----------------
-anthropic==0.75.0        # Tier-1 provider (Claude) -- silent-degrade without it
+anthropic==0.116.0        # Tier-1 provider (Claude) -- silent-degrade without it
 httpx==0.28.1            # DW provider / HTTP clients
 PyYAML==6.0.3            # brain_selection_policy.yaml -- zero hardcoded models
 python-dotenv==1.2.1
