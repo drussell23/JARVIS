@@ -533,3 +533,80 @@ def test_dry_run_local_leaves_tree_reverted(tmp_path, monkeypatch):
     monkeypatch.setattr(harness, "build_dry_run_local", _wrapped)
     harness.main(["--dry-run-local", "--stub-soak", "--lenient"])
     assert revert_marker["reverted"], "dry-run-local must revert chaos in finally"
+
+
+# ===========================================================================
+# SoakRunner.flush_stdout() -- durability barrier (rc=1 boot telemetry gap
+# fix, 2026-07-05). A real (tiny, non-organism) child process is launched so
+# the fh-open/Popen/exit lifecycle is exercised for real -- no mocked
+# subprocess -- proving soak_stdout.log is durably readable (not stuck
+# unflushed) once the child has exited.
+# ===========================================================================
+
+
+def _write_fake_crashing_soak_script(tmp_path) -> str:
+    """A tiny standalone script that mimics a fast rc=1 organism boot crash:
+    prints a traceback-shaped message to stdout, then exits 1. Ignores its
+    argv entirely (SoakRunner.launch() passes --production-soak/--headless/
+    --cost-cap/--max-wall-seconds -- this stub tolerates any argv)."""
+    script = tmp_path / "fake_crashing_soak.py"
+    script.write_text(
+        "import sys\n"
+        "print('Traceback (most recent call last):')\n"
+        "print('RuntimeError: simulated boot rc=1')\n"
+        "sys.exit(1)\n"
+    )
+    return str(script)
+
+
+def test_flush_stdout_is_noop_before_launch():
+    # Never launched -> _stdout_fh is None -> flush_stdout() is a safe no-op.
+    runner = harness.SoakRunner(repo_root="/tmp", cost_cap=0.0, wall_seconds=5)
+    runner.flush_stdout()  # must not raise
+
+
+def test_stop_flushes_soak_stdout_after_real_child_exits(tmp_path, monkeypatch):
+    """The common ("exited") path: by the time stop() is called the child has
+    ALREADY exited (proc.poll() is not None), which used to early-return
+    WITHOUT flushing -- proving the fh (and thus a fast-crashing child's
+    traceback) is now durably on disk + closed via the `finally` barrier."""
+    monkeypatch.setattr(harness, "_SOAK_SCRIPT", _write_fake_crashing_soak_script(tmp_path))
+    run_dir = tmp_path / "run"
+    runner = harness.SoakRunner(repo_root=str(tmp_path), cost_cap=0.0, wall_seconds=5)
+    env = dict(os.environ)
+    env.pop("JARVIS_ACTIVE_SESSION_LOG", None)
+    handle = runner.launch(env, str(run_dir))
+    handle.proc.wait(timeout=10)
+    assert handle.proc.returncode == 1, "the fake script must exit rc=1"
+
+    # stop() sees an already-exited child -> the early-return branch -- must
+    # STILL flush via the finally barrier.
+    runner.stop()
+
+    stdout_path = run_dir / "soak_stdout.log"
+    text = stdout_path.read_text()
+    assert "Traceback (most recent call last):" in text
+    assert "RuntimeError: simulated boot rc=1" in text
+    assert runner._stdout_fh is not None and runner._stdout_fh.closed
+
+
+def test_flush_stdout_called_directly_before_stop_is_idempotent(tmp_path, monkeypatch):
+    """Mirrors isomorphic_a1_local.py's call site: flush_stdout() is invoked
+    directly once the child's termination is confirmed (BEFORE stop()/
+    _reap_soak_runners() runs, much later, at final teardown). A subsequent
+    stop() call on the same runner must be a safe no-op (fh already closed)."""
+    monkeypatch.setattr(harness, "_SOAK_SCRIPT", _write_fake_crashing_soak_script(tmp_path))
+    run_dir = tmp_path / "run"
+    runner = harness.SoakRunner(repo_root=str(tmp_path), cost_cap=0.0, wall_seconds=5)
+    env = dict(os.environ)
+    env.pop("JARVIS_ACTIVE_SESSION_LOG", None)
+    handle = runner.launch(env, str(run_dir))
+    handle.proc.wait(timeout=10)
+
+    runner.flush_stdout()  # the isomorphic_a1_local.py call site
+    stdout_path = run_dir / "soak_stdout.log"
+    text = stdout_path.read_text()
+    assert "RuntimeError: simulated boot rc=1" in text
+    assert runner._stdout_fh.closed
+
+    runner.stop()  # later teardown call -- must not raise (idempotent no-op)

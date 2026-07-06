@@ -46,6 +46,16 @@ in-archive ``MANIFEST.txt``, never an abort):
     verdict from -- fail-soft: if none is found it is simply NOTED absent,
     never an abort.
 
+  * SOAK-CHILD STDOUT/STDERR (rc=1 boot telemetry gap) -- the newest
+    ``soak_stdout.log`` discovered under the same iso-run tree (mirrors the
+    A1-verdict discovery exactly: env-tunable globs, newest-mtime wins), added
+    at the STABLE root arcname ``soak_stdout.log``. This is the organism's
+    (soak child's) captured stdout+stderr -- when the organism runs
+    root-wrapped its ``.ouroboros/sessions/bt-iso-*`` dir is ROOT-OWNED and
+    invisible to a non-root bundler, so a fast-crashing (rc=1) boot's
+    traceback would otherwise be lost entirely. Fail-soft: absent -> noted,
+    never an abort.
+
 Output: ``black_box_<run_id>.tar.gz`` + ``black_box_<run_id>.tar.gz.sha256`` in
 ``--out``. The archive path + sha256 are printed to stdout as structured
 ``BLACK_BOX_ARCHIVE=`` / ``BLACK_BOX_SHA256=`` lines the orchestrator parses.
@@ -119,6 +129,22 @@ _VERDICT_GLOB_PATTERNS = [
         "a1_iso_runs/**/iso-a1-*/a1_verdict.json,**/iso-a1-*/a1_verdict.json",
     ).split(",") if g.strip()
 ]
+
+# The soak-child stdout/stderr log (rc=1 boot telemetry gap): env-overridable
+# comma list of glob patterns, mirroring _VERDICT_GLOB_PATTERNS exactly (same
+# iso-run tree layout, `SoakRunner.launch()` writes `soak_stdout.log` into the
+# SAME run dir a1_verdict.json lands in). NOT a frozen `bt-iso-*`/`iso-a1-*`
+# special case -- just another tunable glob list, like the verdict one.
+_SOAK_STDOUT_GLOB_PATTERNS = [
+    g.strip() for g in os.environ.get(
+        "JARVIS_A1_BLACKBOX_SOAK_STDOUT_GLOBS",
+        "a1_iso_runs/**/iso-a1-*/soak_stdout.log,**/iso-a1-*/soak_stdout.log",
+    ).split(",") if g.strip()
+]
+
+# Stable in-archive arcname for the soak-child stdout/stderr log -- lockstep
+# sibling of _A1_VERDICT_ARCNAME (see below).
+_SOAK_STDOUT_ARCNAME = "soak_stdout.log"
 
 # Provider-telemetry grep tokens (env-overridable, comma list).
 _PROVIDER_TOKENS = [
@@ -205,6 +231,49 @@ def _discover_verdict_path(repo_root: str, iso_run_root: str = "") -> Optional[s
                     os.path.join(iso_run_root, "a1_verdict.json")]
     else:
         patterns = [os.path.join(repo_root, p) for p in _VERDICT_GLOB_PATTERNS]
+
+    cand: List[Tuple[float, str]] = []
+    seen = set()
+    for pattern in patterns:
+        try:
+            for hit in glob.glob(pattern, recursive=True):
+                if hit in seen:
+                    continue
+                seen.add(hit)
+                try:
+                    if os.path.isfile(hit):
+                        cand.append((os.path.getmtime(hit), hit))
+                except OSError:
+                    continue
+        except Exception:  # noqa: BLE001 -- discovery must never abort the bundle
+            continue
+    if not cand:
+        return None
+    cand.sort(reverse=True)
+    return cand[0][1]
+
+
+def _discover_soak_stdout(repo_root: str, iso_run_root: str = "") -> Optional[str]:
+    """Best-effort newest ``soak_stdout.log`` under the repo's iso-run tree --
+    the isomorphic soak-child's (the organism) captured stdout+stderr, written
+    by ``a1_live_fire_chaos_harness.py``'s ``SoakRunner.launch()`` into the SAME
+    iso-run dir ``a1_verdict.json`` lands in. This is the ONLY surviving
+    telemetry surface for a fast-crashing (rc=1) organism boot when the run's
+    ``.ouroboros/sessions/bt-iso-*`` session dir is ROOT-OWNED (the organism
+    runs root-wrapped) and this bundler runs as a non-root user -- the session
+    dir listing fails silently for that ONE dir, but the iso-run dir under
+    ``a1_iso_runs/`` (created by the orchestrator, not the root-wrapped child)
+    stays discoverable regardless.
+
+    Mirrors ``_discover_verdict_path`` exactly: fail-soft (`None` on absence),
+    newest-mtime wins, env-overridable glob list (`_SOAK_STDOUT_GLOB_PATTERNS`)
+    -- never a frozen `bt-iso-*` / `iso-a1-*` special case."""
+    patterns: List[str]
+    if iso_run_root:
+        patterns = [os.path.join(iso_run_root, "**", "soak_stdout.log"),
+                    os.path.join(iso_run_root, "soak_stdout.log")]
+    else:
+        patterns = [os.path.join(repo_root, p) for p in _SOAK_STDOUT_GLOB_PATTERNS]
 
     cand: List[Tuple[float, str]] = []
     seen = set()
@@ -476,6 +545,20 @@ def bundle(cfg: BundleConfig) -> BundleResult:
             captured.append(_A1_VERDICT_ARCNAME)
         else:
             absent.append(_A1_VERDICT_ARCNAME)
+
+        # 6b. SOAK-CHILD STDOUT/STDERR (rc=1 boot telemetry gap) -- the newest
+        # soak_stdout.log under the same iso-run tree, at a STABLE root
+        # arcname. Independent of whether the session dir itself was
+        # discoverable above (root-ownership is exactly the failure mode this
+        # closes): a fast-crashing organism boot's traceback survives here
+        # even when the whole .ouroboros/sessions/bt-iso-* dir was invisible.
+        soak_stdout_path = _discover_soak_stdout(cfg.repo_root, cfg.iso_run_root)
+        soak_stdout_text = _read_text_bounded(soak_stdout_path) if soak_stdout_path else None
+        if soak_stdout_text is not None:
+            _add_text(tf, _SOAK_STDOUT_ARCNAME, soak_stdout_text)
+            captured.append(_SOAK_STDOUT_ARCNAME)
+        else:
+            absent.append(_SOAK_STDOUT_ARCNAME)
 
         # 7. MANIFEST.txt: what was captured + what was absent (loud, never silent).
         manifest_lines = [

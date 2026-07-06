@@ -273,3 +273,55 @@ def test_blackbox_failure_path_holds_on_mismatch_and_reverts(tmp_path, monkeypat
     assert ("teardown", "sovereign-node-RF") not in transport.calls
     # Chaos STILL reverted in finally regardless.
     assert "revert" in chaos.calls
+
+
+# ===========================================================================
+# IapBlackBoxTransport.bundle_on_node -- root-wrapped (rc=1 telemetry gap fix,
+# 2026-07-05): the bundler now runs under sudo (root read access to the
+# root-owned organism session dir / soak_stdout.log) and the produced archive
+# is chmod'd world-readable so the subsequent (non-root) scp pull can read it.
+# No real SSH/subprocess -- the runner is injected.
+# ===========================================================================
+
+
+class _HypervisorArgsStub:
+    """Minimal stand-in for the argparse.Namespace `_ssh_cmd` reads."""
+
+    def __init__(self, *, project="proj-x", zone="us-central1-a"):
+        self.project = project
+        self.zone = zone
+
+
+def test_bundle_on_node_runs_bundler_under_sudo_and_chmods_output(monkeypatch):
+    captured_argv = []
+
+    def _fake_runner(argv):
+        captured_argv.append(list(argv))
+        import subprocess as _sp
+        return _sp.CompletedProcess(
+            argv, 0,
+            stdout="BLACK_BOX_ARCHIVE=/tmp/a1_black_box/black_box_run-X.tar.gz\n"
+                   "BLACK_BOX_SHA256=" + ("a" * 64) + "\n",
+            stderr="",
+        )
+
+    transport = harness.IapBlackBoxTransport(
+        node="sovereign-node-1", hypervisor_args=_HypervisorArgsStub(), runner=_fake_runner,
+    )
+    result = transport.bundle_on_node(run_id="run-X", out_dir="/tmp/a1_black_box")
+
+    assert result is not None
+    assert captured_argv, "the runner must have been invoked"
+    # _ssh_cmd(...) -> [..., "--command", remote] -- the remote command is last.
+    remote = captured_argv[0][-1]
+    # The bundler itself runs as root (passwordless OS-Login sudo) so it can
+    # read the root-owned organism session dir + soak_stdout.log.
+    assert "sudo python3 scripts/a1_black_box.py --bundle" in remote
+    # The produced archive (root-owned) is made world-readable so the
+    # subsequent (non-root) scp pull can read it, in the SAME ssh session.
+    assert "sudo chmod -R a+r" in remote
+    assert "/tmp/a1_black_box" in remote
+    # Ordering: bundle first, chmod second (chained with &&).
+    bundle_idx = remote.index("sudo python3 scripts/a1_black_box.py")
+    chmod_idx = remote.index("sudo chmod -R a+r")
+    assert bundle_idx < chmod_idx

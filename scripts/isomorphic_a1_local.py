@@ -1621,6 +1621,27 @@ class IsomorphicA1Driver:
                                      "cascade -- atexit process-group kill is "
                                      "the final backstop")
 
+                        # -- Durability barrier (rc=1 boot telemetry gap fix,
+                        # 2026-07-05) -- flush+fsync+close the parent-owned
+                        # soak_stdout.log fh HERE, before the audit (below)
+                        # reads it. The child has now VERIFIABLY exited (either
+                        # branch above), so this is not a race with its own
+                        # writes. `_reap_soak_runners()`/`SoakRunner.stop()`
+                        # aren't reached until much later (final teardown,
+                        # after the audit already ran) on the normal "exited"
+                        # path, so without this explicit call a fast-crashing
+                        # (rc=1) child's traceback would sit in an unflushed
+                        # fh while the audit -- and later the node-side
+                        # Black-Box bundler -- read the file. Idempotent +
+                        # fail-soft: a later stop()/_reap_soak_runners() call
+                        # on the same runner is a safe no-op (fh already
+                        # closed).
+                        try:
+                            soak_runner.flush_stdout()
+                        except Exception as exc:  # noqa: BLE001 -- never block audit
+                            _log("soak_stdout flush-barrier warning: %r "
+                                 "(proceeding to audit)" % (exc,))
+
                     # ── Fast-Fail short-circuit: a global L4 capacity wall means the
                     # cognitive loop can NEVER reach APPLIED this run. Skip the audit
                     # ceiling entirely, emit a capacity verdict, and flow to teardown
