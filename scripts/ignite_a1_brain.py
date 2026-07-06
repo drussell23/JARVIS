@@ -308,6 +308,14 @@ _DEFAULT_SOAK_WALL_S = 1800  # matches the CLAUDE.md A1 happy-path (~850-1300s)
 # restore the legacy starve scenario.
 _ENV_DW_SESSION_BUDGET = "JARVIS_A1_BRAIN_DW_SESSION_BUDGET"
 _DEFAULT_DW_SESSION_BUDGET = 5.0  # ~50 ops at the $0.10 static estimate; free stub
+# Posture-context seed forwarding: the isomorphic driver defaults to seeding
+# HARDEN into the overlay's posture triplet (organism boots context-aware,
+# background-sensor budgets reshape natively). Operators override/disable
+# Mac-side via this env; forwarded verbatim to the remote cmd when set.
+# Token-validated (alnum/underscore) because the remote cmd runs inside a
+# single-quoted bash -c wrapper.
+_ENV_POSTURE_SEED = "JARVIS_A1_POSTURE_SEED"
+_POSTURE_SEED_TOKEN_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _ENV_BOOT_OFFSET_S = "JARVIS_A1_BRAIN_BOOT_OFFSET_S"
 _DEFAULT_BOOT_OFFSET_S = 180  # observed ~168s cold boot, rounded up w/ margin
 _ENV_VERDICT_PULL_MARGIN_S = "JARVIS_A1_BRAIN_VERDICT_PULL_MARGIN_S"
@@ -450,8 +458,17 @@ def _compose_remote_command(
             )
         )
         pip_sync = pip_sync + diag
+    # Operator-explicit posture-seed override rides along (default lives in
+    # the driver itself: HARDEN). Token-validated — the cmd runs inside a
+    # single-quoted bash -c wrapper; a non-token value is dropped, never
+    # quoted-through.
+    posture_seed = ""
+    _seed_raw = os.environ.get(_ENV_POSTURE_SEED, "").strip()
+    if _seed_raw and _POSTURE_SEED_TOKEN_RE.match(_seed_raw):
+        posture_seed = "%s=%s " % (_ENV_POSTURE_SEED, _seed_raw)
     return (
         "cd %s && "
+        "%s"
         "%s"
         "JARVIS_CHAOS_TARGET_DIRS=%s "
         "JARVIS_BRAIN_OUTBOUND_TOPICS=%s "
@@ -463,6 +480,7 @@ def _compose_remote_command(
         % (
             _REMOTE_REPO_ROOT,
             pip_sync,
+            posture_seed,
             _DEFAULT_CHAOS_TARGET_DIRS,
             _DEFAULT_OUTBOUND_TOPICS,
             _SYNTHETIC_DW_API_KEY,
