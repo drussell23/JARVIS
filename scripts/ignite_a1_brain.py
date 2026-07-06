@@ -383,6 +383,38 @@ def _compose_remote_command(
             "%s -m pip install -q -r backend/requirements-brain.txt && "
             % (_REMOTE_PYTHON,)
         )
+    # Diagnostic block (env-gated JARVIS_A1_BRAIN_DIAG, default on): capture the
+    # node's ACTUAL pytest + chaos-injector candidate behavior into the dispatch
+    # log (which is pulled on failure), so a node-specific "no viable candidates"
+    # is rooted with data, not guessed. Non-fatal (`|| true`).
+    diag = ""
+    if _truthy(os.environ.get("JARVIS_A1_BRAIN_DIAG", "0")):
+        # NO single quotes anywhere in the diag: the whole remote command runs
+        # inside `nohup bash -c '...'` (single-quoted), so an inner single quote
+        # breaks the wrapper (dispatch hung, run8). Use hyphen tokens, no quotes.
+        diag = (
+            "echo ===A1DIAG-git-state=== && "
+            "git -C %s rev-parse HEAD 2>&1 | head -1 && "
+            "git -C %s log --oneline -1 2>&1 | head -1 && "
+            "ls %s/tests/governance/a1_ignition_vector/ 2>&1 | head -5 && "
+            "echo ===A1DIAG-pytest-vector=== && "
+            % (_REMOTE_REPO_ROOT, _REMOTE_REPO_ROOT, _REMOTE_REPO_ROOT)
+        ) + (
+            "%s -m pytest %s/test_leaf_predicates.py -p no:cacheprovider "
+            "--no-header 2>&1 | tail -20 || true; "
+            "echo ===A1DIAG-list-candidates=== && "
+            "JARVIS_CHAOS_TARGET_DIRS=%s %s scripts/chaos_injector_ast.py "
+            "--list-candidates --repo-root %s 2>&1 | tail -25 || true; "
+            "echo ===A1DIAG-end=== ; "
+            % (
+                _REMOTE_PYTHON,
+                "tests/governance/a1_ignition_vector",
+                _DEFAULT_CHAOS_TARGET_DIRS,
+                _REMOTE_PYTHON,
+                _REMOTE_REPO_ROOT,
+            )
+        )
+        pip_sync = pip_sync + diag
     return (
         "cd %s && "
         "%s"
@@ -415,8 +447,14 @@ def _compose_dispatch_wrapper(remote_cmd: str, remote_run_dir: str) -> str:
     done_file = remote_run_dir.rstrip("/") + "/ignite_dispatch.done"
     log_file = remote_run_dir.rstrip("/") + "/ignite_dispatch.log"
     inner = "%s; echo DONE_RC=$? > %s" % (remote_cmd, shlex.quote(done_file))
+    # `setsid` starts the soak in a NEW session (fully severed from the SSH
+    # session's process group + controlling terminal), so `sudo bash` returns
+    # immediately and the dispatch SSH command cannot hang on an inherited fd
+    # held open by pip/pytest subprocesses (run8/9: nohup+disown alone left the
+    # SSH channel open -> 60s dispatch timeout). All fds are redirected
+    # (>log 2>&1 </dev/null) and it is backgrounded (&) + disowned.
     return (
-        "mkdir -p %s && nohup bash -c %s > %s 2>&1 < /dev/null & disown; "
+        "mkdir -p %s && setsid nohup bash -c %s > %s 2>&1 < /dev/null & disown; "
         "echo DISPATCH_STARTED"
         % (shlex.quote(remote_run_dir), shlex.quote(inner), shlex.quote(log_file))
     )

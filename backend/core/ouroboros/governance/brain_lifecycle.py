@@ -283,10 +283,20 @@ def _brain_runtime_startup_script() -> str:
         + tls_fetch
         + "chmod 600 %s/%s 2>/dev/null || true\n" % (
             _NODE_TLS_DIR, _TLS_META_KEYS["server_key"][1])
-        # Refresh the baked clone (fail-soft): the golden image tracks main at
-        # ignition, so driver-shipped scripts (e.g. the bus sidecar) that landed
-        # AFTER the bake are present without a re-bake.
-        + "git -C /opt/trinity/jarvis pull --ff-only || true\n"
+        # Refresh the baked clone to CURRENT origin/main (fail-soft, signed-
+        # commit lineage). The golden image is a SHALLOW clone (`git clone
+        # --depth 1`), on which `git pull --ff-only` frequently CANNOT
+        # fast-forward and silently no-ops (`|| true`) -- stranding the node at
+        # the stale baked ref (live-fire a1-brain: the A1 vector's test was
+        # absent though it was on main). A shallow `fetch` + `reset --hard`
+        # deterministically lands the node on the exact current origin/main
+        # (works on shallow clones); the old pull remains as a last-ditch
+        # fallback. Mandate 1: native git, no rsync/un-versioned patch.
+        + "(GIT_TERMINAL_PROMPT=0 timeout 90 git -C /opt/trinity/jarvis fetch "
+          "origin main --depth 1 2>/dev/null "
+          "&& git -C /opt/trinity/jarvis reset --hard FETCH_HEAD 2>/dev/null) "
+          "|| GIT_TERMINAL_PROMPT=0 timeout 60 git -C /opt/trinity/jarvis pull "
+          "--ff-only 2>/dev/null || true\n"
         # Stage-0 bus + acceptance echo responder SIDECAR: the Brain-side WS
         # server the cross-host acceptance connects to. Same venv as the soak.
         + "cat > /etc/systemd/system/jarvis-brain-bus.service <<'UNIT'\n"
