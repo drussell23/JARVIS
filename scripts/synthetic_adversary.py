@@ -1680,7 +1680,7 @@ class SyntheticAdversary:
                 if "## TOOLS" in _dc_str or "2b.2-tool" in _dc_str or "schema_version" in _dc_str:
                     _diag_prompt_has_venom_tools = True
                     break
-            logger.warning(
+            _log.warning(
                 "[A1-DIAG-ADV-TOOL-SEAM] has_tools=%s "
                 "prompt_has_venom_tools=%s body_keys=%s "
                 "msg_count=%d tool_choice=%s",
