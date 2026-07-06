@@ -143,6 +143,21 @@ def dynamic_scoping_enabled() -> bool:
     ).lower() in ("true", "1", "yes")
 
 
+def fs_confirm_enabled() -> bool:
+    """Re-read ``JARVIS_TEST_FAILURE_FS_CONFIRM_ENABLED`` at call-time
+    (default true). When on, an fs.changed-scoped run that observes a NEW
+    failure re-runs the SAME scoped targets once, immediately — a
+    deterministic failure reaches the 2-consecutive-runs stability gate in
+    seconds instead of waiting for the 600s poll fallback (which the A1
+    soak wall outlives: a1-brain-20260706-014931, where the vector's
+    single scoped observation starved at streak 1 for the whole session).
+    Bounded: at most ONE confirmation re-run per fs.changed event, scoped
+    targets only, never the full suite."""
+    return os.environ.get(
+        "JARVIS_TEST_FAILURE_FS_CONFIRM_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
 def full_suite_fallback_enabled() -> bool:
     """Re-read ``JARVIS_TEST_FULL_SUITE_FALLBACK`` at call-time (default false).
 
@@ -730,13 +745,44 @@ class TestFailureSensor:
                     "TestFailureSensor: scoped %d test target(s) for %r",
                     len(targets), changed_rel_path,
                 )
-                signals = await self._watcher.poll_once(target_paths=targets)
+                await self._run_scoped_with_confirmation(targets)
+                return
             if signals:
                 await self.handle_signals(signals)
         except asyncio.CancelledError:
             pass  # Newer edit arrived — debounce reset
         except Exception:
             logger.debug("TestFailureSensor: debounced run error", exc_info=True)
+
+    async def _run_scoped_with_confirmation(self, targets: Any) -> None:
+        """Scoped run + bounded immediate confirmation (fs.changed path).
+
+        The stability gate needs two consecutive failing observations; an
+        fs.changed detection used to provide only ONE, leaving emission to
+        the 600s poll fallback — which the A1 soak wall outlives
+        (a1-brain-20260706-014931: the vector starved at streak 1 all
+        session). When the first scoped run observes a NEW failure without
+        emitting, re-run the SAME scoped targets once, immediately: a
+        deterministic RED reaches the gate in seconds; a flake that greens
+        on the re-run is correctly absorbed (that is the gate's purpose).
+        Bounded to one re-run; gated by fs_confirm_enabled()."""
+        pre = dict(self._watcher._failure_streak)
+        signals = await self._watcher.poll_once(target_paths=targets)
+        if not signals and fs_confirm_enabled():
+            streak = self._watcher._failure_streak
+            observed_new_failure = any(
+                streak.get(test_id, 0) > pre.get(test_id, 0)
+                for test_id in streak
+            )
+            if observed_new_failure:
+                logger.info(
+                    "TestFailureSensor: scoped RED below stability gate — "
+                    "immediate confirmation re-run (%d target(s))",
+                    len(targets),
+                )
+                signals = await self._watcher.poll_once(target_paths=targets)
+        if signals:
+            await self.handle_signals(signals)
 
     # ------------------------------------------------------------------
     # Dynamic test scoping — changed file -> scoped test targets
