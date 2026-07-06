@@ -1680,15 +1680,20 @@ class SyntheticAdversary:
                 if "## TOOLS" in _dc_str or "2b.2-tool" in _dc_str or "schema_version" in _dc_str:
                     _diag_prompt_has_venom_tools = True
                     break
-            _log.warning(
+            _diag_adv_msg = (
                 "[A1-DIAG-ADV-TOOL-SEAM] has_tools=%s "
                 "prompt_has_venom_tools=%s body_keys=%s "
-                "msg_count=%d tool_choice=%s",
-                has_tools, _diag_prompt_has_venom_tools,
-                sorted(body.keys()),
-                len(messages),
-                body.get("tool_choice", "<absent>"),
+                "msg_count=%d tool_choice=%s"
+                % (
+                    has_tools, _diag_prompt_has_venom_tools,
+                    sorted(body.keys()),
+                    len(messages),
+                    body.get("tool_choice", "<absent>"),
+                )
             )
+            _log.warning(_diag_adv_msg)
+            import sys as _diag_sys
+            print(_diag_adv_msg, file=_diag_sys.stderr, flush=True)
         _manifest = _load_chaos_manifest()
         manifest_present = _manifest is not None
 
