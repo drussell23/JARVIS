@@ -344,7 +344,7 @@ def test_dry_run_via_main_never_calls_asyncio_run(monkeypatch, capsys):
 def test_remote_command_contains_piece_b_and_c_config():
     remote_cmd = ignite._compose_remote_command(
         remote_run_dir="/opt/trinity/jarvis/a1_iso_runs/x", seed=0, verbose=True,
-        soak_wall_s=1800)
+        soak_wall_s=1800, dw_session_budget=5.0)
 
     assert "JARVIS_CHAOS_TARGET_DIRS=backend/core/ouroboros/a1_ignition_vector" in remote_cmd
     assert "autonomy.*" in remote_cmd
@@ -362,10 +362,40 @@ def test_plan_remote_cmd_matches_composer():
     plan = ignition.build_plan()
     expected = ignite._compose_remote_command(
         remote_run_dir=ignition.remote_run_dir, seed=ignition.seed, verbose=ignition.verbose,
-        soak_wall_s=ignition.soak_wall_s)
+        soak_wall_s=ignition.soak_wall_s, dw_session_budget=ignition.dw_session_budget)
     assert plan.remote_cmd == expected
     assert "autonomy.*" in plan.remote_cmd
     assert "backend/core/ouroboros/a1_ignition_vector" in plan.remote_cmd
+
+
+def test_remote_command_opts_into_dw_rehearsal_budget_by_default():
+    """The A1 Brain ignition drill EXISTS to prove the APPLIED threshold, so it
+    must pass a NONZERO --dw-session-budget to the on-node isomorphic soak.
+
+    Root cause (live-fire a1-brain-20260705-221612): isomorphic_a1_local defaults
+    --dw-session-budget to 0.0 (the failover "starve" scenario). With a $0 cap the
+    SessionBudgetAuthority preflight refuses every DW dispatch (est $0.10 > $0.00),
+    so GENERATE never produces a candidate and no op reaches APPLY (209 CLASSIFY /
+    106 GENERATE / 0 VALIDATE / 0 APPLIED). The on-node DW is the free
+    SyntheticAdversary stub, so a nonzero cap opts into the sanctioned rehearsal
+    lane at ~$0 real cost."""
+    ignition = _make_ignition(dry_run=True, project="p", zone="z")
+    plan = ignition.build_plan()
+    assert ignition.dw_session_budget > 0.0, "the drill must fund the DW rehearsal lane"
+    assert "--dw-session-budget %g" % ignition.dw_session_budget in plan.remote_cmd
+
+
+def test_dw_session_budget_env_override(monkeypatch):
+    """JARVIS_A1_BRAIN_DW_SESSION_BUDGET overrides the default -- incl. 0 to
+    restore the legacy starve scenario (no hardcoding)."""
+    monkeypatch.setenv("JARVIS_A1_BRAIN_DW_SESSION_BUDGET", "0")
+    starve = _make_ignition(dry_run=True, project="p", zone="z")
+    assert starve.dw_session_budget == 0.0
+    assert "--dw-session-budget 0 " in starve.build_plan().remote_cmd
+    monkeypatch.setenv("JARVIS_A1_BRAIN_DW_SESSION_BUDGET", "12.5")
+    funded = _make_ignition(dry_run=True, project="p", zone="z")
+    assert funded.dw_session_budget == 12.5
+    assert "--dw-session-budget 12.5 " in funded.build_plan().remote_cmd
 
 
 # ===========================================================================

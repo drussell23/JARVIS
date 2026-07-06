@@ -827,10 +827,18 @@ class TestSubprocessIsomorphismPropagation:
                 pass
 
         class _NoopEnv:
+            # Hermetic: honors the REAL IsomorphicEnv contract (disjoint
+            # cwd under tmp_path, restored on exit). The old no-chdir fake
+            # left cwd on the HOST repo -- the 2026-07-06 leak vector that
+            # let a cwd-anchored resolver chaos-inject production source.
             root = tmp_path
             def __enter__(self) -> "_NoopEnv":
+                self._prev_cwd = os.getcwd()
+                (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+                os.chdir(tmp_path / "app")
                 return self
             def __exit__(self, *args: Any) -> bool:
+                os.chdir(self._prev_cwd)
                 return False
 
         class _CapturingChaos:
@@ -965,10 +973,18 @@ class TestSubprocessIsomorphismPropagation:
                 pass
 
         class _NoopEnv:
+            # Hermetic: honors the REAL IsomorphicEnv contract (disjoint
+            # cwd under tmp_path, restored on exit). The old no-chdir fake
+            # left cwd on the HOST repo -- the 2026-07-06 leak vector that
+            # let a cwd-anchored resolver chaos-inject production source.
             root = tmp_path
             def __enter__(self) -> "_NoopEnv":
+                self._prev_cwd = os.getcwd()
+                (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+                os.chdir(tmp_path / "app")
                 return self
             def __exit__(self, *args: Any) -> bool:
+                os.chdir(self._prev_cwd)
                 return False
 
         class _CapturingChaos:
@@ -1047,10 +1063,18 @@ class TestSubprocessIsomorphismPropagation:
                 pass
 
         class _NoopEnv:
+            # Hermetic: honors the REAL IsomorphicEnv contract (disjoint
+            # cwd under tmp_path, restored on exit). The old no-chdir fake
+            # left cwd on the HOST repo -- the 2026-07-06 leak vector that
+            # let a cwd-anchored resolver chaos-inject production source.
             root = tmp_path
             def __enter__(self) -> "_NoopEnv":
+                self._prev_cwd = os.getcwd()
+                (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+                os.chdir(tmp_path / "app")
                 return self
             def __exit__(self, *args: Any) -> bool:
+                os.chdir(self._prev_cwd)
                 return False
 
         class _CapturingChaos:
@@ -1160,10 +1184,18 @@ class TestSubprocessIsomorphismPropagation:
                 pass
 
         class _NoopEnv:
+            # Hermetic: honors the REAL IsomorphicEnv contract (disjoint
+            # cwd under tmp_path, restored on exit). The old no-chdir fake
+            # left cwd on the HOST repo -- the 2026-07-06 leak vector that
+            # let a cwd-anchored resolver chaos-inject production source.
             root = tmp_path
             def __enter__(self) -> "_NoopEnv":
+                self._prev_cwd = os.getcwd()
+                (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+                os.chdir(tmp_path / "app")
                 return self
             def __exit__(self, *args: Any) -> bool:
+                os.chdir(self._prev_cwd)
                 return False
 
         class _CapturingChaos:
@@ -1247,10 +1279,18 @@ class TestSubprocessIsomorphismPropagation:
                 pass
 
         class _NoopEnv:
+            # Hermetic: honors the REAL IsomorphicEnv contract (disjoint
+            # cwd under tmp_path, restored on exit). The old no-chdir fake
+            # left cwd on the HOST repo -- the 2026-07-06 leak vector that
+            # let a cwd-anchored resolver chaos-inject production source.
             root = tmp_path
             def __enter__(self) -> "_NoopEnv":
+                self._prev_cwd = os.getcwd()
+                (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+                os.chdir(tmp_path / "app")
                 return self
             def __exit__(self, *args: Any) -> bool:
+                os.chdir(self._prev_cwd)
                 return False
 
         class _CapturingChaos:
@@ -1765,12 +1805,24 @@ class TestAuditAtTeardownSequencing:
     ceiling (_a1_audit_ceiling_s) while the soak child was STILL RUNNING --
     stale FAILED verdicts, because the chain hadn't finished yet.
 
-    The fix: bind the audit invocation to the soak child's ACTUAL exit,
-    reusing the existing process-wait primitive (Popen.wait -- the SAME one
-    SoakRunner.stop()/_reap_soak_runners() already use in teardown), offloaded
-    via run_in_executor so it does not starve the co-located SyntheticAdversary
-    event loop. These tests prove: (1) the wait happens BEFORE the audit is
-    invoked, and (2) the completed-session audit runs in --replay mode.
+    The contract under test (updated for the wall-coordination rewrite,
+    bt-iso-1783144982): the audit fires ONLY after the soak-child
+    termination-wait (_await_soak_child_termination) completes -- never on
+    a fixed post-boot ceiling. These tests prove: (1) the termination-wait
+    happens BEFORE the audit is invoked, and (2) the completed-session
+    audit runs in --replay mode.
+
+    HERMETIC-ISOLATION NOTE (2026-07-06 leak postmortem): the original
+    scaffold was structurally un-passable AND unsafe -- (a) its fake proc's
+    only exit path was the pre-arm ceiling (floor 120s >= pytest.ini's
+    120s timeout, so pytest-timeout ALWAYS killed it first), and (b) its
+    _NoopEnv did not chdir, so any cwd-anchored repo-root fallback inside
+    the driver flow resolved to the REAL working tree -- a pytest run
+    mutated production source (leaf_predicates.py chaos-injected on the
+    host). Fixed structurally: _NoopEnv now honors the real IsomorphicEnv
+    contract (chdir into tmp_path, restore on exit) and the termination-
+    wait is an async spy that simulates the child's exit -- a unit test
+    mathematically cannot touch the host tree or the wall clock.
     """
 
     def _scaffold(self, tmp_path: Path, harness_mod: Any):
@@ -1790,10 +1842,18 @@ class TestAuditAtTeardownSequencing:
                 pass
 
         class _NoopEnv:
+            # Hermetic: honors the REAL IsomorphicEnv contract (disjoint
+            # cwd under tmp_path, restored on exit). The old no-chdir fake
+            # left cwd on the HOST repo -- the 2026-07-06 leak vector that
+            # let a cwd-anchored resolver chaos-inject production source.
             root = tmp_path
             def __enter__(self) -> "_NoopEnv":
+                self._prev_cwd = os.getcwd()
+                (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+                os.chdir(tmp_path / "app")
                 return self
             def __exit__(self, *args: Any) -> bool:
+                os.chdir(self._prev_cwd)
                 return False
 
         class _CapturingChaos:
@@ -1850,6 +1910,19 @@ class TestAuditAtTeardownSequencing:
         async def _fake_await_soak_boot(proc: Any, log: str, timeout_s: float = 90.0) -> bool:
             return True
 
+        async def _spy_await_soak_child_termination(
+            soak_proc: Any, dbg_log: str, launch_monotonic: Any,
+        ) -> str:
+            # Simulates the child's clean self-termination: records the
+            # ordering event and stamps the exit code the way a real
+            # Popen.wait would. Removes the old scaffold's wall-clock
+            # dependence (fake proc's only real exit path was the >=120s
+            # pre-arm ceiling -- structurally unreachable under
+            # pytest.ini's 120s timeout).
+            call_order.append("term.wait")
+            soak_proc.returncode = 0
+            return "exited"
+
         driver = IsomorphicA1Driver(
             repo_root=str(tmp_path),
             stub_soak=False,
@@ -1869,27 +1942,39 @@ class TestAuditAtTeardownSequencing:
             patch.object(harness_mod, "SoakRunner", _FakeSoakRunner),
             patch.object(harness_mod, "AuditorRunner", _SpyAuditorRunner),
             patch.object(_driver_mod, "_await_soak_boot", _fake_await_soak_boot),
+            patch.object(
+                _driver_mod,
+                "_await_soak_child_termination",
+                _spy_await_soak_child_termination,
+            ),
         ]
         return driver, patches, call_order, _captured_auditor_kwargs, fake_proc
 
     async def test_soak_proc_wait_happens_before_audit_invocation(
         self, tmp_path: Path,
     ) -> None:
-        """Popen.wait() must be called BEFORE AuditorRunner.watch() -- the
-        audit must never fire while the soak child could still be running."""
+        """The termination-wait (_await_soak_child_termination) must
+        complete BEFORE AuditorRunner.watch() -- the audit must never fire
+        while the soak child could still be running. (Contract updated
+        from the stale 'Popen.wait' assertion: the wall-coordination
+        rewrite replaced the direct wait with the adaptive
+        deadline-coordinated wait.)"""
         harness_mod = _load_script("a1_live_fire_chaos_harness")
-        driver, patches, call_order, _auditor_kwargs, _proc = self._scaffold(
+        driver, patches, call_order, _auditor_kwargs, proc = self._scaffold(
             tmp_path, harness_mod,
         )
-        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
             rc = await driver.run()
 
-        assert "proc.wait" in call_order, "soak-child wait must have been invoked"
+        assert "term.wait" in call_order, (
+            "soak-child termination-wait must have been invoked"
+        )
         assert "auditor.watch" in call_order, "the auditor must still run"
-        assert call_order.index("proc.wait") < call_order.index("auditor.watch"), (
+        assert call_order.index("term.wait") < call_order.index("auditor.watch"), (
             "audit must be invoked AFTER the soak child exits, not on a fixed "
             "post-boot ceiling; got order=%r" % (call_order,)
         )
+        assert proc.returncode == 0, "child exit must be observed pre-audit"
         assert rc == 0
 
     async def test_audit_invoked_in_replay_mode_after_completion(
@@ -1902,7 +1987,7 @@ class TestAuditAtTeardownSequencing:
         driver, patches, _call_order, auditor_kwargs, _proc = self._scaffold(
             tmp_path, harness_mod,
         )
-        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
             await driver.run()
 
         assert auditor_kwargs, "AuditorRunner must have been constructed"

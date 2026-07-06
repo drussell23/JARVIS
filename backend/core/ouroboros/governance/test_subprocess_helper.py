@@ -90,6 +90,7 @@ import enum
 import logging
 import os
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Optional, Sequence
@@ -155,6 +156,35 @@ _GRACE_S_MAX: float = 30.0
 
 _DEFAULT_OUTPUT_CAP_CHARS: int = 200_000
 _OUTPUT_CAP_MIN: int = 1_000
+
+# Interpreter override for every pytest spawn routed through this helper.
+# Same env precedent as hybrid_teammate_executor / isolated_agent_worker.
+_PYTHON_BIN_ENV: str = "JARVIS_PYTHON_BIN"
+
+
+def resolve_python_bin() -> str:
+    """Resolve the interpreter for pytest spawns — NEVER bare ``python3``.
+
+    Resolution order:
+
+    1. ``JARVIS_PYTHON_BIN`` env override (operator-explicit wins);
+    2. ``sys.executable`` — the running interpreter, structurally
+       guaranteed to carry the organism's own test deps;
+    3. bare ``"python3"`` only as a last resort for embedded/frozen
+       interpreters where ``sys.executable`` is empty.
+
+    Root cause this closes (run a1-brain-20260705-233225, GCP Brain node):
+    a bare ``"python3"`` argv[0] resolves PATH-dependently — under the
+    systemd-run unit's minimal PATH it hit ``/usr/bin/python3`` (no
+    pytest), so every TestWatcher run died at bootstrap with the 41-byte
+    ``No module named pytest`` and the organism was blind to test
+    failures for the whole session (the A1 injection vector never became
+    an op). Classic passes-local-fails-remote.
+    """
+    env = os.environ.get(_PYTHON_BIN_ENV, "").strip()
+    if env:
+        return env
+    return sys.executable or "python3"
 
 
 def _resolve_grace_s() -> float:

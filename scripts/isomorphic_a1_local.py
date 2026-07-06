@@ -943,6 +943,85 @@ def _install_revert_signal_handlers() -> None:
 
 
 # ---------------------------------------------------------------------------
+# A1 posture-context seed (run a1-brain-20260705-233225)
+# ---------------------------------------------------------------------------
+
+def _seed_posture_context(repo_root: str) -> bool:
+    """Seed the overlay's durable posture triplet so the organism boots
+    knowing its operating context — an A1 ignition rehearsal is
+    definitionally a HARDEN context (prove a repair loop against an
+    injected failure).
+
+    Why this and not a sensor-disable flag: 63 doc_staleness + 3
+    todo_scanner background signals swamped the a1-brain-20260705-233225
+    loop while the vector's lane sat idle. Disabling sensors is a
+    governance bypass; seeding posture routes the SAME intent through the
+    organism's existing metacognition — SensorGovernor weighted caps
+    (HARDEN: TestFailure 1.8x, discovery 0.3x, consolidation 0.6x via
+    sensor_governor_seed.py), posture prompt injection, and L3
+    direct-enforcement all consume it natively.
+
+    Contract:
+      * ``JARVIS_A1_POSTURE_SEED`` selects the posture (default HARDEN;
+        ``0/false/off/none/empty`` disables; invalid values fail soft).
+      * Round-trips through the REAL PostureStore serializer — never a
+        hand-rolled JSON shape that could drift from the schema.
+      * NEVER clobbers an existing reading (resumed overlay / operator
+        state wins — this is a cold-start default, not authority).
+      * The seed is a starting state, not a lock: PostureObserver's own
+        cadence + hysteresis may move off it if live signals demand.
+      * Fail-soft: any error logs and returns False; ignition proceeds.
+
+    Returns True iff a fresh reading was written.
+    """
+    raw = os.environ.get("JARVIS_A1_POSTURE_SEED", "HARDEN").strip()
+    if raw.lower() in ("", "0", "false", "off", "none"):
+        return False
+    try:
+        from backend.core.ouroboros.governance.posture import (
+            Posture,
+            PostureReading,
+        )
+        from backend.core.ouroboros.governance.posture_store import (
+            PostureStore,
+        )
+
+        try:
+            posture = Posture.from_str(raw)
+        except Exception:  # noqa: BLE001 — unknown vocabulary → fail soft
+            _log(
+                "[PostureSeed] unknown posture %r — seed skipped "
+                "(valid: %s)" % (raw, [p.value for p in Posture]),
+            )
+            return False
+
+        store = PostureStore(Path(repo_root) / ".jarvis")
+        if store.load_current() is not None:
+            _log("[PostureSeed] existing reading present — seed skipped")
+            return False
+        now = time.time()
+        store.write_current(
+            PostureReading(
+                posture=posture,
+                confidence=0.9,
+                evidence=(),
+                inferred_at=now,
+                signal_bundle_hash="a1-ignition-seed",
+                all_scores=((posture, 0.9),),
+            ),
+            change_marker_at=now,
+        )
+        _log(
+            "[PostureSeed] seeded posture=%s at %s/.jarvis — organism "
+            "boots context-aware" % (posture.value, repo_root),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — never blocks ignition
+        _log("[PostureSeed] fail-soft: %s" % (exc,))
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Run-#12 helpers: touch chaos files + derive scoped test targets
 # ---------------------------------------------------------------------------
 
@@ -999,12 +1078,18 @@ def _derive_scoped_test_targets(chaos_files: List[str], repo_root: str) -> List[
     return sorted(set(targets))
 
 
-def _await_soak_boot(
+async def _await_soak_boot(
     proc: Any,
     debug_log: str,
     timeout_s: float = 60.0,
 ) -> bool:
     """Poll the soak's debug.log for the TestWatcher READY marker.
+
+    ``async def`` is load-bearing (the e2e spine pins it): a synchronous
+    blocking-sleep poll here blocked the driver's event loop for up
+    to *timeout_s* — starving the SyntheticAdversary's aiohttp server
+    exactly while the booting organism runs its provider preflight, so
+    real preflight requests read as CONNECTION_ERROR.
 
     Returns True when the marker is found within *timeout_s*, False on timeout
     or premature process exit.  Stub-soak callers pass ``proc=None`` and this
@@ -1027,7 +1112,7 @@ def _await_soak_boot(
                         return True
         except OSError:
             pass
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
     _log("soak boot TIMEOUT after %.0fs (%d lines scanned)" % (timeout_s, seen_lines))
     return False  # timeout -- proceed anyway; sensor may still start
 
@@ -1232,6 +1317,13 @@ class IsomorphicA1Driver:
                 # Capture the disjoint cwd now (IsomorphicEnv chdir'd us here).
                 # Used later to run the organism subprocess under the same path.
                 iso_cwd: str = os.getcwd()
+
+                # Seed the overlay's durable posture triplet so the organism
+                # boots knowing this is a HARDEN-context rehearsal — the
+                # existing metacognitive stack (SensorGovernor weights,
+                # posture prompt injection, L3 enforcement) consumes it
+                # natively. Cold-start default only; never clobbers state.
+                _seed_posture_context(str(env_ctx.root))
 
                 # Compose env: node vars (from IsomorphicEnv via os.environ, which
                 # now includes JARVIS_SANDBOX_PREFIXES) + cognitive flags ON (from
@@ -1500,7 +1592,7 @@ class IsomorphicA1Driver:
                         # the child publishes its true wall deadline).
                         _soak_launch_monotonic = time.monotonic()
                         _log("STEP await boot READY (TestWatcher fs.changed.* sub)")
-                        _await_soak_boot(
+                        await _await_soak_boot(
                             soak_proc, debug_log,
                             timeout_s=_SOAK_BOOT_READY_POLL_S)
 

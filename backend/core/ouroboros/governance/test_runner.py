@@ -1307,8 +1307,13 @@ class TestRunner:
         streaming_on = _streaming_enabled()
         verbosity_flag = "-v" if streaming_on else "-q"
 
+        # resolve_python_bin — NEVER bare "python3" (PATH-dependent argv[0]
+        # blinded VERIFY on minimal-PATH nodes; see test_subprocess_helper).
+        from backend.core.ouroboros.governance.test_subprocess_helper import (
+            resolve_python_bin,
+        )
         cmd = [
-            "python3", "-m", "pytest",
+            resolve_python_bin(), "-m", "pytest",
             "-o", "addopts=",
             "--continue-on-collection-errors",
             "--timeout=" + str(_TEST_PER_TEST_TIMEOUT_S),

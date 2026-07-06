@@ -180,14 +180,16 @@ class TestWatcher:
         soak). When *target_paths* is None / empty, the legacy
         whole-``test_dir`` behavior is byte-identical (back-compat).
         """
-        from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
-            run_pytest_subprocess,
-        )
+        from backend.core.ouroboros.governance import test_subprocess_helper as _tsh  # noqa: E501
         # Scoped targets (FS-driven primary) vs. legacy whole-suite.
         scoped = [str(p) for p in (target_paths or []) if str(p).strip()]
         pytest_targets = scoped if scoped else [str(self.test_dir)]
+        # resolve_python_bin — NEVER bare "python3": PATH-dependent argv[0]
+        # under a minimal-PATH node hit /usr/bin/python3 (no pytest) and
+        # blinded the TestFailure sensor for the whole a1-brain-20260705-
+        # 233225 session (the 41-byte "No module named pytest" class).
         argv = [
-            "python3",
+            _tsh.resolve_python_bin(),
             "-m",
             "pytest",
             *pytest_targets,
@@ -196,7 +198,7 @@ class TestWatcher:
             "--no-header",
             "--color=no",
         ]
-        result = await run_pytest_subprocess(
+        result = await _tsh.run_pytest_subprocess(
             argv,
             cwd=str(self.repo_path),
             timeout_s=float(self.pytest_timeout_s),

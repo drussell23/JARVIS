@@ -73,6 +73,7 @@ from typing import (
     List,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 
@@ -550,13 +551,19 @@ _LEDGER_TERMINAL_RE = re.compile(
 )
 # 'op=<op> is_noop=True (...) terminal_reason_code=<code> ... skipping APPLY'
 # -- a legitimate, BY-DESIGN FSM branch: a read-only/no-op op structurally
-# SKIPS the literal APPLY phase yet still reaches a genuine autonomous
-# terminal completion (LEDGER_TERMINAL state=applied). Counted as
-# APPLY-equivalent evidence (labelled distinctly -- never silently relabeled
-# as a literal "APPLY" phase observation) so a no-op autonomous completion is
-# not wrongly reported as "never reached APPLY".
+# SKIPS the literal APPLY phase and reaches an autonomous terminal
+# completion (LEDGER_TERMINAL state=applied) WITHOUT writing a byte.
+# Recorded distinctly as "APPLY_SKIPPED_NOOP" for observability AND the
+# op_id is registered in ``_noop_op_ids`` so its subsequent
+# ``state=applied`` ledger record can NEVER satisfy the autonomous-
+# MUTATION gate (``fsm_classify_to_applied``). This is the fix for the
+# run-a1-brain-20260705-233225 false positive where the old
+# "APPLY-equivalent evidence" semantics let two read_only_complete noops
+# flip the criterion true. written=True AND is_noop=False are absolute
+# prerequisites for a PASS.
 _NOOP_SKIP_APPLY_RE = re.compile(
-    r"is_noop=True.*?terminal_reason_code=\S+.*?skipping APPLY"
+    r"op=(?P<op>\S+)\s+is_noop=True.*?"
+    r"terminal_reason_code=(?P<code>\S+).*?skipping APPLY"
 )
 # '[HYDRATION-HANDSHAKE] HMAC-SHA256 VERIFIED op=<op> phase=<phase> digest=<hex>...'
 # -- fsm_checkpoint.list_pending() emits this ONLY after its own _verify()
@@ -1031,6 +1038,17 @@ _TERMINAL_MERGE_MARKERS: Tuple[str, ...] = (
 # FSM phases (from the 11-phase pipeline). state=applied is the win.
 _TERMINAL_APPLIED_STATES = frozenset({"applied"})
 
+# Terminal reason codes that mark a NO-MUTATION completion. An op that
+# terminates with one of these wrote zero bytes — its ``state=applied``
+# ledger record is an autonomous *completion*, never autonomous *mutation*
+# evidence. Mirrors the orchestrator's read-only APPLY short-circuit
+# (orchestrator.py ``terminal_reason_code="read_only_complete"`` emit sites)
+# — the parser twin of that contract, kept in lockstep the same way the
+# regexes above mirror their log emitters. Run a1-brain-20260705-233225
+# false-positive: two is_noop=True read_only_complete ops flipped
+# ``fsm_classify_to_applied`` true with zero bytes written.
+_NOOP_TERMINAL_REASON_CODES = frozenset({"read_only_complete"})
+
 
 @dataclass
 class A1Verdict:
@@ -1091,7 +1109,17 @@ class A1GraduationAuditor:
 
         self.trace = A1TraceTimeline()
         self.fsm_phases_seen: List[str] = []
-        self.state_applied = False
+        # Autonomous-MUTATION evidence (op-scoped). ``_applied_written_ops``
+        # holds ops with a ``state=applied`` terminal AND a durable write
+        # (log path: ``written=True`` literal; SSE path: publish happens
+        # only after a successful ledger.append per
+        # ``publish_operation_terminal``'s contract). ``_noop_op_ids``
+        # holds ops that terminated via a no-mutation reason code
+        # (read_only_complete) or the is_noop skip-APPLY branch. The gate
+        # is their set difference — written=True AND is_noop=False are
+        # absolute prerequisites (see ``state_applied`` property).
+        self._applied_written_ops: Set[str] = set()
+        self._noop_op_ids: Set[str] = set()
         self.pr_signal_observed = False
         self.terminal_merge_reached = False
         self.intervention_tripped = False
@@ -1417,11 +1445,24 @@ class A1GraduationAuditor:
                 self.fsm_phases_seen.append(phase)
                 self._last_fsm_phase = phase
 
-        # Terminal applied / PR signal.
+        # Terminal applied / PR signal. Op-scoped mutation evidence: a
+        # no-mutation reason code (read_only_complete) registers the op as
+        # noop; anything else with an op_id counts as applied evidence
+        # (publish fires only after a successful ledger append — see
+        # publish_operation_terminal). Anonymous events (no op_id) can't be
+        # correlated against noop markers and are never mutation proof.
         if event_type == "operation_terminal":
             state = str(payload.get("state", "")).strip().lower()
             if state in _TERMINAL_APPLIED_STATES:
-                self.state_applied = True
+                op = str(payload.get("op_id", "")).strip()
+                reason = str(
+                    payload.get("terminal_reason_code", "")
+                ).strip().lower()
+                if reason in _NOOP_TERMINAL_REASON_CODES:
+                    if op:
+                        self._noop_op_ids.add(op)
+                elif op:
+                    self._applied_written_ops.add(op)
         if self._is_pr_signal(event_type, payload, blob):
             self.pr_signal_observed = True
 
@@ -1512,17 +1553,24 @@ class A1GraduationAuditor:
                 self._last_fsm_phase = phase.upper()
 
         # LEDGER_TERMINAL state=applied (textual twin of operation_terminal).
+        # written=True is an ABSOLUTE prerequisite — written=False is a
+        # deduped/phantom record, never mutation proof. Op-scoped so a noop
+        # op's applied terminal is subtracted at verdict time.
         lt = _LEDGER_TERMINAL_RE.search(line)
         if lt is not None:
             state = lt.group("state").strip().lower()
-            if state in _TERMINAL_APPLIED_STATES:
-                self.state_applied = True
+            written = lt.group("written").strip().lower() == "true"
+            if state in _TERMINAL_APPLIED_STATES and written:
+                self._applied_written_ops.add(lt.group("op").strip())
 
         # A no-op/read-only op that structurally SKIPS the literal APPLY
-        # phase yet still reaches a genuine autonomous completion -- counted
-        # as APPLY-equivalent (see _NOOP_SKIP_APPLY_RE docstring above).
-        if _NOOP_SKIP_APPLY_RE.search(line) is not None:
+        # phase. Recorded for observability + the op is registered as noop
+        # so its applied terminal can never satisfy the mutation gate (see
+        # _NOOP_SKIP_APPLY_RE docstring above).
+        noop_m = _NOOP_SKIP_APPLY_RE.search(line)
+        if noop_m is not None:
             self.fsm_phases_seen.append("APPLY_SKIPPED_NOOP")
+            self._noop_op_ids.add(noop_m.group("op").strip())
 
         # HMAC-anchored resume-splice authentication record.
         hh = parse_hydration_handshake_verified(line)
@@ -1618,12 +1666,26 @@ class A1GraduationAuditor:
                 return False, "flag_audit:unverifiable:%s" % (st.flag,)
         return True, ""
 
+    @property
+    def state_applied(self) -> bool:
+        """True iff at least one op has a durable ``state=applied`` terminal
+        (``written=True``) AND is not a no-mutation completion. This is the
+        autonomous-MUTATION gate: written=True and is_noop=False are
+        absolute prerequisites — a ``read_only_complete`` no-op can never
+        satisfy it (run a1-brain-20260705-233225 false-positive fix)."""
+        return bool(self._applied_written_ops - self._noop_op_ids)
+
     def _fsm_reached_applied(self) -> bool:
-        # CLASSIFY...APPLY present + state=applied observed.
+        # CLASSIFY...APPLY present + a genuine (written, non-noop)
+        # state=applied observed. "APPLY_SKIPPED_NOOP" is observability
+        # labelling, NEVER mutation-gate evidence.
         saw_classify = any(
             p.upper().startswith("CLASSIFY") for p in self.fsm_phases_seen
         )
-        saw_apply = any(p.upper().startswith("APPLY") for p in self.fsm_phases_seen)
+        saw_apply = any(
+            p.upper().startswith("APPLY") and p.upper() != "APPLY_SKIPPED_NOOP"
+            for p in self.fsm_phases_seen
+        )
         return saw_classify and saw_apply and self.state_applied
 
     def verdict(self) -> A1Verdict:
@@ -1676,7 +1738,16 @@ class A1GraduationAuditor:
                 missing = self._missing_hops()
                 locus = "a1trace:missing_or_out_of_order:%s" % (",".join(missing) or "order",)
             elif not fsm_ok:
-                locus = "fsm:did_not_reach_state_applied"
+                if self._noop_op_ids and not (
+                    self._applied_written_ops - self._noop_op_ids
+                ):
+                    # Diagnosable, not generic: the ONLY applied evidence
+                    # was no-mutation (read_only_complete / is_noop)
+                    # completions — the exact false-positive class this
+                    # gate was tightened against.
+                    locus = "fsm:only_noop_read_only_completions_no_mutation"
+                else:
+                    locus = "fsm:did_not_reach_state_applied"
             elif not flag_pass:
                 locus = flag_locus
             elif not pr_ok:

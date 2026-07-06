@@ -152,8 +152,14 @@ def test_stitching_makes_fsm_classify_to_applied_provable(tmp_path):
             "[A1Trace] dequeue goal=op-RESUME-1",
             "[A1Trace] submit goal=op-RESUME-1",
             "[A1Trace] accept goal=op-RESUME-1 phase=CLASSIFY",
-            "op=op-RESUME-1 is_noop=True (provider=doubleword) "
-            "terminal_reason_code=read_only_complete — skipping APPLY",
+            # Genuine mutation evidence (mutation-gate tightening,
+            # run a1-brain-20260705-233225): a real APPLY phase heartbeat +
+            # a written, NON-noop applied terminal. The old shape here (an
+            # is_noop=True read_only_complete skip-APPLY) is now correctly
+            # rejected by the gate — noop coverage lives in
+            # test_a1_graduation_auditor.py section 10.
+            "[CommProtocol] HEARTBEAT op=op-RESUME-1 seq=3 "
+            "payload={'phase': 'APPLY'}",
             "[Slice74Probe] LEDGER_TERMINAL op_id=op-RESUME-1 state=applied "
             "written=True",
         ],

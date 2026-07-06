@@ -4838,12 +4838,17 @@ class AsyncProcessToolBackend:
         branch, which SIGKILL-pgrp's the child before re-raising.
         """
         from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
+            resolve_python_bin,
             run_pytest_subprocess,
         )
         paths_arg = call.arguments.get("paths", [])
         if isinstance(paths_arg, str):
             paths_arg = [paths_arg]
-        cmd = ["python3", "-m", "pytest", "--tb=short", "-q"] + list(paths_arg)
+        # resolve_python_bin — NEVER bare "python3" (PATH-dependent argv[0]
+        # broke run_tests on minimal-PATH nodes; see test_subprocess_helper).
+        cmd = [resolve_python_bin(), "-m", "pytest", "--tb=short", "-q"] + list(
+            paths_arg
+        )
 
         try:
             result = await run_pytest_subprocess(

@@ -244,7 +244,9 @@ class TestLiveFailoverHelpers:
         assert env["JARVIS_FAILOVER_QUALITY_TIER_ENABLED"] == "true"
         assert env["JARVIS_FAILOVER_VIOLENT_TEARDOWN_ENABLED"] == "true"
         assert env["JARVIS_FAILOVER_QUALITY_IMAGE"] == "jarvis-prime-coder-32b"
-        assert env["JARVIS_FAILOVER_QUALITY_MACHINE"] == "g2-standard-4"
+        # g2-standard-8: deliberate host bump (6c46126e0c, RAM Pre-Flight
+        # Gate) — this assertion tracks the script's authoritative value.
+        assert env["JARVIS_FAILOVER_QUALITY_MACHINE"] == "g2-standard-8"
 
     def test_live_failover_argv_contains_enable_failover(self, tmp_path):
         """_build_soak_argv appends --enable-failover when live_failover=True."""
