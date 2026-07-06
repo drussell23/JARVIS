@@ -856,6 +856,24 @@ class A1BrainIgnition:
              % (budget_s,))
         return False
 
+    async def _quiesce_production_service(self) -> None:
+        """Stop the baked ``jarvis-brain.service`` (production warm-standby
+        organism) BEFORE the A1 drill. On the full-clone image its Oracle
+        cold-index over the whole repo loads the node enough to starve the
+        dispatch SSH (`sudo bash` could not return in 60s on the fresh image;
+        the shallow image indexed fewer files). The A1 drill runs its OWN
+        isomorphic soak and must not compete with the production organism.
+        Root-wrapped (via _ssh_exec) + fail-soft: a node without the unit still
+        proceeds. Env-gated JARVIS_A1_BRAIN_QUIESCE_SERVICE (default on)."""
+        if not _truthy(os.environ.get("JARVIS_A1_BRAIN_QUIESCE_SERVICE", "1")):
+            return
+        rc, _out = await self._ssh_exec_async(
+            "systemctl stop jarvis-brain.service 2>/dev/null || true; "
+            "systemctl stop jarvis-brain-idle.timer 2>/dev/null || true",
+            timeout_s=60.0)
+        _log("[IgniteA1Brain] quiesced production jarvis-brain.service "
+             "(rc=%d) so the A1 soak has the node to itself" % (rc,))
+
     # -- plan (pure, dry-run-safe) --------------------------------------------
 
     def build_plan(self) -> IgnitionPlan:
@@ -1463,6 +1481,7 @@ class A1BrainIgnition:
                 _log("ABORT: node SSH-over-IAP not reachable within budget "
                      "(teardown will $0 the node)")
                 return 1
+            await self._quiesce_production_service()
             await self.verify_head()
             dispatched = await self.dispatch()
             if not dispatched:
