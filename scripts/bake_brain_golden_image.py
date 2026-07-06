@@ -207,7 +207,13 @@ echo "[brain-bake] phase=brain-env-done ts=$(_ts)"
 echo "[brain-bake] phase=clone-start repo={repo_url_q} ref={repo_ref_q} ts=$(_ts)"
 mkdir -p /opt/trinity
 rm -rf {_REPO_PATH}
-if git clone --branch {repo_ref_q} --depth 1 {repo_url_q} {_REPO_PATH}; then
+# FULL clone (no --depth 1): a shallow clone cannot reliably `git pull
+# --ff-only` at ignition -- it silently no-ops, stranding the node on the stale
+# baked ref (live-fire: the A1 vector's test was absent though it was on main).
+# A full clone lets the boot-time fetch/pull deterministically land current
+# origin/main. Costs a little bake-time disk; worth it for a mutation-target
+# repo the IsomorphicEnv + chaos injector actually exercise.
+if git clone --branch {repo_ref_q} {repo_url_q} {_REPO_PATH}; then
     echo "[brain-bake] phase=clone-done ts=$(_ts)"
 else
     echo "[brain-bake] ERROR: git clone failed -- NOT writing sentinel"
