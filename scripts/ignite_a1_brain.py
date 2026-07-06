@@ -296,6 +296,18 @@ def _default_remote_run_dir(node_name: str) -> str:
 # ---------------------------------------------------------------------------
 _ENV_SOAK_WALL_S = "JARVIS_A1_BRAIN_SOAK_WALL_S"
 _DEFAULT_SOAK_WALL_S = 1800  # matches the CLAUDE.md A1 happy-path (~850-1300s)
+# DW-rehearsal session budget for the on-node isomorphic soak. isomorphic_a1_local
+# defaults --dw-session-budget to 0.0 (the "starve" scenario for failover forcing);
+# with a $0 cap the SessionBudgetAuthority preflight REFUSES every DW dispatch
+# (est $0.10 > $0.00) so GENERATE never produces a candidate and no op reaches
+# APPLY (live-fire a1-brain-20260705-221612: 209 CLASSIFY / 106 GENERATE / 0
+# VALIDATE / 0 APPLIED). This driver EXISTS to prove the APPLIED threshold, so it
+# opts into the sanctioned DW-powered rehearsal lane by default -- the on-node DW
+# is the SyntheticAdversary stub (free: HeavyProbe cost_usd~$0.00002/call), so a
+# nonzero cap lets the budget preflight pass at ~$0 real cost. Set the env to 0 to
+# restore the legacy starve scenario.
+_ENV_DW_SESSION_BUDGET = "JARVIS_A1_BRAIN_DW_SESSION_BUDGET"
+_DEFAULT_DW_SESSION_BUDGET = 5.0  # ~50 ops at the $0.10 static estimate; free stub
 _ENV_BOOT_OFFSET_S = "JARVIS_A1_BRAIN_BOOT_OFFSET_S"
 _DEFAULT_BOOT_OFFSET_S = 180  # observed ~168s cold boot, rounded up w/ margin
 _ENV_VERDICT_PULL_MARGIN_S = "JARVIS_A1_BRAIN_VERDICT_PULL_MARGIN_S"
@@ -379,6 +391,7 @@ def _resolve_lifetime_s(
 # ---------------------------------------------------------------------------
 def _compose_remote_command(
     *, remote_run_dir: str, seed: int, verbose: bool, soak_wall_s: int,
+    dw_session_budget: float,
 ) -> str:
     """The actual isomorphic_a1_local.py invocation that runs ON the node.
     Co-located (parent driver's SSH session + the soak child it launches share
@@ -446,7 +459,7 @@ def _compose_remote_command(
         "OUROBOROS_BATTLE_HEADLESS=1 "
         "OUROBOROS_BATTLE_MAX_WALL_SECONDS=%d "
         "%s scripts/isomorphic_a1_local.py --mode process --run-root %s "
-        "--seed %d%s"
+        "--dw-session-budget %s --seed %d%s"
         % (
             _REMOTE_REPO_ROOT,
             pip_sync,
@@ -456,6 +469,7 @@ def _compose_remote_command(
             int(soak_wall_s),
             _REMOTE_PYTHON,
             remote_run_dir,
+            "%g" % float(dw_session_budget),
             seed,
             verbose_flag,
         )
@@ -800,6 +814,8 @@ class A1BrainIgnition:
         self.post_wall_margin_s = int(
             _env_int(_ENV_POST_WALL_MARGIN_S, _DEFAULT_POST_WALL_MARGIN_S))
         self.soak_wall_s = _resolve_soak_wall_s(soak_wall_s)
+        self.dw_session_budget = _env_float(
+            _ENV_DW_SESSION_BUDGET, _DEFAULT_DW_SESSION_BUDGET)
         self.lifetime_s = _resolve_lifetime_s(
             explicit=lifetime_s,
             soak_wall_s=self.soak_wall_s,
@@ -925,7 +941,7 @@ class A1BrainIgnition:
         zone = self.zone or _resolve_zone_for_plan()
         remote_cmd = _compose_remote_command(
             remote_run_dir=self.remote_run_dir, seed=self.seed, verbose=self.verbose,
-            soak_wall_s=self.soak_wall_s)
+            soak_wall_s=self.soak_wall_s, dw_session_budget=self.dw_session_budget)
         dispatch_wrapper = _compose_dispatch_wrapper(remote_cmd, self.remote_run_dir)
         # Bug 3: the command actually sent over SSH is root-wrapped (single
         # base64 | sudo bash pipe) -- /opt/trinity/jarvis is root-owned.
@@ -1184,7 +1200,7 @@ class A1BrainIgnition:
     async def dispatch(self) -> bool:
         remote = _compose_remote_command(
             remote_run_dir=self.remote_run_dir, seed=self.seed, verbose=self.verbose,
-            soak_wall_s=self.soak_wall_s)
+            soak_wall_s=self.soak_wall_s, dw_session_budget=self.dw_session_budget)
         wrapper = _compose_dispatch_wrapper(remote, self.remote_run_dir)
         # Bug 3: the mkdir + nohup + isomorphic_a1_local.py invocation all
         # write under the root-owned /opt/trinity/jarvis tree -- root-wrap the
