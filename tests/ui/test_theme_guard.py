@@ -29,18 +29,20 @@ _BATTLE = _REPO / "backend" / "core" / "ouroboros" / "battle_test"
 # theme.py is the token source-of-truth (holds #3AAFA9, "cyan", box glyphs).
 _EXEMPT = {"theme.py"}
 
-# Presentation consumers migrated to the theme. Grows as the sweep proceeds;
-# every listed file is held to the no-literal-styling contract forever.
+# Presentation consumers migrated to the theme. Every listed file is held to
+# the no-literal-styling contract forever. diff_preview uses portable concrete
+# styles (theme.styles()) so its returned renderable is themed on any console.
 #
-# REMAINING (final increment — pending themed print-site console integration):
-#   * diff_preview.py            -- _build_renderable returns a Panel; its style
-#                                   names resolve only on a themed print console.
-#   * serpent_flow.py::boot_banner + harness _layers emoji icons.
-# Add both here (and restore the boot_banner region scan) when migrated.
+# serpent_flow.boot_banner: its ACTIVE (Restrained Mono) path delegates to the
+# guarded render_minimal_welcome/render_organism above; its own log line was
+# migrated. The dense multi-section path below the restraint guard is the
+# intentional JARVIS_PRESENTATION_RESTRAINT_ENABLED=false rollback (old look by
+# design) and is deliberately NOT scanned.
 _MIGRATED_CONSUMERS = [
     _BATTLE / "presentation_restraint.py",
     _BATTLE / "status_line.py",
     _BATTLE / "live_status_line.py",
+    _BATTLE / "diff_preview.py",
     _BATTLE / "diff_display.py",
     _BATTLE / "tool_render_view.py",
     _BATTLE / "boot_timing.py",
@@ -104,30 +106,12 @@ def test_migrated_consumers_have_no_literal_styling() -> None:
     assert not offenders, f"literal styling regressed: {offenders}"
 
 
-import pytest
-
-
-@pytest.mark.skip(reason="boot_banner migration pending (final sweep increment)")
-def test_boot_banner_region_is_clean() -> None:
-    """serpent_flow.py is only partially migrated (boot_banner). Scan just that
-    method so the 8000-line REPL's out-of-scope literals aren't falsely flagged
-    while still protecting the migrated banner from regression.
-
-    Skipped until boot_banner + harness _layers emoji are migrated; then remove
-    the skip so this permanently guards the banner from regression."""
-    sf = _BATTLE / "serpent_flow.py"
-    text = sf.read_text(encoding="utf-8").splitlines()
-    start = next((i for i, l in enumerate(text) if "def boot_banner" in l), None)
-    assert start is not None, "boot_banner method not found"
-    end = start + 1
-    while end < len(text) and not re.match(r"    def \w", text[end]):
-        end += 1
-    region = "\n".join(text[start:end])
-    banner_emojis = re.compile(r"[\U0001F300-\U0001FAFF☀-➿]")
-    offenders = []
-    for name, rx in _BANNED.items():
-        if rx.search(region):
-            offenders.append(name)
-    if banner_emojis.search(region):
-        offenders.append("banner_emoji")
-    assert not offenders, f"boot_banner literal styling: {offenders}"
+def test_boot_banner_active_path_log_line_migrated() -> None:
+    """boot_banner's Restrained Mono (active) path delegates to the guarded
+    render_minimal_welcome/render_organism; its own log line must use the muted
+    token — not the legacy ``[dim]`` + emoji form. Positive assertion, robust to
+    the 8000-line REPL. The dense multi-section path below the restraint guard
+    is the intentional PRESENTATION_RESTRAINT=false rollback and is not scanned.
+    """
+    sf = (_BATTLE / "serpent_flow.py").read_text(encoding="utf-8")
+    assert "[muted]{log_path}[/muted]" in sf

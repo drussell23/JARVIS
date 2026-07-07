@@ -188,8 +188,45 @@ def _theme_for(tier: ColorTier) -> Theme:
     style for the given tier. Empty styles become ``"none"`` (a valid null
     Rich style) so ``Theme`` construction never rejects them.
     """
-    styles = {t.value: (style_for(t, tier) or "none") for t in Token}
-    return Theme(styles)
+    styles_map = {t.value: (style_for(t, tier) or "none") for t in Token}
+    return Theme(styles_map)
+
+
+_active_tier_cache: Optional[ColorTier] = None
+
+
+def active_tier() -> ColorTier:
+    """Detect + cache the current terminal's color tier from a probe console.
+
+    Lets renderables that do NOT own a console (e.g. ``diff_preview`` returns a
+    Panel printed elsewhere) resolve tokens to concrete styles for the live
+    environment via :func:`styles`. Cached for the session. NEVER raises.
+    """
+    global _active_tier_cache
+    if _active_tier_cache is None:
+        try:
+            _active_tier_cache = detect_tier(Console())
+        except Exception:  # noqa: BLE001
+            _active_tier_cache = ColorTier.STANDARD
+    return _active_tier_cache
+
+
+def reset_active_tier_cache() -> None:
+    """Test isolation for :func:`active_tier`."""
+    global _active_tier_cache
+    _active_tier_cache = None
+
+
+def styles(tier: Optional[ColorTier] = None):
+    """Return ``{Token: concrete Rich style string}`` for a tier.
+
+    Default tier is :func:`active_tier`. Because the values are *concrete*
+    (hex / xterm / base name / empty), a renderable that embeds them renders
+    correctly on any console -- themed or not -- while still sourcing every
+    style from the one token table (DRY). NEVER raises.
+    """
+    t = tier if tier is not None else active_tier()
+    return {tok: style_for(tok, t) for tok in Token}
 
 
 # ===========================================================================
@@ -354,6 +391,7 @@ __all__ = [
     "FORCE_TIER_ENV_VAR",
     "ColorTier",
     "Token",
+    "active_tier",
     "box_for",
     "build_console",
     "detect_tier",
@@ -361,6 +399,8 @@ __all__ = [
     "mark",
     "render_panel",
     "render_rule",
+    "reset_active_tier_cache",
     "style_for",
+    "styles",
     "supports_unicode",
 ]

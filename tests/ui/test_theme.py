@@ -141,6 +141,23 @@ class TestBoxFor:
             assert isinstance(theme.box_for(tier), Box)
 
 
+class TestStylesAndActiveTier:
+    def test_styles_resolves_concrete_for_every_token(self) -> None:
+        s = theme.styles(ColorTier.TRUECOLOR)
+        assert set(s.keys()) == set(Token)
+        assert s[Token.ACCENT] == theme.ACCENT_HEX  # concrete value, not a name
+
+    def test_styles_none_tier_all_empty(self) -> None:
+        s = theme.styles(ColorTier.NONE)
+        assert all(v == "" for v in s.values())
+
+    def test_active_tier_returns_a_tier(self) -> None:
+        assert isinstance(theme.active_tier(), ColorTier)
+
+    def test_styles_defaults_to_active_tier(self) -> None:
+        assert set(theme.styles().keys()) == set(Token)
+
+
 class TestEnsureTheme:
     def test_ensure_theme_makes_accent_markup_resolve(self) -> None:
         """A raw (unthemed) console can't resolve [accent]; ensure_theme fixes it."""

@@ -676,7 +676,14 @@ class SerpentFlow:
         # prompt_toolkit's patch_stdout proxy (which replaces sys.stdout
         # with a non-tty wrapper). Without this, Rich detects the proxy
         # as non-terminal and falls back to plain text.
-        self.console = Console(emoji=True, highlight=False, force_terminal=True)
+        #
+        # Routed through the theme factory (the ONE themed console for the
+        # whole CLI) so every consumer's semantic tokens ([accent], [muted],
+        # ...) resolve here — no per-surface theme wiring (DRY).
+        from backend.core.ouroboros.ui import theme as _ov_theme
+        self.console = _ov_theme.build_console(
+            emoji=True, highlight=False, force_terminal=True,
+        )
 
         # Live spinner state — refactored 2026-05-03 from rich.Status
         # widget (which bypassed patch_stdout via direct cursor writes)
@@ -831,7 +838,7 @@ class SerpentFlow:
                     cwd_str=_cwd,
                 )
                 if log_path:
-                    self.console.print(f"  [dim]📝 {log_path}[/dim]")
+                    self.console.print(f"  [muted]{log_path}[/muted]")
                     self.console.print()
                 # §41.3 Slice 2 #15 — first-launch expanded
                 # onboarding. welcome_state composes the verb

@@ -44,11 +44,13 @@ def _reset_env(monkeypatch):
 
 
 def _record(renderable, width: int = 120) -> str:
-    """Render a Rich renderable via Console(record=True) and return the
-    exported plain text. ``force_terminal=True`` makes the recording
-    path behave like a real TTY so styled text is emitted."""
-    from rich.console import Console
-    console = Console(record=True, width=width, force_terminal=True)
+    """Render a Rich renderable via a *themed* record console and return the
+    exported plain text. Uses ``theme.build_console`` (not a raw Console) so
+    the renderer's semantic token names ([accent], [warning], ...) resolve --
+    mirroring production, where serpent_flow's themed self.console renders the
+    preview. ``force_terminal=True`` makes recording behave like a real TTY."""
+    from backend.core.ouroboros.ui import theme
+    console = theme.build_console(record=True, width=width, force_terminal=True)
     console.print(renderable)
     return console.export_text()
 
