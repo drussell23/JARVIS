@@ -2551,6 +2551,29 @@ class DoublewordProvider:
                 exc,
                 content[:300].replace("\n", "\\n") if content else "(no content)",
             )
+            # ── Syntax-failure escalation recording (batch path) ──
+            # Record in the SyntaxExhaustionEscalator so the J-Prime
+            # cascade can fire when the CandidateGenerator re-enters
+            # _generate_dispatch on the next orchestrator retry.
+            _exc_msg = str(exc)
+            if "all_candidates_syntax_error" in _exc_msg:
+                try:
+                    from backend.core.ouroboros.governance.syntax_escalation import (  # noqa: E501
+                        get_escalator as _get_sx_poll,
+                    )
+                    _sx_p = _get_sx_poll()
+                    _sx_p.record_attempt(
+                        op_id=getattr(pending, "op_id", "") or "",
+                        error_msg=_exc_msg,
+                        candidate_preview=(
+                            content[:800] if content else ""
+                        ),
+                        target_file=getattr(
+                            exc, "target_file", "",
+                        ) or "",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             return None
 
     # ------------------------------------------------------------------

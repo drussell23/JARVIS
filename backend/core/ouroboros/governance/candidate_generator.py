@@ -6511,12 +6511,35 @@ class CandidateGenerator:
                 "[CandidateGenerator] Tier 0 background poll cancelled: %s",
                 pending.batch_id,
             )
-        except Exception:
+        except Exception as _poll_exc:
             logger.warning(
                 "[CandidateGenerator] Tier 0 background poll failed: %s",
                 pending.batch_id,
                 exc_info=True,
             )
+            # ── Syntax-failure escalation recording (batch path) ──
+            # The batch poll swallows the exception here. Record in the
+            # escalator so the J-Prime cascade can fire on the NEXT
+            # orchestrator retry. Mirrors the RT path recording.
+            _poll_err = str(_poll_exc)
+            if "all_candidates_syntax_error" in _poll_err:
+                try:
+                    from backend.core.ouroboros.governance.syntax_escalation import (  # noqa: E501
+                        get_escalator as _get_sx_batch,
+                    )
+                    _sx_b = _get_sx_batch()
+                    _sx_b.record_attempt(
+                        op_id=_op_id or "",
+                        error_msg=_poll_err,
+                        candidate_preview=getattr(
+                            _poll_exc, "candidate_preview", "",
+                        ) or "",
+                        target_file=getattr(
+                            _poll_exc, "target_file", "",
+                        ) or "",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         finally:
             self._background_polls.pop(_op_id, None)
 
