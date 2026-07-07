@@ -20,6 +20,7 @@ Everything after the verb forwards verbatim to the bootstrap, e.g.
 """
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence
@@ -156,7 +157,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         console.print(status_digest(), markup=False, highlight=False)
         return 0
 
-    # cockpit / headless -> the one shared bootstrap (DRY).
+    # cockpit / headless -> the one shared bootstrap (DRY). The facade's ONLY
+    # added responsibility: declare the presentation skin (spec §3.4).
+    from backend.core.ouroboros.ui.presentation_mode import ENV_KEY, PresentationMode
+
+    os.environ[ENV_KEY] = (
+        PresentationMode.COCKPIT.value if inv.action == "cockpit"
+        else PresentationMode.SOAK.value
+    )
     try:
         from scripts.ouroboros_battle_test import main as battle_main
     except Exception as exc:  # noqa: BLE001
