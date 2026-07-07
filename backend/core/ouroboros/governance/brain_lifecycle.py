@@ -295,7 +295,14 @@ def _brain_runtime_startup_script() -> str:
         # fallback. Mandate 1: native git, no rsync/un-versioned patch.
         # JARVIS_BRAIN_GIT_REF (from brain.env) allows feature-branch testing
         # without merging to main; defaults to 'main' when unset.
+        # The golden image is cloned with --single-branch so non-main refs
+        # are invisible until the remote fetch refspec is widened.
+        # Source brain.env so JARVIS_BRAIN_GIT_REF (shipped via metadata) is
+        # available as a shell variable for the git fetch below.
+        + ". /etc/jarvis/brain.env 2>/dev/null || true\n"
         + "BRAIN_REF=${JARVIS_BRAIN_GIT_REF:-main}\n"
+        + "git -C /opt/trinity/jarvis config remote.origin.fetch "
+          "'+refs/heads/*:refs/remotes/origin/*' 2>/dev/null || true\n"
         + "(GIT_TERMINAL_PROMPT=0 timeout 90 git -C /opt/trinity/jarvis fetch "
           "origin \"$BRAIN_REF\" --depth 1 2>/dev/null "
           "&& git -C /opt/trinity/jarvis reset --hard FETCH_HEAD 2>/dev/null) "
