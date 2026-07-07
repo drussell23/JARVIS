@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from .theme import ColorTier
+from .theme import ColorTier, Token, style_for
 
 # ---- reference geometry (verbatim from the approved v5 asset) -------------
 # docs/superpowers/specs/assets/2026-07-07-ov-crest-v5-generator.py
@@ -393,4 +393,17 @@ def generate_crest(
         return CrestFrame(0, 0, (), 0.0, "generation error")
 
 
-__all__ = ["CrestCell", "CrestFrame", "generate_crest"]
+def style_for_cell(cell: CrestCell, tier: ColorTier) -> str:
+    """Resolve one cell's Rich style for the tier. TRUECOLOR/C256 carry the
+    per-cell gradient (Rich downgrades 24-bit for 256 terminals); STANDARD
+    collapses to the single accent (geometry + trace unchanged)."""
+    if tier >= ColorTier.C256:
+        r, g, b = cell.rgb
+        return f"rgb({r},{g},{b})"
+    accent = style_for(Token.ACCENT, tier)
+    if cell.kind == "v":
+        return f"bold {accent}"
+    return accent
+
+
+__all__ = ["CrestCell", "CrestFrame", "generate_crest", "style_for_cell"]

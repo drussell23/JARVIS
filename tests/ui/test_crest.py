@@ -124,3 +124,30 @@ def test_standard_tier_renders_geometry():
     f = gen(tier=ColorTier.STANDARD)
     assert f.unavailable_reason is None
     assert cells_by_kind(f, "coil")
+
+
+# ---- style resolution --------------------------------------------------------
+
+from backend.core.ouroboros.ui.crest import style_for_cell
+from backend.core.ouroboros.ui.theme import Token, style_for
+
+
+def test_truecolor_styles_are_rgb():
+    f = gen()
+    c = cells_by_kind(f, "coil")[0]
+    assert style_for_cell(c, ColorTier.TRUECOLOR).startswith("rgb(")
+
+
+def test_standard_styles_are_accent_mono():
+    f = gen(tier=ColorTier.STANDARD)
+    accent = style_for(Token.ACCENT, ColorTier.STANDARD)
+    coil = cells_by_kind(f, "coil")[0]
+    v = cells_by_kind(f, "v")[0]
+    assert style_for_cell(coil, ColorTier.STANDARD) == accent
+    assert style_for_cell(v, ColorTier.STANDARD) == f"bold {accent}"
+
+
+def test_cache_hit_same_object():
+    a = gen(cols=60)
+    b = gen(cols=60)
+    assert a is b        # lru_cache identity
