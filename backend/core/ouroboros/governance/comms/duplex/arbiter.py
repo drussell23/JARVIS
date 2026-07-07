@@ -158,12 +158,19 @@ class VoiceDuplexArbiter:
 
     def fire_filler(self) -> None:
         """Speak a short LOCAL acknowledgment (LLM-free) to mask synth latency.
-        Ordinary interruptible SpeechRequest; repeats coalesce. Never raises."""
+        Ordinary interruptible SpeechRequest; repeats coalesce. Never raises.
+
+        Priority is PROACTIVE_INFO (not USER_RESPONSE): the filler belongs to
+        the same proactive-narration tier as the sentences it masks the
+        latency for. A new op's filler must not PREEMPT a previous op's
+        still-playing narration sentence — same-priority FIFO keeps "filler
+        first" ordering *within* an op without cross-op preemption.
+        """
         if not self._config.enabled:
             return
         try:
             self.submit(SpeechRequest(
-                self._next_filler(), Priority.USER_RESPONSE, coalesce_key="filler",
+                self._next_filler(), Priority.PROACTIVE_INFO, coalesce_key="filler",
             ))
         except Exception:  # noqa: BLE001
             logger.debug("[Arbiter] fire_filler failed", exc_info=True)

@@ -129,6 +129,72 @@ async def test_narrate_one_no_ops_when_synth_disabled_by_env(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_narrate_one_filters_code_fences_before_submit(monkeypatch):
+    """FIX 1 (Important, Sprint 2 review): synthesized sentences must pass
+    through the same deterministic guard (strip_code) used on ledger input
+    before reaching the arbiter — a fence/traceback the model echoes must
+    never reach TTS."""
+    monkeypatch.setenv("JARVIS_KAREN_SYNTH_ENABLED", "1")
+    from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
+
+    fake_synth = _FakeSynthesizer(["Fixed it. ```rm -rf``` done."])
+    fake_arbiter = _FakeArbiter()
+    say_fn = AsyncMock(return_value=True)
+
+    narrator = VoiceNarrator(
+        say_fn=say_fn,
+        debounce_s=0.0,
+        synthesizer=fake_synth,
+        arbiter=fake_arbiter,
+    )
+
+    msg = _make_comm_message(
+        "INTENT", payload={"goal": "fix test", "target_files": ["a.py"], "test_count": 1},
+    )
+    await narrator.send(msg)
+    await narrator.drain()
+
+    assert fake_arbiter.submitted, "expected the filtered sentence to still be submitted"
+    assert all("```" not in r.text for r in fake_arbiter.submitted)
+
+
+@pytest.mark.asyncio
+async def test_narrate_one_dedupes_second_identical_message_on_synth_outage(monkeypatch):
+    """FIX 2 (Important, Sprint 2 review): if synthesize() yields nothing
+    (DW outage — provider swallows errors, yields empty), the dedup id must
+    still be recorded so a repeat of the SAME message does not fire another
+    filler with no dedup/debounce (filler-spam)."""
+    monkeypatch.setenv("JARVIS_KAREN_SYNTH_ENABLED", "1")
+    from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
+
+    fake_synth = _FakeSynthesizer([])  # synth outage: yields nothing
+    fake_arbiter = _FakeArbiter()
+    say_fn = AsyncMock(return_value=True)
+
+    narrator = VoiceNarrator(
+        say_fn=say_fn,
+        debounce_s=0.0,
+        synthesizer=fake_synth,
+        arbiter=fake_arbiter,
+    )
+
+    msg = _make_comm_message(
+        "INTENT", op_id="op-001", payload={"goal": "fix test", "target_files": ["a.py"], "test_count": 1},
+    )
+    await narrator.send(msg)
+    await narrator.drain()
+
+    # Identical message again (same op_id + msg_type -> same notification_id).
+    msg2 = _make_comm_message(
+        "INTENT", op_id="op-001", payload={"goal": "fix test", "target_files": ["a.py"], "test_count": 1},
+    )
+    await narrator.send(msg2)
+    await narrator.drain()
+
+    assert fake_arbiter.filler_calls == 1, "second identical message must be deduped, not re-fire a filler"
+
+
+@pytest.mark.asyncio
 async def test_narrate_one_no_ops_when_no_injection():
     """Default construction (no synthesizer/arbiter) is a silent no-op —
     there is no template fallback to speak instead."""

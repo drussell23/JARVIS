@@ -18,7 +18,7 @@ from typing import Any, Callable, Coroutine, Optional
 from backend.core.ouroboros.governance.comm_protocol import CommMessage, MessageType
 
 from .duplex.protocols import Priority, SpeechRequest
-from .karen_synth.ledger_view import LedgerView
+from .karen_synth.ledger_view import LedgerView, strip_code
 
 logger = logging.getLogger(__name__)
 
@@ -190,15 +190,25 @@ class VoiceNarrator:
         try:
             view = LedgerView.from_payload(phase, context)
             self._arbiter.fire_filler()
-            spoke_any = False
             async for sentence in self._synthesizer.synthesize(view):
-                self._arbiter.submit(SpeechRequest(sentence, Priority.PROACTIVE_INFO))
-                spoke_any = True
-            if spoke_any:
-                self._narrated_ids[notification_id] = None
-                if len(self._narrated_ids) > _MAX_NARRATED_IDS:
-                    self._narrated_ids.popitem(last=False)
-                self._last_narration = time.monotonic()
+                # Mandate #4 bulletproof: run model output through the SAME
+                # deterministic guard used on ledger input before it ever
+                # reaches TTS — a fence/traceback the model echoes back must
+                # never be submitted for speech.
+                safe = strip_code(sentence)[:200].strip()
+                if not safe:
+                    continue
+                self._arbiter.submit(SpeechRequest(safe, Priority.PROACTIVE_INFO))
+            # Record dedup id + advance debounce regardless of whether any
+            # sentence was actually spoken. The message was handled — the
+            # filler fired and synthesis was attempted. A missed voice line
+            # on a synth outage (DW swallows errors, yields empty) is
+            # acceptable; re-firing a filler for every subsequent duplicate
+            # of the SAME message with no dedup/debounce is not.
+            self._narrated_ids[notification_id] = None
+            if len(self._narrated_ids) > _MAX_NARRATED_IDS:
+                self._narrated_ids.popitem(last=False)
+            self._last_narration = time.monotonic()
         except Exception:
             logger.debug("VoiceNarrator: synthesis failed for op %s", msg.op_id)
 
