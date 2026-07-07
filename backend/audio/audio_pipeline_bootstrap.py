@@ -226,8 +226,10 @@ async def wire_conversation_pipeline(
     if os.getenv("JARVIS_KAREN_VOICE_BUILD_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
         try:
             from backend.core.ouroboros.governance.comms.voice_build.bridge import VoiceBuildBridge
-            from backend.core.ouroboros.governance.intake.sensors.voice_command_sensor import get_default_voice_sensor
-            handle.voice_build = VoiceBuildBridge(get_default_voice_sensor())
+            # Lazy — resolves the sensor per-call via get_default_voice_sensor()
+            # inside the bridge, so mount order relative to IntakeLayerService
+            # publishing the sensor no longer matters (Sprint 4 review fix).
+            handle.voice_build = VoiceBuildBridge()
             # Fork completed turns into voice->build (the LLM chat path is untouched — DRY).
             if handle.conversation_pipeline is not None:
                 handle.conversation_pipeline._on_turn_text = handle.voice_build.on_final_transcript
