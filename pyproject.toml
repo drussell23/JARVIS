@@ -1,3 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ouroboros-ov"
+version = "0.1.0"
+description = "O+V (Ouroboros + Venom) -- autonomous engineering organism CLI"
+requires-python = ">=3.9"
+# Dependencies are managed by the repo's requirements files, not resolved at
+# install time -- an editable install (`pip install -e . --no-deps`) only wires
+# the `ov` console script onto PATH. See spec 2026-07-06 §4.1.
+dependencies = []
+
+[project.scripts]
+# Root-Cause packaging (mandate #1): the `ov` binary is a PEP 621 console
+# entry point, NOT a bin/ wrapper or symlink. Both `ov` and
+# `python3 scripts/ouroboros_battle_test.py` resolve into the same bootstrap.
+ov = "backend.core.ouroboros.cli.ov:main"
+
+[tool.setuptools.packages.find]
+# Scope discovery to the two import roots the CLI needs so setuptools does not
+# choke on the many sibling top-level dirs (docs/, tests/, extensions/, ...).
+# `scripts` is included so `ov` can delegate into the legacy bootstrap (DRY).
+where = ["."]
+include = ["backend*", "scripts*"]
+namespaces = false
+
 [tool.bandit]
 # Bandit security linter configuration
 exclude_dirs = ["/tests/", "/test_*.py", "/__pycache__/"]
