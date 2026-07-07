@@ -157,6 +157,13 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+# ov awakening Task 1 — presentation-mode gate (COCKPIT vs SOAK). Leaf
+# module: stdlib only, safe to import at top level now that _PROJECT_ROOT
+# is on sys.path. See backend/core/ouroboros/ui/presentation_mode.py.
+from backend.core.ouroboros.ui.presentation_mode import (  # noqa: E402
+    PresentationMode, resolve_presentation_mode,
+)
+
 # ANSI color codes
 _CYAN = "\033[96m"
 _GREEN = "\033[92m"
@@ -212,7 +219,7 @@ def _check_env_val(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
-def _reap_zombies() -> "set[int]":
+def _reap_zombies(*, quiet: bool = False) -> "set[int]":
     """Detect and reap any lingering ouroboros_battle_test.py processes.
 
     A terminal disconnect or crashed session can leave the battle test
@@ -234,6 +241,12 @@ def _reap_zombies() -> "set[int]":
     PID between SIGKILL and the probe, making a just-killed PID look
     "alive" again under a fresh unrelated occupant. Closes the boot
     coordination gap between reaper and lock cleanup (2026-05-03).
+
+    ``quiet`` (ov awakening Task 1, Mandate 1) withholds the stdout
+    banner ceremony only — the scan/terminate/kill side effects below
+    are functional and run unconditionally in either mode. Callers in
+    COCKPIT presentation mode pass ``quiet=True`` so lingering
+    processes are still reaped without flooding the clean boot.
     """
     try:
         import psutil  # type: ignore[import-untyped]
@@ -291,19 +304,23 @@ def _reap_zombies() -> "set[int]":
 
     reaped_pids: "set[int]" = {p.pid for p in victims}
 
-    print(f"\n{_BOLD}{_YELLOW}  Zombie Reaper{_RESET}")
-    print(f"{_DIM}  {'─' * 52}{_RESET}")
+    # Mandate 1: gate the banner ceremony at the source, not the
+    # scan/terminate/kill side effects below (those always run).
+    _emit = (lambda *_a, **_k: None) if quiet else print
+
+    _emit(f"\n{_BOLD}{_YELLOW}  Zombie Reaper{_RESET}")
+    _emit(f"{_DIM}  {'─' * 52}{_RESET}")
     for p in victims:
         try:
             age_s = time.time() - p.create_time()
             m, s = int(age_s) // 60, int(age_s) % 60
-            print(
+            _emit(
                 f"  {_YELLOW}→{_RESET} reaping PID {p.pid} "
                 f"{_DIM}(age {m}m{s:02d}s){_RESET}"
             )
             p.terminate()
         except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
-            print(f"  {_DIM}  skipped PID {p.pid}: {type(exc).__name__}{_RESET}")
+            _emit(f"  {_DIM}  skipped PID {p.pid}: {type(exc).__name__}{_RESET}")
 
     # Wait up to 3s for graceful shutdown, then SIGKILL holdouts.
     try:
@@ -313,13 +330,13 @@ def _reap_zombies() -> "set[int]":
     for p in alive:
         try:
             p.kill()
-            print(f"  {_RED}→{_RESET} SIGKILL PID {p.pid} {_DIM}(ignored SIGTERM){_RESET}")
+            _emit(f"  {_RED}→{_RESET} SIGKILL PID {p.pid} {_DIM}(ignored SIGTERM){_RESET}")
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
     count = len(victims)
     plural = "s" if count != 1 else ""
-    print(f"  {_GREEN}✓ reaped {count} zombie{plural}{_RESET}\n")
+    _emit(f"  {_GREEN}✓ reaped {count} zombie{plural}{_RESET}\n")
     return reaped_pids
 
 
@@ -555,18 +572,29 @@ def _single_flight_preflight() -> None:
         sys.exit(75)
 
 
+def _check_api_keys_or_die() -> None:
+    """FATAL preflight: no provider keys -> die loudly. Deliberately OUTSIDE
+    the presentation gate (Mandate 1): no mode can suppress this."""
+    if not os.environ.get("DOUBLEWORD_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
+        print(f"\n  {_RED}{_BOLD}ERROR: No API keys set.{_RESET}")
+        print(f"  {_RED}Export DOUBLEWORD_API_KEY or ANTHROPIC_API_KEY.{_RESET}\n")
+        sys.exit(1)
+
+
 def _print_preflight() -> None:
     """Print a preflight checklist showing what's enabled.
 
     Gap #7 Slice 1 — when ``JARVIS_PRESENTATION_RESTRAINT_ENABLED``
     is on, the verbose multi-line checklist is suppressed at boot.
     Operators retrieve the same content on demand via the ``/preflight``
-    REPL verb. The deeper API-key fail-fast (no providers set at all)
-    still happens — that's a hard error operators MUST see.
+    REPL verb.
+
+    ov awakening Task 1 — this is now pure presentation. The API-key
+    fail-fast lives in ``_check_api_keys_or_die()`` and is called
+    unconditionally by ``main()`` before this function runs, so this
+    function itself never exits the process.
     """
-    # Restraint mode: skip the verbose render, but still enforce the
-    # API-key fail-fast (the script exits with code 1 below if neither
-    # provider is configured — that's not chrome, it's a hard error).
+    # Restraint mode: skip the verbose render.
     try:
         from backend.core.ouroboros.battle_test.presentation_restraint import (
             is_restraint_enabled, suppress_diagnostic_logs,
@@ -582,13 +610,6 @@ def _print_preflight() -> None:
             suppress_diagnostic_logs()
         except Exception:
             pass
-        # Hard-fail check still runs (API keys must be present).
-        has_dw = bool(os.environ.get("DOUBLEWORD_API_KEY"))
-        has_claude = bool(os.environ.get("ANTHROPIC_API_KEY"))
-        if not has_dw and not has_claude:
-            print(f"\n  {_RED}{_BOLD}ERROR: No API keys set.{_RESET}")
-            print(f"  {_RED}Export DOUBLEWORD_API_KEY or ANTHROPIC_API_KEY.{_RESET}\n")
-            sys.exit(1)
         return
 
     print(f"\n{_BOLD}{_CYAN}  Preflight Checklist{_RESET}")
@@ -626,20 +647,42 @@ def _print_preflight() -> None:
     rounds = _check_env_val("JARVIS_GOVERNED_TOOL_MAX_ROUNDS", "10")
     print(f"\n{_DIM}  Tool rounds: {rounds} (deadline-based, safety ceiling){_RESET}")
 
-    # Check at least one provider
+    # Single-provider warnings (non-fatal; the "no keys at all" case is a
+    # hard error and lives in _check_api_keys_or_die, called before this
+    # function ever runs).
     has_dw = bool(os.environ.get("DOUBLEWORD_API_KEY"))
     has_claude = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    if not has_dw and not has_claude:
-        print(f"\n  {_RED}{_BOLD}ERROR: No API keys set.{_RESET}")
-        print(f"  {_RED}Export DOUBLEWORD_API_KEY or ANTHROPIC_API_KEY.{_RESET}\n")
-        sys.exit(1)
-
     if not has_claude:
         print(f"\n  {_YELLOW}WARNING: ANTHROPIC_API_KEY not set — no Claude fallback.{_RESET}")
     if not has_dw:
         print(f"\n  {_YELLOW}WARNING: DOUBLEWORD_API_KEY not set — Claude only (expensive).{_RESET}")
 
     print()
+
+
+def _run_gated_boot_banners(
+    mode: PresentationMode, *, single_flight_enabled: bool, reap_enabled: bool,
+) -> None:
+    """Nominal boot banners, gated AT THE SOURCE (Mandate 1). COCKPIT
+    withholds; detail stays reachable via the /preflight + /organism verbs.
+    Fatal telemetry never routes through here."""
+    if mode is PresentationMode.COCKPIT:
+        return
+    if reap_enabled:
+        _reap_zombies()
+    if single_flight_enabled:
+        _single_flight_preflight()
+    _print_preflight()
+
+
+def _resolve_boot_log_level(mode: PresentationMode, *, verbose: bool = False) -> int:
+    """COCKPIT quiets the INFO flood to WARNING. -v always wins. ERROR and
+    CRITICAL pass at every level -- the gate lowers verbosity, filters nothing."""
+    if verbose:
+        return logging.DEBUG
+    if mode is PresentationMode.COCKPIT:
+        return logging.WARNING
+    return logging.INFO
 
 
 def _render_multi_op_and_exit(arg: str, *, color: bool) -> None:
@@ -1307,12 +1350,30 @@ def main(argv: "list[str] | None" = None) -> None:
     os.environ.setdefault("JARVIS_GOVERNANCE_MODE", "governed")
 
     # ------------------------------------------------------------------
+    # ov awakening Task 1 — resolve presentation mode + the structural
+    # fatal bypass (Mandate 1). Both read env populated by _load_env_files
+    # above, so this must come after it. _check_api_keys_or_die is
+    # deliberately unconditional and outside every gate below — no mode
+    # can suppress it.
+    # ------------------------------------------------------------------
+    _mode = resolve_presentation_mode()
+    _check_api_keys_or_die()
+
+    # ------------------------------------------------------------------
     # Zombie reaper — kill lingering battle tests from prior sessions
     # before they race us on API budget, git branches, and the intake
     # router lock. Opt-out with JARVIS_BATTLE_REAP_ZOMBIES=false.
+    #
+    # ov awakening Task 1: reaping + lock hygiene are FUNCTIONAL side
+    # effects and always run in both presentation modes — only the
+    # reaper's stdout banner is gated (quiet=True in COCKPIT). This is
+    # handled here rather than inside _run_gated_boot_banners below
+    # because _cleanup_stale_router_lock needs the reaped-PID set that
+    # helper's contract doesn't expose.
     # ------------------------------------------------------------------
-    if os.environ.get("JARVIS_BATTLE_REAP_ZOMBIES", "true").lower() not in ("false", "0", "no", "off"):
-        _reaped = _reap_zombies()
+    _reap_enabled = os.environ.get("JARVIS_BATTLE_REAP_ZOMBIES", "true").lower() not in ("false", "0", "no", "off")
+    if _reap_enabled:
+        _reaped = _reap_zombies(quiet=(_mode is PresentationMode.COCKPIT))
         _cleanup_stale_router_lock(reaped_pids=_reaped)
         # Slice 48 — sweep multi-day stale .jarvis/*.lock debris (flock
         # auto-releases on death; these are inert crumbs that accumulate).
@@ -1380,26 +1441,33 @@ def main(argv: "list[str] | None" = None) -> None:
     atexit.register(_lock_stack.close)
 
     # ------------------------------------------------------------------
-    # Harness Epic Slice 2 — single-flight preflight.
-    # Reject concurrent battle-test runs at the process level. The
-    # zombie reap above kills DEAD lingering processes; this check
-    # rejects ALIVE concurrent processes (operator launched twice by
-    # accident, etc.). Exit 75 (EX_TEMPFAIL) signals "try again later"
-    # to wrappers — distinct from generic error code 1.
+    # Harness Epic Slice 2 — single-flight preflight + preflight
+    # checklist. Reject concurrent battle-test runs at the process
+    # level; the zombie reap above kills DEAD lingering processes, this
+    # check rejects ALIVE concurrent processes (operator launched twice
+    # by accident, etc.). Exit 75 (EX_TEMPFAIL) signals "try again
+    # later" to wrappers — distinct from generic error code 1.
     # Master flag: JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED (default true).
+    #
+    # ov awakening Task 1 — gated at the source via
+    # _run_gated_boot_banners: COCKPIT withholds both the single-flight
+    # diagnostic prints and the preflight checklist banner; SOAK calls
+    # through in the legacy order. Reap already ran (functionally) above,
+    # so reap_enabled=False here — this call handles single-flight +
+    # preflight only.
     # ------------------------------------------------------------------
-    if os.environ.get("JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED", "true").lower() not in ("false", "0", "no", "off"):
-        _single_flight_preflight()
-
-    # ------------------------------------------------------------------
-    # Preflight checklist
-    # ------------------------------------------------------------------
-    _print_preflight()
+    _run_gated_boot_banners(
+        _mode,
+        single_flight_enabled=os.environ.get(
+            "JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED", "true"
+        ).lower() not in ("false", "0", "no", "off"),
+        reap_enabled=False,
+    )
 
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
-    log_level = logging.DEBUG if args.verbose else logging.INFO
+    log_level = _resolve_boot_log_level(_mode, verbose=args.verbose)
     logging.basicConfig(
         level=log_level,
         format=(

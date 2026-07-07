@@ -203,15 +203,30 @@ def test_single_flight_gated_by_env_var():
 
 def test_single_flight_called_after_zombie_reap():
     """The single-flight check runs AFTER the zombie reaper so it doesn't
-    falsely trip on dead-PID lockholders the reaper can clean."""
+    falsely trip on dead-PID lockholders the reaper can clean.
+
+    ov awakening Task 1 restructured main()'s boot sequence: zombie
+    reaping is now a mode-independent functional step (quiet=True in
+    COCKPIT) invoked directly in main(), BEFORE the call to
+    ``_run_gated_boot_banners`` -- which is what actually invokes
+    ``_single_flight_preflight()`` from inside its own gated body. This
+    pins the ordering at the new call site (main() -> _reap_zombies,
+    then main() -> _run_gated_boot_banners); the runtime proof that
+    _run_gated_boot_banners itself calls reap before single-flight
+    before preflight (when all are enabled) lives in
+    tests/battle_test/test_presentation_gate.py.
+    """
     src = Path("scripts/ouroboros_battle_test.py").read_text()
-    # Both must exist; single-flight check string must appear after the
-    # zombie reap call in the main() flow.
-    reap_idx = src.find("_reap_zombies()")
-    sf_idx = src.find("_single_flight_preflight()")
-    assert reap_idx > 0
-    assert sf_idx > reap_idx, (
-        "single-flight must be invoked AFTER _reap_zombies in main() flow"
+    main_start = src.find("def main(")
+    assert main_start > 0, "main() entry point missing"
+    body = src[main_start:]
+    reap_idx = body.find("_reap_zombies(")
+    banners_idx = body.find("_run_gated_boot_banners(")
+    assert reap_idx > 0, "_reap_zombies call missing in main()"
+    assert banners_idx > 0, "_run_gated_boot_banners call missing in main()"
+    assert banners_idx > reap_idx, (
+        "single-flight (invoked inside _run_gated_boot_banners) must be "
+        "invoked AFTER _reap_zombies in main() flow"
     )
 
 

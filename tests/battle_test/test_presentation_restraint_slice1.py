@@ -446,14 +446,22 @@ def test_script_print_preflight_short_circuits_under_restraint():
 
 def test_script_still_enforces_api_key_fail_fast():
     """The hard-fail check (no providers configured) MUST run even
-    under restraint — that's not chrome, it's a structural error."""
+    under restraint — that's not chrome, it's a structural error.
+
+    ov awakening Task 1 (Mandate 1) extracted this check out of
+    ``_print_preflight`` into ``_check_api_keys_or_die`` -- a dedicated
+    function called unconditionally by ``main()`` before any
+    presentation-gated banner (restraint, COCKPIT, or SOAK). That's a
+    *stronger* guarantee than living inside ``_print_preflight`` (which
+    only ran under some launch paths) -- so this test now pins the new,
+    always-invoked location instead of the old one.
+    """
     src = (_REPO / "scripts/ouroboros_battle_test.py").read_text()
     tree = ast.parse(src)
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "_print_preflight":
+        if isinstance(node, ast.FunctionDef) and node.name == "_check_api_keys_or_die":
             body = ast.unparse(node)
-            # The restraint branch must still call sys.exit on missing keys
             assert "sys.exit(1)" in body
             assert "No API keys" in body
             return
-    pytest.fail("_print_preflight not found")
+    pytest.fail("_check_api_keys_or_die not found")
