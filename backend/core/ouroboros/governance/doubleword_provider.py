@@ -2487,6 +2487,32 @@ class DoublewordProvider:
                     prompt_preloaded_files=tuple(pending.prompt_preloaded_files),
                 )
 
+            # ── File-scope mismatch guard (env-var gated) ──────────
+            # Reject candidates whose file_path falls outside the op's
+            # declared target_files — prevents cross-contamination where
+            # the model generates a patch for an unrelated file.
+            try:
+                _scope_check_on = os.environ.get(
+                    "JARVIS_DW_SCOPE_MISMATCH_CHECK_ENABLED", "true",
+                ).strip().lower() not in {"0", "false", "no", "off"}
+                if _scope_check_on and ctx.target_files:
+                    _target_set = set(ctx.target_files)
+                    _candidate_paths = {
+                        c.get("file_path", "")
+                        for c in result.candidates
+                        if c.get("file_path")
+                    }
+                    if _candidate_paths and not _candidate_paths & _target_set:
+                        logger.warning(
+                            "[DoublewordProvider] file_scope_mismatch: "
+                            "candidate targets %r but op targets %r "
+                            "— rejecting as scope violation",
+                            _candidate_paths, _target_set,
+                        )
+                        return None
+            except Exception:  # noqa: BLE001 — fail-soft; never crashes
+                pass
+
             # Slice 0 — provider-latency observability (pure side
             # channel; master-flag-gated; NEVER raises). Emitted ONLY
             # when ``usage`` carried a real DW server-side token count
