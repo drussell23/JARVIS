@@ -163,6 +163,7 @@ _A1_VERDICT_ARCNAME = "a1_verdict.json"
 # doesn't lose all verdict visibility. Default-on (fail-soft over silence);
 # set to false to make IapBlackBoxTransport the ONLY verdict source, full stop.
 _ENV_VERDICT_SSH_FALLBACK_ENABLED = "JARVIS_A1_BRAIN_VERDICT_SSH_FALLBACK_ENABLED"
+_ENV_GCS_TELEMETRY_TARGET = "JARVIS_A1_GCS_TELEMETRY_TARGET"
 
 
 def _log(msg: str) -> None:
@@ -1332,6 +1333,67 @@ class A1BrainIgnition:
             _log("[BlackBox] WARN verdict JSON parse error: %r" % (exc,))
             return None
 
+    def _pull_verdict_from_gcs(self) -> Optional[Dict[str, Any]]:
+        """TIER 1.5: pull ``a1_verdict.json`` from GCS (IAP-decoupled).
+
+        Reads the ``JARVIS_A1_GCS_TELEMETRY_TARGET`` env-var for the
+        ``gs://bucket/prefix`` target.  The blob path is
+        ``<prefix>/<run_id>/a1_verdict.json`` -- the same layout that the
+        telemetry sidecar uses for uploads.
+
+        This is a **synchronous** helper (blocking I/O) intended to be called
+        via ``loop.run_in_executor``.  It is fully fail-soft: any exception
+        is logged and swallowed; returns ``None`` on failure."""
+        target = os.environ.get(_ENV_GCS_TELEMETRY_TARGET, "").strip()
+        if not target:
+            return None
+        try:
+            # -- lazy imports: neither the SDK nor the URI parser are
+            # needed unless GCS telemetry is actually configured. --
+            from google.cloud import storage as gcs_storage  # type: ignore[import-untyped]
+            from backend.core.ouroboros.governance.state_persistence_daemon import (
+                _parse_gs_uri,
+            )
+
+            parsed = _parse_gs_uri(target)
+            if parsed is None:
+                _log("[GcsVerdict] WARN env %s is not a valid gs:// URI: %s"
+                     % (_ENV_GCS_TELEMETRY_TARGET, target))
+                return None
+            bucket_name, prefix = parsed
+            run_id = "a1-brain-%s" % (self.node_name,)
+            blob_path = "%s/%s/%s" % (prefix, run_id, _A1_VERDICT_ARCNAME) if prefix else \
+                        "%s/%s" % (run_id, _A1_VERDICT_ARCNAME)
+
+            # 30 s hard deadline: guard against an unexpectedly slow GCS
+            # round-trip (DNS, metadata-server ADC refresh, etc.).
+            deadline = time.monotonic() + 30
+
+            client = gcs_storage.Client()
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_path)
+            if not blob.exists():
+                _log("[GcsVerdict] blob gs://%s/%s does not exist"
+                     % (bucket_name, blob_path))
+                return None
+
+            if time.monotonic() > deadline:
+                _log("[GcsVerdict] WARN 30 s timeout exceeded during GCS pull")
+                return None
+
+            text = blob.download_as_text(encoding="utf-8")
+            start = text.find("{")
+            if start == -1:
+                _log("[GcsVerdict] WARN blob contained no JSON object")
+                return None
+            verdict = json.loads(text[start:])
+            _log("[GcsVerdict] pulled a1_verdict.json from gs://%s/%s "
+                 "(GCS_AUTHORITATIVE)" % (bucket_name, blob_path))
+            return verdict
+        except Exception as exc:  # noqa: BLE001 -- GCS pull must never crash
+            _log("[GcsVerdict] pull failed (fail-soft): %r" % (exc,))
+            return None
+
     async def retrieve_verdict(self) -> Dict[str, Any]:
         """Mandate 3: verdict retrieval is 100% via ``IapBlackBoxTransport``.
 
@@ -1401,6 +1463,17 @@ class A1BrainIgnition:
             else:
                 _log("[BlackBox] WARN checksum-verified archive did not yield a "
                      "parseable a1_verdict.json")
+
+        # -- TIER 1.5: GCS verdict pull (IAP-decoupled, preemption-proof) --
+        if verdict is None:
+            try:
+                verdict = await loop.run_in_executor(None, self._pull_verdict_from_gcs)
+                if verdict is not None:
+                    verdict_source = "gcs"
+                    _log("[GcsVerdict] A1 verdict parsed from GCS "
+                         "(IAP-decoupled, AUTHORITATIVE)")
+            except Exception as exc:  # noqa: BLE001 -- GCS must never crash the driver
+                _log("[GcsVerdict] WARN pull error: %r" % (exc,))
 
         # -- FAIL-SOFT, NON-AUTHORITATIVE fallback: only when the Black-Box
         # channel produced NO verdict at all. --
