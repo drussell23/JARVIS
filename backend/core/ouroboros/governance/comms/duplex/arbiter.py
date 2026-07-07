@@ -28,6 +28,7 @@ class VoiceDuplexArbiter:
         self._wake = asyncio.Event()          # signalled when work is enqueued
         self._play_task: Optional[asyncio.Task] = None
         self._running = False
+        self._stopped = False
         self._active_priority: Optional[Priority] = None
         self.shed_count = 0
         self.coalesced_count = 0
@@ -42,6 +43,11 @@ class VoiceDuplexArbiter:
         raises."""
         if not self._config.enabled:
             return
+        if (
+            request.priority in (Priority.PROACTIVE_INFO, Priority.PROACTIVE_CRITICAL)
+            and not self._config.proactive_enabled
+        ):
+            return
         try:
             q = self._queues[request.priority]
             if request.coalesce_key:
@@ -52,7 +58,7 @@ class VoiceDuplexArbiter:
                 self._queues[request.priority] = q
                 self.coalesced_count += before - len(q)
             q.append(request)
-            while len(q) > self._config.queue_max_per_priority:
+            while len(q) > max(1, self._config.queue_max_per_priority):
                 q.popleft()
                 self.shed_count += 1
             if (
@@ -76,6 +82,8 @@ class VoiceDuplexArbiter:
         return None
 
     async def run(self) -> None:
+        if self._stopped:
+            return
         self._running = True
         while self._running:
             await self._wake.wait()
@@ -130,6 +138,7 @@ class VoiceDuplexArbiter:
     async def stop(self) -> None:
         # Clean shutdown: cancel any active playback so no blocked play task
         # leaks past teardown (bulletproof mandate #4). Idempotent + never raises.
+        self._stopped = True
         self._running = False
         if self._play_task is not None:
             try:

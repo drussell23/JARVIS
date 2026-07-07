@@ -187,6 +187,30 @@ async def test_disabled_arbiter_is_noop():
 
 
 @pytest.mark.asyncio
+async def test_proactive_disabled_drops_proactive_requests():
+    fp = FakePlayback()
+    cfg = ArbiterConfig(enabled=True, barge_in_enabled=True, proactive_enabled=False)
+    arb = VoiceDuplexArbiter(fp, config=cfg)
+    arb.submit(SpeechRequest("fyi", Priority.PROACTIVE_INFO))
+    arb.submit(SpeechRequest("crit", Priority.PROACTIVE_CRITICAL))
+    assert all(len(q) == 0 for q in arb._queues.values())   # both dropped
+    # user-tier requests still enqueue even when proactive is off
+    arb.submit(SpeechRequest("answer", Priority.USER_RESPONSE))
+    assert len(arb._queues[Priority.USER_RESPONSE]) == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_before_run_does_not_resurrect_loop():
+    fp = FakePlayback()
+    arb = VoiceDuplexArbiter(fp, config=_ON)
+    task = asyncio.create_task(arb.run())
+    await arb.stop()                       # stop before run() body executes
+    # run() must return on its own (no task.cancel needed) within 1s
+    await asyncio.wait_for(task, timeout=1.0)
+    assert task.done()
+
+
+@pytest.mark.asyncio
 async def test_playback_exception_does_not_break_loop():
     arb = VoiceDuplexArbiter(_BoomPlayback(), config=_ON)
     task = asyncio.create_task(arb.run())
