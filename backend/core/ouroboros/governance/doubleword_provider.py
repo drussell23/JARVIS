@@ -2927,6 +2927,38 @@ class DoublewordProvider:
         if not _slice36_force_batch and self._s189_storm_forces_batch(context):
             _slice36_force_batch = True
 
+        # Iron Gate alignment override — when the exploration gate will demand
+        # tool calls (read_file/search_code) before accepting any patch, the
+        # BATCH path cannot satisfy that requirement (batch strips the Venom
+        # tool loop). Downgrade to RT so the model can explore first. This
+        # closes the BATCH(force) → exploration_insufficient → terminal catch-22
+        # observed in A1 soak runs where every standard-route mutation op was
+        # killed by the Iron Gate before reaching VALIDATE.
+        # Env-gated for rollback: JARVIS_DW_EXPLORATION_BATCH_OVERRIDE_ENABLED
+        if _slice36_force_batch and self._tool_loop is not None:
+            try:
+                _expl_override_on = os.environ.get(
+                    "JARVIS_DW_EXPLORATION_BATCH_OVERRIDE_ENABLED", "true",
+                ).strip().lower() not in {"0", "false", "no", "off"}
+                if _expl_override_on:
+                    from backend.core.ouroboros.governance.exploration_engine import (
+                        exploration_gate_demands_tools as _gate_demands,
+                    )
+                    _complexity = getattr(context, "task_complexity", "simple")
+                    _route = getattr(context, "provider_route", "standard")
+                    if _gate_demands(complexity=str(_complexity), route=str(_route)):
+                        logger.info(
+                            "[DoublewordProvider] Iron Gate alignment override: "
+                            "force_batch=True downgraded to RT — exploration gate "
+                            "demands tool calls that BATCH cannot provide. "
+                            "op=%s route=%s complexity=%s",
+                            getattr(context, "op_id", "?")[:16],
+                            _route, _complexity,
+                        )
+                        _slice36_force_batch = False
+            except Exception:  # noqa: BLE001 — fail-soft; preserve batch on error
+                pass
+
         # A1-DIAG: dispatch-level topology diagnostic (env-gated, preemption-proof).
         # Captures the RT vs batch branch decision BEFORE it executes, so a SPOT
         # preemption cannot lose the decisive H3a/H3b/H3c signal. Writes to stderr
