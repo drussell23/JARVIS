@@ -2946,7 +2946,7 @@ class DoublewordProvider:
                     )
                     _complexity = getattr(context, "task_complexity", "simple")
                     _route = getattr(context, "provider_route", "standard")
-                    if _gate_demands(complexity=str(_complexity), route=str(_route)):
+                    if _gate_demands(complexity=str(_complexity)):
                         logger.info(
                             "[DoublewordProvider] Iron Gate alignment override: "
                             "force_batch=True downgraded to RT — exploration gate "
