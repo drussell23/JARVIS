@@ -1202,6 +1202,54 @@ def _launch_iso_soak(
 
 
 # ---------------------------------------------------------------------------
+# GCS verdict push (fail-soft, 30s hard timeout)
+# ---------------------------------------------------------------------------
+
+def _push_verdict_to_gcs(verdict_out: str, run_id: str) -> None:
+    """Upload ``a1_verdict.json`` + ``dispatch_done.marker`` to the GCS target
+    used by the telemetry sidecar.  Entirely fail-soft: any error is logged and
+    swallowed so that a GCS outage never blocks teardown or alters the exit code.
+
+    The target URI comes from ``JARVIS_A1_GCS_TELEMETRY_TARGET`` (the same env
+    var the sidecar reads).  If unset/empty the function returns silently — the
+    sidecar was not enabled for this run, so there is no bucket to push to.
+    """
+    target_uri = (os.environ.get("JARVIS_A1_GCS_TELEMETRY_TARGET", "") or "").strip()
+    if not target_uri:
+        return  # sidecar not enabled — nothing to push
+
+    async def _upload() -> None:
+        # Lazy import: the sidecar module + google-cloud-storage SDK are
+        # optional; we only pay the import cost when GCS push is active.
+        from scripts.a1_gcs_telemetry_sidecar import make_gcs_chunk_sink  # type: ignore[import-untyped]
+
+        sink = make_gcs_chunk_sink(target_uri)
+        if sink is None:
+            _log("[a1-gcs-verdict] sink creation returned None — skipping push")
+            return
+
+        # Read the verdict file written by the auditor.
+        with open(verdict_out, "rb") as fh:
+            verdict_bytes = fh.read()
+
+        object_name = "%s/a1_verdict.json" % run_id
+        sink(object_name, verdict_bytes)
+
+        # Write the sentinel marker so the local side can detect completion.
+        marker_name = "%s/dispatch_done.marker" % run_id
+        sink(marker_name, b"\x00")
+
+        _log("[a1-gcs-verdict] pushed a1_verdict.json -> %s/%s" % (target_uri.rstrip("/"), object_name))
+
+    try:
+        asyncio.get_event_loop().run_until_complete(
+            asyncio.wait_for(_upload(), timeout=30.0)
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-soft mandate
+        _log("[a1-gcs-verdict] push failed (fail-soft): %r" % (exc,))
+
+
+# ---------------------------------------------------------------------------
 # IsomorphicA1Driver -- the full-chain local E2E driver
 # ---------------------------------------------------------------------------
 
@@ -1751,6 +1799,7 @@ class IsomorphicA1Driver:
                         }
                         proven = False
                         _log("STEP audit VERDICT: SKIPPED (hardware_capacity_exhausted)")
+                        _push_verdict_to_gcs(verdict_out, run_id)
                     else:
                         # ── e. LAUNCH AUDITOR ────────────────────────────────
                         _log("STEP audit: sse=%s log=%s" % (self.sse_base, debug_log))
@@ -1787,6 +1836,7 @@ class IsomorphicA1Driver:
                              % ("A1_DISPATCH_PROVEN" if proven else "FAILED",
                                 " (log truncated: child force-reaped)"
                                 if _soak_force_reaped else ""))
+                        _push_verdict_to_gcs(verdict_out, run_id)
 
                     # ── f. FAILURE PATH: T5 telemetry + local autopsy ────────
                     if not proven:
