@@ -169,6 +169,13 @@ class AwakeningConductor:
         self._ignited = False
         self._header_printed = False
 
+        #: Resize proof (Mandate 4 / SIGWINCH): count of in-flight crest
+        #: regenerations triggered by a mid-trace console size change, and
+        #: the last size measured by the animated tick loop. ``None`` until
+        #: the first tick establishes a baseline.
+        self.regenerations: int = 0
+        self._last_size: Optional[tuple] = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -233,6 +240,43 @@ class AwakeningConductor:
             return True
         return False
 
+    def _check_resize(self, frame: CrestFrame, tier: ColorTier) -> CrestFrame:
+        """Per-tick SIGWINCH proof (Mandate 4): if the measured console size
+        changed since the last tick, regenerate the crest at the new size.
+
+        Crest cell ``delay_s`` values are derived purely from arc-angle
+        (tail=0 -> head=1), the SAME fractional schedule regardless of
+        width -- so the same ``elapsed`` reveals the same arc fraction on
+        the regenerated frame and the reveal stays monotonic by
+        construction; no remapping is needed, only adoption of the new
+        frame. If the console shrank below the crest minimum, the new
+        frame comes back ``unavailable_reason``-set -- request a skip so
+        the ceremony degrades gracefully to cool-down instead of trying to
+        render a frame with no cells. NEVER raises: any failure to measure
+        or regenerate just keeps the current frame for this tick.
+        """
+        try:
+            size = self._console.size
+            current = (size.width, size.height)
+        except Exception:  # noqa: BLE001
+            logger.debug("[awakening] resize measurement failed", exc_info=True)
+            return frame
+        if current == self._last_size:
+            return frame
+        self._last_size = current
+        try:
+            new_frame = self._generate_frame()
+        except Exception:  # noqa: BLE001
+            logger.debug("[awakening] resize regeneration failed", exc_info=True)
+            return frame
+        if new_frame.unavailable_reason is None:
+            self.regenerations += 1
+            return new_frame
+        # Too small now -- degrade gracefully to cool-down rather than
+        # crashing or spinning on an empty frame.
+        self.request_skip()
+        return frame
+
     # ------------------------------------------------------------------
     # Animated path
     # ------------------------------------------------------------------
@@ -241,6 +285,12 @@ class AwakeningConductor:
         tier = detect_tier(self._console)
         start = self._clock()
         ignite_elapsed: Optional[float] = None
+
+        try:
+            size0 = self._console.size
+            self._last_size = (size0.width, size0.height)
+        except Exception:  # noqa: BLE001
+            self._last_size = None
 
         reader_cm: Optional[_StdinKeyReader] = None
         poll = self._key_source
@@ -256,6 +306,7 @@ class AwakeningConductor:
                     elapsed = now - start
 
                     self._poll_keys(poll)
+                    frame = self._check_resize(frame, tier)
 
                     # Deliberately NOT wrapped in try/except: a rendering
                     # failure must propagate out to run()'s outer handler
