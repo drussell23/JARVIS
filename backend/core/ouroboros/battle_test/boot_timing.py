@@ -38,7 +38,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.BootTiming")
 
@@ -114,6 +114,48 @@ class BootTimer:
         self._stack: List[Tuple[str, float]] = []
         self._lock = threading.RLock()
         self._boot_start: float = time.monotonic()
+        # Observers subscribed to live phase transitions. Fired best-effort
+        # on begin (in-flight), end (completed), and mark. The wake sequence
+        # is the primary consumer -- it renders true system readiness from
+        # these, not a scripted timer (spec 2026-07-06 §5.1).
+        self._observers: List[Callable[[PhaseRecord], None]] = []
+
+    # ---- observers ----------------------------------------------------
+
+    def add_observer(self, callback: Callable[[PhaseRecord], None]) -> None:
+        """Subscribe to live phase transitions.
+
+        ``callback`` receives a :class:`PhaseRecord` on every ``begin``
+        (in-flight: ``ended_at == 0``), ``end`` (completed), and ``mark``.
+        A raising callback is isolated -- it never propagates into the boot
+        hot path. NEVER raises.
+        """
+        if not callable(callback):
+            return
+        try:
+            with self._lock:
+                self._observers.append(callback)
+        except Exception:  # noqa: BLE001
+            logger.debug("[BootTimer] add_observer failed", exc_info=True)
+
+    def _notify(self, record: PhaseRecord) -> None:
+        """Fan a phase record out to all observers, best-effort.
+
+        Observers are snapshotted under the lock but invoked outside it, so a
+        slow observer never blocks recording. Each observer is isolated in its
+        own try/except -- one broken observer cannot starve the others or the
+        boot path. NEVER raises.
+        """
+        try:
+            with self._lock:
+                observers = tuple(self._observers)
+        except Exception:  # noqa: BLE001
+            return
+        for cb in observers:
+            try:
+                cb(record)
+            except Exception:  # noqa: BLE001
+                logger.debug("[BootTimer] observer failed", exc_info=True)
 
     # ---- recording ----------------------------------------------------
 
@@ -129,10 +171,12 @@ class BootTimer:
                 return
             now = time.monotonic()
             parent = self._stack[-1][0] if self._stack else ""
+            record = PhaseRecord(
+                name=safe, started_at=now, ended_at=now, parent=parent,
+            )
             with self._lock:
-                self._records.append(PhaseRecord(
-                    name=safe, started_at=now, ended_at=now, parent=parent,
-                ))
+                self._records.append(record)
+            self._notify(record)
         except Exception:  # noqa: BLE001
             logger.debug("[BootTimer] mark failed", exc_info=True)
 
@@ -148,7 +192,13 @@ class BootTimer:
                 return
             now = time.monotonic()
             with self._lock:
+                parent = self._stack[-1][0] if self._stack else ""
                 self._stack.append((safe, now))
+            # In-flight record (ended_at == 0.0) so observers can render the
+            # phase as active before it completes.
+            self._notify(PhaseRecord(
+                name=safe, started_at=now, ended_at=0.0, parent=parent,
+            ))
         except Exception:  # noqa: BLE001
             logger.debug("[BootTimer] begin failed", exc_info=True)
 
@@ -165,10 +215,12 @@ class BootTimer:
                     return
                 top_name, started = self._stack.pop()
                 parent = self._stack[-1][0] if self._stack else ""
-                self._records.append(PhaseRecord(
+                record = PhaseRecord(
                     name=top_name, started_at=started,
                     ended_at=now, parent=parent,
-                ))
+                )
+                self._records.append(record)
+            self._notify(record)
         except Exception:  # noqa: BLE001
             logger.debug("[BootTimer] end failed", exc_info=True)
 
