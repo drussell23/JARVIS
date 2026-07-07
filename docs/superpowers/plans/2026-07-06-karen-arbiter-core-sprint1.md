@@ -20,6 +20,39 @@
 
 ---
 
+## ⚠️ CORRECTION (applied after Task 3 — binds Tasks 4-7)
+
+The `async def _drain(arb, fp)` helper shown in the task snippets below (a fixed
+`2× await asyncio.sleep(0)`) is **superseded** — it is non-deterministic across
+the arbiter's multi-hop resume chain and leaks a blocked play task into pytest
+teardown (a hang). Task 3 replaced it in `tests/voice/duplex/test_arbiter.py`
+with two helpers that Tasks 4-7 MUST use:
+
+```python
+async def _until(predicate, timeout: float = 2.0) -> None:
+    """Wait until predicate() is true; AssertionError on timeout (fail fast)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"condition not met within {timeout}s")
+
+async def _shutdown(arb, task) -> None:
+    await arb.stop()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+```
+
+**For every Task 4-7 test:** replace `await _drain(arb, fp)` with
+`await _until(lambda: <the condition the drain was waiting for>)`, wrap the body
+in `try: ... finally: await _shutdown(arb, task)`, and NEVER assert on a fixed
+number of `sleep(0)` yields. `arbiter.stop()` already cancels active playback.
+
 ## File Structure
 
 - `backend/core/ouroboros/governance/comms/duplex/__init__.py` — package marker.
