@@ -75,6 +75,27 @@ class VoiceDuplexArbiter:
             if self._state == VoiceState.KAREN_SPEAKING:
                 self._state = VoiceState.LISTENING
 
+    async def on_user_speech_start(self) -> None:
+        """Barge-in trigger. Preempts Karen and holds the floor. Never raises."""
+        if not self._config.barge_in_enabled:
+            return
+        try:
+            if self._state == VoiceState.KAREN_SPEAKING:
+                self._playback.preempt()          # kill playback (idempotent)
+                if self._play_task is not None:
+                    self._play_task.cancel()
+            self._state = VoiceState.USER_SPEAKING
+        except Exception:  # noqa: BLE001
+            logger.debug("[Arbiter] on_user_speech_start failed", exc_info=True)
+
+    async def on_user_speech_end(self) -> None:
+        try:
+            if self._state == VoiceState.USER_SPEAKING:
+                self._state = VoiceState.LISTENING
+                self._wake.set()                  # resume draining the queue
+        except Exception:  # noqa: BLE001
+            logger.debug("[Arbiter] on_user_speech_end failed", exc_info=True)
+
     async def stop(self) -> None:
         # Clean shutdown: cancel any active playback so no blocked play task
         # leaks past teardown (bulletproof mandate #4). Idempotent + never raises.

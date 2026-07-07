@@ -66,3 +66,40 @@ async def test_submit_then_play_highest_priority_first():
         await _until(lambda: arb.state == VoiceState.LISTENING)
     finally:
         await _shutdown(arb, task)
+
+
+@pytest.mark.asyncio
+async def test_user_speech_start_barges_in_and_flushes():
+    fp = FakePlayback()
+    arb = VoiceDuplexArbiter(fp, config=_ON)
+    task = asyncio.create_task(arb.run())
+    try:
+        arb.submit(SpeechRequest("a long narration", Priority.PROACTIVE_INFO))
+        await _until(lambda: arb.state == VoiceState.KAREN_SPEAKING)
+
+        await arb.on_user_speech_start()          # user interrupts
+        assert fp.preempt_count == 1              # playback was killed
+        assert arb.state == VoiceState.USER_SPEAKING
+
+        await arb.on_user_speech_end()
+        assert arb.state == VoiceState.LISTENING
+    finally:
+        await _shutdown(arb, task)
+
+
+@pytest.mark.asyncio
+async def test_no_play_while_user_speaking():
+    fp = FakePlayback()
+    arb = VoiceDuplexArbiter(fp, config=_ON)
+    task = asyncio.create_task(arb.run())
+    try:
+        await arb.on_user_speech_start()
+        arb.submit(SpeechRequest("proactive", Priority.PROACTIVE_CRITICAL))
+        await asyncio.sleep(0.05)                 # give the loop a chance to (wrongly) play
+        assert fp.played == []                    # queued, not played
+        assert arb.state == VoiceState.USER_SPEAKING
+
+        await arb.on_user_speech_end()
+        await _until(lambda: fp.played == ["proactive"])   # drains after user done
+    finally:
+        await _shutdown(arb, task)
