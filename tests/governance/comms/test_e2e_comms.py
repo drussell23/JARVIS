@@ -2,9 +2,16 @@
 
 End-to-end: CommProtocol emits messages through all 3 transports
 (VoiceNarrator, OpsLogger, TUISelfProgramPanel) simultaneously.
+
+Sprint 2 Task 7: VoiceNarrator no longer speaks via say_fn + static
+templates — it drives an injected KarenSpeechSynthesizer + arbiter (gated
+on JARVIS_KAREN_SYNTH_ENABLED). These e2e tests inject fakes for both and
+assert on the arbiter's recorded submissions instead of say_fn calls.
 """
 import asyncio
 import time
+from typing import AsyncIterator, List
+
 import pytest
 from unittest.mock import AsyncMock
 
@@ -25,6 +32,34 @@ from backend.core.ouroboros.governance.comms import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _karen_synth_enabled(monkeypatch):
+    monkeypatch.setenv("JARVIS_KAREN_SYNTH_ENABLED", "1")
+
+
+class _FakeSynthesizer:
+    """Always yields one canned sentence — records how many times it ran."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def synthesize(self, view) -> AsyncIterator[str]:
+        self.calls += 1
+        yield "Update."
+
+
+class _FakeArbiter:
+    def __init__(self) -> None:
+        self.filler_calls = 0
+        self.submitted: List[object] = []
+
+    def fire_filler(self) -> None:
+        self.filler_calls += 1
+
+    def submit(self, request) -> None:
+        self.submitted.append(request)
+
+
 def _make_comm_message(msg_type, op_id="op-001", seq=1, payload=None):
     return CommMessage(
         msg_type=MessageType[msg_type] if isinstance(msg_type, str) else msg_type,
@@ -40,10 +75,14 @@ def _build_transports(tmp_path, mock_say=None):
     """Construct all 3 transports with sensible test defaults."""
     if mock_say is None:
         mock_say = AsyncMock(return_value=True)
-    narrator = VoiceNarrator(say_fn=mock_say, debounce_s=0.0)
+    synth = _FakeSynthesizer()
+    arbiter = _FakeArbiter()
+    narrator = VoiceNarrator(
+        say_fn=mock_say, debounce_s=0.0, synthesizer=synth, arbiter=arbiter,
+    )
     ops_logger = OpsLogger(log_dir=tmp_path)
     tui_panel = TUISelfProgramPanel()
-    return narrator, ops_logger, tui_panel, mock_say
+    return narrator, ops_logger, tui_panel, mock_say, synth, arbiter
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +95,7 @@ class TestDirectDelivery:
 
     @pytest.mark.asyncio
     async def test_all_transports_receive_intent(self, tmp_path):
-        narrator, ops_logger, tui_panel, mock_say = _build_transports(tmp_path)
+        narrator, ops_logger, tui_panel, mock_say, synth, arbiter = _build_transports(tmp_path)
 
         msg = _make_comm_message("INTENT", op_id="op-e2e", payload={
             "goal": "fix edge case",
@@ -72,7 +111,9 @@ class TestDirectDelivery:
         )
 
         # Voice narrator spoke (INTENT is a narrated type)
-        mock_say.assert_called_once()
+        await narrator.drain()
+        assert arbiter.filler_calls == 1
+        assert len(arbiter.submitted) == 1
 
         # Ops logger wrote a daily log file containing the op_id
         log_files = list(tmp_path.glob("*.log"))
@@ -90,7 +131,7 @@ class TestDirectDelivery:
     @pytest.mark.asyncio
     async def test_full_lifecycle(self, tmp_path):
         """INTENT -> HEARTBEAT -> DECISION flows through all transports."""
-        narrator, ops_logger, tui_panel, mock_say = _build_transports(tmp_path)
+        narrator, ops_logger, tui_panel, mock_say, synth, arbiter = _build_transports(tmp_path)
         transports = [narrator, ops_logger, tui_panel]
 
         # 1. INTENT
@@ -136,7 +177,7 @@ class TestDirectDelivery:
         await narrator.drain()
 
         # Narrator spoke for INTENT and DECISION (not HEARTBEAT)
-        assert mock_say.call_count == 2
+        assert synth.calls == 2
 
         # Ops logger captured all 3 message types
         content = list(tmp_path.glob("*.log"))[0].read_text()
@@ -147,7 +188,7 @@ class TestDirectDelivery:
     @pytest.mark.asyncio
     async def test_postmortem_lifecycle(self, tmp_path):
         """INTENT -> POSTMORTEM flows correctly through all transports."""
-        narrator, ops_logger, tui_panel, mock_say = _build_transports(tmp_path)
+        narrator, ops_logger, tui_panel, mock_say, synth, arbiter = _build_transports(tmp_path)
         transports = [narrator, ops_logger, tui_panel]
 
         intent = _make_comm_message("INTENT", op_id="op-pm", payload={
@@ -178,7 +219,7 @@ class TestDirectDelivery:
         await narrator.drain()
 
         # Narrator spoke for both INTENT and POSTMORTEM
-        assert mock_say.call_count == 2
+        assert synth.calls == 2
 
         # Ops logger has both entries
         content = list(tmp_path.glob("*.log"))[0].read_text()
@@ -197,7 +238,7 @@ class TestCommProtocolDriven:
 
     @pytest.mark.asyncio
     async def test_protocol_emits_to_all_transports(self, tmp_path):
-        narrator, ops_logger, tui_panel, mock_say = _build_transports(tmp_path)
+        narrator, ops_logger, tui_panel, mock_say, synth, arbiter = _build_transports(tmp_path)
         protocol = CommProtocol(transports=[narrator, ops_logger, tui_panel])
 
         await protocol.emit_intent(
@@ -210,7 +251,7 @@ class TestCommProtocolDriven:
 
         # All transports received the INTENT
         await narrator.drain()
-        mock_say.assert_called_once()
+        assert synth.calls == 1
 
         log_content = list(tmp_path.glob("*.log"))[0].read_text()
         assert "op-proto" in log_content
@@ -222,7 +263,7 @@ class TestCommProtocolDriven:
     @pytest.mark.asyncio
     async def test_protocol_full_5phase_lifecycle(self, tmp_path):
         """Full INTENT -> PLAN -> HEARTBEAT -> DECISION -> POSTMORTEM cycle."""
-        narrator, ops_logger, tui_panel, mock_say = _build_transports(tmp_path)
+        narrator, ops_logger, tui_panel, mock_say, synth, arbiter = _build_transports(tmp_path)
         protocol = CommProtocol(transports=[narrator, ops_logger, tui_panel])
 
         op = "op-full"
@@ -273,7 +314,7 @@ class TestCommProtocolDriven:
 
         # Narrator: spoke for INTENT, DECISION, POSTMORTEM (3 narrated types)
         await narrator.drain()
-        assert mock_say.call_count == 3
+        assert synth.calls == 3
 
         # Logger captured all 5 phases
         content = list(tmp_path.glob("*.log"))[0].read_text()
@@ -284,7 +325,11 @@ class TestCommProtocolDriven:
     async def test_protocol_fault_isolation(self, tmp_path):
         """A broken transport does not prevent delivery to healthy ones."""
         mock_say = AsyncMock(return_value=True)
-        narrator = VoiceNarrator(say_fn=mock_say, debounce_s=0.0)
+        synth = _FakeSynthesizer()
+        arbiter = _FakeArbiter()
+        narrator = VoiceNarrator(
+            say_fn=mock_say, debounce_s=0.0, synthesizer=synth, arbiter=arbiter,
+        )
         tui_panel = TUISelfProgramPanel()
 
         # Create a transport that always raises
@@ -306,7 +351,7 @@ class TestCommProtocolDriven:
 
         # Healthy transports still received the message
         await narrator.drain()
-        mock_say.assert_called_once()
+        assert synth.calls == 1
         assert len(tui_panel.get_state().active_ops) == 1
 
 
@@ -321,7 +366,7 @@ class TestConcurrency:
     @pytest.mark.asyncio
     async def test_multiple_ops_concurrent(self, tmp_path):
         """Multiple independent operations delivered concurrently."""
-        narrator, ops_logger, tui_panel, mock_say = _build_transports(tmp_path)
+        narrator, ops_logger, tui_panel, mock_say, synth, arbiter = _build_transports(tmp_path)
         transports = [narrator, ops_logger, tui_panel]
 
         ops = [f"op-c{i}" for i in range(5)]
@@ -346,7 +391,7 @@ class TestConcurrency:
 
         # Narrator spoke for all 5 (debounce=0, all unique op_ids)
         await narrator.drain()
-        assert mock_say.call_count == 5
+        assert synth.calls == 5
 
         # Logger has all 5 op_ids
         content = list(tmp_path.glob("*.log"))[0].read_text()
@@ -356,7 +401,7 @@ class TestConcurrency:
     @pytest.mark.asyncio
     async def test_rapid_heartbeats(self, tmp_path):
         """Rapid heartbeat stream updates TUI phase without errors."""
-        _, ops_logger, tui_panel, _ = _build_transports(tmp_path)
+        _, ops_logger, tui_panel, _, _, _ = _build_transports(tmp_path)
 
         # Seed an active op
         intent = _make_comm_message("INTENT", op_id="op-hb", payload={
@@ -382,7 +427,7 @@ class TestConcurrency:
     @pytest.mark.asyncio
     async def test_approval_flow(self, tmp_path):
         """Heartbeat with phase='approve' sets awaiting_approval flag."""
-        _, _, tui_panel, _ = _build_transports(tmp_path)
+        _, _, tui_panel, _, _, _ = _build_transports(tmp_path)
 
         intent = _make_comm_message("INTENT", op_id="op-apr", payload={
             "goal": "dangerous refactor",
@@ -414,7 +459,7 @@ class TestEdgeCases:
     @pytest.mark.asyncio
     async def test_decision_for_unknown_op(self, tmp_path):
         """DECISION for an op never registered via INTENT does not crash."""
-        narrator, ops_logger, tui_panel, mock_say = _build_transports(tmp_path)
+        narrator, ops_logger, tui_panel, mock_say, synth, arbiter = _build_transports(tmp_path)
         transports = [narrator, ops_logger, tui_panel]
 
         decision = _make_comm_message("DECISION", op_id="op-ghost", payload={
@@ -438,7 +483,7 @@ class TestEdgeCases:
     @pytest.mark.asyncio
     async def test_narrator_idempotency_across_lifecycle(self, tmp_path):
         """Same op_id + msg_type is narrated only once even if sent twice."""
-        narrator, _, _, mock_say = _build_transports(tmp_path)
+        narrator, _, _, _, synth, _ = _build_transports(tmp_path)
 
         msg = _make_comm_message("INTENT", op_id="op-idem", payload={
             "goal": "fix once",
@@ -449,12 +494,20 @@ class TestEdgeCases:
         await narrator.send(msg)  # duplicate
         await narrator.drain()
 
-        assert mock_say.call_count == 1
+        assert synth.calls == 1
 
     @pytest.mark.asyncio
     async def test_empty_payload(self, tmp_path):
-        """Transports handle messages with empty payloads gracefully."""
-        narrator, ops_logger, tui_panel, mock_say = _build_transports(tmp_path)
+        """Transports handle messages with empty payloads gracefully.
+
+        Sprint 2: the old sentinel-based suppression (narration skipped when
+        required template keys like goal/file were missing) belonged to the
+        now-eradicated static templates. The dynamic synthesizer builds a
+        LedgerView from whatever context exists (see to_context_line()) and
+        is never hard-gated on missing fields — so narration is still
+        attempted here; it must simply never crash.
+        """
+        narrator, ops_logger, tui_panel, mock_say, synth, arbiter = _build_transports(tmp_path)
 
         msg = _make_comm_message("INTENT", op_id="op-empty", payload={})
         await asyncio.gather(
@@ -462,9 +515,10 @@ class TestEdgeCases:
             ops_logger.send(msg),
             tui_panel.send(msg),
         )
+        await narrator.drain()
 
-        # Narrator stays silent — incomplete context means no narration
-        mock_say.assert_not_called()
+        assert synth.calls == 1
+        mock_say.assert_not_called()  # no template fallback survives
 
         # TUI tracks with defaults
         state = tui_panel.get_state()
@@ -472,24 +526,34 @@ class TestEdgeCases:
         assert state.active_ops[0].target_file == "unknown"
 
     @pytest.mark.asyncio
-    async def test_say_fn_failure_does_not_block_other_transports(self, tmp_path):
-        """When say_fn raises, the other transports are unaffected."""
-        failing_say = AsyncMock(side_effect=RuntimeError("TTS engine crashed"))
-        narrator = VoiceNarrator(say_fn=failing_say, debounce_s=0.0)
+    async def test_synth_failure_does_not_block_other_transports(self, tmp_path):
+        """When the synthesizer raises, the other transports are unaffected."""
+
+        class _RaisingSynth:
+            async def synthesize(self, view):
+                raise RuntimeError("synth engine crashed")
+                yield  # pragma: no cover - unreachable; keeps this an async generator
+
+        arbiter = _FakeArbiter()
+        narrator = VoiceNarrator(
+            say_fn=AsyncMock(return_value=True), debounce_s=0.0,
+            synthesizer=_RaisingSynth(), arbiter=arbiter,
+        )
         ops_logger = OpsLogger(log_dir=tmp_path)
         tui_panel = TUISelfProgramPanel()
 
         protocol = CommProtocol(transports=[narrator, ops_logger, tui_panel])
 
-        # VoiceNarrator internally catches say_fn errors, so protocol sees
+        # VoiceNarrator internally catches synthesizer errors, so protocol sees
         # no exception at all — all transports should still process
         await protocol.emit_intent(
             op_id="op-fail",
-            goal="survive TTS crash",
+            goal="survive synth crash",
             target_files=["survive.py"],
             risk_tier="SAFE_AUTO",
             blast_radius=1,
         )
+        await narrator.drain()
 
         # Logger and TUI still work
         content = list(tmp_path.glob("*.log"))[0].read_text()

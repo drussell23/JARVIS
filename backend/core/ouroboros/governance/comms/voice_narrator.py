@@ -10,13 +10,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import time
 from collections import OrderedDict
 from typing import Any, Callable, Coroutine, Optional
 
 from backend.core.ouroboros.governance.comm_protocol import CommMessage, MessageType
 
-from .narrator_script import format_narration
+from .duplex.protocols import Priority, SpeechRequest
+from .karen_synth.ledger_view import LedgerView
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,14 @@ _MAX_NARRATED_IDS = 1000
 # P2-1: Bounded narration queue — prevents TTS backlog under burst load.
 # DROP_OLDEST policy: newer events (DECISION, POSTMORTEM) displace stale INTENTs.
 _NARRATE_QUEUE_MAXSIZE = 50
+
+
+def _karen_synth_enabled() -> bool:
+    """Read at call time (not cached) so tests/ops can toggle live."""
+    raw = os.environ.get("JARVIS_KAREN_SYNTH_ENABLED")
+    if raw is None:
+        return False
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
 class VoiceNarrator:
@@ -44,13 +54,20 @@ class VoiceNarrator:
         debounce_s: float = 60.0,
         source: str = "intent_engine",
         voice: str = "Karen",
+        synthesizer: Optional[Any] = None,
+        arbiter: Optional[Any] = None,
     ) -> None:
-        import os
         self._enabled = os.environ.get("OUROBOROS_NARRATOR_ENABLED", "true").lower() in ("true", "1", "yes")
         self._say_fn = say_fn
         self._debounce_s = debounce_s
         self._source = source
         self._voice = voice
+        # Sprint 2 (Karen Full-Duplex Voice): dynamic synthesis replaces the
+        # eradicated static template module. Both are optional injections —
+        # production wiring (integration.py) leaves them unset until a
+        # DW-backed synthesizer + arbiter are constructed there (follow-up).
+        self._synthesizer = synthesizer
+        self._arbiter = arbiter
         self._last_narration: float = float("-inf")  # monotonic; -inf so first msg always passes
         self._narrated_ids: OrderedDict[str, None] = OrderedDict()  # bounded LRU for idempotency
         if not self._enabled:
@@ -133,7 +150,17 @@ class VoiceNarrator:
                 break
 
     async def _narrate_one(self, msg: CommMessage) -> None:
-        """Execute TTS for a single message (called from drain loop)."""
+        """Drive dynamic Karen speech synthesis for a single message (called
+        from drain loop). Fault-isolated: never raises into the transport —
+        any failure here is swallowed and logged at debug level.
+
+        Sprint 2: the static template module is eradicated. When a
+        synthesizer + arbiter are injected AND JARVIS_KAREN_SYNTH_ENABLED is
+        truthy, this builds a LedgerView from the message, fires a local
+        filler to mask synth latency, then streams synthesized sentences into
+        the arbiter. Otherwise this is a silent no-op — there is no template
+        fallback.
+        """
         notification_id = hashlib.sha256(
             f"{msg.op_id}:{msg.msg_type.name}".encode()
         ).hexdigest()[:12]
@@ -141,7 +168,7 @@ class VoiceNarrator:
             return
 
         # Debounce check at dequeue time — uses current _last_narration which
-        # reflects the most recent successful TTS call from this drain loop.
+        # reflects the most recent successful narration from this drain loop.
         if msg.msg_type == MessageType.INTENT:
             if (time.monotonic() - self._last_narration) < self._debounce_s:
                 return
@@ -153,19 +180,27 @@ class VoiceNarrator:
         if target_files and isinstance(target_files, (list, tuple)):
             context.setdefault("file", target_files[0])
 
-        text = format_narration(phase, context)
-        if text is None:
-            logger.debug("VoiceNarrator: suppressed narration for op %s (incomplete context)", msg.op_id)
+        if self._synthesizer is None or self._arbiter is None or not _karen_synth_enabled():
+            logger.debug(
+                "VoiceNarrator: synth path unavailable/disabled for op %s (phase=%s)",
+                msg.op_id, phase,
+            )
             return
 
         try:
-            await self._say_fn(text, voice=self._voice, source=self._source)
-            self._narrated_ids[notification_id] = None
-            if len(self._narrated_ids) > _MAX_NARRATED_IDS:
-                self._narrated_ids.popitem(last=False)
-            self._last_narration = time.monotonic()
+            view = LedgerView.from_payload(phase, context)
+            self._arbiter.fire_filler()
+            spoke_any = False
+            async for sentence in self._synthesizer.synthesize(view):
+                self._arbiter.submit(SpeechRequest(sentence, Priority.PROACTIVE_INFO))
+                spoke_any = True
+            if spoke_any:
+                self._narrated_ids[notification_id] = None
+                if len(self._narrated_ids) > _MAX_NARRATED_IDS:
+                    self._narrated_ids.popitem(last=False)
+                self._last_narration = time.monotonic()
         except Exception:
-            logger.debug("VoiceNarrator: say_fn failed for op %s", msg.op_id)
+            logger.debug("VoiceNarrator: synthesis failed for op %s", msg.op_id)
 
     @staticmethod
     def _map_phase(msg: CommMessage) -> str:
