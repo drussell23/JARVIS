@@ -173,16 +173,31 @@ def test_corrupt_lock_removed(tmp_path) -> None:
 
 
 def test_single_flight_helper_exists():
-    """Helper function `_single_flight_preflight` must exist in launcher."""
+    """Helper function `_single_flight_preflight` must exist in launcher.
+
+    ov awakening Task 1 gave it a keyword-only ``quiet`` param (COCKPIT
+    gates only the happy-path chatter; the guard itself and its
+    conflict-path REJECTED output run in both presentation modes), so
+    the pin matches the def line prefix rather than the exact
+    zero-arg signature.
+    """
     src = Path("scripts/ouroboros_battle_test.py").read_text()
-    assert "def _single_flight_preflight()" in src
+    assert "def _single_flight_preflight(" in src
 
 
 def test_single_flight_uses_pgrep_canonical_pattern():
     """Pgrep pattern must be the operator-runbook canonical form
-    (avoids matching zsh wrapper eval text — addressed in Slice 3 too)."""
+    (avoids matching zsh wrapper eval text — addressed in Slice 3 too).
+
+    Pattern evolution 2026-05-13: the canonical form gained a leading
+    ``^`` anchor so wrappers like ``caffeinate -dimsu python3 ...``
+    (whose cmdline contains the python invocation as later argv
+    elements) don't self-match. This pin was stale against that change;
+    it now pins the anchored canonical form, matching the load-bearing
+    anchor test in test_harness_epic_graduation_pins_slice4.py.
+    """
     src = Path("scripts/ouroboros_battle_test.py").read_text()
-    assert r'"python3? scripts/ouroboros_battle_test\.py"' in src
+    assert r'"^python3? scripts/ouroboros_battle_test\.py"' in src
 
 
 def test_single_flight_exits_75_on_violation():
@@ -205,28 +220,22 @@ def test_single_flight_called_after_zombie_reap():
     """The single-flight check runs AFTER the zombie reaper so it doesn't
     falsely trip on dead-PID lockholders the reaper can clean.
 
-    ov awakening Task 1 restructured main()'s boot sequence: zombie
-    reaping is now a mode-independent functional step (quiet=True in
-    COCKPIT) invoked directly in main(), BEFORE the call to
-    ``_run_gated_boot_banners`` -- which is what actually invokes
-    ``_single_flight_preflight()`` from inside its own gated body. This
-    pins the ordering at the new call site (main() -> _reap_zombies,
-    then main() -> _run_gated_boot_banners); the runtime proof that
-    _run_gated_boot_banners itself calls reap before single-flight
-    before preflight (when all are enabled) lives in
-    tests/battle_test/test_presentation_gate.py.
+    ov awakening Task 1: both steps are mode-independent FUNCTIONAL boot
+    work invoked directly in main() (each with quiet=True in COCKPIT —
+    only their chatter is presentation-gated, never the side effects).
+    The search is scoped to main()'s body so the function *definitions*
+    above main() can't satisfy it.
     """
     src = Path("scripts/ouroboros_battle_test.py").read_text()
     main_start = src.find("def main(")
     assert main_start > 0, "main() entry point missing"
     body = src[main_start:]
     reap_idx = body.find("_reap_zombies(")
-    banners_idx = body.find("_run_gated_boot_banners(")
+    sf_idx = body.find("_single_flight_preflight(")
     assert reap_idx > 0, "_reap_zombies call missing in main()"
-    assert banners_idx > 0, "_run_gated_boot_banners call missing in main()"
-    assert banners_idx > reap_idx, (
-        "single-flight (invoked inside _run_gated_boot_banners) must be "
-        "invoked AFTER _reap_zombies in main() flow"
+    assert sf_idx > 0, "_single_flight_preflight call missing in main()"
+    assert sf_idx > reap_idx, (
+        "single-flight must be invoked AFTER _reap_zombies in main() flow"
     )
 
 

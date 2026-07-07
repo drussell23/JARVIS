@@ -447,7 +447,7 @@ def _reap_stale_jarvis_locks(
     return reaped
 
 
-def _single_flight_preflight() -> None:
+def _single_flight_preflight(*, quiet: bool = False) -> None:
     """Harness Epic Slice 2 — single-flight launcher enforcement.
 
     Rejects concurrent battle-test runs at the process level. Two checks:
@@ -481,6 +481,13 @@ def _single_flight_preflight() -> None:
 
     Disable via ``JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED=false`` (operator
     escape hatch — useful for diagnostics or recovery).
+
+    ov awakening Task 1 (Mandate 1): this guard is FUNCTIONAL (prevents two
+    sessions competing for budget/locks/branches) and runs in BOTH
+    presentation modes. ``quiet`` withholds only the happy-path diagnostic
+    chatter (the wedged-lock adoption note below, where the launch
+    proceeds). The conflict-path REJECTED block is ERROR-class telemetry
+    and prints unconditionally — no mode can suppress it.
     """
     from pathlib import Path as _Path
     import json as _json
@@ -546,12 +553,15 @@ def _single_flight_preflight() -> None:
                 if alive and fresh:
                     violators.append(("lock", holder_pid))
                 elif alive and not fresh:
-                    print(
-                        f"  {_DIM}[single-flight] adopting wedged lock "
-                        f"(PID={holder_pid} alive, age={age_s:.0f}s > "
-                        f"TTL={_stale_ttl:.0f}s — Py_FinalizeEx-class "
-                        f"zombie pattern){_RESET}"
-                    )
+                    # Happy-path chatter (launch proceeds) — the only
+                    # print this guard gates on ``quiet``.
+                    if not quiet:
+                        print(
+                            f"  {_DIM}[single-flight] adopting wedged lock "
+                            f"(PID={holder_pid} alive, age={age_s:.0f}s > "
+                            f"TTL={_stale_ttl:.0f}s — Py_FinalizeEx-class "
+                            f"zombie pattern){_RESET}"
+                        )
         except (ValueError, OSError, KeyError):
             pass  # corrupt lock — IntakeRouter._cleanup_stale_lock will handle
 
@@ -661,17 +671,21 @@ def _print_preflight() -> None:
 
 
 def _run_gated_boot_banners(
-    mode: PresentationMode, *, single_flight_enabled: bool, reap_enabled: bool,
+    mode: PresentationMode, *, reap_enabled: bool,
 ) -> None:
     """Nominal boot banners, gated AT THE SOURCE (Mandate 1). COCKPIT
     withholds; detail stays reachable via the /preflight + /organism verbs.
-    Fatal telemetry never routes through here."""
+    Fatal telemetry never routes through here.
+
+    Only pure ceremony belongs in this helper. FUNCTIONAL boot steps —
+    _check_api_keys_or_die, _single_flight_preflight (concurrent-launch
+    guard), and the zombie reap in main() — run unconditionally in both
+    modes at their own call sites; they must never be added back here.
+    """
     if mode is PresentationMode.COCKPIT:
         return
     if reap_enabled:
         _reap_zombies()
-    if single_flight_enabled:
-        _single_flight_preflight()
     _print_preflight()
 
 
@@ -1441,28 +1455,33 @@ def main(argv: "list[str] | None" = None) -> None:
     atexit.register(_lock_stack.close)
 
     # ------------------------------------------------------------------
-    # Harness Epic Slice 2 — single-flight preflight + preflight
-    # checklist. Reject concurrent battle-test runs at the process
-    # level; the zombie reap above kills DEAD lingering processes, this
-    # check rejects ALIVE concurrent processes (operator launched twice
-    # by accident, etc.). Exit 75 (EX_TEMPFAIL) signals "try again
-    # later" to wrappers — distinct from generic error code 1.
+    # Harness Epic Slice 2 — single-flight preflight. Reject concurrent
+    # battle-test runs at the process level; the zombie reap above kills
+    # DEAD lingering processes, this check rejects ALIVE concurrent
+    # processes (operator launched twice by accident, etc.). Exit 75
+    # (EX_TEMPFAIL) signals "try again later" to wrappers — distinct
+    # from generic error code 1.
     # Master flag: JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED (default true).
     #
-    # ov awakening Task 1 — gated at the source via
-    # _run_gated_boot_banners: COCKPIT withholds both the single-flight
-    # diagnostic prints and the preflight checklist banner; SOAK calls
-    # through in the legacy order. Reap already ran (functionally) above,
-    # so reap_enabled=False here — this call handles single-flight +
-    # preflight only.
+    # ov awakening Task 1 fix — this guard is FUNCTIONAL (prevents two
+    # sessions competing for budget), so it runs unconditionally in BOTH
+    # presentation modes, structurally outside _run_gated_boot_banners.
+    # COCKPIT gates only the happy-path chatter (quiet=True); the
+    # conflict-path REJECTED block prints in every mode (same Mandate 1
+    # rationale as _check_api_keys_or_die). It stays at this position —
+    # after the reap (dead-PID locks must be cleaned first, or this
+    # check false-positives on them) and after the singleton lock
+    # (structural defense fires before the pgrep diagnostic).
     # ------------------------------------------------------------------
-    _run_gated_boot_banners(
-        _mode,
-        single_flight_enabled=os.environ.get(
-            "JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED", "true"
-        ).lower() not in ("false", "0", "no", "off"),
-        reap_enabled=False,
-    )
+    if os.environ.get("JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED", "true").lower() not in ("false", "0", "no", "off"):
+        _single_flight_preflight(quiet=(_mode is PresentationMode.COCKPIT))
+
+    # ------------------------------------------------------------------
+    # Preflight checklist — pure ceremony, gated at the source: COCKPIT
+    # withholds, SOAK calls through. Reap already ran (functionally)
+    # above, so reap_enabled=False here.
+    # ------------------------------------------------------------------
+    _run_gated_boot_banners(_mode, reap_enabled=False)
 
     # ------------------------------------------------------------------
     # Logging

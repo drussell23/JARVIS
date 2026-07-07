@@ -33,19 +33,68 @@ def test_print_preflight_no_longer_contains_fatal_exit(monkeypatch, capsys):
 
 def test_gated_banner_helpers_skip_in_cockpit(monkeypatch):
     """The boot path calls banners through _run_gated_boot_banners(mode);
-    COCKPIT skips them, SOAK calls through."""
+    COCKPIT skips them, SOAK calls through. Single-flight is NOT in this
+    helper — it is a FUNCTIONAL guard invoked unconditionally by main()
+    (see the cockpit boot-path test below)."""
     calls = []
     monkeypatch.setattr(bt, "_reap_zombies", lambda: calls.append("reap") or set())
-    monkeypatch.setattr(bt, "_single_flight_preflight", lambda: calls.append("sf"))
     monkeypatch.setattr(bt, "_print_preflight", lambda: calls.append("pf"))
 
-    bt._run_gated_boot_banners(PresentationMode.COCKPIT, single_flight_enabled=True,
-                               reap_enabled=True)
+    bt._run_gated_boot_banners(PresentationMode.COCKPIT, reap_enabled=True)
     assert calls == []             # all withheld at the source
 
-    bt._run_gated_boot_banners(PresentationMode.SOAK, single_flight_enabled=True,
-                               reap_enabled=True)
-    assert calls == ["reap", "sf", "pf"]   # legacy order preserved
+    bt._run_gated_boot_banners(PresentationMode.SOAK, reap_enabled=True)
+    assert calls == ["reap", "pf"]   # legacy order preserved
+
+
+class _BootSentinel(Exception):
+    """Raised by the single-flight spy to halt main() before stack boot."""
+
+
+def test_single_flight_invoked_in_cockpit_boot_path(monkeypatch):
+    """Mandate 1 invariant: single-flight is a FUNCTIONAL concurrent-launch
+    guard (budget competition), not ceremony — main() must invoke it in
+    COCKPIT mode too, with quiet=True (chatter gated, guard live)."""
+    monkeypatch.setenv("JARVIS_OV_PRESENTATION", "cockpit")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.delenv("JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED", raising=False)
+    monkeypatch.delenv("JARVIS_BATTLE_TEST_SINGLETON_LOCK_ENABLED", raising=False)
+    # Neutralize earlier boot steps (functional, but not under test here).
+    monkeypatch.setattr(bt, "_load_env_files", lambda: None)
+    monkeypatch.setattr(bt, "_reap_zombies", lambda quiet=False: set())
+    monkeypatch.setattr(bt, "_cleanup_stale_router_lock", lambda reaped_pids=None: None)
+    monkeypatch.setattr(bt, "_reap_stale_jarvis_locks", lambda *a, **k: 0)
+
+    calls = []
+
+    def _spy(*, quiet=False):
+        calls.append(("sf", quiet))
+        raise _BootSentinel  # stop main() before it boots the full stack
+
+    monkeypatch.setattr(bt, "_single_flight_preflight", _spy)
+
+    with pytest.raises(_BootSentinel):
+        bt.main([])
+    assert calls == [("sf", True)]   # invoked in COCKPIT, chatter-quiet
+
+
+def test_single_flight_conflict_output_not_suppressed(monkeypatch, capsys):
+    """The conflict path is ERROR-class telemetry: even with quiet=True
+    (COCKPIT), a detected concurrent run prints the REJECTED block and
+    exits 75 — the gate never carries fatal telemetry."""
+    import subprocess
+
+    class _FakePgrep:
+        returncode = 0
+        stdout = "99999999\n"   # a PID that is not this process
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakePgrep())
+    with pytest.raises(SystemExit) as excinfo:
+        bt._single_flight_preflight(quiet=True)
+    assert excinfo.value.code == 75
+    out = capsys.readouterr().out
+    assert "REJECTED" in out
+    assert "99999999" in out
 
 
 def test_resolve_boot_log_level_cockpit_is_warning():
