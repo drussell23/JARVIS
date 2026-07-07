@@ -137,3 +137,28 @@ async def test_equal_or_lower_priority_does_not_preempt():
         assert fp.played == ["crit1"]
     finally:
         await _shutdown(arb, task)
+
+
+@pytest.mark.asyncio
+async def test_coalesce_keeps_latest_same_key():
+    fp = FakePlayback()
+    arb = VoiceDuplexArbiter(fp, config=_ON)
+    # Don't start run() — inspect the queue directly.
+    arb.submit(SpeechRequest("hb v1", Priority.PROACTIVE_INFO, coalesce_key="hb"))
+    arb.submit(SpeechRequest("hb v2", Priority.PROACTIVE_INFO, coalesce_key="hb"))
+    q = arb._queues[Priority.PROACTIVE_INFO]
+    assert [r.text for r in q] == ["hb v2"]        # only the latest survives
+    assert arb.snapshot()["coalesced_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_queue_drops_oldest():
+    fp = FakePlayback()
+    cfg = ArbiterConfig(enabled=True, barge_in_enabled=True,
+                        proactive_enabled=True, queue_max_per_priority=2)
+    arb = VoiceDuplexArbiter(fp, config=cfg)
+    for i in range(4):
+        arb.submit(SpeechRequest(f"m{i}", Priority.PROACTIVE_INFO))
+    q = arb._queues[Priority.PROACTIVE_INFO]
+    assert [r.text for r in q] == ["m2", "m3"]     # oldest two shed
+    assert arb.snapshot()["shed_count"] == 2

@@ -29,6 +29,8 @@ class VoiceDuplexArbiter:
         self._play_task: Optional[asyncio.Task] = None
         self._running = False
         self._active_priority: Optional[Priority] = None
+        self.shed_count = 0
+        self.coalesced_count = 0
 
     @property
     def state(self) -> VoiceState:
@@ -41,7 +43,18 @@ class VoiceDuplexArbiter:
         if not self._config.enabled:
             return
         try:
-            self._queues[request.priority].append(request)
+            q = self._queues[request.priority]
+            if request.coalesce_key:
+                before = len(q)
+                q = deque(
+                    r for r in q if r.coalesce_key != request.coalesce_key
+                )
+                self._queues[request.priority] = q
+                self.coalesced_count += before - len(q)
+            q.append(request)
+            while len(q) > self._config.queue_max_per_priority:
+                q.popleft()
+                self.shed_count += 1
             if (
                 self._state == VoiceState.KAREN_SPEAKING
                 and self._active_priority is not None
@@ -131,4 +144,6 @@ class VoiceDuplexArbiter:
             "state": self._state.value,
             "queued": {p.name: len(q) for p, q in self._queues.items()},
             "enabled": self._config.enabled,
+            "shed_count": self.shed_count,
+            "coalesced_count": self.coalesced_count,
         }
