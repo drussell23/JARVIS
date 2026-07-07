@@ -220,3 +220,26 @@ async def test_playback_exception_does_not_break_loop():
         await _until(lambda: arb.state == VoiceState.LISTENING)
     finally:
         await _shutdown(arb, task)
+
+
+_FILLER_TEXTS = {"On it.", "Checking.", "Right.", "One sec.", "Hmm."}
+
+
+@pytest.mark.asyncio
+async def test_fire_filler_speaks_a_local_ack():
+    fp = FakePlayback()
+    arb = VoiceDuplexArbiter(fp, config=_ON)
+    task = asyncio.create_task(arb.run())
+    try:
+        arb.fire_filler()
+        await _until(lambda: len(fp.played) == 1)
+        assert fp.played[0] in _FILLER_TEXTS         # a local filler, no LLM
+    finally:
+        await _shutdown(arb, task)
+
+@pytest.mark.asyncio
+async def test_fillers_rotate_not_repeat_consecutively():
+    fp = FakePlayback()
+    arb = VoiceDuplexArbiter(fp, config=_ON)
+    seen = [arb._next_filler() for _ in range(3)]
+    assert len(set(seen)) == 3                        # three distinct in a row

@@ -15,6 +15,8 @@ logger = logging.getLogger("Ouroboros.Karen.Arbiter")
 class VoiceDuplexArbiter:
     """Single async owner of the audio floor (Sprint 1: engine-free)."""
 
+    _FILLERS = ("On it.", "Checking.", "Right.", "One sec.", "Hmm.")
+
     def __init__(
         self, playback: PlaybackHandle, *, config: Optional[ArbiterConfig] = None,
     ) -> None:
@@ -32,6 +34,7 @@ class VoiceDuplexArbiter:
         self._active_priority: Optional[Priority] = None
         self.shed_count = 0
         self.coalesced_count = 0
+        self._filler_idx = 0
 
     @property
     def state(self) -> VoiceState:
@@ -147,6 +150,23 @@ class VoiceDuplexArbiter:
             except Exception:  # noqa: BLE001
                 logger.debug("[Arbiter] stop cleanup failed", exc_info=True)
         self._wake.set()
+
+    def _next_filler(self) -> str:
+        f = self._FILLERS[self._filler_idx % len(self._FILLERS)]
+        self._filler_idx += 1
+        return f
+
+    def fire_filler(self) -> None:
+        """Speak a short LOCAL acknowledgment (LLM-free) to mask synth latency.
+        Ordinary interruptible SpeechRequest; repeats coalesce. Never raises."""
+        if not self._config.enabled:
+            return
+        try:
+            self.submit(SpeechRequest(
+                self._next_filler(), Priority.USER_RESPONSE, coalesce_key="filler",
+            ))
+        except Exception:  # noqa: BLE001
+            logger.debug("[Arbiter] fire_filler failed", exc_info=True)
 
     def snapshot(self) -> dict:
         return {
