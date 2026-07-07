@@ -60,6 +60,7 @@ class PipelineHandle:
     health_task: Optional[asyncio.Task] = None
     _bargein_vad_consumer: object = None  # stored for unregister on shutdown
     karen: object = None  # Sprint 3: full-duplex control layer (env-gated mount)
+    voice_build: object = None  # Sprint 4: voice->build bridge (env-gated mount)
 
     def get_status(self) -> dict:
         """Aggregate status from all components."""
@@ -217,6 +218,24 @@ async def wire_conversation_pipeline(
     except Exception as e:
         logger.warning(f"[Bootstrap] ConversationPipeline init skipped: {e}")
 
+    # 4b. Karen voice->build bridge (Sprint 4) — env-gated adaptive mount.
+    #     Default OFF: zero allocation/behavior change on the pipeline (mandate #2).
+    #     When enabled, completed conversation turns are forked (not replaced) into
+    #     the voice->build classify+route path — the LLM chat reply is untouched
+    #     (DRY, mandate #3). Fault-isolated — a mount failure never touches the FSM.
+    if os.getenv("JARVIS_KAREN_VOICE_BUILD_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            from backend.core.ouroboros.governance.comms.voice_build.bridge import VoiceBuildBridge
+            from backend.core.ouroboros.governance.intake.sensors.voice_command_sensor import get_default_voice_sensor
+            handle.voice_build = VoiceBuildBridge(get_default_voice_sensor())
+            # Fork completed turns into voice->build (the LLM chat path is untouched — DRY).
+            if handle.conversation_pipeline is not None:
+                handle.conversation_pipeline._on_turn_text = handle.voice_build.on_final_transcript
+            logger.info("[Bootstrap] Karen voice->build bridge mounted")
+        except Exception as e:
+            handle.voice_build = None
+            logger.warning(f"[Bootstrap] voice->build mount skipped: {e}")
+
     # 5. ModeDispatcher
     try:
         from backend.audio.mode_dispatcher import ModeDispatcher
@@ -234,17 +253,6 @@ async def wire_conversation_pipeline(
         logger.info("[Bootstrap] ModeDispatcher started")
     except Exception as e:
         logger.warning(f"[Bootstrap] ModeDispatcher init skipped: {e}")
-
-    # 5b. JarvisVoiceBridge — glue between ConversationManager and Ouroboros
-    try:
-        from backend.voice.jarvis_voice_bridge import create_voice_bridge
-        handle.voice_bridge = await create_voice_bridge(
-            mode_dispatcher=handle.mode_dispatcher,
-            audio_bus=audio_bus,
-        )
-        logger.info("[Bootstrap] JarvisVoiceBridge wired")
-    except Exception as e:
-        logger.debug(f"[Bootstrap] JarvisVoiceBridge skipped: {e}")
 
     # 6. Register ModeDispatcher transcript hook on voice communicator
     try:
@@ -309,6 +317,9 @@ async def shutdown(handle: PipelineHandle) -> None:
             await asyncio.wait_for(handle.karen.stop(), timeout=_timeout)
         except Exception as e:
             logger.debug(f"[Bootstrap] Karen duplex stop error: {e}")
+
+    # 0b. Karen voice->build bridge (Sprint 4) — drop the ref, no async teardown needed.
+    handle.voice_build = None
 
     # 1. ModeDispatcher
     if handle.mode_dispatcher is not None:

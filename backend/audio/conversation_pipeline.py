@@ -272,6 +272,7 @@ class ConversationPipeline:
         self._intent_classifier_init_failed = False
         self._command_processor_init_failed = False
         self._query_complexity_lookup_attempted = False
+        self._on_turn_text = None  # Sprint 4: optional async (text)->... fork for voice->build
 
         self._session: Optional[ConversationSession] = None
         self._sentence_splitter = SentenceSplitter()
@@ -472,6 +473,12 @@ class ConversationPipeline:
                     )
 
                 # 6. Discuss route → generate and speak LLM response
+                if self._on_turn_text is not None and user_text:
+                    try:
+                        await self._on_turn_text(user_text)
+                    except Exception:
+                        logger.debug("[ConvPipeline] on_turn_text fork failed", exc_info=True)
+
                 await self._generate_and_speak_response(
                     user_text=user_text,
                     intent_decision=intent_decision,
