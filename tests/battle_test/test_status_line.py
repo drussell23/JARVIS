@@ -126,14 +126,15 @@ def test_register_and_reset():
 
 
 def test_plain_format_idle_state():
-    """No active op, no cost, no idle timer — still renders something."""
+    """No active op → the compact idle breadcrumb (Gap #7 Slice 2, restraint
+    default-on), not the verbose Phase/Cost/Idle labels. Still renders
+    something (not the old silent empty line)."""
     snap = StatusSnapshot()
     line = _format_plain(snap, compact=False)
-    # No Op/badge when nothing is active.
-    assert "Phase: IDLE" in line
-    assert "Cost: $0.00 / $0.00" in line
-    assert "Idle: 0s / 0s" in line
-    assert "Op:" not in line  # no primary op
+    assert line               # renders something
+    assert "IDLE" in line
+    assert "Phase:" not in line  # idle takes the breadcrumb, not verbose labels
+    assert "Op:" not in line     # no primary op
 
 
 def test_plain_format_full_line_matches_user_example():
@@ -195,6 +196,7 @@ def test_warn_marker_absent_below_threshold():
 
 def test_warn_marker_present_above_threshold():
     snap = StatusSnapshot(
+        phase="GENERATE",  # non-idle → verbose path with the Cost/Idle segments
         cost_spent_usd=0.45, cost_budget_usd=0.50,  # 90% — past 80% default
         idle_elapsed_s=100, idle_timeout_s=1000,    # 10% — no warn
     )
@@ -208,6 +210,7 @@ def test_warn_marker_present_above_threshold():
 
 def test_warn_marker_on_both_when_both_hot():
     snap = StatusSnapshot(
+        phase="GENERATE",  # non-idle → verbose path renders the ⚠ warn markers
         cost_spent_usd=0.48, cost_budget_usd=0.50,   # 96%
         idle_elapsed_s=550, idle_timeout_s=600,      # 92%
     )
@@ -226,6 +229,7 @@ def test_warn_threshold_env_override_moves_the_line(monkeypatch):
     """Lowering WARN_PCT to 40 pulls the ⚠ marker down to 40%."""
     monkeypatch.setenv("JARVIS_UI_STATUS_LINE_WARN_PCT", "40")
     snap = StatusSnapshot(
+        phase="GENERATE",  # non-idle → verbose path with the Cost segment
         cost_spent_usd=0.25, cost_budget_usd=0.50,  # 50% — now past 40% threshold
         idle_elapsed_s=100, idle_timeout_s=1000,
     )
@@ -243,6 +247,7 @@ def test_op_id_truncated_to_core_prefix():
     """Full ops look like 'op-019d9368-654b-7612-a031-6507ffde327c-cau' —
     the line should show only the first core segment for scannability."""
     snap = StatusSnapshot(
+        phase="GENERATE",  # non-idle → verbose path renders the Op id tail
         primary_op_id="op-019d9368-654b-7612-a031-6507ffde327c-cau",
     )
     line = _format_plain(snap, compact=False)
@@ -253,6 +258,7 @@ def test_op_id_truncated_to_core_prefix():
 
 def test_multi_op_indicator_appears_when_extra_ops_present():
     snap = StatusSnapshot(
+        phase="GENERATE",  # non-idle → verbose path renders the multi-op tail
         primary_op_id="op-019d9368-abc", extra_op_count=3,
     )
     line = _format_plain(snap, compact=False)
@@ -262,6 +268,7 @@ def test_multi_op_indicator_appears_when_extra_ops_present():
 
 def test_multi_op_indicator_hidden_when_single_op():
     snap = StatusSnapshot(
+        phase="GENERATE",  # non-idle → verbose path (pairs with the +N test)
         primary_op_id="op-019d9368-abc", extra_op_count=0,
     )
     line = _format_plain(snap, compact=False)
@@ -281,8 +288,11 @@ def test_multi_op_indicator_hidden_when_single_op():
     ("speculative", "dw", "[spec·dw]"),
 ])
 def test_route_provider_badge_abbreviations(route, provider, expected):
+    # A non-idle phase exercises the verbose render path where the route·
+    # provider badge appears. (Idle snapshots take the compact breadcrumb
+    # short-circuit — Gap #7 Slice 2, restraint default-on — which omits it.)
     snap = StatusSnapshot(
-        primary_op_id="op-x", route=route, provider=provider,
+        primary_op_id="op-x", phase="GENERATE", route=route, provider=provider,
     )
     line = _format_plain(snap, compact=False)
     assert expected in line
@@ -457,7 +467,9 @@ def test_render_plain_non_empty_when_enabled():
     builder = StatusLineBuilder()
     plain = builder.render_plain()
     assert plain  # non-empty
-    assert "Phase:" in plain
+    # A fresh builder is idle → compact breadcrumb (Gap #7 Slice 2, restraint
+    # default-on). The verbose "Phase:" label only renders for a non-idle op.
+    assert "IDLE" in plain.upper()
 
 
 def test_render_never_raises_even_with_broken_refs():
@@ -509,17 +521,25 @@ def test_serpent_flow_no_bottom_toolbar():
     assert "bottom_toolbar=lambda" not in src
 
 
-def test_serpent_flow_no_refresh_interval():
-    """UI Slice 3 inverted contract: no fixed refresh cadence. The
-    flowing CLI doesn't tick a fixed UI region — events emit when
-    they happen (op heartbeats, completion receipts, REPL prompts)."""
+def test_serpent_flow_repl_refresh_is_event_driven_by_default():
+    """UI Slice 3 contract (no FIXED refresh cadence) — preserved by the
+    2026-05-05 event-driven redraw fix (commit a6ee58a8c3). PromptSession is
+    given ``refresh_interval=None`` by default so redraws are event-driven; a
+    fixed cadence is opt-in only via ``JARVIS_REPL_AUTO_REFRESH_ENABLED``.
+    Enforces the contract (no unconditional numeric cadence) rather than the
+    brittle absence of the kwarg string, which the event-driven fix reintroduced
+    precisely to switch prompt_toolkit into None/event-driven mode."""
+    import re
     path = (
         Path(__file__).resolve().parent.parent.parent
         / "backend" / "core" / "ouroboros" / "battle_test" / "serpent_flow.py"
     )
     src = path.read_text(encoding="utf-8")
-    # The kwarg must be absent from any PromptSession construction.
-    assert "refresh_interval=" not in src
+    # No hardcoded numeric cadence passed to a session (the anti-pattern).
+    assert not re.search(r"refresh_interval\s*=\s*[0-9.]", src)
+    # Default branch is event-driven (None); fixed cadence gated behind opt-in.
+    assert "else None" in src
+    assert "is_auto_refresh_enabled" in src
 
 
 def test_harness_registers_status_line_builder():
