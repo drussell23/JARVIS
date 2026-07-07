@@ -5278,7 +5278,14 @@ def _parse_generation_response(
         validated.append(enriched)
 
     if not validated:
-        raise RuntimeError(f"{pfx}_schema_invalid:all_candidates_syntax_error")
+        _syntax_exc = RuntimeError(f"{pfx}_schema_invalid:all_candidates_syntax_error")
+        # Attach failure context for the SyntaxExhaustionEscalator so
+        # J-Prime receives the DW model's failed candidate preview and
+        # target file path — enabling structural avoidance of the same
+        # hallucination patterns.
+        _syntax_exc.candidate_preview = str(raw)[:800]  # type: ignore[attr-defined]
+        _syntax_exc.target_file = str(source_path or "")  # type: ignore[attr-defined]
+        raise _syntax_exc
 
     # Extract model_id from provider_metadata (optional)
     provider_metadata = data.get("provider_metadata", {})
