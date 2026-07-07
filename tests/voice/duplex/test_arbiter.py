@@ -162,3 +162,37 @@ async def test_bounded_queue_drops_oldest():
     q = arb._queues[Priority.PROACTIVE_INFO]
     assert [r.text for r in q] == ["m2", "m3"]     # oldest two shed
     assert arb.snapshot()["shed_count"] == 2
+
+
+class _BoomPlayback:
+    """PlaybackHandle whose play() raises — must not crash the arbiter."""
+    def __init__(self):
+        self.preempt_count = 0
+    @property
+    def is_active(self):
+        return False
+    async def play(self, text):
+        raise RuntimeError("audio device on fire")
+    def preempt(self):
+        self.preempt_count += 1
+
+
+@pytest.mark.asyncio
+async def test_disabled_arbiter_is_noop():
+    fp = FakePlayback()
+    off = ArbiterConfig(enabled=False, barge_in_enabled=False, proactive_enabled=False)
+    arb = VoiceDuplexArbiter(fp, config=off)
+    arb.submit(SpeechRequest("x", Priority.PROACTIVE_INFO))
+    assert all(len(q) == 0 for q in arb._queues.values())  # nothing enqueued
+
+
+@pytest.mark.asyncio
+async def test_playback_exception_does_not_break_loop():
+    arb = VoiceDuplexArbiter(_BoomPlayback(), config=_ON)
+    task = asyncio.create_task(arb.run())
+    try:
+        arb.submit(SpeechRequest("boom", Priority.PROACTIVE_INFO))
+        # play() raises immediately; the loop must survive and settle to LISTENING.
+        await _until(lambda: arb.state == VoiceState.LISTENING)
+    finally:
+        await _shutdown(arb, task)
