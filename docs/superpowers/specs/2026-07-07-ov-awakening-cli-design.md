@@ -147,10 +147,13 @@ The awakening conductor — a **thin orchestrator** (Mandate 3):
   Live region replaced by the single cooled header line
   (`ov · ouroboros   live` + one muted context line) → returns control; the
   REPL proceeds exactly as today.
-- **Skip:** any keypress (raw, non-blocking read while Live is active) jumps
-  straight to cool-down completion. Headless/non-TTY/NONE-tier/no-unicode/
-  narrow terminal → no Live at all: plain sequential wake lines (existing
-  fallback path).
+- **Skip:** `Esc` or `Enter` ONLY (raw, non-blocking read while Live is
+  active) jumps straight to cool-down completion. Any other key is passed
+  through untouched — "any keypress" would swallow the first character of a
+  command typed during the wake phase and corrupt the REPL's stdin buffer
+  (approved §10 resolution 2). Headless/non-TTY/NONE-tier/no-unicode/narrow
+  terminal → no Live at all: plain sequential wake lines (existing fallback
+  path).
 - **Resize (SIGWINCH):** on console size change mid-animation, the conductor
   regenerates the crest for the new measurement (cache miss → recompute),
   remaps elapsed trace time onto the new frame, and continues — no crash, no
@@ -362,11 +365,17 @@ no-old-look-flag decision.
 
 ---
 
-## 10. Open questions for review
+## 10. Review resolutions (approved 2026-07-07)
 
-1. **Cool-down destination line** — cooled header currently specced as
-   `ov · ouroboros   live` + one muted context line (`awakened HH:MM ·
-   N ops queued`). Keep the context line, or header only?
-2. **Skip key scope** — any keypress vs. Esc/Enter only? (Specced: any key.)
-3. **Crest max width 72** — bump for ultra-wide terminals, or keep the crest
-   intimate? (Specced: 72.)
+1. **Cool-down destination line — RESOLVED: keep the context line.** The
+   cooled header is `ov · ouroboros   live` plus one muted context line
+   (`awakened HH:MM · N ops queued`), its values sourced from the same
+   briefing vector gather (LedgerView-shaped telemetry — DRY, high-SNR).
+   The header is never empty.
+2. **Skip key scope — RESOLVED: `Esc`/`Enter` only.** "Any keypress" would
+   swallow the first character of a command typed during the wake phase and
+   corrupt the REPL's stdin buffer (Bulletproof violation). All other keys
+   pass through untouched.
+3. **Crest max width — RESOLVED: hard clamp at 72 columns.** Generation
+   stays dynamic below the clamp; unbounded scalar growth on ultra-wide
+   viewports would disperse visual density and break Restrained Mono.
