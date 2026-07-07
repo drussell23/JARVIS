@@ -2487,6 +2487,32 @@ class DoublewordProvider:
                     prompt_preloaded_files=tuple(pending.prompt_preloaded_files),
                 )
 
+            # ── File-scope mismatch guard (env-var gated) ──────────
+            # Reject candidates whose file_path falls outside the op's
+            # declared target_files — prevents cross-contamination where
+            # the model generates a patch for an unrelated file.
+            try:
+                _scope_check_on = os.environ.get(
+                    "JARVIS_DW_SCOPE_MISMATCH_CHECK_ENABLED", "true",
+                ).strip().lower() not in {"0", "false", "no", "off"}
+                if _scope_check_on and ctx.target_files:
+                    _target_set = set(ctx.target_files)
+                    _candidate_paths = {
+                        c.get("file_path", "")
+                        for c in result.candidates
+                        if c.get("file_path")
+                    }
+                    if _candidate_paths and not _candidate_paths & _target_set:
+                        logger.warning(
+                            "[DoublewordProvider] file_scope_mismatch: "
+                            "candidate targets %r but op targets %r "
+                            "— rejecting as scope violation",
+                            _candidate_paths, _target_set,
+                        )
+                        return None
+            except Exception:  # noqa: BLE001 — fail-soft; never crashes
+                pass
+
             # Slice 0 — provider-latency observability (pure side
             # channel; master-flag-gated; NEVER raises). Emitted ONLY
             # when ``usage`` carried a real DW server-side token count
@@ -2525,6 +2551,29 @@ class DoublewordProvider:
                 exc,
                 content[:300].replace("\n", "\\n") if content else "(no content)",
             )
+            # ── Syntax-failure escalation recording (batch path) ──
+            # Record in the SyntaxExhaustionEscalator so the J-Prime
+            # cascade can fire when the CandidateGenerator re-enters
+            # _generate_dispatch on the next orchestrator retry.
+            _exc_msg = str(exc)
+            if "all_candidates_syntax_error" in _exc_msg:
+                try:
+                    from backend.core.ouroboros.governance.syntax_escalation import (  # noqa: E501
+                        get_escalator as _get_sx_poll,
+                    )
+                    _sx_p = _get_sx_poll()
+                    _sx_p.record_attempt(
+                        op_id=getattr(pending, "op_id", "") or "",
+                        error_msg=_exc_msg,
+                        candidate_preview=(
+                            content[:800] if content else ""
+                        ),
+                        target_file=getattr(
+                            exc, "target_file", "",
+                        ) or "",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             return None
 
     # ------------------------------------------------------------------
@@ -2900,6 +2949,38 @@ class DoublewordProvider:
         # RT path is pure waste (it will rupture) — force batch-only, saving the hedge spend.
         if not _slice36_force_batch and self._s189_storm_forces_batch(context):
             _slice36_force_batch = True
+
+        # Iron Gate alignment override — when the exploration gate will demand
+        # tool calls (read_file/search_code) before accepting any patch, the
+        # BATCH path cannot satisfy that requirement (batch strips the Venom
+        # tool loop). Downgrade to RT so the model can explore first. This
+        # closes the BATCH(force) → exploration_insufficient → terminal catch-22
+        # observed in A1 soak runs where every standard-route mutation op was
+        # killed by the Iron Gate before reaching VALIDATE.
+        # Env-gated for rollback: JARVIS_DW_EXPLORATION_BATCH_OVERRIDE_ENABLED
+        if _slice36_force_batch and self._tool_loop is not None:
+            try:
+                _expl_override_on = os.environ.get(
+                    "JARVIS_DW_EXPLORATION_BATCH_OVERRIDE_ENABLED", "true",
+                ).strip().lower() not in {"0", "false", "no", "off"}
+                if _expl_override_on:
+                    from backend.core.ouroboros.governance.exploration_engine import (
+                        exploration_gate_demands_tools as _gate_demands,
+                    )
+                    _complexity = getattr(context, "task_complexity", "simple")
+                    _route = getattr(context, "provider_route", "standard")
+                    if _gate_demands(complexity=str(_complexity)):
+                        logger.info(
+                            "[DoublewordProvider] Iron Gate alignment override: "
+                            "force_batch=True downgraded to RT — exploration gate "
+                            "demands tool calls that BATCH cannot provide. "
+                            "op=%s route=%s complexity=%s",
+                            getattr(context, "op_id", "?")[:16],
+                            _route, _complexity,
+                        )
+                        _slice36_force_batch = False
+            except Exception:  # noqa: BLE001 — fail-soft; preserve batch on error
+                pass
 
         # A1-DIAG: dispatch-level topology diagnostic (env-gated, preemption-proof).
         # Captures the RT vs batch branch decision BEFORE it executes, so a SPOT

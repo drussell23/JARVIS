@@ -59,6 +59,8 @@ class PipelineHandle:
     mode_dispatcher: object = None
     health_task: Optional[asyncio.Task] = None
     _bargein_vad_consumer: object = None  # stored for unregister on shutdown
+    karen: object = None  # Sprint 3: full-duplex control layer (env-gated mount)
+    voice_build: object = None  # Sprint 4: voice->build bridge (env-gated mount)
 
     def get_status(self) -> dict:
         """Aggregate status from all components."""
@@ -164,7 +166,15 @@ async def wire_conversation_pipeline(
         if audio_bus is not None:
             handle.barge_in.set_audio_bus(audio_bus)
             # Register barge-in VAD callback as AudioBus mic consumer.
-            handle._bargein_vad_consumer = _create_bargein_vad_consumer(handle.barge_in)
+            handle._bargein_vad_consumer = _create_bargein_vad_consumer(
+                handle.barge_in,
+                # DRY (mandate #3): the SAME per-frame VAD decision drives both the
+                # legacy barge-in controller and Karen's arbiter — no second loop.
+                # handle.karen resolves at frame-time (mounted just below).
+                karen_vad=lambda s: (
+                    handle.karen.on_vad(s) if handle.karen is not None else None
+                ),
+            )
             audio_bus.register_mic_consumer(handle._bargein_vad_consumer)
             logger.info("[Bootstrap] BargeInController registered on AudioBus")
 
@@ -173,6 +183,24 @@ async def wire_conversation_pipeline(
 
     except Exception as e:
         logger.warning(f"[Bootstrap] TurnDetector/BargeIn skipped: {e}")
+
+    # 3b. Karen full-duplex control layer (Sprint 3) — env-gated adaptive mount.
+    #     Default OFF: the pipeline pays zero voice-allocation overhead and its
+    #     lifecycle is byte-identical to before (mandate #2). When enabled, the
+    #     arbiter speaks through the real streaming TTS and the shared barge-in
+    #     VAD (above) drives it. Fault-isolated — a mount failure never touches
+    #     the FSM (mandate #4).
+    if os.getenv("JARVIS_KAREN_VOICE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            from backend.core.ouroboros.governance.comms.duplex.karen_duplex_factory import (
+                build_karen_duplex,
+            )
+            handle.karen = build_karen_duplex(handle.tts_engine)
+            await handle.karen.start()
+            logger.info("[Bootstrap] Karen full-duplex control layer mounted")
+        except Exception as e:
+            handle.karen = None
+            logger.warning(f"[Bootstrap] Karen duplex mount skipped: {e}")
 
     # 4. ConversationPipeline
     try:
@@ -189,6 +217,26 @@ async def wire_conversation_pipeline(
         logger.info("[Bootstrap] ConversationPipeline created")
     except Exception as e:
         logger.warning(f"[Bootstrap] ConversationPipeline init skipped: {e}")
+
+    # 4b. Karen voice->build bridge (Sprint 4) — env-gated adaptive mount.
+    #     Default OFF: zero allocation/behavior change on the pipeline (mandate #2).
+    #     When enabled, completed conversation turns are forked (not replaced) into
+    #     the voice->build classify+route path — the LLM chat reply is untouched
+    #     (DRY, mandate #3). Fault-isolated — a mount failure never touches the FSM.
+    if os.getenv("JARVIS_KAREN_VOICE_BUILD_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            from backend.core.ouroboros.governance.comms.voice_build.bridge import VoiceBuildBridge
+            # Lazy — resolves the sensor per-call via get_default_voice_sensor()
+            # inside the bridge, so mount order relative to IntakeLayerService
+            # publishing the sensor no longer matters (Sprint 4 review fix).
+            handle.voice_build = VoiceBuildBridge()
+            # Fork completed turns into voice->build (the LLM chat path is untouched — DRY).
+            if handle.conversation_pipeline is not None:
+                handle.conversation_pipeline._on_turn_text = handle.voice_build.on_final_transcript
+            logger.info("[Bootstrap] Karen voice->build bridge mounted")
+        except Exception as e:
+            handle.voice_build = None
+            logger.warning(f"[Bootstrap] voice->build mount skipped: {e}")
 
     # 5. ModeDispatcher
     try:
@@ -207,17 +255,6 @@ async def wire_conversation_pipeline(
         logger.info("[Bootstrap] ModeDispatcher started")
     except Exception as e:
         logger.warning(f"[Bootstrap] ModeDispatcher init skipped: {e}")
-
-    # 5b. JarvisVoiceBridge — glue between ConversationManager and Ouroboros
-    try:
-        from backend.voice.jarvis_voice_bridge import create_voice_bridge
-        handle.voice_bridge = await create_voice_bridge(
-            mode_dispatcher=handle.mode_dispatcher,
-            audio_bus=audio_bus,
-        )
-        logger.info("[Bootstrap] JarvisVoiceBridge wired")
-    except Exception as e:
-        logger.debug(f"[Bootstrap] JarvisVoiceBridge skipped: {e}")
 
     # 6. Register ModeDispatcher transcript hook on voice communicator
     try:
@@ -239,10 +276,15 @@ async def wire_conversation_pipeline(
     return handle
 
 
-def _create_bargein_vad_consumer(barge_in):
+def _create_bargein_vad_consumer(barge_in, karen_vad=None):
     """
     Create a mic consumer callback that runs energy-based VAD and feeds
     results to the BargeInController.
+
+    ``karen_vad`` (optional): a sync ``(is_speech: bool) -> None`` sink that
+    receives the SAME per-frame VAD decision, so one energy analysis serves both
+    the legacy barge-in controller and the Karen duplex arbiter (DRY, mandate #3
+    — no second frame loop).
 
     Runs in the audio thread — must be fast and non-blocking.
     """
@@ -254,6 +296,11 @@ def _create_bargein_vad_consumer(barge_in):
         energy = float(np.sqrt(np.mean(frame ** 2)))
         is_speech = energy > _energy_threshold
         barge_in.on_vad_speech_detected(is_speech)
+        if karen_vad is not None:
+            try:
+                karen_vad(is_speech)   # audio-thread-safe marshal lives inside
+            except Exception:
+                pass
 
     return _on_frame
 
@@ -264,6 +311,17 @@ async def shutdown(handle: PipelineHandle) -> None:
     Each step has a timeout to prevent shutdown stall.
     """
     _timeout = 5.0
+
+    # 0. Karen full-duplex control layer (Sprint 3) — stop first so its arbiter
+    #    run loop + VAD bridge tear down before the audio components they use.
+    if getattr(handle, "karen", None) is not None:
+        try:
+            await asyncio.wait_for(handle.karen.stop(), timeout=_timeout)
+        except Exception as e:
+            logger.debug(f"[Bootstrap] Karen duplex stop error: {e}")
+
+    # 0b. Karen voice->build bridge (Sprint 4) — drop the ref, no async teardown needed.
+    handle.voice_build = None
 
     # 1. ModeDispatcher
     if handle.mode_dispatcher is not None:

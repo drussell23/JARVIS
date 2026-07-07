@@ -276,6 +276,11 @@ def _build_comm_protocol(
             logger.debug("[Integration] VoiceNarrator skipped (audio unavailable): %s", exc)
         else:
             _debounce = float(os.environ.get("OUROBOROS_VOICE_DEBOUNCE_S", "60.0"))
+            # TODO(Sprint 2 follow-up): construct DWSpeechProvider-backed synthesizer
+            # here and pass synthesizer=/arbiter= — VoiceNarrator now accepts both as
+            # optional injections and drives KarenSpeechSynthesizer + VoiceDuplexArbiter
+            # when present and JARVIS_KAREN_SYNTH_ENABLED is set. Needs a DW provider
+            # accessor at this call site; out of scope for Task 7 (injection points only).
             transports.append(VoiceNarrator(say_fn=safe_say, debounce_s=_debounce, source="ouroboros"))
             logger.info("[Integration] VoiceNarrator added to CommProtocol")
 

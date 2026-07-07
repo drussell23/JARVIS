@@ -85,6 +85,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
+from backend.core.ouroboros.ui import theme
+
 logger = logging.getLogger("Ouroboros.PresentationRestraint")
 
 
@@ -336,7 +338,7 @@ def render_minimal_welcome(
     mode_str: str = "",
     cwd_str: str = "",
     verb_hints: Optional[Sequence[Tuple[str, str]]] = None,
-    title: str = "🐍 OUROBOROS + VENOM",
+    title: str = "OUROBOROS + VENOM",
     subtitle: str = "autonomous coding organism",
 ) -> bool:
     # ``session_id`` is accepted for caller compatibility (the harness
@@ -360,7 +362,6 @@ def render_minimal_welcome(
         return False
 
     try:
-        from rich.panel import Panel
         from rich.text import Text
     except ImportError:
         # Fallback: print plain lines without panel (still respects the
@@ -382,24 +383,20 @@ def render_minimal_welcome(
     hints = verb_hints if verb_hints is not None else _DEFAULT_VERB_HINTS
 
     # Build the panel body. Rich accepts plain text or a Text instance.
+    theme.ensure_theme(console)
     body = Text()
-    body.append(f"{title}\n", style="bold cyan")
-    body.append(f"{subtitle}\n", style="dim")
+    body.append(f"{title}\n", style=theme.Token.HEADING.value)
+    body.append(f"{subtitle}\n", style=theme.Token.MUTED.value)
     body.append("\n")
     # Verb hints — 2-space indent per CC's pattern.
     for verb, desc in hints:
-        body.append(f"  {verb:<14s}", style="bright_blue")
-        body.append(f"{desc}\n", style="dim")
+        body.append(f"  {verb:<14s}", style=theme.Token.ACCENT.value)
+        body.append(f"{desc}\n", style=theme.Token.MUTED.value)
 
     try:
-        panel = Panel(
-            body,
-            border_style="dim",
-            padding=(0, 2),
-            expand=False,
-        )
         print_fn()
-        print_fn(panel)
+        # Single panel primitive — no hand-rolled Panel/box logic (DRY).
+        theme.render_panel(console, body, token=theme.Token.MUTED)
         # Context line below the panel — matches CC's "cwd:" format.
         print_fn(_format_context_line(
             cwd_str, branch, cost_cap, idle_timeout_s, mode_str,
@@ -421,15 +418,16 @@ def _format_context_line(
     """One-line context summary. Plain Rich markup string."""
     parts: List[str] = []
     if cwd_str:
-        parts.append(f"[dim]cwd:[/dim] {cwd_str}")
+        parts.append(f"[muted]cwd:[/muted] {cwd_str}")
     if branch:
-        parts.append(f"[dim]branch:[/dim] {branch}")
-    parts.append(f"[dim]budget:[/dim] $0.00 / ${cost_cap:.2f}")
+        parts.append(f"[muted]branch:[/muted] {branch}")
+    parts.append(f"[muted]budget:[/muted] $0.00 / ${cost_cap:.2f}")
     if idle_timeout_s > 0:
-        parts.append(f"[dim]idle:[/dim] 0s / {idle_timeout_s:.0f}s")
+        parts.append(f"[muted]idle:[/muted] 0s / {idle_timeout_s:.0f}s")
     if mode_str:
-        parts.append(f"[dim]mode:[/dim] {mode_str}")
-    return "  " + "  [dim]·[/dim]  ".join(parts)
+        parts.append(f"[muted]mode:[/muted] {mode_str}")
+    sep = theme.mark("dot") or "-"
+    return "  " + f"  [muted]{sep}[/muted]  ".join(parts)
 
 
 def render_preflight(
@@ -456,43 +454,44 @@ def render_preflight(
         checks = _default_preflight_checks()
 
     try:
+        theme.ensure_theme(console)
         print_fn()
-        print_fn("[bold cyan]  Preflight Checklist[/bold cyan]")
-        print_fn("[dim]  " + "─" * 52 + "[/dim]")
+        print_fn("[heading]  Preflight Checklist[/heading]")
+        theme.render_rule(console)
         for check in checks:
             label = str(check.get("label", "?"))
             env_key = str(check.get("env_key", ""))
             detail = str(check.get("detail", ""))
             is_on = bool(os.environ.get(env_key, ""))
             mark = (
-                "[bright_green]ON[/bright_green]"
-                if is_on else "[dim]OFF[/dim]"
+                "[success]ON[/success]"
+                if is_on else "[muted]OFF[/muted]"
             )
             print_fn(
-                f"  [{mark}] {label:<30s} [dim]{detail}[/dim]"
+                f"  [{mark}] {label:<30s} [muted]{detail}[/muted]"
             )
         rounds = os.environ.get("JARVIS_GOVERNED_TOOL_MAX_ROUNDS", "10")
         print_fn(
-            f"\n[dim]  Tool rounds: {rounds} "
-            "(deadline-based, safety ceiling)[/dim]"
+            f"\n[muted]  Tool rounds: {rounds} "
+            "(deadline-based, safety ceiling)[/muted]"
         )
         # API-key warnings (matches the legacy script's behavior).
         has_dw = bool(os.environ.get("DOUBLEWORD_API_KEY"))
         has_claude = bool(os.environ.get("ANTHROPIC_API_KEY"))
         if not has_dw and not has_claude:
             print_fn(
-                "  [bold red]ERROR: No API keys set. "
-                "Export DOUBLEWORD_API_KEY or ANTHROPIC_API_KEY.[/bold red]"
+                "  [danger]ERROR: No API keys set. "
+                "Export DOUBLEWORD_API_KEY or ANTHROPIC_API_KEY.[/danger]"
             )
         elif not has_claude:
             print_fn(
-                "  [yellow]WARNING: ANTHROPIC_API_KEY not set "
-                "— no Claude fallback.[/yellow]"
+                "  [warning]WARNING: ANTHROPIC_API_KEY not set "
+                "— no Claude fallback.[/warning]"
             )
         elif not has_dw:
             print_fn(
-                "  [yellow]WARNING: DOUBLEWORD_API_KEY not set "
-                "— Claude only (expensive).[/yellow]"
+                "  [warning]WARNING: DOUBLEWORD_API_KEY not set "
+                "— Claude only (expensive).[/warning]"
             )
         print_fn()
         return True
@@ -573,14 +572,15 @@ def render_organism(
     if not callable(print_fn):
         return False
 
+    theme.ensure_theme(console)
     if layers is None:
         layers = get_captured_layers()
 
     if not layers:
         try:
             print_fn(
-                "[dim]  No organism state captured yet — "
-                "harness boot has not completed.[/dim]"
+                "[muted]  No organism state captured yet — "
+                "harness boot has not completed.[/muted]"
             )
         except Exception:  # noqa: BLE001
             return False
@@ -588,20 +588,20 @@ def render_organism(
 
     try:
         print_fn()
-        print_fn("[bold]── 6-Layer Organism ──[/bold]")
+        theme.render_rule(console, label="6-Layer Organism")
         for entry in layers:
             if not isinstance(entry, (tuple, list)) or len(entry) < 4:
                 continue
-            icon = str(entry[0]) if entry[0] is not None else ""
+            # entry[0] is the legacy emoji icon — dropped under Restrained Mono.
             name = str(entry[1]) if entry[1] is not None else ""
             is_on = bool(entry[2])
             detail = str(entry[3]) if entry[3] is not None else ""
             mark = (
-                "[bright_green]ON[/bright_green]"
-                if is_on else "[dim]OFF[/dim]"
+                "[success]ON[/success]"
+                if is_on else "[muted]OFF[/muted]"
             )
             print_fn(
-                f"  {icon}  {name:<24s} {mark}  [dim]{detail}[/dim]"
+                f"  {name:<24s} {mark}  [muted]{detail}[/muted]"
             )
         print_fn()
         return True

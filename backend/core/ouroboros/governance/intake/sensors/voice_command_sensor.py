@@ -139,3 +139,24 @@ class VoiceCommandSensor:
         except Exception:
             logger.exception("VoiceCommandSensor: ingest failed: %s", payload.description)
             return "error"
+
+
+# ---------------------------------------------------------------------------
+# Process-wide default singleton (Karen Full-Duplex Voice, Sprint 4 Task 1)
+# ---------------------------------------------------------------------------
+# Mirrors unified_intake_router.set_default_intake_router /
+# get_default_intake_router: the sensor is constructed inside
+# IntakeLayerService, but the voice/audio side needs a handle to the live
+# instance without threading it through every call site. Last-write-wins;
+# NEVER raises.
+
+_default_voice_sensor = None
+
+
+def set_default_voice_sensor(sensor) -> None:
+    global _default_voice_sensor
+    _default_voice_sensor = sensor
+
+
+def get_default_voice_sensor():
+    return _default_voice_sensor

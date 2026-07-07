@@ -272,6 +272,8 @@ class ConversationPipeline:
         self._intent_classifier_init_failed = False
         self._command_processor_init_failed = False
         self._query_complexity_lookup_attempted = False
+        self._on_turn_text = None  # Sprint 4: optional async (text)->... fork for voice->build
+        self._turn_forks: set = set()  # retained refs for fire-and-forget forks (avoids GC of pending tasks)
 
         self._session: Optional[ConversationSession] = None
         self._sentence_splitter = SentenceSplitter()
@@ -472,6 +474,20 @@ class ConversationPipeline:
                     )
 
                 # 6. Discuss route → generate and speak LLM response
+                # Fire-and-forget: the voice->build fork must never block the
+                # spoken reply on intake ingest (WAL writes). The task ref is
+                # retained in self._turn_forks so it isn't GC'd mid-flight;
+                # the done-callback discards it once complete. The bridge
+                # itself swallows its own exceptions, so a bare create_task
+                # is safe here.
+                if self._on_turn_text is not None and user_text:
+                    try:
+                        _t = asyncio.create_task(self._on_turn_text(user_text))
+                        self._turn_forks.add(_t)
+                        _t.add_done_callback(self._turn_forks.discard)
+                    except Exception:
+                        logger.debug("[ConvPipeline] voice->build fork failed", exc_info=True)
+
                 await self._generate_and_speak_response(
                     user_text=user_text,
                     intent_decision=intent_decision,

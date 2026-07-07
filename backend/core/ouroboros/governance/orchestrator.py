@@ -525,7 +525,7 @@ def _failfast_cb_enabled() -> bool:
     """Fail-Fast Exhaustion Circuit Breaker master switch.
 
     ``JARVIS_FAILFAST_EXHAUSTION_CB_ENABLED`` — §33.1 **default
-    FALSE**. When OFF the legacy retry/park behaviour is
+    TRUE**. When OFF the legacy retry/park behaviour is
     byte-identical (an op that exhausts all providers keeps cycling
     until the 1800s eval window / op deadline). When ON, an op that
     raises ``all_providers_exhausted`` for N consecutive attempts is
@@ -534,8 +534,8 @@ def _failfast_cb_enabled() -> bool:
     (B.2.2 evaluate_problem) wakes in seconds, not 1800s. Read at
     call time."""
     return os.environ.get(
-        "JARVIS_FAILFAST_EXHAUSTION_CB_ENABLED", "",
-    ).strip().lower() in {"1", "true", "yes", "on"}
+        "JARVIS_FAILFAST_EXHAUSTION_CB_ENABLED", "true",
+    ).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _failfast_cb_threshold() -> int:

@@ -145,23 +145,9 @@ def test_map_phase_generic_decision_unchanged():
     assert VoiceNarrator._map_phase(msg) == "applied"
 
 
-def test_narration_template_duplication():
-    """duplication_blocked template renders with file context."""
-    from backend.core.ouroboros.governance.comms.narrator_script import format_narration
-    result = format_narration("duplication_blocked", {"file": "module.py", "op_id": "op-1"})
-    assert result is not None
-    assert "module.py" in result
-    assert "duplicat" in result.lower()
-
-
-def test_narration_template_verify():
-    """verify_regression template renders with file and root_cause."""
-    from backend.core.ouroboros.governance.comms.narrator_script import format_narration
-    result = format_narration("verify_regression", {
-        "file": "module.py",
-        "root_cause": "pass_rate=0.85 < threshold=1.00",
-        "op_id": "op-1",
-    })
-    assert result is not None
-    assert "module.py" in result
-    assert "pass_rate" in result
+# NOTE: test_narration_template_duplication / test_narration_template_verify
+# were removed (Sprint 2 Task 7) — they asserted on narrator_script's static
+# templates via format_narration(), which is eradicated. The phase-routing
+# behavior they exercised (_map_phase → "duplication_blocked" /
+# "verify_regression") is still covered above by test_map_phase_duplication
+# and test_map_phase_verify_regression.

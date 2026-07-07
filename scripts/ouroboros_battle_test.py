@@ -867,7 +867,11 @@ def _replay_session(session_ref: str) -> None:
     print(f"{'═' * 64}\n")
 
 
-def main() -> None:
+def main(argv: "list[str] | None" = None) -> None:
+    # ``argv`` defaults to ``None`` (reads ``sys.argv`` -- unchanged legacy
+    # behavior for direct ``python3 scripts/...`` invocation). The ``ov``
+    # console script passes a translated argv so both front-ends share this
+    # single bootstrap (DRY -- spec 2026-07-06 §4.3).
     # ------------------------------------------------------------------
     # Argument parsing
     # ------------------------------------------------------------------
@@ -1111,7 +1115,7 @@ def main() -> None:
         ),
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # ------------------------------------------------------------------
     # Belt-and-suspenders repo-root anchor (run-#14 SOURCE fix).

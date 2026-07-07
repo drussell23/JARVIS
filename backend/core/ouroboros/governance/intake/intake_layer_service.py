@@ -581,6 +581,13 @@ class IntakeLayerService:
             stt_confidence_threshold=self._config.voice_stt_confidence_threshold,
             signal_bus=_signal_bus,
         )
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.voice_command_sensor import (
+                set_default_voice_sensor,
+            )
+            set_default_voice_sensor(self._voice_sensor)
+        except Exception:  # noqa: BLE001
+            pass
 
         # Sensors with start/stop lifecycle
         self._sensors = backlog_sensors + test_failure_sensors + miner_sensors

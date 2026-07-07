@@ -4043,6 +4043,35 @@ class CandidateGenerator:
                             if self._latency_tracker is not None:
                                 self._latency_tracker.record_failure()
 
+                        # ── Syntax-failure escalation recording ──
+                        # When DW produces persistent AST failures, record
+                        # the attempt in the SyntaxExhaustionEscalator so
+                        # the J-Prime cascade can fire once the threshold
+                        # is met. Fail-soft: never blocks the cascade.
+                        _rt_err_msg = str(rt_exc)
+                        if "all_candidates_syntax_error" in _rt_err_msg:
+                            try:
+                                from backend.core.ouroboros.governance.syntax_escalation import (  # noqa: E501
+                                    get_escalator as _get_syntax_escalator,
+                                )
+                                _sx = _get_syntax_escalator()
+                                _sx.record_attempt(
+                                    op_id=getattr(context, "op_id", "") or "",
+                                    error_msg=_rt_err_msg,
+                                    candidate_preview=getattr(
+                                        rt_exc, "candidate_preview", "",
+                                    ) or "",
+                                    target_file=getattr(
+                                        rt_exc, "target_file", "",
+                                    ) or "",
+                                )
+                            except Exception:  # noqa: BLE001
+                                logger.debug(
+                                    "[CandidateGenerator] syntax escalation "
+                                    "recording failed (non-fatal)",
+                                    exc_info=True,
+                                )
+
             else:
                 # ── Legacy batch path (DOUBLEWORD_REALTIME_ENABLED=false) ──
                 # submit_batch() → background poll → await result.
@@ -4135,6 +4164,74 @@ class CandidateGenerator:
                                 len(_result.candidates),
                             )
                             return _result
+
+        # ── Syntax-failure J-Prime escalation (DW → J-Prime cascade) ──
+        # When DW has produced persistent all_candidates_syntax_error
+        # failures for this op, escalate to J-Prime with full failure
+        # context (candidate previews + anti-hallucination directive).
+        # This fires BEFORE the normal Tier 1 cascade so J-Prime gets
+        # the enriched context. Fail-soft: on any error, falls through
+        # to the normal cascade. Env-gated via
+        # JARVIS_SYNTAX_ESCALATION_ENABLED (default true).
+        if self._jprime is not None and _tier0_attempted:
+            try:
+                from backend.core.ouroboros.governance.syntax_escalation import (  # noqa: E501
+                    get_escalator as _get_sx,
+                    enrich_context_for_escalation as _enrich_sx,
+                )
+                _sx_op_id = getattr(context, "op_id", "") or ""
+                _sx_esc = _get_sx()
+                if _sx_esc.should_escalate(_sx_op_id):
+                    _sx_ctx = _sx_esc.build_escalation_context(
+                        _sx_op_id, op_context=context,
+                    )
+                    logger.warning(
+                        "[SyntaxEscalator] ESCALATE op=%s "
+                        "consecutive_syntax_failures=%d threshold_met=True "
+                        "target=jprime target_file=%s — routing to J-Prime "
+                        "with failure dossier (%.1fs remaining)",
+                        _sx_op_id[:16],
+                        _sx_ctx.consecutive_failures,
+                        _sx_ctx.target_file,
+                        self._remaining_seconds(deadline),
+                    )
+                    _sx_esc.mark_escalated(_sx_op_id)
+                    _enriched_ctx = _enrich_sx(context, _sx_ctx)
+                    try:
+                        _sx_result = await self._jprime.generate(
+                            _enriched_ctx, deadline,
+                        )
+                        if (
+                            _sx_result is not None
+                            and len(_sx_result.candidates) > 0
+                        ):
+                            logger.info(
+                                "[SyntaxEscalator] J-Prime produced %d "
+                                "candidates for op=%s — escalation "
+                                "SUCCEEDED",
+                                len(_sx_result.candidates),
+                                _sx_op_id[:16],
+                            )
+                            _sx_esc.clear(_sx_op_id)
+                            return _sx_result
+                        logger.warning(
+                            "[SyntaxEscalator] J-Prime returned no "
+                            "candidates for op=%s — falling through "
+                            "to normal Tier 1 cascade",
+                            _sx_op_id[:16],
+                        )
+                    except Exception as _sx_jprime_exc:
+                        logger.warning(
+                            "[SyntaxEscalator] J-Prime escalation failed "
+                            "for op=%s: %s — falling through to normal "
+                            "Tier 1 cascade",
+                            _sx_op_id[:16], _sx_jprime_exc,
+                        )
+            except Exception:  # noqa: BLE001 — never block the cascade
+                logger.debug(
+                    "[SyntaxEscalator] escalation check failed (non-fatal)",
+                    exc_info=True,
+                )
 
         # ── Tier 1: Primary → Fallback cascade ───────────────────
         #
@@ -6414,12 +6511,35 @@ class CandidateGenerator:
                 "[CandidateGenerator] Tier 0 background poll cancelled: %s",
                 pending.batch_id,
             )
-        except Exception:
+        except Exception as _poll_exc:
             logger.warning(
                 "[CandidateGenerator] Tier 0 background poll failed: %s",
                 pending.batch_id,
                 exc_info=True,
             )
+            # ── Syntax-failure escalation recording (batch path) ──
+            # The batch poll swallows the exception here. Record in the
+            # escalator so the J-Prime cascade can fire on the NEXT
+            # orchestrator retry. Mirrors the RT path recording.
+            _poll_err = str(_poll_exc)
+            if "all_candidates_syntax_error" in _poll_err:
+                try:
+                    from backend.core.ouroboros.governance.syntax_escalation import (  # noqa: E501
+                        get_escalator as _get_sx_batch,
+                    )
+                    _sx_b = _get_sx_batch()
+                    _sx_b.record_attempt(
+                        op_id=_op_id or "",
+                        error_msg=_poll_err,
+                        candidate_preview=getattr(
+                            _poll_exc, "candidate_preview", "",
+                        ) or "",
+                        target_file=getattr(
+                            _poll_exc, "target_file", "",
+                        ) or "",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         finally:
             self._background_polls.pop(_op_id, None)
 

@@ -857,6 +857,36 @@ class TestFailureSensor:
         mirror = self._mirror_tests_dir(changed_abs, repo_root)
         if mirror is not None:
             return [str(mirror)]
+
+        # Tier 3: package-layout test discovery — search for test_<stem>.py
+        # across known test dirs when both primary resolver and mirror-dir
+        # fail. Prevents silent signal drop on AST analysis failures.
+        try:
+            stem = Path(changed_rel_path).stem
+            if stem and not stem.startswith("test_"):
+                pattern = "test_%s.py" % (stem,)
+                pkg_targets: list = []
+                for test_root_name in ("tests", "test"):
+                    test_root = repo_root / test_root_name
+                    if test_root.is_dir():
+                        for hit in test_root.rglob(pattern):
+                            pkg_targets.append(str(hit))
+                            if len(pkg_targets) >= 3:  # bounded
+                                break
+                    if len(pkg_targets) >= 3:
+                        break
+                if pkg_targets:
+                    logger.info(
+                        "TestFailureSensor: package-layout fallback resolved "
+                        "%d test target(s) for %r",
+                        len(pkg_targets), changed_rel_path,
+                    )
+                    return pkg_targets
+        except Exception:  # noqa: BLE001 — fail-soft
+            logger.debug(
+                "TestFailureSensor: package-layout fallback error for %r",
+                changed_rel_path, exc_info=True,
+            )
         return None
 
     @staticmethod

@@ -42,16 +42,18 @@ _SRC = Path(_orch.__file__).read_text(encoding="utf-8")
 # ---------------------------------------------------------------------------
 
 
-def test_cb_enabled_default_false(monkeypatch):
+def test_cb_enabled_default_true(monkeypatch):
     monkeypatch.delenv(
         "JARVIS_FAILFAST_EXHAUSTION_CB_ENABLED", raising=False)
-    assert _orch._failfast_cb_enabled() is False
+    assert _orch._failfast_cb_enabled() is True       # default ON
     for v in ("1", "true", "TRUE", "yes", "on"):
         monkeypatch.setenv(
             "JARVIS_FAILFAST_EXHAUSTION_CB_ENABLED", v)
         assert _orch._failfast_cb_enabled() is True
-    monkeypatch.setenv("JARVIS_FAILFAST_EXHAUSTION_CB_ENABLED", "off")
-    assert _orch._failfast_cb_enabled() is False
+    for v in ("0", "false", "no", "off"):
+        monkeypatch.setenv(
+            "JARVIS_FAILFAST_EXHAUSTION_CB_ENABLED", v)
+        assert _orch._failfast_cb_enabled() is False
 
 
 def test_cb_threshold_default_two_env_tunable_clamped(monkeypatch):

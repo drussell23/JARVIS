@@ -211,17 +211,20 @@ class DiffPreviewRenderer:
         total_added = sum(c.added_lines for c in changes)
         total_removed = sum(c.removed_lines for c in changes)
         n_files = len(changes)
+        # Semantic token names -- resolved at render time by the themed console
+        # (serpent_flow's self.console via build_console), so styling tracks the
+        # real terminal tier even under patch_stdout's forced-terminal.
         header_line = Text()
-        header_line.append("⚠ NOTIFY_APPLY", style="bold yellow")
+        header_line.append("⚠ NOTIFY_APPLY", style="warning")
         header_line.append("  ")
-        header_line.append(f"op={op_id}", style="dim")
+        header_line.append(f"op={op_id}", style="muted")
         header_line.append("  •  ")
-        header_line.append(f"reason: {reason or 'n/a'}", style="cyan")
+        header_line.append(f"reason: {reason or 'n/a'}", style="accent")
         header_line.append("  •  ")
         header_line.append(
             f"+{total_added}/-{total_removed} lines across {n_files} "
             f"file{'s' if n_files != 1 else ''}",
-            style="bold",
+            style="heading",
         )
 
         parts: List[Any] = [header_line]
@@ -237,19 +240,19 @@ class DiffPreviewRenderer:
         # ---- Countdown footer ----------------------------------------
         footer = Text()
         if delay_remaining_s > 0:
-            footer.append("Applying in ", style="dim")
-            footer.append(f"{delay_remaining_s:.1f}s", style="bold green")
-            footer.append("  —  ", style="dim")
-            footer.append("/reject", style="bold red")
-            footer.append(" to cancel", style="dim")
+            footer.append("Applying in ", style="muted")
+            footer.append(f"{delay_remaining_s:.1f}s", style="success")
+            footer.append("  —  ", style="muted")
+            footer.append("/reject", style="danger")
+            footer.append(" to cancel", style="muted")
         else:
-            footer.append("Applying…", style="bold green")
+            footer.append("Applying…", style="success")
         parts.append(footer)
 
         return Panel(
             Group(*parts),
-            title="[bold yellow]Yellow Tier — Auto-apply Preview[/bold yellow]",
-            border_style="yellow",
+            title="[warning]Yellow Tier — Auto-apply Preview[/warning]",
+            border_style="warning",
             padding=(1, 2),
         )
 
@@ -262,10 +265,10 @@ class DiffPreviewRenderer:
         from rich.text import Text
         tree = Tree(
             Text.assemble(
-                ("📁 Changed files ", "bold"),
-                (f"({len(changes)})", "dim"),
+                ("Changed files ", "heading"),
+                (f"({len(changes)})", "muted"),
             ),
-            guide_style="dim",
+            guide_style="muted",
         )
         for c in changes:
             label = Text()
@@ -274,12 +277,12 @@ class DiffPreviewRenderer:
             label.append(_badge(c.status))
             if not c.is_binary and c.status != "unchanged":
                 label.append("  ")
-                label.append(f"+{c.added_lines}", style="green")
-                label.append("/", style="dim")
-                label.append(f"-{c.removed_lines}", style="red")
+                label.append(f"+{c.added_lines}", style="success")
+                label.append("/", style="muted")
+                label.append(f"-{c.removed_lines}", style="danger")
             elif c.is_binary:
                 label.append("  ")
-                label.append("[binary]", style="dim")
+                label.append("[binary]", style="muted")
             tree.add(label)
         return tree
 
@@ -289,20 +292,20 @@ class DiffPreviewRenderer:
         from rich.text import Text
 
         header = Text()
-        header.append(change.path, style="bold")
+        header.append(change.path, style="heading")
         header.append("  ")
         header.append(_badge(change.status))
         if not change.is_binary and change.status != "unchanged":
             header.append("  ")
-            header.append(f"+{change.added_lines}", style="green")
-            header.append("/", style="dim")
-            header.append(f"-{change.removed_lines}", style="red")
+            header.append(f"+{change.added_lines}", style="success")
+            header.append("/", style="muted")
+            header.append(f"-{change.removed_lines}", style="danger")
 
         parts: List[Any] = [header]
 
         if change.rationale:
             rationale = Text()
-            rationale.append("rationale: ", style="dim italic")
+            rationale.append("rationale: ", style="muted italic")
             rationale.append(change.rationale, style="italic")
             parts.append(rationale)
 
@@ -323,11 +326,11 @@ class DiffPreviewRenderer:
         if change.is_binary:
             return Text(
                 f"[binary file — not diffable, {len(change.new_content)} bytes]",
-                style="dim italic",
+                style="muted italic",
             )
 
         if change.status == "unchanged":
-            return Text("(no textual changes)", style="dim italic")
+            return Text("(no textual changes)", style="muted italic")
 
         try:
             diff_lines = list(
@@ -347,11 +350,11 @@ class DiffPreviewRenderer:
             )
             return Text(
                 "(diff generation failed — see dump file if enabled)",
-                style="dim italic",
+                style="muted italic",
             )
 
         if not diff_lines:
-            return Text("(identical content)", style="dim italic")
+            return Text("(identical content)", style="muted italic")
 
         truncated, omitted = _truncate_head_tail(
             diff_lines, self.max_lines_per_file,
@@ -377,7 +380,7 @@ class DiffPreviewRenderer:
             note = Text(
                 f"… {omitted} lines omitted (head+tail shown; cap "
                 f"JARVIS_DIFF_PREVIEW_MAX_LINES_PER_FILE={self.max_lines_per_file}) …",
-                style="dim italic",
+                style="muted italic",
             )
             return Group(body, note)
         return body
@@ -392,25 +395,27 @@ def _badge(status: str) -> "Text":  # type: ignore[name-defined]
     from rich.text import Text
     t = Text()
     if status == "new":
-        t.append("[+ new]", style="bold green")
+        t.append("[+ new]", style="success")
     elif status == "deleted":
-        t.append("[− deleted]", style="bold red")
+        t.append("[− deleted]", style="danger")
     elif status == "modified":
-        t.append("[~ modified]", style="bold yellow")
+        t.append("[~ modified]", style="warning")
     elif status == "unchanged":
-        t.append("[= unchanged]", style="dim")
+        t.append("[= unchanged]", style="muted")
     else:
-        t.append(f"[? {status}]", style="dim")
+        t.append(f"[? {status}]", style="muted")
     return t
 
 
 def _status_color(status: str) -> str:
+    """Semantic token name used as a Panel border_style (resolved by the
+    themed render console)."""
     return {
-        "new": "green",
-        "modified": "yellow",
-        "deleted": "red",
-        "unchanged": "dim",
-    }.get(status, "white")
+        "new": "success",
+        "modified": "warning",
+        "deleted": "danger",
+        "unchanged": "muted",
+    }.get(status, "body")
 
 
 def _truncate_head_tail(lines: List[str], max_lines: int) -> tuple:
