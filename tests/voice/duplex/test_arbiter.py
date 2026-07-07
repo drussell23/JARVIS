@@ -103,3 +103,37 @@ async def test_no_play_while_user_speaking():
         await _until(lambda: fp.played == ["proactive"])   # drains after user done
     finally:
         await _shutdown(arb, task)
+
+
+@pytest.mark.asyncio
+async def test_critical_preempts_active_info_playback():
+    fp = FakePlayback()
+    arb = VoiceDuplexArbiter(fp, config=_ON)
+    task = asyncio.create_task(arb.run())
+    try:
+        arb.submit(SpeechRequest("info", Priority.PROACTIVE_INFO))
+        await _until(lambda: fp.played == ["info"]
+                     and arb.state == VoiceState.KAREN_SPEAKING)
+
+        arb.submit(SpeechRequest("APPROVAL", Priority.PROACTIVE_CRITICAL))
+        await _until(lambda: fp.played[-1:] == ["APPROVAL"])   # critical played
+        assert fp.preempt_count == 1                            # info was cut
+    finally:
+        await _shutdown(arb, task)
+
+
+@pytest.mark.asyncio
+async def test_equal_or_lower_priority_does_not_preempt():
+    fp = FakePlayback()
+    arb = VoiceDuplexArbiter(fp, config=_ON)
+    task = asyncio.create_task(arb.run())
+    try:
+        arb.submit(SpeechRequest("crit1", Priority.PROACTIVE_CRITICAL))
+        await _until(lambda: fp.played == ["crit1"])
+
+        arb.submit(SpeechRequest("info", Priority.PROACTIVE_INFO))
+        await asyncio.sleep(0.05)                  # let the loop NOT preempt
+        assert fp.preempt_count == 0               # info waits its turn
+        assert fp.played == ["crit1"]
+    finally:
+        await _shutdown(arb, task)

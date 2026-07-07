@@ -28,17 +28,29 @@ class VoiceDuplexArbiter:
         self._wake = asyncio.Event()          # signalled when work is enqueued
         self._play_task: Optional[asyncio.Task] = None
         self._running = False
+        self._active_priority: Optional[Priority] = None
 
     @property
     def state(self) -> VoiceState:
         return self._state
 
     def submit(self, request: SpeechRequest) -> None:
-        """Non-blocking enqueue. Never raises."""
+        """Non-blocking enqueue. A strictly-higher-priority request preempts an
+        active lower-priority playback (but never interrupts the user). Never
+        raises."""
         if not self._config.enabled:
             return
         try:
             self._queues[request.priority].append(request)
+            if (
+                self._state == VoiceState.KAREN_SPEAKING
+                and self._active_priority is not None
+                and request.priority > self._active_priority
+            ):
+                self._playback.preempt()
+                if self._play_task is not None:
+                    self._play_task.cancel()
+                self._state = VoiceState.LISTENING     # let run() pick the winner
             self._wake.set()
         except Exception:  # noqa: BLE001
             logger.debug("[Arbiter] submit failed", exc_info=True)
@@ -55,7 +67,11 @@ class VoiceDuplexArbiter:
         while self._running:
             await self._wake.wait()
             self._wake.clear()
-            while self._state == VoiceState.LISTENING:
+            # Inner drain MUST also honor _running: after stop() sets it false,
+            # _speak's finally flips state back to LISTENING, and without this
+            # guard the loop would pop queued work into a new, never-cancelled
+            # play task that blocks teardown forever (shutdown race).
+            while self._running and self._state == VoiceState.LISTENING:
                 req = self._pop_highest()
                 if req is None:
                     break
@@ -63,6 +79,7 @@ class VoiceDuplexArbiter:
 
     async def _speak(self, req: SpeechRequest) -> None:
         self._state = VoiceState.KAREN_SPEAKING
+        self._active_priority = req.priority
         self._play_task = asyncio.create_task(self._playback.play(req.text))
         try:
             await self._play_task
@@ -74,6 +91,7 @@ class VoiceDuplexArbiter:
             self._play_task = None
             if self._state == VoiceState.KAREN_SPEAKING:
                 self._state = VoiceState.LISTENING
+            self._active_priority = None
 
     async def on_user_speech_start(self) -> None:
         """Barge-in trigger. Preempts Karen and holds the floor. Never raises."""
