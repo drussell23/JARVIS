@@ -244,17 +244,90 @@ def build_console(
     tier = force_tier if force_tier is not None else _forced_tier_from_env()
     try:
         if tier is not None:
-            return Console(
+            console = Console(
                 color_system=_TIER_TO_COLOR_SYSTEM[tier],
                 theme=_theme_for(tier),
                 **console_kwargs,  # type: ignore[arg-type]
             )
-        console = Console(**console_kwargs)  # type: ignore[arg-type]
-        console.push_theme(_theme_for(detect_tier(console)))
+        else:
+            console = Console(**console_kwargs)  # type: ignore[arg-type]
+            console.push_theme(_theme_for(detect_tier(console)))
+        _mark_themed(console)
         return console
     except Exception:  # noqa: BLE001 -- construction must never crash the CLI
         logger.debug("[theme] build_console failed; plain fallback", exc_info=True)
         return Console(**console_kwargs)  # type: ignore[arg-type]
+
+
+def _mark_themed(console: object) -> None:
+    """Tag a console as already carrying the O+V theme (idempotency marker)."""
+    try:
+        setattr(console, "_ov_themed", True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def ensure_theme(console: Console) -> Console:
+    """Push the tier-appropriate theme onto a console if it lacks one.
+
+    Idempotent -- consoles built via :func:`build_console` are already tagged
+    and skipped. Lets any consumer safely use ``[accent]`` markup regardless of
+    how its console was constructed (DRY -- the render helpers call this).
+    NEVER raises.
+    """
+    try:
+        if getattr(console, "_ov_themed", False):
+            return console
+        push = getattr(console, "push_theme", None)
+        if callable(push):
+            push(_theme_for(detect_tier(console)))
+            _mark_themed(console)
+    except Exception:  # noqa: BLE001
+        logger.debug("[theme] ensure_theme failed", exc_info=True)
+    return console
+
+
+def box_for(tier: ColorTier):
+    """Return the box style for a tier: rounded when unicode is available,
+    ASCII otherwise (bulletproof mandate #4). ``tier`` reserved for future
+    per-tier box tuning. NEVER raises."""
+    from rich import box
+    try:
+        return box.ROUNDED if supports_unicode() else box.ASCII
+    except Exception:  # noqa: BLE001
+        return box.ASCII
+
+
+def render_panel(
+    console: Console,
+    body: object,
+    *,
+    token: Token = Token.MUTED,
+    title: Optional[str] = None,
+) -> None:
+    """Draw a bordered panel styled by a semantic token.
+
+    The single panel-drawing primitive -- consumers must not hand-roll their
+    own Panel/box logic (DRY mandate #3). Box degrades to ASCII without
+    unicode; border color degrades with the tier. NEVER raises.
+    """
+    from rich.panel import Panel
+    ensure_theme(console)
+    try:
+        console.print(Panel(
+            body,
+            border_style=token.value,
+            box=box_for(detect_tier(console)),
+            title=title,
+            expand=False,
+            padding=(0, 2),
+        ))
+    except Exception:  # noqa: BLE001
+        logger.debug("[theme] render_panel failed", exc_info=True)
+        try:
+            console.print(body)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def render_rule(console: Console, label: Optional[str] = None) -> None:
@@ -281,9 +354,12 @@ __all__ = [
     "FORCE_TIER_ENV_VAR",
     "ColorTier",
     "Token",
+    "box_for",
     "build_console",
     "detect_tier",
+    "ensure_theme",
     "mark",
+    "render_panel",
     "render_rule",
     "style_for",
     "supports_unicode",

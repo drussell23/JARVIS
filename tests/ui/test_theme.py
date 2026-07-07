@@ -118,3 +118,47 @@ class TestRenderRulePrimitive:
                 console = theme.build_console(force_tier=tier, width=width)
                 theme.render_rule(console)  # must never raise
                 theme.render_rule(console, label="boot")
+
+
+class TestRenderPanelPrimitive:
+    def test_render_panel_never_raises_across_tiers_and_widths(self) -> None:
+        for tier in ColorTier:
+            for width in (40, 80, 120):
+                console = theme.build_console(force_tier=tier, width=width)
+                theme.render_panel(console, "body text", title="ov")
+
+    def test_render_panel_no_escape_leakage_at_none_tier(self) -> None:
+        console = theme.build_console(force_tier=ColorTier.NONE, force_terminal=True)
+        with console.capture() as cap:
+            theme.render_panel(console, "hello", token=Token.ACCENT)
+        assert "\x1b[" not in cap.get()
+
+
+class TestBoxFor:
+    def test_box_for_returns_a_box_every_tier(self) -> None:
+        from rich.box import Box
+        for tier in ColorTier:
+            assert isinstance(theme.box_for(tier), Box)
+
+
+class TestEnsureTheme:
+    def test_ensure_theme_makes_accent_markup_resolve(self) -> None:
+        """A raw (unthemed) console can't resolve [accent]; ensure_theme fixes it."""
+        from rich.console import Console
+        raw = Console(color_system="truecolor", force_terminal=True)
+        theme.ensure_theme(raw)
+        with raw.capture() as cap:
+            raw.print("[accent]hi[/accent]")
+        assert "\x1b[" in cap.get()  # accent now resolves to a real color
+
+    def test_ensure_theme_is_idempotent(self) -> None:
+        console = theme.build_console(force_tier=ColorTier.TRUECOLOR, force_terminal=True)
+        # build_console already themed it; ensure_theme must be a safe no-op.
+        theme.ensure_theme(console)
+        theme.ensure_theme(console)
+        with console.capture() as cap:
+            console.print("[accent]hi[/accent]")
+        assert "\x1b[" in cap.get()
+
+    def test_ensure_theme_never_raises_on_junk(self) -> None:
+        theme.ensure_theme(object())  # not a console -> must not raise

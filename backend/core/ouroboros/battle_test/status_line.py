@@ -708,7 +708,7 @@ def _format_posture_badge_token() -> str:
     :func:`posture_aurora.format_posture_aurora_badge` which adds
     confidence-band intensity modulation on top of the canonical
     palette. The aurora variant returns Rich markup
-    (``[bright_green]🐍 EXPLORE[/bright_green]``) so the
+    (``[success]EXPLORE[/success]``) so the
     plain-text status line embeds the markup directly — Rich
     consumers render the color, plain stdout sees the brackets
     as visual decoration. Aurora flag default-FALSE.

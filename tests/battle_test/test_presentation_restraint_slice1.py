@@ -97,9 +97,9 @@ def test_payload_schema_version():
 # ===========================================================================
 
 
-def test_render_minimal_welcome_emits_title_emoji_kept():
-    """Operator decision: emojis are kept inside the panel — restraint
-    is about density, not identity erasure."""
+def test_render_minimal_welcome_no_emoji_restrained_mono():
+    """Restrained Mono (2026-07-06): the wordmark is kept, emojis are gone.
+    Supersedes the earlier 'emojis kept' decision."""
     console = Console(record=True, force_terminal=True, color_system="truecolor")
     ok = render_minimal_welcome(
         console,
@@ -112,7 +112,7 @@ def test_render_minimal_welcome_emits_title_emoji_kept():
     )
     assert ok is True
     text = console.export_text()
-    assert "🐍" in text
+    assert "🐍" not in text
     assert "OUROBOROS + VENOM" in text
 
 
@@ -255,14 +255,17 @@ def test_render_organism_no_layers_prints_hint():
     assert "No organism state" in text or "harness boot" in text
 
 
-def test_render_organism_emits_emojis_kept():
+def test_render_organism_no_emoji_restrained_mono():
+    """Restrained Mono (2026-07-06): the layer's legacy emoji icon is dropped;
+    the layer name is still rendered. Supersedes 'emojis kept'."""
     set_captured_layers([
         ("🧭", "Strategic Direction", True, "7 principles"),
     ])
     console = Console(record=True, force_terminal=True)
     render_organism(console)
     text = console.export_text()
-    assert "🧭" in text
+    assert "🧭" not in text
+    assert "Strategic Direction" in text
 
 
 def test_render_organism_handles_non_console_input():

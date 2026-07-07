@@ -357,7 +357,7 @@ class ComposedToolRender:
     Fields
     ------
     * ``header_markup`` — first display line (e.g. CC-style
-      ``[cyan]⏺ Read[/cyan]([blue]foo.py[/blue])  [dim]42ms[/dim]``).
+      ``[accent]⏺ Read[/accent]([muted]foo.py[/muted])  [muted]42ms[/muted]``).
     * ``summary_markup`` — body-summary line under the header,
       prefixed with the ``⎿`` continuation glyph; empty string
       when the descriptor has nothing useful to summarize.
@@ -365,7 +365,7 @@ class ComposedToolRender:
       caller emits each via ``_op_line`` so the existing per-op
       indenting + side-rail glyphs apply uniformly.
     * ``expansion_hint`` — when the body was elided, a one-line
-      ``[dim]…+N more lines elided · /expand t-12[/dim]`` hint
+      ``[muted]…+N more lines elided · /expand t-12[/muted]`` hint
       so the operator knows recovery is one verb away. Empty string
       when no elision happened OR no expansion ref was issued.
     * ``policy`` — the :class:`DensityPolicy` actually applied;
@@ -474,13 +474,13 @@ def _compose_header(
 
     For CC-verb descriptors (Read/Update/Write):
 
-      ``[cyan]⏺ Read[/cyan]([blue]foo.py[/blue])  [dim]42ms[/dim]``
+      ``[accent]⏺ Read[/accent]([muted]foo.py[/muted])  [muted]42ms[/muted]``
 
     For icon descriptors (everything else):
 
-      ``[cyan]🔍 search_code "pat"[/cyan]  [dim]120ms[/dim]``
+      ``[accent]search_code "pat"[/accent]  [muted]120ms[/muted]``
 
-    Failure status appends an [red]✗[/red] mark.
+    Failure status appends a [danger]✗[/danger] mark.
     """
     duration_part = ""
     if duration_ms and duration_ms > 0:

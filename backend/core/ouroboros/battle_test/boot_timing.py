@@ -284,7 +284,20 @@ class BootTimer:
         lines: List[str] = []
         lines.append("")
         lines.append(f"  Boot timing  (total: {self.total_elapsed_s() * 1000:.1f}ms)")
-        lines.append("  " + "─" * 52)
+        # Dimension-aware separator via the theme's rule glyph (degrades to
+        # ASCII without unicode) -- no hardcoded frame char or width.
+        try:
+            from backend.core.ouroboros.ui import theme as _theme
+            _rule_char = _theme.mark("rule") or "-"
+        except Exception:  # noqa: BLE001
+            _rule_char = "-"
+        _rule_w = 52
+        if console is not None:
+            try:
+                _rule_w = max(10, int(getattr(console, "width", 54) or 54) - 2)
+            except Exception:  # noqa: BLE001
+                _rule_w = 52
+        lines.append("  " + _rule_char * _rule_w)
         for r in recs:
             indent = "    " if r.parent else "  "
             elapsed_ms = r.elapsed_s * 1000
