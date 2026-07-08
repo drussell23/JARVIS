@@ -130,6 +130,20 @@ def _spawn_daemon(
     # Build the subprocess env: start from the current env (so PATH,
     # PYTHONPATH, etc. survive) BUT inject the credentials (which the
     # harness env is about to lose).
+    #
+    # ov cockpit silence (Slice 2 Task 2) -- presentation-mode survival:
+    # ``JARVIS_OV_PRESENTATION`` is NOT an upstream credential (it isn't
+    # in credential_registry.upstream_credential_env_vars()), so
+    # scrub_upstream_credentials() below never touches it, AND this
+    # spawn happens BEFORE that scrub call runs (see aegis_preflight's
+    # step ordering) against a full ``dict(os.environ)`` snapshot -- so
+    # the daemon subprocess already inherits it structurally, with no
+    # allowlist entry needed. Carrying it in BootstrapPayload instead
+    # was considered and rejected: that payload is a ONE-WAY handshake
+    # (daemon writes -> harness reads, see bootstrap.py) -- there is no
+    # channel on it for the harness to hand settings TO the daemon, so
+    # it cannot carry a harness-side var into the child at all. Pinned
+    # by tests/aegis/test_daemon_presentation.py.
     sub_env = dict(os.environ)
     sub_env.update(credentials)
 

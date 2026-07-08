@@ -217,6 +217,38 @@ class TestLedgerHygieneBannerGate:
         assert "[LedgerHygiene] WARNING" in captured.err
 
 
+class _FakeAegisReadyResult:
+    def __init__(self, *, aegis_url: str = "http://127.0.0.1:55555", subprocess_pid: int = 4242):
+        self.aegis_url = aegis_url
+        self.subprocess_pid = subprocess_pid
+
+
+class TestAegisDaemonReadyBannerGate:
+    """``[Aegis] daemon ready`` -- ov cockpit silence (Slice 2 Task 2).
+    Same ceremony-gate shape as BattleTestDefaults/LedgerHygiene above:
+    COCKPIT withholds the READY-path success line at the source; SOAK
+    prints it unchanged. Aegis preflight FAILURE prints live at a
+    separate, unconditional call site a few lines above in main() and
+    are not covered by this gate (Mandate 1)."""
+
+    def test_ready_banner_skipped_in_cockpit(self, capsys):
+        bt._print_aegis_daemon_ready(
+            _FakeAegisReadyResult(), PresentationMode.COCKPIT,
+        )
+        captured = capsys.readouterr()
+        assert "[Aegis]" not in captured.out
+        assert "[Aegis]" not in captured.err
+
+    def test_ready_banner_prints_in_soak(self, capsys):
+        result = _FakeAegisReadyResult(
+            aegis_url="http://127.0.0.1:61234", subprocess_pid=9911,
+        )
+        bt._print_aegis_daemon_ready(result, PresentationMode.SOAK)
+        captured = capsys.readouterr()
+        assert "[Aegis] daemon ready at http://127.0.0.1:61234" in captured.out
+        assert "pid=9911" in captured.out
+
+
 class TestBootExorcismMarkerGate:
     """The script-top ``[Slice12X.BootExorcism]`` marker is pure ceremony
     and gated via a raw env check (only os/sys are importable that early).

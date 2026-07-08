@@ -46,6 +46,7 @@ ENV_AEGIS_NONCE_LEDGER_CAPACITY: str = "JARVIS_AEGIS_NONCE_LEDGER_CAPACITY"
 ENV_AEGIS_WAL_PATH: str = "JARVIS_AEGIS_WAL_PATH"
 ENV_AEGIS_SESSION_CAP_USD: str = "JARVIS_AEGIS_SESSION_CAP_USD"
 ENV_AEGIS_HOURLY_BURN_CAP_USD: str = "JARVIS_AEGIS_HOURLY_BURN_CAP_USD"
+ENV_AEGIS_DAEMON_LOG_PATH: str = "JARVIS_AEGIS_DAEMON_LOG_PATH"
 
 
 def env_route_cap(route: str) -> str:
@@ -61,6 +62,7 @@ DEFAULT_BOOTSTRAP_TIMEOUT_S: int = 10
 DEFAULT_DAEMON_BIND_HOST: str = "127.0.0.1"
 DEFAULT_NONCE_LEDGER_CAPACITY: int = 8192
 DEFAULT_WAL_PATH_REL: str = ".jarvis/aegis/spend.jsonl"
+DEFAULT_DAEMON_LOG_PATH_REL: str = ".jarvis/aegis/daemon.log"
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +180,18 @@ def nonce_ledger_capacity() -> int:
 def wal_path() -> Path:
     raw = os.environ.get(ENV_AEGIS_WAL_PATH, "").strip()
     return Path(raw).expanduser() if raw else Path(DEFAULT_WAL_PATH_REL)
+
+
+def daemon_log_path() -> Path:
+    """Path for the daemon's COCKPIT-mode relocated log file (ov cockpit
+    silence, Slice 2 Task 2). Reuses the existing ``.jarvis/aegis/``
+    runtime-state directory (same convention as :func:`wal_path`) rather
+    than inventing a new session-dir concept -- the daemon is a detached
+    subprocess with no knowledge of the harness's session_dir. Default
+    ``.jarvis/aegis/daemon.log``; override via
+    ``JARVIS_AEGIS_DAEMON_LOG_PATH`` for sandboxed envs."""
+    raw = os.environ.get(ENV_AEGIS_DAEMON_LOG_PATH, "").strip()
+    return Path(raw).expanduser() if raw else Path(DEFAULT_DAEMON_LOG_PATH_REL)
 
 
 def session_cap_usd() -> float:
@@ -415,6 +429,23 @@ def _seeds() -> List[FlagSpec]:
             source_file=_SRC_AEGIS,
             example=f"{ENV_AEGIS_HOURLY_BURN_CAP_USD}=0.50",
         ),
+        FlagSpec(
+            name=ENV_AEGIS_DAEMON_LOG_PATH,
+            type=FlagType.STR,
+            default=DEFAULT_DAEMON_LOG_PATH_REL,
+            description=(
+                "ov cockpit silence (Slice 2 Task 2): path the daemon's "
+                "console-suppressed INFO/access logs (AegisPassthrough / "
+                "AegisForward / credential env-load lines) are relocated "
+                "to under JARVIS_OV_PRESENTATION=cockpit. Default "
+                ".jarvis/aegis/daemon.log (same runtime-state dir as the "
+                "spend WAL). SOAK mode is unaffected -- logs stay on the "
+                "inherited terminal, byte-identical to pre-Slice-2."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=_SRC_AEGIS,
+            example=f"{ENV_AEGIS_DAEMON_LOG_PATH}=/var/log/aegis/daemon.log",
+        ),
     ]
 
     # Per-route caps — one spec per known route.
@@ -465,11 +496,13 @@ def register_aegis_flags(registry: FlagRegistry | None = None) -> Tuple[int, int
 __all__ = [
     "DEFAULT_BOOTSTRAP_TIMEOUT_S",
     "DEFAULT_DAEMON_BIND_HOST",
+    "DEFAULT_DAEMON_LOG_PATH_REL",
     "DEFAULT_NONCE_LEDGER_CAPACITY",
     "DEFAULT_WAL_PATH_REL",
     "ENV_AEGIS_BOOTSTRAP_DIR",
     "ENV_AEGIS_BOOTSTRAP_TIMEOUT_S",
     "ENV_AEGIS_DAEMON_BIND_HOST",
+    "ENV_AEGIS_DAEMON_LOG_PATH",
     "ENV_AEGIS_ENABLED",
     "ENV_AEGIS_FORWARDING_ENABLED",
     "ENV_AEGIS_MAX_REQUEST_BODY_BYTES",
@@ -484,6 +517,7 @@ __all__ = [
     "bootstrap_dir",
     "bootstrap_timeout_s",
     "daemon_bind_host",
+    "daemon_log_path",
     "env_route_cap",
     "forwarding_enabled",
     "hourly_burn_cap_usd",

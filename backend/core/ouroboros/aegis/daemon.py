@@ -75,6 +75,10 @@ from backend.core.ouroboros.aegis.lease import (
     validate_lease_token,
     validate_session_token,
 )
+from backend.core.ouroboros.ui.presentation_mode import (
+    PresentationMode,
+    resolve_presentation_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -665,11 +669,68 @@ async def _serve(args: argparse.Namespace) -> None:
         await runner.cleanup()
 
 
+_DAEMON_LOG_FORMAT: str = "%(asctime)s aegis-daemon %(levelname)s %(message)s"
+
+
+def _configure_daemon_logging(mode: Optional[PresentationMode] = None) -> None:
+    """Configure the daemon process's root logging (ov cockpit silence,
+    Slice 2 Task 2).
+
+    The daemon is a SUBPROCESS spawned by ``aegis/preflight.py`` with
+    stdout/stderr inherited from the parent terminal (``preflight.py``'s
+    ``_spawn_daemon`` sets neither ``stdout=`` nor ``stderr=`` on
+    ``subprocess.Popen``, so the child writes straight to the operator's
+    tty). Its per-request access logs (``AegisPassthrough`` /
+    ``AegisForward``) and credential env-load lines are ``logger.info(...)``
+    calls that, pre-Slice-2, always reached that inherited terminal via
+    ``logging.basicConfig(level=INFO, ...)`` below.
+
+    SOAK (default, resolved via ``resolve_presentation_mode()`` when
+    ``mode`` is unset): byte-identical to pre-Slice-2 -- a single INFO+
+    ``StreamHandler`` via ``logging.basicConfig``.
+
+    COCKPIT: the console handler moves to ERROR+ (ERROR/CRITICAL always
+    reach the operator -- Mandate 1); the same INFO+ chatter is
+    relocated, never dropped, to a durable file under the daemon's
+    ``.jarvis/aegis/`` runtime-state convention (``flags.daemon_log_path()``,
+    same directory as the spend WAL). File-handler install failure
+    (permission denied, disk full, sandboxed FS) fails SOFT to
+    console-only ERROR+ rather than crashing the daemon boot -- losing
+    the file sink is tolerable, losing the daemon itself is not.
+    """
+    resolved = mode if mode is not None else resolve_presentation_mode()
+
+    if resolved is not PresentationMode.COCKPIT:
+        logging.basicConfig(level=logging.INFO, format=_DAEMON_LOG_FORMAT)
+        return
+
+    formatter = logging.Formatter(_DAEMON_LOG_FORMAT)
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    console = logging.StreamHandler()
+    console.setLevel(logging.ERROR)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    try:
+        from backend.core.ouroboros.aegis.flags import daemon_log_path
+
+        log_path = daemon_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(str(log_path), encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    except Exception:  # noqa: BLE001 — fail-soft, never block daemon boot
+        logger.debug(
+            "[AegisDaemon] cockpit log file handler install failed",
+            exc_info=True,
+        )
+
+
 def main(argv: Optional[list] = None) -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s aegis-daemon %(levelname)s %(message)s",
-    )
+    _configure_daemon_logging()
     args = _parse_args(argv)
     try:
         asyncio.run(_serve(args))

@@ -760,6 +760,25 @@ def _print_ledger_hygiene_banner(
         print(f"[LedgerHygiene] WARNING: {hygiene_result.detail} — boot continues", file=sys.stderr)
 
 
+def _print_aegis_daemon_ready(result: Any, mode: PresentationMode) -> None:
+    """``[Aegis] daemon ready`` boot line -- ov cockpit silence (Slice 2 Task 2).
+
+    Pure ceremony, gated at the source: COCKPIT withholds, SOAK prints
+    (unchanged). The preflight-FAILURE print (a few lines above this
+    call site in ``main()``) stays UNCONDITIONAL in both modes
+    (Mandate 1 -- fatal-adjacent telemetry never routes through this
+    gate); only the READY-path success line is ceremony. Extracted to a
+    free function so it's spy-testable without booting the full
+    ``main()``.
+    """
+    if mode is PresentationMode.COCKPIT:
+        return
+    print(
+        f"[Aegis] daemon ready at {result.aegis_url} "
+        f"(pid={result.subprocess_pid})"
+    )
+
+
 def _render_multi_op_and_exit(arg: str, *, color: bool) -> None:
     """Phase 8 Slice 3 — render a multi-op timeline view via the
     observability/multi_op_renderer module and print to stdout.
@@ -1696,10 +1715,7 @@ def main(argv: "list[str] | None" = None) -> None:
         )
         sys.exit(1)
     if _aegis_result.outcome is _AegisPreflightOutcome.READY:
-        print(
-            f"[Aegis] daemon ready at {_aegis_result.aegis_url} "
-            f"(pid={_aegis_result.subprocess_pid})"
-        )
+        _print_aegis_daemon_ready(_aegis_result, _mode)
         # Slice 125 — credential health probe. Prove the daemon injects a VALID
         # credential of the funded class BEFORE a multi-hour soak spends time.
         # Two arms (direct funded key vs Aegis-routed); a 402 through Aegis while
