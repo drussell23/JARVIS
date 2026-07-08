@@ -6529,7 +6529,7 @@ class CandidateGenerator:
                     )
                     _sx_b = _get_sx_batch()
                     _sx_b.record_attempt(
-                        op_id=_op_id or "",
+                        op_id=getattr(context, "op_id", "") or _op_id or "",
                         error_msg=_poll_err,
                         candidate_preview=getattr(
                             _poll_exc, "candidate_preview", "",

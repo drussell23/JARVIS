@@ -115,3 +115,100 @@ def test_boot_banner_active_path_log_line_migrated() -> None:
     """
     sf = (_BATTLE / "serpent_flow.py").read_text(encoding="utf-8")
     assert "[muted]{log_path}[/muted]" in sf
+
+
+# --- ov awakening Task 9: Mandate 1 made permanent ----------------------
+#
+# Task 1 split boot-time behavior in scripts/ouroboros_battle_test.py into
+# two classes:
+#
+#   * PURE CEREMONY (``_print_preflight``, the zombie-reap banner) --
+#     withheld entirely in COCKPIT mode by being called ONLY from inside
+#     ``_run_gated_boot_banners``.
+#   * FUNCTIONAL side effects (``_check_api_keys_or_die`` fatal check,
+#     ``_reap_zombies`` scan/kill, ``_single_flight_preflight`` conflict
+#     rejection) -- these must run unconditionally in BOTH presentation
+#     modes, so they live OUTSIDE the gate at their own call sites.
+#     ``_reap_zombies``/``_single_flight_preflight`` additionally gate
+#     only their own happy-path banner chatter via an explicit ``quiet=``
+#     keyword passed at the (ungated) call site -- not via the gate helper.
+#
+# The brief's literal test (``_single_flight_preflight()`` bare-call count
+# outside the gate == 0) does not hold for the real Task 1 shape: that
+# function is *never* called from inside the gate at all -- it always runs
+# outside it, distinguished instead by requiring an explicit ``quiet=``
+# argument. The guard below asserts the invariant that actually holds:
+# ceremony-only functions are gate-exclusive; functional-but-gated-banner
+# functions always pass ``quiet=`` when called outside the gate; and the
+# fatal API-key check is never reachable only from inside the gate.
+_SCRIPT = _REPO / "scripts" / "ouroboros_battle_test.py"
+
+
+def _gate_span(src: str) -> Tuple[int, int]:
+    """Return the (start, end) char offsets of _run_gated_boot_banners'
+    body within ``src`` -- from its ``def`` line up to (not including)
+    the next top-level ``def``."""
+    start = src.index("def _run_gated_boot_banners")
+    end = src.index("\ndef ", start)
+    return start, end
+
+
+def test_boot_banner_ceremony_only_called_via_gate() -> None:
+    """Mandate 1, made permanent: pure-ceremony banners are gate-exclusive;
+    functional/fatal boot steps are never gated.
+
+    Would go red if someone re-added an ungated ``_print_preflight()`` call
+    to ``main()``'s hot path, or stripped the ``quiet=`` kwarg from an
+    outside-the-gate ``_reap_zombies``/``_single_flight_preflight`` call
+    (both of which would let COCKPIT's banner-suppression contract leak),
+    or moved ``_check_api_keys_or_die()`` inside the gate (which would let
+    a presentation mode suppress the no-API-keys fatal exit).
+    """
+    src = _SCRIPT.read_text(encoding="utf-8")
+    gate_start, gate_end = _gate_span(src)
+
+    # 1. _print_preflight() is pure ceremony -- every call site in the
+    # file must fall inside the gate body.
+    print_preflight_calls = [
+        m for m in re.finditer(r"(?<!def )_print_preflight\(\)", src)
+    ]
+    assert print_preflight_calls, "_print_preflight() is never called at all"
+    outside = [
+        m for m in print_preflight_calls
+        if not (gate_start <= m.start() < gate_end)
+    ]
+    assert not outside, (
+        "_print_preflight() called outside _run_gated_boot_banners at "
+        f"offset(s) {[m.start() for m in outside]} -- Mandate 1 violation: "
+        "COCKPIT can no longer withhold this banner at the source"
+    )
+
+    # 2. _reap_zombies / _single_flight_preflight are FUNCTIONAL and run
+    # unconditionally; every call site OUTSIDE the gate body must pass an
+    # explicit quiet= kwarg, so only the happy-path banner is suppressed
+    # in COCKPIT -- never the scan/kill or conflict-rejection side effects.
+    for fn_name in ("_reap_zombies", "_single_flight_preflight"):
+        call_rx = re.compile(rf"(?<!def ){re.escape(fn_name)}\(([^)]*)\)")
+        outside_calls = [
+            m for m in call_rx.finditer(src)
+            if not (gate_start <= m.start() < gate_end)
+        ]
+        assert outside_calls, f"{fn_name} is never called outside the gate"
+        for m in outside_calls:
+            assert "quiet=" in m.group(1), (
+                f"{fn_name} called outside the gate without an explicit "
+                f"quiet= kwarg ({m.group(0)!r} at offset {m.start()}) -- "
+                "its banner ceremony would leak past Mandate 1"
+            )
+
+    # 3. _check_api_keys_or_die is the FATAL preflight -- it must never be
+    # reachable only from inside the gate (no presentation mode may
+    # suppress the no-API-keys exit).
+    assert "_check_api_keys_or_die()" in src
+    fatal_calls = [
+        m for m in re.finditer(r"(?<!def )_check_api_keys_or_die\(\)", src)
+    ]
+    assert fatal_calls, "_check_api_keys_or_die() is never called at all"
+    assert all(
+        not (gate_start <= m.start() < gate_end) for m in fatal_calls
+    ), "_check_api_keys_or_die() called from inside the presentation gate"

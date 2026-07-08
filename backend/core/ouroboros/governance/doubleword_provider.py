@@ -2563,7 +2563,7 @@ class DoublewordProvider:
                     )
                     _sx_p = _get_sx_poll()
                     _sx_p.record_attempt(
-                        op_id=getattr(pending, "op_id", "") or "",
+                        op_id=getattr(ctx, "op_id", "") or getattr(pending, "op_id", "") or "",
                         error_msg=_exc_msg,
                         candidate_preview=(
                             content[:800] if content else ""

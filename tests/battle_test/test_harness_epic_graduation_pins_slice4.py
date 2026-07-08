@@ -241,17 +241,28 @@ def test_slice_2_pin_single_flight_helper_exists():
     rationale.  This pin accepts the new shape so we don't fight
     ourselves; the anchor-specific test is the load-bearing one."""
     src = _read("scripts/ouroboros_battle_test.py")
-    assert "def _single_flight_preflight()" in src
+    # ov awakening Task 1: signature gained a keyword-only ``quiet`` param
+    # (COCKPIT gates only happy-path chatter; the guard + its REJECTED
+    # conflict output run in both presentation modes) — pin the def-line
+    # prefix, not the exact zero-arg shape.
+    assert "def _single_flight_preflight(" in src
     assert r'"^python3? scripts/ouroboros_battle_test\.py"' in src
     assert "sys.exit(75)" in src
 
 
 def test_slice_2_pin_single_flight_runs_after_zombie_reap():
     """Slice 2 — single-flight check runs AFTER the zombie reap so it
-    doesn't false-trip on dead-PID lockholders the reaper can clean."""
+    doesn't false-trip on dead-PID lockholders the reaper can clean.
+
+    ov awakening Task 1: both are direct mode-independent calls in
+    main() (each takes ``quiet=...`` in COCKPIT), so the search is
+    scoped to main()'s body and matches the call prefix."""
     src = _read("scripts/ouroboros_battle_test.py")
-    reap_idx = src.find("_reap_zombies()")
-    sf_idx = src.find("_single_flight_preflight()")
+    main_start = src.find("def main(")
+    assert main_start > 0
+    body = src[main_start:]
+    reap_idx = body.find("_reap_zombies(")
+    sf_idx = body.find("_single_flight_preflight(")
     assert reap_idx > 0
     assert sf_idx > reap_idx
 
