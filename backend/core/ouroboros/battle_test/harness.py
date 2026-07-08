@@ -34,6 +34,16 @@ logger = logging.getLogger(__name__)
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+#: ov cockpit silence Slice 2 Task 3 (Mandate 4) -- bound on the
+#: fatal-abort await of a still-live awakening ceremony task. Module-level
+#: (not inline) so tests can monkeypatch it down from the production 3.0s
+#: default without a real-time wait. AwakeningConductor.run() never raises
+#: on its own (falls back to plain path internally), so this bound only
+#: guards the pathological case of the task never reaching completion --
+#: it NEVER gates the original boot exception, which the caller re-raises
+#: unconditionally regardless of what happens here.
+_AWAKENING_FATAL_ABORT_BOUND_S = 3.0
+
 
 def _boot_mark(name: str) -> None:
     """Defensive boot-timing mark. NEVER raises into boot path.
@@ -412,6 +422,33 @@ def _print_discord_bridge_boot_banner(enabled: bool) -> None:
         f"(JARVIS_DISCORD_BRIDGE_ENABLED)",
         file=sys.stderr, flush=True,
     )
+
+
+def _print_discord_bridge_boot_failure(exc: BaseException) -> None:
+    """``[DiscordBridge] boot FAILED:`` line -- ov cockpit silence
+    (Slice 2, Task 3 follow-up).
+
+    Sibling of :func:`_print_discord_bridge_boot_banner` -- Task 1 gated
+    the armed/skip banner but missed this raw ``print`` on the (rare)
+    exception path. Found during Task 3's t0-dispatch audit: with the
+    awakening ceremony now dispatched at t0 (immediately after the D1
+    silent-boot block, before the Discord bridge boot try/except),
+    this stderr write races the ceremony's ``Live`` region and would
+    corrupt it if the bridge import/boot ever raises. Same gate as the
+    banner: COCKPIT withholds (the ``logger.warning`` immediately below
+    the call site already carries the diagnostic through the
+    presentation-aware console handler), SOAK prints (unchanged).
+    NEVER raises -- a presentation-mode read failure falls back to
+    printing rather than silently swallowing the diagnostic.
+    """
+    try:
+        from backend.core.ouroboros.ui.presentation_mode import is_cockpit
+        cockpit = is_cockpit()
+    except Exception:  # noqa: BLE001 — defensive
+        cockpit = False
+    if cockpit:
+        return
+    print(f"[DiscordBridge] boot FAILED: {exc!r}", file=sys.stderr, flush=True)
 
 
 def build_awakening_for_cockpit(
@@ -985,6 +1022,19 @@ class BattleTestHarness:
                 "to legacy redirect path", exc_info=True,
             )
 
+        # ov cockpit silence Slice 2 Task 3 — ceremony at t0. Dispatch the
+        # awakening conductor IMMEDIATELY after D1 silent-boot config so the
+        # crest starts drawing before any of the heavy boot phases below
+        # run, instead of after them (the live-run regression this task
+        # fixes: ~2.5 minutes of silent boot before the first frame). The
+        # conductor already renders reactively off the default BootTimer
+        # (WakeSequenceRenderer) -- it was BUILT for exactly this concurrent
+        # timeline; only the wiring ran late before this task. No-op in
+        # SOAK (build_awakening_for_cockpit returns None there per spec
+        # §3.5) -- self._awakening / self._awakening_task stay None and the
+        # legacy compact boot_banner() path below is untouched.
+        self._start_awakening_t0()
+
         # Asyncio loop-level exception handler — global safety net for
         # the entire session lifetime (2026-05-03 audit). Replaces both
         # asyncio's default handler (which formats with no message,
@@ -1073,7 +1123,7 @@ class BattleTestHarness:
                     "[DiscordBridge] NOT armed — JARVIS_DISCORD_BRIDGE_ENABLED is off"
                 )
         except Exception as exc:  # noqa: BLE001 — never fatal to the soak
-            print(f"[DiscordBridge] boot FAILED: {exc!r}", file=sys.stderr, flush=True)
+            _print_discord_bridge_boot_failure(exc)
             logger.warning(
                 "[DiscordBridge] bridge boot FAILED: %r", exc, exc_info=True,
             )
@@ -1201,212 +1251,26 @@ class BattleTestHarness:
 
         _boot_mark("harness_run_pre_boot_done")
         try:
-            # Boot sequence — each phase wrapped for boot-timing visibility
-            # GitIndexGuard (Phase C Slice 2) MUST be the first phase:
-            # a missing .git/index (the background-Cursor-Agent unlink
-            # failure mode) corrupts every git-touching subsystem
-            # downstream. §2 Progressive Awakening — mirrors
-            # WorktreeManager.reap_orphans boot recovery. Master-
-            # gated inside the guard (default-OFF → DISABLED no-op);
-            # NEVER raises into boot.
-            with _BootPhase("boot_git_index_guard"):
-                await self._boot_git_index_guard()
-            with _BootPhase("boot_oracle"):
-                await self.boot_oracle()
-            with _BootPhase("boot_governance_stack"):
-                await self.boot_governance_stack()
-            with _BootPhase("boot_governed_loop_service"):
-                await self.boot_governed_loop_service()
-
-            # Gap 3 — ASYNC INTAKE PRE-WARM. The roadmap_ignition_daemon (started
-            # inside boot_governance_stack) opens a 60s window for the
-            # UnifiedIntakeRouter to attach. Intake used to boot LAST (after the
-            # provider-readiness gate + jarvis tiers + branch creation), racing
-            # that window -> the soak bt-2026-06-29-055555 circuit breaker.
-            # Now that the GLS exists, kick intake off CONCURRENTLY so it warms
-            # in parallel with those serial steps and the router is ready well
-            # inside the window. Joined below where boot_intake was awaited.
-            # Gated (default ON) -> OFF falls back to the legacy serial boot.
-            self._intake_boot_task = None
-            if (os.environ.get("JARVIS_INTAKE_CONCURRENT_PREWARM", "true")
-                    or "true").strip().lower() not in ("false", "0", "no", "off"):
-                self._intake_boot_task = asyncio.create_task(
-                    self.boot_intake(), name="intake_concurrent_prewarm",
-                )
-                logger.info(
-                    "[harness] intake pre-warm started CONCURRENTLY (Gap 3) -- "
-                    "router warms in parallel with governance-tail boot",
-                )
-
-            # ── Slice 156 — interactive Discord control gateway ──
-            # GLS (+ its _approval_provider) is up → start the bidirectional bot as a
-            # decoupled background task: it DMs the operator [APPROVE]/[REJECT]/[STEER]
-            # for each Orange APPROVAL_REQUIRED and resolves it remotely. Gated
-            # default-FALSE + fail-soft (no token / no operator id → no-op); off the
-            # FSM loop. Authorization is enforced in the gateway (DISCORD_OPERATOR_ID).
             try:
-                from backend.core.ouroboros.governance.discord_gateway import (
-                    discord_gateway_enabled,
-                    run_gateway_daemon,
-                )
-                if discord_gateway_enabled():
-                    self._discord_gateway_task = asyncio.create_task(
-                        run_gateway_daemon(
-                            self._governed_loop_service, stop=self._shutdown_event,
-                        )
-                    )
-                    logger.warning(
-                        "[DiscordGateway] interactive control gateway armed (Slice 156)"
-                    )
-            except Exception as exc:  # noqa: BLE001 — never fatal to the soak
-                logger.debug("[DiscordGateway] gateway boot skipped: %s", exc)
-            # Provider-readiness gate (§33.1, default-FALSE). Fail-fast
-            # *before* any op-emitting subsystem boots when Claude/DW
-            # are unhealthy — closes the v18 27-min thrash failure mode
-            # (8 EXHAUSTIONs before idle-timeout). Composes canonical
-            # ClaudeProvider.health_probe + claude_circuit_breaker +
-            # optional DW probe. NEVER raises.
-            with _BootPhase("boot_provider_readiness_gate"):
-                if await self._gate_provider_readiness_or_refuse():
-                    # Gate refused — finally-block runs shutdown +
-                    # report; stop_reason already stamped.
-                    return
-            # P1 Slice 2 — Ledger Sovereignty workspace. Under
-            # master flag, creates an isolated worktree at
-            # ouroboros/auto/<session> via the canonical
-            # WorktreeManager. The AutoCommitter resolves its
-            # cwd from JARVIS_AUTO_COMMIT_WORKSPACE at commit
-            # time and refuses (typed) if the path isn't an
-            # owned work-area. Master-FALSE path is byte-
-            # identical; this phase no-ops cleanly.
-            with _BootPhase("boot_ledger_sovereignty_workspace"):
-                await self._boot_ledger_sovereignty_workspace()
-            with _BootPhase("boot_jarvis_tiers"):
-                await self.boot_jarvis_tiers()
-            with _BootPhase("create_branch"):
-                self._branch_name = await self.create_branch()
-            with _BootPhase("boot_intake"):
-                if self._intake_boot_task is not None:
-                    # Gap 3 -- join the concurrent pre-warm (already warming since
-                    # right after the GLS came up). boot_intake runs exactly once.
-                    await self._intake_boot_task
-                else:
-                    await self.boot_intake()
-            # Phase 9 Slice 2 — synthetic workload injection.
-            # Composes the canonical UnifiedIntakeRouter pipeline via
-            # IntakeLayerService.ingest_envelope. Headless-only +
-            # config-gated + hard-capped + transparency-tagged. Per
-            # operator binding 2026-05-05: single pipeline, honest
-            # source token, defaults safe, no dilution of P9.2
-            # graduation contract.
-            await self._inject_phase_9_synthetic_workload()
-            _boot_mark("harness_boot_sequence_done")
-
-            # Wire SerpentApprovalProvider — wraps the inner CLIApprovalProvider
-            # with diff preview + interactive [Y/n] Iron Gate prompt when
-            # SerpentFlow is the active transport.
-            try:
-                if hasattr(self, "_serpent_flow") and self._serpent_flow is not None:
-                    _gls_ref = self._governed_loop_service
-                    _inner_ap = getattr(_gls_ref, "_approval_provider", None)
-                    if _inner_ap is not None:
-                        from backend.core.ouroboros.battle_test.serpent_flow import SerpentApprovalProvider
-                        _serpent_ap = SerpentApprovalProvider(flow=self._serpent_flow, inner=_inner_ap)
-                        _gls_ref._approval_provider = _serpent_ap
-                        # Also update the orchestrator's reference
-                        _orch = getattr(_gls_ref, "_orchestrator", None)
-                        if _orch is not None:
-                            _orch._approval_provider = _serpent_ap
-                        logger.info("SerpentApprovalProvider wired (Iron Gate prompt active)")
-            except Exception as _ap_exc:
-                logger.debug("SerpentApprovalProvider wiring failed: %s", _ap_exc)
-
-            logger.info(
-                "Ouroboros is alive — session %s | budget=$%.2f | idle=%ds",
-                self._session_id,
-                self._config.cost_cap_usd,
-                int(self._config.idle_timeout_s),
-            )
-            # ── Compact boot banner via SerpentFlow.boot_banner() ──
-            # Detects active subsystems and renders a single Rich Panel
-            # instead of 30+ loose print lines.
-            _gls = self._governed_loop_service
-            _has_consciousness = (
-                _gls is not None
-                and getattr(_gls, "_consciousness_bridge", None) is not None
-            )
-            _has_strategic = (
-                _gls is not None
-                and getattr(_gls, "_strategic_direction", None) is not None
-                and getattr(_gls._strategic_direction, "is_loaded", False)
-            )
-            _has_tool_loop = (
-                _gls is not None
-                and getattr(_gls, "_config", None) is not None
-                and getattr(_gls._config, "tool_use_enabled", False)
-            )
-            _has_l2 = bool(os.environ.get("JARVIS_L2_ENABLED", "").lower() == "true")
-            _has_bg_pool = (
-                _gls is not None
-                and getattr(_gls, "_bg_pool", None) is not None
-            )
-
-            _n_principles = 0
-            if _has_strategic:
-                _n_principles = len(_gls._strategic_direction.principles)
-
-            _pool_info = (
-                f"parallel ({getattr(_gls._bg_pool, '_pool_size', 2)} workers)"
-                if _has_bg_pool else "sequential"
-            )
-            _venom_info = "bash + web + tests + L2" if _has_l2 else "tools active"
-
-            # Build 6-layer status: (icon, name, is_on, detail)
-            _layers = [
-                ("🧭", "Strategic Direction", _has_strategic, f"{_n_principles} Manifesto principles"),
-                ("🧠", "Consciousness", _has_consciousness, "Memory + Prophecy + Health"),
-                ("📡", "Event Spine", True, "FileWatch → TrinityBus → sensors"),
-                ("⚙️ ", "Ouroboros Pipeline", True, _pool_info),
-                ("🐍", "Venom Agentic Loop", _has_tool_loop, _venom_info),
-                ("📝", "Thought Log", True, "ouroboros_thoughts.jsonl"),
-            ]
-
-            _log_path = getattr(self, "_log_file_path", "")
-
-            self._awakening = None
-            if hasattr(self, "_serpent_flow") and self._serpent_flow is not None:
-                self._awakening = build_awakening_for_cockpit(
-                    self._serpent_flow.console,
-                    intake_probe=self._intake_pending_probe,
-                    approvals_probe=None,
-                )
-                if self._awakening is not None:
-                    # COCKPIT: play the boot ceremony now, serialized against
-                    # the rest of boot -- it owns a Rich Live region on the
-                    # same console, and its animate-vs-plain decision reads
-                    # console.is_terminal, which is only reliable BEFORE the
-                    # REPL's patch_stdout(raw=True) wraps stdout (Task 5
-                    # review's load-bearing ordering invariant). Awaited to
-                    # completion here so no later boot-path console.print()
-                    # (e.g. SerpentFlow.start()'s ribbon) can interleave with
-                    # the Live-owned ceremony.
-                    await self._awakening.run()
-                else:
-                    # legacy SOAK banner path -- UNCHANGED
-                    self._serpent_flow.boot_banner(
-                        layers=_layers,
-                        n_sensors=0,  # Updated below after intake boot
-                        log_path=_log_path,
-                    )
-            else:
-                # Fallback: basic Rich console output
-                from rich.console import Console as _C
-                _c = _C(emoji=True, highlight=False)
-                _c.print("[bold cyan]🐍 OUROBOROS + VENOM[/bold cyan]", highlight=False)
-                _c.print(f"  Session: {self._session_id}", highlight=False)
-                _c.print(f"  Branch:  {self._branch_name or 'N/A'}", highlight=False)
-                _c.print(f"  Budget:  ${self._config.cost_cap_usd:.2f}", highlight=False)
-                _c.print()
+                _gate_refused = await self._run_boot_phase_region()
+            except Exception:
+                # ov cockpit silence Slice 2 Task 3 (Mandate 4) — fatal-abort.
+                # A live ceremony task (dispatched at t0 by
+                # _start_awakening_t0, above) must never be left dangling
+                # when a boot-phase exception escapes: request skip + await
+                # with a short bound so the Live region closes and termios
+                # is restored BEFORE the ORIGINAL exception reaches the
+                # outer handler below (which logs it — console passes
+                # ERROR+ per Task 1 — then proceeds to report + shutdown
+                # exactly as before). NEVER swallows the boot exception —
+                # only a (rare) wait-bound timeout is caught inside the
+                # helper.
+                await self._abort_awakening_on_fatal_boot_error()
+                raise
+            if _gate_refused:
+                # Gate refused — finally-block runs shutdown + report;
+                # stop_reason already stamped.
+                return
 
             # Subscribe to operation completion events for session recording
             try:
@@ -2228,6 +2092,345 @@ class BattleTestHarness:
                     _wdg.disarm()
             except Exception:  # noqa: BLE001
                 pass
+
+    # ------------------------------------------------------------------
+    # ov cockpit silence Slice 2 Task 3 — ceremony at t0 + fatal-abort
+    # ------------------------------------------------------------------
+
+    def _start_awakening_t0(self) -> Optional["asyncio.Task[None]"]:
+        """Dispatch the boot ceremony at t0 -- COCKPIT only.
+
+        Called from ``run()`` immediately after the D1 silent-boot block,
+        BEFORE any of the heavy boot phases (``boot_git_index_guard`` /
+        ``boot_oracle`` / ``boot_governance_stack`` /
+        ``boot_governed_loop_service`` / ...) run. The dispatched task then
+        races those phases CONCURRENTLY -- the crest starts drawing at t0
+        and the conductor's mounted ``WakeSequenceRenderer`` renders the
+        real phases reactively beneath it as ``BootTimer`` marks land,
+        instead of waiting ~2.5 minutes for boot to finish first (the
+        regression this task fixes).
+
+        Builds its OWN themed console via ``theme.build_console()`` rather
+        than reusing ``self._serpent_flow.console`` -- SerpentFlow is not
+        constructed yet at t0 (it comes up later, inside
+        ``boot_governance_stack``, one of the phases this ceremony now
+        races against). SerpentFlow's own console output stays deferred
+        until AFTER the ceremony task is awaited in ``_run_boot_phase_region``
+        (mirrors ``SerpentFlow.console``'s ``force_terminal=True`` /
+        ``emoji=True`` / ``highlight=False`` construction so the
+        animate-vs-plain ``is_terminal`` decision reads the same either
+        way), preserving the Live-region serialization invariant even
+        though construction moved earlier.
+
+        ``build_awakening_for_cockpit`` (the single construction chokepoint,
+        unchanged -- DRY mandate #3) internally checks ``is_cockpit()`` and
+        returns ``None`` in SOAK, so this is a no-op there: ``self._awakening``
+        / ``self._awakening_task`` stay ``None`` and the legacy compact
+        ``boot_banner()`` path (in ``_run_boot_phase_region``) stays byte-
+        identical.
+
+        Sets ``self._awakening`` (the conductor -- unchanged surface for the
+        REPL ``typed_prefix`` handoff) and ``self._awakening_task`` (the
+        dispatched task, awaited in ``_run_boot_phase_region``). Returns the
+        task (or ``None`` in SOAK / on any construction failure) so t0
+        ordering is directly unit-testable. NEVER raises into boot --
+        mirrors every other boot-glue helper in this module.
+        """
+        self._awakening = None
+        self._awakening_task = None
+        try:
+            from backend.core.ouroboros.ui.presentation_mode import is_cockpit
+            if not is_cockpit():
+                return None  # SOAK -- skip console construction entirely
+            from backend.core.ouroboros.ui import theme as _ov_theme
+            console = _ov_theme.build_console(
+                emoji=True, highlight=False, force_terminal=True,
+            )
+            conductor = build_awakening_for_cockpit(
+                console,
+                intake_probe=self._intake_pending_probe,
+                approvals_probe=None,
+            )
+            if conductor is None:
+                return None  # SOAK -- legacy boot_banner() path handles it
+            self._awakening = conductor
+            self._awakening_task = asyncio.create_task(
+                conductor.run(), name="awakening_ceremony_t0",
+            )
+            return self._awakening_task
+        except Exception:  # noqa: BLE001 — ceremony must never block boot
+            logger.debug(
+                "[harness] _start_awakening_t0 failed", exc_info=True,
+            )
+            self._awakening = None
+            self._awakening_task = None
+            return None
+
+    async def _abort_awakening_on_fatal_boot_error(self) -> None:
+        """Mandate 4 fatal-abort cleanup for a live ceremony task.
+
+        Called from ``run()``'s inner except clause when ANY exception
+        escapes ``_run_boot_phase_region``. If the ceremony task dispatched
+        by ``_start_awakening_t0`` is still live, requests an immediate
+        skip (jumps straight to cool-down) and awaits the task with a short
+        bound so the ``Live`` region closes and termios is restored BEFORE
+        the caller re-raises the original exception. ``AwakeningConductor
+        .run()`` never raises on its own (falls back to the plain path on
+        any internal failure), so the bound here only guards against the
+        (pathological) case of the task never reaching its own completion
+        in time -- NEVER the original boot exception, which the caller
+        re-raises unchanged regardless of what happens in here.
+        """
+        task = getattr(self, "_awakening_task", None)
+        if task is None or task.done():
+            return
+        conductor = getattr(self, "_awakening", None)
+        if conductor is not None:
+            try:
+                conductor.request_skip()
+            except Exception:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[harness] awakening request_skip failed during "
+                    "fatal-abort", exc_info=True,
+                )
+        try:
+            await asyncio.wait_for(task, timeout=_AWAKENING_FATAL_ABORT_BOUND_S)
+        except Exception:  # noqa: BLE001 — wait-bound expiry / task-internal
+            # error ONLY. The original boot exception is re-raised by the
+            # caller regardless -- never swallowed here.
+            logger.debug(
+                "[harness] awakening ceremony did not complete within the "
+                "fatal-abort bound", exc_info=True,
+            )
+
+    async def _run_boot_phase_region(self) -> bool:
+        """The boot-phase region wrapped by ``run()``'s fatal-abort guard.
+
+        Extracted VERBATIM from ``run()`` (ov cockpit silence Slice 2 Task
+        3) so the fatal-abort try/except in ``run()`` can bracket exactly
+        this region without re-indenting ~190 lines of phase code. Runs the
+        4 heavy boot phases + boot-tail glue (intake pre-warm join, Discord
+        gateway, provider-readiness gate, ledger-sovereignty workspace,
+        jarvis tiers, branch creation, Phase 9 synthetic workload) through
+        the banner block, ending with the COCKPIT ceremony await (the task
+        dispatched earlier at t0 by ``_start_awakening_t0``) or the legacy
+        SOAK ``boot_banner()`` call.
+
+        Returns ``True`` when the provider-readiness gate refused (the
+        original inline ``return`` from ``run()`` for that case -- widened
+        to a boolean since a bare ``return`` here would only exit this
+        method, not ``run()`` itself; the caller checks the return value
+        and returns from ``run()`` so the outer ``finally`` still runs
+        shutdown + report exactly as before). Returns ``False`` on normal
+        completion.
+        """
+        # Boot sequence — each phase wrapped for boot-timing visibility
+        # GitIndexGuard (Phase C Slice 2) MUST be the first phase:
+        # a missing .git/index (the background-Cursor-Agent unlink
+        # failure mode) corrupts every git-touching subsystem
+        # downstream. §2 Progressive Awakening — mirrors
+        # WorktreeManager.reap_orphans boot recovery. Master-
+        # gated inside the guard (default-OFF → DISABLED no-op);
+        # NEVER raises into boot.
+        with _BootPhase("boot_git_index_guard"):
+            await self._boot_git_index_guard()
+        with _BootPhase("boot_oracle"):
+            await self.boot_oracle()
+        with _BootPhase("boot_governance_stack"):
+            await self.boot_governance_stack()
+        with _BootPhase("boot_governed_loop_service"):
+            await self.boot_governed_loop_service()
+
+        # Gap 3 — ASYNC INTAKE PRE-WARM. The roadmap_ignition_daemon (started
+        # inside boot_governance_stack) opens a 60s window for the
+        # UnifiedIntakeRouter to attach. Intake used to boot LAST (after the
+        # provider-readiness gate + jarvis tiers + branch creation), racing
+        # that window -> the soak bt-2026-06-29-055555 circuit breaker.
+        # Now that the GLS exists, kick intake off CONCURRENTLY so it warms
+        # in parallel with those serial steps and the router is ready well
+        # inside the window. Joined below where boot_intake was awaited.
+        # Gated (default ON) -> OFF falls back to the legacy serial boot.
+        self._intake_boot_task = None
+        if (os.environ.get("JARVIS_INTAKE_CONCURRENT_PREWARM", "true")
+                or "true").strip().lower() not in ("false", "0", "no", "off"):
+            self._intake_boot_task = asyncio.create_task(
+                self.boot_intake(), name="intake_concurrent_prewarm",
+            )
+            logger.info(
+                "[harness] intake pre-warm started CONCURRENTLY (Gap 3) -- "
+                "router warms in parallel with governance-tail boot",
+            )
+
+        # ── Slice 156 — interactive Discord control gateway ──
+        # GLS (+ its _approval_provider) is up → start the bidirectional bot as a
+        # decoupled background task: it DMs the operator [APPROVE]/[REJECT]/[STEER]
+        # for each Orange APPROVAL_REQUIRED and resolves it remotely. Gated
+        # default-FALSE + fail-soft (no token / no operator id → no-op); off the
+        # FSM loop. Authorization is enforced in the gateway (DISCORD_OPERATOR_ID).
+        try:
+            from backend.core.ouroboros.governance.discord_gateway import (
+                discord_gateway_enabled,
+                run_gateway_daemon,
+            )
+            if discord_gateway_enabled():
+                self._discord_gateway_task = asyncio.create_task(
+                    run_gateway_daemon(
+                        self._governed_loop_service, stop=self._shutdown_event,
+                    )
+                )
+                logger.warning(
+                    "[DiscordGateway] interactive control gateway armed (Slice 156)"
+                )
+        except Exception as exc:  # noqa: BLE001 — never fatal to the soak
+            logger.debug("[DiscordGateway] gateway boot skipped: %s", exc)
+        # Provider-readiness gate (§33.1, default-FALSE). Fail-fast
+        # *before* any op-emitting subsystem boots when Claude/DW
+        # are unhealthy — closes the v18 27-min thrash failure mode
+        # (8 EXHAUSTIONs before idle-timeout). Composes canonical
+        # ClaudeProvider.health_probe + claude_circuit_breaker +
+        # optional DW probe. NEVER raises.
+        with _BootPhase("boot_provider_readiness_gate"):
+            if await self._gate_provider_readiness_or_refuse():
+                # Gate refused — caller (run()) must return early; its
+                # finally-block runs shutdown + report — stop_reason
+                # already stamped.
+                return True
+        # P1 Slice 2 — Ledger Sovereignty workspace. Under
+        # master flag, creates an isolated worktree at
+        # ouroboros/auto/<session> via the canonical
+        # WorktreeManager. The AutoCommitter resolves its
+        # cwd from JARVIS_AUTO_COMMIT_WORKSPACE at commit
+        # time and refuses (typed) if the path isn't an
+        # owned work-area. Master-FALSE path is byte-
+        # identical; this phase no-ops cleanly.
+        with _BootPhase("boot_ledger_sovereignty_workspace"):
+            await self._boot_ledger_sovereignty_workspace()
+        with _BootPhase("boot_jarvis_tiers"):
+            await self.boot_jarvis_tiers()
+        with _BootPhase("create_branch"):
+            self._branch_name = await self.create_branch()
+        with _BootPhase("boot_intake"):
+            if self._intake_boot_task is not None:
+                # Gap 3 -- join the concurrent pre-warm (already warming since
+                # right after the GLS came up). boot_intake runs exactly once.
+                await self._intake_boot_task
+            else:
+                await self.boot_intake()
+        # Phase 9 Slice 2 — synthetic workload injection.
+        # Composes the canonical UnifiedIntakeRouter pipeline via
+        # IntakeLayerService.ingest_envelope. Headless-only +
+        # config-gated + hard-capped + transparency-tagged. Per
+        # operator binding 2026-05-05: single pipeline, honest
+        # source token, defaults safe, no dilution of P9.2
+        # graduation contract.
+        await self._inject_phase_9_synthetic_workload()
+        _boot_mark("harness_boot_sequence_done")
+
+        # Wire SerpentApprovalProvider — wraps the inner CLIApprovalProvider
+        # with diff preview + interactive [Y/n] Iron Gate prompt when
+        # SerpentFlow is the active transport.
+        try:
+            if hasattr(self, "_serpent_flow") and self._serpent_flow is not None:
+                _gls_ref = self._governed_loop_service
+                _inner_ap = getattr(_gls_ref, "_approval_provider", None)
+                if _inner_ap is not None:
+                    from backend.core.ouroboros.battle_test.serpent_flow import SerpentApprovalProvider
+                    _serpent_ap = SerpentApprovalProvider(flow=self._serpent_flow, inner=_inner_ap)
+                    _gls_ref._approval_provider = _serpent_ap
+                    # Also update the orchestrator's reference
+                    _orch = getattr(_gls_ref, "_orchestrator", None)
+                    if _orch is not None:
+                        _orch._approval_provider = _serpent_ap
+                    logger.info("SerpentApprovalProvider wired (Iron Gate prompt active)")
+        except Exception as _ap_exc:
+            logger.debug("SerpentApprovalProvider wiring failed: %s", _ap_exc)
+
+        logger.info(
+            "Ouroboros is alive — session %s | budget=$%.2f | idle=%ds",
+            self._session_id,
+            self._config.cost_cap_usd,
+            int(self._config.idle_timeout_s),
+        )
+        # ── Compact boot banner via SerpentFlow.boot_banner() ──
+        # Detects active subsystems and renders a single Rich Panel
+        # instead of 30+ loose print lines.
+        _gls = self._governed_loop_service
+        _has_consciousness = (
+            _gls is not None
+            and getattr(_gls, "_consciousness_bridge", None) is not None
+        )
+        _has_strategic = (
+            _gls is not None
+            and getattr(_gls, "_strategic_direction", None) is not None
+            and getattr(_gls._strategic_direction, "is_loaded", False)
+        )
+        _has_tool_loop = (
+            _gls is not None
+            and getattr(_gls, "_config", None) is not None
+            and getattr(_gls._config, "tool_use_enabled", False)
+        )
+        _has_l2 = bool(os.environ.get("JARVIS_L2_ENABLED", "").lower() == "true")
+        _has_bg_pool = (
+            _gls is not None
+            and getattr(_gls, "_bg_pool", None) is not None
+        )
+
+        _n_principles = 0
+        if _has_strategic:
+            _n_principles = len(_gls._strategic_direction.principles)
+
+        _pool_info = (
+            f"parallel ({getattr(_gls._bg_pool, '_pool_size', 2)} workers)"
+            if _has_bg_pool else "sequential"
+        )
+        _venom_info = "bash + web + tests + L2" if _has_l2 else "tools active"
+
+        # Build 6-layer status: (icon, name, is_on, detail)
+        _layers = [
+            ("🧭", "Strategic Direction", _has_strategic, f"{_n_principles} Manifesto principles"),
+            ("🧠", "Consciousness", _has_consciousness, "Memory + Prophecy + Health"),
+            ("📡", "Event Spine", True, "FileWatch → TrinityBus → sensors"),
+            ("⚙️ ", "Ouroboros Pipeline", True, _pool_info),
+            ("🐍", "Venom Agentic Loop", _has_tool_loop, _venom_info),
+            ("📝", "Thought Log", True, "ouroboros_thoughts.jsonl"),
+        ]
+
+        _log_path = getattr(self, "_log_file_path", "")
+
+        if getattr(self, "_awakening_task", None) is not None:
+            # COCKPIT: the ceremony task was already dispatched at t0 by
+            # _start_awakening_t0 (run() calls it immediately after the D1
+            # silent-boot block, BEFORE this region's heavy phases). Await
+            # its completion now -- serialized against the rest of boot --
+            # it owns a Rich Live region on its own console, and its
+            # animate-vs-plain decision read console.is_terminal at t0,
+            # which is only reliable BEFORE the REPL's
+            # patch_stdout(raw=True) wraps stdout (Task 5 review's
+            # load-bearing ordering invariant -- preserved even though
+            # construction moved earlier). Awaited here, regardless of
+            # whether SerpentFlow itself ended up constructing successfully
+            # above, so no later boot-path console.print() (e.g.
+            # SerpentFlow.start()'s ribbon) can interleave with the
+            # Live-owned ceremony.
+            await self._awakening_task
+        elif hasattr(self, "_serpent_flow") and self._serpent_flow is not None:
+            # legacy SOAK banner path -- UNCHANGED
+            self._serpent_flow.boot_banner(
+                layers=_layers,
+                n_sensors=0,  # Updated below after intake boot
+                log_path=_log_path,
+            )
+        else:
+            # Fallback: basic Rich console output
+            from rich.console import Console as _C
+            _c = _C(emoji=True, highlight=False)
+            _c.print("[bold cyan]🐍 OUROBOROS + VENOM[/bold cyan]", highlight=False)
+            _c.print(f"  Session: {self._session_id}", highlight=False)
+            _c.print(f"  Branch:  {self._branch_name or 'N/A'}", highlight=False)
+            _c.print(f"  Budget:  ${self._config.cost_cap_usd:.2f}", highlight=False)
+            _c.print()
+
+        return False
 
     # ------------------------------------------------------------------
     # Boot methods (all overridable for test mocking)
