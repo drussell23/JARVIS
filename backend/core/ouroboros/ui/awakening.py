@@ -240,7 +240,7 @@ class AwakeningConductor:
             return True
         return False
 
-    def _check_resize(self, frame: CrestFrame, tier: ColorTier) -> CrestFrame:
+    def _check_resize(self, frame: CrestFrame) -> CrestFrame:
         """Per-tick SIGWINCH proof (Mandate 4): if the measured console size
         changed since the last tick, regenerate the crest at the new size.
 
@@ -306,7 +306,7 @@ class AwakeningConductor:
                     elapsed = now - start
 
                     self._poll_keys(poll)
-                    frame = self._check_resize(frame, tier)
+                    frame = self._check_resize(frame)
 
                     # Deliberately NOT wrapped in try/except: a rendering
                     # failure must propagate out to run()'s outer handler
