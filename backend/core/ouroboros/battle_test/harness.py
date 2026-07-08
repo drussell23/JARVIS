@@ -3449,6 +3449,21 @@ class BattleTestHarness:
                 workspace_branch,
             )
             branch_name = workspace_branch(self._session_id)
+
+            # ov cockpit silence Slice 2 Task 5 (F4) — sweep dangling
+            # ouroboros/auto/* debris from dead sessions BEFORE
+            # creating this session's own worktree, closing the
+            # boot-time "branch already exists" collision that left
+            # AutoCommitter refusing commits all session. Fail-soft:
+            # a reaper error must never block worktree creation.
+            try:
+                await mgr.reap_dangling_auto_branches(current_branch=branch_name)
+            except Exception as reap_err:  # noqa: BLE001 — fail-soft
+                logger.warning(
+                    "[ledger_sovereignty] dangling ouroboros/auto/* "
+                    "reap failed (non-fatal): %r", reap_err,
+                )
+
             wt_path = await mgr.create(branch_name)
         except Exception as wt_err:  # noqa: BLE001 — fail-open
             logger.warning(

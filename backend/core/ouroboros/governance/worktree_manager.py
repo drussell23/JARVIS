@@ -502,6 +502,220 @@ class WorktreeManager:
             )
         return len(reaped)
 
+    async def reap_dangling_auto_branches(
+        self,
+        *,
+        current_branch: Optional[str] = None,
+        branch_prefix: str = "ouroboros/auto/",
+    ) -> int:
+        """ov cockpit silence Slice 2 Task 5 (F4) — sweep dangling
+        ``ouroboros/auto/<session>-<nonce>`` branches + their
+        registered worktrees left behind by a dead session, BEFORE the
+        current session's own ``WorktreeManager.create(branch_name)``
+        call. The observed failure was ``[ledger_sovereignty]
+        auto-commit worktree create failed: fatal: a branch named
+        '...' already exists`` at boot — after which AutoCommitter
+        refuses commits for the rest of the session (the create-path
+        fail-open catch in ``_boot_ledger_sovereignty_workspace``
+        never retries).
+
+        Unlike :meth:`reap_orphans` (``unit-*`` — safe to blind-sweep,
+        since L3 work units never survive a process boundary by
+        design), an ``ouroboros/auto/*`` branch IS the Ledger-
+        Sovereignty commit workspace: ``AutoCommitter``'s default
+        posture (``JARVIS_AUTO_PUSH_BRANCH=""``) never pushes it
+        anywhere, and nothing in this codebase merges or cherry-picks
+        it back into the operator's checkout — autonomous commits stay
+        quarantined by design (Sovereign Execution Boundary). A dead
+        session's branch CAN therefore hold real unpushed, unreviewed
+        work. This method reaps in two independently-gated steps:
+
+          1. **Worktree directory** — removed once the creating
+             session is PROVEN dead via the ``ledger_sovereignty``
+             ownership marker's ``creator_pid``, probed with
+             ``os.kill(pid, 0)`` (the same PID-liveness idiom
+             ``_cleanup_stale_router_lock`` already uses in the boot
+             script). The branch ref alone keeps any commits
+             reachable, so removing only the checkout never loses
+             data. A missing/unreadable marker, a live PID, or a
+             permission error probing the PID all mean "leave it
+             alone" — never touch anything we can't PROVE is dead.
+          2. **Branch ref** — only deleted when its tip commit is
+             reachable from some OTHER ref too (``git for-each-ref
+             --contains <branch>`` returns more than the branch
+             itself). A dead session that never reached APPLY+VERIFY+
+             commit (the overwhelmingly common case) leaves a branch
+             tip identical to the commit it forked from — trivially
+             reachable from ``main``/other branches, so deleting the
+             label loses nothing. A branch with unique, unreachable
+             commits is intentionally LEFT ALONE (forensic evidence
+             over cleanliness); the worktree-directory removal above
+             already reclaims the disk debris, and the next session
+             mints a freshly-nonced branch name regardless, so a rare
+             orphaned-but-unique branch does not block boot.
+
+        ``current_branch`` (the branch this session is about to
+        create, or already owns) is NEVER touched — exact string
+        match. Anything not matching ``branch_prefix`` is untouched:
+        ``unit-*`` worktrees are structurally out of scope here
+        (reaped separately by :meth:`reap_orphans`).
+
+        NEVER raises — any per-entry failure is logged and skipped.
+        Returns the count of worktree directories reaped (mirrors
+        :meth:`reap_orphans`'s return contract; branch-only reaps of
+        already-worktree-less refs are not counted).
+        """
+        reaped: Set[str] = set()
+
+        try:
+            from backend.core.ouroboros.governance.ledger_sovereignty import (  # noqa: E501
+                read_ownership,
+            )
+        except Exception:  # noqa: BLE001 — defensive import
+            read_ownership = None  # type: ignore[assignment]
+
+        def _owner_is_dead(wt_path: Path) -> bool:
+            """True ONLY when we have positive proof the creating PID
+            is gone. Any uncertainty returns False — never touch."""
+            if read_ownership is None:
+                return False
+            try:
+                record = read_ownership(wt_path)
+            except Exception:  # noqa: BLE001
+                return False
+            if record is None:
+                return False
+            pid = record.creator_pid
+            if not pid or pid <= 0:
+                return False
+            if pid == os.getpid():
+                return False  # this process itself — never reap our own
+            try:
+                os.kill(pid, 0)
+                return False  # alive — existence probe succeeded
+            except ProcessLookupError:
+                return True  # definitively dead
+            except PermissionError:
+                return False  # different-user live process — conservative
+            except OSError:
+                return False  # unknown — conservative
+
+        try:
+            porcelain = await self._run_git_capture(
+                ["worktree", "list", "--porcelain"],
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            porcelain = ""
+
+        entries = _parse_worktree_porcelain(porcelain)
+        known_registered = {
+            e.get("branch", "")[len("refs/heads/"):]
+            for e in entries
+            if e.get("branch", "").startswith("refs/heads/")
+        }
+        dangling_branches: "list[str]" = []
+
+        for entry in entries:
+            path_str = entry.get("worktree", "")
+            if not path_str:
+                continue
+            wt_path = Path(path_str)
+            branch_ref = entry.get("branch", "")
+            branch_short = (
+                branch_ref[len("refs/heads/"):]
+                if branch_ref.startswith("refs/heads/")
+                else ""
+            )
+            if not branch_short.startswith(branch_prefix):
+                continue
+            if current_branch and branch_short == current_branch:
+                continue
+            if not _owner_is_dead(wt_path):
+                continue  # live, unknown, or unowned — never touch
+
+            git_ok = await self._git_worktree_remove(wt_path)
+            if git_ok:
+                reaped.add(str(wt_path))
+            elif wt_path.exists():
+                try:
+                    shutil.rmtree(wt_path)
+                    reaped.add(str(wt_path))
+                except OSError as exc:
+                    logger.warning(
+                        "WorktreeManager.reap_dangling_auto_branches: "
+                        "rmtree(%s) failed: %s", wt_path, exc,
+                    )
+                    continue  # dir removal failed — don't touch the branch
+            dangling_branches.append(branch_short)
+
+        # Bare branch refs matching the prefix that have NO registered
+        # worktree at all (e.g. a prior worktree was already removed
+        # but the ref survived). A branch that still has a LIVE
+        # (not-just-reaped) registered worktree is protected here too.
+        try:
+            refs_out = await self._run_git_capture(
+                ["for-each-ref", "--format=%(refname:short)", f"refs/heads/{branch_prefix}*"],
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            refs_out = ""
+        for name in refs_out.splitlines():
+            name = name.strip()
+            if not name.startswith(branch_prefix):
+                continue
+            if current_branch and name == current_branch:
+                continue
+            if name in known_registered and name not in dangling_branches:
+                continue  # still has a live registered worktree
+            if name not in dangling_branches:
+                dangling_branches.append(name)
+
+        for branch_short in dangling_branches:
+            try:
+                reachable = await self._branch_reachable_elsewhere(branch_short)
+            except Exception:  # noqa: BLE001 — conservative on error
+                reachable = False
+            if reachable:
+                await self._git_delete_branch(branch_short)
+            else:
+                logger.info(
+                    "WorktreeManager.reap_dangling_auto_branches: "
+                    "preserving branch %s — tip not reachable from any "
+                    "other ref (possible unpushed autonomous commits; "
+                    "worktree already reaped, branch left as forensic "
+                    "evidence)",
+                    branch_short,
+                )
+
+        try:
+            await self._run_git_capture(["worktree", "prune"])
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+
+        if reaped:
+            logger.info(
+                "WorktreeManager.reap_dangling_auto_branches: reaped %d "
+                "dangling worktree(s) from dead sessions",
+                len(reaped),
+            )
+        return len(reaped)
+
+    async def _branch_reachable_elsewhere(self, branch: str) -> bool:
+        """True iff ``branch``'s tip commit is reachable from some ref
+        OTHER than ``branch`` itself — i.e. deleting the branch label
+        would not make the commit unreachable (safe to prune). Used to
+        decide whether a dangling ``ouroboros/auto/*`` branch's ref
+        can be deleted without risking unpushed/unmerged autonomous
+        work. NEVER raises — a git failure is treated as "not
+        reachable" (conservative — leaves the branch alone)."""
+        out = await self._run_git_capture(
+            ["for-each-ref", "--format=%(refname:short)", "--contains", branch],
+        )
+        others = [
+            line.strip() for line in out.splitlines()
+            if line.strip() and line.strip() != branch
+        ]
+        return bool(others)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

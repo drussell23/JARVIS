@@ -458,6 +458,97 @@ def _reap_stale_jarvis_locks(
     return reaped
 
 
+def _reap_stale_cross_process_jsonl_locks(
+    jarvis_dir: "Path",
+    now: "float | None" = None,
+    *,
+    quiet: bool = False,
+) -> int:
+    """ov cockpit silence Slice 2 Task 5 (F3) — sweep stale
+    ``.jarvis/**/*.jsonl.lock`` files at boot, ahead of (and at a
+    tighter threshold than) the coarser 24h ``_reap_stale_jarvis_locks``
+    debris sweep.
+
+    A live battle-test session (bt-2026-07-08-013911) logged::
+
+        WARNING [CrossProcessJSONL] stale_lock_detected
+            path=.jarvis/coherence_window.jsonl.lock age_s=29261 threshold_s=300
+
+    An 8h-stale lock from a dead session survives boot because
+    ``_reap_stale_jarvis_locks``'s debris sweep uses a 24h default —
+    far looser than the 300s (5 min) threshold the runtime module
+    itself already treats as stale
+    (:func:`cross_process_jsonl.stale_lock_age_s`, env
+    ``JARVIS_STALE_LOCK_AGE_S``). This function reuses that SAME
+    threshold rather than inventing a new one (Mandate 3, DRY).
+
+    Liveness detection: these lock files carry no PID payload (unlike
+    ``intake_router.lock``'s ``{"pid": ..., "ts": ...}``) — the file
+    is a pure ``fcntl.flock`` target created by
+    ``cross_process_jsonl._acquire_cross_process_lock``. The correct
+    liveness proxy is therefore the SAME primitive the module uses
+    internally: a non-blocking flock attempt via
+    :func:`cross_process_jsonl.flock_critical_section`. If a live
+    process currently holds the lock, the attempt fails immediately
+    and the lock is left untouched — NEVER reaped, regardless of age
+    (binding constraint: never touch a lock owned by a live PID).
+    Only when BOTH conditions hold — the lock is uncontended right
+    now AND its mtime exceeds the threshold — is it removed, deleting
+    the file while still holding our own flock (the same TOCTOU-safe
+    pattern ``_cleanup_stale_router_lock`` already uses: unlink on an
+    open fd is safe on POSIX, and the kernel releases the flock when
+    the fd closes on ``__exit__``).
+
+    Fail-soft: any per-file or import error is swallowed and the file
+    is left alone; the function itself NEVER raises. ``quiet``
+    withholds only the summary print (Mandate 1 presentation gate) —
+    the reap side effects always run. Returns the count reaped.
+    """
+    if not jarvis_dir.exists():
+        return 0
+    try:
+        from backend.core.ouroboros.governance.cross_process_jsonl import (
+            flock_critical_section,
+            stale_lock_age_s,
+        )
+    except Exception:
+        return 0  # substrate unavailable — nothing to reuse, skip safely
+
+    cutoff_age = stale_lock_age_s()
+    now_ts = time.time() if now is None else now
+    reaped = 0
+    try:
+        candidates = list(jarvis_dir.rglob("*.jsonl.lock"))
+    except OSError:
+        return 0
+    for lock in candidates:
+        try:
+            age = now_ts - lock.stat().st_mtime
+        except OSError:
+            continue  # raced/removed — leave it
+        if age <= cutoff_age:
+            continue  # fresh enough — a live session may be about to use it
+        data_path = lock.with_suffix("")  # strip only the trailing ".lock"
+        try:
+            with flock_critical_section(data_path, timeout_s=0.05) as acquired:
+                if not acquired:
+                    continue  # live holder — NEVER touch (binding constraint)
+                try:
+                    lock.unlink()
+                    reaped += 1
+                except OSError:
+                    continue  # raced/removed — leave it
+        except Exception:
+            continue  # fail-soft — reaper errors never block boot
+    if reaped and not quiet:
+        print(
+            f"  {_DIM}  reaped {reaped} stale CrossProcessJSONL lock file(s) "
+            f"(>{cutoff_age:.0f}s idle, threshold reused from "
+            f"JARVIS_STALE_LOCK_AGE_S){_RESET}"
+        )
+    return reaped
+
+
 def _single_flight_preflight(*, quiet: bool = False) -> None:
     """Harness Epic Slice 2 — single-flight launcher enforcement.
 
@@ -1477,6 +1568,15 @@ def main(argv: "list[str] | None" = None) -> None:
             )
             _reap_stale_jarvis_locks(
                 _PROJECT_ROOT / ".jarvis", max_age_s=_stale_lock_age_s,
+            )
+            # ov cockpit silence Slice 2 Task 5 (F3) — tighter,
+            # threshold-matched sweep for CrossProcessJSONL's own
+            # *.jsonl.lock files (300s default vs. the 24h debris
+            # default above). Runs after the coarse sweep so it never
+            # duplicates work; unrelated .lock files are untouched.
+            _reap_stale_cross_process_jsonl_locks(
+                _PROJECT_ROOT / ".jarvis",
+                quiet=(_mode is PresentationMode.COCKPIT),
             )
 
     # ------------------------------------------------------------------
