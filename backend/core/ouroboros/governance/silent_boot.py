@@ -55,14 +55,47 @@ Kill switches:
   * ``JARVIS_SILENT_BOOT_LOG_FILENAME`` — filename inside the supplied
     session_dir. Default ``debug.log``. Operators may use ``boot.log``
     if they want a separate file from the existing debug.log.
+
+ov cockpit silence (Slice 2, 2026-07): a live COCKPIT run proved
+``WARNING`` alone is insufficient -- this codebase uses ``logger.
+warning(...)`` for routine boot chatter (see ``[DiscordBridge]``,
+``[asyncio leak]`` etc.), so the terminal still flooded even after
+Slice 1's PresentationMode gate. ``configure_silent_boot`` now takes
+an optional ``mode`` (:class:`~backend.core.ouroboros.ui.
+presentation_mode.PresentationMode`); when unset it resolves via
+``presentation_mode.resolve_presentation_mode()`` (env-driven,
+fail-safe to SOAK). Precedence for the terminal-handler threshold:
+
+  1. explicit ``terminal_threshold`` kwarg (caller/test override --
+     unchanged from pre-Slice-2 behavior)
+  2. explicit operator override via ``JARVIS_SILENT_BOOT_TERMINAL_LEVEL``
+     (honored in EITHER mode -- operators asking for a specific level
+     are never silenced)
+  3. mode-aware default: COCKPIT -> ``ERROR`` (only fatal-adjacent
+     events reach the terminal); SOAK -> ``terminal_level()``'s
+     existing default (``WARNING``) -- byte-identical to pre-Slice-2.
+
+The root logger is unaffected by this change: ``_configure_locked``
+already calls ``root.setLevel(logging.DEBUG)`` unconditionally so the
+DEBUG-fidelity file handler sees everything; only the per-handler
+level on the terminal StreamHandler differs by mode. No double-
+emission: the same pre-existing loop that strips competing
+``StreamHandler`` instances (the caller's ``basicConfig`` handler)
+before installing our own terminal handler is untouched.
 """
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 from pathlib import Path
 from typing import Any, List, Optional
+
+from backend.core.ouroboros.ui.presentation_mode import (
+    PresentationMode,
+    resolve_presentation_mode,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -148,6 +181,33 @@ def log_filename() -> str:
     return name or "debug.log"
 
 
+def _resolve_terminal_threshold(
+    mode: PresentationMode,
+    explicit_threshold: Optional[int],
+) -> int:
+    """Resolve the terminal-handler threshold (ov cockpit silence,
+    Slice 2). Precedence, highest first:
+
+      1. ``explicit_threshold`` — caller/test override, unchanged
+         contract from pre-Slice-2 ``configure_silent_boot``.
+      2. ``JARVIS_SILENT_BOOT_TERMINAL_LEVEL`` explicitly set by the
+         operator — honored in EITHER mode; an operator who asked for
+         a specific level is never silenced by the mode default.
+      3. Mode-aware default: COCKPIT -> ``ERROR`` (boot chatter uses
+         ``logger.warning(...)`` throughout this codebase, so WARNING
+         alone still floods the cockpit terminal); SOAK ->
+         ``terminal_level()``'s existing default (``WARNING``,
+         byte-identical to pre-Slice-2 behavior).
+    """
+    if explicit_threshold is not None:
+        return explicit_threshold
+    if os.environ.get(_FLAG_SILENT_BOOT_TERMINAL_LEVEL) is not None:
+        return terminal_level()
+    if mode is PresentationMode.COCKPIT:
+        return logging.ERROR
+    return terminal_level()
+
+
 # ---------------------------------------------------------------------------
 # Public API: configure_silent_boot
 # ---------------------------------------------------------------------------
@@ -158,9 +218,19 @@ def configure_silent_boot(
     *,
     terminal_threshold: Optional[int] = None,
     log_filename_override: Optional[str] = None,
+    mode: Optional[PresentationMode] = None,
 ) -> Optional[logging.Handler]:
     """Reconfigure the root logger so boot-time INFO/DEBUG goes to
-    ``session_dir/debug.log`` and only WARNING+ surfaces on terminal.
+    ``session_dir/debug.log`` and only WARNING+ (SOAK) / ERROR+
+    (COCKPIT) surfaces on terminal.
+
+    ``mode`` (ov cockpit silence, Slice 2): when ``None`` (the
+    default), resolved internally via
+    ``presentation_mode.resolve_presentation_mode()`` — matches the
+    existing direct-read convention used elsewhere in this codebase
+    (e.g. ``harness.build_awakening_for_cockpit``). Callers that
+    already computed the mode may pass it explicitly to avoid a
+    redundant env read.
 
     Returns the installed session-sink handler so callers (the
     harness) can retain a reference for explicit close on shutdown.
@@ -196,6 +266,7 @@ def configure_silent_boot(
                 session_dir=session_dir,
                 terminal_threshold=terminal_threshold,
                 log_filename_override=log_filename_override,
+                mode=mode,
             )
         except Exception:  # noqa: BLE001 — never block boot
             logger.debug(
@@ -209,10 +280,23 @@ def _configure_locked(
     session_dir: Any,
     terminal_threshold: Optional[int],
     log_filename_override: Optional[str],
+    mode: Optional[PresentationMode] = None,
 ) -> Optional[logging.Handler]:
     """Internal — actual configuration logic, runs under the module
     lock. Same defensive contract as the public wrapper."""
     root = logging.getLogger()
+
+    # ov cockpit silence (Slice 2) — resolve the presentation mode
+    # once, up front. Never raises: resolve_presentation_mode() is a
+    # pure stdlib env read that fails safe to SOAK on its own; the
+    # try/except here is belt-and-suspenders against a future
+    # refactor of that function.
+    try:
+        _resolved_mode = (
+            mode if mode is not None else resolve_presentation_mode()
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        _resolved_mode = PresentationMode.SOAK
 
     # Idempotency: if our marker handler is already installed,
     # return it. Caller may have called us a second time during a
@@ -298,13 +382,14 @@ def _configure_locked(
                 )
 
     # Install a NEW terminal stream handler at the configured
-    # threshold (default WARNING). This is the operator-facing
-    # surface — error/warning events still reach them; INFO chatter
-    # goes only to the file.
+    # threshold (COCKPIT: ERROR; SOAK: WARNING default — see
+    # _resolve_terminal_threshold). This is the operator-facing
+    # surface — error/warning (SOAK) or error-only (COCKPIT) events
+    # still reach them; everything below the threshold goes only to
+    # the file.
     try:
-        threshold = (
-            terminal_threshold if terminal_threshold is not None
-            else terminal_level()
+        threshold = _resolve_terminal_threshold(
+            _resolved_mode, terminal_threshold,
         )
         term_handler = logging.StreamHandler(stream=sys.stderr)
         term_handler.setLevel(threshold)

@@ -154,6 +154,21 @@ class HeartbeatConsoleHandler(logging.Handler):
             self._count += 1
             if not _env_bool(_FLAG_HB_ENABLED, True):
                 return
+            # ov cockpit silence (Slice 2) — the heartbeat is a
+            # headless-session liveness surface; COCKPIT has its own
+            # boot skin and must never render it. Lazy + defensive
+            # import: presentation_mode is a stdlib-only leaf module,
+            # but a failure here must never break the (pre-existing)
+            # heartbeat contract of "never raises" — fall through to
+            # legacy behavior on any import/read error.
+            try:
+                from backend.core.ouroboros.ui.presentation_mode import (
+                    is_cockpit,
+                )
+                if is_cockpit():
+                    return
+            except Exception:  # noqa: BLE001 — defensive
+                pass
             stream = self._stream
             if stream is None or not getattr(stream, "isatty", lambda: False)():
                 return

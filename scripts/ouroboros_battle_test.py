@@ -77,15 +77,25 @@ for _env_var, _env_value in _SLICE12X_TELEMETRY_DEFAULTS:
             _slice12x_applied.append(_env_var)
     except Exception:  # noqa: BLE001 — never raise during boot
         pass
+# ov cockpit silence (Slice 2) — this pure-ceremony marker is gated on
+# presentation mode. Only ``os``/``sys`` are importable this early
+# (see the block comment above), so we can't import
+# ``presentation_mode.resolve_presentation_mode`` yet; the raw env
+# check below mirrors that function's exact resolution logic
+# (stripped + lowercased comparison, fail-safe to SOAK/print).
+_ov_mode_for_boot_exorcism = (
+    _os_for_boot_exorcism.environ.get("JARVIS_OV_PRESENTATION") or ""
+).strip().lower()
 try:
-    _sys_for_boot_exorcism.stderr.write(
-        "[Slice12X.BootExorcism] script-top env hygiene applied — "
-        "pre-import telemetry kill switches set: "
-        + (",".join(_slice12x_applied) if _slice12x_applied
-           else "<none-needed, all pre-set>")
-        + " (operator overrides preserved via setdefault)\n"
-    )
-    _sys_for_boot_exorcism.stderr.flush()
+    if _ov_mode_for_boot_exorcism != "cockpit":
+        _sys_for_boot_exorcism.stderr.write(
+            "[Slice12X.BootExorcism] script-top env hygiene applied — "
+            "pre-import telemetry kill switches set: "
+            + (",".join(_slice12x_applied) if _slice12x_applied
+               else "<none-needed, all pre-set>")
+            + " (operator overrides preserved via setdefault)\n"
+        )
+        _sys_for_boot_exorcism.stderr.flush()
 except Exception:  # noqa: BLE001 — never raise during boot
     pass
 
@@ -101,6 +111,7 @@ import textwrap
 import time
 import warnings
 from pathlib import Path
+from typing import Any
 
 # Python 3.9 compat: patch packages_distributions before any library touches it
 if not hasattr(_metadata, "packages_distributions"):
@@ -697,6 +708,56 @@ def _resolve_boot_log_level(mode: PresentationMode, *, verbose: bool = False) ->
     if mode is PresentationMode.COCKPIT:
         return logging.WARNING
     return logging.INFO
+
+
+def _print_battle_test_defaults_banner(
+    caps_result: Any, mode: PresentationMode,
+) -> None:
+    """``[BattleTestDefaults]`` boot line -- ov cockpit silence (Slice 2).
+
+    The success line is pure ceremony, gated at the source: COCKPIT
+    withholds, SOAK prints (unchanged). The WARNING/failure line stays
+    UNCONDITIONAL in both modes (Mandate 1: fatal-adjacent telemetry
+    never routes through a presentation gate). Extracted to a free
+    function so it's spy-testable without booting the full ``main()``.
+    """
+    if caps_result.ok:
+        if mode is not PresentationMode.COCKPIT:
+            print(
+                f"[BattleTestDefaults] session_cap_source={caps_result.session_cap_source} "
+                f"hourly_burn_cap_source={caps_result.hourly_burn_cap_source} "
+                f"({caps_result.detail})"
+            )
+    else:
+        print(f"[BattleTestDefaults] WARNING: {caps_result.detail} — boot continues", file=sys.stderr)
+
+
+def _print_ledger_hygiene_banner(
+    hygiene_result: Any, mode: PresentationMode,
+) -> None:
+    """``[LedgerHygiene]`` boot line -- ov cockpit silence (Slice 2).
+
+    The skipped/ok lines are pure ceremony, gated at the source:
+    COCKPIT withholds, SOAK prints (unchanged). The WARNING/failure
+    line stays UNCONDITIONAL in both modes (Mandate 1). Extracted to a
+    free function so it's spy-testable without booting the full
+    ``main()``.
+    """
+    if hygiene_result.skipped:
+        if mode is not PresentationMode.COCKPIT:
+            print(f"[LedgerHygiene] skipped (operator opt-out): {hygiene_result.detail}")
+    elif hygiene_result.ok:
+        if mode is not PresentationMode.COCKPIT:
+            _bits = []
+            if hygiene_result.rotated_path:
+                _bits.append(f"rotated→{hygiene_result.rotated_path}")
+            if hygiene_result.lock_removed:
+                _bits.append("lock_removed")
+            if hygiene_result.pruned_count:
+                _bits.append(f"pruned={hygiene_result.pruned_count}")
+            print(f"[LedgerHygiene] {' '.join(_bits) or 'no-op (fresh WAL)'}")
+    else:
+        print(f"[LedgerHygiene] WARNING: {hygiene_result.detail} — boot continues", file=sys.stderr)
 
 
 def _render_multi_op_and_exit(arg: str, *, color: bool) -> None:
@@ -1581,14 +1642,7 @@ def main(argv: "list[str] | None" = None) -> None:
         default_battle_test_caps as _default_battle_test_caps,
     )
     _caps_result = _default_battle_test_caps()
-    if _caps_result.ok:
-        print(
-            f"[BattleTestDefaults] session_cap_source={_caps_result.session_cap_source} "
-            f"hourly_burn_cap_source={_caps_result.hourly_burn_cap_source} "
-            f"({_caps_result.detail})"
-        )
-    else:
-        print(f"[BattleTestDefaults] WARNING: {_caps_result.detail} — boot continues", file=sys.stderr)
+    _print_battle_test_defaults_banner(_caps_result, _mode)
 
     # ------------------------------------------------------------------
     # Aegis battle-test ledger hygiene (Slice 2B-iii.1)
@@ -1613,19 +1667,7 @@ def main(argv: "list[str] | None" = None) -> None:
     _hygiene_result = _rotate_aegis_wal_for_battle_test(
         session_tag=_hygiene_session_tag,
     )
-    if _hygiene_result.skipped:
-        print(f"[LedgerHygiene] skipped (operator opt-out): {_hygiene_result.detail}")
-    elif _hygiene_result.ok:
-        _bits = []
-        if _hygiene_result.rotated_path:
-            _bits.append(f"rotated→{_hygiene_result.rotated_path}")
-        if _hygiene_result.lock_removed:
-            _bits.append("lock_removed")
-        if _hygiene_result.pruned_count:
-            _bits.append(f"pruned={_hygiene_result.pruned_count}")
-        print(f"[LedgerHygiene] {' '.join(_bits) or 'no-op (fresh WAL)'}")
-    else:
-        print(f"[LedgerHygiene] WARNING: {_hygiene_result.detail} — boot continues", file=sys.stderr)
+    _print_ledger_hygiene_banner(_hygiene_result, _mode)
 
     # ------------------------------------------------------------------
     # Aegis preflight (Arc #1 — out-of-process egress + budget chokepoint)

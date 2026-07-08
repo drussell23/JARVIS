@@ -385,6 +385,35 @@ def _resolve_active_session_dir(default_dir: Path) -> Path:
         return default_dir
 
 
+def _print_discord_bridge_boot_banner(enabled: bool) -> None:
+    """``[DiscordBridge] boot:`` line -- ov cockpit silence (Slice 2, Task 1).
+
+    Pure ceremony (the functional arm/skip decision + its outcome are
+    still logged via ``logger.warning`` immediately below the call
+    site -- those already route through the presentation-aware
+    console handler installed by ``silent_boot.configure_silent_boot``
+    and are silenced in COCKPIT there). This raw ``print`` bypasses
+    logging entirely, so it needs its own gate: COCKPIT withholds,
+    SOAK prints (unchanged). Extracted to a free function so it's
+    spy-testable without booting the full async harness. NEVER raises
+    -- a presentation-mode read failure falls back to printing (the
+    legacy, always-visible behavior) rather than silently swallowing
+    the diagnostic.
+    """
+    try:
+        from backend.core.ouroboros.ui.presentation_mode import is_cockpit
+        cockpit = is_cockpit()
+    except Exception:  # noqa: BLE001 — defensive
+        cockpit = False
+    if cockpit:
+        return
+    print(
+        f"[DiscordBridge] boot: enabled={enabled} "
+        f"(JARVIS_DISCORD_BRIDGE_ENABLED)",
+        file=sys.stderr, flush=True,
+    )
+
+
 def build_awakening_for_cockpit(
     console: Any,
     *,
@@ -1030,11 +1059,7 @@ class BattleTestHarness:
                 run_bridge_against_broker,
             )
             _bridge_on = discord_bridge_enabled()
-            print(
-                f"[DiscordBridge] boot: enabled={_bridge_on} "
-                f"(JARVIS_DISCORD_BRIDGE_ENABLED)",
-                file=sys.stderr, flush=True,
-            )
+            _print_discord_bridge_boot_banner(_bridge_on)
             if _bridge_on:
                 self._discord_bridge_task = asyncio.create_task(
                     run_bridge_against_broker(stop=self._shutdown_event)

@@ -115,3 +115,171 @@ def test_error_records_pass_in_cockpit(caplog):
     messages = [r.message for r in caplog.records]
     assert "initialization collapse" in messages
     assert "fatal" in messages
+
+
+# ---------------------------------------------------------------------------
+# ov cockpit silence (Slice 2, Task 1) -- named raw-print sites gated on
+# PresentationMode. Spy pattern: exercise the extracted free functions
+# directly (no need to boot the full stack).
+# ---------------------------------------------------------------------------
+
+
+def _fake_caps_result(*, ok: bool, detail: str = "detail-x"):
+    from backend.core.ouroboros.aegis.battle_test_defaults import CapsResult
+    return CapsResult(
+        ok=ok, session_cap_source="default",
+        hourly_burn_cap_source="default", detail=detail,
+    )
+
+
+def _fake_hygiene_result(*, ok: bool, skipped: bool = False, detail: str = "detail-y"):
+    from backend.core.ouroboros.aegis.ledger_hygiene import HygieneResult
+    return HygieneResult(ok=ok, skipped=skipped, detail=detail)
+
+
+class TestBattleTestDefaultsBannerGate:
+    def test_ok_banner_skipped_in_cockpit(self, capsys):
+        bt._print_battle_test_defaults_banner(
+            _fake_caps_result(ok=True), PresentationMode.COCKPIT,
+        )
+        captured = capsys.readouterr()
+        assert "[BattleTestDefaults]" not in captured.out
+        assert "[BattleTestDefaults]" not in captured.err
+
+    def test_ok_banner_prints_in_soak(self, capsys):
+        bt._print_battle_test_defaults_banner(
+            _fake_caps_result(ok=True), PresentationMode.SOAK,
+        )
+        captured = capsys.readouterr()
+        assert "[BattleTestDefaults]" in captured.out
+
+    def test_warning_banner_unconditional_in_cockpit(self, capsys):
+        """The failure path is fatal-adjacent telemetry (Mandate 1) --
+        it must print in COCKPIT too."""
+        bt._print_battle_test_defaults_banner(
+            _fake_caps_result(ok=False), PresentationMode.COCKPIT,
+        )
+        captured = capsys.readouterr()
+        assert "[BattleTestDefaults] WARNING" in captured.err
+
+    def test_warning_banner_unconditional_in_soak(self, capsys):
+        bt._print_battle_test_defaults_banner(
+            _fake_caps_result(ok=False), PresentationMode.SOAK,
+        )
+        captured = capsys.readouterr()
+        assert "[BattleTestDefaults] WARNING" in captured.err
+
+
+class TestLedgerHygieneBannerGate:
+    def test_ok_banner_skipped_in_cockpit(self, capsys):
+        bt._print_ledger_hygiene_banner(
+            _fake_hygiene_result(ok=True), PresentationMode.COCKPIT,
+        )
+        captured = capsys.readouterr()
+        assert "[LedgerHygiene]" not in captured.out
+        assert "[LedgerHygiene]" not in captured.err
+
+    def test_ok_banner_prints_in_soak(self, capsys):
+        bt._print_ledger_hygiene_banner(
+            _fake_hygiene_result(ok=True), PresentationMode.SOAK,
+        )
+        captured = capsys.readouterr()
+        assert "[LedgerHygiene]" in captured.out
+
+    def test_skipped_banner_skipped_in_cockpit(self, capsys):
+        bt._print_ledger_hygiene_banner(
+            _fake_hygiene_result(ok=True, skipped=True),
+            PresentationMode.COCKPIT,
+        )
+        captured = capsys.readouterr()
+        assert "[LedgerHygiene]" not in captured.out
+
+    def test_skipped_banner_prints_in_soak(self, capsys):
+        bt._print_ledger_hygiene_banner(
+            _fake_hygiene_result(ok=True, skipped=True),
+            PresentationMode.SOAK,
+        )
+        captured = capsys.readouterr()
+        assert "[LedgerHygiene] skipped" in captured.out
+
+    def test_warning_banner_unconditional_in_cockpit(self, capsys):
+        bt._print_ledger_hygiene_banner(
+            _fake_hygiene_result(ok=False), PresentationMode.COCKPIT,
+        )
+        captured = capsys.readouterr()
+        assert "[LedgerHygiene] WARNING" in captured.err
+
+    def test_warning_banner_unconditional_in_soak(self, capsys):
+        bt._print_ledger_hygiene_banner(
+            _fake_hygiene_result(ok=False), PresentationMode.SOAK,
+        )
+        captured = capsys.readouterr()
+        assert "[LedgerHygiene] WARNING" in captured.err
+
+
+class TestBootExorcismMarkerGate:
+    """The script-top ``[Slice12X.BootExorcism]`` marker is pure ceremony
+    and gated via a raw env check (only os/sys are importable that early).
+    Verified via the same subprocess-driver technique as
+    test_slice12x_boot_supremacy.py::TestPhase1ScriptTopRuntime."""
+
+    def _run_script_top(self, tmp_path, extra_env: dict):
+        import os
+        import subprocess
+        import sys
+
+        driver = tmp_path / "driver.py"
+        driver.write_text(
+            "with open('scripts/ouroboros_battle_test.py') as f:\n"
+            "    src = f.read()\n"
+            "cut = src.find('import argparse')\n"
+            "assert cut > 0\n"
+            "exec(src[:cut + len('import argparse')])\n"
+        )
+        env = dict(os.environ)
+        env.update(extra_env)
+        env["PYTHONPATH"] = os.getcwd()
+        return subprocess.run(
+            [sys.executable, str(driver)],
+            capture_output=True, text=True, timeout=30,
+            env=env, cwd=os.getcwd(),
+        )
+
+    def test_marker_withheld_in_cockpit(self, tmp_path):
+        result = self._run_script_top(
+            tmp_path, {"JARVIS_OV_PRESENTATION": "cockpit"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Slice12X.BootExorcism" not in result.stderr
+
+    def test_marker_printed_in_soak(self, tmp_path):
+        result = self._run_script_top(
+            tmp_path, {"JARVIS_OV_PRESENTATION": "soak"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Slice12X.BootExorcism" in result.stderr
+
+    def test_marker_printed_when_unset(self, tmp_path):
+        import os as _os
+        env = {"JARVIS_OV_PRESENTATION": ""}
+        result = self._run_script_top(tmp_path, env)
+        assert result.returncode == 0, result.stderr
+        assert "Slice12X.BootExorcism" in result.stderr
+
+
+class TestDiscordBridgeBannerGate:
+    def test_banner_skipped_in_cockpit(self, monkeypatch, capsys):
+        from backend.core.ouroboros.battle_test import harness as bt_harness
+
+        monkeypatch.setenv("JARVIS_OV_PRESENTATION", "cockpit")
+        bt_harness._print_discord_bridge_boot_banner(True)
+        captured = capsys.readouterr()
+        assert "[DiscordBridge] boot:" not in captured.err
+
+    def test_banner_prints_in_soak(self, monkeypatch, capsys):
+        from backend.core.ouroboros.battle_test import harness as bt_harness
+
+        monkeypatch.setenv("JARVIS_OV_PRESENTATION", "soak")
+        bt_harness._print_discord_bridge_boot_banner(True)
+        captured = capsys.readouterr()
+        assert "[DiscordBridge] boot: enabled=True" in captured.err
