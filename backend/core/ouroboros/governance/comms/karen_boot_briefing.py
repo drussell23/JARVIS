@@ -161,7 +161,11 @@ class BootBriefing:
                 sink(line)
             except Exception:  # noqa: BLE001
                 logger.debug("[briefing] sink failed", exc_info=True)
-            return                        # speak wins; text is the fallback
+            # Deliver to the FIRST configured sink only, then stop: speak_sink
+            # is the cockpit path; text_sink is the voice-off alternative used
+            # when speak_sink is None. (Not a speak-failure fallback -- a
+            # raising speak_sink is logged and swallowed, not retried on text.)
+            return
 
 
 def build_default_synthesizer() -> Optional[object]:

@@ -455,28 +455,4 @@ class AwakeningConductor:
             logger.debug("[awakening] cooled header print failed", exc_info=True)
 
 
-async def run_awakening(console: Optional[Console] = None, **kwargs: object) -> "AwakeningConductor":
-    """Build a console (if not given) and play the ceremony end-to-end.
-
-    NEVER raises -- ``AwakeningConductor.run`` already guards its whole
-    body, and any failure constructing the console falls back to a bare
-    :class:`~rich.console.Console`.
-    """
-    if console is None:
-        try:
-            from .theme import build_console
-
-            console = build_console()
-        except Exception:  # noqa: BLE001
-            logger.debug("[awakening] build_console failed; bare Console", exc_info=True)
-            console = Console()
-
-    conductor = AwakeningConductor(console, **kwargs)  # type: ignore[arg-type]
-    try:
-        await conductor.run()
-    except Exception:  # noqa: BLE001 -- conductor.run() already never raises; stay defensive
-        logger.debug("[awakening] run_awakening failed unexpectedly", exc_info=True)
-    return conductor
-
-
-__all__ = ["AwakeningConductor", "run_awakening"]
+__all__ = ["AwakeningConductor"]
