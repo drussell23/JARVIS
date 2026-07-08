@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from backend.core.ouroboros.governance.arc_context import (
+    ArcContextSignal,
     build_arc_context,
 )
 from backend.core.ouroboros.governance.direction_inferrer import (
@@ -1357,16 +1358,36 @@ class PostureObserver:
         """Legacy async cadence tick (master-off rollback). Per-signal
         chunked-async collect via ``build_bundle_async`` (Tier-2b
         ``_offload_signal``), then the shared sync ``_process_bundle``
-        tail. Runs entirely ON the loop, so ``on_change`` fires inline
-        here (still on the loop) — byte-behavior-identical to the pre-fix
-        legacy path. ``epoch=None`` disables the stale-write guard (this
-        path is fully awaited, no overlapping cycles to race)."""
+        tail. ``epoch=None`` disables the stale-write guard (this path is
+        fully awaited, no overlapping cycles to race).
+
+        F8 (bt-2026-07-08-013911) — ``_process_bundle`` itself stays
+        synchronous (it's the shared tail with the offloaded path, which
+        runs it inside a worker thread), but this caller no longer calls
+        it directly on the loop. ``build_arc_context`` — the one signal
+        ``_process_bundle`` builds internally rather than receiving from
+        ``build_bundle_async`` — is offloaded here first via the same
+        ``_offload_signal``/``cooperative_fs_io.offload`` substrate every
+        other collector in this file already uses, then handed to
+        ``_process_bundle`` via ``arc_ctx=``/``build_arc_ctx=False`` so it
+        is never rebuilt inline. Closes the last on-loop git-subprocess
+        fork in this path (Slice 257 pattern) — everything else in
+        ``_process_bundle`` (hysteresis math, ``PostureStore`` writes) is
+        pure/bounded, not a fork/IO source."""
         bundle = await self._collect_with_timeout()
         if bundle is None:
             return None
         lss_one_liner = await self._read_lss_one_liner()
+        from backend.core.ouroboros.telemetry.loop_sink import (
+            sink_async as _ls_sink_async,
+        )
+        async with _ls_sink_async("posture.signal.arc_context"):
+            arc_ctx = await _offload_signal(
+                build_arc_context, self._root, lss_one_liner,
+            )
         outcome = self._process_bundle(
             bundle, lss_one_liner=lss_one_liner, epoch=None,
+            arc_ctx=arc_ctx, build_arc_ctx=False,
         )
         if outcome is None:
             return None
@@ -1376,8 +1397,30 @@ class PostureObserver:
     def _process_bundle(
         self, bundle: SignalBundle, *, lss_one_liner: str = "",
         epoch: Optional[int] = None,
+        arc_ctx: Optional[ArcContextSignal] = None,
+        build_arc_ctx: bool = True,
     ) -> Optional[_CycleOutcome]:
         """Shared SYNC tail — arc-context, infer, hysteresis, persist.
+
+        ``build_arc_ctx`` (default True) — build ``arc_ctx`` inline via the
+        synchronous ``build_arc_context`` (git-momentum subprocess.run +
+        LSS token parse). Correct for the offloaded (wholesale) path: this
+        whole method already executes inside the ``cooperative_fs_io``
+        worker thread, so building it here is still off-loop.
+
+        F8 (bt-2026-07-08-013911, ``blocked_ms=5341.60`` on
+        ``posture_observer.run_one_cycle``) — the LEGACY async path
+        (``_run_one_cycle_impl``, ``JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED
+        =false`` rollback) called this method DIRECTLY on the loop thread,
+        so ``build_arc_context``'s subprocess ``fork`` (the Slice 257
+        pattern — the fork itself, not the git query, is the cost on a
+        large multi-threaded process) blocked the loop synchronously.
+        The legacy caller now offloads ``build_arc_context`` through
+        ``cooperative_fs_io.offload`` (via ``_offload_signal``, mirroring
+        every other signal collector) BEFORE calling this method, and
+        passes the result here with ``build_arc_ctx=False`` — ``arc_ctx``
+        is used verbatim (including ``None`` on a fail-soft offload
+        error), never rebuilt.
 
         Purely synchronous and THREAD-SAFE: called either off-loop inside
         the offload worker thread (Fix 2 default path) or inline after the
@@ -1400,11 +1443,14 @@ class PostureObserver:
         # P0.5 Slice 2 — build arc-context (best-effort, never raises) and
         # pass to inferrer. Helper is observability-only by default; score
         # adjustment fires only when JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED=true.
-        arc_ctx = None
-        try:
-            arc_ctx = build_arc_context(self._root, lss_one_liner=lss_one_liner)
-        except Exception:
-            logger.debug("[PostureObserver] arc_context build skipped", exc_info=True)
+        # F8 — only build inline when the caller hasn't already offloaded it
+        # (see the docstring above and the class comment on ``build_arc_ctx``).
+        if build_arc_ctx:
+            arc_ctx = None
+            try:
+                arc_ctx = build_arc_context(self._root, lss_one_liner=lss_one_liner)
+            except Exception:
+                logger.debug("[PostureObserver] arc_context build skipped", exc_info=True)
         reading = self._inferrer.infer(bundle, arc_context=arc_ctx)
         # Single observability line for the arc-context state per cycle.
         if arc_ctx is not None:

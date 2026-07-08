@@ -16,9 +16,11 @@ from pathlib import Path
 
 import pytest
 
+from backend.core.ouroboros.governance.arc_context import ArcContextSignal
 from backend.core.ouroboros.governance.direction_inferrer import (
     DirectionInferrer,
 )
+from backend.core.ouroboros.governance.git_momentum import MomentumSnapshot
 from backend.core.ouroboros.governance.posture import (
     Posture,
     PostureReading,
@@ -877,6 +879,159 @@ class TestOnChangeMarshalledToLoopThread:
         assert seen_threads
         for t in seen_threads:
             assert t is threading.main_thread()
+
+
+# ---------------------------------------------------------------------------
+# F8 (bt-2026-07-08-013911) — the legacy async path (wholesale offload
+# master OFF) called ``build_arc_context`` (git-momentum subprocess.run)
+# directly on the loop thread via ``_process_bundle``. Under the DEFAULT
+# wholesale path this was already off-loop (the whole ``_process_bundle``
+# tail runs inside the ``cooperative_fs_io`` worker), but the rollback path
+# had no protection of its own — a genuine on-loop fork/subprocess block
+# (the Slice 257 pattern). Fixed by routing ``build_arc_context`` through
+# ``_offload_signal``/``cooperative_fs_io.offload`` before calling
+# ``_process_bundle``, mirroring every other signal collector in this file.
+# ---------------------------------------------------------------------------
+
+
+class _ThreadRecordingArcBuilder:
+    """Records which thread ``build_arc_context`` ran on, and returns a
+    fixed ``ArcContextSignal`` so downstream inference stays deterministic."""
+
+    def __init__(self, signal: ArcContextSignal) -> None:
+        self.signal = signal
+        self.threads: list = []
+
+    def __call__(self, project_root, lss_one_liner: str = "") -> ArcContextSignal:
+        self.threads.append(threading.current_thread())
+        return self.signal
+
+
+class TestArcContextOffloadLegacyPath:
+
+    @pytest.mark.asyncio
+    async def test_legacy_path_routes_build_arc_context_through_offload(
+        self, tmp_store: PostureStore, monkeypatch,
+    ):
+        """Spy/injection proof: under the legacy (wholesale-off) path,
+        ``build_arc_context`` must run on an offload worker thread, never
+        the loop/main thread — the F8 regression this task closes."""
+        monkeypatch.setenv("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED", "false")
+        recorder = _ThreadRecordingArcBuilder(ArcContextSignal())
+        monkeypatch.setattr(
+            "backend.core.ouroboros.governance.posture_observer.build_arc_context",
+            recorder,
+        )
+        observer = PostureObserver(
+            Path("."), tmp_store, collector=_DualCollector(_explore_bundle()),
+        )
+        reading = await observer.run_one_cycle()
+
+        assert reading is not None
+        assert recorder.threads, "build_arc_context was never called"
+        assert recorder.threads[0] is not threading.main_thread(), (
+            "build_arc_context ran on the loop/main thread under the "
+            "legacy path — F8 regression (on-loop git-subprocess fork)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_wholesale_path_also_off_loop_thread(
+        self, tmp_store: PostureStore,
+    ):
+        """Same proof for the DEFAULT path, for symmetry — build_arc_context
+        already ran off-loop here (nested in the wholesale dispatch) and
+        must remain so after the refactor (``build_arc_ctx=True`` default)."""
+        recorder = _ThreadRecordingArcBuilder(ArcContextSignal())
+        import backend.core.ouroboros.governance.posture_observer as po
+        original = po.build_arc_context
+        po.build_arc_context = recorder
+        try:
+            observer = PostureObserver(
+                Path("."), tmp_store, collector=_DualCollector(_explore_bundle()),
+            )
+            reading = await observer.run_one_cycle()
+        finally:
+            po.build_arc_context = original
+
+        assert reading is not None
+        assert recorder.threads, "build_arc_context was never called"
+        assert recorder.threads[0] is not threading.main_thread()
+
+    @pytest.mark.asyncio
+    async def test_loop_stays_responsive_during_legacy_arc_context_build(
+        self, tmp_store: PostureStore, monkeypatch,
+    ):
+        """A heartbeat coroutine keeps ticking while the legacy path builds
+        a slow arc-context — proving it is genuinely off the primary loop
+        (mirrors ``test_loop_stays_responsive_during_offloaded_cycle``)."""
+        monkeypatch.setenv("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED", "false")
+
+        def _slow_arc_context(project_root, lss_one_liner: str = "") -> ArcContextSignal:
+            time.sleep(0.3)
+            return ArcContextSignal()
+
+        monkeypatch.setattr(
+            "backend.core.ouroboros.governance.posture_observer.build_arc_context",
+            _slow_arc_context,
+        )
+        ticks = {"n": 0}
+        stop = asyncio.Event()
+
+        async def _heartbeat():
+            while not stop.is_set():
+                ticks["n"] += 1
+                await asyncio.sleep(0.005)
+
+        hb = asyncio.create_task(_heartbeat())
+        observer = PostureObserver(
+            Path("."), tmp_store, collector=_DualCollector(_explore_bundle()),
+        )
+        reading = await observer.run_one_cycle()
+        stop.set()
+        await hb
+
+        assert reading is not None  # cycle completed off-loop
+        # 0.3s / 5ms ≈ 60 potential ticks; require a robust floor.
+        assert ticks["n"] >= 15
+
+    @pytest.mark.asyncio
+    async def test_cycle_result_equivalent_offloaded_vs_legacy(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Cycle-result equivalence: the SAME bundle + fixed arc-context
+        must yield an identical posture/confidence/arc_context whether the
+        cycle ran wholesale-offloaded (default) or via the legacy path —
+        proving the F8 refactor changed WHERE ``build_arc_context`` runs,
+        never WHAT it returns or how it's scored."""
+        fixed_arc = ArcContextSignal(
+            momentum=MomentumSnapshot(commit_count=5, type_counts={"feat": 5}),
+            lss_verify_ratio=0.9,
+        )
+        monkeypatch.setattr(
+            "backend.core.ouroboros.governance.posture_observer.build_arc_context",
+            lambda project_root, lss_one_liner="": fixed_arc,
+        )
+
+        store_a = PostureStore(tmp_path / "a" / ".jarvis")
+        observer_a = PostureObserver(
+            Path("."), store_a, collector=_DualCollector(_explore_bundle()),
+        )
+        reading_offloaded = await observer_a.run_one_cycle()
+
+        monkeypatch.setenv("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED", "false")
+        store_b = PostureStore(tmp_path / "b" / ".jarvis")
+        observer_b = PostureObserver(
+            Path("."), store_b, collector=_DualCollector(_explore_bundle()),
+        )
+        reading_legacy = await observer_b.run_one_cycle()
+
+        assert reading_offloaded is not None and reading_legacy is not None
+        assert reading_offloaded.posture is reading_legacy.posture
+        assert reading_offloaded.confidence == pytest.approx(
+            reading_legacy.confidence,
+        )
+        assert reading_offloaded.arc_context == fixed_arc
+        assert reading_legacy.arc_context == fixed_arc
 
 
 # ---------------------------------------------------------------------------
