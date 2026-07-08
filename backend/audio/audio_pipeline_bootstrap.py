@@ -194,12 +194,21 @@ async def wire_conversation_pipeline(
         try:
             from backend.core.ouroboros.governance.comms.duplex.karen_duplex_factory import (
                 build_karen_duplex,
+                set_default_karen,
             )
             handle.karen = build_karen_duplex(handle.tts_engine)
             await handle.karen.start()
+            set_default_karen(handle.karen)
             logger.info("[Bootstrap] Karen full-duplex control layer mounted")
         except Exception as e:
             handle.karen = None
+            try:
+                from backend.core.ouroboros.governance.comms.duplex.karen_duplex_factory import (
+                    set_default_karen,
+                )
+                set_default_karen(None)
+            except Exception:
+                pass
             logger.warning(f"[Bootstrap] Karen duplex mount skipped: {e}")
 
     # 4. ConversationPipeline
@@ -319,6 +328,13 @@ async def shutdown(handle: PipelineHandle) -> None:
             await asyncio.wait_for(handle.karen.stop(), timeout=_timeout)
         except Exception as e:
             logger.debug(f"[Bootstrap] Karen duplex stop error: {e}")
+        try:
+            from backend.core.ouroboros.governance.comms.duplex.karen_duplex_factory import (
+                set_default_karen,
+            )
+            set_default_karen(None)
+        except Exception:
+            pass
 
     # 0b. Karen voice->build bridge (Sprint 4) — drop the ref, no async teardown needed.
     handle.voice_build = None

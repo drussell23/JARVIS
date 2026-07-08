@@ -97,4 +97,32 @@ def build_karen_duplex(
     return KarenDuplexHandle(arbiter=arbiter, playback=playback, bridge=bridge)
 
 
-__all__ = ["KarenDuplexHandle", "build_karen_duplex"]
+# ---------------------------------------------------------------------------
+# Process-wide default singleton (ov awakening Task 8)
+# ---------------------------------------------------------------------------
+# Mirrors voice_command_sensor.set_default_voice_sensor /
+# get_default_voice_sensor: the handle is mounted inside
+# audio_pipeline_bootstrap, but late-binding consumers (the Karen boot
+# briefing) need a handle to the live instance without threading it through
+# every call site. Last-write-wins; NEVER raises.
+
+_DEFAULT_KAREN: Optional[KarenDuplexHandle] = None
+
+
+def set_default_karen(handle: Optional[KarenDuplexHandle]) -> None:
+    """Publish the mounted duplex handle for late-binding consumers (boot
+    briefing). Same pattern as intake's set_default_voice_sensor."""
+    global _DEFAULT_KAREN
+    _DEFAULT_KAREN = handle
+
+
+def get_default_karen() -> Optional[KarenDuplexHandle]:
+    return _DEFAULT_KAREN
+
+
+__all__ = [
+    "KarenDuplexHandle",
+    "build_karen_duplex",
+    "set_default_karen",
+    "get_default_karen",
+]

@@ -4567,6 +4567,7 @@ class SerpentREPL:
         on_command: Optional[Callable[[str], Any]] = None,
         prompt_str: str = "🐍 ouroboros > ",
         gls: Any = None,
+        initial_text: str = "",
     ) -> None:
         self._flow = flow
         self._on_command = on_command
@@ -4577,6 +4578,11 @@ class SerpentREPL:
         self._gls = gls  # GovernedLoopService reference for /cancel
         # Slice 253 — live shadow-trap breadcrumb listener task.
         self._shadow_breadcrumb_task: Optional[asyncio.Task[None]] = None
+        # ov awakening Task 8 — non-skip keys typed during the boot ceremony
+        # are buffered into AwakeningConductor.typed_prefix and handed off
+        # here so the first prompt pre-fills instead of dropping the input.
+        # Consumed (not re-applied) after the first prompt_async call.
+        self._initial_text: str = initial_text
 
     async def start(self) -> None:
         """Start the REPL loop as a background task."""
@@ -5125,9 +5131,18 @@ class SerpentREPL:
                         )
                     except Exception:
                         prompt_html = HTML(f"<b>{self._prompt_str}</b>")
+                    # ov awakening Task 8 — pre-fill the FIRST prompt only
+                    # with keys buffered during the boot ceremony; consumed
+                    # immediately so later iterations never re-apply it.
+                    _prompt_kwargs: Dict[str, Any] = {
+                        "set_exception_handler": False,
+                    }
+                    if self._initial_text:
+                        _prompt_kwargs["default"] = self._initial_text
+                        self._initial_text = ""
                     line = await self._session.prompt_async(
                         prompt_html,
-                        set_exception_handler=False,
+                        **_prompt_kwargs,
                     )
                     line = line.strip()
                     if not line:

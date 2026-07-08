@@ -385,6 +385,99 @@ def _resolve_active_session_dir(default_dir: Path) -> Path:
         return default_dir
 
 
+def build_awakening_for_cockpit(
+    console: Any,
+    *,
+    intake_probe: Optional[Callable[[], Optional[int]]] = None,
+    approvals_probe: Optional[Callable[[], Optional[int]]] = None,
+) -> Optional[Any]:
+    """COCKPIT boot skin factory (ov awakening Task 8). Returns ``None`` in
+    SOAK (spec §3.5) -- the legacy compact boot banner stays byte-identical.
+
+    Orchestrates existing Task 3-7 pieces only (DRY mandate #3): the
+    conductor (Task 5), the Karen boot briefing composer (Task 7), and the
+    process-wide default-Karen handle (this task). No boot-ordering logic is
+    duplicated here.
+
+    The briefing rides ``on_ignition`` fire-and-forget -- its own breaker +
+    NEVER-raises contract (karen_boot_briefing.BootBriefing) means a
+    synthesis failure can never touch boot. ``_speak_sink`` prefers the live
+    mounted Karen duplex handle; when voice is off (no handle mounted) it
+    degrades to a muted console line -- still observable (spec: "voice-off
+    degrades to console print").
+    """
+    from backend.core.ouroboros.ui.presentation_mode import is_cockpit
+
+    if not is_cockpit():
+        return None
+
+    from backend.core.ouroboros.battle_test.boot_timing import get_default_timer
+    from backend.core.ouroboros.governance.comms.karen_boot_briefing import (
+        BootBriefing,
+        build_default_synthesizer,
+        gather_vectors,
+    )
+    from backend.core.ouroboros.ui.awakening import AwakeningConductor
+
+    briefing_tasks: List[Any] = []
+
+    def _speak_sink(line: str) -> None:
+        try:
+            from backend.core.ouroboros.governance.comms.duplex.karen_duplex_factory import (
+                get_default_karen,
+            )
+            karen = get_default_karen()
+            if karen is not None:
+                karen.submit_speech(line)
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            console.print(
+                f"  \U0001f4ad Karen ▸ “{line}”",
+                style="muted", markup=False,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_ignition() -> None:
+        async def _deliver() -> None:
+            try:
+                vectors = await gather_vectors(
+                    intake_probe=intake_probe, approvals_probe=approvals_probe,
+                )
+            except Exception:  # noqa: BLE001
+                vectors = None
+            briefing = BootBriefing(
+                synthesizer=build_default_synthesizer(),
+                speak_sink=_speak_sink,
+                vectors_override=vectors,
+            )
+            await briefing.run()
+        try:
+            briefing_tasks.append(asyncio.get_event_loop().create_task(_deliver()))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _context_line() -> str:
+        import datetime
+        parts = [f"awakened {datetime.datetime.now().strftime('%H:%M')}"]
+        try:
+            n = intake_probe() if intake_probe else None
+            if n:
+                parts.append(f"{n} ops queued")
+        except Exception:  # noqa: BLE001
+            pass
+        return " · ".join(parts)
+
+    conductor = AwakeningConductor(
+        console, timer=get_default_timer(),
+        on_ignition=_on_ignition, context_provider=_context_line,
+    )
+    conductor._briefing_tasks = briefing_tasks  # keep references (no GC)
+    return conductor
+
+
 class BattleTestHarness:
     """Orchestrates the full Ouroboros boot, event-driven session loop, and shutdown.
 
@@ -1255,12 +1348,31 @@ class BattleTestHarness:
 
             _log_path = getattr(self, "_log_file_path", "")
 
+            self._awakening = None
             if hasattr(self, "_serpent_flow") and self._serpent_flow is not None:
-                self._serpent_flow.boot_banner(
-                    layers=_layers,
-                    n_sensors=0,  # Updated below after intake boot
-                    log_path=_log_path,
+                self._awakening = build_awakening_for_cockpit(
+                    self._serpent_flow.console,
+                    intake_probe=self._intake_pending_probe,
+                    approvals_probe=None,
                 )
+                if self._awakening is not None:
+                    # COCKPIT: play the boot ceremony now, serialized against
+                    # the rest of boot -- it owns a Rich Live region on the
+                    # same console, and its animate-vs-plain decision reads
+                    # console.is_terminal, which is only reliable BEFORE the
+                    # REPL's patch_stdout(raw=True) wraps stdout (Task 5
+                    # review's load-bearing ordering invariant). Awaited to
+                    # completion here so no later boot-path console.print()
+                    # (e.g. SerpentFlow.start()'s ribbon) can interleave with
+                    # the Live-owned ceremony.
+                    await self._awakening.run()
+                else:
+                    # legacy SOAK banner path -- UNCHANGED
+                    self._serpent_flow.boot_banner(
+                        layers=_layers,
+                        n_sensors=0,  # Updated below after intake boot
+                        log_path=_log_path,
+                    )
             else:
                 # Fallback: basic Rich console output
                 from rich.console import Console as _C
@@ -1363,9 +1475,20 @@ class BattleTestHarness:
                 else:
                     try:
                         from backend.core.ouroboros.battle_test.serpent_flow import SerpentREPL
+                        # ov awakening Task 8 — hand off keys typed during
+                        # the boot ceremony (self._awakening is None in
+                        # SOAK / when the ceremony fell back to plain
+                        # before any keys were buffered) into the first
+                        # prompt instead of dropping them.
+                        _awakening_prefix = (
+                            self._awakening.typed_prefix
+                            if getattr(self, "_awakening", None) is not None
+                            else ""
+                        )
                         self._serpent_repl = SerpentREPL(
                             flow=self._serpent_flow,
                             on_command=self._handle_repl_command,
+                            initial_text=_awakening_prefix,
                         )
                         await self._serpent_repl.start()
                     except Exception as _repl_exc:
@@ -3152,6 +3275,27 @@ class BattleTestHarness:
         except Exception as exc:
             logger.warning("Branch creation failed: %s", exc)
             return f"{self._config.branch_prefix}/failed"
+
+    def _intake_pending_probe(self) -> Optional[int]:
+        """Best-effort live intake-queue depth for the Karen boot briefing
+        context line (ov awakening Task 8). Mirrors the router-resolution
+        walk used for plugin sensor wiring / ``/resume`` (harness.py's
+        ``_intake_router``/``intake_router``/``_router``/``router`` probe on
+        ``self._governed_loop_service`` -- DRY reuse of the existing idiom,
+        not a new router-lookup mechanism). NEVER raises."""
+        try:
+            gls = getattr(self, "_governed_loop_service", None)
+            router = None
+            for _attr in ("_intake_router", "intake_router", "_router", "router"):
+                _cand = getattr(gls, _attr, None)
+                if _cand is not None:
+                    router = _cand
+                    break
+            if router is not None and hasattr(router, "pending_ack_count"):
+                return int(router.pending_ack_count())
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     async def boot_intake(self) -> None:
         """Create IntakeLayerConfig, IntakeLayerService, and start()."""
