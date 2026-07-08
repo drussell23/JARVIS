@@ -224,13 +224,36 @@ class SemanticTriageEngine:
                 self._model_verified = False
                 return False
 
+            # Task 4 (F2, bt-2026-07-08-013911) — root cause of the
+            # persistent "/v1/models returned 401 after N attempt(s)"
+            # warning: this GET carried NO Authorization header at all.
+            # doubleword_provider._get_session() intentionally bakes no
+            # real bearer into the session when Aegis is enabled (the
+            # raw DOUBLEWORD_API_KEY is confiscated from the loop
+            # process's env) — every outbound call must fetch the
+            # per-call Aegis session bearer via
+            # ``dw_session_auth_header()`` and attach it explicitly.
+            # Every other DW call site does this (``_upload_file``,
+            # ``dw_catalog_client.DwCatalogClient._auth_headers``,
+            # ``dw_surface_probes.probe_auth_sync``) — this probe was
+            # the one outbound site that never got it, so it 401'd
+            # while the Aegis daemon's own GET of the same endpoint
+            # (which DOES attach the session bearer) returned 200.
+            # Fixed at the root: attach the same credentialed header
+            # every call, not just a retry band-aid.
+            from backend.core.ouroboros.governance.aegis_provider_bridge import (
+                dw_session_auth_header as _triage_dw_auth_header,
+            )
+
             # Bounded retry on transient auth / upstream blips — the probe can
             # outrace the Aegis credential proxy at boot (401 before the key is
             # injected, 200 moments later). Async backoff keeps the loop free.
             body = None
             for _attempt in range(1, _TRIAGE_VERIFY_MAX_ATTEMPTS + 1):
+                _headers = await _triage_dw_auth_header()
                 async with session.get(
                     f"{base_url}/models",
+                    headers=_headers,
                     timeout=self._dw._request_timeout(),
                 ) as resp:
                     if resp.status == 200:

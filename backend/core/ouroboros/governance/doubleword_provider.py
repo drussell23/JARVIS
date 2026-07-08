@@ -5017,8 +5017,70 @@ class DoublewordProvider:
         # newline-independent.
         return json.dumps(entry) + "\n"
 
+    @staticmethod
+    def _swap_jsonl_model_field(jsonl_content: str, new_model: str) -> str:
+        """Task 4 (F1) — rebuild a JSONL batch payload with every
+        entry's ``body.model`` replaced by *new_model*.
+
+        Used for the single entitlement-fallback retry in
+        ``_upload_file``: the failed upload's model is not entitled,
+        so the retry must carry the resolved fallback model instead —
+        everything else about the payload (custom_id, messages, etc.)
+        is preserved byte-for-byte. Lines that fail to parse are
+        passed through unchanged (defensive — never raises)."""
+        out_lines = []
+        for line in jsonl_content.splitlines():
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj.get("body"), dict):
+                    obj["body"]["model"] = new_model
+                out_lines.append(json.dumps(obj))
+            except Exception:  # noqa: BLE001 — defensive passthrough
+                out_lines.append(line)
+        return "\n".join(out_lines) + "\n"
+
+    async def _entitlement_fallback_model(
+        self, blocked_model_id: str,
+    ) -> Optional[str]:
+        """Task 4 (F1) — resolve a live-entitled fallback for
+        *blocked_model_id* via the shared ``dw_entitlement_fallback``
+        helper (the SAME resolver ``dw_surface_probes.py`` reaches
+        through this method, since ``probe_batch_storage`` delegates
+        to ``_upload_file`` directly — one wiring point covers both
+        live-run emission sites).
+
+        Isolated as its own method (rather than inlined in
+        ``_upload_file``) so tests can monkeypatch fallback resolution
+        without mocking the full DW catalog/Aegis/session stack. NEVER
+        raises — any failure here just means no fallback (legacy
+        degrade)."""
+        try:
+            from backend.core.ouroboros.governance.dw_catalog_client import (
+                DwCatalogClient,
+            )
+            from backend.core.ouroboros.governance.dw_entitlement_fallback import (
+                resolve_entitlement_fallback,
+            )
+            session = await self._get_session()
+            client = DwCatalogClient(
+                session=session, base_url=self._base_url,
+                api_key=self._api_key,
+            )
+            return await resolve_entitlement_fallback(
+                blocked_model_id=blocked_model_id, catalog_client=client,
+            )
+        except Exception as exc:  # noqa: BLE001 — never break upload path
+            logger.debug(
+                "[DWEntitlement] fallback resolution failed for "
+                "model=%s: %r", blocked_model_id, exc,
+            )
+            return None
+
     async def _upload_file(
         self, jsonl_content: str, *, op_id: str = "dw-batch-upload",
+        _entitlement_retry: bool = False,
     ) -> Optional[str]:
         """Stage 1: Upload JSONL file to Doubleword.
 
@@ -5176,6 +5238,37 @@ class DoublewordProvider:
                         _payload_custom_id, _payload_model, op_id[:16],
                         body[:2000],
                     )
+                    # Task 4 (F1) — entitlement-fallback retry. bt-2026-
+                    # 07-08-013911 hit exactly this: a 403 because the
+                    # DW account isn't entitled to ``model``, not a bad
+                    # request. On the FIRST failure only (the
+                    # ``_entitlement_retry`` guard prevents a retry
+                    # storm — at most one fallback attempt per op),
+                    # classify the failure and, if it's a per-model
+                    # entitlement block, resolve a live-entitled
+                    # fallback (policy ∩ catalog) and retry ONCE with
+                    # the fallback swapped into the payload. Empty
+                    # intersection / classification miss → falls
+                    # through to the unchanged ``return None`` below.
+                    if (
+                        not _entitlement_retry
+                        and _payload_model not in ("", "?")
+                    ):
+                        from backend.core.ouroboros.governance.dw_entitlement_fallback import (  # noqa: E501
+                            is_entitlement_blocked,
+                        )
+                        if is_entitlement_blocked(resp.status, body):
+                            fallback_model = await self._entitlement_fallback_model(
+                                _payload_model,
+                            )
+                            if fallback_model:
+                                retry_jsonl = self._swap_jsonl_model_field(
+                                    jsonl_content, fallback_model,
+                                )
+                                return await self._upload_file(
+                                    retry_jsonl, op_id=op_id,
+                                    _entitlement_retry=True,
+                                )
                     return None
                 result = await resp.json()
                 return result.get("id")

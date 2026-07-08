@@ -109,6 +109,16 @@ _DEFAULT_MARKERS_LOWER: Tuple[str, ...] = (
     "blocked by a routing rule",
     "contact your administrator",
     "request access",
+    # bt-2026-07-08-013911 (Task 4, F1) — DW's file-upload/dispatch 403
+    # for a model the account isn't entitled to comes back as "Model
+    # 'X' has not been configured or is not available to user", NOT
+    # any of the three markers above. Without these two additions the
+    # legacy status==403-without-marker branch mis-classified this as
+    # AUTH_FAILURE (transient, no per-model blame) instead of
+    # ENTITLEMENT_BLOCKED (permanent, per-model) — so no downstream
+    # consumer (breaker, fallback resolver) ever saw the real signal.
+    "has not been configured",
+    "is not available to user",
 )
 
 
