@@ -134,10 +134,17 @@ class BootBriefing:
 
         task = asyncio.get_event_loop().create_task(_consume())
         try:
+            # asyncio.wait_for raises asyncio.TimeoutError (an Exception) on its
+            # own deadline — NEVER CancelledError. So we deliberately do NOT
+            # catch CancelledError here: a genuine OUTER cancellation (boot
+            # shutdown while we await DW) MUST propagate out of run(), not be
+            # eaten by the breaker's local-fallback path.
             await asyncio.wait_for(task, timeout=self._timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
+        except Exception:  # noqa: BLE001  (asyncio.TimeoutError is a subclass)
             task.cancel()
             try:
+                # Awaiting the child we just cancelled legitimately raises
+                # CancelledError HERE — it is ours to absorb, not the caller's.
                 await task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass

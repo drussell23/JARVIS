@@ -67,6 +67,26 @@ async def test_breaker_falls_back_fast_without_stalling():
 
 
 @pytest.mark.asyncio
+async def test_outer_cancellation_propagates_not_swallowed():
+    """SHUTDOWN SAFETY: asyncio.wait_for raises TimeoutError (not
+    CancelledError) on its OWN deadline, so run() must NOT catch
+    CancelledError at the breaker site. A genuine outer cancellation (boot
+    shutdown while awaiting DW) MUST propagate out of run() — never be eaten
+    by the local-fallback path. Task 8 runs run() inside a cancellable boot."""
+    spoken = []
+    synth = SlowSynth()
+    # Long timeout so the breaker CANNOT trip first — only outer cancel acts.
+    b = BootBriefing(synthesizer=synth, speak_sink=spoken.append,
+                     timeout_s=5.0, vectors_override=V)
+    task = asyncio.ensure_future(b.run())
+    await asyncio.sleep(0.1)                  # let it reach the DW await
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task                           # propagates, NOT swallowed
+    assert spoken == []                      # nothing delivered on shutdown
+
+
+@pytest.mark.asyncio
 async def test_primary_path_speaks_sentences():
     spoken = []
     b = BootBriefing(synthesizer=GoodSynth(), speak_sink=spoken.append,
