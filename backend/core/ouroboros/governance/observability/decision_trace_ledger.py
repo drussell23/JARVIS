@@ -361,9 +361,15 @@ class DecisionTraceLedger:
         factors: Optional[Dict[str, Any]] = None,
         weights: Optional[Dict[str, float]] = None,
         rationale: str = "",
+        predecessor_ids: Optional[Tuple[str, ...]] = None,
+        decision_tier: str = "NORMAL",
+        decision_hash_digest: str = "",
     ) -> Tuple[bool, str]:
-        """Async record — identical semantics to :meth:`record`; the
-        flock append (incl. mkdir) runs off-loop via
+        """Async record — identical semantics AND signature to
+        :meth:`record` (Slice 3 T2 review #2: full lineage parity —
+        ``predecessor_ids``/``decision_tier``/``decision_hash_digest``
+        pass through :meth:`_prepare_append` identically); the flock
+        append (incl. mkdir) runs off-loop via
         ``cross_process_jsonl.async_flock_append_line``. NEVER
         raises."""
         line, meta, current_count = self._prepare_append(
@@ -373,6 +379,9 @@ class DecisionTraceLedger:
             factors=factors,
             weights=weights,
             rationale=rationale,
+            predecessor_ids=predecessor_ids,
+            decision_tier=decision_tier,
+            decision_hash_digest=decision_hash_digest,
         )
         if line is None:
             return meta  # (ok, detail) rejection tuple

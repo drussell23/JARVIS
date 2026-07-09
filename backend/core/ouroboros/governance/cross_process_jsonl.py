@@ -677,16 +677,27 @@ async def async_flock_append_lines(
             )
         except Exception:  # noqa: BLE001
             return False
-    result = await offload(
-        _append_lines_with_mkdir, path, materialized, timeout_s,
-        cpu_bound=False,
-    )
-    if is_offload_error(result):
+    # NEVER-raises guard (Slice 3 T2 review #1): offload()'s thread
+    # path acquires the shared executor + dispatches run_in_executor
+    # without a top-level guard of its own — a RuntimeError from an
+    # executor-shutdown race at teardown would otherwise propagate
+    # out of this coroutine, contradicting the NEVER-raises contract.
+    try:
+        result = await offload(
+            _append_lines_with_mkdir, path, materialized, timeout_s,
+            cpu_bound=False,
+        )
+        if is_offload_error(result):
+            logger.debug(
+                "[CrossProcessJSONL] async append fail-soft: %r", result,
+            )
+            return False
+        return bool(result)
+    except Exception as exc:  # noqa: BLE001 — NEVER raise into caller
         logger.debug(
-            "[CrossProcessJSONL] async append fail-soft: %r", result,
+            "[CrossProcessJSONL] async append offload raised: %s", exc,
         )
         return False
-    return bool(result)
 
 
 async def async_flock_append_line(

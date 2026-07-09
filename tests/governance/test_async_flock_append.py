@@ -157,6 +157,24 @@ async def test_lock_timeout_returns_false_never_deadlocks(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_offload_raising_returns_false_never_raises(tmp_path, monkeypatch):
+    """Slice 3 T2 review #1: offload()'s thread path has no top-level
+    guard of its own — a RuntimeError awaited out of offload (e.g. an
+    executor-shutdown race at teardown) must NOT propagate out of
+    async_flock_append_line; it fail-softs to False."""
+    from backend.core.ouroboros.governance import cooperative_fs_io as cfio
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr(cfio, "offload", boom)
+    target = tmp_path / "raise.jsonl"
+    ok = await cpj.async_flock_append_line(target, '{"e":5}')
+    assert ok is False
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
 async def test_master_off_inline_still_appends(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_COOPERATIVE_FS_IO_ENABLED", "false")
     target = tmp_path / "off.jsonl"
@@ -179,6 +197,41 @@ async def test_ledger_record_async(tmp_path, monkeypatch):
     assert ok is True and detail == "ok"
     row = json.loads((tmp_path / "decision_trace.jsonl").read_text().splitlines()[0])
     assert row["op_id"] == "op-test1" and row["decision"] == "standard"
+
+
+@pytest.mark.asyncio
+async def test_record_async_lineage_parity_with_record(tmp_path):
+    """Slice 3 T2 review #2: record_async accepts the full record()
+    signature — predecessor_ids/decision_tier/decision_hash_digest —
+    and the written row carries them exactly as a sync record() row
+    does (both routed through the shared _prepare_append prefix)."""
+    from backend.core.ouroboros.governance.observability.decision_trace_ledger import (
+        DecisionTraceLedger,
+    )
+    ledger = DecisionTraceLedger(path=tmp_path / "decision_trace.jsonl")
+    kwargs = dict(
+        phase="ROUTE", decision="standard",
+        factors={"k": "v"}, weights={"k": 1.0}, rationale="parity",
+        predecessor_ids=("row-a", "row-b"),
+        decision_tier="high",  # normalized to HIGH by _prepare_append
+        decision_hash_digest="deadbeef",
+    )
+    ok_sync, d_sync = ledger.record(op_id="op-sync", **kwargs)
+    ok_async, d_async = await ledger.record_async(op_id="op-async", **kwargs)
+    assert (ok_sync, d_sync) == (True, "ok")
+    assert (ok_async, d_async) == (True, "ok")
+    rows = [
+        json.loads(ln)
+        for ln in (tmp_path / "decision_trace.jsonl").read_text().splitlines()
+    ]
+    assert len(rows) == 2
+    sync_row, async_row = rows
+    assert sync_row["op_id"] == "op-sync" and async_row["op_id"] == "op-async"
+    for key in ("predecessor_ids", "decision_tier", "decision_hash_digest"):
+        assert async_row[key] == sync_row[key], key
+    assert async_row["predecessor_ids"] == ["row-a", "row-b"]
+    assert async_row["decision_tier"] == "HIGH"
+    assert async_row["decision_hash_digest"] == "deadbeef"
 
 
 @pytest.mark.asyncio
