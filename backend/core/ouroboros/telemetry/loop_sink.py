@@ -262,15 +262,36 @@ def get_leaderboard(top_n: int = 20) -> str:
 
 
 def _emit_blocked(
-    callsite: str, elapsed_ms: float, threshold_ms: float, kind: str,
+    callsite: str,
+    elapsed_ms: float,
+    threshold_ms: float,
+    kind: str,
+    cpu_ms: Optional[float] = None,
 ) -> None:
     """Single log line for over-threshold events. Format is stable —
     the v27 probe runbook grep's `[LoopSink] callsite=...` to extract
-    the per-call-site empirical data."""
+    the per-call-site empirical data.
+
+    ``cpu_ms`` (sync callsites only) attributes actual on-thread CPU
+    time alongside wall-clock ``blocked_ms`` — a large wall/cpu gap
+    means the callsite itself is cheap and the reading is GIL/scheduler
+    saturation, not callsite cost. When ``cpu_ms`` is unavailable
+    (thread_time() unsupported/failed) the legacy line is emitted
+    byte-identical so existing log-grep consumers are unaffected.
+    """
+    if cpu_ms is None:
+        logger.warning(
+            "[LoopSink] callsite=%s kind=%s blocked_ms=%.2f "
+            "threshold_ms=%.1f — on-loop call exceeded threshold",
+            callsite, kind, elapsed_ms, threshold_ms,
+        )
+        return
     logger.warning(
-        "[LoopSink] callsite=%s kind=%s blocked_ms=%.2f "
-        "threshold_ms=%.1f — on-loop call exceeded threshold",
-        callsite, kind, elapsed_ms, threshold_ms,
+        "[LoopSink] callsite=%s kind=%s blocked_ms=%.2f cpu_ms=%.2f "
+        "threshold_ms=%.1f — on-loop call exceeded threshold "
+        "(wall>>cpu = scheduler/GIL/syscall-wait inflation, not "
+        "callsite CPU)",
+        callsite, kind, elapsed_ms, cpu_ms, threshold_ms,
     )
 
 
@@ -301,6 +322,10 @@ def sink_sync(
     )
     t0 = time.monotonic()
     try:
+        c0: Optional[float] = time.thread_time()
+    except Exception:  # noqa: BLE001 — fail-soft cpu_ms capture
+        c0 = None
+    try:
         yield
     finally:
         try:
@@ -308,7 +333,15 @@ def sink_sync(
             stats = _get_or_create_stats(callsite)
             stats.record(elapsed_ms, eff_threshold)
             if elapsed_ms >= eff_threshold:
-                _emit_blocked(callsite, elapsed_ms, eff_threshold, "sync")
+                cpu_ms: Optional[float] = None
+                if c0 is not None:
+                    try:
+                        cpu_ms = (time.thread_time() - c0) * 1000.0
+                    except Exception:  # noqa: BLE001 — fail-soft cpu_ms delta
+                        cpu_ms = None
+                _emit_blocked(
+                    callsite, elapsed_ms, eff_threshold, "sync", cpu_ms=cpu_ms,
+                )
         except Exception as exc:  # noqa: BLE001 — never raise from sink
             logger.warning(
                 "[LoopSink] internal error in sink_sync(%s): %s",

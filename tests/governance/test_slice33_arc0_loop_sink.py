@@ -374,3 +374,35 @@ def test_spine_substrate_never_raises_into_caller() -> None:
             pytest.fail(
                 f"sink_async propagated internal error: {exc}"
             )
+
+
+def test_sink_sync_emits_cpu_ms(caplog):
+    import logging
+    import time
+    from backend.core.ouroboros.telemetry import loop_sink as ls
+
+    caplog.set_level(logging.WARNING, logger=ls.logger.name)
+    with ls.sink_sync("unit.test.cpu_attr", threshold_ms=1.0):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 0.02:
+            pass  # genuine CPU burn
+    line = next(
+        r.getMessage() for r in caplog.records if "unit.test.cpu_attr" in r.getMessage()
+    )
+    assert "cpu_ms=" in line
+
+
+def test_sink_sync_cpu_ms_low_for_sleep(caplog):
+    import logging
+    import re
+    import time
+    from backend.core.ouroboros.telemetry import loop_sink as ls
+
+    caplog.set_level(logging.WARNING, logger=ls.logger.name)
+    with ls.sink_sync("unit.test.sleep_attr", threshold_ms=1.0):
+        time.sleep(0.05)  # wall time, ~zero CPU
+    line = next(
+        r.getMessage() for r in caplog.records if "unit.test.sleep_attr" in r.getMessage()
+    )
+    m = re.search(r"cpu_ms=([\d.]+)", line)
+    assert m and float(m.group(1)) < 20.0  # wall was >=50ms, cpu near zero

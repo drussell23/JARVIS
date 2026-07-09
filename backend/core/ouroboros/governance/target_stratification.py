@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import ast as _ast
 import bisect
+import functools
 import logging
 import os
 import threading
@@ -204,6 +205,27 @@ def _resolve_scan_root(repo_root: Union[str, Path]) -> Path:
         return root
 
 
+@functools.lru_cache(maxsize=32)
+def _cached_scan_root(repo_root_str: str) -> Path:
+    """Resolve-once cache for the authoritative scan root.
+
+    ``file_has_test_coverage`` is invoked in tight per-file loops
+    (``operation_advisor.py:2155`` ``sum()``; ``opportunity_miner_sensor.py``
+    ``scan_once``); each call previously issued up to 4 ``Path.resolve()``
+    syscall chains (lstat/readlink per path component). Repo roots are
+    stable for a process lifetime — cache the (auth-root ∘ resolve)
+    composition. Bounded at 32 distinct roots (main repo + L3 worktrees).
+
+    Delegates to :func:`_resolve_scan_root` — the existing auth-root +
+    resolve composition already used by ``coverage_index_ready`` — so
+    there remains a single source of truth for that fail-soft logic;
+    this wrapper adds only the per-process cache. Keyed on the exact
+    string a caller passes (different spellings of the same path may
+    occupy separate cache slots — acceptable, bounded).
+    """
+    return _resolve_scan_root(repo_root_str)
+
+
 def _build_coverage_index_sync(
     repo_root: Path,
     dir_names: FrozenSet[str],
@@ -242,6 +264,24 @@ def coverage_index_ready(repo_root: Union[str, Path]) -> bool:
     warm the index in the background.
     """
     return _coverage_index_lookup(_resolve_scan_root(repo_root)) is not None
+
+
+def _install_coverage_index_for_tests(scan_root: Path) -> None:
+    """TEST-ONLY: synchronously build + register the coverage index for
+    ``scan_root`` so unit tests can exercise the WARM path without the
+    off-loop builder.
+
+    Mirrors the tail of ``_coverage_index_build_task``'s registration
+    (same lock, same ``_coverage_index`` dict) and — critically —
+    pre-warms :func:`_cached_scan_root` under the exact same key a
+    subsequent ``file_has_test_coverage(..., scan_root)`` call will use,
+    so warm-path resolve()-count tests measure the true warm path
+    (cache hit) rather than the one-time cache-miss cost.
+    """
+    resolved = _cached_scan_root(str(scan_root))
+    idx = _build_coverage_index_sync(resolved, _strat_test_dir_names())
+    with _COVERAGE_IDX_LOCK:
+        _coverage_index[resolved] = idx
 
 
 def reset_coverage_index() -> None:
@@ -545,14 +585,12 @@ def file_has_test_coverage(
     with _ls_sink_sync("target_stratification.file_has_test_coverage"):
         # Defense-in-depth: translate .worktrees/<name> paths to the real repo
         # root so coverage detection never returns 0 due to an empty worktree.
-        try:
-            from backend.core.ouroboros.governance.execution_context import (
-                authoritative_repo_root as _auth_root,
-            )
-
-            _scan_root = _auth_root(Path(repo_root))
-        except Exception:  # noqa: BLE001 — fail-soft, never breaks coverage
-            _scan_root = Path(repo_root)
+        # Resolve-once cache (Slice 3 T3): repo roots are stable for a
+        # process lifetime, so the (auth-root ∘ resolve) composition is
+        # computed once per distinct root string instead of on every call
+        # in tight per-file loops (operation_advisor.py sum(),
+        # opportunity_miner_sensor.py scan_once).
+        _scan_root = _cached_scan_root(str(repo_root))
 
         name = Path(file_path).name
         if not name.endswith(".py") or "test_" in name:
@@ -561,10 +599,7 @@ def file_has_test_coverage(
         exact_name = f"test_{stem}.py"
         suffix_prefix = f"test_{stem}_"
 
-        try:
-            _idx_key = _scan_root.resolve()
-        except OSError:  # circular symlink, keep syntactic form
-            _idx_key = _scan_root
+        _idx_key = _scan_root  # already resolved by the cache
         _idx = _coverage_index_lookup(_idx_key)
 
         if _idx is None:
@@ -591,9 +626,25 @@ def file_has_test_coverage(
                 _fp = Path(file_path)
                 if not _fp.is_absolute():
                     _fp = _scan_root / _fp
-                _module_path = _strat_path_to_module(_fp, _scan_root)
-                if _module_path and _idx.ast_map.get(_module_path):
-                    return True
+                # Inlined against the already-resolved _idx_key to avoid a
+                # second Path.resolve() of the root (_strat_path_to_module
+                # itself stays untouched for its other callers — this
+                # transcribes its exact part-munging semantics: empty
+                # parts short-circuit to None, .py suffix stripped,
+                # trailing __init__ popped).
+                try:
+                    _rel = _fp.resolve().relative_to(_idx_key)
+                except ValueError:
+                    _rel = None
+                if _rel is not None:
+                    _parts = list(_rel.parts)
+                    if _parts and _parts[-1].endswith(".py"):
+                        _parts[-1] = _parts[-1][:-3]
+                    if _parts and _parts[-1] == "__init__":
+                        _parts = _parts[:-1]
+                    _module_path = ".".join(_parts) if _parts else None
+                    if _module_path and _idx.ast_map.get(_module_path):
+                        return True
             except Exception:  # noqa: BLE001 — fail-soft, mirror Strategy 2
                 pass
         return False

@@ -143,7 +143,9 @@ def authoritative_repo_root(path: "Path | str") -> Path:
     PosixPath('/repo/backend/bar.py')
 
     NEVER raises — any failure returns ``Path(path)`` unchanged (fail-soft).
-    Authority posture: pure path math, zero I/O, zero git calls.
+    Authority posture: no git calls, no directory walks. NOTE: Path.resolve()
+    DOES issue lstat/readlink syscalls per component — callers in tight
+    loops should cache (see target_stratification._cached_scan_root).
     """
     try:
         p = Path(path).resolve()
