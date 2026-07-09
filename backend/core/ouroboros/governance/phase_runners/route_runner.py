@@ -224,9 +224,9 @@ class ROUTERunner(PhaseRunner):
             # underlying ledger). Routing must always succeed.
             try:
                 from backend.core.ouroboros.governance.observability.phase8_producers import (  # noqa: E501
-                    record_decision as _phase8_record_decision,
+                    record_decision_async as _phase8_record_decision_async,
                 )
-                _phase8_record_decision(
+                await _phase8_record_decision_async(
                     op_id=ctx.op_id,
                     phase="ROUTE",
                     decision=_provider_route.value,
@@ -239,7 +239,7 @@ class ROUTERunner(PhaseRunner):
                 )
             except Exception:  # noqa: BLE001 — defensive
                 logger.debug(
-                    "[Orchestrator] phase8_producers.record_decision(ROUTE) failed",
+                    "[Orchestrator] phase8_producers.record_decision_async(ROUTE) failed",
                     exc_info=True,
                 )
             if hasattr(orch._stack, "comm") and orch._stack.comm is not None:

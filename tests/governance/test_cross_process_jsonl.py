@@ -379,10 +379,12 @@ def _module_path() -> Path:
 
 
 class TestAuthorityInvariants:
-    # NARROW SELF-SEALING ALLOWLIST (durable-reroot fix, 2026-07-04).
+    # NARROW SELF-SEALING ALLOWLIST (durable-reroot fix, 2026-07-04;
+    # cooperative_fs_io added Slice 3 Task 2, 2026-07-08).
     #
-    # cross_process_jsonl may import EXACTLY ONE governance module:
-    # workspace_resolver. Rationale:
+    # cross_process_jsonl may import EXACTLY TWO governance modules:
+    #
+    # 1. workspace_resolver. Rationale:
     #
     #   * workspace_resolver is the repo's single-source-of-truth path
     #     resolver -- stdlib-only, pure path algebra, zero authority
@@ -395,6 +397,22 @@ class TestAuthorityInvariants:
     #     that inherits correctly into subprocess pool workers -- a
     #     boot-injected hook would NOT propagate cross-process.
     #
+    # 2. cooperative_fs_io (Slice 3 Task 2). Rationale:
+    #
+    #   * cooperative_fs_io.offload is the repo's SINGLE canonical
+    #     off-loop delegation substrate (F8) -- a fundamental async
+    #     primitive, not high-level governance (no orchestrator/
+    #     policy/iron_gate coupling).
+    #   * The async append wrappers (async_flock_append_line/lines)
+    #     must route the flock LOCK_NB poll loop (time.sleep backoff)
+    #     through the offload pool -- running it on the asyncio loop
+    #     was the exact 81-300ms LoopSink starvation observed in
+    #     session bt-iso-1783574982 via the decision-trace chain.
+    #   * The import is strictly FUNCTION-LOCAL (deferred to call
+    #     time inside the async wrappers) -- zero module-level
+    #     import-scope pollution -- and cooperative_fs_io never
+    #     imports cross_process_jsonl back (no cycle; verified).
+    #
     # The allowance is EXACT-MATCH (not prefix/substring): every other
     # governance.* import stays banned, and the companion test below
     # (test_workspace_resolver_stays_stdlib_only) pins the resolver to
@@ -402,6 +420,7 @@ class TestAuthorityInvariants:
     # an authority tunnel.
     _ALLOWED_GOVERNANCE_IMPORTS = (
         "backend.core.ouroboros.governance.workspace_resolver",
+        "backend.core.ouroboros.governance.cooperative_fs_io",
     )
 
     def test_no_governance_imports(self):
@@ -476,8 +495,11 @@ class TestAuthorityInvariants:
 
     def test_public_api_exported(self):
         # Synced 2026-07-03: added async_flock_critical_section + stale_lock_age_s (pre-existing drift, predates durability branch)
+        # Synced 2026-07-08: added async_flock_append_line + async_flock_append_lines (Slice 3 Task 2)
         expected = {
             "CROSS_PROCESS_JSONL_SCHEMA_VERSION",
+            "async_flock_append_line",
+            "async_flock_append_lines",
             "async_flock_critical_section",
             "fcntl_available",
             "flock_append_line",

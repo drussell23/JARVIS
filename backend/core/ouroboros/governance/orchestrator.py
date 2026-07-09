@@ -2959,7 +2959,7 @@ class GovernedOrchestrator:
             # microseconds when off.
             try:
                 from backend.core.ouroboros.governance.observability.phase8_producers import (
-                    record_decision as _phase8_record_decision,
+                    record_decision_async as _phase8_record_decision_async,
                     record_phase_latency as _phase8_record_latency,
                 )
                 _phase8_elapsed_s = max(
@@ -2973,7 +2973,7 @@ class GovernedOrchestrator:
                 _phase8_record_latency(
                     "OP_TERMINAL", _phase8_elapsed_s,
                 )
-                _phase8_record_decision(
+                await _phase8_record_decision_async(
                     op_id=getattr(_phase8_final_ctx, "op_id", ""),
                     phase="OP_TERMINAL",
                     decision=_phase8_final_phase_name,

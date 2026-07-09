@@ -56,7 +56,18 @@ Authority invariants (AST-pinned by companion tests):
     everything else is core stdlib).
   * NEVER imports any governance module — this is a pure-stdlib
     primitive consumed by ledgers; reverse-coupling would create
-    a cycle.
+    a cycle. Exactly TWO audited, cycle-free, FUNCTION-LOCAL
+    exceptions (both AST-allowlisted in
+    ``tests/governance/test_cross_process_jsonl.py``):
+
+      1. ``workspace_resolver`` — durable-path resolution; itself
+         stdlib-only (a companion test self-seals its purity).
+      2. ``cooperative_fs_io`` — the F8 async offload substrate,
+         imported ONLY inside the async append wrappers (Slice 3
+         Task 2) so the flock poll loop runs off the asyncio loop.
+         ``cooperative_fs_io`` never imports this module back (no
+         cycle), and the import is deferred to call time, so the
+         module stays pure-stdlib at import scope.
   * Never raises out of any public method.
 """
 from __future__ import annotations
@@ -69,7 +80,7 @@ import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import AsyncIterator, Iterable, Iterator, Optional
+from typing import AsyncIterator, Iterable, Iterator, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -592,12 +603,120 @@ async def async_flock_critical_section(
 
 
 # ---------------------------------------------------------------------------
+# Async append helpers — async_flock_append_line(s)
+# ---------------------------------------------------------------------------
+#
+# Rationale (Slice 3 Task 2): `_acquire_cross_process_lock`'s LOCK_NB
+# poll loop (`time.sleep` backoff, worst-case ~2x
+# JARVIS_CROSS_PROCESS_LOCK_TIMEOUT_S) is sync-blocking. The sync
+# `flock_append_line(s)` above is fine for genuinely sync callers, but
+# an async caller invoking it directly runs the ENTIRE poll loop ON
+# the asyncio event loop — the exact on-loop LoopSink hits observed
+# in session bt-iso-1783574982 (81-300ms) via
+# route_runner._classify_route -> phase8_producers.record_decision ->
+# DecisionTraceLedger.record -> flock_append_line. These helpers route
+# the whole lock-wait+write through cooperative_fs_io.offload so the
+# poll loop runs on the F8 thread pool instead.
+
+
+def _append_lines_with_mkdir(
+    path: Path,
+    lines: Tuple[str, ...],
+    timeout_s: Optional[float],
+) -> bool:
+    """Offload body for the async append helpers — module-level so it
+    is a plain picklable function (thread path doesn't require it,
+    but keeps the substrate contract uniform). Ensures the parent
+    dir exists (mirrors flock_critical_section's mkdir contract at
+    :414-421), then delegates to the canonical sync append.
+    NEVER raises."""
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.debug(
+            "[CrossProcessJSONL] async-append parent mkdir failed: %s", exc,
+        )
+        return False
+    return flock_append_lines(path, lines, timeout_s=timeout_s)
+
+
+async def async_flock_append_lines(
+    path: Path,
+    lines: Iterable[str],
+    *,
+    timeout_s: Optional[float] = None,
+) -> bool:
+    """Async variant of flock_append_lines — the lock poll loop
+    (LOCK_EX|LOCK_NB + time.sleep backoff, worst-case ~2x
+    JARVIS_CROSS_PROCESS_LOCK_TIMEOUT_S) runs on the F8
+    cooperative_fs_io pool, never on the asyncio loop (Slice 3;
+    cures the on-loop decision-trace appends observed in session
+    bt-iso-1783574982, 81-300ms LoopSink hits).
+
+    ORDERING: awaited appends from one coroutine land in call
+    order. Concurrent tasks appending the same path serialize on
+    the per-path in-process lock + flock (all-or-nothing per call)
+    but their relative order is scheduler-defined — same as today's
+    cross-thread behavior.
+
+    NON-REENTRANCY (inherited from the sync substrate): do NOT
+    await this while holding flock_critical_section /
+    async_flock_critical_section on the SAME path — the wait is
+    BOUNDED (returns False at timeout_s) but always fails.
+    NEVER raises."""
+    materialized = tuple(lines)  # never iterate a caller generator off-thread
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+    except Exception:  # noqa: BLE001 — substrate import fault
+        try:
+            return await asyncio.to_thread(
+                _append_lines_with_mkdir, path, materialized, timeout_s,
+            )
+        except Exception:  # noqa: BLE001
+            return False
+    result = await offload(
+        _append_lines_with_mkdir, path, materialized, timeout_s,
+        cpu_bound=False,
+    )
+    if is_offload_error(result):
+        logger.debug(
+            "[CrossProcessJSONL] async append fail-soft: %r", result,
+        )
+        return False
+    return bool(result)
+
+
+async def async_flock_append_line(
+    path: Path,
+    line: str,
+    *,
+    timeout_s: Optional[float] = None,
+) -> bool:
+    """Async variant of flock_append_line. See
+    async_flock_append_lines for the ordering / non-reentrancy
+    contract. NEVER raises."""
+    from backend.core.ouroboros.governance.workspace_resolver import (
+        resolve_durable_path,
+    )
+    try:
+        path = resolve_durable_path(path)
+    except Exception:  # noqa: BLE001 — mirror sync helper's fail-soft
+        pass
+    return await async_flock_append_lines(path, (line,), timeout_s=timeout_s)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
 __all__ = [
     "CROSS_PROCESS_JSONL_SCHEMA_VERSION",
+    "async_flock_append_line",
+    "async_flock_append_lines",
     "async_flock_critical_section",
     "fcntl_available",
     "flock_append_line",

@@ -111,6 +111,58 @@ def record_decision(
     return ok
 
 
+async def record_decision_async(
+    *,
+    op_id: str,
+    phase: str,
+    decision: str,
+    factors: Optional[Mapping[str, Any]] = None,
+    weights: Optional[Mapping[str, float]] = None,
+    rationale: str = "",
+) -> bool:
+    """Async variant of :func:`record_decision` — same defensive
+    envelope + the same best-effort SSE publish tail (kept sync;
+    the SSE bridge is not on the async lock-poll hot path). Routes
+    the ledger append through
+    ``DecisionTraceLedger.record_async`` so the flock lock-wait runs
+    off-loop (Slice 3 Task 2). Returns True on substrate success.
+    NEVER raises."""
+    ok = False
+    try:
+        from backend.core.ouroboros.governance.observability.decision_trace_ledger import (  # noqa: E501
+            get_default_ledger,
+        )
+        ledger = get_default_ledger()
+        ok, _detail = await ledger.record_async(
+            op_id=op_id,
+            phase=phase,
+            decision=decision,
+            factors=dict(factors or {}),
+            weights=dict(weights or {}),
+            rationale=rationale,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[Phase8Producers] record_decision_async raised", exc_info=True,
+        )
+        return False
+    # Best-effort SSE publish (Slice 2 bridge handles its own master flag).
+    try:
+        from backend.core.ouroboros.governance.observability.sse_bridge import (  # noqa: E501
+            publish_decision_recorded,
+        )
+        publish_decision_recorded(
+            op_id=op_id, phase=phase, decision=decision,
+            rationale=rationale,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Phase8Producers] decision SSE publish raised",
+            exc_info=True,
+        )
+    return ok
+
+
 # ---------------------------------------------------------------------------
 # Confidence-ring producer
 # ---------------------------------------------------------------------------
@@ -358,6 +410,7 @@ __all__ = [
     "check_flag_changes_and_publish",
     "record_confidence",
     "record_decision",
+    "record_decision_async",
     "record_phase_latency",
     "substrate_flag_snapshot",
 ]

@@ -61,7 +61,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +193,7 @@ class DecisionTraceLedger:
     path: Path = field(default_factory=ledger_path)
     _per_op_count: Dict[str, int] = field(default_factory=dict)
 
-    def record(
+    def _prepare_append(
         self,
         *,
         op_id: str,
@@ -205,33 +205,33 @@ class DecisionTraceLedger:
         predecessor_ids: Optional[Tuple[str, ...]] = None,
         decision_tier: str = "NORMAL",
         decision_hash_digest: str = "",
-    ) -> Tuple[bool, str]:
-        """Append one decision row. Returns ``(ok, detail)``.
+    ) -> Union[Tuple[str, str, int], Tuple[None, Tuple[bool, str], int]]:
+        """Row build + serialize + size-gate + per-op count check —
+        the pure-CPU prefix shared by :meth:`record` and
+        :meth:`record_async`. Deliberately excludes the mkdir + the
+        actual flock append — those differ between the sync and
+        async callers (the async path's mkdir happens inside the
+        offloaded append body).
 
-        Pre-checks:
-          1. Master flag off → (False, "master_off")
-          2. op_id empty → (False, "empty_op_id")
-          3. phase empty → (False, "empty_phase")
-          4. decision empty → (False, "empty_decision")
-          5. per-op rate cap hit → (False, "rate_cap_exhausted")
-
-        NEVER raises.
-        """
+        Returns ``(line, op_id, current_count)`` on success, or
+        ``(None, (ok, detail), 0)`` on rejection — callers unpack
+        and early-return the middle element verbatim on ``line is
+        None``. NEVER raises."""
         if not is_ledger_enabled():
-            return (False, "master_off")
+            return (None, (False, "master_off"), 0)
         op = (op_id or "").strip()
         if not op:
-            return (False, "empty_op_id")
+            return (None, (False, "empty_op_id"), 0)
         ph = (phase or "").strip()
         if not ph:
-            return (False, "empty_phase")
+            return (None, (False, "empty_phase"), 0)
         dec = (decision or "").strip()
         if not dec:
-            return (False, "empty_decision")
+            return (None, (False, "empty_decision"), 0)
         # Per-op rate cap.
         current_count = self._per_op_count.get(op, 0)
         if current_count >= MAX_RECORDS_PER_OP:
-            return (False, "rate_cap_exhausted")
+            return (None, (False, "rate_cap_exhausted"), 0)
         row = DecisionRow(
             op_id=op,
             phase=ph,
@@ -282,9 +282,53 @@ class DecisionTraceLedger:
         try:
             line = json.dumps(row.to_dict(), separators=(",", ":"))
         except (TypeError, ValueError) as exc:
-            return (False, f"serialize_failed:{exc}")
+            return (None, (False, f"serialize_failed:{exc}"), 0)
         if len(line.encode("utf-8")) > MAX_ROW_BYTES:
-            return (False, f"row_oversize:{len(line)}>max={MAX_ROW_BYTES}")
+            return (
+                None,
+                (False, f"row_oversize:{len(line)}>max={MAX_ROW_BYTES}"),
+                0,
+            )
+        return (line, op, current_count)
+
+    def record(
+        self,
+        *,
+        op_id: str,
+        phase: str,
+        decision: str,
+        factors: Optional[Dict[str, Any]] = None,
+        weights: Optional[Dict[str, float]] = None,
+        rationale: str = "",
+        predecessor_ids: Optional[Tuple[str, ...]] = None,
+        decision_tier: str = "NORMAL",
+        decision_hash_digest: str = "",
+    ) -> Tuple[bool, str]:
+        """Append one decision row. Returns ``(ok, detail)``.
+
+        Pre-checks:
+          1. Master flag off → (False, "master_off")
+          2. op_id empty → (False, "empty_op_id")
+          3. phase empty → (False, "empty_phase")
+          4. decision empty → (False, "empty_decision")
+          5. per-op rate cap hit → (False, "rate_cap_exhausted")
+
+        NEVER raises.
+        """
+        line, meta, current_count = self._prepare_append(
+            op_id=op_id,
+            phase=phase,
+            decision=decision,
+            factors=factors,
+            weights=weights,
+            rationale=rationale,
+            predecessor_ids=predecessor_ids,
+            decision_tier=decision_tier,
+            decision_hash_digest=decision_hash_digest,
+        )
+        if line is None:
+            return meta  # (ok, detail) rejection tuple
+        op = meta
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -303,6 +347,43 @@ class DecisionTraceLedger:
         except ImportError:
             return self._append_legacy_fileno_flock(line, op, current_count)
         ok = flock_append_line(self.path, line)
+        if not ok:
+            return (False, "flock_append_failed")
+        self._per_op_count[op] = current_count + 1
+        return (True, "ok")
+
+    async def record_async(
+        self,
+        *,
+        op_id: str,
+        phase: str,
+        decision: str,
+        factors: Optional[Dict[str, Any]] = None,
+        weights: Optional[Dict[str, float]] = None,
+        rationale: str = "",
+    ) -> Tuple[bool, str]:
+        """Async record — identical semantics to :meth:`record`; the
+        flock append (incl. mkdir) runs off-loop via
+        ``cross_process_jsonl.async_flock_append_line``. NEVER
+        raises."""
+        line, meta, current_count = self._prepare_append(
+            op_id=op_id,
+            phase=phase,
+            decision=decision,
+            factors=factors,
+            weights=weights,
+            rationale=rationale,
+        )
+        if line is None:
+            return meta  # (ok, detail) rejection tuple
+        op = meta
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                async_flock_append_line,
+            )
+        except ImportError:
+            return self._append_legacy_fileno_flock(line, op, current_count)
+        ok = await async_flock_append_line(self.path, line)
         if not ok:
             return (False, "flock_append_failed")
         self._per_op_count[op] = current_count + 1
