@@ -123,6 +123,16 @@ def test_sync_pre_accepts_precomputed_inventory(tmp_path):
     assert n == 1 and ctx.test_files_pre == ("tests/test_a.py",)
 
 
+def test_sync_target_pre_snapshot_is_keyword_only(tmp_path):
+    """Plan constraint: snapshot must be keyword-only — a positional
+    second arg must raise TypeError, never be silently accepted."""
+    f = tmp_path / "mod.py"
+    f.write_text("x = 1\n")
+    ctx = _Ctx(target_files=[str(f)])
+    with pytest.raises(TypeError):
+        ec.stamp_target_files_pre(ctx, ())  # positional snapshot forbidden
+
+
 def test_sync_pre_none_inventory_crawls_inline(tmp_path):
     _make_tree(tmp_path)
     ctx = _Ctx()

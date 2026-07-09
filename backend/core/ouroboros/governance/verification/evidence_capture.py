@@ -332,7 +332,7 @@ def snapshot_target_files(
 
 
 def stamp_target_files_pre(
-    ctx: Any, snapshot: Optional[Tuple[Dict[str, Any], ...]] = None,
+    ctx: Any, *, snapshot: Optional[Tuple[Dict[str, Any], ...]] = None,
 ) -> int:
     """Snapshot ctx.target_files content and stamp ctx.target_files_pre.
     Called BEFORE change_engine.execute. Returns file count. NEVER
@@ -357,7 +357,7 @@ def stamp_target_files_pre(
 
 
 def stamp_target_files_post(
-    ctx: Any, snapshot: Optional[Tuple[Dict[str, Any], ...]] = None,
+    ctx: Any, *, snapshot: Optional[Tuple[Dict[str, Any], ...]] = None,
 ) -> int:
     """Snapshot ctx.target_files content and stamp ctx.target_files_post.
     Called AFTER change_engine.execute (success path).
