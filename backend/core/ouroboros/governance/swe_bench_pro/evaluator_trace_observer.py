@@ -80,6 +80,7 @@ from typing import (
 )
 
 from backend.core.ouroboros.governance.cross_process_jsonl import (
+    async_flock_append_line,
     flock_append_line,
 )
 
@@ -801,8 +802,8 @@ async def async_append_frame_to_jsonl(
     path: Optional[Path] = None,
 ) -> bool:
     """Persist one frame to JSONL — composes canonical
-    :func:`flock_append_line` via ``loop.run_in_executor`` so the
-    sync ``fcntl.flock`` call NEVER blocks the observer task.
+    :func:`async_flock_append_line` so the sync ``fcntl.flock`` call
+    NEVER blocks the observer task.
 
     Returns True on append success, False on any failure. NEVER raises."""
     target = path if path is not None else _resolve_jsonl_path()
@@ -812,14 +813,12 @@ async def async_append_frame_to_jsonl(
         logger.debug("[EvTrace] JSONL encode fault: %s", exc)
         return False
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         # No running loop — synchronous fallback OK for test paths.
         return flock_append_line(target, line)
     try:
-        return await loop.run_in_executor(
-            None, flock_append_line, target, line,
-        )
+        return await async_flock_append_line(target, line)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[EvTrace] JSONL executor fault: %s", exc)
         return False

@@ -1169,7 +1169,7 @@ class CorpusCacheSink:
         """
         try:
             from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
-                flock_append_line,
+                async_flock_append_line,
             )
         except Exception:  # noqa: BLE001
             logger.debug(
@@ -1186,10 +1186,7 @@ class CorpusCacheSink:
             }
             line = json.dumps(payload, sort_keys=True, default=str)
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None, flock_append_line, self._path, line
-            )
+            return await async_flock_append_line(self._path, line)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -1226,7 +1223,7 @@ class EscapeCaptureSink:
         the escapes JSONL.  MUST NOT raise.  Returns True on success."""
         try:
             from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
-                flock_append_line,
+                async_flock_append_line,
             )
         except Exception:  # noqa: BLE001
             logger.debug(
@@ -1250,10 +1247,7 @@ class EscapeCaptureSink:
             }
             line = json.dumps(payload, sort_keys=True, default=str)
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None, flock_append_line, self._path, line
-            )
+            return await async_flock_append_line(self._path, line)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -1553,7 +1547,7 @@ class _LedgerHardeningSink:
     async def record_escape(self, result: MutationResult) -> bool:
         try:
             from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
-                flock_append_line,
+                async_flock_append_line,
             )
         except Exception:  # noqa: BLE001
             logger.debug(
@@ -1570,10 +1564,7 @@ class _LedgerHardeningSink:
             }
             line = json.dumps(payload, sort_keys=True, default=str)
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None, flock_append_line, self._path, line
-            )
+            return await async_flock_append_line(self._path, line)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

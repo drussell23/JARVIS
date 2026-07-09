@@ -40,7 +40,6 @@ let crash recovery distinguish "WAL is from previous session" vs.
 """
 from __future__ import annotations
 
-import asyncio
 import enum
 import json
 import logging
@@ -48,7 +47,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from backend.core.ouroboros.governance.cross_process_jsonl import flock_append_line
+from backend.core.ouroboros.governance.cross_process_jsonl import (
+    async_flock_append_line,
+    flock_append_line,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -191,10 +193,12 @@ def append_entry_sync(wal_path: Path, entry: SpendEntry) -> bool:
 
 async def append_entry(wal_path: Path, entry: SpendEntry) -> bool:
     """Async wrapper. flock_append_line is sync-blocking but its
-    critical section is microsecond-scale; we route it through a
-    worker thread anyway so a busy filesystem cannot stall the event
-    loop. Returns True on success, False on any failure."""
-    return await asyncio.to_thread(append_entry_sync, wal_path, entry)
+    critical section is microsecond-scale; we route the append
+    through the canonical async offload substrate anyway so a busy
+    filesystem cannot stall the event loop. Returns True on success,
+    False on any failure."""
+    line = json.dumps(entry.to_dict(), separators=(",", ":"), sort_keys=True)
+    return await async_flock_append_line(Path(wal_path), line)
 
 
 def replay_wal(wal_path: Path) -> List[SpendEntry]:

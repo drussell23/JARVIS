@@ -56,7 +56,6 @@ Each row is one JSON object. Fields:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -217,13 +216,11 @@ class DWCapacityLedger:
             line = rec.to_jsonl_line()
             # Lazy import — avoid module-init cycle.
             from backend.core.ouroboros.governance.cross_process_jsonl import (
-                flock_append_line,
+                async_flock_append_line,
             )
             # Off-loop write — keeps asyncio main thread responsive
             # even when ledger growth triggers FS sync.
-            ok = await asyncio.to_thread(
-                flock_append_line, self._path, line,
-            )
+            ok = await async_flock_append_line(self._path, line)
             return bool(ok)
         except Exception as exc:  # noqa: BLE001 — fail-closed
             logger.warning(

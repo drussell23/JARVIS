@@ -105,7 +105,13 @@ def test_ast_pin_ledger_composes_existing_flock_writer() -> None:
         "ledger doesn't compose cross_process_jsonl.flock_append_line — "
         "duplicates the write path"
     )
-    # AND it must dispatch off-loop
+    # AND it must dispatch off-loop. Slice 3 T4 consolidated the
+    # hand-rolled to_thread/run_in_executor wrapper onto the canonical
+    # async_flock_append_line helper, which itself guarantees off-loop
+    # dispatch via cooperative_fs_io.offload (pinned independently in
+    # tests/governance/test_async_flock_append.py::
+    # test_async_append_runs_off_loop_thread) — so any of the three
+    # markers satisfies the off-loop guarantee here.
     tree = ast.parse(src, filename=str(LEDGER_FILE))
     for node in ast.walk(tree):
         if (
@@ -113,8 +119,13 @@ def test_ast_pin_ledger_composes_existing_flock_writer() -> None:
             and node.name == "record_call"
         ):
             body = ast.unparse(node)
-            assert "to_thread" in body or "run_in_executor" in body, (
-                "record_call must dispatch off-loop (to_thread/run_in_executor)"
+            assert (
+                "to_thread" in body
+                or "run_in_executor" in body
+                or "async_flock_append_line" in body
+            ), (
+                "record_call must dispatch off-loop (to_thread/"
+                "run_in_executor/async_flock_append_line)"
             )
             return
     pytest.fail("record_call not found")
@@ -293,10 +304,17 @@ def test_spine_ledger_read_recent_skips_malformed_lines(tmp_ledger_env) -> None:
 def test_spine_ledger_record_call_never_raises_on_internal_error(
     tmp_ledger_env, monkeypatch,
 ) -> None:
-    """Force flock_append_line to raise; record_call must swallow."""
+    """Force the underlying flock write to raise; record_call must
+    swallow. Slice 3 T4: record_call now routes through
+    async_flock_append_line -> cooperative_fs_io.offload ->
+    flock_append_lines (plural) rather than calling flock_append_line
+    directly, so the injection point moves to flock_append_lines —
+    the offload trampoline converts the raise into an OffloadError
+    sentinel, which async_flock_append_line maps to False (never
+    raises out to the caller)."""
     from backend.core.ouroboros.governance import cross_process_jsonl
     monkeypatch.setattr(
-        cross_process_jsonl, "flock_append_line",
+        cross_process_jsonl, "flock_append_lines",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("simulated")),
     )
     from backend.core.ouroboros.governance.dw_capacity_ledger import (
