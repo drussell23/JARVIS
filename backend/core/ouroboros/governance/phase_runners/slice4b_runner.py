@@ -751,9 +751,9 @@ class Slice4bRunner(PhaseRunner):
             # credential_shapes evaluates to INSUFFICIENT.
             try:
                 from backend.core.ouroboros.governance.verification.evidence_capture import (
-                    stamp_target_files_pre,
+                    stamp_target_files_pre_async,
                 )
-                stamp_target_files_pre(ctx)
+                await stamp_target_files_pre_async(ctx)
             except Exception:  # noqa: BLE001 — defensive
                 logger.debug(
                     "[Slice4b] stamp_target_files_pre failed",
@@ -822,9 +822,9 @@ class Slice4bRunner(PhaseRunner):
         # Best-effort, never raises.
         try:
             from backend.core.ouroboros.governance.verification.evidence_capture import (
-                stamp_apply_evidence_post,
+                stamp_apply_evidence_post_async,
             )
-            _stamp_diag = stamp_apply_evidence_post(
+            _stamp_diag = await stamp_apply_evidence_post_async(
                 ctx, target_dir=str(orch._config.project_root),
             )
             logger.info(

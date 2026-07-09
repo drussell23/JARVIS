@@ -223,9 +223,9 @@ class PLANRunner(PhaseRunner):
         # never raises. Master-flag-gated at the helper level.
         try:
             from backend.core.ouroboros.governance.verification.evidence_capture import (
-                stamp_test_files_pre,
+                stamp_test_files_pre_async,
             )
-            stamp_test_files_pre(
+            await stamp_test_files_pre_async(
                 ctx, target_dir=str(orch._config.project_root),
             )
         except Exception:  # noqa: BLE001 — defensive

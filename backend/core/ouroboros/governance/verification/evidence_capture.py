@@ -54,6 +54,7 @@ Authority invariants (AST-pinned by tests):
 """
 from __future__ import annotations
 
+import asyncio
 import difflib
 import logging
 import os
@@ -61,6 +62,31 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+async def _offload_fs(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Route a synchronous fs-crawl through the F8 offload substrate.
+
+    Fail-soft contract (mirrors posture_observer._offload_signal):
+    substrate import fault → asyncio.to_thread; OffloadError →
+    None (caller substitutes the neutral value). NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+    except Exception:  # noqa: BLE001 — substrate import fault
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except Exception:  # noqa: BLE001
+            return None
+    result = await offload(fn, *args, cpu_bound=False, **kwargs)
+    if is_offload_error(result):
+        logger.debug(
+            "[EvidenceCapture] offloaded crawl fail-soft: %r", result,
+        )
+        return None
+    return result
 
 
 EVIDENCE_CAPTURE_SCHEMA_VERSION: str = "evidence_capture.1"
@@ -173,6 +199,7 @@ def capture_test_files_inventory(
 
 def stamp_test_files_pre(
     ctx: Any, *, target_dir: Optional[str] = None,
+    inventory: Optional[Tuple[str, ...]] = None,
 ) -> int:
     """Stamp ``ctx.test_files_pre`` with the current test inventory.
     Returns the count of files captured. NEVER raises.
@@ -191,7 +218,8 @@ def stamp_test_files_pre(
         existing = getattr(ctx, "test_files_pre", None)
         if existing is not None:
             return len(existing) if hasattr(existing, "__len__") else 0
-        inventory = capture_test_files_inventory(target_dir)
+        if inventory is None:
+            inventory = capture_test_files_inventory(target_dir)
         try:
             object.__setattr__(ctx, "test_files_pre", inventory)
         except (AttributeError, TypeError):
@@ -206,6 +234,7 @@ def stamp_test_files_pre(
 
 def stamp_test_files_post(
     ctx: Any, *, target_dir: Optional[str] = None,
+    inventory: Optional[Tuple[str, ...]] = None,
 ) -> int:
     """Stamp ``ctx.test_files_post`` with the post-APPLY test
     inventory. Returns count. NEVER raises.
@@ -217,7 +246,8 @@ def stamp_test_files_post(
     if ctx is None:
         return 0
     try:
-        inventory = capture_test_files_inventory(target_dir)
+        if inventory is None:
+            inventory = capture_test_files_inventory(target_dir)
         try:
             object.__setattr__(ctx, "test_files_post", inventory)
         except (AttributeError, TypeError):
@@ -301,7 +331,9 @@ def snapshot_target_files(
         return ()
 
 
-def stamp_target_files_pre(ctx: Any) -> int:
+def stamp_target_files_pre(
+    ctx: Any, snapshot: Optional[Tuple[Dict[str, Any], ...]] = None,
+) -> int:
     """Snapshot ctx.target_files content and stamp ctx.target_files_pre.
     Called BEFORE change_engine.execute. Returns file count. NEVER
     raises."""
@@ -313,7 +345,8 @@ def stamp_target_files_pre(ctx: Any) -> int:
         targets = getattr(ctx, "target_files", None)
         if not targets:
             return 0
-        snapshot = snapshot_target_files(targets)
+        if snapshot is None:
+            snapshot = snapshot_target_files(targets)
         try:
             object.__setattr__(ctx, "target_files_pre", snapshot)
         except (AttributeError, TypeError):
@@ -323,7 +356,9 @@ def stamp_target_files_pre(ctx: Any) -> int:
         return 0
 
 
-def stamp_target_files_post(ctx: Any) -> int:
+def stamp_target_files_post(
+    ctx: Any, snapshot: Optional[Tuple[Dict[str, Any], ...]] = None,
+) -> int:
     """Snapshot ctx.target_files content and stamp ctx.target_files_post.
     Called AFTER change_engine.execute (success path).
 
@@ -337,7 +372,8 @@ def stamp_target_files_post(ctx: Any) -> int:
         targets = getattr(ctx, "target_files", None)
         if not targets:
             return 0
-        snapshot = snapshot_target_files(targets)
+        if snapshot is None:
+            snapshot = snapshot_target_files(targets)
         try:
             object.__setattr__(ctx, "target_files_post", snapshot)
         except (AttributeError, TypeError):
@@ -473,6 +509,8 @@ def stamp_diff_text(
 
 def stamp_apply_evidence_post(
     ctx: Any, *, target_dir: Optional[str] = None,
+    test_inventory: Optional[Tuple[str, ...]] = None,
+    target_snapshot: Optional[Tuple[Dict[str, Any], ...]] = None,
 ) -> Dict[str, int]:
     """One-stop helper called from APPLY-success: stamps
     target_files_post + test_files_post + diff_text on ctx.
@@ -488,12 +526,86 @@ def stamp_apply_evidence_post(
         return {"enabled": 0}
     return {
         "enabled": 1,
-        "target_files_post": stamp_target_files_post(ctx),
+        "target_files_post": stamp_target_files_post(
+            ctx, snapshot=target_snapshot,
+        ),
         "test_files_post": stamp_test_files_post(
-            ctx, target_dir=target_dir,
+            ctx, target_dir=target_dir, inventory=test_inventory,
         ),
         "diff_text_bytes": stamp_diff_text(ctx),
     }
+
+
+# ---------------------------------------------------------------------------
+# Async variants (Slice 3 T1) — route the tests/**/*.py glob + target
+# file snapshots through the F8 cooperative_fs_io.offload substrate so
+# neither crawl blocks the main asyncio loop. Same semantics, same
+# neutral fallbacks, NEVER raise.
+# ---------------------------------------------------------------------------
+
+
+async def stamp_test_files_pre_async(
+    ctx: Any, *, target_dir: Optional[str] = None,
+) -> int:
+    """Async variant of stamp_test_files_pre — the recursive
+    tests/**/*.py glob runs OFF the asyncio loop via the F8
+    cooperative_fs_io substrate (Slice 3; cures the LoopDeadman
+    wedge at plan_runner.py:228, session bt-iso-1783574982).
+    Same semantics, same neutral fallbacks. NEVER raises."""
+    if not evidence_capture_enabled() or ctx is None:
+        return 0
+    try:
+        existing = getattr(ctx, "test_files_pre", None)
+        if existing is not None:  # idempotent — no wasted crawl
+            return len(existing) if hasattr(existing, "__len__") else 0
+        inv = await _offload_fs(capture_test_files_inventory, target_dir)
+        if inv is None:
+            inv = ()  # same neutral as the sync internal-failure path
+        return stamp_test_files_pre(
+            ctx, target_dir=target_dir, inventory=tuple(inv),
+        )
+    except Exception:  # noqa: BLE001 — defensive envelope preserved
+        return 0
+
+
+async def stamp_target_files_pre_async(ctx: Any) -> int:
+    """Async variant of stamp_target_files_pre — per-file
+    read_bytes snapshot runs off-loop. NEVER raises."""
+    if not evidence_capture_enabled() or ctx is None:
+        return 0
+    try:
+        targets = getattr(ctx, "target_files", None)
+        if not targets:
+            return 0
+        snap = await _offload_fs(snapshot_target_files, tuple(targets))
+        if snap is None:
+            snap = ()
+        return stamp_target_files_pre(ctx, snapshot=tuple(snap))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+async def stamp_apply_evidence_post_async(
+    ctx: Any, *, target_dir: Optional[str] = None,
+) -> Dict[str, int]:
+    """Async composite for the APPLY-success path — both crawls
+    (target snapshot + test inventory) run off-loop; diff
+    computation stays inline (inputs already capped at
+    JARVIS_EVIDENCE_MAX_FILE_BYTES, bounded CPU). NEVER raises."""
+    if not evidence_capture_enabled() or ctx is None:
+        return {"enabled": 0}
+    try:
+        targets = tuple(getattr(ctx, "target_files", None) or ())
+        snap = await _offload_fs(snapshot_target_files, targets) if targets else ()
+        inv = await _offload_fs(capture_test_files_inventory, target_dir)
+        return stamp_apply_evidence_post(
+            ctx,
+            target_dir=target_dir,
+            test_inventory=tuple(inv) if inv is not None else (),
+            target_snapshot=tuple(snap) if snap is not None else (),
+        )
+    except Exception:  # noqa: BLE001
+        return {"enabled": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -511,9 +623,12 @@ __all__ = [
     "evidence_capture_enabled",
     "snapshot_target_files",
     "stamp_apply_evidence_post",
+    "stamp_apply_evidence_post_async",
     "stamp_diff_text",
     "stamp_target_files_post",
     "stamp_target_files_pre",
+    "stamp_target_files_pre_async",
     "stamp_test_files_post",
     "stamp_test_files_pre",
+    "stamp_test_files_pre_async",
 ]
