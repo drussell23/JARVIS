@@ -102,6 +102,27 @@ def classify_arm(exc: Optional[BaseException]) -> ArmFailureClass:
         return ArmFailureClass.ABSENT
 
 
+def is_budget_refusal_pair(
+    primary_exc: Optional[BaseException],
+    hedge_exc: Optional[BaseException],
+) -> bool:
+    """Both observed arms (a missing arm = ``None`` carries no evidence) failed
+    on the LOCAL session-budget gate.
+
+    Slice 4 T2: a ``SessionBudgetPreflightRefused`` is a hard-wallet config gate
+    ($0.00 remaining), not a REMOTE provider fault — it is identical for every
+    ranked model. Counting it as a dual-arm model failure blacklisted 27 models
+    in Run #14 and tripped a phantom 79-minute global DW outage. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.session_budget_authority import (
+            is_budget_refusal,
+        )
+        arms = [e for e in (primary_exc, hedge_exc) if e is not None]
+        return bool(arms) and all(is_budget_refusal(e) for e in arms)
+    except Exception:  # noqa: BLE001 — classifier advisory; never raise into throat
+        return False
+
+
 def triage_dual_failure(
     fast_exc: Optional[BaseException],
     stable_exc: Optional[BaseException],
@@ -112,6 +133,24 @@ def triage_dual_failure(
     NEVER raises."""
     fast_class = classify_arm(fast_exc)
     stable_class = classify_arm(stable_exc)
+    # Slice 4 T2 — a LOCAL session-budget refusal pair is NOT a model blockage.
+    # It is a $0.00-wallet config gate that refuses every ranked model
+    # identically; blacklisting the model (and counting it toward the outage
+    # gradient) is the Run #14 failure-taxonomy bug. Surface the real class and
+    # decline the hard verdict so record_dual_arm_blacklist writes nothing.
+    if is_budget_refusal_pair(fast_exc, stable_exc):
+        logger.warning(
+            "[RaceTriage] dual-arm failure is BUDGET-REFUSAL (local gate, not "
+            "provider fault) — NOT blacklisting, NOT counting toward outage",
+        )
+        return RaceTriageVerdict(
+            hard_blockage=False,
+            reason=(
+                "dual-arm failure is a LOCAL session-budget refusal (not a "
+                "provider fault) — NOT blacklisting, NOT counting toward outage"
+            ),
+            fast_class=fast_class, stable_class=stable_class,
+        )
     if ArmFailureClass.INTERNAL_FAULT in (fast_class, stable_class):
         return RaceTriageVerdict(
             hard_blockage=False,

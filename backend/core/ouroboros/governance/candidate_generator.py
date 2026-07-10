@@ -4889,6 +4889,16 @@ class CandidateGenerator:
         # Walk the ranked list. For each model not OPEN, attempt DW.
         attempts: List[str] = []
         last_failure: Optional[str] = None
+        # Slice 4 T2 — LOCAL session-budget refusal tracking. A $0.00 session
+        # budget makes EVERY ranked model refuse identically via
+        # SessionBudgetPreflightRefused. That is a local config gate, NOT a
+        # remote provider outage: it must NEVER poison vendor telemetry
+        # (surface-health, the health gradient, dual-arm blacklist) or wake the
+        # real-$ J-Prime GCE failover. Track it so a PURE budget exhaustion
+        # (no genuine transport failure observed) fails FAST + visibly instead
+        # of quarantining a phantom outage or immortal-re-queueing forever.
+        _budget_refusal_exc: Optional[BaseException] = None
+        _saw_non_refusal_failure: bool = False
         # Slice 83 Phase 2 — consecutive LIVE_TRANSPORT streak across the
         # heterogeneous coder stack. A single model's transport break rotates
         # to the next coder; only a `threshold`-long streak (genuine lane-wide
@@ -5242,6 +5252,32 @@ class CandidateGenerator:
 
             if _attempt_exc is not None:
                 exc = _attempt_exc
+                # Slice 4 T2 — classify a LOCAL session-budget refusal BEFORE any
+                # vendor-fault taxonomy. It is not a transport rupture: do NOT
+                # report it to the sentinel, the DW surface-health ledger, the
+                # transport breaker, the bandit, or the health gradient. Record
+                # it and rotate — every ranked model refuses identically at
+                # $0.00, so the exhaustion path (below) fails fast instead of
+                # quarantining a phantom provider outage or waking the GCE
+                # failover (Run #14 failure-taxonomy fix).
+                from backend.core.ouroboros.governance.session_budget_authority import (
+                    is_budget_refusal as _s4_is_budget_refusal,
+                )
+                if _s4_is_budget_refusal(exc):
+                    _budget_refusal_exc = exc
+                    last_failure = (
+                        f"{model_id}:budget_refusal:{type(exc).__name__}"
+                    )
+                    if attempts:
+                        attempts[-1] = f"{model_id}:budget_refusal"
+                    logger.warning(
+                        "[CandidateGenerator] Sentinel dispatch: model=%s "
+                        "REFUSED by LOCAL session-budget gate (not a provider "
+                        "fault) — rotating without vendor-outage telemetry "
+                        "(op=%s)", model_id, op_id_short,
+                    )
+                    continue
+                _saw_non_refusal_failure = True
                 # Slice 185 Phase 2 — STRICT-TYPE EXCEPTION SEGREGATION. A Python LOGICAL error
                 # (NameError/TypeError/AttributeError/…) is OUR codebase bug, NOT a vendor
                 # network rupture. It must bypass the vendor resilience path entirely: never be
@@ -5608,6 +5644,32 @@ class CandidateGenerator:
         # bounded rolling window (NOT a hops count) -- a full all-False window
         # trips is_global_outage, consumed at the immortal re-queue intercept
         # below. Fail-soft: gradient errors never perturb the dispatch path.
+        #
+        # Slice 4 T2 — a PURE session-budget-refusal exhaustion (every model
+        # refused on the local $0.00 gate, no genuine transport failure) is NOT
+        # a provider-outage sweep. Recording success=False here would poison the
+        # gradient's is_global_outage deduction across ops → spurious DW
+        # quarantine (Run #14: a phantom 79-minute global outage from 30 budget
+        # refusals). Skip the sweep in that case.
+        if _budget_refusal_exc is not None and not _saw_non_refusal_failure:
+            # NON-TRANSIENT local budget exhaustion: retrying, cascading,
+            # quarantining, or waking the J-Prime failover (real GCE $) cannot
+            # help — only an operator refund can. Fail FAST and VISIBLY with a
+            # distinct terminal cause so the op surfaces the real class instead
+            # of masquerading as a provider outage. This raise preempts the
+            # cascade decision, the UPSTREAM QUARANTINE intercept, the immortal
+            # re-queue loop, AND the budget-driven GCE failover awaken below.
+            logger.error(
+                "[Immortal] NON-TRANSIENT budget exhaustion — terminating "
+                "retry loop (fail-fast, op fails visibly): op=%s last=%s",
+                op_id_short, (last_failure or "?")[:80],
+            )
+            self._raise_exhausted(
+                "fallback_skipped:budget_exhausted_non_transient",
+                context=context,
+                deadline=deadline,
+                primary_exc=_budget_refusal_exc,
+            )
         try:
             get_provider_health_gradient().record_sweep(
                 provider_route, success=False,

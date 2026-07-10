@@ -112,6 +112,34 @@ class SessionBudgetPreflightRefused(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Failure-taxonomy classifier (Slice 4 T2)
+# ---------------------------------------------------------------------------
+
+
+def is_budget_refusal(exc: BaseException, *, _depth: int = 8) -> bool:
+    """True iff *exc* is, or was caused by, a :class:`SessionBudgetPreflightRefused`.
+
+    Walks ``__cause__``/``__context__`` up to ``_depth`` hops so transport
+    wrappers (hedge-race arms wrap provider errors) still classify. Budget
+    refusal is a LOCAL config gate — Run #14 counted it as a provider failure,
+    blacklisted both arms, and tripped a 79-minute global DW quarantine (plus
+    an unbounded immortal retry loop and, worse, could wake a real-$ GCE
+    failover). NEVER raises.
+    """
+    try:
+        seen = 0
+        cur: Optional[BaseException] = exc
+        while cur is not None and seen < _depth:
+            if isinstance(cur, SessionBudgetPreflightRefused):
+                return True
+            cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+            seen += 1
+        return False
+    except Exception:  # noqa: BLE001 — classifier is advisory; never raise
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Process-wide registration (mirrors cost_governor singleton pattern)
 # ---------------------------------------------------------------------------
 
@@ -735,6 +763,7 @@ __all__ = [
     "check_preflight",
     "get_background_spend_limit_pct",
     "get_reservations_snapshot",
+    "is_budget_refusal",
     "sweep_stale_reservations",
     "get_session_budget_provider",
     "get_session_remaining_usd",

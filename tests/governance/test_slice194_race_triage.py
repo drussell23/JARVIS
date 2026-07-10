@@ -39,9 +39,13 @@ from backend.core.ouroboros.governance.race_triage import (
     ArmFailureClass,
     classify_arm,
     is_blacklisted_for_op,
+    is_budget_refusal_pair,
     race_triage_enabled,
     record_dual_arm_blacklist,
     triage_dual_failure,
+)
+from backend.core.ouroboros.governance.session_budget_authority import (
+    SessionBudgetPreflightRefused,
 )
 from backend.core.ouroboros.governance.schema_drift_tracker import (
     DriftType,
@@ -259,6 +263,57 @@ def test_soft_verdict_is_never_recorded():
     v = triage_dual_failure(NameError("our bug"), RuntimeError("x"))
     assert record_dual_arm_blacklist("op-6", "m-6", v) is False
     assert is_blacklisted_for_op("op-6", "m-6") is False
+
+
+def _budget_refusal() -> SessionBudgetPreflightRefused:
+    """A LOCAL hard-wallet refusal (session budget $0.00), matching the real
+    keyword-only constructor at session_budget_authority.py:95-111."""
+    return SessionBudgetPreflightRefused(
+        provider="doubleword",
+        estimated_cost_usd=0.10,
+        session_remaining_usd=0.0,
+    )
+
+
+def test_dual_arm_budget_refusal_is_not_a_hard_blockage():
+    """Slice 4 T2 — both arms failing on the LOCAL session-budget gate must NOT
+    be a hard model blockage (Run #14: 27 spurious dual-arm blacklists → a
+    phantom 79-minute global DW quarantine)."""
+    v = triage_dual_failure(_budget_refusal(), _budget_refusal())
+    assert v.hard_blockage is False
+    assert "budget" in v.reason.lower()
+
+
+def test_budget_refusal_pair_writes_no_blacklist():
+    """The NOTE case: with both arms a budget refusal, the CONFIRMED blacklist
+    path writes nothing — the drift registry the dispatch skip reads is
+    untouched, so no model is rotated off for a local config gate."""
+    op_id, model = "op-budget-1", "qwen/qwen3.5-35b-a3b-fp8"
+    v = triage_dual_failure(_budget_refusal(), _budget_refusal())
+    assert record_dual_arm_blacklist(op_id, model, v) is False
+    # The registry is_blacklisted_for_op reads is untouched.
+    assert is_blacklisted_for_op(op_id, model) is False
+    assert not get_default_tracker().events_for(op_id)
+
+
+def test_budget_refusal_pair_helper_variants():
+    assert is_budget_refusal_pair(_budget_refusal(), _budget_refusal()) is True
+    # A missing arm carries no counter-evidence.
+    assert is_budget_refusal_pair(_budget_refusal(), None) is True
+    # One real transport fault → not a pure budget refusal → still blockable.
+    assert is_budget_refusal_pair(
+        _budget_refusal(), RuntimeError("rt severed"),
+    ) is False
+    assert is_budget_refusal_pair(None, None) is False
+
+
+def test_real_dual_vendor_failure_still_blacklists_after_t2():
+    """Regression guard: the T2 budget carve-out must NOT weaken the genuine
+    dual-vendor-outage path — two real transport faults still blacklist."""
+    v = triage_dual_failure(RuntimeError("rt severed"), _vendor_rejection("b"))
+    assert v.hard_blockage is True
+    assert record_dual_arm_blacklist("op-real", "m-real", v) is True
+    assert is_blacklisted_for_op("op-real", "m-real") is True
 
 
 def test_predicate_default_enabled():
