@@ -455,10 +455,19 @@ async def _arm_failover_mesh(env: Dict[str, str]) -> None:
 # last live run.  No hardcoded sleeps: exponential backoff (capped) + a budget.
 # ---------------------------------------------------------------------------
 
-def _env_float(name: str, default: float) -> float:
-    """Read a float env var with a fail-soft fallback (NEVER raises)."""
+def _env_float(
+    name: str, default: float, source: Optional[Dict[str, str]] = None
+) -> float:
+    """Read a float env var with a fail-soft fallback (NEVER raises).
+
+    ``source`` defaults to ``os.environ`` (this process's own env). Pass a
+    mapping explicitly (e.g. the composed child ``env`` dict) to read a
+    var that was overlaid/derived into that dict rather than inherited
+    verbatim from this process's environment.
+    """
+    _src = source if source is not None else os.environ
     try:
-        return float(os.environ.get(name, str(default)))
+        return float(_src.get(name, str(default)))
     except (TypeError, ValueError):
         return default
 
@@ -469,8 +478,8 @@ def _env_float(name: str, default: float) -> float:
 # every GENERATE preflight refused (est=$0.10 > remaining=$0.00) with
 # Claude structurally disabled, so APPLY was never reachable. Env-tunable,
 # funds DW-shaped preflight estimates (~$0.10/op).
-_ISO_SESSION_BUDGET_USD: float = float(
-    os.environ.get("JARVIS_ISO_SESSION_BUDGET_USD", "2.00")
+_ISO_SESSION_BUDGET_USD: float = _env_float(
+    "JARVIS_ISO_SESSION_BUDGET_USD", 2.00
 )
 
 
@@ -1597,8 +1606,16 @@ class IsomorphicA1Driver:
                 # ZERO-BUDGET fail-fast (budget_failfast): Run #14 burned 83 min
                 # against a structurally-unpassable $0.00 wall. Abort ignition
                 # instead -- BEFORE the soak child spawns.
-                _effective_cap = float(env.get("OUROBOROS_BATTLE_COST_CAP", "0") or "0")
-                _s2_budget = float(env.get("JARVIS_S2_SESSION_BUDGET_USD", "0") or "0")
+                # Read from the COMPOSED CHILD env dict (not this process's
+                # own os.environ) -- OUROBOROS_BATTLE_COST_CAP is a
+                # driver-derived key overlaid into `env` above, and
+                # JARVIS_S2_SESSION_BUDGET_USD (operator-supplied) may have
+                # been copied/overlaid into `env` by compose_env() rather
+                # than being read back from this process's os.environ.
+                _effective_cap = _env_float(
+                    "OUROBOROS_BATTLE_COST_CAP", 0.0, source=env)
+                _s2_budget = _env_float(
+                    "JARVIS_S2_SESSION_BUDGET_USD", 0.0, source=env)
                 if max(_effective_cap, _s2_budget) <= 0.0:
                     _log("FATAL ZERO-BUDGET: composed env has no funded session "
                          "budget (OUROBOROS_BATTLE_COST_CAP and "
@@ -1606,6 +1623,24 @@ class IsomorphicA1Driver:
                          "GENERATE would preflight-refuse. Aborting.")
                     verdict = {"proven": False,
                                "failure_locus": "env_compose:budget_failfast"}
+                    # T5 telemetry: this abort fires BEFORE the soak child ever
+                    # spawns (no debug_log/chaos_manifest yet), so the
+                    # local_autopsy sibling (used by the shared "if not
+                    # proven" audit-failure path below) cannot run this early
+                    # -- it hard-requires a debug_log. capture_failure_telemetry
+                    # has no such dependency (already imported above, only
+                    # needs output_dir + reason) and IS the earliest-available
+                    # artifact mechanism at this point in run(), so reuse it
+                    # directly instead of leaving `verdict` an unread dead
+                    # stamp.
+                    try:
+                        capture_failure_telemetry(
+                            output_dir=Path(run_dir) / "telemetry",
+                            reason="a1_iso_not_proven:%s"
+                            % verdict["failure_locus"],
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- never block abort
+                        _log("telemetry warning: %r" % (exc,))
                     return 2
 
                 chaos = harness_mod.ChaosController(
