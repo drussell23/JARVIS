@@ -664,6 +664,22 @@ async def async_flock_append_lines(
     async_flock_critical_section on the SAME path — the wait is
     BOUNDED (returns False at timeout_s) but always fails.
     NEVER raises."""
+    # Durable-path resolution — the SINGLE async-path resolution point
+    # (Slice 3 review): mirrors the sync funnel `flock_append_lines`
+    # (:462) so the offload body's parent mkdir targets the DURABLE
+    # parent, not an active overlay/worktree reroot source. Without
+    # this, a direct call would mkdir a spurious empty overlay dir
+    # while the write — resolved again, idempotently, inside
+    # `flock_append_lines` — lands in the durable root. Both async
+    # entry points funnel here, so `async_flock_append_line` delegates
+    # without resolving itself (no double-resolve on the async path).
+    from backend.core.ouroboros.governance.workspace_resolver import (
+        resolve_durable_path,
+    )
+    try:
+        path = resolve_durable_path(path)
+    except Exception:  # noqa: BLE001 — mirror sync helper's fail-soft
+        pass
     materialized = tuple(lines)  # never iterate a caller generator off-thread
     try:
         from backend.core.ouroboros.governance.cooperative_fs_io import (
@@ -709,13 +725,11 @@ async def async_flock_append_line(
     """Async variant of flock_append_line. See
     async_flock_append_lines for the ordering / non-reentrancy
     contract. NEVER raises."""
-    from backend.core.ouroboros.governance.workspace_resolver import (
-        resolve_durable_path,
-    )
-    try:
-        path = resolve_durable_path(path)
-    except Exception:  # noqa: BLE001 — mirror sync helper's fail-soft
-        pass
+    # Durable-path resolution is single-sourced in
+    # `async_flock_append_lines` (the shared async funnel) — this
+    # wrapper is a pure delegate so the async path resolves exactly
+    # once (Slice 3 review: no double-resolve, symmetry with the
+    # sync `flock_append_line` -> `flock_append_lines` funnel).
     return await async_flock_append_lines(path, (line,), timeout_s=timeout_s)
 
 

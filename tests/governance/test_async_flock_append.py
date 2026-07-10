@@ -175,6 +175,59 @@ async def test_offload_raising_returns_false_never_raises(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_async_append_lines_resolves_durable_no_overlay_dir(
+    tmp_path, monkeypatch,
+):
+    """Slice 3 review — durable-path resolution symmetry.
+
+    A DIRECT ``async_flock_append_lines`` call (not via
+    ``async_flock_append_line``) under an active overlay reroot must
+    resolve durable in the SAME single async-path resolution point
+    that the write uses. Prove it: with ``resolve_durable_path``
+    monkeypatched to remap overlay->durable, a direct call must
+    (1) land the write at the DURABLE path and (2) NOT create the
+    NON-durable (overlay) parent directory.
+
+    Before the fix, ``async_flock_append_lines`` never resolved, so
+    ``_append_lines_with_mkdir`` mkdir'd the overlay parent while the
+    inner ``flock_append_lines`` resolved durable and wrote there —
+    leaving a spurious empty overlay dir. This test is red on that
+    code path.
+    """
+    from backend.core.ouroboros.governance import workspace_resolver as wr
+
+    overlay_root = tmp_path / "overlay"
+    durable_root = tmp_path / "durable"
+
+    def _remap(path):
+        p = Path(path)
+        try:
+            rel = p.relative_to(overlay_root)
+        except ValueError:
+            return p
+        return durable_root / rel
+
+    # Function-local `from ... import resolve_durable_path` in both
+    # flock_append_lines and async_flock_append_lines resolves against
+    # the source module attribute — patch it there.
+    monkeypatch.setattr(wr, "resolve_durable_path", _remap)
+
+    overlay_target = overlay_root / "sub" / "ledger.jsonl"
+    durable_target = durable_root / "sub" / "ledger.jsonl"
+
+    ok = await cpj.async_flock_append_lines(overlay_target, ('{"z":9}',))
+    assert ok is True
+
+    # (1) Write landed at the DURABLE path.
+    assert durable_target.exists()
+    assert durable_target.read_text() == '{"z":9}\n'
+
+    # (2) The overlay parent dir was NEVER created (no spurious mkdir).
+    assert not (overlay_root / "sub").exists()
+    assert not overlay_root.exists()
+
+
+@pytest.mark.asyncio
 async def test_master_off_inline_still_appends(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_COOPERATIVE_FS_IO_ENABLED", "false")
     target = tmp_path / "off.jsonl"

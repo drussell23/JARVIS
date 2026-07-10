@@ -14,11 +14,14 @@ resolve which is true.
     the diagnostic.
   * **No hardcoding:** every threshold env-knobbed.
   * **Compose existing:** writes go through
-    :func:`cross_process_jsonl.flock_append_line` (Slice 33 Arc 2
-    Phase 2 instrumented) — no parallel write path.
-  * **Async-native:** :meth:`record_call` dispatches the file write
-    via ``asyncio.to_thread`` so the asyncio loop keeps ticking
-    during file I/O.
+    :func:`cross_process_jsonl.async_flock_append_line` (Slice 33 Arc 2
+    Phase 2 instrumented; Slice 3 T4 canonicalized) — no parallel
+    write path.
+  * **Async-native:** :meth:`record_call` awaits
+    ``async_flock_append_line``, which routes the whole lock-wait +
+    file write through the ``cooperative_fs_io.offload`` substrate
+    (F8 thread pool) so the asyncio loop keeps ticking during the
+    flock poll loop + FS sync.
   * **Fail-closed:** any internal error logs at WARN and swallows.
     Recording failure MUST NEVER affect the provider call's outcome.
   * **Default ON (passive):** ``JARVIS_DW_CAPACITY_LEDGER_ENABLED``
@@ -167,8 +170,9 @@ class DWCallRecord:
 
 
 class DWCapacityLedger:
-    """Append-only per-call record sink. Composes ``flock_append_line``
-    (Slice 33 Arc 2 Phase 2) for cross-process-safe writes.
+    """Append-only per-call record sink. Composes
+    ``async_flock_append_line`` (Slice 33 Arc 2 Phase 2; Slice 3 T4
+    canonicalized) for off-loop cross-process-safe writes.
 
     Public API:
       * :meth:`record_call` — async write of one record
