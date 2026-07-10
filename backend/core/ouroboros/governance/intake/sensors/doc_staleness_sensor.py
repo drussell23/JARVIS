@@ -56,6 +56,20 @@ _DOC_STALENESS_FALLBACK_INTERVAL_S: float = float(
 )
 
 
+def sensor_enabled() -> bool:
+    """Master enable for the DocStaleness sensor, re-read at call time.
+
+    ``JARVIS_DOC_STALENESS_ENABLED`` (BOOL, default TRUE). Run #14 autopsy:
+    this sensor produced 1049/1065 pool submissions via its ``fs.changed.*``
+    subscription (reacting to the session's own file writes), saturating the
+    6-worker pool and dominating the shutdown-wedge threads. Iso/A1 soaks pin
+    this false; production default is unchanged.
+    """
+    return os.environ.get(
+        "JARVIS_DOC_STALENESS_ENABLED", "true",
+    ).strip().lower() not in ("false", "0", "no", "off")
+
+
 def webhook_enabled() -> bool:
     """Re-read ``JARVIS_DOC_STALENESS_WEBHOOK_ENABLED`` at call-time.
 
@@ -189,6 +203,8 @@ class DocStalenessSensor:
 
     async def _on_fs_event(self, event: Any) -> None:
         """React to file changes — rescan on git commit or .py change."""
+        if not sensor_enabled():
+            return
         rel_path = event.payload.get("relative_path", "")
 
         # Git commit event → rescan changed Python files
@@ -330,6 +346,8 @@ class DocStalenessSensor:
         findings (skip AST parsing + emission). When master flag(s) off
         OR cartographer reports change → full scan as legacy behavior.
         """
+        if not sensor_enabled():
+            return []
         current_hash = self._merkle_current_root_hash()
         if self._merkle_should_short_circuit(current_hash):
             self._merkle_short_circuits += 1

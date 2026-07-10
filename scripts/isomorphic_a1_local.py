@@ -463,6 +463,17 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# Run #14 autopsy fix #1 (economics): the soak child booted with a $0.00
+# SessionBudgetAuthority-visible budget (OUROBOROS_BATTLE_COST_CAP /
+# JARVIS_S2_SESSION_BUDGET_USD both unset in the composed child env) --
+# every GENERATE preflight refused (est=$0.10 > remaining=$0.00) with
+# Claude structurally disabled, so APPLY was never reachable. Env-tunable,
+# funds DW-shaped preflight estimates (~$0.10/op).
+_ISO_SESSION_BUDGET_USD: float = float(
+    os.environ.get("JARVIS_ISO_SESSION_BUDGET_USD", "2.00")
+)
+
+
 # ---------------------------------------------------------------------------
 # Soak-child termination coordination (root cause bt-iso-1783144982)
 # ---------------------------------------------------------------------------
@@ -1379,6 +1390,25 @@ class IsomorphicA1Driver:
                 env: Dict[str, str] = harness_mod.compose_env()
                 env.update(adversary.env_overrides())
 
+                env.update({
+                    # Run #14 autopsy fix #1: the soak child booted with
+                    # budget=$0.00 -> every GENERATE died at
+                    # SessionBudgetAuthority preflight (est=$0.10 >
+                    # remaining=$0.00) with Claude structurally disabled ->
+                    # APPLY unreachable. Fund the harness cost tracker; keep
+                    # it bounded.
+                    "OUROBOROS_BATTLE_COST_CAP": str(_ISO_SESSION_BUDGET_USD),
+                    # Autopsy fix #3 / noise floor: 1049/1065 submissions were
+                    # doc_staleness fs.changed reactions to the session's own
+                    # writes.
+                    "JARVIS_DOC_STALENESS_ENABLED": "false",
+                    # Evidence-pack #5: assert the offload substrate is
+                    # armed -- either flag off silently reintroduces the
+                    # on-loop scan class.
+                    "JARVIS_COOPERATIVE_FS_IO_ENABLED": "true",
+                    "JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED": "true",
+                })
+
                 # Wall-Scaled Router-Readiness Cap (bt-iso-1783035104): derive
                 # JARVIS_A1_ROUTER_READY_TIMEOUT_S from THIS scenario's composed
                 # wall rather than the flat 60s default -- the driver owns the
@@ -1563,6 +1593,20 @@ class IsomorphicA1Driver:
                 _log("env composed: %d keys total, adversary overrides applied, "
                      "failover=%s" % (len(env), "enabled" if self.enable_failover
                                       else "pinned-off"))
+
+                # ZERO-BUDGET fail-fast (budget_failfast): Run #14 burned 83 min
+                # against a structurally-unpassable $0.00 wall. Abort ignition
+                # instead -- BEFORE the soak child spawns.
+                _effective_cap = float(env.get("OUROBOROS_BATTLE_COST_CAP", "0") or "0")
+                _s2_budget = float(env.get("JARVIS_S2_SESSION_BUDGET_USD", "0") or "0")
+                if max(_effective_cap, _s2_budget) <= 0.0:
+                    _log("FATAL ZERO-BUDGET: composed env has no funded session "
+                         "budget (OUROBOROS_BATTLE_COST_CAP and "
+                         "JARVIS_S2_SESSION_BUDGET_USD both <= 0) -- every "
+                         "GENERATE would preflight-refuse. Aborting.")
+                    verdict = {"proven": False,
+                               "failure_locus": "env_compose:budget_failfast"}
+                    return 2
 
                 chaos = harness_mod.ChaosController(
                     repo_root=self.repo_root,
