@@ -551,3 +551,35 @@ s2_pricing:
       "Qwen/Qwen3.5-397B-A17B-FP8":
         input: 0.0000001
         output: 0.0000004
+
+# ---------------------------------------------------------------------------
+# Hosted provider CANDIDATES — Phase 0 probe targets, NOT routing authority.
+# Consumed ONLY by scripts/probe_longcat_phase0.py. Promotion into `brains:` /
+# cascade tiers is Phase 2 work, gated on the Phase 0 verdict artifact.
+# Spec: docs/superpowers/backlog/2026-07-10-longcat-resilience-stub.md
+# ---------------------------------------------------------------------------
+hosted_provider_candidates:
+  longcat:
+    vendor: "meituan-longcat"      # official: longcat.ai + github.com/meituan-longcat
+                                   # (longcatai.org is an SEO mirror — never enter keys there)
+    dialect: "anthropic"           # Path A. base_url is HOST ROOT of the Anthropic-compat
+                                   # surface — the SDK appends /v1/messages; never pre-append /v1.
+    endpoint: "https://api.longcat.chat/anthropic"  # VERIFY-FIRST: Phase 0 P1 validates this
+                                   # exact value; correct HERE (never in code) on a routing delta.
+    api_key_env: "JARVIS_LONGCAT_API_KEY"  # indirection — probe reads the env NAME from policy
+    models:
+      - model_name: "LongCat-Flash-Chat"
+        context_window: 131072
+        pricing_per_mtok: { input_usd: 0.20, output_usd: 0.80 }
+      - model_name: "LongCat-Flash-Thinking"
+        context_window: 131072
+        pricing_per_mtok: { input_usd: 0.20, output_usd: 0.80 }
+    features:
+      extended_thinking: false     # Claude-only semantics — never send thinking params
+      prompt_caching: false        # ditto — no cache_control blocks on this lane
+      vision: "unverified"         # Phase 0 P5 capability probe records the live answer
+    path_b_fallback:               # structural pivot target if Path A fails the dialect gate
+      dialect: "openai"
+      endpoint: "https://openrouter.ai/api/v1"
+      api_key_env: "JARVIS_OPENROUTER_API_KEY"
+      model_name: "meituan/longcat-flash-chat"
