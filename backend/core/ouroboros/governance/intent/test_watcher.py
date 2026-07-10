@@ -149,6 +149,31 @@ class TestWatcher:
         self._running = False
 
     # ------------------------------------------------------------------
+    # Gap #4 Strangler Fig: event-primary poll derate
+    # ------------------------------------------------------------------
+
+    def _event_primary_derate(self) -> bool:
+        """True when the Gap #4 event-primary TestFailure lane is armed and
+        the operator has not forced legacy polling. Run #14: the legacy
+        whole-suite poll (300s cadence, 180s timeout) SIGKILLed 7/7 times
+        under load and produced zero signals while starving the box the
+        event lane needed.
+
+        Reads ``JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED`` (via
+        ``test_failure_sensor.fs_events_enabled()``) and
+        ``JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY`` fresh on every call
+        (dynamic, not cached at ``__init__`` time) so an operator can flip
+        either lane live without restarting the process.
+        """
+        from backend.core.ouroboros.governance.intake.sensors.test_failure_sensor import (
+            fs_events_enabled,
+        )
+        forced = os.environ.get(
+            "JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY", "false",
+        ).strip().lower() in ("true", "1", "yes", "on")
+        return fs_events_enabled() and not forced
+
+    # ------------------------------------------------------------------
     # Subprocess invocation
     # ------------------------------------------------------------------
 
@@ -529,6 +554,16 @@ class TestWatcher:
 
         Sets ``self._running = True`` and repeatedly calls :meth:`poll_once`
         followed by an async sleep.  Exits cleanly on ``CancelledError``.
+
+        Gap #4 Strangler Fig (Slice 4 T3): before invoking ``poll_once`` /
+        ``run_pytest``, consults :meth:`_event_primary_derate`. When the
+        event-primary TestFailure lane is armed (and the operator hasn't
+        forced legacy polling via ``JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY``),
+        this whole-suite sweep is a redundant Strangler-Fig fallback that
+        must NOT compete with the event lane for the box — Run #14 had it
+        SIGKILL 7/7 times at the 180s ceiling while starving the resolver
+        the event lane needed. The interval sleep still runs every cycle
+        (only the sweep itself is skipped) so this never busy-spins.
         """
         self._running = True
         logger.info(
@@ -539,6 +574,14 @@ class TestWatcher:
         )
         try:
             while self._running:
+                if self._event_primary_derate():
+                    logger.debug(
+                        "[TestWatcher] event-primary lane armed — skipping "
+                        "legacy whole-suite poll (JARVIS_INTENT_POLL_WHEN_"
+                        "EVENT_PRIMARY=true to force)."
+                    )
+                    await asyncio.sleep(self.poll_interval_s)
+                    continue  # honoring the existing interval sleep
                 signals = await self.poll_once()
                 if signals:
                     logger.info(

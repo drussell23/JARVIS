@@ -213,6 +213,159 @@ _HYDRATION_DEDUP_TTL_S: float = float(
 TESTWATCHER_READY_MARKER = "[TestWatcher] READY subscribed=fs.changed.*"
 
 
+# --- Slice 4 T3: off-loop scoped-target resolution ------------------------
+#
+# Run #14 tombstone: the main thread wedged 83 minutes inside
+# ``_resolve_scoped_targets`` -> ``pathlib.resolve`` -> ``_joinrealpath``
+# (test_failure_sensor.py:836 at the time). ``Path.resolve()`` walks the
+# filesystem synchronously (symlink resolution, ``_joinrealpath``) and the
+# downstream ``TestRunner.resolve_affected_tests`` call does its own
+# directory walks -- both are blocking work that has no business running on
+# the asyncio loop that ALSO needs to keep servicing the FS-event bridge,
+# heartbeats, and every other sensor. ``_offload_fs`` routes that work
+# through the unified ``cooperative_fs_io.offload`` substrate (thread pool),
+# copying the sanctioned import-fault fallback idiom from
+# ``posture_observer._offload_signal`` (posture_observer.py:204-229) -- the
+# ONLY sanctioned fallback shape (Mandate 3).
+async def _offload_fs(fn, /, *args, **kwargs):
+    """Route blocking FS work through the cooperative substrate; fail-soft
+    to the caller's neutral value at the call site (never raises past it).
+    Copied import-fault idiom from posture_observer._offload_signal."""
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error,
+            offload,
+        )
+    except ImportError:
+        import asyncio as _aio
+        return await _aio.get_event_loop().run_in_executor(
+            None, lambda: fn(*args, **kwargs)
+        )
+    result = await offload(fn, *args, cpu_bound=False, **kwargs)
+    if is_offload_error(result):
+        raise RuntimeError(f"offload failed: {result!r}")
+    return result
+
+
+def _mirror_tests_dir_sync(
+    changed_abs: Path, repo_root: Path
+) -> Optional[Path]:
+    """Module-level counterpart of ``TestFailureSensor._mirror_tests_dir``.
+
+    Extracted (Slice 4 T3) so the off-loop sync resolver
+    (:func:`_resolve_scoped_targets_sync`) can call it without an instance.
+    Bounded to a single nearest sibling ``tests/`` dir, NOT the repo root.
+    """
+    try:
+        from backend.core.ouroboros.governance.test_runner import (
+            _find_sibling_tests_dir,
+        )
+    except Exception:
+        return None
+    try:
+        sibling = _find_sibling_tests_dir(changed_abs)
+    except Exception:
+        return None
+    if sibling is None:
+        return None
+    if TestFailureSensor._is_repo_test_root(sibling, repo_root):
+        return None
+    return sibling
+
+
+def _resolve_scoped_targets_sync(
+    repo_root: Path, changed_rel_path: str
+) -> Optional[List[str]]:
+    """Map *changed_rel_path* -> bounded scoped pytest targets.
+
+    Runs entirely inside the ``cooperative_fs_io`` thread-pool worker
+    (Slice 4 T3) -- the EXISTING logic from
+    ``TestFailureSensor._resolve_scoped_targets`` (primary mapper ->
+    mirror-dir -> tier-3 package discovery), extracted verbatim to a
+    module-level sync function. ``TestRunner.resolve_affected_tests`` is a
+    coroutine with NO synchronous underlying mapper -- every blocking step
+    inside it (``_get_ast_import_map``, ``_find_tests_suffix_aware``,
+    ``_find_test_recursive``) is itself wrapped in
+    ``loop.run_in_executor`` and requires a running loop
+    (test_runner.py:1006-1025, :803-825, :828-862). Since there is no sync
+    mapper to call directly, this function wraps the WHOLE resolution
+    closure and drives it via ``asyncio.run()`` -- safe here because this
+    function only ever executes inside a plain thread-pool worker thread
+    (via ``_offload_fs``/``cooperative_fs_io.offload``), which never has a
+    running event loop of its own.
+
+    Returns
+    -------
+    * A non-empty ``List[str]`` of scoped test paths when the existing
+      ``TestRunner.resolve_affected_tests`` (or the bounded mirror-dir
+      fallback) yields targets.
+    * ``None`` when nothing resolved — the caller then either skips the
+      run or (opt-in) falls back to the whole suite. **Never** returns
+      the whole ``tests/`` directory implicitly.
+
+    Fail-safe by construction: any error in the resolver degrades to the
+    mirror-dir fallback, and any error there degrades to ``None``.
+    """
+    if not changed_rel_path:
+        return None
+
+    changed_abs = (repo_root / changed_rel_path).resolve()
+
+    # Primary: reuse the existing 4-level deterministic mapper.
+    try:
+        from backend.core.ouroboros.governance.test_runner import TestRunner
+
+        runner = TestRunner(repo_root)
+        resolved = asyncio.run(runner.resolve_affected_tests((changed_abs,)))
+        targets = [
+            str(p) for p in resolved
+            if not TestFailureSensor._is_repo_test_root(p, repo_root)
+        ]
+        if targets:
+            return targets
+    except Exception as exc:  # noqa: BLE001 — resolver is best-effort
+        logger.debug(
+            "TestFailureSensor: resolve_affected_tests failed for %r: %s",
+            changed_rel_path, exc,
+        )
+
+    # Fail-safe: nearest sibling mirror tests/ dir (bounded, single dir).
+    mirror = _mirror_tests_dir_sync(changed_abs, repo_root)
+    if mirror is not None:
+        return [str(mirror)]
+
+    # Tier 3: package-layout test discovery — search for test_<stem>.py
+    # across known test dirs when both primary resolver and mirror-dir
+    # fail. Prevents silent signal drop on AST analysis failures.
+    try:
+        stem = Path(changed_rel_path).stem
+        if stem and not stem.startswith("test_"):
+            pattern = "test_%s.py" % (stem,)
+            pkg_targets: list = []
+            for test_root_name in ("tests", "test"):
+                test_root = repo_root / test_root_name
+                if test_root.is_dir():
+                    for hit in test_root.rglob(pattern):
+                        pkg_targets.append(str(hit))
+                        if len(pkg_targets) >= 3:  # bounded
+                            break
+                if len(pkg_targets) >= 3:
+                    break
+            if pkg_targets:
+                logger.info(
+                    "TestFailureSensor: package-layout fallback resolved "
+                    "%d test target(s) for %r",
+                    len(pkg_targets), changed_rel_path,
+                )
+                return pkg_targets
+    except Exception:  # noqa: BLE001 — fail-soft
+        logger.debug(
+            "TestFailureSensor: package-layout fallback error for %r",
+            changed_rel_path, exc_info=True,
+        )
+    return None
+
+
 class TestFailureSensor:
     """Adapter that bridges TestWatcher → UnifiedIntakeRouter.
 
@@ -817,6 +970,13 @@ class TestFailureSensor:
     ) -> Optional[List[str]]:
         """Map *changed_rel_path* -> bounded scoped pytest targets.
 
+        Slice 4 T3: the actual resolution logic now runs OFF the asyncio
+        loop, in the ``cooperative_fs_io`` thread-pool worker (see
+        :func:`_resolve_scoped_targets_sync`) — the Run #14 tombstone was
+        this coroutine's ``(repo_root / changed_rel_path).resolve()``
+        blocking the main thread for 83 minutes. Signature and return
+        contract are unchanged.
+
         Returns
         -------
         * A non-empty ``List[str]`` of scoped test paths when the existing
@@ -826,68 +986,18 @@ class TestFailureSensor:
           run or (opt-in) falls back to the whole suite. **Never** returns
           the whole ``tests/`` directory implicitly.
 
-        Fail-safe by construction: any error in the resolver degrades to the
-        mirror-dir fallback, and any error there degrades to ``None``.
+        Fail-safe by construction: any error in the resolver — including an
+        ``_offload_fs`` substrate fault — degrades to ``None``, same as the
+        sync path's own internal fail-safe ladder.
         """
         if not changed_rel_path:
             return None
-
-        repo_root = self._repo_root()
-        changed_abs = (repo_root / changed_rel_path).resolve()
-
-        # Primary: reuse the existing 4-level deterministic mapper.
         try:
-            from backend.core.ouroboros.governance.test_runner import TestRunner
-
-            runner = TestRunner(repo_root)
-            resolved = await runner.resolve_affected_tests((changed_abs,))
-            targets = [
-                str(p) for p in resolved
-                if not self._is_repo_test_root(p, repo_root)
-            ]
-            if targets:
-                return targets
-        except Exception as exc:  # noqa: BLE001 — resolver is best-effort
-            logger.debug(
-                "TestFailureSensor: resolve_affected_tests failed for %r: %s",
-                changed_rel_path, exc,
+            return await _offload_fs(
+                _resolve_scoped_targets_sync, self._repo_root(), changed_rel_path,
             )
-
-        # Fail-safe: nearest sibling mirror tests/ dir (bounded, single dir).
-        mirror = self._mirror_tests_dir(changed_abs, repo_root)
-        if mirror is not None:
-            return [str(mirror)]
-
-        # Tier 3: package-layout test discovery — search for test_<stem>.py
-        # across known test dirs when both primary resolver and mirror-dir
-        # fail. Prevents silent signal drop on AST analysis failures.
-        try:
-            stem = Path(changed_rel_path).stem
-            if stem and not stem.startswith("test_"):
-                pattern = "test_%s.py" % (stem,)
-                pkg_targets: list = []
-                for test_root_name in ("tests", "test"):
-                    test_root = repo_root / test_root_name
-                    if test_root.is_dir():
-                        for hit in test_root.rglob(pattern):
-                            pkg_targets.append(str(hit))
-                            if len(pkg_targets) >= 3:  # bounded
-                                break
-                    if len(pkg_targets) >= 3:
-                        break
-                if pkg_targets:
-                    logger.info(
-                        "TestFailureSensor: package-layout fallback resolved "
-                        "%d test target(s) for %r",
-                        len(pkg_targets), changed_rel_path,
-                    )
-                    return pkg_targets
-        except Exception:  # noqa: BLE001 — fail-soft
-            logger.debug(
-                "TestFailureSensor: package-layout fallback error for %r",
-                changed_rel_path, exc_info=True,
-            )
-        return None
+        except Exception:  # noqa: BLE001 — resolver is best-effort (existing contract)
+            return None
 
     @staticmethod
     def _is_repo_test_root(path: Path, repo_root: Path) -> bool:
@@ -897,6 +1007,11 @@ class TestFailureSensor:
         ``tests/`` dir, which is exactly the whole-suite sweep we are
         avoiding. Treat it as "did not scope" so the caller can fall to the
         bounded mirror-dir or skip — never run it implicitly.
+
+        Slice 4 T3: also called from the module-level off-loop resolver
+        (:func:`_resolve_scoped_targets_sync`, :func:`_mirror_tests_dir_sync`)
+        — kept ``@staticmethod`` so both the instance and the worker-thread
+        sync path can call it without an instance.
         """
         try:
             from backend.core.ouroboros.governance.test_runner import (
@@ -909,31 +1024,6 @@ class TestFailureSensor:
         except Exception:
             rp = path
         return rp.parent == repo_root and rp.name in _TEST_DIR_NAMES
-
-    def _mirror_tests_dir(
-        self, changed_abs: Path, repo_root: Path
-    ) -> Optional[Path]:
-        """Nearest sibling ``tests/`` dir for *changed_abs*, NOT the repo root.
-
-        Bounded to a single directory so a resolve miss still runs a small,
-        local slice instead of the whole suite. Returns ``None`` when the
-        only sibling test dir IS the repo root (caller then skips / opts in).
-        """
-        try:
-            from backend.core.ouroboros.governance.test_runner import (
-                _find_sibling_tests_dir,
-            )
-        except Exception:
-            return None
-        try:
-            sibling = _find_sibling_tests_dir(changed_abs)
-        except Exception:
-            return None
-        if sibling is None:
-            return None
-        if self._is_repo_test_root(sibling, repo_root):
-            return None
-        return sibling
 
     # ------------------------------------------------------------------
     # Poll fallback (safety net when event spine is unavailable)
