@@ -59,6 +59,90 @@ async def test_resolver_failure_degrades_to_none(monkeypatch, tmp_path):
     assert await sensor._resolve_scoped_targets("backend/x.py") is None
 
 
+# ---------------------------------------------------------------------------
+# cooperative_fs_io master-off degrade: byte-identical resolution
+#
+# Global Constraint: JARVIS_COOPERATIVE_FS_IO_ENABLED=false must degrade to
+# the pre-slice on-loop synchronous behavior VERBATIM — including the
+# PRIMARY TestRunner.resolve_affected_tests mapper. Reviewer-reproduced
+# Critical: master-off makes offload() run the sync worker INLINE on the
+# loop thread, where its asyncio.run() raises "cannot be called from a
+# running event loop" and is swallowed — silently killing the primary AST
+# resolver while the mirror-dir/tier-3 fallbacks mask the loss.
+# ---------------------------------------------------------------------------
+
+
+def _build_ast_import_repo(tmp_path):
+    """repo/foo.py + repo/tests/test_uses_foo.py (imports foo).
+
+    ONLY the primary mapper (TestRunner Strategy 3, AST-import) can map
+    foo.py -> test_uses_foo.py in this layout:
+    * Strategy 0: foo.py is not a test file.
+    * Strategy 1/2: no test_foo.py / test_foo_*.py anywhere.
+    * Mirror-dir fallback: the nearest sibling tests/ IS the repo test
+      root, which _mirror_tests_dir_sync excludes by contract.
+    * Tier-3: looks only for test_foo.py — absent.
+    So fallback survival cannot mask a dead primary.
+    """
+    (tmp_path / "foo.py").write_text("x = 1\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test = tests_dir / "test_uses_foo.py"
+    test.write_text(
+        "import foo\n\n\ndef test_uses_foo():\n    assert foo.x == 1\n",
+        encoding="utf-8",
+    )
+    return test
+
+
+def _resolved(paths):
+    import pathlib
+    return sorted(str(pathlib.Path(p).resolve()) for p in paths)
+
+
+@pytest.mark.asyncio
+async def test_resolver_master_off_runs_primary_mapper(tmp_path, monkeypatch):
+    """JARVIS_COOPERATIVE_FS_IO_ENABLED=false -> the PRIMARY AST resolver
+    must still run (natively on-loop — the inline degrade), producing the
+    Strategy-3 target that no fallback can find."""
+    from backend.core.ouroboros.governance.intake.sensors import (
+        test_failure_sensor as tfs,
+    )
+    expected = _build_ast_import_repo(tmp_path)
+    monkeypatch.setenv("JARVIS_COOPERATIVE_FS_IO_ENABLED", "false")
+
+    sensor = tfs.TestFailureSensor.__new__(tfs.TestFailureSensor)
+    monkeypatch.setattr(sensor, "_repo_root", lambda: tmp_path, raising=False)
+
+    targets = await sensor._resolve_scoped_targets("foo.py")
+    assert targets is not None, (
+        "master-off must degrade byte-identical — primary AST resolver "
+        "silently dead (Run #14 re-review Critical)"
+    )
+    assert _resolved(targets) == _resolved([expected])
+
+
+@pytest.mark.asyncio
+async def test_resolver_master_off_parity_with_master_on(tmp_path, monkeypatch):
+    """Same inputs, both flag states, identical outputs (reviewer's parity pin)."""
+    from backend.core.ouroboros.governance.intake.sensors import (
+        test_failure_sensor as tfs,
+    )
+    expected = _build_ast_import_repo(tmp_path)
+
+    sensor = tfs.TestFailureSensor.__new__(tfs.TestFailureSensor)
+    monkeypatch.setattr(sensor, "_repo_root", lambda: tmp_path, raising=False)
+
+    monkeypatch.setenv("JARVIS_COOPERATIVE_FS_IO_ENABLED", "true")
+    on = await sensor._resolve_scoped_targets("foo.py")
+
+    monkeypatch.setenv("JARVIS_COOPERATIVE_FS_IO_ENABLED", "false")
+    off = await sensor._resolve_scoped_targets("foo.py")
+
+    assert on is not None and off is not None
+    assert _resolved(on) == _resolved(off) == _resolved([expected])
+
+
 def test_watcher_derates_when_event_lane_armed(monkeypatch):
     """Gap #4 Strangler Fig: with the event-primary TestFailure lane armed,
     the legacy poller must not run whole-suite sweeps.

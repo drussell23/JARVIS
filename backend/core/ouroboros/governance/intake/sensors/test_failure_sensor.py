@@ -273,26 +273,96 @@ def _mirror_tests_dir_sync(
     return sibling
 
 
+def _fs_io_inline_mode() -> bool:
+    """True when the ``cooperative_fs_io`` master switch is OFF — i.e.
+    ``offload()`` would run the delegated fn INLINE on this loop thread
+    (cooperative_fs_io.py's master-off byte-identical-rollback contract).
+
+    Consulted by ``_resolve_scoped_targets`` to pick the primary-mapper
+    EXECUTION strategy: master-off must await the primary natively on the
+    loop (``asyncio.run`` inside an inlined worker raises ``RuntimeError:
+    cannot be called from a running event loop`` and would silently kill
+    the primary AST resolver — the Slice 4 T3 re-review Critical).
+    Fail-soft: a consult fault assumes the offload path, which is safe —
+    ``_offload_fs``'s own import-fault fallback still dispatches to a
+    loop-free executor thread where ``asyncio.run`` works.
+    """
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            cooperative_fs_io_enabled,
+        )
+        return not cooperative_fs_io_enabled()
+    except Exception:  # noqa: BLE001 — consult fault -> assume offload path
+        return False
+
+
+async def _resolve_primary(
+    repo_root: Path, changed_abs: Path, changed_rel_path: str
+) -> Optional[List[str]]:
+    """Primary mapper step — the existing 4-level deterministic
+    ``TestRunner.resolve_affected_tests`` + whole-suite-root filter.
+
+    SINGLE-SOURCED (Mandate 3) with two execution strategies:
+    * awaited NATIVELY by ``_resolve_scoped_targets`` when
+      ``cooperative_fs_io`` is master-off (the on-loop inline degrade —
+      same coroutine, same results, byte-identical legacy semantics);
+    * driven via ``asyncio.run`` by ``_resolve_scoped_targets_sync``
+      inside the offload worker thread (no running loop there).
+
+    Best-effort (existing contract): any fault logs at debug and returns
+    ``None`` so the caller falls to the shared fallback ladder.
+    """
+    try:
+        from backend.core.ouroboros.governance.test_runner import TestRunner
+
+        runner = TestRunner(repo_root)
+        resolved = await runner.resolve_affected_tests((changed_abs,))
+        targets = [
+            str(p) for p in resolved
+            if not TestFailureSensor._is_repo_test_root(p, repo_root)
+        ]
+        return targets or None
+    except Exception as exc:  # noqa: BLE001 — resolver is best-effort
+        logger.debug(
+            "TestFailureSensor: resolve_affected_tests failed for %r: %s",
+            changed_rel_path, exc,
+        )
+        return None
+
+
+# Sentinel distinguishing "primary not yet executed" (offload-worker mode:
+# drive it here via asyncio.run) from "primary already executed by the
+# caller and returned None" (master-off mode: the async wrapper awaited it
+# natively and injects the result).
+_PRIMARY_UNSET: Any = object()
+
+
 def _resolve_scoped_targets_sync(
-    repo_root: Path, changed_rel_path: str
+    repo_root: Path,
+    changed_rel_path: str,
+    primary_targets: Any = _PRIMARY_UNSET,
 ) -> Optional[List[str]]:
     """Map *changed_rel_path* -> bounded scoped pytest targets.
 
-    Runs entirely inside the ``cooperative_fs_io`` thread-pool worker
-    (Slice 4 T3) -- the EXISTING logic from
-    ``TestFailureSensor._resolve_scoped_targets`` (primary mapper ->
-    mirror-dir -> tier-3 package discovery), extracted verbatim to a
-    module-level sync function. ``TestRunner.resolve_affected_tests`` is a
-    coroutine with NO synchronous underlying mapper -- every blocking step
-    inside it (``_get_ast_import_map``, ``_find_tests_suffix_aware``,
-    ``_find_test_recursive``) is itself wrapped in
-    ``loop.run_in_executor`` and requires a running loop
-    (test_runner.py:1006-1025, :803-825, :828-862). Since there is no sync
-    mapper to call directly, this function wraps the WHOLE resolution
-    closure and drives it via ``asyncio.run()`` -- safe here because this
-    function only ever executes inside a plain thread-pool worker thread
-    (via ``_offload_fs``/``cooperative_fs_io.offload``), which never has a
-    running event loop of its own.
+    The ONE source of truth for the resolution SEQUENCE (primary mapper ->
+    mirror-dir -> tier-3 package discovery), extracted from the pre-Slice-4
+    ``TestFailureSensor._resolve_scoped_targets`` body. Only the
+    primary-mapper EXECUTION strategy differs by mode:
+
+    * Offload mode (default, ``primary_targets`` unset): this function
+      runs inside the ``cooperative_fs_io`` thread-pool worker and drives
+      the async :func:`_resolve_primary` via ``asyncio.run()`` — safe
+      because a worker thread never has a running event loop.
+      (``TestRunner.resolve_affected_tests`` has NO sync underlying
+      mapper: every blocking step inside it — ``_get_ast_import_map``,
+      ``_find_tests_suffix_aware``, ``_find_test_recursive`` — is itself
+      ``loop.run_in_executor``-wrapped and requires a running loop;
+      test_runner.py:1006-1025, :803-825, :828-862.)
+    * Inline / master-off mode: the async wrapper has ALREADY awaited
+      :func:`_resolve_primary` natively on the loop (``asyncio.run`` on a
+      running loop raises — the Slice 4 T3 re-review Critical) and
+      injects its result via *primary_targets*; only the pure-sync
+      fallback ladder runs here.
 
     Returns
     -------
@@ -311,23 +381,40 @@ def _resolve_scoped_targets_sync(
 
     changed_abs = (repo_root / changed_rel_path).resolve()
 
-    # Primary: reuse the existing 4-level deterministic mapper.
-    try:
-        from backend.core.ouroboros.governance.test_runner import TestRunner
+    if primary_targets is _PRIMARY_UNSET:
+        # Worker-thread mode: drive the shared async primary here.
+        # Defensive belt: if a future code path ever executes this
+        # function INLINE on a loop thread without injecting the primary,
+        # fail LOUD (warning + fallbacks) instead of the silent swallowed
+        # RuntimeError that motivated this split.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            loop_running = False
+        else:
+            loop_running = True
+        if loop_running:
+            logger.warning(
+                "TestFailureSensor: _resolve_scoped_targets_sync executed "
+                "inline on a loop thread without a precomputed primary — "
+                "primary mapper SKIPPED. Inline callers must await "
+                "_resolve_primary natively and inject primary_targets."
+            )
+            primary_targets = None
+        else:
+            try:
+                primary_targets = asyncio.run(
+                    _resolve_primary(repo_root, changed_abs, changed_rel_path)
+                )
+            except Exception as exc:  # noqa: BLE001 — drive fault, not mapper fault
+                logger.debug(
+                    "TestFailureSensor: primary mapper drive failed for "
+                    "%r: %s", changed_rel_path, exc,
+                )
+                primary_targets = None
 
-        runner = TestRunner(repo_root)
-        resolved = asyncio.run(runner.resolve_affected_tests((changed_abs,)))
-        targets = [
-            str(p) for p in resolved
-            if not TestFailureSensor._is_repo_test_root(p, repo_root)
-        ]
-        if targets:
-            return targets
-    except Exception as exc:  # noqa: BLE001 — resolver is best-effort
-        logger.debug(
-            "TestFailureSensor: resolve_affected_tests failed for %r: %s",
-            changed_rel_path, exc,
-        )
+    if primary_targets:
+        return primary_targets
 
     # Fail-safe: nearest sibling mirror tests/ dir (bounded, single dir).
     mirror = _mirror_tests_dir_sync(changed_abs, repo_root)
@@ -981,6 +1068,15 @@ class TestFailureSensor:
         blocking the main thread for 83 minutes. Signature and return
         contract are unchanged.
 
+        Master-off degrade (re-review Critical fix): when
+        ``JARVIS_COOPERATIVE_FS_IO_ENABLED=false``, ``offload()`` runs the
+        worker INLINE on this loop thread, where the worker's
+        ``asyncio.run`` would raise and silently kill the primary AST
+        resolver. So under master-off the primary is awaited NATIVELY here
+        (same coroutine, on-loop — the byte-identical pre-slice
+        semantics), and its result is injected into the shared sync
+        fallback ladder, which runs inline as master-off intends.
+
         Returns
         -------
         * A non-empty ``List[str]`` of scoped test paths when the existing
@@ -997,8 +1093,21 @@ class TestFailureSensor:
         if not changed_rel_path:
             return None
         try:
+            repo_root = self._repo_root()
+            if _fs_io_inline_mode():
+                # Master-off: byte-identical on-loop degrade. Await the
+                # shared primary natively; run the shared fallback ladder
+                # inline with the result injected (Mandate 3: one
+                # resolution sequence, two primary execution strategies).
+                changed_abs = (repo_root / changed_rel_path).resolve()
+                primary = await _resolve_primary(
+                    repo_root, changed_abs, changed_rel_path,
+                )
+                return _resolve_scoped_targets_sync(
+                    repo_root, changed_rel_path, primary,
+                )
             return await _offload_fs(
-                _resolve_scoped_targets_sync, self._repo_root(), changed_rel_path,
+                _resolve_scoped_targets_sync, repo_root, changed_rel_path,
             )
         except Exception:  # noqa: BLE001 — resolver is best-effort (existing contract)
             return None
