@@ -1264,7 +1264,7 @@ class UnifiedIntakeRouter:
         # 4. WAL enqueue — durable before placing on in-memory queue
         lease_id = generate_operation_id("lse")
         envelope = envelope.with_lease(lease_id)
-        self._wal.append(
+        await self._wal.append_async(
             WALEntry(
                 lease_id=lease_id,
                 envelope_dict=envelope.to_dict(),
@@ -1951,7 +1951,7 @@ class UnifiedIntakeRouter:
                     ),
                     timeout=self._config.dispatch_timeout_s,
                 )
-                self._wal.update_status(envelope.lease_id, "acked")
+                await self._wal.update_status_async(envelope.lease_id, "acked")
                 self._retry_count.pop(ikey, None)
                 logger.info(
                     "[Router] Runtime task dispatched: %s -> %s (%d steps)",
@@ -2170,7 +2170,7 @@ class UnifiedIntakeRouter:
                     self._gls.submit(ctx, trigger_source=envelope.source),
                     timeout=self._config.dispatch_timeout_s,
                 )
-            self._wal.update_status(envelope.lease_id, "acked")
+            await self._wal.update_status_async(envelope.lease_id, "acked")
             self._retry_count.pop(ikey, None)
         except QueueFullError:
             # NO-LOSS SUBMIT BOUNDARY. The background pool is at capacity. This
@@ -2205,7 +2205,7 @@ class UnifiedIntakeRouter:
                     envelope.lease_id,
                     retries,
                 )
-                self._wal.update_status(envelope.lease_id, "dead_letter")
+                await self._wal.update_status_async(envelope.lease_id, "dead_letter")
                 self._dead_letter.append(envelope)
                 self._retry_count.pop(ikey, None)
             else:
@@ -2227,7 +2227,7 @@ class UnifiedIntakeRouter:
                         "Router: queue full during retry — dead-lettering lease_id=%s",
                         envelope.lease_id,
                     )
-                    self._wal.update_status(envelope.lease_id, "dead_letter")
+                    await self._wal.update_status_async(envelope.lease_id, "dead_letter")
                     self._dead_letter.append(envelope)
                     self._retry_count.pop(ikey, None)
 

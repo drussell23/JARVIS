@@ -61,31 +61,31 @@ class WAL:
         statement are unaffected (None -> bool is transparent); durability-
         sensitive callers (the CausalGraphIngestor's write-ahead gate) inspect
         it and MUST NOT treat a False as durable."""
-        record = {
-            "v": _WAL_VERSION,
-            "lease_id": entry.lease_id,
-            "envelope": entry.envelope_dict,
-            "status": entry.status,
-            "ts_monotonic": entry.ts_monotonic,
-            "ts_utc": entry.ts_utc,
-        }
+        record = self._append_record(entry)
         return self._write_line(record)
 
     def update_status(self, lease_id: str, status: str) -> None:
         """Append a status-update tombstone for the given lease_id."""
-        if status not in _TERMINAL_STATUSES:
-            raise ValueError(
-                f"status must be one of {sorted(_TERMINAL_STATUSES)}, got {status!r}"
-            )
-        record = {
-            "v": _WAL_VERSION,
-            "lease_id": lease_id,
-            "status": status,
-            "ts_monotonic": time.monotonic(),
-            "ts_utc": datetime.now(timezone.utc).isoformat(),
-            "_type": "status_update",
-        }
+        record = self._status_record(lease_id, status)
         self._write_line(record)
+
+    async def append_async(self, entry: WALEntry) -> bool:
+        """Async twin of :meth:`append` — same record, same HONEST durability
+        bool, but the flock acquire/write/fsync parks in the cooperative
+        offload pool instead of on the event loop (Run #14: this call site
+        was 214 LoopSink events / the dominant starvation mechanism).
+        NEVER raises. Non-reentrancy: do not call while holding
+        ``flock_critical_section`` on the same path (bounded timeout ->
+        False, never deadlock — same hazard note as async_flock_append_line).
+        """
+        record = self._append_record(entry)
+        return await self._write_line_async(record)
+
+    async def update_status_async(self, lease_id: str, status: str) -> None:
+        """Async twin of :meth:`update_status`. ValueError raises BEFORE any
+        await (sync parity); the append itself is fail-soft."""
+        record = self._status_record(lease_id, status)  # may raise ValueError
+        await self._write_line_async(record)
 
     def pending_entries(self) -> List[WALEntry]:
         """Return all entries whose effective status is ``'pending'``.
@@ -216,6 +216,30 @@ class WAL:
     # Internal
     # ------------------------------------------------------------------
 
+    def _append_record(self, entry: WALEntry) -> Dict[str, Any]:
+        return {
+            "v": _WAL_VERSION,
+            "lease_id": entry.lease_id,
+            "envelope": entry.envelope_dict,
+            "status": entry.status,
+            "ts_monotonic": entry.ts_monotonic,
+            "ts_utc": entry.ts_utc,
+        }
+
+    def _status_record(self, lease_id: str, status: str) -> Dict[str, Any]:
+        if status not in _TERMINAL_STATUSES:
+            raise ValueError(
+                f"status must be one of {sorted(_TERMINAL_STATUSES)}, got {status!r}"
+            )
+        return {
+            "v": _WAL_VERSION,
+            "lease_id": lease_id,
+            "status": status,
+            "ts_monotonic": time.monotonic(),
+            "ts_utc": datetime.now(timezone.utc).isoformat(),
+            "_type": "status_update",
+        }
+
     def _write_line(self, record: Dict[str, Any]) -> bool:
         """Append one WAL line cross-process safe via the canonical
         ``cross_process_jsonl.flock_append_line`` substrate
@@ -253,3 +277,23 @@ class WAL:
                 return False
         # Propagate flock_append_line's honest success/failure bool.
         return bool(flock_append_line(self._path, line))
+
+    async def _write_line_async(self, record: Dict[str, Any]) -> bool:
+        """Async twin of :meth:`_write_line` — same record, same honest
+        durability bool, via the canonical
+        ``cross_process_jsonl.async_flock_append_line`` funnel (Slice 3),
+        which parks the flock acquire/write/fsync in the cooperative
+        offload pool instead of blocking the event loop. NEVER raises."""
+        try:
+            line = json.dumps(record, default=str)
+        except (TypeError, ValueError):
+            return False
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                async_flock_append_line,
+            )
+        except ImportError:
+            # Substrate-unavailable rollback — same legacy shape as
+            # _write_line's fallback, kept sync (rare, documented).
+            return self._write_line(record)
+        return bool(await async_flock_append_line(self._path, line))
