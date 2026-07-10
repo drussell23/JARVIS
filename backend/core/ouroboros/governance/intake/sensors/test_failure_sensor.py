@@ -398,6 +398,10 @@ class TestFailureSensor:
         # loop runs at the fallback cadence and the FS subscription is the
         # primary trigger. When False, preserves legacy pure-poll behavior.
         self._fs_events_mode: bool = fs_events_enabled()
+        # Slice 4 T3: latch so the poll-loop derate logs once per
+        # state-change (armed -> derated / disarmed -> resumed), not once
+        # per cycle.
+        self._poll_derate_logged: bool = False
         # Telemetry counters (exposed via health snapshots; useful for
         # convergence tracking during the graduation arc).
         self._fs_events_handled: int = 0
@@ -1029,6 +1033,27 @@ class TestFailureSensor:
     # Poll fallback (safety net when event spine is unavailable)
     # ------------------------------------------------------------------
 
+    def _event_primary_derate(self) -> bool:
+        """Consult the SINGLE-SOURCE derate decision each cycle (dynamic).
+
+        Slice 4 T3 (production path): delegates to
+        ``test_watcher.event_primary_derate()`` — event lane armed AND the
+        ``JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY`` escape hatch unset. Never
+        raises: any fault (import, env parse) degrades to ``False`` so the
+        poll safety-net keeps running rather than silently going dark.
+        """
+        try:
+            from backend.core.ouroboros.governance.intent.test_watcher import (
+                event_primary_derate,
+            )
+            return event_primary_derate()
+        except Exception:  # noqa: BLE001 — fail-open to legacy polling
+            logger.debug(
+                "TestFailureSensor: event_primary_derate consult failed — "
+                "keeping legacy poll", exc_info=True,
+            )
+            return False
+
     async def _poll_loop(self) -> None:
         """Poll loop — primary when FS events are disabled, fallback when on.
 
@@ -1037,8 +1062,40 @@ class TestFailureSensor:
         to ``JARVIS_TEST_FAILURE_FALLBACK_INTERVAL_S`` (default 600s) so
         the FS subscription carries the hot path and this loop only
         catches missed FS events.
+
+        Slice 4 T3 (Run #14 / Run #15 gate): when the event-primary lane
+        is armed AND the operator has NOT set the
+        ``JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY`` escape hatch, the
+        whole-suite ``poll_once()`` sweep is fully SKIPPED for that cycle
+        (not merely interval-demoted) — Run #14 had the 300s sweep SIGKILL
+        at the 180s pytest ceiling 7/7 times, starving the box the event
+        lane needed while producing zero signals. Consulted EACH cycle
+        (dynamic, unlike the init-cached ``_fs_events_mode``) so operators
+        can flip lanes live. The ``_fs_events_mode`` interval demotion is
+        retained for the forced/legacy modes.
         """
         while self._running and self._watcher is not None:
+            if self._event_primary_derate():
+                # Log once per state-change, not per cycle.
+                if not self._poll_derate_logged:
+                    logger.debug(
+                        "[TestFailureSensor] event-primary lane armed — "
+                        "skipping legacy whole-suite poll each cycle "
+                        "(JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY=true to "
+                        "force)."
+                    )
+                    self._poll_derate_logged = True
+                try:
+                    await asyncio.sleep(_TEST_FAILURE_FALLBACK_INTERVAL_S)
+                except asyncio.CancelledError:
+                    break
+                continue
+            if self._poll_derate_logged:
+                logger.debug(
+                    "[TestFailureSensor] event-primary derate lifted — "
+                    "legacy poll resumed."
+                )
+                self._poll_derate_logged = False
             try:
                 signals = await self._watcher.poll_once()
                 if signals:

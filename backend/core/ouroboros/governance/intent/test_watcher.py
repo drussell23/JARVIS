@@ -44,6 +44,39 @@ _FAILED_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
+# Gap #4 Strangler Fig: event-primary poll derate (Slice 4 T3)
+# ---------------------------------------------------------------------------
+
+
+def event_primary_derate() -> bool:
+    """True when the Gap #4 event-primary TestFailure lane is armed and
+    the operator has not forced legacy polling. Run #14: the legacy
+    whole-suite poll (300s cadence, 180s timeout) SIGKILLed 7/7 times
+    under load and produced zero signals while starving the box the
+    event lane needed.
+
+    SINGLE SOURCE of the derate decision — consulted both by
+    ``TestWatcher.start()`` (via the thin
+    ``TestWatcher._event_primary_derate`` delegate) and by the PRODUCTION
+    poll path, ``TestFailureSensor._poll_loop`` (which
+    ``intake_layer_service`` actually runs; ``watcher.start()`` is never
+    awaited in production). Reads
+    ``JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED`` (via
+    ``test_failure_sensor.fs_events_enabled()``) and
+    ``JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY`` fresh on every call
+    (dynamic, not cached at init) so an operator can flip either lane
+    live without restarting the process.
+    """
+    from backend.core.ouroboros.governance.intake.sensors.test_failure_sensor import (
+        fs_events_enabled,
+    )
+    forced = os.environ.get(
+        "JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY", "false",
+    ).strip().lower() in ("true", "1", "yes", "on")
+    return fs_events_enabled() and not forced
+
+
+# ---------------------------------------------------------------------------
 # TestFailure dataclass
 # ---------------------------------------------------------------------------
 
@@ -153,25 +186,9 @@ class TestWatcher:
     # ------------------------------------------------------------------
 
     def _event_primary_derate(self) -> bool:
-        """True when the Gap #4 event-primary TestFailure lane is armed and
-        the operator has not forced legacy polling. Run #14: the legacy
-        whole-suite poll (300s cadence, 180s timeout) SIGKILLed 7/7 times
-        under load and produced zero signals while starving the box the
-        event lane needed.
-
-        Reads ``JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED`` (via
-        ``test_failure_sensor.fs_events_enabled()``) and
-        ``JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY`` fresh on every call
-        (dynamic, not cached at ``__init__`` time) so an operator can flip
-        either lane live without restarting the process.
-        """
-        from backend.core.ouroboros.governance.intake.sensors.test_failure_sensor import (
-            fs_events_enabled,
-        )
-        forced = os.environ.get(
-            "JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY", "false",
-        ).strip().lower() in ("true", "1", "yes", "on")
-        return fs_events_enabled() and not forced
+        """Thin delegate to the module-level :func:`event_primary_derate`
+        (single source of the derate decision — see its docstring)."""
+        return event_primary_derate()
 
     # ------------------------------------------------------------------
     # Subprocess invocation

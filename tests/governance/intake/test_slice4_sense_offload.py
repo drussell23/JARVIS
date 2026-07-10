@@ -90,3 +90,138 @@ def test_watcher_escape_hatch(monkeypatch):
     monkeypatch.setenv("JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY", "true")
     w = TestWatcher.__new__(TestWatcher)
     assert w._event_primary_derate() is False
+
+
+# ---------------------------------------------------------------------------
+# Production path: TestFailureSensor._poll_loop derate (scope extension)
+#
+# TestWatcher.start() is NOT the wired production poll loop —
+# TestFailureSensor._poll_loop is (intake_layer_service.py builds the sensor
+# and never awaits watcher.start()). The Run #15 gate needs the derate on
+# THIS path: with the event lane armed and the escape hatch unset, the
+# whole-suite poll_once() sweep must be fully SKIPPED each cycle, not merely
+# interval-demoted. Harness mirrors the graduated
+# test_test_failure_sensor_fs_events.py captured-sleep pattern.
+# ---------------------------------------------------------------------------
+
+
+class _SpyRouter:
+    def __init__(self) -> None:
+        self.envelopes: list = []
+
+    async def ingest(self, envelope) -> str:
+        self.envelopes.append(envelope)
+        return "enqueued"
+
+
+class _StubWatcher:
+    """Minimal TestWatcher surface: poll_once + poll_interval_s + stop.
+
+    Mirrors the REAL TestWatcher contract as consumed by
+    TestFailureSensor._poll_loop (feedback_fakes_must_mirror_real_contract).
+    """
+
+    def __init__(self, poll_interval_s: float = 30.0) -> None:
+        self.poll_interval_s = poll_interval_s
+        self.poll_calls = 0
+        self.stopped = False
+
+    async def poll_once(self) -> list:
+        self.poll_calls += 1
+        return []
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+async def _drive_one_poll_cycle(sensor, tfm, monkeypatch) -> list:
+    """Run _poll_loop until its first inter-cycle sleep; return captured delays."""
+    captured: list = []
+
+    async def _capture_sleep(delay: float) -> None:
+        captured.append(delay)
+        sensor._running = False
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(tfm.asyncio, "sleep", _capture_sleep)
+    sensor._running = True
+    try:
+        await sensor._poll_loop()
+    except asyncio.CancelledError:
+        pass
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_sensor_poll_loop_skips_sweep_when_event_lane_armed(monkeypatch):
+    """Event lane armed + escape hatch unset -> poll_once NEVER called;
+    the cycle still sleeps the fallback interval (no busy-spin)."""
+    from backend.core.ouroboros.governance.intake.sensors import (
+        test_failure_sensor as tfm,
+    )
+    monkeypatch.setenv("JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED", "true")
+    monkeypatch.delenv("JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY", raising=False)
+    monkeypatch.setattr(tfm, "_TEST_FAILURE_FALLBACK_INTERVAL_S", 600.0)
+
+    watcher = _StubWatcher(poll_interval_s=30.0)
+    sensor = tfm.TestFailureSensor(
+        repo="jarvis", router=_SpyRouter(), test_watcher=watcher,
+    )
+    captured = await _drive_one_poll_cycle(sensor, tfm, monkeypatch)
+
+    assert watcher.poll_calls == 0, (
+        "event-primary lane armed: the whole-suite sweep must be fully "
+        f"skipped, but poll_once ran {watcher.poll_calls}x"
+    )
+    assert captured == [600.0], (
+        f"derated cycle must still sleep the fallback interval, got {captured!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sensor_poll_loop_escape_hatch_forces_sweep(monkeypatch):
+    """Escape hatch set -> poll_once IS called; interval demotion (600s)
+    still applies because the event lane remains armed."""
+    from backend.core.ouroboros.governance.intake.sensors import (
+        test_failure_sensor as tfm,
+    )
+    monkeypatch.setenv("JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY", "true")
+    monkeypatch.setattr(tfm, "_TEST_FAILURE_FALLBACK_INTERVAL_S", 600.0)
+
+    watcher = _StubWatcher(poll_interval_s=30.0)
+    sensor = tfm.TestFailureSensor(
+        repo="jarvis", router=_SpyRouter(), test_watcher=watcher,
+    )
+    captured = await _drive_one_poll_cycle(sensor, tfm, monkeypatch)
+
+    assert watcher.poll_calls == 1, (
+        f"escape hatch must force the sweep, poll_once ran {watcher.poll_calls}x"
+    )
+    assert captured == [600.0], (
+        f"forced sweep under armed lane keeps the demoted interval, got {captured!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sensor_poll_loop_polls_at_legacy_interval_when_lane_off(monkeypatch):
+    """Event lane off -> legacy behavior byte-identical: poll_once called,
+    watcher's own interval (30s) used."""
+    from backend.core.ouroboros.governance.intake.sensors import (
+        test_failure_sensor as tfm,
+    )
+    monkeypatch.setenv("JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED", "false")
+    monkeypatch.delenv("JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY", raising=False)
+
+    watcher = _StubWatcher(poll_interval_s=30.0)
+    sensor = tfm.TestFailureSensor(
+        repo="jarvis", router=_SpyRouter(), test_watcher=watcher,
+    )
+    captured = await _drive_one_poll_cycle(sensor, tfm, monkeypatch)
+
+    assert watcher.poll_calls == 1, (
+        f"lane off: legacy poll must run, poll_once ran {watcher.poll_calls}x"
+    )
+    assert captured == [30.0], (
+        f"lane off must keep the watcher's legacy interval, got {captured!r}"
+    )

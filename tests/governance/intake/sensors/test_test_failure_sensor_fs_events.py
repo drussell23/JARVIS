@@ -248,13 +248,22 @@ async def test_poll_loop_uses_fallback_interval_when_flag_on(
     Verifies by capturing the exact value passed to asyncio.sleep from
     inside the loop. Uses a captured-sleep monkeypatch to avoid waiting
     10 minutes in a unit test.
+
+    Re-targeted (Slice 4 T3): with the event lane armed and no escape
+    hatch, the sweep is now fully SKIPPED each cycle (pinned in
+    test_slice4_sense_offload.py). This test's interval-demotion contract
+    survives in the FORCED mode — JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY
+    set — where the sweep still runs at the demoted 600s cadence. The
+    poll_calls pin makes the sweep-actually-ran half explicit (it was
+    implicit before the derate branch existed).
     """
     monkeypatch.setenv("JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY", "true")
     monkeypatch.setattr(tfm, "_TEST_FAILURE_FALLBACK_INTERVAL_S", 600.0)
 
+    watcher = _StubWatcher(poll_interval_s=30.0)
     sensor = TestFailureSensor(
-        repo="jarvis", router=_SpyRouter(),
-        test_watcher=_StubWatcher(poll_interval_s=30.0),
+        repo="jarvis", router=_SpyRouter(), test_watcher=watcher,
     )
 
     captured: List[float] = []
@@ -272,6 +281,9 @@ async def test_poll_loop_uses_fallback_interval_when_flag_on(
     except asyncio.CancelledError:
         pass
 
+    assert watcher.poll_calls == 1, (
+        f"forced mode must still run the sweep, poll_once ran {watcher.poll_calls}x"
+    )
     assert captured == [600.0], (
         f"flag on must demote poll to 600s, got {captured!r}"
     )
@@ -284,12 +296,17 @@ async def test_poll_loop_uses_watcher_interval_when_flag_off(
     """Explicit flag=off -> poll interval = TestWatcher.poll_interval_s.
 
     Graduated 2026-04-20 — test must explicitly set flag off.
+
+    Strengthened (Slice 4 T3): with the event lane off the derate never
+    engages, so the legacy sweep must both RUN (poll_calls pin, explicit
+    now that a skip branch exists) and keep the watcher's own interval.
     """
     monkeypatch.setenv("JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED", "false")
+    monkeypatch.delenv("JARVIS_INTENT_POLL_WHEN_EVENT_PRIMARY", raising=False)
 
+    watcher = _StubWatcher(poll_interval_s=30.0)
     sensor = TestFailureSensor(
-        repo="jarvis", router=_SpyRouter(),
-        test_watcher=_StubWatcher(poll_interval_s=30.0),
+        repo="jarvis", router=_SpyRouter(), test_watcher=watcher,
     )
 
     captured: List[float] = []
@@ -306,6 +323,9 @@ async def test_poll_loop_uses_watcher_interval_when_flag_off(
     except asyncio.CancelledError:
         pass
 
+    assert watcher.poll_calls == 1, (
+        f"flag off: legacy sweep must run, poll_once ran {watcher.poll_calls}x"
+    )
     assert captured == [30.0], (
         f"flag off must keep watcher's 30s interval, got {captured!r}"
     )
