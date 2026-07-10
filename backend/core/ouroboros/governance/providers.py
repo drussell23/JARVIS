@@ -6656,9 +6656,24 @@ class ClaudeProvider:
         tools_enabled: bool = False,
         tool_loop: Optional[Any] = None,  # Optional[ToolLoopCoordinator]
         mcp_client: Optional[Any] = None,  # Optional[GovernanceMCPClient]
+        base_url: Optional[str] = None,
     ) -> None:
         self._api_key = api_key
         self._model = model
+        # Anthropic-dialect endpoint override, resolved at the instantiation
+        # boundary (LongCat resilience-lane Phase 1 — the seam the backlog
+        # stub's Mandate 1 names). ``None`` (default) = byte-identical legacy
+        # behavior: the canonical factory decides (Aegis or SDK default).
+        # Non-None = an Anthropic-COMPATIBLE host root from
+        # brain_selection_policy.yaml (hosted_provider_candidates.*.endpoint;
+        # the SDK appends /v1/messages — never pre-append /v1). Threaded to
+        # every _aegis_make_anthropic construction site; NEVER string-patched
+        # at call sites. HAZARD: with Aegis enabled the factory swaps api_key
+        # for a daemon placeholder while extra_kwargs would still override
+        # base_url — placeholder key + LongCat host = guaranteed auth-fail.
+        # The resilience lane's preflight therefore refuses to arm while
+        # Aegis is active (mirrors probe_longcat_phase0's BLOCKED_AEGIS gate).
+        self._base_url = base_url
         # Dynamic output budget ceiling — env-tunable up to the model's actual
         # max (currently 64000 for Sonnet 4.5/4.6). Default 32768 is a safe
         # middle ground that handles ~1800-line full-file rewrites while
@@ -6978,6 +6993,9 @@ class ClaudeProvider:
                 self._client = _aegis_make_anthropic(
                     api_key=self._api_key,
                     max_retries=0,
+                    # Policy-resolved endpoint override (resilience lane);
+                    # empty dict = byte-identical legacy construction.
+                    **({"base_url": self._base_url} if self._base_url else {}),
                 )
                 logger.info(
                     "[ClaudeProvider] anthropic client initialized "
@@ -7026,6 +7044,9 @@ class ClaudeProvider:
                     # SDK-level retries hide signal and consume our timebox
                     # silently. We do our own visible retry in _call_with_backoff.
                     max_retries=0,
+                    # Policy-resolved endpoint override (resilience lane);
+                    # empty dict = byte-identical legacy construction.
+                    **({"base_url": self._base_url} if self._base_url else {}),
                 )
                 logger.info(
                     "[ClaudeProvider] anthropic client initialized "

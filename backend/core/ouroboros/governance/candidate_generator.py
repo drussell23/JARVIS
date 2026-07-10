@@ -6197,6 +6197,101 @@ class CandidateGenerator:
         )
         return result
 
+    def _get_resilience_provider(self, route: str) -> Tuple[Optional[Any], str]:
+        """Lazy, fail-soft resolver for the hosted resilience lane's armed
+        provider on *route*. Returns ``(provider, reason)``; ``(None, ...)``
+        on any disarm/import failure — a broken lane module can NEVER brick
+        generator dispatch (Bulletproof mandate). All arm/disarm authority
+        lives in hosted_resilience_lane.py, driven by policy shape only."""
+        lane = getattr(self, "_hosted_resilience_lane", None)
+        if lane is None:
+            if getattr(self, "_hosted_resilience_lane_broken", False):
+                return None, "lane_module_broken"
+            try:
+                from backend.core.ouroboros.governance.hosted_resilience_lane import (  # noqa: E501
+                    HostedResilienceLane,
+                )
+                lane = HostedResilienceLane()
+                self._hosted_resilience_lane = lane
+            except Exception as exc:  # noqa: BLE001 — lane must never brick dispatch
+                self._hosted_resilience_lane_broken = True
+                logger.warning(
+                    "[CandidateGenerator] hosted resilience lane import "
+                    "failed (%s) — lane dark for this session", exc,
+                )
+                return None, "lane_import_failed"
+        return lane.provider_for_route(route)
+
+    async def _try_hosted_resilience_lane(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+        *,
+        route: str,
+        tier0_error: Optional[str],
+    ) -> Optional[GenerationResult]:
+        """Consult the policy-driven hosted resilience lane after Tier-0
+        exhaustion (LongCat stub Phase 1 — hosted_resilience_lane.py).
+
+        GENERIC by design: candidates and their routes come exclusively
+        from ``brain_selection_policy.yaml`` (``hosted_provider_candidates.
+        *.resilience_lane``); no vendor name appears in this FSM. The lane
+        is DOUBLE-DARK by default (policy ``enabled: false`` + master env
+        default-false + Phase 0 verdict gate), so this consult is a single
+        cached no-op in production today.
+
+        Returns a GenerationResult on lane success, ``None`` on ANY
+        disarm/failure condition (caller falls through to its legacy
+        behavior unchanged — Bulletproof mandate: never an unhandled
+        exception out of a dark lane), with ONE exception class:
+        ``SessionBudgetPreflightRefused`` propagates. The lane provider is
+        a real ClaudeProvider, so its internal wallet preflight raises the
+        same exception DW/Claude raise — re-raising keeps a $0.00 session
+        on the Slice 4 T2 ``is_budget_refusal`` axis (local gate, fail
+        fast + visible) instead of masquerading as a lane fault or, worse,
+        silently igniting the J-Prime GCE failover.
+        """
+        provider, reason = self._get_resilience_provider(route)
+        if provider is None:
+            return None
+        logger.info(
+            "[CandidateGenerator] %s: Tier-0 exhausted (%s) — trying hosted "
+            "resilience lane (%s) [%s]",
+            route.upper(), tier0_error or "unavailable", reason,
+            getattr(context, "op_id", "?")[:16],
+        )
+        try:
+            result = await provider.generate(context, deadline)
+        except Exception as exc:  # noqa: BLE001 — classify, then fall through
+            from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
+                is_budget_refusal,
+            )
+            if is_budget_refusal(exc):
+                raise  # T2 axis: local wallet gate, NOT a lane/provider fault
+            logger.warning(
+                "[CandidateGenerator] %s: resilience lane failed "
+                "(%s: %s) — falling through to legacy path [%s]",
+                route.upper(), type(exc).__name__, str(exc)[:120],
+                getattr(context, "op_id", "?")[:16],
+            )
+            return None
+        if result is not None and len(result.candidates) > 0:
+            logger.info(
+                "[CandidateGenerator] %s: resilience lane produced %d "
+                "candidates in %.1fs ($%.4f) [%s]",
+                route.upper(), len(result.candidates),
+                getattr(result, "generation_duration_s", 0.0) or 0.0,
+                getattr(result, "cost_usd", 0.0) or 0.0,
+                getattr(context, "op_id", "?")[:16],
+            )
+            return result
+        logger.info(
+            "[CandidateGenerator] %s: resilience lane returned empty — "
+            "falling through to legacy path [%s]",
+            route.upper(), getattr(context, "op_id", "?")[:16],
+        )
+        return None
+
     async def _generate_background(
         self,
         context: OperationContext,
@@ -6301,7 +6396,15 @@ class CandidateGenerator:
             return _primacy_result
 
         if self._tier0 is None or not getattr(self._tier0, "is_available", False):
-            # DW not configured — cascade to Claude if allowed, else raise.
+            # DW not configured — resilience lane, then Claude cascade if
+            # allowed, else raise (lane is dark-by-default; see
+            # _try_hosted_resilience_lane).
+            _lane_result = await self._try_hosted_resilience_lane(
+                context, deadline, route="background",
+                tier0_error="background_dw_unavailable:tier0_not_configured",
+            )
+            if _lane_result is not None:
+                return _lane_result
             if _allow_fallback and self._fallback is not None:
                 logger.info(
                     "[CandidateGenerator] BACKGROUND: DW unavailable — "
@@ -6411,7 +6514,20 @@ class CandidateGenerator:
                     f"background_dw_batch_error:{type(exc).__name__}"
                 )
 
-        # DW exhausted. Either cascade to Claude or raise.
+        # DW exhausted. Policy-driven hosted resilience lane first (LongCat
+        # stub Phase 1): the cheap metered fallback for the route that
+        # otherwise has NONE. Dark by default (double-gated in policy + env
+        # + Phase 0 verdict); returns None on any disarm/failure so the
+        # legacy cascade/raise below is byte-identical when dark. A
+        # SessionBudgetPreflightRefused from the lane propagates (Slice 4
+        # T2 axis — a $0 wallet is a local gate, not a lane fault).
+        _lane_result = await self._try_hosted_resilience_lane(
+            context, deadline, route="background", tier0_error=_dw_error,
+        )
+        if _lane_result is not None:
+            return _lane_result
+
+        # Either cascade to Claude or raise.
         if _allow_fallback and self._fallback is not None:
             _post_dw_remaining = self._remaining_seconds(deadline)
             logger.info(
@@ -6526,6 +6642,28 @@ class CandidateGenerator:
                         "[CandidateGenerator] SPECULATIVE: batch submit failed: %s",
                         exc,
                     )
+
+        else:
+            # Tier-0 unavailable — the hosted resilience lane (dark by
+            # default; policy-driven, see _get_resilience_provider) keeps
+            # SPECULATIVE pre-computation alive through a DW outage.
+            # Fire-and-forget mirror of the DW RT idiom above: dispatch as
+            # a background task, store for later retrieval, swallow
+            # exceptions (the route tolerates high discard by contract).
+            _lane_provider, _lane_reason = self._get_resilience_provider(
+                "speculative",
+            )
+            if _lane_provider is not None:
+                _lane_task = asyncio.ensure_future(
+                    _lane_provider.generate(context, deadline),
+                )
+                _lane_task.add_done_callback(_swallow_task_exception)
+                self._background_polls[_op_id] = _lane_task
+                logger.info(
+                    "[CandidateGenerator] SPECULATIVE: Tier-0 unavailable — "
+                    "resilience lane task dispatched as background "
+                    "(%s, op=%s)", _lane_reason, _op_id,
+                )
 
         # Always raise — speculative ops are deferred, not completed.
         raise RuntimeError("speculative_deferred")

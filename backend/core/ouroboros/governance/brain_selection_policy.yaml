@@ -578,6 +578,16 @@ hosted_provider_candidates:
       extended_thinking: false     # Claude-only semantics — never send thinking params
       prompt_caching: false        # ditto — no cache_control blocks on this lane
       vision: "unverified"         # Phase 0 P5 capability probe records the live answer
+    resilience_lane:               # Phase 1 scaffold — consumed GENERICALLY by
+                                   # hosted_resilience_lane.py (the generator never
+                                   # matches on a vendor name, only on this shape).
+      enabled: false               # DOUBLE-DARK with the master env below; flip only
+                                   # after the Phase 0 wire run passes + a quality soak.
+      routes: ["background", "speculative"]  # the two routes with NO fallback today
+      master_env: "JARVIS_HOSTED_RESILIENCE_LANE_ENABLED"  # default false
+      phase0_verdict_artifact: ".superpowers/sdd/longcat-phase0-report.json"
+      required_verdict: "PATH_A_VERIFIED"  # contract-validation gate (Mandate 4)
+      lane_model: "LongCat-Flash-Chat"     # must exist in models: above
     path_b_fallback:               # structural pivot target if Path A fails the dialect gate
       dialect: "openai"
       endpoint: "https://openrouter.ai/api/v1"
