@@ -1014,13 +1014,25 @@ class TestCodeReviewFixes:
     async def test_corpus_sink_called_for_all_mutations(self, tmp_path):
         """Fix #3: run_immunization_campaign with corpus_sink calls
         record_candidate for every MutationResult (escaped, caged,
-        unparseable).  One JSONL line per generated mutation."""
+        unparseable).  One JSONL line per generated mutation.
+
+        Slice 3 T4 re-target: CorpusCacheSink now composes
+        async_flock_append_line -> cooperative_fs_io.offload ->
+        flock_append_lines (plural); the singular flock_append_line
+        is never invoked on this path, so the seam moves to the
+        plural primitive. The campaign's default _LedgerHardeningSink
+        also funnels through that same plural primitive (to a
+        different, real default ledger path) whenever a mutation
+        escapes, so counted calls are filtered down to those
+        addressed at our corpus_sink's own cache_path -- otherwise an
+        escape would over-count and neuter the assertion's strength.
+        """
         cache_path = tmp_path / "corpus.jsonl"
         corpus_sink = si.CorpusCacheSink(path=cache_path)
 
         with patch(
             "backend.core.ouroboros.governance.cross_process_jsonl"
-            ".flock_append_line",
+            ".flock_append_lines",
         ) as mock_flock:
             mock_flock.return_value = True
 
@@ -1037,10 +1049,17 @@ class TestCodeReviewFixes:
 
         assert len(reports) == 1
         rep = reports[0]
-        # flock_append_line should have been called once per total mutation.
-        assert mock_flock.call_count == rep.total_mutations, (
+        # flock_append_lines should have been called once per total
+        # mutation, addressed at our corpus cache path specifically
+        # (excludes any default-ledger escape writes sharing the mock).
+        corpus_calls = [
+            c for c in mock_flock.call_args_list
+            if c.args and c.args[0] == cache_path
+        ]
+        assert len(corpus_calls) == rep.total_mutations, (
             f"expected {rep.total_mutations} corpus writes, "
-            f"got {mock_flock.call_count}"
+            f"got {len(corpus_calls)} addressed to {cache_path} "
+            f"({mock_flock.call_count} total mock calls)"
         )
 
     async def test_corpus_sink_called_for_unparseable_too(self, tmp_path):
