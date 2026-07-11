@@ -10,8 +10,10 @@ Boundary Principle (Manifesto §3 / §5):
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time as _time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -23,6 +25,20 @@ _DEFAULT_IGNORE_GLOBS = (
     "*/.worktrees/*", "*/__pycache__/*", "*/.git/*", "*/.ouroboros/*",
     "*/node_modules/*", "*/venv/*", "*/.venv/*", "*/*.egg-info/*",
 )
+
+_SENTINEL_BASENAME = "fs_watch_sentinel.json"
+
+
+def _sentinel_enabled() -> bool:
+    return os.environ.get("JARVIS_FS_BRIDGE_SENTINEL_ENABLED", "true").lower() in ("1", "true", "yes")
+
+
+def _ready_budget_s() -> float:
+    return float(os.environ.get("JARVIS_FS_BRIDGE_READY_BUDGET_S", "300"))
+
+
+def _sentinel_retouch_s() -> float:
+    return float(os.environ.get("JARVIS_FS_BRIDGE_SENTINEL_RETOUCH_S", "15"))
 
 
 def _ignore_globs_from_env() -> List[str]:
@@ -62,6 +78,10 @@ class FileSystemEventBridge:
         self._watch_config = watch_config
         self._guard: Optional[Any] = None
         self._events_published: int = 0
+        self._sentinel_path: Path = self._project_root / ".jarvis" / _SENTINEL_BASENAME
+        self._sentinel_observed: Optional[asyncio.Event] = None  # armed in start()
+        self._verify_task: Optional[asyncio.Task] = None
+        self._watch_confirmed: bool = False
 
     async def start(self) -> None:
         """Start the FileWatchGuard and begin publishing events."""
@@ -94,6 +114,11 @@ class FileSystemEventBridge:
                 "[FSEventBridge] Watching %s (patterns=%s)",
                 self._project_root, config.patterns,
             )
+            if _sentinel_enabled():
+                self._sentinel_observed = asyncio.Event()
+                self._verify_task = asyncio.create_task(
+                    self._verify_pipeline_live(), name="fs_bridge_watch_verify",
+                )
         else:
             logger.warning(
                 "[FSEventBridge] FileWatchGuard failed to start for %s",
@@ -102,6 +127,12 @@ class FileSystemEventBridge:
 
     async def stop(self) -> None:
         """Stop the FileWatchGuard."""
+        if self._verify_task is not None and not self._verify_task.done():
+            self._verify_task.cancel()
+            try:
+                await self._verify_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._guard is not None:
             await self._guard.stop()
             logger.info(
@@ -120,6 +151,11 @@ class FileSystemEventBridge:
         from logs alone is now a single grep away.
         """
         try:
+            if event.path.name == _SENTINEL_BASENAME:
+                if self._sentinel_observed is not None and not self._sentinel_observed.is_set():
+                    self._sentinel_observed.set()
+                return  # internal liveness probe — never published downstream
+
             topic = f"fs.changed.{event.event_type.value}"
 
             # Compute relative path safely
@@ -170,6 +206,64 @@ class FileSystemEventBridge:
         except Exception:
             logger.debug("[FSEventBridge] Failed to publish event", exc_info=True)
 
+    async def _verify_pipeline_live(self) -> None:
+        """Prove the watch pipeline delivers events (Slice 5 F1/F6, Run #15 L1).
+
+        Touches a sentinel inside the watch root and awaits its own event.
+        Observed  -> publish ``fs.watch.ready`` + the WATCH ACTIVE marker
+        (the isomorphic driver gates chaos injection on that marker).
+        Budget exhausted -> the WATCH NOT CONFIRMED warning (F6 boot half).
+        Fail-soft by construction: background task, never blocks start().
+        """
+        t0 = _time.monotonic()
+        budget = _ready_budget_s()
+        retouch = _sentinel_retouch_s()
+        attempt = 0
+        try:
+            while (_time.monotonic() - t0) < budget:
+                try:
+                    self._sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+                    # Content NONCE per attempt: the guard checksum-gates
+                    # events once a baseline md5 exists (file_watch_guard
+                    # :1933), so identical-bytes retouches could be dropped.
+                    attempt += 1
+                    self._sentinel_path.write_text(
+                        '{"probe": "fs-watch-liveness", "attempt": %d}\n' % attempt,
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    logger.debug("[FSEventBridge] sentinel touch failed", exc_info=True)
+                try:
+                    await asyncio.wait_for(self._sentinel_observed.wait(), timeout=retouch)
+                except asyncio.TimeoutError:
+                    continue  # bounded re-touch; the wait itself is event-driven
+                elapsed = _time.monotonic() - t0
+                self._watch_confirmed = True
+                logger.info(
+                    "[FSEventBridge] WATCH ACTIVE — pipeline verified live "
+                    "(sentinel observed after %.1fs)", elapsed,
+                )
+                try:
+                    await self._event_bus.publish_raw(
+                        topic="fs.watch.ready",
+                        data={"elapsed_s": elapsed, "watch_root": str(self._project_root)},
+                        persist=False,
+                    )
+                except Exception:
+                    logger.debug("[FSEventBridge] fs.watch.ready publish failed", exc_info=True)
+                return
+            logger.warning(
+                "[FSEventBridge] WATCH NOT CONFIRMED — zero sentinel "
+                "observations after %.0fs (events_published=%d); fs.changed "
+                "consumers may be blind to changes in this window",
+                budget, self._events_published,
+            )
+        finally:
+            try:
+                self._sentinel_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def get_metrics(self) -> Dict[str, Any]:
         """Return bridge metrics for observability."""
         guard_metrics = {}
@@ -178,5 +272,6 @@ class FileSystemEventBridge:
         return {
             "events_published": self._events_published,
             "guard_healthy": self._guard.is_healthy if self._guard else False,
+            "watch_confirmed": self._watch_confirmed,
             **guard_metrics,
         }
