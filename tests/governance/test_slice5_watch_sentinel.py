@@ -185,3 +185,54 @@ class TestRealGuardIntegration:
             except Exception:
                 pass
             registry.unregister(tmp_path)
+
+    @pytest.mark.timeout(90)
+    @pytest.mark.asyncio
+    async def test_env_exclude_override_respected_by_sentinel_dir(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """T4 re-review Important: JARVIS_FILE_WATCH_EXCLUDE_DIRS fully
+        REPLACES config.exclude_top_level_dirs in the guard — the sentinel
+        parent must follow the guard's ACTUAL schedule, not a config
+        mirror, so a custom exclude list can't make it unobservable."""
+        from watchdog.observers.polling import PollingObserver
+        monkeypatch.setattr(
+            "watchdog.observers.Observer", PollingObserver, raising=True
+        )
+        from backend.core.resilience.file_watch_guard import (
+            get_global_watch_registry,
+        )
+        registry = get_global_watch_registry()
+        registry.unregister(tmp_path)
+
+        monkeypatch.setenv("JARVIS_FS_BRIDGE_SENTINEL_RETOUCH_S", "0.2")
+        monkeypatch.setenv("JARVIS_FS_BRIDGE_READY_BUDGET_S", "20")
+        # Exclude the would-be-first sorted dir ("code") via the guard's
+        # env override — the config-mirror alone would still pick it.
+        monkeypatch.setenv("JARVIS_FILE_WATCH_EXCLUDE_DIRS", "code")
+
+        (tmp_path / "code").mkdir()
+        (tmp_path / "code" / "a.py").write_text("x = 1\n")
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "b.py").write_text("y = 2\n")
+
+        bus = _Bus()
+        b = FileSystemEventBridge(project_root=tmp_path, event_bus=bus)
+        try:
+            with caplog.at_level("INFO"):
+                await b.start()
+                assert b._sentinel_path.parent.name != "code", (
+                    "sentinel landed in an env-excluded (unscheduled) dir"
+                )
+                assert b._sentinel_path.parent.name == "docs"
+                assert b._verify_task is not None
+                await asyncio.wait_for(b._verify_task, timeout=60.0)
+            assert b.get_metrics()["watch_confirmed"] is True
+            assert any("WATCH ACTIVE" in r.message for r in caplog.records)
+            assert "fs.watch.ready" in [t for t, _ in bus.published]
+        finally:
+            try:
+                await b.stop()
+            except Exception:
+                pass
+            registry.unregister(tmp_path)

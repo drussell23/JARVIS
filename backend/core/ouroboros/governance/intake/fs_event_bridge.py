@@ -86,6 +86,7 @@ class FileSystemEventBridge:
         self._sentinel_observed: Optional[asyncio.Event] = None  # armed in start()
         self._verify_task: Optional[asyncio.Task] = None
         self._watch_confirmed: bool = False
+        self._watch_config_active: Any = None  # the config start() handed the guard
 
     async def start(self) -> None:
         """Start the FileWatchGuard and begin publishing events."""
@@ -107,6 +108,7 @@ class FileSystemEventBridge:
             dedup_ttl_seconds=2.0,
         )
 
+        self._watch_config_active = config
         self._guard = FileWatchGuard(
             watch_dir=self._project_root,
             on_event=self._on_file_event,
@@ -120,7 +122,7 @@ class FileSystemEventBridge:
             )
             if _sentinel_enabled():
                 self._sentinel_path = (
-                    self._resolve_sentinel_dir(config) / _SENTINEL_BASENAME
+                    self._resolve_sentinel_parent() / _SENTINEL_BASENAME
                 )
                 self._sentinel_observed = asyncio.Event()
                 self._verify_task = asyncio.create_task(
@@ -218,8 +220,61 @@ class FileSystemEventBridge:
         except Exception:
             logger.debug("[FSEventBridge] Failed to publish event", exc_info=True)
 
+    def _sentinel_dir_from_schedule(self) -> Optional[Path]:
+        """First sorted scheduled root at the root/depth-1 tier, or None.
+
+        T4 re-review Important: the guard's ACTUAL schedule is the
+        authoritative truth — ``JARVIS_FILE_WATCH_EXCLUDE_DIRS`` fully
+        REPLACES ``config.exclude_top_level_dirs`` in
+        ``_resolve_excluded_dirs()`` (file_watch_guard.py:1071), and
+        ``exclude_path_patterns`` + its env twin can also drop depth-1
+        dirs — so mirroring the config object alone can reintroduce the
+        unobservable-sentinel failure. Consulting ``_scheduled_paths``
+        (set by ``guard.start()``) automatically respects any current or
+        future exclusion mechanism. Fail-soft: returns None when the
+        attribute is unavailable (e.g. test doubles) so the caller can
+        fall back to the config mirror.
+        """
+        scheduled = getattr(self._guard, "_scheduled_paths", None)
+        if not scheduled:
+            return None
+        try:
+            candidates = sorted(
+                {
+                    Path(p) for p, _recursive in scheduled
+                    if Path(p) == self._project_root
+                    or Path(p).parent == self._project_root
+                },
+                key=str,
+            )
+        except Exception:
+            logger.debug(
+                "[FSEventBridge] schedule introspection failed", exc_info=True,
+            )
+            return None
+        return candidates[0] if candidates else None
+
+    def _resolve_sentinel_parent(self) -> Path:
+        """Sentinel parent: guard schedule (authoritative) → config mirror."""
+        chosen = self._sentinel_dir_from_schedule()
+        if chosen is not None:
+            logger.debug(
+                "[FSEventBridge] sentinel dir resolved via guard_schedule: %s",
+                chosen,
+            )
+            return chosen
+        chosen = self._resolve_sentinel_dir(self._watch_config_active)
+        logger.debug(
+            "[FSEventBridge] sentinel dir resolved via config_mirror: %s",
+            chosen,
+        )
+        return chosen
+
     def _resolve_sentinel_dir(self, config: Any) -> Path:
-        """Pick a sentinel parent the guard actually schedules (T4 review Critical).
+        """Config-mirror FALLBACK for the sentinel parent (T4 review Critical).
+
+        Used only when ``_sentinel_dir_from_schedule`` cannot read the
+        guard's authoritative schedule (test doubles, exotic guards).
 
         ``.jarvis`` sits in FileWatchGuard's ``exclude_top_level_dirs``
         (Slice 12I) — in the NON-coalesced scheduling regime,
@@ -285,18 +340,27 @@ class FileSystemEventBridge:
         )
         try:
             while (_time.monotonic() - t0) < budget:
+                # Content NONCE per attempt: the guard checksum-gates
+                # events once a baseline md5 exists (file_watch_guard
+                # :1933), so identical-bytes retouches could be dropped.
+                attempt += 1
+                content = '{"probe": "fs-watch-liveness", "attempt": %d}\n' % attempt
                 try:
-                    self._sentinel_path.parent.mkdir(parents=True, exist_ok=True)
-                    # Content NONCE per attempt: the guard checksum-gates
-                    # events once a baseline md5 exists (file_watch_guard
-                    # :1933), so identical-bytes retouches could be dropped.
-                    attempt += 1
-                    self._sentinel_path.write_text(
-                        '{"probe": "fs-watch-liveness", "attempt": %d}\n' % attempt,
-                        encoding="utf-8",
-                    )
+                    self._sentinel_path.write_text(content, encoding="utf-8")
                 except OSError:
-                    logger.debug("[FSEventBridge] sentinel touch failed", exc_info=True)
+                    # Parent may have vanished mid-verify. Re-resolve ONCE
+                    # from the authoritative schedule and retry — never
+                    # mkdir-resurrect arbitrary top-level dirs.
+                    try:
+                        self._sentinel_path = (
+                            self._resolve_sentinel_parent() / _SENTINEL_BASENAME
+                        )
+                        self._sentinel_path.write_text(content, encoding="utf-8")
+                    except OSError:
+                        logger.debug(
+                            "[FSEventBridge] sentinel touch failed after "
+                            "re-resolve", exc_info=True,
+                        )
                 try:
                     # Clamp so the final wait never overshoots the budget.
                     wait_s = min(retouch, max(0.1, budget - (_time.monotonic() - t0)))
