@@ -1658,6 +1658,9 @@ class IsomorphicA1Driver:
                 # explicit --cost-cap SoakRunner passes (CLI beats env in the
                 # harness; a $0 CostTracker registers as SBA Tier 1). A $0 cap
                 # is only sanctioned as the failover-run starve scenario.
+                # NOTE: the env belt is effectively vestigial here (the
+                # composed dict funds OUROBOROS_BATTLE_COST_CAP
+                # unconditionally above); only _cli_cap_unfunded is live.
                 _cli_cap_unfunded = (
                     self.effective_soak_cost_cap <= 0.0
                     and not self.enable_failover

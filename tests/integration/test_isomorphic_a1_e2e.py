@@ -1126,23 +1126,30 @@ class TestSubprocessIsomorphismPropagation:
         assert _derive_router_ready_timeout_s(4800) == 600.0
 
     # ------------------------------------------------------------------
-    # 4f. --dw-session-budget default is 0.0 when env unset (legacy pin)
+    # 4f. --dw-session-budget default is the None SENTINEL when env unset
+    # (Slice 4 T1b -- supersedes the legacy "default 0.0" pin)
     # ------------------------------------------------------------------
 
-    def test_dw_session_budget_default_zero_when_env_unset(
+    def test_dw_session_budget_default_none_sentinel_when_env_unset(
         self, monkeypatch: Any,
     ) -> None:
         """With JARVIS_ISO_DW_SESSION_BUDGET_USD unset, --dw-session-budget
-        must default to 0.0 -- preserving the legacy $0 multi-vector-awaken
-        starve scenario byte-identical (root cause: run bt-iso-1783033231)."""
+        must default to the None SENTINEL (Slice 4 T1b, Run #15 root cause:
+        bt-iso-1783737892). 'Unset' and 'explicit 0.0' must be
+        distinguishable -- unset resolves via _resolve_soak_cost_cap (legacy
+        $0 starve preserved for --enable-failover runs; funded from
+        JARVIS_ISO_SESSION_BUDGET_USD otherwise), while an explicit 0.0 is
+        honored verbatim."""
         monkeypatch.delenv("JARVIS_ISO_DW_SESSION_BUDGET_USD", raising=False)
         parser = _driver_mod.build_arg_parser()
         args = parser.parse_args([])
-        assert args.dw_session_budget == 0.0, (
-            "Default --dw-session-budget must be 0.0 when "
+        assert args.dw_session_budget is None, (
+            "Default --dw-session-budget must be the None sentinel when "
             "JARVIS_ISO_DW_SESSION_BUDGET_USD is unset; got %r"
             % (args.dw_session_budget,)
         )
+        # The failover starve scenario itself is pinned at the resolver:
+        assert _driver_mod._resolve_soak_cost_cap(None, True) == 0.0
 
     # ------------------------------------------------------------------
     # 4g. JARVIS_ISO_DW_SESSION_BUDGET_USD sets the --dw-session-budget default
@@ -1929,7 +1936,12 @@ class TestAuditAtTeardownSequencing:
             seed=0,
             run_root=str(tmp_path / "runs"),
             enable_failover=False,
-            dw_session_budget=0.0,
+            # Slice 4 T1b: an explicit 0.0 without failover now aborts at the
+            # zero-budget fail-fast (returns 2 before SoakRunner/Auditor ever
+            # run), which would silently void this scaffold's termination-
+            # ordering coverage. Fund it -- the budget value is irrelevant to
+            # what these tests assert (term.wait ordering).
+            dw_session_budget=2.0,
             _adversary_factory=lambda: _MockAdversary(),
         )
 
