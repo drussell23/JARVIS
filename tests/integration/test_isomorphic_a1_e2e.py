@@ -1887,7 +1887,18 @@ class TestAuditAtTeardownSequencing:
 
         debug_log = tmp_path / "session" / "debug.log"
         debug_log.parent.mkdir(parents=True, exist_ok=True)
-        debug_log.write_text("boot complete\n", encoding="utf-8")
+        # Slice 5 T6: the driver now awaits the FSEventBridge WATCH ACTIVE
+        # sentinel (via _await_log_predicate, NOT _await_soak_boot -- that
+        # patch below only covers the run-#12 READY gate) BEFORE injecting
+        # chaos. Seed it here so this scaffold's fake soak "boots" past the
+        # new gate immediately instead of blocking for the real
+        # JARVIS_ISO_WATCH_ACTIVE_BUDGET_S default (360s, well past
+        # pytest.ini's 120s timeout).
+        debug_log.write_text(
+            "boot complete\n[FSEventBridge] WATCH ACTIVE — pipeline verified "
+            "live (sentinel observed after 0.1s)\n",
+            encoding="utf-8",
+        )
         fake_proc = _FakeProc()
 
         class _FakeSoakHandle:

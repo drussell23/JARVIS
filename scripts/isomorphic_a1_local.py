@@ -96,6 +96,14 @@ _ADVERSARY_SCRIPT: str = os.path.join(_SCRIPTS_DIR, "synthetic_adversary.py")
 # fs.changed.* on the TrinityEventBus.  Used by _await_soak_boot().
 _TESTWATCHER_READY_MARKER: str = "[TestWatcher] READY subscribed=fs.changed.*"
 
+# Slice 5 T6: markers emitted by FSEventBridge's own self-verification
+# sentinel -- run-#12's READY gate above proves the SUBSCRIPTION exists, not
+# that the watch PIPELINE actually fires end-to-end (Run #15 L1). WATCH
+# ACTIVE is the bridge's bus-derived readiness projection; the driver awaits
+# its log-marker mirror before injecting chaos.
+_WATCH_ACTIVE_MARKER: str = "[FSEventBridge] WATCH ACTIVE"
+_WATCH_NOT_CONFIRMED_MARKER: str = "[FSEventBridge] WATCH NOT CONFIRMED"
+
 
 # ---------------------------------------------------------------------------
 # Lazy module loaders (same pattern as a1_live_fire_chaos_harness.py)
@@ -1099,10 +1107,29 @@ def _touch_chaos_files(chaos_files: List[str], repo_root: str) -> List[str]:
         try:
             Path(abs_cf).touch()
             touched.append(abs_cf)
-            _log("run-#12 fix: touched %s (fires fs.changed.modified)" % abs_cf)
+            _log("run-#12 fix: touched %s "
+                 "(fs.changed.modified pending driver verification)" % abs_cf)
         except OSError as exc:
             _log("touch warning %s: %r" % (abs_cf, exc))
     return touched
+
+
+def _refire_chaos_files_with_nonce(touched: List[str], attempt: int) -> None:
+    """Append a nonce comment so the content checksum ACTUALLY changes.
+
+    A bare mtime touch is checksum-gated (guard :1933) and can be absorbed
+    by the watchdog baseline race — Run #15's falsified "(fires
+    fs.changed.modified)" assumption. The nonce line is driver-owned litter
+    on an already-chaos-mutated file; chaos revert restores byte-identical
+    original content, discarding it.
+    """
+    for abs_cf in touched:
+        try:
+            with open(abs_cf, "a", encoding="utf-8") as fh:
+                fh.write("# chaos-refire-nonce-%d\n" % attempt)
+            _log("run-#15 fix: nonce-refired %s (attempt %d)" % (abs_cf, attempt))
+        except OSError as exc:
+            _log("run-#15 fix: nonce refire FAILED for %s: %s" % (abs_cf, exc))
 
 
 def _derive_scoped_test_targets(chaos_files: List[str], repo_root: str) -> List[str]:
@@ -1129,22 +1156,21 @@ def _derive_scoped_test_targets(chaos_files: List[str], repo_root: str) -> List[
     return sorted(set(targets))
 
 
-async def _await_soak_boot(
+async def _await_log_predicate(
     proc: Any,
     debug_log: str,
-    timeout_s: float = 60.0,
+    predicate: Any,
+    timeout_s: float,
+    label: str,
 ) -> bool:
-    """Poll the soak's debug.log for the TestWatcher READY marker.
+    """Async-scan debug_log until a line satisfies *predicate*.
 
-    ``async def`` is load-bearing (the e2e spine pins it): a synchronous
-    blocking-sleep poll here blocked the driver's event loop for up
-    to *timeout_s* — starving the SyntheticAdversary's aiohttp server
+    Generalization of the run-#12 READY scan (async loop is load-bearing:
+    a blocking sleep here starves the SyntheticAdversary's aiohttp server
     exactly while the booting organism runs its provider preflight, so
-    real preflight requests read as CONNECTION_ERROR.
-
-    Returns True when the marker is found within *timeout_s*, False on timeout
-    or premature process exit.  Stub-soak callers pass ``proc=None`` and this
-    returns immediately (no real boot to await).
+    real preflight requests read as CONNECTION_ERROR). Returns False on
+    timeout or premature soak exit.  Stub-soak callers pass ``proc=None``
+    and this returns immediately (no real boot to await).
     """
     if proc is None:
         return True  # stub soak -- no real O+V boot
@@ -1152,20 +1178,46 @@ async def _await_soak_boot(
     seen_lines: int = 0
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            _log("soak exited prematurely (rc=%d)" % proc.poll())
+            _log("%s: soak exited prematurely (rc=%s)" % (label, proc.poll()))
             return False
         try:
             with open(debug_log, "r", encoding="utf-8", errors="ignore") as fh:
                 for line in fh:
                     seen_lines += 1
-                    if _TESTWATCHER_READY_MARKER in line:
-                        _log("soak boot READY (%d lines scanned)" % seen_lines)
+                    if predicate(line):
+                        _log("%s: marker observed (%d lines scanned)"
+                             % (label, seen_lines))
                         return True
         except OSError:
             pass
         await asyncio.sleep(0.5)
-    _log("soak boot TIMEOUT after %.0fs (%d lines scanned)" % (timeout_s, seen_lines))
-    return False  # timeout -- proceed anyway; sensor may still start
+    _log("%s: TIMEOUT after %.0fs (%d lines scanned)" % (label, timeout_s, seen_lines))
+    return False
+
+
+async def _await_soak_boot(
+    proc: Any,
+    debug_log: str,
+    timeout_s: float = 60.0,
+) -> bool:
+    """Poll the soak's debug.log for the TestWatcher READY marker.
+
+    Thin delegate onto ``_await_log_predicate`` -- kept for call-site
+    stability (this is the run-#12 boot gate the e2e spine pins on).
+    """
+    return await _await_log_predicate(
+        proc, debug_log, lambda l: _TESTWATCHER_READY_MARKER in l,
+        timeout_s, "soak-boot",
+    )
+
+
+def _chaos_evidence_predicate(chaos_basenames: List[str]) -> Any:
+    """Line-predicate: the sensor visibly scoped one of the chaos files."""
+    def _pred(line: str) -> bool:
+        return "TestFailureSensor" in line and any(
+            b in line for b in chaos_basenames
+        )
+    return _pred
 
 
 # ---------------------------------------------------------------------------
@@ -1779,7 +1831,67 @@ class IsomorphicA1Driver:
 
                     _log("STEP soak boot OK: debug_log=%s" % debug_log)
 
+                    # ── b.5 WATCH ACTIVE GATE (Slice 5 T6, Run #15 L1) ────────
+                    # run-#12's READY marker above proves the TestWatcher
+                    # SUBSCRIPTION exists, not that the fs.changed pipeline
+                    # actually fires end-to-end. Await the bridge's own
+                    # self-verification sentinel BEFORE injecting chaos --
+                    # otherwise SENSE may be blind and the entire chain below
+                    # proves nothing.
+                    _watch_budget = _env_float(
+                        "JARVIS_ISO_WATCH_ACTIVE_BUDGET_S", 360.0)
+                    _log("STEP await WATCH ACTIVE (bridge sentinel self-verification)")
+                    _watch_ok = await _await_log_predicate(
+                        soak_proc, debug_log,
+                        lambda l: _WATCH_ACTIVE_MARKER in l,
+                        _watch_budget, "watch-active",
+                    )
+                    if not _watch_ok:
+                        _require_watch_active = os.environ.get(
+                            "JARVIS_ISO_REQUIRE_WATCH_ACTIVE", "true"
+                        ).lower() in ("1", "true", "yes")
+                        if _require_watch_active:
+                            _log("FATAL: watch pipeline never confirmed (WATCH "
+                                 "ACTIVE absent after %.0fs) — aborting BEFORE "
+                                 "injection; SENSE would be blind (Run #15 L1)"
+                                 % _watch_budget)
+                            verdict = {
+                                "proven": False,
+                                "failure_locus": "watch_gate:not_confirmed",
+                            }
+                            # Same telemetry-capture path as the T1 zero-budget
+                            # abort and the f. FAILURE PATH below -- no new
+                            # abort shape. Runs inside the b/finally chain
+                            # (chaos-revert-always + adversary/soak teardown)
+                            # since `injected` is still False here (nothing to
+                            # revert) but soak_proc/_ACTIVE_SOAK_RUNNERS/chaos
+                            # are already registered for the finally blocks.
+                            try:
+                                capture_failure_telemetry(
+                                    output_dir=Path(run_dir) / "telemetry",
+                                    reason="a1_iso_not_proven:%s"
+                                    % verdict["failure_locus"],
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                _log("telemetry warning: %r" % (exc,))
+                            return 1
+                        _log("WARN: WATCH ACTIVE unconfirmed — proceeding "
+                             "(gate disabled via JARVIS_ISO_REQUIRE_WATCH_ACTIVE)")
+
                     # ── c. INJECT CHAOS POST-BOOT (run-#12 fix) ───────────────
+                    # run-#15 fix: purge any stale plugin-results snapshot so
+                    # the sensor's plugin lane cannot serve a pre-mutation "0
+                    # failures" read (parallel-autopsy fix 1c; T3's mtime gate
+                    # is the durable belt -- this is the harness-side suspender).
+                    _stale_results = os.path.join(
+                        self.repo_root, ".jarvis", "test_results.json")
+                    try:
+                        os.unlink(_stale_results)
+                        _log("run-#15 fix: purged stale %s pre-inject"
+                             % _stale_results)
+                    except FileNotFoundError:
+                        pass
+
                     _log("STEP inject POST-BOOT: seed=%d" % self.seed)
                     red = chaos.inject(self.seed)
                     injected = True
@@ -1801,6 +1913,57 @@ class IsomorphicA1Driver:
                         _log("run-#12: %d file(s) touched; scoped pytest: %s"
                              % (len(touched),
                                 scoped[0] if scoped else "<none found locally>"))
+
+                        # ── d.6 POST-TOUCH EVIDENCE VERIFICATION (Run #15 L1) ──
+                        # The touch's "(fires fs.changed.modified)" claim was
+                        # NEVER verified -- prove the sensor actually scoped
+                        # the chaos file(s), with bounded content-nonce retry
+                        # (a bare mtime touch is checksum-gated and can be
+                        # absorbed by the watchdog baseline race).
+                        _basenames = [Path(p).name for p in touched]
+                        _retries = int(_env_float(
+                            "JARVIS_ISO_CHAOS_TOUCH_RETRIES", 3.0))
+                        _evidence_budget = _env_float(
+                            "JARVIS_ISO_CHAOS_EVIDENCE_BUDGET_S", 240.0)
+                        _evidence = False
+                        for _attempt in range(1, _retries + 1):
+                            if await _await_log_predicate(
+                                soak_proc, debug_log,
+                                _chaos_evidence_predicate(_basenames),
+                                _evidence_budget, "chaos-evidence",
+                            ):
+                                _log("run-#15 fix: sensor evidence observed "
+                                     "(attempt %d/%d) — the touch VERIFIABLY "
+                                     "reached SENSE" % (_attempt, _retries))
+                                _evidence = True
+                                break
+                            _log("run-#15 fix: no sensor evidence in %.0fs — "
+                                 "re-firing chaos files WITH CONTENT NONCE "
+                                 "(attempt %d/%d)"
+                                 % (_evidence_budget, _attempt, _retries))
+                            _refire_chaos_files_with_nonce(touched, _attempt)
+                        if not _evidence:
+                            _log("FATAL: chaos touch produced no sensor "
+                                 "evidence after %d attempts — SENSE blind, "
+                                 "aborting (Run #15 L1-L3 class)" % _retries)
+                            verdict = {
+                                "proven": False,
+                                "failure_locus": "chaos_evidence:not_observed",
+                            }
+                            # Same abort helper as the WATCH ACTIVE gate above
+                            # (and the T1 zero-budget site) -- capture
+                            # telemetry, return. `injected` is True here so
+                            # the b/finally chain reverts chaos + tears down
+                            # the soak child/adversary as usual.
+                            try:
+                                capture_failure_telemetry(
+                                    output_dir=Path(run_dir) / "telemetry",
+                                    reason="a1_iso_not_proven:%s"
+                                    % verdict["failure_locus"],
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                _log("telemetry warning: %r" % (exc,))
+                            return 1
                     else:
                         _log("run-#12: no chaos files in manifest (stub mode?)")
 
