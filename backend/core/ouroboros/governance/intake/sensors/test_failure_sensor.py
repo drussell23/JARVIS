@@ -19,7 +19,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from backend.core.ouroboros.governance.intent.signals import IntentSignal
 from backend.core.ouroboros.governance.intent.test_watcher import TestFailure
@@ -88,6 +88,28 @@ _INFLIGHT_TTL_S: float = float(
 _TEST_FAILURE_FALLBACK_INTERVAL_S: float = float(
     os.environ.get("JARVIS_TEST_FAILURE_FALLBACK_INTERVAL_S", "600")
 )
+
+
+# --- Slice 5 T2: set-based accumulator debounce (Run #15 L2, F2) ----------
+#
+# The single-slot debounce (``asyncio.create_task`` + cancel-on-every-event)
+# was last-event-wins: a burst of FS events (e.g. a worktree checkout
+# touching many files) cancelled the pending task on EVERY new event, so a
+# task that never survives long enough to fire never runs the FIRST event's
+# scoped targets. Run #15's leaf-change event was evicted this way inside a
+# worktree burst. Fixed window semantics replace cancel-on-event: the first
+# ``.py`` event opens a ``_debounce_window_s()`` window, every event during
+# it ADDS to ``_pending_changed_paths`` (never evicts), and one scoped run
+# covers the union. Not re-read into a module constant (env re-checked at
+# call time), same pattern as the other gate helpers above.
+
+
+def _debounce_window_s() -> float:
+    return float(os.environ.get("JARVIS_TEST_FAILURE_DEBOUNCE_WINDOW_S", "2.0"))
+
+
+def _debounce_max_paths() -> int:
+    return int(os.environ.get("JARVIS_TEST_FAILURE_DEBOUNCE_MAX_PATHS", "32"))
 
 
 def fs_events_enabled() -> bool:
@@ -498,6 +520,17 @@ class TestFailureSensor:
         # fs.changed run for ``_HYDRATION_DEDUP_TTL_S``.
         self._hydrated_keys: Dict[str, float] = {}
         self._boot_hydrated: bool = False
+        # Slice 5 T2 (Run #15 autopsy L2, F2): set-based debounce
+        # accumulator. Events never cancel the pending window — paths
+        # aggregate and one scoped run covers the union.
+        self._pending_changed_paths: Set[str] = set()
+        # Initialized here (not only in ``subscribe_to_bus``) so a caller
+        # that drives ``_on_fs_event`` directly (e.g. tests, or a future
+        # non-bus event source) never hits an AttributeError before the
+        # bus subscription runs. ``subscribe_to_bus`` re-initializes this
+        # to ``None`` too, which is safe/idempotent — it always runs
+        # before any ``fs.changed`` event could reach ``_on_fs_event``.
+        self._debounce_task: Optional[asyncio.Task] = None
 
     def _prune_stale_pending(self) -> None:
         """Drop pending target entries that have exceeded their TTL.
@@ -851,10 +884,11 @@ class TestFailureSensor:
             self._fs_events_ignored += 1
             return
         self._fs_events_handled += 1
+        self._pending_changed_paths.add(rel_path)
         if self._debounce_task is not None and not self._debounce_task.done():
-            self._debounce_task.cancel()
+            return  # window open — accumulate, NEVER cancel/evict (Slice 5 F2)
         self._debounce_task = asyncio.create_task(
-            self._debounced_pytest_run(changed_rel_path=rel_path),
+            self._debounced_pytest_run(),
             name="test_failure_debounced_run",
         )
 
@@ -922,22 +956,26 @@ class TestFailureSensor:
     # Phase 1 fallback: debounced subprocess pytest run
     # ------------------------------------------------------------------
 
-    async def _debounced_pytest_run(
-        self, changed_rel_path: str = ""
-    ) -> None:
-        """Wait 2s for edits to settle, then trigger a pytest run.
+    async def _debounced_pytest_run(self, changed_rel_path: str = "") -> None:
+        """Fixed-window set-accumulator debounce (Slice 5 F2).
 
-        Dynamic test scoping (2026-06-24): *changed_rel_path* is the
-        FS-event's relative path. When scoping is enabled it is resolved
-        (via the existing :meth:`TestRunner.resolve_affected_tests`) to a
-        bounded set of scoped test targets and passed to
-        ``poll_once(target_paths=...)`` so ONLY that file's tests run — not
-        the whole ``tests/`` suite. Fail-safe: an unresolvable change skips
-        the run (or falls back to whole-suite only when
-        ``JARVIS_TEST_FULL_SUITE_FALLBACK`` is explicitly true).
+        The first .py event opens a ``_debounce_window_s()`` window; every
+        event during it adds to ``_pending_changed_paths``. One scoped run
+        covers the UNION of resolved targets. Paths arriving mid-run land
+        in the (fresh) set and re-arm one follow-up window — nothing is
+        evicted (Run #15 L2: last-event-wins cancel dropped the chaos leaf
+        under a worktree burst). *changed_rel_path* kept for back-compat:
+        a direct caller's path seeds the set.
         """
+        cancelled = False
         try:
-            await asyncio.sleep(2.0)
+            if changed_rel_path:
+                self._pending_changed_paths.add(changed_rel_path)
+            await asyncio.sleep(_debounce_window_s())
+            batch = sorted(self._pending_changed_paths)
+            self._pending_changed_paths.clear()
+            if not batch:
+                return
             # Suppress if plugin results were consumed recently (Phase 2 active)
             if time.monotonic() - self._last_plugin_ts < 10.0:
                 logger.debug(
@@ -953,13 +991,19 @@ class TestFailureSensor:
             # working tree on boot must not be re-run by the live event that
             # the same edit also triggers. The TTL window expires so a genuine
             # later edit still re-runs.
-            if changed_rel_path and self._is_recently_hydrated(changed_rel_path):
-                logger.debug(
-                    "TestFailureSensor: suppressing live run for %r -- "
-                    "hydrated on boot within de-dupe window",
-                    changed_rel_path,
-                )
+            batch = [p for p in batch if not self._is_recently_hydrated(p)]
+            if not batch:
                 return
+
+            # No-silent-cap: bound the batch, but name every dropped path.
+            cap = _debounce_max_paths()
+            if len(batch) > cap:
+                logger.warning(
+                    "TestFailureSensor: debounce batch %d paths > cap %d — "
+                    "resolving first %d, dropped: %s",
+                    len(batch), cap, cap, batch[cap:],
+                )
+                batch = batch[:cap]
 
             if not dynamic_scoping_enabled():
                 # OFF -> byte-identical legacy whole-suite behavior.
@@ -968,35 +1012,52 @@ class TestFailureSensor:
                     await self.handle_signals(signals)
                 return
 
-            targets = await self._resolve_scoped_targets(changed_rel_path)
-            if targets is None:
-                # Nothing resolved (no scoped targets, no mirror dir).
-                if not full_suite_fallback_enabled():
-                    logger.debug(
-                        "TestFailureSensor: no scoped targets for %r and "
-                        "full-suite fallback disabled — skipping run",
-                        changed_rel_path,
-                    )
-                    return
+            union = await self._resolve_union(batch)
+            if union:
                 logger.info(
-                    "TestFailureSensor: no scoped targets for %r — "
-                    "JARVIS_TEST_FULL_SUITE_FALLBACK on, running full suite",
-                    changed_rel_path,
+                    "TestFailureSensor: scoped %d test target(s) for %d "
+                    "changed path(s): %r",
+                    len(union), len(batch), batch,
                 )
-                signals = await self._watcher.poll_once()
-            else:
-                logger.info(
-                    "TestFailureSensor: scoped %d test target(s) for %r",
-                    len(targets), changed_rel_path,
-                )
-                await self._run_scoped_with_confirmation(targets)
+                await self._run_scoped_with_confirmation(union)
                 return
+            if not full_suite_fallback_enabled():
+                logger.debug(
+                    "TestFailureSensor: no scoped targets for %r and "
+                    "full-suite fallback disabled — skipping run", batch,
+                )
+                return
+            logger.info(
+                "TestFailureSensor: no scoped targets for %r — "
+                "JARVIS_TEST_FULL_SUITE_FALLBACK on, running full suite",
+                batch,
+            )
+            signals = await self._watcher.poll_once()
             if signals:
                 await self.handle_signals(signals)
         except asyncio.CancelledError:
-            pass  # Newer edit arrived — debounce reset
+            cancelled = True  # sensor stopping — the finally below must NOT re-arm
+            pass
         except Exception:
             logger.debug("TestFailureSensor: debounced run error", exc_info=True)
+        finally:
+            if not cancelled and self._pending_changed_paths and self._running:
+                self._debounce_task = asyncio.create_task(
+                    self._debounced_pytest_run(),
+                    name="test_failure_debounced_run",
+                )
+
+    async def _resolve_union(self, rel_paths: Sequence[str]) -> list:
+        """Resolve each path via the T3 scoped resolver; ordered dedup union."""
+        union: list = []
+        seen: Set[str] = set()
+        for rel in rel_paths:
+            targets = await self._resolve_scoped_targets(rel)
+            for t in targets or ():
+                if t not in seen:
+                    seen.add(t)
+                    union.append(t)
+        return union
 
     async def _run_scoped_with_confirmation(self, targets: Any) -> None:
         """Scoped run + bounded immediate confirmation (fs.changed path).
