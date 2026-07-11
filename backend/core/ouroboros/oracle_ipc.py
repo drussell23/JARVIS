@@ -151,7 +151,7 @@ def oracle_dependencies_available(
 # ===========================================================================
 
 
-def _oracle_worker_main(conn: Any) -> None:
+def _oracle_worker_main(conn: Any, parent_pid: Optional[int] = None) -> None:
     """Top-level (spawn-picklable) child entrypoint. Builds + initializes a
     TheOracle in THIS process (the 1.1 GB load happens here, never on the engine
     loop), signals readiness, then serves requests until shutdown/EOF. NEVER
@@ -164,6 +164,18 @@ def _oracle_worker_main(conn: Any) -> None:
     # loop (our own process), so the nested pool is redundant: force in-process
     # AST analyze here. Set before TheOracle is built so its first index uses it.
     os.environ.setdefault("JARVIS_AST_HELPER_INPROCESS_ENABLED", "1")
+    # 2026-07-11 OOM RCA — the daemon flag and pipe-EOF both have structural
+    # holes (SIGKILL'd parent skips daemon cleanup; EOF is unseen while a long
+    # index call is in flight): an orphaned worker survived 29h at 33.9GB.
+    # The lifeline self-terminates on parent death or footprint blowout; the
+    # proxy's existing crash/respawn machinery rebuilds a fresh worker.
+    try:
+        from backend.core.ouroboros.governance.worker_lifeline import (
+            arm_worker_lifeline,
+        )
+        arm_worker_lifeline("oracle_ipc", expected_parent_pid=parent_pid)
+    except Exception:  # noqa: BLE001 — sentinel is protective, never fatal
+        pass
     try:
         asyncio.run(_oracle_worker_async(conn))
     except Exception as exc:  # noqa: BLE001 — last-resort; pipe close signals parent
@@ -229,7 +241,13 @@ def _default_spawn() -> Tuple[Any, Any]:
     happy path beyond what Process.start would."""
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=True)
-    proc = ctx.Process(target=_oracle_worker_main, args=(child_conn,), daemon=True)
+    # Ship OUR pid so the worker's lifeline baseline is authoritative even if
+    # the worker boots after we die (arm-after-parent-death race).
+    proc = ctx.Process(
+        target=_oracle_worker_main,
+        args=(child_conn, os.getpid()),
+        daemon=True,
+    )
     proc.start()
     # The parent holds its own copy of the child end open until start(); close it
     # now so an EOF propagates correctly when the child dies.

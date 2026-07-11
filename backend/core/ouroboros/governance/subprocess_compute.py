@@ -73,6 +73,18 @@ def run_worker_loop(
     Fail-closed PER CALL: a handler exception is reported, the loop survives.
     ``{"control": "shutdown"}`` or a closed pipe (EOF/OSError) ends it cleanly.
     NEVER raises out of the worker. Results must be picklable (Pipe transport)."""
+    # 2026-07-11 OOM RCA — daemon-flag/pipe-EOF exits both have structural
+    # holes (see worker_lifeline docstring); the sentinel self-terminates the
+    # worker on parent death or footprint blowout, and the proxy's respawn
+    # machinery rebuilds. Armed here (worker entry) so EVERY run_worker_loop
+    # worker is covered without changing the worker_main(conn) contract.
+    try:
+        from backend.core.ouroboros.governance.worker_lifeline import (
+            arm_worker_lifeline,
+        )
+        arm_worker_lifeline("subprocess_compute")
+    except Exception:  # noqa: BLE001 — sentinel is protective, never fatal
+        pass
     if signal_ready:
         try:
             conn.send({"control": "ready"})

@@ -144,6 +144,7 @@ import atexit
 import logging
 import os
 import pickle
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -481,6 +482,36 @@ def fs_process_pool_workers() -> int:
     return _default_fs_process_pool_workers()
 
 
+_FS_POOL_MAX_TASKS_ENV_VAR = "JARVIS_FS_POOL_MAX_TASKS_PER_CHILD"
+
+
+def fs_pool_max_tasks_per_child() -> Optional[int]:
+    """Worker-recycling threshold for the FS process pool (2026-07-11
+    OOM RCA): an immortal worker accumulates heap high-water /
+    fragmentation across every crawl for the whole session — macOS
+    compresses the cold pages, so rss-scoped monitors never see the
+    ratchet. Recycling a worker every N tasks resets its footprint to
+    baseline at ~100ms respawn cost (negligible at crawl cadence).
+
+    ``JARVIS_FS_POOL_MAX_TASKS_PER_CHILD``: positive int = recycle
+    threshold (default 64); ``0``/negative = immortal workers (legacy).
+    Returns None when disabled OR when the runtime predates
+    ``max_tasks_per_child`` (py<3.11) — the caller then simply omits
+    the kwarg. NEVER raises."""
+    raw = os.environ.get(_FS_POOL_MAX_TASKS_ENV_VAR, "").strip()
+    value = 64
+    if raw:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 64
+    if value <= 0:
+        return None
+    if sys.version_info < (3, 11):
+        return None
+    return value
+
+
 def _get_fs_process_pool():
     """Lazy-init singleton bounded ``ProcessPoolExecutor`` for
     ``cpu_bound=True`` offload work.
@@ -512,15 +543,47 @@ def _get_fs_process_pool():
                     ctx = _mp.get_context("spawn")
                 except (ValueError, RuntimeError):  # noqa: BLE001
                     ctx = None
-                _FS_PROCESS_POOL = ProcessPoolExecutor(
-                    max_workers=workers,
-                    mp_context=ctx,
-                )
+                # 2026-07-11 OOM RCA hardening — two per-worker guards:
+                #   * lifeline initializer: every worker self-terminates
+                #     on parent death (the 29h/33.9GB orphan class) or
+                #     footprint blowout; the pool respawns on demand.
+                #     initargs ship OUR pid so the baseline survives the
+                #     arm-after-parent-death race.
+                #   * max_tasks_per_child (3.11+): recycles workers
+                #     before heap high-water/fragmentation ratchets —
+                #     the growth the compressor hides from rss monitors.
+                pool_kwargs: dict = {
+                    "max_workers": workers,
+                    "mp_context": ctx,
+                }
+                try:
+                    from backend.core.ouroboros.governance.worker_lifeline import (  # noqa: E501
+                        pool_worker_initializer,
+                    )
+                    pool_kwargs["initializer"] = pool_worker_initializer
+                    pool_kwargs["initargs"] = (
+                        "fs_process_pool", os.getpid(),
+                    )
+                except Exception:  # noqa: BLE001 — guard is protective
+                    pass
+                # max_tasks_per_child requires a spawn/forkserver start
+                # method — only pass it when the spawn ctx resolved (a
+                # fork-default platform where get_context failed would
+                # otherwise ValueError at construction).
+                max_tasks = fs_pool_max_tasks_per_child()
+                if max_tasks is not None and ctx is not None:
+                    pool_kwargs["max_tasks_per_child"] = max_tasks
+                else:
+                    max_tasks = None
+                _FS_PROCESS_POOL = ProcessPoolExecutor(**pool_kwargs)
                 atexit.register(shutdown_fs_process_pool)
                 logger.info(
                     "[CooperativeFSIO] lazily created bounded FS "
-                    "process pool (max_workers=%d, start_method=spawn)",
+                    "process pool (max_workers=%d, start_method=spawn, "
+                    "max_tasks_per_child=%s, lifeline=%s)",
                     workers,
+                    max_tasks if max_tasks is not None else "unbounded",
+                    "armed" if "initializer" in pool_kwargs else "off",
                 )
     return _FS_PROCESS_POOL
 

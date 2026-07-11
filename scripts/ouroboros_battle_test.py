@@ -230,6 +230,66 @@ def _check_env_val(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
+def _is_spawn_worker_cmdline(cmdline: list) -> bool:
+    """A python interpreter running multiprocessing spawn bootstrap —
+    the cmdline shape of every Oracle IPC / FS-pool worker:
+    ``python -c "from multiprocessing.spawn import spawn_main; ..."
+    --multiprocessing-fork``. Strict: both markers required."""
+    if not cmdline:
+        return False
+    exe = Path(str(cmdline[0])).name.lower()
+    if not exe.startswith("python"):
+        return False
+    has_spawn_main = any(
+        "multiprocessing.spawn" in str(arg) and "spawn_main" in str(arg)
+        for arg in cmdline[1:]
+    )
+    has_fork_flag = any(
+        str(arg).startswith("--multiprocessing-fork") for arg in cmdline[1:]
+    )
+    return has_spawn_main and has_fork_flag
+
+
+_ORPHAN_WORKER_ENV_MARKERS = ("JARVIS_ACTIVE_SESSION_LOG", "OUROBOROS_BATTLE_")
+
+
+def _has_session_env_marker(environ: dict) -> bool:
+    """True iff *environ* carries a battle-session fingerprint — the
+    tie that scopes orphan reaping to OUR spawn workers and never
+    another app's multiprocessing children."""
+    for key in environ:
+        if key == _ORPHAN_WORKER_ENV_MARKERS[0]:
+            return True
+        if key.startswith(_ORPHAN_WORKER_ENV_MARKERS[1]):
+            return True
+    return False
+
+
+def _is_orphaned_session_spawn_worker(proc) -> bool:
+    """2026-07-11 OOM RCA — the orphan class the path-tail match above
+    can never see: multiprocessing spawn workers (Oracle IPC, FS pool)
+    whose organism died non-gracefully. One was caught live 29h later
+    at a 33.9 GB phys_footprint (7 MB rss — compressor-hidden). The
+    in-worker lifeline (worker_lifeline.py) is the primary kill; this
+    reaper is boot-time defense in depth for pre-fix stragglers.
+
+    Reaps ONLY when ALL hold (fail-safe: any probe error → False):
+      • spawn-bootstrap cmdline (``_is_spawn_worker_cmdline``)
+      • ppid == 1 — already orphaned; live sessions' workers keep
+        their organism as parent and are NEVER matched
+      • environ carries a battle-session fingerprint (inherited from
+        the organism) — scopes to us, not other apps' pools
+    """
+    try:
+        if proc.ppid() != 1:
+            return False
+        if not _is_spawn_worker_cmdline(proc.cmdline()):
+            return False
+        return _has_session_env_marker(proc.environ())
+    except Exception:  # noqa: BLE001 — NoSuchProcess/AccessDenied/zombie
+        return False
+
+
 def _reap_zombies(*, quiet: bool = False) -> "set[int]":
     """Detect and reap any lingering ouroboros_battle_test.py processes.
 
@@ -240,7 +300,10 @@ def _reap_zombies(*, quiet: bool = False) -> "set[int]":
     them cleanly (SIGTERM, then SIGKILL after 3s) before we boot.
 
     Only reaps processes:
-      • whose cmdline contains ``ouroboros_battle_test.py``
+      • whose cmdline contains ``ouroboros_battle_test.py``, OR that
+        match ``_is_orphaned_session_spawn_worker`` (ppid==1 spawn
+        workers carrying our session env fingerprint — the 33.9 GB /
+        29 h Oracle-worker orphan class, 2026-07-11 OOM RCA)
       • owned by the current UID
       • that are not this process
 
@@ -300,7 +363,13 @@ def _reap_zombies(*, quiet: bool = False) -> "set[int]":
             if pid == my_pid or pid == my_ppid:
                 continue
             cmdline = proc.info.get("cmdline") or []
-            if not _is_battle_test_proc(cmdline):
+            # Two victim classes: (1) lingering battle-test mains by
+            # script path; (2) orphaned session spawn workers — cheap
+            # cmdline+ppid prefilter first, environ() probe last.
+            if not _is_battle_test_proc(cmdline) and not (
+                _is_spawn_worker_cmdline(cmdline)
+                and _is_orphaned_session_spawn_worker(proc)
+            ):
                 continue
             if my_uid is not None:
                 uids = proc.info.get("uids")
