@@ -31,15 +31,33 @@ _SENTINEL_BASENAME = "fs_watch_sentinel.json"
 
 
 def _sentinel_enabled() -> bool:
-    return os.environ.get("JARVIS_FS_BRIDGE_SENTINEL_ENABLED", "true").lower() in ("1", "true", "yes")
+    return os.environ.get(
+        "JARVIS_FS_BRIDGE_SENTINEL_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _ready_budget_s() -> float:
-    return float(os.environ.get("JARVIS_FS_BRIDGE_READY_BUDGET_S", "300"))
+    raw = os.environ.get("JARVIS_FS_BRIDGE_READY_BUDGET_S", "300")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[FSEventBridge] malformed JARVIS_FS_BRIDGE_READY_BUDGET_S=%r "
+            "— falling back to default 300s", raw,
+        )
+        return 300.0
 
 
 def _sentinel_retouch_s() -> float:
-    return float(os.environ.get("JARVIS_FS_BRIDGE_SENTINEL_RETOUCH_S", "15"))
+    raw = os.environ.get("JARVIS_FS_BRIDGE_SENTINEL_RETOUCH_S", "15")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[FSEventBridge] malformed JARVIS_FS_BRIDGE_SENTINEL_RETOUCH_S=%r "
+            "— falling back to default 15s", raw,
+        )
+        return 15.0
 
 
 def _ignore_globs_from_env() -> List[str]:
@@ -128,6 +146,7 @@ class FileSystemEventBridge:
                 self._verify_task = asyncio.create_task(
                     self._verify_pipeline_live(), name="fs_bridge_watch_verify",
                 )
+                self._verify_task.add_done_callback(self._on_verify_task_done)
         else:
             logger.warning(
                 "[FSEventBridge] FileWatchGuard failed to start for %s",
@@ -140,7 +159,19 @@ class FileSystemEventBridge:
             self._verify_task.cancel()
             try:
                 await self._verify_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
+                # Only re-raise when stop() ITSELF is being cancelled — not
+                # merely the verify_task cancellation requested above, which
+                # is the expected outcome of the cancel() call. Python
+                # 3.11+ can tell the two apart via ``Task.cancelling()``
+                # (PEP 682, same pattern as cancellation_shield.py); earlier
+                # versions fall back to the prior swallow-everything
+                # behavior for this specific case.
+                current = asyncio.current_task()
+                cancelling_fn = getattr(current, "cancelling", None) if current is not None else None
+                if cancelling_fn is not None and cancelling_fn() > 0:
+                    raise
+            except Exception:
                 pass
         if self._guard is not None:
             await self._guard.stop()
@@ -319,6 +350,26 @@ class FileSystemEventBridge:
                 if _watchable(child):
                     return child
         return self._project_root
+
+    def _on_verify_task_done(self, task: "asyncio.Task[Any]") -> None:
+        """Surface any unhandled exception from the verify task (review fix).
+
+        A malformed-env raise (or any other exception) inside
+        ``_verify_pipeline_live`` previously died silently — the task's
+        exception went unobserved and NEITHER "WATCH ACTIVE" nor
+        "WATCH NOT CONFIRMED" was ever logged, leaving a misleading
+        silent-third-state for the iso driver. Cancellation is expected
+        (stop()) and not logged as an error.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(
+                "[FSEventBridge] verify task died with an unhandled "
+                "exception — neither WATCH ACTIVE nor WATCH NOT CONFIRMED "
+                "will be emitted: %r", exc, exc_info=exc,
+            )
 
     async def _verify_pipeline_live(self) -> None:
         """Prove the watch pipeline delivers events (Slice 5 F1/F6, Run #15 L1).

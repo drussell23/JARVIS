@@ -1471,6 +1471,15 @@ class TestFailureSensor:
                 # Rename/copy line — keep the NEW (post-rename) path, the
                 # one that actually exists on disk right now.
                 p = p.split(" -> ", 1)[1].strip()
+            # git quotes porcelain paths containing spaces/special chars
+            # (e.g. `"a b.py"`) — strip the surrounding double-quotes so
+            # they aren't silently dropped by the .endswith(".py") check
+            # below. Basic unescape only: a full C-style unescape (git's
+            # \NNN octal + \\/\" escapes for core.quotePath) is NOT
+            # attempted here — pathological filenames with embedded
+            # backslash-escapes may still round-trip imperfectly.
+            if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+                p = p[1:-1]
             if p.endswith(".py"):
                 dirty.append(p)
         return dirty
@@ -1507,6 +1516,6 @@ class TestFailureSensor:
             return
         logger.info(
             "TestFailureSensor: quiet-lane reconcile scoped %d test "
-            "target(s) for %d dirty path(s)", len(union), len(dirty),
+            "target(s) for %d dirty path(s): %r", len(union), len(dirty), dirty,
         )
         await self._run_scoped_with_confirmation(union)

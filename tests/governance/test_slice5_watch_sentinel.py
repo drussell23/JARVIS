@@ -91,6 +91,37 @@ class TestSentinel:
         assert bridge.get_metrics()["watch_confirmed"] is False
 
     @pytest.mark.asyncio
+    async def test_malformed_ready_budget_falls_back_to_default_with_warning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Review fix: a malformed READY_BUDGET/RETOUCH env previously
+        raised inside the background verify task, killing it with an
+        unobserved exception — neither marker was ever emitted. It must
+        now fall back to the default (with a WARNING) and the task must
+        still reach one of the two terminal markers."""
+        import backend.core.resilience.file_watch_guard as g
+        monkeypatch.setattr(g, "FileWatchGuard", _Guard)
+        monkeypatch.setenv("JARVIS_FS_BRIDGE_READY_BUDGET_S", "not-a-float")
+        monkeypatch.setenv("JARVIS_FS_BRIDGE_SENTINEL_RETOUCH_S", "0.05")
+        b = FileSystemEventBridge(project_root=tmp_path, event_bus=_Bus())
+        with caplog.at_level("INFO"):
+            await b.start()
+            # Budget silently degrading to 300s would hang this test, so
+            # force the loop to observe the sentinel quickly instead of
+            # waiting out the full fallback budget.
+            await b._on_file_event(_sentinel_event(b))
+            await asyncio.wait_for(b._verify_task, timeout=5.0)
+        assert any(
+            "malformed JARVIS_FS_BRIDGE_READY_BUDGET_S" in r.message
+            for r in caplog.records
+        )
+        markers = [
+            r.message for r in caplog.records
+            if "WATCH ACTIVE" in r.message or "WATCH NOT CONFIRMED" in r.message
+        ]
+        assert markers, "verify task died silently — no terminal marker emitted"
+
+    @pytest.mark.asyncio
     async def test_master_off_no_task(self, bridge, monkeypatch):
         import backend.core.resilience.file_watch_guard as g
         monkeypatch.setattr(g, "FileWatchGuard", _Guard)

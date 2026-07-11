@@ -1983,12 +1983,24 @@ class IsomorphicA1Driver:
                                          "it)" % (_attempt, _retries))
                                     _evidence = True
                                     break
-                                _log("run-#15 fix: no sensor evidence in "
-                                     "%.0fs — re-firing chaos files WITH "
-                                     "CONTENT NONCE (attempt %d/%d)"
-                                     % (_evidence_budget, _attempt, _retries))
-                                _refire_chaos_files_with_nonce(
-                                    touched, _attempt)
+                                # Only refire when another await will
+                                # follow (i.e. this wasn't the last
+                                # attempt) — a refire after the final
+                                # failed await is never observed and only
+                                # mutates chaos files post-verdict.
+                                if _attempt < _retries:
+                                    _log("run-#15 fix: no sensor evidence "
+                                         "in %.0fs — re-firing chaos files "
+                                         "WITH CONTENT NONCE (attempt %d/%d)"
+                                         % (_evidence_budget, _attempt, _retries))
+                                    _refire_chaos_files_with_nonce(
+                                        touched, _attempt)
+                                else:
+                                    _log("run-#15 fix: no sensor evidence "
+                                         "in %.0fs on final attempt "
+                                         "(%d/%d) — not re-firing "
+                                         "post-verdict"
+                                         % (_evidence_budget, _attempt, _retries))
                         if not _evidence:
                             _log("FATAL: chaos touch produced no sensor "
                                  "evidence after %d attempts — SENSE blind, "

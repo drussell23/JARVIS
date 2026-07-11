@@ -56,6 +56,37 @@ class TestQuietLaneReconcile:
         assert ran == [["tests/test_leaf.py"]]
 
     @pytest.mark.asyncio
+    async def test_reconcile_log_names_dirty_paths(self, monkeypatch, caplog):
+        """Review fix: the quiet-lane reconcile INFO line must name the
+        dirty paths (not just a count) so reconcile-lane detections are
+        visible to the driver's evidence predicate."""
+        s = _sensor(monkeypatch)
+
+        async def _dirty():
+            return ["backend/leaf.py"]
+
+        async def _resolve_union(paths):
+            return ["tests/test_leaf.py"]
+
+        monkeypatch.setattr(s, "_git_dirty_py_paths", _dirty)
+        monkeypatch.setattr(s, "_resolve_union", _resolve_union)
+
+        async def _scoped(targets):
+            return None
+
+        monkeypatch.setattr(s, "_run_scoped_with_confirmation", _scoped)
+        with caplog.at_level("INFO"):
+            await s._reconcile_quiet_lane()
+        matches = [
+            r.message for r in caplog.records
+            if "quiet-lane reconcile" in r.message
+        ]
+        assert matches, "no quiet-lane reconcile log line emitted"
+        assert any("backend/leaf.py" in m for m in matches), (
+            "reconcile log line does not name the dirty path(s)"
+        )
+
+    @pytest.mark.asyncio
     async def test_clean_tree_runs_nothing(self, monkeypatch):
         s = _sensor(monkeypatch)
 
@@ -133,6 +164,25 @@ class TestGitDirtyPyPaths:
         monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
         dirty = await s._git_dirty_py_paths()
         assert dirty == ["pkg/mod.py", "pkg/new_name.py"]
+
+    @pytest.mark.asyncio
+    async def test_parses_quoted_paths_with_spaces(self, monkeypatch):
+        """Review fix: git quotes porcelain paths containing spaces/special
+        chars — the surrounding double-quotes must be stripped before the
+        .endswith(".py") check or such files are silently skipped."""
+        s = _sensor(monkeypatch)
+        porcelain = ' M "pkg/a b.py"\n M pkg/plain.py\n'
+
+        class _FakeProc:
+            async def communicate(self):
+                return porcelain.encode(), b""
+
+        async def _fake_exec(*args, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+        dirty = await s._git_dirty_py_paths()
+        assert dirty == ["pkg/a b.py", "pkg/plain.py"]
 
     @pytest.mark.asyncio
     async def test_timeout_kills_and_reaps_no_zombie(self, monkeypatch):

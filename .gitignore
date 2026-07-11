@@ -388,6 +388,12 @@ terraform/terraform.tfvars
 .jarvis/vision_cost_ledger.json
 .jarvis/vision_sensor_fp_ledger.json
 
+# FSEventBridge sentinel liveness probe (Slice 5 T4) — lands at a
+# guard-scheduled depth-1 dir (never .jarvis/, which is excluded from the
+# watch schedule). A hard-kill mid-verify can strand it; the finally-block
+# unlink only covers soft-exit paths.
+fs_watch_sentinel.json
+
 # ─────────────────────────────────────────────────────────────────────────────
 # COMPILED-ARTIFACT INVARIANT — must remain the LAST word in this file.
 # ─────────────────────────────────────────────────────────────────────────────
