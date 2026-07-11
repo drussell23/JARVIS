@@ -84,6 +84,59 @@ def _module_from_relpath(rel_path: str) -> str:
     return ".".join(parts)
 
 
+def extract_module_imports(
+    tree: "_ast.Module",
+    module: str,
+    is_init: bool,
+) -> Set[str]:
+    """Absolute dotted import targets of one parsed module (Slice 6).
+
+    THE single import extractor — factored verbatim from the
+    ``_build_forward_import_graph`` walk so the forward graph (source→tests,
+    Gate 2) and the test→source attribution bridge (Slice 6) share one
+    implementation. ``from x import y`` emits BOTH ``x`` and ``x.y``
+    (exact-match-first resolution downstream); ``import x as y`` records
+    ``x`` (``alias.name``, never the alias); relative imports resolve
+    against *module* via CPython's algorithm (``_add_relative_import_edges``).
+    """
+    imports: Set[str] = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                if alias.name:
+                    imports.add(alias.name)
+        elif isinstance(node, _ast.ImportFrom):
+            if node.level and node.level > 0:
+                _add_relative_import_edges(imports, module, is_init, node)
+            else:
+                mod = node.module or ""
+                if mod:
+                    imports.add(mod)
+                    for alias in node.names:
+                        if alias.name:
+                            imports.add(f"{mod}.{alias.name}")
+    return imports
+
+
+def build_module_to_path(root: str) -> Dict[str, str]:
+    """``{dotted_module: repo-relative path}`` for every ``*.py`` under
+    *root* (Slice 6) — the inverse of ``_module_from_relpath``, captured
+    from the same walk the forward-graph builder performs. Deterministic:
+    sorted traversal, first-wins on the rare ``pkg/__init__.py`` vs
+    ``pkg.py`` collision. Unreadability of individual entries is not an
+    error (mirrors the graph builder's skip discipline)."""
+    mapping: Dict[str, str] = {}
+    root_path = Path(root)
+    for py_file in sorted(root_path.rglob("*.py")):
+        if not py_file.is_file():
+            continue
+        rel = os.path.relpath(str(py_file), root).replace("\\", "/")
+        module = _module_from_relpath(rel)
+        if module and module not in mapping:
+            mapping[module] = rel
+    return mapping
+
+
 def _relpath_under_root(file_path: str, root: str) -> str:
     """Return *file_path* as a path relative to *root*, or ``""`` if it escapes
     root or is not a ``.py`` file. Accepts already-relative paths."""
@@ -161,25 +214,10 @@ def _build_forward_import_graph(root: str) -> Dict[str, Set[str]]:
             # Skip unrelated broken/unreadable files -- not a build failure.
             continue
 
-        imports: Set[str] = graph.setdefault(module, set())
-        for node in _ast.walk(tree):
-            if isinstance(node, _ast.Import):
-                for alias in node.names:
-                    if alias.name:
-                        imports.add(alias.name)
-            elif isinstance(node, _ast.ImportFrom):
-                if node.level and node.level > 0:
-                    # Relative import -- resolve against the importing module's
-                    # package using CPython's algorithm, so intra-package edges
-                    # (``from . import sib``) stay visible to the reverse graph.
-                    _add_relative_import_edges(imports, module, is_init, node)
-                else:
-                    mod = node.module or ""
-                    if mod:
-                        imports.add(mod)
-                        for alias in node.names:
-                            if alias.name:
-                                imports.add(f"{mod}.{alias.name}")
+        is_init_flag = is_init
+        graph.setdefault(module, set()).update(
+            extract_module_imports(tree, module, is_init_flag)
+        )
 
     return graph
 
