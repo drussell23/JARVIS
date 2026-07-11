@@ -180,6 +180,21 @@ def fs_confirm_enabled() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+def quiet_reconcile_enabled() -> bool:
+    """Re-read ``JARVIS_TEST_FAILURE_QUIET_RECONCILE_ENABLED`` (default true).
+
+    Slice 5 F5/F6 (Run #15 L4): the event-primary derate skips the legacy
+    whole-suite poll indefinitely once armed, so a dropped ``fs.changed``
+    event is dropped for the rest of the session. This flag gates the
+    bounded recovery — a single git-dirty-scoped reconcile fired only when
+    a whole fallback window observed ZERO fs events. Not cached so tests
+    can monkeypatch per-case (same pattern as ``fs_events_enabled``).
+    """
+    return os.environ.get(
+        "JARVIS_TEST_FAILURE_QUIET_RECONCILE_ENABLED", "true",
+    ).lower() in ("1", "true", "yes")
+
+
 def full_suite_fallback_enabled() -> bool:
     """Re-read ``JARVIS_TEST_FULL_SUITE_FALLBACK`` at call-time (default false).
 
@@ -1328,10 +1343,34 @@ class TestFailureSensor:
                         "force)."
                     )
                     self._poll_derate_logged = True
+                lane_counter = self._fs_events_handled + self._fs_events_ignored
                 try:
                     await asyncio.sleep(_TEST_FAILURE_FALLBACK_INTERVAL_S)
                 except asyncio.CancelledError:
                     break
+                # Slice 5 F5 (Run #15 L4): the derate skip is only safe when
+                # the event lane demonstrably delivers. Zero events across a
+                # whole fallback window -> one bounded git-dirty-scoped
+                # reconcile (NEVER the whole suite — T3 anti-storm holds).
+                if (
+                    quiet_reconcile_enabled()
+                    and self._running
+                    and (self._fs_events_handled + self._fs_events_ignored)
+                    == lane_counter
+                ):
+                    logger.info(
+                        "TestFailureSensor: event lane delivered ZERO events "
+                        "in %.0fs window — quiet-lane reconcile (bounded, "
+                        "git-dirty scoped)",
+                        _TEST_FAILURE_FALLBACK_INTERVAL_S,
+                    )
+                    try:
+                        await self._reconcile_quiet_lane()
+                    except Exception:
+                        logger.debug(
+                            "TestFailureSensor: quiet-lane reconcile error",
+                            exc_info=True,
+                        )
                 continue
             if self._poll_derate_logged:
                 logger.debug(
@@ -1357,3 +1396,86 @@ class TestFailureSensor:
                 await asyncio.sleep(effective_interval)
             except asyncio.CancelledError:
                 break
+
+    # ------------------------------------------------------------------
+    # Quiet-lane reconcile (Slice 5 T5, Run #15 L4, F5/F6)
+    # ------------------------------------------------------------------
+
+    async def _git_dirty_py_paths(self) -> list:
+        """Tracked-dirty ``.py`` files via async git — bounded, never raises.
+
+        Uses ``git status --porcelain=v1 --untracked-files=no`` (not the
+        boot-hydration path's ``git diff --name-only HEAD``) so staged AND
+        unstaged tracked changes both surface — the reconcile's job is to
+        catch whatever is dirty right now, not diff against a specific ref.
+        Rename/copy lines (``R  old.py -> new.py``) are parsed by splitting
+        on `` -> `` and keeping the NEW path — a naive ``line[3:]`` slice
+        would yield the compound ``"old.py -> new.py"`` which itself ends
+        in ``.py`` and would silently corrupt the path list rather than
+        crash, so it must be split explicitly rather than trusted to fail
+        safe. 10s bound; on timeout the subprocess is killed and reaped via
+        ``wait()`` so no zombie is left behind.
+        """
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "status", "--porcelain=v1", "--untracked-files=no",
+                cwd=self._repo,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return []
+        except Exception:
+            logger.debug("TestFailureSensor: git dirty scan failed", exc_info=True)
+            return []
+        dirty: list = []
+        for line in out.decode(errors="ignore").splitlines():
+            p = line[3:].strip()
+            if " -> " in p:
+                # Rename/copy line — keep the NEW (post-rename) path, the
+                # one that actually exists on disk right now.
+                p = p.split(" -> ", 1)[1].strip()
+            if p.endswith(".py"):
+                dirty.append(p)
+        return dirty
+
+    async def _reconcile_quiet_lane(self) -> None:
+        """One bounded scoped run over git-dirty paths (Slice 5 F5).
+
+        Fired from the derate branch of ``_poll_loop`` only when a whole
+        fallback window observed zero fs events. Scoped to git-dirty ``.py``
+        files — never the whole suite (T3 anti-storm invariant). A clean
+        tree runs nothing.
+        """
+        dirty = await self._git_dirty_py_paths()
+        if not dirty:
+            logger.debug(
+                "TestFailureSensor: quiet-lane reconcile — tree clean, "
+                "nothing to reconcile",
+            )
+            return
+        cap = _debounce_max_paths()
+        if len(dirty) > cap:
+            logger.warning(
+                "TestFailureSensor: reconcile %d dirty paths > cap %d — "
+                "first %d only, dropped: %s",
+                len(dirty), cap, cap, dirty[cap:],
+            )
+            dirty = dirty[:cap]
+        union = await self._resolve_union(dirty)
+        if not union:
+            logger.debug(
+                "TestFailureSensor: quiet-lane reconcile — no scoped "
+                "targets for %r", dirty,
+            )
+            return
+        logger.info(
+            "TestFailureSensor: quiet-lane reconcile scoped %d test "
+            "target(s) for %d dirty path(s)", len(union), len(dirty),
+        )
+        await self._run_scoped_with_confirmation(union)
