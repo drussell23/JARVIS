@@ -13,11 +13,28 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 _HEARTBEAT_EVERY_N = int(os.environ.get("JARVIS_FS_BRIDGE_HEARTBEAT_EVERY", "100"))
+
+_DEFAULT_IGNORE_GLOBS = (
+    "*/.worktrees/*", "*/__pycache__/*", "*/.git/*", "*/.ouroboros/*",
+    "*/node_modules/*", "*/venv/*", "*/.venv/*", "*/*.egg-info/*",
+)
+
+
+def _ignore_globs_from_env() -> List[str]:
+    """Deep-glob ignore entries, env-tunable (Slice 5 T1, mandate 2).
+
+    ``JARVIS_FS_BRIDGE_IGNORE_GLOBS`` — comma-separated full-path fnmatch
+    globs. Unset -> defaults; set-but-empty -> [] (legacy basename-only).
+    """
+    raw = os.environ.get("JARVIS_FS_BRIDGE_IGNORE_GLOBS")
+    if raw is None:
+        return list(_DEFAULT_IGNORE_GLOBS)
+    return [g.strip() for g in raw.split(",") if g.strip()]
 
 
 class FileSystemEventBridge:
@@ -59,7 +76,7 @@ class FileSystemEventBridge:
                 "__pycache__/*", ".git/*", "*.pyc", "node_modules/*",
                 "venv/*", ".venv/*", "*.egg-info/*", ".ouroboros/*",
                 ".worktrees/*", "*.swp", "*.tmp", "*~",
-            ],
+            ] + _ignore_globs_from_env(),
             recursive=True,
             debounce_seconds=0.3,
             verify_checksum=True,

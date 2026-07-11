@@ -261,9 +261,12 @@ _SCHEDULE_GROUP_KIND_COALESCED = "nested_venv_split_coalesced"
 # event filtering: ONE poll thread releases the GIL on every
 # scandir/stat syscall and cannot aggregate-GIL-wedge the loop the
 # way 51 contending walkers did. Re-included subtrees (venv/cache) DO
-# emit events — ``ignore_patterns`` fnmatches BASENAME only against
-# *.tmp/*.swp/*.bak/*~ and does NOT drop venv/.../foo.py; downstream
-# dedup + debounce absorb them — and ARE walked by the single poller:
+# emit events — ``ignore_patterns`` fnmatches BASENAME only for
+# slash-less entries like *.tmp/*.swp/*.bak/*~ (does NOT drop
+# venv/.../foo.py); slash-containing entries (e.g. "*/venv/*", Slice 5
+# T1 deep-glob) match the FULL path and DO drop nested subtree files —
+# downstream dedup + debounce absorb whatever still gets through — and
+# re-included subtrees ARE walked by the single poller regardless:
 # an accepted operator-authorized tradeoff (12J binding: fewer
 # schedules beats perfect exclusion). The catastrophic 56K-file SWE
 # worktree stays pattern-descent-protected (never collapsed). This
@@ -926,9 +929,11 @@ class FileWatchGuard:
         # thread releases the GIL on every scandir/stat syscall and
         # cannot aggregate-GIL-wedge the loop the way 51 contending
         # walkers did. Re-included subtrees DO emit events (deduped
-        # downstream; ignore_patterns only fnmatches basenames like
-        # *.tmp) and ARE walked by the single poller — the accepted
-        # operator-authorized tradeoff (12J binding: fewer schedules
+        # downstream; ignore_patterns fnmatches basenames like *.tmp
+        # for slash-less entries, and full paths for slash-containing
+        # entries — Slice 5 T1 deep-glob — which drop nested subtree
+        # files outright) and ARE walked by the single poller — the
+        # accepted operator-authorized tradeoff (12J binding: fewer schedules
         # beats perfect exclusion). The 56K-file SWE worktree stays
         # pattern-descent-protected (never collapsed).
         if hard_coalesced_count > 0:
@@ -1511,10 +1516,13 @@ class FileWatchGuard:
         scandir/stat syscall and cannot aggregate-GIL-wedge the loop
         the way 51 contending walkers did (the LoopDeadman evidence).
         Re-included subtrees (venv/cache) DO emit events —
-        ``ignore_patterns`` fnmatches BASENAME only against
-        *.tmp/*.swp/*.bak/*~, so venv/.../foo.py is NOT dropped;
-        downstream dedup + debounce absorb them — and ARE walked by
-        the single poller: an accepted operator-authorized tradeoff
+        ``ignore_patterns`` fnmatches BASENAME only for slash-less
+        entries like *.tmp/*.swp/*.bak/*~ (venv/.../foo.py is NOT
+        dropped by those); slash-containing entries (e.g. "*/venv/*",
+        Slice 5 T1 deep-glob) match the FULL path and DO drop nested
+        subtree files — downstream dedup + debounce absorb whatever
+        still gets through — and ARE walked by the single poller
+        regardless: an accepted operator-authorized tradeoff
         (12J binding: fewer schedules beats perfect exclusion). The
         catastrophic 56K-file SWE worktree stays pattern-descent-
         protected (never collapsed).
@@ -1795,11 +1803,20 @@ class FileWatchGuard:
         path = event.path
         name = path.name
 
-        # Check ignore patterns
+        # Check ignore patterns.
+        # Slice 5 T1 (Run #15 autopsy F3): patterns containing "/" are
+        # matched against the FULL path string — fnmatch's "*" crosses
+        # separators, giving deep-glob semantics ("*/.worktrees/*" drops
+        # any path with a .worktrees segment at any depth). Slash-less
+        # patterns keep the legacy basename-only behavior byte-identical.
         import fnmatch
 
+        full = str(path)
         for pattern in self.config.ignore_patterns:
-            if fnmatch.fnmatch(name, pattern):
+            if "/" in pattern:
+                if fnmatch.fnmatch(full, pattern):
+                    return False
+            elif fnmatch.fnmatch(name, pattern):
                 return False
 
         # Check include patterns
