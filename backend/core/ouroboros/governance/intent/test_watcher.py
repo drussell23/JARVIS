@@ -27,6 +27,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -181,6 +182,12 @@ class TestWatcher:
 
         self._running = False
 
+        # Slice 5 F4 (Run #15 L3): wall-clock timestamp of the most recent
+        # pytest spawn. 0.0 until the first spawn. Consulted by the sensor's
+        # results-file staleness gate — a ``test_results.json`` mtime older
+        # than this stamp is a leftover from a previous run.
+        self.last_pytest_spawn_walltime: float = 0.0
+
     # ------------------------------------------------------------------
     # Gap #4 Strangler Fig: event-primary poll derate
     # ------------------------------------------------------------------
@@ -240,6 +247,10 @@ class TestWatcher:
             "--no-header",
             "--color=no",
         ]
+        # Slice 5 F4: results-file freshness floor — a test_results.json
+        # older than this stamp is a leftover from a previous run and must
+        # never arm the sensor's plugin-suppression window.
+        self.last_pytest_spawn_walltime = time.time()
         result = await _tsh.run_pytest_subprocess(
             argv,
             cwd=str(self.repo_path),

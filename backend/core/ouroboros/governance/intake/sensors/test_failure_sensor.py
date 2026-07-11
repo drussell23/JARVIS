@@ -531,6 +531,16 @@ class TestFailureSensor:
         # to ``None`` too, which is safe/idempotent — it always runs
         # before any ``fs.changed`` event could reach ``_on_fs_event``.
         self._debounce_task: Optional[asyncio.Task] = None
+        # Slice 5 F4 (Run #15 L3, results-file staleness gate): monotonic
+        # timestamp of the last time a *fresh, parseable* plugin results
+        # read armed the 10s suppression window. Sole other write site is
+        # the fresh-parse path in ``_on_test_results_changed`` — absent/
+        # stale/unparseable results files never touch this.
+        self._last_plugin_ts: float = 0.0
+        # Slice 5 F4: wall-clock boot time, used as the staleness floor's
+        # fallback when no pytest run has been spawned yet by the watcher
+        # (e.g. a results file left over from before this sensor booted).
+        self._boot_walltime: float = time.time()
 
     def _prune_stale_pending(self) -> None:
         """Drop pending target entries that have exceeded their TTL.
@@ -813,11 +823,12 @@ class TestFailureSensor:
         check lives here so one sensor's decision doesn't require
         special-casing at the call site.
         """
-        # Initialize these attributes unconditionally so the rest of the
-        # class can reference them without AttributeError regardless of
-        # whether the flag flipped subscription on.
+        # Initialize unconditionally so the rest of the class can reference
+        # it without AttributeError regardless of whether the flag flipped
+        # subscription on. (``_last_plugin_ts`` is initialized in
+        # ``__init__`` — see Slice 5 F4 note there; not re-initialized here
+        # to keep the fresh-parse bump its sole other write site.)
         self._debounce_task: Optional[asyncio.Task] = None
-        self._last_plugin_ts: float = 0.0
 
         if not self._fs_events_mode:
             logger.debug(
@@ -897,9 +908,48 @@ class TestFailureSensor:
     # ------------------------------------------------------------------
 
     async def _on_test_results_changed(self, event: Any) -> None:
-        """Consume .jarvis/test_results.json written by the pytest plugin."""
+        """Consume .jarvis/test_results.json written by the pytest plugin.
+
+        Slice 5 F4 (Run #15 L3): the sensor once consumed a DELETED/stale
+        results file (parse of a missing file -> "0 failures") and still
+        armed the 10s plugin-suppression window at exactly the wrong
+        moment. This gate is structural: the file's ``st_mtime`` must be
+        >= ``max(watcher.last_pytest_spawn_walltime, boot_walltime) - 1.0``
+        (1s slack for coarse FS timestamps) or the event is ignored
+        entirely — ``_last_plugin_ts`` is untouched.
+        """
         path = event.payload.get("path", "")
+        floor_ts = max(
+            getattr(self._watcher, "last_pytest_spawn_walltime", 0.0),
+            self._boot_walltime,
+        ) - 1.0  # 1s slack for coarse FS timestamps
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            logger.debug(
+                "TestFailureSensor: results file absent/unreadable (%r) — "
+                "ignored, suppression NOT armed (Slice 5 F4)", path,
+            )
+            return
+        if mtime < floor_ts:
+            logger.debug(
+                "TestFailureSensor: STALE plugin results ignored "
+                "(mtime %.1fs before run/boot floor) — suppression NOT armed",
+                floor_ts - mtime,
+            )
+            return
+
         failures = self._parse_results_file(path)
+        if failures is None:
+            # Slice 5 F4: mtime was fresh but the payload itself was
+            # unparseable (truncated write, mid-write torn read, corrupt
+            # JSON). Not a "fresh, parseable read" — suppression must NOT
+            # arm on garbage.
+            logger.debug(
+                "TestFailureSensor: fresh results file unparseable (%r) — "
+                "ignored, suppression NOT armed (Slice 5 F4)", path,
+            )
+            return
 
         if self._watcher is not None:
             signals = self._watcher.process_failures(failures)
@@ -918,13 +968,19 @@ class TestFailureSensor:
 
         self._last_plugin_ts = time.monotonic()
 
-    def _parse_results_file(self, path: str) -> List[TestFailure]:
-        """Parse the JSON results file into TestFailure objects."""
+    def _parse_results_file(self, path: str) -> Optional[List[TestFailure]]:
+        """Parse the JSON results file into TestFailure objects.
+
+        Returns ``None`` (distinct from ``[]``) when the payload itself
+        could not be read/decoded — Slice 5 F4's staleness-gate bump must
+        distinguish "fresh file, genuinely zero failures" from "fresh
+        file, garbage payload" (the latter must NOT arm suppression).
+        """
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, ValueError) as exc:
             logger.debug("TestFailureSensor: failed to read results file: %s", exc)
-            return []
+            return None
 
         if data.get("schema_version") != 1:
             logger.debug(
