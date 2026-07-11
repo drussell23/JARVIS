@@ -11,6 +11,7 @@ Boundary Principle (Manifesto §3 / §5):
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import logging
 import os
 import time as _time
@@ -78,7 +79,10 @@ class FileSystemEventBridge:
         self._watch_config = watch_config
         self._guard: Optional[Any] = None
         self._events_published: int = 0
-        self._sentinel_path: Path = self._project_root / ".jarvis" / _SENTINEL_BASENAME
+        # Placeholder — re-resolved schedule-aware in start() (see
+        # _resolve_sentinel_dir): the parent dir must be one the guard
+        # actually schedules, which ".jarvis" is NOT (exclude_top_level_dirs).
+        self._sentinel_path: Path = self._project_root / _SENTINEL_BASENAME
         self._sentinel_observed: Optional[asyncio.Event] = None  # armed in start()
         self._verify_task: Optional[asyncio.Task] = None
         self._watch_confirmed: bool = False
@@ -115,6 +119,9 @@ class FileSystemEventBridge:
                 self._project_root, config.patterns,
             )
             if _sentinel_enabled():
+                self._sentinel_path = (
+                    self._resolve_sentinel_dir(config) / _SENTINEL_BASENAME
+                )
                 self._sentinel_observed = asyncio.Event()
                 self._verify_task = asyncio.create_task(
                     self._verify_pipeline_live(), name="fs_bridge_watch_verify",
@@ -151,6 +158,11 @@ class FileSystemEventBridge:
         from logs alone is now a single grep away.
         """
         try:
+            # Basename-filter tradeoff: ANY file named fs_watch_sentinel.json
+            # anywhere in the watch root is suppressed from sensors — even
+            # when the sentinel master switch is off. The name is reserved
+            # for the liveness probe; a user file with this exact basename
+            # will never reach fs.changed.* subscribers.
             if event.path.name == _SENTINEL_BASENAME:
                 if self._sentinel_observed is not None and not self._sentinel_observed.is_set():
                     self._sentinel_observed.set()
@@ -206,6 +218,53 @@ class FileSystemEventBridge:
         except Exception:
             logger.debug("[FSEventBridge] Failed to publish event", exc_info=True)
 
+    def _resolve_sentinel_dir(self, config: Any) -> Path:
+        """Pick a sentinel parent the guard actually schedules (T4 review Critical).
+
+        ``.jarvis`` sits in FileWatchGuard's ``exclude_top_level_dirs``
+        (Slice 12I) — in the NON-coalesced scheduling regime,
+        ``_resolve_watch_paths`` never passes it to ``observer.schedule()``,
+        so a sentinel there is unobservable and WATCH NOT CONFIRMED would
+        fire falsely every boot. (In the HARD-COALESCED regime the single
+        recursive root schedule DOES emit for re-included subtrees — the
+        fragility is regime-dependent, so this resolution must be
+        regime-independent.)
+
+        Chooses the first (sorted) depth-1 subdirectory of the watch root
+        that is (a) a real directory, (b) not in ``exclude_top_level_dirs``,
+        (c) not matched by any ignore pattern (probed against a
+        representative child path, both absolute and root-relative, per
+        Task 1's deep-glob semantics), and (d) not dot-prefixed unless
+        nothing else qualifies. Falls back to the watch root itself.
+        """
+        exclude = getattr(config, "exclude_top_level_dirs", None) or frozenset()
+        ignore_patterns = list(getattr(config, "ignore_patterns", None) or [])
+
+        def _watchable(d: Path) -> bool:
+            if d.name in exclude:
+                return False
+            probe_abs = str(d / _SENTINEL_BASENAME)
+            probe_rel = f"{d.name}/{_SENTINEL_BASENAME}"
+            for pat in ignore_patterns:
+                if fnmatch.fnmatch(probe_abs, pat) or fnmatch.fnmatch(probe_rel, pat):
+                    return False
+            return True
+
+        try:
+            children = sorted(
+                (p for p in self._project_root.iterdir() if p.is_dir()),
+                key=lambda p: p.name,
+            )
+        except OSError:
+            return self._project_root
+        for allow_hidden in (False, True):
+            for child in children:
+                if not allow_hidden and child.name.startswith("."):
+                    continue
+                if _watchable(child):
+                    return child
+        return self._project_root
+
     async def _verify_pipeline_live(self) -> None:
         """Prove the watch pipeline delivers events (Slice 5 F1/F6, Run #15 L1).
 
@@ -215,10 +274,15 @@ class FileSystemEventBridge:
         Budget exhausted -> the WATCH NOT CONFIRMED warning (F6 boot half).
         Fail-soft by construction: background task, never blocks start().
         """
+        assert self._sentinel_observed is not None  # armed in start() before spawn
         t0 = _time.monotonic()
         budget = _ready_budget_s()
         retouch = _sentinel_retouch_s()
         attempt = 0
+        logger.debug(
+            "[FSEventBridge] sentinel verify starting — path=%s budget=%.0fs "
+            "retouch=%.1fs", self._sentinel_path, budget, retouch,
+        )
         try:
             while (_time.monotonic() - t0) < budget:
                 try:
@@ -234,7 +298,9 @@ class FileSystemEventBridge:
                 except OSError:
                     logger.debug("[FSEventBridge] sentinel touch failed", exc_info=True)
                 try:
-                    await asyncio.wait_for(self._sentinel_observed.wait(), timeout=retouch)
+                    # Clamp so the final wait never overshoots the budget.
+                    wait_s = min(retouch, max(0.1, budget - (_time.monotonic() - t0)))
+                    await asyncio.wait_for(self._sentinel_observed.wait(), timeout=wait_s)
                 except asyncio.TimeoutError:
                     continue  # bounded re-touch; the wait itself is event-driven
                 elapsed = _time.monotonic() - t0
