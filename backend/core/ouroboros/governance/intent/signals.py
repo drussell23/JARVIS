@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple, TypedDict
+from typing import Any, Dict, Optional, Sequence, Tuple, TypedDict
 
 from backend.core.ouroboros.governance.operation_id import generate_operation_id
 
@@ -336,6 +336,68 @@ def build_vision_signal_evidence(
     }
     validate_vision_signal_evidence(evidence)
     return evidence
+
+
+# ---------------------------------------------------------------------------
+# TestFailure attribution evidence (Slice 6) — schema-versioned, mirrors the
+# VisionSignalEvidence discipline. Lives under evidence["attribution"].
+# ---------------------------------------------------------------------------
+
+TEST_FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
+
+_ATTRIBUTION_STATUSES = ("resolved", "unresolved", "disabled")
+
+
+def build_attribution_evidence(
+    *,
+    status: str,
+    test_locus: str,
+    source_loci: Sequence[str] = (),
+    method: str = "",
+    reason: str = "",
+) -> Dict[str, Any]:
+    """Construct the ``evidence['attribution']`` block (Slice 6).
+
+    ``status``: ``resolved`` (source_loci non-empty, method set) |
+    ``unresolved`` (reason set — the typed fail-fast) | ``disabled``
+    (master switch off; scope stays legacy test-locus)."""
+    return {
+        "schema_version": TEST_FAILURE_ATTRIBUTION_SCHEMA_VERSION,
+        "status": status,
+        "test_locus": test_locus,
+        "source_loci": list(source_loci),
+        "method": method,
+        "reason": reason,
+    }
+
+
+def validate_attribution_evidence(obj: Any) -> Tuple[bool, str]:
+    """(ok, error). Structural validation only — deterministic, no IO."""
+    if not isinstance(obj, dict):
+        return False, "attribution evidence must be a dict"
+    if obj.get("schema_version") != TEST_FAILURE_ATTRIBUTION_SCHEMA_VERSION:
+        return False, (
+            f"schema_version must be {TEST_FAILURE_ATTRIBUTION_SCHEMA_VERSION}"
+        )
+    status = obj.get("status")
+    if status not in _ATTRIBUTION_STATUSES:
+        return False, f"status must be one of {_ATTRIBUTION_STATUSES}"
+    test_locus = obj.get("test_locus")
+    if not isinstance(test_locus, str) or not test_locus:
+        return False, "test_locus must be a non-empty string"
+    loci = obj.get("source_loci")
+    if not isinstance(loci, list) or not all(
+        isinstance(p, str) and p for p in loci
+    ):
+        return False, "source_loci must be a list of non-empty strings"
+    if status == "resolved":
+        if not loci:
+            return False, "resolved attribution requires non-empty source_loci"
+        if not obj.get("method"):
+            return False, "resolved attribution requires method"
+    if status == "unresolved" and not obj.get("reason"):
+        return False, "unresolved attribution requires reason"
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
