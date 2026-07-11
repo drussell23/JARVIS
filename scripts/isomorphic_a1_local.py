@@ -1212,7 +1212,14 @@ async def _await_soak_boot(
 
 
 def _chaos_evidence_predicate(chaos_basenames: List[str]) -> Any:
-    """Line-predicate: the sensor visibly scoped one of the chaos files."""
+    """Line-predicate: a chaos file became sensor-visible.
+
+    Matches the TestFailureSensor scoping line naming one of the chaos
+    files.  The evidence may be inject-time (the chaos mutation itself
+    fired fs.changed) or touch/nonce-caused — the gate's purpose is "the
+    chaos file became sensor-visible", and either source proves SENSE
+    sees it.  No attribution between the two is attempted (or needed).
+    """
     def _pred(line: str) -> bool:
         return "TestFailureSensor" in line and any(
             b in line for b in chaos_basenames
@@ -1841,11 +1848,29 @@ class IsomorphicA1Driver:
                     _watch_budget = _env_float(
                         "JARVIS_ISO_WATCH_ACTIVE_BUDGET_S", 360.0)
                     _log("STEP await WATCH ACTIVE (bridge sentinel self-verification)")
-                    _watch_ok = await _await_log_predicate(
+                    # Fail-fast belt: if the bridge self-reports WATCH NOT
+                    # CONFIRMED (its own sentinel budget exhausted), stop
+                    # waiting immediately -- the verdict is already in; do
+                    # not burn the remaining _watch_budget re-scanning for a
+                    # WATCH ACTIVE that cannot arrive.
+                    _watch_flags: Dict[str, bool] = {"not_confirmed": False}
+
+                    def _watch_gate_pred(line: str) -> bool:
+                        if _WATCH_NOT_CONFIRMED_MARKER in line:
+                            _watch_flags["not_confirmed"] = True
+                            return True  # terminate the scan NOW (fail-fast)
+                        return _WATCH_ACTIVE_MARKER in line
+
+                    _watch_found = await _await_log_predicate(
                         soak_proc, debug_log,
-                        lambda l: _WATCH_ACTIVE_MARKER in l,
+                        _watch_gate_pred,
                         _watch_budget, "watch-active",
                     )
+                    _watch_ok = _watch_found and not _watch_flags["not_confirmed"]
+                    if _watch_flags["not_confirmed"]:
+                        _log("watch-active: bridge self-reported WATCH NOT "
+                             "CONFIRMED — failing the gate immediately "
+                             "(no budget burn)")
                     if not _watch_ok:
                         _require_watch_active = os.environ.get(
                             "JARVIS_ISO_REQUIRE_WATCH_ACTIVE", "true"
@@ -1916,32 +1941,54 @@ class IsomorphicA1Driver:
 
                         # ── d.6 POST-TOUCH EVIDENCE VERIFICATION (Run #15 L1) ──
                         # The touch's "(fires fs.changed.modified)" claim was
-                        # NEVER verified -- prove the sensor actually scoped
-                        # the chaos file(s), with bounded content-nonce retry
-                        # (a bare mtime touch is checksum-gated and can be
-                        # absorbed by the watchdog baseline race).
-                        _basenames = [Path(p).name for p in touched]
-                        _retries = int(_env_float(
-                            "JARVIS_ISO_CHAOS_TOUCH_RETRIES", 3.0))
-                        _evidence_budget = _env_float(
-                            "JARVIS_ISO_CHAOS_EVIDENCE_BUDGET_S", 240.0)
-                        _evidence = False
-                        for _attempt in range(1, _retries + 1):
-                            if await _await_log_predicate(
-                                soak_proc, debug_log,
-                                _chaos_evidence_predicate(_basenames),
-                                _evidence_budget, "chaos-evidence",
-                            ):
-                                _log("run-#15 fix: sensor evidence observed "
-                                     "(attempt %d/%d) — the touch VERIFIABLY "
-                                     "reached SENSE" % (_attempt, _retries))
-                                _evidence = True
-                                break
-                            _log("run-#15 fix: no sensor evidence in %.0fs — "
-                                 "re-firing chaos files WITH CONTENT NONCE "
-                                 "(attempt %d/%d)"
-                                 % (_evidence_budget, _attempt, _retries))
-                            _refire_chaos_files_with_nonce(touched, _attempt)
+                        # NEVER verified -- prove the chaos file(s) became
+                        # sensor-visible, with bounded content-nonce retry (a
+                        # bare mtime touch is checksum-gated and can be
+                        # absorbed by the watchdog baseline race). Honesty
+                        # note: the gate accepts evidence from EITHER source
+                        # -- attempt-1 passes are commonly injection-caused
+                        # (the chaos mutation itself fired fs.changed before
+                        # the touch), and that satisfies the gate's purpose
+                        # exactly as well as touch-caused evidence. No
+                        # attribution machinery -- "SENSE sees the chaos
+                        # file" is the whole contract.
+                        if not touched:
+                            # Short-circuit: no files on disk means there is
+                            # nothing for the sensor to see and nothing the
+                            # nonce refire could mutate -- burning the retry
+                            # budget would be pure theater. Preserve the
+                            # legacy proceed behavior.
+                            _log("run-#15: nothing to verify — no chaos "
+                                 "files on disk (0 touched); skipping "
+                                 "evidence gate")
+                            _evidence = True
+                        else:
+                            _basenames = [Path(p).name for p in touched]
+                            _retries = int(_env_float(
+                                "JARVIS_ISO_CHAOS_TOUCH_RETRIES", 3.0))
+                            _evidence_budget = _env_float(
+                                "JARVIS_ISO_CHAOS_EVIDENCE_BUDGET_S", 240.0)
+                            _evidence = False
+                            for _attempt in range(1, _retries + 1):
+                                if await _await_log_predicate(
+                                    soak_proc, debug_log,
+                                    _chaos_evidence_predicate(_basenames),
+                                    _evidence_budget, "chaos-evidence",
+                                ):
+                                    _log("run-#15 fix: sensor evidence "
+                                         "observed (attempt %d/%d) — the "
+                                         "chaos file became sensor-visible "
+                                         "(via inject-time event or driver "
+                                         "touch — either proves SENSE sees "
+                                         "it)" % (_attempt, _retries))
+                                    _evidence = True
+                                    break
+                                _log("run-#15 fix: no sensor evidence in "
+                                     "%.0fs — re-firing chaos files WITH "
+                                     "CONTENT NONCE (attempt %d/%d)"
+                                     % (_evidence_budget, _attempt, _retries))
+                                _refire_chaos_files_with_nonce(
+                                    touched, _attempt)
                         if not _evidence:
                             _log("FATAL: chaos touch produced no sensor "
                                  "evidence after %d attempts — SENSE blind, "

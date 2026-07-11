@@ -20,6 +20,7 @@ integration tests are marked ``@pytest.mark.slow`` and can be skipped in CI.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -2018,3 +2019,269 @@ class TestAuditAtTeardownSequencing:
             "post-completion audit must run in --replay mode; got kwargs=%r"
             % (auditor_kwargs[0],)
         )
+
+
+# ===========================================================================
+# Group 9 -- Slice 5 T6: WATCH ACTIVE gate + evidence-exhaustion abort wiring
+# ===========================================================================
+
+
+class TestSlice5WatchGateAbortWiring:
+    """Integration coverage for the Run #15 L1 driver-half abort paths.
+
+    Unlike tests/scripts/test_slice5_driver_watch_gate.py (unit-level
+    predicate/scanner coverage), these prove the MAIN-FLOW wiring: the
+    driver's run() actually aborts (rc=1 + telemetry with the right reason)
+    on WATCH-gate timeout / NOT CONFIRMED fail-fast / evidence exhaustion,
+    proceeds when the gate is disabled, and counts nonce refires.
+
+    Scaffold mirrors TestAuditAtTeardownSequencing._scaffold (hermetic
+    _NoopEnv chdir contract, fake soak handle, async spies) with three
+    deltas: injectable debug_log text (the gates under test scan it),
+    a chaos-inject spy (proves injection ordering), and a telemetry spy
+    on the real failure_telemetry seam.
+    """
+
+    def _gate_scaffold(
+        self,
+        tmp_path: Path,
+        harness_mod: Any,
+        debug_log_text: str,
+        with_chaos_manifest: bool = False,
+    ):
+        telemetry_calls: List[Dict[str, Any]] = []
+        inject_seeds: List[int] = []
+        log_lines: List[str] = []
+
+        class _MockAdversary:
+            async def start(self) -> Dict[str, str]:
+                return {"doubleword": "http://127.0.0.1:19997/dw"}
+            async def stop(self) -> None:
+                pass
+            def env_overrides(self) -> Dict[str, str]:
+                return {}
+            def schedule(self, **_: Any) -> None:
+                pass
+
+        class _NoopEnv:
+            # Hermetic: honors the REAL IsomorphicEnv contract (disjoint
+            # cwd under tmp_path, restored on exit) — see the 2026-07-06
+            # leak postmortem note on TestAuditAtTeardownSequencing.
+            root = tmp_path
+            def __enter__(self) -> "_NoopEnv":
+                self._prev_cwd = os.getcwd()
+                (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+                os.chdir(tmp_path / "app")
+                return self
+            def __exit__(self, *args: Any) -> bool:
+                os.chdir(self._prev_cwd)
+                return False
+
+        class _SpyChaos:
+            def status(self) -> Dict[str, Any]:
+                return {"active": False}
+            def inject(self, seed: int) -> bool:
+                inject_seeds.append(seed)
+                return True
+            def revert(self) -> bool:
+                return True
+
+        class _FakeProc:
+            def __init__(self) -> None:
+                self.pid = 4242
+                self.returncode: "Optional[int]" = None
+            def poll(self) -> "Optional[int]":
+                return self.returncode
+            def wait(self, timeout: "Optional[float]" = None) -> int:
+                self.returncode = 0
+                return 0
+
+        debug_log = tmp_path / "session" / "debug.log"
+        debug_log.parent.mkdir(parents=True, exist_ok=True)
+        debug_log.write_text(debug_log_text, encoding="utf-8")
+        fake_proc = _FakeProc()
+
+        class _FakeSoakHandle:
+            def __init__(self) -> None:
+                self.debug_log = str(debug_log)
+                self.session_dir = str(debug_log.parent)
+                self.proc = fake_proc
+
+        class _FakeSoakRunner:
+            def __init__(self, **kwargs: Any) -> None:
+                pass
+            def launch(self, env: Dict[str, str], run_dir: str) -> Any:
+                return _FakeSoakHandle()
+            def stop(self) -> None:
+                pass
+
+        class _FakeAuditorRunner:
+            def __init__(self, **kwargs: Any) -> None:
+                pass
+            def watch(self, **kwargs: Any) -> Dict[str, Any]:
+                return {"proven": True, "criteria": {}}
+
+        async def _fake_await_soak_boot(
+            proc: Any, log: str, timeout_s: float = 90.0,
+        ) -> bool:
+            return True
+
+        async def _fake_await_term(
+            soak_proc: Any, dbg_log: str, launch_monotonic: Any,
+        ) -> str:
+            soak_proc.returncode = 0
+            return "exited"
+
+        def _spy_telemetry(output_dir: Any = None, reason: str = "",
+                           **kw: Any) -> None:
+            telemetry_calls.append({"output_dir": output_dir,
+                                    "reason": reason})
+
+        def _recording_log(msg: str) -> None:
+            log_lines.append(msg)
+
+        if with_chaos_manifest:
+            (tmp_path / ".jarvis").mkdir(exist_ok=True)
+            chaos_target = tmp_path / "chaos_target.py"
+            chaos_target.write_text("def chaos(): return 1\n",
+                                    encoding="utf-8")
+            (tmp_path / ".jarvis" / "chaos_manifest.json").write_text(
+                json.dumps({"target_file": "chaos_target.py"}),
+                encoding="utf-8",
+            )
+
+        driver = IsomorphicA1Driver(
+            repo_root=str(tmp_path),
+            stub_soak=False,
+            seed=0,
+            run_root=str(tmp_path / "runs"),
+            enable_failover=False,
+            dw_session_budget=2.0,
+            _adversary_factory=lambda: _MockAdversary(),
+        )
+
+        patches = [
+            patch(
+                "backend.core.ouroboros.battle_test.isomorphic_env.IsomorphicEnv",
+                return_value=_NoopEnv(),
+            ),
+            patch.object(harness_mod, "ChaosController",
+                         lambda **kw: _SpyChaos()),
+            patch.object(harness_mod, "SoakRunner", _FakeSoakRunner),
+            patch.object(harness_mod, "AuditorRunner", _FakeAuditorRunner),
+            patch.object(_driver_mod, "_await_soak_boot",
+                         _fake_await_soak_boot),
+            patch.object(_driver_mod, "_await_soak_child_termination",
+                         _fake_await_term),
+            patch(
+                "backend.core.ouroboros.battle_test.failure_telemetry."
+                "capture_failure_telemetry",
+                _spy_telemetry,
+            ),
+            patch.object(_driver_mod, "_log", _recording_log),
+        ]
+        return driver, patches, telemetry_calls, inject_seeds, log_lines
+
+    async def _run_with(self, driver: Any, patches: List[Any]) -> int:
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            return await driver.run()
+
+    async def test_watch_gate_timeout_aborts_before_inject(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        """(a) No WATCH ACTIVE marker + REQUIRE default(true) + tiny budget
+        -> rc=1, telemetry reason names watch_gate:not_confirmed, and
+        injection was NEVER reached."""
+        monkeypatch.setenv("JARVIS_ISO_WATCH_ACTIVE_BUDGET_S", "0.5")
+        monkeypatch.delenv("JARVIS_ISO_REQUIRE_WATCH_ACTIVE", raising=False)
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        driver, patches, telemetry, injects, _logs = self._gate_scaffold(
+            tmp_path, harness_mod, "boot complete\n",
+        )
+        rc = await self._run_with(driver, patches)
+        assert rc == 1
+        assert any(
+            "watch_gate:not_confirmed" in c["reason"] for c in telemetry
+        ), "telemetry must carry the watch-gate failure locus; got %r" % (
+            telemetry,)
+        assert injects == [], "abort must fire BEFORE chaos injection"
+
+    async def test_watch_gate_not_confirmed_fails_fast(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        """(Minor 1) The bridge self-reporting WATCH NOT CONFIRMED must fail
+        the gate IMMEDIATELY — no burning the (deliberately large here)
+        watch budget."""
+        monkeypatch.setenv("JARVIS_ISO_WATCH_ACTIVE_BUDGET_S", "60")
+        monkeypatch.delenv("JARVIS_ISO_REQUIRE_WATCH_ACTIVE", raising=False)
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        driver, patches, telemetry, injects, _logs = self._gate_scaffold(
+            tmp_path, harness_mod,
+            "boot complete\n[FSEventBridge] WATCH NOT CONFIRMED — zero "
+            "sentinel events observed within budget\n",
+        )
+        t0 = time.monotonic()
+        rc = await self._run_with(driver, patches)
+        elapsed = time.monotonic() - t0
+        assert rc == 1
+        assert elapsed < 10.0, (
+            "NOT CONFIRMED must fail-fast, not wait out the 60s budget "
+            "(elapsed=%.1fs)" % elapsed)
+        assert any(
+            "watch_gate:not_confirmed" in c["reason"] for c in telemetry)
+        assert injects == [], "abort must fire BEFORE chaos injection"
+
+    async def test_require_false_proceeds_past_gate(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        """(b) JARVIS_ISO_REQUIRE_WATCH_ACTIVE=false -> the warn fires and
+        execution reaches the inject seam (and completes)."""
+        monkeypatch.setenv("JARVIS_ISO_WATCH_ACTIVE_BUDGET_S", "0.5")
+        monkeypatch.setenv("JARVIS_ISO_REQUIRE_WATCH_ACTIVE", "false")
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        driver, patches, telemetry, injects, logs = self._gate_scaffold(
+            tmp_path, harness_mod, "boot complete\n",
+        )
+        rc = await self._run_with(driver, patches)
+        assert rc == 0, "gate disabled -> the run must proceed to completion"
+        assert any("WATCH ACTIVE unconfirmed" in l for l in logs), (
+            "the proceed-anyway warn must be visible")
+        assert injects == [0], "execution must reach the inject step seam"
+        assert not any(
+            "watch_gate:not_confirmed" in c["reason"] for c in telemetry)
+
+    async def test_evidence_exhaustion_aborts_and_counts_refires(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        """(c) WATCH ACTIVE seeded but NO sensor-evidence line -> rc=1,
+        telemetry reason names chaos_evidence:not_observed, and the nonce
+        refire ran exactly JARVIS_ISO_CHAOS_TOUCH_RETRIES times."""
+        monkeypatch.setenv("JARVIS_ISO_CHAOS_EVIDENCE_BUDGET_S", "0.3")
+        monkeypatch.setenv("JARVIS_ISO_CHAOS_TOUCH_RETRIES", "2")
+        monkeypatch.delenv("JARVIS_ISO_REQUIRE_WATCH_ACTIVE", raising=False)
+        harness_mod = _load_script("a1_live_fire_chaos_harness")
+        driver, patches, telemetry, injects, _logs = self._gate_scaffold(
+            tmp_path, harness_mod,
+            "boot complete\n[FSEventBridge] WATCH ACTIVE — pipeline "
+            "verified live (sentinel observed after 0.1s)\n",
+            with_chaos_manifest=True,
+        )
+        refire_attempts: List[int] = []
+
+        def _spy_refire(touched: List[str], attempt: int) -> None:
+            refire_attempts.append(attempt)
+
+        patches.append(patch.object(
+            _driver_mod, "_refire_chaos_files_with_nonce", _spy_refire))
+        rc = await self._run_with(driver, patches)
+        assert rc == 1
+        assert injects == [0], "injection happened before the evidence gate"
+        assert any(
+            "chaos_evidence:not_observed" in c["reason"] for c in telemetry
+        ), "telemetry must carry the evidence failure locus; got %r" % (
+            telemetry,)
+        assert refire_attempts == [1, 2], (
+            "nonce refire must run exactly retries(2) times with 1-based "
+            "attempt numbers; got %r" % (refire_attempts,))
