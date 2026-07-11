@@ -150,6 +150,33 @@ def make_async_anthropic_client(
         }
         if http_client is not None:
             kwargs["http_client"] = http_client
+        # Aegis-override hazard (Slice 4 whole-branch review): the update
+        # below is last-write-wins, so a caller-supplied ``base_url`` (or
+        # ``api_key``) in ``extra_kwargs`` SILENTLY beats the daemon values
+        # set above — the client would then bypass Aegis capture entirely
+        # (real base_url/key on the wire while the operator believes
+        # traffic is confiscated). Today's only known caller of a
+        # non-empty ``base_url`` override (``ClaudeProvider`` /
+        # ``hosted_resilience_lane.py``) already gates on
+        # ``aegis_client_mod.is_enabled()`` at its own preflight and never
+        # reaches here with Aegis active — but that is a CALLER convention,
+        # not a structural guarantee this factory enforces. Surface it
+        # loudly rather than let a future/unaudited caller silently win.
+        if "base_url" in extra_kwargs or "api_key" in extra_kwargs:
+            _overridden = [
+                k for k in ("base_url", "api_key") if k in extra_kwargs
+            ]
+            logger.warning(
+                "[ProviderBridge] Aegis is ACTIVE but caller passed "
+                "%s in extra_kwargs — the caller-supplied value(s) WIN "
+                "over the Aegis daemon's base_url=%s (last-write-wins "
+                "kwargs.update below). This likely bypasses Aegis "
+                "credential confiscation for this client. If this is "
+                "unexpected, add an aegis_client_mod.is_enabled() "
+                "preflight at the caller (see hosted_resilience_lane.py "
+                "preflight() reason=aegis_active_would_placeholder_key).",
+                _overridden, aegis_url,
+            )
         kwargs.update(extra_kwargs)
         logger.debug(
             "[ProviderBridge] AsyncAnthropic via Aegis: base_url=%s "

@@ -78,15 +78,43 @@ def test_ordinary_exception_not_refusal():
     assert is_budget_refusal(TimeoutError("provider timed out")) is False
 
 
+def _build_cause_chain(n_wrappers: int) -> BaseException:
+    """Build a REAL ``__cause__`` chain: ``outer <- wrapper_n <- ... <-
+    wrapper_1 <- refusal``, via genuine ``raise ... from`` semantics (not a
+    fabricated/discarded local). ``n_wrappers`` is the ``__cause__``-hop
+    distance from the returned outer exception down to the buried
+    :class:`SessionBudgetPreflightRefused`.
+    """
+    cur: BaseException = _refusal()
+    for i in range(n_wrappers):
+        try:
+            raise cur
+        except BaseException as e:  # noqa: BLE001 — building a real cause chain
+            wrapper = RuntimeError(f"transport wrapper {i}")
+            wrapper.__cause__ = e
+            cur = wrapper
+    return cur
+
+
 def test_depth_bound_terminates_on_long_chain():
-    """The walk is bounded (_depth) — a refusal buried deeper than the bound
-    reads False rather than looping. Proves the bound is real."""
-    exc: BaseException = _refusal()
-    for _ in range(20):
-        exc = RuntimeError("wrap") if True else exc  # noqa: SIM222
-    # A pathological non-refusal outer with no refusal in the first _depth
-    # hops must classify False.
-    assert is_budget_refusal(RuntimeError("plain")) is False
+    """The walk is bounded (default ``_depth=8``): it inspects the outer
+    exception plus its next 7 ``__cause__`` hops (cause-distance 0..7 from
+    the outer, 8 checks total). A refusal buried strictly deeper than that
+    (cause-distance >= 8) is unreachable and must classify False — proving
+    the bound actually terminates the walk rather than traversing forever.
+    """
+    outer = _build_cause_chain(9)  # refusal at cause-distance 9 > reachable max (7)
+    assert is_budget_refusal(outer) is False
+
+
+def test_depth_bound_boundary_finds_refusal_within_bound():
+    """Complement of the above: a refusal at the maximum *reachable*
+    cause-distance (7, the last hop the ``seen < _depth`` loop still visits
+    under the default ``_depth=8``) must still classify True. Together with
+    ``test_depth_bound_terminates_on_long_chain`` this pins the exact
+    boundary the guard enforces."""
+    outer = _build_cause_chain(7)  # refusal at cause-distance 7 == reachable max
+    assert is_budget_refusal(outer) is True
 
 
 # ---------------------------------------------------------------------------
