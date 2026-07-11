@@ -231,10 +231,17 @@ class TestBridgeOffByteIdentical:
         await watcher._enrich_failures([f], _TB_OUTPUT)
         assert f.traceback_evidence is None  # untouched
         # streak 2 → stable signal carries only the legacy evidence keys
+        # plus the always-present Slice 6 "attribution" block (stamped for
+        # every stable signal regardless of the repair-bridge flag — the
+        # bridge-off invariant is the ABSENCE of traceback keys).
         watcher.process_failures([f])
         signals = watcher.process_failures([_make_failure()])
         ev = signals[0].evidence
-        assert set(ev) == {"signature", "test_id", "streak", "error_text"}
+        assert set(ev) == {
+            "signature", "test_id", "streak", "error_text", "attribution",
+        }
+        assert "traceback_frames" not in ev
+        assert "fault_node_keys" not in ev
 
 
 class TestBridgeOnEnriches:

@@ -31,7 +31,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from .signals import IntentSignal
+from .signals import IntentSignal, build_attribution_evidence
+from .test_source_attribution import (
+    AttributionUnresolved,
+    attribute_test_to_sources,
+    attribution_enabled,
+)
 from backend.core.ouroboros.governance.workspace_resolver import resolve_repo_root
 
 logger = logging.getLogger(__name__)
@@ -435,13 +440,70 @@ class TestWatcher:
                     "error_text": f.error_text,
                 }
                 # Repair Context Bridge (Slice 1): additive traceback enrichment.
-                # Only present when the bridge enriched this failure; merging
-                # ``None``/empty leaves the evidence byte-identical to before.
                 if f.traceback_evidence:
                     evidence.update(f.traceback_evidence)
+
+                # Slice 6 — deterministic test→source attribution. Resolved:
+                # scope = (*sources, test) so APPLY can repair the module
+                # under test AND the file_scope_mismatch guard passes correct
+                # source patches. Unresolved: typed fail-fast — scope stays
+                # test-locus, evidence carries the error, and the orchestrator
+                # attribution gate forbids blind test-only mutation. Any
+                # UNEXPECTED attributor fault degrades to legacy scope
+                # (fail-soft: never eat a real failure signal).
+                target_files: Tuple[str, ...] = (f.file_path,)
+                if not attribution_enabled():
+                    evidence["attribution"] = build_attribution_evidence(
+                        status="disabled", test_locus=f.file_path,
+                    )
+                else:
+                    try:
+                        _tb_frames = tuple(
+                            fr.get("file", "") if isinstance(fr, dict) else str(fr)
+                            for fr in (evidence.get("traceback_frames") or ())
+                        )
+                        attr = attribute_test_to_sources(
+                            f.file_path,
+                            repo_root=self.repo_path,
+                            traceback_frames=_tb_frames,
+                        )
+                        target_files = (*attr.source_loci, attr.test_locus)
+                        evidence["attribution"] = build_attribution_evidence(
+                            status="resolved",
+                            test_locus=attr.test_locus,
+                            source_loci=attr.source_loci,
+                            method=attr.method,
+                        )
+                        logger.info(
+                            "[Attribution] %s -> %s (method=%s)",
+                            f.file_path, list(attr.source_loci), attr.method,
+                        )
+                    except AttributionUnresolved as exc:
+                        evidence["attribution"] = build_attribution_evidence(
+                            status="unresolved",
+                            test_locus=f.file_path,
+                            reason=exc.reason,
+                        )
+                        logger.warning(
+                            "[Attribution] FAIL-FAST unresolved for %s: %s "
+                            "— scope stays test-locus; blind test mutation "
+                            "gated at the orchestrator",
+                            f.file_path, exc,
+                        )
+                    except Exception:  # noqa: BLE001 — fail-soft, never eat the signal
+                        evidence["attribution"] = build_attribution_evidence(
+                            status="unresolved",
+                            test_locus=f.file_path,
+                            reason="attributor_fault",
+                        )
+                        logger.warning(
+                            "[Attribution] attributor fault for %s — legacy "
+                            "scope retained", f.file_path, exc_info=True,
+                        )
+
                 signal = IntentSignal(
                     source="intent:test_failure",
-                    target_files=(f.file_path,),
+                    target_files=target_files,
                     repo=self.repo,
                     description=(
                         f"Stable test failure: {f.test_id} "
