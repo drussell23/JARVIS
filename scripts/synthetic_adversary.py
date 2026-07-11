@@ -89,6 +89,7 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Repo-root bootstrap so the module works both as a script and as an import.
@@ -916,6 +917,68 @@ def build_passthrough_candidate_content(prompt: str) -> str:
     })
 
 
+def build_batch_candidates_content(
+    prompt: str,
+    manifest: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build the assistant-message candidates content for a batched op.
+
+    THIS is the extracted seam (Slice 5 T7, Run #15 L6): the batch lane
+    previously never consulted the chaos manifest, so every batched
+    chaos-repair op got the fixed ~1306-byte truncated canned payload
+    instead of the real file -- 8x ``full_content too short (1306 vs
+    15183 bytes)`` VALIDATE rejections made ACT untestable in iso mode.
+    ``build_repair_completion`` (:576) already served the manifest's full
+    file correctly on the RT/tool-loop path; this function gives the batch
+    lane the same guarantee via its own narrower, single-purpose seam.
+
+    Chaos match: ``manifest`` carries a non-empty ``target_file`` AND a
+    non-empty ``original_source`` AND ``prompt`` references the target --
+    either the full repo-relative path or just its basename
+    (``Path(target_file).name``, so a shortened prompt like "Fix
+    leaf_predicates.py" still matches).  Returns a schema ``2b.1``
+    candidates JSON whose ``full_content`` is the manifest's
+    ``original_source`` (the FULL pre-mutation file -- chaos revert writes
+    the whole file from it, verified byte-identical).
+
+    Guard: an empty/missing ``original_source`` (malformed or
+    partially-written manifest) NEVER produces an empty ``full_content``
+    candidate -- it falls through to the legacy generic passthrough body
+    below, which is always schema-valid.
+
+    Non-chaos / no-manifest: falls back to
+    ``build_passthrough_candidate_content`` -- byte-identical to the batch
+    lane's pre-existing generic 2b.1 behavior for any prompt that isn't a
+    chaos-manifest match.
+
+    Pure function: no I/O beyond the read-only ``_read_repo_file_safe``
+    call inside the passthrough fallback.  No shared mutable state.
+    Thread-safe.
+    """
+    if manifest is not None:
+        target_file = manifest.get("target_file", "") or ""
+        original_source = manifest.get("original_source", "") or ""
+        if target_file and original_source and (
+            target_file in prompt or Path(target_file).name in prompt
+        ):
+            function_name = manifest.get("function", "target")
+            return json.dumps({
+                "schema_version": _DW_CANDIDATES_SCHEMA_VERSION,
+                "candidates": [
+                    {
+                        "candidate_id": "c1",
+                        "file_path": target_file,
+                        "full_content": original_source,
+                        "rationale": (
+                            "Chaos-manifest repair: restore verified "
+                            "original implementation of %s." % function_name
+                        ),
+                    }
+                ],
+            })
+    return build_passthrough_candidate_content(prompt)
+
+
 def build_batch_output_line(
     custom_id: str,
     input_line_json: str,
@@ -934,7 +997,10 @@ def build_batch_output_line(
     ``simulate_zero_shot``: when True the zero-shot profile is active.  In the
     batch path there is no tool loop and no ``tool_choice`` header, so zero-shot
     means the same as the no-tools branch: return the 2b.1 candidate directly.
-    The ``simulate_zero_shot`` flag is forwarded to ``build_repair_completion``.
+    The zero-shot profile has no effect on the extracted
+    ``build_batch_candidates_content`` seam (batch has no tool loop to
+    bypass either way -- the only difference upstream was cosmetic
+    rationale text), so it is no longer forwarded past this point.
 
     Output shape matches ``doubleword_provider._retrieve_result`` parse
     (lines 4974-5007):
@@ -958,17 +1024,18 @@ def build_batch_output_line(
         )
 
     if is_repair:
-        # batch path = single-completion (no Venom tool loop); has_tools=False
-        # forces the trivial 2b.1 direct-candidates branch of build_repair_completion.
-        # simulate_zero_shot is forwarded so the zero-shot profile also exercises
-        # the batch path (though in batch the effect is the same as has_tools=False
-        # since there is no tool loop to bypass).
-        content = build_repair_completion(
-            prompt=input_line_json,
-            messages=[],
-            manifest=manifest,  # type: ignore[arg-type]
-            has_tools=False,
-            simulate_zero_shot=simulate_zero_shot,
+        # Slice 5 T7: route through the extracted build_batch_candidates_content
+        # seam -- ONE source of truth for "does this prompt reference the chaos
+        # manifest's target_file (path or basename), and if so serve the FULL
+        # original_source" -- reused by both direct pure-function callers
+        # (tests) and this JSONL-line builder.  Its own internal match is
+        # narrower than the `is_repair` gate above (path/basename only, no
+        # 2b.1/REPAIR_MARKER-alone triggers), so an op whose prompt merely
+        # carries the 2b.1 instruction without actually referencing the
+        # chaos target correctly falls through to the generic passthrough
+        # body instead of misattributing the manifest's file.
+        content = build_batch_candidates_content(
+            prompt=input_line_json, manifest=manifest,
         )
     elif _prompt_is_2b1(input_line_json):
         # Batch-Passthrough contract parity (bt-iso-1783036735). A real DW
