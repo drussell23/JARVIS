@@ -979,19 +979,36 @@ class TestFailureSensor:
             # Suppress if plugin results were consumed recently (Phase 2 active)
             if time.monotonic() - self._last_plugin_ts < 10.0:
                 logger.debug(
-                    "TestFailureSensor: skipping subprocess run — "
+                    "TestFailureSensor: deferring subprocess run — "
                     "plugin results consumed %.1fs ago",
                     time.monotonic() - self._last_plugin_ts,
                 )
+                # Review fix (Slice 5 T2 Critical): the batch was already
+                # drained — re-seed it so the finally re-arm schedules a
+                # follow-up window instead of silently losing the paths.
+                # Bounded self-healing: the chain loops at window cadence
+                # until the 10s suppression expires, then runs.
+                self._pending_changed_paths.update(batch)
                 return
             if self._watcher is None:
+                # Same re-seed contract: never silently lose a drained batch.
+                self._pending_changed_paths.update(batch)
                 return
 
             # Boot-hydration de-dupe: a file just reconstructed from the
             # working tree on boot must not be re-run by the live event that
             # the same edit also triggers. The TTL window expires so a genuine
-            # later edit still re-runs.
-            batch = [p for p in batch if not self._is_recently_hydrated(p)]
+            # later edit still re-runs. Filtered paths are dropped BY DESIGN
+            # (the hydration run already covered them) — but named, never
+            # silent (review fix: restores the pre-F2 per-path debug log).
+            hydration_filtered = [p for p in batch if self._is_recently_hydrated(p)]
+            if hydration_filtered:
+                logger.debug(
+                    "TestFailureSensor: suppressing live run for %r -- "
+                    "hydrated on boot within de-dupe window",
+                    hydration_filtered,
+                )
+                batch = [p for p in batch if p not in hydration_filtered]
             if not batch:
                 return
 
