@@ -175,3 +175,79 @@ class TestGitDirtyPyPaths:
         monkeypatch.setattr(asyncio, "create_subprocess_exec", _boom)
         dirty = await s._git_dirty_py_paths()
         assert dirty == []
+
+    @pytest.mark.asyncio
+    async def test_git_spawn_anchors_at_repo_root_not_repo_label(
+        self, monkeypatch
+    ):
+        """T5 review Critical: ``repo`` is a LABEL ("jarvis"/"prime") in
+        production wiring (intake_layer_service), not a filesystem path —
+        git must anchor at the authoritative ``_repo_root()``."""
+        s = _sensor(monkeypatch)   # repo="." is the label here
+        seen_cwd: List = []
+
+        class _FakeProc:
+            async def communicate(self):
+                return b"", b""
+
+        async def _fake_exec(*args, **kwargs):
+            seen_cwd.append(kwargs.get("cwd"))
+            return _FakeProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+        await s._git_dirty_py_paths()
+        assert seen_cwd == [str(s._repo_root())]
+        assert seen_cwd != [s._repo], (
+            "git anchored at the bare repo label — reconcile would "
+            "silently no-op in production"
+        )
+
+
+class TestPollOnceSerialization:
+    """T5 review Important: the reconcile (_poll_task) and the debounce
+    run (_debounce_task) both reach watcher.poll_once, and
+    _run_scoped_with_confirmation reads _failure_streak around a
+    subprocess await — interleaving corrupts stability-gate accounting.
+    Every sensor-side poll_once must serialize through _poll_once_lock."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_trigger_paths_serialize(self, monkeypatch):
+        s = _sensor(monkeypatch)
+        in_flight = {"now": 0, "max": 0}
+
+        async def _slow_poll(target_paths=None):
+            in_flight["now"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["now"])
+            await asyncio.sleep(0.05)
+            in_flight["now"] -= 1
+            return []
+
+        monkeypatch.setattr(s._watcher, "poll_once", _slow_poll)
+
+        async def _dirty():
+            return ["backend/leaf.py"]
+
+        async def _resolve_union(paths):
+            return ["tests/test_leaf.py"]
+
+        monkeypatch.setattr(s, "_git_dirty_py_paths", _dirty)
+        monkeypatch.setattr(s, "_resolve_union", _resolve_union)
+        # Debounce lane exercises the legacy whole-suite poll_once branch
+        # (scoping off); the reconcile lane goes scoped through
+        # _run_scoped_with_confirmation. Fired concurrently.
+        monkeypatch.setenv("JARVIS_TEST_DYNAMIC_SCOPING_ENABLED", "false")
+        monkeypatch.setenv("JARVIS_TEST_FAILURE_DEBOUNCE_WINDOW_S", "0.0")
+        s._pending_changed_paths.add("backend/other.py")
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                s._reconcile_quiet_lane(),
+                s._debounced_pytest_run(),
+            ),
+            timeout=5.0,
+        )
+        assert in_flight["max"] == 1, (
+            "poll_once interleaved across trigger paths — stability-gate "
+            "accounting can corrupt"
+        )
+        assert in_flight["now"] == 0

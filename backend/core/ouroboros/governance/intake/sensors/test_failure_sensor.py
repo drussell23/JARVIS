@@ -192,7 +192,7 @@ def quiet_reconcile_enabled() -> bool:
     """
     return os.environ.get(
         "JARVIS_TEST_FAILURE_QUIET_RECONCILE_ENABLED", "true",
-    ).lower() in ("1", "true", "yes")
+    ).strip().lower() in ("1", "true", "yes", "on")
 
 
 def full_suite_fallback_enabled() -> bool:
@@ -530,6 +530,15 @@ class TestFailureSensor:
         # convergence tracking during the graduation arc).
         self._fs_events_handled: int = 0
         self._fs_events_ignored: int = 0
+        # Review fix (T5 Important): the quiet-lane reconcile (_poll_task)
+        # and the debounce run (_debounce_task) both reach
+        # ``self._watcher.poll_once`` — and _run_scoped_with_confirmation
+        # snapshots + re-reads ``_failure_streak`` around a subprocess
+        # await, so interleaved runs can corrupt the stability-gate
+        # accounting. Every sensor-side poll_once invocation (plus its
+        # streak read-back critical section) serializes through this lock.
+        # NEVER held across the derate sleep — only around the run itself.
+        self._poll_once_lock: asyncio.Lock = asyncio.Lock()
         # Boot hydration de-dupe: changed_rel_path -> monotonic hydrated_at.
         # A file hydrated on boot is suppressed from a redundant live
         # fs.changed run for ``_HYDRATION_DEDUP_TTL_S``.
@@ -790,7 +799,10 @@ class TestFailureSensor:
             # Record BEFORE running so a concurrent live event is de-duped.
             self._hydrated_keys[rel] = now
             try:
-                signals = await self._watcher.poll_once(target_paths=targets)
+                async with self._poll_once_lock:
+                    signals = await self._watcher.poll_once(
+                        target_paths=targets
+                    )
             except Exception:
                 logger.debug(
                     "[BootHydration] scoped poll failed for %r", rel, exc_info=True
@@ -1095,7 +1107,8 @@ class TestFailureSensor:
 
             if not dynamic_scoping_enabled():
                 # OFF -> byte-identical legacy whole-suite behavior.
-                signals = await self._watcher.poll_once()
+                async with self._poll_once_lock:
+                    signals = await self._watcher.poll_once()
                 if signals:
                     await self.handle_signals(signals)
                 return
@@ -1120,7 +1133,8 @@ class TestFailureSensor:
                 "JARVIS_TEST_FULL_SUITE_FALLBACK on, running full suite",
                 batch,
             )
-            signals = await self._watcher.poll_once()
+            async with self._poll_once_lock:
+                signals = await self._watcher.poll_once()
             if signals:
                 await self.handle_signals(signals)
         except asyncio.CancelledError:
@@ -1158,22 +1172,32 @@ class TestFailureSensor:
         emitting, re-run the SAME scoped targets once, immediately: a
         deterministic RED reaches the gate in seconds; a flake that greens
         on the re-run is correctly absorbed (that is the gate's purpose).
-        Bounded to one re-run; gated by fs_confirm_enabled()."""
-        pre = dict(self._watcher._failure_streak)
-        signals = await self._watcher.poll_once(target_paths=targets)
-        if not signals and fs_confirm_enabled():
-            streak = self._watcher._failure_streak
-            observed_new_failure = any(
-                streak.get(test_id, 0) > pre.get(test_id, 0)
-                for test_id in streak
-            )
-            if observed_new_failure:
-                logger.info(
-                    "TestFailureSensor: scoped RED below stability gate — "
-                    "immediate confirmation re-run (%d target(s))",
-                    len(targets),
+        Bounded to one re-run; gated by fs_confirm_enabled().
+
+        Review fix (T5 Important): the streak snapshot (``pre``), both
+        poll_once calls, and the streak read-back are ONE critical section
+        under ``_poll_once_lock`` — an interleaved run from the other
+        trigger path (debounce vs quiet-lane reconcile) mutates
+        ``_failure_streak`` mid-flight and corrupts the gate accounting.
+        Callers must NOT already hold the lock (it is not reentrant)."""
+        async with self._poll_once_lock:
+            pre = dict(self._watcher._failure_streak)
+            signals = await self._watcher.poll_once(target_paths=targets)
+            if not signals and fs_confirm_enabled():
+                streak = self._watcher._failure_streak
+                observed_new_failure = any(
+                    streak.get(test_id, 0) > pre.get(test_id, 0)
+                    for test_id in streak
                 )
-                signals = await self._watcher.poll_once(target_paths=targets)
+                if observed_new_failure:
+                    logger.info(
+                        "TestFailureSensor: scoped RED below stability gate — "
+                        "immediate confirmation re-run (%d target(s))",
+                        len(targets),
+                    )
+                    signals = await self._watcher.poll_once(
+                        target_paths=targets
+                    )
         if signals:
             await self.handle_signals(signals)
 
@@ -1379,7 +1403,8 @@ class TestFailureSensor:
                 )
                 self._poll_derate_logged = False
             try:
-                signals = await self._watcher.poll_once()
+                async with self._poll_once_lock:
+                    signals = await self._watcher.poll_once()
                 if signals:
                     await self.handle_signals(signals)
             except Exception:
@@ -1418,9 +1443,15 @@ class TestFailureSensor:
         """
         proc = None
         try:
+            # Review fix (T5 Critical): ``self._repo`` is a repo LABEL
+            # ("jarvis"/"prime"/…) in production wiring, not a filesystem
+            # path — anchoring git there raises and silently no-ops the
+            # whole reconcile. ``_repo_root()`` is the file's authoritative
+            # ``.git``-anchored path (same fix class as run #12's resolver
+            # anchoring).
             proc = await asyncio.create_subprocess_exec(
                 "git", "status", "--porcelain=v1", "--untracked-files=no",
-                cwd=self._repo,
+                cwd=str(self._repo_root()),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
