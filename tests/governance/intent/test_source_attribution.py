@@ -113,6 +113,110 @@ def test_patch_target_secondary_signal(repo, monkeypatch) -> None:
     assert "patch_target" in attr.evidence_kinds
 
 
+def test_pure_patch_method_label_is_honest(repo, monkeypatch) -> None:
+    """A patch-only attribution (zero direct imports) must label its
+    method 'patch_target' — never falsely claim direct-import evidence
+    by piggybacking on the direct+patch combined label."""
+    root, tdir = repo
+    monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
+    tf = _write_test(tdir, """
+        from unittest import mock
+        def test_spun():
+            with mock.patch("backend.core.widgets.gadget.spin", return_value=9):
+                assert True
+    """)
+    attr = attribute_test_to_sources(tf, repo_root=str(root))
+    assert attr.method == "patch_target"
+    assert attr.evidence_kinds == ("patch_target",)
+
+
+def test_direct_and_patch_combined_method_label(repo, monkeypatch) -> None:
+    """When both direct-import and patch-target evidence are present in
+    the ranked (bounded) result, method reflects both kinds present."""
+    root, tdir = repo
+    monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
+    tf = _write_test(tdir, """
+        from unittest import mock
+        from backend.core.widgets.helper import aid
+        def test_both():
+            with mock.patch("backend.core.widgets.gadget.spin", return_value=9):
+                assert aid() == 2
+    """)
+    attr = attribute_test_to_sources(tf, repo_root=str(root))
+    assert attr.method == "direct_import+patch_target"
+    assert set(attr.evidence_kinds) == {"direct_import", "patch_target"}
+
+
+def test_rest_client_patch_call_not_attributed(repo, monkeypatch) -> None:
+    """A REST-client-shaped `.patch(...)` call (e.g. `client.patch(path)`
+    where `client` is not `mock`/`unittest.mock`) must NOT be treated as
+    a mock.patch target — receiver identity, not bare call-name, gates
+    the match (avoids the REST-client false-positive class)."""
+    root, tdir = repo
+    monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
+    tf = _write_test(tdir, """
+        def test_calls_rest_client(client):
+            resp = client.patch("backend.core.widgets.gadget.spin")
+            assert resp
+    """)
+    with pytest.raises(AttributionUnresolved) as exc:
+        attribute_test_to_sources(tf, repo_root=str(root))
+    assert exc.value.reason == "no_first_party_source_imports"
+
+
+def test_bare_setattr_call_not_attributed(repo, monkeypatch) -> None:
+    """Bare `setattr(obj, "attr", val)` (stdlib builtin, no receiver
+    identity) must never be treated as a patch target — even when its
+    string argument is dotted and even in the contrived bare-Name-first-
+    arg form."""
+    root, tdir = repo
+    monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
+    tf = _write_test(tdir, """
+        class Obj:
+            pass
+
+        def test_bare_setattr():
+            obj = Obj()
+            setattr(obj, "backend.core.widgets.gadget.spin", 1)
+            setattr("backend.core.widgets.gadget.spin", "x")
+            assert True
+    """)
+    with pytest.raises(AttributionUnresolved) as exc:
+        attribute_test_to_sources(tf, repo_root=str(root))
+    assert exc.value.reason == "no_first_party_source_imports"
+
+
+def test_monkeypatch_setattr_still_attributes(repo, monkeypatch) -> None:
+    """The canonical monkeypatch.setattr shape must remain a positive
+    signal (receiver-identity tightening must not regress it)."""
+    root, tdir = repo
+    monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
+    tf = _write_test(tdir, """
+        def test_patches(monkeypatch):
+            monkeypatch.setattr("backend.core.widgets.gadget.spin", lambda: 1)
+            assert True
+    """)
+    attr = attribute_test_to_sources(tf, repo_root=str(root))
+    assert "backend/core/widgets/gadget.py" in attr.source_loci
+    assert attr.method == "patch_target"
+
+
+def test_bare_patch_import_still_attributes(repo, monkeypatch) -> None:
+    """`from unittest.mock import patch; patch(...)` (bare Name callee)
+    must remain a positive signal."""
+    root, tdir = repo
+    monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
+    tf = _write_test(tdir, """
+        from unittest.mock import patch
+        def test_spun():
+            with patch("backend.core.widgets.gadget.spin", return_value=9):
+                assert True
+    """)
+    attr = attribute_test_to_sources(tf, repo_root=str(root))
+    assert "backend/core/widgets/gadget.py" in attr.source_loci
+    assert attr.method == "patch_target"
+
+
 def test_traceback_frames_rank_first(repo, monkeypatch) -> None:
     root, tdir = repo
     monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
@@ -178,6 +282,15 @@ def test_unresolved_missing_file(repo) -> None:
     assert exc.value.reason == "test_file_missing"
 
 
+def test_unresolved_test_outside_root(repo) -> None:
+    root, _ = repo
+    with pytest.raises(AttributionUnresolved) as exc:
+        attribute_test_to_sources(
+            "/absolute/elsewhere/test_x.py", repo_root=str(root),
+        )
+    assert exc.value.reason == "test_outside_root"
+
+
 def test_deterministic_across_calls(repo, monkeypatch) -> None:
     """Same inputs → identical output tuple (mandate 1: deterministic)."""
     root, tdir = repo
@@ -234,3 +347,14 @@ def test_gate_silent_when_candidate_touches_source(monkeypatch) -> None:
 def test_gate_fail_soft_on_malformed_evidence() -> None:
     assert unattributed_test_scope_violation("{not json", ["x.py"]) is None
     assert unattributed_test_scope_violation("", ["x.py"]) is None
+
+
+def test_gate_off_switch_returns_none_even_for_unresolved(monkeypatch) -> None:
+    """JARVIS_ATTRIBUTION_SCOPE_GATE_ENABLED=false must short-circuit the
+    gate to None even for an otherwise-firing unresolved test-only
+    mutation."""
+    monkeypatch.setenv("JARVIS_ATTRIBUTION_SCOPE_GATE_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
+    assert unattributed_test_scope_violation(
+        _ev("unresolved"), ["tests/unit_checks/test_gadget.py"],
+    ) is None

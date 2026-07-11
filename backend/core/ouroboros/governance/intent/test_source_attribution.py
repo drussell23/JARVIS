@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import ast
 import json
-import logging
 import os
 import threading
 import time
@@ -33,8 +32,6 @@ from backend.core.ouroboros.governance.reverse_dep_resolver import (
     build_module_to_path,
     extract_module_imports,
 )
-
-logger = logging.getLogger(__name__)
 
 ATTRIBUTION_SCHEMA_VERSION = 1
 
@@ -61,7 +58,13 @@ class AttributionUnresolved(Exception):
 @dataclass(frozen=True)
 class Attribution:
     """Resolved loci. All paths repo-relative POSIX. ``source_loci`` is
-    never empty (emptiness raises ``AttributionUnresolved`` instead)."""
+    never empty (emptiness raises ``AttributionUnresolved`` instead).
+
+    ``method`` is derived honestly from the evidence kinds actually
+    present in ``evidence_kinds`` (never inferred from one kind's
+    presence when another is absent) — valid values are
+    ``"direct_import"``, ``"patch_target"``, or
+    ``"direct_import+patch_target"``."""
 
     test_locus: str
     source_loci: Tuple[str, ...]
@@ -134,25 +137,55 @@ def _resolve_dotted_to_path(
     return None
 
 
-_PATCH_CALL_NAMES = frozenset({"patch", "setattr", "delattr"})
+_MOCK_PATCH_RECEIVERS = frozenset({"mock", "unittest.mock"})
+
+
+def _dotted_receiver(node: ast.expr) -> str:
+    """Render a callee *receiver* chain of ``Name``/``Attribute`` nodes to
+    its dotted string (e.g. ``mock.patch`` -> receiver node ``mock`` ->
+    ``"mock"``; ``unittest.mock.patch`` -> receiver ``unittest.mock`` ->
+    ``"unittest.mock"``). Returns ``""`` for any other node shape (calls,
+    subscripts, etc. are not a resolvable identity and are ignored)."""
+    parts: list = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+    else:
+        return ""
+    return ".".join(reversed(parts))
 
 
 def _extract_patch_targets(tree: ast.Module) -> Set[str]:
     """Dotted-string first arguments of ``mock.patch("x.y.z")`` /
     ``monkeypatch.setattr("x.y.z", ...)`` calls — deterministic AST
     literal extraction (string constants only; f-strings/variables are
-    not resolvable and are correctly ignored)."""
+    not resolvable and are correctly ignored). Receiver-identity checked
+    (mandate 4 tightening): a REST client's ``client.patch(path)`` or a
+    bare builtin ``setattr(obj, "x.y", val)`` must NOT match — only the
+    canonical ``unittest.mock`` / ``monkeypatch`` call shapes do."""
     targets: Set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         fn = node.func
-        name = ""
-        if isinstance(fn, ast.Attribute):
-            name = fn.attr
-        elif isinstance(fn, ast.Name):
-            name = fn.id
-        if name not in _PATCH_CALL_NAMES:
+        if isinstance(fn, ast.Name) and fn.id == "patch":
+            # Bare `patch(...)` — only valid via `from unittest.mock import patch`.
+            pass
+        elif isinstance(fn, ast.Attribute) and fn.attr == "patch":
+            receiver = _dotted_receiver(fn.value)
+            if receiver not in _MOCK_PATCH_RECEIVERS:
+                continue
+        elif (
+            isinstance(fn, ast.Attribute)
+            and fn.attr in ("setattr", "delattr")
+            and isinstance(fn.value, ast.Name)
+            and fn.value.id == "monkeypatch"
+        ):
+            pass
+        else:
             continue
         if not node.args:
             continue
@@ -236,8 +269,9 @@ def attribute_test_to_sources(
     )[: _max_source_files()]
 
     kinds = tuple(kind for _, kind in ranked)
-    method = _KIND_DIRECT if set(kinds) == {_KIND_DIRECT} else (
-        f"{_KIND_DIRECT}+{_KIND_PATCH}" if _KIND_PATCH in kinds else kinds[0]
+    present_kinds = set(kinds)
+    method = "+".join(
+        kind for kind in (_KIND_DIRECT, _KIND_PATCH) if kind in present_kinds
     )
     return Attribution(
         test_locus=rel_test,
@@ -281,7 +315,12 @@ def unattributed_test_scope_violation(
         return None
     dir_names = _test_dir_names()
     test_locus = str(attribution.get("test_locus", ""))
-    normalized = [str(f).replace("\\", "/").lstrip("./") for f in candidate_files]
+    normalized = []
+    for f in candidate_files:
+        _norm = str(f).replace("\\", "/")
+        if _norm.startswith("./"):
+            _norm = _norm[2:]
+        normalized.append(_norm)
     if all(
         f == test_locus or _is_test_infra(f, dir_names) for f in normalized
     ):
