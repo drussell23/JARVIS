@@ -483,6 +483,37 @@ _ISO_SESSION_BUDGET_USD: float = _env_float(
 )
 
 
+def _resolve_soak_cost_cap(
+    dw_session_budget: Optional[float], enable_failover: bool
+) -> float:
+    """Effective ``--cost-cap`` for the soak child — the AUTHORITATIVE budget
+    channel.
+
+    Run #15 root cause (session bt-iso-1783737892): SoakRunner always passes
+    an explicit ``--cost-cap`` on the child argv, and in the harness the
+    explicit CLI flag wins over the composed ``OUROBOROS_BATTLE_COST_CAP``
+    env (the env only feeds the argparse *default*, never consulted when the
+    flag is present; the harness then registers a $0 CostTracker — SBA Tier 1
+    — and ``setdefault``s ``JARVIS_S2_SESSION_BUDGET_USD`` from the same
+    flag). Funding the env while launching with ``cost_cap=0.0`` therefore
+    still boots the harness at ``budget=$0.00`` — the exact Run #14 wall, one
+    knob to the left of the T1 fix.
+
+    Resolution: an explicit operator value (``JARVIS_ISO_DW_SESSION_BUDGET_USD``
+    / ``--dw-session-budget``) is honored verbatim — including an explicit
+    0.0 (the sanctioned failover starve). When UNSET: failover runs keep the
+    legacy $0 starve (it IS the multi-vector-awaken forcing function);
+    non-failover runs are funded from ``JARVIS_ISO_SESSION_BUDGET_USD`` so
+    the T1 funded-budget intent reaches the child on the channel that
+    actually wins.
+    """
+    if dw_session_budget is not None:
+        return float(dw_session_budget)
+    if enable_failover:
+        return 0.0
+    return _ISO_SESSION_BUDGET_USD
+
+
 # ---------------------------------------------------------------------------
 # Soak-child termination coordination (root cause bt-iso-1783144982)
 # ---------------------------------------------------------------------------
@@ -1301,7 +1332,7 @@ class IsomorphicA1Driver:
         adversary_fault: Optional[str] = None,
         verbose: bool = False,
         enable_failover: bool = False,
-        dw_session_budget: float = 0.0,
+        dw_session_budget: Optional[float] = None,
         # Injection seam for tests: a zero-arg callable that returns an adversary
         # instance.  None -> use the real SyntheticAdversary from adversary_mod.
         _adversary_factory: Optional[Any] = None,
@@ -1325,7 +1356,13 @@ class IsomorphicA1Driver:
         # providers. Default 0.0 preserves that legacy starve scenario byte-identical;
         # a nonzero value opts into DW as a live generation lane for the APPLY tail
         # (the sanctioned DW-powered rehearsal mode).
-        self.dw_session_budget: float = dw_session_budget
+        self.dw_session_budget: Optional[float] = dw_session_budget
+        # Run #15 fix: resolve the AUTHORITATIVE soak-child budget channel
+        # once, at init — consumed by BOTH the zero-budget fail-fast and the
+        # SoakRunner launch so they can never disagree again.
+        self.effective_soak_cost_cap: float = _resolve_soak_cost_cap(
+            dw_session_budget, enable_failover
+        )
         self._adversary_factory: Optional[Any] = _adversary_factory
 
     async def run(self) -> int:
@@ -1616,11 +1653,25 @@ class IsomorphicA1Driver:
                     "OUROBOROS_BATTLE_COST_CAP", 0.0, source=env)
                 _s2_budget = _env_float(
                     "JARVIS_S2_SESSION_BUDGET_USD", 0.0, source=env)
-                if max(_effective_cap, _s2_budget) <= 0.0:
-                    _log("FATAL ZERO-BUDGET: composed env has no funded session "
-                         "budget (OUROBOROS_BATTLE_COST_CAP and "
-                         "JARVIS_S2_SESSION_BUDGET_USD both <= 0) -- every "
-                         "GENERATE would preflight-refuse. Aborting.")
+                # Run #15 fix: the env checks above are a belt for other spawn
+                # topologies -- in THIS launch the AUTHORITATIVE channel is the
+                # explicit --cost-cap SoakRunner passes (CLI beats env in the
+                # harness; a $0 CostTracker registers as SBA Tier 1). A $0 cap
+                # is only sanctioned as the failover-run starve scenario.
+                _cli_cap_unfunded = (
+                    self.effective_soak_cost_cap <= 0.0
+                    and not self.enable_failover
+                )
+                if max(_effective_cap, _s2_budget) <= 0.0 or _cli_cap_unfunded:
+                    _log("FATAL ZERO-BUDGET: %s -- every GENERATE would "
+                         "preflight-refuse. Aborting." % (
+                             "soak-child --cost-cap resolves to $0 without "
+                             "--enable-failover (the authoritative CLI channel "
+                             "shadows the composed env in the harness)"
+                             if _cli_cap_unfunded else
+                             "composed env has no funded session budget "
+                             "(OUROBOROS_BATTLE_COST_CAP and "
+                             "JARVIS_S2_SESSION_BUDGET_USD both <= 0)"))
                     verdict = {"proven": False,
                                "failure_locus": "env_compose:budget_failfast"}
                     # T5 telemetry: this abort fires BEFORE the soak child ever
@@ -1701,7 +1752,7 @@ class IsomorphicA1Driver:
                                  "default 300s)" % (_soak_wall_s,))
                         soak_runner = harness_mod.SoakRunner(
                             repo_root=self.repo_root,
-                            cost_cap=self.dw_session_budget,
+                            cost_cap=self.effective_soak_cost_cap,
                             wall_seconds=_soak_wall_s,
                         )
                         # Register for process-group teardown (finally+atexit+signal)
@@ -2044,16 +2095,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "(default: JARVIS_FAILOVER_LIFECYCLE_ENABLED=false is pinned in "
              "child env to prevent accidental GCE spend).",
     )
+    _dw_budget_env = os.environ.get(
+        "JARVIS_ISO_DW_SESSION_BUDGET_USD", "").strip()
     p.add_argument(
         "--dw-session-budget",
         type=float,
-        default=float(os.environ.get("JARVIS_ISO_DW_SESSION_BUDGET_USD", "0.0")),
+        default=(float(_dw_budget_env) if _dw_budget_env else None),
         help="DW rehearsal mode: session budget in USD threaded into the soak "
-             "child's cost-cap (env: JARVIS_ISO_DW_SESSION_BUDGET_USD, default: "
-             "0.0). Default 0.0 preserves the legacy $0 multi-vector-awaken "
-             "starve scenario byte-identical; a nonzero value makes DW a live "
-             "generation lane for the APPLY tail (the sanctioned DW-powered "
-             "rehearsal mode) instead of a forced provider starve.",
+             "child's --cost-cap, the AUTHORITATIVE budget channel (env: "
+             "JARVIS_ISO_DW_SESSION_BUDGET_USD). An explicit value is honored "
+             "verbatim, including 0.0 (the sanctioned failover-run starve). "
+             "UNSET (default): --enable-failover runs keep the legacy $0 "
+             "multi-vector-awaken starve; non-failover runs are funded from "
+             "JARVIS_ISO_SESSION_BUDGET_USD (Run #15 fix: the explicit CLI "
+             "flag shadows the composed OUROBOROS_BATTLE_COST_CAP env in the "
+             "harness, so the funded intent must travel on this channel).",
     )
     return p
 
