@@ -167,9 +167,18 @@ def test_flag_audit_fails_strict_on_unverifiable():
 
 def test_flag_audit_fails_on_rejection():
     # An iron_gate rejection marker -> REJECTED -> FAIL even in lenient mode.
+    # Slice 8 Task 5: REJECT requires same-line family corroboration, so the
+    # synthetic line must carry the family's own voice ("exploration") on the
+    # same line -- mirrors the real production format at
+    # orchestrator.py's "[Orchestrator] Iron Gate -- ExplorationLedger
+    # (decision) insufficient op=%s exploration_insufficient: ..." emission.
     a = _make_auditor(strict=False)
     _feed_passing(a)
-    a.ingest_log_line("ExplorationInsufficientError op=op-abc")
+    a.ingest_log_line(
+        "[Orchestrator] Iron Gate -- ExplorationLedger(decision) "
+        "insufficient op=op-abc exploration_insufficient: score=1.0/2.0 "
+        "categories=1/2 missing=- (attempt=1)"
+    )
     passed, locus = a._flag_audit_passed()
     assert passed is False
     assert "rejected" in locus

@@ -370,7 +370,19 @@ def test_replay_does_not_mask_rejected_flag():
         replay=True,
     )
     a.ingest_log_line("[SemanticGuard] op=op-abc findings=0")  # evaluated
-    a.ingest_log_line("removed_import_still_referenced for op-abc")  # then rejected
+    # Slice 8 Task 5: REJECT requires same-line family corroboration -- the
+    # real production line always carries "[SemanticGuard]" alongside the
+    # pattern name marker (orchestrator.py's
+    # "[SemanticGuard] op=%s findings=%d ... patterns=[%s] ... risk_after=%s"
+    # emission), so the synthetic reject line must match that shape. Uses
+    # the pattern-name reject marker (not the bare "APPROVAL_REQUIRED"
+    # substring) to avoid also tripping the unrelated intervention-lock's
+    # own (separately family-blind) _HUMAN_GATE_MARKERS check.
+    a.ingest_log_line(
+        "[SemanticGuard] op=op-abc findings=1 "
+        "patterns=[removed_import_still_referenced] "
+        "risk_after=NOTIFY_APPLY"
+    )  # then rejected
     v = a.verdict()
     assert v.criteria["twelve_flag_audit_passed"] is False
     assert any(f["verdict"] == "rejected" for f in v.flags), (

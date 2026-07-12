@@ -321,6 +321,17 @@ def lineage_scoping_enabled_default() -> bool:
     return val not in {"0", "false", "no", "off"}
 
 
+def _corroborated_rejects_enabled() -> bool:
+    """Read ``JARVIS_A1_AUDIT_CORROBORATED_REJECTS`` (default true). OFF
+    restores legacy behavior where a bare rejected-marker substring anywhere
+    in a log line poisons the family, even without the family's own
+    'evaluated' voice on the same line (the Run-18 CommProtocol INTENT
+    payload false-red class)."""
+    return os.environ.get(
+        "JARVIS_A1_AUDIT_CORROBORATED_REJECTS", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
 def _default_chaos_manifest_path() -> str:
     """Default chaos manifest location: ``<repo>/.jarvis/chaos_manifest.json``.
     Mirrors ``chaos_injector_ast.MANIFEST_REL_PATH``."""
@@ -1153,6 +1164,13 @@ class A1GraduationAuditor:
         # lineage OR resumed-op set) -- logged for transparency, never a
         # false-positive REJECTED flag (mirrors observed_unrelated_gates).
         self.observed_unrelated_flag_rejects: List[str] = []
+        # REJECT hits with no same-line family 'evaluated' corroboration --
+        # e.g. a CommProtocol INTENT payload carrying risk_tier=
+        # APPROVAL_REQUIRED (legitimately stamped by the Slice-6 attribution
+        # gate) matching semantic_guardian's bare rejected-marker substring.
+        # Recorded, never silently dropped (Manifesto §7). See
+        # _corroborated_rejects_enabled / _correlate_flag_signal.
+        self.uncorroborated_reject_lines: List[str] = []
 
         # --- multi-session lineage-aware audit (Fix: resumed ops) ----------- #
         self.replay: bool = bool(replay)
@@ -1626,6 +1644,16 @@ class A1GraduationAuditor:
             evaluated_markers = sig.get("evaluated", ())
             hit_reject = any(m and m in text for m in rejected_markers)
             hit_eval = any(m and m in text for m in evaluated_markers)
+            if hit_reject and not hit_eval and _corroborated_rejects_enabled():
+                # Family-blind substring (e.g. a CommProtocol INTENT payload
+                # carrying risk_tier=APPROVAL_REQUIRED, stamped legitimately
+                # by the Slice-6 attribution gate) — not this family's own
+                # gate speaking. Run-18 false-red class. Recorded, never
+                # silently dropped (§7).
+                self.uncorroborated_reject_lines.append(
+                    "%s:%s" % (family, text[:120])
+                )
+                hit_reject = False
             if hit_reject:
                 if self.resumed_ops and op_id and op_id not in self.resumed_ops:
                     self.observed_unrelated_flag_rejects.append(
@@ -1769,6 +1797,9 @@ class A1GraduationAuditor:
                 "unverifiable_lineage_gates": list(self.unverifiable_lineage_gates),
                 "observed_unrelated_flag_rejects": list(
                     self.observed_unrelated_flag_rejects
+                ),
+                "uncorroborated_reject_lines": list(
+                    self.uncorroborated_reject_lines
                 ),
                 "resumed_ops": dict(self.resumed_ops),
                 "stitched_ancestor_logs": list(self.stitched_ancestor_logs),
