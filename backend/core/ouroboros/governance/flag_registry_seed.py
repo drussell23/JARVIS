@@ -5296,7 +5296,7 @@ SEED_SPECS: list = [
         posture_relevance={},
     ),
     # ====================================================================
-    # Test->Source Attribution Bridge (Slice 6) — 4 flags
+    # Test->Source Attribution Bridge (Slice 6) — 5 flags (Slice 7 added subset coverage)
     # ====================================================================
     FlagSpec(
         name="JARVIS_TEST_SOURCE_ATTRIBUTION_ENABLED",
@@ -5363,6 +5363,25 @@ SEED_SPECS: list = [
         example="300",
         since="2026-07-11",
         posture_relevance={},
+    ),
+    FlagSpec(
+        name="JARVIS_ATTRIBUTION_SUBSET_COVERAGE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 7: the MultiFileCoverageGate judges resolved-"
+            "attribution TestFailure scope with SUBSET semantics — a "
+            "candidate covering >=1 of the attributed target files "
+            "(e.g. the source-only repair) passes instead of being "
+            "rejected multi_file_coverage_insufficient. Zero-coverage "
+            "candidates are still rejected; ops without resolved "
+            "attribution keep the strict full-coverage demand. OFF "
+            "restores pre-Slice-7 strictness for every op."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/multi_file_coverage_gate.py",
+        example="true",
+        since="2026-07-11",
+        posture_relevance=_HARDEN_CRITICAL,
     ),
 ]
 

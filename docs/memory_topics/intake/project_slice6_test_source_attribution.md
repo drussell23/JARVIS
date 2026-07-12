@@ -173,3 +173,53 @@ SOURCE file → adversary's manifest full-file repair passes the scope gate
 → APPLY targets the source → VERIFY `pass_rate=1.0` → AutoCommit. Per
 `feedback_agent_conducted_soak_delegation`, this ignition is the user's
 call, not an implementation-task step.
+
+## Slice 7 — subset coverage semantics (2026-07-11)
+
+Run #17 fired the live proof of the section above: attribution resolved
+correctly (`[Attribution] test_leaf → leaf_predicates (direct_import)`,
+scope = `[source, test]`), one layer deeper than Run #16 — but the op
+still FAILED with `multi_file_coverage_insufficient covers 1/2`. The
+`MultiFileCoverageGate` was reading attributed scope as an EXHAUSTIVE
+change-set (both loci must be touched) when Slice 6 made it deliberately
+PERMISSIVE (either locus is a valid fix target — a source-only repair is
+correct and complete on its own). The gate outlived the assumption it was
+built under.
+
+**Fix — subset semantics, evidence-scoped.** `attribution_status()`
+(`test_source_attribution.py`) is a new single fail-soft parser over the
+Slice-6 evidence block — `unattributed_test_scope_violation` was refactored
+onto it so there's one reader, not two. `MultiFileCoverageGate.check_candidate`
+gained `*, intake_evidence_json=""`: when `attribution.status == "resolved"`
+and `JARVIS_ATTRIBUTION_SUBSET_COVERAGE_ENABLED` is not falsy, a candidate
+covering **>=1** of the attributed target files passes instead of being
+rejected; zero-coverage candidates are still rejected outright; ops without
+resolved attribution (or with the flag off) keep the pre-Slice-7 strict
+full-coverage demand. Any fault parsing evidence (malformed JSON, missing
+keys, unexpected exception) falls CLOSED to strict superset — the subset
+relaxation never fires on ambiguous input. True multi-file refactors are
+unaffected: the pre-existing `file_scope_mismatch` guard (`doubleword_provider.py`)
+still enforces ⊆ containment against `ctx.target_files`, so subset semantics
+only widens what counts as SUFFICIENT coverage, never what's IN scope.
+
+**Wiring — the Slice-6 T5 lesson, applied structurally.** Intake evidence is
+forwarded at BOTH GENERATE call sites — inline `orchestrator.py` and the
+extracted `phase_runners/generate_runner.py` (the shipping default under
+`JARVIS_PHASE_RUNNER_GATE_EXTRACTED`) — and pinned by a single AST wiring
+test parametrized over both files, so a future refactor that adds a third
+call path or silently drops the argument on one path fails CI instead of
+shipping wired-but-inert like the Task-5 gate did.
+
+**Fast-follow — lock-free prewarm probe.** Slice-6 final review flagged
+`prewarm_module_map`'s freshness probe as blocking the event loop: an
+in-flight executor build holds `_MAP_CACHE_LOCK` for ~7s (one repo-wide
+`rglob`), and probing staleness under that same lock serialized every
+concurrent caller behind it. Fixed to read cache freshness lock-free.
+
+**Proof.** `tests/governance/intent/test_attribution_e2e_leaf_predicates.py`
+pins the exact Run #17 scenario end-to-end: real `TestWatcher`-produced
+evidence flowing through the real gate, asserting the source-only
+candidate now passes where it previously rejected at `covers 1/2`.
+
+Env: `JARVIS_ATTRIBUTION_SUBSET_COVERAGE_ENABLED` (bool, default true) —
+`backend/core/ouroboros/governance/multi_file_coverage_gate.py`.
