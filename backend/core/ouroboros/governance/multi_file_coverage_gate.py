@@ -30,6 +30,12 @@ Contract
   (see :func:`_normalize_path`). Legacy-shape candidates that provide
   only ``file_path`` on a multi-target op are rejected with every
   target listed as missing.
+- Slice 7 exception: when ``intake_evidence_json`` carries
+  ``attribution.status == "resolved"`` (Slice-6 test→source bridge) and
+  ``JARVIS_ATTRIBUTION_SUBSET_COVERAGE_ENABLED`` is not falsy, covering
+  at least ONE target file passes — attributed scope is permissive
+  (either locus may be the fix target), not an exhaustive change-set.
+  Zero-coverage candidates are still rejected.
 
 Return shape from :func:`check_candidate`:
     ``None`` — gate passes, candidate is fine
@@ -49,6 +55,7 @@ logger = logging.getLogger("Ouroboros.MultiFileCoverageGate")
 
 _ENV_ENABLED = "JARVIS_MULTI_FILE_ENFORCEMENT"
 _ENV_MULTI_GEN = "JARVIS_MULTI_FILE_GEN_ENABLED"
+_ENV_SUBSET = "JARVIS_ATTRIBUTION_SUBSET_COVERAGE_ENABLED"
 
 # Public reason prefix used in retry-feedback classification.
 REASON_PREFIX = "multi_file_coverage_insufficient"
@@ -69,6 +76,33 @@ def is_enabled() -> bool:
     if raw_multi in ("false", "0", "no", "off"):
         return False
     return True
+
+
+def subset_coverage_enabled() -> bool:
+    """Slice 7 master switch (default ON): resolved-attribution
+    TestFailure scope is judged with subset semantics — covering >=1
+    target file suffices. OFF restores the pre-Slice-7 strict superset
+    demand for every op."""
+    raw = os.environ.get(_ENV_SUBSET, "true").strip().lower()
+    return raw not in ("false", "0", "no", "off")
+
+
+def _attribution_resolved(intake_evidence_json: str) -> bool:
+    """True iff the op's intake evidence carries ``attribution.status ==
+    "resolved"`` — only the Slice-6 test→source attribution bridge stamps
+    that status, so it is a sufficient discriminator for a permissive
+    (either-locus-may-be-the-fix) TestFailure scope. Fail-CLOSED to
+    ``False``: any import/parse fault keeps the strict superset demand,
+    i.e. the pre-Slice-7 behavior."""
+    if not intake_evidence_json:
+        return False
+    try:
+        from backend.core.ouroboros.governance.intent.test_source_attribution import (  # noqa: E501
+            attribution_status,
+        )
+        return attribution_status(intake_evidence_json) == "resolved"
+    except Exception:  # noqa: BLE001 — waiver is a relaxation, never fatal
+        return False
 
 
 def _normalize_path(path: str, project_root: Optional[Path] = None) -> str:
@@ -142,6 +176,8 @@ def check_candidate(
     candidate: Dict[str, Any],
     target_files: Sequence[str],
     project_root: Optional[Path] = None,
+    *,
+    intake_evidence_json: str = "",
 ) -> Optional[Tuple[str, List[str]]]:
     """Return ``None`` if the candidate covers every target file.
 
@@ -162,6 +198,28 @@ def check_candidate(
     missing = [t for t in normalized_targets if t and t not in covered]
 
     if not missing:
+        return None
+
+    covered_targets = len(normalized_targets) - len(missing)
+    if (
+        covered_targets >= 1
+        and subset_coverage_enabled()
+        and _attribution_resolved(intake_evidence_json)
+    ):
+        # Slice 7 (Run #17): a resolved-attribution TestFailure scope is
+        # PERMISSIVE — target_files names the candidate fix loci (source
+        # AND test), not an exhaustive change-set. Demanding full
+        # coverage here rejected the correct source-only repair
+        # ("covers 1/2") and killed the op. Covering >=1 target
+        # suffices; ⊆ containment is file_scope_mismatch's job, and
+        # true multi-file change-set goals (no resolved attribution)
+        # keep the strict superset demand above.
+        logger.info(
+            "[MultiFileCoverageGate] subset-coverage waiver: resolved "
+            "attribution — candidate covers %d/%d target file(s)",
+            covered_targets,
+            len(normalized_targets),
+        )
         return None
 
     reason = (

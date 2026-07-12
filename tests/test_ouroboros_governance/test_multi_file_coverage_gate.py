@@ -8,6 +8,7 @@ list when the op targets more than one file.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from backend.core.ouroboros.governance.multi_file_coverage_gate import (
     check_candidate,
     is_enabled,
     render_missing_block,
+    subset_coverage_enabled,
 )
 
 
@@ -317,3 +319,100 @@ class TestSessionOReproduction:
             "rationale": "four-file sensor test suite",
         }
         assert check_candidate(candidate, targets) is None
+
+
+# ---------------------------------------------------------------------------
+# Slice 7 — subset semantics for resolved-attribution scope (Run #17)
+# ---------------------------------------------------------------------------
+
+_SOURCE = "backend/core/ouroboros/a1_ignition_vector/leaf_predicates.py"
+_TEST = "tests/governance/a1_ignition_vector/test_leaf_predicates.py"
+_RESOLVED = json.dumps({"attribution": {
+    "status": "resolved", "test_locus": _TEST, "method": "direct_import",
+}})
+_UNRESOLVED = json.dumps({"attribution": {
+    "status": "unresolved", "reason": "no_first_party_source_imports",
+}})
+
+
+class TestSubsetCoverageSemantics:
+    """Run #17 blocker: attributed scope is PERMISSIVE (either locus may
+    be the fix target), not an exhaustive change-set. Resolved
+    attribution ⇒ covering >=1 target suffices; everything else keeps
+    the strict superset demand byte-identically."""
+
+    def test_resolved_source_only_candidate_passes(self):
+        """THE Run #17 repro: correct source-only repair on a 2-file scope."""
+        cand = {"file_path": _SOURCE, "full_content": "def clamp01(x):\n    return min(1.0, max(0.0, x))\n"}
+        assert check_candidate(
+            cand, [_SOURCE, _TEST], intake_evidence_json=_RESOLVED,
+        ) is None
+
+    def test_resolved_test_only_candidate_passes(self):
+        """The test itself may legitimately be the fix target — the
+        unresolved-only scope gate (Slice 6 T5) intentionally does not
+        fire on resolved attribution, so the coverage gate must not
+        re-block it either."""
+        cand = {"file_path": _TEST, "full_content": "def test_clamp01():\n    assert True\n"}
+        assert check_candidate(
+            cand, [_SOURCE, _TEST], intake_evidence_json=_RESOLVED,
+        ) is None
+
+    def test_resolved_full_coverage_still_passes(self):
+        cand = {"files": [
+            {"file_path": _SOURCE, "full_content": "a = 1\n"},
+            {"file_path": _TEST, "full_content": "b = 2\n"},
+        ]}
+        assert check_candidate(
+            cand, [_SOURCE, _TEST], intake_evidence_json=_RESOLVED,
+        ) is None
+
+    def test_resolved_zero_target_coverage_still_rejected(self):
+        """Subset never means 'anything goes' — a candidate covering NO
+        target file is still rejected even with resolved attribution."""
+        cand = {"file_path": "backend/somewhere/else.py", "full_content": "x = 1\n"}
+        result = check_candidate(
+            cand, [_SOURCE, _TEST], intake_evidence_json=_RESOLVED,
+        )
+        assert result is not None
+        reason, missing = result
+        assert reason.startswith(REASON_PREFIX)
+        assert set(missing) == {_SOURCE, _TEST}
+
+    def test_unresolved_attribution_keeps_superset_demand(self):
+        cand = {"file_path": _SOURCE, "full_content": "x = 1\n"}
+        result = check_candidate(
+            cand, [_SOURCE, _TEST], intake_evidence_json=_UNRESOLVED,
+        )
+        assert result is not None and result[0].startswith(REASON_PREFIX)
+
+    def test_absent_evidence_keeps_superset_demand(self):
+        """Default kwarg — every pre-Slice-7 caller is byte-identical."""
+        cand = {"file_path": _SOURCE, "full_content": "x = 1\n"}
+        assert check_candidate(cand, [_SOURCE, _TEST]) is not None
+
+    def test_malformed_evidence_fail_closed_strict(self):
+        cand = {"file_path": _SOURCE, "full_content": "x = 1\n"}
+        result = check_candidate(
+            cand, [_SOURCE, _TEST], intake_evidence_json="{not json",
+        )
+        assert result is not None
+
+    def test_subset_master_off_keeps_superset_demand(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_ATTRIBUTION_SUBSET_COVERAGE_ENABLED", "false")
+        cand = {"file_path": _SOURCE, "full_content": "x = 1\n"}
+        result = check_candidate(
+            cand, [_SOURCE, _TEST], intake_evidence_json=_RESOLVED,
+        )
+        assert result is not None
+
+
+class TestSubsetCoverageEnabled:
+    def test_default_is_on(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_ATTRIBUTION_SUBSET_COVERAGE_ENABLED", raising=False)
+        assert subset_coverage_enabled() is True
+
+    @pytest.mark.parametrize("val", ["false", "FALSE", "0", "no", "off"])
+    def test_explicit_off(self, monkeypatch, val):
+        monkeypatch.setenv("JARVIS_ATTRIBUTION_SUBSET_COVERAGE_ENABLED", val)
+        assert subset_coverage_enabled() is False
