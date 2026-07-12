@@ -16,6 +16,7 @@ from backend.core.ouroboros.governance.intent.test_source_attribution import (
     AttributionUnresolved,
     attribute_test_to_sources,
     attribution_enabled,
+    attribution_status,
     prewarm_module_map,
     unattributed_test_scope_violation,
 )
@@ -485,3 +486,34 @@ def test_gate_silent_on_absolute_source_candidate(tmp_path, monkeypatch):
     assert unattributed_test_scope_violation(
         _ev("unresolved"), [abs_source], repo_root=root,
     ) is None
+
+
+# ---- Slice 7 — single evidence parser ----
+
+
+class TestAttributionStatus:
+    """Slice 7 — single evidence parser consumed by the coverage gate."""
+
+    def test_resolved(self):
+        j = json.dumps({"attribution": {"status": "resolved"}})
+        assert attribution_status(j) == "resolved"
+
+    def test_unresolved(self):
+        j = json.dumps({"attribution": {"status": "unresolved"}})
+        assert attribution_status(j) == "unresolved"
+
+    def test_absent_attribution_block(self):
+        assert attribution_status(json.dumps({"other": 1})) == ""
+
+    def test_empty_and_none_ish(self):
+        assert attribution_status("") == ""
+        assert attribution_status("{}") == ""
+
+    def test_malformed_json(self):
+        assert attribution_status("{not json") == ""
+
+    def test_non_dict_evidence(self):
+        assert attribution_status("[1, 2]") == ""
+
+    def test_non_dict_attribution_value(self):
+        assert attribution_status(json.dumps({"attribution": "resolved"})) == ""

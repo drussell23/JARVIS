@@ -23,7 +23,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
 from backend.core.ouroboros.governance.reverse_dep_resolver import (
     _is_test_module,
@@ -347,6 +347,25 @@ def scope_gate_enabled() -> bool:
     ).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _attribution_dict(intake_evidence_json: str) -> Dict[str, Any]:
+    """Fail-soft parse of the Slice-6 evidence block: returns the
+    ``attribution`` dict from an op's intake evidence JSON, or ``{}`` on
+    absent / non-JSON / non-dict shapes. Never raises."""
+    try:
+        evidence = json.loads(intake_evidence_json or "{}")
+        attribution = evidence.get("attribution") or {}
+    except (ValueError, TypeError, AttributeError):
+        return {}
+    return attribution if isinstance(attribution, dict) else {}
+
+
+def attribution_status(intake_evidence_json: str) -> str:
+    """``attribution.status`` from an op's intake evidence JSON, ``""``
+    when absent or malformed. The single evidence parser shared by the
+    scope gate (Slice 6) and the coverage-gate subset waiver (Slice 7)."""
+    return str(_attribution_dict(intake_evidence_json).get("status", ""))
+
+
 def unattributed_test_scope_violation(
     intake_evidence_json: str,
     candidate_files: Sequence[str],
@@ -372,12 +391,8 @@ def unattributed_test_scope_violation(
     outside the root (relativizer returns "")."""
     if not scope_gate_enabled() or not candidate_files:
         return None
-    try:
-        evidence = json.loads(intake_evidence_json or "{}")
-        attribution = evidence.get("attribution") or {}
-        status = str(attribution.get("status", ""))
-    except (ValueError, TypeError, AttributeError):
-        return None
+    attribution = _attribution_dict(intake_evidence_json)
+    status = str(attribution.get("status", ""))
     if status != "unresolved":
         return None
     dir_names = _test_dir_names()
