@@ -134,3 +134,68 @@ class TestRouteWithDeclaredSandbox:
         f.write_text("x = 1\n")
         required = _route((f,), repo, sandbox_dir=sandbox)
         assert required == frozenset({"python"})
+
+
+import ast as _ast
+import asyncio
+import tempfile
+
+_REPO = Path(__file__).resolve().parents[2]
+_LEAF_REL = Path("backend/core/ouroboros/a1_ignition_vector/leaf_predicates.py")
+
+
+class TestRun18EndToEnd:
+    def test_run18_repro_full_router_under_node_policy(self, node_policy):
+        """THE Run #18 scenario, end-to-end through the REAL router +
+        PythonAdapter + real pytest on the real leaf pair: under node
+        policy, the declared per-op sandbox must validate green — not
+        die BlockedPathError → fc='security'."""
+        from backend.core.ouroboros.governance.test_runner import (
+            LanguageRouter,
+            PythonAdapter,
+        )
+        router = LanguageRouter(
+            repo_root=_REPO,
+            adapters={"python": PythonAdapter(repo_root=_REPO)},
+        )
+        content = (_REPO / _LEAF_REL).read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix="ouroboros_validate_") as sb:
+            sbp = Path(sb)
+            f = sbp / _LEAF_REL
+            f.parent.mkdir(parents=True)
+            f.write_text(content, encoding="utf-8")
+            result = asyncio.run(router.run(
+                changed_files=(f,),
+                sandbox_dir=sbp,
+                timeout_budget_s=120,
+                op_id="slice8-pin",
+                original_paths={f: _REPO / _LEAF_REL},
+            ))
+        assert result.passed, (
+            f"fc={result.failure_class}: "
+            f"{result.dominant_failure and result.dominant_failure.test_result.stdout[:300]}"
+        )
+
+
+class TestOrchestratorDeclaresContract:
+    """AST pin: the VALIDATE call site must keep declaring sandbox_dir +
+    original_paths to the router — deleting either silently reverts the
+    Run #18 class (the wired-but-inert lesson, structurally enforced)."""
+
+    def test_run_validation_forwards_declared_roots(self):
+        src = (
+            _REPO / "backend" / "core" / "ouroboros" / "governance"
+            / "orchestrator.py"
+        ).read_text(encoding="utf-8")
+        tree = _ast.parse(src)
+        hits = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                fn = node.func
+                if getattr(fn, "attr", "") == "run" and any(
+                    k.arg == "sandbox_dir" for k in node.keywords
+                ):
+                    hits.append({k.arg for k in node.keywords})
+        assert any(
+            {"sandbox_dir", "original_paths"} <= kw for kw in hits
+        ), "no .run(sandbox_dir=..., original_paths=...) call in orchestrator"
