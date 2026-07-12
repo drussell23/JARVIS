@@ -54,9 +54,19 @@ def test_validator_rejects(mutation, expected_err) -> None:
 
 
 def test_resolved_requires_nonempty_source_loci() -> None:
-    block = build_attribution_evidence(
-        status="resolved", test_locus="tests/g/test_leaf.py",
-        source_loci=[], method="direct_import",
-    )
-    ok, err = validate_attribution_evidence(block)
-    assert not ok and "source_loci" in err
+    """I1: the builder now self-validates (Vision-discipline parity), so an
+    invalid construction (resolved + empty source_loci) raises at build
+    time instead of silently producing a malformed block."""
+    with pytest.raises(ValueError, match="source_loci"):
+        build_attribution_evidence(
+            status="resolved", test_locus="tests/g/test_leaf.py",
+            source_loci=[], method="direct_import",
+        )
+
+
+def test_builder_raises_on_unresolved_without_reason() -> None:
+    """I1: unresolved status with no reason is also rejected at build."""
+    with pytest.raises(ValueError, match="reason"):
+        build_attribution_evidence(
+            status="unresolved", test_locus="tests/g/test_leaf.py",
+        )

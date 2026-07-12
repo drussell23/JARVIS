@@ -36,6 +36,7 @@ from .test_source_attribution import (
     AttributionUnresolved,
     attribute_test_to_sources,
     attribution_enabled,
+    prewarm_module_map,
 )
 from backend.core.ouroboros.governance.workspace_resolver import resolve_repo_root
 
@@ -637,6 +638,13 @@ class TestWatcher:
         # Repair Context Bridge (Slice 1): non-blocking AST traceback enrichment
         # (gated, fail-soft) — populates f.traceback_evidence before signal build.
         await self._enrich_failures(failures, output)
+        # C1: process_failures → attribute_test_to_sources → _get_module_map
+        # runs a synchronous ~7s repo-wide rglob (build_module_to_path over
+        # ~63k files). Pre-warm that build OFF the event loop first — but only
+        # on red cycles with attribution armed, so green polls never pay the
+        # crawl. Fail-soft inside prewarm; the inline path still works.
+        if failures and attribution_enabled():
+            await prewarm_module_map(self.repo_path)
         return self.process_failures(failures)
 
     async def start(self) -> None:

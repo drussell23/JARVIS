@@ -101,3 +101,51 @@ def test_evidence_signature_unchanged_for_dedup_continuity(repo) -> None:
     w = TestWatcher(repo="jarvis", repo_path=str(repo))
     sig = _stable_signal(w, _fail("tests/test_engine.py"))
     assert sig.evidence["signature"] == "AssertionError: boom:tests/test_engine.py"
+
+
+# ---- C1: poll_once pre-warms the module-map OFF-loop, red-cycles only ----
+
+import backend.core.ouroboros.governance.intent.test_watcher as tw_mod
+
+
+async def _run_poll_with_spy(repo_root, monkeypatch, *, red: bool):
+    """Drive one poll_once with run_pytest/parse stubbed; count prewarms."""
+    w = TestWatcher(repo="jarvis", repo_path=str(repo_root))
+
+    async def _fake_run_pytest(*_a, **_k):
+        return ("output", 1 if red else 0)
+
+    monkeypatch.setattr(
+        w, "run_pytest", _fake_run_pytest, raising=True,
+    )
+    failures = [_fail("tests/test_engine.py")] if red else []
+    monkeypatch.setattr(
+        w, "parse_pytest_output", lambda *_a, **_k: failures, raising=True,
+    )
+
+    calls = {"n": 0}
+
+    async def _spy_prewarm(root):
+        calls["n"] += 1
+
+    monkeypatch.setattr(tw_mod, "prewarm_module_map", _spy_prewarm, raising=True)
+    await w.poll_once()
+    return calls["n"]
+
+
+async def test_red_poll_prewarms_exactly_once(repo, monkeypatch):
+    monkeypatch.setenv("JARVIS_TEST_SOURCE_ATTRIBUTION_ENABLED", "true")
+    n = await _run_poll_with_spy(repo, monkeypatch, red=True)
+    assert n == 1
+
+
+async def test_green_poll_never_prewarms(repo, monkeypatch):
+    monkeypatch.setenv("JARVIS_TEST_SOURCE_ATTRIBUTION_ENABLED", "true")
+    n = await _run_poll_with_spy(repo, monkeypatch, red=False)
+    assert n == 0
+
+
+async def test_red_poll_skips_prewarm_when_attribution_disabled(repo, monkeypatch):
+    monkeypatch.setenv("JARVIS_TEST_SOURCE_ATTRIBUTION_ENABLED", "false")
+    n = await _run_poll_with_spy(repo, monkeypatch, red=True)
+    assert n == 0

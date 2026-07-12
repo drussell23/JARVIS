@@ -99,6 +99,45 @@ def test_notify_apply_also_escalates_to_approval(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Contract 1b (I2) — ABSOLUTE test-infra candidate escalates once repo_root
+# is threaded through (without it the absolute path defeated classification)
+# ---------------------------------------------------------------------------
+
+
+def test_absolute_test_infra_candidate_escalates_with_repo_root(monkeypatch) -> None:
+    monkeypatch.delenv("JARVIS_ATTRIBUTION_SCOPE_GATE_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
+    ctx = _Ctx(UNRESOLVED_EVIDENCE)
+    abs_conftest = "/Users/x/repo/tests/conftest.py"
+
+    # Without repo_root the absolute path slips the gate (the I2 bug).
+    tier_no_root, violation_no_root = _attribution_scope_risk_floor(
+        ctx, [abs_conftest], RiskTier.SAFE_AUTO,
+    )
+    assert tier_no_root is RiskTier.SAFE_AUTO
+    assert violation_no_root is None
+
+    # With repo_root the candidate normalizes to tests/conftest.py and fires.
+    tier, violation = _attribution_scope_risk_floor(
+        ctx, [abs_conftest], RiskTier.SAFE_AUTO, repo_root="/Users/x/repo",
+    )
+    assert tier is RiskTier.APPROVAL_REQUIRED
+    assert violation is not None
+
+
+def test_absolute_source_candidate_no_false_positive_with_repo_root(monkeypatch) -> None:
+    monkeypatch.delenv("JARVIS_ATTRIBUTION_SCOPE_GATE_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
+    ctx = _Ctx(UNRESOLVED_EVIDENCE)
+    tier, violation = _attribution_scope_risk_floor(
+        ctx, ["/Users/x/repo/backend/engine.py"], RiskTier.SAFE_AUTO,
+        repo_root="/Users/x/repo",
+    )
+    assert tier is RiskTier.SAFE_AUTO
+    assert violation is None
+
+
+# ---------------------------------------------------------------------------
 # Contract 2 — resolved attribution never escalates
 # ---------------------------------------------------------------------------
 

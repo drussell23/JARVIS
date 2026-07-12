@@ -109,16 +109,71 @@ _MAP_CACHE: Dict[str, Tuple[float, Dict[str, str]]] = {}
 _MAP_CACHE_LOCK = threading.Lock()
 
 
-def _get_module_map(repo_root: str) -> Dict[str, str]:
+def _build_and_cache_module_map(repo_root: str) -> Dict[str, str]:
+    """Single-flight builder for the module→path map.
+
+    Holds ``_MAP_CACHE_LOCK`` across the ~7s ``build_module_to_path``
+    rglob (double-checked inside the lock) so two concurrent expirers
+    never both pay the crawl — the first to enter builds, the rest see
+    the fresh entry and return it. When dispatched off-loop (via
+    :func:`prewarm_module_map`'s ``cooperative_fs_io.offload``), the
+    executor threads may briefly serialize on this lock — that is
+    off-loop and correct; the event loop is never the thread waiting."""
     now = time.monotonic()
     with _MAP_CACHE_LOCK:
         hit = _MAP_CACHE.get(repo_root)
         if hit is not None and now - hit[0] < _module_map_ttl_s():
             return hit[1]
-    mapping = build_module_to_path(repo_root)
+        mapping = build_module_to_path(repo_root)
+        _MAP_CACHE[repo_root] = (time.monotonic(), mapping)
+        return mapping
+
+
+def _get_module_map(repo_root: str) -> Dict[str, str]:
+    return _build_and_cache_module_map(repo_root)
+
+
+async def prewarm_module_map(repo_root: str) -> None:
+    """Off-loop pre-warm of the module→path cache (C1).
+
+    ``build_module_to_path`` does a synchronous repo-wide ``rglob("*.py")``
+    over ~63k files (~7s measured) — running it inside the in-loop
+    ``_get_module_map`` (as ``process_failures`` does) reintroduces the
+    repo's closed "sync-FS-on-loop" class every red poll. This helper
+    routes that build through ``cooperative_fs_io.offload`` (the repo's
+    canonical off-loop substrate) so the SAME ``_MAP_CACHE`` the sync
+    path reads is populated in an executor thread; the subsequent in-loop
+    ``_get_module_map(repo_root)`` is then a dict cache-hit, not a crawl.
+
+    Callers must invoke this (``await``) before ``process_failures`` runs,
+    and only on red cycles (failures present + attribution enabled) so
+    green cycles never pay the crawl.
+
+    Fail-soft: the substrate is imported lazily and any offload fault
+    (import error, ``OffloadError``, non-dict result) leaves the cache
+    untouched — the inline sync path in ``_get_module_map`` still works
+    (just on-loop, which is exactly what this pre-warm avoids)."""
+    now = time.monotonic()
     with _MAP_CACHE_LOCK:
-        _MAP_CACHE[repo_root] = (now, mapping)
-    return mapping
+        hit = _MAP_CACHE.get(repo_root)
+        if hit is not None and now - hit[0] < _module_map_ttl_s():
+            return  # already warm — no crawl, on- or off-loop
+    try:
+        from backend.core.ouroboros.governance import cooperative_fs_io
+    except Exception:  # noqa: BLE001 — substrate optional; fall back to inline
+        return
+    try:
+        result = await cooperative_fs_io.offload(
+            _build_and_cache_module_map, repo_root
+        )
+    except Exception:  # noqa: BLE001 — offload must never break the poll
+        return
+    if cooperative_fs_io.is_offload_error(result) or not isinstance(result, dict):
+        # Build faulted inside the worker — cache left as-is; the inline
+        # sync path remains correct (this pre-warm is best-effort).
+        return
+    # ``_build_and_cache_module_map`` already stored the result in
+    # ``_MAP_CACHE`` inside the executor thread — nothing further to do.
 
 
 def _resolve_dotted_to_path(
@@ -295,6 +350,8 @@ def scope_gate_enabled() -> bool:
 def unattributed_test_scope_violation(
     intake_evidence_json: str,
     candidate_files: Sequence[str],
+    *,
+    repo_root: str = "",
 ) -> Optional[str]:
     """Mandate 4's enforcement predicate: when the op's attribution is
     ``unresolved`` and EVERY candidate file is a test-locus, mutating is
@@ -302,7 +359,17 @@ def unattributed_test_scope_violation(
     orchestrator escalates to APPROVAL_REQUIRED). ``None`` = no
     violation. Strictly fail-soft on malformed evidence (absent /
     non-JSON / missing keys → None): this gate must never break ops that
-    predate the schema."""
+    predate the schema.
+
+    ``repo_root`` (I2): model candidates may carry ABSOLUTE paths
+    (``/Users/x/repo/tests/conftest.py``). Without normalization the
+    module derived from such a path becomes ``Users.x…`` — NOT
+    test-classified — so ``_is_test_infra`` silently fails and the blind-
+    mutation gate never fires. When ``repo_root`` is provided each
+    candidate is normalized to a repo-relative POSIX path via
+    ``_relpath_under_root`` (the same relativizer the attributor uses),
+    falling back to the plain slash/``./`` normalization when the file is
+    outside the root (relativizer returns "")."""
     if not scope_gate_enabled() or not candidate_files:
         return None
     try:
@@ -318,6 +385,11 @@ def unattributed_test_scope_violation(
     normalized = []
     for f in candidate_files:
         _norm = str(f).replace("\\", "/")
+        if repo_root:
+            _rel = _relpath_under_root(str(f), repo_root)
+            if _rel:
+                normalized.append(_rel)
+                continue
         if _norm.startswith("./"):
             _norm = _norm[2:]
         normalized.append(_norm)

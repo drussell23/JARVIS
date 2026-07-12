@@ -10,11 +10,13 @@ import textwrap
 
 import pytest
 
+import backend.core.ouroboros.governance.intent.test_source_attribution as tsa
 from backend.core.ouroboros.governance.intent.test_source_attribution import (
     Attribution,
     AttributionUnresolved,
     attribute_test_to_sources,
     attribution_enabled,
+    prewarm_module_map,
     unattributed_test_scope_violation,
 )
 
@@ -357,4 +359,129 @@ def test_gate_off_switch_returns_none_even_for_unresolved(monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
     assert unattributed_test_scope_violation(
         _ev("unresolved"), ["tests/unit_checks/test_gadget.py"],
+    ) is None
+
+
+# ---- C1: off-loop module-map pre-warm (single-flight + offload seam) ----
+
+@pytest.fixture(autouse=True)
+def _clear_map_cache():
+    """Each pre-warm/module-map test starts with a cold cache."""
+    tsa._MAP_CACHE.clear()
+    yield
+    tsa._MAP_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_prewarm_populates_cache_via_offload_seam(repo, monkeypatch):
+    """4a: prewarm routes the build through cooperative_fs_io.offload and
+    populates the SAME _MAP_CACHE the sync path reads."""
+    root, _tdir = repo
+    root = str(root)
+    import backend.core.ouroboros.governance.cooperative_fs_io as cfio
+
+    seen = {"called": False, "fn": None}
+    real_offload = cfio.offload
+
+    async def _spy_offload(fn, *args, **kwargs):
+        seen["called"] = True
+        seen["fn"] = fn
+        return await real_offload(fn, *args, **kwargs)
+
+    monkeypatch.setattr(cfio, "offload", _spy_offload)
+    assert root not in tsa._MAP_CACHE
+
+    await prewarm_module_map(root)
+
+    assert seen["called"] is True
+    assert seen["fn"] is tsa._build_and_cache_module_map
+    # Same cache the in-loop sync path reads is now warm.
+    assert root in tsa._MAP_CACHE
+    assert isinstance(tsa._MAP_CACHE[root][1], dict)
+
+
+@pytest.mark.asyncio
+async def test_get_module_map_is_cache_hit_after_prewarm(repo, monkeypatch):
+    """4b: after prewarm, the in-loop _get_module_map must NOT rebuild —
+    monkeypatch build_module_to_path to raise; a cache hit never calls it."""
+    root, _tdir = repo
+    root = str(root)
+    await prewarm_module_map(root)
+    assert root in tsa._MAP_CACHE
+
+    def _boom(*_a, **_k):
+        raise AssertionError("build_module_to_path must not be called on a hit")
+
+    monkeypatch.setattr(tsa, "build_module_to_path", _boom)
+    mapping = tsa._get_module_map(root)  # must be a pure dict hit
+    assert isinstance(mapping, dict)
+
+
+@pytest.mark.asyncio
+async def test_prewarm_noop_when_already_warm(repo, monkeypatch):
+    """A fresh cache entry short-circuits prewarm before touching offload
+    (no redundant crawl on back-to-back red cycles)."""
+    root, _tdir = repo
+    root = str(root)
+    await prewarm_module_map(root)  # first warm
+
+    import backend.core.ouroboros.governance.cooperative_fs_io as cfio
+    called = {"n": 0}
+    real = cfio.offload
+
+    async def _count(fn, *a, **k):
+        called["n"] += 1
+        return await real(fn, *a, **k)
+
+    monkeypatch.setattr(cfio, "offload", _count)
+    await prewarm_module_map(root)  # warm -> must not offload again
+    assert called["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_prewarm_fail_soft_on_offload_error(repo, monkeypatch):
+    """An OffloadError result leaves the cache untouched (inline path still
+    works); prewarm never raises."""
+    root, _tdir = repo
+    root = str(root)
+    import backend.core.ouroboros.governance.cooperative_fs_io as cfio
+
+    async def _err(fn, *a, **k):
+        return cfio.OffloadError(
+            fn_name="build", exc_type="OSError", message="boom", cpu_bound=False,
+        )
+
+    monkeypatch.setattr(cfio, "offload", _err)
+    await prewarm_module_map(root)  # must not raise
+    assert root not in tsa._MAP_CACHE
+
+
+# ---- I2: gate predicate normalizes ABSOLUTE candidate paths ----
+
+def test_gate_fires_on_absolute_test_infra_candidate(tmp_path, monkeypatch):
+    """An ABSOLUTE test-infra candidate path must still trip the gate once
+    repo_root is supplied (without it, module became Users.x… — not test-
+    classified — and the blind-mutation gate silently no-op'd)."""
+    monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
+    root = str(tmp_path)
+    abs_conftest = str(tmp_path / "tests" / "conftest.py")
+    # Sanity: without repo_root the absolute path defeats classification.
+    assert unattributed_test_scope_violation(
+        _ev("unresolved"), [abs_conftest],
+    ) is None
+    # With repo_root the absolute path normalizes and the gate fires.
+    msg = unattributed_test_scope_violation(
+        _ev("unresolved"), [abs_conftest], repo_root=root,
+    )
+    assert msg is not None and "unresolved" in msg
+
+
+def test_gate_silent_on_absolute_source_candidate(tmp_path, monkeypatch):
+    """An ABSOLUTE SOURCE-file candidate must NOT trip the gate (no false
+    positive) even with repo_root supplied."""
+    monkeypatch.setenv("JARVIS_TEST_DIR_NAMES", "tests")
+    root = str(tmp_path)
+    abs_source = str(tmp_path / "backend" / "mod" / "engine.py")
+    assert unattributed_test_scope_violation(
+        _ev("unresolved"), [abs_source], repo_root=root,
     ) is None

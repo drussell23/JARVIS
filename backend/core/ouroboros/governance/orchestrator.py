@@ -478,6 +478,8 @@ def _attribution_scope_risk_floor(
     ctx: Any,
     candidate_file_paths: Sequence[str],
     risk_tier: RiskTier,
+    *,
+    repo_root: str = "",
 ) -> Tuple[RiskTier, Optional[str]]:
     """Return ``(possibly-escalated risk_tier, violation_message|None)``.
 
@@ -485,6 +487,11 @@ def _attribution_scope_risk_floor(
     detected (unresolved attribution + test-only candidate), even if the
     tier was already strict enough that no escalation was applied — the
     caller logs it for operator visibility either way.
+
+    ``repo_root`` (I2): passed through to the predicate so ABSOLUTE
+    candidate paths (which the model may emit) are normalized to
+    repo-relative before test-locus classification — an absolute
+    ``…/tests/conftest.py`` must not slip the gate.
     """
     try:
         from backend.core.ouroboros.governance.intent.test_source_attribution import (  # noqa: E501
@@ -493,6 +500,7 @@ def _attribution_scope_risk_floor(
         violation = unattributed_test_scope_violation(
             getattr(ctx, "intake_evidence_json", "") or "",
             candidate_file_paths,
+            repo_root=repo_root,
         )
     except Exception:  # noqa: BLE001 — gate is protective, never fatal
         return risk_tier, None
@@ -9068,6 +9076,7 @@ class GovernedOrchestrator:
                     # covers JARVIS_PHASE_RUNNER_GATE_EXTRACTED=false.
                     risk_tier, _attr_violation = _attribution_scope_risk_floor(
                         ctx, [_p for (_p, _o, _n) in _pairs], risk_tier,
+                        repo_root=str(self._config.project_root),
                     )
                     if _attr_violation:
                         logger.warning(

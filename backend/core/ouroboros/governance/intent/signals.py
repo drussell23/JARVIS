@@ -360,8 +360,16 @@ def build_attribution_evidence(
 
     ``status``: ``resolved`` (source_loci non-empty, method set) |
     ``unresolved`` (reason set — the typed fail-fast) | ``disabled``
-    (master switch off; scope stays legacy test-locus)."""
-    return {
+    (master switch off; scope stays legacy test-locus).
+
+    Self-validates the built block (I1 — Vision-discipline parity with
+    :func:`build_vision_signal_evidence`): runs
+    :func:`validate_attribution_evidence` and raises ``ValueError`` on
+    failure, so a malformed payload can never leave this constructor.
+    Every production call path already supplies a valid construction
+    (unresolved always carries a typed reason; resolved always carries
+    loci + method), so nothing should trip in practice."""
+    evidence: Dict[str, Any] = {
         "schema_version": TEST_FAILURE_ATTRIBUTION_SCHEMA_VERSION,
         "status": status,
         "test_locus": test_locus,
@@ -369,6 +377,10 @@ def build_attribution_evidence(
         "method": method,
         "reason": reason,
     }
+    ok, error = validate_attribution_evidence(evidence)
+    if not ok:
+        raise ValueError(error)
+    return evidence
 
 
 def validate_attribution_evidence(obj: Any) -> Tuple[bool, str]:

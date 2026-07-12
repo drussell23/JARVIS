@@ -22,6 +22,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from backend.core.ouroboros.governance.intent.signals import IntentSignal
+from backend.core.ouroboros.governance.intent.test_source_attribution import (
+    attribution_enabled,
+    prewarm_module_map,
+)
 from backend.core.ouroboros.governance.intent.test_watcher import TestFailure
 from backend.core.ouroboros.governance.workspace_resolver import resolve_repo_root
 from backend.core.ouroboros.governance.intake.intent_envelope import (
@@ -979,6 +983,14 @@ class TestFailureSensor:
             return
 
         if self._watcher is not None:
+            # C1: process_failures runs a synchronous ~7s repo-wide rglob
+            # (build_module_to_path) in-loop via the attribution path. This
+            # is the ONLY site that calls process_failures directly (all
+            # other sites route through poll_once, which pre-warms itself);
+            # pre-warm the module-map cache OFF the loop here, red-cycles
+            # only. Fail-soft.
+            if failures and attribution_enabled():
+                await prewarm_module_map(self._watcher.repo_path)
             signals = self._watcher.process_failures(failures)
             if signals:
                 logger.info(

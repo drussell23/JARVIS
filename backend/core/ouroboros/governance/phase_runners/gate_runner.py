@@ -407,6 +407,7 @@ class GATERunner(PhaseRunner):
                 # risk_after telemetry below.
                 risk_tier, _attr_violation = _attribution_scope_risk_floor(
                     ctx, [_p for (_p, _o, _n) in _pairs], risk_tier,
+                    repo_root=str(orch._config.project_root),
                 )
                 if _attr_violation:
                     logger.warning(
