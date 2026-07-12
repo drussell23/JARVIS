@@ -65,6 +65,22 @@ class TestDeclaredSandboxContainment:
         )
         assert norm == "mlforge/kernel.py"
 
+    def test_original_paths_key_is_not_an_acceptance_path(
+        self, node_policy, repo, sandbox, tmp_path
+    ):
+        """A path outside repo_root ∪ declared sandbox ∪ env prefixes must
+        raise even when present as an original_paths key — the mapping
+        affects SHAPE only, never containment (review Critical)."""
+        evil_dir = tmp_path / "evil_unrelated"
+        evil_dir.mkdir()
+        evil = evil_dir / "evil.py"
+        evil.write_text("x = 1\n")
+        with pytest.raises(BlockedPathError):
+            _normalize(
+                evil, repo, sandbox_dir=sandbox,
+                original_paths={evil: repo / "legit.py"},
+            )
+
     def test_node_policy_undeclared_still_blocked(self, node_policy, repo, sandbox):
         """No declaration → legacy env-prefix policy governs; under node
         policy the tempdir is outside it → still a security rejection."""

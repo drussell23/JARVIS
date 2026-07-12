@@ -230,35 +230,53 @@ def _normalize(
     env guess. Run #18 root cause: under the node's no-/tmp policy the
     env guess rejected the orchestrator's OWN validate sandbox.
 
-    Routing shape: prefer the ORIGINAL repo-relative shape via
-    *original_paths* (so directory-shape adapter rules match sandbox
-    copies exactly as in-repo files), then the sandbox-relative shape,
-    then (legacy prefixes) the bare filename — the pre-Slice-8 behavior.
+    Containment is proven FIRST, in order: repo_root, then the declared
+    *sandbox_dir*, then (legacy fallback) the env-policy prefixes.
+    *original_paths* is consulted ONLY after sandbox_dir containment is
+    already proven — it can never widen acceptance, it only picks the
+    returned SHAPE (review Critical: a dict-key match must never be an
+    acceptance path). Within that branch: prefer the ORIGINAL
+    repo-relative shape via *original_paths* (so directory-shape adapter
+    rules match sandbox copies exactly as in-repo files), falling back to
+    the sandbox-relative shape if the original itself resolves outside
+    repo_root. Env-prefix-contained paths keep the legacy bare-filename
+    return — the pre-Slice-8 behavior.
     """
+    resolved = path.resolve()
+
+    # 1) repo_root containment — primary, unconditional allow.
     try:
-        resolved = path.resolve()
         return resolved.relative_to(repo_root.resolve()).as_posix()
     except ValueError:
-        resolved = path.resolve()
-    # Declared sandbox: map back to the original repo-relative shape when
-    # the caller provided the mapping (truthful adapter routing).
-    if original_paths:
-        orig = original_paths.get(path) or original_paths.get(resolved)
-        if orig is not None:
-            try:
-                return (
-                    Path(orig).resolve()
-                    .relative_to(repo_root.resolve())
-                    .as_posix()
-                )
-            except ValueError:
-                pass  # original itself outside repo — fall through
+        pass
+
+    # 2) declared sandbox_dir containment. original_paths is ONLY ever
+    #    consulted inside this branch, and only to pick the return SHAPE
+    #    — containment under sandbox_dir has already been proven above.
     if sandbox_dir is not None:
         try:
-            return resolved.relative_to(Path(sandbox_dir).resolve()).as_posix()
+            sandbox_relative = resolved.relative_to(
+                Path(sandbox_dir).resolve()
+            ).as_posix()
         except ValueError:
-            pass  # not under the declared sandbox — fall through
-    # Legacy env-prefix fallback — byte-identical pre-Slice-8 behavior for
+            sandbox_relative = None
+        if sandbox_relative is not None:
+            if original_paths is not None:
+                orig = original_paths.get(path)
+                if orig is None:
+                    orig = original_paths.get(resolved)
+                if orig is not None:
+                    try:
+                        return (
+                            Path(orig).resolve()
+                            .relative_to(repo_root.resolve())
+                            .as_posix()
+                        )
+                    except ValueError:
+                        pass  # original itself outside repo — sandbox shape below
+            return sandbox_relative
+
+    # 3) Legacy env-prefix fallback — byte-identical pre-Slice-8 behavior for
     # callers that do not declare a sandbox.
     resolved_str = str(resolved)
     if any(resolved_str.startswith(p) for p in _effective_sandbox_prefixes()):
