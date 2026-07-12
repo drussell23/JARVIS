@@ -6647,6 +6647,9 @@ class GovernedOrchestrator:
                                 _cand,
                                 ctx.target_files,
                                 self._config.project_root,
+                                intake_evidence_json=getattr(
+                                    ctx, "intake_evidence_json", "",
+                                ) or "",
                             )
                             if _mf_result is None:
                                 continue

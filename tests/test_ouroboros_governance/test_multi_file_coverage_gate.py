@@ -416,3 +416,44 @@ class TestSubsetCoverageEnabled:
     def test_explicit_off(self, monkeypatch, val):
         monkeypatch.setenv("JARVIS_ATTRIBUTION_SUBSET_COVERAGE_ENABLED", val)
         assert subset_coverage_enabled() is False
+
+
+# ---------------------------------------------------------------------------
+# Slice 7 — wiring pins (the T5 wired-but-inert lesson, structurally enforced)
+# ---------------------------------------------------------------------------
+
+import ast as _ast
+
+_GOV = Path(__file__).resolve().parents[2] / "backend" / "core" / "ouroboros" / "governance"
+
+
+def _mf_check_call_nodes(path: Path):
+    tree = _ast.parse(path.read_text(encoding="utf-8"))
+    out = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call):
+            fn = node.func
+            name = fn.id if isinstance(fn, _ast.Name) else getattr(fn, "attr", "")
+            if name == "_mf_check":
+                out.append(node)
+    return out
+
+
+class TestBothGatePathsForwardEvidence:
+    """Slice 6 shipped a Critical where the extracted runner (the
+    shipping default) lacked the new gate. This pin makes 'one path
+    wired, the other inert' a red test forever."""
+
+    @pytest.mark.parametrize("rel", [
+        "orchestrator.py",
+        "phase_runners/generate_runner.py",
+    ])
+    def test_call_site_passes_intake_evidence(self, rel):
+        calls = _mf_check_call_nodes(_GOV / rel)
+        assert calls, f"no _mf_check(...) call found in {rel}"
+        for call in calls:
+            kwargs = {k.arg for k in call.keywords}
+            assert "intake_evidence_json" in kwargs, (
+                f"{rel}: _mf_check call does not forward "
+                "intake_evidence_json — subset semantics inert on this path"
+            )
