@@ -455,6 +455,56 @@ _SENTINEL_GUARDIAN_CRASH = _GuardianDetection(
 )
 
 
+# Slice 6 Task 5 — attribution scope gate.
+#
+# Run #16 root cause: a TestFailure op scoped to the failing TEST file
+# blindly mutated that test file (Task 4 now stamps such
+# unresolved-attribution ops with evidence ``attribution.status=
+# "unresolved"`` in ``ctx.intake_evidence_json``). When the op's
+# attribution is unresolved AND the candidate mutates ONLY test loci,
+# auto-applying is exactly that blind class. This helper wires the pure,
+# fully-unit-tested Task 2 predicate ``unattributed_test_scope_violation``
+# into the post-VALIDATE risk decision and escalates to APPROVAL_REQUIRED
+# — a HUMAN GATE, not a reject: the test itself may be the legitimate fix
+# target, so that judgment needs eyes, not a retry loop.
+#
+# It mirrors the SemanticGuardian hard-finding escalation at the same
+# site: stricter-wins (``risk_tier.value < APPROVAL_REQUIRED.value``) so
+# it never downgrades an already-strict tier (APPROVAL_REQUIRED / BLOCKED)
+# and composes with — never bypasses — the existing risk machinery.
+# Fail-SOFT: any exception (import error, malformed evidence, predicate
+# raise) yields no escalation — the gate is protective, never fatal.
+def _attribution_scope_risk_floor(
+    ctx: Any,
+    candidate_file_paths: Sequence[str],
+    risk_tier: RiskTier,
+) -> Tuple[RiskTier, Optional[str]]:
+    """Return ``(possibly-escalated risk_tier, violation_message|None)``.
+
+    ``violation_message`` is non-None whenever the Run-16 blind class is
+    detected (unresolved attribution + test-only candidate), even if the
+    tier was already strict enough that no escalation was applied — the
+    caller logs it for operator visibility either way.
+    """
+    try:
+        from backend.core.ouroboros.governance.intent.test_source_attribution import (  # noqa: E501
+            unattributed_test_scope_violation,
+        )
+        violation = unattributed_test_scope_violation(
+            getattr(ctx, "intake_evidence_json", "") or "",
+            candidate_file_paths,
+        )
+    except Exception:  # noqa: BLE001 — gate is protective, never fatal
+        return risk_tier, None
+    if not violation:
+        return risk_tier, None
+    # Escalate exactly as a SemanticGuardian HARD finding does at this
+    # site: floor at APPROVAL_REQUIRED, stricter-wins (never a downgrade).
+    if risk_tier.value < RiskTier.APPROVAL_REQUIRED.value:
+        risk_tier = RiskTier.APPROVAL_REQUIRED
+    return risk_tier, violation
+
+
 # Contiguous, grep-discoverable terminal reason marker (single
 # source — referenced by the breaker's ctx.advance + ledger payload;
 # never split across string-concat lines so log/forensic greps and
@@ -9002,6 +9052,24 @@ class GovernedOrchestrator:
                             risk_tier = _upgrade
                         else:
                             _upgrade = None  # floor wasn't stricter; no upgrade
+
+                    # Slice 6 Task 5 — attribution scope gate. Reuses ``_iter``
+                    # (the EXACT file list the guardian just inspected) so the
+                    # gate and guardian agree on scope. An unresolved-attribution
+                    # op whose candidate mutates ONLY test loci is the Run-16
+                    # blind class — escalate to human approval (NOT reject: the
+                    # test itself may be the legitimate fix target). Mirrors the
+                    # guardian's stricter-wins hard-finding escalation above; the
+                    # resulting tier is captured in the [SemanticGuard] risk_after
+                    # telemetry below. Helper is fail-soft (never fatal).
+                    risk_tier, _attr_violation = _attribution_scope_risk_floor(
+                        ctx, [_p for (_p, _c) in _iter], risk_tier,
+                    )
+                    if _attr_violation:
+                        logger.warning(
+                            "[Attribution] gate: %s op=%s",
+                            _attr_violation, ctx.op_id,
+                        )
 
                     # Stable structured line — always emitted. Fields are
                     # intentionally key=value so a simple split("=") parser
