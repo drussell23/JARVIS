@@ -211,40 +211,87 @@ _ADAPTER_RULES: Tuple[_AdapterRule, ...] = (
 )
 
 
-def _normalize(path: Path, repo_root: Path) -> str:
-    """Resolve path to repo-relative POSIX string.
+def _normalize(
+    path: Path,
+    repo_root: Path,
+    sandbox_dir: Optional[Path] = None,
+    original_paths: Optional[Dict[Path, Path]] = None,
+) -> str:
+    """Resolve *path* to a repo-relative POSIX string for adapter routing.
 
-    Raises BlockedPathError if path resolves outside repo_root *and*
-    outside allowed sandbox prefixes.  Sandbox paths are expected —
-    the orchestrator writes candidate content into a temp directory
-    before calling LanguageRouter.  For sandbox paths, the filename
-    is returned as-is (sufficient for adapter routing).
+    Declared-roots containment contract (Slice 8): a changed file is
+    legitimate iff it lives under *repo_root*, under the caller-DECLARED
+    *sandbox_dir* (the per-op temp sandbox the orchestrator itself created
+    and passed down through ``LanguageRouter.run``), or — legacy fallback
+    for callers that declare nothing — under the env-policy prefixes from
+    :func:`_effective_sandbox_prefixes`. Anything else raises
+    :class:`BlockedPathError`. Direction unchanged, provenance STRICTER:
+    the primary allow is an explicit per-call contract, not an ambient
+    env guess. Run #18 root cause: under the node's no-/tmp policy the
+    env guess rejected the orchestrator's OWN validate sandbox.
+
+    Routing shape: prefer the ORIGINAL repo-relative shape via
+    *original_paths* (so directory-shape adapter rules match sandbox
+    copies exactly as in-repo files), then the sandbox-relative shape,
+    then (legacy prefixes) the bare filename — the pre-Slice-8 behavior.
     """
     try:
         resolved = path.resolve()
         return resolved.relative_to(repo_root.resolve()).as_posix()
     except ValueError:
-        # Allow paths under known sandbox/temp prefixes — the
-        # orchestrator writes files there for validation.
-        resolved_str = str(path.resolve())
-        if any(resolved_str.startswith(p) for p in _effective_sandbox_prefixes()):
-            return path.name
-        raise BlockedPathError(
-            f"Path {path} resolves outside repo root {repo_root}. "
-            "Pipeline CANCELLED — security gate."
+        resolved = path.resolve()
+    # Declared sandbox: map back to the original repo-relative shape when
+    # the caller provided the mapping (truthful adapter routing).
+    if original_paths:
+        orig = original_paths.get(path) or original_paths.get(resolved)
+        if orig is not None:
+            try:
+                return (
+                    Path(orig).resolve()
+                    .relative_to(repo_root.resolve())
+                    .as_posix()
+                )
+            except ValueError:
+                pass  # original itself outside repo — fall through
+    if sandbox_dir is not None:
+        try:
+            return resolved.relative_to(Path(sandbox_dir).resolve()).as_posix()
+        except ValueError:
+            pass  # not under the declared sandbox — fall through
+    # Legacy env-prefix fallback — byte-identical pre-Slice-8 behavior for
+    # callers that do not declare a sandbox.
+    resolved_str = str(resolved)
+    if any(resolved_str.startswith(p) for p in _effective_sandbox_prefixes()):
+        return path.name
+    raise BlockedPathError(
+        f"Path {path} resolves outside repo root {repo_root}"
+        + (
+            f" and declared sandbox {sandbox_dir}"
+            if sandbox_dir is not None else ""
         )
+        + ". Pipeline CANCELLED — security gate."
+    )
 
 
 # used by LanguageRouter (Task 3)
-def _route(changed_files: Tuple[Path, ...], repo_root: Path) -> FrozenSet[str]:
+def _route(
+    changed_files: Tuple[Path, ...],
+    repo_root: Path,
+    sandbox_dir: Optional[Path] = None,
+    original_paths: Optional[Dict[Path, Path]] = None,
+) -> FrozenSet[str]:
     """Return union of required adapters across all changed files.
 
     Uses first-matching rule per file (table order), union across all files.
-    Raises BlockedPathError if any file is outside repo_root.
+    Raises BlockedPathError if any file is outside the declared-roots
+    contract (repo_root ∪ declared sandbox_dir ∪ legacy env prefixes).
     """
     required: set[str] = set()
     for path in changed_files:
-        norm = _normalize(path, repo_root)
+        norm = _normalize(
+            path, repo_root,
+            sandbox_dir=sandbox_dir, original_paths=original_paths,
+        )
         for rule in _ADAPTER_RULES:
             if rule.pattern.match(norm):
                 required.update(rule.adapters)
@@ -665,7 +712,10 @@ class LanguageRouter:
         """
         t0 = time.monotonic()
         # Raises BlockedPathError if any file is outside repo_root
-        required_names = _route(changed_files, self._repo_root)
+        required_names = _route(
+            changed_files, self._repo_root,
+            sandbox_dir=sandbox_dir, original_paths=original_paths,
+        )
 
         results: List[AdapterResult] = []
         for name in sorted(required_names):  # sorted for determinism
