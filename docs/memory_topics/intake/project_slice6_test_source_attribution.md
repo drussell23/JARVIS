@@ -232,3 +232,50 @@ candidate now passes where it previously rejected at `covers 1/2`.
 
 Env: `JARVIS_ATTRIBUTION_SUBSET_COVERAGE_ENABLED` (bool, default true) —
 `backend/core/ouroboros/governance/multi_file_coverage_gate.py`.
+
+## Slice 8 — declared-roots contract + audit/gate hardening (2026-07-12)
+
+Run #18 fired the Slice-7 acceptance re-fire: SUBSET COVERAGE WORKED (attribution
+resolved `direct_import`, sig-op born `[source, test]`, zero
+`multi_file_coverage_insufficient` — the Run-17 blocker class closed) but VERDICT
+still FAILED, one layer deeper again. Repro was ~2s: VALIDATE returned
+`failure_class='security'` on the adversary's correct, byte-identical-to-original
+source-only candidate. Mechanism pinned to a single source —
+`BlockedPathError` (`test_runner.py:224-232`): the changed file's `relative_to
+(repo_root)` failed AND the path wasn't under `_effective_sandbox_prefixes()`.
+Single-file ops validated fine in the SAME session; the leaf op's only
+distinguishing feature was the Slice-6 two-locus scope routing through a
+sandbox copy.
+
+**Fix — declared-roots containment contract.** `test_runner._normalize`/`_route`
+and `LanguageRouter.run` now honor the caller-declared `sandbox_dir` +
+`original_paths`: containment is proven FIRST against `repo_root ∪ declared
+sandbox_dir ∪ legacy env prefixes`; `original_paths` affects mapping/shape
+ONLY after containment is proven. A review catch closed a structural bypass
+here — the first pass let an `original_paths` dict-key match accept a path
+BEFORE containment was checked, an independent route around
+`BlockedPathError` (fixed in `6c00305e62`).
+
+**Three more hardening items, same slice:** (1) §7 — failed VALIDATE results
+are now logged WARNING at the shared `_run_validation` seam (3 call sites incl.
+L2 re-validation), closing the observability gap that made Run #18's blocked
+path unrecoverable post-hoc. (2) `a1_graduation_auditor.py` flag-audit REJECTs
+now require same-line family corroboration (`JARVIS_A1_AUDIT_CORROBORATED_REJECTS`,
+script-level — no FlagSpec) — kills Run-18's INTENT-payload false red;
+uncorroborated hits are recorded, never silently dropped. (3) Resolved-attribution
+containment at the coverage gate (`JARVIS_ATTRIBUTION_CONTAINMENT_ENABLED`):
+attributed loci become the authoritative write-set — the `MultiFileCoverageGate`
+rejects any candidate path outside them even at full coverage, closing the
+Slice-7 review's named gap (subset coverage widened sufficiency without ever
+checking containment); a ≥1-covered guard keeps the zero-coverage case a
+coverage rejection. (4) Test-only NOTIFY_APPLY floor
+(`JARVIS_ATTRIBUTION_TEST_ONLY_NOTIFY_ENABLED`): when attribution is RESOLVED
+and the candidate mutates ONLY test loci, risk tier floors at NOTIFY_APPLY on
+BOTH GATE paths — closes the residual where an assertion-weakening test edit
+could auto-apply green (VERIFY passes by construction).
+
+Env: `JARVIS_ATTRIBUTION_CONTAINMENT_ENABLED`,
+`JARVIS_ATTRIBUTION_TEST_ONLY_NOTIFY_ENABLED` (both bool, default true,
+`multi_file_coverage_gate.py` / `test_source_attribution.py`);
+`JARVIS_A1_AUDIT_CORROBORATED_REJECTS` (bool, default true,
+`scripts/a1_graduation_auditor.py`).

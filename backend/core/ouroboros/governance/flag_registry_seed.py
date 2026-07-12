@@ -5296,7 +5296,7 @@ SEED_SPECS: list = [
         posture_relevance={},
     ),
     # ====================================================================
-    # Test->Source Attribution Bridge (Slice 6) — 5 flags (Slice 7 added subset coverage)
+    # Test->Source Attribution Bridge (Slice 6) — 7 flags (Slices 7+8)
     # ====================================================================
     FlagSpec(
         name="JARVIS_TEST_SOURCE_ATTRIBUTION_ENABLED",
@@ -5381,6 +5381,42 @@ SEED_SPECS: list = [
         source_file="backend/core/ouroboros/governance/multi_file_coverage_gate.py",
         example="true",
         since="2026-07-11",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_ATTRIBUTION_CONTAINMENT_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 8: with RESOLVED test->source attribution the "
+            "attributed loci are the authoritative write-set — the "
+            "MultiFileCoverageGate rejects any candidate path outside "
+            "them (scope_containment), even at full coverage. Runs at "
+            "the gate for EVERY provider route (the DW-only "
+            "file_scope_mismatch guard checks intersection only). OFF "
+            "restores Slice-7 semantics."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/multi_file_coverage_gate.py",
+        example="true",
+        since="2026-07-12",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_ATTRIBUTION_TEST_ONLY_NOTIFY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 8: when attribution is RESOLVED and the candidate "
+            "mutates ONLY test loci, the risk tier is floored at "
+            "NOTIFY_APPLY (operator-visible diff + delay; stricter-wins, "
+            "never a downgrade, never a block) on BOTH GATE paths. "
+            "Closes the Slice-7 review's residual: an assertion-weakening "
+            "test edit could auto-apply green and VERIFY passes by "
+            "construction."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/intent/test_source_attribution.py",
+        example="true",
+        since="2026-07-12",
         posture_relevance=_HARDEN_CRITICAL,
     ),
 ]
