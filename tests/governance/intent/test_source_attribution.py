@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import textwrap
+import time
 
 import pytest
 
@@ -517,3 +518,34 @@ class TestAttributionStatus:
 
     def test_non_dict_attribution_value(self):
         assert attribution_status(json.dumps({"attribution": "resolved"})) == ""
+
+
+class _ForbiddenLock:
+    """Trips the moment anything on the probe path touches the lock."""
+
+    def __enter__(self):
+        raise AssertionError("prewarm warm-path probe must not take _MAP_CACHE_LOCK")
+
+    def __exit__(self, *args):
+        return False
+
+    def acquire(self, *args, **kwargs):
+        raise AssertionError("prewarm warm-path probe must not take _MAP_CACHE_LOCK")
+
+    def release(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_prewarm_warm_probe_never_touches_lock(monkeypatch):
+    """Slice 7 fast-follow (Slice-6 final review): an in-flight executor
+    build holds _MAP_CACHE_LOCK for the full ~7s crawl; probing under
+    the lock would block the event loop for exactly that long."""
+    root = "/definitely/fake/slice7-root"
+    monkeypatch.setitem(
+        tsa._MAP_CACHE, root, (time.monotonic(), {"m": "m.py"}),
+    )
+    monkeypatch.setattr(tsa, "_MAP_CACHE_LOCK", _ForbiddenLock())
+    # Old code raises AssertionError from the `with _MAP_CACHE_LOCK:`
+    # probe; fixed code returns without ever touching the lock.
+    await tsa.prewarm_module_map(root)

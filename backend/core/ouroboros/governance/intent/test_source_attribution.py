@@ -152,12 +152,17 @@ async def prewarm_module_map(repo_root: str) -> None:
     Fail-soft: the substrate is imported lazily and any offload fault
     (import error, ``OffloadError``, non-dict result) leaves the cache
     untouched — the inline sync path in ``_get_module_map`` still works
-    (just on-loop, which is exactly what this pre-warm avoids)."""
+    (just on-loop, which is exactly what this pre-warm avoids). The
+    freshness probe itself is lock-free to avoid blocking the event loop."""
     now = time.monotonic()
-    with _MAP_CACHE_LOCK:
-        hit = _MAP_CACHE.get(repo_root)
-        if hit is not None and now - hit[0] < _module_map_ttl_s():
-            return  # already warm — no crawl, on- or off-loop
+    # Lock-free probe (Slice 7 fast-follow): an in-flight executor build
+    # holds _MAP_CACHE_LOCK for the full ~7s crawl, so probing under the
+    # lock would block the event loop for exactly that long. CPython
+    # dict reads are atomic; a stale read is benign — the offload lands
+    # in the single-flight builder, which dedups inside the lock.
+    hit = _MAP_CACHE.get(repo_root)
+    if hit is not None and now - hit[0] < _module_map_ttl_s():
+        return  # already warm — no crawl, on- or off-loop
     try:
         from backend.core.ouroboros.governance import cooperative_fs_io
     except Exception:  # noqa: BLE001 — substrate optional; fall back to inline
