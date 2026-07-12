@@ -345,6 +345,12 @@ async def test_extracted_path_unresolved_test_only_escalates(
 async def test_extracted_path_resolved_attribution_unchanged(
     tmp_path: Path, monkeypatch,
 ) -> None:
+    """Slice 6's APPROVAL_REQUIRED escalation (``_attribution_scope_risk_
+    floor``) stays inert for RESOLVED attribution on the extracted path —
+    that contract is unchanged. Slice 8 layers a SEPARATE, lesser floor
+    on this exact lane: RESOLVED + test-only now correctly lands at
+    NOTIFY_APPLY (never APPROVAL_REQUIRED, never a downgrade below
+    SAFE_AUTO) — see ``test_notify_floor_wired_on_both_gate_paths``."""
     monkeypatch.delenv("JARVIS_ATTRIBUTION_SCOPE_GATE_ENABLED", raising=False)
     monkeypatch.delenv("JARVIS_TEST_DIR_NAMES", raising=False)
     monkeypatch.setenv("JARVIS_NOTIFY_APPLY_DELAY_S", "0")
@@ -360,9 +366,13 @@ async def test_extracted_path_resolved_attribution_unchanged(
 
     assert result.status == "ok"
     risk_after = result.artifacts["risk_tier"]
-    assert risk_after is RiskTier.SAFE_AUTO, (
-        f"resolved attribution must not escalate on the extracted path, "
-        f"got {risk_after!r}"
+    assert risk_after is not RiskTier.APPROVAL_REQUIRED, (
+        f"resolved attribution must not escalate to APPROVAL_REQUIRED on "
+        f"the extracted path (Slice 6 gate), got {risk_after!r}"
+    )
+    assert risk_after is RiskTier.NOTIFY_APPLY, (
+        f"Slice 8: resolved-attribution test-only candidate must floor to "
+        f"NOTIFY_APPLY on the extracted path, got {risk_after!r}"
     )
 
 
@@ -389,3 +399,66 @@ async def test_extracted_path_master_switch_off_unchanged(
         f"gate must be inert on the extracted path when the master switch "
         f"is off, got {risk_after!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Slice 8 — test-only NOTIFY_APPLY floor: helper + dual-path wiring pin
+# ---------------------------------------------------------------------------
+
+import ast as _s8_ast
+import json as _s8_json
+from pathlib import Path as _S8Path
+
+_S8_GOV = _S8Path(__file__).resolve().parents[2] / "backend" / "core" / "ouroboros" / "governance"
+
+
+def test_notify_floor_raises_green_to_notify():
+    from backend.core.ouroboros.governance.orchestrator import (
+        RiskTier,
+        _attribution_test_only_notify_floor,
+    )
+
+    class _Ctx:
+        intake_evidence_json = _s8_json.dumps({"attribution": {
+            "status": "resolved", "test_locus": "tests/x/test_a.py",
+        }})
+
+    tier, advisory = _attribution_test_only_notify_floor(
+        _Ctx(), ["tests/x/test_a.py"], RiskTier.SAFE_AUTO,
+    )
+    assert tier is RiskTier.NOTIFY_APPLY
+    assert advisory is not None
+
+
+def test_notify_floor_never_downgrades():
+    from backend.core.ouroboros.governance.orchestrator import (
+        RiskTier,
+        _attribution_test_only_notify_floor,
+    )
+
+    class _Ctx:
+        intake_evidence_json = _s8_json.dumps({"attribution": {
+            "status": "resolved", "test_locus": "tests/x/test_a.py",
+        }})
+
+    tier, _ = _attribution_test_only_notify_floor(
+        _Ctx(), ["tests/x/test_a.py"], RiskTier.APPROVAL_REQUIRED,
+    )
+    assert tier is RiskTier.APPROVAL_REQUIRED
+
+
+def _s8_calls(path, name):
+    tree = _s8_ast.parse(path.read_text(encoding="utf-8"))
+    return [
+        n for n in _s8_ast.walk(tree)
+        if isinstance(n, _s8_ast.Call)
+        and (getattr(n.func, "id", "") == name or getattr(n.func, "attr", "") == name)
+    ]
+
+
+def test_notify_floor_wired_on_both_gate_paths():
+    """The Slice-6 T5 lesson, pinned: one path wired + one inert is a red
+    test forever."""
+    for rel in ("orchestrator.py", "phase_runners/gate_runner.py"):
+        calls = _s8_calls(_S8_GOV / rel, "_attribution_test_only_notify_floor")
+        assert calls, f"{rel}: _attribution_test_only_notify_floor not wired"

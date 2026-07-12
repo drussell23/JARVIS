@@ -128,6 +128,7 @@ class GATERunner(PhaseRunner):
         from backend.core.ouroboros.governance.orchestrator import (
             _SENTINEL_GUARDIAN_CRASH,
             _attribution_scope_risk_floor,
+            _attribution_test_only_notify_floor,
             _human_is_watching,
         )
 
@@ -413,6 +414,25 @@ class GATERunner(PhaseRunner):
                     logger.warning(
                         "[Attribution] gate: %s op=%s",
                         _attr_violation, ctx.op_id,
+                    )
+
+                # Slice 8 — test-only NOTIFY_APPLY floor (extracted path;
+                # mirrors orchestrator.py inline site). Companion to the
+                # Slice 6 Task 5 escalation above: a RESOLVED-attribution
+                # op whose candidate mutates ONLY test loci is a
+                # legitimate lane (Slice 7's subset waiver) but a
+                # sensitive one (assertion-weakening test edits auto-apply
+                # green) — floor at NOTIFY_APPLY, never blocking, never
+                # downgrading. Same ``_pairs``-derived scope + repo_root
+                # as the escalation above. Fail-soft.
+                risk_tier, _attr_test_only = _attribution_test_only_notify_floor(
+                    ctx, [_p for (_p, _o, _n) in _pairs], risk_tier,
+                    repo_root=str(orch._config.project_root),
+                )
+                if _attr_test_only:
+                    logger.info(
+                        "[Attribution] notify: %s op=%s",
+                        _attr_test_only, ctx.op_id,
                     )
 
                 _pattern_names = (

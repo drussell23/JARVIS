@@ -513,6 +513,44 @@ def _attribution_scope_risk_floor(
     return risk_tier, violation
 
 
+# Slice 8 companion to _attribution_scope_risk_floor above: Slice 7's
+# subset waiver correctly lets a test-only candidate pass the coverage
+# gate when attribution is RESOLVED (the test may genuinely BE the fix
+# target), but that opened a residual lane the Slice-7 final review
+# flagged — a green-tier assertion-weakening test edit now auto-applies
+# and VERIFY passes by construction (the test agrees with the broken
+# code it was meant to catch). This floors that lane at NOTIFY_APPLY
+# (operator-visible diff + delay), never blocking (the lane is
+# legitimate) and never downgrading an already-stricter tier.
+def _attribution_test_only_notify_floor(
+    ctx: Any,
+    candidate_file_paths: Sequence[str],
+    risk_tier: RiskTier,
+    *,
+    repo_root: str = "",
+) -> Tuple[RiskTier, Optional[str]]:
+    """Slice 8 companion to :func:`_attribution_scope_risk_floor`:
+    RESOLVED attribution + test-only candidate → floor at NOTIFY_APPLY
+    (operator-visible diff+delay; legitimate lane, so a notify, not an
+    approval). Stricter-wins; fail-SOFT (any fault → no escalation)."""
+    try:
+        from backend.core.ouroboros.governance.intent.test_source_attribution import (  # noqa: E501
+            resolved_test_only_scope,
+        )
+        advisory = resolved_test_only_scope(
+            getattr(ctx, "intake_evidence_json", "") or "",
+            candidate_file_paths,
+            repo_root=repo_root,
+        )
+    except Exception:  # noqa: BLE001 — floor is protective, never fatal
+        return risk_tier, None
+    if not advisory:
+        return risk_tier, None
+    if risk_tier.value < RiskTier.NOTIFY_APPLY.value:
+        risk_tier = RiskTier.NOTIFY_APPLY
+    return risk_tier, advisory
+
+
 # Contiguous, grep-discoverable terminal reason marker (single
 # source — referenced by the breaker's ctx.advance + ledger payload;
 # never split across string-concat lines so log/forensic greps and
@@ -9085,6 +9123,25 @@ class GovernedOrchestrator:
                         logger.warning(
                             "[Attribution] gate: %s op=%s",
                             _attr_violation, ctx.op_id,
+                        )
+
+                    # Slice 8 — test-only NOTIFY_APPLY floor. Companion to
+                    # the Slice 6 Task 5 escalation above: a RESOLVED-
+                    # attribution op whose candidate mutates ONLY test loci
+                    # is a legitimate lane (Slice 7's subset waiver) but a
+                    # sensitive one (assertion-weakening test edits
+                    # auto-apply green) — floor at NOTIFY_APPLY, never
+                    # blocking, never downgrading. Same ``_pairs``-derived
+                    # scope + repo_root as the escalation above so both
+                    # gates provably agree on scope. Fail-soft.
+                    risk_tier, _attr_test_only = _attribution_test_only_notify_floor(
+                        ctx, [_p for (_p, _o, _n) in _pairs], risk_tier,
+                        repo_root=str(self._config.project_root),
+                    )
+                    if _attr_test_only:
+                        logger.info(
+                            "[Attribution] notify: %s op=%s",
+                            _attr_test_only, ctx.op_id,
                         )
 
                     # Stable structured line — always emitted. Fields are

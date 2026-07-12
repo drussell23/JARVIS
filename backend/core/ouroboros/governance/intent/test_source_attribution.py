@@ -402,6 +402,41 @@ def unattributed_test_scope_violation(
         return None
     dir_names = _test_dir_names()
     test_locus = str(attribution.get("test_locus", ""))
+    normalized = _normalize_candidate_paths(candidate_files, repo_root)
+    if all(
+        f == test_locus or _is_test_infra(f, dir_names) for f in normalized
+    ):
+        return (
+            "attribution_unresolved_test_scope: op attribution is "
+            f"unresolved ({attribution.get('reason', 'unknown')}) and the "
+            f"candidate mutates only test loci {normalized} — blind "
+            "test-file mutation is forbidden; requires human approval "
+            "or source-locus exploration"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Slice 8 — NOTIFY_APPLY floor for RESOLVED-attribution test-only candidates
+# ---------------------------------------------------------------------------
+#
+# Slice 7's subset waiver correctly lets a test-only candidate pass the
+# coverage gate when attribution is RESOLVED (the test may genuinely BE
+# the fix target). But that lane is sensitive: an assertion-weakening
+# test edit auto-applies at SAFE_AUTO and VERIFY passes by construction
+# (the test now agrees with the broken code it was supposed to catch).
+# This predicate floors that lane at NOTIFY_APPLY — operator-visible
+# diff + delay, never blocking (the lane is legitimate) and never
+# downgrading a stricter tier.
+
+
+def _normalize_candidate_paths(
+    candidate_files: Sequence[str], repo_root: str,
+) -> list:
+    """Repo-relative POSIX normalization for candidate paths — shared by
+    the unresolved scope gate (Slice 6) and the test-only NOTIFY floor
+    (Slice 8). Absolute paths under *repo_root* relativize via
+    ``_relpath_under_root``; everything else gets slash/``./`` cleanup."""
     normalized = []
     for f in candidate_files:
         _norm = str(f).replace("\\", "/")
@@ -413,14 +448,43 @@ def unattributed_test_scope_violation(
         if _norm.startswith("./"):
             _norm = _norm[2:]
         normalized.append(_norm)
+    return normalized
+
+
+def test_only_notify_floor_enabled() -> bool:
+    return os.environ.get(
+        "JARVIS_ATTRIBUTION_TEST_ONLY_NOTIFY_ENABLED", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def resolved_test_only_scope(
+    intake_evidence_json: str,
+    candidate_files: Sequence[str],
+    *,
+    repo_root: str = "",
+) -> Optional[str]:
+    """Slice 8: attribution RESOLVED + candidate mutates ONLY test loci.
+
+    That lane is legitimate (the test may genuinely be the fix target —
+    the whole point of the Slice-7 subset waiver) but sensitive: an
+    assertion-weakening test edit auto-applies green and VERIFY passes by
+    construction. Returns an advisory message — the caller floors risk at
+    NOTIFY_APPLY (operator-visible diff, stricter-wins, never blocks,
+    never downgrades) — or ``None``. Fail-soft on malformed evidence."""
+    if not test_only_notify_floor_enabled() or not candidate_files:
+        return None
+    attribution = _attribution_dict(intake_evidence_json)
+    if str(attribution.get("status", "")) != "resolved":
+        return None
+    dir_names = _test_dir_names()
+    test_locus = str(attribution.get("test_locus", ""))
+    normalized = _normalize_candidate_paths(candidate_files, repo_root)
     if all(
         f == test_locus or _is_test_infra(f, dir_names) for f in normalized
     ):
         return (
-            "attribution_unresolved_test_scope: op attribution is "
-            f"unresolved ({attribution.get('reason', 'unknown')}) and the "
-            f"candidate mutates only test loci {normalized} — blind "
-            "test-file mutation is forbidden; requires human approval "
-            "or source-locus exploration"
+            "attribution_resolved_test_only_scope: attribution resolved "
+            f"but the candidate mutates only test loci {normalized} — "
+            "floored to NOTIFY_APPLY for operator visibility"
         )
     return None

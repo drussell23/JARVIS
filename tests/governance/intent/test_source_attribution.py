@@ -19,6 +19,7 @@ from backend.core.ouroboros.governance.intent.test_source_attribution import (
     attribution_enabled,
     attribution_status,
     prewarm_module_map,
+    resolved_test_only_scope,
     unattributed_test_scope_violation,
 )
 
@@ -549,3 +550,56 @@ async def test_prewarm_warm_probe_never_touches_lock(monkeypatch):
     # Old code raises AssertionError from the `with _MAP_CACHE_LOCK:`
     # probe; fixed code returns without ever touching the lock.
     await tsa.prewarm_module_map(root)
+
+
+class TestResolvedTestOnlyScope:
+    _RESOLVED = json.dumps({"attribution": {
+        "status": "resolved",
+        "test_locus": "tests/governance/x/test_a.py",
+        "source_loci": ["backend/x/a.py"],
+    }})
+
+    def test_test_only_candidate_flags(self):
+        msg = resolved_test_only_scope(
+            self._RESOLVED, ["tests/governance/x/test_a.py"],
+        )
+        assert msg is not None
+        assert "test_only" in msg or "test loci" in msg
+
+    def test_source_candidate_none(self):
+        assert resolved_test_only_scope(
+            self._RESOLVED, ["backend/x/a.py"],
+        ) is None
+
+    def test_mixed_candidate_none(self):
+        assert resolved_test_only_scope(
+            self._RESOLVED,
+            ["backend/x/a.py", "tests/governance/x/test_a.py"],
+        ) is None
+
+    def test_unresolved_none(self):
+        j = json.dumps({"attribution": {"status": "unresolved"}})
+        assert resolved_test_only_scope(
+            j, ["tests/governance/x/test_a.py"],
+        ) is None
+
+    def test_absolute_paths_normalized(self, tmp_path):
+        root = str(tmp_path)
+        j = self._RESOLVED
+        assert resolved_test_only_scope(
+            j, [str(tmp_path / "tests/governance/x/test_a.py")],
+            repo_root=root,
+        ) is not None
+
+    def test_master_off_none(self, monkeypatch):
+        monkeypatch.setenv(
+            "JARVIS_ATTRIBUTION_TEST_ONLY_NOTIFY_ENABLED", "false",
+        )
+        assert resolved_test_only_scope(
+            self._RESOLVED, ["tests/governance/x/test_a.py"],
+        ) is None
+
+    def test_malformed_evidence_none(self):
+        assert resolved_test_only_scope(
+            "{not json", ["tests/governance/x/test_a.py"],
+        ) is None
