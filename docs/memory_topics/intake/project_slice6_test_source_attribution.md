@@ -197,10 +197,19 @@ rejected; zero-coverage candidates are still rejected outright; ops without
 resolved attribution (or with the flag off) keep the pre-Slice-7 strict
 full-coverage demand. Any fault parsing evidence (malformed JSON, missing
 keys, unexpected exception) falls CLOSED to strict superset — the subset
-relaxation never fires on ambiguous input. True multi-file refactors are
-unaffected: the pre-existing `file_scope_mismatch` guard (`doubleword_provider.py`)
-still enforces ⊆ containment against `ctx.target_files`, so subset semantics
-only widens what counts as SUFFICIENT coverage, never what's IN scope.
+relaxation never fires on ambiguous input. **Correction (final review,
+2026-07-12):** the pre-existing `file_scope_mismatch` guard
+(`doubleword_provider.py:2496-2515`) does NOT enforce ⊆ containment — it
+only rejects a candidate whose paths have EMPTY INTERSECTION with
+`ctx.target_files` (a candidate touching `[target, /anywhere/else.py]`
+passes), reads only the top-level `file_path` (not `files: [...]`
+entries), and runs on the DoubleWord provider path only — TestFailure ops
+route IMMEDIATE straight to Claude, where it never runs at all. So
+subset-coverage semantics widens what counts as SUFFICIENT coverage while
+real containment of candidate paths against the attributed scope is not
+enforced anywhere today; a genuine containment check at the waiver site
+for resolved-attribution candidates is a named, ledgered follow-up, not
+yet built.
 
 **Wiring — the Slice-6 T5 lesson, applied structurally.** Intake evidence is
 forwarded at BOTH GENERATE call sites — inline `orchestrator.py` and the

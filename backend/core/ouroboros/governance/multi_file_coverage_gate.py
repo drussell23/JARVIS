@@ -211,9 +211,13 @@ def check_candidate(
         # AND test), not an exhaustive change-set. Demanding full
         # coverage here rejected the correct source-only repair
         # ("covers 1/2") and killed the op. Covering >=1 target
-        # suffices; ⊆ containment is file_scope_mismatch's job, and
-        # true multi-file change-set goals (no resolved attribution)
-        # keep the strict superset demand above.
+        # suffices; candidate-path containment (⊆) is NOT enforced here
+        # or elsewhere — the DW-only file_scope_mismatch guard checks
+        # non-empty intersection with target_files, not subset
+        # containment, and a real containment check for resolved-
+        # attribution candidates is a ledgered follow-up. True
+        # multi-file change-set goals (no resolved attribution) keep
+        # the strict superset demand above.
         logger.info(
             "[MultiFileCoverageGate] subset-coverage waiver: resolved "
             "attribution — candidate covers %d/%d target file(s)",
