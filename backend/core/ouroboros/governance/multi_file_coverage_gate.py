@@ -36,6 +36,11 @@ Contract
   at least ONE target file passes — attributed scope is permissive
   (either locus may be the fix target), not an exhaustive change-set.
   Zero-coverage candidates are still rejected.
+- Slice 8 containment: with ``attribution.status == "resolved"`` and
+  ``JARVIS_ATTRIBUTION_CONTAINMENT_ENABLED`` truthy, ANY candidate path
+  outside the attributed ``target_files`` rejects
+  (``scope_containment``) — even at full coverage. The attributed loci
+  are the authoritative write-set for the op.
 
 Return shape from :func:`check_candidate`:
     ``None`` — gate passes, candidate is fine
@@ -56,6 +61,7 @@ logger = logging.getLogger("Ouroboros.MultiFileCoverageGate")
 _ENV_ENABLED = "JARVIS_MULTI_FILE_ENFORCEMENT"
 _ENV_MULTI_GEN = "JARVIS_MULTI_FILE_GEN_ENABLED"
 _ENV_SUBSET = "JARVIS_ATTRIBUTION_SUBSET_COVERAGE_ENABLED"
+_ENV_CONTAINMENT = "JARVIS_ATTRIBUTION_CONTAINMENT_ENABLED"
 
 # Public reason prefix used in retry-feedback classification.
 REASON_PREFIX = "multi_file_coverage_insufficient"
@@ -84,6 +90,15 @@ def subset_coverage_enabled() -> bool:
     target file suffices. OFF restores the pre-Slice-7 strict superset
     demand for every op."""
     raw = os.environ.get(_ENV_SUBSET, "true").strip().lower()
+    return raw not in ("false", "0", "no", "off")
+
+
+def containment_enabled() -> bool:
+    """Slice 8 (default ON): with RESOLVED attribution the attributed
+    loci are authoritative — a candidate touching any path outside them
+    is rejected. Provider-agnostic: unlike the DW-only intersection
+    guard, this runs at the gate for every route (final-review I1)."""
+    raw = os.environ.get(_ENV_CONTAINMENT, "true").strip().lower()
     return raw not in ("false", "0", "no", "off")
 
 
@@ -197,27 +212,40 @@ def check_candidate(
     covered = _candidate_paths(candidate, project_root)
     missing = [t for t in normalized_targets if t and t not in covered]
 
+    attr_resolved = _attribution_resolved(intake_evidence_json)
+
+    covered_targets = len(normalized_targets) - len(missing)
+
+    # Slice 8 — containment: with RESOLVED attribution the attributed
+    # loci are the authoritative write-set; any candidate path outside
+    # them is rejected regardless of coverage. Fires ONLY when we cover
+    # at least one target (otherwise it's a coverage failure, not a
+    # containment issue). Fires before the full-coverage early return
+    # (extras at full coverage are equally out-of-scope).
+    # Non-attributed ops keep legacy semantics.
+    if attr_resolved and containment_enabled() and covered_targets >= 1:
+        _target_set = {t for t in normalized_targets if t}
+        _outside = sorted(p for p in covered if p and p not in _target_set)
+        if _outside:
+            reason = (
+                f"{REASON_PREFIX}: scope_containment: resolved-attribution "
+                f"candidate touches {len(_outside)} file(s) outside the "
+                f"attributed loci: {', '.join(_outside[:5])}"
+            )
+            logger.warning("[MultiFileCoverageGate] %s", reason)
+            return (reason, _outside)
+
     if not missing:
         return None
 
-    covered_targets = len(normalized_targets) - len(missing)
     if (
         covered_targets >= 1
         and subset_coverage_enabled()
-        and _attribution_resolved(intake_evidence_json)
+        and attr_resolved
     ):
-        # Slice 7 (Run #17): a resolved-attribution TestFailure scope is
-        # PERMISSIVE — target_files names the candidate fix loci (source
-        # AND test), not an exhaustive change-set. Demanding full
-        # coverage here rejected the correct source-only repair
-        # ("covers 1/2") and killed the op. Covering >=1 target
-        # suffices; candidate-path containment (⊆) is NOT enforced here
-        # or elsewhere — the DW-only file_scope_mismatch guard checks
-        # non-empty intersection with target_files, not subset
-        # containment, and a real containment check for resolved-
-        # attribution candidates is a ledgered follow-up. True
-        # multi-file change-set goals (no resolved attribution) keep
-        # the strict superset demand above.
+        # Slice 7 (Run #17): resolved-attribution scope is PERMISSIVE —
+        # covering >=1 target suffices. (Containment above has already
+        # bounded the candidate to the attributed loci when enabled.)
         logger.info(
             "[MultiFileCoverageGate] subset-coverage waiver: resolved "
             "attribution — candidate covers %d/%d target file(s)",

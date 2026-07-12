@@ -457,3 +457,67 @@ class TestBothGatePathsForwardEvidence:
                 f"{rel}: _mf_check call does not forward "
                 "intake_evidence_json — subset semantics inert on this path"
             )
+
+
+# ---------------------------------------------------------------------------
+# Slice 8 — resolved-attribution containment (candidate ⊆ attributed loci)
+# ---------------------------------------------------------------------------
+
+
+class TestAttributionContainment:
+    """With RESOLVED attribution the scope is authoritative: any write
+    outside the attributed loci is suspect (final-review I1: no ⊆ guard
+    exists anywhere else, and none at all on the Claude route)."""
+
+    def test_resolved_candidate_outside_loci_rejected(self):
+        cand = {"files": [
+            {"file_path": _SOURCE, "full_content": "a = 1\n"},
+            {"file_path": "backend/somewhere/else.py", "full_content": "b = 2\n"},
+        ]}
+        result = check_candidate(
+            cand, [_SOURCE, _TEST], intake_evidence_json=_RESOLVED,
+        )
+        assert result is not None
+        reason, offending = result
+        assert reason.startswith(REASON_PREFIX + ": scope_containment")
+        assert offending == ["backend/somewhere/else.py"]
+
+    def test_resolved_full_coverage_plus_extra_rejected(self):
+        """Containment fires even at full coverage — stricter than
+        pre-Slice-7 for resolved-attribution ops ONLY (deliberate)."""
+        cand = {"files": [
+            {"file_path": _SOURCE, "full_content": "a = 1\n"},
+            {"file_path": _TEST, "full_content": "b = 2\n"},
+            {"file_path": "backend/extra.py", "full_content": "c = 3\n"},
+        ]}
+        result = check_candidate(
+            cand, [_SOURCE, _TEST], intake_evidence_json=_RESOLVED,
+        )
+        assert result is not None and "scope_containment" in result[0]
+
+    def test_resolved_subset_within_loci_still_passes(self):
+        cand = {"file_path": _SOURCE, "full_content": "a = 1\n"}
+        assert check_candidate(
+            cand, [_SOURCE, _TEST], intake_evidence_json=_RESOLVED,
+        ) is None
+
+    def test_unresolved_extra_paths_keep_legacy_pass(self):
+        """No resolved attribution → legacy semantics (extras allowed at
+        full coverage) — byte-identical for plain multi-file ops."""
+        cand = {"files": [
+            {"file_path": _SOURCE, "full_content": "a = 1\n"},
+            {"file_path": _TEST, "full_content": "b = 2\n"},
+            {"file_path": "backend/extra.py", "full_content": "c = 3\n"},
+        ]}
+        assert check_candidate(cand, [_SOURCE, _TEST]) is None
+
+    def test_containment_master_off_restores_slice7(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_ATTRIBUTION_CONTAINMENT_ENABLED", "false")
+        cand = {"files": [
+            {"file_path": _SOURCE, "full_content": "a = 1\n"},
+            {"file_path": _TEST, "full_content": "b = 2\n"},
+            {"file_path": "backend/extra.py", "full_content": "c = 3\n"},
+        ]}
+        assert check_candidate(
+            cand, [_SOURCE, _TEST], intake_evidence_json=_RESOLVED,
+        ) is None
