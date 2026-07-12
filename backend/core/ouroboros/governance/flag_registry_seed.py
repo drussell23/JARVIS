@@ -5295,6 +5295,75 @@ SEED_SPECS: list = [
         since="2026-06-29",
         posture_relevance={},
     ),
+    # ====================================================================
+    # Test->Source Attribution Bridge (Slice 6) — 4 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_TEST_SOURCE_ATTRIBUTION_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for the test->source attribution bridge. "
+            "When true, TestFailure signals resolve the source module(s) "
+            "a failing test imports (deterministic AST tracing) and scope "
+            "target_files to (*source_loci, test_locus) instead of the "
+            "test file alone. When false, evidence carries "
+            "attribution.status=disabled and scope reverts to the legacy "
+            "test-locus-only behavior."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/intent/test_source_attribution.py",
+        example="true",
+        since="2026-07-11",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_ATTRIBUTION_SCOPE_GATE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate applied post-VALIDATE on both GATE paths (inline "
+            "orchestrator + extracted GATERunner, via "
+            "_attribution_scope_risk_floor): when a TestFailure op's "
+            "attribution is unresolved AND the candidate mutates ONLY "
+            "test loci, escalates risk tier to APPROVAL_REQUIRED "
+            "(stricter-wins, never a downgrade) instead of silently "
+            "auto-applying a blind test-only mutation."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/intent/test_source_attribution.py",
+        example="true",
+        since="2026-07-11",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_ATTRIBUTION_MAX_SOURCE_FILES",
+        type=FlagType.INT, default=8,
+        description=(
+            "Maximum number of resolved source files carried in one "
+            "Attribution's source_loci (and thus target_files). Ranked "
+            "candidates beyond this cap (traceback-implicated first, "
+            "direct imports before patch targets, then lexical) are "
+            "dropped."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/intent/test_source_attribution.py",
+        example="8",
+        since="2026-07-11",
+        posture_relevance={},
+    ),
+    FlagSpec(
+        name="JARVIS_ATTRIBUTION_MODULE_MAP_TTL_S",
+        type=FlagType.FLOAT, default=300,
+        description=(
+            "TTL in seconds for the cached repo-wide module->path map "
+            "(build_module_to_path). Bounds attribution to one rglob per "
+            "repo per TTL window rather than one per failing test."
+        ),
+        category=Category.TIMING,
+        source_file="backend/core/ouroboros/governance/intent/test_source_attribution.py",
+        example="300",
+        since="2026-07-11",
+        posture_relevance={},
+    ),
 ]
 
 
