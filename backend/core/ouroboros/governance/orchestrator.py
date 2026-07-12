@@ -8664,7 +8664,8 @@ class GovernedOrchestrator:
                 pass
 
         # Wave 2 (5) Slice 4a.2 - GATERunner delegation gate.
-        # Flag JARVIS_PHASE_RUNNER_GATE_EXTRACTED (default false) routes
+        # Flag JARVIS_PHASE_RUNNER_GATE_EXTRACTED (default true — graduated;
+        # the extracted runner is the shipping GATE path) routes
         # the 600-line GATE block (can_write + SecurityReviewer +
         # SimilarityGate + frozen_tier + risk ceiling + SemanticGuardian
         # + REVIEW shadow + MutationGate + MIN_RISK_TIER floor + 5a green
@@ -9053,17 +9054,20 @@ class GovernedOrchestrator:
                         else:
                             _upgrade = None  # floor wasn't stricter; no upgrade
 
-                    # Slice 6 Task 5 — attribution scope gate. Reuses ``_iter``
-                    # (the EXACT file list the guardian just inspected) so the
-                    # gate and guardian agree on scope. An unresolved-attribution
-                    # op whose candidate mutates ONLY test loci is the Run-16
-                    # blind class — escalate to human approval (NOT reject: the
-                    # test itself may be the legitimate fix target). Mirrors the
-                    # guardian's stricter-wins hard-finding escalation above; the
-                    # resulting tier is captured in the [SemanticGuard] risk_after
-                    # telemetry below. Helper is fail-soft (never fatal).
+                    # Slice 6 Task 5 — attribution scope gate. Reuses ``_pairs``
+                    # (the EXACT filtered file list the guardian just batch-
+                    # inspected) so gate and guardian provably agree on scope.
+                    # An unresolved-attribution op whose candidate mutates ONLY
+                    # test loci is the Run-16 blind class — escalate to human
+                    # approval (NOT reject: the test itself may be the legitimate
+                    # fix target). Mirrors the guardian's stricter-wins hard-
+                    # finding escalation above; the resulting tier is captured in
+                    # the [SemanticGuard] risk_after telemetry below. Helper is
+                    # fail-soft (never fatal). NOTE: the SHIPPING path is the
+                    # extracted GATERunner (gate_runner.py) — this inline twin
+                    # covers JARVIS_PHASE_RUNNER_GATE_EXTRACTED=false.
                     risk_tier, _attr_violation = _attribution_scope_risk_floor(
-                        ctx, [_p for (_p, _c) in _iter], risk_tier,
+                        ctx, [_p for (_p, _o, _n) in _pairs], risk_tier,
                     )
                     if _attr_violation:
                         logger.warning(

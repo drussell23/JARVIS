@@ -2,7 +2,8 @@
 
 Extracts orchestrator.py GATE body (~600 lines, post-Slice-4a.1 lines
 ~5496-6098) into a :class:`PhaseRunner` behind
-``JARVIS_PHASE_RUNNER_GATE_EXTRACTED`` (default ``false``).
+``JARVIS_PHASE_RUNNER_GATE_EXTRACTED`` (default ``true`` — graduated;
+this runner IS the shipping GATE path).
 
 **Zero behavior change per slice.** Verbatim transcription with
 ``self.`` → ``orch.`` substitutions.
@@ -126,6 +127,7 @@ class GATERunner(PhaseRunner):
         # namespace so env overrides remain test-patchable.
         from backend.core.ouroboros.governance.orchestrator import (
             _SENTINEL_GUARDIAN_CRASH,
+            _attribution_scope_risk_floor,
             _human_is_watching,
         )
 
@@ -392,6 +394,25 @@ class GATERunner(PhaseRunner):
                         risk_tier = _upgrade
                     else:
                         _upgrade = None
+
+                # Slice 6 Task 5 — attribution scope gate (extracted path;
+                # mirrors orchestrator.py inline site). Reuses ``_pairs``
+                # (the EXACT filtered file list the guardian just batch-
+                # inspected) so gate and guardian provably agree on scope.
+                # An unresolved-attribution op whose candidate mutates ONLY
+                # test loci is the Run-16 blind class — escalate to human
+                # approval (NOT reject: the test itself may be the legitimate
+                # fix target). Stricter-wins; helper is fail-soft (never
+                # fatal). Resulting tier lands in the [SemanticGuard]
+                # risk_after telemetry below.
+                risk_tier, _attr_violation = _attribution_scope_risk_floor(
+                    ctx, [_p for (_p, _o, _n) in _pairs], risk_tier,
+                )
+                if _attr_violation:
+                    logger.warning(
+                        "[Attribution] gate: %s op=%s",
+                        _attr_violation, ctx.op_id,
+                    )
 
                 _pattern_names = (
                     ",".join(sorted({f.pattern for f in _guardian_findings}))

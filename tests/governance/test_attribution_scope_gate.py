@@ -17,10 +17,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from backend.core.ouroboros.governance.orchestrator import (
     _attribution_scope_risk_floor,
 )
+from backend.core.ouroboros.governance.phase_runners.gate_runner import GATERunner
 from backend.core.ouroboros.governance.risk_engine import RiskTier
+
+# Established parity-test fakes for driving the REAL GATERunner.run()
+# (the same harness test_gate_noncandidate_regate.py uses).
+from tests.governance.phase_runner import test_gate_runner_parity as _gp
 
 
 UNRESOLVED_EVIDENCE = json.dumps({
@@ -234,3 +241,112 @@ def test_gate_is_wired_at_guardian_site() -> None:
 
     # The mandated operator-visible log line is present.
     assert "[Attribution] gate: %s op=%s" in src
+
+
+def test_gate_is_wired_in_extracted_gate_runner() -> None:
+    """JARVIS_PHASE_RUNNER_GATE_EXTRACTED is graduated default-TRUE, so
+    gate_runner.py is the SHIPPING GATE path — the gate must be wired
+    there too (a gate only on the flag-off inline path is theater)."""
+    src = Path(
+        "backend/core/ouroboros/governance/phase_runners/gate_runner.py"
+    ).read_text(encoding="utf-8")
+
+    guard_idx = src.index("_guardian_findings = _guardian.inspect_batch(_pairs)")
+    call_idx = src.index(
+        "risk_tier, _attr_violation = _attribution_scope_risk_floor",
+    )
+    log_idx = src.index('"[SemanticGuard] op=%s findings=%d')
+    assert guard_idx < call_idx < log_idx, (
+        "extracted-path attribution gate must run after guardian findings "
+        "are collected and be captured in [SemanticGuard] risk_after"
+    )
+    assert "[Attribution] gate: %s op=%s" in src
+
+
+# ---------------------------------------------------------------------------
+# Behavioral — the DEFAULT (extracted GATERunner) path. Drives the real
+# GATERunner.run() end-to-end via the established parity fakes and proves
+# unresolved + test-only escalates to APPROVAL_REQUIRED on the shipping path.
+# ---------------------------------------------------------------------------
+
+
+_TEST_ONLY_CANDIDATE = {
+    "candidate_id": "c0",
+    "file_path": "tests/test_engine.py",
+    "full_content": "def test_x():\n    assert True\n",
+}
+
+
+@pytest.mark.asyncio
+async def test_extracted_path_unresolved_test_only_escalates(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.delenv("JARVIS_ATTRIBUTION_SCOPE_GATE_ENABLED", raising=False)
+    monkeypatch.delenv("JARVIS_TEST_DIR_NAMES", raising=False)
+    monkeypatch.setenv("JARVIS_NOTIFY_APPLY_DELAY_S", "0")
+    monkeypatch.setenv("JARVIS_SAFE_AUTO_PREVIEW_DELAY_S", "0")
+
+    ctx = _gp._gate_ctx(tmp_path)
+    object.__setattr__(ctx, "intake_evidence_json", UNRESOLVED_EVIDENCE)
+    orch = _gp._orch(tmp_path)
+
+    result = await GATERunner(
+        orch, None, dict(_TEST_ONLY_CANDIDATE), RiskTier.SAFE_AUTO,
+    ).run(ctx)
+
+    assert result.status == "ok", f"Expected ok from GATE, got: {result!r}"
+    risk_after = result.artifacts["risk_tier"]
+    assert risk_after is RiskTier.APPROVAL_REQUIRED, (
+        "the DEFAULT (extracted GATERunner) path must escalate an "
+        f"unresolved+test-only op to APPROVAL_REQUIRED, got {risk_after!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_extracted_path_resolved_attribution_unchanged(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.delenv("JARVIS_ATTRIBUTION_SCOPE_GATE_ENABLED", raising=False)
+    monkeypatch.delenv("JARVIS_TEST_DIR_NAMES", raising=False)
+    monkeypatch.setenv("JARVIS_NOTIFY_APPLY_DELAY_S", "0")
+    monkeypatch.setenv("JARVIS_SAFE_AUTO_PREVIEW_DELAY_S", "0")
+
+    ctx = _gp._gate_ctx(tmp_path)
+    object.__setattr__(ctx, "intake_evidence_json", RESOLVED_EVIDENCE)
+    orch = _gp._orch(tmp_path)
+
+    result = await GATERunner(
+        orch, None, dict(_TEST_ONLY_CANDIDATE), RiskTier.SAFE_AUTO,
+    ).run(ctx)
+
+    assert result.status == "ok"
+    risk_after = result.artifacts["risk_tier"]
+    assert risk_after is RiskTier.SAFE_AUTO, (
+        f"resolved attribution must not escalate on the extracted path, "
+        f"got {risk_after!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_extracted_path_master_switch_off_unchanged(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ATTRIBUTION_SCOPE_GATE_ENABLED", "false")
+    monkeypatch.delenv("JARVIS_TEST_DIR_NAMES", raising=False)
+    monkeypatch.setenv("JARVIS_NOTIFY_APPLY_DELAY_S", "0")
+    monkeypatch.setenv("JARVIS_SAFE_AUTO_PREVIEW_DELAY_S", "0")
+
+    ctx = _gp._gate_ctx(tmp_path)
+    object.__setattr__(ctx, "intake_evidence_json", UNRESOLVED_EVIDENCE)
+    orch = _gp._orch(tmp_path)
+
+    result = await GATERunner(
+        orch, None, dict(_TEST_ONLY_CANDIDATE), RiskTier.SAFE_AUTO,
+    ).run(ctx)
+
+    assert result.status == "ok"
+    risk_after = result.artifacts["risk_tier"]
+    assert risk_after is RiskTier.SAFE_AUTO, (
+        f"gate must be inert on the extracted path when the master switch "
+        f"is off, got {risk_after!r}"
+    )
