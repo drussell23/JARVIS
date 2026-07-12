@@ -12495,6 +12495,24 @@ class GovernedOrchestrator:
         callers — the inline VALIDATE block, the extracted VALIDATERunner, and
         L2 re-validation — so the advisory holds on every validation path."""
         result = await self._run_validation_core(ctx, candidate, remaining_s)
+        # Slice 8 §7 — a failed validation MUST be operator-visible.
+        # Run #18: a BlockedPathError → fc='security' rejection carried
+        # its reason ONLY inside the ValidationResult; nothing logged it,
+        # so the blocked path was unrecoverable post-hoc. Single seam:
+        # both the inline FSM and the extracted validate_runner call
+        # this wrapper.
+        try:
+            if result is not None and not result.passed:
+                logger.warning(
+                    "[Validation] FAILED op=%s fc=%s summary=%s error=%s adapters=%s",
+                    str(getattr(ctx, "op_id", ""))[:16],
+                    result.failure_class or "",
+                    (result.short_summary or "")[:200],
+                    (result.error or "")[:280],
+                    ",".join(result.adapter_names_run or ()),
+                )
+        except Exception:  # noqa: BLE001 — logging must never perturb VALIDATE
+            pass
         return _swe_bench_test_advisory(
             getattr(ctx, "signal_source", "") or "",
             getattr(ctx, "op_id", "") or "",
