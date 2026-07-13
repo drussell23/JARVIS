@@ -50,6 +50,22 @@ def _working_tree_mirror_enabled() -> bool:
     ).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _overlay_max_files() -> int:
+    """Slice 9 final review (Important): cap the working-tree overlay's
+    O(dirty-delta) materialization cost — on a repo with thousands of
+    untracked/modified files (e.g. no ``.gitignore``), copying every one
+    of them into the sandbox dominates VALIDATE setup time. Env:
+    ``JARVIS_SANDBOX_OVERLAY_MAX_FILES``, default ``2000``. Read at call
+    time; never raises."""
+    try:
+        v = int(os.environ.get(
+            "JARVIS_SANDBOX_OVERLAY_MAX_FILES", "2000",
+        ).strip())
+        return v if v > 0 else 2000
+    except (ValueError, TypeError):
+        return 2000
+
+
 # ---------------------------------------------------------------------------
 # Public exceptions
 # ---------------------------------------------------------------------------
@@ -177,9 +193,18 @@ class RepairSandbox:
                 except Exception as exc:  # noqa: BLE001 — fail-soft: HEAD
                     # baseline is degraded-but-functional; rsync strategy
                     # is the heavyweight fallback, not worth forcing here.
+                    # Slice 9 final review (Important): tag the reason so
+                    # a delta-size cap-trip is distinguishable in logs
+                    # from a genuine git fault (both raise Exception here).
+                    _reason = (
+                        "overlay_cap_exceeded"
+                        if "too large for overlay" in str(exc)
+                        else "git_fault"
+                    )
                     _logger.warning(
-                        "repair_sandbox: working-tree overlay failed (%s) — "
-                        "sandbox baseline is HEAD, not the working tree", exc,
+                        "repair_sandbox: working-tree overlay failed "
+                        "reason=%s (%s) — sandbox baseline is HEAD, not "
+                        "the working tree", _reason, exc,
                     )
             _logger.debug("repair_sandbox: initialised via git worktree at %s", tmpdir)
             return
@@ -246,6 +271,21 @@ class RepairSandbox:
         if proc.returncode:
             raise RuntimeError("git status failed for working-tree overlay")
         entries = stdout_b.decode(errors="replace").split("\0")
+
+        # Slice 9 final review (Important): delta-size guard — count the
+        # parsed status entries FIRST, before copying a single byte. An
+        # unbounded dirty delta (e.g. thousands of untracked files on a
+        # repo with no .gitignore) makes this overlay dominate VALIDATE
+        # setup time. Over the cap, refuse the overlay outright so the
+        # caller's fail-soft degrades to a HEAD-baseline sandbox instead
+        # of silently eating the pipeline budget.
+        _n_entries = sum(1 for _e in entries if len(_e) >= 4)
+        _cap = _overlay_max_files()
+        if _n_entries > _cap:
+            raise RuntimeError(
+                f"working-tree delta too large for overlay: {_n_entries} > {_cap}"
+            )
+
         i = 0
         while i < len(entries):
             entry = entries[i]

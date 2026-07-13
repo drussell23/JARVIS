@@ -660,6 +660,23 @@ def _candidate_tree_enabled() -> bool:
     ).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _validate_tree_min_budget_s() -> float:
+    """Slice 9 final review (Important): minimum remaining pipeline budget
+    (seconds) required before VALIDATE will materialize the candidate-tree
+    (RepairSandbox + working-tree overlay — measured ~14s setup on this
+    repo). Below this floor, skip straight to the legacy side-sandbox path
+    instead of spending most of the remaining budget on setup alone. Env:
+    ``JARVIS_VALIDATE_TREE_MIN_BUDGET_S``, default ``30.0``. Read at call
+    time; never raises."""
+    try:
+        v = float(os.environ.get(
+            "JARVIS_VALIDATE_TREE_MIN_BUDGET_S", "30.0",
+        ).strip())
+        return v if v >= 0.0 else 30.0
+    except (ValueError, TypeError):
+        return 30.0
+
+
 def _map_tree_run_exception(exc: Exception, t0: float) -> "ValidationResult":
     """Slice 9 review (Important): map a candidate-tree ``_tree_runner.run()``
     exception to the SAME ``ValidationResult`` shape the legacy side-sandbox
@@ -12917,7 +12934,29 @@ class GovernedOrchestrator:
         # tree root with the tree's own pytest.ini. Fail-SOFT: any fault
         # falls through to the legacy path (today's behavior).
         _tree_used = False
-        if _candidate_tree_enabled() and _all_files:
+        _tree_gate = _candidate_tree_enabled() and _all_files
+        _tree_has_runnable = any(
+            Path(_fp).suffix in _RUNNABLE_EXTENSIONS for _fp, _ in _all_files
+        )
+        if _tree_gate and not _tree_has_runnable:
+            # Slice 9 final review (Important): runnable pre-check —
+            # nothing in this candidate is executable (.py/.cpp/etc.), so
+            # there is nothing for the tree runner to run. Skip straight
+            # to legacy WITHOUT paying the RepairSandbox + working-tree-
+            # overlay materialization cost (measured ~14s on this repo).
+            pass
+        elif _tree_gate and remaining_s < _validate_tree_min_budget_s():
+            # Slice 9 final review (Important): budget-aware skip — tree
+            # materialization itself costs real wall-clock (worktree +
+            # overlay); when too little budget remains, spending it on
+            # setup instead of the actual test run is a net loss. Skip
+            # straight to legacy.
+            logger.info(
+                "[Validation] candidate-tree skipped op=%s reason=low_budget "
+                "remaining=%.1fs",
+                ctx.op_id[:12], remaining_s,
+            )
+        elif _tree_gate:
             # Slice 9 review (Important): the fail-soft try below covers
             # ONLY candidate-tree MATERIALIZATION — RepairSandbox entry
             # and the apply_full_content loop (incl. the relative-path

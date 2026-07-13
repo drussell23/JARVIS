@@ -5296,7 +5296,7 @@ SEED_SPECS: list = [
         posture_relevance={},
     ),
     # ====================================================================
-    # Test->Source Attribution Bridge (Slice 6) — 10 flags (Slices 7-9)
+    # Test->Source Attribution Bridge (Slice 6) — 12 flags (Slices 7-9)
     # ====================================================================
     FlagSpec(
         name="JARVIS_TEST_SOURCE_ATTRIBUTION_ENABLED",
@@ -5466,6 +5466,44 @@ SEED_SPECS: list = [
         category=Category.SAFETY,
         source_file="backend/core/ouroboros/governance/repair_engine.py",
         example="true",
+        since="2026-07-12",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_VALIDATE_TREE_MIN_BUDGET_S",
+        type=FlagType.FLOAT, default=30.0,
+        description=(
+            "Slice 9 final review: minimum remaining pipeline budget "
+            "(seconds) required before VALIDATE will materialize the "
+            "candidate-tree (RepairSandbox + working-tree overlay — "
+            "measured ~14s setup on this repo). Below this floor, the "
+            "tree is skipped (one-line INFO, reason=low_budget) and "
+            "VALIDATE falls back to the legacy side-sandbox path instead "
+            "of spending most of the remaining budget on setup alone."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/orchestrator.py",
+        example="30.0",
+        since="2026-07-12",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_SANDBOX_OVERLAY_MAX_FILES",
+        type=FlagType.INT, default=2000,
+        description=(
+            "Slice 9 final review: caps RepairSandbox's working-tree "
+            "overlay to this many dirty-delta entries (git status "
+            "porcelain entries). A repo with an unbounded dirty delta "
+            "(e.g. no .gitignore, thousands of untracked files) makes "
+            "the O(dirty-delta) copy dominate VALIDATE setup time. Over "
+            "the cap, the overlay raises and the existing fail-soft "
+            "degrades the sandbox baseline to HEAD (WARNING "
+            "reason=overlay_cap_exceeded) instead of silently eating the "
+            "pipeline budget."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/repair_sandbox.py",
+        example="2000",
         since="2026-07-12",
         posture_relevance=_HARDEN_CRITICAL,
     ),

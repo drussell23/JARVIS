@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,7 @@ def broken_repo(tmp_path):
     git("config", "user.email", "t@t")
     git("config", "user.name", "t")
     (repo / "pytest.ini").write_text("[pytest]\naddopts = -p no:cacheprovider\n")
+    (repo / ".gitignore").write_text("__pycache__/\n")
     (repo / "pkg" / "__init__.py").write_text("")
     (repo / "pkg" / "mod.py").write_text("def f():\n    return 1\n")
     (repo / "tests" / "test_mod.py").write_text(
@@ -133,6 +135,46 @@ def test_legacy_path_pins_run19_class(broken_repo, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_budget_skip_falls_back_to_legacy_run19_class(broken_repo, monkeypatch):
+    """Slice 9 final review (Important): budget-aware skip — when the
+    remaining pipeline budget is under JARVIS_VALIDATE_TREE_MIN_BUDGET_S,
+    candidate-tree materialization must be skipped even though the flag is
+    ON, landing on the SAME legacy fc=test Run-19 class as the flag-off
+    path (test_legacy_path_pins_run19_class) — proving the skip actually
+    reroutes to legacy rather than silently no-op'ing."""
+    monkeypatch.setenv("JARVIS_VALIDATE_TREE_MIN_BUDGET_S", "999999")
+    result = _run_validation(broken_repo, monkeypatch, tree_enabled=True)
+    assert not result.passed
+    assert result.failure_class == "test"
+
+
+def test_runnable_precheck_never_constructs_repair_sandbox(
+    broken_repo, monkeypatch, caplog
+):
+    """Slice 9 final review (Important): a candidate with NO runnable file
+    (.md-only) must never enter the candidate-tree block at all — proven
+    by the absence of the "[Validation] candidate-tree run" log line that
+    only fires after a real RepairSandbox + LanguageRouter run. No mocking
+    of RepairSandbox itself; this drives the REAL _run_validation_core
+    seam exactly like the other tests in this file."""
+    caplog.set_level(
+        "INFO", logger="backend.core.ouroboros.governance.orchestrator",
+    )
+    result = _run_validation_for(
+        broken_repo, "README.md", "# hello\n", monkeypatch, tree_enabled=True,
+    )
+    assert result.passed, f"fc={result.failure_class} err={result.error}"
+    assert "validation skipped: non-code file" in (result.short_summary or "")
+    assert not any(
+        "[Validation] candidate-tree run" in rec.message
+        for rec in caplog.records
+    )
+    assert not any(
+        "candidate-tree materialization failed" in rec.message
+        for rec in caplog.records
+    )
+
+
 def test_map_tree_run_exception_blocked_path_classifies_security():
     from backend.core.ouroboros.governance import orchestrator as om
 
@@ -210,6 +252,7 @@ class TestRun19LeafPairEndToEnd:
             if not init.exists():
                 init.write_text("")
         (repo / "pytest.ini").write_text("[pytest]\naddopts = -p no:cacheprovider\n")
+        (repo / ".gitignore").write_text("__pycache__/\n")
 
         def git(*args):
             subprocess.run(["git", *args], cwd=repo, check=True,
@@ -246,6 +289,7 @@ class TestRun19LeafPairEndToEnd:
         standalone = subprocess.run(
             [sys.executable, "-m", "pytest", str(test_rel), "-q"],
             cwd=repo, capture_output=True, text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
         assert standalone.returncode != 0, (
             "chaos mutation did not break the copied test standalone:\n"

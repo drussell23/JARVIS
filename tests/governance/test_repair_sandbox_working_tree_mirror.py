@@ -7,6 +7,7 @@ strategies share the working-tree baseline."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import subprocess
 from pathlib import Path
 
@@ -66,3 +67,30 @@ def test_env_kill_switch(dirty_repo, monkeypatch):
         async with RepairSandbox(dirty_repo, 30.0) as sb:
             assert (sb.sandbox_root / "committed.py").read_text() == "x = 1\n"
     asyncio.run(_run())
+
+
+def test_overlay_cap_trip_falls_back_to_head_baseline(dirty_repo, monkeypatch, caplog):
+    """Slice 9 final review (Important): an overlay whose dirty-delta
+    exceeds JARVIS_SANDBOX_OVERLAY_MAX_FILES must not silently eat the
+    materialization budget — the sandbox still gets created, but its
+    baseline degrades to HEAD (the pre-existing fail-soft), and the
+    WARNING names the cap-trip reason distinctly from a git fault."""
+    monkeypatch.setenv("JARVIS_SANDBOX_OVERLAY_MAX_FILES", "1")
+    caplog.set_level(
+        logging.WARNING,
+        logger="backend.core.ouroboros.governance.repair_sandbox",
+    )
+
+    async def _run():
+        async with RepairSandbox(dirty_repo, 30.0) as sb:
+            root = sb.sandbox_root
+            assert root is not None
+            # HEAD baseline, NOT the working-tree overlay: committed
+            # content survives, the working-tree deletion does not.
+            assert (root / "committed.py").read_text() == "x = 1\n"
+            assert (root / "doomed.py").exists()
+    asyncio.run(_run())
+
+    warnings = [rec.message for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert any("delta too large" in msg for msg in warnings), warnings
+    assert any("overlay_cap_exceeded" in msg for msg in warnings), warnings
