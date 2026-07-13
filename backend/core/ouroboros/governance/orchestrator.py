@@ -649,6 +649,17 @@ def _failfast_cb_threshold() -> int:
         return 2
 
 
+def _candidate_tree_enabled() -> bool:
+    """Slice 9 (default ON): VALIDATE materializes a working-tree-faithful
+    candidate tree (RepairSandbox + dirty overlay + candidate files applied)
+    and anchors the LanguageRouter AT the tree — so validation exercises
+    the CANDIDATE, not the still-broken real tree (Run #19 root cause).
+    OFF restores the legacy side-sandbox path byte-identically."""
+    return os.environ.get(
+        "JARVIS_VALIDATE_CANDIDATE_TREE_ENABLED", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
 def _phase_runner_complete_extracted() -> bool:
     """Slice 1 of Wave 2 (5) — COMPLETE phase extraction gate.
 
@@ -12857,74 +12868,152 @@ class GovernedOrchestrator:
                     exc_info=True,
                 )
 
-        with tempfile.TemporaryDirectory(prefix="ouroboros_validate_") as sandbox_str:
-            sandbox = Path(sandbox_str)
-            runner_changed: list[Path] = []
-            _original_paths: Dict[Path, Path] = {}
-            for _fp, _fc in _all_files:
-                _rel = Path(_fp)
-                if _rel.is_absolute():
-                    _sandbox_file = sandbox / _rel.name
-                else:
-                    _sandbox_file = sandbox / _rel
-                _sandbox_file.parent.mkdir(parents=True, exist_ok=True)
-                _sandbox_file.write_text(_fc, encoding="utf-8")
-                if _sandbox_file.suffix in _RUNNABLE_EXTENSIONS:
-                    runner_changed.append(_sandbox_file)
-                    # Slice 12AE: anchor on per-envelope effective
-                    # repo_root (TMPDIR worktree for SWE-Bench-Pro
-                    # fixtures; project_root for everything else).
-                    _original_paths[_sandbox_file] = (
-                        _ae_effective_repo_root / _rel
-                        if not _rel.is_absolute()
-                        else _rel
+        # ── Slice 9: candidate-tree validation (default ON) ─────────────
+        # Run #19 root cause: the legacy path writes candidates into an
+        # EMPTY side-tempdir while pytest runs from the main repo root —
+        # the candidate is never exercised, so a repair op whose failing
+        # test stays red until APPLY structurally cannot pass VALIDATE.
+        # Here: materialize a working-tree-faithful full tree
+        # (RepairSandbox + Slice-9 dirty overlay), apply the candidate
+        # files INTO it, and run a per-op LanguageRouter anchored AT the
+        # tree root (the Slice-12AE per-op-router pattern) — discovery
+        # finds the sibling tests in the tree and pytest runs from the
+        # tree root with the tree's own pytest.ini. Fail-SOFT: any fault
+        # falls through to the legacy path (today's behavior).
+        _tree_used = False
+        if _candidate_tree_enabled() and _all_files:
+            try:
+                from backend.core.ouroboros.governance.repair_sandbox import (
+                    RepairSandbox,
+                )
+                from backend.core.ouroboros.governance.test_runner import (
+                    CppAdapter,
+                    LanguageRouter,
+                    PythonAdapter,
+                )
+                async with RepairSandbox(
+                    _ae_effective_repo_root, max(remaining_s, 30.0),
+                ) as _tree:
+                    _troot = _tree.sandbox_root
+                    _tree_changed: list = []
+                    for _fp, _fc in _all_files:
+                        _rel = Path(_fp)
+                        if _rel.is_absolute():
+                            try:
+                                _rel = _rel.resolve().relative_to(
+                                    Path(_ae_effective_repo_root).resolve()
+                                )
+                            except ValueError:
+                                raise RuntimeError(
+                                    f"candidate path outside repo: {_fp}"
+                                )
+                        await _tree.apply_full_content(_fc, str(_rel))
+                        _tf = _troot / _rel
+                        if _tf.suffix in _RUNNABLE_EXTENSIONS:
+                            _tree_changed.append(_tf)
+                    if _tree_changed:
+                        _tree_runner = LanguageRouter(
+                            repo_root=_troot,
+                            adapters={
+                                "python": PythonAdapter(repo_root=_troot),
+                                "cpp": CppAdapter(repo_root=_troot),
+                            },
+                        )
+                        multi = await _tree_runner.run(
+                            changed_files=tuple(_tree_changed),
+                            sandbox_dir=_troot,
+                            timeout_budget_s=remaining_s,
+                            op_id=ctx.op_id,
+                            original_paths={
+                                p: _troot / p.relative_to(_troot)
+                                for p in _tree_changed
+                            },
+                        )
+                        _tree_used = True
+                        logger.info(
+                            "[Validation] candidate-tree run op=%s files=%d "
+                            "passed=%s",
+                            ctx.op_id[:12], len(_tree_changed),
+                            getattr(multi, "passed", None),
+                        )
+            except Exception as _tree_exc:  # noqa: BLE001 — fail-soft
+                multi = None
+                _tree_used = False
+                logger.warning(
+                    "[Validation] candidate-tree materialization failed "
+                    "(%s) — falling back to legacy side-sandbox path op=%s",
+                    _tree_exc, ctx.op_id[:12],
+                )
+
+        if not _tree_used:
+            with tempfile.TemporaryDirectory(prefix="ouroboros_validate_") as sandbox_str:
+                sandbox = Path(sandbox_str)
+                runner_changed: list[Path] = []
+                _original_paths: Dict[Path, Path] = {}
+                for _fp, _fc in _all_files:
+                    _rel = Path(_fp)
+                    if _rel.is_absolute():
+                        _sandbox_file = sandbox / _rel.name
+                    else:
+                        _sandbox_file = sandbox / _rel
+                    _sandbox_file.parent.mkdir(parents=True, exist_ok=True)
+                    _sandbox_file.write_text(_fc, encoding="utf-8")
+                    if _sandbox_file.suffix in _RUNNABLE_EXTENSIONS:
+                        runner_changed.append(_sandbox_file)
+                        # Slice 12AE: anchor on per-envelope effective
+                        # repo_root (TMPDIR worktree for SWE-Bench-Pro
+                        # fixtures; project_root for everything else).
+                        _original_paths[_sandbox_file] = (
+                            _ae_effective_repo_root / _rel
+                            if not _rel.is_absolute()
+                            else _rel
+                        )
+
+                if not runner_changed:
+                    _primary_rel = Path(target_file_str)
+                    _primary_file = sandbox / (_primary_rel.name if _primary_rel.is_absolute() else _primary_rel)
+                    runner_changed = [_primary_file]
+                    # Slice 12AE: same per-envelope anchor for the
+                    # primary-file fallback path.
+                    _original_paths[_primary_file] = (
+                        _ae_effective_repo_root / _primary_rel
+                        if not _primary_rel.is_absolute()
+                        else _primary_rel
                     )
 
-            if not runner_changed:
-                _primary_rel = Path(target_file_str)
-                _primary_file = sandbox / (_primary_rel.name if _primary_rel.is_absolute() else _primary_rel)
-                runner_changed = [_primary_file]
-                # Slice 12AE: same per-envelope anchor for the
-                # primary-file fallback path.
-                _original_paths[_primary_file] = (
-                    _ae_effective_repo_root / _primary_rel
-                    if not _primary_rel.is_absolute()
-                    else _primary_rel
-                )
-
-            # Step 4: Run LanguageRouter (or any duck-typed runner)
-            # Slice 12AE: use the per-op runner when constructed (its
-            # repo_root matches the per-envelope TMPDIR worktree);
-            # otherwise the boot-time runner (project_root anchored).
-            try:
-                multi = await _ae_effective_runner.run(
-                    changed_files=tuple(runner_changed),
-                    sandbox_dir=sandbox,
-                    timeout_budget_s=remaining_s,
-                    op_id=ctx.op_id,
-                    original_paths=_original_paths,
-                )
-            except BlockedPathError as exc:
-                # Security gate rejection → failure_class="security" → CANCELLED (not POSTMORTEM)
-                return ValidationResult(
-                    passed=False,
-                    best_candidate=None,
-                    validation_duration_s=time.monotonic() - t0,
-                    error=str(exc),
-                    failure_class="security",
-                    short_summary=f"BlockedPathError: {str(exc)[:280]}",
-                    adapter_names_run=(),
-                )
-            except Exception as exc:
-                return ValidationResult(
-                    passed=False,
-                    best_candidate=None,
-                    validation_duration_s=time.monotonic() - t0,
-                    error=str(exc),
-                    failure_class="infra",
-                    short_summary=f"runner exception: {str(exc)[:200]}",
-                    adapter_names_run=(),
-                )
+                # Step 4: Run LanguageRouter (or any duck-typed runner)
+                # Slice 12AE: use the per-op runner when constructed (its
+                # repo_root matches the per-envelope TMPDIR worktree);
+                # otherwise the boot-time runner (project_root anchored).
+                try:
+                    multi = await _ae_effective_runner.run(
+                        changed_files=tuple(runner_changed),
+                        sandbox_dir=sandbox,
+                        timeout_budget_s=remaining_s,
+                        op_id=ctx.op_id,
+                        original_paths=_original_paths,
+                    )
+                except BlockedPathError as exc:
+                    # Security gate rejection → failure_class="security" → CANCELLED (not POSTMORTEM)
+                    return ValidationResult(
+                        passed=False,
+                        best_candidate=None,
+                        validation_duration_s=time.monotonic() - t0,
+                        error=str(exc),
+                        failure_class="security",
+                        short_summary=f"BlockedPathError: {str(exc)[:280]}",
+                        adapter_names_run=(),
+                    )
+                except Exception as exc:
+                    return ValidationResult(
+                        passed=False,
+                        best_candidate=None,
+                        validation_duration_s=time.monotonic() - t0,
+                        error=str(exc),
+                        failure_class="infra",
+                        short_summary=f"runner exception: {str(exc)[:200]}",
+                        adapter_names_run=(),
+                    )
 
         # Step 5: Map to compact ValidationResult (sandbox dir is now cleaned up)
         assert multi is not None
