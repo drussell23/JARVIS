@@ -148,15 +148,20 @@ def test_budget_skip_falls_back_to_legacy_run19_class(broken_repo, monkeypatch):
     assert result.failure_class == "test"
 
 
-def test_runnable_precheck_never_constructs_repair_sandbox(
+def test_non_code_candidate_short_circuits_before_any_sandbox(
     broken_repo, monkeypatch, caplog
 ):
-    """Slice 9 final review (Important): a candidate with NO runnable file
-    (.md-only) must never enter the candidate-tree block at all — proven
-    by the absence of the "[Validation] candidate-tree run" log line that
-    only fires after a real RepairSandbox + LanguageRouter run. No mocking
-    of RepairSandbox itself; this drives the REAL _run_validation_core
-    seam exactly like the other tests in this file."""
+    """Slice 9 review F9: pins the non-code EARLY RETURN in
+    _run_validation_core (the unconditional "no runnable file → passed,
+    'validation skipped: non-code file'" branch that fires before the
+    runner/candidate-tree section). Because of that return, a .md-only
+    candidate never reaches the tree block — which is exactly why the
+    block needs no runnable pre-check of its own (the F9 dead code this
+    test replaced the pin for). Proven by the absence of the
+    "[Validation] candidate-tree run" log line that only fires after a
+    real RepairSandbox + LanguageRouter run. No mocking of RepairSandbox
+    itself; this drives the REAL _run_validation_core seam exactly like
+    the other tests in this file."""
     caplog.set_level(
         "INFO", logger="backend.core.ouroboros.governance.orchestrator",
     )
@@ -172,6 +177,112 @@ def test_runnable_precheck_never_constructs_repair_sandbox(
     assert not any(
         "candidate-tree materialization failed" in rec.message
         for rec in caplog.records
+    )
+
+
+def test_degraded_baseline_falls_back_to_legacy(broken_repo, monkeypatch, caplog):
+    """Slice 9 review F4: mirror ON but the working-tree overlay is refused
+    (dirty delta over JARVIS_SANDBOX_OVERLAY_MAX_FILES → OverlayCapExceeded
+    → baseline_fidelity='head') — the tree would validate the candidate
+    against HEAD, NOT what TestWatcher observed. The orchestrator must log
+    the degradation WARNING and take the legacy path, proven by the legacy
+    fc=test Run-19 class on the CORRECT repair (which the tree path passes
+    — see test_candidate_tree_on_correct_repair_validates_green)."""
+    caplog.set_level(
+        "WARNING", logger="backend.core.ouroboros.governance.orchestrator",
+    )
+    # Dirty delta of 2 (pkg/mod.py modified + one untracked file) against
+    # a cap of 1 trips OverlayCapExceeded BEFORE any copy → fidelity='head'.
+    (broken_repo / "scratch.txt").write_text("untracked\n")
+    monkeypatch.setenv("JARVIS_SANDBOX_OVERLAY_MAX_FILES", "1")
+    result = _run_validation(broken_repo, monkeypatch, tree_enabled=True)
+    assert not result.passed
+    assert result.failure_class == "test"
+    assert any(
+        "candidate-tree baseline degraded" in rec.getMessage()
+        and "fidelity=head" in rec.getMessage()
+        for rec in caplog.records
+    ), "degradation WARNING did not fire"
+
+
+def test_mirror_off_head_baseline_is_respected_no_fallback(
+    broken_repo, monkeypatch, caplog
+):
+    """Slice 9 review F4 counter-case: mirror kill-switch OFF means the
+    operator CHOSE a HEAD baseline — fidelity='head' is not a degradation
+    and must NOT trigger the legacy fallback. Proven discriminatively: the
+    tree run passes the correct repair (HEAD holds the correct committed
+    code and the candidate is applied on top), whereas the legacy path
+    fails it fc=test (test_legacy_path_pins_run19_class)."""
+    caplog.set_level(
+        "WARNING", logger="backend.core.ouroboros.governance.orchestrator",
+    )
+    monkeypatch.setenv("JARVIS_SANDBOX_WORKING_TREE_MIRROR_ENABLED", "false")
+    result = _run_validation(broken_repo, monkeypatch, tree_enabled=True)
+    assert result.passed, f"fc={result.failure_class} err={result.error}"
+    assert not any(
+        "candidate-tree baseline degraded" in rec.getMessage()
+        for rec in caplog.records
+    ), "operator-chosen HEAD baseline was misreported as degradation"
+
+
+def test_legacy_generic_write_fault_propagates(broken_repo, monkeypatch):
+    """Slice 9 review F6: a generic write-side fault (disk-full OSError)
+    in the legacy sandbox write loop must PROPAGATE out of
+    _run_validation_core — pre-branch semantics, where the caller's
+    gather(return_exceptions=True) merely skips the candidate — NOT be
+    swallowed into a non-retryable fc='infra' POSTMORTEM escalation."""
+    real_write_text = Path.write_text
+
+    def _disk_full(self, *args, **kwargs):
+        if "ouroboros_validate_" in str(self):
+            raise OSError(28, "No space left on device")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", _disk_full)
+    with pytest.raises(OSError):
+        _run_validation(broken_repo, monkeypatch, tree_enabled=False)
+
+
+def test_legacy_dotdot_write_still_security_rejected(broken_repo, monkeypatch):
+    """Slice 9 review F6 companion: re-scoping the legacy write loop's try
+    to BlockedPathError only must NOT lose the Slice-9 '..' clamp contract
+    — an escaping candidate still returns fc='security' (no propagation)."""
+    result = _run_validation_for(
+        broken_repo, "../" * 12 + "evil.py", "print('pwned')\n",
+        monkeypatch, tree_enabled=False,
+    )
+    assert not result.passed
+    assert result.failure_class == "security"
+
+
+def test_tree_runner_grant_is_decremented_after_materialization(
+    broken_repo, monkeypatch
+):
+    """Slice 9 review F7: the tree runner's timeout_budget_s must be the
+    freshly decremented post-materialization remainder — never the stale
+    remaining_s captured before the ~14s RepairSandbox setup. Pinned with
+    a pass-through spy on LanguageRouter.run: the granted budget must be
+    STRICTLY below the 120.0s handed to _run_validation_core (worktree
+    add + overlay always consume real wall-clock before the run)."""
+    from backend.core.ouroboros.governance import test_runner as tr
+
+    captured = {}
+    real_run = tr.LanguageRouter.run
+
+    async def _spy(self, *args, **kwargs):
+        # First run() call is the tree-anchored runner (tree path returns
+        # before the legacy runner can fire).
+        captured.setdefault("timeout_budget_s", kwargs.get("timeout_budget_s"))
+        return await real_run(self, *args, **kwargs)
+
+    monkeypatch.setattr(tr.LanguageRouter, "run", _spy)
+    result = _run_validation(broken_repo, monkeypatch, tree_enabled=True)
+    assert result.passed, f"fc={result.failure_class} err={result.error}"
+    granted = captured.get("timeout_budget_s")
+    assert granted is not None, "spy never saw a run() call"
+    assert 0.0 < granted < 120.0, (
+        f"tree runner granted stale/inflated budget: {granted}"
     )
 
 

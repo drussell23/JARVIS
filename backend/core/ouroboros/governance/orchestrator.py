@@ -12933,19 +12933,21 @@ class GovernedOrchestrator:
         # finds the sibling tests in the tree and pytest runs from the
         # tree root with the tree's own pytest.ini. Fail-SOFT: any fault
         # falls through to the legacy path (today's behavior).
+        # No runnable pre-check needed here: the non-code early return
+        # above ("validation skipped: non-code file") fires whenever the
+        # candidate has NO runnable file, so this block is only reachable
+        # with at least one .py/.cpp/etc. file in _all_files.
         _tree_used = False
         _tree_gate = _candidate_tree_enabled() and _all_files
-        _tree_has_runnable = any(
-            Path(_fp).suffix in _RUNNABLE_EXTENSIONS for _fp, _ in _all_files
-        )
-        if _tree_gate and not _tree_has_runnable:
-            # Slice 9 final review (Important): runnable pre-check —
-            # nothing in this candidate is executable (.py/.cpp/etc.), so
-            # there is nothing for the tree runner to run. Skip straight
-            # to legacy WITHOUT paying the RepairSandbox + working-tree-
-            # overlay materialization cost (measured ~14s on this repo).
-            pass
-        elif _tree_gate and remaining_s < _validate_tree_min_budget_s():
+        # Slice 9 review F7: capture the wall-clock BEFORE tree
+        # materialization — every runner grant below (tree AND legacy
+        # fallback) is decremented from this anchor, so the ~14s
+        # RepairSandbox setup never inflates the budget actually handed
+        # to pytest. The pre-setup floor check below deliberately keeps
+        # the un-decremented remaining_s (its semantics are "budget on
+        # entry", not "budget after setup").
+        _v_t0 = time.monotonic()
+        if _tree_gate and remaining_s < _validate_tree_min_budget_s():
             # Slice 9 final review (Important): budget-aware skip — tree
             # materialization itself costs real wall-clock (worktree +
             # overlay); when too little budget remains, spending it on
@@ -12972,6 +12974,7 @@ class GovernedOrchestrator:
             try:
                 from backend.core.ouroboros.governance.repair_sandbox import (
                     RepairSandbox,
+                    _working_tree_mirror_enabled,
                 )
                 from backend.core.ouroboros.governance.test_runner import (
                     CppAdapter,
@@ -12981,88 +12984,118 @@ class GovernedOrchestrator:
                 async with RepairSandbox(
                     _ae_effective_repo_root, max(remaining_s, 30.0),
                 ) as _tree:
-                    _troot = _tree.sandbox_root
-                    _tree_changed: list = []
-                    for _fp, _fc in _all_files:
-                        _rel = Path(_fp)
-                        if _rel.is_absolute():
-                            try:
-                                _rel = _rel.resolve().relative_to(
-                                    Path(_ae_effective_repo_root).resolve()
-                                )
-                            except ValueError:
-                                raise RuntimeError(
-                                    f"candidate path outside repo: {_fp}"
-                                )
-                        # Slice 9 — write-escape clamp (Slice-8 final
-                        # review I1): a model-chosen ``..``-containing
-                        # relative file_path must not write outside the
-                        # candidate tree either. Resolve WITHOUT touching
-                        # the filesystem (os.path.normpath — pure string
-                        # normalization, no FS access, no symlink-
-                        # following on not-yet-existing paths) and prove
-                        # containment BEFORE apply_full_content lands any
-                        # byte. A BlockedPathError raised here is caught
-                        # by the materialization fail-soft except below
-                        # (no write has landed in the tree) and falls
-                        # back to the legacy path, whose own clamp
-                        # (below) re-raises the same BlockedPathError for
-                        # the same escaping candidate — this time
-                        # enclosed by the fc="security" handler. Net
-                        # effect on EITHER path: escaping candidate ->
-                        # fc="security", no write lands anywhere.
-                        _tf = _troot / _rel
-                        _resolved_tf = Path(os.path.normpath(str(_tf)))
-                        if not str(_resolved_tf).startswith(
-                            os.path.normpath(str(_troot)) + os.sep
-                        ):
-                            raise BlockedPathError(
-                                f"candidate file_path {_fp!r} escapes the "
-                                "VALIDATE candidate tree — write refused "
-                                "(security gate)"
-                            )
-                        await _tree.apply_full_content(_fc, str(_rel))
-                        if _tf.suffix in _RUNNABLE_EXTENSIONS:
-                            _tree_changed.append(_tf)
-
-                    if _tree_changed:
-                        _tree_runner = LanguageRouter(
-                            repo_root=_troot,
-                            adapters={
-                                "python": PythonAdapter(repo_root=_troot),
-                                "cpp": CppAdapter(repo_root=_troot),
-                            },
+                    # Slice 9 review F4: honest-baseline gate. When the
+                    # working-tree mirror is ON but the sandbox reports a
+                    # degraded baseline (overlay refused → "head", or a
+                    # mid-copy chimera → "partial"), the tree would
+                    # validate the candidate against a tree that is NOT
+                    # what TestWatcher observed — treat it exactly like a
+                    # materialization failure and fall back to legacy
+                    # (_tree_used stays False; the tree is never run).
+                    # Mirror OFF is the operator CHOOSING a HEAD baseline
+                    # (fidelity=="head" by design) — respected, no
+                    # fallback.
+                    if (
+                        _working_tree_mirror_enabled()
+                        and _tree.baseline_fidelity != "working_tree"
+                    ):
+                        logger.warning(
+                            "[Validation] candidate-tree baseline degraded "
+                            "op=%s fidelity=%s — falling back to legacy",
+                            ctx.op_id[:12], _tree.baseline_fidelity,
                         )
-                        # NOT covered by the materialization fail-soft
-                        # except below: a `return` here propagates past
-                        # it without triggering that except clause (only
-                        # raised exceptions are caught by `except`), so
-                        # this is a genuine early return from
-                        # _run_validation_core, not a fallback trigger.
-                        # The `async with` above still exits normally
-                        # (RepairSandbox __aexit__ runs) on the way out.
-                        try:
-                            multi = await _tree_runner.run(
-                                changed_files=tuple(_tree_changed),
-                                sandbox_dir=_troot,
-                                timeout_budget_s=remaining_s,
-                                op_id=ctx.op_id,
-                                original_paths={
-                                    p: _troot / p.relative_to(_troot)
-                                    for p in _tree_changed
+                    else:
+                        _troot = _tree.sandbox_root
+                        _tree_changed: list = []
+                        for _fp, _fc in _all_files:
+                            _rel = Path(_fp)
+                            if _rel.is_absolute():
+                                try:
+                                    _rel = _rel.resolve().relative_to(
+                                        Path(_ae_effective_repo_root).resolve()
+                                    )
+                                except ValueError:
+                                    raise RuntimeError(
+                                        f"candidate path outside repo: {_fp}"
+                                    )
+                            # Slice 9 — write-escape clamp (Slice-8 final
+                            # review I1): a model-chosen ``..``-containing
+                            # relative file_path must not write outside the
+                            # candidate tree either. Resolve WITHOUT touching
+                            # the filesystem (os.path.normpath — pure string
+                            # normalization, no FS access, no symlink-
+                            # following on not-yet-existing paths) and prove
+                            # containment BEFORE apply_full_content lands any
+                            # byte. A BlockedPathError raised here is caught
+                            # by the materialization fail-soft except below
+                            # (no write has landed in the tree) and falls
+                            # back to the legacy path, whose own clamp
+                            # (below) re-raises the same BlockedPathError for
+                            # the same escaping candidate — this time
+                            # enclosed by the fc="security" handler. Net
+                            # effect on EITHER path: escaping candidate ->
+                            # fc="security", no write lands anywhere.
+                            _tf = _troot / _rel
+                            _resolved_tf = Path(os.path.normpath(str(_tf)))
+                            if not str(_resolved_tf).startswith(
+                                os.path.normpath(str(_troot)) + os.sep
+                            ):
+                                raise BlockedPathError(
+                                    f"candidate file_path {_fp!r} escapes the "
+                                    "VALIDATE candidate tree — write refused "
+                                    "(security gate)"
+                                )
+                            await _tree.apply_full_content(_fc, str(_rel))
+                            if _tf.suffix in _RUNNABLE_EXTENSIONS:
+                                _tree_changed.append(_tf)
+
+                        if _tree_changed:
+                            _tree_runner = LanguageRouter(
+                                repo_root=_troot,
+                                adapters={
+                                    "python": PythonAdapter(repo_root=_troot),
+                                    "cpp": CppAdapter(repo_root=_troot),
                                 },
                             )
-                            _tree_used = True
-                            logger.info(
-                                "[Validation] candidate-tree run op=%s "
-                                "files=%d passed=%s",
-                                ctx.op_id[:12], len(_tree_changed),
-                                getattr(multi, "passed", None),
+                            # Slice 9 review F7: the grant must reflect the
+                            # ~14s materialization just paid — freshly
+                            # decrement from the pre-tree-block anchor
+                            # instead of handing pytest the stale pre-setup
+                            # remaining_s.
+                            _rem_after = max(
+                                0.0,
+                                remaining_s - (time.monotonic() - _v_t0),
                             )
-                        except BlockedPathError as exc:
-                            return _map_tree_run_exception(exc, t0)
-                        except Exception as exc:
-                            return _map_tree_run_exception(exc, t0)
+                            # NOT covered by the materialization fail-soft
+                            # except below: a `return` here propagates past
+                            # it without triggering that except clause (only
+                            # raised exceptions are caught by `except`), so
+                            # this is a genuine early return from
+                            # _run_validation_core, not a fallback trigger.
+                            # The `async with` above still exits normally
+                            # (RepairSandbox __aexit__ runs) on the way out.
+                            try:
+                                multi = await _tree_runner.run(
+                                    changed_files=tuple(_tree_changed),
+                                    sandbox_dir=_troot,
+                                    timeout_budget_s=_rem_after,
+                                    op_id=ctx.op_id,
+                                    original_paths={
+                                        p: _troot / p.relative_to(_troot)
+                                        for p in _tree_changed
+                                    },
+                                )
+                                _tree_used = True
+                                logger.info(
+                                    "[Validation] candidate-tree run op=%s "
+                                    "files=%d passed=%s",
+                                    ctx.op_id[:12], len(_tree_changed),
+                                    getattr(multi, "passed", None),
+                                )
+                            except BlockedPathError as exc:
+                                return _map_tree_run_exception(exc, t0)
+                            except Exception as exc:
+                                return _map_tree_run_exception(exc, t0)
             except Exception as _tree_exc:  # noqa: BLE001 — fail-soft
                 multi = None
                 _tree_used = False
@@ -13077,13 +13110,17 @@ class GovernedOrchestrator:
                 sandbox = Path(sandbox_str)
                 runner_changed: list[Path] = []
                 _original_paths: Dict[Path, Path] = {}
-                # Slice 9 — write-escape clamp (Slice-8 final review I1):
-                # the try now encloses the WRITE LOOP itself (previously
-                # it wrapped only the runner call below) so a
-                # BlockedPathError raised BEFORE any byte lands still
-                # reaches the same except clause and the same
-                # fc="security" classification — caught at the write now,
-                # not after it.
+                # Slice 9 — write-escape clamp (Slice-8 final review I1),
+                # re-scoped by review F6: the write loop gets its OWN
+                # try/except for BlockedPathError ONLY, so the clamp's
+                # rejection is caught at the write (before any byte
+                # lands) with the same fc="security" classification —
+                # while every OTHER write-side fault (disk-full OSError,
+                # UnicodeEncodeError, ...) PROPAGATES exactly as it did
+                # pre-branch, where the caller's
+                # gather(return_exceptions=True) skips the candidate
+                # instead of escalating a non-retryable fc="infra"
+                # POSTMORTEM.
                 try:
                     for _fp, _fc in _all_files:
                         _rel = Path(_fp)
@@ -13120,27 +13157,46 @@ class GovernedOrchestrator:
                                 if not _rel.is_absolute()
                                 else _rel
                             )
+                except BlockedPathError as exc:
+                    # Security gate rejection → failure_class="security" → CANCELLED (not POSTMORTEM)
+                    return ValidationResult(
+                        passed=False,
+                        best_candidate=None,
+                        validation_duration_s=time.monotonic() - t0,
+                        error=str(exc),
+                        failure_class="security",
+                        short_summary=f"BlockedPathError: {str(exc)[:280]}",
+                        adapter_names_run=(),
+                    )
 
-                    if not runner_changed:
-                        _primary_rel = Path(target_file_str)
-                        _primary_file = sandbox / (_primary_rel.name if _primary_rel.is_absolute() else _primary_rel)
-                        runner_changed = [_primary_file]
-                        # Slice 12AE: same per-envelope anchor for the
-                        # primary-file fallback path.
-                        _original_paths[_primary_file] = (
-                            _ae_effective_repo_root / _primary_rel
-                            if not _primary_rel.is_absolute()
-                            else _primary_rel
-                        )
+                if not runner_changed:
+                    _primary_rel = Path(target_file_str)
+                    _primary_file = sandbox / (_primary_rel.name if _primary_rel.is_absolute() else _primary_rel)
+                    runner_changed = [_primary_file]
+                    # Slice 12AE: same per-envelope anchor for the
+                    # primary-file fallback path.
+                    _original_paths[_primary_file] = (
+                        _ae_effective_repo_root / _primary_rel
+                        if not _primary_rel.is_absolute()
+                        else _primary_rel
+                    )
 
-                    # Step 4: Run LanguageRouter (or any duck-typed runner)
-                    # Slice 12AE: use the per-op runner when constructed (its
-                    # repo_root matches the per-envelope TMPDIR worktree);
-                    # otherwise the boot-time runner (project_root anchored).
+                # Step 4: Run LanguageRouter (or any duck-typed runner)
+                # Slice 12AE: use the per-op runner when constructed (its
+                # repo_root matches the per-envelope TMPDIR worktree);
+                # otherwise the boot-time runner (project_root anchored).
+                # Slice 9 review F7: freshly decremented grant — this
+                # legacy block may follow a failed/degraded candidate-tree
+                # materialization that already consumed real wall-clock,
+                # so it must not be handed the stale pre-setup remaining_s.
+                _rem_after = max(
+                    0.0, remaining_s - (time.monotonic() - _v_t0),
+                )
+                try:
                     multi = await _ae_effective_runner.run(
                         changed_files=tuple(runner_changed),
                         sandbox_dir=sandbox,
-                        timeout_budget_s=remaining_s,
+                        timeout_budget_s=_rem_after,
                         op_id=ctx.op_id,
                         original_paths=_original_paths,
                     )
