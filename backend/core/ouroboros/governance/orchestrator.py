@@ -38,7 +38,7 @@ import dataclasses
 from dataclasses import asdict as _dc_asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
@@ -1539,6 +1539,26 @@ class OrchestratorConfig:
             else:
                 roots[repo] = self.project_root
         return roots
+
+
+class _LiveWorkGateResult(NamedTuple):
+    """Outcome of ``_live_work_apply_gate`` (Slice 10 + review C1).
+
+    ``active_hit`` — ``(file, reason)`` when the gate went terminal on a
+    human-active file (wait master off, infinite horizon, or an
+    unaffordable horizon); ``None`` when the scan cleared.
+    ``waited_s`` — total seconds actually slept inside this invocation.
+    ``drift_stale_files`` — non-``None`` iff the gate WAITED and the
+    post-wait re-run of the stale-exploration drift check
+    (``state_drift.should_block_apply`` — the SAME helper the pre-gate
+    check uses) came back blocking: a human edit made mid-wait is
+    invisible to the pre-gate hash snapshot (TOCTOU), so callers must
+    route this to the SAME ``state_drift_unreconciled`` terminal shape.
+    """
+
+    active_hit: Optional[Tuple[str, str]]
+    waited_s: float
+    drift_stale_files: Optional[List[str]]
 
 
 # ---------------------------------------------------------------------------
@@ -10217,9 +10237,9 @@ class GovernedOrchestrator:
                     is_enabled as _lws_enabled,
                 )
                 if _lws_enabled() and ctx.risk_tier is not RiskTier.APPROVAL_REQUIRED:
-                    _active_hit = await self._live_work_apply_gate(ctx, best_candidate)
-                    if _active_hit is not None:
-                        _hit_file, _hit_reason = _active_hit
+                    _lw_gate = await self._live_work_apply_gate(ctx, best_candidate)
+                    if _lw_gate.active_hit is not None:
+                        _hit_file, _hit_reason = _lw_gate.active_hit
                         await self._record_ledger(ctx, OperationState.FAILED, {
                             "reason": "human_active_on_target",
                             "file": _hit_file,
@@ -10230,6 +10250,34 @@ class GovernedOrchestrator:
                             terminal_reason_code="human_active_on_target",
                         )
                         await self._publish_outcome(ctx, OperationState.FAILED, "human_active_on_target")
+                        return ctx
+                    if _lw_gate.drift_stale_files is not None:
+                        # Review C1 (TOCTOU) — the Slice 248 drift check
+                        # above ran BEFORE the gate's wait; the gate re-ran
+                        # the SAME helper post-wait and it came back
+                        # blocking. SAME terminal shape as the pre-gate
+                        # block (state_drift_unreconciled).
+                        from backend.core.ouroboros.governance.state_drift import (
+                            STATE_DRIFT_UNRECONCILED as _SD_UNRECONCILED,
+                        )
+                        logger.warning(
+                            "[Orchestrator] STATE DRIFT UNRECONCILED post-LiveWork-wait "
+                            "(%.0fs) — blocking APPLY of stale candidate on %s — "
+                            "failing safe (no corruption) [%s]",
+                            _lw_gate.waited_s,
+                            _lw_gate.drift_stale_files[:3], ctx.op_id[:12],
+                        )
+                        await self._record_ledger(ctx, OperationState.FAILED, {
+                            "reason": _SD_UNRECONCILED,
+                            "stale_files": _lw_gate.drift_stale_files,
+                        })
+                        ctx = ctx.advance(
+                            OperationPhase.POSTMORTEM,
+                            terminal_reason_code=_SD_UNRECONCILED,
+                        )
+                        await self._publish_outcome(
+                            ctx, OperationState.FAILED, _SD_UNRECONCILED,
+                        )
                         return ctx
             except Exception:
                 logger.debug("[Orchestrator] LiveWorkSensor check skipped", exc_info=True)
@@ -12437,7 +12485,7 @@ class GovernedOrchestrator:
         self,
         ctx: OperationContext,
         best_candidate: Dict[str, Any],
-    ) -> Optional[Tuple[str, str]]:
+    ) -> _LiveWorkGateResult:
         """LiveWorkSensor APPLY gate with bounded defer-wait (Slice 10).
 
         Scans ``ctx.target_files`` ∪ every file the candidate proposes
@@ -12445,8 +12493,8 @@ class GovernedOrchestrator:
         treated as TERMINAL (``human_active_on_target``) even though the
         condition is recoverable — a chaos-dirtied file crosses the
         recency window on its own. When ``JARVIS_APPLY_LIVE_WORK_WAIT_
-        ENABLED`` (default true) and the sensor's ``seconds_until_quiet``
-        horizon fits the op's remaining pipeline budget (re-clocked from
+        ENABLED`` (default true) and the sensor's horizon fits the op's
+        remaining pipeline budget (re-clocked from
         ``ctx.pipeline_deadline`` — the same source the VALIDATE retry
         loop re-clocks from), the gate waits exactly that horizon, drops
         the sensor's git cache, and re-runs the FULL scan (a different
@@ -12455,18 +12503,46 @@ class GovernedOrchestrator:
         horizon that either re-waits or exhausts the budget. NO fixed
         sleep constants — every wait is the sensor-derived horizon.
 
-        Returns ``None`` when the scan is quiet (APPLY may proceed) or
-        ``(file, reason)`` when the hit is terminal: master flag off
-        (legacy immediate-terminal), infinite horizon (IDE lock,
-        unreadable-dirty), or a horizon the remaining budget cannot
-        cover. Shared by BOTH APPLY paths — the inline orchestrator
-        block and Slice4bRunner (the shipping default under
-        ``JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED``). Callers keep the
-        Orange-tier bypass, the ledger/terminal shape, and the fail-open
-        try/except (sensor malfunction must never block APPLY).
+        Review-round hardening:
+        - I1: ONE sensor evaluation per file per iteration
+          (``LiveWorkSensor.evaluate``) — active/horizon can never
+          disagree across two calls at the window boundary. The residual
+          exact-boundary case (age == window is inclusive-active with
+          horizon 0) gets ONE bounded immediate rescan; a second
+          consecutive zero-horizon-active eval goes terminal.
+        - I2: the deadline-less fallback budget is initialized once from
+          ``validation_timeout_s`` and shrinks by every slept horizon —
+          a constant re-read would never terminate.
+        - I4: cumulative sleeps within one invocation are clamped by
+          ``JARVIS_APPLY_LIVE_WORK_WAIT_MAX_S``. The seeded default
+          ``0.0`` means DERIVE at call time from ``JARVIS_FILE_LOCK_TTL_S``
+          (default 300, matching unified_intake_router): a wait may never
+          outlive the file lock that serializes writers, or a second op
+          can acquire the same file mid-wait; an explicit positive env
+          value wins. Bounds worker-pool occupancy too — 3 concurrent
+          deferred ops must not put the whole pool to sleep for the full
+          pipeline deadline.
+        - C1 (TOCTOU): the callers' stale-exploration drift hash check
+          runs BEFORE this gate — any wait here makes that snapshot
+          stale, so a human edit made mid-wait would be applied over.
+          When the gate actually waited, it re-runs the SAME helper
+          (``state_drift.should_block_apply``) before clearing; blocking
+          → ``drift_stale_files`` for the callers' SAME
+          ``state_drift_unreconciled`` terminal shape. No-wait ops skip
+          the recheck — today's failure-class ordering is preserved.
+
+        Returns a :class:`_LiveWorkGateResult`. Shared by BOTH APPLY
+        paths — the inline orchestrator block and Slice4bRunner (the
+        shipping default under ``JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED``).
+        Callers keep the Orange-tier bypass, the ledger/terminal shapes,
+        and the fail-open try/except (sensor malfunction must never
+        block APPLY).
         """
         from backend.core.ouroboros.governance.live_work_sensor import (
             LiveWorkSensor,
+        )
+        from backend.core.ouroboros.governance.state_drift import (
+            should_block_apply as _should_block_apply,
         )
         _lws = LiveWorkSensor(self._config.project_root)
         _scan_targets: set[str] = set(ctx.target_files)
@@ -12477,16 +12553,44 @@ class GovernedOrchestrator:
             os.environ.get("JARVIS_APPLY_LIVE_WORK_WAIT_ENABLED", "true")
             .strip().lower() in _TRUTHY
         )
+        # I4 — cumulative-wait clamp; 0.0/unset/garbage → derive from the
+        # file-lock TTL (see docstring for the derivation rationale).
+        try:
+            _max_wait_s = float(
+                os.environ.get("JARVIS_APPLY_LIVE_WORK_WAIT_MAX_S", "0") or 0.0
+            )
+        except ValueError:
+            _max_wait_s = 0.0
+        if _max_wait_s <= 0.0:
+            try:
+                _max_wait_s = float(os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300"))
+            except ValueError:
+                _max_wait_s = 300.0
+        # I2 — deadline-less fallback budget, initialized ONCE.
+        _fallback_budget_s = self._config.validation_timeout_s
+        _slept_total = 0.0
+        _zero_horizon_strikes = 0
         while True:
-            _active_hit: Optional[Tuple[str, str]] = None
+            _active_eval = None
+            _hit_file: Optional[str] = None
             for _tf in sorted(_scan_targets):
-                _is_active, _reason = await _lws.is_human_active(str(_tf))
-                if _is_active:
-                    _active_hit = (str(_tf), _reason or "human active")
+                _eval = await _lws.evaluate(str(_tf))
+                if _eval.active:
+                    _active_eval = _eval
+                    _hit_file = str(_tf)
                     break
-            if _active_hit is None:
-                return None
-            _hit_file, _hit_reason = _active_hit
+            if _active_eval is None:
+                # Scan is quiet — C1: if we waited, the pre-gate drift
+                # snapshot is stale; re-run the SAME check before clearing.
+                if _slept_total > 0.0 and getattr(ctx, "generate_file_hashes", None):
+                    _block, _stale = _should_block_apply(
+                        ctx.generate_file_hashes, self._config.project_root,
+                    )
+                    if _block:
+                        return _LiveWorkGateResult(None, _slept_total, list(_stale))
+                return _LiveWorkGateResult(None, _slept_total, None)
+            _hit_reason = _active_eval.reason or "human active"
+            _active_hit = (_hit_file, _hit_reason)
             if not _wait_enabled:
                 # Legacy immediate-terminal (kill switch) — today's path,
                 # including its WARNING text, unchanged.
@@ -12494,33 +12598,47 @@ class GovernedOrchestrator:
                     "[Orchestrator] LiveWorkSensor: human is active on %s (%s) — deferring APPLY [%s]",
                     _hit_file, _hit_reason, ctx.op_id[:12],
                 )
-                return _active_hit
-            _horizon = await _lws.seconds_until_quiet(_hit_file)
+                return _LiveWorkGateResult(_active_hit, _slept_total, None)
+            _horizon = _active_eval.horizon_s
+            # I1 residual — exact window boundary (age == window is
+            # inclusive-active with horizon 0): one bounded immediate
+            # rescan; the 2-strike counter keeps this from ever busy-
+            # looping — a second consecutive zero-horizon-active eval
+            # falls through to the terminal check below.
+            if _horizon <= 0.0:
+                _zero_horizon_strikes += 1
+                if _zero_horizon_strikes < 2:
+                    _lws.invalidate_cache()
+                    continue
+            else:
+                _zero_horizon_strikes = 0
             # Re-clock remaining budget from the op's pipeline deadline —
-            # same source as the VALIDATE retry loop.
+            # same source as the VALIDATE retry loop. Deadline-less ops
+            # consume the shrinking fallback budget (I2).
             if ctx.pipeline_deadline is not None:
                 _remaining_s = (
                     ctx.pipeline_deadline - datetime.now(tz=timezone.utc)
                 ).total_seconds()
             else:
-                _remaining_s = self._config.validation_timeout_s  # fallback
+                _remaining_s = _fallback_budget_s - _slept_total
+            _wait_allowance = min(_remaining_s, _max_wait_s - _slept_total)
             # inf fails the affordability check naturally (inf > any
-            # finite remaining); horizon<=0 with an active hit is a
-            # cache-staleness race — terminal, never a busy-loop.
-            if not (0.0 < _horizon <= _remaining_s):
+            # finite allowance); a persisting zero horizon lands here too.
+            if not (0.0 < _horizon <= _wait_allowance):
                 logger.warning(
                     "[Orchestrator] LiveWorkSensor: human is active on %s (%s) "
-                    "— wait infeasible (horizon=%.0fs remaining=%.0fs), "
-                    "failing op [%s]",
+                    "— wait infeasible (horizon=%.0fs remaining=%.0fs "
+                    "max_wait=%.0fs slept=%.0fs), failing op [%s]",
                     _hit_file, _hit_reason, _horizon, _remaining_s,
-                    ctx.op_id[:12],
+                    _max_wait_s, _slept_total, ctx.op_id[:12],
                 )
-                return _active_hit
+                return _LiveWorkGateResult(_active_hit, _slept_total, None)
             logger.info(
                 "[Orchestrator] LiveWorkSensor: %s active (%s) — waiting %.1fs for quiet [%s]",
                 _hit_file, _hit_reason, _horizon, ctx.op_id[:12],
             )
             await asyncio.sleep(_horizon)
+            _slept_total += _horizon
             _lws.invalidate_cache()
 
     @staticmethod

@@ -61,7 +61,7 @@ def is_enabled() -> bool:
     return _ENABLED
 
 
-class _SignalEval(NamedTuple):
+class SignalEval(NamedTuple):
     """One evaluation pass over the three signals for a single file.
 
     ``horizon_s`` is the sensor's prediction of how long until the file
@@ -137,13 +137,26 @@ class LiveWorkSensor:
         appears idle. Any unexpected error returns ``(False, None)`` —
         we prefer to not block autonomous work on sensor malfunctions.
         """
-        if not _ENABLED:
-            return False, None
-        if not rel_path:
-            return False, None
-
-        result = await self._evaluate_signals(rel_path)
+        result = await self.evaluate(rel_path)
         return result.active, result.reason
+
+    async def evaluate(self, rel_path: str) -> SignalEval:
+        """Return the full signal evaluation for ``rel_path`` in ONE pass.
+
+        Slice 10 review I1: single-eval consumers (the orchestrator's
+        APPLY defer-wait gate) need ``(active, reason, horizon_s)`` from
+        the SAME evaluation — two separate calls can disagree at the
+        exact window boundary (active with horizon 0). ``is_human_active``
+        and ``seconds_until_quiet`` remain as thin projections of this
+        method for existing callers. Same never-raise discipline: the
+        env-disabled and empty-path cases read as idle.
+        """
+        if not _ENABLED:
+            return SignalEval(False, None, 0.0)
+        if not rel_path:
+            return SignalEval(False, None, 0.0)
+
+        return await self._evaluate_signals(rel_path)
 
     async def seconds_until_quiet(self, rel_path: str) -> float:
         """Predict how long (seconds) until ``rel_path`` reads as idle.
@@ -157,28 +170,24 @@ class LiveWorkSensor:
         exact, non-polled wait horizon (Slice 10 — the orchestrator's
         APPLY defer-wait).
         """
-        if not _ENABLED:
-            return 0.0
-        if not rel_path:
-            return 0.0
-
-        result = await self._evaluate_signals(rel_path)
+        result = await self.evaluate(rel_path)
         return result.horizon_s
 
-    async def _evaluate_signals(self, rel_path: str) -> _SignalEval:
-        """Single evaluation pass shared by :meth:`is_human_active` and
-        :meth:`seconds_until_quiet` — ONE copy of the signal logic, two
-        public projections of the result (active/reason vs horizon).
+    async def _evaluate_signals(self, rel_path: str) -> SignalEval:
+        """Single evaluation pass behind :meth:`evaluate` — ONE copy of
+        the signal logic; :meth:`is_human_active` and
+        :meth:`seconds_until_quiet` are thin projections of the result.
         """
         normalized = rel_path.replace("\\", "/").lstrip("./")
         abs_path = (self._repo_root / normalized).resolve()
 
-        # Slice 10 kill switch — read at call time like the module's
-        # other env reads; ``false`` restores the legacy timeless-dirty
-        # signal exactly.
+        # Slice 10 kill switch — read at call time; negative-list idiom
+        # (review M2: "=0" must disable too). Any value outside the list
+        # keeps recency composition; a listed value restores the legacy
+        # timeless-dirty signal exactly.
         dirty_requires_recency = (
-            os.environ.get("JARVIS_LIVE_WORK_DIRTY_REQUIRES_RECENCY", "true").lower()
-            != "false"
+            os.environ.get("JARVIS_LIVE_WORK_DIRTY_REQUIRES_RECENCY", "true")
+            .strip().lower() not in ("0", "false", "no", "off")
         )
 
         # 1. Git dirty state — cheapest reliable signal. Slice 10 (Run
@@ -194,7 +203,7 @@ class LiveWorkSensor:
                 if not dirty_requires_recency:
                     # Legacy: any uncommitted change is active, with no
                     # predictable expiry (dirty until the human commits).
-                    return _SignalEval(
+                    return SignalEval(
                         True,
                         f"git status: {normalized} has uncommitted changes",
                         float("inf"),
@@ -204,14 +213,26 @@ class LiveWorkSensor:
                 except OSError:
                     # Dirty but mtime unreadable — fail SAFE (treat as
                     # active): the no-stomp guarantee outranks progress.
-                    return _SignalEval(
+                    return SignalEval(
                         True,
                         f"git status: {normalized} has uncommitted changes "
                         "(mtime unreadable)",
                         float("inf"),
                     )
-                if 0 <= age <= self._active_window_s:
-                    return _SignalEval(
+                if age < 0:
+                    # Review I3: a FUTURE mtime (clock skew, touch -t) on
+                    # a DIRTY file must fail SAFE like unreadable-mtime —
+                    # legacy-dirty said active; reading it as idle would
+                    # fail OPEN. Clean files keep signal-2's plain
+                    # recent-window semantics (no-stomp binds to dirty).
+                    return SignalEval(
+                        True,
+                        f"git status: {normalized} has uncommitted changes "
+                        f"(mtime {int(-age)}s in the future)",
+                        float("inf"),
+                    )
+                if age <= self._active_window_s:
+                    return SignalEval(
                         True,
                         f"git status: {normalized} has uncommitted changes "
                         f"(modified {int(age)}s ago)",
@@ -225,7 +246,7 @@ class LiveWorkSensor:
             if abs_path.exists() and abs_path.is_file():
                 age = time.time() - abs_path.stat().st_mtime
                 if 0 <= age <= self._active_window_s:
-                    return _SignalEval(
+                    return SignalEval(
                         True,
                         f"mtime: modified {int(age)}s ago (window={int(self._active_window_s)}s)",
                         max(0.0, self._active_window_s - age),
@@ -238,11 +259,11 @@ class LiveWorkSensor:
             lock = await self._find_ide_lock(abs_path)
             if lock is not None:
                 # A lock has no expiry the sensor can predict.
-                return _SignalEval(True, f"ide-lock: {lock}", float("inf"))
+                return SignalEval(True, f"ide-lock: {lock}", float("inf"))
         except OSError as exc:
             logger.debug("[LiveWork] lock-scan failed for %s: %s", normalized, exc)
 
-        return _SignalEval(False, None, 0.0)
+        return SignalEval(False, None, 0.0)
 
     def get_active_files(self) -> Set[str]:
         """Return the set of currently-active rel paths (git dirty union).

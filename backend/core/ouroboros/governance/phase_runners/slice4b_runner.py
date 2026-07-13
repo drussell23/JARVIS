@@ -589,9 +589,9 @@ class Slice4bRunner(PhaseRunner):
                 is_enabled as _lws_enabled,
             )
             if _lws_enabled() and ctx.risk_tier is not RiskTier.APPROVAL_REQUIRED:
-                _active_hit = await orch._live_work_apply_gate(ctx, best_candidate)
-                if _active_hit is not None:
-                    _hit_file, _hit_reason = _active_hit
+                _lw_gate = await orch._live_work_apply_gate(ctx, best_candidate)
+                if _lw_gate.active_hit is not None:
+                    _hit_file, _hit_reason = _lw_gate.active_hit
                     await orch._record_ledger(ctx, OperationState.FAILED, {
                         "reason": "human_active_on_target",
                         "file": _hit_file,
@@ -605,6 +605,37 @@ class Slice4bRunner(PhaseRunner):
                     return PhaseResult(
                         next_ctx=ctx, next_phase=None, status="fail",
                         reason="human_active_on_target",
+                        artifacts={"t_apply": _t_apply},
+                    )
+                if _lw_gate.drift_stale_files is not None:
+                    # Review C1 (TOCTOU) — the Slice 248 drift check above
+                    # ran BEFORE the gate's wait; the gate re-ran the SAME
+                    # helper post-wait and it came back blocking. SAME
+                    # terminal shape as the pre-gate block.
+                    from backend.core.ouroboros.governance.state_drift import (
+                        STATE_DRIFT_UNRECONCILED as _SD_UNRECONCILED,
+                    )
+                    logger.warning(
+                        "[Orchestrator] STATE DRIFT UNRECONCILED post-LiveWork-wait "
+                        "(%.0fs) — blocking APPLY of stale candidate on %s — "
+                        "failing safe (no corruption) [%s]",
+                        _lw_gate.waited_s,
+                        _lw_gate.drift_stale_files[:3], ctx.op_id[:12],
+                    )
+                    await orch._record_ledger(ctx, OperationState.FAILED, {
+                        "reason": _SD_UNRECONCILED,
+                        "stale_files": _lw_gate.drift_stale_files,
+                    })
+                    ctx = ctx.advance(
+                        OperationPhase.POSTMORTEM,
+                        terminal_reason_code=_SD_UNRECONCILED,
+                    )
+                    await orch._publish_outcome(
+                        ctx, OperationState.FAILED, _SD_UNRECONCILED,
+                    )
+                    return PhaseResult(
+                        next_ctx=ctx, next_phase=None, status="fail",
+                        reason=_SD_UNRECONCILED,
                         artifacts={"t_apply": _t_apply},
                     )
         except Exception:

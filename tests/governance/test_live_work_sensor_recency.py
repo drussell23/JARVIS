@@ -160,6 +160,71 @@ async def test_seconds_until_quiet_recent_clean_mtime_is_window_minus_age(repo):
     assert horizon == pytest.approx(_WINDOW_S - 80, abs=2.0)
 
 
+# ---------------------------------------------------------------------------
+# I3 — a FUTURE mtime on a dirty file fails SAFE (clock skew / touch -t
+# must not read as idle where legacy-dirty said active)
+# ---------------------------------------------------------------------------
+
+
+async def test_dirty_future_mtime_fails_safe_active(repo):
+    (repo / "mod.py").write_text("x = 2  # chaos\n")
+    future = time.time() + 60
+    os.utime(repo / "mod.py", (future, future))
+    sensor = _sensor(repo)
+    active, reason = await sensor.is_human_active("mod.py")
+    assert active is True
+    assert "git status" in (reason or "")
+    assert await sensor.seconds_until_quiet("mod.py") == float("inf")
+
+
+async def test_clean_future_mtime_keeps_signal2_semantics(repo):
+    """The no-stomp doctrine binds to DIRTY files — a clean file with a
+    future mtime keeps today's signal-2 recent-window-only semantics
+    (not recent → idle)."""
+    future = time.time() + 60
+    os.utime(repo / "mod.py", (future, future))
+    active, reason = await _sensor(repo).is_human_active("mod.py")
+    assert active is False
+    assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# Single-pass evaluation — public `evaluate` is the one source both thin
+# projections (is_human_active / seconds_until_quiet) share
+# ---------------------------------------------------------------------------
+
+
+async def test_evaluate_returns_full_signal_eval(repo):
+    (repo / "mod.py").write_text("x = 2\n")
+    _age(repo / "mod.py", 60)
+    sensor = _sensor(repo)
+    ev = await sensor.evaluate("mod.py")
+    assert ev.active is True
+    assert "git status" in (ev.reason or "")
+    assert ev.horizon_s == pytest.approx(_WINDOW_S - 60, abs=2.0)
+    # Projections agree with the eval they project.
+    assert (await sensor.is_human_active("mod.py")) == (ev.active, ev.reason)
+
+
+async def test_evaluate_empty_path_is_idle(repo):
+    ev = await _sensor(repo).evaluate("")
+    assert (ev.active, ev.reason, ev.horizon_s) == (False, None, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# M2 — kill switch parses the negative-list idiom ("0" disables too)
+# ---------------------------------------------------------------------------
+
+
+async def test_kill_switch_zero_also_disables_recency(repo, monkeypatch):
+    monkeypatch.setenv("JARVIS_LIVE_WORK_DIRTY_REQUIRES_RECENCY", "0")
+    (repo / "mod.py").write_text("x = 2  # chaos\n")
+    _age(repo / "mod.py", 3600)
+    active, reason = await _sensor(repo).is_human_active("mod.py")
+    assert active is True
+    assert reason == "git status: mod.py has uncommitted changes"
+
+
 async def test_horizon_agrees_with_is_human_active(repo):
     """The two public methods project the SAME signal evaluation —
     active ⟺ horizon > 0, idle ⟺ horizon == 0."""

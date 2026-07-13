@@ -363,22 +363,28 @@ class TestFindIdeLockOffload:
 
 
 class TestAwaitGuardProductionCallSites:
-    def test_orchestrator_awaits_is_human_active(self):
+    def test_orchestrator_awaits_single_pass_evaluate(self):
+        # Slice 10 review I1: the shared APPLY gate consumes ONE sensor
+        # evaluation per file (evaluate — active/reason/horizon from a
+        # single pass) instead of separate is_human_active +
+        # seconds_until_quiet calls that can disagree at the window
+        # boundary. A missed await would silently swallow the guard.
         src = (
             Path(__file__).resolve().parents[2]
             / "backend/core/ouroboros/governance/orchestrator.py"
         ).read_text(encoding="utf-8")
-        assert "await _lws.is_human_active(str(_tf))" in src, (
-            "orchestrator.py call site must await the now-async "
-            "is_human_active — a missed await would silently swallow "
+        assert "await _lws.evaluate(str(_tf))" in src, (
+            "orchestrator.py gate must await the now-async single-pass "
+            "evaluate — a missed await would silently swallow "
             "the human-active-file guard"
         )
 
     def test_slice4b_runner_awaits_shared_live_work_gate(self):
         # Slice 10: the runner no longer scans inline — it awaits the
-        # shared defer-wait gate (which itself awaits is_human_active,
-        # pinned by test_orchestrator_awaits_is_human_active above). A
-        # missed await here would silently drop the guard the same way.
+        # shared defer-wait gate (which itself awaits the single-pass
+        # evaluate, pinned by test_orchestrator_awaits_single_pass_
+        # evaluate above). A missed await here would silently drop the
+        # guard the same way.
         src = (
             Path(__file__).resolve().parents[2]
             / "backend/core/ouroboros/governance/phase_runners/slice4b_runner.py"

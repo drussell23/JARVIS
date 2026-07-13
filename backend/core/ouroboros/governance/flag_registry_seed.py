@@ -5296,7 +5296,7 @@ SEED_SPECS: list = [
         posture_relevance={},
     ),
     # ====================================================================
-    # Test->Source Attribution Bridge (Slice 6) — 14 flags (Slices 7-10)
+    # Test->Source Attribution Bridge (Slice 6) — 15 flags (Slices 7-10)
     # ====================================================================
     FlagSpec(
         name="JARVIS_TEST_SOURCE_ATTRIBUTION_ENABLED",
@@ -5546,6 +5546,27 @@ SEED_SPECS: list = [
         source_file="backend/core/ouroboros/governance/orchestrator.py",
         example="true",
         since="2026-07-12",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_APPLY_LIVE_WORK_WAIT_MAX_S",
+        type=FlagType.FLOAT, default=0.0,
+        description=(
+            "Slice 10 review I4: clamp on the SUM of defer-wait sleeps "
+            "within one APPLY LiveWork gate invocation (pool occupancy: "
+            "3 concurrent deferred ops must not put the whole worker "
+            "pool to sleep for the full pipeline deadline). 0.0 (the "
+            "default) is a sentinel meaning DERIVE at call time from "
+            "JARVIS_FILE_LOCK_TTL_S (default 300) — a wait may never "
+            "outlive the file lock that serializes writers, or a second "
+            "op can acquire the same file mid-wait. An explicit positive "
+            "value wins over the derivation. Exceeding the clamp takes "
+            "the wait-infeasible terminal path."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/orchestrator.py",
+        example="0.0",
+        since="2026-07-13",
         posture_relevance=_HARDEN_CRITICAL,
     ),
 ]
