@@ -332,6 +332,19 @@ def _corroborated_rejects_enabled() -> bool:
     ).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _lineage_scoped_rejects_enabled() -> bool:
+    """Read ``JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS`` (default true). Extends
+    the resumed-ops unrelated-reject lane (see ``_corroborated_rejects_enabled``
+    / ``_correlate_flag_signal``) to single-session audits that have a chaos
+    manifest but no resumed-op set: a corroborated REJECT on an op OUTSIDE the
+    chaos lineage is the gate working correctly elsewhere, not a poisoning
+    signal for the audited chaos repair (Run #19). OFF restores legacy global
+    correlation for single-session audits."""
+    return os.environ.get(
+        "JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
 def _default_chaos_manifest_path() -> str:
     """Default chaos manifest location: ``<repo>/.jarvis/chaos_manifest.json``.
     Mirrors ``chaos_injector_ast.MANIFEST_REL_PATH``."""
@@ -1635,7 +1648,22 @@ class A1GraduationAuditor:
         observed signal (the gate working correctly elsewhere), not a
         poisoning REJECT. With no resumed-op scope (legacy / non-resume
         audits) behavior is UNCHANGED -- global correlation, exactly as
-        before."""
+        before.
+
+        Chaos-lineage reject scoping (Run #19 fix, single-session audits):
+        the resumed-ops lane above only activates for multi-session/resumed
+        audits. A single-session audit with a chaos manifest but no resumed
+        ops (the common case) still globally correlated -- a GENUINE,
+        self-corroborated rejection on a background op with nothing to do
+        with the audited chaos repair (e.g. Iron Gate's exploration floor
+        firing on an unrelated op) poisoned the flag anyway. When there is
+        no resumed-op scope, ``JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS``
+        (default true) extends the same unrelated-but-observed treatment to
+        ops OUTSIDE the chaos lineage graph. The op id is taken from the
+        caller-supplied ``op_id`` or, when absent, parsed from the line
+        itself. A reject line with NO recoverable op id stays globally
+        correlated -- fail-CLOSED, an unattributable rejection still
+        poisons."""
         for family, states in self._by_family.items():
             sig = _FAMILY_SIGNALS.get(family)
             if not sig:
@@ -1655,9 +1683,20 @@ class A1GraduationAuditor:
                 )
                 hit_reject = False
             if hit_reject:
-                if self.resumed_ops and op_id and op_id not in self.resumed_ops:
+                _op = op_id or self._extract_op_id("", {}, text)
+                _outside_resumed = bool(
+                    self.resumed_ops and _op and _op not in self.resumed_ops
+                )
+                _outside_chaos = (
+                    not self.resumed_ops
+                    and _lineage_scoped_rejects_enabled()
+                    and bool(_op)
+                    and self.lineage.has_chaos_target()
+                    and not self.lineage.in_chaos_lineage(_op)
+                )
+                if _outside_resumed or _outside_chaos:
                     self.observed_unrelated_flag_rejects.append(
-                        "%s:op=%s" % (family, op_id)
+                        "%s:op=%s" % (family, _op)
                     )
                     continue
                 for st in states:
