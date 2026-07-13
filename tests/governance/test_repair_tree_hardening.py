@@ -352,7 +352,26 @@ def test_pin_10_run_inner_legacy_bytes_pinned():
     # change is still nested under ``if _efe():`` -> OFF byte-identical
     # (verified by tests/governance/test_epistemic_pivot.py reachability
     # test). Pin updated atomically.
-    EXPECTED_DIGEST = "51bf4e5724ad2afc"
+    #
+    # Phase tag: Adaptive Epistemic Feedback Matrix — thrash pivot
+    # (e1c3a23fe1, 2026-06-23, RETROACTIVE — the commit modified
+    # _run_inner's divergence stop to compose budget-exhaustion thrash
+    # with stuck-signature but MISSED this pin; discovered red during the
+    # Slice 9 merge sweep 2026-07-12 and tagged after the fact. The change
+    # itself is arc-reviewed and nested under ``if _efe():`` like its T2/T3
+    # siblings — OFF byte-identical.)
+    #
+    # Phase tag: Slice 9 — L2 exercises the REAL failing tests
+    # (d7a57c4926 + c4c1d2be34, 2026-07-12). _run_inner's per-iteration
+    # test scope now flows through _resolve_l2_test_targets
+    # (attribution-first test locus + changed-sibling union, pinned
+    # pytest config); LINEAR rollback semantics untouched (the FSM's
+    # apply/verify/rollback skeleton is unchanged — only the pytest
+    # target selection feeding run_tests changed, verified by
+    # tests/governance/test_repair_lane_test_targets.py 12/12 +
+    # test_validate_candidate_tree.py e2e). Soak validation: Run #20
+    # (first ignition after the Slice 9 merge). Pin updated atomically.
+    EXPECTED_DIGEST = "411775083e93b81b"
     assert digest == EXPECTED_DIGEST, (
         f"_run_inner bytes drift detected: expected "
         f"{EXPECTED_DIGEST}, got {digest}. Legacy LINEAR semantics "
