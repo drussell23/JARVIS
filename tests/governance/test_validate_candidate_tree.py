@@ -12,6 +12,7 @@ import ast
 import asyncio
 import inspect
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -176,6 +177,86 @@ def _calls_tree_runner_run(node: ast.AST) -> bool:
 
 def _handler_exc_name(handler: ast.ExceptHandler):
     return handler.type.id if isinstance(handler.type, ast.Name) else None
+
+
+class TestRun19LeafPairEndToEnd:
+    """THE Run #19 scenario against the REAL repo: mutate the leaf source
+    in a scratch clone's working tree (the chaos shape), hand VALIDATE the
+    correct candidate, and require candidate-tree validation to pass under
+    node policy. Uses a shallow file-copy clone of just the involved
+    packages to keep the tree materialization fast and hermetic."""
+
+    def test_leaf_repair_validates_green_under_node_policy(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "JARVIS_SANDBOX_PREFIXES", "/nonexistent-sandbox-prefix",
+        )
+        real = Path(__file__).resolve().parents[2]
+        leaf_rel = Path("backend/core/ouroboros/a1_ignition_vector/leaf_predicates.py")
+        test_rel = Path("tests/governance/a1_ignition_vector/test_leaf_predicates.py")
+
+        repo = tmp_path / "repo"
+        for rel in (leaf_rel, test_rel):
+            dst = repo / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text((real / rel).read_text())
+        # package __init__ chain for imports (source side) + root pytest.ini
+        for parent in (leaf_rel.parent, *leaf_rel.parent.parents):
+            if parent == Path("."):
+                break
+            init = repo / parent / "__init__.py"
+            init.parent.mkdir(parents=True, exist_ok=True)
+            if not init.exists():
+                init.write_text("")
+        (repo / "pytest.ini").write_text("[pytest]\naddopts = -p no:cacheprovider\n")
+
+        def git(*args):
+            subprocess.run(["git", *args], cwd=repo, check=True,
+                           capture_output=True)
+        git("init", "-q")
+        git("config", "user.email", "t@t")
+        git("config", "user.name", "t")
+        git("add", "-A")
+        git("commit", "-qm", "base")
+
+        correct = (repo / leaf_rel).read_text()
+        # Chaos: invert clamp01's clamping branches in the WORKING TREE
+        # (uncommitted) so the real test_clamp01 assertions genuinely fail
+        # (clamp01(-5) returns 1 instead of 0, clamp01(7) returns 0 instead
+        # of 1). Deterministic, constructed by reading the real leaf file
+        # first (not a blind string-replace).
+        broken = correct.replace(
+            "    if x < 0:\n"
+            "        return 0\n"
+            "    if x > 1:\n"
+            "        return 1\n"
+            "    return x\n",
+            "    if x < 0:\n"
+            "        return 1\n"
+            "    if x > 1:\n"
+            "        return 0\n"
+            "    return x\n",
+        )
+        assert broken != correct, "chaos mutation did not match clamp01's body"
+        (repo / leaf_rel).write_text(broken)
+
+        # Prove the chaos genuinely breaks the real test standalone before
+        # relying on it inside VALIDATE.
+        standalone = subprocess.run(
+            [sys.executable, "-m", "pytest", str(test_rel), "-q"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        assert standalone.returncode != 0, (
+            "chaos mutation did not break the copied test standalone:\n"
+            f"{standalone.stdout}\n{standalone.stderr}"
+        )
+        assert "test_clamp01" in standalone.stdout
+
+        result = _run_validation_for(
+            repo, str(leaf_rel), correct, monkeypatch, tree_enabled=True,
+        )
+        assert result.passed, f"fc={result.failure_class} err={result.error}"
 
 
 def test_tree_run_except_clauses_delegate_to_map_helper():
