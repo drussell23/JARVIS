@@ -308,3 +308,154 @@ def test_master_switch_off_disables_lane_despite_env_flag(monkeypatch):
         for st in a._by_family.get("iron_gate", ())
     )
     assert not a.observed_unrelated_flag_rejects
+
+
+# ---------------------------------------------------------------------------
+# Slice 10 — CommProtocol INTENT lineage stitching (Run #20 false-red).
+#
+# Run #20 ran in replay_mode=True (log-grep-only, no SSE): unrelated
+# background ops never got lineage-graph nodes, so their GENUINE iron_gate
+# rejects could not be excused -- resolve_op_id fail-closed correctly, but the
+# evidence to stitch those nodes WAS in the debug.log: the op's
+# '[CommProtocol] INTENT op=<full-id> seq=1 payload={...}' line carries the
+# full op id AND target_files. Teach the log-ingest lane to stitch lineage
+# nodes from INTENT lines (fail-soft per line), and make it a PRE-PASS over
+# the log so reject correlation is order-independent (false_positive_rejected
+# is sticky -- a reject correlated before its op's INTENT line would fail
+# closed forever).
+# ---------------------------------------------------------------------------
+
+_RUN20_OP_A = "op-019f5a32-80fd-7a59-a84e-62be2e97f179-cau"
+_RUN20_OP_B = "op-019f5a32-8108-7bb2-9c01-5f7d2ab90d22-cau"
+_UNRELATED_FILE = "backend/core/some/unrelated_module.py"
+_CHAOS_FILE = "backend/core/ouroboros/a1_ignition_vector/leaf_predicates.py"
+
+
+def _intent_line(op_id, target_files, seq: int = 1) -> str:
+    # Real Run-20 debug.log line shape (Python-literal dict repr payload).
+    return (
+        "2026-07-12T23:38:39 [backend.core.ouroboros.governance.comm_protocol]"
+        " INFO [CommProtocol] INTENT op=%s seq=%d payload={'goal': \"Wave 3"
+        " (6) Slice 5b / F1 gra...\", 'target_files': %r,"
+        " 'risk_tier': 'SAFE_AUTO'}" % (op_id, seq, list(target_files))
+    )
+
+
+def _auditor_for_intent_stitching(chaos_op: str = "op-chaos-1"):
+    a = _fresh_auditor_families(["JARVIS_ADAPTIVE_IRON_GATE_FLOORS_ENABLED"])
+    a.lineage_scoping_enabled = True
+    a.lineage = auditor_mod.OpLineageGraph([_CHAOS_FILE])
+    a.lineage.observe_op(chaos_op, target_files=[_CHAOS_FILE])
+    return a
+
+
+def _iron_gate_poisoned(a) -> bool:
+    return any(
+        st.false_positive_rejected
+        for st in a._by_family.get("iron_gate", ())
+    )
+
+
+def test_intent_stitched_node_excuses_unrelated_reject(monkeypatch):
+    """(a) An INTENT line stitches the op's node (non-chaos target_files);
+    a later corroborated reject naming the FULL id is excused, with no
+    stitch failure recorded."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
+    a = _auditor_for_intent_stitching()
+    a.ingest_log_line(_intent_line(_RUN20_OP_A, [_UNRELATED_FILE]))
+    a.ingest_log_line(_iron_gate_reject_line(_RUN20_OP_A))
+    assert not _iron_gate_poisoned(a)
+    assert any("iron_gate" in x for x in a.observed_unrelated_flag_rejects)
+    assert not any(
+        "flag_reject_op_unresolved" in x for x in a.lineage_stitch_failures
+    )
+
+
+def test_intent_stitched_chaos_op_reject_poisons(monkeypatch):
+    """(b) Same, but the INTENT payload's target_files include the chaos
+    target -> the op IS the chaos lineage -> the reject poisons."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
+    a = _auditor_for_intent_stitching()
+    a.ingest_log_line(_intent_line(_RUN20_OP_A, [_CHAOS_FILE]))
+    a.ingest_log_line(_iron_gate_reject_line(_RUN20_OP_A))
+    assert _iron_gate_poisoned(a)
+
+
+def test_truncated_reject_resolves_to_intent_stitched_node(monkeypatch):
+    """(c) A truncated-prefix reject id resolves uniquely to the
+    INTENT-stitched node and is excused per its (non-chaos) lineage."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
+    a = _auditor_for_intent_stitching()
+    a.ingest_log_line(_intent_line(_RUN20_OP_A, [_UNRELATED_FILE]))
+    a.ingest_log_line(_iron_gate_reject_line(_RUN20_OP_A[:16]))
+    assert not _iron_gate_poisoned(a)
+    assert any("iron_gate" in x for x in a.observed_unrelated_flag_rejects)
+
+
+def test_unparseable_intent_payload_fails_soft_then_closed(monkeypatch):
+    """(d) An INTENT line truncated mid-dict is skipped WITHOUT raising; the
+    op stays unresolved -> the reject falls back to fail-closed poison and
+    the miss is recorded in lineage_stitch_failures."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
+    a = _auditor_for_intent_stitching()
+    truncated = _intent_line(_RUN20_OP_A, [_UNRELATED_FILE])[:-40]
+    assert "payload={" in truncated  # truncation landed mid-dict
+    a.ingest_log_line(truncated)  # must NOT raise
+    a.ingest_log_line(_iron_gate_reject_line(_RUN20_OP_A))
+    assert _iron_gate_poisoned(a)
+    assert any(
+        "flag_reject_op_unresolved" in x and _RUN20_OP_A in x
+        for x in a.lineage_stitch_failures
+    )
+
+
+def test_non_seq1_intent_lines_are_ignored(monkeypatch):
+    """Only seq=1 INTENT lines stitch lineage; a seq=2 line does not create
+    a node, so the reject stays fail-closed."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
+    a = _auditor_for_intent_stitching()
+    a.ingest_log_line(_intent_line(_RUN20_OP_A, [_UNRELATED_FILE], seq=2))
+    a.ingest_log_line(_iron_gate_reject_line(_RUN20_OP_A))
+    assert _iron_gate_poisoned(a)
+
+
+def test_run20_ambiguous_prefix_still_fails_closed(monkeypatch):
+    """(e) The Run-20 ambiguity case: two INTENT-stitched ops share the
+    12-char prefix op-019f5a32 -- a truncated reject id stays AMBIGUOUS ->
+    fail-closed poison + stitch failure."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
+    a = _auditor_for_intent_stitching()
+    a.ingest_log_line(_intent_line(_RUN20_OP_A, [_UNRELATED_FILE]))
+    a.ingest_log_line(_intent_line(_RUN20_OP_B, [_UNRELATED_FILE]))
+    a.ingest_log_line(_iron_gate_reject_line("op-019f5a32"))
+    assert _iron_gate_poisoned(a)
+    assert any(
+        "flag_reject_op_unresolved" in x for x in a.lineage_stitch_failures
+    )
+
+
+def test_intent_prepass_makes_reject_order_independent(monkeypatch, tmp_path):
+    """(3) Order-independence: the streaming lane ingests strictly in file
+    order with NO pre-pass and false_positive_rejected is sticky, so a
+    reject line appearing BEFORE its op's INTENT line poisons forever.
+    prestitch_intent_lineage scans the log for INTENT nodes BEFORE reject
+    correlation runs, making the excusal order-independent."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
+    reject = _iron_gate_reject_line(_RUN20_OP_A)
+    intent = _intent_line(_RUN20_OP_A, [_UNRELATED_FILE])
+    log = tmp_path / "debug.log"
+    log.write_text(reject + "\n" + intent + "\n", encoding="utf-8")
+
+    # Counterfactual: without the pre-pass, reject-before-INTENT poisons.
+    a_bare = _auditor_for_intent_stitching()
+    for line in log.read_text(encoding="utf-8").splitlines():
+        a_bare.ingest_log_line(line)
+    assert _iron_gate_poisoned(a_bare)
+
+    # With the pre-pass, the same stream is excused.
+    a = _auditor_for_intent_stitching()
+    a.prestitch_intent_lineage(str(log))
+    for line in log.read_text(encoding="utf-8").splitlines():
+        a.ingest_log_line(line)
+    assert not _iron_gate_poisoned(a)
+    assert any("iron_gate" in x for x in a.observed_unrelated_flag_rejects)

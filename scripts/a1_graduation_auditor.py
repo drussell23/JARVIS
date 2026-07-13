@@ -57,6 +57,7 @@ Design constraints: ``from __future__ import annotations``, Python 3.9+
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import json
 import os
@@ -632,6 +633,17 @@ _A1TRACE_EMIT_RESUMED_RE = re.compile(
     r"\[A1Trace\]\s+emit\s+goal=(?P<goal>\S+)\s+source=(?P<source>\S+)\s+"
     r"lineage=resumed\s+original_emit_wall=(?P<wall>\S+)"
 )
+# '[CommProtocol] INTENT op=<op> seq=1 payload={...}' -- the op's INTENT
+# announcement carries its FULL op id + target_files in a Python-literal
+# dict repr; textual twin of the SSE payload the lineage graph is normally
+# fed from (Run #20 fix: a log-only replay has no SSE payloads, so unrelated
+# background ops never got lineage nodes and their genuine rejects could not
+# be excused -- resolve_op_id correctly failed closed on op ids the graph
+# had simply never observed).
+_COMM_INTENT_LINEAGE_RE = re.compile(
+    r"\[CommProtocol\]\s+INTENT\s+op=(?P<op>[\w.:-]+)\s+seq=(?P<seq>\d+)"
+    r"\s.*?\bpayload=(?P<payload>\{.*)$"
+)
 
 
 def parse_hydration_handshake_verified(line: str) -> Optional[Tuple[str, str, str]]:
@@ -643,6 +655,30 @@ def parse_hydration_handshake_verified(line: str) -> Optional[Tuple[str, str, st
             return None
         return m.group("op"), m.group("phase"), m.group("digest")
     except Exception:  # noqa: BLE001
+        return None
+
+
+def parse_comm_intent_lineage(line: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Parse a ``[CommProtocol] INTENT op=<id> seq=1 payload={...}`` line ->
+    ``(op_id, payload_dict)``, or None. Only seq=1 INTENT lines matter (the
+    op's announcement -- later seqs are phase chatter). The payload is a
+    Python-literal dict repr, possibly TRUNCATED mid-dict by the logger --
+    parsed with ``ast.literal_eval``, fail-soft per line: an unparseable /
+    truncated payload returns None, NEVER raises (a malformed log line must
+    never crash an audit; the reject-scoping caller then simply stays
+    fail-closed for that op)."""
+    try:
+        m = _COMM_INTENT_LINEAGE_RE.search(line or "")
+        if m is None or m.group("seq") != "1":
+            return None
+        op_id = m.group("op").rstrip(":.-")
+        if not op_id:
+            return None
+        payload = ast.literal_eval(m.group("payload"))
+        if not isinstance(payload, dict):
+            return None
+        return op_id, payload
+    except Exception:  # noqa: BLE001 -- truncated/malformed payload repr
         return None
 
 
@@ -1238,6 +1274,10 @@ class A1GraduationAuditor:
         # Cycle-safe bounded traversal guards for ancestor stitching.
         self._stitched_ops: set = set()
         self._stitched_sessions: set = set()
+        # Ops whose lineage node was stitched from a [CommProtocol] INTENT
+        # seq=1 log line (Run #20 fix) -- dedupe by op id so each INTENT is
+        # parsed/fed once.
+        self._intent_stitched_ops: Set[str] = set()
         # Flags whose honest UNVERIFIABLE verdict was downgraded to a WARN
         # under --replay (log-only static replay cannot observe live-SSE-only
         # signal families). REJECTED flags are NEVER downgraded.
@@ -1399,6 +1439,47 @@ class A1GraduationAuditor:
         self.lineage.observe_op(
             op_id, target_files=target_files or None, parents=parents or None
         )
+
+    # ----- CommProtocol INTENT lineage stitching (Run #20 fix) -------------
+
+    def _stitch_intent_lineage_from_line(self, line: str) -> None:
+        """If *line* is a ``[CommProtocol] INTENT op=<id> seq=1`` line, feed
+        its op id + payload target_files into the SAME node-construction API
+        the SSE lane uses (``_record_op_lineage_from_payload``) so
+        ``in_chaos_lineage``/``resolve_op_id`` can see log-only ops. Deduped
+        by op id; fail-soft (an unparseable payload is skipped, never
+        raised)."""
+        intent = parse_comm_intent_lineage(line)
+        if intent is None:
+            return
+        i_op, i_payload = intent
+        if i_op in self._intent_stitched_ops:
+            return
+        self._intent_stitched_ops.add(i_op)
+        # The op= token on the line is authoritative for identity (the
+        # payload repr may be truncated past its own id fields).
+        i_payload["op_id"] = i_op
+        self._record_op_lineage_from_payload(i_payload)
+
+    def prestitch_intent_lineage(self, log_path: Optional[str]) -> None:
+        """Order-independence pre-pass over *log_path* (Run #20 fix): stitch
+        every INTENT seq=1 lineage node BEFORE reject correlation runs. The
+        streaming lane (``log_tail_source`` -> ``ingest_log_line``) ingests
+        strictly in file order with NO pre-pass, and
+        ``false_positive_rejected`` is sticky -- a reject correlated before
+        its op's INTENT line is ingested would fail closed forever even
+        though the excusing evidence exists later in the log. Node
+        registration ONLY (no gates, no correlation) -> purely additive and
+        idempotent against the main pass. Fail-soft: any error leaves the
+        audit untouched (a malformed log must never crash an audit)."""
+        if not log_path:
+            return
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as fh:
+                for raw_line in fh:
+                    self._stitch_intent_lineage_from_line(raw_line.rstrip("\n"))
+        except Exception:  # noqa: BLE001 -- missing/unreadable log: no pre-pass
+            return
 
     # ----- cross-session lineage stitching (multi-session lineage-aware) --
 
@@ -1602,6 +1683,15 @@ class A1GraduationAuditor:
         # Log-replay bridges for SSE-only phase/terminal signals (never
         # returns early -- these markers still flow through the gate-check +
         # flag-correlation + PR-signal paths below like any other line).
+
+        # CommProtocol INTENT lineage stitch (textual twin of the SSE lane's
+        # _record_op_lineage_from_payload -- Run #20 fix): a log-only replay
+        # has no SSE payloads, so unrelated background ops never got lineage
+        # nodes and their genuine rejects could not be excused. The INTENT
+        # seq=1 line carries the full op id + target_files; feed it through
+        # the SAME node-construction API BEFORE this line reaches
+        # _correlate_flag_signal below. Deduped by op id, fail-soft per line.
+        self._stitch_intent_lineage_from_line(line)
 
         # CommProtocol HEARTBEAT phase (textual twin of fsm_phase_changed).
         hb = _COMM_HEARTBEAT_PHASE_RE.search(line)
@@ -2158,6 +2248,11 @@ async def run_watch(
             )
         )
     if log_file:
+        # Run #20 order-independence pre-pass: stitch INTENT lineage nodes
+        # from the already-written log BEFORE per-line reject correlation
+        # starts (see prestitch_intent_lineage). Purely additive/idempotent
+        # for the live-tail case; load-bearing for --replay.
+        auditor.prestitch_intent_lineage(log_file)
         tasks.append(
             asyncio.ensure_future(
                 log_tail_source(log_file, on_line=_on_line, stop=stop, log=log)
