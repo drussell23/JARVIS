@@ -23,10 +23,43 @@ import hashlib
 import logging
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Slice 11 — workspace-commit promotion primitives (pure git layer)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PromotionResult:
+    """Successful promotion: which commits landed, how, and where."""
+
+    promoted_shas: Tuple[str, ...]
+    mode: str  # 'ff' | 'cherry-pick' | 'none'
+    target_root: str
+
+
+class PromotionError(RuntimeError):
+    """Typed fail-closed promotion failure (Slice 11 mandate 2).
+
+    ``state`` is one of: ``target_dirty``, ``conflict_aborted``,
+    ``branch_missing``, ``commit_budget_exceeded``, ``git_failure``.
+    On ANY failure the workspace branch is untouched — it remains the
+    quarantined, reviewable artifact (Sovereign Execution Boundary).
+    """
+
+    def __init__(self, state: str, detail: str = "") -> None:
+        super().__init__(
+            "promotion %s: %s" % (state, detail) if detail
+            else "promotion %s" % state
+        )
+        self.state = state
+        self.detail = detail
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +752,156 @@ class WorktreeManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _run_git_rc(
+        self, root: Path, args: Sequence[str],
+    ) -> Tuple[int, str, str]:
+        """Run ``git -C <root> <args>``; return (rc, stdout, stderr).
+
+        Unlike ``_run_git_capture`` this is rc-faithful (no empty-string
+        failure sentinel) and root-parameterized — promotion executes
+        against the TARGET checkout, not this manager's repo_root.
+        """
+        cmd = ["git", "-C", str(root), *args]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await proc.communicate()
+            return (
+                proc.returncode or 0,
+                out.decode(errors="replace"),
+                err.decode(errors="replace"),
+            )
+        except OSError as exc:
+            return 127, "", str(exc)
+
+    async def promote_commits(
+        self,
+        target_root: Path,
+        branch: str,
+        commit_shas: Sequence[str],
+        *,
+        allow_ff: bool = True,
+    ) -> PromotionResult:
+        """Promote verified workspace commits onto ``target_root`` (Slice 11).
+
+        The mechanism half of the promotion gap: moves the op's commits from
+        the quarantined ``ouroboros/auto/<session>`` branch into the target
+        checkout via ``merge --ff-only`` (only when the target head is an
+        ancestor AND the branch tip is exactly the last promoted sha) or
+        ``cherry-pick`` in sha order. Non-destructive by construction: no
+        forced refs, no history rewrites on the target — a conflicted
+        cherry-pick is aborted (git-native restore) and surfaced as a typed
+        ``PromotionError('conflict_aborted')`` with the target working tree
+        byte-identical.
+
+        Fail-closed preflight, all read-only before the first mutating git:
+        commit budget (``JARVIS_PROMOTION_MAX_COMMITS``, default 8) →
+        branch + sha existence → touched-path dirty check
+        (``JARVIS_PROMOTION_REQUIRE_CLEAN_TARGETS``, default true; scoped to
+        the paths the promoted commits touch, so unrelated operator dirt
+        never blocks). Governance (LiveWork consult, GENERATE-hash drift)
+        lives in WorkspacePromoter — this layer is pure git.
+        """
+        target = Path(os.path.realpath(target_root))
+        shas = [s for s in commit_shas if s]
+        if not shas:
+            return PromotionResult((), "none", str(target))
+        try:
+            _max = int(os.environ.get("JARVIS_PROMOTION_MAX_COMMITS", "8"))
+        except ValueError:
+            _max = 8
+        if len(shas) > _max:
+            raise PromotionError(
+                "commit_budget_exceeded", "%d > %d" % (len(shas), _max),
+            )
+
+        rc, _, _ = await self._run_git_rc(
+            target, ["rev-parse", "--verify", "--quiet",
+                     "refs/heads/%s" % branch],
+        )
+        if rc != 0:
+            raise PromotionError("branch_missing", branch)
+        for s in shas:
+            rc, _, _ = await self._run_git_rc(
+                target, ["rev-parse", "--verify", "--quiet", s + "^{commit}"],
+            )
+            if rc != 0:
+                raise PromotionError("git_failure", "unknown commit %s" % s[:12])
+
+        touched: Set[str] = set()
+        for s in shas:
+            rc, out, err = await self._run_git_rc(
+                target,
+                ["diff-tree", "--no-commit-id", "--name-only", "-r", s],
+            )
+            if rc != 0:
+                raise PromotionError(
+                    "git_failure",
+                    "diff-tree %s: %s" % (s[:12], err.strip()[:200]),
+                )
+            touched.update(ln for ln in out.splitlines() if ln.strip())
+
+        _require_clean = os.environ.get(
+            "JARVIS_PROMOTION_REQUIRE_CLEAN_TARGETS", "true",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if _require_clean and touched:
+            rc, out, err = await self._run_git_rc(
+                target, ["status", "--porcelain", "--", *sorted(touched)],
+            )
+            if rc != 0:
+                raise PromotionError(
+                    "git_failure", "status: %s" % err.strip()[:200],
+                )
+            if out.strip():
+                raise PromotionError(
+                    "target_dirty", out.strip().splitlines()[0][:200],
+                )
+
+        if allow_ff:
+            rc_anc, _, _ = await self._run_git_rc(
+                target, ["merge-base", "--is-ancestor", "HEAD", branch],
+            )
+            _, tip_out, _ = await self._run_git_rc(
+                target, ["rev-parse", "refs/heads/%s" % branch],
+            )
+            if rc_anc == 0 and tip_out.strip() == shas[-1]:
+                rc_ff, _, err_ff = await self._run_git_rc(
+                    target, ["merge", "--ff-only", branch],
+                )
+                if rc_ff == 0:
+                    logger.info(
+                        "WorktreeManager.promote_commits: ff %s -> %s "
+                        "(%d commit(s))", branch, target, len(shas),
+                    )
+                    return PromotionResult(tuple(shas), "ff", str(target))
+                logger.debug(
+                    "WorktreeManager.promote_commits: ff-only declined "
+                    "(%s); falling through to cherry-pick", err_ff.strip(),
+                )
+
+        rc_cp, _, err_cp = await self._run_git_rc(
+            target, ["cherry-pick", "--allow-empty", *shas],
+        )
+        if rc_cp != 0:
+            rc_ab, _, err_ab = await self._run_git_rc(
+                target, ["cherry-pick", "--abort"],
+            )
+            if rc_ab != 0:
+                raise PromotionError(
+                    "git_failure",
+                    "cherry-pick failed and abort failed: %s / %s"
+                    % (err_cp.strip()[:200], err_ab.strip()[:200]),
+                )
+            raise PromotionError("conflict_aborted", err_cp.strip()[:300])
+        logger.info(
+            "WorktreeManager.promote_commits: cherry-pick %s -> %s "
+            "(%d commit(s))", branch, target, len(shas),
+        )
+        return PromotionResult(tuple(shas), "cherry-pick", str(target))
 
     async def _run_git_capture(self, args: List[str]) -> str:
         """Run ``git -C <repo> <args>`` and return stdout. Empty on failure."""
