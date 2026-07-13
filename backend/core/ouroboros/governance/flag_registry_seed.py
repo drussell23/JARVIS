@@ -5296,7 +5296,7 @@ SEED_SPECS: list = [
         posture_relevance={},
     ),
     # ====================================================================
-    # Test->Source Attribution Bridge (Slice 6) — 12 flags (Slices 7-9)
+    # Test->Source Attribution Bridge (Slice 6) — 14 flags (Slices 7-10)
     # ====================================================================
     FlagSpec(
         name="JARVIS_TEST_SOURCE_ATTRIBUTION_ENABLED",
@@ -5504,6 +5504,47 @@ SEED_SPECS: list = [
         category=Category.SAFETY,
         source_file="backend/core/ouroboros/governance/repair_sandbox.py",
         example="2000",
+        since="2026-07-12",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_LIVE_WORK_DIRTY_REQUIRES_RECENCY",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 10 (Run #20 root cause): LiveWorkSensor's git-dirty "
+            "signal composes with mtime recency — dirty marks a file "
+            "human-active ONLY while its mtime is within the active "
+            "window (a file dirty for days is not being edited; a "
+            "chaos-injected file is dirty by construction until the "
+            "repair lands, which a timeless signal itself forbids — "
+            "deadlock class). Stale-dirty falls through to the mtime/"
+            "IDE-lock signals. OFF restores the legacy timeless-dirty "
+            "signal exactly."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/live_work_sensor.py",
+        example="true",
+        since="2026-07-12",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_APPLY_LIVE_WORK_WAIT_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 10: the APPLY LiveWork gate DEFERS for real — on an "
+            "active hit it waits the sensor-derived seconds_until_quiet "
+            "horizon (clamped by the op's remaining pipeline budget, "
+            "re-clocked from ctx.pipeline_deadline) and re-runs the "
+            "full scan, on BOTH APPLY paths (inline orchestrator + "
+            "Slice4bRunner via the shared _live_work_apply_gate). "
+            "Terminal human_active_on_target only when the wait is "
+            "infeasible (IDE lock -> infinite horizon, or horizon over "
+            "budget). OFF restores the legacy immediate-terminal path "
+            "(the Run #20 'deferring' that was actually a kill)."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/orchestrator.py",
+        example="true",
         since="2026-07-12",
         posture_relevance=_HARDEN_CRITICAL,
     ),

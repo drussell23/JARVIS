@@ -10207,31 +10207,19 @@ class GovernedOrchestrator:
 
             # ── LiveWorkSensor: don't stomp on human-active files ──
             # If the human is actively editing a target file, defer the autonomous
-            # apply. Green/Yellow tiers abort with `human_active`; Orange tier
+            # apply. Slice 10: "defer" now means a bounded sensor-derived wait
+            # (_live_work_apply_gate) — the gate only returns a hit when the wait
+            # is infeasible (IDE lock, exhausted budget) or the wait master is
+            # off. Green/Yellow tiers abort with `human_active`; Orange tier
             # (APPROVAL_REQUIRED) proceeds because the human already approved.
             try:
                 from backend.core.ouroboros.governance.live_work_sensor import (
-                    LiveWorkSensor,
                     is_enabled as _lws_enabled,
                 )
                 if _lws_enabled() and ctx.risk_tier is not RiskTier.APPROVAL_REQUIRED:
-                    _lws = LiveWorkSensor(self._config.project_root)
-                    _active_hit: Optional[Tuple[str, str]] = None
-                    _scan_targets: set[str] = set(ctx.target_files)
-                    for _cf, _ in self._iter_candidate_files(best_candidate):
-                        if _cf:
-                            _scan_targets.add(_cf)
-                    for _tf in sorted(_scan_targets):
-                        _is_active, _reason = await _lws.is_human_active(str(_tf))
-                        if _is_active:
-                            _active_hit = (str(_tf), _reason or "human active")
-                            break
+                    _active_hit = await self._live_work_apply_gate(ctx, best_candidate)
                     if _active_hit is not None:
                         _hit_file, _hit_reason = _active_hit
-                        logger.warning(
-                            "[Orchestrator] LiveWorkSensor: human is active on %s (%s) — deferring APPLY [%s]",
-                            _hit_file, _hit_reason, ctx.op_id[:12],
-                        )
                         await self._record_ledger(ctx, OperationState.FAILED, {
                             "reason": "human_active_on_target",
                             "file": _hit_file,
@@ -12444,6 +12432,96 @@ class GovernedOrchestrator:
                 **l2_result.summary,
             })
             return ("fatal", ctx)
+
+    async def _live_work_apply_gate(
+        self,
+        ctx: OperationContext,
+        best_candidate: Dict[str, Any],
+    ) -> Optional[Tuple[str, str]]:
+        """LiveWorkSensor APPLY gate with bounded defer-wait (Slice 10).
+
+        Scans ``ctx.target_files`` ∪ every file the candidate proposes
+        for human activity. Run #20 root cause: an active hit was
+        treated as TERMINAL (``human_active_on_target``) even though the
+        condition is recoverable — a chaos-dirtied file crosses the
+        recency window on its own. When ``JARVIS_APPLY_LIVE_WORK_WAIT_
+        ENABLED`` (default true) and the sensor's ``seconds_until_quiet``
+        horizon fits the op's remaining pipeline budget (re-clocked from
+        ``ctx.pipeline_deadline`` — the same source the VALIDATE retry
+        loop re-clocks from), the gate waits exactly that horizon, drops
+        the sensor's git cache, and re-runs the FULL scan (a different
+        file may be active now). Loops while hits remain and horizons
+        stay finite + affordable; a mid-wait re-edit yields a fresh
+        horizon that either re-waits or exhausts the budget. NO fixed
+        sleep constants — every wait is the sensor-derived horizon.
+
+        Returns ``None`` when the scan is quiet (APPLY may proceed) or
+        ``(file, reason)`` when the hit is terminal: master flag off
+        (legacy immediate-terminal), infinite horizon (IDE lock,
+        unreadable-dirty), or a horizon the remaining budget cannot
+        cover. Shared by BOTH APPLY paths — the inline orchestrator
+        block and Slice4bRunner (the shipping default under
+        ``JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED``). Callers keep the
+        Orange-tier bypass, the ledger/terminal shape, and the fail-open
+        try/except (sensor malfunction must never block APPLY).
+        """
+        from backend.core.ouroboros.governance.live_work_sensor import (
+            LiveWorkSensor,
+        )
+        _lws = LiveWorkSensor(self._config.project_root)
+        _scan_targets: set[str] = set(ctx.target_files)
+        for _cf, _ in self._iter_candidate_files(best_candidate):
+            if _cf:
+                _scan_targets.add(_cf)
+        _wait_enabled = (
+            os.environ.get("JARVIS_APPLY_LIVE_WORK_WAIT_ENABLED", "true")
+            .strip().lower() in _TRUTHY
+        )
+        while True:
+            _active_hit: Optional[Tuple[str, str]] = None
+            for _tf in sorted(_scan_targets):
+                _is_active, _reason = await _lws.is_human_active(str(_tf))
+                if _is_active:
+                    _active_hit = (str(_tf), _reason or "human active")
+                    break
+            if _active_hit is None:
+                return None
+            _hit_file, _hit_reason = _active_hit
+            if not _wait_enabled:
+                # Legacy immediate-terminal (kill switch) — today's path,
+                # including its WARNING text, unchanged.
+                logger.warning(
+                    "[Orchestrator] LiveWorkSensor: human is active on %s (%s) — deferring APPLY [%s]",
+                    _hit_file, _hit_reason, ctx.op_id[:12],
+                )
+                return _active_hit
+            _horizon = await _lws.seconds_until_quiet(_hit_file)
+            # Re-clock remaining budget from the op's pipeline deadline —
+            # same source as the VALIDATE retry loop.
+            if ctx.pipeline_deadline is not None:
+                _remaining_s = (
+                    ctx.pipeline_deadline - datetime.now(tz=timezone.utc)
+                ).total_seconds()
+            else:
+                _remaining_s = self._config.validation_timeout_s  # fallback
+            # inf fails the affordability check naturally (inf > any
+            # finite remaining); horizon<=0 with an active hit is a
+            # cache-staleness race — terminal, never a busy-loop.
+            if not (0.0 < _horizon <= _remaining_s):
+                logger.warning(
+                    "[Orchestrator] LiveWorkSensor: human is active on %s (%s) "
+                    "— wait infeasible (horizon=%.0fs remaining=%.0fs), "
+                    "failing op [%s]",
+                    _hit_file, _hit_reason, _horizon, _remaining_s,
+                    ctx.op_id[:12],
+                )
+                return _active_hit
+            logger.info(
+                "[Orchestrator] LiveWorkSensor: %s active (%s) — waiting %.1fs for quiet [%s]",
+                _hit_file, _hit_reason, _horizon, ctx.op_id[:12],
+            )
+            await asyncio.sleep(_horizon)
+            _lws.invalidate_cache()
 
     @staticmethod
     def _iter_candidate_files(

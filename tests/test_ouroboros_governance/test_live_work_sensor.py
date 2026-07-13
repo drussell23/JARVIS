@@ -374,9 +374,13 @@ class TestAwaitGuardProductionCallSites:
             "the human-active-file guard"
         )
 
-    def test_slice4b_runner_awaits_is_human_active(self):
+    def test_slice4b_runner_awaits_shared_live_work_gate(self):
+        # Slice 10: the runner no longer scans inline — it awaits the
+        # shared defer-wait gate (which itself awaits is_human_active,
+        # pinned by test_orchestrator_awaits_is_human_active above). A
+        # missed await here would silently drop the guard the same way.
         src = (
             Path(__file__).resolve().parents[2]
             / "backend/core/ouroboros/governance/phase_runners/slice4b_runner.py"
         ).read_text(encoding="utf-8")
-        assert "await _lws.is_human_active(str(_tf))" in src
+        assert "await orch._live_work_apply_gate(ctx, best_candidate)" in src
