@@ -6519,10 +6519,15 @@ class GovernedOrchestrator:
                                 f"callers, then return your patch."
                             )
                             logger.warning(
+                                # Slice 11: FULL op id — this line is an
+                                # audit-keyed REJECT marker; [:12] cuts at
+                                # the UUIDv7 same-millisecond boundary and
+                                # poisoned 3 flags on an ambiguous prefix
+                                # (Run-21 false-red class).
                                 "[Orchestrator] Iron Gate — exploration_insufficient: "
                                 "%d/%d (attempt=%d cumulative, preloaded=%d) for op=%s",
                                 _op_explore_credit, _min_explore, attempt + 1,
-                                _preloaded_credit, ctx.op_id[:12],
+                                _preloaded_credit, ctx.op_id,
                             )
                             # Slice 230 — feed the rejection back into model
                             # rotation: drift-mark the model that produced this

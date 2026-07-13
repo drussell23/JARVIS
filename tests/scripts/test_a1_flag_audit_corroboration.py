@@ -275,23 +275,30 @@ def test_unknown_reject_op_fails_closed_and_recorded(monkeypatch):
     )
 
 
-def test_ambiguous_truncated_reject_id_fails_closed(monkeypatch):
-    """A truncated id that prefixes TWO node keys is AMBIGUOUS -> NOT
-    excused (poisons) and recorded in lineage_stitch_failures."""
+def test_ambiguous_truncated_reject_id_all_outside_is_excused(monkeypatch):
+    """CONTRACT UPDATED BY SLICE 11 (operator-locked mandate 4): a truncated
+    id that prefixes TWO node keys is ambiguous, but when EVERY candidate is
+    deterministically outside the chaos lineage the reject is provably
+    unrelated whichever op emitted it -> EXCUSED (recorded, §7). The
+    fail-closed half lives in tests/scripts/
+    test_a1_auditor_ambiguous_prefix.py: any in-lineage candidate or an
+    empty candidate set still poisons."""
     monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
     a = _auditor_with_chaos_lineage()
-    # A sibling node sharing the Run-19 op's 16-char prefix.
+    # A sibling node sharing the Run-19 op's 16-char prefix — BOTH
+    # candidates carry non-chaos target files.
     a.lineage.observe_op(
         "op-019f58a7-f623-9999-8888-777766665555",
         target_files=["backend/core/some/other_unrelated.py"],
     )
     a._correlate_flag_signal(_iron_gate_reject_line(_RUN19_FULL_OP[:16]))
-    assert any(
+    assert not any(
         st.false_positive_rejected
         for st in a._by_family.get("iron_gate", ())
     )
     assert any(
-        "flag_reject_op_unresolved" in x for x in a.lineage_stitch_failures
+        "ambiguous_all_outside" in x
+        for x in a.observed_unrelated_flag_rejects
     )
 
 
@@ -419,18 +426,22 @@ def test_non_seq1_intent_lines_are_ignored(monkeypatch):
     assert _iron_gate_poisoned(a)
 
 
-def test_run20_ambiguous_prefix_still_fails_closed(monkeypatch):
-    """(e) The Run-20 ambiguity case: two INTENT-stitched ops share the
-    12-char prefix op-019f5a32 -- a truncated reject id stays AMBIGUOUS ->
-    fail-closed poison + stitch failure."""
+def test_run20_ambiguous_prefix_all_outside_is_excused(monkeypatch):
+    """(e) CONTRACT UPDATED BY SLICE 11 (operator-locked mandate 4): two
+    INTENT-stitched ops share the 12-char prefix op-019f5a32 and BOTH carry
+    non-chaos targets — the truncated reject is provably unrelated
+    whichever op emitted it -> EXCUSED with an ambiguous_all_outside
+    record. In-lineage/zero-candidate ambiguity still poisons (pinned in
+    tests/scripts/test_a1_auditor_ambiguous_prefix.py)."""
     monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
     a = _auditor_for_intent_stitching()
     a.ingest_log_line(_intent_line(_RUN20_OP_A, [_UNRELATED_FILE]))
     a.ingest_log_line(_intent_line(_RUN20_OP_B, [_UNRELATED_FILE]))
     a.ingest_log_line(_iron_gate_reject_line("op-019f5a32"))
-    assert _iron_gate_poisoned(a)
+    assert not _iron_gate_poisoned(a)
     assert any(
-        "flag_reject_op_unresolved" in x for x in a.lineage_stitch_failures
+        "ambiguous_all_outside" in x
+        for x in a.observed_unrelated_flag_rejects
     )
 
 

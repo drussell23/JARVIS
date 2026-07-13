@@ -481,6 +481,26 @@ class OpLineageGraph:
             return matches[0]
         return None
 
+    def resolve_op_candidates(self, op_id: Optional[str]) -> Tuple[str, ...]:
+        """Every node key ``op_id`` could denote (Slice 11).
+
+        Exact key -> that single key. Otherwise ALL strict-prefix matches
+        (subject to the same ``_MIN_PREFIX_RESOLVE_LEN`` floor), sorted.
+        Empty tuple when unknown/too short. Companion to
+        :meth:`resolve_op_id` for the bulletproof ambiguity rule: a
+        truncated REJECT op id that is ambiguous may still be EXCUSED iff
+        every candidate is deterministically outside the chaos lineage —
+        whichever op actually emitted it, the reject is provably
+        unrelated. Any in-lineage candidate keeps the fail-closed poison.
+        """
+        if not op_id or not isinstance(op_id, str):
+            return ()
+        if op_id in self.nodes:
+            return (op_id,)
+        if len(op_id) < self._MIN_PREFIX_RESOLVE_LEN:
+            return ()
+        return tuple(sorted(k for k in self.nodes if k.startswith(op_id)))
+
     def _is_chaos_root(self, op_id: str) -> bool:
         node = self.nodes.get(op_id)
         if node is None:
@@ -1836,9 +1856,34 @@ class A1GraduationAuditor:
                     # the env flag, matching the intervention-lock lane.
                     _resolved = self.lineage.resolve_op_id(_op)
                     if _resolved is None:
-                        self.lineage_stitch_failures.append(
-                            "flag_reject_op_unresolved:%s:op=%s" % (family, _op)
-                        )
+                        # Slice 11 bulletproof rule: an AMBIGUOUS prefix is
+                        # excusable iff EVERY candidate node lies provably
+                        # outside the chaos lineage — whichever op emitted
+                        # the reject, it is unrelated (Run-21: op-019f5a91-
+                        # denoted two background ops born the same ms; the
+                        # unconditional poison here was the false-red).
+                        # Any in-lineage candidate OR an empty candidate
+                        # set keeps the pre-Slice-11 fail-closed poison.
+                        _cands = self.lineage.resolve_op_candidates(_op)
+                        if _cands and all(
+                            not self.lineage.in_chaos_lineage(c)
+                            for c in _cands
+                        ):
+                            self.observed_unrelated_flag_rejects.append(
+                                "%s:op=%s:ambiguous_all_outside(%d)"
+                                % (family, _op, len(_cands))
+                            )
+                            continue
+                        if _cands:
+                            self.lineage_stitch_failures.append(
+                                "flag_reject_op_ambiguous_in_lineage:"
+                                "%s:op=%s(%d)" % (family, _op, len(_cands))
+                            )
+                        else:
+                            self.lineage_stitch_failures.append(
+                                "flag_reject_op_unresolved:%s:op=%s"
+                                % (family, _op)
+                            )
                     else:
                         _outside_chaos = not self.lineage.in_chaos_lineage(
                             _resolved
