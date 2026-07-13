@@ -22,8 +22,10 @@ The sandbox lifecycle:
 Public API
 ----------
 - ``SandboxSetupError``
+- ``OverlayCapExceeded``
+- ``OverlayCopyFault``
 - ``SandboxValidationResult``
-- ``RepairSandbox``
+- ``RepairSandbox`` (incl. ``baseline_fidelity``)
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 _logger = logging.getLogger(__name__)
 
@@ -78,6 +80,24 @@ class SandboxSetupError(Exception):
     """
 
 
+class OverlayCapExceeded(RuntimeError):
+    """Raised when the working-tree dirty delta exceeds
+    ``JARVIS_SANDBOX_OVERLAY_MAX_FILES`` — the overlay is refused BEFORE
+    any copy, so the sandbox baseline degrades cleanly to HEAD."""
+
+
+class OverlayCopyFault(RuntimeError):
+    """Raised when the overlay copy loop faults mid-way.
+
+    ``files_applied`` counts the overlay mutations (copies/removals)
+    that landed BEFORE the fault — ``> 0`` means the sandbox baseline
+    is a HEAD+partial-delta chimera, not clean HEAD."""
+
+    def __init__(self, message: str, files_applied: int) -> None:
+        super().__init__(message)
+        self.files_applied = files_applied
+
+
 # ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
@@ -106,6 +126,57 @@ class SandboxValidationResult:
     stderr: str
     returncode: int
     duration_s: float
+
+
+# ---------------------------------------------------------------------------
+# Working-tree overlay copy worker (sync, runs off the event loop)
+# ---------------------------------------------------------------------------
+
+
+def _apply_delta_entries(
+    repo_root: str, tmpdir: str, entries: List[str],
+) -> Tuple[int, Optional[str]]:
+    """Parse ``git status --porcelain=v1 -z`` entries and apply the dirty
+    delta onto the HEAD worktree at ``tmpdir``.
+
+    Sync on purpose: up to ``JARVIS_SANDBOX_OVERLAY_MAX_FILES`` stat/
+    mkdir/copy2/unlink syscalls must not run ON the event loop — the
+    caller dispatches this via ``cooperative_fs_io.offload``.
+
+    Never raises. Returns ``(applied, fault)`` where ``applied`` counts
+    the overlay mutations (copies + removals) that landed, and ``fault``
+    is ``None`` on success or a fault description — so the caller can
+    tell a clean HEAD baseline (``applied == 0``) from a HEAD+partial-
+    delta chimera (``applied > 0``)."""
+    root = Path(repo_root)
+    box = Path(tmpdir)
+    applied = 0
+    try:
+        i = 0
+        while i < len(entries):
+            entry = entries[i]
+            i += 1
+            if len(entry) < 4:
+                continue
+            code, rel = entry[:2], entry[3:]
+            if code[0] == "R":  # rename: next entry is the ORIGINAL path
+                orig = entries[i] if i < len(entries) else ""
+                i += 1
+                if orig and (box / orig).exists():
+                    (box / orig).unlink()
+                    applied += 1
+            src = root / rel
+            dst = box / rel
+            if src.exists() and src.is_file():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                applied += 1
+            elif not src.exists() and dst.exists():
+                dst.unlink()
+                applied += 1
+    except Exception as exc:  # noqa: BLE001 — fault reported with state
+        return applied, f"{type(exc).__name__}: {exc}"
+    return applied, None
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +221,13 @@ class RepairSandbox:
             if mirror_working_tree is None
             else mirror_working_tree
         )
+        # Slice 9 review Finding 2: honest baseline provenance, set by
+        # _setup. "working_tree" = overlay fully applied (or rsync copy,
+        # which IS the working tree); "head" = mirror disabled OR overlay
+        # refused before any copy (cap-trip / git-status failure);
+        # "partial" = copy loop faulted mid-way (HEAD+delta chimera).
+        # Meaningful after __aenter__; consumers: repair_engine/orchestrator.
+        self.baseline_fidelity: str = "head"
 
     # ------------------------------------------------------------------
     # Context manager protocol
@@ -190,7 +268,8 @@ class RepairSandbox:
             if self._mirror_working_tree:
                 try:
                     await self._overlay_working_tree_delta(tmpdir)
-                except Exception as exc:  # noqa: BLE001 — fail-soft: HEAD
+                    self.baseline_fidelity = "working_tree"
+                except Exception as exc:  # noqa: BLE001 — fail-soft: the
                     # baseline is degraded-but-functional; rsync strategy
                     # is the heavyweight fallback, not worth forcing here.
                     # Slice 9 final review (Important): tag the reason so
@@ -198,14 +277,30 @@ class RepairSandbox:
                     # from a genuine git fault (both raise Exception here).
                     _reason = (
                         "overlay_cap_exceeded"
-                        if "too large for overlay" in str(exc)
+                        if isinstance(exc, OverlayCapExceeded)
                         else "git_fault"
                     )
-                    _logger.warning(
-                        "repair_sandbox: working-tree overlay failed "
-                        "reason=%s (%s) — sandbox baseline is HEAD, not "
-                        "the working tree", _reason, exc,
-                    )
+                    # Slice 9 review Finding 2: honest degradation report.
+                    # "baseline is HEAD" is only true when NOTHING was
+                    # copied; a mid-loop fault leaves a chimera.
+                    if isinstance(exc, OverlayCopyFault) and exc.files_applied > 0:
+                        self.baseline_fidelity = "partial"
+                        _logger.warning(
+                            "repair_sandbox: working-tree overlay faulted "
+                            "mid-copy reason=%s (%s) — sandbox baseline is "
+                            "PARTIAL (chimera: HEAD + %d overlay "
+                            "mutation(s), no rollback)",
+                            _reason, exc, exc.files_applied,
+                        )
+                    else:
+                        self.baseline_fidelity = "head"
+                        _logger.warning(
+                            "repair_sandbox: working-tree overlay failed "
+                            "reason=%s (%s) — sandbox baseline is HEAD, not "
+                            "the working tree", _reason, exc,
+                        )
+            else:
+                self.baseline_fidelity = "head"
             _logger.debug("repair_sandbox: initialised via git worktree at %s", tmpdir)
             return
         except Exception as exc:
@@ -216,6 +311,9 @@ class RepairSandbox:
             await self._rsync_copy(tmpdir)
             self._sandbox_dir = tmpdir
             self._worktree_mode = False
+            # rsync copies the live tree directly — the baseline IS the
+            # working tree, no overlay needed.
+            self.baseline_fidelity = "working_tree"
             _logger.debug("repair_sandbox: initialised via rsync at %s", tmpdir)
             return
         except Exception as exc:
@@ -282,29 +380,36 @@ class RepairSandbox:
         _n_entries = sum(1 for _e in entries if len(_e) >= 4)
         _cap = _overlay_max_files()
         if _n_entries > _cap:
-            raise RuntimeError(
+            raise OverlayCapExceeded(
                 f"working-tree delta too large for overlay: {_n_entries} > {_cap}"
             )
 
-        i = 0
-        while i < len(entries):
-            entry = entries[i]
-            i += 1
-            if len(entry) < 4:
-                continue
-            code, rel = entry[:2], entry[3:]
-            if code[0] == "R":  # rename: next entry is the ORIGINAL path
-                orig = entries[i] if i < len(entries) else ""
-                i += 1
-                if orig:
-                    (tmpdir / orig).unlink(missing_ok=True)
-            src = self._repo_root / rel
-            dst = tmpdir / rel
-            if src.exists() and src.is_file():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-            elif not src.exists():
-                dst.unlink(missing_ok=True)
+        # Slice 9 review Finding 3: the parse+copy loop (stat/mkdir/copy2/
+        # unlink × up to _cap files) must not run ON the event loop —
+        # dispatch it through the shared offload substrate (thread pool;
+        # IO-bound). The worker never raises: it returns (applied, fault)
+        # so mid-loop-fault state survives the offload boundary.
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+        result = await offload(
+            _apply_delta_entries,
+            str(self._repo_root), str(tmpdir), entries,
+            cpu_bound=False,
+        )
+        if is_offload_error(result):
+            # Pool-level fault before the worker ran — nothing copied.
+            raise RuntimeError(
+                f"working-tree overlay offload failed: {result.message}"
+            )
+        applied, fault = result
+        if fault is not None:
+            raise OverlayCopyFault(
+                f"working-tree overlay copy faulted after "
+                f"{applied} mutation(s): {fault}",
+                files_applied=applied,
+            )
 
     async def _rsync_copy(self, tmpdir: Path) -> None:
         """Attempt rsync copy, excluding .git, __pycache__, and *.pyc."""
@@ -337,6 +442,52 @@ class RepairSandbox:
     # Patch application
     # ------------------------------------------------------------------
 
+    def _contained_target(self, file_path: str) -> Path:
+        """Clamp a MODEL-CHOSEN candidate path to the sandbox root.
+
+        pathlib ``/`` with an absolute right operand REPLACES the left
+        side entirely, and ``..`` segments walk out of the sandbox — the
+        L2 repair lane feeds candidate paths straight into apply_patch /
+        apply_full_content, so containment must be proven HERE, before
+        any byte lands. Two proofs: (1) lexical — the normalized join
+        stays under the normalized sandbox root; (2) physical — the
+        nearest existing ancestor resolves (symlinks followed) inside
+        the resolved root, defeating symlink hops.
+
+        Raises ``BlockedPathError`` (the type the orchestrator's
+        ``_map_tree_run_exception`` classifies fc='security') on any
+        violation."""
+        # Lazy import: keeps repair_sandbox free of module-level
+        # governance imports (test_runner is heavyweight).
+        from backend.core.ouroboros.governance.test_runner import BlockedPathError
+
+        assert self._sandbox_dir is not None  # callers check sandbox is active
+        root_norm = os.path.normpath(str(self._sandbox_dir))
+
+        if os.path.isabs(file_path):
+            raise BlockedPathError(
+                f"sandbox write blocked: absolute path {file_path!r}"
+            )
+        joined = os.path.normpath(os.path.join(root_norm, file_path))
+        if not joined.startswith(root_norm + os.sep):
+            raise BlockedPathError(
+                f"sandbox write blocked: {file_path!r} escapes sandbox root"
+            )
+        # Symlink hop defense: resolve the nearest existing (or dangling-
+        # symlink) ancestor and require it to land inside the real root.
+        target = Path(joined)
+        anc = target
+        while not (anc.exists() or anc.is_symlink()) and anc != anc.parent:
+            anc = anc.parent
+        root_resolved = Path(root_norm).resolve()
+        anc_resolved = anc.resolve()
+        if anc_resolved != root_resolved and root_resolved not in anc_resolved.parents:
+            raise BlockedPathError(
+                f"sandbox write blocked: {file_path!r} resolves outside "
+                f"sandbox root (symlink hop)"
+            )
+        return target
+
     async def apply_patch(self, unified_diff: str, file_path: str) -> None:
         """Apply unified_diff to file_path inside the sandbox.
 
@@ -357,7 +508,7 @@ class RepairSandbox:
         if self._sandbox_dir is None:
             raise RuntimeError("RepairSandbox is not active (call __aenter__ first)")
 
-        target = self._sandbox_dir / file_path
+        target = self._contained_target(file_path)
 
         # Ensure the target file exists in the sandbox; copy from repo if missing.
         if not target.exists():
@@ -437,7 +588,7 @@ class RepairSandbox:
         if self._sandbox_dir is None:
             raise RuntimeError("RepairSandbox is not active (call __aenter__ first)")
 
-        target = self._sandbox_dir / file_path
+        target = self._contained_target(file_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             target.write_text(content, encoding="utf-8")

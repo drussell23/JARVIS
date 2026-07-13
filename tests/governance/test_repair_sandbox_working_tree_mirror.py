@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -47,6 +48,7 @@ def test_mirror_on_baseline_is_working_tree(dirty_repo, monkeypatch):
             assert (root / "committed.py").read_text() == "x = 999  # dirty\n"
             assert (root / "untracked.py").read_text() == "z = 3\n"
             assert not (root / "doomed.py").exists()
+            assert sb.baseline_fidelity == "working_tree"
     asyncio.run(_run())
 
 
@@ -66,6 +68,7 @@ def test_env_kill_switch(dirty_repo, monkeypatch):
     async def _run():
         async with RepairSandbox(dirty_repo, 30.0) as sb:
             assert (sb.sandbox_root / "committed.py").read_text() == "x = 1\n"
+            assert sb.baseline_fidelity == "head"
     asyncio.run(_run())
 
 
@@ -89,8 +92,42 @@ def test_overlay_cap_trip_falls_back_to_head_baseline(dirty_repo, monkeypatch, c
             # content survives, the working-tree deletion does not.
             assert (root / "committed.py").read_text() == "x = 1\n"
             assert (root / "doomed.py").exists()
+            # Refused BEFORE any copy — nothing landed, baseline is HEAD.
+            assert sb.baseline_fidelity == "head"
     asyncio.run(_run())
 
     warnings = [rec.message for rec in caplog.records if rec.levelno == logging.WARNING]
     assert any("delta too large" in msg for msg in warnings), warnings
     assert any("overlay_cap_exceeded" in msg for msg in warnings), warnings
+
+
+def test_mid_copy_fault_yields_partial_fidelity(dirty_repo, monkeypatch, caplog):
+    """Slice 9 review Finding 2: a copy-loop fault AFTER files have
+    already landed leaves a HEAD+partial-delta chimera — the fidelity
+    attribute must say 'partial' and the WARNING must not claim the
+    baseline is (pure) HEAD."""
+    caplog.set_level(
+        logging.WARNING,
+        logger="backend.core.ouroboros.governance.repair_sandbox",
+    )
+    real_copy2 = shutil.copy2
+    calls = {"n": 0}
+
+    def _flaky_copy2(src, dst, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError("disk fault (injected)")
+        return real_copy2(src, dst, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", _flaky_copy2)
+
+    async def _run():
+        async with RepairSandbox(dirty_repo, 30.0) as sb:
+            assert sb.sandbox_root is not None
+            assert sb.baseline_fidelity == "partial"
+    asyncio.run(_run())
+
+    assert calls["n"] > 1  # the fault actually fired mid-loop
+    warnings = [rec.message for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert any("PARTIAL" in msg for msg in warnings), warnings
+    assert not any("baseline is HEAD" in msg for msg in warnings), warnings
