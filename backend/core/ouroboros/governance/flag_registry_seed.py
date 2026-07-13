@@ -5296,7 +5296,7 @@ SEED_SPECS: list = [
         posture_relevance={},
     ),
     # ====================================================================
-    # Test->Source Attribution Bridge (Slice 6) — 7 flags (Slices 7+8)
+    # Test->Source Attribution Bridge (Slice 6) — 10 flags (Slices 7-9)
     # ====================================================================
     FlagSpec(
         name="JARVIS_TEST_SOURCE_ATTRIBUTION_ENABLED",
@@ -5415,6 +5415,56 @@ SEED_SPECS: list = [
         ),
         category=Category.SAFETY,
         source_file="backend/core/ouroboros/governance/intent/test_source_attribution.py",
+        example="true",
+        since="2026-07-12",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_SANDBOX_WORKING_TREE_MIRROR_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 9: RepairSandbox's git-worktree strategy overlays the "
+            "working tree's dirty delta so the sandbox baseline matches "
+            "what TestWatcher actually observed (HEAD-only baselines "
+            "validated repairs against the wrong world). OFF restores "
+            "the legacy HEAD baseline."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/repair_sandbox.py",
+        example="true",
+        since="2026-07-12",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_VALIDATE_CANDIDATE_TREE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 9 (Run #19 root cause): VALIDATE materializes a "
+            "working-tree-faithful candidate tree (RepairSandbox + "
+            "candidate files applied) and anchors a per-op LanguageRouter "
+            "AT the tree, so validation exercises the CANDIDATE instead "
+            "of the still-broken real tree. Fail-soft: any tree fault "
+            "falls back to the legacy side-sandbox path. OFF restores "
+            "legacy byte-identically."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/orchestrator.py",
+        example="true",
+        since="2026-07-12",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_L2_TEST_TARGET_THREADING_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 9: L2's sandbox pytest runs against the op's REAL "
+            "failing test(s) (the test-shaped entries of "
+            "ctx.target_files) instead of the candidate file (which for "
+            "source repairs contains zero tests). OFF restores legacy "
+            "candidate-file scoping."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/repair_engine.py",
         example="true",
         since="2026-07-12",
         posture_relevance=_HARDEN_CRITICAL,

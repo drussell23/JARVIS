@@ -279,3 +279,66 @@ Env: `JARVIS_ATTRIBUTION_CONTAINMENT_ENABLED`,
 `multi_file_coverage_gate.py` / `test_source_attribution.py`);
 `JARVIS_A1_AUDIT_CORROBORATED_REJECTS` (bool, default true,
 `scripts/a1_graduation_auditor.py`).
+
+## Slice 9 — VALIDATE exercises the candidate (2026-07-12)
+
+Run #19 fired the Slice-8 acceptance re-fire: declared-roots containment
+worked (no more `BlockedPathError`), but VERDICT still FAILED — one grep
+found the root cause: `[Validation] FAILED op=... fc=test
+summary=[python:FAIL] ...test_clamp01`. The legacy VALIDATE path wrote the
+candidate into an EMPTY side-tempdir, but `PythonAdapter` ran pytest from
+the MAIN repo root against the still-broken working tree — a repair op
+structurally could not pass VALIDATE until APPLY, because VALIDATE never
+actually exercised the candidate.
+
+**Fix — candidate tree.** VALIDATE now materializes a working-tree-faithful
+full tree (`RepairSandbox`'s git-worktree strategy, extended with a
+dirty-delta overlay so its baseline matches the WORKING TREE TestWatcher
+actually observed, not HEAD — the rsync strategy already mirrored it) with
+the candidate files applied on top, then anchors a per-op `LanguageRouter`
+AT the tree root (the existing Slice-12AE per-op-router pattern). A correct
+repair now validates green against the broken baseline; a wrong one still
+fails `fc=test` (`JARVIS_VALIDATE_CANDIDATE_TREE_ENABLED`, default true).
+Fail-soft is scoped narrowly: only materialization faults (RepairSandbox
+entry, `apply_full_content`) fall back to the legacy side-sandbox path — a
+`BlockedPathError` out of the actual tree run is a genuine security
+rejection and returns `fc="security"` directly via
+`_map_tree_run_exception`, never silently re-validated by the
+differently-anchored legacy path (review Important, closed same slice).
+
+**The L2 lane's own three-defect stack**, diagnosed alongside: (1) L2's
+sandbox pytest ran against the candidate FILE, which for source repairs
+contains zero tests — `_resolve_l2_test_targets` now threads the op's
+attributed test-shaped `target_files` instead
+(`JARVIS_L2_TEST_TARGET_THREADING_ENABLED`). (2) targets under `backend/`
+made pytest adopt `backend/pytest.ini`, whose `--cov`/`-n` addopts are
+unrecognized in the sandbox runtime — usage-error rc=4, reproduced live —
+fixed by pinning `-c <sandbox>/pytest.ini` when present. (3) every L2
+failure logged `FAILED (unknown)` — a phantom
+`getattr(svr, "failure_class", ...)` on a `SandboxValidationResult` that
+never has that field; replaced with honest `rc=<returncode>` plus a
+200-char stdout/stderr tail.
+
+**Also same slice:** the auditor's chaos-lineage reject scoping
+(`JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS`, script-side, no FlagSpec — same
+rule as Slice 8) stops single-session audits from globally correlating an
+unrelated op's GENUINE reject (Run #19 poisoned three iron_gate flags off
+background op `op-019f58a7`'s correct `exploration_insufficient`); and a
+pre-GATE write-escape clamp (Slice-8 final review Important #1) proves
+containment on BOTH VALIDATE write paths BEFORE any byte lands, closing the
+window where the routing gate only caught an escaping `..` path AFTER the
+write had already landed.
+
+**The working-tree-baseline principle, generalized:** the RepairSandbox
+mirror and the L2 lane fixes converge on one lesson — every sandbox
+baseline in the repair loop must match the WORLD TestWatcher actually
+observed (the dirty working tree), not HEAD; divergence between "what
+failed" and "what gets re-validated" is a structural deadlock, the same
+shape as the Run #16/#17/#18 blind classes.
+
+Env: `JARVIS_SANDBOX_WORKING_TREE_MIRROR_ENABLED`,
+`JARVIS_VALIDATE_CANDIDATE_TREE_ENABLED`,
+`JARVIS_L2_TEST_TARGET_THREADING_ENABLED` (all bool, default true,
+`repair_sandbox.py` / `orchestrator.py` / `repair_engine.py`);
+`JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS` (bool, default true, script-side —
+`scripts/a1_graduation_auditor.py`, no FlagSpec).
