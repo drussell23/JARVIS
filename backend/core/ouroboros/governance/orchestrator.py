@@ -11105,6 +11105,44 @@ class GovernedOrchestrator:
                     ctx.op_id, exc,
                 )
 
+            # ---- Phase 8b-p: Workspace promotion (Slice 11) ----
+            # Inline twin of the Slice4bRunner hook (T5 lesson: BOTH paths).
+            # Lands the verified workspace commit on the operator tree;
+            # must precede 8b2 (hot-reload re-imports from the REAL tree).
+            # Refusals are fail-closed: op -> POSTMORTEM, workspace branch
+            # stays quarantined.
+            from backend.core.ouroboros.governance.workspace_promoter import (
+                run_workspace_promotion,
+            )
+            _promo = await run_workspace_promotion(
+                self, ctx, _committed_hash, best_candidate,
+            )
+            if _promo.attempted and not _promo.promoted:
+                if _serpent: _serpent.update_phase("POSTMORTEM")
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code="promotion_failed",
+                    rollback_occurred=False,
+                )
+                await self._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {"reason": "promotion_failed", "detail": _promo.state},
+                )
+                await self._publish_outcome(
+                    ctx, OperationState.FAILED, "promotion_failed",
+                )
+                return ctx
+            if _promo.promoted:
+                try:
+                    await self._stack.comm.emit_heartbeat(
+                        op_id=ctx.op_id, phase="promotion",
+                        progress_pct=98.5,
+                        promoted_shas=list(_promo.shas),
+                    )
+                except Exception:
+                    pass
+
             # ---- Phase 8b2: In-process hot-reload (Manifesto §6 RSI loop closer) ----
             # If this op modified one of our hot-reloadable governance modules,
             # reload it now so the next op uses the freshly-fixed code without

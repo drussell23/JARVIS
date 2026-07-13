@@ -1422,6 +1422,34 @@ class Slice4bRunner(PhaseRunner):
                     ctx.op_id, exc,
                 )
 
+            # ---- Phase 8b-p: Workspace promotion (Slice 11) ----
+            # Lands the verified workspace commit on the operator tree.
+            # MUST precede 8b2: hot-reload re-imports modules from the REAL
+            # tree, so it may only run after the fix lives there. Refusals
+            # fail the op (fail-closed) — the workspace branch remains the
+            # quarantined artifact.
+            from backend.core.ouroboros.governance.workspace_promoter import (
+                run_workspace_promotion,
+            )
+            _promo = await run_workspace_promotion(
+                orch, ctx, _committed_hash, best_candidate,
+            )
+            if _promo.attempted and not _promo.promoted:
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason="promotion_failed:%s" % _promo.state,
+                    artifacts={"t_apply": _t_apply},
+                )
+            if _promo.promoted:
+                try:
+                    await orch._stack.comm.emit_heartbeat(
+                        op_id=ctx.op_id, phase="promotion",
+                        progress_pct=98.5,
+                        promoted_shas=list(_promo.shas),
+                    )
+                except Exception:
+                    pass
+
             # ---- Phase 8b2: In-process hot-reload ----
             if orch._hot_reloader is not None:
                 try:
