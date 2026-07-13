@@ -52,22 +52,59 @@ def _resolve_l2_test_targets(ctx: Any, fallback: Tuple[str, ...]) -> Tuple[str, 
     test_locus)`` — the test-shaped entries are the ones pytest can
     actually exercise; scoping to the CANDIDATE file (the legacy
     behavior, kept as *fallback*) collects zero tests for source repairs.
-    Deterministic path-shape check (no imports of the attribution
-    module — same convention TestRunner's JARVIS_TEST_DIR_NAMES uses)."""
+
+    Attribution-first: when ``ctx.intake_evidence_json`` carries a
+    RESOLVED Slice-6 attribution block, ``attribution.test_locus`` names
+    the failing test exactly — the OTHER ``target_files`` entries are
+    source loci and must never be handed to pytest even when named
+    ``test_*.py`` (this repo ships source modules ``test_runner.py``,
+    ``test_watcher.py``, ``test_source_attribution.py``; collecting one
+    yields rc=5 → a structurally-guaranteed false FAILED). Unresolved /
+    absent / malformed evidence falls through to the deterministic
+    path-shape heuristic (no imports of the attribution module — same
+    convention TestRunner's JARVIS_TEST_DIR_NAMES uses). Residual: the
+    heuristic lane still misclassifies test_*-named SOURCE modules; the
+    attributed lane is what kills that class for resolved (live) ops.
+
+    Batch coherence: test-shaped entries in the changed-files *fallback*
+    (e.g. a multi-file candidate that also rewrites a sibling test file)
+    are UNIONED in so the batch is validated coherently — changed source
+    files stay excluded (they're exercised through the tests)."""
     if not _l2_test_threading_enabled():
         return fallback
     targets = getattr(ctx, "target_files", None) or ()
     dir_names = {
         p.strip() for p in os.environ.get(
-            "JARVIS_TEST_DIR_NAMES", "tests",
+            "JARVIS_TEST_DIR_NAMES", "tests,test",
         ).split(",") if p.strip()
     }
-    test_shaped = tuple(
-        t for t in targets
-        if str(t).replace("\\", "/").split("/", 1)[0] in dir_names
-        or Path(str(t)).name.startswith("test_")
+
+    def _is_test_shaped(t: Any) -> bool:
+        return (
+            str(t).replace("\\", "/").split("/", 1)[0] in dir_names
+            or Path(str(t)).name.startswith("test_")
+        )
+
+    test_shaped: Tuple[str, ...] = ()
+    try:
+        evidence = json.loads(
+            getattr(ctx, "intake_evidence_json", "") or "{}"
+        )
+        attribution = evidence.get("attribution") or {}
+        if (
+            isinstance(attribution, dict)
+            and str(attribution.get("status", "")) == "resolved"
+            and str(attribution.get("test_locus", "") or "")
+        ):
+            test_shaped = (str(attribution["test_locus"]),)
+    except (ValueError, TypeError, AttributeError):
+        test_shaped = ()  # malformed evidence → heuristic, never raise
+    if not test_shaped:
+        test_shaped = tuple(t for t in targets if _is_test_shaped(t))
+    changed_test_siblings = tuple(
+        f for f in fallback if _is_test_shaped(f) and f not in test_shaped
     )
-    return test_shaped or fallback
+    return (test_shaped + changed_test_siblings) or fallback
 
 
 # ---------------------------------------------------------------------------
@@ -1156,8 +1193,10 @@ class RepairEngine:
                     if _patch_failed:
                         svr = None
                     else:
-                        # Multi-file: scope tests to ALL changed files so the batch is
-                        # validated coherently; single-file keeps the original scoping.
+                        # Multi-file: pass ALL changed files as the fallback — the
+                        # resolver unions in every test-shaped changed file (sibling
+                        # test rewrites) so the batch is validated coherently;
+                        # single-file keeps the original scoping.
                         if _is_multi:
                             test_targets: Tuple[str, ...] = _resolve_l2_test_targets(
                                 ctx, tuple(p for p, _ in _multi_files),
