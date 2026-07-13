@@ -29,6 +29,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
+from backend.core.ouroboros.governance.autonomous_workspace import (
+    effective_execution_root,
+)
 from backend.core.ouroboros.governance.break_glass import BreakGlassManager
 from backend.core.ouroboros.governance.comm_protocol import (
     CommProtocol,
@@ -565,22 +568,24 @@ class ChangeEngine:
     def _effective_write_root(self, request_write_root: Optional[Path] = None) -> Path:
         """Resolve the root that APPLY writes into.
 
-        Precedence (Slice 64):
+        Precedence (Slice 64 / Slice 11):
           1. ``request_write_root`` — a per-op root (e.g. a swe_bench_pro
              prepared per-problem worktree from the envelope repo_root). Wins
              so the patch lands in the correct cloned-repo tree, not the JARVIS
              auto-commit workspace (the bt-2026-06-02-081453 mis-route).
-          2. ``JARVIS_AUTO_COMMIT_WORKSPACE`` (harness ledger-sovereignty owned
-             worktree) — writes land in the SAME tree AutoCommitter commits from
-             (coherent by construction); the operator's main tree is untouched.
-          3. ``self._project_root`` (byte-identical legacy path).
+          2. The canonical execution-root seam (Slice 11) — pure delegate to
+             ``autonomous_workspace.effective_execution_root``, the SAME
+             resolver ``GovernedLoopConfig.execution_root`` uses, so the tree
+             APPLY writes and the tree VERIFY judges are identical by
+             construction. The seam owns env presence+validity; an invalid
+             ``JARVIS_AUTO_COMMIT_WORKSPACE`` now falls back to
+             ``project_root`` instead of becoming a raw rogue write root
+             (contract change vs Slice 56, pinned in
+             tests/governance/test_execution_root_seam.py).
         """
         if request_write_root is not None:
             return Path(request_write_root)
-        override = os.environ.get("JARVIS_AUTO_COMMIT_WORKSPACE")
-        if override:
-            return Path(override)
-        return self._project_root
+        return effective_execution_root(self._project_root)
 
     def _redirect_target(
         self, target: Path, request_write_root: Optional[Path] = None,

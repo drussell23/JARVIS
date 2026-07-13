@@ -118,6 +118,44 @@ def _arm_boundary_flags() -> None:
         pass
 
 
+def effective_execution_root(project_root: Any) -> Path:
+    """THE canonical execution-root seam (Slice 11 Task 1, mandate 1).
+
+    Resolve the tree that mutation/judgment operates on — APPLY writes,
+    scoped VERIFY, PatchBenchmarker, verify-gate rollback, AutoCommit —
+    as distinct from the *observation* root (``GovernedLoopConfig.
+    project_root``: sensors/TestWatcher/intake, which must keep watching
+    the operator's real tree).
+
+    Resolution is strictly presence + validity of
+    ``JARVIS_AUTO_COMMIT_WORKSPACE`` (exported by the ledger-sovereignty
+    bootloader, ``harness._boot_ledger_sovereignty_workspace``):
+
+      * env absent/blank        → ``project_root`` (byte-identical legacy)
+      * env set to a real dir   → that workspace worktree
+      * env set to anything else → ``project_root`` (a nonexistent
+        "workspace" must never become a write root — bytes would land in
+        a rogue tree outside any git worktree)
+
+    Pure read-time resolution — no caching, no polling, never raises.
+    Single source of truth consumed by ``ChangeEngine._effective_write_root``
+    (delegate) and ``GovernedLoopConfig.execution_root`` (dynamic property);
+    duplicating this logic anywhere else is a review-rejectable offense
+    (Run-21 root cause was exactly such a split-truth).
+    """
+    root = Path(project_root)
+    override = (os.environ.get(_ENV_COMMIT_WORKSPACE) or "").strip()
+    if not override:
+        return root
+    try:
+        candidate = Path(override)
+        if candidate.is_dir():
+            return candidate
+    except (OSError, ValueError):  # ENAMETOOLONG, NUL bytes, … — fall back
+        pass
+    return root
+
+
 def workspace_branch(session_id: str) -> str:
     """Quarantine branch name. Intentionally identical to the
     Ledger-Sovereignty commit-workspace branch so file + commit isolation

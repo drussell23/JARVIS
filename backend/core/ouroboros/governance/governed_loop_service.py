@@ -856,6 +856,25 @@ class GovernedLoopConfig:
         default_factory=lambda: Path.home() / ".jarvis" / "ouroboros" / "advanced_coordination"
     )
 
+    @property
+    def execution_root(self) -> Path:
+        """The mutation/judgment tree (Slice 11 role split).
+
+        ``project_root`` is the OBSERVATION root (sensors, TestWatcher,
+        intake — always the operator's real tree). ``execution_root`` is
+        where APPLY writes and therefore where VERIFY/benchmark/rollback
+        MUST judge — resolved lazily at every read through the canonical
+        ``autonomous_workspace.effective_execution_root`` seam, because
+        the ledger-sovereignty bootloader exports
+        ``JARVIS_AUTO_COMMIT_WORKSPACE`` AFTER this frozen config is
+        constructed (harness boot ordering). Never cache this value.
+        """
+        from backend.core.ouroboros.governance.autonomous_workspace import (
+            effective_execution_root,
+        )
+
+        return effective_execution_root(self.project_root)
+
     @classmethod
     def from_env(cls, args: Any = None, project_root: Optional[Path] = None) -> GovernedLoopConfig:
         """Build config from environment variables with safe defaults.

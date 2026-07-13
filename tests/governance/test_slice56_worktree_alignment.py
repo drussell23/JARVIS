@@ -38,14 +38,25 @@ def test_no_redirect_without_env(tmp_path, monkeypatch):
     assert e._effective_write_root() == tmp_path
 
 
+# NOTE (Slice 11): the workspace dirs below are mkdir'd because the canonical
+# seam (autonomous_workspace.effective_execution_root) now validates presence
+# AND validity — an env override pointing at a nonexistent dir falls back to
+# project_root instead of becoming a raw rogue write root. Production always
+# satisfies this: WorktreeManager.create materializes the worktree BEFORE the
+# harness exports the env. The invalid-override case is pinned explicitly in
+# tests/governance/test_execution_root_seam.py.
+
+
 def test_effective_write_root_follows_env(tmp_path, monkeypatch):
     ws = tmp_path / ".worktrees" / "owned"
+    ws.mkdir(parents=True)
     monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", str(ws))
     assert _engine(tmp_path)._effective_write_root() == ws
 
 
 def test_redirect_absolute_target_under_project_root(tmp_path, monkeypatch):
     ws = tmp_path / ".worktrees" / "owned"
+    ws.mkdir(parents=True)
     monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", str(ws))
     e = _engine(tmp_path)
     t = tmp_path / "tests" / "foo.py"
@@ -54,6 +65,7 @@ def test_redirect_absolute_target_under_project_root(tmp_path, monkeypatch):
 
 def test_redirect_relative_target(tmp_path, monkeypatch):
     ws = tmp_path / "owned"
+    ws.mkdir()
     monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", str(ws))
     e = _engine(tmp_path)
     assert e._redirect_target(Path("tests/foo.py")) == ws / "tests" / "foo.py"
