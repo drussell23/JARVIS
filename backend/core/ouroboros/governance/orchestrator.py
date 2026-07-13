@@ -660,6 +660,42 @@ def _candidate_tree_enabled() -> bool:
     ).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _map_tree_run_exception(exc: Exception, t0: float) -> "ValidationResult":
+    """Slice 9 review (Important): map a candidate-tree ``_tree_runner.run()``
+    exception to the SAME ``ValidationResult`` shape the legacy side-sandbox
+    path's ``except BlockedPathError`` / ``except Exception`` handlers
+    produce (see ``_run_validation_core`` ~L12996-13016).
+
+    A ``BlockedPathError`` out of the tree run is a genuine Slice-8 security
+    rejection — it must classify ``failure_class="security"`` and RETURN
+    directly, never fall through to a second, differently-anchored legacy
+    VALIDATE run that may not reproduce it. Any other exception mirrors the
+    legacy generic handler (``failure_class="infra"``). Callers use this
+    ONLY for exceptions raised by ``_tree_runner.run()`` itself — faults
+    during candidate-tree MATERIALIZATION (RepairSandbox entry,
+    ``apply_full_content``) stay fail-soft and fall back to the legacy path
+    unchanged (never routed through this helper)."""
+    if isinstance(exc, BlockedPathError):
+        return ValidationResult(
+            passed=False,
+            best_candidate=None,
+            validation_duration_s=time.monotonic() - t0,
+            error=str(exc),
+            failure_class="security",
+            short_summary=f"BlockedPathError: {str(exc)[:280]}",
+            adapter_names_run=(),
+        )
+    return ValidationResult(
+        passed=False,
+        best_candidate=None,
+        validation_duration_s=time.monotonic() - t0,
+        error=str(exc),
+        failure_class="infra",
+        short_summary=f"runner exception: {str(exc)[:200]}",
+        adapter_names_run=(),
+    )
+
+
 def _phase_runner_complete_extracted() -> bool:
     """Slice 1 of Wave 2 (5) — COMPLETE phase extraction gate.
 
@@ -12882,6 +12918,18 @@ class GovernedOrchestrator:
         # falls through to the legacy path (today's behavior).
         _tree_used = False
         if _candidate_tree_enabled() and _all_files:
+            # Slice 9 review (Important): the fail-soft try below covers
+            # ONLY candidate-tree MATERIALIZATION — RepairSandbox entry
+            # and the apply_full_content loop (incl. the relative-path
+            # resolution inside it). A materialization fault is a real
+            # "the tree itself couldn't be built" problem, so falling
+            # back to the legacy side-sandbox path is correct there.
+            # _tree_runner.run() (actual test execution) is deliberately
+            # OUTSIDE this except's reach — see the nested try below,
+            # which RETURNS instead of falling back so a BlockedPathError
+            # security rejection keeps its fc="security" classification
+            # instead of being silently re-run (and possibly not
+            # reproduced) by the differently-anchored legacy path.
             try:
                 from backend.core.ouroboros.governance.repair_sandbox import (
                     RepairSandbox,
@@ -12911,6 +12959,7 @@ class GovernedOrchestrator:
                         _tf = _troot / _rel
                         if _tf.suffix in _RUNNABLE_EXTENSIONS:
                             _tree_changed.append(_tf)
+
                     if _tree_changed:
                         _tree_runner = LanguageRouter(
                             repo_root=_troot,
@@ -12919,23 +12968,36 @@ class GovernedOrchestrator:
                                 "cpp": CppAdapter(repo_root=_troot),
                             },
                         )
-                        multi = await _tree_runner.run(
-                            changed_files=tuple(_tree_changed),
-                            sandbox_dir=_troot,
-                            timeout_budget_s=remaining_s,
-                            op_id=ctx.op_id,
-                            original_paths={
-                                p: _troot / p.relative_to(_troot)
-                                for p in _tree_changed
-                            },
-                        )
-                        _tree_used = True
-                        logger.info(
-                            "[Validation] candidate-tree run op=%s files=%d "
-                            "passed=%s",
-                            ctx.op_id[:12], len(_tree_changed),
-                            getattr(multi, "passed", None),
-                        )
+                        # NOT covered by the materialization fail-soft
+                        # except below: a `return` here propagates past
+                        # it without triggering that except clause (only
+                        # raised exceptions are caught by `except`), so
+                        # this is a genuine early return from
+                        # _run_validation_core, not a fallback trigger.
+                        # The `async with` above still exits normally
+                        # (RepairSandbox __aexit__ runs) on the way out.
+                        try:
+                            multi = await _tree_runner.run(
+                                changed_files=tuple(_tree_changed),
+                                sandbox_dir=_troot,
+                                timeout_budget_s=remaining_s,
+                                op_id=ctx.op_id,
+                                original_paths={
+                                    p: _troot / p.relative_to(_troot)
+                                    for p in _tree_changed
+                                },
+                            )
+                            _tree_used = True
+                            logger.info(
+                                "[Validation] candidate-tree run op=%s "
+                                "files=%d passed=%s",
+                                ctx.op_id[:12], len(_tree_changed),
+                                getattr(multi, "passed", None),
+                            )
+                        except BlockedPathError as exc:
+                            return _map_tree_run_exception(exc, t0)
+                        except Exception as exc:
+                            return _map_tree_run_exception(exc, t0)
             except Exception as _tree_exc:  # noqa: BLE001 — fail-soft
                 multi = None
                 _tree_used = False
