@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -104,9 +103,12 @@ def _run_pytest(code: str, test_src: str, timeout_s: float) -> bool:
                 fh.write(code + "\n")
             with open(os.path.join(td, "test_m.py"), "w", encoding="utf-8") as fh:
                 fh.write(test_src)
-            r = subprocess.run(
+            from backend.core.ouroboros.governance.test_subprocess_helper import (
+                run_pytest_subprocess_sync,
+            )
+            r = run_pytest_subprocess_sync(
                 [sys.executable, "-m", "pytest", "test_m.py", "-q"],
-                cwd=td, capture_output=True, text=True, timeout=timeout_s,
+                cwd=td, timeout_s=timeout_s, caller="fleet_repair_battery",
             )
             return r.returncode == 0
     except Exception:  # noqa: BLE001 — verify failure is a fail, never a raise
