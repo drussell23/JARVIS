@@ -52,7 +52,7 @@ pytest-timeout==2.4.0
 pytest-asyncio==1.3.0
 pytest-json-report==1.5.0
 pytest-metadata==3.1.1
-anyio==4.12.0
+anyio==4.14.2
 redis>=4.2.0             # cost_tracker streaming (inert without a server)
 fastapi==0.124.2         # MCP HTTP transport (guarded)
 uvicorn==0.38.0          # telemetry broker (guarded)
