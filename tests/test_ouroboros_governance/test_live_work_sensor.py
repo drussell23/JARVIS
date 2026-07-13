@@ -116,11 +116,13 @@ async def test_clean_file_is_not_active(tmp_path: Path) -> None:
 
 
 async def test_unstaged_change_marks_file_active(tmp_path: Path) -> None:
+    # Slice 10: the git signal fires first for a dirty file with a
+    # RECENT mtime (the just-written file), so the reason names git —
+    # proving signal-1 priority. A dirty file with a stale mtime is
+    # idle under the new recency-composed default (see
+    # tests/governance/test_live_work_sensor_recency.py).
     repo = _make_repo(tmp_path)
     (repo / "backend" / "main.py").write_text("print('modified')\n", encoding="utf-8")
-    # Move mtime backwards so only the git signal can fire.
-    old_ts = time.time() - 3600
-    os.utime(repo / "backend" / "main.py", (old_ts, old_ts))
     sensor = LiveWorkSensor(repo)
     active, reason = await sensor.is_human_active("backend/main.py")
     assert active is True
@@ -132,8 +134,6 @@ async def test_staged_change_marks_file_active(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     (repo / "backend" / "main.py").write_text("print('staged')\n", encoding="utf-8")
     subprocess.run(["git", "add", "backend/main.py"], cwd=repo, check=True)
-    old_ts = time.time() - 3600
-    os.utime(repo / "backend" / "main.py", (old_ts, old_ts))
     sensor = LiveWorkSensor(repo)
     active, reason = await sensor.is_human_active("backend/main.py")
     assert active is True
@@ -144,8 +144,6 @@ async def test_untracked_new_file_marks_active(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     new_file = repo / "backend" / "new_mod.py"
     new_file.write_text("x = 1\n", encoding="utf-8")
-    old_ts = time.time() - 3600
-    os.utime(new_file, (old_ts, old_ts))
     sensor = LiveWorkSensor(repo)
     active, reason = await sensor.is_human_active("backend/new_mod.py")
     assert active is True
