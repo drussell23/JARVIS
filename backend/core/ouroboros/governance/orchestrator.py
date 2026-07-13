@@ -12955,8 +12955,34 @@ class GovernedOrchestrator:
                                 raise RuntimeError(
                                     f"candidate path outside repo: {_fp}"
                                 )
-                        await _tree.apply_full_content(_fc, str(_rel))
+                        # Slice 9 — write-escape clamp (Slice-8 final
+                        # review I1): a model-chosen ``..``-containing
+                        # relative file_path must not write outside the
+                        # candidate tree either. Resolve WITHOUT touching
+                        # the filesystem (os.path.normpath — pure string
+                        # normalization, no FS access, no symlink-
+                        # following on not-yet-existing paths) and prove
+                        # containment BEFORE apply_full_content lands any
+                        # byte. A BlockedPathError raised here is caught
+                        # by the materialization fail-soft except below
+                        # (no write has landed in the tree) and falls
+                        # back to the legacy path, whose own clamp
+                        # (below) re-raises the same BlockedPathError for
+                        # the same escaping candidate — this time
+                        # enclosed by the fc="security" handler. Net
+                        # effect on EITHER path: escaping candidate ->
+                        # fc="security", no write lands anywhere.
                         _tf = _troot / _rel
+                        _resolved_tf = Path(os.path.normpath(str(_tf)))
+                        if not str(_resolved_tf).startswith(
+                            os.path.normpath(str(_troot)) + os.sep
+                        ):
+                            raise BlockedPathError(
+                                f"candidate file_path {_fp!r} escapes the "
+                                "VALIDATE candidate tree — write refused "
+                                "(security gate)"
+                            )
+                        await _tree.apply_full_content(_fc, str(_rel))
                         if _tf.suffix in _RUNNABLE_EXTENSIONS:
                             _tree_changed.append(_tf)
 
@@ -13012,42 +13038,66 @@ class GovernedOrchestrator:
                 sandbox = Path(sandbox_str)
                 runner_changed: list[Path] = []
                 _original_paths: Dict[Path, Path] = {}
-                for _fp, _fc in _all_files:
-                    _rel = Path(_fp)
-                    if _rel.is_absolute():
-                        _sandbox_file = sandbox / _rel.name
-                    else:
-                        _sandbox_file = sandbox / _rel
-                    _sandbox_file.parent.mkdir(parents=True, exist_ok=True)
-                    _sandbox_file.write_text(_fc, encoding="utf-8")
-                    if _sandbox_file.suffix in _RUNNABLE_EXTENSIONS:
-                        runner_changed.append(_sandbox_file)
-                        # Slice 12AE: anchor on per-envelope effective
-                        # repo_root (TMPDIR worktree for SWE-Bench-Pro
-                        # fixtures; project_root for everything else).
-                        _original_paths[_sandbox_file] = (
-                            _ae_effective_repo_root / _rel
-                            if not _rel.is_absolute()
-                            else _rel
+                # Slice 9 — write-escape clamp (Slice-8 final review I1):
+                # the try now encloses the WRITE LOOP itself (previously
+                # it wrapped only the runner call below) so a
+                # BlockedPathError raised BEFORE any byte lands still
+                # reaches the same except clause and the same
+                # fc="security" classification — caught at the write now,
+                # not after it.
+                try:
+                    for _fp, _fc in _all_files:
+                        _rel = Path(_fp)
+                        if _rel.is_absolute():
+                            _sandbox_file = sandbox / _rel.name
+                        else:
+                            _sandbox_file = sandbox / _rel
+                        # Slice 9 — write-escape clamp (Slice-8 final
+                        # review I1): a model-chosen ``..``-containing
+                        # file_path must not write outside the sandbox.
+                        # Resolve WITHOUT touching the filesystem
+                        # (os.path.normpath — pure string normalization,
+                        # no FS access, no symlink-following on
+                        # not-yet-existing paths) and prove containment
+                        # BEFORE mkdir/write_text lands any byte.
+                        _resolved_target = Path(os.path.normpath(str(_sandbox_file)))
+                        if not str(_resolved_target).startswith(
+                            os.path.normpath(str(sandbox)) + os.sep
+                        ):
+                            raise BlockedPathError(
+                                f"candidate file_path {_fp!r} escapes the "
+                                "VALIDATE sandbox — write refused "
+                                "(security gate)"
+                            )
+                        _sandbox_file.parent.mkdir(parents=True, exist_ok=True)
+                        _sandbox_file.write_text(_fc, encoding="utf-8")
+                        if _sandbox_file.suffix in _RUNNABLE_EXTENSIONS:
+                            runner_changed.append(_sandbox_file)
+                            # Slice 12AE: anchor on per-envelope effective
+                            # repo_root (TMPDIR worktree for SWE-Bench-Pro
+                            # fixtures; project_root for everything else).
+                            _original_paths[_sandbox_file] = (
+                                _ae_effective_repo_root / _rel
+                                if not _rel.is_absolute()
+                                else _rel
+                            )
+
+                    if not runner_changed:
+                        _primary_rel = Path(target_file_str)
+                        _primary_file = sandbox / (_primary_rel.name if _primary_rel.is_absolute() else _primary_rel)
+                        runner_changed = [_primary_file]
+                        # Slice 12AE: same per-envelope anchor for the
+                        # primary-file fallback path.
+                        _original_paths[_primary_file] = (
+                            _ae_effective_repo_root / _primary_rel
+                            if not _primary_rel.is_absolute()
+                            else _primary_rel
                         )
 
-                if not runner_changed:
-                    _primary_rel = Path(target_file_str)
-                    _primary_file = sandbox / (_primary_rel.name if _primary_rel.is_absolute() else _primary_rel)
-                    runner_changed = [_primary_file]
-                    # Slice 12AE: same per-envelope anchor for the
-                    # primary-file fallback path.
-                    _original_paths[_primary_file] = (
-                        _ae_effective_repo_root / _primary_rel
-                        if not _primary_rel.is_absolute()
-                        else _primary_rel
-                    )
-
-                # Step 4: Run LanguageRouter (or any duck-typed runner)
-                # Slice 12AE: use the per-op runner when constructed (its
-                # repo_root matches the per-envelope TMPDIR worktree);
-                # otherwise the boot-time runner (project_root anchored).
-                try:
+                    # Step 4: Run LanguageRouter (or any duck-typed runner)
+                    # Slice 12AE: use the per-op runner when constructed (its
+                    # repo_root matches the per-envelope TMPDIR worktree);
+                    # otherwise the boot-time runner (project_root anchored).
                     multi = await _ae_effective_runner.run(
                         changed_files=tuple(runner_changed),
                         sandbox_dir=sandbox,
