@@ -985,6 +985,7 @@ class Slice4bRunner(PhaseRunner):
             _verify_test_passed = True
             _verify_test_total = 0
             _verify_test_failures = 0
+            _verify_timed_out = False
             _verify_failed_names: Tuple[str, ...] = ()
             # Slice 11: resolve the judgment tree ONCE per VERIFY pass —
             # the tree APPLY wrote. All VERIFY-side consumers below anchor
@@ -1034,6 +1035,7 @@ class Slice4bRunner(PhaseRunner):
                     logger.warning("[Orchestrator] Verify scoped test timed out [%s]", ctx.op_id)
                     _verify_test_passed = False
                     _verify_test_failures = 1
+                    _verify_timed_out = True
                 except BlockedPathError:
                     pass
                 except Exception as exc:
@@ -1150,7 +1152,15 @@ class Slice4bRunner(PhaseRunner):
                 logger.debug("[Orchestrator] Verify gate skipped: %s", exc)
 
             if _verify_error is None and not _verify_test_passed:
-                _verify_error = f"scoped verify: {_verify_test_failures}/{_verify_test_total} tests failing"
+                if _verify_timed_out:
+                    # Slice 11 rider (§7 honesty): the timeout sentinel
+                    # counters rendered as "1/0 tests failing" (Runs #20/#21).
+                    _verify_error = (
+                        "scoped verify timed out after "
+                        f"{_verify_budget_s:.0f}s"
+                    )
+                else:
+                    _verify_error = f"scoped verify: {_verify_test_failures}/{_verify_test_total} tests failing"
 
             # Slice 67 — swe_bench_pro VERIFY regression gate is advisory (LIVE
             # extracted-runner path; mirrors the inline orchestrator block). The

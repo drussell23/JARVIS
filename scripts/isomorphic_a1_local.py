@@ -1628,12 +1628,22 @@ class IsomorphicA1Driver:
                 env["JARVIS_A1_BLAST_RADIUS_ENABLED"] = "true"   # Gate 2
                 env["JARVIS_A1_PR_LINTER_ENABLED"] = "true"      # Gate 3
                 env["JARVIS_A1_TOKEN_ENFORCER_ENABLED"] = "true" # enforcer (PR needs token chain)
-                # File-isolation OFF -> autonomous writes land in repo_root ->
-                # durable commit (written=True) -> fixes the fsm_classify_to_applied
-                # blocker. Mirrors the failover_lifecycle pin (stale a1-disable-file-
-                # isolation branch folded here as 2 env vars).
+                # File-isolation OFF keeps the OBSERVATION root (sensors /
+                # TestWatcher / chaos detection) on the real tree. NOTE
+                # (Slice 11 correction): this does NOT make writes land in
+                # repo_root — since Slice 56, ChangeEngine honors
+                # JARVIS_AUTO_COMMIT_WORKSPACE whenever ledger sovereignty
+                # is armed (signed persistent record, env-independent), so
+                # APPLY+commit land in the session workspace regardless of
+                # these two flags. The fsm_classify_to_applied closure is
+                # workspace promotion (below), not file-isolation-off.
                 env["JARVIS_FILE_ISOLATION_ENABLED"] = "false"
                 env["JARVIS_DETERMINISTIC_ISOLATION_LOCK_ENABLED"] = "false"
+                # Slice 11: land verified workspace commits on the operator
+                # tree (LiveWork-consulted, drift-checked, fail-closed
+                # cherry-pick/ff — never force). This driver IS the A1
+                # ignition harness; production default stays FALSE.
+                env["JARVIS_WORKSPACE_PROMOTION_ENABLED"] = "true"
 
                 # ---- Virtualized writable Trinity root (Blocker #4 structural fix) ----
                 # The isomorphic env makes the organism believe it lives at the

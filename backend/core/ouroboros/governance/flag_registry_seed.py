@@ -5569,6 +5569,67 @@ SEED_SPECS: list = [
         since="2026-07-13",
         posture_relevance=_HARDEN_CRITICAL,
     ),
+    # ---- Slice 11 — governed workspace promotion --------------------------
+    FlagSpec(
+        name="JARVIS_WORKSPACE_PROMOTION_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Slice 11 master: after VERIFY-green + AutoCommit, promote the "
+            "op's workspace commit onto the operator tree (WorkspacePromoter "
+            "in the 8b terminal sequence; WorktreeManager cherry-pick / "
+            "ff-only, fail-closed, never force). Default FALSE — the "
+            "production posture stays quarantine + Orange PR; the A1 "
+            "ignition driver opts in so verified repairs land on the tree "
+            "TestWatcher polls (kills the Run-21 re-attribution loop)."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/workspace_promoter.py",
+        example="false",
+        since="2026-07-13",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_PROMOTION_LIVE_WORK_CONSULT",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 11: consult the LiveWork APPLY gate (reused coroutine) "
+            "against the OPERATOR tree at promotion time — a human editing "
+            "the target refuses the landing, fail-closed."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/workspace_promoter.py",
+        example="true",
+        since="2026-07-13",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_PROMOTION_MAX_COMMITS",
+        type=FlagType.INT, default=8,
+        description=(
+            "Slice 11: bounded per-promotion commit fan-in for "
+            "WorktreeManager.promote_commits — exceeding it is a typed "
+            "commit_budget_exceeded refusal (fail-closed)."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/worktree_manager.py",
+        example="8",
+        since="2026-07-13",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_PROMOTION_REQUIRE_CLEAN_TARGETS",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 11: refuse promotion when the operator tree is dirty on "
+            "any path the promoted commits touch (touched-paths-only "
+            "scoping — unrelated operator dirt never blocks)."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/worktree_manager.py",
+        example="true",
+        since="2026-07-13",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
 ]
 
 

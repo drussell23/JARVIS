@@ -10573,6 +10573,7 @@ class GovernedOrchestrator:
             _verify_test_passed = True
             _verify_test_total = 0
             _verify_test_failures = 0
+            _verify_timed_out = False
             _verify_failed_names: Tuple[str, ...] = ()
             # Slice 11: resolve the judgment tree ONCE per VERIFY pass —
             # the tree APPLY wrote (workspace when Ledger Sovereignty is
@@ -10627,6 +10628,7 @@ class GovernedOrchestrator:
                     logger.warning("[Orchestrator] Verify scoped test timed out [%s]", ctx.op_id)
                     _verify_test_passed = False
                     _verify_test_failures = 1
+                    _verify_timed_out = True
                 except BlockedPathError:
                     pass  # security gate — skip scoped verify, let benchmark handle
                 except Exception as exc:
@@ -10966,7 +10968,16 @@ class GovernedOrchestrator:
 
             # Combine scoped-test failure with benchmark regression
             if _verify_error is None and not _verify_test_passed:
-                _verify_error = f"scoped verify: {_verify_test_failures}/{_verify_test_total} tests failing"
+                if _verify_timed_out:
+                    # Slice 11 rider (§7 honesty): the timeout sentinel
+                    # counters rendered as "1/0 tests failing" and read as
+                    # a denominator bug across Runs #20/#21.
+                    _verify_error = (
+                        "scoped verify timed out after "
+                        f"{_verify_budget_s:.0f}s"
+                    )
+                else:
+                    _verify_error = f"scoped verify: {_verify_test_failures}/{_verify_test_total} tests failing"
 
             # Slice 67 — swe_bench_pro VERIFY regression gate is advisory (the
             # repo tests can't run locally; the held-out container scoring is
@@ -12686,6 +12697,14 @@ class GovernedOrchestrator:
                     _hit_file = str(_tf)
                     break
             if _active_eval is None:
+                # Slice 11 rider: positive quiet-path evidence. Run-21's
+                # audit could only prove "the gate ran" by the ABSENCE of
+                # the fail-open DEBUG line — one line makes it affirmative.
+                logger.debug(
+                    "[LiveWork] quiet — APPLY gate cleared op=%s "
+                    "scanned=%d waited=%.1fs",
+                    ctx.op_id, len(_scan_targets), _slept_total,
+                )
                 # Scan is quiet — C1: if we waited, the pre-gate drift
                 # snapshot is stale; re-run the SAME check before clearing.
                 if _slept_total > 0.0 and getattr(ctx, "generate_file_hashes", None):
