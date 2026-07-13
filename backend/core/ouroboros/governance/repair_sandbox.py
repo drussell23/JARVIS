@@ -41,6 +41,15 @@ from typing import Optional, Sequence
 _logger = logging.getLogger(__name__)
 
 
+def _working_tree_mirror_enabled() -> bool:
+    """Slice 9 (default ON): the sandbox baseline mirrors the WORKING
+    TREE (what TestWatcher actually observed), not HEAD. OFF restores
+    the legacy HEAD-baseline worktree strategy byte-identically."""
+    return os.environ.get(
+        "JARVIS_SANDBOX_WORKING_TREE_MIRROR_ENABLED", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
 # ---------------------------------------------------------------------------
 # Public exceptions
 # ---------------------------------------------------------------------------
@@ -109,12 +118,22 @@ class RepairSandbox:
         :meth:`run_tests` may pass a different ``timeout_s``.
     """
 
-    def __init__(self, repo_root: Path, test_timeout_s: float) -> None:
+    def __init__(
+        self,
+        repo_root: Path,
+        test_timeout_s: float,
+        mirror_working_tree: Optional[bool] = None,
+    ) -> None:
         self._repo_root: Path = repo_root
         self._test_timeout_s: float = test_timeout_s
         self._sandbox_dir: Optional[Path] = None
         self._worktree_mode: bool = False
         self._active_proc: Optional[asyncio.subprocess.Process] = None
+        self._mirror_working_tree: bool = (
+            _working_tree_mirror_enabled()
+            if mirror_working_tree is None
+            else mirror_working_tree
+        )
 
     # ------------------------------------------------------------------
     # Context manager protocol
@@ -152,6 +171,16 @@ class RepairSandbox:
             await self._git_worktree_add(tmpdir)
             self._sandbox_dir = tmpdir
             self._worktree_mode = True
+            if self._mirror_working_tree:
+                try:
+                    await self._overlay_working_tree_delta(tmpdir)
+                except Exception as exc:  # noqa: BLE001 — fail-soft: HEAD
+                    # baseline is degraded-but-functional; rsync strategy
+                    # is the heavyweight fallback, not worth forcing here.
+                    _logger.warning(
+                        "repair_sandbox: working-tree overlay failed (%s) — "
+                        "sandbox baseline is HEAD, not the working tree", exc,
+                    )
             _logger.debug("repair_sandbox: initialised via git worktree at %s", tmpdir)
             return
         except Exception as exc:
@@ -199,6 +228,43 @@ class RepairSandbox:
                 f"git worktree add exited {proc.returncode}: "
                 f"{stderr.decode(errors='replace').strip()}"
             )
+
+    async def _overlay_working_tree_delta(self, tmpdir: Path) -> None:
+        """Copy the working tree's dirty delta onto the HEAD worktree so
+        the sandbox baseline matches what TestWatcher observed. Uses
+        ``git status --porcelain=v1 -z`` (NUL-safe); modified/added/
+        untracked files are copied in, deleted files removed. Renames
+        (``R``) arrive as two NUL-separated paths — both handled."""
+        proc = await asyncio.create_subprocess_exec(
+            "git", "status", "--porcelain=v1", "-z",
+            "--untracked-files=all",
+            cwd=str(self._repo_root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        if proc.returncode:
+            raise RuntimeError("git status failed for working-tree overlay")
+        entries = stdout_b.decode(errors="replace").split("\0")
+        i = 0
+        while i < len(entries):
+            entry = entries[i]
+            i += 1
+            if len(entry) < 4:
+                continue
+            code, rel = entry[:2], entry[3:]
+            if code[0] == "R":  # rename: next entry is the ORIGINAL path
+                orig = entries[i] if i < len(entries) else ""
+                i += 1
+                if orig:
+                    (tmpdir / orig).unlink(missing_ok=True)
+            src = self._repo_root / rel
+            dst = tmpdir / rel
+            if src.exists() and src.is_file():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            elif not src.exists():
+                dst.unlink(missing_ok=True)
 
     async def _rsync_copy(self, tmpdir: Path) -> None:
         """Attempt rsync copy, excluding .git, __pycache__, and *.pyc."""
