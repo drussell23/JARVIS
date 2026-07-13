@@ -689,8 +689,12 @@ class Slice4bRunner(PhaseRunner):
         for _cf, _ in orch._iter_candidate_files(best_candidate):
             if _cf:
                 _snapshot_targets.add(_cf)
+        # Slice 11 review C3: capture from the EXECUTION root — the tree
+        # APPLY writes and verify-gate rollback restores (capture-root must
+        # equal restore-root or rollback corrupts the workspace baseline).
+        _snap_root = Path(orch._config.execution_root)
         for f in _snapshot_targets:
-            fpath = Path(f) if Path(f).is_absolute() else orch._config.project_root / f
+            fpath = Path(f) if Path(f).is_absolute() else _snap_root / f
             if fpath.exists():
                 try:
                     snapshots[str(f)] = fpath.read_text(errors="replace")
@@ -1364,6 +1368,7 @@ class Slice4bRunner(PhaseRunner):
             # ---- Phase 8b: Auto-commit ----
             _txn_commit_stage_reached = True
             _committed_hash: Optional[str] = None
+            _commit_skip_reason: Optional[str] = None
             try:
                 from backend.core.ouroboros.governance.auto_committer import AutoCommitter
                 _committer = AutoCommitter(repo_root=orch._config.project_root)
@@ -1419,6 +1424,7 @@ class Slice4bRunner(PhaseRunner):
                             exc_info=True,
                         )
                 elif _commit_result.skipped_reason:
+                    _commit_skip_reason = _commit_result.skipped_reason
                     logger.debug(
                         "[Orchestrator] Auto-commit skipped: %s",
                         _commit_result.skipped_reason,
@@ -1443,6 +1449,7 @@ class Slice4bRunner(PhaseRunner):
             )
             _promo = await run_workspace_promotion(
                 orch, ctx, _committed_hash, best_candidate,
+                commit_skipped_reason=_commit_skip_reason,
             )
             if _promo.attempted and not _promo.promoted:
                 return PhaseResult(

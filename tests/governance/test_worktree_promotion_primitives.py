@@ -186,6 +186,68 @@ class TestPromoteCommitsFailClosed:
         assert ei.value.state == "commit_budget_exceeded"
 
 
+class TestReviewRoundPins:
+    async def test_short_sha_input_still_fast_forwards(self, repo):
+        """Review P1: AutoCommitter reports SHORT hashes; the ff tip
+        comparison against full 40-char rev-parse output was always False,
+        making the ff path dead in production. Inputs are now normalized
+        to full ids before any comparison."""
+        sha = _workspace_commit(repo, "ouroboros/auto/p1", "fix.py",
+                                "x = 1\n", "repair")
+        short = _git(repo, "rev-parse", "--short", sha)
+        assert len(short) < 40
+        mgr = WorktreeManager(repo_root=repo)
+        result = await mgr.promote_commits(repo, "ouroboros/auto/p1", [short])
+        assert result.mode == "ff", (
+            "short-sha input must be normalized and fast-forward cleanly"
+        )
+        assert result.promoted_shas == (sha,)  # full-id normalized
+        assert result.landed_shas == (sha,)
+
+    async def test_ff_never_drags_unrequested_branch_commits(self, repo):
+        """Review P2: `merge --ff-only` lands the whole HEAD..tip range, so
+        ff is only sound when the requested shas are EXACTLY that range —
+        a session branch carrying an earlier quarantined (refused) commit
+        must cherry-pick the requested sha only."""
+        c1 = _workspace_commit(repo, "ouroboros/auto/p2", "quarantined.py",
+                               "unvetted = True\n", "earlier refused op")
+        c2 = _workspace_commit(repo, "ouroboros/auto/p2", "fix.py",
+                               "x = 2\n", "this op", create=False)
+        mgr = WorktreeManager(repo_root=repo)
+        result = await mgr.promote_commits(repo, "ouroboros/auto/p2", [c2])
+        assert result.mode == "cherry-pick", (
+            "requested shas != HEAD..tip range must NOT fast-forward"
+        )
+        assert not (repo / "quarantined.py").exists(), (
+            "the earlier quarantined commit must never land"
+        )
+        assert (repo / "fix.py").read_text() == "x = 2\n"
+        assert len(result.landed_shas) == 1
+        assert result.landed_shas[0] != c2, (
+            "cherry-pick creates a NEW commit object — landed sha must be "
+            "the operator-tree commit, not the workspace sha (review P4)"
+        )
+        assert _git(repo, "rev-parse", "HEAD") == result.landed_shas[0]
+
+    async def test_bracket_named_file_dirty_is_detected(self, repo):
+        """Review B3: raw pathspecs treat [..] as a character class — the
+        repo tracks Next.js dynamic-route files like [jobId]/route.ts, and
+        dirt on exactly those files sailed through the clean-target check.
+        ':(literal)' magic pins the paths."""
+        rel = "app/api/[jobId]/route.ts"
+        (repo / "app/api/[jobId]").mkdir(parents=True)
+        (repo / rel).write_text("export {}\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "add dynamic route")
+        sha = _workspace_commit(repo, "ouroboros/auto/b3", rel,
+                                "export const fixed = 1\n", "repair")
+        (repo / rel).write_text("operator uncommitted edit\n")
+        mgr = WorktreeManager(repo_root=repo)
+        with pytest.raises(PromotionError) as ei:
+            await mgr.promote_commits(repo, "ouroboros/auto/b3", [sha])
+        assert ei.value.state == "target_dirty"
+
+
 class TestPromotionPurityPins:
     def test_no_force_flags_or_hard_resets_in_source(self):
         src = inspect.getsource(WorktreeManager.promote_commits)

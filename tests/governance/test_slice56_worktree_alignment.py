@@ -50,6 +50,7 @@ def test_no_redirect_without_env(tmp_path, monkeypatch):
 def test_effective_write_root_follows_env(tmp_path, monkeypatch):
     ws = tmp_path / ".worktrees" / "owned"
     ws.mkdir(parents=True)
+    (ws / ".git").write_text("gitdir: /x\n")
     monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", str(ws))
     assert _engine(tmp_path)._effective_write_root() == ws
 
@@ -57,6 +58,7 @@ def test_effective_write_root_follows_env(tmp_path, monkeypatch):
 def test_redirect_absolute_target_under_project_root(tmp_path, monkeypatch):
     ws = tmp_path / ".worktrees" / "owned"
     ws.mkdir(parents=True)
+    (ws / ".git").write_text("gitdir: /x\n")
     monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", str(ws))
     e = _engine(tmp_path)
     t = tmp_path / "tests" / "foo.py"
@@ -66,6 +68,7 @@ def test_redirect_absolute_target_under_project_root(tmp_path, monkeypatch):
 def test_redirect_relative_target(tmp_path, monkeypatch):
     ws = tmp_path / "owned"
     ws.mkdir()
+    (ws / ".git").write_text("gitdir: /x\n")
     monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", str(ws))
     e = _engine(tmp_path)
     assert e._redirect_target(Path("tests/foo.py")) == ws / "tests" / "foo.py"
@@ -75,6 +78,8 @@ def test_target_outside_project_root_is_left_unchanged(tmp_path, monkeypatch):
     # Defensive: a path not under project_root is not rebased (no silent
     # cross-tree write to an unexpected location).
     ws = tmp_path / "owned"
+    ws.mkdir()
+    (ws / ".git").write_text("gitdir: /x\n")
     monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", str(ws))
     e = _engine(tmp_path)
     outside = Path("/tmp/some_other_root/foo.py")
@@ -85,6 +90,8 @@ def test_coherent_with_autocommitter_root(tmp_path, monkeypatch):
     """ChangeEngine write root and AutoCommitter commit root must resolve to
     the SAME tree under the env — that coherence is the whole fix."""
     ws = tmp_path / ".worktrees" / "owned"
+    ws.mkdir(parents=True)
+    (ws / ".git").write_text("gitdir: /x\n")
     monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", str(ws))
     from backend.core.ouroboros.governance.auto_committer import AutoCommitter
 

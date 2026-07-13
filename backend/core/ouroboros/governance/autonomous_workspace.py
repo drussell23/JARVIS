@@ -118,6 +118,28 @@ def _arm_boundary_flags() -> None:
         pass
 
 
+class ExecutionRootInvalid(RuntimeError):
+    """Raised when ``JARVIS_AUTO_COMMIT_WORKSPACE`` is SET but does not
+    name a usable git work-area (Slice 11 review C2 — fail CLOSED).
+
+    An armed-but-invalid workspace has no safe answer: honoring the raw
+    path writes into a rogue tree; falling back writes into the
+    operator's live checkout UNQUARANTINED (the Slice-56 leak class) —
+    and a mid-session flip lets APPLY and VERIFY resolve different trees
+    within one op. The only correct behavior is a loud typed refusal so
+    the op fails instead of mutating either tree.
+    """
+
+    def __init__(self, override: str, reason: str) -> None:
+        super().__init__(
+            "JARVIS_AUTO_COMMIT_WORKSPACE=%r is armed but unusable (%s) — "
+            "refusing to resolve an execution root (fail-closed; fix or "
+            "unset the env)" % (override, reason)
+        )
+        self.override = override
+        self.reason = reason
+
+
 def effective_execution_root(project_root: Any) -> Path:
     """THE canonical execution-root seam (Slice 11 Task 1, mandate 1).
 
@@ -131,17 +153,25 @@ def effective_execution_root(project_root: Any) -> Path:
     ``JARVIS_AUTO_COMMIT_WORKSPACE`` (exported by the ledger-sovereignty
     bootloader, ``harness._boot_ledger_sovereignty_workspace``):
 
-      * env absent/blank        → ``project_root`` (byte-identical legacy)
-      * env set to a real dir   → that workspace worktree
-      * env set to anything else → ``project_root`` (a nonexistent
-        "workspace" must never become a write root — bytes would land in
-        a rogue tree outside any git worktree)
+      * env absent/blank → ``project_root`` (byte-identical legacy)
+      * env set to a real git work-area (a dir containing ``.git`` —
+        FILE for linked worktrees, DIR for full checkouts) → that tree
+      * env set to anything else → raise :class:`ExecutionRootInvalid`
+        (review C2: a silent fallback routed APPLY bytes into the
+        operator's live tree unquarantined; a raw honor wrote a rogue
+        tree — an armed-but-broken workspace must fail LOUD, not pick
+        a tree). The ``.git`` requirement is review C1: AutoCommitter
+        always demanded it, so a plain dir made VERIFY judge one tree
+        while commit fell back to another — the validity rule now lives
+        HERE, once, for all four consumers.
 
-    Pure read-time resolution — no caching, no polling, never raises.
-    Single source of truth consumed by ``ChangeEngine._effective_write_root``
-    (delegate) and ``GovernedLoopConfig.execution_root`` (dynamic property);
-    duplicating this logic anywhere else is a review-rejectable offense
-    (Run-21 root cause was exactly such a split-truth).
+    Pure read-time resolution — no caching, no polling. Single source of
+    truth consumed by ``ChangeEngine._effective_write_root`` and
+    ``AutoCommitter._effective_repo_root`` (delegates) and the
+    ``execution_root`` dynamic properties on GovernedLoopConfig /
+    OrchestratorConfig; duplicating this logic anywhere else is a
+    review-rejectable offense (Run-21 root cause was exactly such a
+    split-truth).
     """
     root = Path(project_root)
     override = (os.environ.get(_ENV_COMMIT_WORKSPACE) or "").strip()
@@ -150,10 +180,14 @@ def effective_execution_root(project_root: Any) -> Path:
     try:
         candidate = Path(override)
         if candidate.is_dir():
-            return candidate
-    except (OSError, ValueError):  # ENAMETOOLONG, NUL bytes, … — fall back
-        pass
-    return root
+            if (candidate / ".git").exists():
+                return candidate
+            raise ExecutionRootInvalid(override, "no .git in workspace dir")
+        raise ExecutionRootInvalid(override, "not a directory")
+    except ExecutionRootInvalid:
+        raise
+    except (OSError, ValueError) as exc:  # ENAMETOOLONG, NUL bytes, …
+        raise ExecutionRootInvalid(override, repr(exc)) from exc
 
 
 def workspace_branch(session_id: str) -> str:

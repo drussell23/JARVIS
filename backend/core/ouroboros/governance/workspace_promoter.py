@@ -87,6 +87,7 @@ async def run_workspace_promotion(
     best_candidate: Optional[dict],
     *,
     manager: Optional[WorktreeManager] = None,
+    commit_skipped_reason: Optional[str] = None,
 ) -> PromotionOutcome:
     """Promote ``committed_hash`` from the workspace branch onto the
     operator tree, under governance. Never raises — returns a typed
@@ -123,18 +124,44 @@ async def run_workspace_promotion(
         return PromotionOutcome(True, False, state, detail=detail)
 
     if not committed_hash:
-        # Promotion ON requires a workspace commit to land; an uncommitted
-        # workspace mutation has no promotable artifact (AutoCommit off or
-        # skipped is an invalid combination with the promotion master).
+        # Review P3: classify AutoCommit's documented NON-FATAL outcomes
+        # instead of blanket-failing verified-green ops. 'nothing_to_stage'
+        # means the op produced NO net diff — there is genuinely nothing to
+        # land; failing it would publish a successful no-op as FAILED. Every
+        # other missing-hash case (transient git lock, fenced generation,
+        # commit exception) stays fail-closed: with promotion armed, landing
+        # IS part of the op's contract, and the skip reason is surfaced
+        # verbatim for diagnosability.
+        if (commit_skipped_reason or "").strip() == "nothing_to_stage":
+            logger.info(
+                "[WorkspacePromoter] op=%s no net diff to promote "
+                "(nothing_to_stage) — no-op, op proceeds", op_id,
+            )
+            return PromotionOutcome(False, False, "no_change_to_promote")
         return await _fail(
             "no_commit",
-            "workspace promotion enabled but AutoCommit produced no hash",
+            "workspace promotion enabled but AutoCommit produced no hash "
+            "(skipped_reason=%r)" % (commit_skipped_reason or ""),
         )
 
     # ---- LiveWork consult (reused gate; the target IS the tree it scans) --
+    # Review P5: a DEDICATED small wait budget — at ~98% op progress the
+    # pipeline deadline is spent, so the gate's default budgeting would turn
+    # any momentary human edit into an instant wait-infeasible kill of a
+    # verified+committed op; and a deadline-less ctx would grant a second
+    # full FILE_LOCK_TTL wait holding the worker.
     if _consult_enabled():
         try:
-            _gate_res = await orch._live_work_apply_gate(ctx, best_candidate)
+            _consult_budget_s = float(os.environ.get(
+                "JARVIS_PROMOTION_LIVE_WORK_MAX_WAIT_S", "30",
+            ))
+        except ValueError:
+            _consult_budget_s = 30.0
+        try:
+            _gate_res = await orch._live_work_apply_gate(
+                ctx, best_candidate,
+                max_wait_override_s=_consult_budget_s,
+            )
             if getattr(_gate_res, "active_hit", None):
                 return await _fail(
                     "live_work_active",
@@ -194,21 +221,26 @@ async def run_workspace_promotion(
             "git_failure", "%s: %s" % (type(exc).__name__, exc),
         )
 
+    # Review P4: surface the LANDED shas (cherry-pick creates NEW commit
+    # objects on the operator branch; workspace shas don't exist there).
+    _landed = result.landed_shas or result.promoted_shas
     logger.info(
-        "[WorkspacePromoter] op=%s PROMOTED %s -> %s (mode=%s)",
+        "[WorkspacePromoter] op=%s PROMOTED %s -> %s (mode=%s landed=%s)",
         op_id, committed_hash[:12], project_root, result.mode,
+        [s[:12] for s in _landed],
     )
     if comm is not None:
         try:
             await comm.emit_decision(
                 op_id=op_id, outcome="promoted",
                 reason_code="workspace_promotion",
-                diff_summary="promoted %s (%s) onto %s"
-                % (committed_hash[:12], result.mode, project_root),
+                diff_summary="promoted %s (%s) onto %s as %s"
+                % (committed_hash[:12], result.mode, project_root,
+                   ",".join(s[:12] for s in _landed)),
                 target_files=list(getattr(ctx, "target_files", ())),
             )
         except Exception:  # noqa: BLE001
             pass
     return PromotionOutcome(
-        True, True, "promoted", shas=result.promoted_shas,
+        True, True, "promoted", shas=_landed,
     )

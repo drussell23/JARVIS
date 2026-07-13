@@ -10315,8 +10315,13 @@ class GovernedOrchestrator:
             for _cf, _ in self._iter_candidate_files(best_candidate):
                 if _cf:
                     _snapshot_targets.add(_cf)
+            # Slice 11 review C3: capture from the EXECUTION root — the tree
+            # APPLY writes and verify-gate rollback restores. Capturing the
+            # observation tree while restoring into the workspace corrupted
+            # the workspace baseline whenever the two trees diverged.
+            _snap_root = Path(self._config.execution_root)
             for f in _snapshot_targets:
-                fpath = Path(f) if Path(f).is_absolute() else self._config.project_root / f
+                fpath = Path(f) if Path(f).is_absolute() else _snap_root / f
                 if fpath.exists():
                     try:
                         snapshots[str(f)] = fpath.read_text(errors="replace")
@@ -11044,6 +11049,7 @@ class GovernedOrchestrator:
             # After successful APPLY+VERIFY, commit with structured O+V signature.
             # Commit failures are non-fatal — the change is already applied on disk.
             _committed_hash: Optional[str] = None  # captured for Phase 3a critique below
+            _commit_skip_reason: Optional[str] = None
             try:
                 from backend.core.ouroboros.governance.auto_committer import AutoCommitter
                 _committer = AutoCommitter(repo_root=self._config.project_root)
@@ -11108,6 +11114,7 @@ class GovernedOrchestrator:
                             exc_info=True,
                         )
                 elif _commit_result.skipped_reason:
+                    _commit_skip_reason = _commit_result.skipped_reason
                     logger.debug(
                         "[Orchestrator] Auto-commit skipped: %s",
                         _commit_result.skipped_reason,
@@ -11132,6 +11139,7 @@ class GovernedOrchestrator:
             )
             _promo = await run_workspace_promotion(
                 self, ctx, _committed_hash, best_candidate,
+                commit_skipped_reason=_commit_skip_reason,
             )
             if _promo.attempted and not _promo.promoted:
                 if _serpent: _serpent.update_phase("POSTMORTEM")
@@ -12602,6 +12610,8 @@ class GovernedOrchestrator:
         self,
         ctx: OperationContext,
         best_candidate: Dict[str, Any],
+        *,
+        max_wait_override_s: Optional[float] = None,
     ) -> _LiveWorkGateResult:
         """LiveWorkSensor APPLY gate with bounded defer-wait (Slice 10).
 
@@ -12683,6 +12693,13 @@ class GovernedOrchestrator:
                 _max_wait_s = float(os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300"))
             except ValueError:
                 _max_wait_s = 300.0
+        # Slice 11 review P5: a caller-scoped budget (promotion-time consult)
+        # decouples the wait from the op's nearly-spent pipeline deadline AND
+        # caps the second bounded wait — a verified+committed op must neither
+        # die on a momentary human edit (allowance≈0 at 98% progress) nor
+        # hold a worker for the full FILE_LOCK_TTL again.
+        if max_wait_override_s is not None:
+            _max_wait_s = min(_max_wait_s, float(max_wait_override_s))
         # I2 — deadline-less fallback budget, initialized ONCE.
         _fallback_budget_s = self._config.validation_timeout_s
         _slept_total = 0.0
@@ -12740,7 +12757,11 @@ class GovernedOrchestrator:
             # Re-clock remaining budget from the op's pipeline deadline —
             # same source as the VALIDATE retry loop. Deadline-less ops
             # consume the shrinking fallback budget (I2).
-            if ctx.pipeline_deadline is not None:
+            if max_wait_override_s is not None:
+                # Caller-scoped budget (promotion consult): dedicated
+                # allowance, independent of the exhausted pipeline deadline.
+                _remaining_s = float(max_wait_override_s) - _slept_total
+            elif ctx.pipeline_deadline is not None:
                 _remaining_s = (
                     ctx.pipeline_deadline - datetime.now(tz=timezone.utc)
                 ).total_seconds()

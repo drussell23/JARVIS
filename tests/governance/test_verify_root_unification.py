@@ -58,6 +58,7 @@ class TestOrchestratorConfigExecutionRoot:
         before the ledger-sovereignty bootloader exports the env."""
         ws = tmp_path / "ws"
         ws.mkdir()
+        (ws / ".git").write_text("gitdir: /x\n")
         repo = tmp_path / "repo"
         cfg = OrchestratorConfig(project_root=repo)
         assert cfg.execution_root == repo
@@ -87,6 +88,7 @@ class TestScopedVerifyRunner:
     ):
         ws = tmp_path / "ws"
         ws.mkdir()
+        (ws / ".git").write_text("gitdir: /x\n")
         repo = tmp_path / "repo"
         repo.mkdir()
         sentinel = object()

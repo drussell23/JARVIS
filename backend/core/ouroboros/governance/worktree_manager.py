@@ -37,11 +37,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class PromotionResult:
-    """Successful promotion: which commits landed, how, and where."""
+    """Successful promotion: which commits landed, how, and where.
+
+    ``promoted_shas`` are the SOURCE (workspace-branch) commits, full-id
+    normalized. ``landed_shas`` are the commits that actually appeared on
+    the target branch — identical to the source for ff, NEW objects for
+    cherry-pick (review P4: telemetry keyed on workspace shas pointed at
+    commits that do not exist on the operator branch).
+    """
 
     promoted_shas: Tuple[str, ...]
     mode: str  # 'ff' | 'cherry-pick' | 'none'
     target_root: str
+    landed_shas: Tuple[str, ...] = ()
 
 
 class PromotionError(RuntimeError):
@@ -825,15 +833,20 @@ class WorktreeManager:
         )
         if rc != 0:
             raise PromotionError("branch_missing", branch)
+        # Review P1: NORMALIZE to full ids. AutoCommitter reports SHORT
+        # hashes (`rev-parse --short HEAD`); every downstream comparison
+        # (ff range equality, landed-sha readback) needs full 40-char forms.
+        full_shas: List[str] = []
         for s in shas:
-            rc, _, _ = await self._run_git_rc(
+            rc, out, _ = await self._run_git_rc(
                 target, ["rev-parse", "--verify", "--quiet", s + "^{commit}"],
             )
             if rc != 0:
                 raise PromotionError("git_failure", "unknown commit %s" % s[:12])
+            full_shas.append(out.strip())
 
         touched: Set[str] = set()
-        for s in shas:
+        for s in full_shas:
             rc, out, err = await self._run_git_rc(
                 target,
                 ["diff-tree", "--no-commit-id", "--name-only", "-r", s],
@@ -849,8 +862,14 @@ class WorktreeManager:
             "JARVIS_PROMOTION_REQUIRE_CLEAN_TARGETS", "true",
         ).strip().lower() in ("1", "true", "yes", "on")
         if _require_clean and touched:
+            # Review B3: ':(literal)' pathspec magic — the repo tracks
+            # bracket-named files (Next.js dynamic routes like
+            # app/api/.../[jobId]/route.ts); raw pathspecs treat [..] as a
+            # character class and silently miss dirt on exactly those files.
             rc, out, err = await self._run_git_rc(
-                target, ["status", "--porcelain", "--", *sorted(touched)],
+                target,
+                ["status", "--porcelain", "--",
+                 *(":(literal)%s" % p for p in sorted(touched))],
             )
             if rc != 0:
                 raise PromotionError(
@@ -861,47 +880,70 @@ class WorktreeManager:
                     "target_dirty", out.strip().splitlines()[0][:200],
                 )
 
+        rc, out, _ = await self._run_git_rc(target, ["rev-parse", "HEAD"])
+        if rc != 0:
+            raise PromotionError("git_failure", "cannot resolve target HEAD")
+        _pre_head = out.strip()
+
+        _mode = "cherry-pick"
+        _ff_taken = False
         if allow_ff:
-            rc_anc, _, _ = await self._run_git_rc(
-                target, ["merge-base", "--is-ancestor", "HEAD", branch],
+            # Review P2: ff is only sound when the branch's commits-ahead
+            # are EXACTLY the requested shas — `merge --ff-only` lands the
+            # whole HEAD..tip range, so a session branch carrying earlier
+            # quarantined (promotion-refused) commits must never ff past
+            # the per-sha budget + dirty checks.
+            rc_rl, rl_out, _ = await self._run_git_rc(
+                target,
+                ["rev-list", "--reverse", "HEAD..refs/heads/%s" % branch],
             )
-            _, tip_out, _ = await self._run_git_rc(
-                target, ["rev-parse", "refs/heads/%s" % branch],
-            )
-            if rc_anc == 0 and tip_out.strip() == shas[-1]:
+            _range = [ln.strip() for ln in rl_out.splitlines() if ln.strip()]
+            if rc_rl == 0 and _range == full_shas:
                 rc_ff, _, err_ff = await self._run_git_rc(
                     target, ["merge", "--ff-only", branch],
                 )
                 if rc_ff == 0:
-                    logger.info(
-                        "WorktreeManager.promote_commits: ff %s -> %s "
-                        "(%d commit(s))", branch, target, len(shas),
+                    _mode = "ff"
+                    _ff_taken = True
+                else:
+                    logger.debug(
+                        "WorktreeManager.promote_commits: ff-only declined "
+                        "(%s); falling through to cherry-pick",
+                        err_ff.strip(),
                     )
-                    return PromotionResult(tuple(shas), "ff", str(target))
-                logger.debug(
-                    "WorktreeManager.promote_commits: ff-only declined "
-                    "(%s); falling through to cherry-pick", err_ff.strip(),
-                )
-
-        rc_cp, _, err_cp = await self._run_git_rc(
-            target, ["cherry-pick", "--allow-empty", *shas],
-        )
-        if rc_cp != 0:
-            rc_ab, _, err_ab = await self._run_git_rc(
-                target, ["cherry-pick", "--abort"],
+        if not _ff_taken:
+            rc_cp, _, err_cp = await self._run_git_rc(
+                target, ["cherry-pick", "--allow-empty", *full_shas],
             )
-            if rc_ab != 0:
-                raise PromotionError(
-                    "git_failure",
-                    "cherry-pick failed and abort failed: %s / %s"
-                    % (err_cp.strip()[:200], err_ab.strip()[:200]),
+            if rc_cp != 0:
+                rc_ab, _, err_ab = await self._run_git_rc(
+                    target, ["cherry-pick", "--abort"],
                 )
-            raise PromotionError("conflict_aborted", err_cp.strip()[:300])
-        logger.info(
-            "WorktreeManager.promote_commits: cherry-pick %s -> %s "
-            "(%d commit(s))", branch, target, len(shas),
+                if rc_ab != 0:
+                    raise PromotionError(
+                        "git_failure",
+                        "cherry-pick failed and abort failed: %s / %s"
+                        % (err_cp.strip()[:200], err_ab.strip()[:200]),
+                    )
+                raise PromotionError("conflict_aborted", err_cp.strip()[:300])
+
+        # Review P4: read back what actually LANDED — cherry-pick creates
+        # NEW commit objects; telemetry keyed on workspace shas would point
+        # at commits that do not exist on the operator branch.
+        rc_lr, lr_out, _ = await self._run_git_rc(
+            target, ["rev-list", "--reverse", "%s..HEAD" % _pre_head],
         )
-        return PromotionResult(tuple(shas), "cherry-pick", str(target))
+        landed = tuple(
+            ln.strip() for ln in lr_out.splitlines() if ln.strip()
+        ) if rc_lr == 0 else ()
+        logger.info(
+            "WorktreeManager.promote_commits: %s %s -> %s "
+            "(%d requested, %d landed)",
+            _mode, branch, target, len(full_shas), len(landed),
+        )
+        return PromotionResult(
+            tuple(full_shas), _mode, str(target), landed_shas=landed,
+        )
 
     async def _run_git_capture(self, args: List[str]) -> str:
         """Run ``git -C <repo> <args>`` and return stdout. Empty on failure."""

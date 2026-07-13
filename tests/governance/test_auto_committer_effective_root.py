@@ -7,15 +7,27 @@ the producer never materialized). Every git subprocess then died with
 ``fatal: cannot change to '<path>'`` (exit 128), so APPLIED never durably
 committed and the auditor's ``fsm_classify_to_applied`` stayed False.
 
-The fix: validate the override is a real, usable git working tree; otherwise
-fall back to ``repo_root`` so the commit still lands durably. Fail-safe.
+CONTRACT UPDATED BY SLICE 11 (review C1/C2): the resolver now delegates to
+the canonical seam ``autonomous_workspace.effective_execution_root``. A
+valid override (dir + .git) is adopted exactly as before; an armed-but-
+INVALID override now raises ``ExecutionRootInvalid`` instead of silently
+falling back — post-Slice-56, APPLY/VERIFY target the workspace, so the old
+fallback committed a DIFFERENT tree's state (the split-truth class). The
+loud failure surfaces through commit()'s non-fatal wrapper as
+``CommitResult.error``; the dead-cwd class stays dead (no git subprocess
+ever runs against a bad cwd), it just fails visibly rather than sideways.
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
+import pytest
+
 from backend.core.ouroboros.governance.auto_committer import AutoCommitter
+from backend.core.ouroboros.governance.autonomous_workspace import (
+    ExecutionRootInvalid,
+)
 
 _ENV = "JARVIS_AUTO_COMMIT_WORKSPACE"
 
@@ -32,20 +44,26 @@ def test_unset_override_returns_repo_root(monkeypatch, tmp_path):
     assert ac._effective_repo_root() == tmp_path
 
 
-def test_nonexistent_override_falls_back_to_repo_root(monkeypatch, tmp_path):
+def test_nonexistent_override_raises_fail_closed(monkeypatch, tmp_path):
     # The exact A1 failure: a worktree path that was never created.
+    # Slice 11: LOUD typed refusal, never a silent wrong-tree commit.
     monkeypatch.setenv(_ENV, str(tmp_path / ".worktrees" / "ouroboros" / "nope"))
     ac = _ac(tmp_path)
-    assert ac._effective_repo_root() == tmp_path  # fail-safe fallback
+    with pytest.raises(ExecutionRootInvalid):
+        ac._effective_repo_root()
 
 
-def test_existing_dir_without_git_falls_back(monkeypatch, tmp_path):
-    # Exists + is a dir but is NOT a git worktree -> git ops would fail -> fall back.
+def test_existing_dir_without_git_raises_fail_closed(monkeypatch, tmp_path):
+    # Exists + is a dir but is NOT a git worktree. Slice 11 (review C1): the
+    # .git rule lives in the shared seam now — ChangeEngine would previously
+    # ACCEPT this dir (writes land there) while this class fell back (commit
+    # runs elsewhere). Every consumer now refuses it identically.
     plain = tmp_path / "plain_dir"
     plain.mkdir()
     monkeypatch.setenv(_ENV, str(plain))
     ac = _ac(tmp_path)
-    assert ac._effective_repo_root() == tmp_path
+    with pytest.raises(ExecutionRootInvalid):
+        ac._effective_repo_root()
 
 
 def test_valid_git_worktree_override_is_used(monkeypatch, tmp_path):

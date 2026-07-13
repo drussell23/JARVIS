@@ -58,6 +58,8 @@ class _FakeManager:
         return SimpleNamespace(
             promoted_shas=tuple(shas), mode="cherry-pick",
             target_root=str(target_root),
+            # Review P4: cherry-pick lands NEW commit objects.
+            landed_shas=tuple("landed-" + s for s in shas),
         )
 
 
@@ -67,9 +69,11 @@ class _QuietGate:
     def __init__(self, active=False):
         self.active = active
         self.calls = 0
+        self.wait_overrides = []
 
-    async def __call__(self, ctx, best_candidate):
+    async def __call__(self, ctx, best_candidate, **kw):
         self.calls += 1
+        self.wait_overrides.append(kw.get("max_wait_override_s"))
         return SimpleNamespace(
             active_hit=("file.py", "dirty") if self.active else None,
         )
@@ -78,6 +82,7 @@ class _QuietGate:
 def _orch(tmp_path, monkeypatch, *, gate=None, comm=None):
     ws = tmp_path / "ws"
     ws.mkdir(exist_ok=True)
+    (ws / ".git").write_text("gitdir: /x\n")
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
     monkeypatch.setenv(ENV_WS, str(ws))
@@ -155,6 +160,27 @@ class TestHappyPath:
         assert gate.calls == 1, "LiveWork consult must run at promotion time"
         assert ("op-test-1234", "promoted", "workspace_promotion") \
             in comm.decisions
+        # Review P4: telemetry surfaces the LANDED shas, not workspace shas.
+        assert out.shas == ("landed-deadbeef",)
+        # Review P5: the consult carries a DEDICATED small wait budget,
+        # decoupled from the exhausted pipeline deadline.
+        assert gate.wait_overrides == [30.0]
+
+    async def test_nothing_to_stage_is_benign_noop(
+        self, tmp_path, monkeypatch,
+    ):
+        """Review P3: a verified-green op with NO net diff must not be
+        published FAILED — there is genuinely nothing to land."""
+        monkeypatch.setenv(MASTER, "true")
+        mgr = _FakeManager()
+        orch = _orch(tmp_path, monkeypatch)
+        out = await run_workspace_promotion(
+            orch, _ctx(), None, None, manager=mgr,
+            commit_skipped_reason="nothing_to_stage",
+        )
+        assert out.attempted is False
+        assert out.state == "no_change_to_promote"
+        assert mgr.promote_calls == []
 
     async def test_consult_knob_off_skips_gate(self, tmp_path, monkeypatch):
         monkeypatch.setenv(MASTER, "true")
