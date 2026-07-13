@@ -1504,6 +1504,24 @@ class OrchestratorConfig:
     # JARVIS_SHADOW_HARNESS_ENABLED=true in .env
     shadow_harness: Optional[Any] = None
 
+    @property
+    def execution_root(self) -> Path:
+        """The mutation/judgment tree (Slice 11 role split).
+
+        Twin of ``GovernedLoopConfig.execution_root`` — OrchestratorConfig
+        is a separate frozen dataclass, so the property exists on both;
+        each is a thin delegate to the ONE canonical seam
+        (``autonomous_workspace.effective_execution_root``). Resolved
+        lazily at every read: the ledger-sovereignty bootloader exports
+        ``JARVIS_AUTO_COMMIT_WORKSPACE`` after configs are constructed.
+        ``project_root`` keeps the observation role (sensors/TestWatcher).
+        """
+        from backend.core.ouroboros.governance.autonomous_workspace import (
+            effective_execution_root,
+        )
+
+        return effective_execution_root(self.project_root)
+
     def resolve_repo_roots(
         self,
         repo_scope: Tuple[str, ...],
@@ -10551,10 +10569,16 @@ class GovernedOrchestrator:
             _verify_test_total = 0
             _verify_test_failures = 0
             _verify_failed_names: Tuple[str, ...] = ()
+            # Slice 11: resolve the judgment tree ONCE per VERIFY pass —
+            # the tree APPLY wrote (workspace when Ledger Sovereignty is
+            # armed, else the observation root). Every VERIFY-side consumer
+            # below (scoped tests, containment probe, rollback) anchors
+            # this local; none may re-read the observation root.
+            _exec_root = Path(self._config.execution_root)
 
             if self._validation_runner is not None and ctx.target_files:
                 _changed = tuple(
-                    self._config.project_root / f for f in ctx.target_files
+                    _exec_root / f for f in ctx.target_files
                 )
                 _files_str = ", ".join(str(f) for f in list(ctx.target_files)[:3])
 
@@ -10572,11 +10596,12 @@ class GovernedOrchestrator:
                     60.0,
                     float(os.environ.get("JARVIS_VERIFY_TIMEOUT_S", "60")),
                 )
+                _v_runner, _v_sandbox = self._scoped_verify_runner(_exec_root)
                 try:
                     _multi = await asyncio.wait_for(
-                        self._validation_runner.run(
+                        _v_runner.run(
                             changed_files=_changed,
-                            sandbox_dir=None,
+                            sandbox_dir=_v_sandbox,
                             timeout_budget_s=_verify_budget_s,
                             op_id=ctx.op_id,
                         ),
@@ -10640,7 +10665,7 @@ class GovernedOrchestrator:
                     ).strip()
                     if containerized_sandbox_enabled() and _probe106:
                         _cres106 = await run_payload_contained(
-                            _probe106, worktree=str(self._config.project_root),
+                            _probe106, worktree=str(_exec_root),
                         )
                         if (
                             _cres106 is not None and not _cres106.ok
@@ -10968,7 +10993,7 @@ class GovernedOrchestrator:
                         rollback_files(
                             pre_apply_snapshots=_snapshots,
                             target_files=list(ctx.target_files),
-                            repo_root=self._config.project_root,
+                            repo_root=_exec_root,
                         )
                 except Exception as exc:
                     logger.error("[Orchestrator] Verify rollback failed: %s", exc)
@@ -11915,6 +11940,41 @@ class GovernedOrchestrator:
             )
         return "Unknown failure. Read target files and check dependents before retrying."
 
+    def _scoped_verify_runner(
+        self, exec_root: Path,
+    ) -> Tuple[Any, Optional[Path]]:
+        """Select the scoped post-APPLY verify runner for ``exec_root``.
+
+        Legacy (execution root == observation root): the boot-time
+        ``_validation_runner`` with ``sandbox_dir=None`` — byte-identical.
+
+        Redirected (Ledger-Sovereignty workspace active): a per-root
+        ``LanguageRouter`` anchored at ``exec_root`` — the SAME discipline
+        as Slice 9's candidate-tree VALIDATE. Anchoring MUST live in the
+        router/adapters' ``repo_root``: ``PythonAdapter.run`` ignores the
+        ``sandbox_dir`` kwarg (see the L2 lane note in this file), and a
+        boot-runner rooted at the real tree would let pytest resolve
+        ``backend.*`` imports from the UNPATCHED tree — silently judging
+        the wrong source, the exact Run-21 class this seam kills.
+        """
+        _exec = Path(exec_root)
+        if _exec == Path(self._config.project_root):
+            return self._validation_runner, None
+        from backend.core.ouroboros.governance.test_runner import (
+            CppAdapter,
+            LanguageRouter,
+            PythonAdapter,
+        )
+
+        router = LanguageRouter(
+            repo_root=_exec,
+            adapters={
+                "python": PythonAdapter(repo_root=_exec),
+                "cpp": CppAdapter(repo_root=_exec),
+            },
+        )
+        return router, _exec
+
     async def _run_benchmark(
         self,
         ctx: OperationContext,
@@ -11930,8 +11990,11 @@ class GovernedOrchestrator:
             from backend.core.ouroboros.governance.patch_benchmarker import (
                 PatchBenchmarker,
             )
+            # Slice 11: the benchmarker is the pass_rate source for the
+            # VERIFY regression gate — it must judge the tree APPLY wrote
+            # (the execution root), never the observation root.
             benchmarker = PatchBenchmarker(
-                project_root=self._config.project_root,
+                project_root=self._config.execution_root,
                 timeout_s=self._config.benchmark_timeout_s,
                 pre_apply_snapshots=getattr(ctx, "pre_apply_snapshots", {}),
             )

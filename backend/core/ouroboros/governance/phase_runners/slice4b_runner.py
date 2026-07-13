@@ -986,10 +986,16 @@ class Slice4bRunner(PhaseRunner):
             _verify_test_total = 0
             _verify_test_failures = 0
             _verify_failed_names: Tuple[str, ...] = ()
+            # Slice 11: resolve the judgment tree ONCE per VERIFY pass —
+            # the tree APPLY wrote. All VERIFY-side consumers below anchor
+            # this local; none may re-read the observation root (Run-21:
+            # correct workspace repair judged against the unpatched real
+            # tree -> pass_rate=0.75 terminal).
+            _exec_root = Path(orch._config.execution_root)
 
             if orch._validation_runner is not None and ctx.target_files:
                 _changed = tuple(
-                    orch._config.project_root / f for f in ctx.target_files
+                    _exec_root / f for f in ctx.target_files
                 )
                 _files_str = ", ".join(str(f) for f in list(ctx.target_files)[:3])
 
@@ -1006,11 +1012,12 @@ class Slice4bRunner(PhaseRunner):
                     60.0,
                     float(os.environ.get("JARVIS_VERIFY_TIMEOUT_S", "60")),
                 )
+                _v_runner, _v_sandbox = orch._scoped_verify_runner(_exec_root)
                 try:
                     _multi = await asyncio.wait_for(
-                        orch._validation_runner.run(
+                        _v_runner.run(
                             changed_files=_changed,
-                            sandbox_dir=None,
+                            sandbox_dir=_v_sandbox,
                             timeout_budget_s=_verify_budget_s,
                             op_id=ctx.op_id,
                         ),
@@ -1184,7 +1191,7 @@ class Slice4bRunner(PhaseRunner):
                         _rollback_files(
                             pre_apply_snapshots=_snapshots,
                             target_files=list(ctx.target_files),
-                            repo_root=orch._config.project_root,
+                            repo_root=_exec_root,
                         )
                 except Exception as exc:
                     logger.error("[Orchestrator] Verify rollback failed: %s", exc)
@@ -1246,7 +1253,10 @@ class Slice4bRunner(PhaseRunner):
                 from .. import intake_dlq as _g2_dlq
                 from ..test_runner import TestRunner as _G2TestRunner
 
-                _g2_root = orch._config.project_root  # Path
+                # Slice 11: blast-radius verify JUDGES the applied change —
+                # it must anchor the tree APPLY wrote, not the observation
+                # root (same false-red class as scoped verify otherwise).
+                _g2_root = _exec_root  # Path
                 _g2_scope = sorted(
                     set(ctx.target_files)
                     | {cf for cf, _ in orch._iter_candidate_files(best_candidate) if cf}
