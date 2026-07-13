@@ -452,6 +452,34 @@ class OpLineageGraph:
         if parents:
             node.merge_parents(parents)
 
+    # Minimum id length eligible for prefix resolution. Orchestrator log
+    # lines truncate to ctx.op_id[:12]/[:16], and _extract_op_id rstrips a
+    # trailing '-' ('op-019f58a7-' -> 'op-019f58a7', 11 chars). Anything
+    # shorter is too weak to prove identity -> UNRESOLVED (caller fails
+    # CLOSED).
+    _MIN_PREFIX_RESOLVE_LEN = 8
+
+    def resolve_op_id(self, op_id: Optional[str]) -> Optional[str]:
+        """Resolve a possibly-TRUNCATED op id to a known node key.
+
+        Exact key match first. Otherwise a UNIQUE strict-prefix match over
+        the node keys: an id that is a strict prefix of exactly ONE node
+        resolves to that node (log lines truncate ctx.op_id to 12/16 chars
+        while graph nodes hold FULL ids). Zero matches (op never observed --
+        SSE gap / log-only replay) or 2+ matches (ambiguous prefix) ->
+        ``None``; the caller MUST treat ``None`` as unresolvable and fail
+        CLOSED."""
+        if not op_id or not isinstance(op_id, str):
+            return None
+        if op_id in self.nodes:
+            return op_id
+        if len(op_id) < self._MIN_PREFIX_RESOLVE_LEN:
+            return None
+        matches = [k for k in self.nodes if k.startswith(op_id)]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def _is_chaos_root(self, op_id: str) -> bool:
         node = self.nodes.get(op_id)
         if node is None:
@@ -1663,7 +1691,14 @@ class A1GraduationAuditor:
         caller-supplied ``op_id`` or, when absent, parsed from the line
         itself. A reject line with NO recoverable op id stays globally
         correlated -- fail-CLOSED, an unattributable rejection still
-        poisons."""
+        poisons. The recovered id is resolved against the lineage graph
+        (``OpLineageGraph.resolve_op_id``: exact key, else UNIQUE strict-
+        prefix -- log lines truncate op ids to 12/16 chars); an UNRESOLVED
+        or AMBIGUOUS id also stays globally correlated and the miss is
+        recorded in ``lineage_stitch_failures``. The whole lane requires
+        the auditor's ``lineage_scoping_enabled`` master switch in addition
+        to the env flag (master switch dominates, matching the
+        intervention-lock lane)."""
         for family, states in self._by_family.items():
             sig = _FAMILY_SIGNALS.get(family)
             if not sig:
@@ -1687,13 +1722,37 @@ class A1GraduationAuditor:
                 _outside_resumed = bool(
                     self.resumed_ops and _op and _op not in self.resumed_ops
                 )
-                _outside_chaos = (
+                _outside_chaos = False
+                if (
                     not self.resumed_ops
+                    and self.lineage_scoping_enabled
                     and _lineage_scoped_rejects_enabled()
                     and bool(_op)
                     and self.lineage.has_chaos_target()
-                    and not self.lineage.in_chaos_lineage(_op)
-                )
+                ):
+                    # Fail-CLOSED node resolution: log lines truncate op ids
+                    # (ctx.op_id[:12]/[:16]) while graph nodes hold FULL
+                    # ids, and a log-only --replay audit may never have
+                    # observed the op at all -- an exact-key lineage lookup
+                    # would make BOTH look "outside" the lineage and excuse
+                    # a genuine reject on the audited chaos op itself
+                    # (false GREEN). A reject is excused as unrelated ONLY
+                    # when the op PROVABLY resolves to a known node that is
+                    # PROVABLY outside the chaos lineage; UNRESOLVED or
+                    # AMBIGUOUS keeps global correlation (the reject
+                    # poisons, pre-Slice-9 behavior) and records the miss
+                    # so the drop is visible in the report (§7). The
+                    # ``lineage_scoping_enabled`` master switch dominates
+                    # the env flag, matching the intervention-lock lane.
+                    _resolved = self.lineage.resolve_op_id(_op)
+                    if _resolved is None:
+                        self.lineage_stitch_failures.append(
+                            "flag_reject_op_unresolved:%s:op=%s" % (family, _op)
+                        )
+                    else:
+                        _outside_chaos = not self.lineage.in_chaos_lineage(
+                            _resolved
+                        )
                 if _outside_resumed or _outside_chaos:
                     self.observed_unrelated_flag_rejects.append(
                         "%s:op=%s" % (family, _op)

@@ -95,15 +95,29 @@ def test_kill_switch_restores_legacy(monkeypatch):
 # with the audited chaos repair poisoned the flag anyway.
 # ---------------------------------------------------------------------------
 
+_RUN19_FULL_OP = "op-019f58a7-f623-756b-bf73-0b4309aaaaaa"
+
 _GENUINE_IRON_GATE_REJECT_UNRELATED_OP = (
     "2026-07-12T16:27:44 [Ouroboros.Orchestrator] WARNING [Orchestrator] "
     "Iron Gate — exploration_insufficient: 0/2 (attempt=1) "
-    "op=op-019f58a7-f623-756b-bf73-0b4309aaaaaa"
+    "op=" + _RUN19_FULL_OP
 )
+
+
+def _iron_gate_reject_line(op_token: str) -> str:
+    return (
+        "2026-07-12T16:27:44 [Ouroboros.Orchestrator] WARNING [Orchestrator] "
+        "Iron Gate — exploration_insufficient: 0/2 (attempt=1) "
+        "op=" + op_token
+    )
 
 
 def _auditor_with_chaos_lineage(chaos_op: str = "op-chaos-1"):
     a = _fresh_auditor_families(["JARVIS_ADAPTIVE_IRON_GATE_FLOORS_ENABLED"])
+    # The reject-scoping lane must honor the auditor's master switch (same
+    # precedent as the intervention-lock lane) -- turn it ON explicitly here
+    # (the shared Slice-8 fixture constructs with it OFF).
+    a.lineage_scoping_enabled = True
     a.lineage = auditor_mod.OpLineageGraph(
         ["backend/core/ouroboros/a1_ignition_vector/leaf_predicates.py"],
     )
@@ -114,6 +128,13 @@ def _auditor_with_chaos_lineage(chaos_op: str = "op-chaos-1"):
         target_files=[
             "backend/core/ouroboros/a1_ignition_vector/leaf_predicates.py",
         ],
+    )
+    # The unrelated Run-19 background op was OBSERVED by the graph with its
+    # own (non-chaos) target files -- a reject may only be excused for an op
+    # the graph provably knows.
+    a.lineage.observe_op(
+        _RUN19_FULL_OP,
+        target_files=["backend/core/some/unrelated_module.py"],
     )
     return a
 
@@ -192,3 +213,98 @@ def test_unattributable_reject_stays_globally_correlated(monkeypatch):
         st.false_positive_rejected
         for st in a._by_family.get("iron_gate", ())
     )
+
+
+# ---------------------------------------------------------------------------
+# Slice 9 review fix — fail-CLOSED node resolution + master-switch gating.
+#
+# The lane above failed OPEN two ways: (a) in_chaos_lineage's exact
+# nodes.get() lookup made a truncated (ctx.op_id[:12]/[:16]) or
+# never-observed op id look "outside" the lineage -- a GENUINE reject on the
+# audited chaos op itself was excused (false GREEN); (b) the lane ignored the
+# auditor's lineage_scoping_enabled master switch that the intervention-lock
+# lane honors. A reject may be excused as unrelated ONLY when the op is
+# PROVABLY known and PROVABLY outside the chaos lineage.
+# ---------------------------------------------------------------------------
+
+_CHAOS_FULL_OP = "op-019f5900-ab12-7cd3-9ef4-0123456789ab"
+
+
+def test_truncated_reject_id_resolving_to_chaos_op_poisons(monkeypatch):
+    """A [:16]-truncated op id that uniquely prefixes the CHAOS op's full
+    node id must RESOLVE to it -- the reject is on the audited chaos op
+    itself and poisons (the false-GREEN class this fix kills)."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
+    a = _auditor_with_chaos_lineage(chaos_op=_CHAOS_FULL_OP)
+    a._correlate_flag_signal(_iron_gate_reject_line(_CHAOS_FULL_OP[:16]))
+    assert any(
+        st.false_positive_rejected
+        for st in a._by_family.get("iron_gate", ())
+    )
+
+
+def test_truncated_reject_id_resolving_outside_lineage_excused(monkeypatch):
+    """A truncated id that uniquely resolves to a known NON-chaos node is
+    provably outside the lineage -> correctly excused. Uses the [:12]
+    orchestrator truncation (trailing '-' stripped by _extract_op_id)."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
+    a = _auditor_with_chaos_lineage()
+    a._correlate_flag_signal(_iron_gate_reject_line(_RUN19_FULL_OP[:12]))
+    assert not any(
+        st.false_positive_rejected
+        for st in a._by_family.get("iron_gate", ())
+    )
+    assert any("iron_gate" in x for x in a.observed_unrelated_flag_rejects)
+
+
+def test_unknown_reject_op_fails_closed_and_recorded(monkeypatch):
+    """An op id the graph never observed (SSE gap / log-only replay) is
+    UNRESOLVED -> NOT excused (poisons, pre-Slice-9 behavior) and the miss
+    is recorded in lineage_stitch_failures."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
+    a = _auditor_with_chaos_lineage()
+    unknown = "op-ffffffff-dead-beef-0000-111122223333"
+    a._correlate_flag_signal(_iron_gate_reject_line(unknown))
+    assert any(
+        st.false_positive_rejected
+        for st in a._by_family.get("iron_gate", ())
+    )
+    assert any(
+        "flag_reject_op_unresolved" in x and unknown in x
+        for x in a.lineage_stitch_failures
+    )
+
+
+def test_ambiguous_truncated_reject_id_fails_closed(monkeypatch):
+    """A truncated id that prefixes TWO node keys is AMBIGUOUS -> NOT
+    excused (poisons) and recorded in lineage_stitch_failures."""
+    monkeypatch.delenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", raising=False)
+    a = _auditor_with_chaos_lineage()
+    # A sibling node sharing the Run-19 op's 16-char prefix.
+    a.lineage.observe_op(
+        "op-019f58a7-f623-9999-8888-777766665555",
+        target_files=["backend/core/some/other_unrelated.py"],
+    )
+    a._correlate_flag_signal(_iron_gate_reject_line(_RUN19_FULL_OP[:16]))
+    assert any(
+        st.false_positive_rejected
+        for st in a._by_family.get("iron_gate", ())
+    )
+    assert any(
+        "flag_reject_op_unresolved" in x for x in a.lineage_stitch_failures
+    )
+
+
+def test_master_switch_off_disables_lane_despite_env_flag(monkeypatch):
+    """lineage_scoping_enabled=False (constructor / --lineage-scoping) must
+    dominate the env flag -- the lane is fully off and every corroborated
+    reject poisons, matching the intervention-lock lane's precedent."""
+    monkeypatch.setenv("JARVIS_A1_AUDIT_LINEAGE_SCOPED_REJECTS", "true")
+    a = _auditor_with_chaos_lineage()
+    a.lineage_scoping_enabled = False
+    a._correlate_flag_signal(_GENUINE_IRON_GATE_REJECT_UNRELATED_OP)
+    assert any(
+        st.false_positive_rejected
+        for st in a._by_family.get("iron_gate", ())
+    )
+    assert not a.observed_unrelated_flag_rejects
