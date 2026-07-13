@@ -453,3 +453,9 @@ Derek J. Russell - Resume*.pdf
 
 # Local AI-tool configs that may hold per-user credentials (never commit)
 .codex/
+
+# iCloud conflict-copy shield (2026-07-13) — generalized, placed LAST so it
+# wins over the !backend/core/**/* re-include at line ~211. Space+digit names
+# are never legitimate modules here; the .nosync rename stopped production,
+# this guards any stragglers if the tree ever lands back under sync.
+* [0-9].*
