@@ -465,6 +465,13 @@ class RepairSandbox:
             "--basetemp",
             str(sandbox / ".pytest_tmp"),
         ]
+        _ini = sandbox / "pytest.ini"
+        if _ini.exists():
+            # Pin the config: without this, targets under backend/ make
+            # pytest adopt backend/pytest.ini whose --cov/-n addopts are
+            # unrecognized in the runtime → usage error rc=4 (Run 18/19
+            # 'FAILED (unknown)' contributor).
+            cmd.extend(["-c", str(_ini)])
         cmd.extend(test_targets)
 
         start = time.monotonic()

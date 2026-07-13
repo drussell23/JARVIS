@@ -29,9 +29,45 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional, Set, Tuple
 
 _logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# L2 test target resolution (Slice 9 — real failing tests, not the candidate)
+# ---------------------------------------------------------------------------
+
+
+def _l2_test_threading_enabled() -> bool:
+    return os.environ.get(
+        "JARVIS_L2_TEST_TARGET_THREADING_ENABLED", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _resolve_l2_test_targets(ctx: Any, fallback: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Slice 9: run L2's sandbox pytest against the op's REAL failing
+    test(s). Attributed TestFailure scope is ``(*source_loci,
+    test_locus)`` — the test-shaped entries are the ones pytest can
+    actually exercise; scoping to the CANDIDATE file (the legacy
+    behavior, kept as *fallback*) collects zero tests for source repairs.
+    Deterministic path-shape check (no imports of the attribution
+    module — same convention TestRunner's JARVIS_TEST_DIR_NAMES uses)."""
+    if not _l2_test_threading_enabled():
+        return fallback
+    targets = getattr(ctx, "target_files", None) or ()
+    dir_names = {
+        p.strip() for p in os.environ.get(
+            "JARVIS_TEST_DIR_NAMES", "tests",
+        ).split(",") if p.strip()
+    }
+    test_shaped = tuple(
+        t for t in targets
+        if str(t).replace("\\", "/").split("/", 1)[0] in dir_names
+        or Path(str(t)).name.startswith("test_")
+    )
+    return test_shaped or fallback
 
 
 # ---------------------------------------------------------------------------
@@ -1111,23 +1147,25 @@ class RepairEngine:
                     # where ``file_path`` IS the failing test module (test_failure
                     # source) scoping to it runs in ~1s instead.
                     #
-                    # Known limitation: for ops whose target is a source file
-                    # (e.g. fix ``src/foo.py`` from a failure in
-                    # ``tests/test_foo.py``), scoping to ``file_path`` alone
-                    # misses the real failing test. The right fix is to thread
-                    # an explicit test path / node id through via ``ctx`` or
-                    # ``best_validation`` metadata — tracked as a follow-up.
+                    # Slice 9: for ops whose target is a source file (e.g. fix
+                    # ``src/foo.py`` from a failure in ``tests/test_foo.py``),
+                    # scoping to ``file_path`` alone misses the real failing
+                    # test — attributed TestFailure ops carry the test locus
+                    # in ``ctx.target_files``; thread it through when present,
+                    # otherwise fall back to the legacy candidate-file scoping.
                     if _patch_failed:
                         svr = None
                     else:
                         # Multi-file: scope tests to ALL changed files so the batch is
                         # validated coherently; single-file keeps the original scoping.
                         if _is_multi:
-                            test_targets: Tuple[str, ...] = tuple(
-                                p for p, _ in _multi_files
+                            test_targets: Tuple[str, ...] = _resolve_l2_test_targets(
+                                ctx, tuple(p for p, _ in _multi_files),
                             )
                         else:
-                            test_targets = (file_path,) if file_path else ()
+                            test_targets = _resolve_l2_test_targets(
+                                ctx, (file_path,) if file_path else (),
+                            )
                         svr = await sb.run_tests(
                             test_targets, budget.per_iteration_test_timeout_s
                         )
@@ -1150,11 +1188,18 @@ class RepairEngine:
             # ----------------------------------------------------------------
             # CONVERGED?
             # ----------------------------------------------------------------
-            _test_status = "\u2705 PASSED" if svr.passed else f"\u274c FAILED ({getattr(svr, 'failure_class', 'unknown')})"
             _logger.info(
-                "\U0001f527 [L2 Repair] Iteration %d/%d tests: %s",
-                iteration, budget.max_iterations, _test_status,
+                "\U0001f527 [L2 Repair] Iteration %d/%d tests: %s (rc=%s)",
+                iteration, budget.max_iterations,
+                "\u2705 PASSED" if svr.passed else "\u274c FAILED",
+                svr.returncode,
             )
+            if not svr.passed:
+                _tail = (svr.stdout or svr.stderr or "")[-200:]
+                _logger.info(
+                    "\U0001f527 [L2 Repair] Iteration %d failure tail: %s",
+                    iteration, _tail,
+                )
             # For telemetry, record *content* line count on the full_content
             # path so dashboards don't read diff_lines=0 as "nothing changed".
             _metric_lines = (
