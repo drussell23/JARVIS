@@ -5530,10 +5530,24 @@ class CandidateGenerator:
                 try:
                     # Slice 201 — feed the bandit a FAILURE reward for this arm
                     # so its posterior learns which models actually deliver.
+                    #
+                    # Slice 17 (mandate 3): classify the fault FIRST. A 403
+                    # entitlement denial, an RT rupture, or a breaker timeout is
+                    # a fact about the ENVIRONMENT, not about this model's
+                    # generation quality — folding it into alpha/beta is how the
+                    # posterior converged on garbage in Run-25c (it down-weighted
+                    # models that generate fine and up-weighted an unreachable
+                    # one). Infra faults are quarantined into ``infra_faults``;
+                    # only genuine quality failures move the posterior.
                     from backend.core.ouroboros.governance.bandit_router import (
+                        classify_fault as _s17_classify,
                         get_bandit_router as _s201_bandit_fail,
                     )
-                    _s201_bandit_fail().record_outcome(model_id, success=False)
+                    _s201_bandit_fail().record_outcome(
+                        model_id,
+                        success=False,
+                        fault_class=_s17_classify(exc),
+                    )
                 except Exception:  # noqa: BLE001
                     pass
                 try:

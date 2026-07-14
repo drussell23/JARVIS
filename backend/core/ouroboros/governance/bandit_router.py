@@ -28,6 +28,7 @@ order — authority-adjacent, opt-in). Durable state in
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -41,6 +42,64 @@ logger = logging.getLogger(__name__)
 _ENV_ENABLED = "JARVIS_BANDIT_ROUTER_ENABLED"
 _ENV_STATE_PATH = "JARVIS_BANDIT_STATE_PATH"
 _DEFAULT_STATE_PATH = ".jarvis/bandit_router_state.json"
+
+# ---------------------------------------------------------------------------
+# Fault taxonomy (Slice 17, mandate 3)
+# ---------------------------------------------------------------------------
+# A bandit arm's posterior is a claim about a model's GENERATION QUALITY. It is
+# only meaningful when the model actually got to generate. Folding
+# infrastructure faults into it teaches the router lies about the model:
+#
+#   Run-25c: ``-dottxt`` 403s on RT (an ENTITLEMENT fact) → laundered into a
+#   batch demotion → 300s batch breaker → TimeoutError → recorded as a QUALITY
+#   failure. The bandit then down-weighted models that generate perfectly well
+#   (DeepSeek-V4-Flash: 15s, valid schema) and up-weighted an unreachable one.
+#   The posterior converged on garbage and the ladder starved to zero.
+#
+# An infra fault says nothing about the model, so it MUST NOT move alpha/beta.
+# It is counted separately (observability, never ranking).
+FAULT_QUALITY = "quality"          # the model generated, and the output was bad
+FAULT_ENTITLEMENT = "entitlement"  # 403 — we are not permitted to call it
+FAULT_TRANSPORT = "transport"      # RT rupture / done_before_content / 5xx
+FAULT_TIMEOUT = "timeout"          # breaker / deadline — a budget fact
+FAULT_INFRA = "infra"              # anything else environmental
+
+_INFRA_FAULTS = frozenset(
+    {FAULT_ENTITLEMENT, FAULT_TRANSPORT, FAULT_TIMEOUT, FAULT_INFRA}
+)
+
+
+def classify_fault(exc: Optional[BaseException]) -> str:
+    """Map an exception to the taxonomy above. Structural, not keyword-guessy:
+    an explicit ``status_code``/``http_status`` of 403 is an entitlement fact;
+    the stdlib timeout types are budget facts. Anything we cannot positively
+    identify as infrastructure stays ``FAULT_QUALITY`` — the conservative
+    choice, since mislabelling a real quality failure as infra would let a
+    genuinely bad model escape its posterior. NEVER raises."""
+    if exc is None:
+        return FAULT_QUALITY
+    try:
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            status = getattr(exc, "http_status", None)
+        if status is None:
+            status = getattr(exc, "status", None)
+        if status is not None and int(status) == 403:
+            return FAULT_ENTITLEMENT
+        if status is not None and int(status) in (429, 500, 502, 503, 504):
+            return FAULT_TRANSPORT
+    except (TypeError, ValueError):
+        pass
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return FAULT_TIMEOUT
+    if isinstance(exc, (ConnectionError, OSError)):
+        return FAULT_INFRA
+    return FAULT_QUALITY
+
+
+def is_infra_fault(fault_class: Optional[str]) -> bool:
+    """True iff *fault_class* is environmental (must not move the posterior)."""
+    return bool(fault_class) and str(fault_class) in _INFRA_FAULTS
 
 
 def bandit_router_enabled() -> bool:
@@ -136,7 +195,7 @@ class BanditRouter:
         a = self._arms.get(model_id)
         if a is None:
             a = {"alpha": 1.0, "beta": 1.0, "n": 0.0,
-                 "cost_ema": 0.0, "latency_ema": 0.0}
+                 "cost_ema": 0.0, "latency_ema": 0.0, "infra_faults": 0.0}
             self._arms[model_id] = a
         return a
 
@@ -148,10 +207,31 @@ class BanditRouter:
         success: bool,
         cost_usd: Optional[float] = None,
         latency_s: Optional[float] = None,
+        fault_class: Optional[str] = None,
     ) -> None:
-        """Fold one dispatch outcome into the arm's posterior. NEVER raises."""
+        """Fold one dispatch outcome into the arm's posterior. NEVER raises.
+
+        Slice 17 mandate 3 — QUARANTINE: a FAILURE whose *fault_class* is
+        infrastructural (403 entitlement, RT rupture, breaker timeout) says
+        nothing about this model's generation quality, so it does NOT move
+        alpha/beta. It is counted in ``infra_faults`` for observability only.
+        Successes always fold (a model that generated well, generated well —
+        regardless of how the transport behaved).
+        """
         try:
             if not model_id or not isinstance(model_id, str):
+                return
+            if not success and is_infra_fault(fault_class):
+                with self._lock:
+                    a = self._arm(model_id)
+                    a["infra_faults"] = float(a.get("infra_faults", 0.0)) + 1.0
+                    self._save()
+                logger.info(
+                    "[BanditRouter] model=%s INFRA FAULT (%s) — posterior "
+                    "UNCHANGED (alpha/beta quarantined); this is an "
+                    "environment fact, not a quality signal",
+                    model_id, fault_class,
+                )
                 return
             reward = compute_reward(success, cost_usd, latency_s)
             with self._lock:

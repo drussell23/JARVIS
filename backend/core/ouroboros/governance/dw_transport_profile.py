@@ -49,11 +49,26 @@ from backend.core.ouroboros.governance.dw_ttft_observer import _atomic_write
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "transport_profile.1"
+SCHEMA_VERSION = "transport_profile.2"
+_LEGACY_SCHEMA_VERSIONS = ("transport_profile.1",)
 
 _ENV_MASTER = "JARVIS_DW_TRANSPORT_PROFILE_ENABLED"
 _ENV_TTL_S = "JARVIS_DW_TRANSPORT_PROFILE_TTL_S"
+_ENV_ENTITLEMENT_TTL_S = "JARVIS_DW_ENTITLEMENT_TTL_S"
 _ENV_STATE_PATH = "JARVIS_DW_TRANSPORT_PROFILE_STATE_PATH"
+
+# Transport layers a model can be denied on. A denial is per-(model, transport):
+# an account may hold batch entitlement while RT is refused by a routing rule
+# (the Run-25c class — ``Qwen3.5-397B-...-dottxt`` 403s on RT, 201s on batch).
+TRANSPORT_REALTIME = "realtime"
+TRANSPORT_BATCH = "batch"
+
+# Slice 17 defaults. Mandate 2: NO infinite persistence for a routing demotion.
+# A demotion is a HYPOTHESIS about a live endpoint, and endpoints change
+# (entitlements get granted, streaming gets enabled). Both decay so the system
+# re-probes reality instead of trusting a fossil.
+_DEFAULT_BATCH_ONLY_TTL_S = 6 * 3600.0        # 6h
+_DEFAULT_ENTITLEMENT_TTL_S = 24 * 3600.0      # 24h — an admin grant is slower
 
 
 def transport_profile_enabled() -> bool:
@@ -65,17 +80,30 @@ def transport_profile_enabled() -> bool:
     )
 
 
-def _profile_ttl_s() -> float:
-    """Re-probe TTL for a learned batch-only tag, in seconds. Default 0 = IMMORTAL
-    (never decays — a model that needs batch keeps needing it). A positive value
-    re-opens the model for RT re-probe after the window (so a model that GAINS
-    streaming capability can be re-learned). Clamped to [0, 30 days]. NEVER raises."""
-    raw = (os.environ.get(_ENV_TTL_S, "") or "").strip()
+def _ttl_from_env(name: str, default_s: float) -> float:
+    """Positive TTL seconds from *name*, else *default_s*. Clamped to
+    (0, 30 days]. Mandate 2: a demotion TTL can never be 0/infinite — an
+    explicit ``0`` (or garbage) falls back to the finite default rather than
+    resurrecting the immortal-fossil behavior that condemned RT-capable
+    models forever (Run-25c). NEVER raises."""
+    raw = (os.environ.get(name, "") or "").strip()
     try:
-        v = float(raw) if raw else 0.0
+        v = float(raw) if raw else default_s
     except (TypeError, ValueError):
-        v = 0.0
-    return max(0.0, min(v, 30 * 24 * 3600.0))
+        v = default_s
+    if v <= 0.0:
+        v = default_s
+    return min(v, 30 * 24 * 3600.0)
+
+
+def _profile_ttl_s() -> float:
+    """Re-probe TTL for a learned batch-only tag. Finite by construction."""
+    return _ttl_from_env(_ENV_TTL_S, _DEFAULT_BATCH_ONLY_TTL_S)
+
+
+def _entitlement_ttl_s() -> float:
+    """Re-probe TTL for a learned entitlement denial. Finite by construction."""
+    return _ttl_from_env(_ENV_ENTITLEMENT_TTL_S, _DEFAULT_ENTITLEMENT_TTL_S)
 
 
 def _state_path() -> Path:
@@ -86,10 +114,23 @@ def _state_path() -> Path:
 
 
 class TransportProfile:
-    """Per-model immortal batch-only profile.
+    """Per-model transport profile over TWO structurally distinct axes.
 
-    Pure profile — does NOT route, budget, or park. Emits one READ-ONLY signal
-    (``is_batch_only``) that the budget / quarantine / park layers consult.
+    Pure profile — does NOT route, budget, or park. Emits READ-ONLY signals
+    that the budget / quarantine / park / ladder layers consult.
+
+    * ``is_batch_only(model)`` — a CAPABILITY claim: the model's RT arm
+      structurally yields ``done_before_content``, so only batch can serve it.
+    * ``is_unavailable(model, transport)`` — an AUTHORIZATION fact: the
+      endpoint REFUSED the call (HTTP 403). The model is not weaker on that
+      transport; we are not permitted to use it there at all.
+
+    Conflating the two is what blinded Run-25c (Slice 17): a 403-on-RT was
+    laundered into "batch-only", which shoved the op onto the 300s batch
+    breaker, which timed out, which the bandit scored as a QUALITY failure —
+    a death spiral that ended in ``exhausted all 1 DW models`` and zero
+    generation. An entitlement denial must EXCLUDE the transport, never
+    silently re-route to a slower one.
     """
 
     def __init__(
@@ -102,6 +143,8 @@ class TransportProfile:
         self._autosave = autosave
         # model_id → unix timestamp when it was last observed batch-only.
         self._batch_only: Dict[str, float] = {}
+        # model_id → {transport → unix ts of the 403 denial}.
+        self._unavailable: Dict[str, Dict[str, float]] = {}
         self._lock = threading.RLock()
         self._loaded = False
 
@@ -130,11 +173,11 @@ class TransportProfile:
                 return
             if not isinstance(payload, Mapping):
                 return
-            if payload.get("schema_version") != SCHEMA_VERSION:
+            _found = payload.get("schema_version")
+            if _found not in (SCHEMA_VERSION,) + _LEGACY_SCHEMA_VERSIONS:
                 logger.warning(
                     "[TransportProfile] schema mismatch at %s (found=%r expected=%r)"
-                    " — starting empty", p, payload.get("schema_version"),
-                    SCHEMA_VERSION,
+                    " — starting empty", p, _found, SCHEMA_VERSION,
                 )
                 return
             raw = payload.get("batch_only", {})
@@ -145,6 +188,24 @@ class TransportProfile:
                             self._batch_only[mid] = float(ts)
                     except (ValueError, TypeError):
                         continue
+            # v1 carried no entitlement axis — a v1 file simply has none, and
+            # its batch_only tags now decay under the finite TTL rather than
+            # persisting as fossils (mandate 2).
+            raw_u = payload.get("unavailable", {})
+            if isinstance(raw_u, Mapping):
+                for mid, per_transport in raw_u.items():
+                    if not isinstance(mid, str) or not isinstance(
+                        per_transport, Mapping
+                    ):
+                        continue
+                    for transport, ts in per_transport.items():
+                        try:
+                            if isinstance(transport, str):
+                                self._unavailable.setdefault(mid, {})[
+                                    transport
+                                ] = float(ts)
+                        except (ValueError, TypeError):
+                            continue
 
     def save(self) -> None:
         """Persist the profile atomically. NEVER raises."""
@@ -152,6 +213,9 @@ class TransportProfile:
             payload = {
                 "schema_version": SCHEMA_VERSION,
                 "batch_only": dict(self._batch_only),
+                "unavailable": {
+                    m: dict(t) for m, t in self._unavailable.items()
+                },
             }
             try:
                 _atomic_write(
@@ -176,10 +240,84 @@ class TransportProfile:
     # Write side
     # ------------------------------------------------------------------
 
+    def record_unavailable(
+        self, model_id: str, transport: str, *, status: int = 403,
+    ) -> None:
+        """Record an AUTHORIZATION denial: the endpoint refused ``model_id`` on
+        ``transport`` (HTTP 403 — a routing rule / missing entitlement).
+
+        Mandate 1: this is NOT a capability signal and MUST NOT be laundered
+        into ``record_batch_only``. A refused transport is EXCLUDED, not
+        downgraded — routing an unauthorized RT call onto the batch API buys
+        a guaranteed 300s-breaker timeout and teaches the bandit a lie.
+
+        Decays under ``_entitlement_ttl_s`` so an entitlement granted later is
+        re-discovered. Gated + fail-soft — NEVER raises into dispatch.
+        """
+        try:
+            if not model_id or not transport or not transport_profile_enabled():
+                return
+            self._ensure_loaded()
+            with self._lock:
+                self._unavailable.setdefault(model_id, {})[transport] = time.time()
+                self._maybe_autosave()
+            logger.warning(
+                "[TransportProfile] model=%s transport=%s ENTITLEMENT DENIED "
+                "(HTTP %s) — excluded from that transport (NOT batch-demoted); "
+                "re-probe after %.0fs",
+                model_id, transport, status, _entitlement_ttl_s(),
+            )
+        except Exception:  # noqa: BLE001 — never perturb the dispatch path
+            logger.debug(
+                "[TransportProfile] record_unavailable swallowed", exc_info=True,
+            )
+
+    def record_rt_success(self, model_id: str) -> None:
+        """A REAL-TIME call succeeded for ``model_id`` — ground truth that beats
+        every historical demotion.
+
+        Mandate 2 (dynamic cache invalidation): evict BOTH the batch-only tag
+        and any RT entitlement denial. Live evidence of an RT-capable,
+        RT-authorized endpoint is the strongest signal the profile can hold, so
+        it clears the fossils that would otherwise keep shoving this model onto
+        batch. Gated + fail-soft — NEVER raises into dispatch.
+        """
+        try:
+            if not model_id or not transport_profile_enabled():
+                return
+            self._ensure_loaded()
+            with self._lock:
+                dropped_batch = self._batch_only.pop(model_id, None) is not None
+                per_transport = self._unavailable.get(model_id) or {}
+                dropped_ent = per_transport.pop(TRANSPORT_REALTIME, None) is not None
+                if not per_transport:
+                    self._unavailable.pop(model_id, None)
+                if dropped_batch or dropped_ent:
+                    self._maybe_autosave()
+            if dropped_batch or dropped_ent:
+                logger.info(
+                    "[TransportProfile] model=%s RT SUCCESS — invalidated stale "
+                    "demotions (batch_only=%s rt_entitlement_denial=%s); the "
+                    "endpoint serves real-time, so the fossil is dropped",
+                    model_id, dropped_batch, dropped_ent,
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[TransportProfile] record_rt_success swallowed", exc_info=True,
+            )
+
     def record_batch_only(self, model_id: str) -> None:
-        """Tag ``model_id`` batch-only (RT yields ``done_before_content``). 1-strike,
-        immortal (persisted), idempotent (refreshes the timestamp). Gated + fail-soft
-        — NEVER raises into dispatch."""
+        """Tag ``model_id`` batch-only — a CAPABILITY claim, valid ONLY when RT
+        structurally yields ``done_before_content``.
+
+        Slice 17: this tag now DECAYS (``_profile_ttl_s``, finite by
+        construction). The pre-Slice-17 "immortal" contract permanently
+        condemned models that in fact serve RT fine (the plain 397B answers in
+        1.6s; gpt-oss-120b in 0.7s — both were fossil-tagged), because ANY
+        batch dispatch was read as proof of batch-boundness. Callers must only
+        invoke this on genuine RT-rupture evidence. Gated + fail-soft — NEVER
+        raises into dispatch.
+        """
         try:
             if not model_id or not transport_profile_enabled():
                 return
@@ -189,7 +327,9 @@ class TransportProfile:
                 self._maybe_autosave()
             logger.info(
                 "[TransportProfile] model=%s tagged ASYNC_BATCH_PAYLOAD "
-                "(RT yields done_before_content → batch-only, immortal)", model_id,
+                "(RT yields done_before_content → batch-only; decays after "
+                "%.0fs, and any RT success invalidates it immediately)",
+                model_id, _profile_ttl_s(),
             )
         except Exception:  # noqa: BLE001 — never perturb the dispatch path
             logger.debug("[TransportProfile] record_batch_only swallowed", exc_info=True)
@@ -207,6 +347,36 @@ class TransportProfile:
     # ------------------------------------------------------------------
     # Read side
     # ------------------------------------------------------------------
+
+    def is_unavailable(self, model_id: str, transport: str) -> bool:
+        """True iff ``model_id`` is known to be REFUSED on ``transport`` (a
+        non-expired 403 entitlement denial).
+
+        Mandate 4: the ladder consults this to bypass unauthorized variants
+        BEFORE dispatch, instead of discovering the 403 by burning an op on it.
+        Decays under ``_entitlement_ttl_s`` (an admin can grant access), and any
+        RT success clears it outright. Master-off → False. NEVER raises.
+        """
+        try:
+            if not model_id or not transport or not transport_profile_enabled():
+                return False
+            self._ensure_loaded()
+            with self._lock:
+                ts = (self._unavailable.get(model_id) or {}).get(transport)
+                if ts is None:
+                    return False
+                if (time.time() - ts) > _entitlement_ttl_s():
+                    # TTL elapsed → re-open for an entitlement re-probe.
+                    per_transport = self._unavailable.get(model_id) or {}
+                    per_transport.pop(transport, None)
+                    if not per_transport:
+                        self._unavailable.pop(model_id, None)
+                    self._maybe_autosave()
+                    return False
+                return True
+        except Exception:  # noqa: BLE001
+            logger.debug("[TransportProfile] is_unavailable swallowed", exc_info=True)
+            return False
 
     def is_batch_only(self, model_id: str) -> bool:
         """True iff ``model_id`` is a known batch-only model (non-expired tag). Decays
@@ -261,4 +431,6 @@ __all__ = [
     "get_transport_profile",
     "transport_profile_enabled",
     "SCHEMA_VERSION",
+    "TRANSPORT_REALTIME",
+    "TRANSPORT_BATCH",
 ]

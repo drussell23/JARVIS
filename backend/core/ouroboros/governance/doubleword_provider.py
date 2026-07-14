@@ -1738,6 +1738,44 @@ class DoublewordProvider:
             pass
         return _DW_TEMPERATURE
 
+    def _note_rt_transport_status(self, model_id: str, status: int) -> None:
+        """Slice 17 — the ONE seam where a real-time HTTP status becomes
+        transport knowledge about *model_id*.
+
+        Mandate 1: a 403 is an ENTITLEMENT fact ("a routing rule forbids
+        real-time access to this model on this account"), so the model is
+        marked strictly unavailable ON RT and the ladder skips it. It is
+        emphatically NOT evidence that the model needs the batch API, and it
+        must never be laundered into ``record_batch_only`` — doing so is what
+        drove Run-25c's zero-generation death spiral.
+
+        Mandate 2: a 2xx is ground truth that the endpoint serves RT, so it
+        dynamically invalidates any stale batch-only / entitlement fossil for
+        that model.
+
+        Fail-soft — NEVER raises into dispatch.
+        """
+        try:
+            if not model_id:
+                return
+            from backend.core.ouroboros.governance.dw_transport_profile import (
+                TRANSPORT_REALTIME,
+                get_transport_profile,
+            )
+
+            profile = get_transport_profile()
+            if status == 403:
+                profile.record_unavailable(
+                    model_id, TRANSPORT_REALTIME, status=status,
+                )
+            elif 200 <= status < 300:
+                profile.record_rt_success(model_id)
+        except Exception:  # noqa: BLE001 — never perturb the dispatch path
+            logger.debug(
+                "[DoublewordProvider] _note_rt_transport_status swallowed",
+                exc_info=True,
+            )
+
     def _resolve_effective_model(self, ctx: Any) -> str:
         """Resolve the DW model for this call.
 
@@ -2305,24 +2343,24 @@ class DoublewordProvider:
                 "[DoublewordProvider] Batch %s submitted async (model=%s, op=%s)",
                 batch_id, _effective_model, operation_id,
             )
-            # Sovereign Transport Profiler Matrix (2026-06-20) — LEARN step (broad).
-            # ANY model dispatched via the batch path is batch-bound: the system chose
-            # batch for it (force-batch cortex / hedge / sequential fallback), so its
-            # provider call is a minutes-long async batch poll that the RT/autarky
-            # budget (180s) strangles. Record it IMMORTALLY here — the single point
-            # common to ALL batch dispatches (the hedge-outcome seam only sees the
-            # ~1-in-16 ops that actually race; force-batch skips the hedge). The NEXT
-            # op for this model is tagged ASYNC_BATCH_PAYLOAD before the budget layer
-            # → batch budget + Zero-Shot immunity + park-detachment. Learn-then-detach:
-            # first contact may still time out once, then immortal. Gated + fail-soft.
-            try:
-                if _effective_model:
-                    from backend.core.ouroboros.governance.dw_transport_profile import (  # noqa: E501
-                        get_transport_profile as _tp_learn,
-                    )
-                    _tp_learn().record_batch_only(_effective_model)
-            except Exception:  # noqa: BLE001 — never raise from learn step
-                pass
+            # Sovereign Transport Profiler Matrix — LEARN step.
+            #
+            # SLICE 17 (2026-07-13): the BROAD learn that used to live here is
+            # DELETED. It tagged ANY model dispatched via batch as batch-only,
+            # immortally — but "this op went to batch" is NOT evidence that the
+            # model's RT arm is broken. The system routes to batch for many
+            # reasons that have nothing to do with the model (force-batch
+            # cortex, hedge policy, sequential fallback, an RT 403 that isn't
+            # ours to reinterpret). Reading that as a capability verdict is a
+            # non-sequitur, and it fossilized models that demonstrably serve RT
+            # (plain 397B: 1.6s; gpt-oss-120b: 0.7s) onto the 300s batch
+            # breaker — timeouts the bandit then scored as quality failures,
+            # until the ladder starved to "exhausted all 1 DW models".
+            #
+            # A batch-only tag is now written at exactly ONE place: the
+            # hedge-outcome seam, where batch winning WITH an RT rupture is
+            # genuine ``done_before_content`` evidence about the model's RT arm.
+            # 403s take the entitlement path (record_unavailable) instead.
             return PendingBatch(
                 op_id=operation_id,
                 batch_id=batch_id,
@@ -4053,6 +4091,12 @@ class DoublewordProvider:
                         ) as resp:
                             if resp.status >= 300:
                                 self._last_error_status = resp.status
+                                # Slice 17 — entitlement vs capability at the
+                                # source: 403 ⇒ RT-unavailable (ladder skips),
+                                # never a batch demotion.
+                                self._note_rt_transport_status(
+                                    _effective_model, resp.status,
+                                )
                                 err_body = await resp.text()
                                 # Sovereign Reasoning-Capability Profiler — ADAPTIVE learn:
                                 # if DW rejected our reasoning knob, remember this model needs
@@ -4536,6 +4580,10 @@ class DoublewordProvider:
                         ) as resp:
                             if resp.status >= 300:
                                 self._last_error_status = resp.status
+                                # Slice 17 — see _note_rt_transport_status.
+                                self._note_rt_transport_status(
+                                    _effective_model, resp.status,
+                                )
                                 err_body = await resp.text()
                                 # PR D C2 — fail-soft on 400 rejection of native tool schemas.
                                 if resp.status == 400 and _tool_forced:
@@ -4558,6 +4606,13 @@ class DoublewordProvider:
                                     ratelimit_reset_ts=_parse_retry_after_headers(resp.headers),
                                 )
 
+                            # Slice 17 mandate 2 — a 2xx on the RT arm is ground
+                            # truth that this endpoint serves real-time, so it
+                            # dynamically invalidates any stale batch-only /
+                            # entitlement fossil for the model.
+                            self._note_rt_transport_status(
+                                _effective_model, resp.status,
+                            )
                             data = await resp.json()
                             choices = data.get("choices", [])
                             usage = data.get("usage", {})

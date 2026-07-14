@@ -689,15 +689,73 @@ def _pin_and_fleet_guarded(route: str, result: Tuple[str, ...]) -> Tuple[str, ..
     (``JARVIS_DW_PRIMARY_OVERRIDE``) is promoted to Rank 1; a soft-locked pin
     (consecutive failures over threshold → cooldown) yields straight back to the
     EWMA ordering. Pin unset → returns the fleet result byte-identically. Pure +
-    fail-soft: any error returns the fleet-guarded result unchanged."""
+    fail-soft: any error returns the fleet-guarded result unchanged.
+
+    Slice 17 composes an ENTITLEMENT filter LAST (see
+    :func:`_entitlement_filtered`) so that neither the fleet re-rank nor an
+    operator pin can resurrect a model the endpoint refuses to serve."""
     fleet_ranked = _fleet_guarded(route, result)
     try:
         from backend.core.ouroboros.governance.model_pinning_heuristic import (
             apply_model_pin,
         )
-        return apply_model_pin(route, fleet_ranked)
+        pinned = apply_model_pin(route, fleet_ranked)
     except Exception:
-        return fleet_ranked
+        pinned = fleet_ranked
+    return _entitlement_filtered(route, pinned)
+
+
+def _entitlement_filtered(route: str, result: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Drop models the endpoint has REFUSED on real-time (HTTP 403).
+
+    Mandate 4 — the ladder verifies entitlement instead of discovering it by
+    burning an op: in Run-25c the BACKGROUND ladder held exactly one model
+    (``…-397B…-dottxt``) whose RT arm 403s on this account. Every dispatch
+    failed, the failure was mis-learned as a batch-capability constraint, and
+    the route starved to ``exhausted all 1 DW models`` with zero generation.
+
+    A model denied on RT is skipped *for the ladder* — it is not demoted,
+    re-routed to batch, or scored. The denial decays (``_entitlement_ttl_s``)
+    and any successful RT call clears it, so a later admin grant is picked up
+    automatically. No hardcoded model names: the exclusion set is entirely
+    LEARNED from live 403s (and the boot entitlement probe).
+
+    Fail-CLOSED against over-filtering: if the filter would empty a non-empty
+    ladder, the original list is returned unchanged — starving a route is worse
+    than attempting a model that might 403, and it keeps this filter from ever
+    becoming a new single point of starvation. Pure + fail-soft.
+    """
+    try:
+        if not result:
+            return result
+        from backend.core.ouroboros.governance.dw_transport_profile import (
+            TRANSPORT_REALTIME,
+            get_transport_profile,
+        )
+
+        profile = get_transport_profile()
+        allowed = tuple(
+            m for m in result
+            if not profile.is_unavailable(m, TRANSPORT_REALTIME)
+        )
+        if not allowed:
+            logger.warning(
+                "[ProviderTopology] route=%s every model is RT-entitlement "
+                "denied (%s) — returning the unfiltered ladder rather than "
+                "starving the route",
+                route, list(result),
+            )
+            return result
+        if len(allowed) != len(result):
+            logger.info(
+                "[ProviderTopology] route=%s entitlement filter dropped %d "
+                "RT-denied model(s): %s",
+                route, len(result) - len(allowed),
+                [m for m in result if m not in allowed],
+            )
+        return allowed
+    except Exception:  # noqa: BLE001 — never starve dispatch on a filter fault
+        return result
 
 
 def _locate_policy_yaml() -> Optional[Path]:

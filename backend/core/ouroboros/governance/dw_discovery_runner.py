@@ -26,9 +26,11 @@ preflight surfaces it as a diagnostic, not a failed assertion.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from backend.core.ouroboros.governance.dw_catalog_classifier import (
     ClassificationOutcome,
@@ -178,6 +180,32 @@ async def run_discovery(
         except Exception:  # noqa: BLE001 — defensive
             logger.debug(
                 "[DiscoveryRunner] active topology recovery failed",
+                exc_info=True,
+            )
+
+    # Step 1.4: Slice 17 — REAL-TIME ENTITLEMENT VERIFICATION.
+    # Runs BEFORE classify so the ladder is built from models we are
+    # actually PERMITTED to call in real-time. Bounded, concurrent,
+    # fail-soft; a transient/unknown result NEVER demotes a model.
+    if snapshot.fetch_failure_reason is None and snapshot.models:
+        try:
+            _denied, _cleared = await probe_rt_entitlement(
+                session=session,
+                base_url=base_url,
+                api_key=api_key,
+                model_ids=[
+                    str(getattr(m, "model_id", "") or "")
+                    for m in snapshot.models
+                ],
+            )
+            if _denied or _cleared:
+                diagnostics.append(
+                    f"rt_entitlement:denied={len(_denied)}"
+                    f":cleared={len(_cleared)}"
+                )
+        except Exception:  # noqa: BLE001 — never crash discovery
+            logger.debug(
+                "[DiscoveryRunner] RT entitlement probe failed",
                 exc_info=True,
             )
 
@@ -398,6 +426,125 @@ def _compute_snapshot_id(snapshot: Any) -> str:
         return hashlib.sha256(joined).hexdigest()[:16]
     except Exception:  # noqa: BLE001 — defensive
         return ""
+
+
+def _entitlement_probe_enabled() -> bool:
+    """Master — ``JARVIS_DW_ENTITLEMENT_PROBE_ENABLED`` (default true)."""
+    return (
+        os.environ.get("JARVIS_DW_ENTITLEMENT_PROBE_ENABLED", "true") or ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _envf_probe(name: str, default: float) -> float:
+    try:
+        raw = (os.environ.get(name, "") or "").strip()
+        v = float(raw) if raw else default
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+async def probe_rt_entitlement(
+    *,
+    session: Any,
+    base_url: str,
+    api_key: str,
+    model_ids: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    """Verify which models this account may call on the REAL-TIME endpoint.
+
+    Slice 17 mandate 4: entitlement is *verified*, never assumed and never
+    discovered the expensive way (by burning a real op on a model that 403s and
+    then mis-learning the failure as a capability constraint — the Run-25c
+    death spiral). One minimal completion per model, concurrently, bounded.
+
+    Recording discipline is deliberately asymmetric — only UNAMBIGUOUS evidence
+    is ever written:
+
+      * ``403``  → ``record_unavailable(model, realtime)``. A routing rule
+        forbids RT for this model; the ladder skips it (decays; a later admin
+        grant is re-discovered automatically).
+      * ``2xx``  → ``record_rt_success(model)``. Ground truth that the endpoint
+        serves RT, so it clears any stale batch-only / entitlement fossil.
+      * anything else (timeout, 429, 5xx, transport error) → **NOTHING**. A
+        transient must never demote a model; silence is the correct answer to
+        an ambiguous probe.
+
+    Returns ``(denied, cleared)`` model-id lists for diagnostics. NEVER raises.
+    """
+    denied: List[str] = []
+    cleared: List[str] = []
+    if not _entitlement_probe_enabled() or not model_ids or not api_key:
+        return denied, cleared
+
+    timeout_s = _envf_probe("JARVIS_DW_ENTITLEMENT_PROBE_TIMEOUT_S", 20.0)
+    max_conc = int(_envf_probe("JARVIS_DW_ENTITLEMENT_PROBE_CONCURRENCY", 6.0))
+    sem = asyncio.Semaphore(max(1, max_conc))
+    url = f"{(base_url or '').rstrip('/')}/chat/completions"
+
+    from backend.core.ouroboros.governance.dw_transport_profile import (
+        TRANSPORT_REALTIME,
+        get_transport_profile,
+    )
+
+    profile = get_transport_profile()
+
+    async def _probe(model_id: str) -> None:
+        if not model_id:
+            return
+        payload = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "ok"}],
+            "max_tokens": 1,
+        }
+        try:
+            async with sem:
+                async with session.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=timeout_s,
+                ) as resp:
+                    status = int(resp.status)
+                    await resp.read()  # drain so the connection is reusable
+        except Exception:  # noqa: BLE001 — ambiguous → record NOTHING
+            logger.debug(
+                "[EntitlementProbe] model=%s probe inconclusive — no demotion",
+                model_id, exc_info=True,
+            )
+            return
+        if status == 403:
+            profile.record_unavailable(
+                model_id, TRANSPORT_REALTIME, status=status,
+            )
+            denied.append(model_id)
+        elif 200 <= status < 300:
+            profile.record_rt_success(model_id)
+            cleared.append(model_id)
+
+    try:
+        await asyncio.gather(
+            *(_probe(str(m)) for m in model_ids), return_exceptions=True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[EntitlementProbe] gather failed", exc_info=True)
+        return denied, cleared
+
+    if denied:
+        logger.warning(
+            "[EntitlementProbe] %d model(s) RT-DENIED (403) and excluded from "
+            "the real-time ladder: %s", len(denied), denied,
+        )
+    logger.info(
+        "[EntitlementProbe] real-time entitlement verified: %d authorized, "
+        "%d denied, %d inconclusive (of %d probed)",
+        len(cleared), len(denied),
+        len(model_ids) - len(cleared) - len(denied), len(model_ids),
+    )
+    return denied, cleared
 
 
 def _failed_result(
