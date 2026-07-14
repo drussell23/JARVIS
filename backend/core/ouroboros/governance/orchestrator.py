@@ -7918,6 +7918,77 @@ class GovernedOrchestrator:
                 )
                 return ctx
 
+            # ---- Slice 13: semantic value gate (post-GENERATE, pre-VALIDATE)
+            # Run-22 operator verdict: a duplicate requirements.txt comment
+            # consumed the FULL pipeline and landed on main. When EVERY file
+            # of EVERY candidate is mathematically cosmetic (Python: AST
+            # equality after docstring stripping — comments never reach the
+            # AST; declared line-grammar formats: whole-line comment/blank
+            # normalization), the op terminates HERE as a benign completion:
+            # no candidate tree, no APPLY, no VERIFY, no commit, no
+            # promotion. One byte of executable change, a syntax error, or
+            # an unknown format passes forward untouched (fail-safe). Both
+            # GENERATE paths rejoin at this seam (wiring-pinned).
+            if os.environ.get(
+                "JARVIS_CANDIDATE_VALUE_GATE_ENABLED", "true",
+            ).strip().lower() in ("1", "true", "yes", "on"):
+                try:
+                    from backend.core.ouroboros.governance.candidate_value_gate import (  # noqa: E501
+                        COSMETIC as _VG_COSMETIC,
+                        evaluate_candidate_value,
+                    )
+                    _vg_root = Path(self._config.execution_root)
+                    _vg_all_cosmetic = bool(generation.candidates)
+                    _vg_detail: list = []
+                    for _vg_cand in generation.candidates:
+                        _vg_files = self._iter_candidate_files(_vg_cand)
+                        _verdict, _d = evaluate_candidate_value(
+                            _vg_root, _vg_files,
+                        )
+                        _vg_detail.extend(_d)
+                        if _verdict != _VG_COSMETIC:
+                            _vg_all_cosmetic = False
+                            break
+                    if _vg_all_cosmetic:
+                        logger.info(
+                            "[ValueGate] op=%s all %d candidate file(s) "
+                            "proven cosmetic (no executable-logic change) "
+                            "— completing as no_op_cosmetic, skipping "
+                            "VALIDATE/APPLY/VERIFY",
+                            ctx.op_id, len(_vg_detail),
+                        )
+                        try:
+                            await self._stack.comm.emit_postmortem(
+                                op_id=ctx.op_id,
+                                root_cause="no_op_cosmetic",
+                                failed_phase=None,
+                                next_safe_action="none",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[ValueGate] postmortem emit failed",
+                                exc_info=True,
+                            )
+                        ctx = ctx.advance(
+                            OperationPhase.COMPLETE,
+                            generation=generation,
+                            terminal_reason_code="no_op_cosmetic",
+                        )
+                        await self._record_ledger(
+                            ctx,
+                            OperationState.APPLIED,
+                            {
+                                "reason": "no_op_cosmetic",
+                                "files": [p for p, _ in _vg_detail],
+                            },
+                        )
+                        return ctx
+                except Exception:  # noqa: BLE001 — gate must never kill GENERATE
+                    logger.debug(
+                        "[ValueGate] evaluation skipped (non-fatal)",
+                        exc_info=True,
+                    )
+
         # Wave 2 (5) Slice 4a.1 - VALIDATERunner delegation gate.
         # Flag JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED (default false) routes
         # the 762-line VALIDATE block (nested retry FSM + L2 dispatch +

@@ -5617,6 +5617,25 @@ SEED_SPECS: list = [
         posture_relevance=_HARDEN_CRITICAL,
     ),
     FlagSpec(
+        name="JARVIS_CANDIDATE_VALUE_GATE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 13: semantic value gate at the post-GENERATE seam — a "
+            "candidate whose EVERY file change is mathematically cosmetic "
+            "(Python: AST equality after docstring stripping; declared "
+            "line-grammar formats: whole-line comment/blank normalization) "
+            "terminates as benign no_op_cosmetic before VALIDATE/APPLY/"
+            "VERIFY spend. Fail-safe forward: any executable change, "
+            "syntax error, or unknown format passes untouched. OFF = "
+            "byte-identical legacy (Run-22 noise class flows again)."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/candidate_value_gate.py",
+        example="true",
+        since="2026-07-13",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
         name="JARVIS_PROMOTION_BASELINE_EXEMPTION_ENABLED",
         type=FlagType.BOOL, default=True,
         description=(
