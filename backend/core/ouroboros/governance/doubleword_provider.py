@@ -5122,6 +5122,20 @@ class DoublewordProvider:
                 from backend.core.ouroboros.governance.epistemic_budget_provider_bridge import (
                     attach_to_provider_run as _eb_attach,
                 )
+                # Task #4b — construct + inject the real probe runner (see the
+                # Claude/Prime provider site for the rationale). Gated
+                # (JARVIS_EPISTEMIC_RUNNERS_ENABLED, default off) →
+                # (None,None,None) is byte-identical to legacy.
+                from backend.core.ouroboros.governance.epistemic_runners import (
+                    build_epistemic_runners as _build_eb_runners,
+                )
+                _eb_target_files = getattr(context, "target_files", ()) or ()
+                _eb_probe, _eb_sbt, _eb_orange = _build_eb_runners(
+                    op_id=_eb_op_id,
+                    target_file=str(_eb_target_files[0]) if _eb_target_files else "",
+                    claim=str(getattr(context, "description", "") or ""),
+                    posture=str(getattr(context, "posture", "") or ""),
+                )
                 _eb_observer = _eb_attach(
                     op_id=_eb_op_id,
                     route=(
@@ -5131,6 +5145,9 @@ class DoublewordProvider:
                     risk_tier=str(
                         getattr(context, "risk_tier", None) or ""
                     ),
+                    probe_runner=_eb_probe,
+                    sbt_runner=_eb_sbt,
+                    orange_queue=_eb_orange,
                 )
             except Exception:  # noqa: BLE001 — defensive
                 _eb_observer = None
