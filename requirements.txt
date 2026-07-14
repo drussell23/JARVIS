@@ -95,6 +95,9 @@
 # [Ouroboros] Modified by Ouroboros (op=op-019e3d14-) at 2026-05-18 21:55 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019e5d6a-b4bd-7aa9-923d-e4c5cedb9fb2-cau) at 2026-05-19 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019e5d6a-) at 2026-05-25 04:39 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019f5e3a-) at 2026-07-14 01:25 UTC
+# Reason: torch is 8 minor versions behind (installed: 2.5.1, latest: 2.13.0)
+
 # Reason: torch is 7 minor versions behind (installed: 2.5.1, latest: 2.12.0)
 
 # Reason: torch is 7 minor versions behind (installed: 2.5.1, latest: 2.12.0) -- bumped to 2.12.0
@@ -146,7 +149,7 @@ build==1.3.0
 cachetools==6.2.2
 certifi==2025.11.12
 cryptography>=42.0.0  # Slice 122: Ed25519 operator-signed Layer-4 roadmap authority
-z3-solver>=4.16.0  # Slice 129: SMT formal-proof engine (smt_invariant_prover); optional — import-guarded + fail-closed when absent
+z3-solver>=4.16.0  # Slice 129: SMT formal-proof engine (smt_invariant_prover); optional - import-guarded + fail-closed when absent
 cffi==2.0.0
 charset-normalizer==3.4.4
 chromadb==1.3.6
@@ -209,7 +212,7 @@ numpy>=1.26.4,<2.5
 oauthlib==3.3.1
 opencv-python==4.10.0.84
 onnxruntime==1.19.2
-# fastembed — the LITE embedding tier of the Adaptive Model Tiering Engine
+# fastembed - the LITE embedding tier of the Adaptive Model Tiering Engine
 # (EmbeddingService). ONNX/CoreML-backed bge-small (~200MB) the service pivots
 # to when the ~800MB PyTorch SentenceTransformer is denied under memory
 # pressure, and promotes back from once headroom returns. Rides the pinned
@@ -317,4 +320,4 @@ google-cloud-monitoring>=2.0.0
 # Upgrade your interpreter to Python 3.12 or 3.13 before installing.
 # Requires-Python: >=3.12
 
-discord.py>=2.3  # Slice 156 — interactive Discord control gateway (bot)
+discord.py>=2.3  # Slice 156 - interactive Discord control gateway (bot)
