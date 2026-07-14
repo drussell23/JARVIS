@@ -720,10 +720,19 @@ def _entitlement_filtered(route: str, result: Tuple[str, ...]) -> Tuple[str, ...
     automatically. No hardcoded model names: the exclusion set is entirely
     LEARNED from live 403s (and the boot entitlement probe).
 
-    Fail-CLOSED against over-filtering: if the filter would empty a non-empty
-    ladder, the original list is returned unchanged — starving a route is worse
-    than attempting a model that might 403, and it keeps this filter from ever
-    becoming a new single point of starvation. Pure + fail-soft.
+    When EVERY model on a ladder is RT-denied, the ladder goes EMPTY and the
+    route falls through to its own ``fallback_tolerance`` (BACKGROUND/SPECULATIVE
+    → queue, per the sealed cost contract; STANDARD/COMPLEX → cascade to Claude).
+
+    That is deliberate, and it corrects this filter's first draft. Handing back a
+    ladder of models we have PROVEN return 403 is not "avoiding starvation" — it
+    is a guaranteed failure with extra latency, and it is exactly what kept
+    Run-26's BACKGROUND route dispatching ``-dottxt`` into a wall after the
+    entitlement probe had already condemned it. An empty ladder is an honest
+    statement ("DW cannot serve this route right now") that the cascade matrix
+    already knows how to handle; a poisoned ladder is a lie that burns an op.
+
+    Pure + fail-soft: any internal error returns the input unchanged.
     """
     try:
         if not result:
@@ -740,12 +749,13 @@ def _entitlement_filtered(route: str, result: Tuple[str, ...]) -> Tuple[str, ...
         )
         if not allowed:
             logger.warning(
-                "[ProviderTopology] route=%s every model is RT-entitlement "
-                "denied (%s) — returning the unfiltered ladder rather than "
-                "starving the route",
+                "[ProviderTopology] route=%s EVERY model is RT-entitlement "
+                "denied (%s) — ladder emptied; the route now falls through to "
+                "its fallback_tolerance instead of dispatching a known-403 "
+                "model",
                 route, list(result),
             )
-            return result
+            return ()
         if len(allowed) != len(result):
             logger.info(
                 "[ProviderTopology] route=%s entitlement filter dropped %d "

@@ -219,12 +219,21 @@ def test_ladder_bypasses_rt_denied_models(
     assert out == (FLASH, PLAIN_397B)
 
 
-def test_ladder_fails_closed_rather_than_starving_the_route(
+def test_all_denied_empties_the_ladder_instead_of_dispatching_a_known_403(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Run-25c ended in 'exhausted all 1 DW models' → zero generation. The
-    filter must never be able to CAUSE that: if every model is denied, hand
-    back the unfiltered ladder and let dispatch try."""
+    """Run-26 correction.
+
+    The filter's first draft returned the UNFILTERED ladder when every model was
+    denied, reasoning that starving a route was worse. That was wrong, and it
+    showed up live: BACKGROUND's ladder held exactly one model (``-dottxt``,
+    already condemned by the entitlement probe), so the "never starve" rule
+    handed it straight back and the route kept dispatching into a guaranteed 403.
+
+    Emptying the ladder is the honest signal — the cascade matrix already knows
+    what to do with "DW cannot serve this route" (queue for BG/SPEC, cascade to
+    Claude for STANDARD/COMPLEX). A poisoned ladder just burns the op.
+    """
     monkeypatch.setenv(
         "JARVIS_DW_TRANSPORT_PROFILE_STATE_PATH",
         tempfile.mktemp(suffix=".json"),
@@ -241,5 +250,26 @@ def test_ladder_fails_closed_rather_than_starving_the_route(
     for model in ladder:
         profile.record_unavailable(model, TRANSPORT_REALTIME, status=403)
 
-    assert _entitlement_filtered("background", ladder) == ladder
+    assert _entitlement_filtered("background", ladder) == ()
     assert _entitlement_filtered("background", ()) == ()
+
+
+def test_single_model_denied_ladder_empties(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact Run-26 BACKGROUND shape: a one-model ladder holding the 403."""
+    monkeypatch.setenv(
+        "JARVIS_DW_TRANSPORT_PROFILE_STATE_PATH",
+        tempfile.mktemp(suffix=".json"),
+    )
+    from backend.core.ouroboros.governance.dw_transport_profile import (
+        get_transport_profile,
+    )
+    from backend.core.ouroboros.governance.provider_topology import (
+        _entitlement_filtered,
+    )
+
+    get_transport_profile().record_unavailable(
+        DOTTXT, TRANSPORT_REALTIME, status=403,
+    )
+    assert _entitlement_filtered("background", (DOTTXT,)) == ()
