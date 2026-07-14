@@ -793,15 +793,120 @@ async def _strategy_subagent_explore_placeholder(
     )
 
 
-async def _strategy_dry_run_placeholder(
+def _probe_worktree_root() -> str:
+    """Repo root as the read-only sandbox mount. Resolved structurally
+    (this module lives at
+    ``backend/core/ouroboros/governance/verification/`` → repo root is
+    ``parents[5]``). The container mounts it READ-ONLY, so probing against
+    the live tree cannot mutate it. NEVER raises."""
+    try:
+        return str(Path(__file__).resolve().parents[5])
+    except Exception:  # noqa: BLE001 — defensive
+        return "."
+
+
+async def _strategy_dry_run(
     h: Hypothesis,
 ) -> Tuple[str, float, str]:
-    """Placeholder for the dry-run strategy. Future slice wires the
-    existing dry-run infrastructure in read-only mode."""
-    return (
-        "dry_run strategy not yet wired (future slice C2.c)",
-        0.0, "INCONCLUSIVE",
-    )
+    """Run the hypothesis as a BOUNDED experiment in the hardened sandbox.
+
+    This is the experiment surface the probe lacked. ``lookup`` can only READ
+    files and match string/AST predicates; ``dry_run`` OBSERVES BEHAVIOR by
+    executing a bounded, air-gapped probe inside ``container_sandbox`` (delegated
+    via ``sandbox_exec``: ``--network none --cap-drop ALL --read-only --tmpfs
+    --rm``). The repo is mounted READ-ONLY, so the experiment cannot mutate the
+    tree — this is a *dry* run by construction, not by convention.
+
+    ``expected_signal`` conventions (mirrors the ``lookup`` prefix grammar):
+
+      * ``"dry_run:tests:<t1,t2,…>"`` — pytest the comma-separated targets;
+        CONFIRMED iff the suite is green, REFUTED iff it fails.
+      * ``"dry_run:bash:<cmd>"`` — run an inspection command; CONFIRMED iff it
+        exits 0, REFUTED otherwise.
+      * ``"dry_run:bash:<cmd>::<substr>"`` — CONFIRMED iff it exits 0 AND
+        ``<substr>`` appears in stdout.
+
+    **Fail-CLOSED**: if the sandbox is unavailable/denied, or the command is
+    malformed, the result is INCONCLUSIVE — a hypothesis is NEVER CONFIRMED
+    without a real, contained run (the same asymmetry the entitlement probe uses:
+    silence is not confirmation). Bounded by the probe framework's per-strategy
+    wall clock. Cost 0.0 — a container run incurs no LLM spend. NEVER raises.
+    """
+    sig = str(h.expected_signal or "").strip()
+    _PFX = "dry_run:"
+    if not sig.startswith(_PFX):
+        return (
+            f"dry_run signal must start {_PFX!r}, got {sig[:40]!r}",
+            0.0, "INCONCLUSIVE",
+        )
+    body = sig[len(_PFX):]
+    worktree = _probe_worktree_root()
+    try:
+        from backend.core.ouroboros.governance.sandbox_exec import (
+            sandbox_run_bash,
+            sandbox_run_tests,
+        )
+
+        if body.startswith("tests:"):
+            targets = [
+                t.strip() for t in body[len("tests:"):].split(",") if t.strip()
+            ]
+            if not targets:
+                return ("dry_run:tests has no targets", 0.0, "INCONCLUSIVE")
+            res = await sandbox_run_tests(targets, worktree=worktree)
+            if res.denied:
+                return (
+                    f"sandbox unavailable ({res.reason}) — cannot run experiment",
+                    0.0, "INCONCLUSIVE",
+                )
+            if res.ok:
+                return (
+                    f"tests green in sandbox: {targets}", 0.0, "CONFIRMED",
+                )
+            return (
+                f"tests failed (rc={res.returncode}) in sandbox: {targets}",
+                0.0, "REFUTED",
+            )
+
+        if body.startswith("bash:"):
+            cmd, _sep, needle = body[len("bash:"):].partition("::")
+            cmd = cmd.strip()
+            needle = needle.strip()
+            if not cmd:
+                return ("dry_run:bash has no command", 0.0, "INCONCLUSIVE")
+            res = await sandbox_run_bash(cmd, worktree=worktree)
+            if res.denied:
+                return (
+                    f"sandbox unavailable ({res.reason}) — cannot run experiment",
+                    0.0, "INCONCLUSIVE",
+                )
+            exit_ok = res.returncode == 0
+            if needle:
+                if exit_ok and needle in res.stdout:
+                    return (
+                        f"cmd exit0 and {needle!r} present in output",
+                        0.0, "CONFIRMED",
+                    )
+                return (
+                    f"cmd rc={res.returncode}, {needle!r} present="
+                    f"{needle in res.stdout}",
+                    0.0, "REFUTED",
+                )
+            if exit_ok:
+                return ("cmd exited 0 in sandbox", 0.0, "CONFIRMED")
+            return (
+                f"cmd exited {res.returncode} in sandbox", 0.0, "REFUTED",
+            )
+
+        return (
+            f"unknown dry_run mode: {body[:40]!r} "
+            "(expected 'tests:' or 'bash:')",
+            0.0, "INCONCLUSIVE",
+        )
+    except Exception as exc:  # noqa: BLE001 — a probe must never raise
+        return (
+            f"dry_run raised: {type(exc).__name__}", 0.0, "INCONCLUSIVE",
+        )
 
 
 def _register_seed_strategies() -> None:
@@ -833,10 +938,12 @@ def _register_seed_strategies() -> None:
         TestStrategy(
             strategy_kind="dry_run",
             description=(
-                "Placeholder. Future slice wires existing dry-run "
-                "infrastructure in read-only mode."
+                "Runs the hypothesis as a bounded experiment in the hardened "
+                "read-only container sandbox (sandbox_exec → container_sandbox). "
+                "'dry_run:tests:<targets>' or 'dry_run:bash:<cmd>[::<substr>]'. "
+                "Fail-closed to INCONCLUSIVE when the sandbox is unavailable."
             ),
-            execute=_strategy_dry_run_placeholder,
+            execute=_strategy_dry_run,
         ),
     )
 
