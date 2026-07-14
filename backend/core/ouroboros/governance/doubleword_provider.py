@@ -1572,20 +1572,26 @@ class BatchStalledError(SovereignBatchTimeoutError):
 
 
 def _dw_batch_stall_detector_enabled() -> bool:
-    """Slice 18 — progress-aware stall detection. Default FALSE (UNVERIFIED).
+    """Slice 18 — progress-aware stall detection. Default TRUE.
 
-    Per the graduation policy a flag earns its default from live proof, and this
-    one changes *when* we give up on a batch and *what we blame* — routing
-    authority. OFF → the temporal breaker behaves byte-identically (a wedged
-    batch raises the generic ``SovereignBatchTimeoutError`` at the same instant);
-    the only difference is that the progress counts are logged.
-    NEVER raises (fail-soft → disabled)."""
+    GRADUATED 2026-07-14 (a flag earns its default from live proof): the
+    teardown drill drove a real zero-progress batch on the live DW API through
+    the full chain — counts-anchored verdict (``{total:1, completed:0,
+    failed:0}``), immediate typed ``BatchStalledError``, spawned cancel landed
+    at DW, zero orphaned tasks. The graduation soak's organic traffic produced
+    zero stalls, which is the upstream layers doing their job, not absence of
+    coverage.
+
+    OFF → the temporal breaker behaves byte-identically to legacy (a wedged
+    batch raises the generic ``SovereignBatchTimeoutError`` at the same
+    instant); the only difference is that the progress counts are logged.
+    NEVER raises (fail-soft → enabled)."""
     try:
         return (os.environ.get(
-            "JARVIS_DW_BATCH_STALL_DETECTOR_ENABLED", "false",
-        ) or "").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:  # noqa: BLE001 — fail-soft: legacy
-        return False
+            "JARVIS_DW_BATCH_STALL_DETECTOR_ENABLED", "true",
+        ) or "").strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001 — fail-soft: enabled
+        return True
 
 
 def _dw_batch_cancel_enabled() -> bool:
@@ -1611,8 +1617,11 @@ def _dw_batch_cancel_enabled() -> bool:
 
 
 def _dw_batch_diagnostic_reflex_enabled() -> bool:
-    """Slice 18 — on a stall, ASK the real-time plane why. Default FALSE
-    (UNVERIFIED; it spends one ~1-token call per stall).
+    """Slice 18 — on a stall, ASK the real-time plane why. Default TRUE
+    (GRADUATED 2026-07-14: drill-proven live — probe fired on a real stall,
+    returned the 403 verdict, and both axes recorded honestly; cost is one
+    ~1-token call per stall, and stalls are rare by construction once
+    admission is on).
 
     The batch transport cannot refuse a request, so it can never tell us *why* a
     batch died. The real-time transport can, definitively, in under a second. On
@@ -1629,58 +1638,73 @@ def _dw_batch_diagnostic_reflex_enabled() -> bool:
     This is emphatically NOT the Run-25c laundering that Slice 17 outlawed: we
     never *infer* a batch conclusion from an RT observation. We run a real
     experiment and record two independent facts from two real calls.
-    NEVER raises (fail-soft → disabled)."""
+    NEVER raises (fail-soft → enabled)."""
     try:
         return (os.environ.get(
-            "JARVIS_DW_BATCH_DIAGNOSTIC_REFLEX_ENABLED", "false",
-        ) or "").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:  # noqa: BLE001 — fail-soft: disabled
-        return False
+            "JARVIS_DW_BATCH_DIAGNOSTIC_REFLEX_ENABLED", "true",
+        ) or "").strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001 — fail-soft: enabled
+        return True
 
 
 def _dw_batch_terminal_forensics_enabled() -> bool:
     """Slice 18 — wire-touching forensics on a terminal batch (error-file GET
-    + RT diagnostic reflex + reasoning-floor learning). Default FALSE
-    (UNVERIFIED — it adds a network GET to every failed/expired/cancelled
-    batch, and the flags-off terminal path must keep its legacy cost).
+    + RT diagnostic reflex + reasoning-floor learning). Default TRUE
+    (GRADUATED 2026-07-14: organically captured a real
+    ``NonRetriableHttpStatus 400`` at batch death during the soak — the
+    evidence that was an empty file in the original incident. Cost is one
+    fail-soft GET per terminal batch, a rare event).
 
     OFF → the terminal handler is ledger-settle + log + telemetry only.
-    NEVER raises (fail-soft → disabled)."""
+    NEVER raises (fail-soft → enabled)."""
     try:
         return (os.environ.get(
-            "JARVIS_DW_BATCH_TERMINAL_FORENSICS_ENABLED", "false",
-        ) or "").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:  # noqa: BLE001 — fail-soft: legacy
-        return False
+            "JARVIS_DW_BATCH_TERMINAL_FORENSICS_ENABLED", "true",
+        ) or "").strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001 — fail-soft: enabled
+        return True
 
 
 def _dw_batch_reconcile_enabled() -> bool:
-    """Slice 18 — boot reconciliation of orphaned batch claims. Default FALSE
-    (UNVERIFIED — it makes remote calls at boot and can cancel remote state).
+    """Slice 18 — boot reconciliation of orphaned batch claims. Default TRUE.
 
-    OFF → byte-identical legacy boot (orphans stay orphaned, which is the status
-    quo ante, not a new harm).
-    NEVER raises (fail-soft → disabled)."""
+    GRADUATED 2026-07-14 on organic wreckage, both branches: a killed session's
+    15 still-live orphans were RELEASED on DW's queue at the next boot, and a
+    second session's 14 completed-while-abandoned orphans were ADOPTED
+    (accounted + servability credited). 29 orphans, two distinct outcomes,
+    zero leaks — the cleanup that previously required a human at DoubleWord.
+
+    OFF → legacy boot (orphans stay orphaned — the status quo ante that
+    produced the 2026-07-14 support email).
+    NEVER raises (fail-soft → enabled)."""
     try:
         return (os.environ.get(
-            "JARVIS_DW_BATCH_RECONCILE_ENABLED", "false",
-        ) or "").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:  # noqa: BLE001 — fail-soft: legacy
-        return False
+            "JARVIS_DW_BATCH_RECONCILE_ENABLED", "true",
+        ) or "").strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001 — fail-soft: enabled
+        return True
 
 
 def _dw_batch_admission_enabled() -> bool:
     """Slice 18 — refuse to open a batch we have reason to believe will never be
-    served. Default FALSE (UNVERIFIED — it can withhold a dispatch).
+    served. Default TRUE.
 
-    OFF → byte-identical legacy behavior (every batch is submitted).
-    NEVER raises (fail-soft → disabled)."""
+    GRADUATED 2026-07-14 on the strongest evidence a gate can earn: during the
+    soak the organism organically re-selected the EXACT incident model
+    (``Devstral-2-123B``), having learned its RT-403 live mid-session, and the
+    gate refused the batch at the chokepoint (``rt_denied_and_batch_unproven``)
+    — the original support-email incident, prevented in production. The refusal
+    surfaces as a non-transient 403, and the caller falls back normally.
+
+    OFF → legacy behavior (every batch is submitted, including ones the
+    platform will accept and silently never run).
+    NEVER raises (fail-soft → enabled)."""
     try:
         return (os.environ.get(
-            "JARVIS_DW_BATCH_ADMISSION_ENABLED", "false",
-        ) or "").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:  # noqa: BLE001 — fail-soft: legacy
-        return False
+            "JARVIS_DW_BATCH_ADMISSION_ENABLED", "true",
+        ) or "").strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001 — fail-soft: enabled
+        return True
 
 
 def _batch_admission_verdict(model_id: str) -> Tuple[bool, str]:
