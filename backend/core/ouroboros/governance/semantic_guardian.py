@@ -152,12 +152,28 @@ class SemanticGuardian:
         self,
         candidates: Sequence[Tuple[str, str, str]],
     ) -> List[Detection]:
-        """Run inspect() over a list of (path, old, new) tuples."""
+        """Run inspect() over a list of (path, old, new) tuples, THEN run a
+        whole-candidate cross-file pass.
+
+        F4 closure — the per-file loop alone gives a per-file verdict, so a
+        COMPOSED attack (file A removes a construct, file B depends on it) is
+        invisible: each file is benign in isolation. The cross-file pass
+        (:func:`_inspect_cross_file`) adds the first whole-candidate dimension —
+        it sees all files together. Gated + fail-soft; a cross-file fault can
+        never crash the batch or drop the per-file findings."""
         out: List[Detection] = []
         for path, old, new in candidates:
             out.extend(self.inspect(
                 file_path=path, old_content=old, new_content=new,
             ))
+        if guardian_enabled() and pattern_enabled("cross_file_dangling_removal"):
+            try:
+                out.extend(_inspect_cross_file(candidates))
+            except Exception:  # noqa: BLE001 — cross-file pass must never crash
+                logger.debug(
+                    "[SemanticGuard] cross-file pass raised — dropping",
+                    exc_info=True,
+                )
         return out
 
 
@@ -230,6 +246,94 @@ def _functions_by_name(module: ast.Module) -> dict:
                 _walk(f"{scope}{node.name}.", node.body)
     _walk("", module.body)
     return out
+
+
+def _top_level_defs(module: ast.Module) -> Set[str]:
+    """Names of top-level functions/classes defined in *module*."""
+    out: Set[str] = set()
+    for node in module.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(node.name)
+    return out
+
+
+def _collect_local_bindings(module: ast.Module) -> Set[str]:
+    """Every name bound anywhere in *module* — imports, def/class names,
+    assignment targets, function args, comprehension/for targets. A reference
+    to any of these is resolved LOCALLY (not a dangling cross-file reference)."""
+    names: Set[str] = set(_collect_imports(module))
+    for node in ast.walk(module):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, ast.alias):
+            names.add((node.asname or node.name).split(".")[0])
+    return names
+
+
+def _inspect_cross_file(
+    candidates: Sequence[Tuple[str, str, str]],
+) -> List[Detection]:
+    """F4 closure — the whole-candidate cross-file pass.
+
+    Detects a CROSS-FILE dangling removal: a top-level function/class DEFINED in
+    file A's old content and REMOVED in A's new content, still REFERENCED by
+    name in a DIFFERENT file B's new content where B has no local binding for
+    it. No per-file detector can see this — each file's old→new is benign in
+    isolation — yet the composition removed a construct another file depends on
+    (a broken guard, a laundered removal, or a runtime NameError). HARD.
+
+    Only meaningful for multi-file Python candidates. Precise + low-FP: it fires
+    only on an ACTUAL unresolved cross-file reference (referenced AND not locally
+    bound in the referencing file). NEVER raises."""
+    py = [
+        (p, o, n) for (p, o, n) in candidates
+        if isinstance(p, str) and p.endswith(".py")
+    ]
+    if len(py) < 2:
+        return []
+
+    parsed: List[Tuple[str, Optional[ast.Module], Optional[ast.Module]]] = []
+    for (p, o, n) in py:
+        parsed.append((p, _safe_parse(o), _safe_parse(n)))
+
+    # symbol → file where a top-level def/class was removed (old had it, new
+    # does not). If the SAME candidate re-adds it in another file, the reference
+    # resolves there (handled by the local-binding check below).
+    removed: dict = {}
+    for (p, ot, nt) in parsed:
+        if ot is None or nt is None:
+            continue
+        for sym in (_top_level_defs(ot) - _top_level_defs(nt)):
+            removed.setdefault(sym, p)
+    if not removed:
+        return []
+
+    findings: List[Detection] = []
+    for (p, _ot, nt) in parsed:
+        if nt is None:
+            continue
+        refs = _collect_name_references(nt)
+        local = _collect_local_bindings(nt)
+        for sym, src_file in removed.items():
+            if src_file == p:
+                continue  # same-file removal is the per-file detector's job
+            if sym in refs and sym not in local:
+                findings.append(Detection(
+                    pattern="cross_file_dangling_removal",
+                    severity="hard",
+                    message=(
+                        f"'{sym}' removed in {os.path.basename(src_file)} but "
+                        f"still referenced (unbound) in {os.path.basename(p)} "
+                        "— cross-file composition removed a depended-on construct"
+                    ),
+                    file_path=p,
+                    snippet=f"{sym} (removed in {os.path.basename(src_file)})",
+                ))
+    return findings
 
 
 def _body_is_trivial(body: List[ast.stmt]) -> bool:
@@ -629,6 +733,69 @@ def _pat_test_assertion_inverted(
         ),
         file_path=file_path,
         snippet=f"tests: {', '.join(flipped)}",
+    )
+
+
+def _assertions_by_func(tree: ast.Module) -> dict:
+    """Map test-function qname → set of (is_not, expr_repr) assertion sigs."""
+    out: dict = {}
+    for (q, is_not, expr) in _extract_assertions(tree):
+        out.setdefault(q, set()).add((is_not, expr))
+    return out
+
+
+def _pat_test_assertion_weakened(
+    *, file_path: str, old_content: str, new_content: str,
+) -> Optional[Detection]:
+    """F8 closure — detect a test whose EXISTING assertions were REMOVED or
+    REWRITTEN, not merely negated.
+
+    The sibling ``test_assertion_inverted`` keys on ``(func, expr_repr)`` and
+    only compares the ``not`` polarity, so it catches ``assert x`` → ``assert
+    not x`` but is BLIND to a value rewrite: ``assert x == 5`` → ``assert x ==
+    6`` changes the ``expr_repr`` itself, so the old key never matches the new
+    one. That is the working attack shape — weaken a test's expected value so a
+    bad change passes.
+
+    This detector compares, per test function present in BOTH old and new, the
+    SET of assertion signatures. Any signature that existed in old and is gone
+    in new is a removal/rewrite → the test was weakened. Adding assertions
+    (strengthening) never fires. Subsumes the negation-flip case as a special
+    kind of removal. Test files only; HARD → APPROVAL_REQUIRED (defense in
+    depth: a human reviews any weakening of an existing test's checks)."""
+    if not _is_test_file(file_path):
+        return None
+    if not hasattr(ast, "unparse"):
+        return None
+    old_tree = _safe_parse(old_content)
+    new_tree = _safe_parse(new_content)
+    if old_tree is None or new_tree is None:
+        return None
+    old_by = _assertions_by_func(old_tree)
+    new_by = _assertions_by_func(new_tree)
+    weakened: List[str] = []
+    for qname, old_asserts in old_by.items():
+        new_asserts = new_by.get(qname)
+        if new_asserts is None:
+            # The whole test function is gone — a distinct concern handled by
+            # the deletion path (risk_engine escalates test deletions); not
+            # flagged here to keep this signal about IN-PLACE weakening.
+            continue
+        removed = old_asserts - new_asserts
+        if removed:
+            weakened.append(qname)
+    if not weakened:
+        return None
+    return Detection(
+        pattern="test_assertion_weakened",
+        severity="hard",
+        message=(
+            "Existing test assertion removed or rewritten (value-weakened) "
+            f"in: {', '.join(weakened[:3])}"
+            + (" …" if len(weakened) > 3 else "")
+        ),
+        file_path=file_path,
+        snippet=f"tests: {', '.join(weakened)}",
     )
 
 
@@ -1385,6 +1552,7 @@ _ALL_PATTERNS: Tuple[str, ...] = (
     "guard_boolean_inverted",
     "credential_shape_introduced",
     "test_assertion_inverted",
+    "test_assertion_weakened",
     "return_value_flipped",
     "permission_loosened",
     "silent_exception_swallow",
@@ -1407,6 +1575,7 @@ _PATTERNS: dict = {
     "guard_boolean_inverted": _pat_guard_boolean_inverted,
     "credential_shape_introduced": _pat_credential_shape_introduced,
     "test_assertion_inverted": _pat_test_assertion_inverted,
+    "test_assertion_weakened": _pat_test_assertion_weakened,
     "return_value_flipped": _pat_return_value_flipped,
     "permission_loosened": _pat_permission_loosened,
     "silent_exception_swallow": _pat_silent_exception_swallow,

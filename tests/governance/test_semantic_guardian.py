@@ -98,7 +98,8 @@ def test_all_pattern_names_is_exhaustive():
     # blindspot detectors (frozen_dataclass_mutation / namedtuple_attr_assignment /
     # pydantic_immutable_set / type_coercion_blindspot / loop_var_rebind_lost)
     # + 1 S6-closure regex pattern (shell_exec_introduced).
-    assert len(all_pattern_names()) == 21
+    # Task #7 added test_assertion_weakened (F8 closure): 21 → 22.
+    assert len(all_pattern_names()) == 22
 
 
 # ---------------------------------------------------------------------------
