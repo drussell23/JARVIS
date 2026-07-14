@@ -453,12 +453,14 @@ class TestShippedInvariants:
         )
         assert self._run("spec_drift_authority_asymmetry", bad)
 
-    def test_master_default_false_regression(self):
+    def test_master_default_true_regression(self):
+        # Graduated Task #2: the pin now asserts default=True, so the "bad"
+        # source that must FIRE the pin is one that reverts to default=False.
         bad = (
             "def master_enabled():\n"
-            "    return _flag('X', default=True)\n"
+            "    return _flag('X', default=False)\n"
         )
-        assert self._run("spec_drift_master_default_false", bad)
+        assert self._run("spec_drift_master_default_true", bad)
 
     def test_composes_canonical_regression(self):
         bad = "x = 1  # references nothing canonical\n"
@@ -478,7 +480,13 @@ class TestFlagSeed:
         spec = reg.get_spec(_MASTER)
         assert spec is not None
         assert spec.type is FlagType.BOOL
-        assert spec.default is False
+        # Graduated Task #2 — the seed default MUST match master_enabled()'s
+        # graduated default (True); a mismatch here would be the exact
+        # registry-vs-code drift this module exists to detect.
+        assert spec.default is True
+        import os as _os
+        _os.environ.pop("JARVIS_MIRROR_SELF_SPEC_DRIFT_ENABLED", None)
+        assert spec.default == msd.master_enabled()
 
 
 # ---------------------------------------------------------------------------

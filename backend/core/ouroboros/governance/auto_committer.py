@@ -159,6 +159,33 @@ def _schedule_post_commit_self_audit(op_id: str, commit_hash: str) -> None:
         pass
 
 
+def _schedule_post_commit_spec_drift(op_id: str, commit_hash: str) -> None:
+    """Task #2 — after an O+V commit lands, schedule a NON-BLOCKING spec-drift
+    audit so the organism catches its OWN drift between CLAUDE.md's stated flag
+    defaults and the FlagRegistry's actual defaults the moment a commit could
+    have introduced it — closing the self-checking loop (a commit that flips a
+    flag default without updating its documentation is exactly the Class-2
+    "severed wire masked by stale docs" pattern this detector exists to find).
+
+    ``run_spec_drift_audit`` reads CLAUDE.md + the registry (file I/O), so it
+    runs in a thread executor (Zero-Block Invariant) — fire-and-forget; the
+    commit path NEVER waits on it. Self-gates on the spec-drift master so
+    nothing is spawned when off. NEVER raises into the commit path.
+    """
+    try:
+        from backend.core.ouroboros.governance.mirror_self_spec_drift import (
+            master_enabled as _spec_drift_enabled,
+            run_spec_drift_audit,
+        )
+        if not _spec_drift_enabled():
+            return
+        loop = asyncio.get_running_loop()
+        # Fire-and-forget: do NOT await. run_spec_drift_audit never raises.
+        loop.run_in_executor(None, run_spec_drift_audit)
+    except Exception:  # noqa: BLE001 — scheduling must never touch the commit
+        pass
+
+
 def ov_coauthor_line() -> str:
     """Canonical ``Co-Authored-By:`` trailer line for O+V commits."""
     return _OV_COAUTHOR
@@ -694,6 +721,9 @@ class AutoCommitter:
             # Slice 101 Phase 7 — fire-and-forget self-audit (non-blocking,
             # master-gated, never touches the commit path).
             _schedule_post_commit_self_audit(op_id, commit_hash)
+            # Task #2 — fire-and-forget spec-drift audit (the organism checks
+            # its own commit for CLAUDE.md-vs-registry flag-default drift).
+            _schedule_post_commit_spec_drift(op_id, commit_hash)
 
             result = CommitResult(
                 committed=True,

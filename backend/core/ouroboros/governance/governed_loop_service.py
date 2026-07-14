@@ -2961,6 +2961,31 @@ class GovernedLoopService:
             )
             self._sleep_daemon_task = None
 
+        # Task #2 — boot-time spec-drift one-shot. The post-commit scheduler
+        # (auto_committer) catches drift a FUTURE commit introduces; this catches
+        # drift that ALREADY exists at boot (e.g. a docstring/CLAUDE.md default
+        # that silently diverged from the registry) so the organism surfaces it
+        # immediately, not only after its next commit happens to run. Runs in a
+        # thread executor (reads CLAUDE.md + registry = file I/O; keep off the
+        # loop). Master-gated + fail-soft; a drift audit must never fail boot.
+        try:
+            from backend.core.ouroboros.governance.mirror_self_spec_drift import (  # noqa: E501
+                master_enabled as _spec_drift_enabled,
+                run_spec_drift_audit,
+            )
+            if _spec_drift_enabled():
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(None, run_spec_drift_audit)
+                _incr_observer_boot("spec_drift")
+                logger.info(
+                    "[GovernedLoop] spec-drift boot audit scheduled (Task #2)",
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[GovernedLoop] spec-drift boot audit failed (non-fatal)",
+                exc_info=True,
+            )
+
     async def _stop_governance_observers(self) -> None:
         """Stop the Tier 0.5 (batches 1+2) observers gracefully.
 

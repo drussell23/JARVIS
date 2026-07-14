@@ -85,6 +85,7 @@ import ast
 import enum
 import os
 import re
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,6 +97,8 @@ from typing import (
     Optional,
     Tuple,
 )
+
+logger = logging.getLogger(__name__)
 
 MIRROR_SELF_SPEC_DRIFT_SCHEMA_VERSION: str = "mirror_self_spec_drift.1"
 
@@ -121,12 +124,23 @@ def _flag(name: str, *, default: bool = False) -> bool:
 
 
 def master_enabled() -> bool:
-    """§33.1 cognitive substrate — default-FALSE.
+    """§33.1 cognitive substrate — GRADUATED default-TRUE (2026-07-14, Task #2).
 
-    Operator-paced opt-in. When off, :func:`detect_spec_drift`
-    returns a DISABLED report with zero records.
+    This is a pure READ-ONLY observer: it compares CLAUDE.md's claimed flag
+    defaults against the FlagRegistry's actual defaults and, on a mismatch,
+    emits an ADVISORY record into the already-graduated invariant-drift
+    auto-action pipeline (``invariant_drift_auditor`` + ``…_auto_action_bridge``,
+    both default-TRUE since 2026-04-30). It never mutates a flag, never blocks
+    an op, and cannot narrow the cage. For an advisory producer feeding a
+    graduated advisory sink, OFF is not "safer" — it is *blind*: the exact
+    blindness that let CLAUDE.md's stated defaults drift from reality unnoticed
+    (e.g. ``phase_dispatcher.py`` docstring "default false" vs code "default
+    true"). The organism must be able to see its own spec drift.
+
+    Explicit ``0``/``false``/``no``/``off`` hot-reverts to silent (the kill
+    switch is intact); empty/unset = the graduated default TRUE.
     """
-    return _flag(_ENV_MASTER, default=False)
+    return _flag(_ENV_MASTER, default=True)
 
 
 def doll_gate_ratio() -> float:
@@ -567,6 +581,73 @@ def to_bridge_snapshot(report: Optional[SpecDriftReport]) -> Any:
 
 
 # ===========================================================================
+# Composition — the single live entry point (detect → advise), fail-soft
+# ===========================================================================
+
+
+def run_spec_drift_audit(
+    *,
+    emit: bool = True,
+    spec_text: Optional[str] = None,
+    registry: Optional[Any] = None,
+) -> Optional[SpecDriftReport]:
+    """Run one spec-drift audit and route any drift into the EXISTING
+    invariant-drift advisory pipeline. This is the module's live entry point —
+    the one function callers invoke; it composes the module's own adapters
+    (``detect_spec_drift`` → ``to_invariant_drift_records`` +
+    ``to_bridge_snapshot``) with the already-graduated
+    ``install_auto_action_bridge().emit(...)`` sink. No parallel machinery.
+
+    Returns the :class:`SpecDriftReport` (or ``None`` only on a catastrophic
+    fault). When ``emit`` is False the drift is detected and logged but not
+    routed to the bridge (used by the boot one-shot that only wants to surface
+    pre-existing drift without generating advisory proposals, and by tests).
+
+    Fail-soft everywhere — a drift audit must NEVER perturb the path that
+    triggered it (a commit, boot). NEVER raises.
+    """
+    try:
+        if not master_enabled():
+            return None
+        report = detect_spec_drift(spec_text=spec_text, registry=registry)
+    except Exception:  # noqa: BLE001 — detection must never raise into a caller
+        logger.debug("[SpecDrift] detect swallowed", exc_info=True)
+        return None
+
+    try:
+        if report.verdict is SpecDriftVerdict.DRIFTED and report.records:
+            logger.warning(
+                "[SpecDrift] %d spec-drift(s) detected — CLAUDE.md's stated "
+                "flag defaults disagree with the FlagRegistry: %s",
+                len(report.records),
+                ", ".join(
+                    f"{r.flag}(claims={r.claimed_default},"
+                    f"actual={r.actual_default})"
+                    for r in report.records[:12]
+                ),
+            )
+            if emit:
+                records = to_invariant_drift_records(report)
+                snapshot = to_bridge_snapshot(report)
+                if records and snapshot is not None:
+                    from backend.core.ouroboros.governance.invariant_drift_auto_action_bridge import (  # noqa: E501
+                        install_auto_action_bridge,
+                    )
+                    # Idempotent: returns the process-wide bridge, registering
+                    # it as the InvariantDriftSignalEmitter on first call. The
+                    # bridge self-gates on its own master flag and is fail-soft.
+                    install_auto_action_bridge().emit(snapshot, records)
+        else:
+            logger.debug(
+                "[SpecDrift] no drift (%s): %s",
+                report.verdict.value, report.diagnostic,
+            )
+    except Exception:  # noqa: BLE001 — routing must never raise into a caller
+        logger.debug("[SpecDrift] emit swallowed", exc_info=True)
+    return report
+
+
+# ===========================================================================
 # Renderer
 # ===========================================================================
 
@@ -674,9 +755,14 @@ def register_shipped_invariants() -> list:
                     )
         return tuple(violations)
 
-    def _validate_master_default_false(
+    def _validate_master_default_true(
         tree: ast.AST, source: str,  # noqa: ARG001
     ) -> tuple:
+        # Graduated 2026-07-14 (Task #2): the detector is a read-only,
+        # advisory-only observer feeding the already-graduated invariant-drift
+        # pipeline; OFF is blind, not safe. The self-pin now asserts the
+        # graduated default TRUE — a module whose own invariant misstated its
+        # own default would be the exact spec-drift it exists to detect.
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.FunctionDef)
@@ -692,12 +778,12 @@ def register_shipped_invariants() -> list:
                             if (
                                 kw.arg == "default"
                                 and isinstance(kw.value, ast.Constant)
-                                and kw.value.value is False
+                                and kw.value.value is True
                             ):
                                 return ()
                 return (
                     "master_enabled() must call _flag(...) with "
-                    "default=False per §33.1",
+                    "default=True (graduated Task #2)",
                 )
         return ("master_enabled() not found",)
 
@@ -746,12 +832,12 @@ def register_shipped_invariants() -> list:
             validate=_validate_authority_asymmetry,
         ),
         ShippedCodeInvariant(
-            invariant_name="spec_drift_master_default_false",
+            invariant_name="spec_drift_master_default_true",
             target_file=target,
             description=(
-                "§33.1 cognitive substrate default-FALSE."
+                "Graduated Task #2 — read-only/advisory observer default-TRUE."
             ),
-            validate=_validate_master_default_false,
+            validate=_validate_master_default_true,
         ),
         ShippedCodeInvariant(
             invariant_name="spec_drift_composes_canonical",
@@ -787,10 +873,11 @@ def register_flags(registry: Any) -> int:
         FlagSpec(
             name=_ENV_MASTER,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
                 "Mirror-Self spec-drift validator master switch. "
-                "§33.1 cognitive substrate default-FALSE. When on, "
+                "GRADUATED default-TRUE (Task #2) — read-only/advisory "
+                "observer. When on, "
                 "detect_spec_drift compares CLAUDE.md's claimed "
                 "env-flag defaults (parseable default-TRUE / "
                 "default-FALSE / (default `true`) phrasings) against "
@@ -842,6 +929,7 @@ __all__ = [
     "master_enabled",
     "doll_gate_ratio",
     "detect_spec_drift",
+    "run_spec_drift_audit",
     "to_invariant_drift_records",
     "to_bridge_snapshot",
     "format_spec_drift_panel",
