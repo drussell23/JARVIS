@@ -1381,6 +1381,38 @@ class GovernedLoopService:
                 logger.debug("[GovernedLoop] attestation infra swallowed: %r", _ax)
 
         try:
+            # Task #5 — GRADUATION-OVERRIDE BOOT APPLIER (un-sever the autonomy
+            # bootstrap's output). The autonomous_graduation_engine records
+            # AUTO_FLIP decisions "applied at next boot", but nothing at boot
+            # ever read the ledger — apply_overrides_to_environ had ZERO callers,
+            # so graduation was write-only theater and every default-off flag was
+            # frozen transitively by this one missing call. Wire it FIRST in the
+            # boot block, before any substrate reads its flag, so a graduated
+            # STANDARD-tier flag is in effect for the rest of boot.
+            #
+            # Safe-by-default via THREE independent gates the applier already
+            # owns: apply_enabled() default-FALSE (operator opt-in required);
+            # shadow_mode_enabled() default-TRUE (the engine writes shadow
+            # receipts the applier never reads); SAFETY-tier flags structurally
+            # absent from the override ledger; operator env-precedence always
+            # wins. NEVER raises into boot.
+            try:
+                from backend.core.ouroboros.governance.graduation_override_ledger import (  # noqa: E501
+                    apply_overrides_to_environ as _apply_grad_overrides,
+                )
+                _grad_applied = _apply_grad_overrides()
+                if _grad_applied:
+                    logger.warning(
+                        "[GovernedLoop] graduation boot applier activated %d "
+                        "evidence-graduated flag(s): %s",
+                        len(_grad_applied), ", ".join(_grad_applied),
+                    )
+            except Exception as _grad_exc:  # noqa: BLE001 — boot must never fail
+                logger.debug(
+                    "[GovernedLoop] graduation boot applier swallowed: %r",
+                    _grad_exc,
+                )
+
             # Slice 185 Phase 4 — purge DW learned-state corrupted by the NameError phantom
             # (surface-health + calibration learned from internal faults mislabeled as vendor
             # ruptures). Opt-in (JARVIS_DW_LEDGER_WIPE_ON_BOOT); NEVER raises.
