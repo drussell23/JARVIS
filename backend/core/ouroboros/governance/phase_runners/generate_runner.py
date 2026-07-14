@@ -630,6 +630,25 @@ class GENERATERunner(PhaseRunner):
                     "speculative": float(os.environ.get(
                         "JARVIS_GEN_TIMEOUT_SPECULATIVE_S", "180")),
                 }
+                # Slice 15 T4 — value-band adaptive allocation: the REAL
+                # dispatch lever scales as a function of verifiable
+                # semantic weight (oracle-band repairs earn a wider
+                # window; cosmetic/indeterminate never do). Fail-soft.
+                try:
+                    from backend.core.ouroboros.governance.signal_value import (  # noqa: E501
+                        adaptive_generation_scale as _vb_scale,
+                        score_ctx as _vb_score,
+                        signal_value_routing_enabled as _vb_on,
+                    )
+                    if _vb_on():
+                        _vb_tm, _ = _vb_scale(_vb_score(ctx))
+                        if _vb_tm > 1.0:
+                            _route_timeouts = {
+                                k: v * _vb_tm
+                                for k, v in _route_timeouts.items()
+                            }
+                except Exception:  # noqa: BLE001 — never crash routing
+                    pass
                 _gen_timeout = _route_timeouts.get(
                     _route, orch._config.generation_timeout_s
                 )

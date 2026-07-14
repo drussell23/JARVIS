@@ -1203,6 +1203,37 @@ async def dispatch_pipeline(
         ctx = result.next_ctx
         dispatch_phase = result.next_phase
 
+        # ---- Slice 15 T1 — semantic value gate on the LIVE route ----
+        # Run-24 proved the Slice-13 legacy inline seam is unreachable
+        # here ("the legacy inline blocks below are never reached"): the
+        # gate MUST fire at THIS GENERATE→VALIDATE transition or cosmetic
+        # noise consumes the full pipeline again. Shared helper (one
+        # implementation, both routes); fail-safe FORWARD on any error —
+        # a gate exception must never block a real candidate (mandate 4).
+        if (
+            dispatch_phase is OperationPhase.VALIDATE
+            and pctx.generation is not None
+        ):
+            try:
+                _vg_terminal = (
+                    await orchestrator._maybe_complete_cosmetic_candidate(
+                        ctx, pctx.generation,
+                    )
+                )
+            except Exception:  # noqa: BLE001 — fail-safe forward
+                logger.debug(
+                    "[PhaseDispatcher] value-gate consult failed "
+                    "(pass-forward)", exc_info=True,
+                )
+                _vg_terminal = None
+            if _vg_terminal is not None:
+                logger.info(
+                    "[PhaseDispatcher] value gate terminated op=%s as "
+                    "no_op_cosmetic before VALIDATE dispatch",
+                    _vg_terminal.op_id,
+                )
+                return _vg_terminal
+
     raise PhaseDispatchError(
         f"dispatcher exceeded max_iterations={max_iterations}; "
         f"likely a phase cycle in the registry DAG"

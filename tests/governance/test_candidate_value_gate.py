@@ -203,17 +203,27 @@ class TestOrchestratorSeamWiring:
     )
 
     def test_gate_wired_pre_validate(self):
+        """Slice 15 update: the seam delegates to the SHARED helper (the
+        legacy inline block was unreachable on the dispatcher route —
+        Run-24). Runtime reachability on the live route is pinned in
+        tests/governance/test_slice15_appetite_layer.py."""
         src = self.ORCH.read_text()
         i = src.index('if generation.is_noop:')
         j = src.index("VALIDATERunner delegation gate", i)
         seam = src[i:j]
-        assert "evaluate_candidate_value" in seam, (
-            "the value gate must sit at the single post-GENERATE / "
-            "pre-VALIDATE seam both GENERATE paths rejoin — terminating "
-            "cosmetic NO_OPs before the ~14s candidate tree, APPLY, and "
-            "VERIFY are ever paid"
+        assert "_maybe_complete_cosmetic_candidate" in seam, (
+            "the legacy pre-VALIDATE seam must delegate to the shared "
+            "value-gate helper"
         )
-        assert "no_op_cosmetic" in seam
+        import inspect
+        from backend.core.ouroboros.governance.orchestrator import (
+            Orchestrator,
+        )
+        helper = inspect.getsource(
+            Orchestrator._maybe_complete_cosmetic_candidate,
+        )
+        assert "evaluate_candidate_value" in helper
+        assert "no_op_cosmetic" in helper
 
     def test_no_audit_reject_markers_in_gate_emits(self):
         src = self.ORCH.read_text()

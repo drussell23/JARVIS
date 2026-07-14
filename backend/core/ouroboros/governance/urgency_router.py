@@ -503,7 +503,91 @@ class UrgencyRouter:
         self,
         ctx: "OperationContext",
     ) -> Tuple[ProviderRoute, str]:
-        """Classify an operation into a provider route.
+        """Classify an operation into a provider route (Slice 15 T3 outer
+        layer: semantic-value governance OVER the canonical matrix).
+
+        The value layer is a CLAMP + ESCALATOR, never a preempt — the
+        Priority 0-5 matrix below remains the authority and keeps its own
+        telemetry:
+
+          * oracle band (resolved failing-test attribution — a real,
+            machine-checkable defect) ESCALATES out of the BACKGROUND
+            trough it would otherwise fall into;
+          * cosmetic-class / indeterminate work is CLAMPED to BACKGROUND
+            when the matrix would have granted it premium compute
+            (mandate 4: unprovable weight never buys escalation) — but a
+            signal the matrix already routes to BACKGROUND passes through
+            untouched, reason string intact;
+          * critical urgency and target-less ops are never touched;
+          * any internal fault falls through to the matrix verbatim.
+
+        Master: ``JARVIS_SIGNAL_VALUE_ROUTING_ENABLED`` (default true).
+        """
+        try:
+            from backend.core.ouroboros.governance.signal_value import (
+                BAND_COSMETIC_CLASS,
+                BAND_ORACLE,
+                score_ctx,
+                signal_value_routing_enabled,
+            )
+            if not signal_value_routing_enabled():
+                return self._classify_matrix(ctx)
+            _urg = str(
+                getattr(ctx, "signal_urgency", "") or "",
+            ).strip().lower()
+            _targets = getattr(ctx, "target_files", ()) or ()
+            if _urg == "critical" or not _targets:
+                return self._classify_matrix(ctx)
+            _band = score_ctx(ctx)
+            if _band >= BAND_ORACLE:
+                _cx = str(
+                    getattr(ctx, "task_complexity", "") or "",
+                ).strip().lower()
+                if _cx in _COMPLEX_COMPLEXITIES:
+                    return (
+                        ProviderRoute.COMPLEX,
+                        "value_band=3:oracle_escalation_complex",
+                    )
+                return (
+                    ProviderRoute.STANDARD,
+                    "value_band=3:oracle_escalation",
+                )
+            _route, _reason = self._classify_matrix(ctx)
+            # EXPLICIT AUTHORITY OUTRANKS INFERRED VALUE: a forced
+            # pre-stamped route, an envelope routing_override, or the
+            # wiring-validation short-circuit are deliberate operator /
+            # harness declarations. The value layer never second-guesses
+            # them — it only governs routes the matrix INFERRED.
+            if any(
+                _reason.startswith(_p) for _p in (
+                    "forced_pre_stamped",
+                    _ENVELOPE_ROUTING_OVERRIDE_REASON_PREFIX,
+                    "wiring_validation_envelope",
+                )
+            ):
+                return _route, _reason
+            if _band <= BAND_COSMETIC_CLASS and _route not in (
+                ProviderRoute.BACKGROUND, ProviderRoute.SPECULATIVE,
+            ):
+                return (
+                    ProviderRoute.BACKGROUND,
+                    "value_band=%d:clamped_from_%s(%s)"
+                    % (_band, _route.value, _reason),
+                )
+            return _route, _reason
+        except Exception:  # noqa: BLE001 — never let scoring break routing
+            logger.debug(
+                "[UrgencyRouter] value layer failed — matrix verbatim",
+                exc_info=True,
+            )
+            return self._classify_matrix(ctx)
+
+    def _classify_matrix(
+        self,
+        ctx: "OperationContext",
+    ) -> Tuple[ProviderRoute, str]:
+        """The canonical Priority 0-5 routing matrix (pre-Slice-15
+        ``classify`` verbatim — unchanged authority and telemetry).
 
         Parameters
         ----------

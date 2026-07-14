@@ -415,6 +415,19 @@ class GATERunner(PhaseRunner):
                         "[Attribution] gate: %s op=%s",
                         _attr_violation, ctx.op_id,
                     )
+                # Slice 15 T4 — adaptive-ceiling halt (SHIPPING path):
+                # oracle-band work above the ceiling queues for the human
+                # exception-handler; Orange preserved, never demoted.
+                from backend.core.ouroboros.governance.orchestrator import (
+                    _value_ceiling_risk_floor,
+                )
+                risk_tier, _vc_note = _value_ceiling_risk_floor(
+                    ctx, risk_tier,
+                )
+                if _vc_note:
+                    logger.warning(
+                        "[SignalValue] gate: %s op=%s", _vc_note, ctx.op_id,
+                    )
 
                 # Slice 8 — test-only NOTIFY_APPLY floor (extracted path;
                 # mirrors orchestrator.py inline site). Companion to the

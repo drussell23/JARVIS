@@ -5617,6 +5617,58 @@ SEED_SPECS: list = [
         posture_relevance=_HARDEN_CRITICAL,
     ),
     FlagSpec(
+        name="JARVIS_SIGNAL_VALUE_ROUTING_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 15 (the appetite layer): semantic-value governance over "
+            "the UrgencyRouter matrix. Bands score from VERIFIABLE state "
+            "only (resolved failing-test attribution / AST executable-"
+            "statement census / format identity — zero keyword heuristics). "
+            "Oracle-band defects ESCALATE out of the BACKGROUND trough; "
+            "cosmetic/indeterminate work is CLAMPED to BACKGROUND when the "
+            "matrix would grant it premium compute; explicit route "
+            "overrides always win. Also drives weight-scaled generation "
+            "windows and the adaptive-ceiling halt."
+        ),
+        category=Category.ROUTING,
+        source_file="backend/core/ouroboros/governance/signal_value.py",
+        example="true",
+        since="2026-07-13",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_VALUE_CEILING_FILES",
+        type=FlagType.INT, default=4,
+        description=(
+            "Slice 15 mandate 4: an oracle-band op spanning MORE than this "
+            "many target files is real, high-value, high-blast work — the "
+            "GATE escalates it to APPROVAL_REQUIRED and it queues for the "
+            "human exception-handler (the Orange flow is preserved; the "
+            "ceiling never demotes)."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/signal_value.py",
+        example="4",
+        since="2026-07-13",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
+        name="JARVIS_VALUE_TIME_SCALE_COEFF",
+        type=FlagType.FLOAT, default=0.5,
+        description=(
+            "Slice 15 mandate 2: per-band multiplier coefficient for the "
+            "generation window (the REAL dispatch lever). Window = route "
+            "baseline x (1 + coeff x band_steps_above_cosmetic) — allocation "
+            "is a FUNCTION of verifiable semantic weight, not a static "
+            "limit. Restricted bands never scale."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/signal_value.py",
+        example="0.5",
+        since="2026-07-13",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
         name="JARVIS_CANDIDATE_VALUE_GATE_ENABLED",
         type=FlagType.BOOL, default=True,
         description=(

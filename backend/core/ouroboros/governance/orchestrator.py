@@ -513,6 +513,43 @@ def _attribution_scope_risk_floor(
     return risk_tier, violation
 
 
+def _value_ceiling_risk_floor(
+    ctx: Any,
+    risk_tier: RiskTier,
+) -> Tuple[RiskTier, Optional[str]]:
+    """Slice 15 T4 mandate 4 — above the adaptive ceiling, HALT for the
+    human exception-handler. An oracle-band op (verified failing-test
+    attribution) spanning more target files than
+    ``JARVIS_VALUE_CEILING_FILES`` is real, high-value, high-blast work —
+    exactly the exception a human reviews. Escalates to APPROVAL_REQUIRED;
+    NEVER demotes (the Orange flow is preserved absolutely). Sibling of
+    :func:`_attribution_scope_risk_floor`, wired at the SAME two GATE call
+    sites (gate_runner is the shipping path). Fail-soft: any internal
+    fault returns the tier unchanged."""
+    try:
+        from backend.core.ouroboros.governance.signal_value import (
+            score_ctx,
+            signal_value_routing_enabled,
+            value_ceiling_breached,
+        )
+        if not signal_value_routing_enabled():
+            return risk_tier, None
+        _n = len(getattr(ctx, "target_files", ()) or ())
+        if value_ceiling_breached(score_ctx(ctx), _n):
+            if risk_tier not in (
+                RiskTier.APPROVAL_REQUIRED, RiskTier.BLOCKED,
+            ):
+                return (
+                    RiskTier.APPROVAL_REQUIRED,
+                    "value_ceiling: oracle-band op spans %d target files "
+                    "(> ceiling) — queued for the human exception-handler"
+                    % _n,
+                )
+    except Exception:  # noqa: BLE001 — fail-soft, never fatal at GATE
+        pass
+    return risk_tier, None
+
+
 # Slice 8 companion to _attribution_scope_risk_floor above: Slice 7's
 # subset waiver correctly lets a test-only candidate pass the coverage
 # gate when attribution is RESOLVED (the test may genuinely BE the fix
@@ -5842,6 +5879,23 @@ class GovernedOrchestrator:
                         "speculative": float(os.environ.get(
                             "JARVIS_GEN_TIMEOUT_SPECULATIVE_S", "180")),
                     }
+                    # Slice 15 T4 — value-band adaptive allocation (parity
+                    # twin of the live generate_runner seam). Fail-soft.
+                    try:
+                        from backend.core.ouroboros.governance.signal_value import (  # noqa: E501
+                            adaptive_generation_scale as _vb_scale,
+                            score_ctx as _vb_score,
+                            signal_value_routing_enabled as _vb_on,
+                        )
+                        if _vb_on():
+                            _vb_tm, _ = _vb_scale(_vb_score(ctx))
+                            if _vb_tm > 1.0:
+                                _route_timeouts = {
+                                    k: v * _vb_tm
+                                    for k, v in _route_timeouts.items()
+                                }
+                    except Exception:  # noqa: BLE001 — never crash routing
+                        pass
                     _gen_timeout = _route_timeouts.get(
                         _route, self._config.generation_timeout_s
                     )
@@ -7918,84 +7972,18 @@ class GovernedOrchestrator:
                 )
                 return ctx
 
-            # ---- Slice 13: semantic value gate (post-GENERATE, pre-VALIDATE)
-            # Run-22 operator verdict: a duplicate requirements.txt comment
-            # consumed the FULL pipeline and landed on main. When EVERY file
-            # of EVERY candidate is mathematically cosmetic (Python: AST
-            # equality after docstring stripping — comments never reach the
-            # AST; declared line-grammar formats: whole-line comment/blank
-            # normalization), the op terminates HERE as a benign completion:
-            # no candidate tree, no APPLY, no VERIFY, no commit, no
-            # promotion. One byte of executable change, a syntax error, or
-            # an unknown format passes forward untouched (fail-safe). Both
-            # GENERATE paths rejoin at this seam (wiring-pinned).
-            if os.environ.get(
-                "JARVIS_CANDIDATE_VALUE_GATE_ENABLED", "true",
-            ).strip().lower() in ("1", "true", "yes", "on"):
-                try:
-                    from backend.core.ouroboros.governance.candidate_value_gate import (  # noqa: E501
-                        COSMETIC as _VG_COSMETIC,
-                        evaluate_candidate_value,
-                    )
-                    _vg_root = Path(self._config.execution_root)
-                    _vg_all_cosmetic = bool(generation.candidates)
-                    _vg_detail: list = []
-                    for _vg_cand in generation.candidates:
-                        _vg_files = self._iter_candidate_files(_vg_cand)
-                        _verdict, _d = evaluate_candidate_value(
-                            _vg_root, _vg_files,
-                        )
-                        _vg_detail.extend(_d)
-                        if _verdict != _VG_COSMETIC:
-                            _vg_all_cosmetic = False
-                            break
-                    # Slice 14 (Run-23 catch): NEVER a silent pass-through —
-                    # log the verdict + per-file reasoning on EVERY
-                    # evaluation, cosmetic or not.
-                    logger.debug(
-                        "[ValueGate] verdict op=%s all_cosmetic=%s files=%s",
-                        ctx.op_id, _vg_all_cosmetic,
-                        [(p, v) for p, v in _vg_detail],
-                    )
-                    if _vg_all_cosmetic:
-                        logger.info(
-                            "[ValueGate] op=%s all %d candidate file(s) "
-                            "proven cosmetic (no executable-logic change) "
-                            "— completing as no_op_cosmetic, skipping "
-                            "VALIDATE/APPLY/VERIFY",
-                            ctx.op_id, len(_vg_detail),
-                        )
-                        try:
-                            await self._stack.comm.emit_postmortem(
-                                op_id=ctx.op_id,
-                                root_cause="no_op_cosmetic",
-                                failed_phase=None,
-                                next_safe_action="none",
-                            )
-                        except Exception:
-                            logger.debug(
-                                "[ValueGate] postmortem emit failed",
-                                exc_info=True,
-                            )
-                        ctx = ctx.advance(
-                            OperationPhase.COMPLETE,
-                            generation=generation,
-                            terminal_reason_code="no_op_cosmetic",
-                        )
-                        await self._record_ledger(
-                            ctx,
-                            OperationState.APPLIED,
-                            {
-                                "reason": "no_op_cosmetic",
-                                "files": [p for p, _ in _vg_detail],
-                            },
-                        )
-                        return ctx
-                except Exception:  # noqa: BLE001 — gate must never kill GENERATE
-                    logger.debug(
-                        "[ValueGate] evaluation skipped (non-fatal)",
-                        exc_info=True,
-                    )
+            # ---- Slice 13/15: semantic value gate (post-GENERATE, pre-
+            # VALIDATE). Slice 15 hoisted the body into the shared
+            # _maybe_complete_cosmetic_candidate helper because THIS legacy
+            # inline seam is unreached on the dispatcher route (Run-24: zero
+            # [ValueGate] lines — 'the legacy inline blocks below are never
+            # reached'); the live call site is dispatch_pipeline's
+            # GENERATE→VALIDATE transition, runtime-reachability-pinned.
+            _vg_terminal = await self._maybe_complete_cosmetic_candidate(
+                ctx, generation,
+            )
+            if _vg_terminal is not None:
+                return _vg_terminal
 
         # Wave 2 (5) Slice 4a.1 - VALIDATERunner delegation gate.
         # Flag JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED (default false) routes
@@ -9309,6 +9297,14 @@ class GovernedOrchestrator:
                         logger.warning(
                             "[Attribution] gate: %s op=%s",
                             _attr_violation, ctx.op_id,
+                        )
+                    # Slice 15 T4 — adaptive-ceiling halt (inline twin).
+                    risk_tier, _vc_note = _value_ceiling_risk_floor(
+                        ctx, risk_tier,
+                    )
+                    if _vc_note:
+                        logger.warning(
+                            "[SignalValue] gate: %s op=%s", _vc_note, ctx.op_id,
                         )
 
                     # Slice 8 — test-only NOTIFY_APPLY floor. Companion to
@@ -12082,6 +12078,88 @@ class GovernedOrchestrator:
                 "harder — consider splitting into single-file operations."
             )
         return "Unknown failure. Read target files and check dependents before retrying."
+
+    async def _maybe_complete_cosmetic_candidate(
+        self, ctx: "OperationContext", generation: Any,
+    ) -> Optional["OperationContext"]:
+        """Slice 13/15 semantic value gate — SHARED by the legacy inline
+        seam and dispatch_pipeline's GENERATE→VALIDATE transition (the live
+        route; Run-24 proved the inline seam alone is never reached there).
+
+        When EVERY file of EVERY candidate is mathematically cosmetic
+        (candidate_value_gate: AST equality after docstring stripping /
+        declared line-grammar normalization), terminates the op as the
+        benign ``no_op_cosmetic`` completion and returns the terminal ctx —
+        no candidate tree, no APPLY, no VERIFY, no commit, no promotion.
+        Returns ``None`` (op proceeds untouched) for any substantive or
+        indeterminate candidate, when the master is off, and on ANY
+        internal error (fail-safe FORWARD, mandate 4). Verdict + per-file
+        reasoning logged on every evaluation (Slice 14 — never silent).
+        Master: ``JARVIS_CANDIDATE_VALUE_GATE_ENABLED`` (default true).
+        """
+        if os.environ.get(
+            "JARVIS_CANDIDATE_VALUE_GATE_ENABLED", "true",
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            return None
+        try:
+            from backend.core.ouroboros.governance.candidate_value_gate import (  # noqa: E501
+                COSMETIC as _VG_COSMETIC,
+                evaluate_candidate_value,
+            )
+            _vg_root = Path(self._config.execution_root)
+            _vg_cands = getattr(generation, "candidates", None) or []
+            _vg_all_cosmetic = bool(_vg_cands)
+            _vg_detail: list = []
+            for _vg_cand in _vg_cands:
+                _vg_files = self._iter_candidate_files(_vg_cand)
+                _verdict, _d = evaluate_candidate_value(_vg_root, _vg_files)
+                _vg_detail.extend(_d)
+                if _verdict != _VG_COSMETIC:
+                    _vg_all_cosmetic = False
+                    break
+            logger.debug(
+                "[ValueGate] verdict op=%s all_cosmetic=%s files=%s",
+                ctx.op_id, _vg_all_cosmetic,
+                [(p, v) for p, v in _vg_detail],
+            )
+            if not _vg_all_cosmetic:
+                return None
+            logger.info(
+                "[ValueGate] op=%s all %d candidate file(s) proven cosmetic "
+                "(no executable-logic change) — completing as "
+                "no_op_cosmetic, skipping VALIDATE/APPLY/VERIFY",
+                ctx.op_id, len(_vg_detail),
+            )
+            try:
+                await self._stack.comm.emit_postmortem(
+                    op_id=ctx.op_id,
+                    root_cause="no_op_cosmetic",
+                    failed_phase=None,
+                    next_safe_action="none",
+                )
+            except Exception:
+                logger.debug(
+                    "[ValueGate] postmortem emit failed", exc_info=True,
+                )
+            _t_ctx = ctx.advance(
+                OperationPhase.COMPLETE,
+                generation=generation,
+                terminal_reason_code="no_op_cosmetic",
+            )
+            await self._record_ledger(
+                _t_ctx,
+                OperationState.APPLIED,
+                {
+                    "reason": "no_op_cosmetic",
+                    "files": [p for p, _ in _vg_detail],
+                },
+            )
+            return _t_ctx
+        except Exception:  # noqa: BLE001 — gate must never kill the pipeline
+            logger.debug(
+                "[ValueGate] evaluation skipped (non-fatal)", exc_info=True,
+            )
+            return None
 
     @staticmethod
     def _terminal_durability(
