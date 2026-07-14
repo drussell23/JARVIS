@@ -29,6 +29,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .signals import IntentSignal, build_attribution_evidence
@@ -53,6 +54,23 @@ _FAILED_RE = re.compile(
 # ---------------------------------------------------------------------------
 # Gap #4 Strangler Fig: event-primary poll derate (Slice 4 T3)
 # ---------------------------------------------------------------------------
+
+
+def census_sharding_enabled() -> bool:
+    """Master — ``JARVIS_INTENT_CENSUS_SHARDING_ENABLED`` (default **false**).
+
+    UNVERIFIED as of 2026-07-14: the sharded census is implemented but has NOT
+    yet been proven against the live suite (the proving run — "does a sharded
+    census survive the hang and surface the 4 reds?" — is the first action of
+    the next session). It therefore lands default-OFF per the graduation policy:
+    a flag earns its default from live proof, not from the author's confidence.
+
+    OFF restores the legacy single-process whole-suite census byte-identically
+    (and with it the cork: one hanging test hard-kills pytest before it can
+    write the summary section the parser depends on). NEVER raises."""
+    return (
+        os.environ.get("JARVIS_INTENT_CENSUS_SHARDING_ENABLED", "false") or ""
+    ).strip().lower() in ("1", "true", "yes", "on")
 
 
 def event_primary_derate() -> bool:
@@ -252,6 +270,13 @@ class TestWatcher:
             "-q",
             "--no-header",
             "--color=no",
+            # Slice 16 — SILENCING fix. A collection error anywhere in the
+            # target set used to abort the whole run to rc=2 with NO results,
+            # so two months-stale broken imports (test_opp_miner_merkle,
+            # test_phase11_graduation_pins) blinded the sensor to every OTHER
+            # test in the repo. Collection errors are now reported and the
+            # census proceeds — a broken import is one datum, not a gag order.
+            "--continue-on-collection-errors",
         ]
         # Slice 5 F4: results-file freshness floor — a test_results.json
         # older than this stamp is a leftover from a previous run and must
@@ -272,6 +297,109 @@ class TestWatcher:
             )
             return "", -1
         return result.stdout, result.returncode
+
+    # ------------------------------------------------------------------
+    # Sharded census (Slice 16 — the CORK fix)
+    # ------------------------------------------------------------------
+
+    def _census_shards(self) -> List[str]:
+        """Split ``test_dir`` into independently-runnable shards.
+
+        Slice 16, mandate 1 — the census must be structurally resilient to a
+        hanging test. ``pytest.ini`` sets ``timeout_method = thread``, which
+        HARD-KILLS the whole pytest process when a test exceeds the per-test
+        timeout. One hang (``test_intake_layer_cu_wiring.py`` — its
+        ``IntakeLayerService.stop()`` leaks a watchdog Observer thread, so the
+        event loop can never close) therefore killed the census at ~3% progress,
+        BEFORE pytest wrote its "short test summary info" section — the only
+        place ``FAILED`` lines appear. The sensor then parsed 28KB of rc=1
+        evidence into ZERO failures and reported the repo as healthy, while four
+        real red tests sat unexecuted behind the cork.
+
+        Sharding contains the blast radius: each shard is its own pytest
+        process, so a hang costs exactly ONE shard's evidence instead of the
+        whole repo's. The hang also stops being invisible — its shard reports a
+        typed timeout, which is itself a discoverable signal.
+
+        Shards are top-level entries of ``test_dir`` (dirs and root-level test
+        files). A shard list of ``[test_dir]`` (unsplittable) preserves legacy
+        single-process behavior exactly.
+        """
+        try:
+            root = Path(self.repo_path) / str(self.test_dir)
+            if not root.is_dir():
+                return [str(self.test_dir)]
+            shards: List[str] = []
+            for child in sorted(root.iterdir()):
+                name = child.name
+                if name.startswith(".") or name == "__pycache__":
+                    continue
+                if child.is_dir() or (
+                    child.is_file()
+                    and name.startswith("test_")
+                    and name.endswith(".py")
+                ):
+                    shards.append(str(Path(self.test_dir) / name))
+            return shards or [str(self.test_dir)]
+        except OSError:
+            return [str(self.test_dir)]
+
+    async def run_census(self) -> Tuple[List[TestFailure], List[str], List[str]]:
+        """Run the whole-suite census as independent bounded shards.
+
+        Returns ``(failures, completed_shards, breached_shards)``.
+
+        Mandate 4 — a shard that times out, is killed, or returns a
+        no-information exit code yields NO failures AND is reported as breached.
+        It is never silently folded into "everything passed": the caller must be
+        able to distinguish "this shard is green" from "this shard never spoke",
+        because conflating them is precisely how a hang got read as health.
+
+        Shards run with bounded concurrency so the census cannot storm the box.
+        NEVER raises.
+        """
+        shards = self._census_shards()
+        try:
+            max_conc = int(
+                os.environ.get("JARVIS_INTENT_CENSUS_CONCURRENCY", "4")
+            )
+        except (TypeError, ValueError):
+            max_conc = 4
+        sem = asyncio.Semaphore(max(1, max_conc))
+
+        failures: List[TestFailure] = []
+        completed: List[str] = []
+        breached: List[str] = []
+        lock = asyncio.Lock()
+
+        async def _run_shard(shard: str) -> None:
+            async with sem:
+                output, rc = await self.run_pytest(target_paths=[shard])
+            # rc -1 == timeout/kill; 2/3/4/5 == no-information exits. Both mean
+            # the shard carries no evidence about ITS tests (Slice 16: absence
+            # of evidence is not evidence of absence).
+            if rc == -1 or rc in (2, 3, 4, 5):
+                async with lock:
+                    breached.append(shard)
+                logger.warning(
+                    "[Census] shard=%s BREACHED (rc=%s) — no evidence; its "
+                    "tests keep their streaks (never read as passing)",
+                    shard, rc,
+                )
+                return
+            parsed = self.parse_pytest_output(output, rc)
+            async with lock:
+                completed.append(shard)
+                failures.extend(parsed)
+
+        await asyncio.gather(
+            *(_run_shard(s) for s in shards), return_exceptions=True,
+        )
+        logger.info(
+            "[Census] %d shard(s): %d completed, %d breached, %d failure(s) found",
+            len(shards), len(completed), len(breached), len(failures),
+        )
+        return failures, completed, breached
 
     # ------------------------------------------------------------------
     # Boot-Time Differential Hydration (offline-state blindspot fix)
@@ -399,8 +527,22 @@ class TestWatcher:
     # Stability tracking
     # ------------------------------------------------------------------
 
+    def _in_scope(self, test_id: str, scope: Optional[Sequence[str]]) -> bool:
+        """True iff *test_id* belongs to one of the *scope* paths (shards /
+        scoped targets). ``scope=None`` means "the run covered everything"."""
+        if scope is None:
+            return True
+        locus = self.extract_file(test_id)
+        for path in scope:
+            p = str(path).split("::", 1)[0]
+            if locus == p or locus.startswith(p.rstrip("/") + "/"):
+                return True
+        return False
+
     def process_failures(
-        self, failures: List[TestFailure]
+        self,
+        failures: List[TestFailure],
+        completed_scope: Optional[Sequence[str]] = None,
     ) -> List[IntentSignal]:
         """Track consecutive failure streaks and emit stable signals.
 
@@ -420,10 +562,27 @@ class TestWatcher:
         """
         current_failed_ids = {f.test_id for f in failures}
 
-        # Reset streaks for tests that passed (were failing before, now absent)
+        # Reset streaks for tests that passed (were failing before, now absent).
+        #
+        # Slice 16 — SCOPE-AWARE. "Absent from this run's failures" only means
+        # "now passing" for tests the run ACTUALLY EXERCISED. Two live paths
+        # violate that:
+        #   * a scoped FS-event poll covers one changed file, so every OTHER
+        #     failing test is absent — and used to have its streak deleted, so a
+        #     whole-suite red could never reach streak=2 in any repo where files
+        #     change between censuses;
+        #   * a BREACHED census shard (hang / collection abort) returns no
+        #     evidence at all about its tests.
+        # In both cases absence is silence, not health. Out-of-scope streaks are
+        # PRESERVED. This is the same "absence-by-abort read as passing" class
+        # the rc in (2,3,4,5) guard already fixed for whole-run aborts — that
+        # guard fixed the abort case and missed the scope case.
         for prev_id in list(self._failure_streak.keys()):
-            if prev_id not in current_failed_ids:
-                del self._failure_streak[prev_id]
+            if prev_id in current_failed_ids:
+                continue
+            if not self._in_scope(prev_id, completed_scope):
+                continue  # never exercised → silence, not a pass
+            del self._failure_streak[prev_id]
 
         # Update streaks for current failures
         signals: List[IntentSignal] = []
@@ -613,6 +772,25 @@ class TestWatcher:
         -------
         List of :class:`IntentSignal` emitted for stable failures.
         """
+        scoped = [str(p) for p in (target_paths or []) if str(p).strip()]
+
+        # Whole-suite census → SHARDED (Slice 16). One hanging test can no
+        # longer kill the process and blind the sensor to the entire repo; a
+        # breached shard costs only its own evidence, and its tests keep their
+        # streaks rather than being read as passing.
+        if not scoped and census_sharding_enabled():
+            failures, completed, breached = await self.run_census()
+            if not completed:
+                logger.warning(
+                    "[Census] EVERY shard breached (%d) — no evidence this "
+                    "cycle; all streaks preserved", len(breached),
+                )
+                return []
+            await self._enrich_failures(failures, "")
+            if failures and attribution_enabled():
+                await prewarm_module_map(self.repo_path)
+            return self.process_failures(failures, completed_scope=completed)
+
         output, exit_code = await self.run_pytest(target_paths=target_paths)
         if exit_code == -1:
             return []  # timeout -- skip cycle, preserve streaks
