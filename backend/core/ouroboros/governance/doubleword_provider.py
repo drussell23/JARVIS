@@ -2693,6 +2693,13 @@ class DoublewordProvider:
             dispatch_profiler as _s35p_dp,
         )
         _s35p_model = self._model or "(unspecified)"
+        # Pre-bind: the generic failure handler below logs a content preview,
+        # and an exception raised BEFORE retrieval (e.g. inside
+        # _await_batch_result) used to leave ``content`` unbound — turning
+        # every temporal-breaker trip into an UnboundLocalError raised from
+        # inside the except block, masking the real error. Caught live by the
+        # Slice-18 teardown drill.
+        content: Optional[str] = None
         try:
             # Slice 2B-ii — forward pending.op_id for per-call Aegis lease.
             _s35p_t_await = time.monotonic()
@@ -2878,6 +2885,16 @@ class DoublewordProvider:
             return result
 
         except asyncio.CancelledError:
+            raise
+        except SovereignBatchTimeoutError:
+            # The Sovereign Temporal Breaker's contract (see the class
+            # docstring): this error — and its Slice-18 subclass
+            # BatchStalledError — MUST escape poll_and_retrieve so the
+            # dw_fault_taxonomy predicate can walk its class ancestry and
+            # rotate the op off the batch lane. The generic handler below was
+            # swallowing it into a None (losing the type) and then tripping
+            # over the unbound ``content`` besides.
+            self._stats.failed_batches += 1
             raise
         except Exception as exc:
             self._stats.failed_batches += 1

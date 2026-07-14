@@ -526,3 +526,65 @@ def test_failed_cancel_leaves_claim_open_for_retry(tmp_path):
         "an undeliverable cancel must leave the obligation visible"
     )
     assert len(led.open_claims()) == 1
+
+
+# ── poll_and_retrieve propagation contract (teardown-drill find) ─────
+
+def test_stall_error_propagates_through_poll_and_retrieve(monkeypatch):
+    """SovereignBatchTimeoutError/BatchStalledError MUST escape
+    poll_and_retrieve — the dw_fault_taxonomy predicate walks the class
+    ancestry to rotate the op off the batch lane (the class docstring's
+    explicit contract). The generic except was swallowing it into None,
+    losing the type AND tripping UnboundLocalError on the unbound `content`
+    preview. Caught by the live teardown drill of 2026-07-14."""
+    import asyncio
+    from backend.core.ouroboros.governance.doubleword_provider import (
+        BatchStalledError,
+        DoublewordProvider,
+        PendingBatch,
+    )
+
+    async def main():
+        p = DoublewordProvider(api_key="k")
+
+        async def _stalls(batch_id, *, op_id=""):
+            raise BatchStalledError(
+                elapsed_s=45.0, deadline_s=45.0, model_id=DEVSTRAL,
+                batch_id="b-1", counts={"total": 1, "completed": 0, "failed": 0},
+            )
+        monkeypatch.setattr(p, "_await_batch_result", _stalls)
+        pending = PendingBatch(
+            op_id="op-1", batch_id="b-1", file_id="f-1",
+            prompt="x", submitted_at=0.0,
+        )
+        with pytest.raises(BatchStalledError) as exc_info:
+            await p.poll_and_retrieve(pending, None)
+        assert exc_info.value.batch_id == "b-1"
+        assert exc_info.value.model_id == DEVSTRAL
+
+    asyncio.run(main())
+
+
+def test_pre_retrieval_failure_does_not_unboundlocal(monkeypatch, caplog):
+    """A non-typed exception raised BEFORE content retrieval must surface as
+    a logged None return — never as UnboundLocalError from inside the except
+    handler's content preview."""
+    import asyncio
+    from backend.core.ouroboros.governance.doubleword_provider import (
+        DoublewordProvider,
+        PendingBatch,
+    )
+
+    async def main():
+        p = DoublewordProvider(api_key="k")
+
+        async def _explodes(batch_id, *, op_id=""):
+            raise ValueError("wire glitch before any content existed")
+        monkeypatch.setattr(p, "_await_batch_result", _explodes)
+        pending = PendingBatch(
+            op_id="op-2", batch_id="b-2", file_id="f-2",
+            prompt="x", submitted_at=0.0,
+        )
+        return await p.poll_and_retrieve(pending, None)
+
+    assert asyncio.run(main()) is None
