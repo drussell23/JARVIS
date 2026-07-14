@@ -203,54 +203,198 @@ class RiskEngine:
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
-    # Exploration-source sentinel strings (no hardcoding of paths beyond
-    # these category descriptors — the engine checks substrings so that
-    # new modules added under these packages are automatically covered).
+    # Immune-surface sentinel strings — category descriptors, NOT a hand-
+    # maintained per-file list.
+    #
+    # Root-cause history: the previous incarnation enumerated individual
+    # governance modules (``.../risk_engine``, ``.../orchestrator``,
+    # ``.../semantic_guardian`` …). That list went stale the moment the live
+    # enforcement code was extracted into the ``phase_runners/`` package —
+    # ``gate_runner.py``, ``slice4b_runner.py``, ``generate_runner.py`` were
+    # never added, so a candidate editing the *shipping* GATE code escaped the
+    # self-modification block entirely. A per-file list re-rots at every
+    # refactor by construction.
+    #
+    # The fix is to name the immune surface by PACKAGE, not by file: the whole
+    # of ``ouroboros/governance/`` IS the cage, so a single substring covers
+    # every current module, every future module, and every refactor. This is
+    # the §51/RRD invariant made literal — the immune system's scope is defined
+    # structurally (the package boundary) and therefore scales with the shell.
     # ------------------------------------------------------------------
-    _EXPLORATION_KERNEL_SENTINELS: tuple = (
+    _KERNEL_SENTINELS_BASE: tuple = (
         "unified_supervisor",
     )
-    _EXPLORATION_SELF_MOD_SENTINELS: tuple = (
+    _SELF_MOD_SENTINELS_BASE: tuple = (
+        # The governance package in its entirety — the cage. Covers
+        # orchestrator, risk_engine, semantic_guardian, phase_runners/*,
+        # gate_runner, slice4b_runner, generate_runner, intake/*, and anything
+        # added under governance/ hereafter. Refactor-proof by construction.
+        "ouroboros/governance/",
+        # Kernel-adjacent lifecycle modules that live OUTSIDE the governance
+        # package but are still O+V's own body.
         "ouroboros/daemon",
         "ouroboros/vital_scan",
         "ouroboros/spinal_cord",
         "ouroboros/rem_sleep",
         "ouroboros/rem_epoch",
-        "ouroboros/governance/risk_engine",
-        "ouroboros/governance/orchestrator",
-        "ouroboros/governance/governed_loop",
-        # Anti-Venom Task 2: defense-in-depth Lock C sentinels
-        "ouroboros/governance/semantic_guardian",
-        "ouroboros/governance/tool_executor",
-        "ouroboros/governance/semantic_firewall",
-        "ouroboros/governance/scoped_tool_access",
-        "ouroboros/governance/risk_tier_floor",
-        "ouroboros/governance/change_engine",
-        "ouroboros/governance/sandbox_exec",
-        "ouroboros/governance/intake/unified_intake_router",
     )
-    _EXPLORATION_SECURITY_SENTINELS: tuple = (
+    _SECURITY_SENTINELS_BASE: tuple = (
         "auth/",
         "credential",
         "secret",
         "token",
         ".env",
     )
+
+    # The ONLY operation source permitted to modify the cage autonomously, and
+    # only at APPROVAL_REQUIRED (human-in-the-loop) — the sanctioned Order-2 /
+    # "Neurosurgeon" path (M10 ArchitectureProposer). This tuple is IMMUTABLE
+    # and deliberately NOT env-configurable: an env switch that added a
+    # sanctioned source would be a cage-weakening surface, exactly the class of
+    # off-switch the change-engine phantom-gate lesson retired. Widening the
+    # PROTECTION (sentinels) via env is safe and allowed below; widening the
+    # PERMISSION is not.
+    _SANCTIONED_SELF_MOD_SOURCES: tuple = ("architecture",)
+    # Sources treated as lowest-trust (curiosity / roaming): self-mod is BLOCKED
+    # and reason-coded under the historical ``exploration_*`` family.
+    _UNTRUSTED_SELF_MOD_SOURCES: tuple = ("exploration", "roadmap")
+
+    # Env knobs — ADDITIVE ONLY. Each ADDS sentinels to the baseline; none can
+    # remove a baseline sentinel or lower a floor. Comma-separated substrings.
+    _ENV_EXTRA_KERNEL: str = "JARVIS_RISK_KERNEL_EXTRA_SENTINELS"
+    _ENV_EXTRA_SELF_MOD: str = "JARVIS_RISK_SELF_MOD_EXTRA_SENTINELS"
+    _ENV_EXTRA_SECURITY: str = "JARVIS_RISK_SECURITY_EXTRA_SENTINELS"
+
     # Blast-radius threshold stricter than the default for exploration ops.
     _EXPLORATION_BLAST_RADIUS_THRESHOLD: int = 3
+
+    # Backward-compatible alias — external readers (and older tests) referenced
+    # ``_EXPLORATION_SELF_MOD_SENTINELS`` directly. Kept as the baseline view;
+    # the live gate consults ``_self_mod_sentinels()`` (baseline + env).
+    _EXPLORATION_SELF_MOD_SENTINELS: tuple = _SELF_MOD_SENTINELS_BASE
+    _EXPLORATION_KERNEL_SENTINELS: tuple = _KERNEL_SENTINELS_BASE
+    _EXPLORATION_SECURITY_SENTINELS: tuple = _SECURITY_SENTINELS_BASE
+
+    # ------------------------------------------------------------------
+    # Sentinel derivation (baseline ∪ env-additive) + matcher — DRY helpers
+    # consumed by the unconditional self-protection gate.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _env_extra_sentinels(env_name: str) -> tuple:
+        """Parse comma-separated ADDITIVE sentinels from *env_name*. Never
+        raises; empty/garbage → empty tuple. Additive-only by contract."""
+        try:
+            raw = (os.environ.get(env_name, "") or "").strip()
+            if not raw:
+                return ()
+            return tuple(s.strip() for s in raw.split(",") if s.strip())
+        except Exception:  # noqa: BLE001 — a config-parse fault must never
+            # narrow the cage; degrade to the safe baseline.
+            return ()
+
+    def _kernel_sentinels(self) -> tuple:
+        return self._KERNEL_SENTINELS_BASE + self._env_extra_sentinels(
+            self._ENV_EXTRA_KERNEL
+        )
+
+    def _self_mod_sentinels(self) -> tuple:
+        return self._SELF_MOD_SENTINELS_BASE + self._env_extra_sentinels(
+            self._ENV_EXTRA_SELF_MOD
+        )
+
+    def _security_sentinels(self) -> tuple:
+        return self._SECURITY_SENTINELS_BASE + self._env_extra_sentinels(
+            self._ENV_EXTRA_SECURITY
+        )
+
+    @staticmethod
+    def _matches_any(file_strs: List[str], sentinels: tuple) -> bool:
+        """True iff any affected file path contains any sentinel substring."""
+        return any(
+            sentinel in fpath for fpath in file_strs for sentinel in sentinels
+        )
+
+    def _self_protection_verdict(self, file_strs, source):
+        """UNCONDITIONAL, source-independent self-protection.
+
+        The immune system must classify a modification of ITSELF at a floor no
+        sensor source can lower. This is path-based rather than dependent on the
+        profile-builder correctly setting ``touches_supervisor`` /
+        ``touches_security_surface`` — the orchestrator's main classification
+        path (``_build_profile``) never sets ``source`` and governance files do
+        not trip those boolean heuristics, so before this gate a governance
+        self-edit fell straight through to the general rules and could land
+        SAFE_AUTO. This substring gate is the reliable self-protection.
+
+        Returns a :class:`RiskClassification` when the op touches the immune
+        surface, else ``None`` (fall through to the ordinary rules).
+        """
+        # Kernel — unconditionally BLOCKED for EVERY source.
+        if self._matches_any(file_strs, self._kernel_sentinels()):
+            return RiskClassification(
+                tier=RiskTier.BLOCKED,
+                reason_code=self._selfmod_reason(source, "touches_kernel"),
+            )
+        # Security surface — unconditionally BLOCKED for EVERY source.
+        if self._matches_any(file_strs, self._security_sentinels()):
+            return RiskClassification(
+                tier=RiskTier.BLOCKED,
+                reason_code=self._selfmod_reason(source, "touches_security"),
+            )
+        # Governance / kernel-adjacent self-modification.
+        if self._matches_any(file_strs, self._self_mod_sentinels()):
+            if source in self._SANCTIONED_SELF_MOD_SOURCES:
+                # The one sanctioned Order-2 path — human-gated, not blocked.
+                return RiskClassification(
+                    tier=RiskTier.APPROVAL_REQUIRED,
+                    reason_code="architecture_self_modification",
+                )
+            if source in self._UNTRUSTED_SELF_MOD_SOURCES:
+                return RiskClassification(
+                    tier=RiskTier.BLOCKED,
+                    reason_code="exploration_self_modification",
+                )
+            # THE HOLE THIS FIX CLOSES: every other source (TestFailure,
+            # Backlog, OpportunityMiner, ai_miner, postmortem, the empty
+            # default the orchestrator uses, …) editing the cage. Unsanctioned
+            # autonomous self-modification is BLOCKED — a human may still do it
+            # manually or route it through the architecture/M10 path.
+            return RiskClassification(
+                tier=RiskTier.BLOCKED,
+                reason_code="self_modification_unsanctioned_source",
+            )
+        return None
+
+    @staticmethod
+    def _selfmod_reason(source: str, base: str) -> str:
+        """Source-appropriate reason code, preserving the historical
+        ``exploration_*`` / ``architecture_*`` families for the two sources
+        that had them, and a bare ``base`` for all others."""
+        if source in ("exploration", "roadmap"):
+            return f"exploration_{base}"
+        if source == "architecture":
+            return f"architecture_{base}"
+        return base
 
     def classify(self, profile: OperationProfile) -> RiskClassification:
         """Classify an operation profile into a risk tier.
 
         Rules are evaluated in strict priority order; **first match wins**.
 
-        Exploration-source rules (evaluated first when profile.source == "exploration"):
-        E1. Files touching unified_supervisor          -> BLOCKED
-        E2. Files touching ouroboros daemon/governance -> BLOCKED (no self-modification)
-        E3. Files touching security surface paths      -> BLOCKED
-        E4. blast_radius > 3                           -> APPROVAL_REQUIRED (stricter)
+        UNCONDITIONAL self-protection (evaluated FIRST, for EVERY source):
+        S1. Files touching the kernel (unified_supervisor)   -> BLOCKED
+        S2. Files touching the security surface              -> BLOCKED
+        S3. Files touching the governance package / body:
+              - source == "architecture" (sanctioned Order-2) -> APPROVAL_REQUIRED
+              - source in {exploration, roadmap} (untrusted)  -> BLOCKED
+              - any other source (incl. the empty default)    -> BLOCKED
 
-        General rules (applied to all sources, and as fallthrough for exploration):
+        Source-specific stricter rules (after self-protection):
+        E4. exploration/roadmap + blast_radius > 3          -> APPROVAL_REQUIRED
+        A3. architecture + crosses_repo_boundary            -> APPROVAL_REQUIRED
+
+        General rules (applied to all sources, as fallthrough):
         1. ``touches_supervisor``        -> BLOCKED
         2. ``touches_security_surface``  -> BLOCKED
         3. ``crosses_repo_boundary``     -> APPROVAL_REQUIRED
@@ -273,69 +417,43 @@ class RiskEngine:
             The deterministic classification including tier, reason code,
             and policy version.
         """
-        # Exploration-source stricter rules — evaluated before all other rules
-        if profile.source in ("exploration", "roadmap"):
-            file_strs = [str(f) for f in profile.files_affected]
+        file_strs = [str(f) for f in profile.files_affected]
+        _source = (profile.source or "").strip()
 
-            # Rule E1: Cannot modify the kernel
-            if any(
-                sentinel in fpath
-                for fpath in file_strs
-                for sentinel in self._EXPLORATION_KERNEL_SENTINELS
-            ):
-                return RiskClassification(
-                    tier=RiskTier.BLOCKED,
-                    reason_code="exploration_touches_kernel",
-                )
+        # ══════════════════════════════════════════════════════════════════
+        # UNCONDITIONAL SELF-PROTECTION (source-independent) — evaluated FIRST,
+        # for EVERY source. Kernel + security → BLOCKED always; governance/
+        # kernel-adjacent self-modification → BLOCKED for every source except
+        # the single sanctioned Order-2 ``architecture`` path (APPROVAL_REQUIRED).
+        #
+        # This closes the hole where the self-mod block was source-gated to
+        # exploration/roadmap/architecture only: every OTHER source (and the
+        # empty default the orchestrator's main path emits) bypassed it and a
+        # cage self-edit could land SAFE_AUTO. First match wins, so this floor
+        # cannot be lowered by any downstream rule.
+        # ══════════════════════════════════════════════════════════════════
+        _self_protect = self._self_protection_verdict(file_strs, _source)
+        if _self_protect is not None:
+            return _self_protect
 
-            # Rule E2: Cannot self-modify ouroboros daemon / governance code
-            if any(
-                sentinel in fpath
-                for fpath in file_strs
-                for sentinel in self._EXPLORATION_SELF_MOD_SENTINELS
-            ):
-                return RiskClassification(
-                    tier=RiskTier.BLOCKED,
-                    reason_code="exploration_self_modification",
-                )
-
-            # Rule E3: Cannot touch security surface paths
-            if any(
-                sentinel in fpath
-                for fpath in file_strs
-                for sentinel in self._EXPLORATION_SECURITY_SENTINELS
-            ):
-                return RiskClassification(
-                    tier=RiskTier.BLOCKED,
-                    reason_code="exploration_touches_security",
-                )
-
+        # Exploration/roadmap — remaining stricter rule (E4) after the
+        # self-protection gate above has already handled kernel/security/self-mod.
+        if _source in self._UNTRUSTED_SELF_MOD_SOURCES:
             # Rule E4: Stricter blast-radius cap for exploration ops
             if profile.blast_radius > self._EXPLORATION_BLAST_RADIUS_THRESHOLD:
                 return RiskClassification(
                     tier=RiskTier.APPROVAL_REQUIRED,
                     reason_code="exploration_blast_radius_exceeded",
                 )
+            # Remaining exploration changes fall through to the standard rules.
 
-            # Remaining exploration changes fall through to the standard rules below
-
-        # Architecture-source rules — evaluated before all other rules for architecture ops
-        if profile.source == "architecture":
-            file_strs = [str(f) for f in profile.files_affected]
-
-            # A1: BLOCK kernel + security (same sentinels as exploration)
-            if any(sentinel in fpath for fpath in file_strs for sentinel in self._EXPLORATION_KERNEL_SENTINELS):
-                return RiskClassification(tier=RiskTier.BLOCKED, reason_code="architecture_touches_kernel")
-            if any(sentinel in fpath for fpath in file_strs for sentinel in self._EXPLORATION_SECURITY_SENTINELS):
-                return RiskClassification(tier=RiskTier.BLOCKED, reason_code="architecture_touches_security")
-
-            # A2: APPROVAL_REQUIRED for ouroboros self-modification
-            if any(sentinel in fpath for fpath in file_strs for sentinel in self._EXPLORATION_SELF_MOD_SENTINELS):
-                return RiskClassification(tier=RiskTier.APPROVAL_REQUIRED, reason_code="architecture_self_modification")
-
-            # A3: APPROVAL_REQUIRED for cross-repo
+        # Architecture — remaining rule (A3 cross-repo) after self-protection.
+        if _source in self._SANCTIONED_SELF_MOD_SOURCES:
             if getattr(profile, 'crosses_repo_boundary', False):
-                return RiskClassification(tier=RiskTier.APPROVAL_REQUIRED, reason_code="architecture_cross_repo")
+                return RiskClassification(
+                    tier=RiskTier.APPROVAL_REQUIRED,
+                    reason_code="architecture_cross_repo",
+                )
 
         # Rule 1: Supervisor is unconditionally off-limits
         if profile.touches_supervisor:

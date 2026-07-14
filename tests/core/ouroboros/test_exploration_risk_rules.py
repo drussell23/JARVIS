@@ -129,14 +129,32 @@ class TestExplorationSelfModificationBlock:
         assert result.tier is RiskTier.BLOCKED
         assert result.reason_code == "exploration_self_modification"
 
-    def test_ouroboros_non_daemon_paths_not_blocked_by_self_mod(self, engine: RiskEngine) -> None:
-        """Paths under ouroboros/ that are NOT in the sentinel list are allowed."""
+    def test_ouroboros_non_immune_paths_not_blocked_by_self_mod(self, engine: RiskEngine) -> None:
+        """Paths under ouroboros/ that are OUTSIDE the immune surface (not the
+        governance package, not a kernel-adjacent lifecycle module) are allowed.
+
+        NOTE (Task #1, 2026-07-14): the self-mod surface is now the whole
+        ``ouroboros/governance/`` PACKAGE, not a hand-maintained per-file list.
+        This closed the staleness hole where extracted modules (phase_runners/*)
+        and never-listed governance files (``providers.py`` — the LLM egress /
+        provider layer, unambiguously cage code) silently escaped protection.
+        The example here therefore uses a genuinely non-governance ouroboros path
+        (``oracle.py`` — the codebase index), which is correctly NOT self-mod."""
         profile = _safe_exploration_profile(
-            files_affected=[Path("backend/core/ouroboros/governance/providers.py")],
+            files_affected=[Path("backend/core/ouroboros/oracle.py")],
         )
         result = engine.classify(profile)
         # Should not be BLOCKED by self-mod rule (may still hit other rules)
         assert result.reason_code != "exploration_self_modification"
+
+    def test_governance_providers_is_now_protected(self, engine: RiskEngine) -> None:
+        """Regression pin for the closed hole: governance/providers.py (and any
+        governance module) IS now self-mod-protected under exploration."""
+        result = engine.classify(_safe_exploration_profile(
+            files_affected=[Path("backend/core/ouroboros/governance/providers.py")],
+        ))
+        assert result.tier is RiskTier.BLOCKED
+        assert result.reason_code == "exploration_self_modification"
 
 
 # ---------------------------------------------------------------------------
