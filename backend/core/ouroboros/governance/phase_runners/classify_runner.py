@@ -848,6 +848,35 @@ class CLASSIFYRunner(PhaseRunner):
                 exc_info=True,
             )
 
+        # ---- P0 PostmortemRecall + Prior Ephemeral Knowledge (Task #9) ----
+        # THE synthetic-soul learning cascade on the shipping (extracted)
+        # path. Prior-op POSTMORTEM lessons + cross-session ephemeral
+        # knowledge are recalled into strategic_memory_prompt at the NEXT
+        # op's decision time. The inline CLASSIFY branch wired these
+        # (`_inject_postmortem_recall_impl` / `_inject_prior_knowledge_impl`
+        # at orchestrator.py:3812/3819), but the extracted classify_runner —
+        # the DEFAULT path (JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED=true) —
+        # never called them, so failure lessons were written to debug.log
+        # and never read back at decision time (the exact gap named in
+        # postmortem_recall.py's own docstring). Ordering mirrors the inline
+        # path: Bridge → PostmortemRecall → PriorKnowledge → Semantic. Both
+        # helpers are read-only, best-effort, master-flag-gated, and fail-
+        # soft — they never block the FSM (the try/except is belt-and-braces
+        # around the import + call, matching the sibling injection blocks).
+        try:
+            from backend.core.ouroboros.governance.orchestrator import (
+                _inject_postmortem_recall_impl,
+                _inject_prior_knowledge_impl,
+            )
+            ctx = await _inject_postmortem_recall_impl(ctx)
+            ctx = _inject_prior_knowledge_impl(ctx)
+        except Exception:
+            logger.debug(
+                "[Orchestrator] PostmortemRecall/PriorKnowledge injection "
+                "skipped (extracted classify_runner)",
+                exc_info=True,
+            )
+
         # ---- SemanticIndex v0.1: recency-weighted focus + closures ----
         # Soft semantic prior drawn from the recency-weighted centroid
         # over recent commits + active goals + recent conversation.

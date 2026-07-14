@@ -28,6 +28,7 @@ default-FALSE. All paths fail-soft (memory never blocks generation).
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import threading
 import time
@@ -37,8 +38,11 @@ from typing import Any, Callable, Deque, List, Optional, Sequence, Tuple
 _ENV_MASTER = "JARVIS_EPISODIC_CORE_ENABLED"
 _ENV_WINDOW = "JARVIS_EPISODIC_WINDOW"
 _ENV_LONGTERM_MAX = "JARVIS_EPISODIC_LONGTERM_MAX"
+_ENV_RELEVANCE_K = "JARVIS_EPISODIC_RELEVANCE_K"
+_ENV_PERSIST = "JARVIS_EPISODIC_PERSIST_ENABLED"
 _DEFAULT_WINDOW = 8
 _DEFAULT_LONGTERM_MAX = 512
+_DEFAULT_RELEVANCE_K = 3
 
 
 def episodic_core_enabled() -> bool:
@@ -58,6 +62,13 @@ def _longterm_max() -> int:
         return max(1, int(os.getenv(_ENV_LONGTERM_MAX, _DEFAULT_LONGTERM_MAX)))
     except (TypeError, ValueError):
         return _DEFAULT_LONGTERM_MAX
+
+
+def _persist_enabled() -> bool:
+    """Durable cross-session long-term store. Default TRUE, but only ever
+    engages under the master gate (``episodic_core_enabled``), so no file is
+    touched while episodic memory is off. NEVER raises."""
+    return os.getenv(_ENV_PERSIST, "true").strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclasses.dataclass
@@ -99,6 +110,7 @@ class EpisodicLedger:
         blue_ledger: Any = None,
         embedder: Any = None,
         longterm_max: Optional[int] = None,
+        store_path: Any = None,
     ) -> None:
         self._window: Deque[Episode] = deque(maxlen=window or _window_size())
         self._longterm: Deque[Tuple[List[float], Episode]] = deque(
@@ -109,6 +121,13 @@ class EpisodicLedger:
         self._embedder = embedder         # None → lazy SemanticIndex factory
         self._seq = 0
         self._lock = threading.Lock()
+        # Cross-session long-term store (Task #9). None → default
+        # `.jarvis/episodic_longterm.jsonl`. Text + embedding are preserved
+        # here (the tamper-evident blue ledger keeps only payload_sha256, so
+        # it can't rehydrate recall). Rehydrated once, now, so recall spans
+        # sessions — the synthetic soul (Manifesto §4).
+        self._store_path = store_path
+        self._rehydrate_longterm()
 
     # ── substrate composition (lazy, fail-soft) ─────────────────────────────
     def _blue_ledger(self) -> Any:
@@ -206,6 +225,112 @@ class EpisodicLedger:
             return
         with self._lock:
             self._longterm.append((vec, ep))
+        # Cross-session durability: append this episode (text + embedding) to
+        # the durable store so a future process can recall it. Fail-soft —
+        # persistence never blocks the learning path.
+        self._persist_one(vec, ep)
+
+    # ── cross-session durability (Task #9) ──────────────────────────────────
+    def _resolved_store_path(self):
+        from pathlib import Path
+        if self._store_path is not None:
+            return Path(self._store_path)
+        return Path(".jarvis") / "episodic_longterm.jsonl"
+
+    def _persist_one(self, vec: List[float], ep: Episode) -> None:
+        """Append one (embedding, episode) row to the durable long-term store.
+        Best-effort: only under the master + persist gates, never raises."""
+        if not (episodic_core_enabled() and _persist_enabled()):
+            return
+        try:
+            row = {
+                "seq": ep.seq, "ts": ep.ts, "kind": ep.kind,
+                "op_id": ep.op_id, "summary": ep.summary,
+                "context": ep.context, "coalesce_key": ep.coalesce_key,
+                "vec": [float(x) for x in vec],
+            }
+            path = self._resolved_store_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+        except Exception:  # noqa: BLE001 — durability never blocks learning
+            pass
+
+    def _rehydrate_longterm(self) -> None:
+        """Load the durable store into ``_longterm`` at construction so recall
+        spans sessions, then COMPACT the file to the retained tail (bounds
+        disk to ``longterm_max``). Uses each row's stored embedding — no boot
+        re-embedding — and falls back to re-embedding only if a vec is
+        missing/corrupt. Gated + fail-soft: a missing/garbage store yields an
+        empty long-term memory, never an error."""
+        if not (episodic_core_enabled() and _persist_enabled()):
+            return
+        try:
+            path = self._resolved_store_path()
+            if not path.exists():
+                return
+            cap = self._longterm.maxlen or _longterm_max()
+            rows: List[dict] = []
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:  # noqa: BLE001 — skip a torn line
+                        continue
+            # Keep only the most-recent `cap` rows (the deque's own bound).
+            tail = rows[-cap:] if len(rows) > cap else rows
+            restored: List[Tuple[List[float], Episode]] = []
+            max_seq = -1
+            for r in tail:
+                try:
+                    ep = Episode(
+                        int(r.get("seq", 0)), float(r.get("ts", 0.0)),
+                        str(r.get("kind", "")), str(r.get("op_id", "")),
+                        str(r.get("summary", "")), dict(r.get("context", {}) or {}),
+                        str(r.get("coalesce_key", "")),
+                    )
+                    vec = r.get("vec")
+                    if not (isinstance(vec, list) and vec):
+                        vec = self._embed(ep.summary)
+                    if vec is None:
+                        continue
+                    restored.append(([float(x) for x in vec], ep))
+                    max_seq = max(max_seq, ep.seq)
+                except Exception:  # noqa: BLE001 — skip a bad row
+                    continue
+            with self._lock:
+                self._longterm.extend(restored)
+                # Continue the sequence past the rehydrated high-water mark so
+                # new episodes never collide with restored seqs.
+                if max_seq >= self._seq:
+                    self._seq = max_seq + 1
+            # Compact the file to the retained tail so it can't grow unbounded
+            # across sessions (rewrite is best-effort; a failure just leaves
+            # the longer file, which the next boot re-trims).
+            if len(rows) > cap:
+                self._compact_store(path, restored)
+        except Exception:  # noqa: BLE001 — rehydration never blocks boot
+            pass
+
+    def _compact_store(self, path, restored: List[Tuple[List[float], Episode]]) -> None:
+        """Atomically rewrite the store to just the retained rows. Fail-soft."""
+        try:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                for vec, ep in restored:
+                    row = {
+                        "seq": ep.seq, "ts": ep.ts, "kind": ep.kind,
+                        "op_id": ep.op_id, "summary": ep.summary,
+                        "context": ep.context, "coalesce_key": ep.coalesce_key,
+                        "vec": [float(x) for x in vec],
+                    }
+                    fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+            os.replace(str(tmp), str(path))
+        except Exception:  # noqa: BLE001
+            pass
 
     def prune(self, match: Callable[["Episode"], bool], *, tombstone_label: str = "") -> int:
         """Integrity-preserving retirement of superseded episodes.
@@ -260,8 +385,11 @@ class EpisodicLedger:
         except Exception:  # noqa: BLE001
             return []
 
-    async def recall(self, query: str, k: int = 3) -> List[Episode]:
-        """Cosine recall over long-term (aged-out) episodes. Fail-soft → []."""
+    def recall_sync(self, query: str, k: int = 3) -> List[Episode]:
+        """Sync cosine recall over long-term (aged-out) episodes, ranked by
+        similarity to ``query``. Fail-soft → []. This is the substrate the
+        generation path consumes (the prompt builder is sync); ``recall`` is
+        the async façade over the same core — no duplicated ranking logic."""
         try:
             qv = self._embed(query)
             if qv is None:
@@ -275,6 +403,28 @@ class EpisodicLedger:
             return [ep for _, ep in scored[: max(1, int(k))]]
         except Exception:  # noqa: BLE001
             return []
+
+    async def recall(self, query: str, k: int = 3) -> List[Episode]:
+        """Cosine recall over long-term (aged-out) episodes. Fail-soft → []."""
+        return self.recall_sync(query, k)
+
+    def render_relevant(self, query: str, n: int) -> str:
+        """Render the top-``n`` long-term episodes SEMANTICALLY RELEVANT to
+        ``query`` (the current op's intent) as a prompt block. This is the
+        active-recall counterpart to ``render_recent``: instead of "what I
+        just did" it surfaces "how I handled similar situations before" —
+        the long-term learning tier the organism accumulates but, until this
+        wire, never consulted. VOLATILE (caller appends to the user-prompt
+        tail, never the cached prefix). "" when nothing relevant. NEVER
+        raises."""
+        eps = self.recall_sync(query, n)
+        if not eps:
+            return ""
+        body = "\n".join(ep.render() for ep in eps)
+        return (
+            "## Relevant Past Experience (semantic recall — how you handled "
+            "similar situations before)\n\n" + body
+        )
 
     def render_recent(self, n: int) -> str:
         """Render the recent window as a prompt block (VOLATILE — caller appends
@@ -414,6 +564,31 @@ def render_episodic_context(n: int = 0) -> str:
         return ""
 
 
+def _relevance_k() -> int:
+    try:
+        return max(1, int(os.getenv(_ENV_RELEVANCE_K, _DEFAULT_RELEVANCE_K)))
+    except (TypeError, ValueError):
+        return _DEFAULT_RELEVANCE_K
+
+
+def render_relevant_context(query: str, k: int = 0) -> str:
+    """Gated ACTIVE recall: surface the long-term episodes most relevant to
+    ``query`` (the current op's intent) for injection into the generation
+    prompt. This is the wire that makes the accumulated long-term episodic
+    memory actionable — without it, ``recall`` has no consumer and the
+    learning tier is write-only. "" when disabled / no query / nothing
+    relevant. NEVER raises."""
+    if not episodic_core_enabled():
+        return ""
+    q = (query or "").strip()
+    if not q:
+        return ""
+    try:
+        return get_episodic_ledger().render_relevant(q, k or _relevance_k())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 __all__ = [
     "episodic_core_enabled",
     "Episode",
@@ -425,4 +600,5 @@ __all__ = [
     "note_transition_nowait",
     "note_route_nowait",
     "render_episodic_context",
+    "render_relevant_context",
 ]

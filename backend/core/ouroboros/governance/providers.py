@@ -2783,6 +2783,23 @@ def _build_lean_codegen_prompt(
     except Exception:  # noqa: BLE001 — memory never blocks generation
         pass
 
+    # ── 5a-bis. Relevant past experience (Task #9) — ACTIVE long-term recall.
+    # §5a injects "what I just did" (the recent window). This injects "how I
+    # handled SIMILAR situations before": the top-k long-term (aged-out)
+    # episodes semantically closest to THIS op's intent. Closes the severed
+    # synthetic-soul learning cascade — the long-term tier was accumulated on
+    # every eviction but never consulted (`recall` had no consumer). Same
+    # P2a-safe volatile-tail discipline as §5a; gated + fail-soft.
+    try:
+        from backend.core.ouroboros.governance.episodic_core import (
+            render_relevant_context as _render_relevant,
+        )
+        _relevant_block = _render_relevant(getattr(ctx, "description", "") or "")
+        if _relevant_block:
+            parts.append(_relevant_block)
+    except Exception:  # noqa: BLE001 — memory never blocks generation
+        pass
+
     # ── 5b. Dependency impact from Oracle graph ─────────────────────────
     _dep_summary = getattr(ctx, "dependency_summary", "")
     if isinstance(_dep_summary, str) and _dep_summary.strip():
