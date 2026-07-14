@@ -230,3 +230,31 @@ def get_gap_signal_bus() -> GapSignalBus:
             if _bus_instance is None:
                 _bus_instance = GapSignalBus()
     return _bus_instance
+
+
+def emit_capability_gap(event: CapabilityGapEvent) -> bool:
+    """The ONE producer accessor — emit *event* onto the process-wide singleton.
+
+    Every producer MUST route through this rather than reaching for a bus
+    instance of its own. The class this closes: two orchestrator/validate
+    call-sites reached for a non-existent ``GapSignalBus.get_instance()`` (an
+    ``AttributeError`` swallowed by a blanket ``except``), so for the life of the
+    feature the Shannon-entropy capability-gap signal was emitted **nowhere** —
+    the producers were live, the :class:`CapabilityGapSensor` consumer was live,
+    and the wire between them called a method that did not exist. The subtler
+    failure this also forecloses is the *silent second bus*: a naive
+    ``get_instance`` classmethod returning ``GapSignalBus()`` would have minted a
+    fresh instance the consumer never reads — green tests, dead signal.
+
+    Centralising on ``get_gap_signal_bus()`` guarantees the event lands on the
+    exact singleton the consumer polls. Returns ``True`` iff the emit was
+    dispatched (best-effort — ``emit`` itself drops-on-full without raising, per
+    the bus's fire-and-forget contract). NEVER raises: capability-gap detection
+    is a side channel and must never perturb the op that produced it.
+    """
+    try:
+        get_gap_signal_bus().emit(event)
+        return True
+    except Exception:  # noqa: BLE001 — a side-channel emit must never raise
+        logger.debug("emit_capability_gap swallowed", exc_info=True)
+        return False

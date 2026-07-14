@@ -412,6 +412,70 @@ def build_cognitive_inefficiency_event(
     )
 
 
+def emit_entropy_capability_gap(
+    *,
+    op_id: str,
+    domain_key: str,
+    composite: CompositeEntropySignal,
+    description: str = "",
+) -> bool:
+    """Fold a Shannon-entropy IMMEDIATE_TRIGGER signal into a
+    :class:`CapabilityGapEvent` and emit it onto the process-wide GapSignalBus
+    that :class:`CapabilityGapSensor` consumes — the single seam that turns a
+    detected capability gap into a neuroplasticity op (Pillar 6).
+
+    This is the DRY home for what were two byte-identical, and both *severed*,
+    inline blocks in the orchestrator and the VALIDATE runner. Beyond fixing the
+    dead ``GapSignalBus.get_instance()`` accessor, it strengthens the signal:
+
+      * ``resolution_mode`` carries the quadrant's actual recommendation
+        (``_QUADRANT_RECOMMENDATIONS``) rather than a hardcoded ``"synthesis"``
+        — the downstream consumer gets the real, quadrant-specific guidance.
+      * ``goal`` embeds the systemic entropy score so the gap's severity travels
+        with it (no information lost versus the discarded
+        ``CognitiveInefficiencyEvent`` the old blocks built and threw away).
+
+    Deterministic + fail-soft: NEVER raises into the caller's phase path.
+    Returns ``True`` iff an event was dispatched to the bus.
+    """
+    try:
+        from backend.neural_mesh.synthesis.gap_signal_bus import (
+            CapabilityGapEvent,
+            emit_capability_gap,
+        )
+        try:
+            _systemic = float(getattr(composite, "systemic_score", 0.0))
+        except (TypeError, ValueError):
+            _systemic = 0.0
+        _quadrant = getattr(composite, "quadrant", None)
+        _recommendation = (
+            _QUADRANT_RECOMMENDATIONS[_quadrant]
+            if _quadrant in _QUADRANT_RECOMMENDATIONS
+            else "synthesize new capability"
+        )
+        event = CapabilityGapEvent(
+            goal=(
+                f"{description or 'capability gap detected via entropy'} "
+                f"[systemic={_systemic:.3f}]"
+            ),
+            task_type=domain_key,
+            target_app="ouroboros",
+            source="entropy_calculator",
+            resolution_mode=_recommendation,
+        )
+        emitted = emit_capability_gap(event)
+        if emitted:
+            logger.warning(
+                "[EntropyGap] IMMEDIATE_TRIGGER capability gap emitted "
+                "domain=%s systemic=%.3f op=%s",
+                domain_key, _systemic, op_id,
+            )
+        return emitted
+    except Exception:  # noqa: BLE001 — a side-channel emit must never raise
+        logger.debug("[EntropyGap] emit swallowed", exc_info=True)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Domain key extraction — deterministic classification
 # ---------------------------------------------------------------------------

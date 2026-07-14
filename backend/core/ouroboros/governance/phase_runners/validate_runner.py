@@ -1044,7 +1044,7 @@ class VALIDATERunner(PhaseRunner):
                 compute_acute_signal,
                 compute_chronic_signal,
                 compute_systemic_entropy,
-                build_cognitive_inefficiency_event,
+                emit_entropy_capability_gap,
                 extract_domain_key,
                 EntropyQuadrant,
             )
@@ -1108,28 +1108,21 @@ class VALIDATERunner(PhaseRunner):
             })
 
             if _composite.quadrant == EntropyQuadrant.IMMEDIATE_TRIGGER:
-                _event = build_cognitive_inefficiency_event(ctx.op_id, _composite)
-                try:
-                    from backend.neural_mesh.synthesis.gap_signal_bus import (
-                        GapSignalBus, CapabilityGapEvent,
-                    )
-                    _bus = GapSignalBus.get_instance()
-                    if _bus is not None:
-                        _gap_event = CapabilityGapEvent(
-                            goal=ctx.description or "capability gap detected via entropy",
-                            task_type=_domain_key,
-                            target_app="ouroboros",
-                            source="entropy_calculator",
-                            resolution_mode="synthesis",
-                        )
-                        _bus.emit(_gap_event)
-                        logger.warning(
-                            "[Orchestrator] IMMEDIATE_TRIGGER: CognitiveInefficiencyEvent "
-                            "emitted for domain=%s systemic=%.3f (op=%s)",
-                            _domain_key, _composite.systemic_score, ctx.op_id,
-                        )
-                except Exception:
-                    logger.debug("[Orchestrator] GapSignalBus emit failed", exc_info=True)
+                # Fold the entropy signal into a CapabilityGapEvent and emit it
+                # onto the GapSignalBus the CapabilityGapSensor consumes (Pillar
+                # 6 neuroplasticity). Previously severed: the old block called a
+                # non-existent singleton accessor on the bus class, swallowed as
+                # an AttributeError, so this signal reached the consumer NEVER.
+                # Now routed through the single safe seam.
+                from backend.core.ouroboros.governance.entropy_calculator import (
+                    emit_entropy_capability_gap,
+                )
+                emit_entropy_capability_gap(
+                    op_id=ctx.op_id,
+                    domain_key=_domain_key,
+                    composite=_composite,
+                    description=ctx.description or "",
+                )
 
             elif _composite.quadrant == EntropyQuadrant.FALSE_CONFIDENCE:
                 logger.warning(
