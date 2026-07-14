@@ -70,7 +70,8 @@ enforced — scan ALL MCP outputs". When populated, the predicate
 Substrate exposes the predicate; per-server enforcement is the
 follow-on integration slice.
 
-§33.1 master flag ``JARVIS_MCP_OUTPUT_SCANNER_ENABLED`` default-**FALSE**
+§33.1 master flag ``JARVIS_MCP_OUTPUT_SCANNER_ENABLED`` graduated default-**TRUE**
+(observation/shadow; enforcement soak-gated via ``JARVIS_MCP_OUTPUT_SCANNER_SHADOW``)
 per the cognitive-substrate convention. Operator opts in once the
 follow-on integration hook is wired in mcp_tool_client.
 
@@ -133,14 +134,47 @@ def _flag(name: str, *, default: bool = False) -> bool:
 
 
 def master_enabled() -> bool:
-    """§33.1 cognitive substrate — default-FALSE.
+    """§33.1 cognitive substrate — GRADUATED default-TRUE (Task #6).
 
-    Operator-paced opt-in. Substrate returns ``DISABLED`` verdict
-    + zero cost when off. Flip the master flag once the
-    per-MCP-server integration hook (in mcp_tool_client) is wired
-    in a follow-on slice.
+    "Master on" means the scanner RUNS on every tool output (web_fetch / bash /
+    read_file / MCP are all credential vectors). It is graduated on to close the
+    live credential-exfiltration blind spot — but it runs in SHADOW by default
+    (see :func:`shadow_mode_enabled`): it DETECTS + logs credential shapes and
+    does NOT mutate the tool output. Observation carries zero behavioral risk (no
+    redaction, no false-positive mangling), so it is safe to run by default and
+    it produces the soak evidence needed to graduate ENFORCEMENT.
+
+    Explicit ``0``/``false``/``no``/``off`` reverts to fully inert (DISABLED
+    verdict, zero cost) — the kill switch is intact.
     """
-    return _flag(_ENV_MASTER, default=False)
+    return _flag(_ENV_MASTER, default=True)
+
+
+def shadow_mode_enabled() -> bool:
+    """When the scanner is on, does it OBSERVE (shadow) or ENFORCE?
+
+    Default-TRUE = SHADOW: detect + log credential findings but NEVER mutate the
+    tool output. This is the safe activation posture — an operator soaks real
+    traffic, measures the false-positive rate from the log trail, and only then
+    un-shadows to enforcement. Mirrors the graduation-ledger shadow discipline:
+    the default-truthy check means a typo'd value stays SHADOW (the safe way to
+    fail for an actuator) — ONLY an explicit ``0``/``false``/``no``/``off``
+    un-shadows into redaction. NEVER raises."""
+    raw = (os.environ.get("JARVIS_MCP_OUTPUT_SCANNER_SHADOW", "") or "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+def enforce_enabled() -> bool:
+    """True iff the scanner should actually REDACT (mutate) credential shapes
+    from tool output: the master is on AND shadow mode has been explicitly
+    turned off. This is the predicate the tool-loop seam consults before
+    replacing a tool result with its redacted form. NEVER raises."""
+    try:
+        return master_enabled() and not shadow_mode_enabled()
+    except Exception:  # noqa: BLE001 — fail-soft: do not enforce on a gate fault
+        return False
 
 
 def _read_clamped_int(
@@ -779,9 +813,13 @@ def register_shipped_invariants() -> list:
                     )
         return tuple(violations)
 
-    def _validate_master_default_false(
+    def _validate_master_default_true(
         tree: ast.AST, source: str,  # noqa: ARG001
     ) -> tuple:
+        # Graduated Task #6: master default-TRUE (observation runs by default;
+        # enforcement stays soak-gated behind shadow_mode_enabled). A module
+        # whose own invariant misstated its default would be exactly the
+        # spec-drift the mirror detector exists to catch.
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.FunctionDef)
@@ -797,12 +835,12 @@ def register_shipped_invariants() -> list:
                             if (
                                 kw.arg == "default"
                                 and isinstance(kw.value, ast.Constant)
-                                and kw.value.value is False
+                                and kw.value.value is True
                             ):
                                 return ()
                 return (
                     "master_enabled() must call _flag(...) "
-                    "with default=False per §33.1",
+                    "with default=True (graduated Task #6)",
                 )
         return ("master_enabled() not found",)
 
@@ -875,13 +913,14 @@ def register_shipped_invariants() -> list:
         ),
         ShippedCodeInvariant(
             invariant_name=(
-                "mcp_output_scanner_master_default_false"
+                "mcp_output_scanner_master_default_true"
             ),
             target_file=target,
             description=(
-                "§33.1 cognitive substrate default-FALSE."
+                "Graduated Task #6 — observation default-TRUE, enforcement "
+                "soak-gated via shadow_mode_enabled."
             ),
-            validate=_validate_master_default_false,
+            validate=_validate_master_default_true,
         ),
         ShippedCodeInvariant(
             invariant_name=(
@@ -920,17 +959,32 @@ def register_flags(registry: Any) -> int:
         FlagSpec(
             name=_ENV_MASTER,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
-                "MCP output scanner master switch. §33.1 "
-                "cognitive substrate default-FALSE. Operator "
-                "opts in once the per-MCP-server integration "
-                "hook (in mcp_tool_client) is wired in a "
-                "follow-on slice."
+                "MCP output scanner master switch. GRADUATED default-TRUE "
+                "(Task #6) — the scanner OBSERVES credential shapes in every "
+                "tool output. It runs in SHADOW by default (detect+log, no "
+                "mutation, zero behavioral risk); enforcement (redaction) is "
+                "soak-gated behind JARVIS_MCP_OUTPUT_SCANNER_SHADOW. Explicit "
+                "false reverts to fully inert."
             ),
             category=Category.SAFETY,
             source_file=src,
-            example=f"{_ENV_MASTER}=true",
+            example=f"{_ENV_MASTER}=false",
+        ),
+        FlagSpec(
+            name="JARVIS_MCP_OUTPUT_SCANNER_SHADOW",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Enforcement gate for the MCP output scanner. Default-TRUE = "
+                "SHADOW (detect+log credential findings, do NOT redact). Set to "
+                "false ONLY after a soak with a clean false-positive rate to "
+                "enable actual redaction of credential shapes from tool output."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_MCP_OUTPUT_SCANNER_SHADOW=false",
         ),
         FlagSpec(
             name=_ENV_SERVER_WHITELIST,
@@ -978,6 +1032,8 @@ __all__ = [
     "McpScanFinding",
     "McpScanReport",
     "master_enabled",
+    "shadow_mode_enabled",
+    "enforce_enabled",
     "max_findings",
     "whitelisted_servers",
     "is_server_whitelisted",

@@ -95,8 +95,9 @@ _FAKE_PRIVATE_KEY = (
 
 
 class TestMasterFlag:
-    def test_default_false(self):
-        assert master_enabled() is False
+    def test_default_true(self):
+        # Graduated Task #6 — observation on by default (enforcement soak-gated).
+        assert master_enabled() is True
 
     @pytest.mark.parametrize("truthy", ["1", "true", "yes", "on"])
     def test_truthy(self, monkeypatch, truthy):
@@ -326,7 +327,10 @@ class TestPatternDelta:
 
 
 class TestVerdictCascade:
-    def test_master_off_returns_disabled(self):
+    def test_master_off_returns_disabled(self, monkeypatch):
+        # Graduated Task #6: master defaults TRUE, so the OFF path is now an
+        # explicit opt-out — set the kill switch to test DISABLED.
+        monkeypatch.setenv(_ENV_MASTER, "false")
         r = scan_mcp_output(f"oops {_FAKE_OPENAI}")
         assert r.verdict is McpScanVerdict.DISABLED
         assert r.master_enabled is False
@@ -482,7 +486,8 @@ class TestInternalHelpers:
 
 
 class TestRenderer:
-    def test_master_off_disabled_marker(self):
+    def test_master_off_disabled_marker(self, monkeypatch):
+        monkeypatch.setenv(_ENV_MASTER, "false")
         out = format_scan_panel(text="anything")
         assert "disabled" in out
 
@@ -521,7 +526,7 @@ class TestAstPinsCanonicalPass:
             "mcp_output_scanner_kind_taxonomy_closed",
             "mcp_output_scanner_label_map_coverage",
             "mcp_output_scanner_authority_asymmetry",
-            "mcp_output_scanner_master_default_false",
+            "mcp_output_scanner_master_default_true",
             "mcp_output_scanner_composes_canonical",
         }
 
@@ -532,7 +537,7 @@ class TestAstPinsCanonicalPass:
             "mcp_output_scanner_kind_taxonomy_closed",
             "mcp_output_scanner_label_map_coverage",
             "mcp_output_scanner_authority_asymmetry",
-            "mcp_output_scanner_master_default_false",
+            "mcp_output_scanner_master_default_true",
             "mcp_output_scanner_composes_canonical",
         ],
     )
@@ -615,16 +620,18 @@ _LABEL_TO_KIND = {
         assert violations
         assert "mcp_tool_client" in violations[0]
 
-    def test_master_pin_fires_on_default_true(self, pins):
+    def test_master_pin_fires_on_default_false(self, pins):
+        # Graduated Task #6: the pin now asserts default=True, so the source
+        # that must FIRE the pin is one that reverts to default=False.
         synthetic = """
 def master_enabled():
-    return _flag("FOO", default=True)
+    return _flag("FOO", default=False)
 """
         tree = ast.parse(synthetic)
         pin = next(
             p for p in pins
             if p.invariant_name
-            == "mcp_output_scanner_master_default_false"
+            == "mcp_output_scanner_master_default_true"
         )
         violations = pin.validate(tree, synthetic)
         assert violations
@@ -675,7 +682,7 @@ class TestFlagSeeds:
             f for f in reg.list_all()
             if f.name == "JARVIS_MCP_OUTPUT_SCANNER_ENABLED"
         )
-        assert spec.default is False
+        assert spec.default is True  # graduated Task #6
         assert spec.category.value == "safety"
 
 

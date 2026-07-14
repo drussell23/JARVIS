@@ -6836,6 +6836,7 @@ class ToolLoopCoordinator:
                     try:
                         from backend.core.ouroboros.governance.mcp_output_scanner import (  # noqa: E501
                             McpScanVerdict,
+                            enforce_enabled as _cred_enforce,
                             scan_mcp_output,
                         )
                         _cred_scan = scan_mcp_output(
@@ -6843,22 +6844,41 @@ class ToolLoopCoordinator:
                             source_label=tc.name,
                         )
                         if _cred_scan.verdict == McpScanVerdict.CREDENTIAL_FOUND:
-                            from backend.core.ouroboros.governance.conversation_bridge import (  # noqa: E501
-                                redact_secrets as _redact_secrets,
-                            )
-                            _redacted, _ = _redact_secrets(tool_result.output or "")
-                            tool_result = type(tool_result)(
-                                output=_redacted,
-                                error=tool_result.error,
-                                status=tool_result.status,
-                            )
-                            logger.warning(
-                                "[Venom] credential scan REDACTED shape(s) in "
-                                "tool=%s findings=%d bytes=%d",
-                                tc.name,
-                                len(_cred_scan.findings),
-                                _cred_scan.bytes_redacted,
-                            )
+                            # Task #6 — three-state posture. Detection ALWAYS
+                            # surfaces (shadow visibility); the mutation
+                            # (redaction) fires ONLY when enforcement is on
+                            # (master on AND shadow explicitly off). Shadow is
+                            # the default posture — it observes credential leaks
+                            # without risking false-positive mangling of
+                            # legitimate tool output, and produces the soak
+                            # evidence to graduate enforcement.
+                            if _cred_enforce():
+                                from backend.core.ouroboros.governance.conversation_bridge import (  # noqa: E501
+                                    redact_secrets as _redact_secrets,
+                                )
+                                _redacted, _ = _redact_secrets(tool_result.output or "")
+                                tool_result = type(tool_result)(
+                                    output=_redacted,
+                                    error=tool_result.error,
+                                    status=tool_result.status,
+                                )
+                                logger.warning(
+                                    "[Venom] credential scan REDACTED shape(s) in "
+                                    "tool=%s findings=%d bytes=%d",
+                                    tc.name,
+                                    len(_cred_scan.findings),
+                                    _cred_scan.bytes_redacted,
+                                )
+                            else:
+                                logger.warning(
+                                    "[Venom] credential scan SHADOW: would redact "
+                                    "shape(s) in tool=%s findings=%d bytes=%d "
+                                    "(set JARVIS_MCP_OUTPUT_SCANNER_SHADOW=false "
+                                    "to enforce)",
+                                    tc.name,
+                                    len(_cred_scan.findings),
+                                    _cred_scan.bytes_redacted,
+                                )
                     except ImportError:
                         pass  # scanner unavailable — skip
                     except Exception:  # noqa: BLE001 — never break the tool loop
