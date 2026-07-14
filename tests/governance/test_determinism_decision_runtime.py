@@ -356,10 +356,19 @@ async def test_replay_returns_recorded_output(
 
 
 @pytest.mark.asyncio
-async def test_replay_miss_falls_through_to_record(
+async def test_replay_miss_is_read_only(
     isolated, monkeypatch,
 ) -> None:
-    """REPLAY with no recording falls through to RECORD (best-effort)."""
+    """REPLAY with no recording computes live (best-effort) but MUST
+    NOT write to the ledger it is replaying.
+
+    Task #8 (bug b): replay used to "fall through to RECORD" on a
+    miss, appending a fresh record to the very JSONL it was replaying
+    from. That made replay non-idempotent (a second --replay produced
+    a different ledger) and corrupted the last-write-wins index on the
+    next pass. Replay must observe, never mutate — the miss surfaces a
+    divergence warning and returns live output, but the ledger stays
+    untouched."""
     monkeypatch.setenv("JARVIS_DETERMINISM_LEDGER_MODE", "replay")
 
     async def compute():
@@ -369,11 +378,11 @@ async def test_replay_miss_falls_through_to_record(
         op_id="op-never-recorded", phase="P", kind="K",
         inputs={}, compute=compute,
     )
-    assert out == "FRESH"  # compute ran (replay miss)
-    # And it was recorded for next time
+    assert out == "FRESH"  # compute ran (replay miss, best-effort)
+    # And it was NOT recorded — replay is read-only.
     rt = runtime_for_session()
     rec = await rt.lookup(op_id="op-never-recorded", phase="P", kind="K")
-    assert rec is not None
+    assert rec is None
 
 
 # ---------------------------------------------------------------------------

@@ -291,12 +291,24 @@ class DeterministicEntropy:
     is ``entropy_for(op_id)`` which derives the per-op seed from
     the session seed via stable hash."""
 
-    __slots__ = ("_rng", "_seed")
+    __slots__ = ("_rng", "_seed", "_lock")
 
     def __init__(self, seed: int) -> None:
         # Clamp + normalize to 64-bit unsigned space
         self._seed = int(seed) & 0xFFFF_FFFF_FFFF_FFFF
         self._rng = _random.Random(self._seed)
+        # Per-stream draw lock. entropy_for() returns a SHARED cached
+        # instance per (session, op_id) so the stream advances across
+        # phase boundaries — which means two concurrent tasks/threads
+        # holding the same op_id draw against ONE _random.Random.
+        # CPython's Mersenne-Twister state (624-word vector + index)
+        # is NOT safe under concurrent mutation: interleaved draws can
+        # corrupt the cursor, producing a byte stream that no replay
+        # can reproduce (the exact "determinism concurrency" defect).
+        # A plain (non-reentrant) Lock suffices: every public draw
+        # acquires it exactly once; uuid4 routes through the unlocked
+        # inner helper so it never re-enters.
+        self._lock = threading.Lock()
 
     @property
     def seed(self) -> int:
@@ -308,20 +320,23 @@ class DeterministicEntropy:
 
     def random(self) -> float:
         """Float in [0.0, 1.0). NEVER raises."""
-        return self._rng.random()
+        with self._lock:
+            return self._rng.random()
 
     def uniform(self, a: float, b: float) -> float:
         """Float in [a, b]. NEVER raises on a > b — Python's
         random.uniform tolerates this."""
         try:
-            return self._rng.uniform(a, b)
+            with self._lock:
+                return self._rng.uniform(a, b)
         except (TypeError, ValueError):
             return float(a)
 
     def randint(self, a: int, b: int) -> int:
         """Integer in [a, b]. NEVER raises on bad input — clamps."""
         try:
-            return self._rng.randint(int(a), int(b))
+            with self._lock:
+                return self._rng.randint(int(a), int(b))
         except (TypeError, ValueError):
             return int(a)
 
@@ -330,13 +345,17 @@ class DeterministicEntropy:
         try:
             if not seq:
                 return None
-            return self._rng.choice(seq)
+            with self._lock:
+                return self._rng.choice(seq)
         except (TypeError, IndexError):
             return None
 
-    def randbytes(self, n: int) -> bytes:
-        """``n`` random bytes. NEVER raises on negative — clamps to 0."""
-        n = max(0, int(n))
+    def _randbytes_locked(self, n: int) -> bytes:
+        """Draw ``n`` bytes assuming ``self._lock`` is ALREADY held.
+        Sole raw-stream byte-draw path; both ``randbytes`` (which
+        takes the lock) and ``uuid4`` (which takes the lock, then
+        draws all 16 bytes atomically) route through here so a UUID
+        is one contiguous slice of the stream even under contention."""
         try:
             # Python 3.9+ random.Random.randbytes
             return self._rng.randbytes(n)
@@ -344,12 +363,21 @@ class DeterministicEntropy:
             # Fallback for older Pythons (defensive)
             return bytes(self._rng.getrandbits(8) for _ in range(n))
 
+    def randbytes(self, n: int) -> bytes:
+        """``n`` random bytes. NEVER raises on negative — clamps to 0."""
+        n = max(0, int(n))
+        with self._lock:
+            return self._randbytes_locked(n)
+
     def uuid4(self) -> uuid.UUID:
         """Deterministic UUID4 from the stream. Same stream position
         → same UUID. NEVER raises."""
         # uuid4 is just 16 random bytes with version+variant bits set
         # per RFC 4122. We reproduce that pattern from our stream.
-        b = bytearray(self.randbytes(16))
+        # Hold the lock across the whole 16-byte draw so a concurrent
+        # random()/randbytes() can't interleave INTO the UUID's slice.
+        with self._lock:
+            b = bytearray(self._randbytes_locked(16))
         # Set version (4) — high nibble of byte 6
         b[6] = (b[6] & 0x0F) | 0x40
         # Set variant (RFC 4122) — high bits of byte 8
@@ -361,7 +389,15 @@ class DeterministicEntropy:
     def as_random(self) -> _random.Random:
         """Return the underlying ``random.Random``. Useful for code
         that already accepts an injectable rng (e.g.,
-        ``full_jitter_backoff_s(rng=...)``)."""
+        ``full_jitter_backoff_s(rng=...)``).
+
+        NOTE: this hands back the RAW stream object, which bypasses
+        this instance's draw lock. It is intended for callers that
+        own the rng for the duration of a single, non-concurrent
+        computation (the jitter-backoff case). Do NOT share the
+        returned object across threads/tasks that draw concurrently —
+        use the locked ``random()`` / ``randbytes()`` / ``uuid4()``
+        methods for that."""
         return self._rng
 
 

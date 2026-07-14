@@ -108,6 +108,35 @@ def _trace_buffer_max() -> int:
         return 100000
 
 
+def _exhaustion_tick_s() -> float:
+    """``JARVIS_DETERMINISM_CLOCK_EXHAUSTION_TICK_S`` (default 1e-6).
+
+    Synthetic time increment applied AFTER a FrozenClock exhausts its
+    recorded trace (the replay run made more clock calls than the
+    recorded session). The clock must keep returning STRICTLY
+    increasing values past exhaustion — a frozen last-value stalls
+    any ``while clock.monotonic() < deadline`` loop into a livelock,
+    because time never advances. Each post-exhaustion call adds one
+    more tick, so the tail is monotonic AND deterministic (same
+    replay → same synthetic sequence).
+
+    1 microsecond is small enough that it never front-runs a real
+    recorded value's granularity yet strictly separates successive
+    synthetic reads. Tunable for ops that compare sub-microsecond
+    deltas. Clamped to a tiny positive floor so it can never be 0
+    (which would re-introduce the freeze) or negative (non-monotonic)."""
+    try:
+        val = float(
+            os.environ.get(
+                "JARVIS_DETERMINISM_CLOCK_EXHAUSTION_TICK_S", "1e-6",
+            ).strip()
+        )
+    except (ValueError, TypeError):
+        return 1e-6
+    # Never 0 (freeze) or negative (non-monotonic) — floor at 1ns.
+    return val if val >= 1e-9 else 1e-6
+
+
 # ---------------------------------------------------------------------------
 # ClockMode + trace dataclass
 # ---------------------------------------------------------------------------
@@ -330,10 +359,18 @@ class FrozenClock(_ClockBase):
                 v = calls[cur]
                 self._trace.monotonic_cursor = cur + 1
                 return v
-            # Past the end of the trace. Fall back to the last value
-            # (or 0.0 if trace is empty) and warn once.
+            # Past the end of the trace. Do NOT freeze at the last
+            # value — a frozen monotonic() stalls any
+            # ``while now < deadline`` loop into a livelock. Emit a
+            # strictly-increasing deterministic synthetic tail:
+            # base + k*tick for the k-th post-exhaustion call. The
+            # cursor keeps advancing so k grows; the sequence is
+            # identical on every replay.
             self._warn_once("monotonic")
-            return calls[-1] if calls else 0.0
+            overflow = cur - len(calls) + 1  # 1, 2, 3, ...
+            self._trace.monotonic_cursor = cur + 1
+            base = calls[-1] if calls else 0.0
+            return base + overflow * _exhaustion_tick_s()
 
     def wall_clock(self) -> float:
         with self._lock:
@@ -343,8 +380,12 @@ class FrozenClock(_ClockBase):
                 v = calls[cur]
                 self._trace.wall_cursor = cur + 1
                 return v
+            # Same anti-livelock synthetic tail as monotonic().
             self._warn_once("wall")
-            return calls[-1] if calls else 0.0
+            overflow = cur - len(calls) + 1  # 1, 2, 3, ...
+            self._trace.wall_cursor = cur + 1
+            base = calls[-1] if calls else 0.0
+            return base + overflow * _exhaustion_tick_s()
 
     async def sleep(self, seconds: float) -> None:  # noqa: ARG002
         """REPLAY: instant. The recorded duration is consumed from

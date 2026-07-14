@@ -574,6 +574,22 @@ class DecisionRuntime:
         # Lazy lookup index for replay/verify: keys → record
         self._index: Optional[Dict[Tuple[str, str, str, int], DecisionRecord]] = None
         self._index_loaded_from_path: Optional[Path] = None
+        # Observability latch (fired at most once per runtime): the
+        # per-worker ENFORCE flag is graduated default-true but the
+        # replay index is NOT yet keyed on worker_id, so the flag is
+        # currently inert (records carry worker_id/sub_ordinal for
+        # forward-compat, but replay lookup still uses the legacy
+        # (op,phase,kind,ordinal) key). This is deliberate, not an
+        # oversight: worker_id embeds os.getpid() (worktree_manager.
+        # worker_id_for_path), which a fresh replay process can never
+        # reproduce, so a naive worker-keyed lookup would miss 100%
+        # of records and break replay entirely. Making the ENFORCE
+        # path authoritative requires a deterministic total-order
+        # merge of the per-worker streams (PRD §26.5.2), not a key
+        # swap. We surface the gap once instead of hiding it (silent
+        # graduated-but-inert flags are exactly the failure class
+        # this substrate exists to eliminate).
+        self._enforce_gap_warned: bool = False
 
     @property
     def session_id(self) -> str:
@@ -669,6 +685,26 @@ class DecisionRuntime:
                     self._per_worker_ordinals[pw_key] = (
                         sub_ordinal_val + 1
                     )
+                    # Surface the graduated-but-inert ENFORCE flag once
+                    # per runtime (see __init__ latch rationale). Kept
+                    # inside the lock so the once-only check is atomic
+                    # across concurrent record() calls.
+                    if (
+                        not self._enforce_gap_warned
+                        and per_worker_ordinals_enforce()
+                    ):
+                        self._enforce_gap_warned = True
+                        logger.warning(
+                            "[determinism] JARVIS_DAG_PER_WORKER_ORDINALS_"
+                            "ENFORCE is set but the replay index is not "
+                            "worker-keyed — the flag is INERT. worker_id "
+                            "embeds os.getpid() and cannot be reproduced "
+                            "by a replay process; authoritative per-worker "
+                            "replay needs a deterministic total-order merge "
+                            "(PRD §26.5.2), not a key swap. Records still "
+                            "carry worker_id/sub_ordinal for forward-compat; "
+                            "replay lookup uses the legacy ordinal key.",
+                        )
 
             inputs_hash = _canonical_hash(dict(inputs) if inputs else {})
             output_repr = _canonical_serialize(output)
@@ -953,18 +989,28 @@ async def decide(
                     "— falling through to live compute",
                     op_id, phase, kind,
                 )
-        # Replay miss — fall through to RECORD mode (best-effort).
-        # record() will advance the counter itself, so we must NOT
-        # advance it here; otherwise the recorded ordinal drifts
-        # ahead of the lookup ordinal.
-        live = await _maybe_await(compute)
-        await runtime.record(
-            op_id=op_id, phase=phase, kind=kind,
-            inputs=inputs, output=live,
-            parent_record_ids=parent_record_ids,
-            counterfactual_of=counterfactual_of,
+        # Replay miss — READ-ONLY. Do NOT append to the ledger being
+        # replayed. The previous "best-effort record on miss" mutated
+        # the replay SOURCE: a fresh record was written at a NEW
+        # ordinal into the same JSONL the runtime is replaying from,
+        # so (a) replay was non-idempotent (running --replay twice
+        # produced different ledgers) and (b) the newly-appended row
+        # collided in the last-write-wins index on the NEXT pass,
+        # silently corrupting subsequent lookups. Replay must observe,
+        # never write. On a miss we surface the divergence, advance
+        # the replay cursor so the NEXT decision looks up the next
+        # ordinal (the counter previously advanced as a side effect of
+        # record(); with record() gone we advance explicitly), and
+        # compute live best-effort so the run doesn't crash.
+        logger.warning(
+            "[determinism] REPLAY miss op_id=%s phase=%s kind=%s "
+            "ordinal=%d — no recorded decision at this cursor; "
+            "computing live (read-only: ledger NOT mutated). This is "
+            "a replay divergence point.",
+            op_id, phase, kind, ordinal,
         )
-        return live
+        _advance_ordinal(runtime, op_id, phase, kind)
+        return await _maybe_await(compute)
 
     if mode is LedgerMode.VERIFY:
         if ordinal is None:

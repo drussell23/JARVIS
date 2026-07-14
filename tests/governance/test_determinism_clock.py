@@ -244,23 +244,32 @@ async def test_frozen_sleep_advances_cursor() -> None:
     await fc.sleep(3.0)
 
 
-def test_frozen_past_end_of_trace_falls_back() -> None:
-    """When trace exhausts, return last value + warn (NEVER raise)."""
+def test_frozen_past_end_of_trace_synthetic_tail() -> None:
+    """When the trace exhausts, monotonic() must keep STRICTLY
+    increasing (never freeze) so a `while now < deadline` loop can
+    still terminate. Task #8 (bug d): the old code froze at the last
+    recorded value, which livelocks any deadline loop. Now it emits a
+    deterministic base+k*tick tail and warns once (never raises)."""
     fc = FrozenClock(op_id="op-1")
     fc.import_trace(monotonic=[100.0])
     assert fc.monotonic() == 100.0
-    # Cursor now past end
-    fallback = fc.monotonic()
-    # Falls back to last recorded value
-    assert fallback == 100.0
+    # Cursor now past end — strictly-increasing synthetic tail.
+    t1 = fc.monotonic()
+    t2 = fc.monotonic()
+    assert t1 > 100.0
+    assert t2 > t1  # monotonic: deadline loops terminate
+    assert t1 == 100.0 + 1e-6  # deterministic (default tick)
 
 
-def test_frozen_empty_trace_returns_zero() -> None:
+def test_frozen_empty_trace_synthetic_tail() -> None:
     fc = FrozenClock(op_id="op-1")
     fc.import_trace(monotonic=[], wall=[], sleep=[])
-    # Empty trace + cursor at 0 = past-end immediately → falls back to 0.0
-    assert fc.monotonic() == 0.0
-    assert fc.wall_clock() == 0.0
+    # Empty trace = past-end immediately → deterministic tail from 0.0,
+    # strictly increasing (never a frozen 0.0 that stalls a loop).
+    m1 = fc.monotonic()
+    m2 = fc.monotonic()
+    assert m1 == 1e-6 and m2 == 2e-6
+    assert fc.wall_clock() == 1e-6
 
 
 def test_frozen_warn_once_per_kind(caplog) -> None:
@@ -365,8 +374,8 @@ def test_import_trace_handles_garbage() -> None:
 def test_import_trace_handles_none() -> None:
     fc = FrozenClock(op_id="op-1")
     fc.import_trace()  # all None
-    # Empty trace, doesn't raise
-    assert fc.monotonic() == 0.0
+    # Empty trace, doesn't raise; first synthetic tick past-end.
+    assert fc.monotonic() == 1e-6
 
 
 def test_trace_lengths_diagnostic() -> None:
