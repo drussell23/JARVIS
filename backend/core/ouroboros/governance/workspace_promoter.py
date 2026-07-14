@@ -210,9 +210,23 @@ async def run_workspace_promotion(
             % (exec_root, _err.strip()[:200]),
         )
 
+    # Slice 12: forward the op's GENERATE-time baselines — the SAME object
+    # the drift check consumed — so the dirty-target exemption can prove
+    # (sha256, state_drift.file_sha256) that target dirt is the defect
+    # state this repair supersedes. No second baseline source exists.
+    _baseline_map: dict = {}
+    for _entry in (getattr(ctx, "generate_file_hashes", None) or ()):
+        try:
+            _rel, _hash = _entry
+        except (TypeError, ValueError):
+            continue
+        if _rel and _hash:
+            _baseline_map[str(_rel)] = str(_hash)
+
     try:
         result = await mgr.promote_commits(
             project_root, _branch, [committed_hash],
+            baseline_hashes=_baseline_map,
         )
     except PromotionError as exc:
         return await _fail(exc.state, exc.detail)

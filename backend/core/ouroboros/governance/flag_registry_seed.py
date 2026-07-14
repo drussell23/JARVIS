@@ -5617,6 +5617,24 @@ SEED_SPECS: list = [
         posture_relevance=_HARDEN_CRITICAL,
     ),
     FlagSpec(
+        name="JARVIS_PROMOTION_BASELINE_EXEMPTION_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 12: cryptographic dirty-target exemption — a dirty "
+            "touched path whose live sha256 EXACTLY equals the op's "
+            "GENERATE-time baseline is provably the defect state the "
+            "repair supersedes (not human work) and may be archived + "
+            "restored for the landing. Any deviation, deletion, or "
+            "unreadable file fails closed to target_dirty. OFF restores "
+            "the unconditional Slice-11 refusal."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/worktree_manager.py",
+        example="true",
+        since="2026-07-13",
+        posture_relevance=_HARDEN_CRITICAL,
+    ),
+    FlagSpec(
         name="JARVIS_PROMOTION_REQUIRE_CLEAN_TARGETS",
         type=FlagType.BOOL, default=True,
         description=(

@@ -248,6 +248,154 @@ class TestReviewRoundPins:
         assert ei.value.state == "target_dirty"
 
 
+def _sha(content: str) -> str:
+    import hashlib
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+class TestBaselineExemption:
+    """Slice 12 — cryptographic dirty-target exemption (Run-22 layer).
+
+    The chaos protocol's mutation IS uncommitted operator-tree dirt by
+    design, so the clean-target guard refused the verified repair. The
+    exemption: a dirty touched path is promotable IFF its live content
+    sha256 EXACTLY equals the op's GENERATE-time baseline — proof the
+    "dirt" is the defect state the model read and repaired, not human
+    work. No path allowlists, no chaos flags, no test hooks (mandate 1).
+    Anything unprovable — missing baseline, byte deviation, deletion,
+    unreadable file, non-modify status — fails closed to target_dirty.
+    Exempted dirt is archived (recoverable) before the landing restores
+    the file to HEAD so ff/cherry-pick can apply.
+    """
+
+    async def test_dirty_matching_baseline_promotes_and_heals(self, repo):
+        defect = "defect = True  # chaos state the model read\n"
+        (repo / "mod.py").write_text("clean = True\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "add mod")
+        sha = _workspace_commit(repo, "ouroboros/auto/s12", "mod.py",
+                                "fixed = True\n", "repair")
+        (repo / "mod.py").write_text(defect)  # uncommitted operator-tree dirt
+        mgr = WorktreeManager(repo_root=repo)
+        result = await mgr.promote_commits(
+            repo, "ouroboros/auto/s12", [sha],
+            baseline_hashes={"mod.py": _sha(defect)},
+        )
+        assert result.promoted_shas == (sha,)
+        assert (repo / "mod.py").read_text() == "fixed = True\n", (
+            "the landing must HEAL the file — fixed content, not the defect"
+        )
+        # Bulletproof recoverability: the displaced dirt is archived.
+        archives = list((repo / ".jarvis" / "promotion_dirt_archive").rglob(
+            "mod.py"))
+        assert archives and archives[0].read_text() == defect
+
+    async def test_single_byte_deviation_fails_closed(self, repo):
+        defect = "defect = True\n"
+        (repo / "mod.py").write_text("clean = True\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "add mod")
+        sha = _workspace_commit(repo, "ouroboros/auto/s12b", "mod.py",
+                                "fixed = True\n", "repair")
+        (repo / "mod.py").write_text(defect + " ")  # ONE extra byte
+        mgr = WorktreeManager(repo_root=repo)
+        with pytest.raises(PromotionError) as ei:
+            await mgr.promote_commits(
+                repo, "ouroboros/auto/s12b", [sha],
+                baseline_hashes={"mod.py": _sha(defect)},
+            )
+        assert ei.value.state == "target_dirty"
+        assert (repo / "mod.py").read_text() == defect + " ", (
+            "fail-closed must not touch the dirty file"
+        )
+
+    async def test_dirty_path_without_baseline_fails_closed(self, repo):
+        sha = _workspace_commit(repo, "ouroboros/auto/s12c", "base.txt",
+                                "ws\n", "repair")
+        (repo / "base.txt").write_text("human edit\n")
+        mgr = WorktreeManager(repo_root=repo)
+        with pytest.raises(PromotionError) as ei:
+            await mgr.promote_commits(
+                repo, "ouroboros/auto/s12c", [sha],
+                baseline_hashes={"other.txt": "0" * 64},
+            )
+        assert ei.value.state == "target_dirty"
+
+    async def test_deleted_touched_file_fails_closed(self, repo):
+        sha = _workspace_commit(repo, "ouroboros/auto/s12d", "base.txt",
+                                "ws\n", "repair")
+        (repo / "base.txt").unlink()  # deletion, a different class
+        mgr = WorktreeManager(repo_root=repo)
+        with pytest.raises(PromotionError) as ei:
+            await mgr.promote_commits(
+                repo, "ouroboros/auto/s12d", [sha],
+                baseline_hashes={"base.txt": _sha("base\n")},
+            )
+        assert ei.value.state == "target_dirty"
+
+    async def test_unreadable_touched_file_fails_closed(self, repo):
+        import os as _os
+        sha = _workspace_commit(repo, "ouroboros/auto/s12e", "base.txt",
+                                "ws\n", "repair")
+        (repo / "base.txt").write_text("base\n")  # dirty vs... same content?
+        (repo / "base.txt").write_text("defect\n")
+        _os.chmod(repo / "base.txt", 0o000)
+        try:
+            mgr = WorktreeManager(repo_root=repo)
+            with pytest.raises(PromotionError) as ei:
+                await mgr.promote_commits(
+                    repo, "ouroboros/auto/s12e", [sha],
+                    baseline_hashes={"base.txt": _sha("defect\n")},
+                )
+            assert ei.value.state == "target_dirty"
+        finally:
+            _os.chmod(repo / "base.txt", 0o644)
+
+    async def test_mixed_exempt_and_unproven_fails_closed(self, repo):
+        defect = "defect\n"
+        (repo / "a.py").write_text("a\n")
+        (repo / "b.py").write_text("b\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "two files")
+        ws = repo.parent / "ws-mixed"
+        _git(repo, "worktree", "add", "-b", "ouroboros/auto/s12f", str(ws))
+        (ws / "a.py").write_text("fixed-a\n")
+        (ws / "b.py").write_text("fixed-b\n")
+        _git(ws, "add", "-A")
+        _git(ws, "commit", "-m", "repair both")
+        sha = _git(ws, "rev-parse", "HEAD")
+        (repo / "a.py").write_text(defect)   # provable (baseline below)
+        (repo / "b.py").write_text("human\n")  # NOT provable
+        mgr = WorktreeManager(repo_root=repo)
+        with pytest.raises(PromotionError) as ei:
+            await mgr.promote_commits(
+                repo, "ouroboros/auto/s12f", [sha],
+                baseline_hashes={"a.py": _sha(defect)},
+            )
+        assert ei.value.state == "target_dirty", "all-or-nothing exemption"
+        assert (repo / "a.py").read_text() == defect
+        assert (repo / "b.py").read_text() == "human\n"
+
+    async def test_exemption_kill_switch(self, repo, monkeypatch):
+        monkeypatch.setenv(
+            "JARVIS_PROMOTION_BASELINE_EXEMPTION_ENABLED", "false",
+        )
+        defect = "defect\n"
+        (repo / "mod.py").write_text("clean\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "add mod")
+        sha = _workspace_commit(repo, "ouroboros/auto/s12g", "mod.py",
+                                "fixed\n", "repair")
+        (repo / "mod.py").write_text(defect)
+        mgr = WorktreeManager(repo_root=repo)
+        with pytest.raises(PromotionError) as ei:
+            await mgr.promote_commits(
+                repo, "ouroboros/auto/s12g", [sha],
+                baseline_hashes={"mod.py": _sha(defect)},
+            )
+        assert ei.value.state == "target_dirty"
+
+
 class TestPromotionPurityPins:
     def test_no_force_flags_or_hard_resets_in_source(self):
         src = inspect.getsource(WorktreeManager.promote_commits)

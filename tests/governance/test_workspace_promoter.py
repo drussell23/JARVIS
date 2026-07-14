@@ -53,6 +53,7 @@ class _FakeManager:
 
     async def promote_commits(self, target_root, branch, shas, **kw):
         self.promote_calls.append((Path(target_root), branch, tuple(shas)))
+        self.last_kwargs = kw
         if self.fail_with is not None:
             raise self.fail_with
         return SimpleNamespace(
@@ -165,6 +166,30 @@ class TestHappyPath:
         # Review P5: the consult carries a DEDICATED small wait budget,
         # decoupled from the exhausted pipeline deadline.
         assert gate.wait_overrides == [30.0]
+
+    async def test_generate_baselines_forwarded_to_primitives(
+        self, tmp_path, monkeypatch,
+    ):
+        """Slice 12: the promoter forwards the op's GENERATE-time baseline
+        hashes so the dirty-target exemption can prove (sha256) that target
+        dirt is the defect state the repair supersedes — the SAME baseline
+        object the drift check consumes (mandate 3, no second source)."""
+        monkeypatch.setenv(MASTER, "true")
+        mgr = _FakeManager()
+        orch = _orch(tmp_path, monkeypatch)
+        mod = tmp_path / "repo" / "backend" / "mod.py"
+        mod.parent.mkdir(parents=True, exist_ok=True)
+        mod.write_text("defect state\n")
+        import hashlib
+        baseline = hashlib.sha256(b"defect state\n").hexdigest()
+        ctx = _ctx(hashes=(("backend/mod.py", baseline),))
+        out = await run_workspace_promotion(
+            orch, ctx, "deadbeef", None, manager=mgr,
+        )
+        assert out.promoted
+        assert mgr.last_kwargs.get("baseline_hashes") == {
+            "backend/mod.py": baseline,
+        }
 
     async def test_nothing_to_stage_is_benign_noop(
         self, tmp_path, monkeypatch,

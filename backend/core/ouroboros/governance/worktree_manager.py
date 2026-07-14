@@ -24,8 +24,9 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -786,6 +787,54 @@ class WorktreeManager:
         except OSError as exc:
             return 127, "", str(exc)
 
+    @staticmethod
+    def _baseline_exempt_dirty(
+        target: Path,
+        dirty_lines: Sequence[str],
+        baseline_hashes: "Dict[str, str]",
+    ) -> Tuple[bool, List[str]]:
+        """Slice 12 — cryptographic dirty-target exemption (sync core, run
+        via asyncio.to_thread). Returns ``(all_exempt, dirty_paths)``.
+
+        A dirty touched path is exempt IFF ALL of:
+          * its porcelain status is pure-Modify (any D/R/C/U/A/? code — a
+            deletion, rename, copy, conflict, or untracked state — is a
+            different class and fails closed);
+          * the op's GENERATE-time baseline carries the path;
+          * ``state_drift.file_sha256`` of the LIVE target file equals that
+            baseline EXACTLY (unreadable/missing → None → never equal).
+
+        Proof semantics (mandate 1): a byte-identical match to the GENERATE
+        baseline means the "dirt" is precisely the defect state the model
+        read and repaired — superseding it is the op's mission. Any human
+        edit, however small, changes the hash and fails closed. No file
+        paths, no chaos knowledge, no flags enter the decision.
+        """
+        from backend.core.ouroboros.governance.state_drift import file_sha256
+
+        dirty_paths: List[str] = []
+        all_exempt = True
+        for line in dirty_lines:
+            if len(line) < 4:
+                all_exempt = False
+                continue
+            code, rel = line[:2], line[3:].strip()
+            if " -> " in rel:  # rename form — not a pure modify
+                all_exempt = False
+                dirty_paths.append(rel)
+                continue
+            dirty_paths.append(rel)
+            if not (set(code) <= {"M", " "} and "M" in code):
+                all_exempt = False
+                continue
+            baseline = baseline_hashes.get(rel)
+            if not baseline:
+                all_exempt = False
+                continue
+            if file_sha256(target / rel) != baseline:
+                all_exempt = False
+        return all_exempt, dirty_paths
+
     async def promote_commits(
         self,
         target_root: Path,
@@ -793,6 +842,7 @@ class WorktreeManager:
         commit_shas: Sequence[str],
         *,
         allow_ff: bool = True,
+        baseline_hashes: "Optional[Dict[str, str]]" = None,
     ) -> PromotionResult:
         """Promote verified workspace commits onto ``target_root`` (Slice 11).
 
@@ -876,8 +926,64 @@ class WorktreeManager:
                     "git_failure", "status: %s" % err.strip()[:200],
                 )
             if out.strip():
-                raise PromotionError(
-                    "target_dirty", out.strip().splitlines()[0][:200],
+                # Slice 12 — cryptographic exemption (Run-22 layer: the A1
+                # chaos mutation IS uncommitted target dirt by protocol
+                # design, and the verified repair was refused here). If
+                # EVERY dirty touched path hash-matches the op's GENERATE
+                # baseline, the dirt is provably the defect state the
+                # repair supersedes: archive it (recoverable), restore the
+                # paths to HEAD so ff/cherry-pick can apply, and proceed.
+                # Anything unprovable fails closed to target_dirty exactly
+                # as before. Kill switch:
+                # JARVIS_PROMOTION_BASELINE_EXEMPTION_ENABLED (default on).
+                _exempt_on = os.environ.get(
+                    "JARVIS_PROMOTION_BASELINE_EXEMPTION_ENABLED", "true",
+                ).strip().lower() in ("1", "true", "yes", "on")
+                _dirty_lines = [
+                    ln for ln in out.splitlines() if ln.strip()
+                ]
+                _all_exempt = False
+                _dirty_paths: List[str] = []
+                if _exempt_on and baseline_hashes:
+                    _all_exempt, _dirty_paths = await asyncio.to_thread(
+                        self._baseline_exempt_dirty,
+                        target, _dirty_lines, dict(baseline_hashes),
+                    )
+                if not _all_exempt:
+                    raise PromotionError(
+                        "target_dirty", out.strip().splitlines()[0][:200],
+                    )
+                _archive_root = (
+                    target / ".jarvis" / "promotion_dirt_archive"
+                    / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                )
+                try:
+                    for _rel in _dirty_paths:
+                        _src = target / _rel
+                        _dst = _archive_root / _rel
+                        _dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(_src, _dst)
+                except OSError as exc:
+                    raise PromotionError(
+                        "target_dirty",
+                        "exempt dirt could not be archived (%s) — "
+                        "refusing to displace it" % exc,
+                    )
+                rc, _, err = await self._run_git_rc(
+                    target,
+                    ["restore", "--source=HEAD", "--worktree", "--",
+                     *(":(literal)%s" % p for p in _dirty_paths)],
+                )
+                if rc != 0:
+                    raise PromotionError(
+                        "git_failure",
+                        "baseline-exempt restore failed: %s"
+                        % err.strip()[:200],
+                    )
+                logger.info(
+                    "WorktreeManager.promote_commits: %d baseline-proven "
+                    "dirty path(s) archived to %s and restored for landing",
+                    len(_dirty_paths), _archive_root,
                 )
 
         rc, out, _ = await self._run_git_rc(target, ["rev-parse", "HEAD"])

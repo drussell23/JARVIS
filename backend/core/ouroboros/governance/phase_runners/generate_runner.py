@@ -1350,10 +1350,17 @@ class GENERATERunner(PhaseRunner):
                             f"callers, then return your patch."
                         )
                         logger.warning(
+                            # Slice 12 (Run-22 catch): FULL op id — this is
+                            # an audit-keyed REJECT marker, and THIS extracted
+                            # runner is the live GENERATE path; its private
+                            # [:12] copy survived the Slice-11 orchestrator
+                            # fix (T5 lesson) and was excused at audit only
+                            # by the ambiguity rule. Sweep test now covers
+                            # phase_runners/.
                             "[Orchestrator] Iron Gate — exploration_insufficient: "
                             "%d/%d (attempt=%d cumulative, preloaded=%d) for op=%s",
                             _op_explore_credit, _min_explore, attempt + 1,
-                            _preloaded_credit, ctx.op_id[:12],
+                            _preloaded_credit, ctx.op_id,
                         )
                         generation = None
                         raise RuntimeError(_explore_err)

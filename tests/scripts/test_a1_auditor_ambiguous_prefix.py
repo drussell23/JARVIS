@@ -165,22 +165,31 @@ class TestEmitSideFullOpIds:
             )
 
     def test_no_audit_keyed_reject_marker_emits_truncated_ids(self):
-        """Sweep: every logger call in orchestrator.py whose format string
-        carries a _FAMILY_SIGNALS rejected marker must not truncate op ids."""
+        """Sweep: every logger call whose format string carries a
+        _FAMILY_SIGNALS rejected marker must not truncate op ids — across
+        orchestrator.py AND every extracted phase runner (Run-22 caught
+        generate_runner.py carrying its own [:12] copy of the Iron Gate
+        emit; the Slice-6 T5 lesson yet again: the extracted runner IS the
+        live path)."""
         markers = (
             "exploration_insufficient",
             "ExplorationInsufficientError",
             "mutation_budget_exhausted",
             "risk_tier_floor_block",
         )
-        src = self.ORCH.read_text()
+        targets = [self.ORCH] + sorted(
+            (_REPO / "backend/core/ouroboros/governance/phase_runners")
+            .glob("*.py")
+        )
         offenders = []
-        for m in markers:
-            for hit in re.finditer(re.escape(m), src):
-                window = src[hit.start():hit.start() + 600]
-                if "op_id[:12]" in window or "op_id[:16]" in window:
-                    line_no = src[:hit.start()].count("\n") + 1
-                    offenders.append(f"{m} @ line {line_no}")
+        for path in targets:
+            src = path.read_text()
+            for m in markers:
+                for hit in re.finditer(re.escape(m), src):
+                    window = src[hit.start():hit.start() + 600]
+                    if "op_id[:12]" in window or "op_id[:16]" in window:
+                        line_no = src[:hit.start()].count("\n") + 1
+                        offenders.append(f"{path.name}:{line_no} ({m})")
         assert not offenders, (
             "audit-keyed reject emit sites still truncating op ids: "
             f"{offenders}"

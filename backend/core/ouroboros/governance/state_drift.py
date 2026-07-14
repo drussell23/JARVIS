@@ -72,6 +72,22 @@ def should_block_apply(
     return block, drifted
 
 
+def file_sha256(path: Any) -> Optional[str]:
+    """sha256 hex of a file's bytes, or ``None`` when it cannot be read
+    (missing, unreadable, not a file). THE canonical content-hash helper
+    for GENERATE-baseline comparisons (Slice 12 mandate 3) — the drift
+    detector below and the promotion dirty-target exemption both consume
+    this one function; callers decide their own None semantics
+    (detect_drift degrades lenient, the promotion exemption fails CLOSED).
+    Never raises."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except (OSError, IOError, TypeError, ValueError):
+        return None
+    except Exception:  # noqa: BLE001 — never crash a caller's hot path
+        return None
+
+
 def detect_drift(
     prior_hashes: Optional[Sequence[Tuple[str, str]]],
     project_root: Optional[Any],
@@ -98,12 +114,9 @@ def detect_drift(
             continue
         if not baseline:
             continue  # new file at GENERATE — nothing to compare
-        try:
-            cur = hashlib.sha256((root / rel).read_bytes()).hexdigest()
-        except (OSError, IOError):
+        cur = file_sha256(root / rel)
+        if cur is None:
             continue  # deleted / unreadable — not a drift
-        except Exception:  # noqa: BLE001 — never crash the hot path
-            continue
         if cur != baseline:
             drifted.append(rel)
     return drifted
