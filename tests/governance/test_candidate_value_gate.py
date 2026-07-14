@@ -104,6 +104,56 @@ class TestLineGrammarFormats:
             "; tuning notes\n[flake8]\nmax-line-length = 100\n",
         ) == COSMETIC
 
+    def test_requirements_trailing_comment_edit_is_cosmetic(self, tmp_path):
+        """Run-23 grammar hole: the model's ASCII rewrites (em-dash→hyphen)
+        live INSIDE trailing comments on requirement lines. Pip's grammar
+        defines a comment as '#' at line start or preceded by whitespace —
+        stripping the trailing comment is the format's own normalization,
+        not a regex band-aid (mandate 1)."""
+        old = (
+            "z3-solver>=4.16.0  # Slice 129: optional — import-guarded\n"
+            "cffi==2.0.0\n"
+        )
+        new = (
+            "z3-solver>=4.16.0  # Slice 129: optional - import-guarded\n"
+            "cffi==2.0.0\n"
+        )
+        (tmp_path / "requirements.txt").write_text(old)
+        assert classify_file_change(
+            tmp_path, "requirements.txt", new,
+        ) == COSMETIC
+
+    def test_requirements_spec_change_with_same_comment_is_substantive(
+        self, tmp_path,
+    ):
+        (tmp_path / "requirements.txt").write_text(
+            "z3-solver>=4.16.0  # pinned\n",
+        )
+        assert classify_file_change(
+            tmp_path, "requirements.txt", "z3-solver>=4.17.0  # pinned\n",
+        ) == SUBSTANTIVE
+
+    def test_requirements_hash_inside_url_not_treated_as_comment(
+        self, tmp_path,
+    ):
+        """Pip grammar: '#' NOT preceded by whitespace is content (egg
+        fragments in VCS URLs). A change there must stay substantive."""
+        (tmp_path / "requirements.txt").write_text(
+            "git+https://x/y.git#egg=pkg1\n",
+        )
+        assert classify_file_change(
+            tmp_path, "requirements.txt",
+            "git+https://x/y.git#egg=pkg2\n",
+        ) == SUBSTANTIVE
+
+    def test_cfg_trailing_hash_is_NOT_stripped(self, tmp_path):
+        """Trailing-strip is requirements-grammar ONLY — ini/cfg values may
+        legitimately contain '#'; whole-line stripping stays their rule."""
+        (tmp_path / "setup.cfg").write_text("[x]\nkey = a#b\n")
+        assert classify_file_change(
+            tmp_path, "setup.cfg", "[x]\nkey = a#c\n",
+        ) == SUBSTANTIVE
+
     def test_unknown_format_is_indeterminate(self, tmp_path):
         (tmp_path / "notes.md").write_text("# heading\n")
         assert classify_file_change(

@@ -51,8 +51,17 @@ SUBSTANTIVE = "substantive"
 INDETERMINATE = "indeterminate"
 
 # Formats whose grammar declares whole-line comments. NEVER code files.
-_LINE_GRAMMAR_GLOBS: Tuple[str, ...] = (
-    "requirements*.txt", "constraints*.txt", "*.cfg", "*.ini",
+# Requirements-class formats ADDITIONALLY strip trailing comments per pip's
+# own grammar ('#' at line start or preceded by whitespace begins a comment;
+# '#' glued to content — e.g. VCS #egg= fragments — is content). Run-23
+# hole: the model's ASCII em-dash→hyphen rewrites inside trailing comments
+# on requirement lines read as substantive under whole-line-only stripping.
+# ini/cfg values may legitimately contain '#', so they stay whole-line-only.
+_REQUIREMENTS_GLOBS: Tuple[str, ...] = (
+    "requirements*.txt", "constraints*.txt",
+)
+_LINE_GRAMMAR_GLOBS: Tuple[str, ...] = _REQUIREMENTS_GLOBS + (
+    "*.cfg", "*.ini",
 )
 _LINE_COMMENT_PREFIXES: Tuple[str, ...] = ("#", ";")
 
@@ -69,9 +78,23 @@ def _python_ast_fingerprint(source: str) -> str:
     return ast.dump(stripped, include_attributes=False)
 
 
-def _line_grammar_residue(source: str) -> List[str]:
+def _strip_pip_trailing_comment(line: str) -> str:
+    """Remove a trailing comment per pip's requirements grammar: a comment
+    begins at a ``#`` that is preceded by whitespace (or starts the line —
+    handled by the whole-line pass). A ``#`` glued to content (VCS
+    ``#egg=`` fragments) is content and survives. Single left-to-right
+    scan — grammar normalization, not a regex band-aid."""
+    for idx, ch in enumerate(line):
+        if ch == "#" and (idx == 0 or line[idx - 1] in (" ", "\t")):
+            return line[:idx].rstrip()
+    return line
+
+
+def _line_grammar_residue(source: str, *, strip_trailing: bool) -> List[str]:
     """Semantic residue per the declared grammar: whole-line comments and
-    blank lines removed; everything else kept verbatim, in order."""
+    blank lines removed; ``strip_trailing`` (requirements-class only)
+    additionally removes whitespace-preceded trailing comments; everything
+    else kept verbatim, in order."""
     residue: List[str] = []
     for line in source.splitlines():
         stripped = line.strip()
@@ -79,6 +102,10 @@ def _line_grammar_residue(source: str) -> List[str]:
             continue
         if any(stripped.startswith(p) for p in _LINE_COMMENT_PREFIXES):
             continue
+        if strip_trailing:
+            line = _strip_pip_trailing_comment(line)
+            if not line.strip():
+                continue
         residue.append(line.rstrip())
     return residue
 
@@ -108,8 +135,12 @@ def classify_file_change(root: Path, rel_path: str, new_content: str) -> str:
             except SyntaxError:
                 return INDETERMINATE
         if any(fnmatch.fnmatch(name, g) for g in _LINE_GRAMMAR_GLOBS):
-            if (_line_grammar_residue(old_content)
-                    == _line_grammar_residue(new_content)):
+            _trailing = any(
+                fnmatch.fnmatch(name, g) for g in _REQUIREMENTS_GLOBS
+            )
+            if (_line_grammar_residue(old_content, strip_trailing=_trailing)
+                    == _line_grammar_residue(
+                        new_content, strip_trailing=_trailing)):
                 return COSMETIC
             return SUBSTANTIVE
         return INDETERMINATE

@@ -7949,6 +7949,14 @@ class GovernedOrchestrator:
                         if _verdict != _VG_COSMETIC:
                             _vg_all_cosmetic = False
                             break
+                    # Slice 14 (Run-23 catch): NEVER a silent pass-through —
+                    # log the verdict + per-file reasoning on EVERY
+                    # evaluation, cosmetic or not.
+                    logger.debug(
+                        "[ValueGate] verdict op=%s all_cosmetic=%s files=%s",
+                        ctx.op_id, _vg_all_cosmetic,
+                        [(p, v) for p, v in _vg_detail],
+                    )
                     if _vg_all_cosmetic:
                         logger.info(
                             "[ValueGate] op=%s all %d candidate file(s) "
@@ -11212,6 +11220,8 @@ class GovernedOrchestrator:
                 self, ctx, _committed_hash, best_candidate,
                 commit_skipped_reason=_commit_skip_reason,
             )
+            # Slice 14: true durable-write probe after 8b, every branch.
+            self._emit_terminal_durability_probe(ctx, _committed_hash, _promo)
             if _promo.attempted and not _promo.promoted:
                 if _serpent: _serpent.update_phase("POSTMORTEM")
                 ctx = ctx.advance(
@@ -12072,6 +12082,60 @@ class GovernedOrchestrator:
                 "harder — consider splitting into single-file operations."
             )
         return "Unknown failure. Read target files and check dependents before retrying."
+
+    @staticmethod
+    def _terminal_durability(
+        committed_hash: Optional[str], promo: Any,
+    ) -> bool:
+        """Slice 14 — the TRUE durable-write state after Phase 8b resolves.
+
+        Durable iff a workspace commit exists AND promotion either
+        succeeded or was legitimately NOT attempted (master off / same
+        root / no net change — the commit itself is then the durable
+        artifact). An ATTEMPTED-but-unpromoted outcome (refused, aborted,
+        failed) is NOT durable — mandate 4, absolutely.
+        """
+        if not committed_hash:
+            return False
+        if promo is None:
+            return True  # promotion subsystem absent — legacy commit posture
+        attempted = bool(getattr(promo, "attempted", False))
+        promoted = bool(getattr(promo, "promoted", False))
+        if attempted and not promoted:
+            return False
+        return True
+
+    @staticmethod
+    def _render_durability_probe(op_id: str, durable: bool) -> str:
+        """The EXACT Slice74Probe LEDGER_TERMINAL schema (mandate 3 — no
+        new logging sequence; the auditor's own regex must match)."""
+        return (
+            "[Slice74Probe] LEDGER_TERMINAL op_id=%s state=applied written=%s"
+            % (op_id, durable)
+        )
+
+    def _emit_terminal_durability_probe(
+        self, ctx: Any, committed_hash: Optional[str], promo: Any,
+    ) -> None:
+        """Re-emit the terminal probe strictly AFTER Phase 8b (AutoCommit +
+        WorkspacePromoter) fully resolves (Slice 14, Run-23 final red).
+
+        The in-``_record_ledger`` probe reports the ledger DEDUP boolean and
+        fires at terminal-record time — BEFORE 8b — so every mutating op
+        stamped ``written=False`` while its repair demonstrably landed
+        (abbddeec24). This re-emission carries the true asynchronous
+        durable-write state; the auditor greps the literal either way.
+        Never raises.
+        """
+        try:
+            durable = self._terminal_durability(committed_hash, promo)
+            logger.info(
+                "%s", self._render_durability_probe(
+                    getattr(ctx, "op_id", "?"), durable,
+                ),
+            )
+        except Exception:  # noqa: BLE001 — probe must never break 8b
+            logger.debug("[Slice74Probe] re-emit failed", exc_info=True)
 
     def _scoped_verify_runner(
         self, exec_root: Path,

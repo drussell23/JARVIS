@@ -1451,6 +1451,10 @@ class Slice4bRunner(PhaseRunner):
                 orch, ctx, _committed_hash, best_candidate,
                 commit_skipped_reason=_commit_skip_reason,
             )
+            # Slice 14: re-emit the terminal durability probe strictly
+            # after 8b resolves — the true written state, on EVERY branch
+            # (a refused promotion registers written=False explicitly).
+            orch._emit_terminal_durability_probe(ctx, _committed_hash, _promo)
             if _promo.attempted and not _promo.promoted:
                 return PhaseResult(
                     next_ctx=ctx, next_phase=None, status="fail",
