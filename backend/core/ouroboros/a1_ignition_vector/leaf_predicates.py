@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=op-019f5e7f-) at 2026-07-14 02:41 UTC
+# Reason: Stable test failure: tests/governance/a1_ignition_vector/test_leaf_predicates.py::test_clamp01 (streak=2): 
+
 """Isolated pure-leaf numeric predicates -- the A1 ignition target surface.
 
 Every function here is a STRUCTURALLY PURE LEAF (operators only, no calls, no
