@@ -4091,7 +4091,40 @@ class CandidateGenerator:
                 if _qualifies:
                     _tier0_attempted = True
                     try:
-                        pending = await self._tier0.submit_batch(context)
+                        # Slice 18 — CAPACITY BEFORE COMMITMENT.
+                        #
+                        # This prune + cap check used to sit AFTER submit_batch().
+                        # That ordering was a guaranteed orphan generator: the
+                        # batch was created on DW's queue, and only then did we
+                        # discover the background-poll pool was full — at which
+                        # point the `if` simply fell through with no `else`. No
+                        # poller was ever created, the batch_id existed nowhere
+                        # but in a local variable, and a live job sat on DW's
+                        # queue that no code in this process knew about. It could
+                        # only ever be cleaned up by a human at DoubleWord.
+                        #
+                        # Submitting work we have no capacity to collect is not a
+                        # race we lost; it is an obligation we had no intention of
+                        # honoring. So we check first, and simply don't submit.
+                        self._background_polls = {
+                            k: t for k, t in self._background_polls.items()
+                            if not t.done()
+                        }
+                        _poll_capacity = (
+                            len(self._background_polls) < self._max_background_polls
+                        )
+                        if not _poll_capacity:
+                            logger.warning(
+                                "[CandidateGenerator] Tier 0 batch NOT submitted "
+                                "for op=%s: background-poll pool is full (%d/%d). "
+                                "Submitting would create a batch on DW that "
+                                "nothing in this process could ever collect.",
+                                _op_id, len(self._background_polls),
+                                self._max_background_polls,
+                            )
+                            pending = None
+                        else:
+                            pending = await self._tier0.submit_batch(context)
                         if pending is not None:
                             logger.info(
                                 "[CandidateGenerator] Tier 0 batch %s submitted",
@@ -4104,23 +4137,18 @@ class CandidateGenerator:
                                     "model": getattr(self._tier0, "_model", "unknown"),
                                 },
                             )
-                            self._background_polls = {
-                                k: t for k, t in self._background_polls.items()
-                                if not t.done()
-                            }
-                            if len(self._background_polls) < self._max_background_polls:
-                                task = asyncio.create_task(
-                                    self._background_poll_tier0(pending, context),
-                                    name=f"dw-poll-{pending.batch_id[:12]}",
-                                )
-                                # Defect #4 Slice A — defensive
-                                # callback (background_poll_tier0
-                                # already has try/except internally,
-                                # but the callback ensures even an
-                                # asyncio.CancelledError that bypasses
-                                # the wrapper gets consumed).
-                                task.add_done_callback(_swallow_task_exception)
-                                self._background_polls[_op_id] = task
+                            task = asyncio.create_task(
+                                self._background_poll_tier0(pending, context),
+                                name=f"dw-poll-{pending.batch_id[:12]}",
+                            )
+                            # Defect #4 Slice A — defensive
+                            # callback (background_poll_tier0
+                            # already has try/except internally,
+                            # but the callback ensures even an
+                            # asyncio.CancelledError that bypasses
+                            # the wrapper gets consumed).
+                            task.add_done_callback(_swallow_task_exception)
+                            self._background_polls[_op_id] = task
                     except asyncio.CancelledError:
                         raise
                     except Exception as t0_exc:

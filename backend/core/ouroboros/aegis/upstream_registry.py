@@ -237,6 +237,27 @@ def _build_registry() -> Mapping[str, UpstreamEndpoint]:
             kind=EndpointKind.PASSTHROUGH,
             http_methods=("GET",),
         ),
+        # POST /v1/batches/{batch_id}/cancel — RELEASE a batch claim (Slice 18).
+        #
+        # This route's absence was load-bearing: the proxy could create a batch
+        # and poll a batch, but had no way to *give one back*. So even if the
+        # provider had wanted to cancel an abandoned batch, the call would have
+        # 404'd at Aegis. The only mechanism that ever cleaned up an orphaned
+        # DoubleWord batch was a human at DoubleWord doing it by hand — which is
+        # exactly the support email that opened Slice 18.
+        #
+        # Idempotent upstream: cancelling an already-terminal batch returns the
+        # batch object rather than an error (verified live against the API), so
+        # this is safe to call from finally-blocks and shutdown paths.
+        "/v1/batches/{batch_id}/cancel": UpstreamEndpoint(
+            aegis_path="/v1/batches/{batch_id}/cancel",
+            upstream_base_url=dw_base,
+            auth_header="Authorization",
+            auth_scheme=AuthScheme.HEADER_BEARER,
+            credential_env_var="DOUBLEWORD_API_KEY",
+            kind=EndpointKind.PASSTHROUGH,
+            http_methods=("POST",),
+        ),
         # GET /v1/files/{file_id}/content — retrieve batch output JSONL
         "/v1/files/{file_id}/content": UpstreamEndpoint(
             aegis_path="/v1/files/{file_id}/content",

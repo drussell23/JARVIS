@@ -45,7 +45,12 @@ def test_persists_to_disk():
     assert "m-dottxt" in payload.get("batch_only", {})
     # Slice 17: schema.2 adds the entitlement axis (``unavailable``) alongside
     # the capability axis (``batch_only``).
-    assert payload["schema_version"] == "transport_profile.2"
+    # Slice 18: schema.3 adds the POSITIVE batch-evidence axis (``batch_served``).
+    # It exists because the batch transport cannot refuse a request: DW returns
+    # 200 at submit for a model it will never serve, so "not known to be denied"
+    # carries no information there and only a completed batch does.
+    assert payload["schema_version"] == "transport_profile.3"
+    assert "batch_served" in payload
 
 
 def test_survives_fork_rehydration():

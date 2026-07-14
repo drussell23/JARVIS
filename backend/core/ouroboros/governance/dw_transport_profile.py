@@ -49,8 +49,11 @@ from backend.core.ouroboros.governance.dw_ttft_observer import _atomic_write
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "transport_profile.2"
-_LEGACY_SCHEMA_VERSIONS = ("transport_profile.1",)
+# Slice 18 adds the ``batch_served`` axis (positive batch evidence). Purely
+# additive: a .1/.2 file loads clean and simply starts with no positive
+# evidence, so every model re-earns batch admission from a real completed batch.
+SCHEMA_VERSION = "transport_profile.3"
+_LEGACY_SCHEMA_VERSIONS = ("transport_profile.1", "transport_profile.2")
 
 _ENV_MASTER = "JARVIS_DW_TRANSPORT_PROFILE_ENABLED"
 _ENV_TTL_S = "JARVIS_DW_TRANSPORT_PROFILE_TTL_S"
@@ -145,6 +148,14 @@ class TransportProfile:
         self._batch_only: Dict[str, float] = {}
         # model_id → {transport → unix ts of the 403 denial}.
         self._unavailable: Dict[str, Dict[str, float]] = {}
+        # Slice 18 — model_id → unix ts of the last COMPLETED batch.
+        # The batch plane's POSITIVE evidence axis. It needs one and real-time
+        # does not, because real-time can refuse: an RT model that is not denied
+        # is, by that very silence, permitted. On batch, silence means nothing —
+        # a submit returns 200 for a model the platform will never serve — so
+        # "not known to be denied" carries no information and only a completed
+        # batch does.
+        self._batch_served: Dict[str, float] = {}
         self._lock = threading.RLock()
         self._loaded = False
 
@@ -206,6 +217,18 @@ class TransportProfile:
                                 ] = float(ts)
                         except (ValueError, TypeError):
                             continue
+            # Slice 18 — the batch-served axis. Absent from schema .1/.2 files,
+            # which simply start with no positive evidence: every model then has
+            # to re-earn its batch admission from a real completed batch. That is
+            # the correct cold-start, not a regression.
+            raw_bs = payload.get("batch_served", {})
+            if isinstance(raw_bs, Mapping):
+                for mid, ts in raw_bs.items():
+                    try:
+                        if isinstance(mid, str):
+                            self._batch_served[mid] = float(ts)
+                    except (ValueError, TypeError):
+                        continue
 
     def save(self) -> None:
         """Persist the profile atomically. NEVER raises."""
@@ -216,6 +239,7 @@ class TransportProfile:
                 "unavailable": {
                     m: dict(t) for m, t in self._unavailable.items()
                 },
+                "batch_served": dict(self._batch_served),
             }
             try:
                 _atomic_write(
@@ -242,9 +266,10 @@ class TransportProfile:
 
     def record_unavailable(
         self, model_id: str, transport: str, *, status: int = 403,
+        reason: str = "",
     ) -> None:
         """Record an AUTHORIZATION denial: the endpoint refused ``model_id`` on
-        ``transport`` (HTTP 403 — a routing rule / missing entitlement).
+        ``transport``.
 
         Mandate 1: this is NOT a capability signal and MUST NOT be laundered
         into ``record_batch_only``. A refused transport is EXCLUDED, not
@@ -253,6 +278,21 @@ class TransportProfile:
 
         Decays under ``_entitlement_ttl_s`` so an entitlement granted later is
         re-discovered. Gated + fail-soft — NEVER raises into dispatch.
+
+        Slice 18 — ``reason`` records HOW the denial was proven, because the two
+        transports cannot prove it the same way:
+
+          * On REAL-TIME a denial arrives as an HTTP 403. Loud, instant,
+            unambiguous (``status=403``, the default).
+          * On BATCH there is no 403 to catch. DW accepts a batch for a model it
+            will never serve, flips it to ``in_progress``, and answers with
+            **silence** — zero completed requests, an empty error file, until the
+            window expires. So a batch denial is proven by a stall
+            (``status=0``, ``reason="batch_stall_no_progress"``), corroborated by
+            the diagnostic reflex.
+
+        Both are honest, plane-native facts. Neither is inferred from the other —
+        that inference is precisely what Mandate 1 forbids.
         """
         try:
             if not model_id or not transport or not transport_profile_enabled():
@@ -263,14 +303,83 @@ class TransportProfile:
                 self._maybe_autosave()
             logger.warning(
                 "[TransportProfile] model=%s transport=%s ENTITLEMENT DENIED "
-                "(HTTP %s) — excluded from that transport (NOT batch-demoted); "
-                "re-probe after %.0fs",
-                model_id, transport, status, _entitlement_ttl_s(),
+                "(status=%s reason=%s) — excluded from that transport (NOT "
+                "batch-demoted); re-probe after %.0fs",
+                model_id, transport, status, reason or "http_403",
+                _entitlement_ttl_s(),
             )
         except Exception:  # noqa: BLE001 — never perturb the dispatch path
             logger.debug(
                 "[TransportProfile] record_unavailable swallowed", exc_info=True,
             )
+
+    def record_batch_success(self, model_id: str) -> None:
+        """Slice 18 — a batch genuinely COMPLETED on ``model_id``.
+
+        The positive fossil for the batch plane, and the mirror of
+        ``record_rt_success``. It is the strongest evidence obtainable that this
+        account can actually get batch work done on this model: not that the
+        catalog lists it, not that a submit returned 200 — that the platform ran
+        the requests and handed back output.
+
+        That distinction is the whole of Slice 18. ``GET /models`` advertised
+        ``Devstral-2-123B``; ``POST /batches`` returned 200 for it; and it served
+        nothing, ever. Catalog membership is an advertisement and a 200 at submit
+        is a receipt, not a promise. Only a completed batch is proof.
+
+        Clears any batch entitlement denial — live evidence beats a fossil, the
+        same invalidation contract ``record_rt_success`` honors for RT.
+        Gated + fail-soft — NEVER raises into dispatch.
+        """
+        try:
+            if not model_id or not transport_profile_enabled():
+                return
+            self._ensure_loaded()
+            with self._lock:
+                per_transport = self._unavailable.get(model_id) or {}
+                dropped = per_transport.pop(TRANSPORT_BATCH, None) is not None
+                if not per_transport:
+                    self._unavailable.pop(model_id, None)
+                # Positive evidence is recorded even when there was no denial to
+                # clear — the batch ladder's admission gate reads it directly.
+                self._batch_served[model_id] = time.time()
+                self._maybe_autosave()
+            if dropped:
+                logger.info(
+                    "[TransportProfile] model=%s BATCH SUCCESS — invalidated the "
+                    "stale batch denial; the lane demonstrably serves this model",
+                    model_id,
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[TransportProfile] record_batch_success swallowed", exc_info=True,
+            )
+
+    def has_served_batch(self, model_id: str) -> bool:
+        """True iff ``model_id`` has PROVEN it can serve a batch (a real batch
+        completed on it) within the entitlement TTL.
+
+        This is the positive evidence the batch ladder's admission gate requires.
+        It exists because the batch transport cannot refuse: on a plane where a
+        submit always returns 200, "we have never seen this fail" is worth
+        nothing, and only "we have seen this succeed" carries information.
+
+        Master-off → False (the gate then admits everything, i.e. legacy).
+        NEVER raises."""
+        try:
+            if not model_id or not transport_profile_enabled():
+                return False
+            self._ensure_loaded()
+            with self._lock:
+                ts = self._batch_served.get(model_id)
+            if not ts:
+                return False
+            return (time.time() - float(ts)) < _entitlement_ttl_s()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[TransportProfile] has_served_batch swallowed", exc_info=True,
+            )
+            return False
 
     def record_rt_success(self, model_id: str) -> None:
         """A REAL-TIME call succeeded for ``model_id`` — ground truth that beats

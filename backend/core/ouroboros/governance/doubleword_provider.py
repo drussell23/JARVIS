@@ -45,7 +45,7 @@ import time
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -1520,6 +1520,268 @@ class SovereignBatchTimeoutError(DoublewordInfraError):
         self.deadline_s = deadline_s
 
 
+class BatchStalledError(SovereignBatchTimeoutError):
+    """Slice 18 — a batch that is not merely SLOW, but provably DEAD.
+
+    The temporal breaker above answers "has this batch taken too long?". It
+    cannot answer the question that actually matters: *is it going to finish at
+    all?* Both a congested-but-working batch and a batch DW will never schedule
+    look identical to a wall clock, so both got the same 300s rotation and
+    neither taught us anything.
+
+    DW hands us the discriminator for free, in a field we were already fetching
+    and throwing away on every poll:
+
+        request_counts: {total: N, completed: C, failed: F}
+
+    ``C + F == 0`` past the temporal deadline means DW has not started a single
+    request in the batch. That is not slowness — nothing is queued behind
+    anything. It is a batch the platform accepted and will never run.
+
+    Root cause (Seb @ Doubleword, 2026-07-14): ``Devstral-2-123B`` batches sat at
+    ``{total:1, completed:0, failed:0}`` for the full 1h window with an empty
+    error file, because the account is not entitled to that model — it answers
+    403 on real-time in 0.68s. The batch API does not enforce entitlement at
+    submit, so the denial arrives as *silence*.
+
+    Raising this instead of the generic timeout is what lets the caller (a)
+    cancel the batch rather than leak it, and (b) attribute the failure to the
+    MODEL rather than to the lane — a distinction the old code could not make,
+    and the reason the same dead model would have been picked again.
+
+    Subclasses ``SovereignBatchTimeoutError`` so every existing lane-escalation
+    predicate (``dw_fault_taxonomy.is_batch_lane_retrieval_timeout``, which walks
+    class ancestry and matches the "Batch retrieval failed" marker) keeps working
+    unchanged. Strictly additive.
+    """
+
+    def __init__(
+        self,
+        elapsed_s: float = 0.0,
+        deadline_s: float = 0.0,
+        *,
+        model_id: str = "",
+        batch_id: str = "",
+        counts: Optional[Dict[str, int]] = None,
+    ) -> None:
+        super().__init__(
+            elapsed_s=elapsed_s, deadline_s=deadline_s, model_id=model_id,
+        )
+        self.batch_id = batch_id
+        self.counts = dict(counts or {})
+
+
+def _dw_batch_stall_detector_enabled() -> bool:
+    """Slice 18 — progress-aware stall detection. Default FALSE (UNVERIFIED).
+
+    Per the graduation policy a flag earns its default from live proof, and this
+    one changes *when* we give up on a batch and *what we blame* — routing
+    authority. OFF → the temporal breaker behaves byte-identically (a wedged
+    batch raises the generic ``SovereignBatchTimeoutError`` at the same instant);
+    the only difference is that the progress counts are logged.
+    NEVER raises (fail-soft → disabled)."""
+    try:
+        return (os.environ.get(
+            "JARVIS_DW_BATCH_STALL_DETECTOR_ENABLED", "false",
+        ) or "").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001 — fail-soft: legacy
+        return False
+
+
+def _dw_batch_cancel_enabled() -> bool:
+    """Slice 18 — release the claim on a batch we are walking away from.
+    Default TRUE.
+
+    This is failure-path-only by construction: it fires ONLY where the legacy
+    code had already abandoned the batch (temporal trip, stall, terminal status,
+    poll exhaustion, provider close). The behavior it replaces is *leaking a live
+    job onto DW's queue* — which is what forced a human at DoubleWord to cancel
+    two of our batches by hand and email us. OFF restores the leak, so OFF is
+    never the safer default.
+
+    It can never cost us a result: we only cancel batches whose result we have
+    already given up on, and never one that has made progress.
+    NEVER raises (fail-soft → enabled)."""
+    try:
+        return (os.environ.get(
+            "JARVIS_DW_BATCH_CANCEL_ENABLED", "true",
+        ) or "").strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001 — fail-soft: enabled
+        return True
+
+
+def _dw_batch_diagnostic_reflex_enabled() -> bool:
+    """Slice 18 — on a stall, ASK the real-time plane why. Default FALSE
+    (UNVERIFIED; it spends one ~1-token call per stall).
+
+    The batch transport cannot refuse a request, so it can never tell us *why* a
+    batch died. The real-time transport can, definitively, in under a second. On
+    a stall we fire one bounded ``max_tokens=1`` probe at the same model and let
+    reality answer:
+
+      * ``403`` → the model is DENIED. Record it on both axes (each honestly
+        sourced: the 403 is an RT fact from a real RT call; the stall is a batch
+        fact from a real batch) and re-ladder.
+      * ``2xx`` → the model is ALIVE and the BATCH LANE is the problem. Do not
+        blame the model — rotate this op to real-time, where it will succeed.
+      * anything else → inconclusive. Record nothing about the model.
+
+    This is emphatically NOT the Run-25c laundering that Slice 17 outlawed: we
+    never *infer* a batch conclusion from an RT observation. We run a real
+    experiment and record two independent facts from two real calls.
+    NEVER raises (fail-soft → disabled)."""
+    try:
+        return (os.environ.get(
+            "JARVIS_DW_BATCH_DIAGNOSTIC_REFLEX_ENABLED", "false",
+        ) or "").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001 — fail-soft: disabled
+        return False
+
+
+def _dw_batch_terminal_forensics_enabled() -> bool:
+    """Slice 18 — wire-touching forensics on a terminal batch (error-file GET
+    + RT diagnostic reflex + reasoning-floor learning). Default FALSE
+    (UNVERIFIED — it adds a network GET to every failed/expired/cancelled
+    batch, and the flags-off terminal path must keep its legacy cost).
+
+    OFF → the terminal handler is ledger-settle + log + telemetry only.
+    NEVER raises (fail-soft → disabled)."""
+    try:
+        return (os.environ.get(
+            "JARVIS_DW_BATCH_TERMINAL_FORENSICS_ENABLED", "false",
+        ) or "").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001 — fail-soft: legacy
+        return False
+
+
+def _dw_batch_reconcile_enabled() -> bool:
+    """Slice 18 — boot reconciliation of orphaned batch claims. Default FALSE
+    (UNVERIFIED — it makes remote calls at boot and can cancel remote state).
+
+    OFF → byte-identical legacy boot (orphans stay orphaned, which is the status
+    quo ante, not a new harm).
+    NEVER raises (fail-soft → disabled)."""
+    try:
+        return (os.environ.get(
+            "JARVIS_DW_BATCH_RECONCILE_ENABLED", "false",
+        ) or "").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001 — fail-soft: legacy
+        return False
+
+
+def _dw_batch_admission_enabled() -> bool:
+    """Slice 18 — refuse to open a batch we have reason to believe will never be
+    served. Default FALSE (UNVERIFIED — it can withhold a dispatch).
+
+    OFF → byte-identical legacy behavior (every batch is submitted).
+    NEVER raises (fail-soft → disabled)."""
+    try:
+        return (os.environ.get(
+            "JARVIS_DW_BATCH_ADMISSION_ENABLED", "false",
+        ) or "").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001 — fail-soft: legacy
+        return False
+
+
+def _batch_admission_verdict(model_id: str) -> Tuple[bool, str]:
+    """Slice 18 — may we open a batch on ``model_id``? Returns ``(ok, reason)``.
+
+    This is the gate that would have stopped the incident that named this slice.
+    It exists at the submit chokepoint rather than in the ladder because the
+    ladder is built before the transport is chosen, and because a single door is
+    a guarantee where a filter is a hope.
+
+    The asymmetry it encodes is the heart of Slice 18. On REAL-TIME, "not known
+    to be denied" is meaningful — the endpoint *can* refuse, so silence is
+    consent. On BATCH the endpoint **cannot refuse**: DW returns 200 at submit for
+    a model it will never serve. There, "not known to be denied" is worth nothing,
+    and only positive evidence carries information.
+
+    So the rule is evidence-based, not a blanket ban:
+
+      * batch-denied (a real batch on it stalled with zero progress) → REFUSE.
+        We have proof on the batch plane itself.
+      * RT-denied AND never proven on batch → REFUSE. This is the Devstral case:
+        403 on real-time in 0.68s, and the batch API will happily take our job and
+        sit on it for an hour. We will not gamble a completion window on a model
+        with no evidence in its favour on either plane.
+      * RT-denied BUT has completed a batch → **ADMIT**. This is not a
+        contradiction, it is the Run-25c class Slice 17 documents explicitly:
+        ``Qwen3.5-397B-…-dottxt`` 403s on RT and serves batch fine, because an
+        account can hold batch entitlement while a routing rule forbids RT.
+        Excluding it would re-starve the very ladder Slice 17 un-starved.
+      * everything else → ADMIT. No evidence against it; batch is the cheap lane
+        and an unproven model is how a model becomes proven.
+
+    Pure + fail-soft: any fault admits (never starve dispatch on a gate fault).
+    """
+    try:
+        if not model_id or not _dw_batch_admission_enabled():
+            return True, "admission_disabled"
+        from backend.core.ouroboros.governance.dw_transport_profile import (
+            TRANSPORT_BATCH, TRANSPORT_REALTIME, get_transport_profile,
+        )
+        profile = get_transport_profile()
+        if profile.is_unavailable(model_id, TRANSPORT_BATCH):
+            return False, "batch_denied"
+        if profile.is_unavailable(model_id, TRANSPORT_REALTIME):
+            if profile.has_served_batch(model_id):
+                # Slice 17's Run-25c class — batch-entitled, RT-forbidden.
+                return True, "rt_denied_but_batch_proven"
+            return False, "rt_denied_and_batch_unproven"
+        return True, "no_evidence_against"
+    except Exception:  # noqa: BLE001 — a gate fault must never starve dispatch
+        return True, "admission_fault"
+
+
+def _batch_progress_counts(data: Mapping[str, Any]) -> Dict[str, int]:
+    """Extract ``request_counts`` from a DW batch object. Missing/garbage → zeros.
+
+    Slice 18: this field is present in EVERY poll response and was discarded on
+    every poll. It is the batch plane's only native progress signal.
+    NEVER raises."""
+    try:
+        rc = data.get("request_counts") or {}
+        if not isinstance(rc, Mapping):
+            return {"total": 0, "completed": 0, "failed": 0}
+        return {
+            "total": int(rc.get("total") or 0),
+            "completed": int(rc.get("completed") or 0),
+            "failed": int(rc.get("failed") or 0),
+        }
+    except Exception:  # noqa: BLE001
+        return {"total": 0, "completed": 0, "failed": 0}
+
+
+def _batch_made_progress(counts: Mapping[str, int]) -> bool:
+    """True iff we may NOT conclude the batch is dead.
+
+    The stall/slow distinction reduces to this. A batch with progress is working
+    (however slowly) and its model is innocent; a batch with zero progress past
+    the deadline is dead and its model is the suspect.
+
+    The subtlety — and it is the whole ethic of this slice — is that **absent
+    evidence is not negative evidence.** ``total == 0`` does not mean "DW has
+    finished nothing"; it means DW told us nothing (a missing or malformed
+    ``request_counts``). Reading that silence as proof of death would demote a
+    model on the strength of data we never received, which is the same
+    mis-attribution that condemned healthy models in Run-25c — arrived at from
+    the opposite direction.
+
+    A real batch always declares ``total >= 1``. So a stall claim requires BOTH
+    that DW told us there is work (``total >= 1``) AND that none of it finished.
+    Anything else returns True (= "no stall claim"), and the model keeps its slot.
+    """
+    try:
+        total = int(counts.get("total") or 0)
+        if total <= 0:
+            return True  # no information → never blame the model
+        done = int(counts.get("completed") or 0) + int(counts.get("failed") or 0)
+        return done > 0
+    except Exception:  # noqa: BLE001
+        return True  # fail-soft: assume progress → never blame the model
+
+
 def _dw_temporal_breaker_enabled() -> bool:
     """Sovereign Temporal Breaker master gate. Default TRUE.
 
@@ -2195,6 +2457,38 @@ class DoublewordProvider:
         )
         operation_id = getattr(ctx, "operation_id", f"dw-{int(time.time())}")
         _effective_model = self._resolve_effective_model(ctx)
+
+        # ── Slice 18: BATCH ADMISSION ────────────────────────────────────
+        # The last gate before we incur an obligation on DW's queue. Refusing
+        # here costs one fallback; being wrong here costs a one-hour black hole,
+        # an orphaned job, and (as of 2026-07-14) an email from a human at
+        # DoubleWord asking us to please clean up after ourselves.
+        _adm_ok, _adm_reason = _batch_admission_verdict(_effective_model)
+        if not _adm_ok:
+            logger.warning(
+                "[DoublewordProvider] BATCH ADMISSION REFUSED model=%s "
+                "reason=%s op=%s — not submitting. The batch API cannot refuse "
+                "this itself: it would accept the job and answer with silence "
+                "until the completion window expired. Falling back instead.",
+                _effective_model, _adm_reason, operation_id,
+            )
+            from backend.core.ouroboros.telemetry import (
+                dispatch_profiler as _s18_dp,
+            )
+            _s18_dp.record_stage(
+                "STAGE_BATCH_ADMISSION",
+                op_id=operation_id, model_id=_effective_model,
+                duration_ms=0.0, outcome=f"refused:{_adm_reason}",
+            )
+            # 403, not 0: an admission refusal is grounded in a recorded
+            # entitlement denial and is DETERMINISTIC — every retry re-hits
+            # this gate. status_code=0 would classify as transient
+            # (DoublewordInfraError.is_transient: `status_code == 0 → True`),
+            # sending the caller into a retry loop against a model admission
+            # has already permanently ruled out.
+            self._last_error_status = 403
+            return None
+
         # Slice 235 — adaptive diff. Was unconditional full_content because the
         # 397B can't produce verbatim diff context. Now gated: a diff-capable
         # ELITE family (Kimi/DeepSeek-V4-Pro/GLM — NOT the 397B) on a LARGE file
@@ -2328,6 +2622,12 @@ class DoublewordProvider:
             _s35b_t_create = time.monotonic()
             batch_id = await self._create_batch(
                 file_id, op_id=operation_id,
+                # Slice 18 — bind the claim to what we actually sent. The effort
+                # is read back out of the composed body rather than recomputed,
+                # so the ledger can never disagree with the wire.
+                model=_effective_model,
+                route=str(getattr(ctx, "provider_route", "") or ""),
+                reasoning_effort=str(_batch_body.get("reasoning_effort") or ""),
             )
             _s35b_dp.record_stage(
                 "STAGE_BATCH_CREATE",
@@ -5357,12 +5657,18 @@ class DoublewordProvider:
                     )
 
     async def _create_batch(
-        self, input_file_id: str, *, op_id: str = "dw-batch-create", _s181_attempt: int = 0,
+        self, input_file_id: str, *, op_id: str = "dw-batch-create",
+        model: str = "", route: str = "", reasoning_effort: str = "",
+        _s181_attempt: int = 0,
     ) -> Optional[str]:
         """Stage 2: Create batch job.
 
         Slice 2B-ii — ``op_id`` is threaded for per-call Aegis lease.
         Slice 181 — ``_s181_attempt`` threads the Kevlar batch-retry recursion depth.
+        Slice 18 — ``model``/``route``/``reasoning_effort`` are threaded so the
+        durable claim records WHAT WE SENT at the instant the obligation is
+        incurred. Without them a batch that outlives the process is just an
+        opaque id: unattributable, unlearnable, and (before Slice 18) unreleasable.
         """
         session = await self._get_session()
         _rl_t0 = time.monotonic()
@@ -5426,11 +5732,44 @@ class DoublewordProvider:
                         )
                         await asyncio.sleep(_s181_br_backoff(_s181_attempt))
                         return await self._create_batch(
-                            input_file_id, op_id=op_id, _s181_attempt=_s181_attempt + 1,
+                            input_file_id, op_id=op_id, model=model, route=route,
+                            reasoning_effort=reasoning_effort,
+                            _s181_attempt=_s181_attempt + 1,
                         )
                     return None
                 result = await resp.json()
                 batch_id = result.get("id")
+                # Slice 18 — OPEN THE CLAIM. This must happen here, at the exact
+                # instant DW hands us an id, and NOT at the caller: the moment
+                # this function returns, the batch is live on DW's queue whether
+                # or not anything downstream ever polls it.
+                #
+                # That ordering is not academic. The pre-Slice-18 orphan
+                # generator (candidate_generator.py:4111) submitted the batch and
+                # only THEN checked whether the background-poll pool had a slot;
+                # when it didn't, no poller was ever created and the batch became
+                # a live job that no code in the process knew existed. A claim
+                # opened here is recoverable by boot reconciliation even in that
+                # case — and even if the process is SIGKILLed one line later.
+                if batch_id:
+                    try:
+                        from backend.core.ouroboros.governance.dw_batch_ledger import (  # noqa: E501
+                            get_batch_ledger,
+                        )
+                        get_batch_ledger().record_open(
+                            batch_id,
+                            model=model or (getattr(self, "_model", "") or ""),
+                            op_id=op_id,
+                            route=route,
+                            expires_at=float(result.get("expires_at") or 0.0),
+                            reasoning_effort=reasoning_effort,
+                        )
+                    except Exception:  # noqa: BLE001 — a ledger fault must never
+                        # fail a batch that DW has already accepted.
+                        logger.debug(
+                            "[DoublewordProvider] batch claim record swallowed",
+                            exc_info=True,
+                        )
                 # Register webhook future (Tier 1) if registry is wired
                 if batch_id and self._batch_registry is not None:
                     self._batch_registry.register(batch_id)
@@ -5474,6 +5813,361 @@ class DoublewordProvider:
     # ------------------------------------------------------------------
     # Batch result awaiting: Tier 1 (webhook future) → Tier 2 (adaptive poll)
     # ------------------------------------------------------------------
+
+    async def _cancel_batch(
+        self, batch_id: str, *, reason: str = "abandoned", op_id: str = "dw-batch-cancel",
+    ) -> bool:
+        """Slice 18 — RELEASE the claim on a batch we are walking away from.
+
+        Before this existed, every walk-away path in the provider (temporal trip,
+        poll exhaustion, terminal status, the 30s RT-reflex sever, process death)
+        simply *stopped looking* at a batch that was still live on DW's queue.
+        The batch kept its slot, and the only entity that ever cleaned one up was
+        a human at DoubleWord — which is precisely the support email that opened
+        Slice 18.
+
+        Submitting work creates an obligation: collect the result, or release the
+        claim. This is the release.
+
+        ``POST /batches/{id}/cancel`` is idempotent on a terminal batch (verified
+        live against the API: cancelling an already-cancelled batch returns the
+        batch object, not an error), so a redundant cancel is harmless — which
+        makes it safe to call from ``finally`` blocks and shutdown paths without
+        first proving the batch is still open.
+
+        Returns True iff DW accepted the cancellation. Fail-soft: NEVER raises
+        into a caller that is already on a failure path, because a failed cancel
+        must not mask the original error.
+
+        A cancel we could NOT deliver leaves the claim **OPEN** — deliberately
+        un-settled. Settling it (the first draft used a terminal ABANDONED
+        state) removes it from ``open_claims``, which is the exact set both
+        ``_release_open_batch_claims`` and boot reconciliation sweep — i.e. a
+        settled 'abandoned' claim would never be retried by anyone, silently
+        re-creating the leak this slice exists to kill. An unsettled obligation
+        stays visible until someone actually discharges it.
+        """
+        from backend.core.ouroboros.governance.dw_batch_ledger import (
+            STATE_CANCELLED, get_batch_ledger,
+        )
+        _ledger = get_batch_ledger()
+
+        if not batch_id:
+            return False
+        if not _dw_batch_cancel_enabled():
+            # The obligation is still real when we are forbidden to release it.
+            # Leave the claim OPEN so it stays visible to reconciliation; just
+            # say so loudly.
+            logger.warning(
+                "[DoublewordProvider] Batch %s NOT cancelled "
+                "(JARVIS_DW_BATCH_CANCEL_ENABLED=false, reason=%s) — the batch "
+                "is still live on DW; its claim stays OPEN for reconciliation",
+                batch_id, reason,
+            )
+            return False
+
+        _aegis_lease = None
+        try:
+            session = await self._get_session()
+            _call_auth = await _aegis_dw_session_auth_header()
+            _aegis_lease = await _aegis_acquire_call_lease(
+                op_id=op_id, route="background", estimated_cost_usd=0.0,
+            )
+            async with session.post(
+                f"{self._base_url}/batches/{batch_id}/cancel",
+                headers=_aegis_merge_lease_headers(_call_auth, _aegis_lease),
+                timeout=self._request_timeout(),
+            ) as resp:
+                if resp.status < 300:
+                    logger.info(
+                        "[DoublewordProvider] Batch %s CANCELLED on DW "
+                        "(reason=%s) — claim released, queue slot returned",
+                        batch_id, reason,
+                    )
+                    _ledger.settle(batch_id, STATE_CANCELLED, reason=reason)
+                    return True
+                body = (await resp.text())[:300]
+                logger.warning(
+                    "[DoublewordProvider] Batch %s cancel REFUSED: %s %s "
+                    "(reason=%s) — claim left OPEN so reconciliation retries it",
+                    batch_id, resp.status, body, reason,
+                )
+                return False
+        except asyncio.CancelledError:
+            # Shutdown mid-cancel. The claim is unsettled and we cannot finish
+            # settling it now — leave it OPEN so the next boot reconciles it,
+            # and let the cancellation propagate.
+            raise
+        except Exception as exc:  # noqa: BLE001 — a failed cancel must never
+            # mask the failure that sent us here.
+            logger.warning(
+                "[DoublewordProvider] Batch %s cancel FAILED (%s: %s) — claim "
+                "left OPEN so reconciliation retries it",
+                batch_id, type(exc).__name__, exc,
+            )
+            return False
+        finally:
+            if _aegis_lease is not None:
+                try:
+                    from backend.core.ouroboros.governance.aegis_provider_bridge import (  # noqa: E501
+                        release_call_lease as _aegis_release_call_lease,
+                    )
+                    await _aegis_release_call_lease(_aegis_lease)
+                except (ImportError, AttributeError):
+                    pass
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[DoublewordProvider] _cancel_batch lease release "
+                        "suppressed", exc_info=True,
+                    )
+
+    async def reconcile_orphan_batches(self) -> Dict[str, int]:
+        """Slice 18 — §2 Progressive Awakening for the batch plane.
+
+        A process that dies (SIGKILL, OOM, power loss, or just an orderly exit
+        that ran out of shutdown budget) leaves behind batches DW is still
+        holding for us. Before this method existed there was no way to even
+        *enumerate* them: ``BatchFutureRegistry`` is two in-memory dicts, so every
+        ``batch_id`` evaporated with the process. The batches themselves did not.
+
+        This is the same pattern as ``WorktreeManager.reap_orphans()``, which
+        sweeps ``unit-*`` worktrees left by a killed session — recover from the
+        crash that actually happens instead of pretending it cannot.
+
+        Outcomes per claim:
+
+          * **ACCOUNT** — the batch COMPLETED while we were gone. The op that
+            wanted it is dead, so the output is not re-fed into any pipeline;
+            what is recovered is the *evidence* (the model provably served a
+            batch — the positive fossil the admission gate reads) and an honest
+            ledger. Re-consuming the paid-for output is a future slice.
+          * **RELEASE** — the batch is still open and nobody is coming for it.
+            Cancel it, return the queue slot, and stop billing.
+          * **DEFER** — DW answered with a transient error; we learned nothing,
+            so the claim stays OPEN and the next sweep retries it.
+
+        Only claims from a *foreign* pid are swept: a claim opened by this process
+        may still have a live poller attached to it, and cancelling a batch we are
+        actively awaiting would be a self-inflicted wound.
+
+        Returns a count dict for telemetry. NEVER raises — a reconciliation fault
+        must not block boot.
+        """
+        stats = {"open_claims": 0, "adopted": 0, "released": 0, "already_done": 0}
+        if not _dw_batch_reconcile_enabled():
+            return stats
+        try:
+            from backend.core.ouroboros.governance.dw_batch_ledger import (
+                STATE_TERMINAL, get_batch_ledger,
+            )
+            ledger = get_batch_ledger()
+            claims = ledger.open_claims(foreign_only=True)
+            stats["open_claims"] = len(claims)
+            if not claims:
+                return stats
+
+            logger.warning(
+                "[DoublewordProvider] BOOT RECONCILE: %d orphaned batch claim(s) "
+                "from dead session(s). These are live jobs on DW's queue that no "
+                "process was coming back for.",
+                len(claims),
+            )
+            for claim in claims:
+                try:
+                    verdict, state = await self._peek_batch_status(claim.batch_id)
+                    if verdict == "error":
+                        # Transient — we learned NOTHING about this batch.
+                        # The claim stays OPEN and the next boot retries it.
+                        # Settling on a blip would remove a possibly-live
+                        # orphan from every future sweep without cancelling
+                        # it: the exact leak this method exists to close.
+                        stats["deferred"] = stats.get("deferred", 0) + 1
+                        continue
+                    if verdict == "gone":
+                        # DW affirmatively does not know this batch (404).
+                        # Nothing to cancel, nothing was served — settle as
+                        # terminal, never as completed (a batch DW never heard
+                        # of is not a paid result, and COMPLETED feeds the
+                        # positive-servability accounting).
+                        ledger.settle(
+                            claim.batch_id, STATE_TERMINAL,
+                            reason="reconcile:gone_404",
+                        )
+                        stats["already_done"] += 1
+                        continue
+                    status = str((state or {}).get("status") or "")
+                    if status == "completed":
+                        # The work finished while we were down. The op that
+                        # wanted it is gone, so the OUTPUT is not re-fed into
+                        # any pipeline — what we recover is the EVIDENCE: the
+                        # model provably served a batch (the fossil the
+                        # admission gate reads) and the claim is honestly
+                        # accounted.
+                        out = str((state or {}).get("output_file_id") or "")
+                        logger.warning(
+                            "[DoublewordProvider] BOOT RECONCILE: batch %s "
+                            "COMPLETED while we were down (model=%s output=%s) "
+                            "— accounting it and crediting the model's batch "
+                            "servability (the originating op is gone; the "
+                            "output is not re-consumed).",
+                            claim.batch_id, claim.model or "?", out or "-",
+                        )
+                        self._record_batch_servability(claim.model, served=True)
+                        self._settle_batch_claim(
+                            claim.batch_id, completed=True,
+                            reason="reconcile:completed_while_down",
+                        )
+                        stats["adopted"] += 1
+                    elif status in ("failed", "expired", "cancelled", "canceled"):
+                        self._settle_batch_claim(
+                            claim.batch_id, completed=False,
+                            reason=f"reconcile:dw_terminal:{status}",
+                        )
+                        stats["already_done"] += 1
+                    else:
+                        # Still open, and its owner is dead. Release it.
+                        if await self._cancel_batch(
+                            claim.batch_id, reason="reconcile:orphan",
+                            op_id=claim.op_id or "dw-reconcile",
+                        ):
+                            stats["released"] += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — one bad claim must not abort
+                    # the sweep.
+                    logger.debug(
+                        "[DoublewordProvider] reconcile of %s swallowed",
+                        claim.batch_id, exc_info=True,
+                    )
+            logger.warning(
+                "[DoublewordProvider] BOOT RECONCILE complete: %s", stats,
+            )
+            return stats
+        except Exception:  # noqa: BLE001 — never block boot
+            logger.debug(
+                "[DoublewordProvider] reconcile_orphan_batches swallowed",
+                exc_info=True,
+            )
+            return stats
+
+    async def _peek_batch_status(
+        self, batch_id: str,
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """One-shot ``GET /batches/{id}`` with no polling, no breaker, no lease
+        accounting. Returns ``(verdict, batch_object)`` where verdict is:
+
+          * ``"ok"``    — DW answered; the batch object follows.
+          * ``"gone"``  — DW affirmatively does not know this batch (404).
+          * ``"error"`` — transient (5xx / 429 / network). We learned NOTHING.
+
+        The three-way split is load-bearing for reconciliation: collapsing
+        404 and a transient 500 into one ``None`` (the first draft) made a
+        network blip during boot settle a still-live orphan as done — removing
+        it from ``open_claims`` forever without cancelling it, which is the
+        precise leak this slice exists to eliminate. Absent evidence is not
+        evidence of absence; only a 404 is. NEVER raises."""
+        try:
+            session = await self._get_session()
+            _call_auth = await _aegis_dw_session_auth_header()
+            async with session.get(
+                f"{self._base_url}/batches/{batch_id}",
+                headers=_call_auth,
+                timeout=self._request_timeout(),
+            ) as resp:
+                if resp.status == 404:
+                    return "gone", None
+                if resp.status >= 300:
+                    return "error", None
+                return "ok", await resp.json()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[DoublewordProvider] _peek_batch_status swallowed", exc_info=True,
+            )
+            return "error", None
+
+    async def _diagnose_stalled_model(self, model_id: str) -> str:
+        """Slice 18 — the DIAGNOSTIC REFLEX. On a stall, ask the plane that can
+        actually answer.
+
+        A stalled batch tells us *that* something is wrong and nothing about
+        *what*. The batch transport is structurally incapable of saying more: DW
+        returns 200 at submit for a model it will never serve, and the resulting
+        error file is empty. Guessing from that silence is how the pre-Slice-18
+        system would have re-picked the same dead model forever.
+
+        So we do not guess. We run the cheapest possible experiment — one
+        ``max_tokens=1`` real-time completion against the same model, ~0.7s — and
+        let reality answer. This *borrows the real-time plane's nerve* to diagnose
+        an injury on a plane that has none.
+
+        Returns one of:
+          * ``"denied"``        — RT said 403. The model is not servable to this
+            account. The batch was never going to run.
+          * ``"model_alive"``   — RT said 2xx. The MODEL is fine; the BATCH LANE
+            is what failed. Blaming the model here would be a lie, and would
+            evict a perfectly good model from the ladder.
+          * ``"inconclusive"``  — timeout / 429 / 5xx / transport error, or the
+            reflex is disabled. Record NOTHING about the model. A transient must
+            never demote (the Slice 17 asymmetry, preserved).
+
+        Mandate 1 (Slice 17) is respected exactly: this does NOT launder an RT
+        observation into a batch conclusion. The stall is recorded as a batch
+        fact because a real batch stalled; the 403 is recorded as an RT fact
+        because a real RT call was refused. Two experiments, two facts.
+
+        Reuses ``probe_rt_entitlement`` — the same bounded prober the boot
+        entitlement sweep uses, with the same deliberately asymmetric recording
+        discipline. NEVER raises.
+        """
+        if not model_id or not _dw_batch_diagnostic_reflex_enabled():
+            return "inconclusive"
+        try:
+            from backend.core.ouroboros.governance.dw_discovery_runner import (
+                probe_rt_entitlement,
+            )
+            session = await self._get_session()
+            # Contract pin: probe_rt_entitlement returns ``(denied, cleared)``
+            # — DENIED FIRST. Slice 18's live verification caught this exact
+            # unpacking reversed, which silently inverted every verdict below:
+            # a 403'd model read as "model_alive" (kept on the ladder to stall
+            # again) and a healthy model read as "denied" (demoted on nothing).
+            # tests/governance/test_dw_batch_sovereignty.py pins the order
+            # against the real function.
+            denied, allowed = await probe_rt_entitlement(
+                session=session,
+                base_url=self._base_url,
+                api_key=self._api_key,
+                model_ids=(model_id,),
+            )
+            if model_id in denied:
+                logger.warning(
+                    "[DoublewordProvider] DIAGNOSTIC REFLEX model=%s → DENIED. "
+                    "The real-time plane refuses this model (403); the batch was "
+                    "never going to run. The batch API accepted it anyway and "
+                    "answered with silence.",
+                    model_id,
+                )
+                return "denied"
+            if model_id in allowed:
+                logger.warning(
+                    "[DoublewordProvider] DIAGNOSTIC REFLEX model=%s → ALIVE on "
+                    "real-time. The model is innocent — the BATCH LANE is what "
+                    "stalled. Not demoting the model; rotating the op to RT.",
+                    model_id,
+                )
+                return "model_alive"
+            logger.info(
+                "[DoublewordProvider] DIAGNOSTIC REFLEX model=%s → inconclusive "
+                "(transient); recording nothing about the model",
+                model_id,
+            )
+            return "inconclusive"
+        except Exception:  # noqa: BLE001 — a diagnosis must never raise into a
+            # path that is already handling a failure.
+            logger.debug(
+                "[DoublewordProvider] diagnostic reflex swallowed", exc_info=True,
+            )
+            return "inconclusive"
 
     async def _await_batch_result(
         self, batch_id: str, *, op_id: str = "dw-batch-await",
@@ -5656,18 +6350,49 @@ class DoublewordProvider:
                         continue
                     data = await resp.json()
                     status = data.get("status", "unknown")
+                    # Slice 18 — the batch plane's only native progress signal.
+                    # Present in EVERY poll response; discarded on every poll
+                    # until now.
+                    _counts = _batch_progress_counts(data)
 
                     if status == "completed":
                         output_file_id = data.get("output_file_id")
                         logger.info(
-                            "[DoublewordProvider] Batch %s completed (output=%s)",
-                            batch_id, output_file_id,
+                            "[DoublewordProvider] Batch %s completed "
+                            "(output=%s counts=%s)",
+                            batch_id, output_file_id, _counts,
+                        )
+                        # Slice 18 — settle the claim and lay down the POSITIVE
+                        # batch fossil. A model that has demonstrably served a
+                        # batch is the only model we can safely admit to the
+                        # batch ladder without a live probe (see
+                        # provider_topology._entitlement_filtered).
+                        self._settle_batch_claim(
+                            batch_id, completed=True, reason="completed",
+                        )
+                        # Credit the model the batch actually RAN ON — the
+                        # ledger claim, not self._model. The instance default
+                        # can differ from the submitted _effective_model
+                        # (topology override), and crediting the wrong model
+                        # both hands a phantom batch_served fossil to the
+                        # baseline AND starves the real server of the proof
+                        # the admission gate needs.
+                        self._record_batch_servability(
+                            self._claim_model(batch_id), served=True,
                         )
                         return output_file_id
                     elif status in ("failed", "expired", "cancelled"):
-                        logger.error(
-                            "[DoublewordProvider] Batch %s terminal: %s",
-                            batch_id, status,
+                        # Slice 18 — a terminal batch is EVIDENCE, not silence.
+                        #
+                        # The pre-Slice-18 code collapsed all three statuses into
+                        # `return None` with one log line: no exception, no
+                        # telemetry, no reason, no learning. "Cancelled because
+                        # the model was never served", "cancelled by an operator",
+                        # "expired past the window", and "failed on a rejected
+                        # parameter" were literally indistinguishable — so the
+                        # ladder re-picked the same dead model on the next op.
+                        await self._handle_terminal_batch(
+                            batch_id, status, data, _counts, op_id=op_id,
                         )
                         return None
                     # Still in_progress — Sovereign Temporal Breaker check
@@ -5687,17 +6412,74 @@ class DoublewordProvider:
                         except Exception:  # noqa: BLE001 — fail-soft: legacy
                             _over_deadline = False
                         if _over_deadline:
+                            # Slice 18 — the breaker now asks a SECOND question.
+                            #
+                            # "Has this taken too long?" (the wall clock) cannot
+                            # distinguish a congested-but-working batch from one
+                            # DW will never schedule. Both looked identical, both
+                            # got the same rotation, and neither taught us
+                            # anything — so a model that could never serve a
+                            # batch kept its place on the ladder.
+                            #
+                            # request_counts answers the question the clock
+                            # cannot: has DW finished even ONE request?
+                            _progressed = _batch_made_progress(_counts)
+                            _stall_on = _dw_batch_stall_detector_enabled()
+                            # The model the batch actually ran on, from the
+                            # durable claim — self._model is the instance
+                            # default and may not be what was submitted.
+                            _model_id = self._claim_model(batch_id)
                             logger.error(
                                 "[DoublewordProvider] Batch %s sovereign "
                                 "temporal breaker tripped: in_progress "
                                 "elapsed=%.1fs > deadline=%.1fs "
-                                "(JARVIS_DW_BATCH_TIMEOUT_S)",
+                                "(JARVIS_DW_BATCH_TIMEOUT_S) counts=%s "
+                                "progressed=%s",
                                 batch_id, _elapsed, _temporal_deadline_s,
+                                _counts, _progressed,
+                            )
+                            # The raise must NEVER wait on the network: this
+                            # breaker exists to BOUND wait time, so gating its
+                            # raise behind a cancel POST (or a diagnostic
+                            # probe) would extend the very deadline it
+                            # enforces. Cleanup and learning are spawned as
+                            # background work; the raise is immediate.
+                            if _stall_on and not _progressed:
+                                # DEAD, not slow. Nothing is queued behind
+                                # anything — DW has not started a single
+                                # request. Release the claim + diagnose WHY,
+                                # off to the side.
+                                self._spawn_batch_task(
+                                    self._on_batch_stalled(
+                                        batch_id, _model_id, _counts,
+                                        elapsed_s=_elapsed, op_id=op_id,
+                                    ),
+                                    name=f"s18-stall-{batch_id[:12]}",
+                                )
+                                raise BatchStalledError(
+                                    elapsed_s=_elapsed,
+                                    deadline_s=_temporal_deadline_s,
+                                    model_id=_model_id,
+                                    batch_id=batch_id,
+                                    counts=_counts,
+                                )
+                            # SLOW (or the detector is off): the batch is doing
+                            # real work, just not fast enough for our budget.
+                            # The model is innocent — rotate the lane, blame
+                            # nobody, and still release the claim rather than
+                            # leak it.
+                            self._spawn_batch_task(
+                                self._cancel_batch(
+                                    batch_id,
+                                    reason="temporal_breaker",
+                                    op_id=op_id,
+                                ),
+                                name=f"s18-cancel-{batch_id[:12]}",
                             )
                             raise SovereignBatchTimeoutError(
                                 elapsed_s=_elapsed,
                                 deadline_s=_temporal_deadline_s,
-                                model_id=getattr(self, "_model", "") or "",
+                                model_id=_model_id,
                             )
                     # Still in_progress — adaptive backoff
             except asyncio.CancelledError:
@@ -5748,7 +6530,362 @@ class DoublewordProvider:
             attempt += 1
 
         logger.error("[DoublewordProvider] Batch %s timed out after %ds", batch_id, _DW_MAX_WAIT_S)
+        # Slice 18 — the legacy backstop also walked away without releasing the
+        # claim. Every exit from this function now settles its obligation.
+        await self._cancel_batch(
+            batch_id, reason="poll_ceiling_exhausted", op_id=op_id,
+        )
         return None
+
+    # ── Slice 18: the batch plane's nervous system ────────────────────
+
+    def _settle_batch_claim(
+        self, batch_id: str, *, completed: bool, reason: str,
+    ) -> None:
+        """Close the ledger claim for *batch_id*. Fail-soft, NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.dw_batch_ledger import (
+                STATE_COMPLETED, STATE_TERMINAL, get_batch_ledger,
+            )
+            get_batch_ledger().settle(
+                batch_id,
+                STATE_COMPLETED if completed else STATE_TERMINAL,
+                reason=reason,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[DoublewordProvider] _settle_batch_claim swallowed",
+                exc_info=True,
+            )
+
+    def _claim_model(self, batch_id: str) -> str:
+        """The model this batch was actually SUBMITTED with, from the durable
+        claim — falling back to the instance default only when no claim exists.
+
+        The claim is the authority: ``self._model`` is the construction-time
+        baseline, and topology resolution routinely submits a different
+        ``_effective_model``. Attributing batch evidence (positive or negative)
+        to the baseline hands a phantom fossil to an innocent model and starves
+        the real one of the proof the admission gate reads. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.dw_batch_ledger import (
+                get_batch_ledger,
+            )
+            claim = get_batch_ledger().get(batch_id)
+            model = getattr(claim, "model", "") or ""
+            return model or (getattr(self, "_model", "") or "")
+        except Exception:  # noqa: BLE001
+            return getattr(self, "_model", "") or ""
+
+    def _spawn_batch_task(self, coro: Any, *, name: str = "s18-batch-bg") -> None:
+        """Run batch cleanup/learning work WITHOUT gating the caller on it.
+
+        The temporal breaker and stall paths raise typed errors whose entire
+        purpose is to bound wait time — awaiting a cancel POST or a diagnostic
+        probe before the raise would extend the very deadline they enforce.
+        Strong references are held in ``self._s18_bg_tasks`` so the tasks
+        survive GC; exceptions are consumed (the coroutines are fail-soft by
+        contract). NEVER raises."""
+        try:
+            tasks = getattr(self, "_s18_bg_tasks", None)
+            if tasks is None:
+                tasks = set()
+                self._s18_bg_tasks = tasks
+            task = asyncio.get_running_loop().create_task(coro, name=name)
+            tasks.add(task)
+            task.add_done_callback(
+                lambda t: (
+                    tasks.discard(t),
+                    None if t.cancelled() else t.exception(),
+                ),
+            )
+        except Exception:  # noqa: BLE001 — fall back to letting the coroutine
+            # die unawaited rather than perturb the raising path.
+            logger.debug(
+                "[DoublewordProvider] _spawn_batch_task swallowed", exc_info=True,
+            )
+            try:
+                coro.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _attribute_stall(self, model_id: str, batch_id: str) -> str:
+        """Shared verdict dispatch for a zero-progress batch: diagnose via the
+        RT reflex, then record honestly. Used by BOTH the stall path and the
+        terminal path so their attribution policy can never drift. Returns the
+        verdict for telemetry. NEVER raises."""
+        verdict = await self._diagnose_stalled_model(model_id)
+        if verdict == "denied":
+            # Two independent facts, each from a real call on its own plane.
+            # NOT the Run-25c laundering Slice 17 outlawed: we did not infer
+            # the batch denial from the RT 403; a real batch really stalled.
+            self._record_batch_servability(model_id, served=False)
+        elif verdict == "model_alive":
+            # The model answers real-time fine. Demoting it here would evict a
+            # healthy model on the strength of a lane fault — exactly the
+            # mis-attribution that starved the ladder in Run-25c. Blame the lane.
+            self._note_batch_lane_degraded(model_id, batch_id)
+        # "inconclusive" → record NOTHING about the model. A transient must
+        # never demote (Slice 17's asymmetry, preserved deliberately).
+        return verdict
+
+    def _record_batch_servability(self, model_id: str, *, served: bool) -> None:
+        """Slice 18 — write the BATCH axis of the entitlement profile.
+
+        Before this, ``TRANSPORT_BATCH`` was a **dead constant**: defined and
+        exported by ``dw_transport_profile``, referenced by nothing. Slice 17
+        built a two-axis ``(model, transport)`` entitlement model and wired only
+        the real-time axis, because real-time is the only plane that produces a
+        403 to learn from. The batch plane could therefore never record a denial
+        — not because we mishandled its errors, but because **it has none to
+        hand us**.
+
+        ``served=True``  → a batch genuinely completed on this model. The
+        strongest possible evidence that the batch plane will serve it, and the
+        fossil that clears a stale denial.
+        ``served=False`` → a batch on this model stalled with zero progress and
+        the diagnostic reflex confirmed the model is denied. A real batch fact,
+        learned on the batch plane, from a real batch.
+
+        Fail-soft, NEVER raises."""
+        try:
+            if not model_id:
+                return
+            from backend.core.ouroboros.governance.dw_transport_profile import (
+                TRANSPORT_BATCH, get_transport_profile,
+            )
+            profile = get_transport_profile()
+            if served:
+                profile.record_batch_success(model_id)
+            else:
+                profile.record_unavailable(
+                    model_id, TRANSPORT_BATCH,
+                    status=0, reason="batch_stall_no_progress",
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[DoublewordProvider] _record_batch_servability swallowed",
+                exc_info=True,
+            )
+
+    async def _on_batch_stalled(
+        self,
+        batch_id: str,
+        model_id: str,
+        counts: Mapping[str, int],
+        *,
+        elapsed_s: float,
+        op_id: str = "dw-batch-stall",
+    ) -> None:
+        """Slice 18 — a batch made ZERO progress past the deadline. Settle it,
+        then diagnose it.
+
+        Order matters: **cancel first, diagnose second.** The claim is released
+        the moment we know we are leaving, so that a slow or failing diagnosis
+        can never turn a stalled batch into a leaked one. The diagnosis is a
+        best-effort enrichment on top of a cleanup that has already happened.
+
+        NEVER raises — this runs on a path that is already failing.
+        """
+        logger.error(
+            "[DoublewordProvider] Batch %s STALLED: model=%s counts=%s "
+            "elapsed=%.1fs — DW has not started a single request. This is not "
+            "slowness; the batch was accepted and never scheduled.",
+            batch_id, model_id or "?", dict(counts), elapsed_s,
+        )
+        await self._cancel_batch(
+            batch_id, reason="stalled_no_progress", op_id=op_id,
+        )
+        verdict = await self._attribute_stall(model_id, batch_id)
+        from backend.core.ouroboros.telemetry import dispatch_profiler as _dp
+        _dp.record_stage(
+            "STAGE_BATCH_STALL",
+            op_id=op_id, model_id=model_id or "(unspecified)",
+            duration_ms=elapsed_s * 1000.0,
+            outcome=f"stalled:{verdict}",
+        )
+
+    def _note_batch_lane_degraded(self, model_id: str, batch_id: str) -> None:
+        """The model is alive on RT but its batch stalled → the LANE is sick, and
+        the MODEL is innocent.
+
+        The load-bearing behavior here is a **refusal to act**: we deliberately do
+        NOT call ``_record_batch_servability(served=False)``. Demoting a model
+        that demonstrably answers real-time, on the strength of a lane fault,
+        is the exact mis-attribution that starved the ladder in Run-25c — a
+        transport failure mis-learned as a model property. The model keeps its
+        slot; the op rotates to RT via the lane-escalation predicate, which the
+        raised ``BatchStalledError`` already triggers.
+
+        Beyond that refusal this is observation only. Persisting lane health to
+        the ``SurfaceHealthLedger`` is a real follow-up, but it is NOT wired here:
+        a call into a surface that does not yet have a batch-lane axis would be
+        inert theater, and this codebase has been bitten by exactly that before.
+        Log + telemetry is the honest floor until that axis exists.
+
+        Fail-soft, NEVER raises."""
+        try:
+            logger.warning(
+                "[DoublewordProvider] BATCH LANE degraded: batch=%s model=%s "
+                "is healthy on real-time but its batch never started. The lane "
+                "is at fault, not the model — the model KEEPS its ladder slot "
+                "and the op rotates to RT.",
+                batch_id, model_id or "?",
+            )
+            from backend.core.ouroboros.telemetry import dispatch_profiler as _dp
+            _dp.record_stage(
+                "STAGE_BATCH_LANE_DEGRADED",
+                op_id=batch_id, model_id=model_id or "(unspecified)",
+                duration_ms=0.0, outcome="model_alive_lane_stalled",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[DoublewordProvider] _note_batch_lane_degraded swallowed",
+                exc_info=True,
+            )
+
+    async def _handle_terminal_batch(
+        self,
+        batch_id: str,
+        status: str,
+        data: Mapping[str, Any],
+        counts: Mapping[str, int],
+        *,
+        op_id: str = "dw-batch-terminal",
+    ) -> None:
+        """Slice 18 — classify a terminal batch instead of discarding it.
+
+        DW settled this batch itself (failed / expired / cancelled). Three very
+        different worlds produce those words, and the old code could not tell
+        them apart because it never read the reason:
+
+          * **failed with an error file** → a request-level rejection (the
+            Slice-168 ``reasoning_effort`` class). The error text is the ONLY
+            place the truth lives, and it is exactly what
+            ``dw_reasoning_profile.maybe_learn_from_error`` was built to consume.
+            That learner is wired on the real-time path (:4107) and was absent
+            here — which is why the per-model effort floor is still a hardcoded
+            string, ``"deepseek-v4-pro:low,gpt-oss:low"``, transcribed by hand
+            out of two DoubleWord support emails. Feeding it here is what turns
+            that constant into something the system LEARNS.
+          * **zero progress** → the batch was never scheduled (the Devstral
+            class). Diagnose the model.
+          * **operator/expiry with progress** → not our fault and not the
+            model's. Record and move on.
+
+        NEVER raises — the caller is already returning a failure.
+
+        The wire-touching forensics (the error-file GET and the RT diagnostic
+        reflex) are gated by ``JARVIS_DW_BATCH_TERMINAL_FORENSICS_ENABLED``
+        (default FALSE, unverified per the graduation policy). With it off,
+        this handler is ledger-settle + log + telemetry only — no network —
+        so the flags-off terminal path stays true to its legacy cost.
+        """
+        _forensics_on = _dw_batch_terminal_forensics_enabled()
+        _progressed = _batch_made_progress(counts)
+        _err_text = (
+            await self._fetch_batch_error_text(data) if _forensics_on else ""
+        )
+        # The claim is the authority on what we actually SENT for this batch —
+        # the model and the reasoning_effort. Reading them back from the ledger
+        # (rather than from self._model, which a later op may already have
+        # rotated) is what keeps the attribution honest under concurrency.
+        _claim = None
+        try:
+            from backend.core.ouroboros.governance.dw_batch_ledger import (
+                get_batch_ledger,
+            )
+            _claim = get_batch_ledger().get(batch_id)
+        except Exception:  # noqa: BLE001
+            _claim = None
+        _model_id = (
+            getattr(_claim, "model", "") or getattr(self, "_model", "") or ""
+        )
+        _effort_sent = getattr(_claim, "reasoning_effort", "") or ""
+
+        logger.error(
+            "[DoublewordProvider] Batch %s TERMINAL status=%s model=%s "
+            "counts=%s progressed=%s error=%s",
+            batch_id, status, _model_id or "?", dict(counts), _progressed,
+            (_err_text or "(empty)")[:400],
+        )
+        self._settle_batch_claim(
+            batch_id, completed=False, reason=f"dw_terminal:{status}",
+        )
+
+        _learned = False
+        if _err_text:
+            # Let the reasoning profile decide whether this error text is a
+            # parameter rejection it can learn a floor from. It is the authority
+            # on that question — we do not pattern-match model names here.
+            try:
+                from backend.core.ouroboros.governance.dw_reasoning_profile import (  # noqa: E501
+                    maybe_learn_from_error as _rp_learn,
+                )
+                _learned = bool(_rp_learn(_model_id, _effort_sent, _err_text))
+                if _learned:
+                    logger.warning(
+                        "[DoublewordProvider] Batch %s terminal error taught the "
+                        "reasoning profile a new floor for model=%s — this is "
+                        "the class that previously required a human at DW to "
+                        "email us and us to hardcode a constant.",
+                        batch_id, _model_id,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[DoublewordProvider] terminal reasoning-learn swallowed",
+                    exc_info=True,
+                )
+
+        if _forensics_on and not _learned and not _progressed:
+            # Terminal with zero progress and no learnable error = the silent
+            # black hole. Ask real-time why — the SAME attribution policy the
+            # stall path uses, via the shared helper, so the two paths can
+            # never drift.
+            await self._attribute_stall(_model_id, batch_id)
+
+        from backend.core.ouroboros.telemetry import dispatch_profiler as _dp
+        _dp.record_stage(
+            "STAGE_BATCH_TERMINAL",
+            op_id=op_id, model_id=_model_id or "(unspecified)",
+            duration_ms=0.0,
+            outcome=f"{status}:progressed={_progressed}",
+        )
+
+    async def _fetch_batch_error_text(self, data: Mapping[str, Any]) -> str:
+        """Pull the batch's error evidence: the inline ``errors`` object if DW
+        set one, else the contents of ``error_file_id``.
+
+        Both were EMPTY for the Devstral batches — which is itself the finding
+        that named this slice: on the batch plane, a denial arrives as silence,
+        so silence has to be treated as evidence in its own right. But a genuine
+        request-level rejection (a bad parameter) DOES populate one of these, and
+        that text is the only thing that can teach the reasoning profile a floor.
+
+        Fail-soft: returns "" on any error. NEVER raises."""
+        try:
+            inline = data.get("errors")
+            if inline:
+                return json.dumps(inline)[:4000]
+            file_id = str(data.get("error_file_id") or "").strip()
+            if not file_id:
+                return ""
+            session = await self._get_session()
+            _call_auth = await _aegis_dw_session_auth_header()
+            async with session.get(
+                f"{self._base_url}/files/{file_id}/content",
+                headers=_call_auth,
+                timeout=self._request_timeout(),
+            ) as resp:
+                if resp.status >= 300:
+                    return ""
+                return (await resp.text())[:4000]
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[DoublewordProvider] _fetch_batch_error_text swallowed",
+                exc_info=True,
+            )
+            return ""
 
     async def _retrieve_result(
         self, output_file_id: str, operation_id: str
@@ -6481,6 +7618,91 @@ class DoublewordProvider:
         )
 
     async def close(self) -> None:
-        """Close the aiohttp session."""
+        """Close the aiohttp session — releasing every claim we still hold first.
+
+        Slice 18. This method used to close a socket and nothing else, which meant
+        an orderly shutdown was indistinguishable from a crash: every in-flight
+        batch stayed live on DW's queue with its poller dead and its id gone.
+
+        Cleanup happens BEFORE the session closes, because cancelling needs the
+        session. Best-effort and bounded: a shutdown that hangs waiting on DW is
+        worse than a leaked batch, so a claim we cannot settle inside the budget
+        is left OPEN in the ledger and handed to boot reconciliation — which is
+        exactly what the ledger's durability is for.
+        """
+        try:
+            await self._release_open_batch_claims(reason="provider_close")
+        except Exception:  # noqa: BLE001 — shutdown must never raise
+            logger.debug(
+                "[DoublewordProvider] close-time claim release swallowed",
+                exc_info=True,
+            )
         if self._session and not self._session.closed:
             await self._session.close()
+        # The ledger's writes coalesce through an off-loop drainer; at close
+        # the loop may die before the drainer runs, so force any pending
+        # snapshot down inline — durability beats latency at the very end.
+        try:
+            from backend.core.ouroboros.governance.dw_batch_ledger import (
+                get_batch_ledger,
+            )
+            get_batch_ledger().flush_sync()
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _release_open_batch_claims(
+        self, *, reason: str, budget_s: Optional[float] = None,
+    ) -> int:
+        """Cancel every batch this process still holds an open claim on.
+
+        Bounded in total by ``JARVIS_DW_BATCH_RELEASE_BUDGET_S`` (default 20s;
+        an explicit ``budget_s`` argument wins): shutdown latency is a hard
+        constraint, and an unreleased claim is recoverable (the ledger survives
+        the process; boot reconciliation picks it up) whereas a wedged shutdown
+        is not.
+
+        Returns the number of claims released. NEVER raises."""
+        if budget_s is None:
+            try:
+                budget_s = float(os.environ.get(
+                    "JARVIS_DW_BATCH_RELEASE_BUDGET_S", "20",
+                ))
+            except (TypeError, ValueError):
+                budget_s = 20.0
+            if budget_s <= 0.0:
+                budget_s = 20.0
+        try:
+            from backend.core.ouroboros.governance.dw_batch_ledger import (
+                get_batch_ledger,
+            )
+            claims = get_batch_ledger().open_claims()
+        except Exception:  # noqa: BLE001
+            return 0
+        if not claims:
+            return 0
+
+        logger.info(
+            "[DoublewordProvider] releasing %d open batch claim(s) at %s",
+            len(claims), reason,
+        )
+        released = 0
+        _t0 = time.monotonic()
+        for claim in claims:
+            if time.monotonic() - _t0 > budget_s:
+                logger.warning(
+                    "[DoublewordProvider] claim-release budget (%.0fs) exhausted "
+                    "with %d claim(s) unsettled — they stay OPEN in the ledger "
+                    "and will be reconciled on next boot",
+                    budget_s, len(claims) - released,
+                )
+                break
+            try:
+                if await self._cancel_batch(
+                    claim.batch_id, reason=reason, op_id=claim.op_id or reason,
+                ):
+                    released += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                continue
+        return released

@@ -2460,9 +2460,14 @@ class GovernedLoopService:
         if self._subagent_scheduler is not None:
             await self._subagent_scheduler.stop()
 
-        # Cancel curriculum and reactor event background tasks
+        # Cancel curriculum and reactor event background tasks.
+        # _batch_reconcile_task (Slice 18) rides this list: an in-flight boot
+        # reconcile makes network calls (GET /batches, POST /cancel on remote
+        # jobs) and must not outlive the service — an interrupted sweep is
+        # safe because deferred claims stay OPEN and the next boot retries.
         for task_attr in ("_curriculum_task", "_reactor_event_task", "_oracle_indexer_task",
-                         "_feedback_loop_task", "_command_consumer_task"):
+                         "_feedback_loop_task", "_command_consumer_task",
+                         "_batch_reconcile_task"):
             task: Optional[asyncio.Task] = getattr(self, task_attr, None)
             if task and not task.done():
                 task.cancel()
@@ -4719,6 +4724,46 @@ class GovernedLoopService:
                     "[GovernedLoop] DoublewordProvider: configured (model=%s, mode=%s)",
                     tier0._model, _mode,
                 )
+
+                # ============================================================
+                # Slice 18 — orphaned-batch reconciliation (§2 Progressive
+                # Awakening for the batch plane)
+                # ============================================================
+                # A session that died — SIGKILL, OOM, power loss, or an orderly
+                # exit that ran out of shutdown budget — leaves batches DW is
+                # still holding for us. Before Slice 18 they were not merely
+                # un-cleaned; they were *unknowable*: BatchFutureRegistry is two
+                # in-memory dicts, so every batch_id evaporated with the process
+                # while the batch itself kept its slot on DW's queue. The only
+                # entity that ever cleaned one up was a human at DoubleWord, who
+                # on 2026-07-14 cancelled two of ours by hand and emailed us.
+                #
+                # The durable claim ledger makes them knowable; this sweep makes
+                # them settled. Each orphan is either ADOPTED (a batch that
+                # completed while we were down is a free result — we already paid
+                # for it) or RELEASED (cancelled, returning the queue slot).
+                #
+                # Fire-and-forget: reconciliation talks to the network and must
+                # never sit in the boot path. Same discipline as the eager
+                # discovery arm below.
+                try:
+                    self._batch_reconcile_task = asyncio.create_task(
+                        tier0.reconcile_orphan_batches(),
+                        name="dw-batch-reconcile",
+                    )
+                    # Consume the result so a failed sweep never surfaces as an
+                    # "exception was never retrieved" warning. The method is
+                    # already fail-soft internally; this is belt-and-braces.
+                    self._batch_reconcile_task.add_done_callback(
+                        lambda t: (
+                            None if t.cancelled() else t.exception()
+                        ),
+                    )
+                except Exception as _rec_exc:  # noqa: BLE001 — never block boot
+                    logger.debug(
+                        "[GovernedLoop] batch reconciliation not armed: %s",
+                        _rec_exc,
+                    )
 
                 # ============================================================
                 # Phase 12.2 Slice F — Autonomic Pacemaker

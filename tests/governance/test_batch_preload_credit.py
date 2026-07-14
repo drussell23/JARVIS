@@ -90,7 +90,12 @@ async def test_submit_batch_populates_prompt_preloaded_files(tmp_path, monkeypat
     async def _fake_upload_file(jsonl_content, *, op_id="dw-batch-upload"):
         return "file-abc123"
 
-    async def _fake_create_batch(input_file_id, *, op_id="dw-batch-create", _s181_attempt=0):
+    # Slice 18 threads model/route/reasoning_effort into _create_batch so the
+    # durable claim records WHAT WE SENT at the instant the obligation is
+    # incurred. Accept **kwargs rather than re-listing them: a fake that pins the
+    # collaborator's exact signature breaks on every additive change, and one
+    # that silently diverges from the real contract is worse than no fake at all.
+    async def _fake_create_batch(input_file_id, *, op_id="dw-batch-create", **kwargs):
         return "batch-abc123"
 
     monkeypatch.setattr(provider, "_upload_file", _fake_upload_file)

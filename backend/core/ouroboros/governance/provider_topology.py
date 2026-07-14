@@ -743,10 +743,44 @@ def _entitlement_filtered(route: str, result: Tuple[str, ...]) -> Tuple[str, ...
         )
 
         profile = get_transport_profile()
-        allowed = tuple(
-            m for m in result
-            if not profile.is_unavailable(m, TRANSPORT_REALTIME)
+        # Slice 18 — the filter is TRANSPORT-AWARE on batch-first routes.
+        #
+        # Dropping every RT-denied model from every ladder re-created the very
+        # starvation Slice 17 diagnosed, one layer up: BACKGROUND/SPECULATIVE
+        # dispatch over the BATCH transport, where an RT 403 says nothing —
+        # the Run-25c model (``…-dottxt``: 403 on RT, serves batch fine) is
+        # exactly an account holding batch entitlement while a routing rule
+        # forbids RT. Filtering it out here meant the batch admission gate's
+        # "rt_denied_but_batch_proven → ADMIT" branch could never even see it.
+        #
+        # Survival is EVIDENCE-GATED, not automatic: on a batch-first route an
+        # RT-denied model keeps its slot only if a real batch has completed on
+        # it (``has_served_batch`` — the positive fossil). The batch API cannot
+        # refuse a request, so on that plane only proof-of-service carries
+        # information; an RT-denied model with no batch proof stays excluded
+        # (submitting it buys a silent one-hour black hole, the Devstral
+        # class). All-denied ladders still EMPTY — that law is untouched.
+        _batch_first = (route or "").strip().lower() in (
+            "background", "speculative",
         )
+
+        def _ladder_permits(m: str) -> bool:
+            if not profile.is_unavailable(m, TRANSPORT_REALTIME):
+                return True
+            return _batch_first and profile.has_served_batch(m)
+
+        allowed = tuple(m for m in result if _ladder_permits(m))
+        _survivors = [
+            m for m in allowed
+            if profile.is_unavailable(m, TRANSPORT_REALTIME)
+        ]
+        if _survivors:
+            logger.info(
+                "[ProviderTopology] route=%s kept %d RT-denied model(s) on the "
+                "batch-first ladder on the strength of PROVEN batch service: "
+                "%s (Slice 18 — an RT 403 does not speak for the batch plane)",
+                route, len(_survivors), _survivors,
+            )
         if not allowed:
             logger.warning(
                 "[ProviderTopology] route=%s EVERY model is RT-entitlement "

@@ -57,20 +57,36 @@ class BatchFutureRegistry:
 
         Called by the webhook handler on ``batch.completed``.
         Returns ``True`` if a future was resolved.
+
+        Slice 18 — this is also where the durable claim settles and the model
+        earns its positive batch-servability fossil. Settlement lives HERE, at
+        the single point every webhook termination flows through, because the
+        first draft bolted it onto individual event branches in the webhook
+        handler and the completed path fell through the crack: on a
+        webhook-ingress host the webhook wins the race in
+        ``_await_batch_result``, the poll task (which carries the poll-side
+        settle) is cancelled, and every completed batch left an OPEN claim —
+        which provider close() would then dutifully "cancel", mislabelling a
+        paid result as cancelled and withholding from the admission gate the
+        exact proof-of-service it was built to consume.
         """
         future = self._futures.pop(batch_id, None)
         self._created_at.pop(batch_id, None)
         if future is not None and not future.done():
             future.set_result(output_file_id)
             logger.info("[BatchFutureRegistry] Resolved %s", batch_id)
+            self._settle_claim(batch_id, completed=True, reason="webhook:completed")
             return True
         return False
 
     def reject(self, batch_id: str, reason: str) -> bool:
         """Reject a pending future with an error.
 
-        Called by the webhook handler on ``batch.failed``.
-        Returns ``True`` if a future was rejected.
+        Called by the webhook handler on ``batch.failed`` / ``batch.cancelled``
+        / ``batch.expired``. Returns ``True`` if a future was rejected.
+
+        Slice 18 — settles the durable claim (terminal, not completed). See
+        ``resolve`` for why settlement is owned here and not per-event-branch.
         """
         future = self._futures.pop(batch_id, None)
         self._created_at.pop(batch_id, None)
@@ -78,8 +94,38 @@ class BatchFutureRegistry:
             from backend.core.ouroboros.governance.doubleword_provider import DoublewordInfraError
             future.set_exception(DoublewordInfraError(f"batch_failed: {reason}"))
             logger.warning("[BatchFutureRegistry] Rejected %s: %s", batch_id, reason)
+            self._settle_claim(
+                batch_id, completed=False, reason=f"webhook:{reason}"[:200],
+            )
             return True
         return False
+
+    @staticmethod
+    def _settle_claim(batch_id: str, *, completed: bool, reason: str) -> None:
+        """Discharge the durable ledger obligation for *batch_id* and, on a
+        completion, lay down the model's positive batch-servability fossil.
+        Fail-soft: the in-memory future result must stand even if the durable
+        layer hiccups. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.dw_batch_ledger import (
+                STATE_COMPLETED, STATE_TERMINAL, get_batch_ledger,
+            )
+            ledger = get_batch_ledger()
+            claim = ledger.get(batch_id)
+            ledger.settle(
+                batch_id,
+                STATE_COMPLETED if completed else STATE_TERMINAL,
+                reason=reason,
+            )
+            if completed and claim is not None and claim.model:
+                from backend.core.ouroboros.governance.dw_transport_profile import (  # noqa: E501
+                    get_transport_profile,
+                )
+                get_transport_profile().record_batch_success(claim.model)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[BatchFutureRegistry] claim settle swallowed", exc_info=True,
+            )
 
     async def wait(self, batch_id: str, timeout: float) -> str:
         """Await the future for *batch_id* with a timeout.

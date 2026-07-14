@@ -1380,6 +1380,31 @@ class EventChannelServer:
             reason = data.get("error", {}).get("message", "unknown")
             self._batch_registry.reject(batch_id, reason)
             logger.warning("[EventChannel] DW batch.failed %s: %s", batch_id, reason)
+        elif event_type in ("batch.cancelled", "batch.canceled", "batch.expired"):
+            # Slice 18 — these are TERMINAL and they were falling through to the
+            # debug-log `else` below, which neither resolved nor rejected the
+            # registered Future. The awaiting op then sat on a future that would
+            # never be completed, until BatchFutureRegistry's 1h TTL cancelled it
+            # — and that TTL is only swept lazily on the next register(), so on a
+            # quiet loop it could be much longer than an hour.
+            #
+            # A terminal batch is exactly the case the webhook exists to make
+            # instant. DW told us the truth and we logged it at DEBUG and hung.
+            reason = (
+                (data.get("error") or {}).get("message")
+                or event_type.rsplit(".", 1)[-1]
+            )
+            # BatchFutureRegistry.reject owns settling the durable ledger claim
+            # (single settlement owner for every webhook termination — see the
+            # registry's docstrings for the crack the per-branch draft fell
+            # through on batch.completed).
+            rejected = self._batch_registry.reject(
+                batch_id, f"{event_type}: {reason}",
+            )
+            logger.warning(
+                "[EventChannel] DW %s %s: %s (future_rejected=%s)",
+                event_type, batch_id, reason, rejected,
+            )
         else:
             logger.debug("[EventChannel] DW webhook unknown type: %s", event_type)
 
