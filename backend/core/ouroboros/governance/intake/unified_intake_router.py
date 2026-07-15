@@ -2138,6 +2138,21 @@ class UnifiedIntakeRouter:
         except Exception:  # noqa: BLE001
             pass
 
+        # P0.5 — substance telemetry. Classify this dispatched signal from the
+        # evidence the perception layers stamped (value_band / work_order /
+        # deep_analysis_category / reputation_boost) into the running substance
+        # ratio, so "everything is annotation-grade" (Run #25) becomes a
+        # measurable KPI. Authority-free, gated, fail-soft — never perturbs
+        # dispatch.
+        try:
+            from backend.core.ouroboros.governance.substance_ledger import (
+                record_dispatch as _record_substance,
+            )
+
+            _record_substance(getattr(envelope, "evidence", None))
+        except Exception:  # noqa: BLE001 — telemetry never blocks dispatch
+            pass
+
         # --- Route to RuntimeTaskOrchestrator for runtime tasks ---
         if self._runtime_orchestrator is not None and self._is_runtime_task(envelope):
             try:

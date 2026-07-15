@@ -578,6 +578,22 @@ class SessionRecorder:
         if self._ops_digest_saw_apply and self._ops_digest:
             summary["ops_digest"] = dict(self._ops_digest)
 
+        # P0.5 — substance telemetry: the fraction of dispatched signals that
+        # were substantive (real code / defects / operator intent) vs
+        # annotation-grade. Emitted only when at least one signal was
+        # classified, so empty sessions add no key. Authority-free; fail-soft.
+        try:
+            from backend.core.ouroboros.governance.substance_ledger import (
+                substance_snapshot,
+                telemetry_enabled,
+            )
+            if telemetry_enabled():
+                _sub = substance_snapshot()
+                if _sub.get("total", 0) > 0:
+                    summary["substance"] = _sub
+        except Exception:  # noqa: BLE001 — telemetry never breaks the summary
+            pass
+
         # Per-Phase Cost Drill-Down arc (Slice 3) — emit ``cost_by_phase``
         # (session rollup) + ``cost_by_op_phase`` (per-op per-phase) only
         # when the finalize observer received at least one op. Additive
