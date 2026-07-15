@@ -144,21 +144,33 @@ def test_stimulus_revert_refuses_foreign_file(tmp_path):
 
 
 def test_stimulus_probe_is_deterministically_red(tmp_path):
-    """The probe body must fail by contract: resolve_yield_every_n is
-    clamped >= 1 so the == -1 assertion can never pass."""
+    """The probe body must fail by contract: the sentence_transformer
+    estimate is a positive MB count so the == -1 assertion can never pass."""
     inj = _load_injector()
-    assert "resolve_yield_every_n() == -1" in inj.PROBE_BODY
-    from backend.core.ouroboros.governance.event_loop_governance import (
-        resolve_yield_every_n,
-    )
-    assert resolve_yield_every_n() >= 1
+    assert 'COMPONENT_MEMORY_ESTIMATES.get("sentence_transformer") == -1' in inj.PROBE_BODY
+    from backend.core.proactive_resource_guard import COMPONENT_MEMORY_ESTIMATES
+    assert COMPONENT_MEMORY_ESTIMATES.get("sentence_transformer", 0) > 0
 
 
 def test_stimulus_probe_imports_real_source_module():
     """Slice 6 attribution contract: the probe imports a real source module
     (direct_import resolution) so the signal carries a source locus."""
     inj = _load_injector()
-    assert (
-        "from backend.core.ouroboros.governance.event_loop_governance import"
-        in inj.PROBE_BODY
-    )
+    assert "from backend.core.proactive_resource_guard import" in inj.PROBE_BODY
+
+
+def test_stimulus_probe_target_outside_the_cage():
+    """Learned live (bt-2026-07-15-223446): an attribution target inside the
+    risk engine's self-mod sentinels is BLOCKED pre-GENERATE
+    (self_modification_unsanctioned_source) — the probe's imported module
+    must sit outside 'ouroboros/governance/' and the kernel/security
+    surfaces or the dispatch proof never fires."""
+    inj = _load_injector()
+    body_import_lines = [
+        ln for ln in inj.PROBE_BODY.splitlines()
+        if ln.startswith(("from ", "import "))
+    ]
+    assert body_import_lines, "probe must import a real source module"
+    for ln in body_import_lines:
+        assert "ouroboros.governance" not in ln
+        assert "auth" not in ln

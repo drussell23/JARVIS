@@ -54,16 +54,22 @@ PROBE_BODY = f'''"""{MARKER}.
 Deliberately-failing test: proves the TestFailure→IMMEDIATE→Claude routing
 chain live. Imports a REAL source module so Slice 6 attribution resolves
 via direct_import. The assertion is impossible by contract
-(resolve_yield_every_n() is clamped >= 1), so the red is deterministic.
+(the sentence_transformer estimate is a positive MB count), so the red is
+deterministic.
+
+Target-choice constraint (learned live, bt-2026-07-15-223446): the imported
+module must sit OUTSIDE the risk engine's self-mod sentinels (anything
+matching "ouroboros/governance/", kernel or security surfaces) — an
+attribution that lands inside the cage is BLOCKED pre-GENERATE with
+reason self_modification_unsanctioned_source (the immune system working
+as designed), which kills the dispatch proof.
 """
-from backend.core.ouroboros.governance.event_loop_governance import (
-    resolve_yield_every_n,
-)
+from backend.core.proactive_resource_guard import COMPONENT_MEMORY_ESTIMATES
 
 
 def test_rt_stimulus_probe_deliberate_failure():
     # {MARKER}
-    assert resolve_yield_every_n() == -1, (
+    assert COMPONENT_MEMORY_ESTIMATES.get("sentence_transformer") == -1, (
         "RT stimulus probe: deliberate failure to exercise the "
         "TestFailure -> IMMEDIATE -> Claude dispatch chain"
     )
