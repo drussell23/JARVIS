@@ -499,16 +499,65 @@ def _get_pool() -> ProcessPoolExecutor:
     with _pool_lock:
         if _pool is None:
             ctx = _mp.get_context("spawn")
+            # Slice 27 — bulletproof worker lifecycle (same discipline as
+            # the cooperative_fs_io pool, Slices 22/23): (a) each worker
+            # self-arms the worker_lifeline ppid-drift sentinel so an
+            # orphaned worker exits on its own even after SIGKILL of the
+            # parent; (b) the pool registers a hard-reap with the
+            # child_reaper cascade so LoopDeadman/graceful-shutdown
+            # teardown covers these children too. Both fail-soft — a
+            # missing module never blocks pool creation.
+            _initializer = None
+            _initargs: tuple = ()
+            try:
+                from backend.core.ouroboros.governance.worker_lifeline import (
+                    pool_worker_initializer,
+                )
+                _initializer = pool_worker_initializer
+                _initargs = ("ast_helper_pool", os.getpid())
+            except Exception:  # noqa: BLE001 — lifeline optional
+                pass
             _pool = ProcessPoolExecutor(
                 max_workers=_resolve_pool_max_workers(),
                 mp_context=ctx,
+                initializer=_initializer,
+                initargs=_initargs,
             )
+            try:
+                from backend.core.ouroboros.governance.child_reaper import (
+                    register_cleanup,
+                )
+                register_cleanup(reap_ast_pool_hard, label="ast_helper_pool")
+            except Exception:  # noqa: BLE001 — reaper optional
+                pass
             logger.info(
                 "[AstCompileHelper] process pool initialised "
                 "max_workers=%d ctx=spawn",
                 _resolve_pool_max_workers(),
             )
     return _pool
+
+
+def reap_ast_pool_hard() -> None:
+    """Signal-safe hard reap for the child_reaper cascade (Slice 27).
+
+    Snapshots current worker PIDs, runs the existing three-layer
+    ``shutdown_pool`` with a short deadline (the cascade's own grace
+    window bounds total teardown time), then SIGKILLs any survivor.
+    NEVER raises — runs from LoopDeadman pre-``os._exit`` context.
+    """
+    try:
+        pool = _pool
+        procs = list((getattr(pool, "_processes", None) or {}).values()) if pool else []
+        shutdown_pool(deadline_s=0.5)
+        for p in procs:
+            if _proc_alive(p):
+                try:
+                    p.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001 — never raise in the cascade
+        pass
 
 
 def _proc_alive(p: Any) -> bool:

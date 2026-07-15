@@ -451,13 +451,17 @@ def test_source_imports_cartographer_lazily() -> None:
 
 
 def test_source_short_circuit_branch_in_scan_once() -> None:
-    """The merkle short-circuit branch must fire BEFORE the
-    `loop.run_in_executor(self._scan_files_sync, ...)` call so the AST
-    sweep is genuinely skipped."""
+    """The merkle short-circuit branch must fire BEFORE the offloaded
+    filesystem walk so the sweep is genuinely skipped.
+
+    (Updated Slice 27: the original pin anchored on the pre-rewrite
+    ``loop.run_in_executor(self._scan_files_sync, ...)`` call; the modern
+    scan_once walks via ``offload_blocking(_iter_python_files_pruned)``
+    — same intent, current anchor.)"""
     import inspect
     src = inspect.getsource(OpportunityMinerSensor.scan_once)
     sc_idx = src.index("_merkle_should_short_circuit")
-    walk_idx = src.index("run_in_executor")
+    walk_idx = src.index("offload_blocking")
     assert sc_idx < walk_idx
 
 
