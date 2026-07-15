@@ -157,6 +157,10 @@ EVENT_TYPE_CANCELLATION_OVERRUN_DETECTED = "cancellation_overrun_detected"
 EVENT_TYPE_PROVIDER_FAILURE_CLASSIFIED = "provider_failure_classified"
 EVENT_TYPE_CIRCUIT_BREAKER_STATE_CHANGE = "circuit_breaker_state_change"
 EVENT_TYPE_CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"
+# Infra MTTR: the failover VM could not resolve its golden image and degraded
+# to a cold boot (or failed). On Spot instances this defeats agile failover, so
+# it MUST be loud, not silent — surfaced to the operator via this SSE frame.
+EVENT_TYPE_GOLDEN_IMAGE_DEGRADED = "golden_image_degraded"
 
 # Slice 249 (Async Observability + Live Steering) — three op-lifecycle events the
 # Sovereign Host streams to keep total situational awareness over autonomous
@@ -1433,6 +1437,7 @@ schema_version. Reason carries the disposition (strip / drop / fail_closed:*)
 but NEVER the offending content. Authority-free anti-jailbreak telemetry."""
 
 _VALID_EVENT_TYPES = frozenset({
+    EVENT_TYPE_GOLDEN_IMAGE_DEGRADED,
     EVENT_TYPE_COGNITIVE_WHY_SNAPSHOT,
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_EVALUATOR_TRACE_FRAME,
@@ -2838,6 +2843,34 @@ def publish_git_index_anomaly(
         logger.debug(
             "[Stream] publish_git_index_anomaly exception",
             exc_info=True,
+        )
+        return None
+
+
+def publish_golden_image_degraded(
+    detail: Mapping[str, Any],
+) -> Optional[str]:
+    """Best-effort publisher for ``golden_image_degraded`` SSE frames — a
+    DEGRADED-MTTR alarm. The failover VM manager invokes this when it cannot
+    resolve its golden image and must cold-boot (or fail): on transient Spot
+    instances that turns ~30-60s agile failover into a ~10-15min cold boot, so
+    it is surfaced loudly to any operator consumer (IDE / Discord / Karen).
+
+    ``detail`` carries family / project / reason / fallback_mode. Keyed by the
+    constant ``"gcp_failover"`` (organism property, no op_id) so
+    ``?op_id=gcp_failover`` filters cleanly. Returns the event_id, or None when
+    the stream is disabled / broker missing / payload invalid. NEVER raises."""
+    if not stream_enabled():
+        return None
+    try:
+        if not isinstance(detail, Mapping):
+            return None
+        return get_default_broker().publish(
+            EVENT_TYPE_GOLDEN_IMAGE_DEGRADED, "gcp_failover", dict(detail),
+        )
+    except Exception:  # noqa: BLE001 — best-effort telemetry
+        logger.debug(
+            "[Stream] publish_golden_image_degraded exception", exc_info=True,
         )
         return None
 

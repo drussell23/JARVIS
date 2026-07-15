@@ -519,6 +519,35 @@ class VMInstance:
         self.component_usage_count += 1
 
 
+def _default_golden_image_family() -> str:
+    """Resolve the failover golden-image family, ROOT-CAUSE style: inherit it
+    from the configuration layer, never an inline literal (the drift that made
+    the config point at a non-existent ``jarvis-prime-golden``).
+
+    Resolution order:
+      1. ``JARVIS_GCP_GOLDEN_IMAGE_FAMILY`` from the environment — the harness
+         already loads ``.env`` into ``os.environ`` (``process_detector`` via
+         ``dotenv.load_dotenv``), so ``os.getenv`` IS the established loader;
+         no secondary parser is introduced.
+      2. The centralized constant ``gcp_compute_rest._DEFAULT_BRAIN_IMAGE_FAMILY``
+         — the single source of truth the REST compute layer + the bake script
+         already share. Lazily imported to avoid a module-load cycle.
+      3. An import-failure floor equal to that canonical value — reached only if
+         the constants module cannot be imported at all (a structural fault),
+         never used as a routine default.
+    """
+    env = os.getenv("JARVIS_GCP_GOLDEN_IMAGE_FAMILY", "").strip()
+    if env:
+        return env
+    try:
+        from backend.core.ouroboros.governance.gcp_compute_rest import (
+            _DEFAULT_BRAIN_IMAGE_FAMILY,
+        )
+        return _DEFAULT_BRAIN_IMAGE_FAMILY
+    except Exception:  # noqa: BLE001 — constants module unavailable (structural)
+        return "jarvis-brain-golden"  # floor == canonical constant, not a default
+
+
 @dataclass
 class VMManagerConfig:
     """
@@ -676,7 +705,8 @@ class VMManagerConfig:
         default_factory=lambda: os.getenv("JARVIS_GCP_USE_GOLDEN_IMAGE", "false").lower() == "true"
     )
     
-    # Custom image name (if not set, auto-detects latest jarvis-prime-golden-* image)
+    # Custom image name (if not set, auto-detects latest image in the
+    # configured golden_image_family, e.g. jarvis-brain-golden-*)
     golden_image_name: Optional[str] = field(
         default_factory=lambda: os.getenv("JARVIS_GCP_GOLDEN_IMAGE_NAME", None)
     )
@@ -686,10 +716,10 @@ class VMManagerConfig:
         default_factory=lambda: os.getenv("JARVIS_GCP_GOLDEN_IMAGE_PROJECT", None)
     )
     
-    # Golden image family for auto-detection of latest version
-    golden_image_family: str = field(
-        default_factory=lambda: os.getenv("JARVIS_GCP_GOLDEN_IMAGE_FAMILY", "jarvis-prime-golden")
-    )
+    # Golden image family for auto-detection of latest version. Resolved
+    # dynamically (env → centralized constant); NO inline literal default —
+    # the inline default was the config-drift root cause.
+    golden_image_family: str = field(default_factory=_default_golden_image_family)
     
     # Maximum age of golden image before rebuild is recommended (days)
     golden_image_max_age_days: int = field(
@@ -1242,7 +1272,7 @@ class GoldenImageInfo:
         return cls(
             name=image.name,
             project=project,
-            family=labels.get("family", image.family or "jarvis-prime-golden"),
+            family=labels.get("family", image.family or _default_golden_image_family()),
             creation_time=creation_time,
             model_name=labels.get("model-name", "unknown"),
             model_version=labels.get("model-version", "unknown"),
@@ -1524,8 +1554,10 @@ class GoldenImageBuilder:
                 if not include_deprecated and image.deprecated:
                     continue
                 
-                # Only include images that match our naming convention
-                if image.name.startswith("jarvis-prime-golden"):
+                # Only include images that match our naming convention. Tracks
+                # the CONFIGURED family (not a fixed literal) so a family change
+                # can never silently exclude every real image.
+                if image.name.startswith(self.config.golden_image_family):
                     images.append(GoldenImageInfo.from_gcp_image(image, project))
             
             # Sort by creation time (newest first)
@@ -2291,7 +2323,10 @@ wait
         zone = self.config.zone
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         builder_vm_name = f"jarvis-golden-builder-{timestamp}"
-        image_name = f"jarvis-prime-golden-{timestamp}"
+        # Bake into the SAME family the boot path reads (config-inherited) so the
+        # create and consume paths can never drift to different family names —
+        # the exact bug this repair closes.
+        image_name = f"{self.config.golden_image_family}-{timestamp}"
         
         self._current_build_vm = builder_vm_name
         
@@ -6081,24 +6116,62 @@ class GCPVMManager:
                         golden_image_disk_size_gb = 100
                         logger.warning(f"⚠️ [GCP] Could not query image size: {e}. Defaulting to {golden_image_disk_size_gb}GB")
                 elif self.config.golden_image_family:
-                    # Use image family (GCP auto-selects latest)
+                    # Use image family (GCP auto-selects latest). VERIFY the
+                    # family actually resolves to a live image BEFORE committing
+                    # to golden mode — an unresolvable family (the config-drift
+                    # class) would otherwise leave use_golden_image_mode=True
+                    # pointing at a phantom source, silently degrading MTTR to a
+                    # cold boot (or failing at VM-create). On transient Spot
+                    # nodes that defeats the entire point of agile failover.
                     golden_project = self.config.golden_image_project or self.config.project_id
-                    golden_image_source = f"projects/{golden_project}/global/images/family/{self.config.golden_image_family}"
-                    use_golden_image_mode = True
-                    # Query the latest image from family to get its disk size
-                    try:
-                        if hasattr(self, '_images_client') and self._images_client:
-                            img_info = self._images_client.get_from_family(project=golden_project, family=self.config.golden_image_family)
-                            golden_image_disk_size_gb = int(img_info.disk_size_gb) if img_info.disk_size_gb else 100
-                            logger.info(f"🌟 [GCP] Using golden image family: {self.config.golden_image_family} (latest: {img_info.name}, {golden_image_disk_size_gb}GB)")
-                        else:
-                            # Default to 100GB for golden images (safe minimum)
-                            golden_image_disk_size_gb = 100
-                            logger.info(f"🌟 [GCP] Using golden image family: {self.config.golden_image_family} (defaulting to {golden_image_disk_size_gb}GB)")
-                    except Exception as e:
-                        # Default to 100GB for golden images (safe minimum)
+                    _family = self.config.golden_image_family
+                    _img_info = None
+                    _family_err: Optional[str] = None
+                    if hasattr(self, '_images_client') and self._images_client:
+                        try:
+                            _img_info = self._images_client.get_from_family(
+                                project=golden_project, family=_family,
+                            )
+                        except Exception as e:  # noqa: BLE001 — unresolvable family
+                            _img_info = None
+                            _family_err = f"{type(e).__name__}: {e}"
+                    else:
+                        # No images client → cannot verify (offline / unit path).
+                        # Proceed optimistically; VM-create validates the source.
+                        _family_err = "images_client_unavailable"
+
+                    if _img_info is not None:
+                        use_golden_image_mode = True
+                        golden_image_source = f"projects/{golden_project}/global/images/family/{_family}"
+                        golden_image_disk_size_gb = int(_img_info.disk_size_gb) if _img_info.disk_size_gb else 100
+                        logger.info(f"🌟 [GCP] Using golden image family: {_family} (latest: {_img_info.name}, {golden_image_disk_size_gb}GB)")
+                    elif _family_err == "images_client_unavailable":
+                        # Unverifiable, not proven-absent → keep prior optimistic
+                        # behavior (source set, default disk) rather than force a
+                        # cold boot on an offline/unit path.
+                        use_golden_image_mode = True
+                        golden_image_source = f"projects/{golden_project}/global/images/family/{_family}"
                         golden_image_disk_size_gb = 100
-                        logger.warning(f"⚠️ [GCP] Could not query family image size: {e}. Defaulting to {golden_image_disk_size_gb}GB")
+                        logger.info(f"🌟 [GCP] Using golden image family: {_family} (unverified — no images client; {golden_image_disk_size_gb}GB)")
+                    else:
+                        # PROVEN unresolvable → DEGRADED MTTR. Loud + on the bus,
+                        # never silent. Do NOT commit golden mode.
+                        use_golden_image_mode = False
+                        golden_image_source = None
+                        self._emit_golden_image_degraded(
+                            family=_family,
+                            project=golden_project,
+                            reason=f"family_unresolved:{_family_err}",
+                            fallback_enabled=self.config.golden_image_fallback,
+                        )
+                        if not self.config.golden_image_fallback:
+                            raise RuntimeError(
+                                f"golden image family '{_family}' is unresolvable in "
+                                f"project '{golden_project}' and "
+                                f"JARVIS_GCP_GOLDEN_IMAGE_FALLBACK is off — refusing "
+                                f"to boot a failover node without its golden image "
+                                f"(fix JARVIS_GCP_GOLDEN_IMAGE_FAMILY)."
+                            )
         
         # Log deployment mode decision
         if use_golden_image_mode:
@@ -6417,6 +6490,45 @@ class GCPVMManager:
         
         # Convert to YAML
         return yaml.dump(manifest, default_flow_style=False)
+
+    def _emit_golden_image_degraded(
+        self,
+        *,
+        family: str,
+        project: str,
+        reason: str,
+        fallback_enabled: bool,
+    ) -> None:
+        """DEGRADED-MTTR alarm — the failover node could not resolve its golden
+        image and is cold-booting (or, with fallback off, refusing to boot).
+        LOUD (CRITICAL log) AND on the observability event bus, never silent: on
+        transient Spot instances an unresolvable family turns ~30-60s agile
+        failover into a ~10-15min cold boot. Best-effort; NEVER raises into the
+        VM-create path."""
+        mode = "cold_boot_fallback" if fallback_enabled else "hard_fail"
+        logger.critical(
+            "🚨 [GCP][MTTR-DEGRADED] golden image family '%s' UNRESOLVABLE in "
+            "project '%s' (%s) — failover degraded to %s. Fix "
+            "JARVIS_GCP_GOLDEN_IMAGE_FAMILY (list real families: `gcloud compute "
+            "images list --no-standard-images`).",
+            family, project, reason, mode,
+        )
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                publish_golden_image_degraded,
+            )
+            publish_golden_image_degraded({
+                "family": str(family),
+                "project": str(project),
+                "reason": str(reason),
+                "fallback_mode": mode,
+                "mttr_impact": "cold_boot" if fallback_enabled else "failover_blocked",
+                "schema_version": "1.0",
+            })
+        except Exception:  # noqa: BLE001 — telemetry never blocks failover
+            logger.debug(
+                "[GCP] golden_image_degraded SSE emit skipped", exc_info=True,
+            )
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # GOLDEN IMAGE COST INTELLIGENCE
