@@ -1562,6 +1562,7 @@ class OperationAdvisor:
         _precomputed_blast_radius: Optional[int] = None,
         scoped_symbols: Tuple[str, ...] = (),
         intake_evidence_json: str = "",
+        _blast_is_synthetic: bool = False,
     ) -> Advisory:
         """Evaluate an operation and return advisory judgment.
 
@@ -1575,6 +1576,18 @@ class OperationAdvisor:
         because this is NOT a public API — operator binding 2026-05-23:
         the Advisor's signal authority is its computation, never an
         injected value from arbitrary callers.
+
+        ``_blast_is_synthetic`` (Slice 21 Fix B, 2026-07-15) — evidence
+        provenance for the injected blast value. ``True`` means the
+        precomputed number is a conservative PLACEHOLDER (Slice 12T
+        background-tier skip injects ``blast_radius_conservative_cap()``
+        with NO scan performed), not a measurement. A synthetic value may
+        contribute *caution* to the risk composite, but it must never
+        satisfy a hard-BLOCK predicate on its own, and the reason string
+        must say the scan was skipped — bt-2026-07-15-063421 deterministically
+        vetoed 5 background ops on the fabricated sentence "50 files import
+        these targets" when nothing had been scanned. Measured-vs-assumed
+        is the same discipline as Slice 20's claim-vs-verification split.
 
         When ``is_read_only`` is True the Advisor skips blast_radius and
         test_coverage signals — the downstream contract is that tool_executor
@@ -1648,9 +1661,19 @@ class OperationAdvisor:
                 target_files, root=repo_root, scoped_symbols=_scoped,
             )
         if not is_read_only and blast_radius >= _BLAST_RADIUS_WARN:
-            reasons.append(
-                f"High blast radius: {blast_radius} files import these targets"
-            )
+            # Slice 21 Fix B — the reason string states what we KNOW. A
+            # synthetic conservative cap (scan skipped) must never be
+            # narrated as a measured import count.
+            if _blast_is_synthetic:
+                reasons.append(
+                    f"Blast radius unmeasured: conservative cap "
+                    f"{blast_radius} assumed (heavy scan skipped for "
+                    f"background tier)"
+                )
+            else:
+                reasons.append(
+                    f"High blast radius: {blast_radius} files import these targets"
+                )
             risk_factors.append(min(1.0, blast_radius / 30))
 
         # Signal 2: Test coverage
@@ -1731,16 +1754,36 @@ class OperationAdvisor:
         # makes blast radius and coverage unreachable — enforced downstream
         # by tool_executor (mutating tools refused) and orchestrator (APPLY
         # phase short-circuited to COMPLETE).
+        # Slice 21 Fix B — a hard BLOCK requires MEASURED blast evidence.
+        # A synthetic conservative cap (scan skipped) satisfies neither this
+        # predicate nor Adaptive Armor's below: bt-2026-07-15-063421 vetoed
+        # 5 ops on the placeholder 50. Synthetic evidence degrades to
+        # CAUTION — the risk composite already carries its contribution, the
+        # downstream cage (Iron Gate, SemanticGuardian, VALIDATE, risk tiers)
+        # keeps every real guarantee, and the op is no longer killed on data
+        # nobody collected.
         if not is_read_only and test_coverage == 0 and blast_radius >= 20:
-            decision = AdvisoryDecision.BLOCK
-            reasons.append("BLOCKED: Zero test coverage + extreme blast radius")
+            if _blast_is_synthetic:
+                if decision == AdvisoryDecision.RECOMMEND:
+                    decision = AdvisoryDecision.CAUTION
+                reasons.append(
+                    "CAUTION (not blocked): zero test coverage + blast "
+                    "UNMEASURED (synthetic cap — hard block requires a real "
+                    "scan)"
+                )
+            else:
+                decision = AdvisoryDecision.BLOCK
+                reasons.append("BLOCKED: Zero test coverage + extreme blast radius")
 
         # Adaptive Armor (Proactive Advisory Plane): a highly-connected node with low coverage,
         # mutated under HIGH/CRITICAL host memory pressure, is the worst-case fragility compound —
         # escalate to at least CAUTION (BLOCK when coverage is zero). Reversible via the axis flags.
+        # Slice 21 Fix B — same measured-evidence requirement as above: the
+        # armor's BLOCK arm needs a real blast scan; synthetic caps to CAUTION.
         if (not is_read_only and blast_radius >= 10 and test_coverage < 0.5
                 and mem_level in ("high", "critical")):
-            if test_coverage <= 0.0 and decision != AdvisoryDecision.BLOCK:
+            if (test_coverage <= 0.0 and decision != AdvisoryDecision.BLOCK
+                    and not _blast_is_synthetic):
                 decision = AdvisoryDecision.BLOCK
                 reasons.append("BLOCKED (Adaptive Armor): high blast + zero coverage + memory pressure")
             elif decision in (AdvisoryDecision.RECOMMEND,):

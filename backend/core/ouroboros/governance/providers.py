@@ -5557,6 +5557,12 @@ class PrimeProvider:
                 is_offload_error,
                 offload,
             )
+            # Slice 21 Fix A1 — the full-builder branch must report
+            # preloaded-prompt exploration credit exactly like the lean
+            # branch above does. Matters whenever this provider runs with
+            # tools OFF (e.g. WIRING_VALIDATION skips Venom but routes
+            # through Claude): without the credit, the Iron Gate demands
+            # tool calls the op cannot make (the bt-2026-07-15 stall class).
             _prompt_kwargs = dict(
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
@@ -5565,6 +5571,7 @@ class PrimeProvider:
                 repair_context=repair_context,
                 mcp_tools=_mcp_tools,
                 provider_route=getattr(context, "provider_route", "") or "",
+                preloaded_out=_preloaded_files,
             )
             _prompt_result = await offload(
                 _build_codegen_prompt,
@@ -5580,6 +5587,9 @@ class PrimeProvider:
                     "(e.g. prompt_too_large) still propagate",
                     _prompt_result.exc_type, _prompt_result.message,
                 )
+                # A failed offload may have partially appended before dying —
+                # reset so the inline retry can't double-count credit.
+                _preloaded_files.clear()
                 prompt = _build_codegen_prompt(context, **_prompt_kwargs)
             else:
                 prompt = _prompt_result
@@ -10035,6 +10045,8 @@ class ClaudeProvider:
                 is_offload_error,
                 offload,
             )
+            # Slice 21 Fix A1 — full-builder branch reports preloaded-prompt
+            # exploration credit (the lean branch above already does).
             _prompt_kwargs = dict(
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
@@ -10045,6 +10057,7 @@ class ClaudeProvider:
                 provider_route=getattr(
                     context, "provider_route", "",
                 ) or "",
+                preloaded_out=_preloaded_files,
             )
             _prompt_result = await offload(
                 _build_codegen_prompt,
@@ -10060,6 +10073,9 @@ class ClaudeProvider:
                     "(e.g. prompt_too_large) still propagate",
                     _prompt_result.exc_type, _prompt_result.message,
                 )
+                # A failed offload may have partially appended — reset so
+                # the inline retry can't double-count credit.
+                _preloaded_files.clear()
                 prompt_text = _build_codegen_prompt(
                     context, **_prompt_kwargs,
                 )

@@ -421,6 +421,7 @@ class CLASSIFYRunner(PhaseRunner):
                             is_read_only=ctx.is_read_only,
                             repo_root=_adv_repo_root,
                             _precomputed_blast_radius=_cap,
+                            _blast_is_synthetic=True,  # Slice 21 Fix B — cap is a placeholder, not a scan
                             cpu_bound=False,
                         )
                         if is_offload_error(_adv_result):
@@ -438,6 +439,7 @@ class CLASSIFYRunner(PhaseRunner):
                                 is_read_only=ctx.is_read_only,
                                 repo_root=_adv_repo_root,
                                 _precomputed_blast_radius=_cap,
+                            _blast_is_synthetic=True,  # Slice 21 Fix B — cap is a placeholder, not a scan
                             )
                         return _adv_result
 
@@ -521,6 +523,7 @@ class CLASSIFYRunner(PhaseRunner):
                         is_read_only=ctx.is_read_only,
                         repo_root=_adv_repo_root,
                         _precomputed_blast_radius=_cap,
+                            _blast_is_synthetic=True,  # Slice 21 Fix B — cap is a placeholder, not a scan
                         cpu_bound=False,
                     )
                     if is_offload_error(_adv_result):
@@ -537,6 +540,7 @@ class CLASSIFYRunner(PhaseRunner):
                             is_read_only=ctx.is_read_only,
                             repo_root=_adv_repo_root,
                             _precomputed_blast_radius=_cap,
+                            _blast_is_synthetic=True,  # Slice 21 Fix B — cap is a placeholder, not a scan
                         )
                     else:
                         _advisory = _adv_result

@@ -3167,6 +3167,13 @@ class DoublewordProvider:
                             preloaded_out=_zw_preloaded,
                         )
                     else:
+                        # Slice 21 Fix A1 — earn-side consistency. NOTE:
+                        # this dormant response-cache path hands the prompt
+                        # to _dispatch_internal via prompt_override, which
+                        # skips the builder there — so _zw_preloaded still
+                        # doesn't reach the result today. Path is default-
+                        # OFF + gated to trivial/simple; full threading is
+                        # deferred until the cache is ever enabled.
                         _zw_prompt = _build_codegen_prompt(
                             context,
                             repo_root=self._repo_root,
@@ -3176,6 +3183,7 @@ class DoublewordProvider:
                             provider_route=getattr(
                                 context, "provider_route", "",
                             ) or "",
+                            preloaded_out=_zw_preloaded,
                         )
                 except Exception:  # noqa: BLE001 — fail-open
                     _zw_prompt = None
@@ -3809,6 +3817,10 @@ class DoublewordProvider:
             _parse_generation_response,
         )
 
+        # Slice 21 Fix A1 — this heavy lane never runs the Venom tool loop,
+        # so the ONLY exploration credit its ops can earn is the target
+        # content the full builder embeds. Report it (mirrors the RT path).
+        _preloaded_files: List[str] = []
         if prompt_override is not None:
             assembled_prompt = prompt_override
         else:
@@ -3821,6 +3833,7 @@ class DoublewordProvider:
                 provider_route=getattr(
                     context, "provider_route", "",
                 ) or "",
+                preloaded_out=_preloaded_files,
             )
 
         try:
@@ -3898,6 +3911,13 @@ class DoublewordProvider:
             cost_usd=float(sync_result.cost_usd or 0.0),
             model_id=str(sync_result.model or effective_model or ""),
         )
+        # Slice 21 Fix A1 — carry the preloaded-prompt exploration credit to
+        # the Iron Gate (same seam as the RT/batch paths).
+        if _preloaded_files:
+            parsed = _dc.replace(
+                parsed,
+                prompt_preloaded_files=tuple(_preloaded_files),
+            )
         logger.info(
             "[DoublewordProvider] heavy-nonstreaming ok in %.2fs: "
             "%d candidates, %d+%d tokens, cost=$%.4f (model=%s)",
@@ -4109,6 +4129,16 @@ class DoublewordProvider:
                 len(prompt), len(prompt) // 4, len(_preloaded_files),
             )
         else:
+            # Slice 21 Fix A1 — the RT full-builder path MUST report
+            # preloaded-prompt exploration credit. This branch is exactly the
+            # one a tool-less BACKGROUND/SPECULATIVE op takes (Slice 226
+            # contract: those routes keep their "preload-credit skip"), and
+            # _build_codegen_prompt EMBEDS each target file's real content.
+            # Omitting preloaded_out here was the bt-2026-07-15-063421
+            # 11× no_forward_progress root cause: credit earned in the
+            # prompt, never reported to the Iron Gate → exploration_
+            # insufficient → retry demanding tool calls the route cannot
+            # make → byte-identical attempt 2 → EC8 forward-progress trip.
             prompt = _build_codegen_prompt(
                 context,
                 repo_root=self._repo_root,
@@ -4116,11 +4146,13 @@ class DoublewordProvider:
                 force_full_content=True,
                 mcp_tools=_mcp_tools,
                 provider_route=getattr(context, "provider_route", "") or "",
+                preloaded_out=_preloaded_files,
             )
             logger.info(
-                "[DoublewordProvider] RT: using full prompt (%d chars, ~%d tokens, route=%s)",
+                "[DoublewordProvider] RT: using full prompt (%d chars, ~%d tokens, route=%s, preloaded=%d)",
                 len(prompt), len(prompt) // 4,
                 getattr(context, "provider_route", "") or "unknown",
+                len(_preloaded_files),
             )
 
         # Slice 35 Phase 1 — record STAGE_RT_PROMPT_BUILD: prompt

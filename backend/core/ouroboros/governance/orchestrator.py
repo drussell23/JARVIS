@@ -6503,12 +6503,24 @@ class GovernedOrchestrator:
                                         _decision_msg,
                                         attempt + 1,
                                     )
-                                    generation = None
-                                    raise ExplorationInsufficientError(
+                                    # Slice 21 Fix A2 — same structural facts
+                                    # on the ledger-path exception. The
+                                    # ledger's unique_call_count includes
+                                    # synthetic preload records, so 0 means
+                                    # ZERO credit of any kind.
+                                    _ledger_exc = ExplorationInsufficientError(
                                         _decision_msg,
                                         verdict=_verdict,
                                         floors=_floors,
                                     )
+                                    _ledger_exc.structural_credit = int(  # type: ignore[attr-defined]
+                                        _ledger.unique_call_count()
+                                    )
+                                    _ledger_exc.rejected_model_id = str(  # type: ignore[attr-defined]
+                                        getattr(generation, "model_id", "") or ""
+                                    )
+                                    generation = None
+                                    raise _ledger_exc
                                 # Ledger PASSED — skip legacy counter gate
                                 # entirely. Jump to the ASCII gate below.
                             else:
@@ -6591,8 +6603,17 @@ class GovernedOrchestrator:
                                 ctx.op_id,
                                 getattr(generation, "model_id", ""),
                             )
+                            # Slice 21 Fix A2 — carry the structural facts the
+                            # retry handler's capability check needs: total
+                            # exploration credit (tools + preload, cumulative)
+                            # and the model that produced the rejected attempt.
+                            _explore_exc = RuntimeError(_explore_err)
+                            _explore_exc.structural_credit = int(_op_explore_credit)  # type: ignore[attr-defined]
+                            _explore_exc.rejected_model_id = str(  # type: ignore[attr-defined]
+                                getattr(generation, "model_id", "") or ""
+                            )
                             generation = None
-                            raise RuntimeError(_explore_err)
+                            raise _explore_exc
 
                     # Gate 2 — ASCII/Unicode strictness (prevent rapidفuzz-class
                     # typos where model emits non-ASCII code points in identifier
@@ -7345,6 +7366,100 @@ class GovernedOrchestrator:
 
                     # ── Iron Gate failures get targeted, in-flight instructions ──
                     if _err_str.startswith("exploration_insufficient"):
+                        # ── Slice 21 Fix A2 — capability-aware halt ─────────
+                        # The retry feedback below demands tool calls. When
+                        # this op STRUCTURALLY cannot make them (the Venom
+                        # loop is suppressed for its route/complexity — per
+                        # the provider's OWN Slice-226 predicate) AND it
+                        # earned ZERO exploration credit of any kind (no tool
+                        # records, no preloaded-prompt credit), the retry is
+                        # deterministically unresolvable: identical
+                        # capability + identical prompt shape ⇒ identical
+                        # rejection. bt-2026-07-15-063421 burned a full
+                        # second generation + an EC8 forward-progress trip on
+                        # 11 ops discovering this the hard way. Halt cleanly
+                        # NOW: precise terminal reason, exact context frame,
+                        # no artificial retry. Fail-open on any fault in the
+                        # check itself (legacy retry proceeds).
+                        _cap_halt = False
+                        try:
+                            _s21_credit = getattr(exc, "structural_credit", None)
+                            if _s21_credit == 0:
+                                from backend.core.ouroboros.governance.dw_terminal_worker_policy import (  # noqa: E501
+                                    background_is_terminal_worker as _s21_bg_tw,
+                                )
+                                from backend.core.ouroboros.governance.exploration_engine import (  # noqa: E501
+                                    compute_tool_loop_suppressed as _s21_suppressed,
+                                )
+                                _s21_route = str(
+                                    getattr(ctx, "provider_route", "") or ""
+                                )
+                                _cap_halt = _s21_suppressed(
+                                    complexity=str(
+                                        getattr(ctx, "task_complexity", "") or ""
+                                    ),
+                                    route=_s21_route,
+                                    is_bg_terminal_worker=_s21_bg_tw(_s21_route),
+                                    has_repair_context=False,
+                                    is_read_only=bool(
+                                        getattr(ctx, "is_read_only", False)
+                                    ),
+                                )
+                        except Exception:  # noqa: BLE001 — check fault ⇒ legacy retry
+                            _cap_halt = False
+                        if _cap_halt:
+                            # Mandate 4 — the exact context frame, one
+                            # grep-stable line, FULL op id (audit-keyed).
+                            logger.warning(
+                                "[Slice21CapabilityHalt] op=%s route=%s "
+                                "complexity=%s model=%s attempt=%d "
+                                "targets=%d first_target=%s credit=0 "
+                                "preloaded=0 — exploration structurally "
+                                "impossible (tool loop suppressed for this "
+                                "route AND nothing preloaded); halting "
+                                "instead of an unresolvable retry",
+                                ctx.op_id,
+                                getattr(ctx, "provider_route", "") or "?",
+                                getattr(ctx, "task_complexity", "") or "?",
+                                getattr(exc, "rejected_model_id", "") or "?",
+                                self._config.max_generate_retries
+                                - generate_retries_remaining + 1,
+                                len(getattr(ctx, "target_files", ()) or ()),
+                                (list(getattr(ctx, "target_files", ()) or ())
+                                 or ["?"])[0],
+                            )
+                            _terminal = self._l2_escape_terminal(ctx.phase)
+                            ctx = ctx.advance(
+                                _terminal,
+                                terminal_reason_code=(
+                                    "exploration_impossible_no_capability"
+                                ),
+                            )
+                            await self._record_ledger(
+                                ctx,
+                                OperationState.FAILED,
+                                {
+                                    "reason": (
+                                        "exploration_impossible_no_capability"
+                                    ),
+                                    "route": getattr(
+                                        ctx, "provider_route", "",
+                                    ) or "",
+                                    "complexity": getattr(
+                                        ctx, "task_complexity", "",
+                                    ) or "",
+                                    "rejected_model_id": getattr(
+                                        exc, "rejected_model_id", "",
+                                    ) or "",
+                                    "structural_credit": 0,
+                                    "entry_phase": "GENERATE",
+                                },
+                            )
+                            try:
+                                self._forward_progress.finish(ctx.op_id)
+                            except Exception:  # noqa: BLE001
+                                pass
+                            return ctx
                         # Ledger path (#103): when the exception carries a
                         # verdict + floors, render a category-aware feedback
                         # block so the model sees *which* categories are missing
