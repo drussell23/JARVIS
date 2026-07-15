@@ -38,6 +38,10 @@ from typing import Dict, Tuple
 
 # role string per pid — purely for observability in the teardown log line.
 _children: Dict[int, str] = {}
+# Cleanup callables (label, fn) run during every cascade — the seam a
+# subsystem uses to fold its OWN teardown (e.g. the fs ProcessPoolExecutor
+# hard-reap) into the cascade without this module knowing its internals.
+_cleanups: list = []
 _lock = threading.Lock()
 
 # Env: seconds to wait between the SIGTERM sweep and the SIGKILL sweep on the
@@ -89,6 +93,35 @@ def registered_children() -> Tuple[Tuple[int, str], ...]:
         return ()
 
 
+def register_cleanup(fn, *, label: str = "cleanup") -> None:
+    """Register a callable run during every :func:`cascade_terminate`. Used by
+    subsystems (the fs ProcessPoolExecutor) to fold their own worker teardown
+    into the cascade — the reaper stays PID-generic, the subsystem owns the
+    'how'. Idempotent per identical (label, fn). NEVER raises."""
+    try:
+        with _lock:
+            if not any(l == label and f is fn for l, f in _cleanups):
+                _cleanups.append((label, fn))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _run_cleanups() -> int:
+    try:
+        with _lock:
+            cbs = list(_cleanups)
+    except Exception:  # noqa: BLE001
+        return 0
+    ran = 0
+    for label, fn in cbs:
+        try:
+            fn()
+            ran += 1
+        except Exception:  # noqa: BLE001 — one bad cleanup never blocks the rest
+            _stderr(f"[ChildReaper] cleanup '{label}' raised (ignored)")
+    return ran
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -120,6 +153,11 @@ def cascade_terminate(
     "no survivor", not "clean shutdown". ``grace_s`` overrides the env default
     on the graceful path.
     """
+    # Run subsystem cleanups FIRST (e.g. the fs ProcessPoolExecutor hard-reap):
+    # they shut their pools + SIGKILL their own workers, so a subsequent PID
+    # sweep finds nothing to do and no ghost worker survives.
+    _run_cleanups()
+
     try:
         with _lock:
             targets = list(_children.items())
@@ -195,6 +233,7 @@ def reset_for_tests() -> None:
     try:
         with _lock:
             _children.clear()
+            _cleanups.clear()
     except Exception:  # noqa: BLE001
         pass
 
@@ -203,6 +242,7 @@ __all__ = [
     "arm_atexit_cascade",
     "cascade_terminate",
     "register_child",
+    "register_cleanup",
     "registered_children",
     "reset_for_tests",
     "unregister_child",

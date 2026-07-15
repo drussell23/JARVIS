@@ -407,6 +407,23 @@ def _intake_cognitive_shed_mode() -> str:
     return "shadow"
 
 
+def _intake_backpressure_shed_fraction() -> float:
+    """Slice 23 — live intake-queue-pressure fraction at/above which a burst
+    escalates cognitive shedding regardless of the (lagging) host-stress
+    forecast. Fraction of ``backpressure_threshold``; env-driven, no hardcoded
+    depth. Default 0.75. Clamped to (0, 1]; out-of-range → default. A 72-signal
+    burst fills the queue faster than host stress rises, so this real-time
+    signal is what makes the shed BURST-responsive (mandate 2). NEVER raises."""
+    try:
+        raw = os.environ.get(
+            "JARVIS_INTAKE_BACKPRESSURE_SHED_FRACTION", "",
+        ).strip()
+        v = float(raw) if raw else 0.75
+        return v if 0.0 < v <= 1.0 else 0.75
+    except (TypeError, ValueError):
+        return 0.75
+
+
 def _allow_log_mode() -> str:
     """Follow-up #1 — visibility for "governor allowed this op" decisions.
 
@@ -1442,7 +1459,23 @@ class UnifiedIntakeRouter:
                 _load = await _offload_cl(evaluate_cognitive_load, cpu_bound=False)
                 if _is_offload_error_cl(_load):
                     _load = evaluate_cognitive_load()
-                _should_shed = _load.verdict in (
+                # Slice 23 — real-time backpressure escalation. The host-stress
+                # forecast lags a signal BURST (the queue fills faster than
+                # memory/CPU stress rises), so compose the LIVE intake queue
+                # pressure: at/above the env fraction of backpressure_threshold,
+                # a sheddable (already low-urgency = low-value) signal is shed
+                # even if the forecast verdict is still NORMAL. This is what
+                # throttles the 72-signal burst at the source before it can
+                # saturate the offload pools and starve the loop.
+                try:
+                    _qcap = max(1, int(self._config.backpressure_threshold))
+                    _queue_pressure = self.intake_queue_depth() / _qcap
+                except Exception:  # noqa: BLE001
+                    _queue_pressure = 0.0
+                _under_backpressure = (
+                    _queue_pressure >= _intake_backpressure_shed_fraction()
+                )
+                _forecast_shed = _load.verdict in (
                     LoadVerdict.ELEVATED,
                     LoadVerdict.OVERLOADED,
                 ) and _load.shed_kind in (
@@ -1450,26 +1483,32 @@ class UnifiedIntakeRouter:
                     ShedKind.BACKGROUND_SHED,
                     ShedKind.FULL_SHED,
                 )
+                # Only signals of a sheddable urgency reached this gate (the
+                # _SHEDDABLE_URGENCIES guard above), so a backpressure shed is
+                # by construction a LOW-VALUE shed — high-urgency/high-value
+                # work is never eligible here.
+                _should_shed = _forecast_shed or _under_backpressure
                 if _should_shed:
+                    _shed_reason = (
+                        "backpressure" if _under_backpressure and not _forecast_shed
+                        else "forecast"
+                    )
                     if shed_mode == "enforce":
                         logger.info(
-                            "[Router] cognitive-shed ENFORCE: source=%s "
-                            "urgency=%s verdict=%s shed=%s load=%.3f",
-                            envelope.source,
-                            envelope.urgency,
-                            _load.verdict.value,
-                            _load.shed_kind.value,
-                            _load.load_score,
+                            "[Router] cognitive-shed ENFORCE (%s): source=%s "
+                            "urgency=%s verdict=%s shed=%s load=%.3f qp=%.2f",
+                            _shed_reason, envelope.source, envelope.urgency,
+                            _load.verdict.value, _load.shed_kind.value,
+                            _load.load_score, _queue_pressure,
                         )
                         return "cognitive_shed"
                     logger.info(
-                        "[Router] cognitive-shed SHADOW (would shed): "
-                        "source=%s urgency=%s verdict=%s shed=%s load=%.3f",
-                        envelope.source,
-                        envelope.urgency,
-                        _load.verdict.value,
-                        _load.shed_kind.value,
-                        _load.load_score,
+                        "[Router] cognitive-shed SHADOW (%s, would shed): "
+                        "source=%s urgency=%s verdict=%s shed=%s load=%.3f "
+                        "qp=%.2f",
+                        _shed_reason, envelope.source, envelope.urgency,
+                        _load.verdict.value, _load.shed_kind.value,
+                        _load.load_score, _queue_pressure,
                     )
             except Exception:  # noqa: BLE001 — never break intake
                 pass

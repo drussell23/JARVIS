@@ -577,6 +577,21 @@ def _get_fs_process_pool():
                     max_tasks = None
                 _FS_PROCESS_POOL = ProcessPoolExecutor(**pool_kwargs)
                 atexit.register(shutdown_fs_process_pool)
+                # Slice 23 — fold this pool's hard-reap into the child_reaper
+                # cascade so a shutdown/OOM-triggered teardown (graceful,
+                # LoopDeadman pre-exit, or atexit) leaves ZERO ghost workers
+                # (mandate 4). Complements the per-worker WorkerLifeline (armed
+                # via the initializer above) — reaper = fast parent-driven kill,
+                # lifeline = ppid-drift self-exit backstop. Fail-soft.
+                try:
+                    from backend.core.ouroboros.governance.child_reaper import (
+                        register_cleanup as _cr_register_cleanup,
+                    )
+                    _cr_register_cleanup(
+                        reap_fs_process_pool_hard, label="fs_process_pool",
+                    )
+                except Exception:  # noqa: BLE001 — registration is protective
+                    pass
                 logger.info(
                     "[CooperativeFSIO] lazily created bounded FS "
                     "process pool (max_workers=%d, start_method=spawn, "
@@ -586,6 +601,35 @@ def _get_fs_process_pool():
                     "armed" if "initializer" in pool_kwargs else "off",
                 )
     return _FS_PROCESS_POOL
+
+
+def reap_fs_process_pool_hard() -> None:
+    """Slice 23 — child_reaper cleanup: shut the pool down AND SIGKILL any
+    surviving worker so a cascade/OOM teardown leaves ZERO ghost workers.
+
+    ``shutdown(wait=False)`` signals shutdown but a worker mid-task can linger;
+    this snapshots the pool's CURRENT worker PIDs (recycle-safe — read at reap
+    time, not registration time) and SIGKILLs any that outlive the shutdown.
+    NEVER raises — it runs from the signal-safe cascade path.
+    """
+    pool = _FS_PROCESS_POOL
+    pids: list = []
+    try:
+        if pool is not None:
+            pids = [
+                p.pid for p in getattr(pool, "_processes", {}).values()
+                if p is not None and getattr(p, "pid", None)
+            ]
+    except Exception:  # noqa: BLE001
+        pids = []
+    shutdown_fs_process_pool()
+    import signal as _signal
+    for pid in pids:
+        try:
+            os.kill(pid, 0)          # alive?
+            os.kill(pid, _signal.SIGKILL)
+        except OSError:
+            pass                     # already gone / not ours
 
 
 def shutdown_fs_process_pool() -> None:

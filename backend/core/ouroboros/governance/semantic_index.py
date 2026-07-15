@@ -686,6 +686,32 @@ class _StdlibHashingEmbedder:
             return None
 
 
+def _stdlib_embed_worker(text: str, dim: int) -> List[float]:
+    """Module-level (spawn-picklable) ProcessPoolExecutor worker for a single
+    stdlib-hashing-TFIDF encode.
+
+    Slice 23 — root GIL fix. When ``fastembed`` is unavailable (offline /
+    sandbox / uninstalled) the SemanticIndex falls back to this pure-Python
+    TF-IDF embedder, which has no C extension and therefore HOLDS the GIL for
+    the whole encode. Dispatched to the shared advisor-blast THREAD pool (the
+    ``cpu_bound=False`` intake path), that GIL hold starves the event-loop
+    heartbeat under a signal burst — the bt-2026-07-15-154242 ``heartbeat_stale``
+    SIGKILL. Running the encode in a SEPARATE PROCESS (its own GIL) makes it
+    structurally impossible for the fallback encode to block the primary loop.
+
+    Deterministic + stateless: the result depends only on ``(text, dim)``, so
+    it marshals cleanly by value and needs none of the index's live state.
+    NEVER raises — a degraded input returns a zero vector (a zero cosine, i.e.
+    "no semantic prior", exactly the existing fail-soft contract)."""
+    try:
+        return _StdlibHashingEmbedder._embed_one(text or "", int(dim))
+    except Exception:  # noqa: BLE001
+        try:
+            return [0.0] * max(16, int(dim))
+        except Exception:  # noqa: BLE001
+            return []
+
+
 class _AdaptiveEmbedder:
     """Composes :class:`_Embedder` + :class:`_StdlibHashingEmbedder`.
 
@@ -2590,46 +2616,107 @@ class SemanticIndex:
         vec = self._embedder.embed([cleaned])
         if not vec:
             return (0, 0.0)
-        sim, winner, policy_used = self._score_and_align(vec[0])
-        self._observe_cluster_alignment(vec[0])
-        with self._lock:
-            self._stats.signals_scored += 1
-            self._stats.scoring_policy = policy_used
-            self._stats.scored_by_policy[policy_used] = (
-                self._stats.scored_by_policy.get(policy_used, 0) + 1
-            )
-        if (
-            policy_used == "max_cluster"
-            and winner is not None
-            and winner.kind == CLUSTER_KIND_POSTMORTEM
-        ):
+        return self._score_vector_sync(vec[0])
+
+    def _score_vector_sync(self, vec: "List[float]") -> Tuple[int, float]:
+        """Score a PRE-COMPUTED embedding vector → ``(boost, raw_cosine)``.
+
+        Slice 23 — this is the GIL-LIGHT tail of the old ``_boost_and_score_sync``
+        (cosine + cluster alignment + stats), split out so the GIL-HEAVY
+        ENCODE can be dispatched to a separate executor (a PROCESS pool for the
+        pure-Python stdlib fallback) while this cheap tail runs in a thread.
+        Byte-identical scoring to the pre-split path — one encode of a
+        deterministic model yields the same cosine either way. NEVER raises;
+        a degraded vector returns ``(0, 0.0)``."""
+        try:
+            if not vec:
+                return (0, 0.0)
+            sim, winner, policy_used = self._score_and_align(vec)
+            self._observe_cluster_alignment(vec)
             with self._lock:
-                self._stats.postmortem_boost_suppressions += 1
-            logger.info(
-                "[SemanticIndex] postmortem_suppress cluster_id=%d "
-                "hash8=%s cosine=%.4f size=%d (boost zeroed; alignment "
-                "still observed — offload intake path)",
-                winner.cluster_id, winner.centroid_hash8, sim, winner.size,
+                self._stats.signals_scored += 1
+                self._stats.scoring_policy = policy_used
+                self._stats.scored_by_policy[policy_used] = (
+                    self._stats.scored_by_policy.get(policy_used, 0) + 1
+                )
+            if (
+                policy_used == "max_cluster"
+                and winner is not None
+                and winner.kind == CLUSTER_KIND_POSTMORTEM
+            ):
+                with self._lock:
+                    self._stats.postmortem_boost_suppressions += 1
+                logger.info(
+                    "[SemanticIndex] postmortem_suppress cluster_id=%d "
+                    "hash8=%s cosine=%.4f size=%d (boost zeroed; alignment "
+                    "still observed — offload intake path)",
+                    winner.cluster_id, winner.centroid_hash8, sim, winner.size,
+                )
+                return (0, sim)
+            if sim <= 0.0:
+                return (0, sim)
+            boost_max = _boost_max()
+            if boost_max <= 0:
+                return (0, sim)
+            raw = int(round(sim * boost_max))
+            return (max(0, min(boost_max, raw)), sim)
+        except Exception:  # noqa: BLE001 — scoring must never break intake
+            return (0, 0.0)
+
+    async def _encode_offloaded(
+        self, cleaned: str, offload: Any, is_offload_error: Any,
+    ) -> "Optional[List[float]]":
+        """Encode ``cleaned`` OFF the event loop, GIL-safe by embedder kind.
+
+        Slice 23 root fix — the choice of executor is DYNAMIC (mandate 2, no
+        hardcoding): when the active embedder is the pure-Python stdlib TF-IDF
+        FALLBACK it holds the GIL, so the encode goes to the fs PROCESS pool
+        (``cpu_bound=True`` → its own GIL, can never block the loop); when it is
+        the fastembed ONNX embedder (releases the GIL in C) the cheaper THREAD
+        pool suffices. A process-pool fault (BrokenProcessPool / pickling)
+        degrades to the thread encode — one bounded GIL hold beats losing the
+        semantic prior. Returns the single vector, or ``None`` fail-soft."""
+        emb = self._embedder
+        if bool(getattr(emb, "using_fallback", False)):
+            dim = _stdlib_embedder_dim()
+            # ``offload(cpu_bound=True)`` returns an OffloadError for a raise
+            # INSIDE the worker, but a dead worker (BrokenProcessPool under OOM /
+            # a recycled pool) propagates as a RAISED exception — catch it so a
+            # burst that OOM-kills a pool worker degrades to the thread encode
+            # instead of crashing intake (mandate 4). NEVER re-raise.
+            try:
+                r = await offload(
+                    _stdlib_embed_worker, cleaned, dim, cpu_bound=True,
+                )
+                if not is_offload_error(r) and r:
+                    return list(r)
+            except Exception:  # noqa: BLE001 — BrokenProcessPool / pickling
+                logger.debug(
+                    "[SemanticIndex] stdlib process-pool encode raised",
+                    exc_info=True,
+                )
+            logger.debug(
+                "[SemanticIndex] stdlib process-pool encode degraded → thread",
             )
-            return (0, sim)
-        if sim <= 0.0:
-            return (0, sim)
-        boost_max = _boost_max()
-        if boost_max <= 0:
-            return (0, sim)
-        raw = int(round(sim * boost_max))
-        return (max(0, min(boost_max, raw)), sim)
+        r = await offload(emb.embed, [cleaned], cpu_bound=False)
+        if is_offload_error(r) or not r:
+            return None
+        try:
+            return list(r[0])
+        except Exception:  # noqa: BLE001
+            return None
 
     async def boost_and_score_offloaded(self, text: str) -> Tuple[int, float]:
         """Off-loop ``(boost, raw_cosine)`` via the unified offload substrate.
 
         The intake ``_compute_priority`` fast-path previously ran two inline
-        fastembed encodes (``boost_for`` + ``score``) ON the asyncio loop
-        (~3.5s / signal, Tier-2b starvation). This routes the single combined
-        encode through ``cooperative_fs_io.offload(cpu_bound=False)`` — thread
-        pool, because fastembed's ONNX encode releases the GIL. Fail-soft: an
-        ``OffloadError`` degrades to ``(0, 0.0)`` — intake still routes, just
-        without the semantic prior — never raised into the loop."""
+        fastembed encodes ON the asyncio loop (~3.5s / signal, Tier-2b
+        starvation). Slice 23 splits the single combined encode from the score:
+        the ENCODE routes through :meth:`_encode_offloaded` (process pool for
+        the GIL-holding stdlib fallback, thread for fastembed), the SCORE
+        through a cheap thread hop. Fail-soft: any fault degrades to
+        ``(0, 0.0)`` — intake still routes, just without the semantic prior —
+        never raised into the loop."""
         if not _is_enabled():
             return (0, 0.0)
         try:
@@ -2642,13 +2729,21 @@ class SemanticIndex:
                 return self._boost_and_score_sync(text or "")
             except Exception:  # noqa: BLE001
                 return (0, 0.0)
-        result = await offload(
-            self._boost_and_score_sync, text or "", cpu_bound=False,
-        )
-        if is_offload_error(result):
+        with self._lock:
+            have_centroid = bool(self._centroid)
+        if not have_centroid:
+            return (0, 0.0)
+        cleaned = _sanitize_corpus_text(text or "")
+        if not cleaned:
+            return (0, 0.0)
+        vec = await self._encode_offloaded(cleaned, offload, is_offload_error)
+        if not vec:
+            return (0, 0.0)
+        scored = await offload(self._score_vector_sync, vec, cpu_bound=False)
+        if is_offload_error(scored):
             return (0, 0.0)
         try:
-            boost, sim = result
+            boost, sim = scored
             return (int(boost), float(sim))
         except Exception:  # noqa: BLE001
             return (0, 0.0)
