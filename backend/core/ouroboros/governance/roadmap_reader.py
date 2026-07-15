@@ -590,6 +590,28 @@ def _make_envelope_for_goal(
         urgency = _PRIORITY_TO_URGENCY.get(
             goal.priority.value, _DEFAULT_URGENCY,
         )
+        evidence: Dict[str, Any] = {
+            "goal_id": goal.goal_id,
+            "success_criteria": goal.success_criteria[:512],
+            "priority": goal.priority.value,
+            "depends_on": list(goal.depends_on),
+            "max_duration_s": goal.max_duration_s,
+            "signature": goal.goal_id,  # dedup signature
+        }
+        # ── Slice 20 — Delegated Provenance ──
+        # This envelope originates from the operator-SIGNED document itself,
+        # so attach the goal's claim POINTER; the risk engine re-verifies the
+        # signature + goal + per-file scope from ground truth at classify.
+        # Feature off / any fault ⇒ no claim (evidence byte-identical).
+        try:
+            from backend.core.ouroboros.governance.delegated_provenance import (  # noqa: E501
+                claim_for_goal,
+            )
+            _claim = claim_for_goal(goal.goal_id)
+            if _claim is not None:
+                evidence["provenance"] = _claim
+        except Exception:  # noqa: BLE001 — provenance is additive, never fatal
+            pass
         env = make_envelope(
             source="roadmap",
             description=(
@@ -599,14 +621,7 @@ def _make_envelope_for_goal(
             repo=repo_name(),
             confidence=0.95,
             urgency=urgency,
-            evidence={
-                "goal_id": goal.goal_id,
-                "success_criteria": goal.success_criteria[:512],
-                "priority": goal.priority.value,
-                "depends_on": list(goal.depends_on),
-                "max_duration_s": goal.max_duration_s,
-                "signature": goal.goal_id,  # dedup signature
-            },
+            evidence=evidence,
             requires_human_ack=False,
             signal_id=f"roadmap_goal_{goal.goal_id[:64]}",
         )

@@ -306,6 +306,32 @@ class WorkOrderSensor:
                     source_rel, item_text[:80],
                 )
                 return None
+            evidence = {
+                "work_order_source": source_rel,
+                "work_order_marker": marker,
+                "work_order": True,
+            }
+            # ── Slice 20 — Delegated Provenance ──
+            # If the operator-SIGNED roadmap (.jarvis/roadmap.yaml, HMAC via
+            # roadmap_reader) contains a goal whose declared scope covers this
+            # item's every target, attach that goal's claim POINTER so the
+            # risk engine can verify delegated authority at classify time.
+            # The claim grants nothing by itself — verification re-derives
+            # signature/goal/scope from ground truth. No match / feature off
+            # / any fault ⇒ no claim ⇒ governance surfaces stay blocked
+            # exactly as before (fail-closed).
+            try:
+                from backend.core.ouroboros.governance.delegated_provenance import (  # noqa: E501
+                    claim_for_targets,
+                )
+                _claim = claim_for_targets(targets)
+                if _claim is not None:
+                    evidence["provenance"] = _claim
+            except Exception:  # noqa: BLE001 — provenance is additive, never fatal
+                logger.debug(
+                    "[WorkOrderSensor] provenance claim lookup degraded",
+                    exc_info=True,
+                )
             return make_envelope(
                 source="roadmap",
                 description=item_text[:2000],
@@ -313,11 +339,7 @@ class WorkOrderSensor:
                 repo=self._repo,
                 confidence=0.95,  # operator-authored intent — high confidence
                 urgency=urgency,
-                evidence={
-                    "work_order_source": source_rel,
-                    "work_order_marker": marker,
-                    "work_order": True,
-                },
+                evidence=evidence,
                 requires_human_ack=False,  # operator already authorized it
             )
         except Exception:  # noqa: BLE001 — a malformed item never breaks scan

@@ -12362,6 +12362,29 @@ class GovernedOrchestrator:
             for p in target_paths
         )
 
+        # ── Slice 20 — Delegated Provenance threading ──
+        # Under the master flag, the profile carries the signal's REAL source
+        # plus any provenance CLAIM riding the existing evidence pipe
+        # (ctx.intake_evidence_json), so risk_engine's self-protection gate
+        # can verify operator-signed roadmap authority. Flag OFF (default)
+        # ⇒ source stays "" and provenance None — byte-identical
+        # pre-Slice-20 classification. Fail-soft: any fault degrades to the
+        # legacy (unsourced) profile, which classifies strictly harsher.
+        _s20_source = ""
+        _s20_provenance = None
+        try:
+            from backend.core.ouroboros.governance.delegated_provenance import (
+                delegated_provenance_enabled,
+                extract_claim_from_evidence_json,
+            )
+            if delegated_provenance_enabled():
+                _s20_source = str(getattr(ctx, "signal_source", "") or "")
+                _s20_provenance = extract_claim_from_evidence_json(
+                    getattr(ctx, "intake_evidence_json", "") or "",
+                )
+        except Exception:  # noqa: BLE001 — never perturb classification
+            _s20_source, _s20_provenance = "", None
+
         return OperationProfile(
             files_affected=target_paths,
             change_type=ChangeType.MODIFY,
@@ -12372,6 +12395,8 @@ class GovernedOrchestrator:
             test_scope_confidence=0.8,
             is_dependency_change=False,
             is_core_orchestration_path=is_core,
+            source=_s20_source,
+            provenance=_s20_provenance,
         )
 
     @staticmethod

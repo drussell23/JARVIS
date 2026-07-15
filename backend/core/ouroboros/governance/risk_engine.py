@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import List
+from typing import Any, List, Mapping, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +144,13 @@ class OperationProfile:
     is_dependency_change: bool = False
     is_core_orchestration_path: bool = False
     source: str = ""
+    # Slice 20 — an OPTIONAL provenance CLAIM (a pointer: {kind, goal_id})
+    # attached by a high-fidelity sensor. Never trusted as-is: the
+    # self-protection gate re-derives every authority-bearing fact from
+    # ground truth (the live operator-signed roadmap + its HMAC) via
+    # delegated_provenance.verify_provenance_claim. Absent/None ⇒
+    # byte-identical pre-Slice-20 classification.
+    provenance: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -315,7 +322,7 @@ class RiskEngine:
             sentinel in fpath for fpath in file_strs for sentinel in sentinels
         )
 
-    def _self_protection_verdict(self, file_strs, source):
+    def _self_protection_verdict(self, file_strs, source, provenance=None):
         """UNCONDITIONAL, source-independent self-protection.
 
         The immune system must classify a modification of ITSELF at a floor no
@@ -350,6 +357,34 @@ class RiskEngine:
                     tier=RiskTier.APPROVAL_REQUIRED,
                     reason_code="architecture_self_modification",
                 )
+            # ── Slice 20 — Delegated Provenance ──
+            # A signal may carry a provenance CLAIM (pointer to a goal inside
+            # the operator-signed .jarvis/roadmap.yaml). The claim itself is
+            # untrusted; verify_provenance_claim re-derives everything from
+            # ground truth (live file + HMAC compare_digest + goal existence
+            # + freshness + per-file scope binding). A VERIFIED claim raises
+            # the verdict from BLOCKED to APPROVAL_REQUIRED — the same
+            # human-gated ceiling as the architecture path, NEVER auto-apply.
+            # This branch sits AFTER the kernel/security unconditional blocks
+            # (structurally unreachable for those surfaces) and any failure —
+            # malformed, expired, hallucinated goal, out-of-scope target,
+            # verifier fault, feature off — falls through to the exact
+            # pre-Slice-20 blocks below (fail-closed).
+            if provenance is not None:
+                try:
+                    from backend.core.ouroboros.governance.delegated_provenance import (  # noqa: E501
+                        verify_provenance_claim,
+                    )
+                    _pv = verify_provenance_claim(
+                        provenance, source=source, file_strs=file_strs,
+                    )
+                except Exception:  # noqa: BLE001 — verifier import/fault ⇒ refuse
+                    _pv = None
+                if _pv is not None and _pv.valid:
+                    return RiskClassification(
+                        tier=RiskTier.APPROVAL_REQUIRED,
+                        reason_code="delegated_provenance_self_modification",
+                    )
             if source in self._UNTRUSTED_SELF_MOD_SOURCES:
                 return RiskClassification(
                     tier=RiskTier.BLOCKED,
@@ -432,7 +467,10 @@ class RiskEngine:
         # cage self-edit could land SAFE_AUTO. First match wins, so this floor
         # cannot be lowered by any downstream rule.
         # ══════════════════════════════════════════════════════════════════
-        _self_protect = self._self_protection_verdict(file_strs, _source)
+        _self_protect = self._self_protection_verdict(
+            file_strs, _source,
+            provenance=getattr(profile, "provenance", None),
+        )
         if _self_protect is not None:
             return _self_protect
 
