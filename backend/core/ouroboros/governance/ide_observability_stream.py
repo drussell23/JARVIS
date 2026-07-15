@@ -162,6 +162,17 @@ EVENT_TYPE_CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"
 # it MUST be loud, not silent — surfaced to the operator via this SSE frame.
 EVENT_TYPE_GOLDEN_IMAGE_DEGRADED = "golden_image_degraded"
 
+# Slice 19 (Soak Budget & Compute Circuit-Breaker) — two events covering the
+# fail-closed boundary around an unattended graduation soak:
+#   * soak_budget_warning — worst-cap utilization crossed the warn fraction
+#     (default 80%); one-shot, precedes any hard trip.
+#   * soak_circuit_tripped — a cumulative-cost OR GCE-runtime threshold was
+#     exceeded; new LLM dispatch + GCE spin-up are now refused and active
+#     batch/RT queues are being cancelled. Both keyed by "soak_budget" (an
+#     organism property, no op_id) so ?op_id=soak_budget filters cleanly.
+EVENT_TYPE_SOAK_BUDGET_WARNING = "soak_budget_warning"
+EVENT_TYPE_SOAK_CIRCUIT_TRIPPED = "soak_circuit_tripped"
+
 # Slice 249 (Async Observability + Live Steering) — three op-lifecycle events the
 # Sovereign Host streams to keep total situational awareness over autonomous
 # background processing. DRIFT_DETECTED fires when the Slice 247/248 validator
@@ -1438,6 +1449,8 @@ but NEVER the offending content. Authority-free anti-jailbreak telemetry."""
 
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_GOLDEN_IMAGE_DEGRADED,
+    EVENT_TYPE_SOAK_BUDGET_WARNING,
+    EVENT_TYPE_SOAK_CIRCUIT_TRIPPED,
     EVENT_TYPE_COGNITIVE_WHY_SNAPSHOT,
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_EVALUATOR_TRACE_FRAME,
@@ -2871,6 +2884,56 @@ def publish_golden_image_degraded(
     except Exception:  # noqa: BLE001 — best-effort telemetry
         logger.debug(
             "[Stream] publish_golden_image_degraded exception", exc_info=True,
+        )
+        return None
+
+
+def publish_soak_budget_warning(
+    detail: Mapping[str, Any],
+) -> Optional[str]:
+    """Best-effort publisher for ``soak_budget_warning`` SSE frames (Slice 19).
+
+    Fired ONCE when the soak circuit-breaker's worst cap utilization (cost or
+    GCE runtime) crosses the warn fraction (default 80%), before any hard trip.
+    ``detail`` carries the assessment (cost/runtime used vs. cap + pct). Keyed
+    by ``"soak_budget"``. Returns the event_id, or None when the stream is
+    disabled / broker missing / payload invalid. NEVER raises."""
+    if not stream_enabled():
+        return None
+    try:
+        if not isinstance(detail, Mapping):
+            return None
+        return get_default_broker().publish(
+            EVENT_TYPE_SOAK_BUDGET_WARNING, "soak_budget", dict(detail),
+        )
+    except Exception:  # noqa: BLE001 — best-effort telemetry
+        logger.debug(
+            "[Stream] publish_soak_budget_warning exception", exc_info=True,
+        )
+        return None
+
+
+def publish_soak_circuit_tripped(
+    detail: Mapping[str, Any],
+) -> Optional[str]:
+    """Best-effort publisher for ``soak_circuit_tripped`` SSE frames (Slice 19).
+
+    Fired when a cumulative-cost OR GCE-runtime threshold is exceeded and the
+    breaker latches: new LLM dispatch + GCE spin-up are refused and active
+    batch/RT queues are cancelled. ``detail`` carries the reason + assessment.
+    Keyed by ``"soak_budget"``. Returns the event_id, or None when the stream
+    is disabled / broker missing / payload invalid. NEVER raises."""
+    if not stream_enabled():
+        return None
+    try:
+        if not isinstance(detail, Mapping):
+            return None
+        return get_default_broker().publish(
+            EVENT_TYPE_SOAK_CIRCUIT_TRIPPED, "soak_budget", dict(detail),
+        )
+    except Exception:  # noqa: BLE001 — best-effort telemetry
+        logger.debug(
+            "[Stream] publish_soak_circuit_tripped exception", exc_info=True,
         )
         return None
 

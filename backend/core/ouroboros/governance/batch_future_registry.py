@@ -140,6 +140,37 @@ class BatchFutureRegistry:
             raise KeyError(f"No future registered for batch {batch_id}")
         return await asyncio.wait_for(future, timeout=timeout)
 
+    def cancel_all(self, reason: str = "cancelled") -> int:
+        """Cancel every pending batch future and settle its durable claim
+        terminal — the trip primitive for the Slice 19 soak circuit-breaker
+        (and any hard shutdown). Reuses the SAME ``_settle_claim`` seam every
+        webhook termination flows through, so a cancelled batch returns its
+        provider queue slot exactly like a ``batch.cancelled`` webhook would.
+
+        Returns the number of futures cancelled. Idempotent + NEVER raises."""
+        cancelled = 0
+        for bid in list(self._futures.keys()):
+            future = self._futures.pop(bid, None)
+            self._created_at.pop(bid, None)
+            try:
+                if future is not None and not future.done():
+                    future.cancel()
+                    cancelled += 1
+                self._settle_claim(
+                    bid, completed=False, reason=f"cancel_all:{reason}"[:200],
+                )
+            except Exception:  # noqa: BLE001 — one bad future never blocks the sweep
+                logger.debug(
+                    "[BatchFutureRegistry] cancel_all swallowed for %s", bid,
+                    exc_info=True,
+                )
+        if cancelled:
+            logger.warning(
+                "[BatchFutureRegistry] cancel_all cancelled %d future(s): %s",
+                cancelled, reason,
+            )
+        return cancelled
+
     @property
     def pending_count(self) -> int:
         """Number of pending (unresolved) futures."""

@@ -4764,6 +4764,19 @@ class GovernedLoopService:
                     _batch_registry = BatchFutureRegistry()
                     self._batch_registry = _batch_registry
                     logger.info("[GovernedLoop] BatchFutureRegistry: wired (Tier 1 webhook)")
+                    # Slice 19 — hand the registry to the soak circuit-breaker so
+                    # a trip can cancel active batch queues (fail-soft; inert
+                    # when the breaker is unarmed).
+                    try:
+                        from backend.core.ouroboros.governance.soak_circuit_breaker import (  # noqa: E501
+                            get_soak_breaker,
+                        )
+                        get_soak_breaker().register_batch_registry(_batch_registry)
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "[GovernedLoop] soak breaker registry wiring skipped",
+                            exc_info=True,
+                        )
                 except Exception as _bfr_exc:
                     logger.debug("[GovernedLoop] BatchFutureRegistry skipped: %s", _bfr_exc)
                 tier0 = DoublewordProvider(
@@ -6628,6 +6641,29 @@ class GovernedLoopService:
 
         Also expires stale PENDING approvals and cancels stale PLANNED ops.
         """
+        # ── Slice 19 — Soak circuit-breaker boot reconciliation ──
+        # Reconstruct cumulative spend (durable Aegis spend-WAL) + live GCE
+        # node runtime (GCP instances.list via the registered manager) BEFORE
+        # the loop resumes, so a soak that already burned most of its budget
+        # resumes at the right utilization (and trips immediately if already
+        # over). Fail-soft + inert when the breaker is unarmed.
+        try:
+            from backend.core.ouroboros.governance.soak_circuit_breaker import (
+                get_soak_breaker,
+                soak_breaker_enabled,
+            )
+            if soak_breaker_enabled():
+                _soak_summary = await get_soak_breaker().reconcile_on_boot()
+                logger.info(
+                    "[GovernedLoop] soak breaker boot reconcile: %s",
+                    _soak_summary,
+                )
+        except Exception:  # noqa: BLE001 — boot reconcile is best-effort
+            logger.debug(
+                "[GovernedLoop] soak breaker boot reconcile skipped",
+                exc_info=True,
+            )
+
         if self._stack is None:
             return
 

@@ -3239,6 +3239,18 @@ class GCPVMManager:
                 )
 
                 self.initialized = True
+
+                # Slice 19 — register with the soak circuit-breaker so its boot
+                # reconciliation + assessments can read this manager's
+                # managed_vms runtime/cost (fail-soft; inert when unarmed).
+                try:
+                    from backend.core.ouroboros.governance.soak_circuit_breaker import (  # noqa: E501
+                        get_soak_breaker,
+                    )
+                    get_soak_breaker().register_vm_manager(self)
+                except Exception:  # noqa: BLE001
+                    logger.debug("[SoakCB] vm_manager registration skipped", exc_info=True)
+
                 logger.info("✅ GCP VM Manager ready")
                 logger.info(f"   Project: {self.config.project_id}")
                 logger.info(f"   Zone: {self.config.zone}")
@@ -5130,6 +5142,39 @@ class GCPVMManager:
             "gate": "cost_tracker",
             "checked_at": time.time(),
         }
+
+        # ── Slice 19 — Soak circuit-breaker gate (fail-closed, env-armed) ──
+        # The absolute boundary around unattended failover spend: when a
+        # cumulative-cost OR GCE-runtime threshold trips, ALL new GCE spin-up
+        # is refused. Registering ``self`` lets the breaker read this
+        # manager's ``managed_vms`` runtime/cost. Lazy import + master-flag
+        # gate + fail-OPEN keep prod byte-identical when the breaker is
+        # unarmed (default). This gate runs BEFORE the cost_tracker check so a
+        # tripped soak refuses even if the daily budget still has headroom.
+        try:
+            from backend.core.ouroboros.governance.soak_circuit_breaker import (
+                get_soak_breaker,
+                soak_breaker_enabled,
+            )
+            if soak_breaker_enabled():
+                _breaker = get_soak_breaker()
+                _breaker.register_vm_manager(self)
+                _soak_reason = _breaker.refusal_reason()
+                if _soak_reason is not None:
+                    details["gate"] = "soak_circuit_breaker"
+                    details["fail_mode"] = "closed"
+                    details["reason"] = _soak_reason
+                    logger.critical(
+                        "🛑 [SoakCB] %s blocked — soak circuit tripped: %s",
+                        operation, _soak_reason,
+                    )
+                    _notify_lifecycle(
+                        "notify_budget_exhausted",
+                        reason=_soak_reason, operation=operation,
+                    )
+                    return False, _soak_reason, details
+        except Exception:  # noqa: BLE001 — never let the breaker break the gate
+            logger.debug("[SoakCB] gce gate check degraded", exc_info=True)
 
         if not self.cost_tracker:
             reason = "cost_tracker_unavailable"
@@ -7992,6 +8037,25 @@ class GCPVMManager:
                 # Check if we should exit after sleep
                 if not self.is_monitoring:
                     break
+
+                # Slice 19 — Soak circuit-breaker periodic assessment. The
+                # LLM-dispatch gate (check_preflight) already advances the
+                # breaker on every provider call, but a node accruing runtime
+                # while the loop is IDLE would otherwise go unassessed until
+                # the next dispatch. This heartbeat closes that gap: it reads
+                # live GCE runtime/cost and trips the moment the runtime cap is
+                # crossed, even with zero new work. Inert when unarmed.
+                try:
+                    from backend.core.ouroboros.governance.soak_circuit_breaker import (  # noqa: E501
+                        get_soak_breaker,
+                        soak_breaker_enabled,
+                    )
+                    if soak_breaker_enabled():
+                        _breaker = get_soak_breaker()
+                        _breaker.register_vm_manager(self)
+                        _breaker.assess_and_maybe_trip()
+                except Exception:  # noqa: BLE001 — never break the monitor loop
+                    logger.debug("[SoakCB] monitor-loop assess degraded", exc_info=True)
 
                 # ═══════════════════════════════════════════════════════════════
                 # v236.2: Spot VM Singleton Enforcement (Duplicate Detection)

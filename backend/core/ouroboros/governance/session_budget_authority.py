@@ -643,6 +643,42 @@ def check_preflight(
 
     NEVER raises any exception class OTHER than
     :class:`SessionBudgetPreflightRefused`."""
+    # ── Slice 19 — Soak circuit-breaker gate ──
+    # A tripped soak breaker refuses ALL new BILLED LLM dispatch, independent
+    # of remaining session budget (it may have tripped on GCE runtime, not
+    # cost — and it must bite even when no session-budget authority is
+    # registered). Free local open-source compute ($0.00) is exempt, matching
+    # the financial-decoupling principle below. Lazy import keeps this
+    # low-level primitive dependency-free of the breaker; fail-OPEN on any
+    # fault. The refusal is a LOCAL config gate — :func:`is_budget_refusal`
+    # classifies it so the cascade never mistakes it for a provider outage
+    # (which could wake a real-$ GCE failover).
+    if compute_context != LOCAL_OPEN_SOURCE:
+        try:
+            from backend.core.ouroboros.governance.soak_circuit_breaker import (
+                soak_dispatch_refusal_reason,
+            )
+            _soak_reason = soak_dispatch_refusal_reason()
+        except Exception:  # noqa: BLE001 — breaker missing / import fault
+            _soak_reason = None
+        if _soak_reason is not None:
+            try:
+                _est_for_refusal = float(max(0.0, estimated_cost_usd or 0.0))
+            except (TypeError, ValueError):
+                _est_for_refusal = 0.0
+            logger.warning(
+                "[SBA] preflight REFUSED (soak_circuit_tripped): provider=%s "
+                "op_id=%s reason=%s", provider_name, op_id, _soak_reason,
+            )
+            raise SessionBudgetPreflightRefused(
+                provider=str(provider_name),
+                estimated_cost_usd=_est_for_refusal,
+                session_remaining_usd=0.0,
+                reason=(
+                    "session_budget_preflight_refused:"
+                    f"soak_circuit_tripped:{_soak_reason}"
+                )[:200],
+            )
     try:
         remaining = get_session_remaining_usd()
     except Exception as exc:  # noqa: BLE001 — defensive
