@@ -1885,6 +1885,23 @@ def main(argv: "list[str] | None" = None) -> None:
         sys.exit(1)
     if _aegis_result.outcome is _AegisPreflightOutcome.READY:
         _print_aegis_daemon_ready(_aegis_result, _mode)
+        # Slice 24 — register the daemon in the LIVE (post-re-exec) battle-test
+        # process so the child_reaper cascade targets it in the fast path. The
+        # register in preflight._spawn_daemon runs in whatever process spawned
+        # it; the battle-test os.execv re-exec (generation restart) clears that
+        # in-memory registry, which is why the graceful-halt cascade saw
+        # "0 children" (the daemon was still reaped by its own WorkerLifeline +
+        # the fs-pool cleanup, so zero orphans held — this closes the fast-path
+        # gap). Idempotent + fail-soft.
+        try:
+            from backend.core.ouroboros.governance.child_reaper import (
+                register_child as _cr_register,
+            )
+            _pid = getattr(_aegis_result, "subprocess_pid", None)
+            if _pid:
+                _cr_register(int(_pid), role="aegis_daemon")
+        except Exception:  # noqa: BLE001 — never block boot
+            pass
         # Slice 125 — credential health probe. Prove the daemon injects a VALID
         # credential of the funded class BEFORE a multi-hour soak spends time.
         # Two arms (direct funded key vs Aegis-routed); a 402 through Aegis while

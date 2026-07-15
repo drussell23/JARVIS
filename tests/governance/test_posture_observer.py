@@ -469,6 +469,12 @@ class _StubCollector:
         self.calls += 1
         return self.bundle
 
+    # Slice 24 — the chunked cadence path (now the default) collects via
+    # build_bundle_async; delegate to the sync build so cycle-behavior tests
+    # exercise the same bundle under either path.
+    async def build_bundle_async(self) -> SignalBundle:
+        return self.build_bundle()
+
 
 class _SlowCollector:
     def __init__(self, delay: float, bundle: SignalBundle) -> None:
@@ -479,9 +485,16 @@ class _SlowCollector:
         time.sleep(self.delay)
         return self.bundle
 
+    async def build_bundle_async(self) -> SignalBundle:
+        await asyncio.sleep(self.delay)
+        return self.bundle
+
 
 class _RaisingCollector:
     def build_bundle(self) -> SignalBundle:
+        raise RuntimeError("collector blew up")
+
+    async def build_bundle_async(self) -> SignalBundle:
         raise RuntimeError("collector blew up")
 
 
@@ -682,8 +695,15 @@ class _DualCollector:
 
 class TestPostureObserverWholesaleOffload:
 
+    # Slice 24 — the default cadence path flipped to CHUNKED (yielding). This
+    # class specifically exercises the WHOLESALE (single-thread) path, so force
+    # it on; the chunked-default routing is covered by TestPostureObserverCycle.
+    @pytest.fixture(autouse=True)
+    def _force_wholesale(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED", "true")
+
     @pytest.mark.asyncio
-    async def test_default_on_routes_through_sync_offloaded_cycle(
+    async def test_wholesale_routes_through_sync_offloaded_cycle(
         self, tmp_store: PostureStore,
     ):
         dual = _DualCollector(_explore_bundle())
@@ -693,6 +713,19 @@ class TestPostureObserverWholesaleOffload:
         # Wholesale offload uses the SYNC build_bundle in a worker thread.
         assert dual.sync_calls == 1
         assert dual.async_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_default_routes_through_chunked_async_cycle(
+        self, tmp_store: PostureStore, monkeypatch,
+    ):
+        # Slice 24 — with no env override the DEFAULT is now the chunked path.
+        monkeypatch.delenv("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED", raising=False)
+        dual = _DualCollector(_explore_bundle())
+        observer = PostureObserver(Path("."), tmp_store, collector=dual)
+        reading = await observer.run_one_cycle()
+        assert reading is not None
+        assert dual.async_calls == 1
+        assert dual.sync_calls == 0
 
     @pytest.mark.asyncio
     async def test_master_off_falls_back_to_legacy_async_path(
@@ -821,6 +854,13 @@ class _ThreadRecordingCollector:
 
 
 class TestOnChangeMarshalledToLoopThread:
+
+    # Slice 24 — this class proves the wholesale worker→loop marshalling of
+    # on_change; force the wholesale path (default flipped to chunked). Tests
+    # that need chunked set the env to false themselves.
+    @pytest.fixture(autouse=True)
+    def _force_wholesale(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED", "true")
 
     @pytest.mark.asyncio
     async def test_on_change_runs_on_loop_thread_not_worker(
@@ -1254,6 +1294,12 @@ class TestSharedBoundedRecentSummaries:
 
 
 class TestStaleCycleEpochGuard:
+
+    # Slice 24 — the stale-write epoch guard is a WHOLESALE-path mechanism
+    # (the chunked path is fully awaited, epoch=None). Force wholesale.
+    @pytest.fixture(autouse=True)
+    def _force_wholesale(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED", "true")
 
     @pytest.mark.asyncio
     async def test_epoch_advances_each_offloaded_cycle(

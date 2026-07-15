@@ -641,6 +641,8 @@ class TestSSEBridge:
                 self.b = b
             def build_bundle(self):
                 return self.b
+            async def build_bundle_async(self):  # Slice 24 — chunked default
+                return self.b
 
         explore_bundle = replace(baseline_bundle(), feat_ratio=0.80)
         harden_bundle = replace(

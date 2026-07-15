@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 from backend.core.ouroboros.governance.arc_context import ArcContextSignal
 from backend.core.ouroboros.governance.git_momentum import MomentumSnapshot
@@ -62,10 +62,14 @@ def _make_observer(tmp_path: Path) -> "PostureObserver":  # noqa: F821
     store.persist_current = MagicMock()
     store.load_current = MagicMock(return_value=None)
 
-    # Real bundle so the inferrer's schema check passes; collector exposes
-    # ``build_bundle`` which the observer calls via ``asyncio.to_thread``.
+    # Real bundle so the inferrer's schema check passes. Slice 24 — the
+    # default cadence path is now the CHUNKED one, which collects via the
+    # async ``build_bundle_async``; configure it as an AsyncMock so this
+    # reachability smoke exercises the REAL production (chunked) arc-context
+    # wiring. ``build_bundle`` (sync) is kept for the wholesale fallback.
     collector = MagicMock()
     collector.build_bundle = MagicMock(return_value=baseline_bundle())
+    collector.build_bundle_async = AsyncMock(return_value=baseline_bundle())
 
     obs = PostureObserver(
         project_root=tmp_path,

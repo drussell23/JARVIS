@@ -151,16 +151,23 @@ def recent_summaries_max() -> int:
 
 
 def wholesale_offload_enabled() -> bool:
-    """3rd starvation tier (Fix 2) — master switch for wholesale
-    off-loop cycle execution. Default TRUE: the ENTIRE ``run_one_cycle``
-    runs synchronously inside the shared ``cooperative_fs_io.offload``
-    thread pool so the whole cadence tick is decoupled from the primary
-    event loop in ONE dispatch. FALSE degrades to the legacy per-signal
-    chunked-async path (``build_bundle_async`` → ``_offload_signal``,
-    Tier-2b) for byte-identical-shape rollback."""
+    """Master switch — wholesale (ONE thread) vs chunked (yielding) cadence.
+
+    Slice 24 — default flipped to FALSE (chunked). The wholesale path runs the
+    ENTIRE cycle in ONE ``offload(cpu_bound=False)`` thread; when fastembed is
+    unavailable / summaries are many, that thread HOLDS the GIL for the whole
+    pure-Python span — 3,182 ms in soak bt-2026-07-15-10:22 and 3,494 ms in
+    ...-154242, both on ``posture_observer.run_one_cycle``, a real heartbeat
+    starver on the ~5-min cadence. The chunked path
+    (``_run_one_cycle_impl`` → ``build_bundle_async`` → ``_offload_signal``)
+    dispatches each of the 12 collectors SEPARATELY with an
+    ``asyncio.sleep(0)`` cooperative yield between them (Slice 12S/Tier-2b),
+    so the event loop gets a scheduling slot between every chunk and the
+    deadman heartbeat keeps ticking. ``JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED
+    =true`` restores the monolithic path for byte-identical rollback."""
     raw = os.environ.get("JARVIS_POSTURE_WHOLESALE_OFFLOAD_ENABLED")
     if raw is None:
-        return True
+        return False
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
@@ -1385,10 +1392,32 @@ class PostureObserver:
             arc_ctx = await _offload_signal(
                 build_arc_context, self._root, lss_one_liner,
             )
-        outcome = self._process_bundle(
+        # Slice 24 — offload the sync tail too. ``_process_bundle`` runs the
+        # DirectionInferrer inference (pure-Python, GIL-holding) + hysteresis +
+        # PostureStore writes; running it directly on the loop was the residual
+        # on-loop cost of this path. It is thread-safe (the wholesale path
+        # already ran it inside a worker thread; PostureStore guards its own
+        # lock), so dispatch it through the SAME offload substrate. The
+        # loop-affine ``_fire_on_change`` stays on the loop (fired AFTER, back
+        # here) — never inside the worker. ``offload``/``is_offload_error`` are
+        # used directly (not ``_offload_signal``, whose None-on-error collides
+        # with a legitimate None outcome): an offload fault degrades to the
+        # inline call (byte-identical), the cycle never raises.
+        import functools as _functools
+        _process = _functools.partial(
+            self._process_bundle,
             bundle, lss_one_liner=lss_one_liner, epoch=None,
             arc_ctx=arc_ctx, build_arc_ctx=False,
         )
+        try:
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                offload as _offload_pb,
+                is_offload_error as _is_offload_err_pb,
+            )
+            _r = await _offload_pb(_process, cpu_bound=False)
+            outcome = _process() if _is_offload_err_pb(_r) else _r
+        except Exception:  # noqa: BLE001 — substrate fault → inline, never raise
+            outcome = _process()
         if outcome is None:
             return None
         self._fire_on_change(outcome.on_change_args)
@@ -1578,6 +1607,17 @@ class PostureObserver:
             logger.warning(
                 "[PostureObserver] collector timeout after %.1fs",
                 collector_timeout_s(),
+            )
+            self._cycles_failed += 1
+            return None
+        except Exception:  # noqa: BLE001
+            # Slice 24 — fail-soft parity with the wholesale path (whose
+            # offload wrapper traps a raising collector as an OffloadError).
+            # Now that the chunked path is the default, a collector that raises
+            # from build_bundle_async must NOT propagate into run_one_cycle —
+            # keep the prior posture, bump cycles_failed, return None.
+            logger.debug(
+                "[PostureObserver] collector raised — fail-soft", exc_info=True,
             )
             self._cycles_failed += 1
             return None
