@@ -1789,6 +1789,11 @@ class OracleSemanticIndex:
         if _chroma and self._collection is None:
             return
 
+        if _oracle_embed_tail_coop_enabled():
+            await self._embed_nodes_coop(nodes, _chroma=_chroma, _stdlib=_stdlib)
+            return
+
+        # ── Legacy tail (JARVIS_ORACLE_EMBED_TAIL_COOP_ENABLED=0 rollback) ──
         try:
             embeddable = [
                 n for n in nodes
@@ -1855,6 +1860,174 @@ class OracleSemanticIndex:
 
             logger.debug("[OracleSemanticIndex] Embedded %d nodes", len(embeddable))
         except Exception as exc:
+            logger.warning("[OracleSemanticIndex] embed_nodes failed: %s", exc)
+
+    async def _embed_nodes_coop(
+        self, nodes: List["NodeData"], *, _chroma: bool, _stdlib: bool,
+    ) -> None:
+        """Slice 28 — adaptive cooperative embed/upsert tail.
+
+        Closes the bt-2026-07-15-225445 10.3s post-sweep hold. The legacy
+        tail's residual on-loop work: ``_build_embed_text`` evaluated over
+        EVERY node twice (filter pass + per-batch rebuild) as pure-Python
+        string joins with zero awaits before the first batch; per-batch
+        metadata dict-builds + numpy ``tolist()`` conversion on the loop;
+        and a static 128 batch with no adaptation between batches.
+
+        Shape (all pre-existing substrate — no new pools, no new queue):
+          * per-batch prep (text-build + ids + metadata) and the vector
+            conversion + chroma upsert run via ``cooperative_fs_io.offload``
+            thread path — the SAME executor Slice 25 chose for the upsert
+            (thread, never process: the PersistentClient's native file lock
+            makes a second writer process corrupt HNSW segments; that pool
+            is already child_reaper-registered, and thread offloads spawn
+            no children — teardown lifecycle unchanged);
+          * batch size is AIMD-governed (``_AdaptiveIndexThrottle``, the
+            Slice 26 congestion-control class) fed by the shared
+            ``event_loop_governance.measure_loop_lag_ms`` probe (Slice 27)
+            — payload-size adaptation is EMERGENT, not configured: a
+            heavier batch produces more observed lag, which halves the
+            next batch; light batches recover additively toward the
+            ``ORACLE_EMBED_BATCH`` ceiling. No static chunk boundary
+            decides anything at runtime;
+          * memory axis: the shared ``MemoryPressureGate`` level (which
+            already folds the Slice 26 in-flight-reservation dimension)
+            maps through ``_ORACLE_MEM_LAG_MULT`` into synthetic lag —
+            elevated pressure contracts the batch AND lengthens the
+            proportional backoff yield, exactly the sweep armor's graded
+            defense.
+
+        Never raises; any batch fault logs + drops that batch (legacy
+        fail-soft contract preserved).
+        """
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error as _cr_is_err,
+            offload as _cr_offload,
+        )
+        from backend.core.ouroboros.governance.event_loop_governance import (
+            measure_loop_lag_ms as _elg_lag_ms,
+        )
+
+        try:
+            # Cheap type filter stays inline (frozenset membership); the
+            # EXPENSIVE text building is per-batch and off-loop below.
+            candidates = [
+                n for n in nodes
+                if n.node_id.node_type in self._EMBEDDABLE_TYPES
+            ]
+            if not candidates:
+                return
+
+            throttle = (
+                _AdaptiveIndexThrottle(
+                    max_batch=OracleConfig.SEMANTIC_EMBED_BATCH_SIZE,
+                    min_batch=_oracle_backpressure_min_batch(),
+                    lag_threshold_ms=_oracle_backpressure_lag_ms(),
+                )
+                if _oracle_backpressure_enabled()
+                else None
+            )
+            _armor_on = _oracle_memory_armor_enabled()
+            total_embedded = 0
+            i = 0
+            while i < len(candidates):
+                # Memory axis BEFORE sizing the batch — same graded defense
+                # as the sweep (shared gate → shared multiplier table).
+                if throttle is not None and _armor_on:
+                    _mult = _ORACLE_MEM_LAG_MULT.get(
+                        _semantic_embed_pressure_level(), 0.0,
+                    )
+                    if _mult > 0.0:
+                        throttle.update(_mult * throttle.lag_threshold_ms)
+                effective = (
+                    throttle.batch if throttle is not None
+                    else OracleConfig.SEMANTIC_EMBED_BATCH_SIZE
+                )
+                batch = candidates[i : i + effective]
+                i += len(batch)
+
+                def _prep(_batch=batch):
+                    texts: List[str] = []
+                    keep: List[Any] = []
+                    for n in _batch:
+                        t = self._build_embed_text(n)
+                        if t is not None:
+                            keep.append(n)
+                            texts.append(t)
+                    ids = [str(n.node_id) for n in keep]
+                    metas = [
+                        {
+                            "repo": n.node_id.repo,
+                            "file_path": n.node_id.file_path,
+                            "name": n.node_id.name,
+                            "node_type": n.node_id.node_type.value,
+                        }
+                        for n in keep
+                    ]
+                    return texts, ids, metas
+
+                prep = await _cr_offload(_prep, cpu_bound=False)
+                if _cr_is_err(prep):
+                    logger.warning(
+                        "[OracleSemanticIndex] embed prep offload failed "
+                        "(%s) — batch dropped", prep,
+                    )
+                    continue
+                texts, ids, metadatas = prep
+                if not texts:
+                    continue
+
+                embeddings = await self._embedder.embed_batch(texts)
+
+                if _stdlib:
+                    for _eid, _emb, _meta in zip(ids, embeddings, metadatas):
+                        _vec = (
+                            _emb.tolist() if hasattr(_emb, "tolist")
+                            else list(_emb)
+                        )
+                        self._stdlib_store[_eid] = (
+                            [float(x) for x in _vec], _meta,
+                        )
+                else:
+                    # Slice 25 discipline unchanged: THREAD offload (never a
+                    # process — persist-dir lock; see embed_nodes legacy
+                    # comment). Slice 28 folds the numpy tolist() conversion
+                    # into the SAME thread hop as the upsert — one offload,
+                    # zero on-loop vector marshalling.
+                    def _convert_and_upsert(
+                        _ids=ids, _embs=embeddings, _metas=metadatas,
+                    ):
+                        return self._collection.upsert(
+                            ids=_ids,
+                            embeddings=[e.tolist() for e in _embs],
+                            metadatas=_metas,
+                        )
+
+                    _up = await _cr_offload(_convert_and_upsert, cpu_bound=False)
+                    if _cr_is_err(_up):
+                        logger.warning(
+                            "[OracleSemanticIndex] chroma upsert offload "
+                            "failed (%s) — batch dropped", _up,
+                        )
+                        continue
+                total_embedded += len(texts)
+
+                # Loop-lag probe BETWEEN batches (shared Slice 27 probe) —
+                # contract + proportional backoff exactly like the sweep.
+                if throttle is not None and i < len(candidates):
+                    lag_ms = await _elg_lag_ms()
+                    throttle.update(lag_ms)
+                    _backoff = throttle.backoff_s(lag_ms)
+                    if _backoff > 0.0:
+                        await asyncio.sleep(_backoff)
+                else:
+                    await asyncio.sleep(0)
+
+            logger.debug(
+                "[OracleSemanticIndex] Embedded %d nodes (coop tail)",
+                total_embedded,
+            )
+        except Exception as exc:  # noqa: BLE001 — never break the caller
             logger.warning("[OracleSemanticIndex] embed_nodes failed: %s", exc)
 
     async def semantic_search(
@@ -2050,6 +2223,34 @@ def _oracle_scoped_sweep_embed_enabled() -> bool:
     all-nodes re-embed."""
     raw = os.environ.get("JARVIS_ORACLE_SCOPED_SWEEP_EMBED_ENABLED", "true")
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _oracle_embed_tail_coop_enabled() -> bool:
+    """``JARVIS_ORACLE_EMBED_TAIL_COOP_ENABLED`` (default true) — Slice 28: the
+    post-sweep embed/upsert tail runs as an ADAPTIVE cooperative pipeline
+    (AIMD batch sizing on live loop lag + memory pressure, text-build and
+    vector-conversion off-loop) instead of the legacy fixed-128 march whose
+    on-loop text building + conversion produced the bt-2026-07-15-225445
+    10.3s cold-tail hold. Kill switch ``=0`` restores the legacy tail."""
+    raw = os.environ.get("JARVIS_ORACLE_EMBED_TAIL_COOP_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _semantic_embed_pressure_level() -> str:
+    """Shared-gate memory level for the embed tail — the SAME advisory
+    ``MemoryPressureGate`` the sweep armor and SensorGovernor consult (no
+    duplication; the Slice 26 reservation dimension rides along for free).
+    Returns ``ok|warn|high|critical``; NEVER raises (any fault → ``ok``,
+    fail-open — this axis only ever contracts a batch, never blocks)."""
+    try:
+        from backend.core.ouroboros.governance.memory_pressure_gate import (
+            get_default_gate, is_enabled,
+        )
+        if not is_enabled():
+            return "ok"
+        return get_default_gate().pressure().value
+    except Exception:  # noqa: BLE001
+        return "ok"
 
 
 def _oracle_memory_armor_enabled() -> bool:
