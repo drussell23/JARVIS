@@ -591,6 +591,14 @@ def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         "--bind-host", type=str, default="",
         help="Loopback host to bind (default from JARVIS_AEGIS_DAEMON_BIND_HOST or 127.0.0.1).",
     )
+    parser.add_argument(
+        "--parent-pid", type=int, default=0,
+        help=(
+            "PID of the spawning organism. Slice 22: arms the WorkerLifeline "
+            "so the daemon self-exits on parent death (ppid drift) instead of "
+            "orphaning and polling DoubleWord forever."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -732,6 +740,24 @@ def _configure_daemon_logging(mode: Optional[PresentationMode] = None) -> None:
 def main(argv: Optional[list] = None) -> int:
     _configure_daemon_logging()
     args = _parse_args(argv)
+    # Slice 22 — arm the WorkerLifeline BEFORE serving so the daemon self-exits
+    # on organism death. The aegis daemon is a plain subprocess with no pool
+    # initializer, so without this it survives a SIGKILLed parent forever
+    # (the 9.6 h orphan of bt-2026-07-15-154242). ``expected_parent_pid`` is
+    # passed explicitly by the spawner to close the arm-after-parent-death race
+    # (matches the pool-worker pattern); falls back to os.getppid() at arm
+    # time. Fail-soft: a lifeline arm fault must never block the daemon boot.
+    try:
+        from backend.core.ouroboros.governance.worker_lifeline import (
+            arm_worker_lifeline,
+        )
+        _ppid = int(getattr(args, "parent_pid", 0) or 0)
+        arm_worker_lifeline(
+            "aegis_daemon",
+            expected_parent_pid=_ppid if _ppid > 0 else None,
+        )
+    except Exception:  # noqa: BLE001 — never block daemon boot
+        logger.debug("[AegisDaemon] worker-lifeline arm skipped", exc_info=True)
     try:
         asyncio.run(_serve(args))
         return 0

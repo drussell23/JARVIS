@@ -1825,6 +1825,17 @@ class BattleTestHarness:
                     )
                 except Exception:  # noqa: BLE001
                     pass
+                # Slice 22 — arm the child-reaper atexit fallback at boot so an
+                # ordinary interpreter exit also cascades to registered children
+                # (the signal handlers + LoopDeadman pre-exit cover the paths
+                # atexit can't). Idempotent + fail-soft.
+                try:
+                    from backend.core.ouroboros.governance.child_reaper import (
+                        arm_atexit_cascade,
+                    )
+                    arm_atexit_cascade()
+                except Exception:  # noqa: BLE001
+                    pass
                 if _deadman_enabled():
                     _deadman = _deadman_get_default()
                     _deadman_started = _deadman.start()
@@ -7342,6 +7353,34 @@ class BattleTestHarness:
         # cannot SIGKILL during a legitimate (BoundedShutdownWatchdog-governed)
         # cleanup. The in-process ShutdownWatchdog covers shutdown-path hangs.
         self._disarm_external_watchdog()
+
+        # Slice 22 — deterministic child cascade on the GRACEFUL path. Reap the
+        # Aegis daemon (registered at spawn) + the fs process pool so no child
+        # survives this shutdown polling DoubleWord (the 14-orphan graveyard of
+        # bt-2026-07-15-154242 accumulated because nothing did this). Fast
+        # (SIGTERM → bounded grace → SIGKILL) + never-raises; runs before the
+        # network cleanup steps that could hang, so orphans die even if a later
+        # step wedges the shutdown watchdog. The daemon's own WorkerLifeline and
+        # the LoopDeadman pre-exit cascade cover the hard-halt paths this can't.
+        try:
+            from backend.core.ouroboros.governance.child_reaper import (
+                cascade_terminate,
+            )
+            _reaped = cascade_terminate()
+            if _reaped:
+                logger.info(
+                    "[Shutdown] child-reaper cascade: %d child(ren) terminated",
+                    _reaped,
+                )
+        except Exception:  # noqa: BLE001 — cleanup must never abort on this
+            logger.debug("[Shutdown] child-reaper cascade skipped", exc_info=True)
+        try:
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                shutdown_fs_process_pool,
+            )
+            shutdown_fs_process_pool()
+        except Exception:  # noqa: BLE001
+            pass
 
         # ── Slice 12V Phase 1 — WAL-first shutdown ──
         #

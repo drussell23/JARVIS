@@ -1429,7 +1429,19 @@ class UnifiedIntakeRouter:
                     evaluate_cognitive_load,
                 )
 
-                _load = evaluate_cognitive_load()
+                # Slice 22 — evaluate_cognitive_load reads the forecast ledger
+                # + flock-appends its own ledger (disk I/O). Off the loop via
+                # the unified offload substrate so a burst of sheddable-urgency
+                # signals can't serialize that I/O on the event-loop thread.
+                # Fail-soft: an offload fault degrades to the inline call
+                # (byte-identical), never breaks intake.
+                from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501
+                    is_offload_error as _is_offload_error_cl,
+                    offload as _offload_cl,
+                )
+                _load = await _offload_cl(evaluate_cognitive_load, cpu_bound=False)
+                if _is_offload_error_cl(_load):
+                    _load = evaluate_cognitive_load()
                 _should_shed = _load.verdict in (
                     LoadVerdict.ELEVATED,
                     LoadVerdict.OVERLOADED,
@@ -1461,6 +1473,20 @@ class UnifiedIntakeRouter:
                     )
             except Exception:  # noqa: BLE001 — never break intake
                 pass
+
+        # Slice 22 — cooperative yield before the heavy (WAL + offload) phase.
+        # Under a signal BURST (72 ingests in ~30s wedged the loop in
+        # bt-2026-07-15-154242), admitted signals would otherwise run their
+        # heavy phase back-to-back; one sleep(0) here hands the loop a
+        # scheduling slot per admitted signal so the deadman heartbeat keeps
+        # ticking. No-op when event-loop governance is disabled. NEVER raises.
+        try:
+            from backend.core.ouroboros.governance.event_loop_governance import (  # noqa: E501
+                cooperative_yield as _coop_yield,
+            )
+            await _coop_yield()
+        except Exception:  # noqa: BLE001 — a yield fault never breaks intake
+            pass
 
         # 4. WAL enqueue — durable before placing on in-memory queue
         lease_id = generate_operation_id("lse")

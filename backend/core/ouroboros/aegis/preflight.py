@@ -166,11 +166,15 @@ def _spawn_daemon(
         "backend.core.ouroboros.aegis.daemon",
         "--bootstrap-out",
         str(bootstrap_out),
+        # Slice 22 — ship the spawner PID so the daemon can arm its
+        # WorkerLifeline against the real parent (race-safe orphan self-exit).
+        "--parent-pid",
+        str(os.getpid()),
     ]
     if bind_host_override:
         cmd.extend(["--bind-host", bind_host_override])
 
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         cmd,
         env=sub_env,
         stdin=subprocess.DEVNULL,
@@ -179,6 +183,15 @@ def _spawn_daemon(
         # `aegis-daemon` for easy grep.
         close_fds=True,
     )
+    # Slice 22 — register the daemon for parent-side cascade teardown. Belt to
+    # the daemon's own lifeline braces: the reaper is the fast graceful/pre-exit
+    # path, the lifeline the pure-SIGKILL backstop. Fail-soft.
+    try:
+        from backend.core.ouroboros.governance.child_reaper import register_child
+        register_child(proc.pid, role="aegis_daemon")
+    except Exception:  # noqa: BLE001 — never break the spawn
+        pass
+    return proc
 
 
 async def _await_bootstrap_payload(

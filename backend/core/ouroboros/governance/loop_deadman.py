@@ -673,6 +673,21 @@ class LoopDeadman:
             except Exception:  # noqa: BLE001
                 pass
 
+        # Slice 22 — cascade-kill registered children (the Aegis daemon, mp
+        # pools) BEFORE we os._exit. os._exit bypasses atexit, so the reaper's
+        # atexit fallback never fires on this path — this is the ONLY in-process
+        # seam that reaps children when the loop is wedged. Signal-safe +
+        # never-raises by contract (only os.kill, no grace sleep under hard=True,
+        # no logging lock). Without it, a wedged organism leaves the aegis
+        # daemon polling DoubleWord for hours (bt-2026-07-15-154242).
+        try:
+            from backend.core.ouroboros.governance.child_reaper import (
+                cascade_terminate,
+            )
+            cascade_terminate(hard=True)
+        except Exception:  # noqa: BLE001 — the exit MUST still fire
+            pass
+
         # Final, unrecoverable exit. ``os._exit`` bypasses Python
         # cleanup (atexit handlers, asyncio __del__, etc.) — those
         # would re-deadlock on the wedge. The session manager's
