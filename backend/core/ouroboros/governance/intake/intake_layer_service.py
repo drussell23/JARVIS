@@ -785,6 +785,28 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] IntentDiscoverySensor skipped: %s", exc)
 
+        # ---- WorkOrderSensor (P0.2: the operator's OWN roadmap as work orders) ----
+        # Reads operator-declared roadmap artifacts (progress.md NEXT: markers,
+        # plan docs) so the human's actual intent becomes high-priority signals
+        # rather than the queue standing empty of substance. Always registered
+        # for lifecycle; its scan is a no-op until JARVIS_WORK_ORDER_SENSOR_
+        # ENABLED (§33.1 default-FALSE) — so the sensor is wired-live-but-inert
+        # by policy, never dead-by-omission.
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.work_order_sensor import (
+                WorkOrderSensor,
+            )
+            _work_order_sensor = WorkOrderSensor(
+                repo="jarvis",
+                router=self._router,
+                project_root=self._config.project_root,
+            )
+            self._sensors.append(_work_order_sensor)
+            self._work_order_sensor = _work_order_sensor
+            logger.info("[IntakeLayer] WorkOrderSensor added (operator roadmap ingestion)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] WorkOrderSensor skipped: %s", exc)
+
         # ---- CrossRepoDriftSensor (P3: Trinity contract integrity) ----
         try:
             from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
