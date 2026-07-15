@@ -2365,9 +2365,14 @@ def publish_task_event(
 #     records (sandboxing, gating, applying, validating, ...) do NOT
 #     publish.
 #
-# Master switch ``JARVIS_OP_LIFECYCLE_SSE_ENABLED`` (§33.1 default-FALSE).
-# When OFF, the publish is a no-op and the broker sees zero
-# operation_terminal events — byte-identical to pre-B.2.0.5 behavior.
+# Master switch ``JARVIS_OP_LIFECYCLE_SSE_ENABLED`` (§33.1 — GRADUATED
+# default-TRUE 2026-07-14, Task #10). Default-on so a headless operator
+# watching via SSE / Discord / the IDE extensions sees the FSM's terminal
+# op OUTCOMES (the four states below) — invisible on the push channel while
+# this was dark. Pure observability: never raises into _record_ledger, zero
+# FSM authority. Explicit ``JARVIS_OP_LIFECYCLE_SSE_ENABLED=false`` restores
+# the byte-identical pre-B.2.0.5 silence (the broker sees zero
+# operation_terminal events) for hot-revert.
 
 OP_LIFECYCLE_SSE_ENABLED_ENV_VAR: str = "JARVIS_OP_LIFECYCLE_SSE_ENABLED"
 
@@ -2386,9 +2391,28 @@ TERMINAL_OPERATION_STATES: frozenset = frozenset({
 
 
 def op_lifecycle_sse_enabled() -> bool:
-    """Master flag query (§33.1 default-FALSE)."""
-    raw = os.environ.get(OP_LIFECYCLE_SSE_ENABLED_ENV_VAR, "")
-    return raw.strip().lower() in ("true", "1", "yes", "on")
+    """Master flag query (§33.1 — GRADUATED default-TRUE 2026-07-14, Task #10).
+
+    Asymmetric semantics (mirrors the other graduated substrate flags):
+    empty / unset / whitespace reads as the graduated default (True); only
+    an explicit ``off`` / ``0`` / ``false`` / ``no`` disables it — so a typo
+    can never silently re-arm the old dark default.
+
+    Why default-on is safe here: this is a PURE observability push. The
+    publisher (``publish_operation_terminal``) is best-effort, bounded, and
+    NEVER raises into ``_record_ledger`` (the operator binding); it carries
+    ZERO authority over the FSM, Iron Gate, or risk tiers. Default-on only
+    ADDS visibility — a headless operator watching via SSE / Discord / the
+    IDE extensions now sees the FSM's terminal op OUTCOMES (applied /
+    rolled_back / failed / blocked), which were invisible on the push
+    channel while this was dark. With no subscriber it degrades to a cheap
+    no-op publish against the bounded broker."""
+    raw = os.environ.get(OP_LIFECYCLE_SSE_ENABLED_ENV_VAR, "").strip().lower()
+    # Fail-safe-on: ONLY an explicit off-token disables. Empty/whitespace,
+    # the on-tokens, AND any unrecognized value (a typo) all resolve to the
+    # graduated default (True) — a fat-fingered env var can never silently
+    # restore the old dark channel.
+    return raw not in ("off", "0", "false", "no")
 
 
 def publish_operation_terminal(ctx: Any, state: Any) -> Optional[str]:
@@ -4567,12 +4591,13 @@ def register_flags(registry: Any) -> int:
         FlagSpec(
             name=OP_LIFECYCLE_SSE_ENABLED_ENV_VAR,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
-                "B.2.0.5 master switch (§33.1 default-FALSE): when ON, "
-                "the orchestrator emits an ``operation_terminal`` SSE "
-                "event after every successful terminal ledger.append() "
-                "(states: applied / rolled_back / failed / blocked). "
+                "B.2.0.5 master switch (§33.1 — GRADUATED default-TRUE "
+                "2026-07-14, Task #10): when ON, the orchestrator emits an "
+                "``operation_terminal`` SSE event after every successful "
+                "terminal ledger.append() (states: applied / rolled_back / "
+                "failed / blocked). "
                 "Distinct from task_* TaskBoard events — this fans out "
                 "the orchestrator FSM's terminal state, consumed by the "
                 "SWE-Bench-Pro Phase B.2.2 evaluator, IDE extensions "

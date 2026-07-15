@@ -117,8 +117,11 @@ def fresh_broker() -> Iterator[Any]:
 # ---------------------------------------------------------------------------
 
 
-def test_master_flag_default_false(clean_env: None) -> None:
-    assert op_lifecycle_sse_enabled() is False
+def test_master_flag_default_true(clean_env: None) -> None:
+    """Task #10 GRADUATION: unset/empty reads as the graduated default
+    (True) so a headless operator sees terminal op outcomes on the push
+    channel without opt-in."""
+    assert op_lifecycle_sse_enabled() is True
 
 
 def test_master_flag_false_explicit(
@@ -128,17 +131,51 @@ def test_master_flag_false_explicit(
     assert op_lifecycle_sse_enabled() is False
 
 
-def test_publish_returns_none_when_master_off(
-    clean_env: None, fresh_broker: Any,
+@pytest.mark.parametrize("bad", ["garbage", " ", "maybe", "tru", "1 "])
+def test_master_flag_typo_stays_default_on(
+    monkeypatch: pytest.MonkeyPatch, bad: str,
 ) -> None:
-    """No event reaches the broker when the master flag is unset."""
+    """Fail-safe-on: ONLY an explicit off-token disables. Whitespace, a
+    typo'd on-token ('tru'), or any garbage value must stay ON — a
+    fat-fingered env var can never silently re-arm the old dark default."""
+    monkeypatch.setenv(OP_LIFECYCLE_SSE_ENABLED_ENV_VAR, bad)
+    assert op_lifecycle_sse_enabled() is True
+
+
+@pytest.mark.parametrize("off", ["off", "0", "false", "no", "FALSE", " off "])
+def test_master_flag_explicit_off_tokens_disable(
+    monkeypatch: pytest.MonkeyPatch, off: str,
+) -> None:
+    monkeypatch.setenv(OP_LIFECYCLE_SSE_ENABLED_ENV_VAR, off)
+    assert op_lifecycle_sse_enabled() is False
+
+
+def test_publish_returns_none_when_master_explicitly_off(
+    monkeypatch: pytest.MonkeyPatch, fresh_broker: Any,
+) -> None:
+    """Explicit off restores the byte-identical pre-B.2.0.5 silence: no
+    event reaches the broker (the hot-revert escape hatch)."""
+    monkeypatch.setenv(OP_LIFECYCLE_SSE_ENABLED_ENV_VAR, "false")
     result = publish_operation_terminal(_DuckCtx(), _DuckState("applied"))
     assert result is None
-    # Broker history should not contain any operation_terminal events.
     history = fresh_broker.recent_history(
         limit=50, event_type=EVENT_TYPE_OPERATION_TERMINAL,
     )
     assert history == []
+
+
+def test_publish_fires_by_default_when_unset(
+    clean_env: None, fresh_broker: Any,
+) -> None:
+    """THE graduation proof: with the flag UNSET (default), a terminal
+    state publishes to the broker — the push channel is live by default."""
+    ctx = _DuckCtx(op_id="op-graduation-default-on", phase="COMPLETE")
+    result = publish_operation_terminal(ctx, _DuckState("applied"))
+    assert result is not None
+    history = fresh_broker.recent_history(
+        limit=50, event_type=EVENT_TYPE_OPERATION_TERMINAL,
+    )
+    assert len(history) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -367,12 +404,27 @@ def _orchestrator_source() -> str:
 
 
 def test_ast_pin_publish_called_exactly_once_in_orchestrator() -> None:
-    """Single-seam invariant: ``publish_operation_terminal`` referenced
-    by name EXACTLY once in orchestrator.py (the body of
-    ``_record_ledger``). Drift here would mean a parallel call site
-    issuing duplicate events for the same terminal."""
+    """Single-seam invariant: the terminal-event publisher is called
+    EXACTLY once in orchestrator.py (the body of ``_record_ledger``).
+    Drift here would mean a parallel call site issuing duplicate events
+    for the same terminal.
+
+    Alias-aware: the orchestrator imports the publisher under a local
+    alias (``publish_operation_terminal as _s74_publish_terminal``), so a
+    literal-name match finds ZERO call sites. This pin resolves every
+    local name bound to ``publish_operation_terminal`` via ``from ...
+    import`` and counts calls to any of them — so it verifies the real
+    producer wiring rather than a stale spelling."""
     src = _orchestrator_source()
     tree = ast.parse(src)
+    # 1. Resolve every local name bound to the publisher via a from-import.
+    bound_names = {"publish_operation_terminal"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "publish_operation_terminal":
+                    bound_names.add(alias.asname or alias.name)
+    # 2. Count calls to any of those bound names.
     call_sites = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
@@ -382,11 +434,12 @@ def test_ast_pin_publish_called_exactly_once_in_orchestrator() -> None:
                 name = fn.id
             elif isinstance(fn, ast.Attribute):
                 name = fn.attr
-            if name == "publish_operation_terminal":
+            if name in bound_names:
                 call_sites.append(node)
     assert len(call_sites) == 1, (
-        f"publish_operation_terminal must be called exactly once "
-        f"in orchestrator.py; found {len(call_sites)} call sites"
+        f"the terminal-event publisher must be called exactly once in "
+        f"orchestrator.py (bound names={sorted(bound_names)}); found "
+        f"{len(call_sites)} call sites"
     )
 
 
@@ -500,7 +553,7 @@ def test_register_flags_returns_one_spec() -> None:
     count = register_flags(_Capturer())
     assert count == 1
     assert captured[0].name == OP_LIFECYCLE_SSE_ENABLED_ENV_VAR
-    assert captured[0].default is False
+    assert captured[0].default is True  # Task #10 graduation
 
 
 def test_register_flags_never_raises_when_registry_register_throws() -> None:
@@ -628,12 +681,15 @@ def test_orchestrator_record_ledger_idempotent_on_duplicate(
     assert len(history) == 1
 
 
-def test_orchestrator_record_ledger_master_off_byte_identical(
-    clean_env: None, fresh_broker: Any,
+def test_orchestrator_record_ledger_explicit_off_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, fresh_broker: Any,
 ) -> None:
-    """With master flag unset, _record_ledger behavior is byte-
-    identical: ledger.append still fires, but no SSE event is
-    published. Defends the §33.1 graduation contract."""
+    """The hot-revert escape hatch: with the flag EXPLICITLY off,
+    _record_ledger behavior is byte-identical to pre-graduation —
+    ledger.append still fires, but no SSE event is published. (Task #10
+    graduated the DEFAULT to on, so 'unset' now publishes; explicit off is
+    how an operator restores the old silence.)"""
+    monkeypatch.setenv(OP_LIFECYCLE_SSE_ENABLED_ENV_VAR, "false")
     from backend.core.ouroboros.governance.orchestrator import (
         GovernedOrchestrator,
     )

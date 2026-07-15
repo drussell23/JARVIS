@@ -148,7 +148,10 @@ def test_boot_hook_backward_compatible_without_ledger(monkeypatch):
 
 def test_inject_autoscore_warns_when_sse_off(monkeypatch, caplog):
     monkeypatch.setattr(hi, "load_problem", lambda iid: (object(), None))
-    monkeypatch.delenv("JARVIS_OP_LIFECYCLE_SSE_ENABLED", raising=False)
+    # Task #10: JARVIS_OP_LIFECYCLE_SSE_ENABLED graduated to default-ON, so an
+    # UNSET soak now gets fast-wake by default (no warning needed). The
+    # coupling warning must still fire when the flag is EXPLICITLY disabled.
+    monkeypatch.setenv("JARVIS_OP_LIFECYCLE_SSE_ENABLED", "false")
 
     async def _noop_drive(specs, intake_service, **kwargs):
         return
@@ -176,6 +179,25 @@ def test_inject_autoscore_no_warn_when_sse_on(monkeypatch, caplog):
         "JARVIS_OP_LIFECYCLE_SSE_ENABLED" in r.getMessage()
         for r in caplog.records
     ), "no coupling warning expected when SSE is enabled"
+
+
+def test_inject_autoscore_no_warn_when_default_unset(monkeypatch, caplog):
+    """Task #10 graduation win: with the flag UNSET, the fast-wake coupling
+    is satisfied by the graduated default-ON, so a soak that never sets the
+    flag no longer trips the 'silently slow' warning."""
+    monkeypatch.setattr(hi, "load_problem", lambda iid: (object(), None))
+    monkeypatch.delenv("JARVIS_OP_LIFECYCLE_SSE_ENABLED", raising=False)
+
+    async def _noop_drive(specs, intake_service, **kwargs):
+        return
+
+    monkeypatch.setattr(hi, "_drive_parallel_evaluate", _noop_drive)
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(hi._inject_autoscore(["x"], intake_service=object()))
+    assert not any(
+        "JARVIS_OP_LIFECYCLE_SSE_ENABLED" in r.getMessage()
+        for r in caplog.records
+    ), "unset must not warn post-graduation (default is ON)"
 
 
 # ── Wiring pins: guard against silent un-wiring (the original failure) ──────
