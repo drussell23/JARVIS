@@ -28,7 +28,7 @@ Doubleword (formerly TitanML, $12M Series A — Dawn Capital) is a managed async
 | Doubleword model | `Qwen/Qwen3.5-35B-A3B-FP8` (35B total · ~3B active params · MoE reasoning) |
 | J-Prime baseline | `Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf` |
 | J-Prime compute | NVIDIA L4, g2-standard-4, 24GB VRAM, GCP us-central1-b |
-| J-Prime boot | `jarvis-prime-golden` custom GCP image (11 GGUF models pre-baked · ~87s cold start) |
+| J-Prime boot | `jarvis-brain-golden` custom GCP image (11 GGUF models pre-baked · ~87s cold start) |
 | Batch window | 1-hour SLA |
 | Tasks | Secure Infrastructure Code (NIST 800-53) + Defense Threat Analysis (SSH lateral movement) |
 | API pricing | $0.10/1M input tokens · $0.40/1M output tokens |
@@ -280,7 +280,7 @@ Reactor-Core DPO Pipeline:
   Telemetry JSONL → Doubleword Batch (397B) → scored preference pairs → J-Prime fine-tune
 ```
 
-**Note on the GCP golden image:** `jarvis-prime-golden` pre-bakes all 11 quantized GGUF models directly into the boot disk, reducing cold-start time from ~8 minutes (model download) to ~87 seconds (model load from disk). Doubleword requires **zero changes** to this image. The integration is entirely client-side: the `autobatcher` pip package is added to requirements, `DOUBLEWORD_API_KEY` and `DOUBLEWORD_BASE_URL` are added to `.env`, and the `DoublewordProvider` class is registered in the governance bootstrap. The golden image stays lean and unchanged.
+**Note on the GCP golden image:** `jarvis-brain-golden` pre-bakes all 11 quantized GGUF models directly into the boot disk, reducing cold-start time from ~8 minutes (model download) to ~87 seconds (model load from disk). Doubleword requires **zero changes** to this image. The integration is entirely client-side: the `autobatcher` pip package is added to requirements, `DOUBLEWORD_API_KEY` and `DOUBLEWORD_BASE_URL` are added to `.env`, and the `DoublewordProvider` class is registered in the governance bootstrap. The golden image stays lean and unchanged.
 
 ---
 
