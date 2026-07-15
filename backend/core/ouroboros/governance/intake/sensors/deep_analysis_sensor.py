@@ -70,6 +70,8 @@ _ENV_CONTRACT = "JARVIS_DEEP_ANALYSIS_CONTRACT_ENABLED"
 _ENV_COVERAGE = "JARVIS_DEEP_ANALYSIS_COVERAGE_ENABLED"
 _ENV_PURPOSE = "JARVIS_DEEP_ANALYSIS_PURPOSE_ENABLED"
 _ENV_ORPHAN = "JARVIS_DEEP_ANALYSIS_ORPHAN_ENABLED"
+_ENV_DEFECT = "JARVIS_DEEP_ANALYSIS_DEFECT_ENABLED"
+_ENV_DEFECT_MAX_FILES = "JARVIS_DEEP_ANALYSIS_DEFECT_MAX_FILES"
 _ENV_POLL = "JARVIS_DEEP_ANALYSIS_POLL_INTERVAL_S"
 _ENV_LOOKBACK = "JARVIS_DEEP_ANALYSIS_LOOKBACK_COMMITS"
 _ENV_MAX_PER_CYCLE = "JARVIS_DEEP_ANALYSIS_MAX_FINDINGS_PER_CYCLE"
@@ -136,13 +138,14 @@ class DeepAnalysisFinding:
     prompt builder uses.
     """
 
-    category: str                      # contract_drift | coverage_gap | purpose_drift | orphan_surface
+    category: str                      # contract_drift | coverage_gap | purpose_drift | orphan_surface | latent_defect
     file: str                          # relative path
     finding_id: str                    # hash(category + file + specifics)[:10]
     description: str                   # one-line human-readable
     line: int = 0                      # optional anchor
     evidence: Dict[str, Any] = field(default_factory=dict)
-    urgency: str = "low"               # analytical → low
+    urgency: str = "low"               # analytical heuristics → low; proven defects → high
+    confidence: float = 0.55           # heuristic default; high-precision defects earn more
 
     @property
     def dedup_key(self) -> str:
@@ -861,6 +864,154 @@ def analyze_orphan_surface(
 
 
 # ---------------------------------------------------------------------------
+# analyze_latent_defects — P0.3: PROVEN defects, not style
+# ---------------------------------------------------------------------------
+#
+# The other four analyzers surface "worth investigating" heuristics (coverage
+# gaps, drift, orphans) at low urgency. This one surfaces REAL bugs — AST
+# patterns chosen for near-zero false positives, so a finding is worth
+# autonomous action (high urgency + high confidence, which P0.1's value layer
+# escalates out of the deferred floor). This is what lets O+V perceive
+# SUBSTANCE while roaming a clean repo, instead of only cosmetic metrics.
+# Deterministic, bounded, no model, no network.
+
+_MUTABLE_DEFAULT_CTORS = frozenset({"list", "dict", "set"})
+
+
+def _is_mutable_default(node: ast.AST) -> bool:
+    """A literal mutable default arg (``def f(x=[])``) — shared across every
+    call, the classic Python footgun. Immutable defaults (``()``, constants,
+    a shared Name) are NOT flagged (precision)."""
+    if isinstance(node, (ast.List, ast.Dict, ast.Set)):
+        return True
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _MUTABLE_DEFAULT_CTORS
+        and not node.args
+        and not node.keywords
+    ):
+        return True
+    return False
+
+
+def _is_identity_literal(node: ast.AST) -> bool:
+    """A literal where ``x is <lit>`` is an identity-vs-equality bug. The
+    CORRECT ``is`` idioms — ``None`` / ``True`` / ``False`` / ``...`` — are
+    excluded so only genuine bugs (``x is 5``, ``x is "s"``, ``x is ()``)
+    fire."""
+    if not isinstance(node, ast.Constant):
+        return False
+    v = node.value
+    return v is not None and not isinstance(v, bool) and v is not Ellipsis
+
+
+def analyze_latent_defects(*, repo_root: Path) -> List[DeepAnalysisFinding]:
+    """High-precision AST bug patterns — REAL defects. Near-zero FP by
+    construction. NEVER raises (per-file fallible)."""
+    out: List[DeepAnalysisFinding] = []
+    max_files = _int_env(_ENV_DEFECT_MAX_FILES, 800, lo=1, hi=1_000_000)
+    scanned = 0
+    for path in _iter_py_files(repo_root):
+        if scanned >= max_files:
+            break
+        tree = _safe_parse(_read(path))
+        if tree is None:
+            continue
+        scanned += 1
+        rel = _rel(path, repo_root)
+
+        def _add(subcat: str, desc: str, line: int) -> None:
+            fid = _finding_hash("latent_defect", rel, f"{subcat}:{line}")
+            out.append(DeepAnalysisFinding(
+                category="latent_defect", file=rel, finding_id=fid,
+                description=desc, line=int(line),
+                urgency="high", confidence=0.9,
+                evidence={"subcategory": subcat},
+            ))
+
+        try:
+            for node in ast.walk(tree):
+                # 1. Mutable default argument.
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for d in (
+                        list(node.args.defaults) + list(node.args.kw_defaults)
+                    ):
+                        if d is not None and _is_mutable_default(d):
+                            _add(
+                                "mutable_default_arg",
+                                f"mutable default argument in {node.name}() — "
+                                "the SAME object is shared across every call",
+                                getattr(d, "lineno", node.lineno),
+                            )
+                # 2. Bare `except: pass` — swallows KeyboardInterrupt/SystemExit
+                #    and hides all errors. (``except Exception:`` is common +
+                #    intentional in this codebase, so it is NOT flagged.)
+                elif isinstance(node, ast.ExceptHandler):
+                    if (
+                        node.type is None
+                        and node.body
+                        and all(isinstance(s, ast.Pass) for s in node.body)
+                    ):
+                        _add(
+                            "bare_except_pass",
+                            "bare `except: pass` silently swallows ALL exceptions "
+                            "(including KeyboardInterrupt / SystemExit)",
+                            node.lineno,
+                        )
+                # 3. `is` / `is not` against a literal — identity-vs-equality.
+                #    (Self-comparison `x == x` is deliberately NOT flagged: it is
+                #    the idiomatic float-NaN check — `x == x` is False iff x is
+                #    NaN — so it fails the near-zero-FP bar this detector holds.)
+                elif isinstance(node, ast.Compare) and len(node.ops) == 1:
+                    op = node.ops[0]
+                    left, right = node.left, node.comparators[0]
+                    if isinstance(op, (ast.Is, ast.IsNot)) and (
+                        _is_identity_literal(left) or _is_identity_literal(right)
+                    ):
+                        _add(
+                            "is_comparison_literal",
+                            "`is` / `is not` compared against a literal — this is "
+                            "identity, not equality (use ==); relies on fragile "
+                            "interpreter object caching",
+                            node.lineno,
+                        )
+                # 5. Unreachable code after an unconditional block exit.
+                _body = getattr(node, "body", None)
+                if isinstance(_body, list):
+                    for i in range(len(_body) - 1):
+                        stmt = _body[i]
+                        if isinstance(
+                            stmt,
+                            (ast.Return, ast.Raise, ast.Break, ast.Continue),
+                        ):
+                            nxt = _body[i + 1]
+                            # Skip a bare string-Expr — that is a triple-quoted
+                            # comment / disabled-code block (intentional
+                            # documentation), not a live-code bug.
+                            if (
+                                isinstance(nxt, ast.Expr)
+                                and isinstance(nxt.value, ast.Constant)
+                                and isinstance(nxt.value.value, str)
+                            ):
+                                break
+                            _add(
+                                "unreachable_code",
+                                f"unreachable code after "
+                                f"{type(stmt).__name__.lower()} on line "
+                                f"{getattr(stmt, 'lineno', '?')}",
+                                getattr(nxt, "lineno", stmt.lineno),
+                            )
+                            break  # one per block is enough signal
+        except Exception:  # noqa: BLE001 — one bad tree never stops the scan
+            logger.debug(
+                "[DeepAnalysis] latent_defect walk failed for %s", rel,
+                exc_info=True,
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Aggregator — one entry point the sensor calls per cycle
 # ---------------------------------------------------------------------------
 
@@ -905,6 +1056,15 @@ def run_all_analyzers(*, repo_root: Path) -> List[DeepAnalysisFinding]:
         "orphan_surface", _ENV_ORPHAN, analyze_orphan_surface,
         repo_root=repo_root,
     )
+    _run(
+        "latent_defect", _ENV_DEFECT, analyze_latent_defects,
+        repo_root=repo_root,
+    )
+    # Substance-first stable sort: proven defects (high urgency) survive the
+    # per-cycle cap ahead of the low-urgency advisory heuristics. Stable, so
+    # ordering WITHIN a rank is preserved (deterministic replay).
+    _rank = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+    merged.sort(key=lambda f: _rank.get(f.urgency, 3))
     return merged[:max_findings]
 
 
@@ -1066,7 +1226,7 @@ class DeepAnalysisSensor:
                     ),
                     target_files=(f.file,) if f.file else (),
                     repo=self._repo,
-                    confidence=0.55,
+                    confidence=f.confidence,
                     urgency=f.urgency,
                     evidence={
                         "deep_analysis_category": f.category,

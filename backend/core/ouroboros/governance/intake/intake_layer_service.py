@@ -807,6 +807,29 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] WorkOrderSensor skipped: %s", exc)
 
+        # ---- DeepAnalysisSensor (P0.3: PROVEN latent defects, not style) ----
+        # The substance-perception sensor (contract_drift / coverage_gap /
+        # purpose_drift / orphan_surface + the new high-precision latent_defect
+        # AST bug patterns) existed but was never registered — resurrected here
+        # so O+V perceives REAL defects while roaming, not only cosmetic
+        # metrics. Wired-live-but-inert: scans no-op until JARVIS_DEEP_ANALYSIS_
+        # SENSOR_ENABLED (§33.1 default-FALSE). CPU-heavy AST passes run OFF the
+        # loop via the sensor's own cooperative_fs_io.offload.
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.deep_analysis_sensor import (
+                DeepAnalysisSensor,
+            )
+            _deep_sensor = DeepAnalysisSensor(
+                repo="jarvis",
+                router=self._router,
+                project_root=self._config.project_root,
+            )
+            self._sensors.append(_deep_sensor)
+            self._deep_analysis_sensor = _deep_sensor
+            logger.info("[IntakeLayer] DeepAnalysisSensor added (proactive substance perception)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] DeepAnalysisSensor skipped: %s", exc)
+
         # ---- CrossRepoDriftSensor (P3: Trinity contract integrity) ----
         try:
             from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
