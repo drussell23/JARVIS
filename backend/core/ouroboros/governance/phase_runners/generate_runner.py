@@ -111,6 +111,106 @@ logger = logging.getLogger("Ouroboros.Orchestrator")
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Task #11 — GENERATE replay adapter (closes GENERATE replay-blindness)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# The determinism substrate records/replays a phase's decision via an
+# OutputAdapter that round-trips the phase output through JSON. Until now
+# GENERATE captured only a provider-selection DIGEST (audit-only), so REPLAY
+# re-invoked the model live — the single most expensive, least reproducible
+# phase was the one blind to replay. This adapter serializes the full
+# GenerationResult so REPLAY returns the recorded candidates and SKIPS the
+# provider call entirely. Mirrors the ROUTE/CLASSIFY adapter-registration
+# pattern (route_runner._register_route_adapter).
+#
+# ``candidates`` are already JSON-safe dicts; every scalar field round-trips.
+# ``tool_execution_records`` (Tuple[Any, ...]) is LIVE-execution audit — no
+# tools actually run during a replay, so it is (correctly) empty on the
+# replayed result rather than reconstructed from opaque objects.
+def _register_generate_adapter() -> None:
+    try:
+        from backend.core.ouroboros.governance.determinism.phase_capture import (
+            OutputAdapter,
+            register_adapter,
+        )
+        from backend.core.ouroboros.governance.op_context import (
+            GenerationResult,
+        )
+
+        def _serialize(gen: Any) -> Any:
+            if gen is None:
+                return {"__none__": True}
+            return {
+                "candidates": [
+                    dict(c) for c in (getattr(gen, "candidates", ()) or ())
+                ],
+                "provider_name": str(getattr(gen, "provider_name", "") or ""),
+                "generation_duration_s": float(
+                    getattr(gen, "generation_duration_s", 0.0) or 0.0,
+                ),
+                "model_id": str(getattr(gen, "model_id", "") or ""),
+                "is_noop": bool(getattr(gen, "is_noop", False)),
+                "venom_edit_history": [
+                    dict(e)
+                    for e in (getattr(gen, "venom_edit_history", ()) or ())
+                ],
+                "prompt_preloaded_files": [
+                    str(f)
+                    for f in (getattr(gen, "prompt_preloaded_files", ()) or ())
+                ],
+                "total_input_tokens": int(
+                    getattr(gen, "total_input_tokens", 0) or 0,
+                ),
+                "total_output_tokens": int(
+                    getattr(gen, "total_output_tokens", 0) or 0,
+                ),
+                "cost_usd": float(getattr(gen, "cost_usd", 0.0) or 0.0),
+            }
+
+        def _deserialize(stored: Any) -> Any:
+            if not isinstance(stored, dict) or stored.get("__none__"):
+                return None
+            return GenerationResult(
+                candidates=tuple(
+                    dict(c) for c in (stored.get("candidates") or [])
+                ),
+                provider_name=str(stored.get("provider_name", "")),
+                generation_duration_s=float(
+                    stored.get("generation_duration_s", 0.0),
+                ),
+                model_id=str(stored.get("model_id", "")),
+                is_noop=bool(stored.get("is_noop", False)),
+                tool_execution_records=(),  # no tools run in a replay
+                venom_edit_history=tuple(
+                    dict(e) for e in (stored.get("venom_edit_history") or [])
+                ),
+                prompt_preloaded_files=tuple(
+                    str(f) for f in (stored.get("prompt_preloaded_files") or [])
+                ),
+                total_input_tokens=int(stored.get("total_input_tokens", 0)),
+                total_output_tokens=int(stored.get("total_output_tokens", 0)),
+                cost_usd=float(stored.get("cost_usd", 0.0)),
+            )
+
+        register_adapter(
+            phase="GENERATE",
+            kind="generate",
+            adapter=OutputAdapter(
+                serialize=_serialize,
+                deserialize=_deserialize,
+                name="generation_result_adapter",
+            ),
+        )
+    except Exception:  # noqa: BLE001 — defensive (import-time)
+        # Determinism module unavailable → capture_phase_decision
+        # short-circuits to a pure passthrough. No import-time log spam.
+        pass
+
+
+_register_generate_adapter()
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Slice 12O — Foreground macro-cooldown helper
 # ──────────────────────────────────────────────────────────────────────────
 #
@@ -853,56 +953,62 @@ class GENERATERunner(PhaseRunner):
                 # Hard timeout — the deadline is advisory to the generator,
                 # but asyncio.wait_for is the Iron Gate (Manifesto §6).
                 try:
-                    # Phase B parallel-edge exploitation (Manifesto §2 + §3).
-                    # Attempt DAG-driven fan-out first; on ANY fallback
-                    # condition (flag off, no DAG, invalid DAG, edges>0,
-                    # single-unit, BG route, read-only, per-unit error /
-                    # timeout / noop) returns None — legacy single-stream
-                    # path runs byte-identically below.
-                    _parallel_gen = None
-                    try:
-                        from backend.core.ouroboros.governance.plan_exploit import (
-                            try_parallel_generate,
-                        )
-                        _parallel_gen = await try_parallel_generate(
-                            ctx,
-                            deadline,
-                            _gen_timeout,
-                            orch._generator,
-                            outer_grace_s=_OUTER_GATE_GRACE_S,
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        # Observer contract: the exploit hook must NEVER
-                        # break the FSM. Any unexpected failure routes
-                        # straight to the legacy path.
-                        logger.debug(
-                            "[Orchestrator] plan_exploit fan-out raised — "
-                            "falling back to legacy generate",
-                            exc_info=True,
-                        )
+                    # Task #11 — close GENERATE replay-blindness. The ENTIRE
+                    # generation acquisition (parallel-edge fan-out + the
+                    # park-aware single-stream seam) is wrapped in
+                    # capture_phase_decision(kind="generate"). In REPLAY mode
+                    # the recorded GenerationResult is returned via the
+                    # module-registered adapter and the provider is NOT
+                    # re-invoked — the model call is skipped entirely. In the
+                    # default PASSTHROUGH mode this is bit-for-bit legacy
+                    # (compute runs, nothing recorded); RECORD serializes the
+                    # result. This REPLACES the old digest-only capture, which
+                    # recorded a provider hash yet always re-ran the model.
+                    async def _acquire_generation() -> Any:
+                        # Phase B parallel-edge exploitation (Manifesto §2+§3).
+                        # DAG-driven fan-out first; ANY fallback condition
+                        # returns None → legacy single-stream path runs
+                        # byte-identically below.
                         _parallel_gen = None
+                        try:
+                            from backend.core.ouroboros.governance.plan_exploit import (
+                                try_parallel_generate,
+                            )
+                            _parallel_gen = await try_parallel_generate(
+                                ctx,
+                                deadline,
+                                _gen_timeout,
+                                orch._generator,
+                                outer_grace_s=_OUTER_GATE_GRACE_S,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            # Observer contract: the exploit hook must NEVER
+                            # break the FSM. Any unexpected failure routes
+                            # straight to the legacy path.
+                            logger.debug(
+                                "[Orchestrator] plan_exploit fan-out raised — "
+                                "falling back to legacy generate",
+                                exc_info=True,
+                            )
+                            _parallel_gen = None
 
-                    if _parallel_gen is not None:
-                        generation = _parallel_gen
-                    else:
-                        # Stage 1.6 — park-aware GENERATE seam.  The
-                        # wrapper has three paths (RESUME / PARK-EMIT /
-                        # LEGACY) and is byte-identical to the legacy
-                        # direct-await when ``JARVIS_BG_PARK_ENABLED``
-                        # is off (default per §33.1).  On PARK-EMIT it
-                        # raises ParkRequested, which propagates up to
-                        # the BG worker's except clause via the same
-                        # unwinding path as CancelledError — every
-                        # ``finally`` block in the orchestrator FSM
-                        # fires cleanly.  See generate_park_wrapper.py
-                        # and project_stage_1_6_park_spike.md for the
-                        # full design.
+                        if _parallel_gen is not None:
+                            return _parallel_gen
+                        # Stage 1.6 — park-aware GENERATE seam (RESUME /
+                        # PARK-EMIT / LEGACY); byte-identical to the legacy
+                        # direct-await when ``JARVIS_BG_PARK_ENABLED`` is off
+                        # (default §33.1). On PARK-EMIT it raises
+                        # ParkRequested — a BaseException, so it flies past
+                        # the capture wrapper's Exception handlers AND the
+                        # import fallback below, unwinding cleanly (the
+                        # generator is never double-run). See
+                        # generate_park_wrapper.py.
                         from backend.core.ouroboros.governance.generate_park_wrapper import (
                             maybe_park_or_resume,
                         )
-                        generation = await maybe_park_or_resume(
+                        return await maybe_park_or_resume(
                             orch=orch,
                             ctx=ctx,
                             deadline=deadline,
@@ -910,68 +1016,33 @@ class GENERATERunner(PhaseRunner):
                             outer_grace_s=_OUTER_GATE_GRACE_S,
                         )
 
-                    # Phase 1 Slice 1.3.b — capture the provider
-                    # selection digest. Audit-only: the actual
-                    # generation always runs live (LLM output isn't
-                    # deterministic-replayable in this slice). The
-                    # closure-over-`generation` pattern means
-                    # capture_phase_decision just records the digest
-                    # without re-invoking .generate(). RECORD writes;
-                    # REPLAY looks up + verifies; VERIFY warns on
-                    # provider drift.
+                    # Only an IMPORT failure of the determinism module is
+                    # caught here → direct acquisition (compute has not run,
+                    # so re-running is single-execution). A genuine GENERATE
+                    # exception raised BY the generator propagates through
+                    # capture_phase_decision exactly as the legacy direct
+                    # call did (never re-run → no double generation).
                     try:
                         from backend.core.ouroboros.governance.determinism.phase_capture import (
-                            capture_phase_decision,
+                            capture_phase_decision as _capture_generate,
                         )
-
-                        async def _digest_compute() -> Any:
-                            return {
-                                "provider_name": str(
-                                    getattr(
-                                        generation, "provider_name", "",
-                                    ) or "",
-                                ),
-                                "model_id": str(
-                                    getattr(
-                                        generation, "model_id", "",
-                                    ) or "",
-                                ),
-                                "candidate_count": int(len(
-                                    getattr(
-                                        generation, "candidates", (),
-                                    ) or (),
-                                )),
-                                "is_noop": bool(
-                                    getattr(generation, "is_noop", False),
-                                ),
-                            }
-
-                        await capture_phase_decision(
+                    except Exception:  # noqa: BLE001 — determinism unavailable
+                        _capture_generate = None
+                    if _capture_generate is not None:
+                        generation = await _capture_generate(
                             op_id=ctx.op_id,
                             phase="GENERATE",
-                            kind="provider_selection",
+                            kind="generate",
                             ctx=ctx,
-                            compute=_digest_compute,
+                            compute=_acquire_generation,
                             extra_inputs={
                                 "provider_route": str(
-                                    getattr(
-                                        ctx, "provider_route", "",
-                                    ) or "",
-                                ),
-                                "parallel_gen_used": bool(
-                                    _parallel_gen is not None,
+                                    getattr(ctx, "provider_route", "") or "",
                                 ),
                             },
                         )
-                    except Exception:  # noqa: BLE001 — defensive
-                        # Capture failure does NOT propagate — the
-                        # generation already succeeded, audit capture
-                        # is best-effort.
-                        logger.debug(
-                            "[Orchestrator] capture_phase_decision "
-                            "failed for GENERATE/provider_selection",
-                            exc_info=True,
-                        )
+                    else:
+                        generation = await _acquire_generation()
                 finally:
                     # End the stream regardless of success / failure so the
                     # Live widget closes and the observability INFO line
