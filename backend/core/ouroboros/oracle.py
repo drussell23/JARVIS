@@ -1820,11 +1820,38 @@ class OracleSemanticIndex:
                         _vec = _emb.tolist() if hasattr(_emb, "tolist") else list(_emb)
                         self._stdlib_store[_eid] = ([float(x) for x in _vec], _meta)
                 else:
-                    self._collection.upsert(
+                    # Slice 25 — offload the chroma upsert OFF the asyncio loop.
+                    # chromadb's Rust HNSW compaction was running SYNCHRONOUSLY
+                    # on the loop thread here: the 57.8s ControlPlaneStarvation
+                    # spike + the swallowed "Error in compaction: Failed to
+                    # apply logs to the hnsw segment writer" of soak
+                    # bt-2026-07-15-180437. A THREAD offload frees the loop —
+                    # chromadb is a Rust extension that RELEASES the GIL during
+                    # native index work, so the loop thread keeps running while
+                    # compaction proceeds. A PROCESS pool is deliberately NOT
+                    # used: the PersistentClient holds a native file lock on the
+                    # persist dir, and a second process writing the same dir
+                    # CORRUPTS the HNSW segments — the exact failure this slice
+                    # exists to prevent (mandate 4). Fail-soft preserved: an
+                    # OffloadError re-raises into the existing except below
+                    # (batch dropped, loop continues) exactly as the inline
+                    # call did.
+                    _emb_lists = [e.tolist() for e in embeddings]
+                    from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501
+                        is_offload_error as _cr_is_err,
+                        offload as _cr_offload,
+                    )
+                    _up = await _cr_offload(
+                        self._collection.upsert,
+                        cpu_bound=False,
                         ids=ids,
-                        embeddings=[e.tolist() for e in embeddings],
+                        embeddings=_emb_lists,
                         metadatas=metadatas,
                     )
+                    if _cr_is_err(_up):
+                        raise RuntimeError(
+                            f"chroma upsert offload failed: {_up}"
+                        )
 
             logger.debug("[OracleSemanticIndex] Embedded %d nodes", len(embeddable))
         except Exception as exc:

@@ -133,6 +133,24 @@ def _stdlib_embedder_dim() -> int:
     return _env_int("JARVIS_SEMANTIC_STDLIB_EMBEDDER_DIM", 128, minimum=16)
 
 
+def _fastembed_cache_dir() -> Optional[Path]:
+    """Slice 25 — durable fastembed weight-cache dir.
+
+    Resolution: ``JARVIS_FASTEMBED_CACHE_DIR`` env → default
+    ``.jarvis/fastembed_cache`` under the CWD (the organism always runs from
+    the repo root). Returns None (→ fastembed's own tempdir default) only if
+    the durable dir cannot be created. Prefetch once via
+    ``scripts/prefetch_fastembed.py``; every later load is network-free.
+    NEVER raises."""
+    try:
+        raw = os.environ.get("JARVIS_FASTEMBED_CACHE_DIR", "").strip()
+        d = Path(raw).expanduser() if raw else Path(".jarvis/fastembed_cache")
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except Exception:  # noqa: BLE001 — fall back to fastembed's default
+        return None
+
+
 def _halflife_days() -> float:
     return _env_float("JARVIS_SEMANTIC_HALFLIFE_DAYS", 14.0, minimum=0.1)
 
@@ -551,10 +569,28 @@ class _Embedder:
                 return False
             try:
                 from fastembed import TextEmbedding  # type: ignore[import-not-found]
-                self._model = TextEmbedding(model_name=self._model_name)
+                # Slice 25 — durable model cache. fastembed defaults its
+                # weight cache to tempfile.gettempdir()/fastembed_cache: an
+                # EPHEMERAL dir the OS cleans, which forces re-downloads that
+                # the soak/harness environment blocks → "fastembed unavailable
+                # (ValueError)" mid-run and the GIL-holding stdlib fallback
+                # takes over. Pin the cache to a durable, repo-local dir
+                # (env-overridable) so a ONE-TIME prefetch
+                # (scripts/prefetch_fastembed.py) makes every later load
+                # network-free. Falls back to the legacy default if the
+                # durable dir can't be created.
+                _cache_dir = _fastembed_cache_dir()
+                if _cache_dir is not None:
+                    self._model = TextEmbedding(
+                        model_name=self._model_name,
+                        cache_dir=str(_cache_dir),
+                    )
+                else:
+                    self._model = TextEmbedding(model_name=self._model_name)
                 logger.info(
-                    "[SemanticIndex] fastembed loaded: model=%s",
+                    "[SemanticIndex] fastembed loaded: model=%s cache=%s",
                     self._model_name,
+                    _cache_dir or "<fastembed default>",
                 )
                 return True
             except Exception as exc:

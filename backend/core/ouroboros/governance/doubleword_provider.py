@@ -497,6 +497,15 @@ def _extract_completion_text(message: dict) -> str:
 
 _DW_CONNECT_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_CONNECT_TIMEOUT_S", "10"))
 _DW_REQUEST_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_REQUEST_TIMEOUT_S", "120"))
+# Slice 25 note: a flat aiohttp ``sock_read`` was considered and REJECTED here —
+# it resets per-read, so during DW's legitimate ~67s first-token wait (no bytes
+# yet) any sub-TTFT value would kill the stream before the first token. The
+# correct fail-fast is the EXISTING PHASE-AWARE app-level watchdog
+# (stream_rupture: 120s TTFT / 30s inter-chunk via asyncio.wait_for(readline))
+# plus the dw_ttft_observer degraded-latency DEMOTION (env
+# JARVIS_TOPOLOGY_TTFT_TRACKING_ENABLED) that elects the faster lane when DW RT
+# p95 degrades. Both already exist; the throughput fix is arming them, not a
+# new socket timeout.
 
 
 _NATIVE_TC_SENTINEL = "\n__NTC__:"  # appended to content string when DW returns native tool_calls
