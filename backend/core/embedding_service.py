@@ -434,6 +434,26 @@ class EmbeddingService:
         need = (self._config.fastembed_estimate_mb / 1024.0) + self._config.lite_floor_gb
         return avail >= need
 
+    async def _construct_model_offloaded(self, constructor, label: str) -> Any:
+        """Slice 26 (2026-07-15, closes the bt-2026-07-15-192117 on-loop model
+        load): run a blocking model constructor in the default executor so the
+        ~800MB HIGH-tier torch load (and the LITE ONNX construct) never executes
+        on the asyncio loop thread. The load was the LAST on-loop heavyweight in
+        this service — ``encode()`` was already executor-offloaded. C-extension
+        weight loading releases the GIL for its native/IO phases, so a thread
+        hop frees the loop the same way the encode path does.
+
+        Kill switch ``JARVIS_EMBED_MODEL_LOAD_OFFLOAD_ENABLED=0`` restores the
+        legacy inline construct. Exceptions propagate unchanged — every caller
+        already owns tier-demotion / budget-release handling.
+        """
+        raw = os.environ.get("JARVIS_EMBED_MODEL_LOAD_OFFLOAD_ENABLED", "true")
+        if raw.strip().lower() in ("0", "false", "no", "off"):
+            return constructor()
+        logger.debug("[EmbeddingService] constructing %s tier model off-loop", label)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, constructor)
+
     async def _load_model(self) -> bool:
         """Lazy-load an embedding tier, adapting to host memory.
 
@@ -500,7 +520,9 @@ class EmbeddingService:
             try:
                 logger.info(f"[EmbeddingService] Loading HIGH tier: {self._config.model_name}")
                 start = time.time()
-                self._model = self._load_sentence_transformer()
+                self._model = await self._construct_model_offloaded(
+                    self._load_sentence_transformer, "HIGH",
+                )
                 self._active_tier = EmbeddingTier.HIGH
                 logger.info(
                     "[EmbeddingService] ✅ HIGH tier loaded in %.2fs (device: %s)",
@@ -535,7 +557,9 @@ class EmbeddingService:
                 return True
             try:
                 start = time.time()
-                self._model = self._make_fastembed_model()
+                self._model = await self._construct_model_offloaded(
+                    self._make_fastembed_model, "LITE",
+                )
                 prev = self._active_tier
                 self._active_tier = EmbeddingTier.LITE
                 if prev != EmbeddingTier.LITE:
@@ -604,7 +628,9 @@ class EmbeddingService:
             old_model = self._model
             try:
                 start = time.time()
-                new_model = self._load_sentence_transformer()
+                new_model = await self._construct_model_offloaded(
+                    self._load_sentence_transformer, "HIGH(promotion)",
+                )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "[EmbeddingService] Promotion HIGH load failed (%s) — staying on LITE.", e,

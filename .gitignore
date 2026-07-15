@@ -461,3 +461,6 @@ Derek J. Russell - Resume*.pdf
 # are never legitimate modules here; the .nosync rename stopped production,
 # this guards any stragglers if the tree ever lands back under sync.
 * [0-9].*
+
+# Slice 25 — fastembed ONNX weight cache (durable, not committed)
+.jarvis/fastembed_cache/
