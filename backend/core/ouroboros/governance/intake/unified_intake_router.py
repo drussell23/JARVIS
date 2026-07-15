@@ -533,6 +533,160 @@ def _sovereign_human_priority() -> int:
     return _resurrection_intake_priority() - _sovereign_primacy_margin()
 
 
+# ---------------------------------------------------------------------------
+# P0.1 — value-derived priority re-anchoring (kills the source-only queue)
+# ---------------------------------------------------------------------------
+#
+# ROOT CAUSE of "O+V can't see real work": the queue's dominant term is
+# ``base = _PRIORITY_MAP.get(envelope.source, 99)`` — priority derived from
+# the SOURCE LABEL only. A substantive-but-deferred source (security_advisory
+# CVE, performance_regression, github_issue, intent_discovery) sits at base 99
+# and is buried ~90 points behind an ``ai_miner`` trivia signal at base 3; the
+# appetite layer that already KNOWS the difference (signal_value, Slice 15) is
+# consulted at ROUTE/GATE but never here. This composes that SAME band into
+# the base with the SAME escalate/clamp semantics the ROUTE layer applies:
+#
+#   * BAND_ORACLE (a resolved failing-test attribution — a machine-checkable
+#     real defect) OR an explicit high/critical urgency (the source DECLARED
+#     it substantive — e.g. a critical CVE, whose requirements.txt change is
+#     cosmetic-SHAPE but critical WORK) → ESCALATE the base up to the
+#     "queued real work" anchor, un-starving it. min() only pulls up; it
+#     never demotes an already-high signal.
+#   * BAND_COSMETIC_CLASS (targets are only requirements/cfg/ini or a
+#     docstring-only module — the Run-22 noise class) with NO explicit
+#     urgency → CLAMP the base down to the deferred floor so trivia can
+#     never outrank substance. max() only pushes down; never promotes.
+#   * BAND_EXECUTABLE / BAND_INDETERMINATE → the source tier stands (the
+#     band cannot tell real work from churn on a live module — that
+#     discrimination is the sensor's job, P0.3 — so we defer to the
+#     class-urgency the source encodes).
+#
+# No new hardcoded tier: both anchors are the map's OWN landmarks
+# (``backlog`` = queued real work; the deferred base 99), env-tunable.
+# Shadow-first rollout (mirrors mcp_output_scanner, Slice 18 #6): master
+# default-TRUE COMPUTES the band + stashes it to evidence for the P0.5 soak;
+# shadow default-TRUE means it is NOT yet applied (queue order byte-identical
+# to today). Graduation = flip shadow off → the re-anchoring becomes
+# authoritative. Composes the global appetite master so a repo-wide
+# ``JARVIS_SIGNAL_VALUE_ROUTING_ENABLED=false`` disables it here too (DRY).
+
+_VALUE_PRIORITY_MASTER_ENV = "JARVIS_INTAKE_VALUE_PRIORITY_ENABLED"
+_VALUE_PRIORITY_SHADOW_ENV = "JARVIS_INTAKE_VALUE_PRIORITY_SHADOW"
+_VALUE_SUBSTANTIVE_ANCHOR_ENV = "JARVIS_INTAKE_VALUE_SUBSTANTIVE_ANCHOR"
+_VALUE_COSMETIC_FLOOR_ENV = "JARVIS_INTAKE_VALUE_COSMETIC_FLOOR"
+_VALUE_URGENT_URGENCIES = frozenset({"high", "critical"})
+
+
+def _value_priority_master_enabled() -> bool:
+    """Compute-and-observe gate. Default TRUE, but composes the global
+    appetite master so the whole layer honors one repo-wide off switch."""
+    if os.environ.get(
+        _VALUE_PRIORITY_MASTER_ENV, "true",
+    ).strip().lower() not in ("1", "true", "yes", "on"):
+        return False
+    try:
+        from backend.core.ouroboros.governance.signal_value import (
+            signal_value_routing_enabled,
+        )
+        return signal_value_routing_enabled()
+    except Exception:  # noqa: BLE001 — appetite layer unavailable → observe off
+        return False
+
+
+def _value_priority_shadow_enabled() -> bool:
+    """Shadow (compute, don't apply). Default TRUE; ONLY an explicit off
+    un-shadows — a typo can never silently make value re-ranking authoritative."""
+    return os.environ.get(
+        _VALUE_PRIORITY_SHADOW_ENV, "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _value_priority_enforce() -> bool:
+    """Re-anchoring is authoritative only when the master is on AND shadow is
+    explicitly off."""
+    return _value_priority_master_enabled() and not _value_priority_shadow_enabled()
+
+
+def _value_substantive_anchor() -> int:
+    """The tier a proven/declared-substantive signal escalates TO. Default =
+    the map's own ``backlog`` (queued-real-work) landmark, NOT a magic number.
+    Env-tunable; floored at 0 (can't out-rank sovereign/resurrection primacy,
+    which short-circuit before this)."""
+    raw = os.environ.get(_VALUE_SUBSTANTIVE_ANCHOR_ENV, "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return _PRIORITY_MAP.get("backlog", 2)
+
+
+def _value_cosmetic_floor() -> int:
+    """The tier un-urgent cosmetic trivia is clamped DOWN to. Default = the
+    deferred-source base (the map's own starvation floor). Env-tunable."""
+    raw = os.environ.get(_VALUE_COSMETIC_FLOOR_ENV, "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    return 99
+
+
+def _reanchor_base_on_value(
+    envelope: "IntentEnvelope", base: int, repo_root: "Optional[Path]",
+) -> Tuple[int, Dict[str, Any]]:
+    """Compose the signal_value band into the source-tier ``base`` so SUBSTANCE
+    sets queue priority. Returns ``(proposed_base, evidence_delta)``. Pure
+    re-ordering — never fed to Iron Gate / risk tier / policy / approval, and
+    never drops a signal. Fail-soft: any scoring fault → the source tier stands.
+    """
+    if not _value_priority_master_enabled():
+        return base, {}
+    try:
+        import json as _vj
+        from backend.core.ouroboros.governance.signal_value import (
+            BAND_COSMETIC_CLASS,
+            BAND_ORACLE,
+            score_signal,
+        )
+        _ev_json = (
+            _vj.dumps(envelope.evidence)
+            if isinstance(getattr(envelope, "evidence", None), dict)
+            else ""
+        )
+        band = score_signal(
+            str(getattr(envelope, "source", "") or ""),
+            envelope.target_files or (),
+            _ev_json,
+            repo_root,
+        )
+    except Exception:  # noqa: BLE001 — substance scoring down → source tier stands
+        return base, {}
+
+    urgent = str(getattr(envelope, "urgency", "")).strip().lower() in (
+        _VALUE_URGENT_URGENCIES
+    )
+    if band >= BAND_ORACLE or urgent:
+        proposed = min(base, _value_substantive_anchor())  # escalate; never demote
+        reason = "oracle" if band >= BAND_ORACLE else "explicit_urgency"
+    elif band <= BAND_COSMETIC_CLASS:
+        proposed = max(base, _value_cosmetic_floor())  # clamp trivia; never promote
+        reason = "cosmetic_clamp"
+    else:
+        proposed = base  # executable / indeterminate → source tier stands
+        reason = "source_tier"
+
+    delta: Dict[str, Any] = {
+        "value_band": int(band),
+        "value_priority_reason": reason,
+        "value_source_base": int(base),
+        "value_reanchored_base": int(proposed),
+        "value_priority_enforced": bool(_value_priority_enforce()),
+    }
+    return proposed, delta
+
+
 def _compute_priority(
     envelope: "IntentEnvelope",
     dependency_credit: int = 0,
@@ -582,6 +736,21 @@ def _compute_priority(
         return _resurrection_intake_priority(), None
 
     base = _PRIORITY_MAP.get(envelope.source, 99)
+    # P0.1 — value-derived re-anchoring. Compose the appetite band (Slice 15)
+    # into the source-tier base so SUBSTANCE, not source label, sets queue
+    # order. Always computed + stashed to evidence when the master is on (the
+    # P0.5 soak reads it); only APPLIED when shadow is off (enforce). Fail-soft
+    # — a scoring fault leaves the source tier untouched.
+    _reanchored_base, _value_delta = _reanchor_base_on_value(
+        envelope, base, repo_root,
+    )
+    if _value_delta and isinstance(envelope.evidence, dict):
+        try:
+            envelope.evidence.update(_value_delta)
+        except Exception:  # noqa: BLE001 — observability must never break intake
+            pass
+    if _value_priority_enforce():
+        base = _reanchored_base
     urgency = _URGENCY_BOOST.get(envelope.urgency, 0)
     # Cost penalty: 0 for 1 file, 1 for 2-4 files, 2 for 5+ files
     file_count = len(envelope.target_files) if envelope.target_files else 1
