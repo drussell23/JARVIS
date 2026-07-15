@@ -711,6 +711,94 @@ def reset_announcer_for_tests() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Control-plane — the live SSE broker tap (Task #12)
+# ---------------------------------------------------------------------------
+#
+# Karen had every downstream organ — the tier table, cooldown/coalescing,
+# canonical TTS pipeline, /voice REPL — but nothing UPSTREAM ever fed her:
+# ``record_event`` had zero callers, so she was a fully-built voice that
+# never heard the organism. This is the missing control-plane, the exact
+# equivalent of the Discord bridge's ``run_bridge_against_broker`` tap: an
+# in-process consumer that subscribes to the canonical ``StreamEventBroker``
+# and forwards every event to ``record_event``. Tier filtering, cooldown,
+# coalescing, and sensitive-redaction all happen INSIDE record_event, so the
+# tap stays a thin, dumb forwarder — no parallel filter, no duplication.
+#
+# Gated on ``master_enabled()`` (JARVIS_KAREN_VOICE_ENABLED, §33.1
+# default-FALSE) and fully fail-soft: a subscriber-cap miss, a dead event, or
+# a broker fault NEVER perturbs the loop it observes. Auto-mute (headless /
+# CI / quiet-hours) still short-circuits every ``record_event`` INSIDE Karen,
+# so arming the tap in a headless soak is a cheap no-op — it only speaks on a
+# real interactive TTY with an audio device.
+
+
+def _tap_poll_interval_s() -> float:
+    """Seconds the tap blocks on the queue before re-checking ``stop``.
+    Env-tunable; a bounded poll keeps shutdown responsive without busy-
+    waiting. NEVER raises."""
+    try:
+        return max(
+            0.05,
+            float(os.getenv("JARVIS_KAREN_VOICE_TAP_POLL_S", "1.0")),
+        )
+    except (TypeError, ValueError):
+        return 1.0
+
+
+async def run_karen_against_broker(*, stop: Any = None) -> None:
+    """Subscribe to the live ``StreamEventBroker`` and voice its events via
+    Karen. Gated + fail-soft. This is what the soak boot starts when
+    ``JARVIS_KAREN_VOICE_ENABLED`` is on — the tap that makes Karen HEAR the
+    organism. NEVER raises out."""
+    if not master_enabled():
+        return
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            get_default_broker,
+        )
+    except Exception as exc:  # noqa: BLE001 — stream substrate unavailable
+        logger.warning("[Karen] broker tap unavailable: %s", exc)
+        return
+    broker = get_default_broker()
+    sub = broker.subscribe()
+    if sub is None:
+        logger.warning(
+            "[Karen] broker subscriber cap reached — not listening",
+        )
+        return
+    karen = get_default_announcer()
+    poll = _tap_poll_interval_s()
+    logger.info("[Karen] live voice tap armed (poll=%.2fs)", poll)
+    try:
+        while True:
+            if stop is not None and getattr(stop, "is_set", lambda: False)():
+                return
+            try:
+                ev = await asyncio.wait_for(sub.queue.get(), timeout=poll)
+            except asyncio.TimeoutError:
+                continue  # re-check stop, keep listening
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — a torn event never stops the tap
+                continue
+            try:
+                karen.record_event(
+                    event_type=str(getattr(ev, "event_type", "") or ""),
+                    payload=dict(getattr(ev, "payload", {}) or {}),
+                    op_id=str(getattr(ev, "op_id", "") or ""),
+                )
+            except Exception:  # noqa: BLE001 — Karen is fail-soft; belt-and-braces
+                logger.debug("[Karen] record_event swallowed", exc_info=True)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        try:
+            broker.unsubscribe(sub)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ---------------------------------------------------------------------------
 # AST pins
 # ---------------------------------------------------------------------------
 
@@ -1030,6 +1118,7 @@ __all__ = [
     "register_flags",
     "register_shipped_invariants",
     "reset_announcer_for_tests",
+    "run_karen_against_broker",
     "tier_for_event",
     "tts_rate",
     "tts_voice",

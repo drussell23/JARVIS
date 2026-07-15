@@ -1127,6 +1127,34 @@ class BattleTestHarness:
             logger.warning(
                 "[DiscordBridge] bridge boot FAILED: %r", exc, exc_info=True,
             )
+        # Task #12 — Karen's voice control-plane. The sibling of the Discord
+        # tap: subscribe to the same StreamEventBroker and voice its events.
+        # Karen filters/coalesces/redacts internally and auto-mutes in
+        # headless/CI, so arming her here is a cheap no-op unless there's a
+        # real interactive TTY + audio device. Gated JARVIS_KAREN_VOICE_ENABLED
+        # (§33.1 default-FALSE); self-terminates on the shutdown event.
+        try:
+            from backend.core.ouroboros.governance.karen_voice_announcer import (
+                master_enabled as _karen_enabled,
+                run_karen_against_broker,
+            )
+            if _karen_enabled():
+                self._karen_voice_task = asyncio.create_task(
+                    run_karen_against_broker(stop=self._shutdown_event)
+                )
+                logger.warning(
+                    "[Karen] voice control-plane armed (Task #12) — "
+                    "voicing broker events"
+                )
+            else:
+                logger.info(
+                    "[Karen] NOT armed — JARVIS_KAREN_VOICE_ENABLED is off"
+                )
+        except Exception as exc:  # noqa: BLE001 — never fatal to the soak
+            logger.warning(
+                "[Karen] voice control-plane boot FAILED: %r",
+                exc, exc_info=True,
+            )
         # Ticket A Guard 2: wall-clock ceiling. Event fires when total session
         # wall time exceeds config.max_wall_seconds_s. Prevents provider retry
         # storms from hijacking both --idle-timeout (reset by retry activity)
