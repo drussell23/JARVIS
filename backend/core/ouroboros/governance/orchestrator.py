@@ -14471,6 +14471,29 @@ class GovernedOrchestrator:
             _s74_publish_terminal(ctx, state)
         except Exception:  # noqa: BLE001 — never raise into _record_ledger
             pass
+        # ── P0.4 — learning plane write seam ──
+        # Record this op's per-file outcome into the default reputation store
+        # so intake can later bias toward historically-substantive (fragile /
+        # high-churn / high-blast) files. Terminal states only (the same
+        # (op_id, state) that fires the SSE above); the store is ledger-free
+        # (uses ctx.target_files, no re-read). Gated (§33.1 default-FALSE),
+        # sync (a dict update + debounced flush), NEVER raises here.
+        try:
+            from backend.core.ouroboros.consciousness.memory_engine import (
+                get_default_memory_engine as _rep_engine,
+                reputation_write_enabled as _rep_write_on,
+            )
+            if _rep_write_on():
+                _rep_state = str(getattr(state, "value", "") or "")
+                if _rep_state in ("applied", "rolled_back", "failed", "blocked"):
+                    _rep_engine(
+                        getattr(self._config, "project_root", "."),
+                    ).record_file_outcome(
+                        getattr(ctx, "target_files", ()) or (),
+                        success=(_rep_state == "applied"),
+                    )
+        except Exception:  # noqa: BLE001 — learning never breaks _record_ledger
+            pass
         # ── Slice 101 — Cognitive Integration Bus lifecycle fan-out ──
         # Mirror the terminal state onto the cognitive bus so dormant
         # substrates (belief revision, counterfactual rehearsal, ...) can

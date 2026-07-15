@@ -917,6 +917,37 @@ def _compute_priority(
         except Exception as exc:  # noqa: BLE001 -- fail-soft, never break intake
             logger.debug("[Router] ingest stratification skipped: %s", exc)
 
+    # P0.4 — reputation bias (the learning plane's READ side). A signal
+    # targeting a historically-substantive file (high fragility = frequent
+    # failures / churn / blast, learned from prior op outcomes) earns a bounded
+    # priority boost, so O+V adaptively prioritizes WHERE the real work has
+    # lived. Read-only, capped, fail-soft; requires BOTH reputation gates
+    # (write master + bias sub-gate) so it is inert until learning accumulated.
+    # Authority invariant: priority ordering ONLY — never fed to UrgencyRouter,
+    # Iron Gate, risk tier, policy engine, FORBIDDEN_PATH, or approval gating.
+    reputation_boost = 0
+    if repo_root is not None:
+        try:
+            from backend.core.ouroboros.consciousness.memory_engine import (
+                get_default_memory_engine,
+                reputation_bias_enabled,
+                reputation_boost_max,
+            )
+
+            if reputation_bias_enabled():
+                _eng = get_default_memory_engine(repo_root)
+                _frag = 0.0
+                for _f in (envelope.target_files or ()):
+                    _r = _eng.get_file_reputation(str(_f)).fragility_score
+                    if _r > _frag:
+                        _frag = _r
+                reputation_boost = int(round(_frag * reputation_boost_max()))
+                if reputation_boost > 0 and isinstance(envelope.evidence, dict):
+                    envelope.evidence["reputation_fragility"] = round(_frag, 3)
+                    envelope.evidence["reputation_boost"] = reputation_boost
+        except Exception as exc:  # noqa: BLE001 — learning never breaks intake
+            logger.debug("[Router] reputation bias skipped: %s", exc)
+
     priority = (
         base
         - urgency
@@ -926,6 +957,7 @@ def _compute_priority(
         - goal_boost
         - semantic_boost
         - inferred_direction_boost
+        - reputation_boost
         + stratification_penalty
     )
     return priority, alignment

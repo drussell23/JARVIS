@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -282,6 +283,8 @@ class MemoryEngine:
         # failure_count, blast_total, co_failures (Counter-like dict)
         self._file_stats: Dict[str, Dict[str, Any]] = {}
         self._last_known_head: Optional[str] = None
+        # P0.4 — debounced-flush counter for the default-path write seam.
+        self._outcomes_since_flush: int = 0
 
         self._persistence_dir.mkdir(parents=True, exist_ok=True)
 
@@ -417,6 +420,34 @@ class MemoryEngine:
             common_co_failures=common_co,
             fragility_score=fragility,
         )
+
+    def record_file_outcome(
+        self,
+        target_files: Any,
+        success: bool,
+        blast_radius: Optional[int] = None,
+    ) -> None:
+        """Ledger-FREE per-file reputation update — the default-path write
+        seam. The terminal op record already carries the target paths + the
+        outcome, so no ledger read is needed (unlike ``ingest_outcome``).
+        Debounced flush persists the store cross-session. NEVER raises."""
+        try:
+            files = tuple(str(f) for f in (target_files or ()) if f)
+            if not files:
+                return
+            br = int(blast_radius) if blast_radius is not None else len(files)
+            self._update_file_reputation(files, bool(success), br)
+            self._outcomes_since_flush += 1
+            if self._outcomes_since_flush >= _reputation_flush_every():
+                self._outcomes_since_flush = 0
+                try:
+                    self._flush_reputations_to_disk()
+                except Exception:  # noqa: BLE001 — persistence best-effort
+                    pass
+        except Exception:  # noqa: BLE001 — learning never breaks the op
+            logger.debug(
+                "MemoryEngine.record_file_outcome swallowed", exc_info=True,
+            )
 
     def get_pattern_summary(self) -> PatternSummary:
         """Aggregate all insights into a PatternSummary.
@@ -678,3 +709,93 @@ class MemoryEngine:
             path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
         except OSError as exc:
             logger.error("MemoryEngine: cannot flush patterns: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# P0.4 — the learning plane: default-path reputation store + gates
+# ---------------------------------------------------------------------------
+#
+# The reputation writer (``ingest_outcome`` / ``record_file_outcome``) and
+# reader (``get_file_reputation``) lived only inside the harness-only
+# ConsciousnessBridge, so on the default path O+V never learned WHICH files
+# historically fail / churn / carry blast radius. This decouples the store
+# into a process-wide, disk-backed singleton (mirrors the Oracle / SemanticIndex
+# ``get_default_*`` pattern) that BOTH the terminal-op write seam and the
+# intake read-bias use — no ConsciousnessBridge required.
+#
+# Two gates (both §33.1 default-FALSE): the WRITE accumulates learning; the
+# intake BIAS applies it to queue priority (a behavior change, so it is opted
+# into separately, after reputation has accumulated).
+
+_ENV_REPUTATION_WRITE = "JARVIS_MEMORY_REPUTATION_ENABLED"
+_ENV_REPUTATION_BIAS = "JARVIS_MEMORY_REPUTATION_BIAS_ENABLED"
+_ENV_REPUTATION_BOOST_MAX = "JARVIS_MEMORY_REPUTATION_BOOST_MAX"
+_ENV_REPUTATION_FLUSH_EVERY = "JARVIS_MEMORY_REPUTATION_FLUSH_EVERY"
+_TRUTHY_REP = ("1", "true", "yes", "on")
+
+
+def reputation_write_enabled() -> bool:
+    """Master gate for the reputation WRITE (learning accumulation).
+    Default-FALSE (§33.1). NEVER raises."""
+    return os.getenv(_ENV_REPUTATION_WRITE, "false").strip().lower() in _TRUTHY_REP
+
+
+def reputation_bias_enabled() -> bool:
+    """Gate for the intake read-BIAS. Requires the write master (bias without
+    accumulation is inert), so a fragility signal exists to bias on."""
+    if not reputation_write_enabled():
+        return False
+    return os.getenv(_ENV_REPUTATION_BIAS, "false").strip().lower() in _TRUTHY_REP
+
+
+def reputation_boost_max() -> int:
+    """Max intake-priority boost a max-fragility target earns. Env-tunable;
+    default 3 (peer with the dependency-credit cap). NEVER raises."""
+    try:
+        return max(0, int(os.getenv(_ENV_REPUTATION_BOOST_MAX, "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _reputation_flush_every() -> int:
+    try:
+        return max(1, int(os.getenv(_ENV_REPUTATION_FLUSH_EVERY, "10")))
+    except (TypeError, ValueError):
+        return 10
+
+
+_DEFAULT_ENGINES: Dict[str, "MemoryEngine"] = {}
+_DEFAULT_ENGINES_LOCK = threading.Lock()
+
+
+def get_default_memory_engine(project_root: Any) -> "MemoryEngine":
+    """Process-wide reputation store keyed on ``project_root``, disk-backed at
+    ``.jarvis/memory_engine/`` and lazily loaded. Ledger-free (the default
+    write seam feeds ``record_file_outcome`` with paths it already has, not a
+    ledger read). NEVER raises — falls back to a fresh in-memory engine."""
+    key = str(project_root)
+    with _DEFAULT_ENGINES_LOCK:
+        eng = _DEFAULT_ENGINES.get(key)
+        if eng is not None:
+            return eng
+        try:
+            pdir = Path(project_root) / ".jarvis" / "memory_engine"
+            eng = MemoryEngine(
+                ledger=None, persistence_dir=pdir, repo_path=str(project_root),
+            )
+            try:
+                eng._load_reputations_from_disk()  # cross-session learning
+            except Exception:  # noqa: BLE001 — cold start is fine
+                pass
+        except Exception:  # noqa: BLE001 — never break a caller
+            eng = MemoryEngine(
+                ledger=None, persistence_dir=Path(".") / ".jarvis" / "memory_engine",
+            )
+        _DEFAULT_ENGINES[key] = eng
+        return eng
+
+
+def reset_default_memory_engine_for_tests() -> None:
+    """Drop cached default engines. Production code MUST NOT call this."""
+    with _DEFAULT_ENGINES_LOCK:
+        _DEFAULT_ENGINES.clear()
