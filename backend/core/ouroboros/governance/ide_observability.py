@@ -312,6 +312,13 @@ class IDEObservabilityRouter:
             "/observability/liveness",
             self._handle_capability_liveness,
         )
+        # Fault-Injection Matrix (autonomy pivot Gap 1) — resilience coverage:
+        # class × verdict over the stability failure taxonomy; NO_SCENARIO/BROKEN
+        # cells are the predicted next-death sites.
+        app.router.add_get(
+            "/observability/resilience",
+            self._handle_resilience_matrix,
+        )
         # W3(7) Slice 6 — Class D/E/F cancel record surface.
         app.router.add_get(
             "/observability/cancels", self._handle_cancel_list,
@@ -1695,6 +1702,16 @@ class IDEObservabilityRouter:
             return False
         return master_enabled()
 
+    @staticmethod
+    def _resilience_matrix_enabled() -> bool:
+        try:
+            from backend.core.ouroboros.governance.fault_injection_matrix import (
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
     def _governor_check_gates(self, request: "web.Request") -> Optional[Any]:
         if not ide_observability_enabled():
             return self._error_response(
@@ -1859,6 +1876,41 @@ class IDEObservabilityRouter:
             return self._json_response(
                 request, 200,
                 {"snapshot": None, "reason_code": "liveness.unavailable"},
+            )
+        return self._json_response(request, 200, snap)
+
+    def _resilience_check_gates(self, request: "web.Request") -> Optional[Any]:
+        if not ide_observability_enabled():
+            return self._error_response(request, 403, "ide_observability.disabled")
+        if not self._resilience_matrix_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.resilience_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(request, 429, "ide_observability.rate_limited")
+        return None
+
+    async def _handle_resilience_matrix(self, request: "web.Request") -> Any:
+        """GET /observability/resilience — the fault-injection coverage matrix:
+        for each stability failure class, whether a controlled injected fault
+        was DEFENDED, plus the NO_SCENARIO/BROKEN gaps that predict where the
+        next novel death hides."""
+        err = self._resilience_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.fault_injection_matrix import (
+                snapshot as _resilience_snapshot,
+            )
+            snap = _resilience_snapshot()
+        except Exception:  # noqa: BLE001 — never 500; degrade to a clean 200
+            logger.debug(
+                "[IDEObservability] resilience matrix snapshot failed",
+                exc_info=True,
+            )
+            return self._json_response(
+                request, 200,
+                {"snapshot": None, "reason_code": "resilience.unavailable"},
             )
         return self._json_response(request, 200, snap)
 
