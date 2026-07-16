@@ -155,3 +155,81 @@ def test_prompt_only_propagates_errors_no_swallow():
     inst._claude_create_with_resilience = _boom
     with pytest.raises(RuntimeError, match="overloaded"):
         _run(inst.prompt_only("p"))
+
+
+# ---------------------------------------------------------------------------
+# complete_sync Aegis credential gate (Slice-27 parity, bt-2026-07-16-185947)
+#
+# Under Aegis env_scrub, DOUBLEWORD_API_KEY is absent from os.environ and
+# self._api_key is empty — but Aegis injects the real key server-side at the
+# daemon's forwarding handler (complete_sync's transport is already
+# Aegis-bridged). The gate must accept EITHER credential source, exactly like
+# prompt_only post-Slice-27.
+# ---------------------------------------------------------------------------
+
+from unittest.mock import MagicMock
+
+import backend.core.ouroboros.aegis.client as aegis_client
+from backend.core.ouroboros.governance.doubleword_provider import DoublewordProvider
+
+
+class _GatePassed(Exception):
+    """Sentinel raised by the mocked budget check — proves the credential
+    gate ADMITTED the call (budget is the very next statement)."""
+
+
+def _scrubbed_provider(monkeypatch):
+    """A provider skeleton in an Aegis-scrubbed world: no env key, empty
+    _api_key. No live HTTP is possible — _check_budget raises the sentinel."""
+    monkeypatch.delenv("DOUBLEWORD_API_KEY", raising=False)
+    p = DoublewordProvider.__new__(DoublewordProvider)
+    p._api_key = ""                       # post-scrub state
+    p._model = "some/model"
+    p._check_budget = MagicMock(side_effect=_GatePassed())
+    return p
+
+
+def test_complete_sync_admits_when_aegis_active(monkeypatch):
+    """Scrubbed env + Aegis broker active → the gate passes and execution
+    reaches payload construction (sentinel fires)."""
+    monkeypatch.setattr(aegis_client, "is_enabled", lambda: True)
+    p = _scrubbed_provider(monkeypatch)
+    with pytest.raises(_GatePassed):
+        asyncio.new_event_loop().run_until_complete(
+            p.complete_sync("hi", system_prompt="s", caller_id="test")
+        )
+
+
+def test_complete_sync_rejects_when_no_credential_source(monkeypatch):
+    """Scrubbed env + Aegis OFF → fail-closed ValueError (no silent no-auth
+    call, no hardcoded fallback)."""
+    monkeypatch.setattr(aegis_client, "is_enabled", lambda: False)
+    p = _scrubbed_provider(monkeypatch)
+    with pytest.raises(ValueError, match="Aegis is not"):
+        asyncio.new_event_loop().run_until_complete(
+            p.complete_sync("hi", system_prompt="s", caller_id="test")
+        )
+
+
+def test_complete_sync_admits_with_direct_key_aegis_off(monkeypatch):
+    """Legacy path unchanged: a directly-configured key admits without Aegis."""
+    monkeypatch.setattr(aegis_client, "is_enabled", lambda: False)
+    p = _scrubbed_provider(monkeypatch)
+    p._api_key = "dw-legacy-key"
+    with pytest.raises(_GatePassed):
+        asyncio.new_event_loop().run_until_complete(
+            p.complete_sync("hi", system_prompt="s", caller_id="test")
+        )
+
+
+def test_complete_sync_gate_defensive_on_aegis_probe_error(monkeypatch):
+    """An erroring Aegis probe degrades to 'not active' (defensive), so
+    scrubbed + broken-probe still fail-closes rather than crashing oddly."""
+    def _boom():
+        raise RuntimeError("aegis probe failed")
+    monkeypatch.setattr(aegis_client, "is_enabled", _boom)
+    p = _scrubbed_provider(monkeypatch)
+    with pytest.raises(ValueError, match="cannot call complete_sync"):
+        asyncio.new_event_loop().run_until_complete(
+            p.complete_sync("hi", system_prompt="s", caller_id="test")
+        )
