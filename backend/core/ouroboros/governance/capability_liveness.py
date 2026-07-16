@@ -244,6 +244,15 @@ class CapabilityVerdict:
     fraction_severed: float = 0.0
     principles: Tuple[str, ...] = ()
     reason: str = ""
+    firing: str = "UNKNOWN"            # FIRING|SILENT|UNKNOWN (Step 2)
+    firing_hits: Tuple[str, ...] = ()
+    firing_channels: Tuple[str, ...] = ()   # derived: "ledger" (reliable) / "log"
+
+    @property
+    def ledger_backed(self) -> bool:
+        """A SILENT verdict with a ``ledger`` channel is high-confidence
+        dormancy (evidence-of-work channel went quiet)."""
+        return "ledger" in self.firing_channels
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -257,6 +266,10 @@ class CapabilityVerdict:
             "fraction_severed": round(self.fraction_severed, 4),
             "principles": list(self.principles),
             "reason": self.reason,
+            "firing": self.firing,
+            "firing_hits": list(self.firing_hits),
+            "firing_channels": list(self.firing_channels),
+            "ledger_backed": self.ledger_backed,
         }
 
 
@@ -269,8 +282,10 @@ def _verdict_for(
     repo: Path,
     caller_index: Dict[str, Set[str]],
     principles_fn: Optional[Callable[[str], Sequence[str]]],
+    firing_probe: Optional[Callable[[str], Tuple[str, List[str], List[str]]]] = None,
 ) -> CapabilityVerdict:
-    """Pure per-capability verdict from the caller-index. Never raises."""
+    """Pure per-capability verdict from the caller-index (+ optional firing
+    probe). Never raises."""
     _flag, _sf, _cat, _on = str(flag), str(source_file), str(category), bool(live_on)
 
     def _mk(verdict: str, **extra: Any) -> CapabilityVerdict:
@@ -288,9 +303,17 @@ def _verdict_for(
         source = abs_path.read_text(encoding="utf-8")
     except Exception:  # noqa: BLE001
         return _mk("UNRESOLVED", reason="source_file unreadable")
+
+    # Firing dimension (Step 2) — derived from THIS source, judged over the
+    # adaptive runtime evidence window. UNKNOWN when firing is off/unprovable.
+    firing, fhits, fchan = ("UNKNOWN", [], [])
+    if firing_probe is not None:
+        firing, fhits, fchan = firing_probe(source)
+
     symbols = _public_symbols(source)
     if not symbols:
-        return _mk("UNRESOLVED",
+        return _mk("UNRESOLVED", firing=firing, firing_hits=tuple(fhits),
+                   firing_channels=tuple(fchan),
                    reason="no public callable entry symbols to resolve reachability")
     severed: List[str] = []
     for sym in symbols:
@@ -308,12 +331,15 @@ def _verdict_for(
         except Exception:  # noqa: BLE001
             principles = ()
     if not severed:
-        return _mk("ALIVE", public_symbols=symbols, fraction_severed=0.0)
+        return _mk("ALIVE", public_symbols=symbols, fraction_severed=0.0,
+                   firing=firing, firing_hits=tuple(fhits),
+                   firing_channels=tuple(fchan))
     verdict = "FULLY_SEVERED" if fraction >= 1.0 else "SEVERED"
     return _mk(
         verdict,
         public_symbols=symbols, severed_symbols=tuple(severed),
         fraction_severed=fraction, principles=principles,
+        firing=firing, firing_hits=tuple(fhits), firing_channels=tuple(fchan),
         reason=(
             "no public callable has a production call site — likely inert subsystem"
             if fraction >= 1.0 else
@@ -340,6 +366,9 @@ class LivenessSnapshot:
     callable_reachability_ratio: Optional[float] = None
     fully_severed: List[Dict[str, Any]] = field(default_factory=list)
     severance_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    dormant: List[Dict[str, Any]] = field(default_factory=list)
+    observability_gaps: List[Dict[str, Any]] = field(default_factory=list)
+    firing_evidence: Dict[str, Any] = field(default_factory=lambda: {"implemented": False})
     spec_drift: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -371,19 +400,34 @@ class LivenessSnapshot:
             # Explicitly static-only — a symbol here may be dynamically
             # dispatched; treat as a review candidate, not proven-dead.
             "severance_candidates": self.severance_candidates,
+            # THE PRECISE MERKLE SIGNATURE (Step 2): capabilities that ARE
+            # statically reachable (ALIVE) yet emitted NO runtime firing
+            # evidence in the adaptive window — wired but dormant. This is the
+            # highest-value output: the exact class the static half could not
+            # distinguish, now caught by combining reachability with runtime
+            # evidence.
+            "dormant": self.dormant,
             # Third self-blindness axis (docs-vs-registry drift), composed from
             # the existing mirror_self_spec_drift auditor.
             "spec_drift": self.spec_drift,
             "interpretation": (
-                "Static reachability is the always-available half of "
-                "self-perception: it proves 'this symbol has no production call "
-                "site', which catches whole-module inertia and NEWLY-introduced "
-                "severances (trend). The precise merkle-class detector — "
-                "'enabled but never FIRED at runtime' — is the firing dimension "
-                "(Step 2: federated .jarvis/*.jsonl + debug.log reader), "
-                "deliberately deferred and wired via the firing_probe seam."
+                "Self-perception combines two proofs: STATIC reachability "
+                "('this callable has a production call site' — catches whole-"
+                "module inertia + newly-introduced severances via trend) and "
+                "RUNTIME firing ('this subsystem emitted evidence in the recent "
+                "window' — markers derived from the capability's own source, "
+                "judged over an adaptive session-anchored window). Their "
+                "intersection — ALIVE but SILENT = 'dormant' — is the precise "
+                "merkle class: reachable, wired, but not running."
             ),
-            "firing": {"implemented": False},
+            # Reachable + SILENT but only a LOG channel (no ledger) — may be
+            # running silently. NOT proven dormant; an observability gap worth
+            # closing (the subsystem should emit durable evidence).
+            "observability_gaps": self.observability_gaps,
+            # Runtime firing dimension summary (evidence window + counts +
+            # dormant/gap totals). ``implemented: false`` when the firing master
+            # is off (firing then UNKNOWN for all; no dormant analysis).
+            "firing": self.firing_evidence,
         }
 
 
@@ -429,12 +473,29 @@ def _principles_fn() -> Optional[Callable[[str], Sequence[str]]]:
         return None
 
 
+def _resolve_firing_probe(
+    repo: Path, now: float,
+) -> Tuple[Optional[Callable[[str], Tuple[str, List[str], List[str]]]], Optional[Dict[str, Any]]]:
+    """Build the Step-2 firing probe from ``capability_firing`` when its master
+    is on. Returns ``(probe, evidence_summary)`` or ``(None, None)`` when firing
+    is off/unavailable (→ firing stays UNKNOWN, no dormant analysis). Never
+    raises."""
+    try:
+        from backend.core.ouroboros.governance import capability_firing as cf
+        if not cf.master_enabled():
+            return None, None
+        probe, evidence = cf.build_firing_probe(repo, now=now)
+        return probe, evidence.to_dict()
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
 def aggregate_capability_liveness(
     *,
     repo_root: Optional[Path] = None,
     now: Optional[float] = None,
     walker: Optional[Callable[[], List[Tuple[str, str]]]] = None,  # test seam
-    firing_probe: Optional[Callable[[str], bool]] = None,  # Step 2 seam (unused in Step 1)
+    firing_probe: Optional[Callable[[str], Tuple[str, List[str]]]] = None,  # Step 2 seam
 ) -> LivenessSnapshot:
     """Compose the capability-liveness snapshot from the FlagRegistry + a
     ripgrep caller-index. Read-only; NEVER raises — any fault degrades to a
@@ -444,7 +505,6 @@ def aggregate_capability_liveness(
     ``(flag_name) -> bool`` (did the subsystem fire in the window). Unused in
     Step 1; wired here so Step 2 needs no signature change.
     """
-    _ = firing_probe  # reserved for the Step-2 firing dimension (see docstring)
     try:
         _now = float(now) if now is not None else time.time()
         repo = _resolve_repo_root(repo_root)
@@ -492,6 +552,16 @@ def aggregate_capability_liveness(
         caller_index = _build_caller_index(repo, all_names, walker=walker)
         reason = "ok"
 
+        # --- firing dimension (Step 2) — one durable evidence read, amortized ---
+        _firing_probe = firing_probe
+        firing_evidence: Dict[str, Any] = {"implemented": False}
+        if _firing_probe is None:
+            _firing_probe, _fev = _resolve_firing_probe(repo, _now)
+            if _fev is not None:
+                firing_evidence = {"implemented": True, **_fev}
+        elif _firing_probe is not None:
+            firing_evidence = {"implemented": True, "source": "injected"}
+
         # --- per-capability verdicts ---
         principles_fn = _principles_fn()
         verdicts: List[CapabilityVerdict] = []
@@ -504,6 +574,7 @@ def aggregate_capability_liveness(
                 repo=repo,
                 caller_index=caller_index,
                 principles_fn=principles_fn,
+                firing_probe=_firing_probe,
             )
             verdicts.append(v)
 
@@ -524,11 +595,39 @@ def aggregate_capability_liveness(
             key=lambda d: (-d["fraction_severed"], d["flag"]),
         )
 
+        # --- the precise merkle signature: REACHABLE (ALIVE) but SILENT ---
+        # A capability whose callables all have production call sites (so it is
+        # statically wired) yet emitted NO runtime evidence in the window is
+        # dormant — the exact class the static half could not distinguish.
+        # HIGH-CONFIDENCE dormancy requires a LEDGER evidence-of-work channel
+        # that went quiet (the merkle merkle_history.jsonl case); a log-tag-only
+        # silence is downgraded to observability_gap (may be running silently).
+        firing_counts: Dict[str, int] = {}
+        for v in verdicts:
+            firing_counts[v.firing] = firing_counts.get(v.firing, 0) + 1
+        _alive_silent = [
+            v for v in verdicts if v.verdict == "ALIVE" and v.firing == "SILENT"
+        ]
+        dormant = sorted(
+            (v.to_dict() for v in _alive_silent if v.ledger_backed),
+            key=lambda d: d["flag"],
+        )
+        observability_gaps = sorted(
+            (v.to_dict() for v in _alive_silent if not v.ledger_backed),
+            key=lambda d: d["flag"],
+        )
+        firing_evidence["counts"] = firing_counts
+        firing_evidence["dormant_count"] = len(dormant)
+        firing_evidence["observability_gap_count"] = len(observability_gaps)
+
         return LivenessSnapshot(
             enabled=True, reason_code=reason, generated_at_unix=_now,
             capabilities_declared=len(live_specs),
             capabilities_resolved=resolved,
             counts=counts,
+            firing_evidence=firing_evidence,
+            dormant=dormant,
+            observability_gaps=observability_gaps,
             callable_reachability_ratio=ratio,
             fully_severed=fully,
             severance_candidates=candidates,
