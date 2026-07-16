@@ -289,12 +289,126 @@ class IntakeLayerService:
             await self._teardown()
             raise
 
+    async def _start_merkle_hydration(self, event_bus: Any) -> None:
+        """Slice 31 — arm the Merkle Cartographer's hydration driver.
+
+        Composition only (no new infrastructure): the cartographer already
+        ships ``hydrate()`` (persisted snapshot), a fully cooperative
+        ``update_full()`` (semaphore-bounded, executor reads via the
+        cooperative_fs_io substrate), and ``MerkleEventSubscriber`` (the
+        ``fs.changed.*`` conduit with debounced ``update_incremental``
+        batching). This method is purely the missing production CALLER.
+
+        Ordering guarantees:
+          * the bus subscription is wired BEFORE the boot walk is scheduled,
+            so no fs event can fall into a gap between snapshot and walk
+            (``update_incremental`` on a cold tree is a safe no-op — the
+            walk rebuilds authoritatively);
+          * both the snapshot read and the full walk run inside a background
+            task — intake boot never blocks on them and the event loop
+            yields throughout (update_full's own cooperative discipline);
+          * master-flag off → nothing constructed; any fault → warn + legacy
+            full-scan behavior (exactly the consumers' built-in fail-safe).
+        NEVER raises.
+        """
+        self._merkle_subscriber: Optional[Any] = None
+        self._merkle_hydration_task: Optional[asyncio.Task] = None
+        try:
+            from backend.core.ouroboros.governance.merkle_cartographer import (
+                MerkleEventSubscriber,
+                get_default_cartographer,
+                is_cartographer_enabled,
+            )
+            if not is_cartographer_enabled():
+                logger.info(
+                    "[IntakeLayer] Merkle cartographer master off — "
+                    "sensors stay on legacy full scans",
+                )
+                return
+            cart = get_default_cartographer(
+                repo_root=self._config.project_root,
+            )
+            subscriber = MerkleEventSubscriber(cart)
+
+            # Shape adapter — TrinityEventBus dispatches ``handler(event)``
+            # (single event object; see trinity_event_bus._execute_handler),
+            # while the subscriber's bus-agnostic ``handle(topic, payload)``
+            # expects the caller to translate (its own documented contract:
+            # "the bus subscriber translates published events"). The
+            # pre-built ``subscribe_to_bus`` passes ``handle`` raw — against
+            # THIS bus that would TypeError on every event (never caught
+            # live because no production caller ever wired it). Adapt here,
+            # in the caller, keeping merkle_cartographer bus-agnostic.
+            async def _bus_adapter(event: Any) -> None:
+                try:
+                    await subscriber.handle(
+                        getattr(event, "topic", "") or "",
+                        getattr(event, "payload", None) or {},
+                    )
+                except Exception:  # noqa: BLE001 — never leak into dispatch
+                    logger.debug(
+                        "[IntakeLayer] merkle bus adapter fault",
+                        exc_info=True,
+                    )
+
+            wired = False
+            try:
+                await event_bus.subscribe("fs.changed.*", _bus_adapter)
+                wired = True
+            except Exception:  # noqa: BLE001 — incremental lane optional
+                logger.debug(
+                    "[IntakeLayer] merkle fs.changed subscription failed",
+                    exc_info=True,
+                )
+            self._merkle_subscriber = subscriber
+
+            async def _boot_hydrate() -> None:
+                # Snapshot first (cheap single-file read, still off-loop),
+                # then the authoritative cooperative walk.
+                loop = asyncio.get_running_loop()
+                loaded = await loop.run_in_executor(None, cart.hydrate)
+                changed = await cart.update_full()
+                logger.info(
+                    "[IntakeLayer] Merkle boot hydration COMPLETE: "
+                    "snapshot_leaves=%d walk_changed=%d — subtree "
+                    "short-circuits are now live for every consumer",
+                    loaded, len(changed),
+                )
+
+            self._merkle_hydration_task = asyncio.create_task(
+                _boot_hydrate(), name="merkle_boot_hydration",
+            )
+            logger.info(
+                "[IntakeLayer] Merkle hydration driver ARMED: bus_wired=%s "
+                "boot_walk=scheduled (Slice 31 — update_full's first "
+                "production caller)", wired,
+            )
+        except Exception:  # noqa: BLE001 — driver is fail-soft by contract
+            logger.warning(
+                "[IntakeLayer] Merkle hydration driver failed to arm "
+                "(non-fatal — sensors keep legacy full scans)",
+                exc_info=True,
+            )
+
     async def stop(self) -> None:
         """Stop sensors first (drain), then router. Idempotent from INACTIVE."""
         if self._state is IntakeServiceState.INACTIVE:
             return
 
         self._state = IntakeServiceState.STOPPING
+
+        # Slice 31 — retire the merkle hydration driver: cancel an
+        # in-flight boot walk and flush the subscriber's pending batch so
+        # the persisted snapshot stays coherent. Best-effort, never raises.
+        _mk_task = getattr(self, "_merkle_hydration_task", None)
+        if _mk_task is not None and not _mk_task.done():
+            _mk_task.cancel()
+        _mk_sub = getattr(self, "_merkle_subscriber", None)
+        if _mk_sub is not None:
+            try:
+                await _mk_sub.flush()
+            except Exception:  # noqa: BLE001
+                pass
 
         # Stop sensors first to prevent new envelopes entering router.
         # Sensor stop() methods are synchronous; call directly.
@@ -1044,6 +1158,16 @@ class IntakeLayerService:
                 "%d/%d sensors subscribed",
                 _subscribed, len(self._sensors),
             )
+
+            # ---- Slice 31: Merkle Cartographer hydration driver ----
+            # The Phase 11 merkle stack shipped consumers (OpportunityMiner /
+            # TodoScanner / DocStaleness subtree consults) but NO production
+            # caller ever hydrated the cartographer — update_full() had zero
+            # callers, _root stayed None, every subtree_hash() returned "",
+            # and every consumer fail-safed to legacy O(N) scans silently,
+            # forever (proven live: 5 quiet-soak cycles bt-2026-07-16-031323,
+            # all full scans). This is that missing driver — the ONE caller.
+            await self._start_merkle_hydration(_event_bus)
         except Exception as exc:
             logger.warning(
                 "[IntakeLayer] Event Spine failed to start, sensors will use "
