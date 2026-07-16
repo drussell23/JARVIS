@@ -289,6 +289,50 @@ class IntakeLayerService:
             await self._teardown()
             raise
 
+    def _start_conception_bridge(self, router: Any) -> None:
+        """Gap 3 — register the conception proposal bridge as a DreamEngine
+        blueprint observer, so ranked blueprints route themselves into the
+        intake queue on production (event-driven, no polling).
+
+        Composition only: the bridge (translation), the value model (ranking),
+        DreamEngine (production), and the router (queue) all pre-exist; this is
+        the missing production wiring. Resolution is best-effort down
+        ``gls._consciousness._dream`` — any missing handle or master-off flag
+        leaves the system byte-identical. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.conception_proposal_bridge import (
+                get_default_bridge,
+                master_enabled as bridge_enabled,
+            )
+            if not bridge_enabled():
+                logger.info(
+                    "[IntakeLayer] Conception bridge master off — blueprints "
+                    "stay unrouted (intent_discovery grounding still active)",
+                )
+                return
+            consciousness = getattr(self._gls, "_consciousness", None)
+            dream = getattr(consciousness, "_dream", None)
+            if dream is None or not hasattr(dream, "register_blueprint_observer"):
+                logger.info(
+                    "[IntakeLayer] Conception bridge enabled but no DreamEngine "
+                    "reachable — bridge idle (no event source)",
+                )
+                return
+            top_n = int(os.environ.get("JARVIS_CONCEPTION_BRIDGE_TOP_N", "5") or 5)
+            bridge = get_default_bridge()
+            observer = bridge.make_observer(
+                router, lambda: dream.get_blueprints(top_n=top_n),
+            )
+            dream.register_blueprint_observer(observer)
+            logger.info(
+                "[IntakeLayer] Conception bridge ARMED: high-EV blueprints will "
+                "route as auto_proposed envelopes (event-driven, dedup-guarded)",
+            )
+        except Exception:  # noqa: BLE001 — wiring is fail-soft by contract
+            logger.debug(
+                "[IntakeLayer] conception bridge wiring skipped", exc_info=True,
+            )
+
     async def _start_merkle_hydration(self, event_bus: Any) -> None:
         """Slice 31 — arm the Merkle Cartographer's hydration driver.
 
@@ -1177,6 +1221,12 @@ class IntakeLayerService:
         router = self._router
         assert router is not None
         await router.start()
+
+        # Gap 3 — arm the conception proposal bridge: high-EV DreamEngine
+        # blueprints route themselves into this now-live router as
+        # ``auto_proposed`` envelopes. Event-driven (DreamEngine observer),
+        # master-off by default. Composition only — the bridge owns no queue.
+        self._start_conception_bridge(router)
 
         # A1-T2 — event-driven router-ready valve. The router is now attached
         # (self._gls._intake_router set above) AND its dispatch loop is live.

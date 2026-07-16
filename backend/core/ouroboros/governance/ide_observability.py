@@ -1971,6 +1971,15 @@ class IDEObservabilityRouter:
                 snapshot as _conception_snapshot,
             )
             snap = _conception_snapshot()
+            # Attach the ledger→router bridge state (Gap 3 unification path) —
+            # best-effort; a missing bridge module never fails the endpoint.
+            try:
+                from backend.core.ouroboros.governance.conception_proposal_bridge import (
+                    snapshot as _bridge_snapshot,
+                )
+                snap = {**snap, "bridge": _bridge_snapshot()}
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001 — never 500; degrade to a clean 200
             logger.debug(
                 "[IDEObservability] conception value snapshot failed",

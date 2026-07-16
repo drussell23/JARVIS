@@ -36,7 +36,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backend.core.ouroboros.consciousness.dream_metrics import DreamMetricsTracker
 from backend.core.ouroboros.consciousness.types import (
@@ -209,9 +209,38 @@ class DreamEngine:
         # Dream loop task
         self._loop_task: Optional[asyncio.Task[None]] = None
 
+        # Blueprint-computed observers (Gap 3 conception bridge) — additive,
+        # default empty. Fired after a blueprint is stored so downstream
+        # consumers (e.g. the conception proposal bridge) can react to
+        # production without polling. No observer registered => no behavior
+        # change.
+        self._blueprint_observers: List[Callable[[Any], Any]] = []
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    def register_blueprint_observer(
+        self, observer: Callable[[Any], Any],
+    ) -> None:
+        """Register an async callback invoked (fail-soft) after each blueprint
+        is computed and stored. Idempotent per identity. Event source for the
+        Gap 3 conception proposal bridge."""
+        if observer not in self._blueprint_observers:
+            self._blueprint_observers.append(observer)
+
+    async def _notify_blueprint_observers(self, blueprint: Any) -> None:
+        """Await each registered observer, isolating faults — an observer
+        error never disturbs the dream loop."""
+        for obs in list(self._blueprint_observers):
+            try:
+                res = obs(blueprint)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:  # noqa: BLE001 — observers are best-effort
+                logger.debug(
+                    "[DreamEngine] blueprint observer faulted", exc_info=True,
+                )
 
     async def start(self) -> None:
         """Load persisted state from disk and start the background dream loop."""
@@ -537,6 +566,9 @@ class DreamEngine:
             self._blueprints[blueprint_id] = blueprint
             self._completed_keys.add(job_key)
             self._metrics_tracker.record_blueprint_computed()
+            # Event source for the conception proposal bridge (Gap 3) — fires
+            # after the blueprint is durably stored. No-op when no observer.
+            await self._notify_blueprint_observers(blueprint)
 
         # Record compute time
         elapsed_min = (time.monotonic() - start_mono) / 60.0
