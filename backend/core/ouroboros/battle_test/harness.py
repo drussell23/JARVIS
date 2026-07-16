@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.battle_test.cost_tracker import CostTracker
 from backend.core.ouroboros.battle_test.idle_watchdog import IdleWatchdog
@@ -380,6 +380,45 @@ class HarnessConfig:
 # ---------------------------------------------------------------------------
 # BattleTestHarness
 # ---------------------------------------------------------------------------
+
+
+def _wall_clock_monitor_max_restarts() -> int:
+    """``JARVIS_WALL_CLOCK_MONITOR_MAX_RESTARTS`` — Slice 29 supervisor
+    restart ceiling for the wall-clock monitor / beat-writer task. Bounded
+    so a deterministically-crashing monitor cannot thrash; the terminal
+    CRITICAL log is the operator signal that beats are gone. Default 5."""
+    try:
+        return max(0, int(os.environ.get(
+            "JARVIS_WALL_CLOCK_MONITOR_MAX_RESTARTS", "5",
+        )))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _should_restart_wall_clock_monitor(
+    *,
+    cancelled: bool,
+    exc: Optional[BaseException],
+    restarts: int,
+    max_restarts: int,
+    closing: bool,
+) -> "Tuple[bool, str]":
+    """Slice 29 — pure supervisor decision for a terminal monitor task.
+
+    Restart IFF the death was unexpected: an exception (ANY BaseException
+    derivative) outside teardown, within the restart budget. Cancellation
+    and normal return are expected lifecycle (teardown / cap fired). Pure
+    logic — unit-testable without an event loop.
+    """
+    if closing:
+        return False, "closing"
+    if cancelled:
+        return False, "cancelled"
+    if exc is None:
+        return False, "normal_return"
+    if restarts >= max_restarts:
+        return False, f"restart_budget_exhausted({restarts}/{max_restarts})"
+    return True, f"unexpected_death:{type(exc).__name__}"
 
 
 def _resolve_active_session_dir(default_dir: Path) -> Path:
@@ -1469,9 +1508,14 @@ class BattleTestHarness:
             self._external_watchdog: Optional[Any] = None  # Slice 49
             _wall_cap = self._config.max_wall_seconds_s
             if _wall_cap is not None and _wall_cap > 0:
-                self._wall_clock_monitor_task = asyncio.ensure_future(
-                    self._monitor_wall_clock(_wall_cap)
-                )
+                # Slice 29 — supervised arming: the monitor task is ALSO the
+                # external sentinel's only beat writer; a silent task death
+                # (bt-2026-07-15-233357) freezes the heartbeat and ends in a
+                # false-positive heartbeat_stale SIGKILL of a healthy
+                # organism. The supervisor logs any terminal outcome loudly
+                # and intelligently recreates the task (bounded).
+                self._wall_clock_monitor_restarts = 0
+                self._arm_wall_clock_monitor_supervised(_wall_cap)
                 # Task #21 — Dynamic Timeout Coherence seam. Publish
                 # the absolute monotonic wall deadline so the
                 # governance layer (swe_bench_pro.evaluator) can
@@ -6398,6 +6442,102 @@ class BattleTestHarness:
     # ------------------------------------------------------------------
     # Hot-reload Restart Monitor
     # ------------------------------------------------------------------
+
+    def _arm_wall_clock_monitor_supervised(self, cap_s: float) -> None:
+        """Slice 29 — create the wall-clock monitor task under a
+        done-callback supervisor.
+
+        The monitor task carries TWO duties: the wall-cap authority AND the
+        external sentinel's heartbeat writer (:meth:`_beat_external_watchdog`
+        per tick). bt-2026-07-15-233357 proved a silent terminal outcome of
+        this task ends, minutes later, in the sentinel SIGKILLing a healthy
+        process. The supervisor guarantees every terminal outcome is LOUD
+        and, when the death is unexpected, recreates the task — bounded by
+        ``JARVIS_WALL_CLOCK_MONITOR_MAX_RESTARTS`` (default 5) so a
+        deterministically-crashing monitor cannot thrash forever (the final
+        CRITICAL log is the operator's signal that beats are gone).
+
+        Watchdog Isolation Invariant (Slice 47) preserved: the supervisor
+        reads NO application state-ledgers — only the task's own terminal
+        state and the harness's shutdown/fire events (which exist precisely
+        to sequence teardown).
+        """
+        self._wall_clock_monitor_task = asyncio.ensure_future(
+            self._monitor_wall_clock(cap_s)
+        )
+        self._wall_clock_monitor_task.add_done_callback(
+            lambda task: self._on_wall_clock_monitor_done(task, cap_s)
+        )
+
+    def _on_wall_clock_monitor_done(self, task: "asyncio.Future", cap_s: float) -> None:
+        """Done-callback supervisor body. NEVER raises (runs on the loop)."""
+        try:
+            exc: Optional[BaseException] = None
+            cancelled = bool(task.cancelled())
+            if not cancelled:
+                try:
+                    # .exception() surfaces ANY BaseException derivative the
+                    # task terminated with (SystemExit/KeyboardInterrupt
+                    # included — asyncio stores them all).
+                    exc = task.exception()
+                except BaseException as retrieval_exc:  # noqa: BLE001 — defensive
+                    exc = retrieval_exc
+            closing = self._wall_clock_monitor_closing()
+            restarts = getattr(self, "_wall_clock_monitor_restarts", 0)
+            max_restarts = _wall_clock_monitor_max_restarts()
+            restart, verdict = _should_restart_wall_clock_monitor(
+                cancelled=cancelled, exc=exc, restarts=restarts,
+                max_restarts=max_restarts, closing=closing,
+            )
+            if exc is not None:
+                logger.critical(
+                    "[WallClockWatchdog] monitor task DIED with %s: %s — "
+                    "this task is the external sentinel's ONLY beat writer; "
+                    "without restart the sentinel will SIGKILL a healthy "
+                    "process at stale-window expiry. verdict=%s "
+                    "(restarts=%d/%d closing=%s)",
+                    type(exc).__name__, exc, verdict,
+                    restarts, max_restarts, closing,
+                    exc_info=exc,
+                )
+            else:
+                # Normal return (wall cap fired) or cancellation (teardown)
+                # — expected lifecycle, INFO-level for the audit trail.
+                logger.info(
+                    "[WallClockWatchdog] monitor task ended "
+                    "(cancelled=%s closing=%s) verdict=%s",
+                    cancelled, closing, verdict,
+                )
+            if restart:
+                self._wall_clock_monitor_restarts = restarts + 1
+                logger.warning(
+                    "[WallClockWatchdog] supervisor RESTARTING monitor task "
+                    "(restart %d/%d) — beats resume this tick",
+                    self._wall_clock_monitor_restarts, max_restarts,
+                )
+                self._arm_wall_clock_monitor_supervised(cap_s)
+        except BaseException:  # noqa: BLE001 — supervisor must never raise
+            try:
+                logger.critical(
+                    "[WallClockWatchdog] supervisor itself faulted",
+                    exc_info=True,
+                )
+            except BaseException:  # noqa: BLE001 — last resort
+                pass
+
+    def _wall_clock_monitor_closing(self) -> bool:
+        """True when the harness is tearing down / the cap already fired —
+        the two expected reasons for the monitor task to end."""
+        try:
+            ev = getattr(self, "_shutdown_event", None)
+            if ev is not None and ev.is_set():
+                return True
+            wc = getattr(self, "_wall_clock_event", None)
+            if wc is not None and wc.is_set():
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     def _arm_external_watchdog(self, cap_s: float) -> None:
         """Slice 49 — spawn the out-of-process GIL-immune kill sentinel.

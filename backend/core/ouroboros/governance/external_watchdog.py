@@ -28,12 +28,18 @@ point (``python external_watchdog.py --watch <pid> <hb> <budget> <stale>``).
 """
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import sys
 import time
 from pathlib import Path
 from typing import Optional, Tuple
+
+# Parent-process logger only — the sentinel CHILD stays logging-free by
+# design (standalone subprocess, no logging config; it speaks via
+# os.write(2, ...) so its lines land on the harness's inherited stderr).
+logger = logging.getLogger("Ouroboros.ExternalWatchdog")
 
 
 def _suspend_detected(
@@ -79,6 +85,47 @@ def _read_beat(heartbeat_path: str) -> Optional[float]:
         return None
 
 
+def format_poll_forensics(
+    *,
+    tag: str,
+    now_wall: float,
+    armed_wall: float,
+    last_beat_wall: Optional[float],
+    stale_window_s: float,
+    budget_s: float,
+    suspended: bool,
+    wall_delta: float,
+    mono_delta: float,
+    poll_s: float,
+    suppressed_polls: int,
+    max_poll_drift_s: float,
+) -> str:
+    """Slice 29 — one dynamically-computed forensic line for the sentinel.
+
+    Pure formatter (unit-testable): every value in the line is a live delta
+    calculation, never a canned narrative. This is the instrumentation the
+    bt-2026-07-15-233357 post-mortem lacked — the kill fired 915s after the
+    beat froze instead of the 120s window and NOTHING recorded why (child
+    scheduling drift? suspend-suppression? unreadable beat file?). Each
+    emitted line answers that mathematically for its poll.
+    """
+    beat_age = (now_wall - last_beat_wall) if last_beat_wall is not None else -1.0
+    return (
+        "[ExternalWatchdog:%s] now_wall=%.3f beat_age_s=%.1f "
+        "stale_window_s=%.0f budget_elapsed_s=%.1f/%.0f suspended=%s "
+        "poll_wall_delta_s=%.2f poll_mono_delta_s=%.2f "
+        "poll_drift_s=%.2f (expected=%.2f) "
+        "suppressed_polls=%d max_poll_drift_s=%.2f"
+        % (
+            tag, now_wall, beat_age, stale_window_s,
+            now_wall - armed_wall, budget_s, suspended,
+            wall_delta, mono_delta,
+            wall_delta - poll_s, poll_s,
+            suppressed_polls, max_poll_drift_s,
+        )
+    )
+
+
 def run_watchdog(
     target_pid: int,
     heartbeat_path: str,
@@ -86,26 +133,52 @@ def run_watchdog(
     stale_window_s: float,
     poll_s: float = 1.0,
     suspend_threshold_s: float = 5.0,
+    status_every_s: float = 60.0,
 ) -> str:
     """Sentinel loop (runs in the child process). Returns the kill reason.
 
     SIGKILLs ``target_pid`` when the budget or a real (non-suspend) staleness
     window is exceeded, then returns. Exits early if the parent already died.
+
+    Slice 29 forensics — the loop now EMITS its delta math (stderr, inherited
+    from the harness so lines land in the session output) at exactly the
+    moments that matter, all values computed live:
+      * a poll whose staleness would fire but is SUPPRESSED (suspended=True);
+      * a poll whose own scheduling drifted (slept far past ``poll_s`` — the
+        App-Nap/timer-coalescing class that can delay a kill for minutes);
+      * a periodic status line every ``status_every_s`` while the beat is
+        older than half the stale window (quiet when healthy);
+      * the kill itself, with the full computation that justified it.
     """
     armed_wall = time.time()
     armed_mono = time.monotonic()
     prev_wall = armed_wall
     prev_mono = armed_mono
+    suppressed_polls = 0
+    max_poll_drift_s = 0.0
+    last_status_wall = armed_wall
+
+    def _emit(line: str) -> None:
+        try:
+            os.write(2, ("\n" + line + "\n").encode("ascii", "replace"))
+        except Exception:
+            pass
+
     # If the parent never writes a beat, fall back to arm time so the budget
     # path still governs.
     while True:
         time.sleep(poll_s)
         now_wall = time.time()
         now_mono = time.monotonic()
+        wall_delta = now_wall - prev_wall
+        mono_delta = now_mono - prev_mono
         suspended = _suspend_detected(
-            now_mono - prev_mono, now_wall - prev_wall, suspend_threshold_s,
+            mono_delta, wall_delta, suspend_threshold_s,
         )
         prev_wall, prev_mono = now_wall, now_mono
+        poll_drift = wall_delta - poll_s
+        if poll_drift > max_poll_drift_s:
+            max_poll_drift_s = poll_drift
 
         # Parent already gone? nothing to guard.
         try:
@@ -116,14 +189,45 @@ def run_watchdog(
             pass  # alive, different ownership — keep guarding
 
         last_beat = _read_beat(heartbeat_path)
-        if last_beat is None:
-            last_beat = armed_wall  # no beat yet → budget still applies
+        effective_beat = last_beat if last_beat is not None else armed_wall
 
         kill, reason = evaluate_kill(
-            now_wall=now_wall, armed_wall=armed_wall, last_beat_wall=last_beat,
-            budget_s=budget_s, stale_window_s=stale_window_s, suspended=suspended,
+            now_wall=now_wall, armed_wall=armed_wall,
+            last_beat_wall=effective_beat,
+            budget_s=budget_s, stale_window_s=stale_window_s,
+            suspended=suspended,
         )
+
+        def _forensics(tag: str) -> str:
+            return format_poll_forensics(
+                tag=tag, now_wall=now_wall, armed_wall=armed_wall,
+                last_beat_wall=last_beat, stale_window_s=stale_window_s,
+                budget_s=budget_s, suspended=suspended,
+                wall_delta=wall_delta, mono_delta=mono_delta, poll_s=poll_s,
+                suppressed_polls=suppressed_polls,
+                max_poll_drift_s=max_poll_drift_s,
+            )
+
+        beat_age = now_wall - effective_beat
+        stale_condition = beat_age >= stale_window_s
+        if stale_condition and suspended and not kill:
+            # The exact blind spot of bt-2026-07-15-233357: staleness true
+            # but suppressed. Every suppression is now on the record.
+            suppressed_polls += 1
+            _emit(_forensics("stale-suppressed"))
+        elif poll_drift >= max(poll_s * 5.0, suspend_threshold_s):
+            # This poll's own sleep overshot badly — child scheduling drift
+            # (App Nap / timer coalescing) delays kill decisions; record it.
+            _emit(_forensics("poll-drift"))
+        elif (
+            beat_age >= stale_window_s / 2.0
+            and (now_wall - last_status_wall) >= status_every_s
+        ):
+            last_status_wall = now_wall
+            _emit(_forensics("beat-aging"))
+
         if kill:
+            _emit(_forensics("kill:" + reason))
             try:
                 os.write(
                     2,
@@ -163,10 +267,30 @@ class ExternalProcessWatchdog:
         self.budget_s = float(budget_s)
         self.stale_window_s = float(stale_window_s)
         self.poll_s = float(poll_s)
+        # Slice 29 — beat-write visibility counters (see beat()).
+        self.beat_failures: int = 0
+        self.beat_successes: int = 0
+        self._beat_consecutive_failures: int = 0
+        try:
+            self._BEAT_WARN_EVERY_N = max(1, int(os.environ.get(
+                "JARVIS_WATCHDOG_BEAT_WARN_EVERY_N", "10",
+            )))
+        except (TypeError, ValueError):
+            self._BEAT_WARN_EVERY_N = 10
         self._proc: Optional["object"] = None
 
     def beat(self) -> None:
-        """Atomically write the current wall timestamp to the heartbeat file."""
+        """Atomically write the current wall timestamp to the heartbeat file.
+
+        Slice 29 — best-effort BUT never silent (bt-2026-07-15-233357: the
+        tick froze 15min before a false-positive heartbeat_stale SIGKILL and
+        post-mortem could not distinguish task death from persistently
+        swallowed write faults). A failed write still never raises into the
+        beat caller, but it now logs a rate-limited WARNING with the actual
+        exception (first failure + every Nth thereafter), and the first
+        success after a failure run logs the recovery. ``beat_failures`` /
+        ``beat_successes`` counters are public for tests/diagnostics.
+        """
         try:
             self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.heartbeat_path.with_suffix(
@@ -174,8 +298,31 @@ class ExternalProcessWatchdog:
             )
             tmp.write_text(repr(time.time()))
             os.replace(tmp, self.heartbeat_path)
-        except OSError:
-            pass  # best-effort — a missed beat just shortens the stale margin
+        except OSError as exc:
+            self.beat_failures += 1
+            self._beat_consecutive_failures += 1
+            # Rate limit: always the 1st of a failure run, then every Nth.
+            if (
+                self._beat_consecutive_failures == 1
+                or self._beat_consecutive_failures % self._BEAT_WARN_EVERY_N == 0
+            ):
+                logger.warning(
+                    "[ExternalWatchdog] heartbeat WRITE FAILED "
+                    "(consecutive=%d total=%d path=%s): %s: %s — beats are "
+                    "the sentinel's ONLY liveness signal; sustained failure "
+                    "ends in a heartbeat_stale SIGKILL of a healthy process",
+                    self._beat_consecutive_failures, self.beat_failures,
+                    self.heartbeat_path, type(exc).__name__, exc,
+                )
+        else:
+            if self._beat_consecutive_failures > 0:
+                logger.warning(
+                    "[ExternalWatchdog] heartbeat write RECOVERED after "
+                    "%d consecutive failure(s)",
+                    self._beat_consecutive_failures,
+                )
+            self._beat_consecutive_failures = 0
+            self.beat_successes += 1
 
     def arm(self) -> None:
         """Spawn the detached sentinel subprocess."""
