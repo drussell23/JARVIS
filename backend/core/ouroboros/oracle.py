@@ -1929,6 +1929,15 @@ class OracleSemanticIndex:
             )
             _armor_on = _oracle_memory_armor_enabled()
             total_embedded = 0
+            # Slice 30 — correlated-failure circuit breaker. A transient
+            # batch fault is tolerable; N CONSECUTIVE faults mean the
+            # backend itself is broken (the bt-2026-07-16-004244 class:
+            # deterministic "Error in compaction" on every upsert) and
+            # continuing amplifies the damage. Abort the remaining run —
+            # embeddings are advisory; the next changed-file embed retries
+            # against a freshly-booted backend.
+            _fail_streak = 0
+            _fail_streak_abort = _oracle_embed_fail_streak_abort()
             i = 0
             while i < len(candidates):
                 # Memory axis BEFORE sizing the batch — same graded defense
@@ -1968,10 +1977,20 @@ class OracleSemanticIndex:
 
                 prep = await _cr_offload(_prep, cpu_bound=False)
                 if _cr_is_err(prep):
+                    _fail_streak += 1
                     logger.warning(
                         "[OracleSemanticIndex] embed prep offload failed "
-                        "(%s) — batch dropped", prep,
+                        "(%s) — batch dropped (fail_streak=%d/%d)",
+                        prep, _fail_streak, _fail_streak_abort,
                     )
+                    if _fail_streak >= _fail_streak_abort:
+                        logger.warning(
+                            "[OracleSemanticIndex] embed tail ABORTED: %d "
+                            "consecutive batch failures — backend broken, "
+                            "containing (embedded=%d of %d candidates)",
+                            _fail_streak, total_embedded, len(candidates),
+                        )
+                        return
                     continue
                 texts, ids, metadatas = prep
                 if not texts:
@@ -2005,11 +2024,23 @@ class OracleSemanticIndex:
 
                     _up = await _cr_offload(_convert_and_upsert, cpu_bound=False)
                     if _cr_is_err(_up):
+                        _fail_streak += 1
                         logger.warning(
                             "[OracleSemanticIndex] chroma upsert offload "
-                            "failed (%s) — batch dropped", _up,
+                            "failed (%s) — batch dropped (fail_streak=%d/%d)",
+                            _up, _fail_streak, _fail_streak_abort,
                         )
+                        if _fail_streak >= _fail_streak_abort:
+                            logger.warning(
+                                "[OracleSemanticIndex] embed tail ABORTED: "
+                                "%d consecutive batch failures — backend "
+                                "broken, containing (embedded=%d of %d "
+                                "candidates)",
+                                _fail_streak, total_embedded, len(candidates),
+                            )
+                            return
                         continue
+                _fail_streak = 0
                 total_embedded += len(texts)
 
                 # Loop-lag probe BETWEEN batches (shared Slice 27 probe) —
@@ -2223,6 +2254,24 @@ def _oracle_scoped_sweep_embed_enabled() -> bool:
     all-nodes re-embed."""
     raw = os.environ.get("JARVIS_ORACLE_SCOPED_SWEEP_EMBED_ENABLED", "true")
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _oracle_embed_fail_streak_abort() -> int:
+    """``JARVIS_ORACLE_EMBED_FAIL_STREAK_ABORT`` — consecutive per-batch
+    failures after which the coop embed tail ABORTS the remaining run
+    (Slice 30, closes bt-2026-07-16-004244). The legacy tail aborted the
+    WHOLE embed on the first upsert exception; Slice 28's per-batch
+    fail-soft ``continue`` kept feeding a chroma collection whose HNSW
+    compaction was failing deterministically — 16 consecutive failing
+    upserts ballooned RSS ~10GB in 90s until the process memory cap fired.
+    Correlated failures need containment, not persistence. Default 3
+    (tolerates a transient, aborts a broken backend)."""
+    try:
+        return max(1, int(os.environ.get(
+            "JARVIS_ORACLE_EMBED_FAIL_STREAK_ABORT", "3",
+        )))
+    except (TypeError, ValueError):
+        return 3
 
 
 def _oracle_embed_tail_coop_enabled() -> bool:

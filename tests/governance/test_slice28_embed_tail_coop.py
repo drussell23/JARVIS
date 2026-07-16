@@ -144,6 +144,74 @@ async def test_coop_tail_never_raises_on_embedder_fault(monkeypatch):
     await idx._embed_nodes_coop(_make_nodes(3), _chroma=False, _stdlib=True)
 
 
+# ── Slice 30: correlated-failure circuit breaker ─────────────────────
+
+
+def test_fail_streak_abort_env_driven(monkeypatch):
+    monkeypatch.setenv("JARVIS_ORACLE_EMBED_FAIL_STREAK_ABORT", "7")
+    assert O._oracle_embed_fail_streak_abort() == 7
+    monkeypatch.setenv("JARVIS_ORACLE_EMBED_FAIL_STREAK_ABORT", "junk")
+    assert O._oracle_embed_fail_streak_abort() == 3
+
+
+async def test_consecutive_upsert_failures_abort_the_run(monkeypatch):
+    """bt-2026-07-16-004244: 16 consecutive failing chroma upserts (HNSW
+    compaction broken) ballooned RSS ~10GB in 90s because the coop tail
+    kept feeding the dying backend. N consecutive failures must ABORT."""
+    import backend.core.ouroboros.governance.cooperative_fs_io as CFS2
+
+    monkeypatch.setenv("JARVIS_ORACLE_EMBED_FAIL_STREAK_ABORT", "3")
+    calls = {"n": 0}
+
+    async def _always_fail_offload(fn, /, *args, **kwargs):
+        # prep succeeds (inline); upsert fails
+        if getattr(fn, "__name__", "") == "_prep":
+            return fn()
+        calls["n"] += 1
+        return CFS2.OffloadError(
+            fn_name="_convert_and_upsert", exc_type="InternalError",
+            message="Error in compaction", cpu_bound=False,
+        )
+
+    monkeypatch.setattr(CFS2, "offload", _always_fail_offload)
+    idx = _make_index(O.OracleSemanticBackendStatus.CHROMA)
+    idx._collection = object()  # non-None so the chroma branch runs
+    # SEMANTIC_EMBED_BATCH_SIZE is frozen at class-definition time — patch
+    # the attribute, not the env.
+    monkeypatch.setattr(O.OracleConfig, "SEMANTIC_EMBED_BATCH_SIZE", 1)
+    # 20 nodes × batch 1 → without the breaker this is 20 failing upserts;
+    # with it, exactly 3.
+    await idx._embed_nodes_coop(_make_nodes(20), _chroma=True, _stdlib=False)
+    assert calls["n"] == 3
+
+
+async def test_streak_resets_on_success(monkeypatch):
+    """A transient fault sandwiched by successes must NOT trip the breaker."""
+    import backend.core.ouroboros.governance.cooperative_fs_io as CFS2
+
+    monkeypatch.setenv("JARVIS_ORACLE_EMBED_FAIL_STREAK_ABORT", "2")
+    upserts = {"n": 0}
+
+    async def _alternating_offload(fn, /, *args, **kwargs):
+        if getattr(fn, "__name__", "") == "_prep":
+            return fn()
+        upserts["n"] += 1
+        if upserts["n"] % 2 == 1:  # odd calls fail, even succeed
+            return CFS2.OffloadError(
+                fn_name="_convert_and_upsert", exc_type="InternalError",
+                message="transient", cpu_bound=False,
+            )
+        return None
+
+    monkeypatch.setattr(CFS2, "offload", _alternating_offload)
+    idx = _make_index(O.OracleSemanticBackendStatus.CHROMA)
+    idx._collection = object()
+    monkeypatch.setattr(O.OracleConfig, "SEMANTIC_EMBED_BATCH_SIZE", 1)
+    await idx._embed_nodes_coop(_make_nodes(6), _chroma=True, _stdlib=False)
+    # All 6 batches attempted (streak never reaches 2 consecutively).
+    assert upserts["n"] == 6
+
+
 async def test_embed_nodes_kill_switch_uses_legacy(monkeypatch):
     """Flag off → embed_nodes runs the legacy inline tail (byte-identical
     rollback), never the coop method."""
