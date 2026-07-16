@@ -879,3 +879,153 @@ def test_hydrate_adaptive_picks_up_advanced_head(tmp_path, monkeypatch):
     assert eng._current_head == "head_one"
     eng._hydrate_repo_state()
     assert eng._current_head == "head_two"        # advanced HEAD honored
+
+
+# ============================================================================
+# RT migration + fail-fast cascade (Phase 1, 2026-07-16)
+#
+# Dreaming is latency-sensitive; the old Tier-1 used the DW 4-stage BATCH API
+# (24h window) and swallowed failures as "" so the Claude tier never fired
+# live (bt-2026-07-16-173540: 5 dream jobs, 0 completions). These pin:
+# DW-RT (complete_sync) primary, per-tier fail-fast RAISING boundaries,
+# Claude-RT fallback actually firing on primary timeout, and typed
+# DreamProviderExhaustedError when the whole cascade is down.
+# ============================================================================
+
+from backend.core.ouroboros.consciousness.dream_engine import (
+    DreamProviderExhaustedError,
+)
+
+
+class _SyncResult:
+    def __init__(self, content):
+        self.content = content
+        self.model = "dw-model-x"
+        self.latency_s = 0.5
+
+
+_BP_JSON = (
+    '{"title":"t","description":"d","category":"debt","priority_score":0.7,'
+    '"target_files":["a.py"],"estimated_effort":"small","estimated_cost_usd":0.01,'
+    '"suggested_approach":"x","risk_assessment":"low"}'
+)
+
+
+def _rt_engine(tmp_path, dw=None, claude=None, jprime_url=""):
+    from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
+    d = tmp_path / "dreams"
+    d.mkdir(exist_ok=True)
+    eng = DreamEngine(
+        health_cortex=MagicMock(),
+        memory_engine=MagicMock(),
+        activity_monitor=MockActivityMonitor(idle_seconds=600.0),
+        resource_governor=MagicMock(),
+        metrics_tracker=DreamMetricsTracker(),
+        config=_make_config(),
+        jprime_url=jprime_url,
+        persistence_dir=d,
+    )
+    eng._dw_provider = dw
+    eng._claude_provider = claude
+    return eng
+
+
+async def test_dw_rt_primary_succeeds(tmp_path):
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(return_value=_SyncResult(_BP_JSON))
+    eng = _rt_engine(tmp_path, dw=dw, claude=MagicMock())
+    result = await eng._call_inference("dream prompt")
+    assert result["_inference_provider"] == "doubleword"
+    dw.complete_sync.assert_awaited_once()          # RT primitive, not batch
+    kwargs = dw.complete_sync.await_args.kwargs
+    assert "timeout_s" in kwargs and kwargs["response_format"] == {"type": "json_object"}
+
+
+async def test_primary_timeout_falls_back_to_claude_rt(tmp_path, monkeypatch):
+    """THE mandate-4 test: primary provider timeout → cascade catches it →
+    Claude RT tier fires and completes the dream."""
+    monkeypatch.setenv("JARVIS_DREAM_RT_TIMEOUT_S", "5")
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(side_effect=asyncio.TimeoutError("dw rt timeout"))
+    claude = MagicMock()
+    claude.prompt_only = AsyncMock(return_value=_BP_JSON)
+    eng = _rt_engine(tmp_path, dw=dw, claude=claude)
+    result = await eng._call_inference("dream prompt")
+    assert result["_inference_provider"] == "claude"    # fallback FIRED
+    claude.prompt_only.assert_awaited_once()
+
+
+async def test_primary_infra_error_falls_back_to_claude_rt(tmp_path):
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(side_effect=RuntimeError("HTTP 403 entitlement"))
+    claude = MagicMock()
+    claude.prompt_only = AsyncMock(return_value=_BP_JSON)
+    eng = _rt_engine(tmp_path, dw=dw, claude=claude)
+    result = await eng._call_inference("dream prompt")
+    assert result["_inference_provider"] == "claude"
+
+
+async def test_hanging_primary_is_bounded_by_wait_for(tmp_path, monkeypatch):
+    """A provider that HANGS (the batch-stall class) is cut by the outer
+    wait_for and the cascade proceeds — a dream cycle can never wedge."""
+    monkeypatch.setenv("JARVIS_DREAM_RT_TIMEOUT_S", "5")   # floor-clamped to 5s
+
+    async def _hang(*a, **k):
+        await asyncio.sleep(3600)
+
+    dw = MagicMock()
+    dw.complete_sync = _hang
+    claude = MagicMock()
+    claude.prompt_only = AsyncMock(return_value=_BP_JSON)
+    eng = _rt_engine(tmp_path, dw=dw, claude=claude)
+    result = await asyncio.wait_for(eng._call_inference("p"), timeout=30)
+    assert result["_inference_provider"] == "claude"
+
+
+async def test_full_cascade_exhaustion_raises_typed_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_DREAM_RT_TIMEOUT_S", "5")
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(side_effect=RuntimeError("down"))
+    claude = MagicMock()
+    claude.prompt_only = AsyncMock(side_effect=RuntimeError("down too"))
+    eng = _rt_engine(tmp_path, dw=dw, claude=claude, jprime_url="")  # no tier 3
+    with pytest.raises(DreamProviderExhaustedError):
+        await eng._call_inference("p")
+
+
+async def test_run_dream_job_handles_exhaustion_with_dormant(tmp_path):
+    """_run_dream_job catches the typed exhaustion, emits DREAM_DORMANT, and
+    returns None — the dream loop survives a total provider outage."""
+    comm = MagicMock()
+    comm.emit_heartbeat = AsyncMock()
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(side_effect=RuntimeError("down"))
+    eng = _rt_engine(tmp_path, dw=dw, claude=None)
+    eng._comm = comm
+    eng._current_head = "h" * 12
+    eng._current_policy_hash = "p" * 16
+    result = await eng._run_dream_job()
+    assert result is None
+    comm.emit_heartbeat.assert_awaited()               # dormant surfaced
+
+
+async def test_no_batch_api_on_dream_path(tmp_path):
+    """Structural: the dream path never touches prompt_only/submit_batch on DW."""
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(return_value=_SyncResult(_BP_JSON))
+    eng = _rt_engine(tmp_path, dw=dw, claude=MagicMock())
+    await eng._call_inference("p")
+    dw.prompt_only.assert_not_called()
+    dw.submit_batch.assert_not_called()
+
+
+def test_rt_timeout_env_parsing(monkeypatch):
+    from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
+    monkeypatch.delenv("JARVIS_DREAM_RT_TIMEOUT_S", raising=False)
+    assert DreamEngine._dream_rt_timeout_s() == 90.0
+    monkeypatch.setenv("JARVIS_DREAM_RT_TIMEOUT_S", "45")
+    assert DreamEngine._dream_rt_timeout_s() == 45.0
+    monkeypatch.setenv("JARVIS_DREAM_RT_TIMEOUT_S", "bogus")
+    assert DreamEngine._dream_rt_timeout_s() == 90.0
+    monkeypatch.setenv("JARVIS_DREAM_RT_TIMEOUT_S", "1")
+    assert DreamEngine._dream_rt_timeout_s() == 5.0    # floor

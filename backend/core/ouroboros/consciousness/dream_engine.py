@@ -55,6 +55,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DREAM_MAX_PROMPT_CHARS: int = 2048
+
+
+class DreamProviderExhaustedError(RuntimeError):
+    """All RT inference tiers (DW → Claude → J-Prime) failed for a dream job.
+
+    Typed routing exception (RT migration, 2026-07-16): per-tier failures are
+    raised and caught at each tier boundary to drive the cascade; when the
+    whole cascade is exhausted THIS is raised so the caller makes an explicit
+    routing decision (emit DREAM_DORMANT + skip the cycle) instead of
+    interpreting an ambiguous ``None``."""
 """Hard cap on dream prompt text length (TC23)."""
 
 _DREAM_LOOP_INTERVAL_S: float = 30.0
@@ -553,8 +563,14 @@ class DreamEngine:
         prompt = self._build_dream_prompt(candidate)
         prompt = self._truncate_prompt(prompt)
 
-        # Send via DW (primary) → Claude (fallback) → J-Prime (legacy)
-        result = await self._call_inference(prompt)
+        # Send via the RT cascade: DW-RT → Claude-RT → J-Prime (legacy).
+        # Exhaustion is a TYPED routing exception, not an ambiguous None.
+        try:
+            result = await self._call_inference(prompt)
+        except DreamProviderExhaustedError as exc:
+            logger.warning("[DreamEngine] inference cascade exhausted: %s", exc)
+            await self._emit_dormant("provider_cascade_exhausted")
+            return None
 
         # Check preemption after HTTP (TC17)
         if self._check_preempted():
@@ -564,8 +580,7 @@ class DreamEngine:
             return None
 
         if result is None:
-            # J-Prime unavailable — emit dormant (TC24)
-            await self._emit_dormant("jprime_request_failed")
+            # Preempted mid-tier — no dormant emit, just skip the cycle.
             return None
 
         # Build blueprint from result
@@ -704,42 +719,79 @@ class DreamEngine:
         if self._check_preempted():
             return None
 
-        # Tier 1: Doubleword (35B for light dreaming — 30x cheaper than Claude)
-        if self._dw_provider is not None:
+        # ------------------------------------------------------------------
+        # RT migration (2026-07-16): dreaming is LATENCY-SENSITIVE (a soak or
+        # idle window waits on it), so every tier is a REAL-TIME call with a
+        # hard per-tier timeout and FAIL-FAST semantics — a tier that times
+        # out or errors RAISES at its boundary and the cascade moves on. The
+        # old Tier-1 used the DW 4-stage BATCH API (24h completion window),
+        # which is the token-cheap queue for volume work — architecturally
+        # wrong for a caller with minutes of patience (bt-2026-07-16-173540:
+        # 40 min soak, 5 dream jobs, 0 completions, 0 blueprints).
+        # ------------------------------------------------------------------
+        rt_timeout = self._dream_rt_timeout_s()
+
+        # Tier 1: Doubleword RT — complete_sync (stream-free
+        # /v1/chat/completions, the Functions-not-Agents primitive built
+        # because DW's SSE endpoint stalls post-accept; it raises
+        # DoublewordInfraError on HTTP errors and TimeoutError on expiry).
+        if self._dw_provider is not None and hasattr(self._dw_provider, "complete_sync"):
             try:
-                _dw_model = os.environ.get(
-                    "JARVIS_DREAM_DW_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8"
-                )
-                raw = await self._dw_provider.prompt_only(
-                    prompt=prompt,
-                    model=_dw_model,
-                    caller_id="dream_engine",
-                    response_format={"type": "json_object"},
-                    max_tokens=DREAM_MAX_PROMPT_CHARS,
+                # Model: env override, else the provider's own default (the
+                # account's entitled model) — no hardcoded model names.
+                _dw_model = os.environ.get("JARVIS_DREAM_DW_MODEL", "").strip() or None
+                res = await asyncio.wait_for(
+                    self._dw_provider.complete_sync(
+                        prompt,
+                        system_prompt=(
+                            "You are a senior AI reasoning engine for the "
+                            "JARVIS Trinity ecosystem. Return well-structured "
+                            "JSON output."
+                        ),
+                        caller_id="dream_engine",
+                        model=_dw_model,
+                        max_tokens=DREAM_MAX_PROMPT_CHARS,
+                        timeout_s=rt_timeout,
+                        response_format={"type": "json_object"},
+                    ),
+                    timeout=rt_timeout + 5.0,
                 )
                 if self._check_preempted():
                     return None
+                raw = getattr(res, "content", "") or ""
                 if raw:
                     result = self._parse_json_response(raw)
                     if result is not None:
                         result["_inference_provider"] = "doubleword"
-                        result["_inference_model"] = _dw_model
-                        logger.debug("[DreamEngine] DW inference succeeded (model=%s)", _dw_model)
+                        result["_inference_model"] = getattr(res, "model", _dw_model or "")
+                        logger.info(
+                            "[DreamEngine] DW RT inference succeeded (model=%s, %.1fs)",
+                            getattr(res, "model", "?"), getattr(res, "latency_s", -1.0),
+                        )
                         return result
-                    logger.debug("[DreamEngine] DW returned non-JSON, trying next tier")
+                    logger.info("[DreamEngine] DW RT returned non-JSON, cascading")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("[DreamEngine] DW inference failed: %s", exc)
+                # Fail-fast boundary: timeout / HTTP error / infra fault →
+                # visible cascade, never a silent empty-string swallow.
+                logger.info(
+                    "[DreamEngine] DW RT tier failed (%s: %s) — cascading to Claude",
+                    type(exc).__name__, exc,
+                )
 
-        # Tier 2: Claude API (reliable, handles complex reasoning)
+        # Tier 2: Claude RT — prompt_only (resilient, Aegis-gated create path).
         if self._claude_provider is not None:
             try:
-                raw = await self._claude_provider.prompt_only(
-                    prompt=prompt,
-                    caller_id="dream_engine",
-                    response_format={"type": "json_object"},
-                    max_tokens=DREAM_MAX_PROMPT_CHARS,
+                raw = await asyncio.wait_for(
+                    self._claude_provider.prompt_only(
+                        prompt=prompt,
+                        caller_id="dream_engine",
+                        response_format={"type": "json_object"},
+                        max_tokens=DREAM_MAX_PROMPT_CHARS,
+                        timeout_s=rt_timeout,
+                    ),
+                    timeout=rt_timeout + 5.0,
                 )
                 if self._check_preempted():
                     return None
@@ -747,15 +799,33 @@ class DreamEngine:
                     result = self._parse_json_response(raw)
                     if result is not None:
                         result["_inference_provider"] = "claude"
-                        logger.debug("[DreamEngine] Claude inference succeeded")
+                        logger.info("[DreamEngine] Claude RT inference succeeded")
                         return result
+                    logger.info("[DreamEngine] Claude RT returned non-JSON, cascading")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("[DreamEngine] Claude inference failed: %s", exc)
+                logger.info(
+                    "[DreamEngine] Claude RT tier failed (%s: %s) — cascading to J-Prime",
+                    type(exc).__name__, exc,
+                )
 
         # Tier 3: J-Prime direct HTTP (legacy fallback — TC29)
-        return await self._call_jprime_legacy(prompt)
+        result = await self._call_jprime_legacy(prompt)
+        if result is None:
+            raise DreamProviderExhaustedError(
+                "all RT inference tiers exhausted (dw_rt, claude_rt, jprime)"
+            )
+        return result
+
+    @staticmethod
+    def _dream_rt_timeout_s() -> float:
+        """Per-tier RT budget (``JARVIS_DREAM_RT_TIMEOUT_S``, default 90s —
+        sized to DW RT's measured ~67s p50 TTFT with headroom). Never raises."""
+        try:
+            return max(5.0, float(os.environ.get("JARVIS_DREAM_RT_TIMEOUT_S", "90")))
+        except (TypeError, ValueError):
+            return 90.0
 
     async def _call_jprime_legacy(self, prompt: str) -> Optional[Dict[str, Any]]:
         """Legacy J-Prime direct HTTP fallback (TC29).
