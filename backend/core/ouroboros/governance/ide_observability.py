@@ -326,6 +326,13 @@ class IDEObservabilityRouter:
             "/observability/trust",
             self._handle_trust_calibration,
         )
+        # Conception Value Model (autonomy pivot Gap 3) — the expected-value
+        # ranker for self-conceived work: composed alignment × substance ×
+        # earned-trust × cost weights + axis provenance.
+        app.router.add_get(
+            "/observability/conception",
+            self._handle_conception_value,
+        )
         # W3(7) Slice 6 — Class D/E/F cancel record surface.
         app.router.add_get(
             "/observability/cancels", self._handle_cancel_list,
@@ -1729,6 +1736,16 @@ class IDEObservabilityRouter:
             return False
         return master_enabled()
 
+    @staticmethod
+    def _conception_value_enabled() -> bool:
+        try:
+            from backend.core.ouroboros.governance.conception_value_model import (
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
     def _governor_check_gates(self, request: "web.Request") -> Optional[Any]:
         if not ide_observability_enabled():
             return self._error_response(
@@ -1927,6 +1944,41 @@ class IDEObservabilityRouter:
             return self._json_response(
                 request, 200,
                 {"snapshot": None, "reason_code": "trust.unavailable"},
+            )
+        return self._json_response(request, 200, snap)
+
+    def _conception_check_gates(self, request: "web.Request") -> Optional[Any]:
+        if not ide_observability_enabled():
+            return self._error_response(request, 403, "ide_observability.disabled")
+        if not self._conception_value_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.conception_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(request, 429, "ide_observability.rate_limited")
+        return None
+
+    async def _handle_conception_value(self, request: "web.Request") -> Any:
+        """GET /observability/conception — the expected-value ranker for
+        self-conceived work: composed axis weights (alignment × substance ×
+        earned-trust × cost), cost/regression coefficients, and axis
+        provenance."""
+        err = self._conception_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.conception_value_model import (
+                snapshot as _conception_snapshot,
+            )
+            snap = _conception_snapshot()
+        except Exception:  # noqa: BLE001 — never 500; degrade to a clean 200
+            logger.debug(
+                "[IDEObservability] conception value snapshot failed",
+                exc_info=True,
+            )
+            return self._json_response(
+                request, 200,
+                {"snapshot": None, "reason_code": "conception.unavailable"},
             )
         return self._json_response(request, 200, snap)
 

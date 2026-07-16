@@ -38,6 +38,16 @@ _DW_MODEL = os.environ.get("JARVIS_INTENT_DISCOVERY_MODEL", "Qwen/Qwen3.5-35B-A3
 _DW_MAX_TOKENS = int(os.environ.get("JARVIS_INTENT_DISCOVERY_MAX_TOKENS", "2000"))
 
 
+def _conception_grounding_enabled() -> bool:
+    """Gap 3 wire — ground each synthesized intent's LLM self-reported
+    confidence in the conception value model's verifiable expected value.
+    Default true; provably inert until the value model has real signal
+    (neutral EV → ×1.0 multiplier). Read at call time so it is togglable."""
+    return os.environ.get(
+        "JARVIS_CONCEPTION_VALUE_GROUNDING_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
 # ---------------------------------------------------------------------------
 # Gap #4 migration: event-driven mode (consumes ConversationBridge turns)
 # ---------------------------------------------------------------------------
@@ -396,6 +406,42 @@ class IntentDiscoverySensor:
             urgency = intent.get("urgency", "low")
             confidence = max(0.1, min(1.0, float(intent.get("confidence", 0.5))))
 
+            # Gap 3: ground the LLM's self-reported confidence in verifiable
+            # expected value — recovers the discarded blueprint/priority scores
+            # by re-scoring each synthesized intent through the conception value
+            # model (alignment × substance × EARNED trust × cost). The multiplier
+            # 0.5+EV maps a NEUTRAL EV (cold organism) to ×1.0 — provably inert
+            # until the model has real signal; a low-value-but-confident intent
+            # is dampened, a well-grounded one preserved.
+            value_detail: Dict[str, Any] = {}
+            try:
+                if _conception_grounding_enabled():
+                    from backend.core.ouroboros.governance.conception_value_model import (
+                        score_proposal as _cv_score,
+                    )
+
+                    _ev = _cv_score(
+                        description=description,
+                        target_files=target_files,
+                        signal_source="intent_discovery",
+                        project_root=self._repo,
+                    )
+                    raw_confidence = confidence
+                    confidence = max(0.1, min(1.0, confidence * (0.5 + _ev.ev)))
+                    value_detail = {
+                        "ev": round(_ev.ev, 4),
+                        "alignment": round(_ev.alignment, 4),
+                        "substance": round(_ev.substance, 4),
+                        "feasibility": round(_ev.feasibility, 4),
+                        "trust_level": _ev.trust_level,
+                        "band": _ev.band,
+                        "raw_confidence": round(raw_confidence, 4),
+                    }
+            except Exception:  # noqa: BLE001 — grounding is best-effort
+                logger.debug(
+                    "[IntentDiscovery] value grounding skipped", exc_info=True,
+                )
+
             envelope = make_envelope(
                 source="intent_discovery",
                 description=description,
@@ -414,6 +460,7 @@ class IntentDiscoverySensor:
                     },
                     "blueprint_count": len(blueprints),
                     "dw_model": _DW_MODEL,
+                    "conception_value": value_detail,  # Gap 3 grounding (may be {})
                 },
                 requires_human_ack=True,  # AC2 safety invariant
             )
