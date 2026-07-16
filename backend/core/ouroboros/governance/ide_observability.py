@@ -298,6 +298,13 @@ class IDEObservabilityRouter:
             "/observability/memory-pressure",
             self._handle_memory_pressure,
         )
+        # Goal Metric Dashboard (autonomy pivot Step 1) — read-only autonomous-
+        # throughput surface composing autonomy_metrics.snapshot (git-provable
+        # landed changes + session-summary runtime/cost/regression).
+        app.router.add_get(
+            "/observability/autonomy",
+            self._handle_autonomy,
+        )
         # W3(7) Slice 6 — Class D/E/F cancel record surface.
         app.router.add_get(
             "/observability/cancels", self._handle_cancel_list,
@@ -1661,6 +1668,16 @@ class IDEObservabilityRouter:
             return False
         return is_enabled()
 
+    @staticmethod
+    def _autonomy_metrics_enabled() -> bool:
+        try:
+            from backend.core.ouroboros.governance.autonomy_metrics import (
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
     def _governor_check_gates(self, request: "web.Request") -> Optional[Any]:
         if not ide_observability_enabled():
             return self._error_response(
@@ -1752,6 +1769,43 @@ class IDEObservabilityRouter:
             return self._json_response(
                 request, 200,
                 {"snapshot": None, "reason_code": "memory.unavailable"},
+            )
+        return self._json_response(request, 200, snap)
+
+    def _autonomy_check_gates(self, request: "web.Request") -> Optional[Any]:
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._autonomy_metrics_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.autonomy_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        return None
+
+    async def _handle_autonomy(self, request: "web.Request") -> Any:
+        """GET /observability/autonomy — the Goal Metric Dashboard snapshot:
+        net-positive landed changes per unattended day, regression rate, and
+        cost, aggregated from git ground truth + session summaries."""
+        err = self._autonomy_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.autonomy_metrics import (
+                snapshot as _autonomy_snapshot,
+            )
+            snap = _autonomy_snapshot()
+        except Exception:  # noqa: BLE001 — never 500; degrade to a clean 200
+            logger.debug(
+                "[IDEObservability] autonomy snapshot failed", exc_info=True,
+            )
+            return self._json_response(
+                request, 200,
+                {"snapshot": None, "reason_code": "autonomy.unavailable"},
             )
         return self._json_response(request, 200, snap)
 
