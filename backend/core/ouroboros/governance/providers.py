@@ -29,7 +29,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -8053,6 +8053,67 @@ class ClaudeProvider:
             label="claude_create",
             deadline=deadline,
         )
+
+    async def prompt_only(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        caller_id: str = "ouroboros_cognition",
+        response_format: Optional[Dict[str, Any]] = None,
+        max_tokens: Optional[int] = None,
+        system: Optional[str] = None,
+        timeout_s: float = 60.0,
+    ) -> str:
+        """Direct single-turn Claude completion returning raw text.
+
+        Symmetric with :meth:`DoublewordProvider.prompt_only` — the raw-text
+        fast-path for cognition layers (DreamEngine, SemanticTriage,
+        IntentDiscovery) that need Claude inference WITHOUT the OperationContext
+        generation pipeline (which produces code-candidates for declared
+        target_files, not free-form text). Composes the existing resilient,
+        Aegis-gated, backoff-wrapped create path
+        (:meth:`_claude_create_with_resilience`, self-acquiring its client via
+        ``_ensure_client``) and extracts text with the same block-walk the
+        generation path uses.
+
+        ``response_format`` is accepted for call-site symmetry with the DW
+        provider but is inapplicable to Claude (no OpenAI-style JSON mode) —
+        callers embed the JSON-shape instruction in ``prompt``. Errors
+        PROPAGATE (no catch-all swallow) so the caller's tier-fallback governs;
+        returns ``""`` only when the model genuinely emits no text block.
+        """
+        _model = model or self._model
+        _max = max_tokens if max_tokens is not None else self._max_tokens
+        _timeout = float(timeout_s or 60.0)
+        _system = system or (
+            "You are a senior AI reasoning engine for the JARVIS Trinity "
+            "ecosystem. Think step by step and return well-structured output."
+        )
+        _messages: List[Dict[str, Any]] = [{"role": "user", "content": prompt}]
+        _create_kwargs: Dict[str, Any] = {
+            "model": _model,
+            "max_tokens": _max,
+            "system": _system,
+            "messages": _messages,
+        }
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=_timeout)
+        msg = await self._claude_create_with_resilience(
+            create_kwargs=_create_kwargs,
+            messages=_messages,
+            use_prefill=False,
+            deadline=deadline,
+            timeout_s=_timeout,
+        )
+        # Text-only extraction (skip thinking blocks) — identical to the
+        # generation path's block walk.
+        raw = ""
+        for _block in (getattr(msg, "content", None) or []):
+            if getattr(_block, "type", None) == "text":
+                raw += getattr(_block, "text", "")
+        if not raw and getattr(msg, "content", None):
+            raw = getattr(msg.content[0], "text", "")
+        return raw or ""
 
     # ---------------------------------------------------------------------
     # Slice 2B-iii — paired extraction from _generate_raw closure

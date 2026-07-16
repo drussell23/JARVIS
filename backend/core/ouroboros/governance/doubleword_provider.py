@@ -459,13 +459,19 @@ def _reasoning_request_params(effort: str = "", *, complexity: str = "", model: 
     if eff == "none":
         # Slice 192 Phase 2 — DW honors enable_thinking ONLY nested in extra_body (Seb @
         # Doubleword). Inject it there DYNAMICALLY for catalog-confirmed reasoning models (no
-        # hardcoded names) to cut stream length → fewer ruptures at the source. When the catalog
-        # can't confirm, fall back to the legacy top-level flag (DW-ignored but harmless).
+        # hardcoded names) to cut stream length → fewer ruptures at the source.
+        #
+        # API-contract decay (2026-07-16, bt-2026-07-16-095428): DW now HARD-REJECTS the
+        # legacy TOP-LEVEL ``chat_template_kwargs.enable_thinking`` with a 400
+        # ("Unsupported parameter 'chat_template_kwargs.enable_thinking'; use 'reasoning_effort'")
+        # — it is no longer "ignored but harmless". ``reasoning_effort=none`` is the compliant,
+        # DW-honored signal and is ALWAYS present in ``params`` above, so when the catalog can't
+        # confirm the nested extra_body form we send reasoning_effort ALONE. The deprecated
+        # top-level flag is removed entirely (restores every prompt_only caller: DreamEngine,
+        # IntentDiscovery, SemanticTriage).
         _eb = _dw_thinking_extra_body(model)
         if _eb:
             params["extra_body"] = _eb
-        else:
-            params["chat_template_kwargs"] = {"enable_thinking": False}
     return params
 
 
