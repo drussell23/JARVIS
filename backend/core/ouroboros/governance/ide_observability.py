@@ -319,6 +319,13 @@ class IDEObservabilityRouter:
             "/observability/resilience",
             self._handle_resilience_matrix,
         )
+        # Trust Calibration (autonomy pivot Gap 4) — the earned auto-apply
+        # envelope: per-scope git-provable trust levels + which scopes are
+        # narrowing (regressed) vs widen-eligible.
+        app.router.add_get(
+            "/observability/trust",
+            self._handle_trust_calibration,
+        )
         # W3(7) Slice 6 — Class D/E/F cancel record surface.
         app.router.add_get(
             "/observability/cancels", self._handle_cancel_list,
@@ -1712,6 +1719,16 @@ class IDEObservabilityRouter:
             return False
         return master_enabled()
 
+    @staticmethod
+    def _trust_calibration_enabled() -> bool:
+        try:
+            from backend.core.ouroboros.governance.trust_calibration import (
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
     def _governor_check_gates(self, request: "web.Request") -> Optional[Any]:
         if not ide_observability_enabled():
             return self._error_response(
@@ -1876,6 +1893,40 @@ class IDEObservabilityRouter:
             return self._json_response(
                 request, 200,
                 {"snapshot": None, "reason_code": "liveness.unavailable"},
+            )
+        return self._json_response(request, 200, snap)
+
+    def _trust_check_gates(self, request: "web.Request") -> Optional[Any]:
+        if not ide_observability_enabled():
+            return self._error_response(request, 403, "ide_observability.disabled")
+        if not self._trust_calibration_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.trust_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(request, 429, "ide_observability.rate_limited")
+        return None
+
+    async def _handle_trust_calibration(self, request: "web.Request") -> Any:
+        """GET /observability/trust — the earned auto-apply envelope: per-scope
+        git-provable trust levels, which scopes are auto-narrowing (regressed),
+        which are widen-eligible, and the operator opt-in state."""
+        err = self._trust_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.trust_calibration import (
+                snapshot as _trust_snapshot,
+            )
+            snap = _trust_snapshot()
+        except Exception:  # noqa: BLE001 — never 500; degrade to a clean 200
+            logger.debug(
+                "[IDEObservability] trust calibration snapshot failed",
+                exc_info=True,
+            )
+            return self._json_response(
+                request, 200,
+                {"snapshot": None, "reason_code": "trust.unavailable"},
             )
         return self._json_response(request, 200, snap)
 
