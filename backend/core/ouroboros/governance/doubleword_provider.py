@@ -7713,10 +7713,40 @@ class DoublewordProvider:
         except Exception:  # noqa: BLE001 — model resolution must not block parse
             _model_id_for_drift = ""
 
+        # Phase 2 RT repositioning (2026-07-16): JSON healing blocks an
+        # in-flight generation parse — it buys TIME. Inject the unified
+        # Claude-RT-first gate router (DW-RT opportunistic) instead of the
+        # 4-stage batch prompt_only. The healer module itself is untouched;
+        # the adapter matches its HealCall shape (prompt/model/caller_id/
+        # max_tokens → str, "" on failure — the documented contract).
+        async def _rt_heal_call(
+            prompt: str,
+            *,
+            model: Optional[str] = None,
+            caller_id: str = "json_healer",
+            response_format: Optional[dict] = None,
+            max_tokens: Optional[int] = None,
+        ) -> str:
+            from backend.core.ouroboros.governance.rt_gate import (
+                GateProviderExhaustedError,
+                gate_completion,
+            )
+            try:
+                return await gate_completion(
+                    prompt,
+                    caller_id=caller_id,
+                    response_format=response_format or {"type": "json_object"},
+                    max_tokens=max_tokens or 2000,
+                    dw_provider=self,
+                    dw_model=model or None,
+                )
+            except GateProviderExhaustedError:
+                return ""  # the healer's documented failure contract
+
         return await heal_and_retry_parse(
             raw=raw,
             parse_fn=_do_parse,
-            heal_call=self.prompt_only,
+            heal_call=_rt_heal_call,
             op_id=getattr(ctx, "op_id", "") or "",
             provider_name=provider_name,
             model_id=_model_id_for_drift,

@@ -258,41 +258,32 @@ async def request_intent(
     user_prompt = build_user_prompt(req)
 
     async def _call() -> str:
-        # Construct + invoke the provider. The exact API varies by
-        # provider; we use a defensive feature-detection pattern.
+        # Phase 2 RT repositioning (2026-07-16): narrative intent renders
+        # inline while the operator watches — it buys TIME. Routed through
+        # the unified Claude-RT-first gate router (DW-RT opportunistic,
+        # constructed lazily as the fallback handle). Outer timeout and
+        # IntentResult semantics unchanged.
+        from backend.core.ouroboros.governance.rt_gate import (
+            GateProviderExhaustedError,
+            gate_completion,
+        )
+
+        _dw = None
         try:
-            provider = DoublewordProvider()
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"provider construct failed: {exc}")
+            _dw = DoublewordProvider()
+        except Exception:  # noqa: BLE001 — DW handle is optional fallback
+            _dw = None
 
-        # Try the modern ``generate(messages, max_tokens=...)`` API
-        # first; fall back to a string-based ``completion(prompt)`` if
-        # the provider exposes it.
-        if hasattr(provider, "generate"):
-            messages = [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ]
-            try:
-                result = await provider.generate(  # type: ignore[attr-defined]
-                    messages=messages,
-                    max_tokens=eff_max_tokens,
-                )
-                return _extract_text(result)
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(f"generate raised: {exc}")
-
-        if hasattr(provider, "completion"):
-            try:
-                result = await provider.completion(  # type: ignore[attr-defined]
-                    prompt=user_prompt,
-                    max_tokens=eff_max_tokens,
-                )
-                return _extract_text(result)
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(f"completion raised: {exc}")
-
-        raise RuntimeError("provider exposes no generate/completion API")
+        try:
+            return await gate_completion(
+                user_prompt,
+                caller_id="intent_prompter",
+                system_prompt=_SYSTEM_PROMPT,
+                max_tokens=eff_max_tokens,
+                dw_provider=_dw,
+            )
+        except GateProviderExhaustedError as exc:
+            raise RuntimeError(f"rt gate exhausted: {exc}")
 
     try:
         prose = await asyncio.wait_for(_call(), timeout=eff_timeout)

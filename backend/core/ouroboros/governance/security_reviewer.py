@@ -146,22 +146,44 @@ class SecurityReviewer:
             prompt = self._build_review_prompt(candidate, target_files, description)
             system_prompt = self._build_system_prompt()
 
-            response = await self._client.generate(
-                prompt=prompt,
-                system_prompt=system_prompt,
-                max_tokens=4096,
-                temperature=0.1,  # low temperature for consistent judgment
-                model_name=self._brain,
-                task_profile=None,
-            )
+            # Phase 2 RT repositioning (2026-07-16): security review blocks
+            # APPLY — it buys TIME. Claude-RT first via the unified gate
+            # router; the injected brain client stays as the FINAL tier so a
+            # configured local/J-Prime brain still serves when the RT tiers
+            # are exhausted. Verdict parsing below is unchanged.
+            raw_text = ""
+            source = ""
+            try:
+                from backend.core.ouroboros.governance.rt_gate import (
+                    gate_completion,
+                )
 
-            result = self._parse_response(response.content, response.source)
+                raw_text = await gate_completion(
+                    prompt,
+                    caller_id="security_reviewer",
+                    system_prompt=system_prompt,
+                    max_tokens=4096,
+                )
+                source = "rt_gate"
+            except Exception:  # noqa: BLE001 — incl. GateProviderExhausted
+                response = await self._client.generate(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=4096,
+                    temperature=0.1,  # low temperature for consistent judgment
+                    model_name=self._brain,
+                    task_profile=None,
+                )
+                raw_text = response.content
+                source = response.source
+
+            result = self._parse_response(raw_text, source)
             elapsed = time.monotonic() - start
             return SecurityReviewResult(
                 verdict=result["verdict"],
                 findings=result["findings"],
                 summary=result["summary"],
-                reviewer_brain=response.source,
+                reviewer_brain=source,
                 review_duration_s=elapsed,
             )
 

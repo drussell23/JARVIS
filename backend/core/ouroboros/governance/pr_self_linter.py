@@ -35,16 +35,24 @@ class LintRejected(RuntimeError):
 
 
 async def default_critique_fn(diff: str) -> dict:
-    """Bounded, structured one-shot critique via the cheapest existing provider."""
-    from .doubleword_provider import DoublewordProvider
+    """Bounded, structured one-shot critique.
+
+    Phase 2 RT repositioning (2026-07-16): this gate blocks PR creation — it
+    buys TIME, so it routes through the unified Claude-RT-first gate router
+    (DW-RT opportunistic fallback). Critique rules/threshold/fail-closed
+    semantics are unchanged."""
+    from .rt_gate import GateProviderExhaustedError, gate_completion
     from .self_critique import parse_critique_json
-    provider = DoublewordProvider()
-    raw = await provider.prompt_only(
-        prompt=f"{_RULES}\n\nDIFF:\n{diff}",
-        caller_id="pr_self_linter",
-        response_format={"type": "json_object"},
-        max_tokens=512,
-    )
+    try:
+        raw = await gate_completion(
+            f"{_RULES}\n\nDIFF:\n{diff}",
+            caller_id="pr_self_linter",
+            response_format={"type": "json_object"},
+            max_tokens=512,
+        )
+    except GateProviderExhaustedError:
+        logger.warning("[Gate3] pr_self_linter: all RT tiers exhausted; fail-closed rating=0")
+        return {"rating": 0, "concerns": ["provider_exhausted"]}
     parsed, ok = parse_critique_json(raw, op_id="pr_self_linter")
     if not ok:
         logger.warning("[Gate3] pr_self_linter: critique parse failed; fail-closed rating=0")
