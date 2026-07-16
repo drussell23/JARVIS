@@ -765,3 +765,117 @@ async def test_start_loads_state(
 
     # Clean up the dream loop task
     await engine.stop()
+
+
+# ============================================================================
+# Repo-state hydration → candidate picker (Gap 3 live-soak fix)
+#
+# The live soak proved _pick_candidate was structurally unreachable: it is
+# gated on _current_head/_current_policy_hash, which nothing ever populated, so
+# DreamEngine produced 0 blueprints and the conception bridge had no event to
+# route. These pin the truthful hydration + the guard both ways.
+# ============================================================================
+
+
+def _hydration_engine(tmp_path: Path, repo_path: Any = None):
+    from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
+    d = tmp_path / "dreams"
+    d.mkdir(exist_ok=True)
+    return DreamEngine(
+        health_cortex=MagicMock(),
+        memory_engine=MagicMock(),
+        activity_monitor=MockActivityMonitor(idle_seconds=600.0),
+        resource_governor=MagicMock(),
+        metrics_tracker=DreamMetricsTracker(),
+        config=_make_config(),
+        persistence_dir=d,
+        repo_path=repo_path,
+    )
+
+
+def test_pick_candidate_none_when_state_unhydrated(tmp_path):
+    """Mandate 4: missing repo-state → no candidate (the guard clause holds)."""
+    eng = _hydration_engine(tmp_path)
+    assert eng._current_head == "" and eng._current_policy_hash == ""
+    assert eng._pick_candidate() is None
+
+
+def test_pick_candidate_returns_candidate_when_hydrated(tmp_path):
+    """Mandate 4: hydrated repo-state → a native candidate derived from it."""
+    eng = _hydration_engine(tmp_path)
+    eng._current_head = "deadbeefcafe"
+    eng._current_policy_hash = "abc123def4567890"
+    cand = eng._pick_candidate()
+    assert cand is not None
+    assert cand["repo_sha"] == "deadbeefcafe"
+    assert cand["policy_hash"] == "abc123def4567890"
+    assert cand["repo"] == "jarvis"
+
+
+def test_hydrate_populates_head_and_policy(tmp_path, monkeypatch):
+    """Truthful hydration: real git HEAD via the reused _get_git_head util."""
+    import backend.core.ouroboros.consciousness.memory_engine as me
+    monkeypatch.setattr(me, "_get_git_head", lambda repo_path=None: "1234abcd5678")
+    eng = _hydration_engine(tmp_path)
+    eng._hydrate_repo_state()
+    assert eng._current_head == "1234abcd5678"
+    assert eng._current_policy_hash != ""       # a policy fingerprint was set
+    assert eng._pick_candidate() is not None     # end-to-end: guard now passes
+
+
+def test_hydrate_failsafe_when_git_unavailable(tmp_path, monkeypatch):
+    """Mandate 2: git locked/absent (head=None) → prior state kept, no crash,
+    candidate stays None (no phantom SHA dreamed about)."""
+    import backend.core.ouroboros.consciousness.memory_engine as me
+    monkeypatch.setattr(me, "_get_git_head", lambda repo_path=None: None)
+    eng = _hydration_engine(tmp_path)
+    eng._hydrate_repo_state()                     # must not raise
+    assert eng._current_head == ""                # untouched
+    assert eng._pick_candidate() is None          # still safe
+
+
+def test_hydrate_never_raises_on_git_exception(tmp_path, monkeypatch):
+    import backend.core.ouroboros.consciousness.memory_engine as me
+
+    def _boom(repo_path=None):
+        raise RuntimeError("git index locked")
+
+    monkeypatch.setattr(me, "_get_git_head", _boom)
+    eng = _hydration_engine(tmp_path)
+    eng._hydrate_repo_state()                     # swallowed, fail-safe
+    assert eng._current_head == ""
+
+
+def test_compute_policy_hash_reads_file(tmp_path):
+    (tmp_path / "brain_selection_policy.yaml").write_text("models:\n  a: b\n")
+    eng = _hydration_engine(tmp_path, repo_path=str(tmp_path))
+    h = eng._compute_policy_hash()
+    assert h != "nopolicy" and len(h) == 16       # sha256[:16] of the file
+
+
+def test_compute_policy_hash_sentinel_when_absent(tmp_path):
+    empty = tmp_path / "empty_repo"
+    empty.mkdir()                                     # exists but has no policy file
+    eng = _hydration_engine(tmp_path, repo_path=str(empty))
+    assert eng._compute_policy_hash() == "nopolicy"   # stable, non-empty
+
+
+def test_compute_policy_hash_honors_env_override(tmp_path, monkeypatch):
+    pol = tmp_path / "custom_policy.yaml"
+    pol.write_text("x: 1\n")
+    monkeypatch.setenv("JARVIS_BRAIN_POLICY_PATH", str(pol))
+    eng = _hydration_engine(tmp_path)
+    import hashlib as _h
+    assert eng._compute_policy_hash() == _h.sha256(pol.read_bytes()).hexdigest()[:16]
+
+
+def test_hydrate_adaptive_picks_up_advanced_head(tmp_path, monkeypatch):
+    """Adaptive: a HEAD that advances between cycles is re-hydrated."""
+    import backend.core.ouroboros.consciousness.memory_engine as me
+    heads = iter(["head_one", "head_two"])
+    monkeypatch.setattr(me, "_get_git_head", lambda repo_path=None: next(heads))
+    eng = _hydration_engine(tmp_path)
+    eng._hydrate_repo_state()
+    assert eng._current_head == "head_one"
+    eng._hydrate_repo_state()
+    assert eng._current_head == "head_two"        # advanced HEAD honored

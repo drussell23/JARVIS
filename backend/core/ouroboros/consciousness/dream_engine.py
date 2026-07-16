@@ -30,6 +30,7 @@ Thread-safety:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -166,6 +167,7 @@ class DreamEngine:
         comm: Any = None,
         dw_provider: Any = None,
         claude_provider: Any = None,
+        repo_path: Optional[str] = None,
     ) -> None:
         self._health_cortex = health_cortex
         self._memory_engine = memory_engine
@@ -175,6 +177,10 @@ class DreamEngine:
         self._config = config
         self._jprime_url: str = jprime_url
         self._comm = comm
+        # Repo root for truthful repo-state hydration (git HEAD + policy hash).
+        # None → _get_git_head falls back to cwd (correct when the process runs
+        # from the repo root, e.g. the battle test).
+        self._repo_path: Optional[str] = repo_path
 
         # DW + Claude providers (preferred over raw J-Prime HTTP)
         self._dw_provider = dw_provider
@@ -245,16 +251,21 @@ class DreamEngine:
     async def start(self) -> None:
         """Load persisted state from disk and start the background dream loop."""
         self._load_state()
+        # Hydrate truthful repo-state at boot so the FIRST idle cycle can
+        # already derive a candidate (no wait for a later refresh).
+        self._hydrate_repo_state()
         self._loop_task = asyncio.create_task(
             self._dream_loop(), name="dream_engine_loop",
         )
         logger.info(
             "[DreamEngine] Started (idle_threshold=%.0fs, max_min/day=%.0f, "
-            "blueprints=%d, keys=%d)",
+            "blueprints=%d, keys=%d, head=%s, policy=%s)",
             self._config.dream_idle_threshold_s,
             self._config.dream_max_minutes_per_day,
             len(self._blueprints),
             len(self._completed_keys),
+            (self._current_head or "unset")[:10],
+            (self._current_policy_hash or "unset"),
         )
 
     async def stop(self) -> None:
@@ -504,6 +515,11 @@ class DreamEngine:
         """
         start_mono = time.monotonic()
 
+        # Adaptive refresh: re-hydrate truthful repo-state before selecting a
+        # candidate so a HEAD advanced since boot is honored (and stale
+        # blueprints from the prior HEAD are correctly discarded downstream).
+        self._hydrate_repo_state()
+
         # Build candidate info (in a real implementation this would
         # come from the oracle/memory engine analysis of the repo)
         candidate = self._pick_candidate()
@@ -575,6 +591,66 @@ class DreamEngine:
         self._metrics_tracker.record_compute_time(elapsed_min)
 
         return blueprint
+
+    def _hydrate_repo_state(self) -> None:
+        """Hydrate ``_current_head`` + ``_current_policy_hash`` from truthful
+        repository state so ``_pick_candidate`` can derive a candidate.
+
+        Dynamic + adaptive: called at boot and before each dream job, so a HEAD
+        that advances between cycles is picked up and older blueprints correctly
+        go stale. **Fail-safe** (Mandate 2): reuses ``memory_engine._get_git_head``
+        (5s-timeout subprocess that returns None on a locked/absent/erroring
+        index — DRY, Mandate 3) and only OVERWRITES the fields on a truthful
+        read. A None read leaves the prior value intact; on first boot that
+        keeps ``_current_head`` empty and ``_pick_candidate`` returns None (no
+        candidate, no crash) rather than dreaming about a phantom SHA. NEVER
+        raises — the dream loop and the primary governed loop are never
+        disturbed by a git hiccup."""
+        try:
+            from backend.core.ouroboros.consciousness.memory_engine import (
+                _get_git_head,
+            )
+
+            head = _get_git_head(self._repo_path)
+            if head:
+                self._current_head = head
+            policy_hash = self._compute_policy_hash()
+            if policy_hash:
+                self._current_policy_hash = policy_hash
+        except Exception:  # noqa: BLE001 — hydration is best-effort, fail-safe
+            logger.debug(
+                "[DreamEngine] repo-state hydration skipped", exc_info=True,
+            )
+
+    def _compute_policy_hash(self) -> str:
+        """Truthful, stable fingerprint of the active brain-selection policy.
+
+        sha256[:16] of ``brain_selection_policy.yaml`` (the canonical model
+        policy per CLAUDE.md), searched by env override then repo-relative
+        candidates. Returns the stable sentinel ``"nopolicy"`` when the file is
+        unreadable/absent — non-empty so the candidate guard passes, and stable
+        so staleness detection stays consistent. NEVER raises."""
+        try:
+            candidates = []
+            env_p = os.environ.get("JARVIS_BRAIN_POLICY_PATH", "").strip()
+            if env_p:
+                candidates.append(Path(env_p))
+            root = Path(self._repo_path) if self._repo_path else Path.cwd()
+            candidates += [
+                root / "brain_selection_policy.yaml",
+                root / "config" / "brain_selection_policy.yaml",
+                root / "backend" / "core" / "ouroboros" / "governance"
+                / "brain_selection_policy.yaml",
+            ]
+            for p in candidates:
+                try:
+                    if p.is_file():
+                        return hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+                except OSError:
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+        return "nopolicy"
 
     def _pick_candidate(self) -> Optional[Dict[str, Any]]:
         """Select the next candidate for speculative analysis.
