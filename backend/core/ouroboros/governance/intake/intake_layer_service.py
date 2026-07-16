@@ -289,6 +289,35 @@ class IntakeLayerService:
             await self._teardown()
             raise
 
+    def _resolve_dream_engine(self) -> Any:
+        """Resolve the live DreamEngine through the canonical consciousness
+        handle chain, tolerant of how it was wired.
+
+        The TrinityConsciousness that owns ``_dream`` is attached to the GLS as
+        a ``ConsciousnessBridge`` (``gls._consciousness_bridge._consciousness``)
+        in the battle-test/production boot, but a direct ``gls._consciousness``
+        handle is also honored. Returns the first DreamEngine found exposing the
+        observer hook, else None. NEVER raises."""
+        gls = self._gls
+        candidates = []
+        try:
+            # 1. direct consciousness handle (if ever set)
+            candidates.append(getattr(gls, "_consciousness", None))
+            # 2. via the ConsciousnessBridge (the real battle-test wiring)
+            cb = getattr(gls, "_consciousness_bridge", None)
+            candidates.append(getattr(cb, "_consciousness", None))
+            # 3. a direct dream handle, if some boot path attaches one
+            direct = getattr(gls, "_dream_engine", None) or getattr(gls, "_dream", None)
+            for consciousness in candidates:
+                dream = getattr(consciousness, "_dream", None)
+                if dream is not None and hasattr(dream, "register_blueprint_observer"):
+                    return dream
+            if direct is not None and hasattr(direct, "register_blueprint_observer"):
+                return direct
+        except Exception:  # noqa: BLE001
+            logger.debug("[IntakeLayer] dream engine resolution faulted", exc_info=True)
+        return None
+
     def _start_conception_bridge(self, router: Any) -> None:
         """Gap 3 — register the conception proposal bridge as a DreamEngine
         blueprint observer, so ranked blueprints route themselves into the
@@ -296,9 +325,10 @@ class IntakeLayerService:
 
         Composition only: the bridge (translation), the value model (ranking),
         DreamEngine (production), and the router (queue) all pre-exist; this is
-        the missing production wiring. Resolution is best-effort down
-        ``gls._consciousness._dream`` — any missing handle or master-off flag
-        leaves the system byte-identical. NEVER raises."""
+        the missing production wiring. The DreamEngine is resolved through the
+        canonical consciousness handle chain (see ``_resolve_dream_engine``) —
+        any missing handle or master-off flag leaves the system byte-identical.
+        NEVER raises."""
         try:
             from backend.core.ouroboros.governance.conception_proposal_bridge import (
                 get_default_bridge,
@@ -310,8 +340,7 @@ class IntakeLayerService:
                     "stay unrouted (intent_discovery grounding still active)",
                 )
                 return
-            consciousness = getattr(self._gls, "_consciousness", None)
-            dream = getattr(consciousness, "_dream", None)
+            dream = self._resolve_dream_engine()
             if dream is None or not hasattr(dream, "register_blueprint_observer"):
                 logger.info(
                     "[IntakeLayer] Conception bridge enabled but no DreamEngine "
