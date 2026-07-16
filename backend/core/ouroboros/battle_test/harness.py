@@ -3204,6 +3204,7 @@ class BattleTestHarness:
                         comm=_comm,
                         dw_provider=_dw_ref,
                         claude_provider=_claude_ref,
+                        repo_path=str(self._config.repo_path),
                     )
                     logger.info(
                         "DreamEngine booted (dw=%s, claude=%s, jprime=%s)",
