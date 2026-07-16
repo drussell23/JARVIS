@@ -346,6 +346,72 @@ _STRATEGIES: List[Tuple[str, str, str]] = [
 
 
 # ---------------------------------------------------------------------------
+# Slice 11.6.c (re-landed Slice 27) — Merkle Cartographer consultation.
+# The subtree-scoped short-circuit originally landed in 82c7f11cf4 but was
+# accidentally stripped when 8f3be950a1 rewrote this file; its regression
+# spine (test_opp_miner_merkle.py) has failed collection since. Restored
+# because it is ALSO the deepest root-cause fix for the bt-2026-07-15-214458
+# starvation residual: most 300s poll cycles re-scanned all ~2.8k files when
+# nothing under the watched subtrees had changed. With the consult back, a
+# quiet cycle is O(watched-paths) hash comparisons instead of O(N) walks.
+# ---------------------------------------------------------------------------
+
+
+def merkle_consult_enabled() -> bool:
+    """Re-read ``JARVIS_OPPMINER_USE_MERKLE`` at call time so monkeypatch
+    works in tests + operator can flip live without re-init.
+
+    Default ``true`` — graduated in Phase 11 Slice 11.7 alongside the
+    cartographer master and the sibling sensor consumers. Hot-revert:
+    ``export JARVIS_OPPMINER_USE_MERKLE=false``."""
+    raw = os.environ.get(
+        "JARVIS_OPPMINER_USE_MERKLE", "",
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _miner_backpressure_enabled() -> bool:
+    """``JARVIS_MINER_BACKPRESSURE_ENABLED`` (default true) — Slice 27: the
+    per-file scan loop folds a loop-lag AIMD throttle (the same congestion-
+    control shape Slice 26 graduated on the Oracle sweep) so a full miner
+    cycle contracts its cadence and backs off exactly when the control plane
+    lags, instead of marching through ~2.8k files at fixed speed. Kill
+    switch ``=0`` restores the legacy fixed-cadence loop."""
+    raw = os.environ.get("JARVIS_MINER_BACKPRESSURE_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _miner_lag_probe_ceiling() -> int:
+    """``JARVIS_MINER_LAG_PROBE_CEILING`` — max files between loop-lag
+    probes (the AIMD batch ceiling; contracts under lag). Default 128."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_MINER_LAG_PROBE_CEILING", "128")))
+    except (TypeError, ValueError):
+        return 128
+
+
+def _miner_lag_probe_floor() -> int:
+    """``JARVIS_MINER_LAG_PROBE_FLOOR`` — min files between loop-lag probes
+    (the AIMD floor; progress never fully stalls). Default 8."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_MINER_LAG_PROBE_FLOOR", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _miner_backpressure_lag_ms() -> float:
+    """``JARVIS_MINER_BACKPRESSURE_LAG_MS`` — event-loop lag (ms) above
+    which the miner throttles its scan cadence. Default 50ms (same
+    control-plane comfort band as the Oracle throttle)."""
+    try:
+        return max(1.0, float(os.environ.get("JARVIS_MINER_BACKPRESSURE_LAG_MS", "50")))
+    except (TypeError, ValueError):
+        return 50.0
+
+
+# ---------------------------------------------------------------------------
 # OpportunityMinerSensor
 # ---------------------------------------------------------------------------
 
@@ -419,6 +485,16 @@ class OpportunityMinerSensor:
         self._explore_ratio: float = float(
             os.environ.get("JARVIS_MINER_EXPLORE_RATIO", "0.4")
         )
+
+        # --- Slice 11.6.c (re-landed Slice 27) — merkle short-circuit state ---
+        # Baseline: watched-path → subtree hash recorded after the last
+        # successful full scan. Cached candidates: what that scan returned.
+        # Stored regardless of merkle flag so flipping the flag mid-session
+        # transitions cleanly.
+        self._merkle_last_seen_subtree_hashes: Dict[str, str] = {}
+        self._merkle_cached_candidates: List[StaticCandidate] = []
+        self._merkle_short_circuits: int = 0
+        self._merkle_full_scans: int = 0
 
     # v350.4: Third-party / non-project directory segments
     _NON_PROJECT_SEGMENTS = frozenset({
@@ -553,7 +629,28 @@ class OpportunityMinerSensor:
 
         Rotates through analysis strategies each cycle, applies cooldowns,
         and uses exploit/explore selection for diverse coverage.
+
+        Slice 11.6.c (re-landed Slice 27) — when
+        ``JARVIS_OPPMINER_USE_MERKLE`` is on AND the Merkle Cartographer
+        reports ALL watched scan-path subtree hashes unchanged since the
+        last successful scan, short-circuit to the cached candidate list
+        (skip filesystem walk + AST parse + ingest entirely — this branch
+        fires BEFORE the offloaded walk). Subtree-scoped: a change outside
+        ``_scan_paths`` does NOT bust the cache.
         """
+        current_subtree_hashes = self._merkle_subtree_hashes()
+        if self._merkle_should_short_circuit(current_subtree_hashes):
+            self._merkle_short_circuits += 1
+            logger.debug(
+                "OpportunityMinerSensor: Merkle short-circuit "
+                "(scan #%d skipped, %d cached candidates, %d watched paths)",
+                self._merkle_short_circuits + self._merkle_full_scans,
+                len(self._merkle_cached_candidates),
+                len(current_subtree_hashes),
+            )
+            return list(self._merkle_cached_candidates)
+
+        self._merkle_full_scans += 1
         self._scan_cycle += 1
 
         # Pick the strategy for this cycle (round-robin)
@@ -592,8 +689,29 @@ class OpportunityMinerSensor:
         #     files inside the otherwise-tight scan loop.
         from backend.core.ouroboros.governance.event_loop_governance import (  # noqa: E501
             cooperative_yield_every_n_async,
+            measure_loop_lag_ms,
             offload_blocking,
         )
+
+        # Slice 27 — loop-lag AIMD throttle on the scan cadence. The Slice
+        # 12L/124 primitives guarantee scheduling SLOTS (sleep(0) per file)
+        # but never ADAPT: under load the miner still marched through ~2.8k
+        # files at fixed speed while the GIL-sharing read_text threads and
+        # per-file sync chunks compounded (bt-2026-07-15-214458: 41
+        # ControlPlaneStarvation events, peak 4.2s, all miner-attributed).
+        # Reuses the exact congestion-control class Slice 26 graduated on
+        # the Oracle sweep — no new mechanism, same AIMD shape + knobs.
+        _throttle = None
+        if _miner_backpressure_enabled():
+            from backend.core.ouroboros.oracle import (  # noqa: E501 — lazy: heavy module, already resident in prod
+                _AdaptiveIndexThrottle,
+            )
+            _throttle = _AdaptiveIndexThrottle(
+                max_batch=_miner_lag_probe_ceiling(),
+                min_batch=_miner_lag_probe_floor(),
+                lag_threshold_ms=_miner_backpressure_lag_ms(),
+            )
+        _files_since_probe = 0
 
         for scan_path in self._scan_paths:
             root = self._repo_root / scan_path
@@ -631,6 +749,20 @@ class OpportunityMinerSensor:
                 # ControlPlaneStarvation lag_ms~3200). sleep(0) is ~free and
                 # forces a yield every iteration, capping FSM lag.
                 await asyncio.sleep(0)
+                # Slice 27 — AIMD lag probe every `throttle.batch` files:
+                # contract the probe window + back off proportionally to
+                # overshoot when the control plane lags; expand back when
+                # the loop is responsive. Fires on EVERY iteration path
+                # (including the skip-continues below) so a long skipped
+                # run still yields adaptively.
+                _files_since_probe += 1
+                if _throttle is not None and _files_since_probe >= _throttle.batch:
+                    _files_since_probe = 0
+                    _lag_ms = await measure_loop_lag_ms()
+                    _throttle.update(_lag_ms)
+                    _backoff = _throttle.backoff_s(_lag_ms)
+                    if _backoff > 0.0:
+                        await asyncio.sleep(_backoff)
                 rel = str(py_file.relative_to(self._repo_root))
 
                 if not self._is_production_code(py_file, root):
@@ -706,9 +838,18 @@ class OpportunityMinerSensor:
 
                 analyses.append(analysis)
 
-        # Phase 2: Diverse candidate selection
+        # Phase 2: Diverse candidate selection — Slice 27: offloaded. The
+        # full eligible.sort over every mined analysis (each key evaluating
+        # the stratification-penalty property chain) is pure-Python CPU with
+        # ZERO awaits; at ~2.8k analyses it held the loop for the 0.5-2s
+        # starvation class. offload_blocking frees the loop for the sort's
+        # duration; the sensor task is the sole state mutator so thread
+        # safety is structural (sequential await).
         counters = _CycleCounters(mined=len(analyses))
-        eligible_count, selected = self._select_diverse_candidates(analyses, sort_field)
+        eligible_count, selected = await offload_blocking(
+            self._select_diverse_candidates, analyses, sort_field,
+            label="opportunity_miner.select_candidates",
+        )
         counters.eligible = eligible_count
         counters.selected = len(selected)
 
@@ -748,6 +889,9 @@ class OpportunityMinerSensor:
                         ingested, errors, skipped_non_package,
                     )
                     self._emit_cycle_summary(counters, strategy_name)
+                    self._merkle_refresh_baseline(
+                        ingested, current_subtree_hashes,
+                    )
                     return ingested
                 # Coalescing envelope was rejected — fall through to per-file
                 # ingest as a best-effort fallback.
@@ -830,7 +974,140 @@ class OpportunityMinerSensor:
             ingested, errors, skipped_non_package,
         )
         self._emit_cycle_summary(counters, strategy_name)
+        self._merkle_refresh_baseline(ingested, current_subtree_hashes)
         return ingested
+
+    # ------------------------------------------------------------------
+    # Slice 11.6.c (re-landed Slice 27) — Merkle consultation (subtree-scoped)
+    # ------------------------------------------------------------------
+
+    def _merkle_normalized_scan_paths(self) -> List[str]:
+        """Project ``self._scan_paths`` into the cartographer's relpath
+        namespace (POSIX, no leading/trailing slash, ``"."`` → root).
+
+        Stable order: same iteration order as ``_scan_paths`` so the
+        baseline dict stays comparable across cycles even if the path
+        list is reordered (it shouldn't be, but defensive)."""
+        out: List[str] = []
+        for raw in self._scan_paths:
+            s = str(raw).replace("\\", "/").strip()
+            if s in ("", ".", "./"):
+                out.append("")  # root marker
+                continue
+            out.append(s.strip("/"))
+        return out
+
+    def _merkle_subtree_hashes(self) -> Dict[str, str]:
+        """Read per-watched-path subtree hashes from the cartographer.
+        Empty dict on any failure path — fail-safe to legacy scan.
+
+        For each scan path: empty-string relpath means "use root hash"
+        (i.e. ``_scan_paths == ["."]``); any other relpath uses
+        ``subtree_hash(relpath)``. A missing/unhashable subtree returns
+        empty string, which the comparison treats as 'always changed'
+        (fail-safe).
+        """
+        if not merkle_consult_enabled():
+            return {}
+        try:
+            from backend.core.ouroboros.governance.merkle_cartographer import (
+                get_default_cartographer,
+            )
+            c = get_default_cartographer(repo_root=self._repo_root)
+            out: Dict[str, str] = {}
+            for relpath in self._merkle_normalized_scan_paths():
+                if relpath == "":
+                    out[relpath] = c.current_root_hash()
+                else:
+                    out[relpath] = c.subtree_hash(relpath)
+            return out
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "OpportunityMinerSensor: subtree hash read failed; "
+                "falling through to full scan", exc_info=True,
+            )
+            return {}
+
+    def _merkle_should_short_circuit(
+        self, current_hashes: Dict[str, str],
+    ) -> bool:
+        """Decide whether to skip the multi-strategy scan based on
+        cartographer state. Returns False (i.e. proceed with full scan)
+        on any failure path — fail-safe to legacy behavior.
+
+        Conditions for short-circuit (ALL must hold):
+          1. Per-sensor flag ``JARVIS_OPPMINER_USE_MERKLE`` is true
+          2. Cartographer master flag enabled (empty hashes dict from
+             ``_merkle_subtree_hashes`` indicates flag off / error /
+             cold-cartographer → fail-safe)
+          3. Every watched subtree hash matches the recorded baseline
+          4. We have a recorded baseline (cold-start guard — the
+             baseline dict is empty until the first full scan
+             completes; an *empty cache* with a populated baseline
+             is a legitimate "scan found 0 candidates" state and
+             SHOULD short-circuit)
+          5. The set of watched paths is unchanged since last scan
+             (operator may have added/removed paths via reconfig —
+             a different shape means we cannot trust the baseline)
+          6. No watched subtree returned an empty hash (would mean
+             cartographer cannot resolve that path — e.g. it doesn't
+             exist on disk yet, fail-safe to full scan)
+        """
+        if not merkle_consult_enabled():
+            return False
+        if not current_hashes:
+            return False  # cartographer disabled / cold-start / error
+        if not self._merkle_last_seen_subtree_hashes:
+            return False  # cold start — no baseline yet
+        if (
+            set(current_hashes.keys())
+            != set(self._merkle_last_seen_subtree_hashes.keys())
+        ):
+            return False  # scan-path topology changed
+        if any(not h for h in current_hashes.values()):
+            return False  # at least one subtree unresolved
+        return all(
+            current_hashes[k] == self._merkle_last_seen_subtree_hashes[k]
+            for k in current_hashes
+        )
+
+    def _merkle_refresh_baseline(
+        self,
+        ingested: List[StaticCandidate],
+        current_hashes: Dict[str, str],
+    ) -> None:
+        """Snapshot the freshly-scanned cartographer state + ingested
+        candidates as the new baseline for the next cycle's
+        short-circuit decision. Always-safe — never raises."""
+        try:
+            self._merkle_cached_candidates = list(ingested)
+            self._merkle_last_seen_subtree_hashes = dict(current_hashes)
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "OpportunityMinerSensor: merkle baseline refresh failed",
+                exc_info=True,
+            )
+
+    def health(self) -> Dict[str, Any]:
+        """Operator-visible health snapshot. Slice 11.6.c added — exposes
+        merkle short-circuit telemetry for graduation observability.
+        (Restored Slice 27; the 8f3be950a1 rewrite dropped it.)"""
+        return {
+            "sensor": "OpportunityMinerSensor",
+            "repo": self._repo,
+            "running": self._running,
+            "scan_cycle": self._scan_cycle,
+            "cooldown_files": len(self._cooldown_map),
+            "seen_files": len(self._seen_file_paths),
+            # Slice 11.6.c — Merkle consultation telemetry
+            "merkle_consult_enabled": merkle_consult_enabled(),
+            "merkle_short_circuits": self._merkle_short_circuits,
+            "merkle_full_scans": self._merkle_full_scans,
+            "merkle_watched_paths": list(
+                self._merkle_last_seen_subtree_hashes.keys()
+            ),
+            "merkle_cached_candidates": len(self._merkle_cached_candidates),
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers (shared between coalesced and per-file paths)

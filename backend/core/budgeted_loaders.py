@@ -676,7 +676,14 @@ class EmbeddingBudgetedLoader:
 
         try:
             await grant.heartbeat()
-            model = self._load_embedding_model()
+            # Slice 26 — the SentenceTransformer construct is a multi-hundred-MB
+            # blocking load; run it in the default executor so the broker path
+            # (like the legacy EmbeddingService path) never holds the asyncio
+            # loop thread through a model load.
+            import asyncio as _asyncio
+            model = await _asyncio.get_running_loop().run_in_executor(
+                None, self._load_embedding_model,
+            )
             self._model_handle = model
 
             elapsed_ms = (_time.monotonic() - start) * 1000

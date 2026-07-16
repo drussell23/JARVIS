@@ -185,6 +185,28 @@ def process_critical_frac() -> float:
     )
 
 
+# -- Slice 26: advisory in-flight reservation dimension -----------------
+# The bt-2026-07-15-192117 death window: ProactiveResourceGuard granted
+# the ~800MB "sentence_transformer" model-init budget seconds before the
+# starvation kill, while every gate consumer (Oracle Memory Armor,
+# subtree scoper, SensorGovernor) still saw the PRE-load free-% probe —
+# they fanned out into memory that was already spoken for. This dim
+# folds granted-but-not-yet-resident reservations into an ADJUSTED
+# free-% (strictest-wins, like the process-tree dim). A grant older
+# than the settle window is assumed resident (the raw probe carries it
+# from then on — no permanent double-count). Fail-open on any error.
+def reservation_dim_enabled() -> bool:
+    return _env_bool("JARVIS_MEMORY_PRESSURE_RESERVATIONS_ENABLED", True)
+
+
+def reservation_settle_s() -> float:
+    """Age (s) after which a granted budget is assumed RESIDENT (visible to
+    the raw probe) and stops being double-counted. Default 120."""
+    return _env_float(
+        "JARVIS_MEMORY_RESERVATION_SETTLE_S", 120.0, minimum=1.0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Vocabulary
 # ---------------------------------------------------------------------------
@@ -471,7 +493,11 @@ class MemoryPressureGate:
         # Disabled → _process_tree_dim returns OK → result == free
         # level (byte-identical legacy free-%-only path).
         proc_level, _rss, _cap = self._process_tree_dim()
-        return _strictest(free_level, proc_level)
+        # Slice 26 — strictest-wins compose with the in-flight
+        # reservation dim (granted-but-not-yet-resident model-init
+        # budgets shrink the effective free-%).
+        resv_level, _resv_mb = self._reservation_dim(probe)
+        return _strictest(_strictest(free_level, proc_level), resv_level)
 
     # -- fanout decision ----------------------------------------------------
 
@@ -537,6 +563,44 @@ class MemoryPressureGate:
             )
             return PressureLevel.OK, None, None
 
+    def _reservation_dim(
+        self, probe: MemoryProbe,
+    ) -> Tuple[PressureLevel, Optional[float]]:
+        """Slice 26 — advisory in-flight reservation pressure dimension.
+
+        Reads granted-but-presumably-not-yet-resident memory budgets from
+        ``ProactiveResourceGuard`` (e.g. the ~800MB ``sentence_transformer``
+        model-init grant) and re-levels an ADJUSTED free-%:
+        ``free_pct - unsettled_mb/total * 100``. Grants older than
+        ``reservation_settle_s()`` are assumed resident — the raw probe
+        carries their weight from then on, so there is no permanent
+        double-count. Returns ``(level, unsettled_mb)``; DISABLED,
+        no-guard, zero-unsettled, or ANY error → ``(OK, None)`` so the
+        strictest-wins composition is a no-op (fail-open — this dimension
+        only ever advises a clamp, never blocks on a glitch).
+        """
+        if not reservation_dim_enabled():
+            return PressureLevel.OK, None
+        try:
+            from backend.core.proactive_resource_guard import (
+                get_proactive_resource_guard,
+            )
+
+            unsettled_mb = get_proactive_resource_guard().unsettled_reservation_mb(
+                settle_s=reservation_settle_s(),
+            )
+            if unsettled_mb <= 0.0 or probe.total_bytes <= 0:
+                return PressureLevel.OK, None
+            reserved_pct = (unsettled_mb * 1024.0 * 1024.0) / probe.total_bytes * 100.0
+            adjusted_free_pct = max(0.0, probe.free_pct - reserved_pct)
+            return self.level_for_free_pct(adjusted_free_pct), unsettled_mb
+        except Exception:  # noqa: BLE001 — fail-open, never clamp on glitch
+            logger.debug(
+                "[MemoryPressureGate] reservation-dim probe raised",
+                exc_info=True,
+            )
+            return PressureLevel.OK, None
+
     def can_fanout(self, n_requested: int) -> FanoutDecision:
         """Advisory: may ``n_requested`` parallel units proceed?
 
@@ -579,8 +643,15 @@ class MemoryPressureGate:
         # Disabled → (OK, None, None): level == free_level, no reason
         # suffix, additive fields None → byte-identical legacy path.
         proc_level, proc_rss_mb, proc_cap_mb = self._process_tree_dim()
-        level = _strictest(free_level, proc_level)
+        # Slice 26 — in-flight reservation dim (same additive contract:
+        # disabled/quiet → OK → composition is a no-op).
+        resv_level, _resv_mb = self._reservation_dim(probe)
+        level = _strictest(_strictest(free_level, proc_level), resv_level)
         proc_dominant = _LEVEL_RANK[proc_level] > _LEVEL_RANK[free_level]
+        resv_dominant = (
+            _LEVEL_RANK[resv_level] > _LEVEL_RANK[free_level]
+            and _LEVEL_RANK[resv_level] > _LEVEL_RANK[proc_level]
+        )
         cap = self._cap_for_level(level)
         if cap is None:
             n_allowed = n_requested
@@ -588,10 +659,12 @@ class MemoryPressureGate:
         else:
             n_allowed = min(n_requested, cap)
             reason = f"memory_pressure_gate.capped_to_{cap}_at_{level.value}"
-            # Suffix ONLY when the process dim escalated — keeps the
+            # Suffix ONLY when a non-free dim escalated — keeps the
             # legacy free-%-only reason_code string byte-identical
             # for existing subagent_scheduler consumers/tests.
-            if proc_dominant:
+            if resv_dominant:
+                reason += "_via_reservations"
+            elif proc_dominant:
                 reason += "_via_process_tree"
         return FanoutDecision(
             allowed=n_allowed >= 1 if n_requested >= 1 else True,
@@ -605,7 +678,9 @@ class MemoryPressureGate:
             process_rss_mb=proc_rss_mb,
             process_cap_mb=proc_cap_mb,
             dominant_dimension=(
-                "process_tree" if proc_dominant else "free_pct"
+                "reservations" if resv_dominant
+                else "process_tree" if proc_dominant
+                else "free_pct"
             ),
         )
 
@@ -653,6 +728,22 @@ class MemoryPressureGate:
             # off). Reuses this surface + GET /observability/
             # memory-pressure; no new event type.
             "process_tree": self._process_tree_snapshot(),
+            # Slice 26 — additive in-flight reservation dimension
+            # (same contract: level=None when quiet/disabled).
+            "reservations": self._reservation_snapshot(probe),
+        }
+
+    def _reservation_snapshot(self, probe: MemoryProbe) -> Dict[str, Any]:
+        """Additive diagnostics for the Slice 26 reservation dimension."""
+        resv_level, unsettled_mb = self._reservation_dim(probe)
+        return {
+            "enabled": reservation_dim_enabled(),
+            "level": (
+                resv_level.value
+                if resv_level is not PressureLevel.OK else None
+            ),
+            "unsettled_mb": unsettled_mb,
+            "settle_s": reservation_settle_s(),
         }
 
     def _process_tree_snapshot(self) -> Dict[str, Any]:

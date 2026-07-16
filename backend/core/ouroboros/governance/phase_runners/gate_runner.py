@@ -123,6 +123,23 @@ class GATERunner(PhaseRunner):
         best_candidate = self._best_candidate
         risk_tier = self._risk_tier
 
+        # Autonomy Gap 4 — earned-trust WIDENING, applied at GATE ENTRY BEFORE
+        # the floor stack so every immutable floor (the cage, governance
+        # boundary, paranoia, the trust NARROWING floor) re-clamps afterwards.
+        # Relaxes a human-gated APPROVAL_REQUIRED op to auto NOTIFY_APPLY ONLY on
+        # sustained HIGH scope trust, within the operator ceiling, never for cage
+        # surfaces. DEFAULT-INERT (double opt-in) — a no-op until enabled. Wrapped
+        # so trust can NEVER break GATE.
+        try:
+            from backend.core.ouroboros.governance.trust_calibration import (
+                relax_tier_for_op as _trust_relax,
+            )
+            risk_tier, _trust_why = _trust_relax(risk_tier, ctx)
+            if _trust_why and _trust_why != "cage_excluded":
+                logger.info("[TrustCalibration] GATE %s", _trust_why)
+        except Exception:  # noqa: BLE001 — trust widening must never break GATE
+            pass
+
         # Resolve _human_is_watching through the orchestrator module
         # namespace so env overrides remain test-patchable.
         from backend.core.ouroboros.governance.orchestrator import (

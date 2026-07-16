@@ -140,9 +140,10 @@ def test_module_exports() -> None:
 # ===========================================================================
 
 
-def test_master_flag_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_master_flag_default_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Graduated in Phase 11 Slice 11.7 — default is ON."""
     monkeypatch.delenv("JARVIS_MERKLE_CARTOGRAPHER_ENABLED", raising=False)
-    assert mc.is_cartographer_enabled() is False
+    assert mc.is_cartographer_enabled() is True
 
 
 def test_master_flag_truthy(monkeypatch: pytest.MonkeyPatch) -> None:

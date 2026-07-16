@@ -546,6 +546,27 @@ def _cross_repo_elevation_floor(
         return "critical_elevation"
 
 
+def _trust_narrowing_floor(target_files) -> Optional[str]:
+    """Autonomy Gap 4 — the earned-trust NARROWING floor candidate. Derives the
+    op's scope from ``target_files`` (the same ``_infer_scope`` key the
+    AutoCommitter stamps, so trust converges with the git record) and asks the
+    trust engine for a tighter floor tier. Lazy-imported + fail-open (any fault
+    → None → no floor contribution). NEVER raises."""
+    try:
+        if not target_files:
+            return None
+        from backend.core.ouroboros.governance.auto_committer import (
+            AutoCommitter,
+        )
+        scope = AutoCommitter._infer_scope(tuple(str(f) for f in target_files))
+        from backend.core.ouroboros.governance.trust_calibration import (
+            trust_narrowing_tier,
+        )
+        return trust_narrowing_tier(scope)
+    except Exception:  # noqa: BLE001 — a floor helper must never raise
+        return None
+
+
 def recommended_floor(
     now: Optional[datetime] = None,
     *,
@@ -628,6 +649,15 @@ def recommended_floor(
     cross_repo = _cross_repo_elevation_floor(target_repo, crosses_repo)
     if cross_repo is not None:
         candidates.append(cross_repo)
+    # Autonomy Gap 4 — earned-trust NARROWING. A scope the organism just
+    # REGRESSED (a fresh git revert of its own commit) or has a poor held-up
+    # record contributes a tighter floor here — safety-forward, composed
+    # strictest-wins like every other floor, so the immune cage re-clamps it
+    # for free. The WIDENING half is applied separately at GATE entry (a floor
+    # can only tighten). None when trust is UNKNOWN/MEDIUM/HIGH or disabled.
+    trust_narrow = _trust_narrowing_floor(target_files)
+    if trust_narrow is not None:
+        candidates.append(trust_narrow)
     if not candidates:
         return None
     # Pick the strictest — highest ordinal wins.

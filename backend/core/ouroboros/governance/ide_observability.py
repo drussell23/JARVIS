@@ -298,6 +298,41 @@ class IDEObservabilityRouter:
             "/observability/memory-pressure",
             self._handle_memory_pressure,
         )
+        # Goal Metric Dashboard (autonomy pivot Step 1) — read-only autonomous-
+        # throughput surface composing autonomy_metrics.snapshot (git-provable
+        # landed changes + session-summary runtime/cost/regression).
+        app.router.add_get(
+            "/observability/autonomy",
+            self._handle_autonomy,
+        )
+        # Capability Liveness (autonomy pivot Gap 2) — self-perception surface
+        # composing capability_liveness.snapshot (FlagRegistry-declared
+        # capabilities × static reachability of their public callables).
+        app.router.add_get(
+            "/observability/liveness",
+            self._handle_capability_liveness,
+        )
+        # Fault-Injection Matrix (autonomy pivot Gap 1) — resilience coverage:
+        # class × verdict over the stability failure taxonomy; NO_SCENARIO/BROKEN
+        # cells are the predicted next-death sites.
+        app.router.add_get(
+            "/observability/resilience",
+            self._handle_resilience_matrix,
+        )
+        # Trust Calibration (autonomy pivot Gap 4) — the earned auto-apply
+        # envelope: per-scope git-provable trust levels + which scopes are
+        # narrowing (regressed) vs widen-eligible.
+        app.router.add_get(
+            "/observability/trust",
+            self._handle_trust_calibration,
+        )
+        # Conception Value Model (autonomy pivot Gap 3) — the expected-value
+        # ranker for self-conceived work: composed alignment × substance ×
+        # earned-trust × cost weights + axis provenance.
+        app.router.add_get(
+            "/observability/conception",
+            self._handle_conception_value,
+        )
         # W3(7) Slice 6 — Class D/E/F cancel record surface.
         app.router.add_get(
             "/observability/cancels", self._handle_cancel_list,
@@ -1661,6 +1696,56 @@ class IDEObservabilityRouter:
             return False
         return is_enabled()
 
+    @staticmethod
+    def _autonomy_metrics_enabled() -> bool:
+        try:
+            from backend.core.ouroboros.governance.autonomy_metrics import (
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
+    @staticmethod
+    def _capability_liveness_enabled() -> bool:
+        try:
+            from backend.core.ouroboros.governance.capability_liveness import (
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
+    @staticmethod
+    def _resilience_matrix_enabled() -> bool:
+        try:
+            from backend.core.ouroboros.governance.fault_injection_matrix import (
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
+    @staticmethod
+    def _trust_calibration_enabled() -> bool:
+        try:
+            from backend.core.ouroboros.governance.trust_calibration import (
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
+    @staticmethod
+    def _conception_value_enabled() -> bool:
+        try:
+            from backend.core.ouroboros.governance.conception_value_model import (
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
     def _governor_check_gates(self, request: "web.Request") -> Optional[Any]:
         if not ide_observability_enabled():
             return self._error_response(
@@ -1752,6 +1837,192 @@ class IDEObservabilityRouter:
             return self._json_response(
                 request, 200,
                 {"snapshot": None, "reason_code": "memory.unavailable"},
+            )
+        return self._json_response(request, 200, snap)
+
+    def _autonomy_check_gates(self, request: "web.Request") -> Optional[Any]:
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._autonomy_metrics_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.autonomy_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        return None
+
+    async def _handle_autonomy(self, request: "web.Request") -> Any:
+        """GET /observability/autonomy — the Goal Metric Dashboard snapshot:
+        net-positive landed changes per unattended day, regression rate, and
+        cost, aggregated from git ground truth + session summaries."""
+        err = self._autonomy_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.autonomy_metrics import (
+                snapshot as _autonomy_snapshot,
+            )
+            snap = _autonomy_snapshot()
+        except Exception:  # noqa: BLE001 — never 500; degrade to a clean 200
+            logger.debug(
+                "[IDEObservability] autonomy snapshot failed", exc_info=True,
+            )
+            return self._json_response(
+                request, 200,
+                {"snapshot": None, "reason_code": "autonomy.unavailable"},
+            )
+        return self._json_response(request, 200, snap)
+
+    def _liveness_check_gates(self, request: "web.Request") -> Optional[Any]:
+        if not ide_observability_enabled():
+            return self._error_response(request, 403, "ide_observability.disabled")
+        if not self._capability_liveness_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.liveness_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(request, 429, "ide_observability.rate_limited")
+        return None
+
+    async def _handle_capability_liveness(self, request: "web.Request") -> Any:
+        """GET /observability/liveness — the self-perception snapshot:
+        FlagRegistry-declared capabilities scored by static reachability of
+        their public callables (fully-severed alert + severance candidates +
+        spec-drift), the foundation for the organism seeing its own inert
+        subsystems."""
+        err = self._liveness_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.capability_liveness import (
+                snapshot as _liveness_snapshot,
+            )
+            snap = _liveness_snapshot()
+        except Exception:  # noqa: BLE001 — never 500; degrade to a clean 200
+            logger.debug(
+                "[IDEObservability] capability liveness snapshot failed",
+                exc_info=True,
+            )
+            return self._json_response(
+                request, 200,
+                {"snapshot": None, "reason_code": "liveness.unavailable"},
+            )
+        return self._json_response(request, 200, snap)
+
+    def _trust_check_gates(self, request: "web.Request") -> Optional[Any]:
+        if not ide_observability_enabled():
+            return self._error_response(request, 403, "ide_observability.disabled")
+        if not self._trust_calibration_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.trust_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(request, 429, "ide_observability.rate_limited")
+        return None
+
+    async def _handle_trust_calibration(self, request: "web.Request") -> Any:
+        """GET /observability/trust — the earned auto-apply envelope: per-scope
+        git-provable trust levels, which scopes are auto-narrowing (regressed),
+        which are widen-eligible, and the operator opt-in state."""
+        err = self._trust_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.trust_calibration import (
+                snapshot as _trust_snapshot,
+            )
+            snap = _trust_snapshot()
+        except Exception:  # noqa: BLE001 — never 500; degrade to a clean 200
+            logger.debug(
+                "[IDEObservability] trust calibration snapshot failed",
+                exc_info=True,
+            )
+            return self._json_response(
+                request, 200,
+                {"snapshot": None, "reason_code": "trust.unavailable"},
+            )
+        return self._json_response(request, 200, snap)
+
+    def _conception_check_gates(self, request: "web.Request") -> Optional[Any]:
+        if not ide_observability_enabled():
+            return self._error_response(request, 403, "ide_observability.disabled")
+        if not self._conception_value_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.conception_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(request, 429, "ide_observability.rate_limited")
+        return None
+
+    async def _handle_conception_value(self, request: "web.Request") -> Any:
+        """GET /observability/conception — the expected-value ranker for
+        self-conceived work: composed axis weights (alignment × substance ×
+        earned-trust × cost), cost/regression coefficients, and axis
+        provenance."""
+        err = self._conception_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.conception_value_model import (
+                snapshot as _conception_snapshot,
+            )
+            snap = _conception_snapshot()
+            # Attach the ledger→router bridge state (Gap 3 unification path) —
+            # best-effort; a missing bridge module never fails the endpoint.
+            try:
+                from backend.core.ouroboros.governance.conception_proposal_bridge import (
+                    snapshot as _bridge_snapshot,
+                )
+                snap = {**snap, "bridge": _bridge_snapshot()}
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001 — never 500; degrade to a clean 200
+            logger.debug(
+                "[IDEObservability] conception value snapshot failed",
+                exc_info=True,
+            )
+            return self._json_response(
+                request, 200,
+                {"snapshot": None, "reason_code": "conception.unavailable"},
+            )
+        return self._json_response(request, 200, snap)
+
+    def _resilience_check_gates(self, request: "web.Request") -> Optional[Any]:
+        if not ide_observability_enabled():
+            return self._error_response(request, 403, "ide_observability.disabled")
+        if not self._resilience_matrix_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.resilience_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(request, 429, "ide_observability.rate_limited")
+        return None
+
+    async def _handle_resilience_matrix(self, request: "web.Request") -> Any:
+        """GET /observability/resilience — the fault-injection coverage matrix:
+        for each stability failure class, whether a controlled injected fault
+        was DEFENDED, plus the NO_SCENARIO/BROKEN gaps that predict where the
+        next novel death hides."""
+        err = self._resilience_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.fault_injection_matrix import (
+                snapshot as _resilience_snapshot,
+            )
+            snap = _resilience_snapshot()
+        except Exception:  # noqa: BLE001 — never 500; degrade to a clean 200
+            logger.debug(
+                "[IDEObservability] resilience matrix snapshot failed",
+                exc_info=True,
+            )
+            return self._json_response(
+                request, 200,
+                {"snapshot": None, "reason_code": "resilience.unavailable"},
             )
         return self._json_response(request, 200, snap)
 

@@ -497,6 +497,28 @@ class ProactiveResourceGuard:
         self._requests_denied += 1
         return False
     
+    def unsettled_reservation_mb(self, settle_s: float = 120.0) -> float:
+        """Sum (MB) of granted budgets younger than ``settle_s`` seconds.
+
+        Slice 26 — the backpressure integration surface. A fresh grant (e.g.
+        the ~800MB ``sentence_transformer`` model-init budget) is memory that
+        is about to materialize but may not yet be visible to host free-memory
+        probes; consumers like ``MemoryPressureGate`` fold this into an
+        adjusted free-% so fan-out contracts BEFORE the allocation lands.
+        Grants older than the settle window are assumed resident (the raw
+        probe carries their weight). Thread-safe; NEVER raises.
+        """
+        try:
+            now = time.time()
+            horizon = max(0.0, float(settle_s))
+            with self._budget_lock:
+                return float(sum(
+                    b.estimated_mb for b in self._budgets.values()
+                    if (now - b.allocated_at) < horizon
+                ))
+        except Exception:  # noqa: BLE001 — advisory surface, fail-open
+            return 0.0
+
     def release_budget(self, component: str) -> bool:
         """
         Release a memory budget when component is unloaded.

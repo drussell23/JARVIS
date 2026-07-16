@@ -187,15 +187,17 @@ def test_typo_suggestion_does_not_fire_for_known_verbs():
 
 
 def test_typo_suggestion_continues_on_match():
-    """When suggestions are surfaced, the dispatch must `continue`
+    """When suggestions are surfaced, the dispatch must exit early
     — otherwise the external handler also fires (double-handling).
     Anchor on the call to `_typo_suggest(` which is unique to the
-    typo wiring block."""
+    typo wiring block.  Slice 32 extracted the dispatch into
+    ``_dispatch_repl_command`` where ``continue`` became
+    ``return True`` (identical no-double-handling guarantee)."""
     src = _source()
     idx = src.find("_typo_suggest(")
     assert idx > 0
     post = src[idx:idx + 3000]
-    assert "continue" in post
+    assert "return True" in post
 
 
 def test_typo_suggestion_surfaces_descriptor_hint():

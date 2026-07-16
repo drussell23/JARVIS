@@ -9020,6 +9020,19 @@ class GovernedOrchestrator:
         else:
             if _serpent: _serpent.update_phase("GATE")
             # ---- Phase 5: GATE ----
+            # Autonomy Gap 4 — earned-trust WIDENING, inline-GATE twin of the
+            # extracted gate_runner hook. Applied at GATE ENTRY before the floor
+            # stack so the immutable cage/governance floors re-clamp afterwards.
+            # DEFAULT-INERT (double opt-in); wrapped so trust can never break GATE.
+            try:
+                from backend.core.ouroboros.governance.trust_calibration import (
+                    relax_tier_for_op as _trust_relax,
+                )
+                risk_tier, _trust_why = _trust_relax(risk_tier, ctx)
+                if _trust_why and _trust_why != "cage_excluded":
+                    logger.info("[TrustCalibration] GATE %s", _trust_why)
+            except Exception:  # noqa: BLE001 — trust widening must never break GATE
+                pass
             allowed, reason = self._stack.can_write(
                 {"files": list(ctx.target_files)}
             )

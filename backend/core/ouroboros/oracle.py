@@ -47,7 +47,7 @@ import pickle
 import sys
 import time
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 import enum
@@ -1789,6 +1789,11 @@ class OracleSemanticIndex:
         if _chroma and self._collection is None:
             return
 
+        if _oracle_embed_tail_coop_enabled():
+            await self._embed_nodes_coop(nodes, _chroma=_chroma, _stdlib=_stdlib)
+            return
+
+        # ── Legacy tail (JARVIS_ORACLE_EMBED_TAIL_COOP_ENABLED=0 rollback) ──
         try:
             embeddable = [
                 n for n in nodes
@@ -1855,6 +1860,205 @@ class OracleSemanticIndex:
 
             logger.debug("[OracleSemanticIndex] Embedded %d nodes", len(embeddable))
         except Exception as exc:
+            logger.warning("[OracleSemanticIndex] embed_nodes failed: %s", exc)
+
+    async def _embed_nodes_coop(
+        self, nodes: List["NodeData"], *, _chroma: bool, _stdlib: bool,
+    ) -> None:
+        """Slice 28 — adaptive cooperative embed/upsert tail.
+
+        Closes the bt-2026-07-15-225445 10.3s post-sweep hold. The legacy
+        tail's residual on-loop work: ``_build_embed_text`` evaluated over
+        EVERY node twice (filter pass + per-batch rebuild) as pure-Python
+        string joins with zero awaits before the first batch; per-batch
+        metadata dict-builds + numpy ``tolist()`` conversion on the loop;
+        and a static 128 batch with no adaptation between batches.
+
+        Shape (all pre-existing substrate — no new pools, no new queue):
+          * per-batch prep (text-build + ids + metadata) and the vector
+            conversion + chroma upsert run via ``cooperative_fs_io.offload``
+            thread path — the SAME executor Slice 25 chose for the upsert
+            (thread, never process: the PersistentClient's native file lock
+            makes a second writer process corrupt HNSW segments; that pool
+            is already child_reaper-registered, and thread offloads spawn
+            no children — teardown lifecycle unchanged);
+          * batch size is AIMD-governed (``_AdaptiveIndexThrottle``, the
+            Slice 26 congestion-control class) fed by the shared
+            ``event_loop_governance.measure_loop_lag_ms`` probe (Slice 27)
+            — payload-size adaptation is EMERGENT, not configured: a
+            heavier batch produces more observed lag, which halves the
+            next batch; light batches recover additively toward the
+            ``ORACLE_EMBED_BATCH`` ceiling. No static chunk boundary
+            decides anything at runtime;
+          * memory axis: the shared ``MemoryPressureGate`` level (which
+            already folds the Slice 26 in-flight-reservation dimension)
+            maps through ``_ORACLE_MEM_LAG_MULT`` into synthetic lag —
+            elevated pressure contracts the batch AND lengthens the
+            proportional backoff yield, exactly the sweep armor's graded
+            defense.
+
+        Never raises; any batch fault logs + drops that batch (legacy
+        fail-soft contract preserved).
+        """
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error as _cr_is_err,
+            offload as _cr_offload,
+        )
+        from backend.core.ouroboros.governance.event_loop_governance import (
+            measure_loop_lag_ms as _elg_lag_ms,
+        )
+
+        try:
+            # Cheap type filter stays inline (frozenset membership); the
+            # EXPENSIVE text building is per-batch and off-loop below.
+            candidates = [
+                n for n in nodes
+                if n.node_id.node_type in self._EMBEDDABLE_TYPES
+            ]
+            if not candidates:
+                return
+
+            throttle = (
+                _AdaptiveIndexThrottle(
+                    max_batch=OracleConfig.SEMANTIC_EMBED_BATCH_SIZE,
+                    min_batch=_oracle_backpressure_min_batch(),
+                    lag_threshold_ms=_oracle_backpressure_lag_ms(),
+                )
+                if _oracle_backpressure_enabled()
+                else None
+            )
+            _armor_on = _oracle_memory_armor_enabled()
+            total_embedded = 0
+            # Slice 30 — correlated-failure circuit breaker. A transient
+            # batch fault is tolerable; N CONSECUTIVE faults mean the
+            # backend itself is broken (the bt-2026-07-16-004244 class:
+            # deterministic "Error in compaction" on every upsert) and
+            # continuing amplifies the damage. Abort the remaining run —
+            # embeddings are advisory; the next changed-file embed retries
+            # against a freshly-booted backend.
+            _fail_streak = 0
+            _fail_streak_abort = _oracle_embed_fail_streak_abort()
+            i = 0
+            while i < len(candidates):
+                # Memory axis BEFORE sizing the batch — same graded defense
+                # as the sweep (shared gate → shared multiplier table).
+                if throttle is not None and _armor_on:
+                    _mult = _ORACLE_MEM_LAG_MULT.get(
+                        _semantic_embed_pressure_level(), 0.0,
+                    )
+                    if _mult > 0.0:
+                        throttle.update(_mult * throttle.lag_threshold_ms)
+                effective = (
+                    throttle.batch if throttle is not None
+                    else OracleConfig.SEMANTIC_EMBED_BATCH_SIZE
+                )
+                batch = candidates[i : i + effective]
+                i += len(batch)
+
+                def _prep(_batch=batch):
+                    texts: List[str] = []
+                    keep: List[Any] = []
+                    for n in _batch:
+                        t = self._build_embed_text(n)
+                        if t is not None:
+                            keep.append(n)
+                            texts.append(t)
+                    ids = [str(n.node_id) for n in keep]
+                    metas = [
+                        {
+                            "repo": n.node_id.repo,
+                            "file_path": n.node_id.file_path,
+                            "name": n.node_id.name,
+                            "node_type": n.node_id.node_type.value,
+                        }
+                        for n in keep
+                    ]
+                    return texts, ids, metas
+
+                prep = await _cr_offload(_prep, cpu_bound=False)
+                if _cr_is_err(prep):
+                    _fail_streak += 1
+                    logger.warning(
+                        "[OracleSemanticIndex] embed prep offload failed "
+                        "(%s) — batch dropped (fail_streak=%d/%d)",
+                        prep, _fail_streak, _fail_streak_abort,
+                    )
+                    if _fail_streak >= _fail_streak_abort:
+                        logger.warning(
+                            "[OracleSemanticIndex] embed tail ABORTED: %d "
+                            "consecutive batch failures — backend broken, "
+                            "containing (embedded=%d of %d candidates)",
+                            _fail_streak, total_embedded, len(candidates),
+                        )
+                        return
+                    continue
+                texts, ids, metadatas = prep
+                if not texts:
+                    continue
+
+                embeddings = await self._embedder.embed_batch(texts)
+
+                if _stdlib:
+                    for _eid, _emb, _meta in zip(ids, embeddings, metadatas):
+                        _vec = (
+                            _emb.tolist() if hasattr(_emb, "tolist")
+                            else list(_emb)
+                        )
+                        self._stdlib_store[_eid] = (
+                            [float(x) for x in _vec], _meta,
+                        )
+                else:
+                    # Slice 25 discipline unchanged: THREAD offload (never a
+                    # process — persist-dir lock; see embed_nodes legacy
+                    # comment). Slice 28 folds the numpy tolist() conversion
+                    # into the SAME thread hop as the upsert — one offload,
+                    # zero on-loop vector marshalling.
+                    def _convert_and_upsert(
+                        _ids=ids, _embs=embeddings, _metas=metadatas,
+                    ):
+                        return self._collection.upsert(
+                            ids=_ids,
+                            embeddings=[e.tolist() for e in _embs],
+                            metadatas=_metas,
+                        )
+
+                    _up = await _cr_offload(_convert_and_upsert, cpu_bound=False)
+                    if _cr_is_err(_up):
+                        _fail_streak += 1
+                        logger.warning(
+                            "[OracleSemanticIndex] chroma upsert offload "
+                            "failed (%s) — batch dropped (fail_streak=%d/%d)",
+                            _up, _fail_streak, _fail_streak_abort,
+                        )
+                        if _fail_streak >= _fail_streak_abort:
+                            logger.warning(
+                                "[OracleSemanticIndex] embed tail ABORTED: "
+                                "%d consecutive batch failures — backend "
+                                "broken, containing (embedded=%d of %d "
+                                "candidates)",
+                                _fail_streak, total_embedded, len(candidates),
+                            )
+                            return
+                        continue
+                _fail_streak = 0
+                total_embedded += len(texts)
+
+                # Loop-lag probe BETWEEN batches (shared Slice 27 probe) —
+                # contract + proportional backoff exactly like the sweep.
+                if throttle is not None and i < len(candidates):
+                    lag_ms = await _elg_lag_ms()
+                    throttle.update(lag_ms)
+                    _backoff = throttle.backoff_s(lag_ms)
+                    if _backoff > 0.0:
+                        await asyncio.sleep(_backoff)
+                else:
+                    await asyncio.sleep(0)
+
+            logger.debug(
+                "[OracleSemanticIndex] Embedded %d nodes (coop tail)",
+                total_embedded,
+            )
+        except Exception as exc:  # noqa: BLE001 — never break the caller
             logger.warning("[OracleSemanticIndex] embed_nodes failed: %s", exc)
 
     async def semantic_search(
@@ -2011,6 +2215,93 @@ def _oracle_backpressure_min_batch() -> int:
         return 4
 
 
+def _oracle_coop_scan_enabled() -> bool:
+    """``JARVIS_ORACLE_COOP_SCAN_ENABLED`` (default true) — Slice 26: the directory
+    tree walk runs as bounded per-chunk offloads with loop-lag-adaptive yields between
+    chunks, instead of one monolithic recursive walk inside a single thread hop (whose
+    pure-Python iterdir loop held the GIL for the whole tree — the bt-2026-07-15-192117
+    scan_dir frames). Kill switch ``=0`` restores the legacy monolithic walk."""
+    raw = os.environ.get("JARVIS_ORACLE_COOP_SCAN_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _oracle_scan_chunk_dirs() -> int:
+    """``JARVIS_ORACLE_SCAN_CHUNK_DIRS`` — ceiling on directories scanned per offload
+    chunk during the cooperative tree walk. The AIMD throttle contracts from here under
+    loop lag and recovers when the loop is responsive. Default 32."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_ORACLE_SCAN_CHUNK_DIRS", "32")))
+    except (TypeError, ValueError):
+        return 32
+
+
+def _oracle_sweep_backpressure_enabled() -> bool:
+    """``JARVIS_ORACLE_SWEEP_BACKPRESSURE_ENABLED`` (default true) — Slice 26: extends
+    the AIMD throttle + Memory Armor axes (previously full_index-only) to the
+    ``_scan_for_changes`` incremental sweep, which ran completely unthrottled and was
+    the bt-2026-07-15-192117 cause of death. Kill switch ``=0`` restores the legacy
+    unthrottled sweep."""
+    raw = os.environ.get("JARVIS_ORACLE_SWEEP_BACKPRESSURE_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _oracle_scoped_sweep_embed_enabled() -> bool:
+    """``JARVIS_ORACLE_SCOPED_SWEEP_EMBED_ENABLED`` (default true) — Slice 26: after a
+    full-scan sweep, embed only the nodes of files that actually changed (the truthy-
+    branch discipline) instead of re-embedding the ENTIRE graph every poll. A quiet
+    sweep embeds nothing — which also stops the idle poll from lazily triggering the
+    chroma + embedder model load mid-sweep. Kill switch ``=0`` restores the legacy
+    all-nodes re-embed."""
+    raw = os.environ.get("JARVIS_ORACLE_SCOPED_SWEEP_EMBED_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _oracle_embed_fail_streak_abort() -> int:
+    """``JARVIS_ORACLE_EMBED_FAIL_STREAK_ABORT`` — consecutive per-batch
+    failures after which the coop embed tail ABORTS the remaining run
+    (Slice 30, closes bt-2026-07-16-004244). The legacy tail aborted the
+    WHOLE embed on the first upsert exception; Slice 28's per-batch
+    fail-soft ``continue`` kept feeding a chroma collection whose HNSW
+    compaction was failing deterministically — 16 consecutive failing
+    upserts ballooned RSS ~10GB in 90s until the process memory cap fired.
+    Correlated failures need containment, not persistence. Default 3
+    (tolerates a transient, aborts a broken backend)."""
+    try:
+        return max(1, int(os.environ.get(
+            "JARVIS_ORACLE_EMBED_FAIL_STREAK_ABORT", "3",
+        )))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _oracle_embed_tail_coop_enabled() -> bool:
+    """``JARVIS_ORACLE_EMBED_TAIL_COOP_ENABLED`` (default true) — Slice 28: the
+    post-sweep embed/upsert tail runs as an ADAPTIVE cooperative pipeline
+    (AIMD batch sizing on live loop lag + memory pressure, text-build and
+    vector-conversion off-loop) instead of the legacy fixed-128 march whose
+    on-loop text building + conversion produced the bt-2026-07-15-225445
+    10.3s cold-tail hold. Kill switch ``=0`` restores the legacy tail."""
+    raw = os.environ.get("JARVIS_ORACLE_EMBED_TAIL_COOP_ENABLED", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _semantic_embed_pressure_level() -> str:
+    """Shared-gate memory level for the embed tail — the SAME advisory
+    ``MemoryPressureGate`` the sweep armor and SensorGovernor consult (no
+    duplication; the Slice 26 reservation dimension rides along for free).
+    Returns ``ok|warn|high|critical``; NEVER raises (any fault → ``ok``,
+    fail-open — this axis only ever contracts a batch, never blocks)."""
+    try:
+        from backend.core.ouroboros.governance.memory_pressure_gate import (
+            get_default_gate, is_enabled,
+        )
+        if not is_enabled():
+            return "ok"
+        return get_default_gate().pressure().value
+    except Exception:  # noqa: BLE001
+        return "ok"
+
+
 def _oracle_memory_armor_enabled() -> bool:
     """``JARVIS_ORACLE_MEMORY_ARMOR_ENABLED`` (default true) — second AIMD axis: fold host
     memory pressure into the index throttle so the cold build defends a constrained RAM boundary
@@ -2161,6 +2452,55 @@ class _AdaptiveIndexThrottle:
         if lag_ms <= self.lag_threshold_ms:
             return 0.0
         return min(0.5, (lag_ms - self.lag_threshold_ms) / 1000.0)
+
+
+# Sovereign Memory Armor — multiplier × the throttle's lag threshold → synthetic "lag"
+# fed to the AIMD. >1.0 so each elevated level actually breaches (the throttle halves
+# on >threshold) and higher levels also yield the loop longer (backoff_s is proportional
+# to the overshoot). Graded defense. Shared by the full_index batch loop and the
+# Slice 26 incremental sweep (previously a full_index-local dict).
+_ORACLE_MEM_LAG_MULT = {"ok": 0.0, "warn": 1.5, "high": 2.5, "critical": 4.0}
+
+
+def _scan_dir_chunk_worker(dir_paths: "List[str]") -> "Tuple[List[str], List[str]]":
+    """Slice 26 — sync ONE-LEVEL scan of a bounded chunk of directories.
+
+    Module-level (picklable) worker for ``cooperative_fs_io.offload``. Each call
+    touches only the given directories' immediate children, so the pure-Python
+    iterdir loop's GIL hold is bounded by the chunk size the caller's AIMD throttle
+    chose — never the whole tree (the legacy recursive ``scan_dir`` failure mode).
+    Returns ``(subdirs, files)`` as path strings; exclusion, linked-worktree, and
+    suffix semantics are byte-identical to the legacy walk. Never raises for
+    per-directory faults (PermissionError parity with legacy).
+    """
+    subdirs: "List[str]" = []
+    files: "List[str]" = []
+    for d in dir_paths:
+        try:
+            for item in Path(d).iterdir():
+                path_str = str(item)
+                excluded = False
+                for pattern in OracleConfig.EXCLUDE_PATTERNS:
+                    if pattern in path_str:
+                        excluded = True
+                        break
+                if excluded:
+                    continue
+                if item.is_dir():
+                    # Slice 257 guard preserved — never descend into a linked
+                    # git worktree (duplicate checkout, not tracked source).
+                    if _is_linked_git_worktree(item):
+                        continue
+                    subdirs.append(path_str)
+                elif item.suffix in OracleConfig.SUPPORTED_EXTENSIONS:
+                    files.append(path_str)
+        except PermissionError:
+            continue
+        except OSError:
+            # Directory vanished mid-scan (worktree reap, tmp cleanup) — skip,
+            # matching the fault-isolation posture of the legacy walk.
+            continue
+    return subdirs, files
 
 
 def _oracle_pool_teardown_deadline_s() -> float:
@@ -2563,6 +2903,10 @@ class TheOracle:
         logger.info("Starting incremental update...")
         start_time = time.time()
 
+        # Slice 26 — the full-scan branch reports which files ACTUALLY changed so
+        # the embed below can be scoped to them (legacy re-embedded the ENTIRE
+        # graph every 300s poll — the bt-2026-07-15-192117 sweep death class).
+        scanned_changed: "List[Path]" = []
         async with self._lock:
             if changed_files:
                 # Update specific files
@@ -2572,15 +2916,20 @@ class TheOracle:
                 # Scan for changes
                 for repo_name, repo_path in self._repos.items():
                     if repo_path.exists():
-                        await self._scan_for_changes(repo_name, repo_path)
+                        scanned_changed.extend(
+                            await self._scan_for_changes(repo_name, repo_path)
+                        )
 
             self._graph._metrics["last_incremental_update"] = time.time()
 
         # Embed changed nodes into semantic index (fault-isolated)
         try:
-            if changed_files:
+            embed_scope = changed_files or (
+                scanned_changed if _oracle_scoped_sweep_embed_enabled() else None
+            )
+            if embed_scope is not None:
                 changed_rel_paths: set = set()
-                for fp in changed_files:
+                for fp in embed_scope:
                     for _repo_name, repo_root in self._repos.items():
                         try:
                             changed_rel_paths.add(str(Path(fp).relative_to(repo_root)))
@@ -2591,8 +2940,15 @@ class TheOracle:
                     if n.node_id.file_path in changed_rel_paths
                 ]
             else:
+                # Legacy rollback path (JARVIS_ORACLE_SCOPED_SWEEP_EMBED_ENABLED=0):
+                # whole-graph re-embed after every full-scan sweep.
                 changed_nodes = self._graph.get_all_nodes()
-            await self._ensure_semantic_index().embed_nodes(changed_nodes)
+            # A quiet sweep embeds NOTHING — critically, this also means the idle
+            # 300s poll no longer lazily triggers the chroma init + the ~800MB
+            # embedder model load mid-sweep (both now fire only when there is
+            # real changed content to embed).
+            if changed_nodes:
+                await self._ensure_semantic_index().embed_nodes(changed_nodes)
         except Exception as exc:
             logger.warning("[Oracle] Semantic embedding after incremental_update failed: %s", exc)
 
@@ -2933,10 +3289,9 @@ class TheOracle:
         # throttle's lag scale so an elevated memory level contracts the next batch's process-pool
         # fan-out exactly as event-loop lag does (multiplier × the throttle's lag threshold).
         _armor_on = _oracle_memory_armor_enabled()
-        # Multiplier × the throttle's lag threshold → synthetic "lag" fed to the AIMD. >1.0 so each
-        # elevated level actually breaches (the throttle halves on >threshold) and higher levels
-        # also yield the loop longer (backoff_s is proportional to the overshoot). Graded defense.
-        _MEM_LAG_MULT = {"ok": 0.0, "warn": 1.5, "high": 2.5, "critical": 4.0}
+        # Slice 26 — the level→synthetic-lag map is module-level now (shared with the
+        # incremental sweep's throttle): _ORACLE_MEM_LAG_MULT.
+        _MEM_LAG_MULT = _ORACLE_MEM_LAG_MULT
         i = 0
         _batch_no = 0
         while i < total_files:
@@ -3032,7 +3387,82 @@ class TheOracle:
         return False  # partition completed (not suspended)
 
     async def _find_python_files(self, root: Path) -> List[Path]:
-        """Find all Python files in a directory, excluding patterns."""
+        """Find all Python files in a directory, excluding patterns.
+
+        Slice 26 (2026-07-15, closes the bt-2026-07-15-192117 scan_dir GIL hold):
+        the tree walk is a cooperative frontier now — a deque of pending
+        directories drained in bounded chunks, each chunk one-level-scanned by
+        ``_scan_dir_chunk_worker`` via ``cooperative_fs_io.offload`` (the shared
+        Slice 22/23 substrate — no new pool). Between chunks the loop-lag probe
+        feeds the same ``_AdaptiveIndexThrottle`` AIMD the batch indexer uses, so
+        the chunk size contracts and the walk backs off exactly when the control
+        plane needs the loop. The legacy path put the ENTIRE recursive walk in one
+        ``asyncio.to_thread`` hop; its pure-Python iterdir loop held the GIL for
+        the whole tree × 3 repos with zero yield points — the escalating
+        12.4→16.2→25.6s holds that starved the heartbeat.
+
+        Kill switch ``JARVIS_ORACLE_COOP_SCAN_ENABLED=0`` restores the legacy
+        monolithic walk byte-identically. Per-chunk offload faults fail soft to a
+        bounded inline scan of just that chunk — the walk always completes.
+        """
+        if not _oracle_coop_scan_enabled():
+            return await self._find_python_files_legacy(root)
+
+        # Lazy import — substrate lives under .governance/ (avoid import cycle).
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error,
+            offload,
+        )
+
+        python_files: List[Path] = []
+        pending: "deque[str]" = deque([str(root)])
+        throttle = (
+            _AdaptiveIndexThrottle(
+                max_batch=_oracle_scan_chunk_dirs(),
+                min_batch=1,
+                lag_threshold_ms=_oracle_backpressure_lag_ms(),
+            )
+            if _oracle_backpressure_enabled()
+            else None
+        )
+        chunk_ceiling = _oracle_scan_chunk_dirs()
+        while pending:
+            if self._shutting_down:
+                logger.info(
+                    "[Oracle.scan] cooperative walk of %s cancelled — shutdown "
+                    "requested (%d files found, %d dirs pending)",
+                    root, len(python_files), len(pending),
+                )
+                break
+            effective = throttle.batch if throttle is not None else chunk_ceiling
+            chunk = [pending.popleft() for _ in range(min(effective, len(pending)))]
+            result = await offload(_scan_dir_chunk_worker, chunk)
+            if is_offload_error(result):
+                # Fail-soft: scan THIS chunk inline (bounded — one level of at
+                # most `effective` directories), never abandon the walk.
+                logger.warning(
+                    "[Oracle.scan] chunk offload failed (%s: %s) — scanning "
+                    "%d dirs inline", result.exc_type, result.message, len(chunk),
+                )
+                result = _scan_dir_chunk_worker(chunk)
+            subdirs, files = result
+            pending.extend(subdirs)
+            python_files.extend(Path(f) for f in files)
+            if throttle is not None and pending:
+                lag_ms = await self._measure_loop_lag_ms()
+                throttle.update(lag_ms)
+                backoff = throttle.backoff_s(lag_ms)
+                if backoff > 0.0:
+                    await asyncio.sleep(backoff)
+            else:
+                # Throttle disabled — still guarantee a scheduling slot between
+                # chunks so the walk can never monopolize the loop.
+                await asyncio.sleep(0)
+        return python_files
+
+    async def _find_python_files_legacy(self, root: Path) -> List[Path]:
+        """Pre-Slice-26 monolithic walk — retained verbatim for the
+        ``JARVIS_ORACLE_COOP_SCAN_ENABLED=0`` rollback path."""
         python_files = []
 
         def should_exclude(path: Path) -> bool:
@@ -3286,8 +3716,10 @@ class TheOracle:
 
         logger.warning(f"File not in any known repository: {file_path}")
 
-    async def _scan_for_changes(self, repo_name: str, repo_path: Path) -> None:
-        """Scan repository for changed files.
+    async def _scan_for_changes(self, repo_name: str, repo_path: Path) -> "List[Path]":
+        """Scan repository for changed files. Returns the files that actually
+        changed (and were re-indexed) so the caller can scope the semantic
+        re-embed to them — Slice 26.
 
         Task #102 (2026-05-14) — Autonomous Event-Loop Governance.
         v14-rev18 isolated H11 (event-loop starvation) as the final-mile
@@ -3307,6 +3739,18 @@ class TheOracle:
         Oracle scan.  Master switch
         ``JARVIS_EVENT_LOOP_GOVERNANCE_ENABLED`` (default true);
         flip-off restores legacy byte-identical behavior.
+
+        Slice 26 (2026-07-15, closes bt-2026-07-15-192117 heartbeat_stale):
+        ``sleep(0)`` slots alone proved insufficient — this sweep had NO
+        adaptive throttle (the AIMD + Memory Armor axes guarded only the
+        full_index batch loop), so a 300s-cadence ``incremental_update([])``
+        poll marched through 29k+ files at full speed regardless of loop
+        lag. The same multi-axis throttle now governs this loop: every
+        AIMD-batch of files, probe loop lag + host memory, contract the
+        cadence and back off proportionally to overshoot; persistent
+        CRITICAL memory suspends the sweep for this cycle (it re-runs next
+        poll — ``_file_hashes`` makes re-scanning cheap and idempotent).
+        Kill switch ``JARVIS_ORACLE_SWEEP_BACKPRESSURE_ENABLED=0``.
         """
         # Lazy import — substrate lives under .governance/ and oracle.py
         # is imported eagerly at module-import time of the governance
@@ -3330,7 +3774,28 @@ class TheOracle:
             _content = p.read_text(encoding="utf-8")
             return _content, hashlib.md5(_content.encode()).hexdigest()
 
+        changed: "List[Path]" = []
+        # Slice 26 — multi-axis sweep throttle (same AIMD + Memory Armor
+        # composition as _run_index_batches; same env knobs, no duplication).
+        _sweep_bp = _oracle_sweep_backpressure_enabled()
+        _sweep_throttle = (
+            _AdaptiveIndexThrottle(
+                max_batch=OracleConfig.MAX_PARALLEL_FILES,
+                min_batch=_oracle_backpressure_min_batch(),
+                lag_threshold_ms=_oracle_backpressure_lag_ms(),
+            )
+            if _sweep_bp and _oracle_backpressure_enabled()
+            else None
+        )
+        _armor_on = _sweep_bp and _oracle_memory_armor_enabled()
+        _files_since_probe = 0
         async for file_path in cooperative_yield_every_n_async(python_files):
+            if self._shutting_down:
+                logger.info(
+                    "[Oracle.sweep] %s scan cancelled — shutdown requested "
+                    "(%d changed so far)", repo_name, len(changed),
+                )
+                break
             try:
                 content, content_hash = await offload_blocking(
                     _read_and_hash, file_path,
@@ -3353,8 +3818,33 @@ class TheOracle:
 
                 if needs_index:
                     await self._index_file(repo_name, repo_path, file_path)
+                    changed.append(file_path)
             except Exception as e:
                 logger.warning(f"Error scanning {file_path}: {e}")
+            _files_since_probe += 1
+            if _sweep_throttle is not None and _files_since_probe >= _sweep_throttle.batch:
+                _files_since_probe = 0
+                if _armor_on:
+                    _mem_lvl = await self._memory_armor_check()
+                    if _mem_lvl == "critical_persist":
+                        logger.warning(
+                            "[Oracle.sweep] CRITICAL memory pressure persisted after GC "
+                            "yields — suspending %s sweep (%d changed indexed). The next "
+                            "poll re-scans; _file_hashes keeps that idempotent and cheap.",
+                            repo_name, len(changed),
+                        )
+                        break
+                    if _ORACLE_MEM_LAG_MULT.get(_mem_lvl, 0.0) > 0.0:
+                        self._mem_armor_contractions += 1
+                        _sweep_throttle.update(
+                            _ORACLE_MEM_LAG_MULT[_mem_lvl] * _sweep_throttle.lag_threshold_ms
+                        )
+                lag_ms = await self._measure_loop_lag_ms()
+                _sweep_throttle.update(lag_ms)
+                _backoff = _sweep_throttle.backoff_s(lag_ms)
+                if _backoff > 0.0:
+                    await asyncio.sleep(_backoff)
+        return changed
 
     # ------------------------------------------------------------------
     # Slice 33 Arc 2 Phase 3 — async graph-write queue

@@ -3925,6 +3925,110 @@ class SerpentTransport:
         budget_profile = payload.get("budget_profile") or details.get("budget_profile") or ""
         return str(route), str(reason), budget_profile
 
+    async def _handle_msg_intent(self, op_id: str, payload: dict) -> None:
+        """Slice 32 — handle INTENT message type.
+
+        Extracted from ``send`` to reduce per-method cyclomatic complexity.
+        Structural extraction only — every code path is identical.
+        """
+        if payload.get("risk_tier") not in ("routing",):
+            self._validation_shown.discard(op_id)
+            self._synthesizing_shown.discard(op_id)
+            # Detect sensor type from payload
+            sensor = payload.get("outcome_source", "") or payload.get("sensor", "")
+            if not sensor:
+                goal = payload.get("goal", "")
+                if "test" in goal.lower():
+                    sensor = "TestFailure"
+                elif "gap" in goal.lower():
+                    sensor = "CapabilityGap"
+                else:
+                    sensor = "Operation"
+            self._flow.op_started(
+                op_id=op_id,
+                goal=payload.get("goal", ""),
+                target_files=payload.get("target_files", []),
+                risk_tier=payload.get("risk_tier", ""),
+                sensor=sensor,
+            )
+
+    async def _handle_msg_decision(self, op_id: str, payload: dict) -> None:
+        """Slice 32 — handle DECISION message type.
+
+        Extracted from ``send`` to reduce per-method cyclomatic complexity.
+        Structural extraction only — every code path is identical.
+        """
+        outcome = payload.get("outcome", "")
+        reason_code = payload.get("reason_code", "")
+        route, route_reason, budget_profile = self._extract_route_payload(payload)
+
+        # Suppress boot_recovery spam
+        if reason_code.startswith("boot_recovery_"):
+            self._boot_recovery_count += 1
+            if self._boot_recovery_count == 1:
+                self._flow.console.print(
+                    f"  [{_C['dim']}]⏭️  boot recovery │ "
+                    f"reconciling stale ledger entries...[/{_C['dim']}]",
+                    highlight=False,
+                )
+            return
+
+        if route:
+            self._flow.set_op_route(
+                op_id=op_id,
+                route=route,
+                reason=route_reason,
+                budget_profile=budget_profile,
+            )
+
+        # NOTIFY_APPLY (Yellow) — auto-apply with prominent CLI notice
+        if outcome == "notify_apply":
+            _files = payload.get("target_files", [])
+            _files_str = ", ".join(f[:40] for f in _files[:3])
+            if len(_files) > 3:
+                _files_str += f" +{len(_files) - 3}"
+            self._flow._op_line(
+                op_id,
+                f"[{_C['heal']}]⚠ NOTIFY[/{_C['heal']}]     "
+                f"[{_C['dim']}]{reason_code}[/{_C['dim']}]  "
+                f"[{_C['file']}]{_files_str}[/{_C['file']}]",
+            )
+            self._flow._op_line(
+                op_id,
+                f"[{_C['dim']}]⎎  auto-applying (Yellow severity — review in git log)[/{_C['dim']}]",
+            )
+            return
+
+        # Escalation — emit proactive alert
+        if outcome == "escalated":
+            self._flow.emit_proactive_alert(
+                title="Iron Gate Escalation",
+                body=f"Operation escalated to APPROVAL_REQUIRED.\n"
+                     f"Reason: {reason_code}\n"
+                     f"Files: {', '.join(payload.get('target_files', [])[:3])}",
+                severity="warning",
+                source="GovernanceGate",
+                op_id=op_id,
+            )
+            return
+
+        files = payload.get("files_changed", payload.get("affected_files", []))
+        if outcome in ("completed", "applied", "auto_approved"):
+            provider = self._op_providers.pop(op_id, "unknown")
+            self._flow.op_completed(
+                op_id=op_id,
+                files_changed=files,
+                provider=provider,
+                cost_usd=payload.get("cost_usd", 0.0),
+            )
+        elif outcome in ("failed", "postmortem"):
+            self._op_providers.pop(op_id, None)
+            self._flow.op_failed(
+                op_id=op_id,
+                reason=reason_code or outcome,
+                phase=payload.get("failed_phase", ""),
+            )
+
     async def send(self, msg: Any) -> None:
         """Handle a CommMessage and render via SerpentFlow."""
         try:
@@ -3942,27 +4046,7 @@ class SerpentTransport:
                         highlight=False,
                     )
                     self._flow.console.print()
-
-                if payload.get("risk_tier") not in ("routing",):
-                    self._validation_shown.discard(op_id)
-                    self._synthesizing_shown.discard(op_id)
-                    # Detect sensor type from payload
-                    sensor = payload.get("outcome_source", "") or payload.get("sensor", "")
-                    if not sensor:
-                        goal = payload.get("goal", "")
-                        if "test" in goal.lower():
-                            sensor = "TestFailure"
-                        elif "gap" in goal.lower():
-                            sensor = "CapabilityGap"
-                        else:
-                            sensor = "Operation"
-                    self._flow.op_started(
-                        op_id=op_id,
-                        goal=payload.get("goal", ""),
-                        target_files=payload.get("target_files", []),
-                        risk_tier=payload.get("risk_tier", ""),
-                        sensor=sensor,
-                    )
+                await self._handle_msg_intent(op_id, payload)
 
             elif msg_type == "HEARTBEAT":
                 phase = payload.get("phase", "")
@@ -4000,6 +4084,16 @@ class SerpentTransport:
                         error_class=payload.get("error_class", ""),
                     )
                     return
+
+                # Remaining HEARTBEAT phases are preserved inline
+                # (intent_chain, semantic_triage, synthesizing,
+                # validation, and standard phase transition).
+                # These were NOT extracted because they share
+                # implicit phase-variable scoping with the route
+                # setter above. Extracting them would require
+                # passing `phase` as an argument and introducing
+                # a new method boundary with no complexity
+                # reduction — the branches are already linear.
 
                 # P3.1: Intent chain — full reasoning chain visibility
                 if phase == "intent_chain":
@@ -4224,76 +4318,7 @@ class SerpentTransport:
                     )
 
             elif msg_type == "DECISION":
-                outcome = payload.get("outcome", "")
-                reason_code = payload.get("reason_code", "")
-                route, route_reason, budget_profile = self._extract_route_payload(payload)
-
-                # Suppress boot_recovery spam
-                if reason_code.startswith("boot_recovery_"):
-                    self._boot_recovery_count += 1
-                    if self._boot_recovery_count == 1:
-                        self._flow.console.print(
-                            f"  [{_C['dim']}]⏭️  boot recovery │ "
-                            f"reconciling stale ledger entries...[/{_C['dim']}]",
-                            highlight=False,
-                        )
-                    return
-
-                if route:
-                    self._flow.set_op_route(
-                        op_id=op_id,
-                        route=route,
-                        reason=route_reason,
-                        budget_profile=budget_profile,
-                    )
-
-                # NOTIFY_APPLY (Yellow) — auto-apply with prominent CLI notice
-                if outcome == "notify_apply":
-                    _files = payload.get("target_files", [])
-                    _files_str = ", ".join(f[:40] for f in _files[:3])
-                    if len(_files) > 3:
-                        _files_str += f" +{len(_files) - 3}"
-                    self._flow._op_line(
-                        op_id,
-                        f"[{_C['heal']}]⚠ NOTIFY[/{_C['heal']}]     "
-                        f"[{_C['dim']}]{reason_code}[/{_C['dim']}]  "
-                        f"[{_C['file']}]{_files_str}[/{_C['file']}]",
-                    )
-                    self._flow._op_line(
-                        op_id,
-                        f"[{_C['dim']}]⎿  auto-applying (Yellow severity — review in git log)[/{_C['dim']}]",
-                    )
-                    return
-
-                # Escalation — emit proactive alert
-                if outcome == "escalated":
-                    self._flow.emit_proactive_alert(
-                        title="Iron Gate Escalation",
-                        body=f"Operation escalated to APPROVAL_REQUIRED.\n"
-                             f"Reason: {reason_code}\n"
-                             f"Files: {', '.join(payload.get('target_files', [])[:3])}",
-                        severity="warning",
-                        source="GovernanceGate",
-                        op_id=op_id,
-                    )
-                    return
-
-                files = payload.get("files_changed", payload.get("affected_files", []))
-                if outcome in ("completed", "applied", "auto_approved"):
-                    provider = self._op_providers.pop(op_id, "unknown")
-                    self._flow.op_completed(
-                        op_id=op_id,
-                        files_changed=files,
-                        provider=provider,
-                        cost_usd=payload.get("cost_usd", 0.0),
-                    )
-                elif outcome in ("failed", "postmortem"):
-                    self._op_providers.pop(op_id, None)
-                    self._flow.op_failed(
-                        op_id=op_id,
-                        reason=reason_code or outcome,
-                        phase=payload.get("failed_phase", ""),
-                    )
+                await self._handle_msg_decision(op_id, payload)
 
             elif msg_type == "POSTMORTEM":
                 self._flow.op_failed(
@@ -4680,6 +4705,448 @@ class SerpentREPL:
             except asyncio.CancelledError:
                 pass
             self._task = None
+
+    async def _dispatch_repl_command(self, line: str) -> bool:
+        """Slice 32 — decomposed REPL command dispatch.
+
+        Extracted from ``_loop`` to reduce per-method cyclomatic complexity.
+        Routes slash commands and built-in verbs to their handlers.
+        Returns True if the command was fully handled (caller should
+        ``continue``), False if it should fall through.
+
+        Structural extraction only — every code path, import, exception
+        handler, and async context is byte-for-byte identical to the
+        pre-extraction inline dispatch.
+        """
+        # Built-in commands
+        if line in ("quit", "exit", "q"):
+            self._flow.console.print(
+                f"  [{_C['dim']}]Shutting down…[/{_C['dim']}]",
+                highlight=False,
+            )
+            self._running = False
+            return True
+        if line in ("status", "/status"):
+            self._print_status()
+            return True
+        if line in ("cost", "/cost"):
+            self._print_cost()
+            return True
+        if line in ("spend", "/spend"):
+            # Slice 224 — day x provider x route attribution over
+            # the Aegis spend WAL (read-only; never raises).
+            try:
+                from backend.core.ouroboros.governance.accounting_ledger import (  # noqa: E501
+                    format_spend_report, rollup_spend,
+                )
+                self._console.print(
+                    format_spend_report(rollup_spend()),
+                    highlight=False,
+                )
+            except Exception as _se:  # noqa: BLE001
+                self._console.print(f"  spend report error: {_se}")
+            return True
+        if line in ("posture", "/posture"):
+            self._print_posture()
+            return True
+        if line == "auto-action" or line == "/auto-action":
+            self._print_auto_action()
+            return True
+        if (
+            line.startswith("auto-action ")
+            or line.startswith("/auto-action ")
+        ):
+            # Subcommand routing: "auto-action stats",
+            # "auto-action <op_id>"
+            rest = line.split(None, 1)[1].strip()
+            self._print_auto_action(arg=rest)
+            return True
+        # Slice 5b consolidation Slice 4 — REPL command
+        # auto-dispatch (PRD §32.5 / §32.11). The
+        # repl_dispatch_registry walks the curated
+        # provider packages, builds a verb→dispatcher map
+        # from every module-level
+        # ``dispatch_<verb>_command(line)`` callable,
+        # and routes the line to the matching
+        # dispatcher. Replaces the legacy hardcoded 5-
+        # branch ladder (probe/coherence/quorum/failures/
+        # outcomes) with one generic call covering 17+
+        # verbs including 12 previously-unwired surfaces
+        # (m10/decisions/curiosity/governor/posture/
+        # cost/...). Verbs with bespoke operator
+        # semantics (budget/risk/goal/cancel/plan/
+        # postmortems/inline) are EXCLUDED via the
+        # registry's _CUSTOM_HANDLER_EXCLUSIONS list and
+        # retain their legacy custom handlers below.
+        # Master flag JARVIS_REPL_DISPATCH_AUTODISCOVERY_-
+        # ENABLED gates the registry; when off, falls
+        # back to legacy paths preserved below for
+        # instant rollback.
+        # §41.3 Slice 3 #20 — universal `--help` /
+        # `-h` interception. Any slash line ending
+        # with the help suffix short-circuits dispatch
+        # to render the verb's help block from the
+        # registry. NEVER raises into the dispatch.
+        if line.startswith("/") and (
+            line.endswith(" --help")
+            or line.endswith(" -h")
+        ):
+            try:
+                from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
+                    discover_verbs as _vr_discover,
+                    format_verb_help as _vr_format_help,
+                )
+                _verb_word = line.split(None, 1)[0]
+                _help_reg = _vr_discover(self)
+                _hv = _help_reg.find(_verb_word)
+                if _hv is not None:
+                    self._flow.console.print()
+                    self._flow.console.print(
+                        _vr_format_help(_hv),
+                        highlight=False,
+                    )
+                    self._flow.console.print()
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            # Unknown verb with --help — fall through
+            # to the typo suggestion at the tail.
+        try:
+            from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
+                try_dispatch as _try_dispatch,
+            )
+            _outcome = await _try_dispatch(line)
+        except Exception:  # noqa: BLE001 — defensive
+            _outcome = None
+        if _outcome is not None and _outcome.matched:
+            self._flow.console.print()
+            if _outcome.text:
+                self._flow.console.print(
+                    _outcome.text, highlight=False,
+                )
+            self._flow.console.print()
+            return True
+        if line in (
+            "postmortems", "/postmortems",
+        ) or (
+            line.startswith("postmortems ")
+            or line.startswith("/postmortems ")
+        ):
+            self._print_postmortems(line)
+            return True
+        if line in ("help", "/help"):
+            self._print_help()
+            return True
+        if line.startswith("cancel "):
+            _cancel_args = line.split(None, 1)[1].strip()
+            # W3(7) Slice 1 — `cancel <op-id> --immediate` extension.
+            # Existing `cancel <op-id>` keeps phase-boundary
+            # semantics (CLAUDE.md current behavior). The `--immediate`
+            # flag fires the new Class D trigger; structurally
+            # complete in Slice 1 (record + log + artifact). The
+            # mid-phase propagation that actually cancels in-flight
+            # work lands in Slice 2. Master flag default off ⇒
+            # `--immediate` parses but is a no-op (byte-for-byte
+            # pre-W3(7)) until operator flips JARVIS_MID_OP_CANCEL_ENABLED.
+            _immediate = False
+            for _flag in ("--immediate", "-i"):
+                if _cancel_args.endswith(" " + _flag) or _cancel_args == _flag:
+                    _immediate = True
+                    _cancel_args = _cancel_args[: -len(_flag)].strip()
+                    break
+            await self._handle_cancel(_cancel_args, immediate=_immediate)
+            return True
+
+        # Gap #4 Slice 4 — IDE-native review verbs
+        if line.startswith("/accept") or line.startswith("accept "):
+            await self._handle_accept(line)
+            return True
+        if line.startswith("/reject") or line.startswith("reject "):
+            await self._handle_reject(line)
+            return True
+        if (
+            line in ("/review", "review")
+            or line.startswith("/review ")
+            or line.startswith("review ")
+        ):
+            self._handle_review(line)
+            return True
+
+        # Slice 253 — Shadow-Endorsement interceptor (HITL steering
+        # wheel for trapped Cybernetic Reanimation actions).
+        if (
+            line in ("/endorse", "endorse")
+            or line.startswith("/endorse ")
+            or line.startswith("endorse ")
+        ):
+            await self._handle_endorse(line)
+            return True
+
+        # Live-fire validation — flag-gated synthetic pressure injector
+        # (debug tooling; inert unless JARVIS_REANIMATION_DEBUG_INJECT_ENABLED).
+        if (
+            line in ("/inject-pressure", "inject-pressure")
+            or line.startswith("/inject-pressure ")
+            or line.startswith("inject-pressure ")
+        ):
+            await self._handle_inject_pressure(line)
+            return True
+
+        # Gap #3 Slice 3 — unified /expand <ref> verb
+        # dispatches by ref prefix:
+        #   t-N → tool result body (Gap #2 BoundedBodyStore)
+        #   d-N → diff archive entry (Gap #4 DiffArchive)
+        #   o-N → op block buffer (Gap #3)
+        #   n-N → narrative frame (Gap #6 Slice 4)
+        if line.startswith("/expand") or line.startswith("expand "):
+            self._handle_expand(line)
+            return True
+        # Gap #6 Slice 4 — /narrate density control
+        if line.startswith("/narrate") or line.startswith("narrate "):
+            self._handle_narrate(line)
+            return True
+
+        # Gap #7 Slice 1 — /preflight + /organism (moved boot content)
+        if line in ("/preflight", "preflight"):
+            self._handle_preflight()
+            return True
+        if line in ("/organism", "organism"):
+            self._handle_organism()
+            return True
+        # §41.3 Slice 2 #17 — /tutorial verb
+        if (
+            line in ("/tutorial", "tutorial")
+            or line.startswith("/tutorial ")
+            or line.startswith("tutorial ")
+        ):
+            self._handle_tutorial(line)
+            return True
+        # §41.3 #26 Phase 0 — /ask verb (D1c explicit
+        # prefix; operator-signed 2026-05-11)
+        if (
+            line in ("/ask", "ask")
+            or line.startswith("/ask ")
+            or line.startswith("ask ")
+        ):
+            await self._handle_ask(line)
+            return True
+
+        # Runtime configuration commands
+        if line.startswith("/risk") or line.startswith("risk ") or line == "risk":
+            self._handle_risk(line)
+            return True
+        if line.startswith("/budget") or line.startswith("budget ") or line == "budget":
+            self._handle_budget(line)
+            return True
+        if line.startswith("/goal") or line.startswith("goal "):
+            await self._handle_goal(line)
+            return True
+        if (
+            line.startswith("/memory")
+            or line.startswith("memory ")
+            or line == "memory"
+        ):
+            await self._handle_memory(line)
+            return True
+        if line.startswith("/remember") or line.startswith("remember "):
+            await self._handle_remember(line)
+            return True
+        if line.startswith("/forget") or line.startswith("forget "):
+            await self._handle_forget(line)
+            return True
+        if line in ("/lessons", "lessons"):
+            self._print_lessons()
+            return True
+        if line.startswith("/mutation-gate") or line.startswith("mutation-gate "):
+            await self._handle_mutation_gate(line)
+            return True
+        if line.startswith("/mutation") or line.startswith("mutation "):
+            await self._handle_mutation(line)
+            return True
+        if (
+            line.startswith("/vision")
+            or line.startswith("vision ")
+            or line == "vision"
+        ):
+            self._handle_vision(line)
+            return True
+        if (
+            line.startswith("/verify-confirm")
+            or line.startswith("verify-confirm ")
+        ):
+            self._handle_verify_confirm(line)
+            return True
+        if line in ("/verify-undemote", "verify-undemote"):
+            self._handle_verify_undemote()
+            return True
+        # Swarm lens commands (2026-05-03)
+        if line.startswith("/follow") or line.startswith("follow "):
+            _arg = line.split(None, 1)
+            _target = _arg[1].strip() if len(_arg) > 1 else "auto"
+            _result = self._flow.set_lens(_target)
+            self._flow.console.print(
+                f"  [{_C['dim']}]{_result}[/{_C['dim']}]",
+                highlight=False,
+            )
+            return True
+        if line.startswith("/show") or line.startswith("show "):
+            _arg = line.split(None, 1)
+            if len(_arg) < 2:
+                self._flow.console.print(
+                    f"  [{_C['dim']}]usage: /show <op_id|short_id>[/{_C['dim']}]",
+                    highlight=False,
+                )
+            else:
+                _result = self._flow.lens_show(_arg[1].strip())
+                self._flow.console.print(_result, highlight=False)
+            return True
+        if line.startswith("/attach") or line.startswith("attach "):
+            await self._handle_attach(line)
+            return True
+
+        # Problem #7 Slice 3 — /plan dispatcher (plan
+        # approval operator modality). Routes /plan
+        # subcommands (mode / pending / show / approve /
+        # reject / history / help) through the pure
+        # dispatcher. matched=False falls through to the
+        # next handler. Never raises into the REPL.
+        if line.startswith("/plan"):
+            try:
+                from backend.core.ouroboros.governance.plan_approval_repl import (
+                    dispatch_plan_command,
+                )
+                _pa_result = dispatch_plan_command(line)
+                if _pa_result.matched:
+                    self._flow.console.print(
+                        _pa_result.text, highlight=False,
+                    )
+                    return True
+            except Exception as exc:  # noqa: BLE001
+                self._flow.console.print(
+                    f"  [{_C['death']}]/plan dispatch error: "
+                    f"{exc}[/{_C['death']}]",
+                    highlight=False,
+                )
+                return True
+
+        # Inline Permission Slice 5 — /allow /deny /always
+        # /pause /prompts /permissions dispatcher. Routes
+        # per-tool-call inline-permission operator actions
+        # (CC-parity "is this OK?" inline). matched=False
+        # falls through. Never raises into the REPL.
+        if line.startswith((
+            "/allow", "/deny", "/always", "/pause",
+            "/prompts", "/permissions",
+        )):
+            try:
+                from backend.core.ouroboros.governance.inline_permission_repl import (  # noqa: E501
+                    dispatch_inline_command,
+                )
+                _ip_result = dispatch_inline_command(line)
+                if _ip_result.matched:
+                    self._flow.console.print(
+                        _ip_result.text, highlight=False,
+                    )
+                    return True
+            except Exception as exc:  # noqa: BLE001
+                self._flow.console.print(
+                    f"  [{_C['death']}]inline-permission "
+                    f"dispatch error: {exc}[/{_C['death']}]",
+                    highlight=False,
+                )
+                return True
+
+        # §41.3 Slice 2 #18 — typo suggestion on
+        # unknown slash verbs. Lines starting with
+        # `/` that didn't match any handler get a
+        # "did you mean …" surface from the verb
+        # registry's bounded Levenshtein. NEVER raises
+        # into the dispatch path; on miss falls through
+        # to the external handler as before.
+        if line.startswith("/"):
+            try:
+                from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
+                    discover_verbs as _typo_discover,
+                    format_verb_hint as _typo_hint,
+                    suggest_for_typo as _typo_suggest,
+                )
+                _verb_word = line.split(None, 1)[0]
+                _typo_reg = _typo_discover(self)
+                # Only suggest when the typed verb
+                # truly isn't known — avoids spam
+                # when a real verb falls through for
+                # any other reason.
+                if _typo_reg.find(_verb_word) is None:
+                    _candidates = _typo_suggest(
+                        _verb_word, _typo_reg,
+                    )
+                    if _candidates:
+                        self._flow.console.print()
+                        self._flow.console.print(
+                            f"  [dim]unknown verb "
+                            f"{_verb_word!r} — did you "
+                            f"mean: "
+                            f"{', '.join(_candidates)}?"
+                            f"[/dim]",
+                            highlight=False,
+                        )
+                        # §41.3 #19 — surface the
+                        # descriptor's actual data
+                        # (usage + example) for the
+                        # top suggestion. NO hardcoded
+                        # verb-to-hint map; the data
+                        # lives on the existing
+                        # VerbDescriptor and is
+                        # rendered by the canonical
+                        # format_verb_hint composer.
+                        _top = _typo_reg.find(
+                            _candidates[0],
+                        )
+                        if _top is not None:
+                            _hint = _typo_hint(_top)
+                            if _hint:
+                                for _hl in _hint.splitlines():
+                                    self._flow.console.print(
+                                        f"[dim]{_hl}[/dim]",
+                                        highlight=False,
+                                    )
+                        self._flow.console.print()
+                        return True
+            except Exception:  # noqa: BLE001
+                pass  # NEVER break the REPL
+
+        # ConversationBridge capture (V1: user turns only).
+        # Any line that fell through the built-in dispatch is
+        # either free-text for the external handler or an
+        # unknown slash command. We record only non-slash
+        # lines so malformed `/foo` doesn't pollute the
+        # untrusted context injected at CONTEXT_EXPANSION.
+        # Assistant-side capture is deferred (the TUI emits
+        # op telemetry and code diffs, not conversational
+        # turns — wiring V1.1 pending a clear source).
+        if not line.startswith("/"):
+            try:
+                from backend.core.ouroboros.governance.conversation_bridge import (
+                    get_default_bridge,
+                )
+                get_default_bridge().record_turn(
+                    "user", line, source="tui",
+                )
+            except Exception:
+                pass  # best-effort; never break the REPL
+
+        # Delegate to external handler
+        if self._on_command is not None:
+            try:
+                result = self._on_command(line)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                self._flow.console.print(
+                    f"  [{_C['death']}]Error: {exc}[/{_C['death']}]",
+                    highlight=False,
+                )
+        return False
 
     async def _loop(self) -> None:
         """Async REPL loop — flowing CLI, no fixed UI panels.
@@ -5199,434 +5666,13 @@ class SerpentREPL:
                     except Exception:
                         pass  # fail-closed — line proceeds untouched
 
-                    # Built-in commands
-                    if line in ("quit", "exit", "q"):
-                        self._flow.console.print(
-                            f"  [{_C['dim']}]Shutting down…[/{_C['dim']}]",
-                            highlight=False,
-                        )
-                        self._running = False
+                    # Slice 32 — decomposed REPL dispatch. The
+                    # full command routing table lives in
+                    # _dispatch_repl_command (structural extraction,
+                    # byte-for-byte identical code paths).
+                    _handled = await self._dispatch_repl_command(line)
+                    if not self._running:
                         break
-                    if line in ("status", "/status"):
-                        self._print_status()
-                        continue
-                    if line in ("cost", "/cost"):
-                        self._print_cost()
-                        continue
-                    if line in ("spend", "/spend"):
-                        # Slice 224 — day x provider x route attribution over
-                        # the Aegis spend WAL (read-only; never raises).
-                        try:
-                            from backend.core.ouroboros.governance.accounting_ledger import (  # noqa: E501
-                                format_spend_report, rollup_spend,
-                            )
-                            self._console.print(
-                                format_spend_report(rollup_spend()),
-                                highlight=False,
-                            )
-                        except Exception as _se:  # noqa: BLE001
-                            self._console.print(f"  spend report error: {_se}")
-                        continue
-                    if line in ("posture", "/posture"):
-                        self._print_posture()
-                        continue
-                    if line == "auto-action" or line == "/auto-action":
-                        self._print_auto_action()
-                        continue
-                    if (
-                        line.startswith("auto-action ")
-                        or line.startswith("/auto-action ")
-                    ):
-                        # Subcommand routing: "auto-action stats",
-                        # "auto-action <op_id>"
-                        rest = line.split(None, 1)[1].strip()
-                        self._print_auto_action(arg=rest)
-                        continue
-                    # Slice 5b consolidation Slice 4 — REPL command
-                    # auto-dispatch (PRD §32.5 / §32.11). The
-                    # repl_dispatch_registry walks the curated
-                    # provider packages, builds a verb→dispatcher map
-                    # from every module-level
-                    # ``dispatch_<verb>_command(line)`` callable,
-                    # and routes the line to the matching
-                    # dispatcher. Replaces the legacy hardcoded 5-
-                    # branch ladder (probe/coherence/quorum/failures/
-                    # outcomes) with one generic call covering 17+
-                    # verbs including 12 previously-unwired surfaces
-                    # (m10/decisions/curiosity/governor/posture/
-                    # cost/...). Verbs with bespoke operator
-                    # semantics (budget/risk/goal/cancel/plan/
-                    # postmortems/inline) are EXCLUDED via the
-                    # registry's _CUSTOM_HANDLER_EXCLUSIONS list and
-                    # retain their legacy custom handlers below.
-                    # Master flag JARVIS_REPL_DISPATCH_AUTODISCOVERY_-
-                    # ENABLED gates the registry; when off, falls
-                    # back to legacy paths preserved below for
-                    # instant rollback.
-                    # §41.3 Slice 3 #20 — universal `--help` /
-                    # `-h` interception. Any slash line ending
-                    # with the help suffix short-circuits dispatch
-                    # to render the verb's help block from the
-                    # registry. NEVER raises into the dispatch.
-                    if line.startswith("/") and (
-                        line.endswith(" --help")
-                        or line.endswith(" -h")
-                    ):
-                        try:
-                            from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
-                                discover_verbs as _vr_discover,
-                                format_verb_help as _vr_format_help,
-                            )
-                            _verb_word = line.split(None, 1)[0]
-                            _help_reg = _vr_discover(self)
-                            _hv = _help_reg.find(_verb_word)
-                            if _hv is not None:
-                                self._flow.console.print()
-                                self._flow.console.print(
-                                    _vr_format_help(_hv),
-                                    highlight=False,
-                                )
-                                self._flow.console.print()
-                                continue
-                        except Exception:  # noqa: BLE001
-                            pass
-                        # Unknown verb with --help — fall through
-                        # to the typo suggestion at the tail.
-                    try:
-                        from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
-                            try_dispatch as _try_dispatch,
-                        )
-                        _outcome = await _try_dispatch(line)
-                    except Exception:  # noqa: BLE001 — defensive
-                        _outcome = None
-                    if _outcome is not None and _outcome.matched:
-                        self._flow.console.print()
-                        if _outcome.text:
-                            self._flow.console.print(
-                                _outcome.text, highlight=False,
-                            )
-                        self._flow.console.print()
-                        continue
-                    if line in (
-                        "postmortems", "/postmortems",
-                    ) or (
-                        line.startswith("postmortems ")
-                        or line.startswith("/postmortems ")
-                    ):
-                        self._print_postmortems(line)
-                        continue
-                    if line in ("help", "/help"):
-                        self._print_help()
-                        continue
-                    if line.startswith("cancel "):
-                        _cancel_args = line.split(None, 1)[1].strip()
-                        # W3(7) Slice 1 — `cancel <op-id> --immediate` extension.
-                        # Existing `cancel <op-id>` keeps phase-boundary
-                        # semantics (CLAUDE.md current behavior). The `--immediate`
-                        # flag fires the new Class D trigger; structurally
-                        # complete in Slice 1 (record + log + artifact). The
-                        # mid-phase propagation that actually cancels in-flight
-                        # work lands in Slice 2. Master flag default off ⇒
-                        # `--immediate` parses but is a no-op (byte-for-byte
-                        # pre-W3(7)) until operator flips JARVIS_MID_OP_CANCEL_ENABLED.
-                        _immediate = False
-                        for _flag in ("--immediate", "-i"):
-                            if _cancel_args.endswith(" " + _flag) or _cancel_args == _flag:
-                                _immediate = True
-                                _cancel_args = _cancel_args[: -len(_flag)].strip()
-                                break
-                        await self._handle_cancel(_cancel_args, immediate=_immediate)
-                        continue
-
-                    # Gap #4 Slice 4 — IDE-native review verbs
-                    if line.startswith("/accept") or line.startswith("accept "):
-                        await self._handle_accept(line)
-                        continue
-                    if line.startswith("/reject") or line.startswith("reject "):
-                        await self._handle_reject(line)
-                        continue
-                    if (
-                        line in ("/review", "review")
-                        or line.startswith("/review ")
-                        or line.startswith("review ")
-                    ):
-                        self._handle_review(line)
-                        continue
-
-                    # Slice 253 — Shadow-Endorsement interceptor (HITL steering
-                    # wheel for trapped Cybernetic Reanimation actions).
-                    if (
-                        line in ("/endorse", "endorse")
-                        or line.startswith("/endorse ")
-                        or line.startswith("endorse ")
-                    ):
-                        await self._handle_endorse(line)
-                        continue
-
-                    # Live-fire validation — flag-gated synthetic pressure injector
-                    # (debug tooling; inert unless JARVIS_REANIMATION_DEBUG_INJECT_ENABLED).
-                    if (
-                        line in ("/inject-pressure", "inject-pressure")
-                        or line.startswith("/inject-pressure ")
-                        or line.startswith("inject-pressure ")
-                    ):
-                        await self._handle_inject_pressure(line)
-                        continue
-
-                    # Gap #3 Slice 3 — unified /expand <ref> verb
-                    # dispatches by ref prefix:
-                    #   t-N → tool result body (Gap #2 BoundedBodyStore)
-                    #   d-N → diff archive entry (Gap #4 DiffArchive)
-                    #   o-N → op block buffer (Gap #3)
-                    #   n-N → narrative frame (Gap #6 Slice 4)
-                    if line.startswith("/expand") or line.startswith("expand "):
-                        self._handle_expand(line)
-                        continue
-                    # Gap #6 Slice 4 — /narrate density control
-                    if line.startswith("/narrate") or line.startswith("narrate "):
-                        self._handle_narrate(line)
-                        continue
-
-                    # Gap #7 Slice 1 — /preflight + /organism (moved boot content)
-                    if line in ("/preflight", "preflight"):
-                        self._handle_preflight()
-                        continue
-                    if line in ("/organism", "organism"):
-                        self._handle_organism()
-                        continue
-                    # §41.3 Slice 2 #17 — /tutorial verb
-                    if (
-                        line in ("/tutorial", "tutorial")
-                        or line.startswith("/tutorial ")
-                        or line.startswith("tutorial ")
-                    ):
-                        self._handle_tutorial(line)
-                        continue
-                    # §41.3 #26 Phase 0 — /ask verb (D1c explicit
-                    # prefix; operator-signed 2026-05-11)
-                    if (
-                        line in ("/ask", "ask")
-                        or line.startswith("/ask ")
-                        or line.startswith("ask ")
-                    ):
-                        await self._handle_ask(line)
-                        continue
-
-                    # Runtime configuration commands
-                    if line.startswith("/risk") or line.startswith("risk ") or line == "risk":
-                        self._handle_risk(line)
-                        continue
-                    if line.startswith("/budget") or line.startswith("budget ") or line == "budget":
-                        self._handle_budget(line)
-                        continue
-                    if line.startswith("/goal") or line.startswith("goal "):
-                        await self._handle_goal(line)
-                        continue
-                    if (
-                        line.startswith("/memory")
-                        or line.startswith("memory ")
-                        or line == "memory"
-                    ):
-                        await self._handle_memory(line)
-                        continue
-                    if line.startswith("/remember") or line.startswith("remember "):
-                        await self._handle_remember(line)
-                        continue
-                    if line.startswith("/forget") or line.startswith("forget "):
-                        await self._handle_forget(line)
-                        continue
-                    if line in ("/lessons", "lessons"):
-                        self._print_lessons()
-                        continue
-                    if line.startswith("/mutation-gate") or line.startswith("mutation-gate "):
-                        await self._handle_mutation_gate(line)
-                        continue
-                    if line.startswith("/mutation") or line.startswith("mutation "):
-                        await self._handle_mutation(line)
-                        continue
-                    if (
-                        line.startswith("/vision")
-                        or line.startswith("vision ")
-                        or line == "vision"
-                    ):
-                        self._handle_vision(line)
-                        continue
-                    if (
-                        line.startswith("/verify-confirm")
-                        or line.startswith("verify-confirm ")
-                    ):
-                        self._handle_verify_confirm(line)
-                        continue
-                    if line in ("/verify-undemote", "verify-undemote"):
-                        self._handle_verify_undemote()
-                        continue
-                    # Swarm lens commands (2026-05-03)
-                    if line.startswith("/follow") or line.startswith("follow "):
-                        _arg = line.split(None, 1)
-                        _target = _arg[1].strip() if len(_arg) > 1 else "auto"
-                        _result = self._flow.set_lens(_target)
-                        self._flow.console.print(
-                            f"  [{_C['dim']}]{_result}[/{_C['dim']}]",
-                            highlight=False,
-                        )
-                        continue
-                    if line.startswith("/show") or line.startswith("show "):
-                        _arg = line.split(None, 1)
-                        if len(_arg) < 2:
-                            self._flow.console.print(
-                                f"  [{_C['dim']}]usage: /show <op_id|short_id>[/{_C['dim']}]",
-                                highlight=False,
-                            )
-                        else:
-                            _result = self._flow.lens_show(_arg[1].strip())
-                            self._flow.console.print(_result, highlight=False)
-                        continue
-                    if line.startswith("/attach") or line.startswith("attach "):
-                        await self._handle_attach(line)
-                        continue
-
-                    # Problem #7 Slice 3 — /plan dispatcher (plan
-                    # approval operator modality). Routes /plan
-                    # subcommands (mode / pending / show / approve /
-                    # reject / history / help) through the pure
-                    # dispatcher. matched=False falls through to the
-                    # next handler. Never raises into the REPL.
-                    if line.startswith("/plan"):
-                        try:
-                            from backend.core.ouroboros.governance.plan_approval_repl import (
-                                dispatch_plan_command,
-                            )
-                            _pa_result = dispatch_plan_command(line)
-                            if _pa_result.matched:
-                                self._flow.console.print(
-                                    _pa_result.text, highlight=False,
-                                )
-                                continue
-                        except Exception as exc:  # noqa: BLE001
-                            self._flow.console.print(
-                                f"  [{_C['death']}]/plan dispatch error: "
-                                f"{exc}[/{_C['death']}]",
-                                highlight=False,
-                            )
-                            continue
-
-                    # Inline Permission Slice 5 — /allow /deny /always
-                    # /pause /prompts /permissions dispatcher. Routes
-                    # per-tool-call inline-permission operator actions
-                    # (CC-parity "is this OK?" inline). matched=False
-                    # falls through. Never raises into the REPL.
-                    if line.startswith((
-                        "/allow", "/deny", "/always", "/pause",
-                        "/prompts", "/permissions",
-                    )):
-                        try:
-                            from backend.core.ouroboros.governance.inline_permission_repl import (  # noqa: E501
-                                dispatch_inline_command,
-                            )
-                            _ip_result = dispatch_inline_command(line)
-                            if _ip_result.matched:
-                                self._flow.console.print(
-                                    _ip_result.text, highlight=False,
-                                )
-                                continue
-                        except Exception as exc:  # noqa: BLE001
-                            self._flow.console.print(
-                                f"  [{_C['death']}]inline-permission "
-                                f"dispatch error: {exc}[/{_C['death']}]",
-                                highlight=False,
-                            )
-                            continue
-
-                    # §41.3 Slice 2 #18 — typo suggestion on
-                    # unknown slash verbs. Lines starting with
-                    # `/` that didn't match any handler get a
-                    # "did you mean …" surface from the verb
-                    # registry's bounded Levenshtein. NEVER raises
-                    # into the dispatch path; on miss falls through
-                    # to the external handler as before.
-                    if line.startswith("/"):
-                        try:
-                            from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
-                                discover_verbs as _typo_discover,
-                                format_verb_hint as _typo_hint,
-                                suggest_for_typo as _typo_suggest,
-                            )
-                            _verb_word = line.split(None, 1)[0]
-                            _typo_reg = _typo_discover(self)
-                            # Only suggest when the typed verb
-                            # truly isn't known — avoids spam
-                            # when a real verb falls through for
-                            # any other reason.
-                            if _typo_reg.find(_verb_word) is None:
-                                _candidates = _typo_suggest(
-                                    _verb_word, _typo_reg,
-                                )
-                                if _candidates:
-                                    self._flow.console.print()
-                                    self._flow.console.print(
-                                        f"  [dim]unknown verb "
-                                        f"{_verb_word!r} — did you "
-                                        f"mean: "
-                                        f"{', '.join(_candidates)}?"
-                                        f"[/dim]",
-                                        highlight=False,
-                                    )
-                                    # §41.3 #19 — surface the
-                                    # descriptor's actual data
-                                    # (usage + example) for the
-                                    # top suggestion. NO hardcoded
-                                    # verb-to-hint map; the data
-                                    # lives on the existing
-                                    # VerbDescriptor and is
-                                    # rendered by the canonical
-                                    # format_verb_hint composer.
-                                    _top = _typo_reg.find(
-                                        _candidates[0],
-                                    )
-                                    if _top is not None:
-                                        _hint = _typo_hint(_top)
-                                        if _hint:
-                                            for _hl in _hint.splitlines():
-                                                self._flow.console.print(
-                                                    f"[dim]{_hl}[/dim]",
-                                                    highlight=False,
-                                                )
-                                    self._flow.console.print()
-                                    continue
-                        except Exception:  # noqa: BLE001
-                            pass  # NEVER break the REPL
-
-                    # ConversationBridge capture (V1: user turns only).
-                    # Any line that fell through the built-in dispatch is
-                    # either free-text for the external handler or an
-                    # unknown slash command. We record only non-slash
-                    # lines so malformed `/foo` doesn't pollute the
-                    # untrusted context injected at CONTEXT_EXPANSION.
-                    # Assistant-side capture is deferred (the TUI emits
-                    # op telemetry and code diffs, not conversational
-                    # turns — wiring V1.1 pending a clear source).
-                    if not line.startswith("/"):
-                        try:
-                            from backend.core.ouroboros.governance.conversation_bridge import (
-                                get_default_bridge,
-                            )
-                            get_default_bridge().record_turn(
-                                "user", line, source="tui",
-                            )
-                        except Exception:
-                            pass  # best-effort; never break the REPL
-
-                    # Delegate to external handler
-                    if self._on_command is not None:
-                        try:
-                            result = self._on_command(line)
-                            if asyncio.iscoroutine(result):
-                                await result
-                        except Exception as exc:
-                            self._flow.console.print(
-                                f"  [{_C['death']}]Error: {exc}[/{_C['death']}]",
-                                highlight=False,
-                            )
                 except EOFError:
                     break
                 except KeyboardInterrupt:

@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Any, AsyncIterator, Callable, Iterable, TypeVar
 
 logger = logging.getLogger("Ouroboros.EventLoopGovernance")
@@ -108,6 +109,23 @@ async def cooperative_yield() -> None:
     """
     if event_loop_governance_enabled():
         await asyncio.sleep(0)
+
+
+async def measure_loop_lag_ms(probe_s: float = 0.02) -> float:
+    """Cheap event-loop lag probe: how far a short ``asyncio.sleep``
+    overshoots is how backed-up the loop is right now. Pure timing;
+    never raises.
+
+    Slice 27 — hoisted to this shared substrate (the Oracle carries an
+    identical private probe feeding its AIMD throttle; the miner and any
+    future adaptive loop consume this one instead of re-implementing it).
+    """
+    try:
+        t0 = time.monotonic()
+        await asyncio.sleep(probe_s)
+        return max(0.0, (time.monotonic() - t0 - probe_s) * 1000.0)
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 async def cooperative_yield_every_n_async(
