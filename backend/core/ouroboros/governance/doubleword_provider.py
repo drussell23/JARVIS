@@ -7383,9 +7383,30 @@ class DoublewordProvider:
         DoublewordInfraError
             On HTTP errors, empty choices, or cost-budget violations.
         """
-        if not self._api_key:
+        # Slice 27-parity Aegis-unified auth bridge (2026-07-16, caught live
+        # by bt-2026-07-16-185947: the dream RT tier failed with
+        # "DOUBLEWORD_API_KEY is not set — cannot call complete_sync()").
+        # ``self._api_key`` may be empty post-Aegis env_scrub — Aegis is the
+        # secure credential broker that injects the real DOUBLEWORD_API_KEY
+        # server-side at the daemon's forwarding handler, and this method's
+        # transport is ALREADY Aegis-bridged (``_get_session()`` +
+        # ``_aegis_merge_lease_headers``). Either credential source is valid —
+        # the EXACT gate ``prompt_only`` received in Slice 27; pre-fix this
+        # raised even when Aegis was the active broker, silently killing every
+        # complete_sync caller (DreamEngine RT tier, CompactionCaller,
+        # BlastRadius, karen_synth) post-scrub.
+        try:
+            from backend.core.ouroboros.aegis.client import (
+                is_enabled as _aegis_enabled,
+            )
+            _aegis_active = _aegis_enabled()
+        except Exception:  # noqa: BLE001 — defensive
+            _aegis_active = False
+        if not self._api_key and not _aegis_active:
             raise ValueError(
-                "DOUBLEWORD_API_KEY is not set — cannot call complete_sync()"
+                "DOUBLEWORD_API_KEY is not set AND Aegis is not "
+                "enabled — cannot call complete_sync() without a "
+                "credential source"
             )
         self._check_budget()
 
