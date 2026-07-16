@@ -293,15 +293,21 @@ class DoublewordCritiqueProvider:
 
     async def critique(self, request: CritiqueRequest) -> str:
         prompt = build_critique_prompt(request)
-        # DoublewordProvider.prompt_only enforces its own budget/session.
-        # Wrap it in our deadline as a second layer of defense.
+        # Phase 2 RT repositioning (2026-07-16): critique blocks apply/PR — it
+        # buys TIME, so it routes through the unified Claude-RT-first gate
+        # router with this backend's DW handle as the opportunistic fallback.
+        # Engine-facing contract unchanged: returns raw text or raises (the
+        # engine handles swallowing).
+        from backend.core.ouroboros.governance.rt_gate import gate_completion
+
         try:
             return await asyncio.wait_for(
-                self._dw.prompt_only(
-                    prompt=prompt,
+                gate_completion(
+                    prompt,
                     caller_id=self._caller_id,
                     response_format={"type": "json_object"},
                     max_tokens=self._max_tokens,
+                    dw_provider=self._dw,
                 ),
                 timeout=request.deadline_s,
             )

@@ -404,19 +404,27 @@ class SemanticTriageEngine:
             if not prompt:
                 return TriageResult(decision=TriageDecision.SKIP)
 
-            # Call DW with the cheap 35B model
-            raw_response = await asyncio.wait_for(
-                self._dw.prompt_only(
-                    prompt=prompt,
-                    model=self._effective_model,
+            # Phase 2 RT repositioning (2026-07-16): triage is a synchronous
+            # gate every op blocks on — it buys TIME, so it routes through the
+            # unified Claude-RT-first gate router (DW-RT opportunistic
+            # fallback). All ordering/timeout/fallback policy lives in
+            # rt_gate.gate_completion; the triage logic below is unchanged.
+            from backend.core.ouroboros.governance.rt_gate import (
+                GateProviderExhaustedError,
+                gate_completion,
+            )
+
+            try:
+                raw_response = await gate_completion(
+                    prompt,
                     caller_id=f"triage_{ctx.op_id[:12]}",
                     response_format={"type": "json_object"},
                     max_tokens=_TRIAGE_MAX_TOKENS,
-                ),
-                timeout=_TRIAGE_TIMEOUT_S,
-            )
-
-            if not raw_response:
+                    timeout_s=_TRIAGE_TIMEOUT_S,
+                    dw_provider=self._dw,
+                    dw_model=self._effective_model,
+                )
+            except GateProviderExhaustedError:
                 self._failures += 1
                 return TriageResult(decision=TriageDecision.SKIP)
 

@@ -22,16 +22,22 @@ class DWSpeechProvider:
         self._max_tokens = max_tokens
 
     async def source(self, *, system_prompt: str, user_prompt: str) -> AsyncIterator[str]:
+        # Phase 2 RT repositioning (2026-07-16): a HUMAN is waiting on speech —
+        # the purest buy-time call in the codebase. Routes through the unified
+        # Claude-RT-first gate router (this provider's DW handle stays as the
+        # opportunistic fallback). Contract unchanged: one chunk, never raises.
         try:
-            res = await self._dw.complete_sync(
+            from backend.core.ouroboros.governance.rt_gate import gate_completion
+
+            content = await gate_completion(
                 user_prompt,
-                system_prompt=system_prompt,
                 caller_id="karen_synth",
+                system_prompt=system_prompt,
                 max_tokens=self._max_tokens,
+                dw_provider=self._dw,
             )
-            content = getattr(res, "content", "") or ""
             if content.strip():
                 yield content
-        except Exception:  # noqa: BLE001
-            logger.debug("[KarenSynth] DW completion failed", exc_info=True)
+        except Exception:  # noqa: BLE001 — incl. GateProviderExhaustedError
+            logger.debug("[KarenSynth] RT completion failed", exc_info=True)
             return

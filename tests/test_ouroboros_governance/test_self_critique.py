@@ -726,29 +726,47 @@ class TestIsSelfCritiqueEnabled:
 
 
 class TestDoublewordCritiqueProvider:
+    """Phase 2 RT repositioning (2026-07-16): the backend now routes through
+    rt_gate.gate_completion (Claude-RT first, this DW handle as the
+    opportunistic fallback via complete_sync — the stream-free RT primitive,
+    never batch prompt_only). The fakes mirror the NEW real contract."""
+
+    @staticmethod
+    def _sync_result(content: str):
+        res = MagicMock()
+        res.content = content
+        res.model = "dw-x"
+        res.latency_s = 0.1
+        return res
+
     @pytest.mark.asyncio
-    async def test_provider_calls_prompt_only(self):
+    async def test_provider_routes_via_rt_gate_dw_complete_sync(self):
         mock_dw = MagicMock()
-        mock_dw.prompt_only = MagicMock()
-        async def _async_prompt_only(**kwargs):
-            return json.dumps({"rating": 4, "rationale": "ok"})
-        mock_dw.prompt_only = _async_prompt_only
+
+        async def _complete_sync(*args, **kwargs):
+            return self._sync_result(json.dumps({"rating": 4, "rationale": "ok"}))
+
+        mock_dw.complete_sync = _complete_sync
         provider = DoublewordCritiqueProvider(mock_dw, max_tokens=256)
         request = CritiqueRequest(
             op_id="op-1", goal="fix bug", diff="+ y",
             risk_tier="notify_apply", target_files=("foo.py",),
             test_summary="ok", deadline_s=30.0,
         )
+        # Claude tiers are absent in the test env (no key) → the gate
+        # cascades to the DW-RT opportunistic fallback.
         raw = await provider.critique(request)
         assert '"rating": 4' in raw
 
     @pytest.mark.asyncio
     async def test_provider_timeout_propagates(self):
         mock_dw = MagicMock()
-        async def _slow(**kwargs):
+
+        async def _slow(*args, **kwargs):
             await asyncio.sleep(5.0)
-            return "late"
-        mock_dw.prompt_only = _slow
+            return self._sync_result("late")
+
+        mock_dw.complete_sync = _slow
         provider = DoublewordCritiqueProvider(mock_dw)
         request = CritiqueRequest(
             op_id="op", goal="g", diff="+ x", risk_tier="low",

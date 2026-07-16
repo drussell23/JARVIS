@@ -242,17 +242,31 @@ class ArchitectureReasoningAgent:
             max_steps=self._config.max_steps,
         )
 
-        # --- 3. Call Doubleword ---
-        raw = await self._doubleword.prompt_only(
-            prompt=prompt,
-            caller_id="architecture_agent",
-            response_format=ARCHITECTURAL_PLAN_JSON_SCHEMA,
+        # --- 3. Call the unified RT gate router ---
+        # Phase 2 RT repositioning (2026-07-16): architectural planning sits on
+        # the COMPLEX route's blocking path ("Claude plans → DW executes") — it
+        # buys TIME. Claude-RT first, this agent's DW handle as the
+        # opportunistic fallback. Plan validation below is unchanged.
+        from backend.core.ouroboros.governance.rt_gate import (
+            GateProviderExhaustedError,
+            gate_completion,
         )
+
+        try:
+            raw = await gate_completion(
+                prompt,
+                caller_id="architecture_agent",
+                response_format=ARCHITECTURAL_PLAN_JSON_SCHEMA,
+                max_tokens=4096,
+                dw_provider=self._doubleword,
+            )
+        except GateProviderExhaustedError:
+            raw = ""
 
         if not raw:
             logger.warning(
-                "ArchitectureReasoningAgent: empty response from Doubleword "
-                "(hypothesis=%r)",
+                "ArchitectureReasoningAgent: empty response from RT gate "
+                "router (hypothesis=%r)",
                 getattr(hypothesis, "hypothesis_id", repr(hypothesis)),
             )
             return None
