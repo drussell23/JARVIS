@@ -1301,21 +1301,31 @@ async def test_empty_claude_response_also_logs(tmp_path, caplog):
 # health; the cascade must READ that state, not re-probe.
 # ============================================================================
 
-import backend.core.ouroboros.governance.provider_heartbeat as _hb_mod
+from backend.core.ouroboros.governance.dw_surface_health import (
+    SurfaceHealthLedger as _SHL,
+    SurfaceKind as _SK,
+    SurfaceVerdict as _SV,
+)
 
 
-def _fake_hb(*, degrading, failures=0, monkeypatch=None):
-    hb = MagicMock()
-    hb.is_degrading.return_value = degrading
-    hb.consecutive_failures.return_value = failures
-    monkeypatch.setattr(_hb_mod, "get_dw_heartbeat", lambda: hb)
-    return hb
+def _surface(monkeypatch, tmp_path, verdict, *, times=1):
+    """Drive the REAL ledger — the fake must mirror the real contract. The
+    bypass reads DIRECT_COMPLETION, NOT the SSE heartbeat (which is chronically
+    degraded by design and must never contaminate this tier)."""
+    lg = _SHL(path=tmp_path / "surf.json", autosave=False)
+    monkeypatch.setattr(
+        "backend.core.ouroboros.governance.dw_surface_health.SurfaceHealthLedger",
+        lambda *a, **k: lg,
+    )
+    for _ in range(times):
+        lg.record(_SK.DIRECT_COMPLETION, verdict)
+    return lg
 
 
 async def test_degraded_dw_is_bypassed_instantly_no_timeout_tax(tmp_path, monkeypatch):
-    """THE fix: heartbeat says DW degraded → DW-RT is never called → Claude
+    """THE fix: DIRECT_COMPLETION degraded -> DW-RT never called -> Claude
     serves with ZERO dead-tier latency."""
-    _fake_hb(degrading=True, failures=3, monkeypatch=monkeypatch)
+    _surface(monkeypatch, tmp_path, _SV.UPSTREAM_DEGRADED, times=3)
     dw = MagicMock()
     dw.complete_sync = AsyncMock(return_value=_SyncResult(_BP_JSON))
     claude = MagicMock()
@@ -1326,9 +1336,9 @@ async def test_degraded_dw_is_bypassed_instantly_no_timeout_tax(tmp_path, monkey
     dw.complete_sync.assert_not_called()          # the 53s tax is gone
 
 
-async def test_healthy_dw_is_still_attempted(tmp_path, monkeypatch):
-    """Bypass must not strand the cheap tier when DW is healthy."""
-    _fake_hb(degrading=False, monkeypatch=monkeypatch)
+async def test_healthy_completion_surface_still_attempts_dw(tmp_path, monkeypatch):
+    """Bypass must not strand the cheap tier when the surface is healthy."""
+    _surface(monkeypatch, tmp_path, _SV.HEALTHY)
     dw = MagicMock()
     dw.complete_sync = AsyncMock(return_value=_SyncResult(_BP_JSON))
     eng = _rt_engine(tmp_path, dw=dw, claude=MagicMock())
@@ -1337,26 +1347,44 @@ async def test_healthy_dw_is_still_attempted(tmp_path, monkeypatch):
     dw.complete_sync.assert_awaited_once()
 
 
-def test_bypass_reads_existing_state_not_a_new_probe(tmp_path, monkeypatch):
-    """DRY: consumes is_degrading()/consecutive_failures() — no re-probe."""
-    hb = _fake_hb(degrading=True, failures=2, monkeypatch=monkeypatch)
+def test_sse_degradation_never_contaminates_the_completion_tier(tmp_path, monkeypatch):
+    """The bug this replaced: 254 SSE failures bypassed a tier built to AVOID
+    SSE. Surfaces are independent health domains."""
     from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
-    assert DreamEngine._dw_health_bypass() is True
-    hb.is_degrading.assert_called()               # existing emission consumed
-
-
-def test_bypass_inert_when_heartbeat_disabled_or_frozen(tmp_path, monkeypatch):
-    """Safety Law: OFF/frozen heartbeats report is_degrading()=False, so a
-    misconfiguration can never steer routing."""
-    _fake_hb(degrading=False, monkeypatch=monkeypatch)   # OFF/frozen semantics
-    from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
+    lg = _surface(monkeypatch, tmp_path, _SV.HEALTHY)
+    for _ in range(254):
+        lg.record(_SK.DIRECT_STREAMING, _SV.UPSTREAM_DEGRADED)
     assert DreamEngine._dw_health_bypass() is False
 
 
 def test_bypass_fail_soft_never_strands_dw(tmp_path, monkeypatch):
     """A telemetry fault must not permanently disable the cheap tier."""
-    def _boom():
-        raise RuntimeError("heartbeat module exploded")
-    monkeypatch.setattr(_hb_mod, "get_dw_heartbeat", _boom)
+    monkeypatch.setattr(
+        "backend.core.ouroboros.governance.dw_surface_health.SurfaceHealthLedger",
+        MagicMock(side_effect=RuntimeError("ledger exploded")),
+    )
     from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
     assert DreamEngine._dw_health_bypass() is False   # attempt DW normally
+
+
+async def test_recovery_tracer_fires_only_when_bypassed(tmp_path, monkeypatch):
+    """Closes the ONE-WAY DOOR: a bypass silences organic traffic, so the
+    tracer is the only thing that can observe DW healing. It must NOT probe a
+    healthy surface (cost proportional to the outage)."""
+    import backend.core.ouroboros.governance.dw_capacity_probe as _cap
+    calls = []
+
+    async def _fake_trace(provider, *, model=None):
+        calls.append(model)
+        return "healthy"
+
+    monkeypatch.setattr(_cap, "trace_direct_completion", _fake_trace)
+
+    _surface(monkeypatch, tmp_path, _SV.HEALTHY)
+    eng = _rt_engine(tmp_path, dw=MagicMock(), claude=MagicMock())
+    await eng._trace_dw_recovery_if_bypassed()
+    assert calls == []                              # healthy -> no probe cost
+
+    _surface(monkeypatch, tmp_path, _SV.UPSTREAM_DEGRADED, times=3)
+    await eng._trace_dw_recovery_if_bypassed()
+    assert len(calls) == 1                          # degraded -> probe for recovery

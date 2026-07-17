@@ -67,6 +67,18 @@ DREAM_MAX_PROMPT_CHARS: int = 2048
 _DREAM_MAX_OUTPUT_TOKENS_DEFAULT: int = 8192
 
 
+def _dw_completion_degrade_streak() -> int:
+    """Consecutive DIRECT_COMPLETION failures before the DW-RT tier is bypassed
+    (``JARVIS_DW_COMPLETION_DEGRADE_STREAK``, default 2 — mirrors the
+    heartbeat's own degrade-streak convention). Floor of 1: a bypass must
+    always require at least one observed failure, never fire on a clean
+    surface. Never raises."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_DW_COMPLETION_DEGRADE_STREAK", "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
 def dream_max_output_tokens() -> int:
     """``JARVIS_DREAM_MAX_OUTPUT_TOKENS`` (default 8192). Floor of 1024 keeps a
     misconfiguration from re-creating the truncation class. Never raises."""
@@ -566,6 +578,11 @@ class DreamEngine:
         # blueprints from the prior HEAD are correctly discarded downstream).
         self._hydrate_repo_state()
 
+        # Recovery probe: if DW's completion surface is bypassed, this is the
+        # ONLY traffic that can observe it healing (a bypass silences organic
+        # calls). Fires only while degraded — a healthy DW costs nothing.
+        await self._trace_dw_recovery_if_bypassed()
+
         # Build candidate info (in a real implementation this would
         # come from the oracle/memory engine analysis of the repo)
         candidate = self._pick_candidate()
@@ -953,38 +970,80 @@ class DreamEngine:
         """True when the DW-RT tier should be SKIPPED because the heartbeat
         already knows DW is unhealthy — eliminating the timeout tax.
 
-        Consumes the EXISTING ``DWHeartbeat.is_degrading()`` state emission
-        (the same surface the failover lifecycle's pre-warm gate reads) rather
-        than probing DW again at the call site: the heartbeat's deep-probe loop
-        is the single source of health truth, so this is a read, not a check.
+        SURFACE-AWARE (2026-07-17). Reads the EXISTING SurfaceHealthLedger
+        verdict for ``DIRECT_COMPLETION`` — the stream-free
+        /v1/chat/completions surface that ``complete_sync`` (this tier's ONLY
+        transport) actually uses — never the SSE surface.
 
-        bt-2026-07-17-074626 is the motivating cost: DW answered HTTP 502
-        (upstream_unreachable) and EVERY dream paid ~53s of dead-tier latency
-        before cascading to Claude — the worst of both providers (DW's latency
-        AND Claude's price). With the heartbeat armed, a degraded DW is skipped
-        instantly.
+        This decoupling is load-bearing. The first version of this bypass read
+        ``DWHeartbeat.is_degrading()``, which probes ``DIRECT_STREAMING``, and
+        bt-2026-07-17-080507 showed the cost: the tier was bypassed on
+        ``consecutive_failures=254`` from a surface it was PURPOSE-BUILT to
+        avoid (complete_sync exists precisely because DW's SSE endpoint stalls
+        post-accept — bt-2026-04-14-182446). Cross-contaminated telemetry
+        neutralizes the opportunistic tier: SSE can be broken forever while
+        completions serve fine.
 
-        Inert by construction: the heartbeat is default-OFF and its
-        ``is_degrading()`` returns False when disabled OR frozen (its Safety
-        Law — a misconfiguration must never steer routing), so this bypass
-        cannot fire on a config error. Fail-soft: any fault → False → attempt
-        DW normally (never strand the cheap tier on a telemetry bug)."""
+        Bypasses on either failure dimension of ITS OWN surface — transport
+        (502/timeout/auth) or inference (HTTP 200 with zero generated content,
+        the reasoning-budget exhaustion class) — once the streak reaches the
+        degrade threshold.
+
+        Fail-soft: any fault → False → attempt DW normally (a telemetry bug
+        must never strand the cheap tier)."""
         try:
-            from backend.core.ouroboros.governance.provider_heartbeat import (
-                get_dw_heartbeat,
+            from backend.core.ouroboros.governance.dw_surface_health import (
+                SurfaceKind,
+                SurfaceHealthLedger,
+                SurfaceVerdict,
             )
 
-            hb = get_dw_heartbeat()
-            if hb.is_degrading():
+            rec = SurfaceHealthLedger().verdict_for(SurfaceKind.DIRECT_COMPLETION)
+            if rec is None:
+                return False  # never probed → attempt DW (no verdict is not a verdict)
+            if rec.verdict is SurfaceVerdict.HEALTHY:
+                return False
+            if int(rec.consecutive_failures) >= _dw_completion_degrade_streak():
                 logger.info(
-                    "[DreamEngine] DW-RT tier BYPASSED — heartbeat reports DW "
-                    "degraded (consecutive_failures=%s); routing straight to "
-                    "Claude (no timeout tax)", hb.consecutive_failures(),
+                    "[DreamEngine] DW-RT tier BYPASSED — DIRECT_COMPLETION "
+                    "surface %s (consecutive_failures=%d, diag=%s); routing "
+                    "straight to Claude (no timeout tax)",
+                    rec.verdict.value, rec.consecutive_failures,
+                    (rec.diagnostic or "")[:80],
                 )
                 return True
         except Exception:  # noqa: BLE001 — health telemetry is advisory
             logger.debug("[DreamEngine] DW health bypass probe cold", exc_info=True)
         return False
+
+    async def _trace_dw_recovery_if_bypassed(self) -> None:
+        """Close the ONE-WAY DOOR: probe a bypassed DW surface for recovery.
+
+        A bypass suppresses organic ``complete_sync`` traffic, so the surface
+        would never earn a fresh HEALTHY record and the bypass would be
+        permanent. This fires the Synthetic Tracer ONLY while the surface is
+        degraded — a healthy DW is never probed, so the cost is strictly
+        proportional to the outage — and the tracer's generated-content
+        assertion re-opens the tier the moment DW can truly serve again.
+
+        Driven from the existing dream loop (no new daemon). NEVER raises."""
+        try:
+            if not self._dw_health_bypass():
+                return  # healthy (or unprobed) → no tracer cost
+            from backend.core.ouroboros.governance.dw_capacity_probe import (
+                trace_direct_completion,
+            )
+
+            verdict = await trace_direct_completion(
+                self._dw_provider,
+                model=os.environ.get("JARVIS_DREAM_DW_MODEL", "").strip() or None,
+            )
+            logger.info(
+                "[DreamEngine] DW recovery tracer → %s (bypass lifts "
+                "automatically once the surface reports healthy)", verdict,
+            )
+        except Exception:  # noqa: BLE001 — recovery probing is advisory
+            logger.debug("[DreamEngine] DW recovery tracer skipped", exc_info=True)
 
     @staticmethod
     def _dream_rt_timeout_s() -> float:

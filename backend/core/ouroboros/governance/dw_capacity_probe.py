@@ -564,3 +564,120 @@ __all__ = [
     "build_capacity_probe_from_default_provider",
     "classify_probe_results",
 ]
+
+
+# ===========================================================================
+# Synthetic Tracer — DIRECT_COMPLETION health (2026-07-17)
+#
+# Repurposes this module (previously 0 production importers — dead code) into
+# the active health source for DW's stream-free completions surface.
+#
+# WHY a tracer and not just passive instrumentation: complete_sync records its
+# own outcome on every ORGANIC call, but once the DW-RT tier is bypassed no
+# organic calls occur — the surface would never see a fresh HEALTHY record and
+# the bypass would become a ONE-WAY DOOR. The tracer is the only thing that can
+# observe recovery on a silent surface, which is what lets cheap tokens resume
+# automatically with no code change.
+#
+# WHY not an HTTP ping: DW proved (bt-2026-07-17-033933) that it returns
+# "ok: 30.25s, 0 chars" — a perfect transport carrying zero inference. A ping
+# would score that HEALTHY and keep routing dreams into a tier that cannot
+# produce. The tracer therefore demands GENERATED CONTENT, asserting two
+# dimensions at once:
+#     transport  → did the call complete without an HTTP/timeout fault?
+#     inference  → did the model actually emit tokens?
+# ===========================================================================
+
+_TRACER_PROMPT = "Reply with the single word: ok"
+_TRACER_SYSTEM = "You are a liveness probe. Reply with exactly one word."
+
+
+def tracer_enabled() -> bool:
+    """``JARVIS_DW_COMPLETION_TRACER_ENABLED`` (default true). The tracer only
+    ever fires when the surface is already degraded (recovery detection), so it
+    costs nothing on a healthy provider."""
+    return os.environ.get(
+        "JARVIS_DW_COMPLETION_TRACER_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _tracer_max_tokens() -> int:
+    """Output ceiling for the tracer. Must leave room for a reasoning model to
+    think AND still emit a token — the entitled 397B carries an effort FLOOR of
+    "low", so a tiny budget reproduces the very exhaustion this probe exists to
+    detect and would report a false INFERENCE_DEGRADED."""
+    try:
+        return max(64, int(os.environ.get("JARVIS_DW_TRACER_MAX_TOKENS", "2048")))
+    except (TypeError, ValueError):
+        return 2048
+
+
+def _tracer_timeout_s() -> float:
+    try:
+        return max(5.0, float(os.environ.get("JARVIS_DW_TRACER_TIMEOUT_S", "90")))
+    except (TypeError, ValueError):
+        return 90.0
+
+
+async def trace_direct_completion(provider: Any, *, model: Optional[str] = None) -> str:
+    """Fire one synthetic generation at DW's stream-free completions surface
+    and inject the verdict into the EXISTING SurfaceHealthLedger.
+
+    Returns the recorded ``SurfaceVerdict`` value (a plain str) — or
+    ``"skipped"`` when disabled / no usable provider. NEVER raises: a health
+    probe must not be able to break the loop that hosts it.
+
+    complete_sync self-records both dimensions internally, so this function
+    does NOT duplicate the recording logic (DRY) — it simply drives a call on a
+    surface that would otherwise be silent, and lets the provider's own
+    instrumentation speak.
+    """
+    if not tracer_enabled():
+        return "skipped"
+    if provider is None or not hasattr(provider, "complete_sync"):
+        return "skipped"
+    try:
+        res = await asyncio.wait_for(
+            provider.complete_sync(
+                _TRACER_PROMPT,
+                system_prompt=_TRACER_SYSTEM,
+                caller_id="completion_tracer",
+                model=model,
+                max_tokens=_tracer_max_tokens(),
+                timeout_s=_tracer_timeout_s(),
+            ),
+            timeout=_tracer_timeout_s() + 5.0,
+        )
+        content = (getattr(res, "content", "") or "").strip()
+        # complete_sync already recorded HEALTHY / INFERENCE_DEGRADED.
+        verdict = "healthy" if content else "inference_degraded"
+        logger.info(
+            "[DWTracer] DIRECT_COMPLETION %s (chars=%d, %.2fs, model=%s)",
+            verdict, len(content), getattr(res, "latency_s", -1.0),
+            getattr(res, "model", "?"),
+        )
+        return verdict
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # complete_sync's own HTTP branch recorded the transport verdict
+        # (AUTH_FAILED / UPSTREAM_DEGRADED / TRANSPORT_DEGRADED). A timeout
+        # never reaches that branch, so record it here — same ledger, same API.
+        if isinstance(exc, asyncio.TimeoutError):
+            try:
+                from backend.core.ouroboros.governance.dw_surface_health import (
+                    SurfaceHealthLedger,
+                    SurfaceKind,
+                    SurfaceVerdict,
+                )
+                SurfaceHealthLedger().record(
+                    SurfaceKind.DIRECT_COMPLETION,
+                    SurfaceVerdict.TRANSPORT_DEGRADED,
+                    latency_ms=int(_tracer_timeout_s() * 1000),
+                    diagnostic="tracer_timeout",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        logger.info("[DWTracer] DIRECT_COMPLETION probe failed (%s: %s)",
+                    type(exc).__name__, exc)
+        return "transport_degraded"
