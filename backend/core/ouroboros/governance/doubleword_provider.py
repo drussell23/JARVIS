@@ -1974,6 +1974,10 @@ class DoublewordProvider:
         # and never rebound, so an alias onto the state dataclass is
         # alias-safe — no property indirection needed.
         self._stats = self._state.stats
+        # Slice 39 transport-pool flush policy owner (lazily constructed on the
+        # first RT transport failure). Holds the 60s anti-thrash cooldown state
+        # across calls, so it must be per-provider and not per-failure.
+        self._client_lifecycle: Any = None
         self._rate_limiter = rate_limiter
         self._tool_loop = tool_loop
         self._batch_registry = batch_registry
@@ -7298,6 +7302,104 @@ class DoublewordProvider:
     # Functions-not-Agents path: complete_sync()
     # ------------------------------------------------------------------
 
+    async def _handle_rt_http_failure(
+        self, *, status: int, body: str, model: str, caller_id: str,
+    ) -> None:
+        """Route an RT-completion HTTP failure to the EXISTING resilience
+        owners. Composition only — no backoff, TTL, or catalog logic here.
+
+        Until now these modules were reachable only from the batch/_upload_file
+        and probe paths, so the RT completion surface (the one the DreamEngine
+        and every rt_gate consumer use) had NO resilience owner at all:
+          * 502 storms never flushed the poisoned aiohttp pool
+            (``dw_client_lifecycle`` had ZERO production callers — severed),
+          * a 403 never pruned the unentitled model from the election matrix on
+            this path, so the organism could cycle 403s forever.
+
+        502/503/504 → ``ClientLifecycleManager.flush_transport_pool`` (Slice 39):
+        it owns the flush POLICY — master switch + a 60s cooldown that stops a
+        storm from thrashing the pool — and calls this provider's own
+        ``force_session_reset``. The jittered exponential recovery window lives
+        in ``dw_transport_recovery`` (Slice 127 Phase 3) and is consulted by the
+        surface-health/breaker consumers; the DIRECT_COMPLETION verdict recorded
+        just above is what the Tier-1 cascade reads to route around us with zero
+        latency.
+
+        401/403 → ``dw_entitlement_fallback`` (LIVE, default-on, TTL-cached via
+        ``JARVIS_DW_ENTITLEMENT_CACHE_TTL_S``, default 1800s): classify the
+        denial and refresh the entitled catalog so the blocked model is pruned
+        dynamically and re-probed only after the TTL expires — RBAC learned at
+        runtime, never hardcoded.
+
+        NEVER raises: resilience handling must not mask the real provider error
+        that the caller is about to receive.
+        """
+        try:
+            if status in (502, 503, 504):
+                from backend.core.ouroboros.governance.dw_client_lifecycle import (
+                    ClientLifecycleManager,
+                )
+
+                mgr = self._client_lifecycle
+                if mgr is None:
+                    mgr = self._client_lifecycle = ClientLifecycleManager()
+                flushed = await mgr.flush_transport_pool(
+                    self, reason=f"rt_http_{status}:{caller_id}",
+                )
+                logger.info(
+                    "[DoublewordProvider] RT %s → transport pool flush %s "
+                    "(model=%s); DIRECT_COMPLETION marked upstream_degraded — "
+                    "cascade routes around DW until it recovers",
+                    status, "APPLIED" if flushed else "suppressed(cooldown/off)",
+                    model,
+                )
+            elif status in (401, 403):
+                from backend.core.ouroboros.governance.dw_entitlement_fallback import (
+                    entitlement_fallback_enabled,
+                    is_entitlement_blocked,
+                )
+
+                if entitlement_fallback_enabled() and is_entitlement_blocked(
+                    status, body or "",
+                ):
+                    logger.info(
+                        "[DoublewordProvider] RT %s entitlement-blocked "
+                        "(model=%s) → pruning from the election matrix; "
+                        "re-probe after the TTL window", status, model,
+                    )
+                    self._prune_unentitled_model(model)
+        except Exception:  # noqa: BLE001 — never mask the caller's real error
+            logger.debug(
+                "[DoublewordProvider] RT failure handler skipped (status=%s)",
+                status, exc_info=True,
+            )
+
+    def _prune_unentitled_model(self, model: str) -> None:
+        """Prune a 403-blocked model from the live entitled set.
+
+        Delegates to the EXISTING process-wide ``EntitlementCatalogCache``
+        (``get_process_entitlement_cache``) — no second cache, no parallel RBAC
+        state. Its only mutation verb is ``reset()``, which invalidates the
+        cached entitled set so the NEXT ``get_entitled_ids`` re-fetches the
+        truth from DW's own /v1/models rather than trusting a stale local
+        guess. That is deliberately better than us subtracting the model
+        ourselves: DW remains the authority on its own RBAC, and the module's
+        TTL (``JARVIS_DW_ENTITLEMENT_CACHE_TTL_S``, default 1800s) still governs
+        re-probing if entitlements are provisioned later. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.dw_entitlement_fallback import (
+                get_process_entitlement_cache,
+            )
+
+            get_process_entitlement_cache().reset()
+            logger.info(
+                "[DoublewordProvider] entitled-catalog cache reset after 403 "
+                "(model=%s) — next election re-derives the entitled set from "
+                "DW itself", model,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[DoublewordProvider] entitlement prune skipped", exc_info=True)
+
     @staticmethod
     def _record_completion_surface(
         *,
@@ -7574,6 +7676,13 @@ class DoublewordProvider:
                         )
                     except Exception:  # noqa: BLE001 — never mask the real error
                         pass
+                    # RT-path resilience wiring (2026-07-17). Both handlers are
+                    # EXISTING modules — this composes them, it does not
+                    # reimplement backoff, TTL, or catalog logic (DRY).
+                    await self._handle_rt_http_failure(
+                        status=resp.status, body=err_body, model=effective_model,
+                        caller_id=caller_id,
+                    )
                     raise DoublewordInfraError(
                         f"complete_sync[{caller_id}] HTTP {resp.status}: {err_body[:200]}",
                         status_code=resp.status,
