@@ -1029,3 +1029,189 @@ def test_rt_timeout_env_parsing(monkeypatch):
     assert DreamEngine._dream_rt_timeout_s() == 90.0
     monkeypatch.setenv("JARVIS_DREAM_RT_TIMEOUT_S", "1")
     assert DreamEngine._dream_rt_timeout_s() == 5.0    # floor
+
+
+# ============================================================================
+# Dynamic candidate hydration (2026-07-17)
+#
+# The stub hardcoded prompt_family="general_improvement" / model_class=
+# "qwen2.5-7b" (the latter a lie — no soak ever served a dream on it), so
+# compute_job_key had exactly ONE possible identity per HEAD: dream once, then
+# correctly skip forever ("Job ... already completed, skipping" x N). The hash
+# and the dedup registry are SOUND and untouched; the fix is to give the key
+# genuine, organically-derived diversity.
+# ============================================================================
+
+from backend.core.ouroboros.consciousness.dream_engine import (
+    _MODEL_CLASS_UNKNOWN,
+    _PROMPT_FAMILY_NEUTRAL,
+)
+from backend.core.ouroboros.consciousness.types import compute_job_key
+
+
+def _insight(category, *, expired=False, evidence=5):
+    i = MagicMock()
+    i.category = category
+    i.evidence_count = evidence
+    i.is_expired = MagicMock(return_value=expired)
+    return i
+
+
+def _mem(*insights):
+    m = MagicMock()
+    s = MagicMock()
+    s.top_patterns = tuple(insights)
+    m.get_pattern_summary.return_value = s
+    return m
+
+
+def _cand_engine(tmp_path, *, memory=None, dw=None, claude=None, repo=None):
+    from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
+    d = tmp_path / "dreams"
+    d.mkdir(exist_ok=True)
+    eng = DreamEngine(
+        health_cortex=MagicMock(),
+        memory_engine=memory if memory is not None else _mem(),
+        activity_monitor=MockActivityMonitor(idle_seconds=600.0),
+        resource_governor=MagicMock(),
+        metrics_tracker=DreamMetricsTracker(),
+        config=_make_config(),
+        persistence_dir=d,
+        repo_path=str(repo) if repo else None,
+    )
+    eng._dw_provider = dw
+    eng._claude_provider = claude
+    eng._current_head = "headsha1234"
+    eng._current_policy_hash = "policyhash01"
+    return eng
+
+
+def _provider(model):
+    p = MagicMock()
+    p._model = model
+    return p
+
+
+# ---- prompt_family derives from live memory telemetry ----------------------
+
+
+def test_prompt_family_tracks_dominant_failure_pattern(tmp_path):
+    eng = _cand_engine(tmp_path, memory=_mem(_insight("failure_pattern")))
+    assert eng._derive_prompt_family() == "failure_repair"
+
+
+def test_prompt_family_tracks_fragility(tmp_path):
+    eng = _cand_engine(tmp_path, memory=_mem(_insight("file_fragility")))
+    assert eng._derive_prompt_family() == "fragility_hardening"
+
+
+def test_prompt_family_tracks_success_pattern(tmp_path):
+    eng = _cand_engine(tmp_path, memory=_mem(_insight("success_pattern")))
+    assert eng._derive_prompt_family() == "success_extension"
+
+
+def test_prompt_family_skips_expired_insights(tmp_path):
+    """An expired insight is not a live focus — the engine's own TTL governs."""
+    eng = _cand_engine(tmp_path, memory=_mem(
+        _insight("failure_pattern", expired=True),
+        _insight("file_fragility", expired=False),
+    ))
+    assert eng._derive_prompt_family() == "fragility_hardening"
+
+
+def test_prompt_family_unknown_category_passes_through(tmp_path):
+    """A NEW MemoryEngine category isn't silently swallowed by our map."""
+    eng = _cand_engine(tmp_path, memory=_mem(_insight("perf_regression")))
+    assert eng._derive_prompt_family() == "perf_regression"
+
+
+def test_prompt_family_cold_memory_is_neutral(tmp_path):
+    """Fresh organism: no insights → honest neutral focus, not a fabrication."""
+    assert _cand_engine(tmp_path, memory=_mem())._derive_prompt_family() == _PROMPT_FAMILY_NEUTRAL
+
+
+def test_prompt_family_never_raises_on_broken_memory(tmp_path):
+    m = MagicMock()
+    m.get_pattern_summary.side_effect = RuntimeError("memory down")
+    assert _cand_engine(tmp_path, memory=m)._derive_prompt_family() == _PROMPT_FAMILY_NEUTRAL
+
+
+# ---- model_class derives from the live provider topology -------------------
+
+
+def test_model_class_reflects_dw_primary(tmp_path):
+    eng = _cand_engine(tmp_path, dw=_provider("Qwen/Qwen3.5-397B-A17B-FP8"),
+                       claude=_provider("claude-sonnet-4-6"))
+    assert eng._derive_model_class() == "dw:Qwen/Qwen3.5-397B-A17B-FP8"  # mirrors tier order
+
+
+def test_model_class_falls_to_claude_when_dw_absent(tmp_path):
+    eng = _cand_engine(tmp_path, dw=None, claude=_provider("claude-sonnet-4-6"))
+    assert eng._derive_model_class() == "claude:claude-sonnet-4-6"
+
+
+def test_model_class_unwired_when_no_providers(tmp_path):
+    assert _cand_engine(tmp_path)._derive_model_class() == _MODEL_CLASS_UNKNOWN
+
+
+def test_model_class_never_hardcodes_the_stub_slug(tmp_path):
+    """The stub's qwen2.5-7b lie must never reappear."""
+    eng = _cand_engine(tmp_path, dw=_provider("Qwen/Qwen3.5-397B-A17B-FP8"))
+    assert "qwen2.5-7b" not in eng._derive_model_class()
+
+
+# ---- the payoff: DIVERSE job keys, hash untouched --------------------------
+
+
+def test_candidate_carries_derived_axes(tmp_path):
+    eng = _cand_engine(tmp_path, memory=_mem(_insight("failure_pattern")),
+                       dw=_provider("dw-model-x"))
+    c = eng._pick_candidate()
+    assert c["prompt_family"] == "failure_repair"
+    assert c["model_class"] == "dw:dw-model-x"
+    assert c["repo_sha"] == "headsha1234" and c["policy_hash"] == "policyhash01"
+
+
+def test_shifting_memory_yields_DISTINCT_job_keys_on_static_head(tmp_path):
+    """THE fix: with HEAD frozen, a shift in live telemetry re-keys the job —
+    so a genuinely new dream is warranted and the (correct) dedup skip no
+    longer starves the DW-RT tier."""
+    keys = set()
+    for cat in ("failure_pattern", "file_fragility", "success_pattern"):
+        eng = _cand_engine(tmp_path, memory=_mem(_insight(cat)), dw=_provider("m"))
+        c = eng._pick_candidate()
+        keys.add(compute_job_key(c["repo_sha"], c["policy_hash"],
+                                 c["prompt_family"], c["model_class"]))
+    assert len(keys) == 3          # same HEAD, three distinct dreamable jobs
+
+
+def test_provider_topology_shift_rekeys_job(tmp_path):
+    """A topology change (entitlement/pin/outage) legitimately re-keys."""
+    a = _cand_engine(tmp_path, dw=_provider("model-a"))._pick_candidate()
+    b = _cand_engine(tmp_path, dw=_provider("model-b"))._pick_candidate()
+    ka = compute_job_key(a["repo_sha"], a["policy_hash"], a["prompt_family"], a["model_class"])
+    kb = compute_job_key(b["repo_sha"], b["policy_hash"], b["prompt_family"], b["model_class"])
+    assert ka != kb
+
+
+def test_identical_state_is_STILL_deduped(tmp_path):
+    """Bulletproof: unchanged state must remain idempotent — no runaway
+    re-dreaming (the OOM/cost failure mode)."""
+    k = []
+    for _ in range(3):
+        eng = _cand_engine(tmp_path, memory=_mem(_insight("failure_pattern")), dw=_provider("m"))
+        c = eng._pick_candidate()
+        k.append(compute_job_key(c["repo_sha"], c["policy_hash"],
+                                 c["prompt_family"], c["model_class"]))
+    assert len(set(k)) == 1        # stable identity — the cache still works
+
+
+def test_repo_name_from_live_path_not_hardcoded(tmp_path):
+    eng = _cand_engine(tmp_path, repo=tmp_path / "my-repo")
+    assert eng._pick_candidate()["repo"] == "my-repo"
+
+
+def test_pick_candidate_still_none_without_repo_state(tmp_path):
+    eng = _cand_engine(tmp_path)
+    eng._current_head = ""
+    assert eng._pick_candidate() is None
