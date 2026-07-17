@@ -332,13 +332,19 @@ class IntakeLayerService:
         try:
             from backend.core.ouroboros.governance.conception_proposal_bridge import (
                 get_default_bridge,
+                mark_observers_armed,
                 master_enabled as bridge_enabled,
             )
+            # Release the DreamEngine's lifecycle barrier on EVERY exit path
+            # below — armed, disabled, or no-source. A bridge that will never
+            # arm an observer must not leave the dream loop blocked; the barrier
+            # is "routing is as ready as it will get", not "an observer exists".
             if not bridge_enabled():
                 logger.info(
                     "[IntakeLayer] Conception bridge master off — blueprints "
                     "stay unrouted (intent_discovery grounding still active)",
                 )
+                mark_observers_armed()
                 return
             dream = self._resolve_dream_engine()
             if dream is None or not hasattr(dream, "register_blueprint_observer"):
@@ -346,18 +352,33 @@ class IntakeLayerService:
                     "[IntakeLayer] Conception bridge enabled but no DreamEngine "
                     "reachable — bridge idle (no event source)",
                 )
+                mark_observers_armed()
                 return
             top_n = int(os.environ.get("JARVIS_CONCEPTION_BRIDGE_TOP_N", "5") or 5)
             bridge = get_default_bridge()
             observer = bridge.make_observer(
                 router, lambda: dream.get_blueprints(top_n=top_n),
             )
+            # register_blueprint_observer atomically reconciles any blueprint
+            # already produced during boot (the TOCTOU-proof drain), THEN we
+            # release the barrier so subsequent first-dreams proceed knowing the
+            # observer is live.
             dream.register_blueprint_observer(observer)
+            mark_observers_armed()
             logger.info(
                 "[IntakeLayer] Conception bridge ARMED: high-EV blueprints will "
                 "route as auto_proposed envelopes (event-driven, dedup-guarded)",
             )
         except Exception:  # noqa: BLE001 — wiring is fail-soft by contract
+            # Never leave the barrier unset on a wiring fault — that would
+            # wedge the dream loop for the full timeout every boot.
+            try:
+                from backend.core.ouroboros.governance.conception_proposal_bridge import (
+                    mark_observers_armed as _mark,
+                )
+                _mark()
+            except Exception:  # noqa: BLE001
+                pass
             logger.debug(
                 "[IntakeLayer] conception bridge wiring skipped", exc_info=True,
             )
