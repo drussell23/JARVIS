@@ -31,6 +31,7 @@ default-OFF master flag (a new autonomous routing capability is opt-in).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -53,6 +54,70 @@ _ROUTED_RESULTS = frozenset({"enqueued", "pending_ack", "deduplicated"})
 # ---------------------------------------------------------------------------
 # Env surface
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# observers_armed lifecycle barrier (2026-07-17)
+#
+# Mirrors the A1-T2 router-ready valve (unified_intake_router.mark_router_ready
+# / await_router_ready): a process-global asyncio.Event the DreamEngine awaits
+# before its first dream, so no inference compute is burned producing a
+# blueprint that nothing can route yet. Set by IntakeLayerService once the
+# conception bridge's blueprint observer is registered (or on any arm-skip path,
+# so a disabled/absent bridge releases the barrier instead of wedging dreaming).
+# ---------------------------------------------------------------------------
+
+_observers_armed_event: Optional["asyncio.Event"] = None
+_observers_armed_lock = threading.Lock()
+
+
+def _get_observers_armed_event() -> "asyncio.Event":
+    """Lazily create the barrier Event on the running loop (asyncio.Event binds
+    to the loop at construction; created on first touch inside the async boot)."""
+    global _observers_armed_event
+    with _observers_armed_lock:
+        if _observers_armed_event is None:
+            import asyncio as _asyncio
+            _observers_armed_event = _asyncio.Event()
+        return _observers_armed_event
+
+
+def mark_observers_armed() -> None:
+    """Signal that the conception observer is armed (or that arming was skipped
+    — a disabled bridge has no observer, so the barrier must still release).
+    Idempotent; NEVER raises."""
+    try:
+        _get_observers_armed_event().set()
+    except Exception:  # noqa: BLE001
+        logger.debug("[ConceptionBridge] mark_observers_armed skipped", exc_info=True)
+
+
+def observers_are_armed() -> bool:
+    try:
+        return _get_observers_armed_event().is_set()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def await_observers_armed(timeout_s: float) -> bool:
+    """Await the observers-armed barrier, bounded by ``timeout_s``. Returns True
+    if armed within the window, False on timeout (caller proceeds — the atomic
+    register-and-drain still reconciles anything produced meanwhile). NEVER
+    raises."""
+    import asyncio as _asyncio
+    try:
+        await _asyncio.wait_for(_get_observers_armed_event().wait(), timeout=timeout_s)
+        return True
+    except _asyncio.TimeoutError:
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reset_observers_armed_for_tests() -> None:
+    global _observers_armed_event
+    with _observers_armed_lock:
+        _observers_armed_event = None
 
 
 def master_enabled() -> bool:

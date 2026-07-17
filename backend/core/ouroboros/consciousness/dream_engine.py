@@ -30,6 +30,7 @@ Thread-safety:
 from __future__ import annotations
 
 import asyncio
+import threading
 import hashlib
 import json
 import logging
@@ -279,6 +280,14 @@ class DreamEngine:
         # production without polling. No observer registered => no behavior
         # change.
         self._blueprint_observers: List[Callable[[Any], Any]] = []
+        # TOCTOU barrier (2026-07-17): the observer list AND the blueprint store
+        # are read/written under this one lock so that register-and-drain vs
+        # store-and-notify can never interleave in a way that drops a payload.
+        # bt-2026-07-17-085445 dropped the run's only blueprint: the dream fired
+        # at 01:55:39, the ConceptionBridge armed its observer at 01:55:40 — the
+        # blueprint was produced into a world with no listener.
+        self._observer_lock = threading.Lock()
+        self._intake_barrier_awaited: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -287,16 +296,61 @@ class DreamEngine:
     def register_blueprint_observer(
         self, observer: Callable[[Any], Any],
     ) -> None:
-        """Register an async callback invoked (fail-soft) after each blueprint
-        is computed and stored. Idempotent per identity. Event source for the
-        Gap 3 conception proposal bridge."""
-        if observer not in self._blueprint_observers:
+        """Register a blueprint observer AND atomically reconcile the store.
+
+        TOCTOU-free (Mandate 3). Under ``_observer_lock`` — a single
+        thread-safe synchronous block — the observer is appended and the
+        CURRENT blueprint store is snapshotted together. This closes the gap a
+        naive ``get_blueprints()`` pull would leave open:
+
+          * a blueprint stored BEFORE this call is in the snapshot → drained to
+            the new observer here;
+          * a blueprint stored AFTER this call sees the observer already in the
+            list → delivered by ``_notify_blueprint_observers``.
+
+        The lock serializes append-vs-snapshot against notify's observer
+        snapshot, so a payload lands via exactly one path (or both — the bridge
+        dedups by blueprint_id, so a double is harmless; a drop is impossible).
+        Idempotent per identity. Delivery of the drained backlog happens OUTSIDE
+        the lock (it awaits) on the running loop; NEVER raises."""
+        with self._observer_lock:
+            if observer in self._blueprint_observers:
+                return
             self._blueprint_observers.append(observer)
+            pending = list(self._blueprints.values())   # atomic w/ the append
+        if pending:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._drain_backlog_to(observer, pending))
+                logger.info(
+                    "[DreamEngine] observer registered + %d historical "
+                    "blueprint(s) reconciled (boot-race closed)", len(pending),
+                )
+            except RuntimeError:
+                # No running loop (rare: sync test / pre-loop wiring). The
+                # observer is registered; future blueprints still reach it.
+                logger.debug("[DreamEngine] backlog drain skipped: no running loop")
+
+    async def _drain_backlog_to(self, observer: Callable[[Any], Any],
+                                pending: List[Any]) -> None:
+        """Deliver the historical blueprint backlog to a freshly-registered
+        observer (fail-soft, per-item isolated)."""
+        for bp in pending:
+            try:
+                res = observer(bp)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:  # noqa: BLE001 — best-effort, never disturb boot
+                logger.debug("[DreamEngine] backlog drain observer faulted",
+                             exc_info=True)
 
     async def _notify_blueprint_observers(self, blueprint: Any) -> None:
         """Await each registered observer, isolating faults — an observer
-        error never disturbs the dream loop."""
-        for obs in list(self._blueprint_observers):
+        error never disturbs the dream loop. The observer snapshot is taken
+        under ``_observer_lock`` so it is atomic against register-and-drain."""
+        with self._observer_lock:
+            observers = list(self._blueprint_observers)
+        for obs in observers:
             try:
                 res = obs(blueprint)
                 if asyncio.iscoroutine(res):
@@ -537,8 +591,53 @@ class DreamEngine:
     # Dream loop
     # ------------------------------------------------------------------
 
+    async def _await_intake_barrier(self) -> None:
+        """Lifecycle barrier (Mandate 2): block the FIRST dream until the
+        conception bridge's observer is armed, so no inference compute is burned
+        producing a blueprint nothing can route. Deterministic — an
+        ``asyncio.Event`` (``observers_armed``), not a sleep/retry.
+
+        Fail-OPEN: when the bridge is disabled there is no observer to wait for,
+        so the barrier releases immediately; a bounded timeout guarantees a
+        never-arming intake can never wedge dreaming (the atomic register-drain
+        would still reconcile any blueprint produced meanwhile). Runs once."""
+        if self._intake_barrier_awaited:
+            return
+        self._intake_barrier_awaited = True
+        try:
+            from backend.core.ouroboros.governance.conception_proposal_bridge import (
+                await_observers_armed,
+                master_enabled as _bridge_enabled,
+            )
+
+            if not _bridge_enabled():
+                return  # no observer will ever arm — do not block dreaming
+            armed = await await_observers_armed(self._intake_barrier_timeout_s())
+            logger.info(
+                "[DreamEngine] intake barrier %s — first dream may proceed",
+                "released (observers armed)" if armed
+                else "timed out (proceeding; atomic drain covers late arm)",
+            )
+        except Exception:  # noqa: BLE001 — the barrier is an optimization, not a gate
+            logger.debug("[DreamEngine] intake barrier skipped", exc_info=True)
+
+    @staticmethod
+    def _intake_barrier_timeout_s() -> float:
+        """``JARVIS_DREAM_INTAKE_BARRIER_TIMEOUT_S`` (default 120s — a full boot
+        of the 6-layer stack). Bounded so a never-arming intake never wedges the
+        dream loop. Never raises."""
+        try:
+            return max(1.0, float(os.environ.get(
+                "JARVIS_DREAM_INTAKE_BARRIER_TIMEOUT_S", "120")))
+        except (TypeError, ValueError):
+            return 120.0
+
     async def _dream_loop(self) -> None:
         """Background loop: check gates, pick candidate, compute blueprint."""
+        # Barrier: wait for the routing infrastructure (conception bridge
+        # observer) before the first candidate/inference cycle. Boot-race fix
+        # (bt-2026-07-17-085445). Bounded + fail-open — never wedges the loop.
+        await self._await_intake_barrier()
         while True:
             try:
                 # Reset preemption at start of each cycle
