@@ -389,6 +389,15 @@ async def acquire_call_lease(
 # AST pins + Aegis daemon stay in sync on the exact spelling.
 LEASE_HEADER_NAME: str = "X-JARVIS-Lease"
 
+# Canonical header a JARVIS client uses to DECLARE its per-request upstream read
+# budget (seconds) to the Aegis forwarding proxy. The proxy honors it (clamped
+# to its own ceiling) instead of imposing a blind inter-chunk sock_read that
+# would cut a legitimately-silent non-streaming generation before the client's
+# own budget. MUST byte-match ``aegis.forwarding._UPSTREAM_READ_BUDGET_HEADER``
+# — pinned by tests/aegis/test_upstream_read_budget.py so the two ends can never
+# drift. Single source of truth on the client side.
+UPSTREAM_READ_BUDGET_HEADER_NAME: str = "X-JARVIS-Upstream-Read-Budget-S"
+
 
 def merge_lease_header(
     extra_headers: Optional[Dict[str, str]],
@@ -439,4 +448,5 @@ __all__ = [
     "merge_lease_header",
     "merge_lease_into_session_headers",
     "LEASE_HEADER_NAME",
+    "UPSTREAM_READ_BUDGET_HEADER_NAME",
 ]
