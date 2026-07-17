@@ -65,6 +65,7 @@ from backend.core.ouroboros.governance.aegis_provider_bridge import (
     dw_authorization_header as _aegis_dw_auth_header,
     dw_session_auth_header as _aegis_dw_session_auth_header,
     merge_lease_into_session_headers as _aegis_merge_lease_headers,
+    UPSTREAM_READ_BUDGET_HEADER_NAME as _AEGIS_READ_BUDGET_HEADER,
 )
 from backend.core.ouroboros.governance.stream_rupture import (
     CognitiveStallError,
@@ -512,6 +513,32 @@ _DW_REQUEST_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_REQUEST_TIMEOUT_S", "12
 # JARVIS_TOPOLOGY_TTFT_TRACKING_ENABLED) that elects the faster lane when DW RT
 # p95 degrades. Both already exist; the throughput fix is arming them, not a
 # new socket timeout.
+#
+# 2026-07-17 — the Aegis forwarding PROXY (a separate process between this client
+# and DW) DID impose a blind 30s sock_read, which the client never wanted: on a
+# stream:false completion DW is silent for the whole generation, so the proxy
+# fired mid-generation and synthesized a 502 upstream_unreachable before this
+# client's 120s budget (the DreamEngine DW-RT tier failure class). The proxy is
+# now shape-aware AND honors a per-request budget this client DECLARES via the
+# X-JARVIS-Upstream-Read-Budget-S header. ``_dw_declare_read_budget`` stamps it
+# from the same rupture/timeout values this client already trusts (DRY) — the
+# proxy clamps it to its own ceiling, so this is a hint, never an authority.
+
+
+def _dw_declare_read_budget(
+    headers: Dict[str, str], budget_s: float,
+) -> Dict[str, str]:
+    """Stamp the Aegis upstream-read-budget header so the forwarding proxy does
+    not cut the upstream read before OUR budget. Mutates + returns *headers*.
+    Non-positive / invalid budget → header omitted (proxy falls back to its
+    shape default). NEVER raises."""
+    try:
+        b = float(budget_s)
+        if b > 0:
+            headers[_AEGIS_READ_BUDGET_HEADER] = f"{b:.3f}"
+    except (TypeError, ValueError):
+        pass
+    return headers
 
 
 _NATIVE_TC_SENTINEL = "\n__NTC__:"  # appended to content string when DW returns native tool_calls
@@ -4454,6 +4481,17 @@ class DoublewordProvider:
                         # missing_session_bearer 401 wedge on RT streaming).
                         _call_auth = await _aegis_dw_session_auth_header()
                         _call_auth["Content-Type"] = "application/json"
+                        # 2026-07-17 — declare our Phase-1 TTFT window to the
+                        # Aegis proxy so it does not cut the upstream read while
+                        # a reasoning model is legitimately silent before its
+                        # first token (the proxy's blind 30s inter-chunk bound
+                        # would pre-empt our own rupture watchdog). Same value
+                        # our Phase-1 breaker uses below (DRY); the proxy clamps
+                        # to its ceiling, and our inter-chunk watchdog stays the
+                        # authority on real mid-stream stalls.
+                        _dw_declare_read_budget(
+                            _call_auth, _stream_rupture_timeout_s(),
+                        )
                         # Slice 2B-ii — per-call Aegis lease (None when disabled
                         # → header is skipped via merge helper).
                         _aegis_lease = await _aegis_acquire_call_lease(
@@ -4956,6 +4994,12 @@ class DoublewordProvider:
                         # missing_session_bearer 401 wedge).
                         _call_auth = await _aegis_dw_session_auth_header()
                         _call_auth["Content-Type"] = "application/json"
+                        # 2026-07-17 — stream:false agent path: DW is silent for
+                        # the whole generation, so declare our transport budget
+                        # to the Aegis proxy (else its inter-chunk sock_read
+                        # false-502s mid-generation). Matches our own aiohttp
+                        # total (_request_timeout) — the bound we already impose.
+                        _dw_declare_read_budget(_call_auth, _DW_REQUEST_TIMEOUT_S)
                         # Slice 2B-ii — per-call Aegis lease.
                         _aegis_lease = await _aegis_acquire_call_lease(
                             op_id=context.op_id,
@@ -7637,6 +7681,12 @@ class DoublewordProvider:
             # Slice 31 — Aegis session bearer for sync complete().
             _call_auth = await _aegis_dw_session_auth_header()
             _call_auth["Content-Type"] = "application/json"
+            # 2026-07-17 — declare OUR patience to the Aegis proxy. complete_sync
+            # is stream:false: DW is silent on the socket for the whole
+            # generation, so without this the proxy's inter-chunk sock_read fires
+            # mid-generation and 502s. ``timeout_s`` is the caller's hard
+            # wait_for bound — the exact maximum we will wait on this socket.
+            _dw_declare_read_budget(_call_auth, timeout_s)
             # Slice 2B-ii — per-call Aegis lease bound to caller_id.
             _aegis_lease = await _aegis_acquire_call_lease(
                 op_id=f"dw-complete-sync:{caller_id}",

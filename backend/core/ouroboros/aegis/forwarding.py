@@ -126,6 +126,113 @@ def _upstream_sock_read_timeout_s() -> float:
 
 
 # ---------------------------------------------------------------------------
+# Shape-aware upstream read budget — kills the non-streaming false-502 class
+# (bt-2026-07-17: the DreamEngine DW-RT tier, and every stream:false op).
+#
+# The ``sock_read`` above is an INTER-CHUNK stall bound: correct for SSE, where
+# tokens arrive continuously and a 30s silence means a stalled stream. It is
+# WRONG for a non-streaming (``stream:false``) request — DW generates the ENTIRE
+# body before writing a single byte, so the socket is legitimately silent for
+# the whole generation (Qwen3.5-397B reasoning TTFT p50 ~66s per the DW client's
+# own STAGE_RT_HTTP_POST calibration). A 30s sock_read then fires mid-generation
+# and this proxy synthesizes a 502 ``upstream_unreachable`` BEFORE the client's
+# own 120s budget — a false outage manufactured by the proxy, not DW.
+#
+# The DW *client* deliberately sets NO sock_read (doubleword_provider
+# ``_request_timeout`` — total only) precisely because it owns a smarter,
+# phase-aware rupture watchdog (120s/360s TTFT then lag-compensated inter-chunk).
+# This proxy must not re-impose a cruder, tighter guard that pre-empts it.
+#
+# Two orthogonal, authority-preserving corrections:
+#   1. Shape default — a non-streaming request gets a generation-sized read
+#      budget (env ``JARVIS_AEGIS_NONSTREAM_READ_S``, default 120s = the DW
+#      client's own total). Streaming is UNCHANGED (30s inter-chunk).
+#   2. Client hint — the trusted local client MAY declare its per-request budget
+#      via the ``X-JARVIS-Upstream-Read-Budget-S`` header (sourced from its own
+#      rupture window / caller timeout). Aegis HONORS it but CLAMPS to
+#      ``[floor, ceiling]`` so a buggy/compromised client can never set an
+#      unbounded upstream read — Aegis stays the authority on the maximum.
+# Absent/invalid header → the shape default (byte-identical for any non-JARVIS
+# caller, e.g. an Anthropic passthrough that never sets the header).
+# ---------------------------------------------------------------------------
+
+_UPSTREAM_READ_BUDGET_HEADER: str = "X-JARVIS-Upstream-Read-Budget-S"
+_NONSTREAM_READ_ENV_VAR: str = "JARVIS_AEGIS_NONSTREAM_READ_S"
+_DEFAULT_NONSTREAM_READ_S: float = 120.0
+_READ_BUDGET_CEILING_ENV_VAR: str = "JARVIS_AEGIS_UPSTREAM_READ_CEILING_S"
+_DEFAULT_READ_BUDGET_CEILING_S: float = 600.0
+_READ_BUDGET_FLOOR_S: float = 5.0
+
+
+def _nonstream_read_default_s() -> float:
+    """Default upstream read budget for a NON-streaming request — there are no
+    inter-chunk semantics (the whole generation arrives as one silent-then-burst
+    read), so the inter-chunk bound does not apply. Env
+    ``JARVIS_AEGIS_NONSTREAM_READ_S``; invalid / non-positive → 120s. NEVER
+    raises."""
+    raw = os.environ.get(_NONSTREAM_READ_ENV_VAR, "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    return _DEFAULT_NONSTREAM_READ_S
+
+
+def _read_budget_ceiling_s() -> float:
+    """Hard upper clamp on ANY resolved upstream read budget — Aegis stays the
+    authority on the maximum a client can request. Env
+    ``JARVIS_AEGIS_UPSTREAM_READ_CEILING_S``; invalid / non-positive → 600s.
+    NEVER raises."""
+    raw = os.environ.get(_READ_BUDGET_CEILING_ENV_VAR, "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    return _DEFAULT_READ_BUDGET_CEILING_S
+
+
+def _resolve_upstream_read_budget_s(
+    request: "web.Request", *, is_streaming: bool,
+) -> float:
+    """Resolve the aiohttp ``sock_read`` budget for THIS upstream request.
+
+    Precedence:
+      1. A valid ``X-JARVIS-Upstream-Read-Budget-S`` header from the trusted
+         local client → clamped to ``[floor, ceiling]``.
+      2. No / invalid header → the shape default: the inter-chunk 30s bound for a
+         streaming request (UNCHANGED), or the generation-sized non-streaming
+         default for ``stream:false``.
+
+    Every branch is ceiling-bounded (defends a mis-set env too). NEVER raises —
+    any parse / header-access failure degrades to the shape default.
+    """
+    ceiling = _read_budget_ceiling_s()
+    raw = ""
+    try:
+        raw = (request.headers.get(_UPSTREAM_READ_BUDGET_HEADER, "") or "").strip()
+    except Exception:  # noqa: BLE001 — header access must never break forwarding
+        raw = ""
+    if raw:
+        try:
+            declared = float(raw)
+            if declared > 0:
+                return max(_READ_BUDGET_FLOOR_S, min(declared, ceiling))
+        except (ValueError, TypeError):
+            pass
+    shape_default = (
+        _upstream_sock_read_timeout_s() if is_streaming
+        else _nonstream_read_default_s()
+    )
+    return max(_READ_BUDGET_FLOOR_S, min(shape_default, ceiling))
+
+
+# ---------------------------------------------------------------------------
 # Wire-family usage parsers — closed dispatch
 # ---------------------------------------------------------------------------
 
@@ -526,7 +633,10 @@ async def forward_request(
     for name, value in request.headers.items():
         lname = name.lower()
         if lname in ("host", "authorization", "x-jarvis-lease",
-                     "content-length", endpoint.auth_header.lower()):
+                     "content-length", _UPSTREAM_READ_BUDGET_HEADER.lower(),
+                     endpoint.auth_header.lower()):
+            # X-JARVIS-Upstream-Read-Budget-S is a JARVIS↔Aegis control header —
+            # consumed here for the timeout decision, never leaked to upstream.
             continue
         outbound_headers[name] = value
     if endpoint.auth_scheme is AuthScheme.HEADER_RAW:
@@ -539,7 +649,12 @@ async def forward_request(
     )
     timeout = aiohttp.ClientTimeout(
         connect=_DEFAULT_CONNECT_TIMEOUT_S,
-        sock_read=_upstream_sock_read_timeout_s(),
+        # Shape-aware, client-hint-honoring, ceiling-clamped upstream read
+        # budget — NOT the blind 30s inter-chunk bound (which false-502'd every
+        # stream:false completion whose generation ran past 30s).
+        sock_read=_resolve_upstream_read_budget_s(
+            request, is_streaming=is_streaming,
+        ),
     )
 
     # 4. Open upstream + stream pass-through ---------------------------------
