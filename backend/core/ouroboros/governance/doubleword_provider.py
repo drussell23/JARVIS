@@ -7298,6 +7298,55 @@ class DoublewordProvider:
     # Functions-not-Agents path: complete_sync()
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _record_completion_surface(
+        *,
+        healthy: bool,
+        latency_s: float,
+        model: str,
+        output_tokens: int = 0,
+        verdict: Optional[Any] = None,
+        diagnostic: str = "",
+    ) -> None:
+        """Inject a DIRECT_COMPLETION outcome into the EXISTING surface-health
+        ledger (no parallel data structure — mandate 3).
+
+        Multi-dimensional by construction:
+          * transport fault (502/timeout/auth) → caller passes an explicit
+            ``verdict`` (UPSTREAM_DEGRADED / TRANSPORT_DEGRADED / AUTH_FAILED),
+          * transport OK but ZERO generated content → INFERENCE_DEGRADED,
+          * content produced → HEALTHY (streak resets in the ledger).
+
+        NEVER raises: health telemetry must never break a live inference call.
+        """
+        try:
+            from backend.core.ouroboros.governance.dw_surface_health import (
+                SurfaceHealthLedger,
+                SurfaceKind,
+                SurfaceVerdict,
+            )
+
+            if verdict is None:
+                verdict = (
+                    SurfaceVerdict.HEALTHY if healthy
+                    else SurfaceVerdict.INFERENCE_DEGRADED
+                )
+                diagnostic = diagnostic or (
+                    "" if healthy else
+                    f"empty_generation:model={model}:out_tokens={output_tokens}"
+                )
+            SurfaceHealthLedger().record(
+                SurfaceKind.DIRECT_COMPLETION,
+                verdict,
+                latency_ms=int(max(0.0, latency_s) * 1000),
+                diagnostic=diagnostic[:200],
+            )
+        except Exception:  # noqa: BLE001 — telemetry is advisory, never fatal
+            logger.debug(
+                "[DoublewordProvider] DIRECT_COMPLETION health record skipped",
+                exc_info=True,
+            )
+
     async def complete_sync(
         self,
         prompt: str,
@@ -7503,6 +7552,28 @@ class DoublewordProvider:
                 if resp.status >= 300:
                     self._last_error_status = resp.status
                     err_body = await resp.text()
+                    # TRANSPORT dimension of DIRECT_COMPLETION health: classify
+                    # the fault so a 502 (DW's upstream unreachable — the live
+                    # bt-2026-07-17-074626 condition) is a DIFFERENT fact from
+                    # an auth failure or an empty generation. Without this the
+                    # surface would only ever hear about successes.
+                    try:
+                        from backend.core.ouroboros.governance.dw_surface_health import (
+                            SurfaceVerdict as _SV,
+                        )
+                        if resp.status in (401, 403):
+                            _v = _SV.AUTH_FAILED
+                        elif resp.status in (502, 503, 504):
+                            _v = _SV.UPSTREAM_DEGRADED
+                        else:
+                            _v = _SV.TRANSPORT_DEGRADED
+                        self._record_completion_surface(
+                            healthy=False, latency_s=0.0, model=effective_model,
+                            verdict=_v,
+                            diagnostic=f"http_{resp.status}:{err_body[:80]}",
+                        )
+                    except Exception:  # noqa: BLE001 — never mask the real error
+                        pass
                     raise DoublewordInfraError(
                         f"complete_sync[{caller_id}] HTTP {resp.status}: {err_body[:200]}",
                         status_code=resp.status,
@@ -7562,6 +7633,22 @@ class DoublewordProvider:
                 "[DoublewordProvider] complete_sync[%s] empty content (model=%s, %.2fs)",
                 caller_id, effective_model, elapsed,
             )
+
+        # DIRECT_COMPLETION surface health (2026-07-17). complete_sync is the
+        # ONLY consumer of DW's stream-free /v1/chat/completions surface and it
+        # recorded NOTHING, so consumers had to borrow the SSE verdict — which
+        # is chronically degraded BY DESIGN (that breakage is why this method
+        # exists). Recording here gives the surface its own health domain.
+        #
+        # TWO DIMENSIONS, not one: a 200 with zero generated content is an
+        # INFERENCE failure wearing a healthy transport's clothes
+        # (bt-2026-07-17-033933: "ok: 30.25s, 0 chars" — the reasoning budget
+        # consumed everything). Transport-only health would score that HEALTHY
+        # and keep routing dreams into a tier that cannot produce.
+        self._record_completion_surface(
+            healthy=bool(content), latency_s=elapsed, model=effective_model,
+            output_tokens=output_tokens,
+        )
 
         logger.info(
             "[DoublewordProvider] complete_sync[%s] ok: %.2fs, %d chars, $%.5f (model=%s)",

@@ -47,20 +47,42 @@ LEDGER_SCHEMA_VERSION = 1
 
 
 class SurfaceKind(str, Enum):
-    """The three DW transport surfaces JARVIS uses."""
+    """The DW transport surfaces JARVIS uses.
+
+    Surfaces are INDEPENDENT health domains — a verdict on one says nothing
+    about another. DIRECT_STREAMING (SSE) has been chronically degraded since
+    bt-2026-04-14-182446 ("stalls post-accept across Qwen 397B and Gemma 4
+    31B"), which is precisely why ``DoublewordProvider.complete_sync`` exists:
+    it reaches /v1/chat/completions with ``stream=False`` and never opens an
+    SSE stream. DIRECT_COMPLETION is that surface's own health domain (added
+    2026-07-17). Before it existed, complete_sync recorded NOTHING, so
+    consumers had to borrow the SSE verdict — and bt-2026-07-17-080507 shows
+    the cost: the dream's DW-RT tier was permanently bypassed on
+    ``consecutive_failures=254`` from a surface it was purpose-built to avoid.
+    """
 
     BATCH_STORAGE = "batch_storage"
     DIRECT_STREAMING = "direct_streaming"
+    DIRECT_COMPLETION = "direct_completion"
     AUTH_SYNC = "auth_sync"
 
 
 class SurfaceVerdict(str, Enum):
-    """Health verdict for a single surface probe outcome."""
+    """Health verdict for a single surface probe outcome.
+
+    TRANSPORT vs INFERENCE are distinct failure dimensions: DW can return a
+    perfectly healthy transport (HTTP 200, low latency) while generating ZERO
+    content — the reasoning-budget exhaustion class proven live in
+    bt-2026-07-17-033933 ("ok: 30.25s, 0 chars, $0.00010"). A 200 that produces
+    nothing is a LIE the transport layer cannot see, so it earns its own
+    verdict rather than counting as HEALTHY.
+    """
 
     HEALTHY = "healthy"
     TRANSPORT_DEGRADED = "transport_degraded"
     UPSTREAM_DEGRADED = "upstream_degraded"
     AUTH_FAILED = "auth_failed"
+    INFERENCE_DEGRADED = "inference_degraded"
     ERROR_OTHER = "error_other"
 
 
