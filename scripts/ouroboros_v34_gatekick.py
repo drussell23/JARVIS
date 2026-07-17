@@ -118,7 +118,13 @@ def _build_smoke_entry(
             ],
             "max_tokens": 16,
             "temperature": 0.0,
-            "chat_template_kwargs": {"enable_thinking": False},
+            # API-contract decay purge (2026-07-16): the deprecated top-level
+            # ``chat_template_kwargs={"enable_thinking": False}`` is now HARD-
+            # REJECTED by DW with a 400 ("Unsupported parameter … use
+            # 'reasoning_effort'"). ``reasoning_effort="none"`` is the honored
+            # knob and carries the same intent (suppress chain-of-thought so a
+            # 16-token ping returns content, not reasoning).
+            "reasoning_effort": "none",
         },
     }
 
