@@ -1215,3 +1215,78 @@ def test_pick_candidate_still_none_without_repo_state(tmp_path):
     eng = _cand_engine(tmp_path)
     eng._current_head = ""
     assert eng._pick_candidate() is None
+
+
+# ============================================================================
+# Output-budget decoupling + empty-tier observability (2026-07-17)
+#
+# bt-2026-07-17-033933: DW returned "0 chars, 30.25s, $0.00010". Two defects:
+#   (1) DREAM_MAX_PROMPT_CHARS (an INPUT char cap, TC23) was passed as the
+#       provider's max_tokens (an OUTPUT budget) — a type error. The only
+#       entitled model (Qwen3.5-397B) has an effort FLOOR of "low" so it ALWAYS
+#       reasons; 2048 output tokens went entirely to chain-of-thought.
+#   (2) the empty response logged NOTHING and fell through silently, so the
+#       cascade looked like DW was never attempted.
+# ============================================================================
+
+import logging
+
+from backend.core.ouroboros.consciousness.dream_engine import (
+    DREAM_MAX_PROMPT_CHARS,
+    dream_max_output_tokens,
+)
+
+
+def test_output_budget_is_decoupled_from_prompt_char_cap(monkeypatch):
+    """The type error must not regrow: the OUTPUT budget is its own knob."""
+    monkeypatch.delenv("JARVIS_DREAM_MAX_OUTPUT_TOKENS", raising=False)
+    assert dream_max_output_tokens() == 8192
+    assert dream_max_output_tokens() != DREAM_MAX_PROMPT_CHARS   # never conflated
+    assert DREAM_MAX_PROMPT_CHARS == 2048                        # input cap unchanged (TC23)
+
+
+def test_output_budget_env_tunable_with_floor(monkeypatch):
+    monkeypatch.setenv("JARVIS_DREAM_MAX_OUTPUT_TOKENS", "16384")
+    assert dream_max_output_tokens() == 16384
+    monkeypatch.setenv("JARVIS_DREAM_MAX_OUTPUT_TOKENS", "64")   # would re-create truncation
+    assert dream_max_output_tokens() == 1024                     # floor protects
+    monkeypatch.setenv("JARVIS_DREAM_MAX_OUTPUT_TOKENS", "junk")
+    assert dream_max_output_tokens() == 8192
+
+
+async def test_dw_tier_sends_the_output_budget_not_prompt_chars(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_DREAM_MAX_OUTPUT_TOKENS", "8192")
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(return_value=_SyncResult(_BP_JSON))
+    eng = _rt_engine(tmp_path, dw=dw, claude=MagicMock())
+    await eng._call_inference("p")
+    sent = dw.complete_sync.await_args.kwargs["max_tokens"]
+    assert sent == 8192
+    assert sent != DREAM_MAX_PROMPT_CHARS      # the 2048 truncation is dead
+
+
+async def test_empty_dw_response_logs_and_still_cascades(tmp_path, caplog):
+    """Mandate 2: an empty tier response emits a DISTINCT diagnostic and the
+    fallback still fires — no silent fall-through."""
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(return_value=_SyncResult(""))   # the live defect
+    claude = MagicMock()
+    claude.prompt_only = AsyncMock(return_value=_BP_JSON)
+    eng = _rt_engine(tmp_path, dw=dw, claude=claude)
+    with caplog.at_level(logging.INFO):
+        result = await eng._call_inference("p")
+    assert result["_inference_provider"] == "claude"             # cascade fired
+    assert any("exhausted/empty" in r.message or "exhausted/empty" in r.getMessage()
+               for r in caplog.records), "empty DW response must log a distinct diagnostic"
+
+
+async def test_empty_claude_response_also_logs(tmp_path, caplog):
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(side_effect=RuntimeError("dw down"))
+    claude = MagicMock()
+    claude.prompt_only = AsyncMock(return_value="")
+    eng = _rt_engine(tmp_path, dw=dw, claude=claude, jprime_url="")
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(DreamProviderExhaustedError):
+            await eng._call_inference("p")
+    assert any("exhausted/empty" in r.getMessage() for r in caplog.records)
