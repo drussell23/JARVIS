@@ -104,7 +104,7 @@ def test_dynamic_threshold_routes_above_batch_mean(monkeypatch):
     bps = [_BP("hi", ("a.py",)), _BP("lo", ("b.py",))]
     out = _run(_bridge({"hi": 0.9, "lo": 0.1}).route(bps, r))
     routed = {o.blueprint_id for o in out if o.routed}
-    below = {o.blueprint_id for o in out if o.reason == "below_threshold"}
+    below = {o.blueprint_id for o in out if o.reason == "incubated"}
     assert routed == {"hi"} and below == {"lo"}         # mean=0.5 → only hi clears
     assert len(r.ingested) == 1
 
