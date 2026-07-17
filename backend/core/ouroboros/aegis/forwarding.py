@@ -157,6 +157,11 @@ def _upstream_sock_read_timeout_s() -> float:
 # ---------------------------------------------------------------------------
 
 _UPSTREAM_READ_BUDGET_HEADER: str = "X-JARVIS-Upstream-Read-Budget-S"
+# Imported (not re-spelled) so the strip set and the admission gate share ONE
+# source of truth for the QoS control-header name.
+from backend.core.ouroboros.aegis.qos_admission import (  # noqa: E402
+    QOS_TIER_HEADER as _QOS_TIER_HEADER,
+)
 _NONSTREAM_READ_ENV_VAR: str = "JARVIS_AEGIS_NONSTREAM_READ_S"
 _DEFAULT_NONSTREAM_READ_S: float = 120.0
 _READ_BUDGET_CEILING_ENV_VAR: str = "JARVIS_AEGIS_UPSTREAM_READ_CEILING_S"
@@ -634,9 +639,11 @@ async def forward_request(
         lname = name.lower()
         if lname in ("host", "authorization", "x-jarvis-lease",
                      "content-length", _UPSTREAM_READ_BUDGET_HEADER.lower(),
+                     _QOS_TIER_HEADER.lower(),
                      endpoint.auth_header.lower()):
-            # X-JARVIS-Upstream-Read-Budget-S is a JARVIS↔Aegis control header —
-            # consumed here for the timeout decision, never leaked to upstream.
+            # X-JARVIS-Upstream-Read-Budget-S and X-JARVIS-QoS-Tier are
+            # JARVIS↔Aegis control headers — consumed by the proxy (timeout +
+            # admission), never leaked to upstream.
             continue
         outbound_headers[name] = value
     if endpoint.auth_scheme is AuthScheme.HEADER_RAW:

@@ -244,14 +244,30 @@ def _make_llm_handler(endpoint):
     """Build a closure-bound handler for an LLM_COMPLETION endpoint."""
     async def _handler(request: web.Request) -> web.StreamResponse:
         from backend.core.ouroboros.aegis.forwarding import forward_request
-        response, _ = await forward_request(
-            request=request,
-            endpoint=endpoint,
-            K=request.app[_K_HMAC_KEY],
-            nonce_ledger=request.app[_K_NONCE_LEDGER],
-            budget=request.app[_K_BUDGET],
+        from backend.core.ouroboros.aegis.qos_admission import (
+            admission_enabled, get_admission_gate, tier_from_header_value,
+            QOS_TIER_HEADER,
         )
-        return response
+
+        async def _do_forward() -> web.StreamResponse:
+            response, _ = await forward_request(
+                request=request,
+                endpoint=endpoint,
+                K=request.app[_K_HMAC_KEY],
+                nonce_ledger=request.app[_K_NONCE_LEDGER],
+                budget=request.app[_K_BUDGET],
+            )
+            return response
+
+        # QoS admission — bound concurrent forwards and, only under saturation,
+        # admit in X-JARVIS-QoS-Tier priority order (critical event-loop traffic
+        # over bulk background sensors). Fail-open + dormant under normal load.
+        # Master-off → pure pass-through (byte-identical to no gate).
+        if not admission_enabled():
+            return await _do_forward()
+        tier = tier_from_header_value(request.headers.get(QOS_TIER_HEADER))
+        async with get_admission_gate().admit(tier):
+            return await _do_forward()
     return _handler
 
 

@@ -398,6 +398,12 @@ LEASE_HEADER_NAME: str = "X-JARVIS-Lease"
 # drift. Single source of truth on the client side.
 UPSTREAM_READ_BUDGET_HEADER_NAME: str = "X-JARVIS-Upstream-Read-Budget-S"
 
+# Canonical header a client stamps to declare a forward's QoS tier
+# ("critical" | "standard" | "bulk") to the Aegis admission gate. MUST byte-match
+# ``aegis.qos_admission.QOS_TIER_HEADER`` — pinned by
+# tests/aegis/test_qos_admission.py. Single source of truth on the client side.
+QOS_TIER_HEADER_NAME: str = "X-JARVIS-QoS-Tier"
+
 
 def merge_lease_header(
     extra_headers: Optional[Dict[str, str]],
