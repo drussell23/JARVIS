@@ -1203,27 +1203,31 @@ class DreamEngine:
 
     @staticmethod
     def _parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
-        """Parse a JSON response from any inference provider."""
-        import json as _json
-        text = raw.strip()
-        # Handle markdown-wrapped JSON
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(ln for ln in lines if not ln.strip().startswith("```"))
+        """Parse a JSON response from any inference provider (the Tier-0/1/2
+        cascade return boundary).
+
+        Structural integrity FIRST: a payload severed mid-transmission — the
+        edge case the 600s Aegis read ceiling opened — is rejected as truncation
+        and routed to the dream's no-blueprint failure path with DISTINCT
+        telemetry, never silently brace-closed into a corrupt blueprint that
+        would flow into the governed loop. Reuses the shared truncation-aware
+        validator + the existing deterministic repair (DRY) in place of the
+        ad-hoc fence-strip / brace-extraction this replaces.
+        """
+        from backend.core.ouroboros.governance.payload_integrity import (
+            PayloadTruncationError, validate_json_payload,
+        )
         try:
-            data = _json.loads(text)
-            if isinstance(data, dict):
-                return data
-        except _json.JSONDecodeError:
-            # Try to extract JSON object from text
-            start = text.find("{")
-            end = text.rfind("}")
-            if start >= 0 and end > start:
-                try:
-                    return _json.loads(text[start:end + 1])
-                except _json.JSONDecodeError:
-                    pass
-        return None
+            return validate_json_payload(raw)
+        except PayloadTruncationError as exc:
+            logger.warning(
+                "[DreamEngine] inference payload TRUNCATED (severed mid-stream) "
+                "— routed to failure lifecycle, NOT parsed: %s", exc.detail,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 — JSONDecodeError / non-object / etc.
+            logger.debug("[DreamEngine] inference payload unparseable: %s", exc)
+            return None
 
     def _parse_blueprint_result(
         self,

@@ -66,6 +66,7 @@ from backend.core.ouroboros.governance.aegis_provider_bridge import (
     dw_session_auth_header as _aegis_dw_session_auth_header,
     merge_lease_into_session_headers as _aegis_merge_lease_headers,
     UPSTREAM_READ_BUDGET_HEADER_NAME as _AEGIS_READ_BUDGET_HEADER,
+    QOS_TIER_HEADER_NAME as _AEGIS_QOS_TIER_HEADER,
 )
 from backend.core.ouroboros.governance.stream_rupture import (
     CognitiveStallError,
@@ -537,6 +538,45 @@ def _dw_declare_read_budget(
         if b > 0:
             headers[_AEGIS_READ_BUDGET_HEADER] = f"{b:.3f}"
     except (TypeError, ValueError):
+        pass
+    return headers
+
+
+# QoS admission tiering — maps the EXISTING provider_route taxonomy (no new
+# vocabulary, no hardcoded op names) onto the Aegis gate's 3 tiers, so a
+# background-sensor forward yields the socket to a latency-critical one under
+# saturation. IMMEDIATE (voice, test-failure, runtime-health, the DreamEngine
+# RT reflex) → critical; STANDARD/COMPLEX interactive → standard; BACKGROUND/
+# SPECULATIVE (OpportunityMiner, DocStaleness, IntentDiscovery, DreamEngine
+# pre-computation) → bulk.
+_ROUTE_QOS_TIER: Dict[str, str] = {
+    "immediate": "critical",
+    "standard": "standard",
+    "complex": "standard",
+    "background": "bulk",
+    "speculative": "bulk",
+}
+
+
+def _qos_tier_for_route(route: str) -> str:
+    """Resolve a QoS tier name from a provider_route. Unknown / empty →
+    'standard' (the safe middle). NEVER raises."""
+    try:
+        return _ROUTE_QOS_TIER.get(str(route or "").strip().lower(), "standard")
+    except Exception:  # noqa: BLE001
+        return "standard"
+
+
+def _dw_declare_qos_tier(
+    headers: Dict[str, str], tier: str,
+) -> Dict[str, str]:
+    """Stamp the Aegis QoS-tier header. Empty tier → omitted (gate defaults to
+    'standard'). Mutates + returns *headers*. NEVER raises."""
+    try:
+        t = str(tier or "").strip()
+        if t:
+            headers[_AEGIS_QOS_TIER_HEADER] = t
+    except Exception:  # noqa: BLE001
         pass
     return headers
 
@@ -4492,6 +4532,11 @@ class DoublewordProvider:
                         _dw_declare_read_budget(
                             _call_auth, _stream_rupture_timeout_s(),
                         )
+                        # QoS tier from the op's provider_route — a background
+                        # sensor stream yields to a critical one under saturation.
+                        _dw_declare_qos_tier(_call_auth, _qos_tier_for_route(
+                            str(getattr(context, "provider_route", "") or ""),
+                        ))
                         # Slice 2B-ii — per-call Aegis lease (None when disabled
                         # → header is skipped via merge helper).
                         _aegis_lease = await _aegis_acquire_call_lease(
@@ -5000,6 +5045,11 @@ class DoublewordProvider:
                         # false-502s mid-generation). Matches our own aiohttp
                         # total (_request_timeout) — the bound we already impose.
                         _dw_declare_read_budget(_call_auth, _DW_REQUEST_TIMEOUT_S)
+                        # QoS tier from the op's provider_route (background sensor
+                        # → bulk; interactive → standard; immediate → critical).
+                        _dw_declare_qos_tier(_call_auth, _qos_tier_for_route(
+                            str(getattr(context, "provider_route", "") or ""),
+                        ))
                         # Slice 2B-ii — per-call Aegis lease.
                         _aegis_lease = await _aegis_acquire_call_lease(
                             op_id=context.op_id,
@@ -7687,6 +7737,10 @@ class DoublewordProvider:
             # mid-generation and 502s. ``timeout_s`` is the caller's hard
             # wait_for bound — the exact maximum we will wait on this socket.
             _dw_declare_read_budget(_call_auth, timeout_s)
+            # complete_sync is the latency-critical Functions path (DreamEngine
+            # RT tier, CompactionCaller, BlastRadius) — declare CRITICAL so it is
+            # admitted ahead of bulk background forwards under saturation.
+            _dw_declare_qos_tier(_call_auth, "critical")
             # Slice 2B-ii — per-call Aegis lease bound to caller_id.
             _aegis_lease = await _aegis_acquire_call_lease(
                 op_id=f"dw-complete-sync:{caller_id}",
