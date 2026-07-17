@@ -56,6 +56,27 @@ logger = logging.getLogger(__name__)
 
 DREAM_MAX_PROMPT_CHARS: int = 2048
 
+# Output-token budget for a dream completion — DECOUPLED from the prompt-char
+# cap above (2026-07-17). The two were conflated: DREAM_MAX_PROMPT_CHARS (an
+# INPUT character limit, TC23) was passed as the provider's ``max_tokens``
+# (an OUTPUT token budget) — a type error with teeth. bt-2026-07-17-033933:
+# the only entitled DW model (Qwen3.5-397B) carries a per-model effort FLOOR of
+# "low", so it ALWAYS reasons; 2048 output tokens were consumed entirely by
+# chain-of-thought, yielding 0 chars of content in 30.25s. The default leaves
+# room for the think phase AND the answer; env-tunable per deployment.
+_DREAM_MAX_OUTPUT_TOKENS_DEFAULT: int = 8192
+
+
+def dream_max_output_tokens() -> int:
+    """``JARVIS_DREAM_MAX_OUTPUT_TOKENS`` (default 8192). Floor of 1024 keeps a
+    misconfiguration from re-creating the truncation class. Never raises."""
+    try:
+        return max(1024, int(os.environ.get(
+            "JARVIS_DREAM_MAX_OUTPUT_TOKENS", _DREAM_MAX_OUTPUT_TOKENS_DEFAULT,
+        )))
+    except (TypeError, ValueError):
+        return _DREAM_MAX_OUTPUT_TOKENS_DEFAULT
+
 # Candidate hydration vocabulary (2026-07-17). The KEYS are the MemoryEngine's
 # own closed insight-category vocabulary (types.MemoryInsight.category) — this
 # maps that existing taxonomy onto a dream focus rather than inventing a second
@@ -834,7 +855,7 @@ class DreamEngine:
                         ),
                         caller_id="dream_engine",
                         model=_dw_model,
-                        max_tokens=DREAM_MAX_PROMPT_CHARS,
+                        max_tokens=dream_max_output_tokens(),
                         timeout_s=rt_timeout,
                         response_format={"type": "json_object"},
                     ),
@@ -854,6 +875,19 @@ class DreamEngine:
                         )
                         return result
                     logger.info("[DreamEngine] DW RT returned non-JSON, cascading")
+                else:
+                    # Observability (2026-07-17): an EMPTY tier response must
+                    # never fall through silently. bt-2026-07-17-033933 burned a
+                    # whole soak here — DW returned 0 chars in 30.25s (the
+                    # chain-of-thought consumed the output budget) and this
+                    # branch logged NOTHING, so the cascade looked like the DW
+                    # tier was never attempted at all.
+                    logger.info(
+                        "[DreamEngine] DW RT generation exhausted/empty "
+                        "(model=%s, %.1fs, out_tokens=%s, budget=%d) — cascading to Claude",
+                        getattr(res, "model", "?"), getattr(res, "latency_s", -1.0),
+                        getattr(res, "output_tokens", "?"), dream_max_output_tokens(),
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -872,7 +906,7 @@ class DreamEngine:
                         prompt=prompt,
                         caller_id="dream_engine",
                         response_format={"type": "json_object"},
-                        max_tokens=DREAM_MAX_PROMPT_CHARS,
+                        max_tokens=dream_max_output_tokens(),
                         timeout_s=rt_timeout,
                     ),
                     timeout=rt_timeout + 5.0,
@@ -886,6 +920,14 @@ class DreamEngine:
                         logger.info("[DreamEngine] Claude RT inference succeeded")
                         return result
                     logger.info("[DreamEngine] Claude RT returned non-JSON, cascading")
+                else:
+                    # Same observability contract as the DW tier — no silent
+                    # fall-through anywhere in the routing topology.
+                    logger.info(
+                        "[DreamEngine] Claude RT generation exhausted/empty "
+                        "(budget=%d) — cascading to J-Prime",
+                        dream_max_output_tokens(),
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

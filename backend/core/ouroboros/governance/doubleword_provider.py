@@ -7517,7 +7517,16 @@ class DoublewordProvider:
                         status_code=0,
                     )
                 message = choices[0].get("message", {}) or {}
-                _content = message.get("content", "") or ""
+                # DRY (2026-07-17) — compose the Slice-54 reasoning-aware
+                # extractor instead of hand-rolling ``message["content"]``.
+                # bt-2026-07-17-033933 proved why: the only ENTITLED model
+                # (Qwen3.5-397B) has a per-model effort FLOOR of "low", so
+                # ``reasoning_effort="none"`` is clamped up and the model always
+                # thinks — leaving ``content`` empty while the real text sits in
+                # ``reasoning`` / ``reasoning_details[].text`` (the correct DW
+                # field names). The hand-rolled read returned "" and the caller
+                # silently cascaded: 30.25s, 0 chars, $0.0001, no blueprint.
+                _content = _extract_completion_text(message)
                 usage = data.get("usage", {}) or {}
                 _input_tokens = int(usage.get("prompt_tokens", 0) or 0)
                 _output_tokens = int(usage.get("completion_tokens", 0) or 0)
