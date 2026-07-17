@@ -141,6 +141,20 @@ def lifecycle_enabled() -> bool:
     return _enabled("JARVIS_FAILOVER_LIFECYCLE_ENABLED", "true")
 
 
+def failover_vm_orchestration_held() -> bool:
+    """Sever ONLY the final VM-spend trigger, keeping all failover logic live.
+
+    ``JARVIS_FAILOVER_VM_ORCHESTRATION_HOLD`` (default FALSE = byte-identical
+    production behavior). When TRUE, ``_do_awaken`` dry-runs at the spend
+    boundary: detection, tier resolution, the RAM pre-flight gate and the
+    startup-script build all still run and stay observable, but no instance is
+    ever created. Purpose (2026-07-17): arming the DW heartbeat activates the
+    ``heartbeat_hard_outage`` vector, and a genuine DW outage (the live HTTP
+    502 in bt-2026-07-17-074626) would otherwise auto-provision GCE. This lets
+    the heartbeat run for its routing intelligence without unintended spend."""
+    return _enabled("JARVIS_FAILOVER_VM_ORCHESTRATION_HOLD", "false")
+
+
 def budget_awaken_enabled() -> bool:
     """Master gate for the budget-exhaustion awaken vector (Task CR2). Default
     OFF -> byte-identical (only a data-plane outage awakens). When ARMED, a
@@ -2176,6 +2190,38 @@ class FailoverLifecycleController:
             except Exception:  # noqa: BLE001
                 _require_gpu = False
             startup_script = self._build_startup_script(require_gpu=_require_gpu)
+
+            # ORCHESTRATION HOLD (2026-07-17) — the single chokepoint where VM
+            # SPEND is committed (covers BOTH awaken paths: the sovereign
+            # instances.insert and the last-resort gcloud fallback, since both
+            # are reached only through ``self._vm_awaken_fn``).
+            #
+            # Placed AFTER every upstream gate so the failover logic is NOT
+            # dismantled: detection, tier resolution, the RAM pre-flight gate,
+            # and the startup-script build all still execute and stay
+            # observable — only the final orchestration trigger is severed.
+            # Enabling the DW heartbeat arms ``heartbeat_hard_outage``, and a
+            # real DW outage (e.g. the live HTTP 502 in bt-2026-07-17-074626)
+            # would otherwise auto-provision a GCE node. Default FALSE =
+            # byte-identical production behavior; TRUE = dry-run the awaken.
+            if failover_vm_orchestration_held():
+                logger.warning(
+                    "[FailoverLifecycle] VM ORCHESTRATION HELD "
+                    "(JARVIS_FAILOVER_VM_ORCHESTRATION_HOLD=true) — awaken "
+                    "reached the spend boundary and was dry-run: NO instance "
+                    "created, no cost incurred. All upstream failover logic "
+                    "executed. Reverting DORMANT (retry next tick); the "
+                    "quarantine Cryo-DLQ remains the backstop.",
+                )
+                try:
+                    self._emit_flare(trigger="vm_orchestration_held",
+                                     route=self._route, now=self._clock_fn())
+                except Exception:  # noqa: BLE001 — observability is best-effort
+                    pass
+                self._state = FailoverState.DORMANT
+                self._awakening_started_at = None
+                return
+
             ok = await self._maybe_await(
                 self._vm_awaken_fn, startup_script=startup_script
             )

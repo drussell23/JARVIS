@@ -840,7 +840,11 @@ class DreamEngine:
         # /v1/chat/completions, the Functions-not-Agents primitive built
         # because DW's SSE endpoint stalls post-accept; it raises
         # DoublewordInfraError on HTTP errors and TimeoutError on expiry).
-        if self._dw_provider is not None and hasattr(self._dw_provider, "complete_sync"):
+        if (
+            self._dw_provider is not None
+            and hasattr(self._dw_provider, "complete_sync")
+            and not self._dw_health_bypass()
+        ):
             try:
                 # Model: env override, else the provider's own default (the
                 # account's entitled model) — no hardcoded model names.
@@ -943,6 +947,44 @@ class DreamEngine:
                 "all RT inference tiers exhausted (dw_rt, claude_rt, jprime)"
             )
         return result
+
+    @staticmethod
+    def _dw_health_bypass() -> bool:
+        """True when the DW-RT tier should be SKIPPED because the heartbeat
+        already knows DW is unhealthy — eliminating the timeout tax.
+
+        Consumes the EXISTING ``DWHeartbeat.is_degrading()`` state emission
+        (the same surface the failover lifecycle's pre-warm gate reads) rather
+        than probing DW again at the call site: the heartbeat's deep-probe loop
+        is the single source of health truth, so this is a read, not a check.
+
+        bt-2026-07-17-074626 is the motivating cost: DW answered HTTP 502
+        (upstream_unreachable) and EVERY dream paid ~53s of dead-tier latency
+        before cascading to Claude — the worst of both providers (DW's latency
+        AND Claude's price). With the heartbeat armed, a degraded DW is skipped
+        instantly.
+
+        Inert by construction: the heartbeat is default-OFF and its
+        ``is_degrading()`` returns False when disabled OR frozen (its Safety
+        Law — a misconfiguration must never steer routing), so this bypass
+        cannot fire on a config error. Fail-soft: any fault → False → attempt
+        DW normally (never strand the cheap tier on a telemetry bug)."""
+        try:
+            from backend.core.ouroboros.governance.provider_heartbeat import (
+                get_dw_heartbeat,
+            )
+
+            hb = get_dw_heartbeat()
+            if hb.is_degrading():
+                logger.info(
+                    "[DreamEngine] DW-RT tier BYPASSED — heartbeat reports DW "
+                    "degraded (consecutive_failures=%s); routing straight to "
+                    "Claude (no timeout tax)", hb.consecutive_failures(),
+                )
+                return True
+        except Exception:  # noqa: BLE001 — health telemetry is advisory
+            logger.debug("[DreamEngine] DW health bypass probe cold", exc_info=True)
+        return False
 
     @staticmethod
     def _dream_rt_timeout_s() -> float:

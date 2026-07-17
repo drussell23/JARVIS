@@ -1290,3 +1290,73 @@ async def test_empty_claude_response_also_logs(tmp_path, caplog):
         with pytest.raises(DreamProviderExhaustedError):
             await eng._call_inference("p")
     assert any("exhausted/empty" in r.getMessage() for r in caplog.records)
+
+
+# ============================================================================
+# Heartbeat-driven DW bypass — the timeout-tax kill (2026-07-17)
+#
+# bt-2026-07-17-074626: DW answered HTTP 502 (upstream_unreachable) and EVERY
+# dream paid ~53s of dead-tier latency before cascading to Claude — DW's
+# latency AND Claude's price. The heartbeat (default-OFF) already knows DW's
+# health; the cascade must READ that state, not re-probe.
+# ============================================================================
+
+import backend.core.ouroboros.governance.provider_heartbeat as _hb_mod
+
+
+def _fake_hb(*, degrading, failures=0, monkeypatch=None):
+    hb = MagicMock()
+    hb.is_degrading.return_value = degrading
+    hb.consecutive_failures.return_value = failures
+    monkeypatch.setattr(_hb_mod, "get_dw_heartbeat", lambda: hb)
+    return hb
+
+
+async def test_degraded_dw_is_bypassed_instantly_no_timeout_tax(tmp_path, monkeypatch):
+    """THE fix: heartbeat says DW degraded → DW-RT is never called → Claude
+    serves with ZERO dead-tier latency."""
+    _fake_hb(degrading=True, failures=3, monkeypatch=monkeypatch)
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(return_value=_SyncResult(_BP_JSON))
+    claude = MagicMock()
+    claude.prompt_only = AsyncMock(return_value=_BP_JSON)
+    eng = _rt_engine(tmp_path, dw=dw, claude=claude)
+    result = await eng._call_inference("p")
+    assert result["_inference_provider"] == "claude"
+    dw.complete_sync.assert_not_called()          # the 53s tax is gone
+
+
+async def test_healthy_dw_is_still_attempted(tmp_path, monkeypatch):
+    """Bypass must not strand the cheap tier when DW is healthy."""
+    _fake_hb(degrading=False, monkeypatch=monkeypatch)
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(return_value=_SyncResult(_BP_JSON))
+    eng = _rt_engine(tmp_path, dw=dw, claude=MagicMock())
+    result = await eng._call_inference("p")
+    assert result["_inference_provider"] == "doubleword"
+    dw.complete_sync.assert_awaited_once()
+
+
+def test_bypass_reads_existing_state_not_a_new_probe(tmp_path, monkeypatch):
+    """DRY: consumes is_degrading()/consecutive_failures() — no re-probe."""
+    hb = _fake_hb(degrading=True, failures=2, monkeypatch=monkeypatch)
+    from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
+    assert DreamEngine._dw_health_bypass() is True
+    hb.is_degrading.assert_called()               # existing emission consumed
+
+
+def test_bypass_inert_when_heartbeat_disabled_or_frozen(tmp_path, monkeypatch):
+    """Safety Law: OFF/frozen heartbeats report is_degrading()=False, so a
+    misconfiguration can never steer routing."""
+    _fake_hb(degrading=False, monkeypatch=monkeypatch)   # OFF/frozen semantics
+    from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
+    assert DreamEngine._dw_health_bypass() is False
+
+
+def test_bypass_fail_soft_never_strands_dw(tmp_path, monkeypatch):
+    """A telemetry fault must not permanently disable the cheap tier."""
+    def _boom():
+        raise RuntimeError("heartbeat module exploded")
+    monkeypatch.setattr(_hb_mod, "get_dw_heartbeat", _boom)
+    from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
+    assert DreamEngine._dw_health_bypass() is False   # attempt DW normally
