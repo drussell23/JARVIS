@@ -36,9 +36,9 @@ import logging
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +162,24 @@ def _top_n() -> int:
     return max(1, _envi("JARVIS_CONCEPTION_BRIDGE_TOP_N", 5))
 
 
+def _incubator_max() -> int:
+    """IncubationStore capacity — bounded so a static repo can't grow the
+    sub-threshold backlog without limit (``JARVIS_CONCEPTION_INCUBATOR_SIZE``,
+    default 50)."""
+    return max(1, _envi("JARVIS_CONCEPTION_INCUBATOR_SIZE", 50))
+
+
+def _incubator_max_attempts() -> int:
+    """Re-evaluation attempts before a chronically sub-threshold blueprint is
+    retired from incubation (``JARVIS_CONCEPTION_INCUBATOR_MAX_ATTEMPTS``,
+    default 20). Prevents an unroutable idea from re-scoring forever."""
+    return max(1, _envi("JARVIS_CONCEPTION_INCUBATOR_MAX_ATTEMPTS", 20))
+
+
+def _decision_ring_size() -> int:
+    return max(1, _envi("JARVIS_CONCEPTION_DECISION_RING_SIZE", 50))
+
+
 # ---------------------------------------------------------------------------
 # Outcome artifact
 # ---------------------------------------------------------------------------
@@ -169,16 +187,38 @@ def _top_n() -> int:
 
 @dataclass(frozen=True)
 class RoutingOutcome:
-    """One blueprint's disposition through the bridge. ``routed`` True iff it
-    reached the intake queue this pass."""
+    """One blueprint's disposition through the bridge — the structured
+    telemetry artifact (Mandate 1). Carries the full EV matrix so an operator
+    reads WHY a proposal was routed or declined, never reconstructs it."""
 
     blueprint_id: str
     ev: float
     scope: str
     threshold: float
     routed: bool
-    reason: str            # "routed" | "below_threshold" | "duplicate" | "ingest_<result>" | "error"
+    reason: str            # "routed" | "below_threshold" | "incubated" | "duplicate" | "ingest_<result>" | "error"
     ingest_result: str = ""
+    # EV matrix breakdown (the axes conception_value_model composed).
+    substance: float = 0.0
+    feasibility: float = 0.0
+    alignment: float = 0.0
+    incubation_attempts: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        from dataclasses import asdict
+        return asdict(self)
+
+
+@dataclass
+class _IncubationRecord:
+    """A sub-threshold blueprint preserved for re-evaluation (Mandate 2). Not a
+    new datastore — it references the existing blueprint artifact and tags it
+    with an incubating state vector (ev + temporal metadata)."""
+
+    blueprint: Any
+    ev: Any
+    first_incubated_unix: float
+    attempts: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +289,18 @@ class ConceptionProposalBridge:
         self._routed_total = 0
         self._dropped_duplicate = 0
         self._below_threshold = 0
+        self._incubated_total = 0
+        self._graduated_total = 0
         self._errors = 0
         self._events = 0
+        # IncubationStore (Mandate 2): sub-threshold blueprints preserved for
+        # re-evaluation as the repo state / EV inputs evolve. Bounded ring —
+        # drop-oldest at capacity, no unbounded growth (Mandate 4).
+        self._incubating: "OrderedDict[str, _IncubationRecord]" = OrderedDict()
+        # Structured decision telemetry ring (Mandate 1) — the last N routing
+        # decisions with full EV matrix, surfaced via snapshot() → the existing
+        # /observability/conception endpoint (Mandate 3, no new endpoint).
+        self._decisions: "Deque[Dict[str, Any]]" = deque(maxlen=_decision_ring_size())
 
     # -- axis resolution (lazy, DRY) --------------------------------------
 
@@ -280,6 +330,69 @@ class ConceptionProposalBridge:
         except Exception:  # noqa: BLE001 — ledger record is best-effort audit
             logger.debug("[ConceptionBridge] ledger emit skipped", exc_info=True)
 
+    # -- structured telemetry + incubation --------------------------------
+
+    def _outcome(
+        self, bp: Any, ev: Any, *, threshold: float, routed: bool, reason: str,
+        ingest_result: str = "", attempts: int = 0,
+    ) -> RoutingOutcome:
+        """Build the structured RoutingOutcome (full EV matrix) AND emit it as
+        deterministic telemetry — a structured record into the decision ring
+        plus one structured log line. Mandate 1: no forensic reconstruction."""
+        oc = RoutingOutcome(
+            blueprint_id=str(getattr(bp, "blueprint_id", "") or ""),
+            ev=float(getattr(ev, "ev", 0.0)),
+            scope=str(getattr(ev, "scope", "")),
+            threshold=float(threshold), routed=routed, reason=reason,
+            ingest_result=ingest_result,
+            substance=float(getattr(ev, "substance", 0.0)),
+            feasibility=float(getattr(ev, "feasibility", 0.0)),
+            alignment=float(getattr(ev, "alignment", 0.0)),
+            incubation_attempts=int(attempts),
+        )
+        self._decisions.append(oc.to_dict())
+        logger.info(
+            "[ConceptionBridge] decision blueprint=%s disposition=%s "
+            "ev=%.4f threshold=%.4f alignment=%.3f substance=%.3f "
+            "feasibility=%.3f attempts=%d%s",
+            oc.blueprint_id[:12], reason, oc.ev, oc.threshold, oc.alignment,
+            oc.substance, oc.feasibility, oc.incubation_attempts,
+            f" ingest={ingest_result}" if ingest_result else "",
+        )
+        return oc
+
+    def _incubate(self, bp: Any, ev: Any, now: float) -> int:
+        """Preserve a sub-threshold blueprint for re-evaluation. Returns the
+        attempt count. Bounded ring (drop-oldest); retires a blueprint that has
+        stayed unroutable past the attempt ceiling."""
+        bid = str(getattr(bp, "blueprint_id", "") or "")
+        if not bid:
+            return 0
+        rec = self._incubating.get(bid)
+        if rec is None:
+            self._incubated_total += 1
+            self._incubating[bid] = _IncubationRecord(
+                blueprint=bp, ev=ev, first_incubated_unix=now, attempts=1)
+            attempts = 1
+        else:
+            rec.attempts += 1
+            rec.ev = ev            # refresh with the latest score
+            rec.blueprint = bp
+            self._incubating.move_to_end(bid)
+            attempts = rec.attempts
+            if attempts >= _incubator_max_attempts():
+                self._incubating.pop(bid, None)   # retire the chronically-cold
+        # capacity bound
+        while len(self._incubating) > _incubator_max():
+            self._incubating.popitem(last=False)
+        return attempts
+
+    def _graduate(self, bid: str) -> None:
+        """A blueprint cleared the threshold on a later pass — remove it from
+        incubation."""
+        if self._incubating.pop(bid, None) is not None:
+            self._graduated_total += 1
+
     # -- core reactor -----------------------------------------------------
 
     async def route(
@@ -297,13 +410,23 @@ class ConceptionProposalBridge:
         now = now if now is not None else time.time()
         self._events += 1
         try:
-            # 1. Score (consume the value model's EMITTED EV; never recompute).
-            scored: List[Tuple[Any, Any]] = []
+            # 1. Assemble the evaluation batch = freshly-produced blueprints
+            #    UNION the incubating ones (Mandate 2: temporally-misaligned
+            #    proposals get re-scored as repo state evolves — "truly adaptive"
+            #    memory). Incoming duplicates of an incubating id take precedence.
+            candidates: "OrderedDict[str, Any]" = OrderedDict()
             for bp in (blueprints or ()):
                 bid = str(getattr(bp, "blueprint_id", "") or "")
                 tfs = tuple(getattr(bp, "target_files", ()) or ())
                 if not bid or not tfs:
                     continue
+                candidates[bid] = bp
+            for bid, rec in list(self._incubating.items()):
+                candidates.setdefault(bid, rec.blueprint)
+
+            # 2. Score (consume the value model's EMITTED EV; never recompute).
+            scored: List[Tuple[Any, Any]] = []
+            for bp in candidates.values():
                 try:
                     ev = self._score_blueprint(bp)
                 except Exception:  # noqa: BLE001
@@ -311,23 +434,21 @@ class ConceptionProposalBridge:
                     continue
                 scored.append((bp, ev))
 
-            # 2. Drop already-routed / in-execution (mandate 4 — durable guard).
-            fresh = [
-                (bp, ev) for (bp, ev) in scored
-                if not self._registry.is_routed(str(bp.blueprint_id), now)
-            ]
+            # 3. Drop already-routed / in-execution (mandate 4 — durable guard).
+            fresh: List[Tuple[Any, Any]] = []
             outcomes: List[RoutingOutcome] = []
             for (bp, ev) in scored:
                 if self._registry.is_routed(str(bp.blueprint_id), now):
                     self._dropped_duplicate += 1
-                    outcomes.append(RoutingOutcome(
-                        blueprint_id=str(bp.blueprint_id), ev=float(ev.ev),
-                        scope=str(ev.scope), threshold=0.0, routed=False,
-                        reason="duplicate"))
+                    self._graduate(str(bp.blueprint_id))  # already in-flight: stop incubating
+                    outcomes.append(self._outcome(
+                        bp, ev, threshold=0.0, routed=False, reason="duplicate"))
+                else:
+                    fresh.append((bp, ev))
             if not fresh:
                 return outcomes
 
-            # 3. Dynamic, batch-relative threshold. No hardcoded cutoff — the
+            # 4. Dynamic, batch-relative threshold. No hardcoded cutoff — the
             #    quality bar rises with the batch mean and never drops below the
             #    neutral floor.
             evs = [float(ev.ev) for (_bp, ev) in fresh]
@@ -339,15 +460,17 @@ class ConceptionProposalBridge:
             )[:_max_per_route()]
             survivor_ids = {str(bp.blueprint_id) for (bp, _ev) in survivors}
 
+            # 5. Below-threshold blueprints INCUBATE (Mandate 2) rather than
+            #    being discarded — preserved for re-evaluation on a later event.
             for (bp, ev) in fresh:
                 if str(bp.blueprint_id) not in survivor_ids:
                     self._below_threshold += 1
-                    outcomes.append(RoutingOutcome(
-                        blueprint_id=str(bp.blueprint_id), ev=float(ev.ev),
-                        scope=str(ev.scope), threshold=threshold, routed=False,
-                        reason="below_threshold"))
+                    attempts = self._incubate(bp, ev, now)
+                    outcomes.append(self._outcome(
+                        bp, ev, threshold=threshold, routed=False,
+                        reason="incubated", attempts=attempts))
 
-            # 4. Translate + ingest each survivor.
+            # 6. Translate + ingest each survivor (graduates it out of incubation).
             for (bp, ev) in survivors:
                 outcomes.append(await self._route_one(bp, ev, router, threshold, now))
             return outcomes
@@ -390,22 +513,19 @@ class ConceptionProposalBridge:
             if result in _ROUTED_RESULTS:
                 self._registry.mark(bid, now)
                 self._routed_total += 1
+                self._graduate(bid)   # cleared the bar — leave incubation
                 self._emit_to_ledger(bp, ev)
-                return RoutingOutcome(
-                    blueprint_id=bid, ev=float(ev.ev), scope=str(ev.scope),
-                    threshold=threshold, routed=True, reason="routed",
+                return self._outcome(
+                    bp, ev, threshold=threshold, routed=True, reason="routed",
                     ingest_result=result)
-            return RoutingOutcome(
-                blueprint_id=bid, ev=float(ev.ev), scope=str(ev.scope),
-                threshold=threshold, routed=False, reason=f"ingest_{result}",
-                ingest_result=result)
+            return self._outcome(
+                bp, ev, threshold=threshold, routed=False,
+                reason=f"ingest_{result}", ingest_result=result)
         except Exception:  # noqa: BLE001
             self._errors += 1
             logger.debug("[ConceptionBridge] ingest faulted for %s", bid, exc_info=True)
-            return RoutingOutcome(
-                blueprint_id=bid, ev=float(getattr(ev, "ev", 0.0)),
-                scope=str(getattr(ev, "scope", "")), threshold=threshold,
-                routed=False, reason="error")
+            return self._outcome(
+                bp, ev, threshold=threshold, routed=False, reason="error")
 
     # -- event wiring -----------------------------------------------------
 
@@ -427,6 +547,21 @@ class ConceptionProposalBridge:
     # -- observability ----------------------------------------------------
 
     def snapshot(self) -> dict:
+        # Incubation projection — the tagged 'incubating' state vectors (Mandate
+        # 2), surfaced through the EXISTING /observability/conception emission
+        # (Mandate 3), never a bespoke endpoint.
+        incubating = [
+            {
+                "blueprint_id": bid,
+                "ev": round(float(getattr(rec.ev, "ev", 0.0)), 4),
+                "alignment": round(float(getattr(rec.ev, "alignment", 0.0)), 3),
+                "substance": round(float(getattr(rec.ev, "substance", 0.0)), 3),
+                "feasibility": round(float(getattr(rec.ev, "feasibility", 0.0)), 3),
+                "attempts": int(rec.attempts),
+                "first_incubated_unix": round(float(rec.first_incubated_unix), 2),
+            }
+            for bid, rec in self._incubating.items()
+        ]
         return {
             "schema_version": CONCEPTION_BRIDGE_SCHEMA_VERSION,
             "enabled": master_enabled(),
@@ -434,19 +569,29 @@ class ConceptionProposalBridge:
             "max_per_route": _max_per_route(),
             "dedup_ttl_s": _dedup_ttl_s(),
             "dedup_registry_size": len(self._registry),
+            "incubator_size": len(self._incubating),
+            "incubator_capacity": _incubator_max(),
             "counters": {
                 "events": self._events,
                 "routed_total": self._routed_total,
                 "dropped_duplicate": self._dropped_duplicate,
                 "below_threshold": self._below_threshold,
+                "incubated_total": self._incubated_total,
+                "graduated_total": self._graduated_total,
                 "errors": self._errors,
             },
+            # Structured decision telemetry (Mandate 1) — newest last.
+            "recent_decisions": list(self._decisions),
+            "incubating": incubating,
         }
 
     def reset_for_tests(self) -> None:
         self._registry.reset()
+        self._incubating.clear()
+        self._decisions.clear()
         self._routed_total = self._dropped_duplicate = 0
         self._below_threshold = self._errors = self._events = 0
+        self._incubated_total = self._graduated_total = 0
 
 
 # ---------------------------------------------------------------------------
