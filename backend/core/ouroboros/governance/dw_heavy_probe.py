@@ -656,8 +656,16 @@ class HeavyProber:
             # knob makes the probe go straight to content (verified Slice 54).
             # The probe is a liveness check, so always "none" regardless of the
             # generation-path effort.
+            #
+            # API-contract decay purge (2026-07-16): the deprecated top-level
+            # ``chat_template_kwargs={"enable_thinking": False}`` companion was
+            # removed — DW now HARD-REJECTS it with a 400 ("Unsupported
+            # parameter … use 'reasoning_effort'"), which would make this
+            # liveness probe report transport faults that are really our own
+            # malformed payload (poisoning the capability verdict it exists to
+            # produce). ``reasoning_effort`` above is the DW-honored knob and
+            # already carries the full intent.
             "reasoning_effort": "none",
-            "chat_template_kwargs": {"enable_thinking": False},
         }
         url = f"{base_url.rstrip('/')}/chat/completions"
         # Slice 2B-ii.2 — Aegis Provider Bridge wire. When

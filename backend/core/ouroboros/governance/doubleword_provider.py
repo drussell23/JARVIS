@@ -7359,15 +7359,18 @@ class DoublewordProvider:
         temperature:
             Override sampling temperature. Defaults to ``_DW_TEMPERATURE``.
         enable_thinking:
-            Optional override for the per-request ``chat_template_kwargs``
-            ``enable_thinking`` flag. ``None`` (default) preserves the
-            legacy behavior of disabling DW's reasoning mode for
-            short structured-function callers (CompactionCaller,
-            BlastRadius, FailureClustering, DreamSeed). The heavy
-            codegen non-streaming lane passes ``True`` to unlock
-            DW reasoning over a stream-free transport. Existing
-            callers that omit this parameter remain byte-identical
-            to pre-extension behavior.
+            Optional override for DW's reasoning mode. ``None`` (default)
+            preserves the legacy behavior of suppressing reasoning for short
+            structured-function callers (CompactionCaller, BlastRadius,
+            FailureClustering, DreamSeed); the heavy codegen non-streaming
+            lane passes ``True`` to unlock DW reasoning over a stream-free
+            transport. The caller contract is unchanged, but as of 2026-07-16
+            the flag is TRANSLATED into the compliant ``reasoning_effort``
+            schema via :func:`_reasoning_request_params` (the single source of
+            truth, shared with ``prompt_only``) rather than emitting the
+            deprecated top-level ``chat_template_kwargs.enable_thinking``,
+            which DW now hard-rejects with a 400. False/None → effort
+            ``"none"``; True → effort derives from the model/complexity.
 
         Returns
         -------
@@ -7415,14 +7418,39 @@ class DoublewordProvider:
             temperature if temperature is not None else _DW_TEMPERATURE
         )
 
-        # Heavy-codegen non-streaming lane needs DW reasoning; legacy
-        # Functions callers (CompactionCaller, BlastRadius, etc.) call
-        # with enable_thinking=None and get the byte-identical legacy
-        # behavior (False). The new heavy lane explicitly passes True.
-        _effective_enable_thinking: bool = (
-            bool(enable_thinking) if enable_thinking is not None
-            else False
+        # DRY (2026-07-16) — ONE source of truth for the DW reasoning payload
+        # schema: ``_reasoning_request_params``, the same helper ``prompt_only``
+        # composes. complete_sync previously hand-rolled a deprecated top-level
+        # ``chat_template_kwargs.enable_thinking``, which DW now HARD-REJECTS
+        # with a 400 ("Unsupported parameter … use 'reasoning_effort'"). Proven
+        # live in bt-2026-07-16-200920: the DreamEngine's DW-RT tier 400'd on
+        # every call while prompt_only's path (already migrated in the earlier
+        # contract fix) was healthy — the duplication WAS the defect.
+        #
+        # The caller-facing ``enable_thinking`` contract is preserved and
+        # TRANSLATED into the compliant schema (no signature change):
+        #   * None/False — legacy Functions callers (CompactionCaller,
+        #     BlastRadius, FailureClustering, DreamSeed) — suppress reasoning
+        #     → effort "none". The helper still applies the Slice-168 per-model
+        #     floor (a model that rejects "none" is clamped up) and the
+        #     Slice-192 nested ``extra_body`` form when the catalog confirms
+        #     reasoning control.
+        #   * True — the heavy non-streaming codegen lane — effort DERIVES from
+        #     the model/complexity instead of being pinned to "none".
+        _reasoning_params = _reasoning_request_params(
+            effort="" if enable_thinking else "none",
+            model=effective_model,
         )
+        # complete_sync POSTs a RAW json body (no OpenAI SDK in this path).
+        # ``extra_body`` is an SDK *client* kwarg whose contents the SDK merges
+        # into the request — it is NOT itself a wire parameter, so forwarding it
+        # raw would introduce a fresh "unsupported parameter" 400. Carry only
+        # the wire-valid knob; the helper remains the single source of truth for
+        # WHICH effort applies (incl. the Slice-168 per-model floor).
+        _wire_reasoning = {
+            k: v for k, v in _reasoning_params.items()
+            if k == "reasoning_effort"
+        }
         body: Dict[str, Any] = {
             "model": effective_model,
             "messages": [
@@ -7432,9 +7460,7 @@ class DoublewordProvider:
             "max_tokens": max_tokens,
             "temperature": effective_temperature,
             "stream": False,
-            "chat_template_kwargs": {
-                "enable_thinking": _effective_enable_thinking,
-            },
+            **_wire_reasoning,
         }
         if response_format is not None:
             body["response_format"] = response_format
