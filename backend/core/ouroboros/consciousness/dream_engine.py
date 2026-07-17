@@ -56,6 +56,21 @@ logger = logging.getLogger(__name__)
 
 DREAM_MAX_PROMPT_CHARS: int = 2048
 
+# Candidate hydration vocabulary (2026-07-17). The KEYS are the MemoryEngine's
+# own closed insight-category vocabulary (types.MemoryInsight.category) — this
+# maps that existing taxonomy onto a dream focus rather than inventing a second
+# one. An unmapped category passes through verbatim, so the MemoryEngine can
+# grow new categories without this dict silently swallowing them.
+_PROMPT_FAMILY_BY_INSIGHT: Dict[str, str] = {
+    "failure_pattern": "failure_repair",
+    "file_fragility": "fragility_hardening",
+    "success_pattern": "success_extension",
+}
+# Honest "nothing learned yet" focus for a cold memory — NOT a fabricated one.
+_PROMPT_FAMILY_NEUTRAL: str = "general_improvement"
+# No provider wired: the job is unkeyable to a serving model class.
+_MODEL_CLASS_UNKNOWN: str = "unwired"
+
 
 class DreamProviderExhaustedError(RuntimeError):
     """All RT inference tiers (DW → Claude → J-Prime) failed for a dream job.
@@ -681,17 +696,86 @@ class DreamEngine:
             logger.info("[DreamEngine] Resuming interrupted job %s", key[:16])
             return info
 
-        # Placeholder — real implementation would query oracle + memory
         if not self._current_head or not self._current_policy_hash:
             return None
 
+        # Dynamic candidate hydration (2026-07-17) — replaces the hardcoded
+        # ``prompt_family="general_improvement"`` / ``model_class="qwen2.5-7b"``
+        # stub (the latter was also a lie: no soak has ever served a dream on
+        # qwen2.5-7b). BOTH axes are now derived organically from live runtime
+        # telemetry, which is what gives ``compute_job_key`` genuine identity
+        # diversity WITHOUT touching the hash or the dedup registry: as the
+        # organism's memory shifts (a new failure family emerges) or its
+        # provider topology changes, the key changes with it and a fresh dream
+        # is legitimately warranted.
         return {
-            "repo": "jarvis",
+            "repo": self._repo_name(),
             "repo_sha": self._current_head,
             "policy_hash": self._current_policy_hash,
-            "prompt_family": "general_improvement",
-            "model_class": "qwen2.5-7b",
+            "prompt_family": self._derive_prompt_family(),
+            "model_class": self._derive_model_class(),
         }
+
+    def _repo_name(self) -> str:
+        """Repo identity from the live repo path (no hardcoded slug)."""
+        try:
+            if self._repo_path:
+                return Path(self._repo_path).name or "jarvis"
+        except Exception:  # noqa: BLE001
+            pass
+        return "jarvis"
+
+    def _derive_prompt_family(self) -> str:
+        """The dream's focus, derived from live MemoryEngine telemetry.
+
+        Composes the existing ``get_pattern_summary()`` API (no duplicated
+        telemetry parsing): the organism's dominant NON-EXPIRED insight
+        category — ranked by the engine's own evidence_count ordering — names
+        what it should speculate about. ``failure_pattern`` → repair the
+        recurring break; ``file_fragility`` → harden the brittle surface;
+        ``success_pattern`` → extend what works.
+
+        The category vocabulary is the MemoryEngine's own (types.MemoryInsight);
+        we map it to a family rather than inventing a taxonomy. A cold memory
+        (fresh organism, no ingested outcomes) has no insights and yields the
+        neutral family — an honest "nothing learned yet", not a fabricated
+        focus. NEVER raises."""
+        try:
+            summary = self._memory_engine.get_pattern_summary()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for insight in getattr(summary, "top_patterns", ()) or ():
+                try:
+                    if insight.is_expired(now_iso):
+                        continue
+                except Exception:  # noqa: BLE001 — malformed insight is not a focus
+                    continue
+                cat = str(getattr(insight, "category", "") or "").strip().lower()
+                if cat:
+                    return _PROMPT_FAMILY_BY_INSIGHT.get(cat, cat)
+        except Exception:  # noqa: BLE001 — telemetry is advisory, never fatal
+            logger.debug("[DreamEngine] prompt_family telemetry cold", exc_info=True)
+        return _PROMPT_FAMILY_NEUTRAL
+
+    def _derive_model_class(self) -> str:
+        """The model class that will actually serve, from the live provider
+        topology — mirroring ``_call_inference``'s real tier order (DW-RT
+        first, Claude-RT fallback). Reads each provider's own ``_model`` rather
+        than restating a slug, so a topology change (entitlement shift, model
+        pin, provider outage) organically re-keys the job. NEVER raises."""
+        for provider, tier in (
+            (self._dw_provider, "dw"),
+            (self._claude_provider, "claude"),
+        ):
+            if provider is None:
+                continue
+            try:
+                model = str(getattr(provider, "_model", "") or "").strip()
+            except Exception:  # noqa: BLE001
+                model = ""
+            if model:
+                return f"{tier}:{model}"
+            return tier
+        return _MODEL_CLASS_UNKNOWN
 
     def _build_dream_prompt(self, candidate: Dict[str, Any]) -> str:
         """Build the speculative analysis prompt for J-Prime."""
