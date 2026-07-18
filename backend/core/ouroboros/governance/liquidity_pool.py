@@ -109,8 +109,14 @@ _reserved_usd: float = 0.0
 
 
 def _dw_rt_denied() -> bool:
-    """True iff DW realtime is ENTIRELY entitlement-denied this session — the
-    ``DIRECT_STREAMING`` surface reads ``AUTH_FAILED`` (all RT models 403). Reuses
+    """True iff DW is ENTIRELY unavailable this session — no usable DW surface
+    (``dw_healthy`` is False after :func:`_resolve_dw` folds in BOTH the streaming
+    AND the ``complete_sync`` surfaces). Fires for ANY total-outage reason
+    (``auth_failed`` entitlement denial OR ``transport_degraded`` SSE collapse) —
+    the earlier ``== "auth_failed"`` gate missed the transport-degraded case
+    (bt-2026-07-18-110439). When DW is reachable on the completion lane,
+    ``dw_healthy`` is True and this correctly returns False (no elevation — DW can
+    still serve the DW-only lanes). Reuses
     ``provider_availability.collect_provider_availability`` (sub-ms, cached ledger
     read). Fail-soft → False (no elevation) on any fault. NEVER raises."""
     try:
@@ -118,9 +124,7 @@ def _dw_rt_denied() -> bool:
             collect_provider_availability,
         )
         snap = collect_provider_availability()
-        return (not getattr(snap, "dw_healthy", True)) and (
-            str(getattr(snap, "dw_reason", "")) == "auth_failed"
-        )
+        return not getattr(snap, "dw_healthy", True)
     except Exception:  # noqa: BLE001
         return False
 

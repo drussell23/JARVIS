@@ -130,22 +130,22 @@ def test_never_raises_on_garbage(monkeypatch):
 # ===========================================================================
 
 
-def test_real_dw_rt_denied_reads_direct_streaming_auth_failed(monkeypatch):
-    """_dw_rt_denied must read provider_availability's dw_healthy/dw_reason."""
+def test_real_dw_rt_denied_fires_on_any_dw_outage(monkeypatch):
+    """_dw_rt_denied reads provider_availability.dw_healthy and fires on ANY total
+    DW outage — entitlement 403 (auth_failed) OR SSE collapse (transport_degraded).
+    The earlier auth_failed-only gate missed the transport-degraded case
+    (bt-2026-07-18-110439)."""
     from backend.core.ouroboros.governance import liquidity_pool as L
+    for reason in ("auth_failed", "transport_degraded", "error_other"):
+        monkeypatch.setattr(
+            "backend.core.ouroboros.governance.provider_availability.collect_provider_availability",
+            lambda *a, _r=reason, **k: SimpleNamespace(dw_healthy=False, dw_reason=_r),
+        )
+        assert L._dw_rt_denied() is True, reason
+    # DW reachable (e.g. via the completion lane) → healthy → no elevation.
     monkeypatch.setattr(
         "backend.core.ouroboros.governance.provider_availability.collect_provider_availability",
-        lambda *a, **k: SimpleNamespace(dw_healthy=False, dw_reason="auth_failed"),
-    )
-    assert L._dw_rt_denied() is True
-    monkeypatch.setattr(
-        "backend.core.ouroboros.governance.provider_availability.collect_provider_availability",
-        lambda *a, **k: SimpleNamespace(dw_healthy=False, dw_reason="transport_degraded"),
-    )
-    assert L._dw_rt_denied() is False       # unhealthy but NOT an entitlement 403
-    monkeypatch.setattr(
-        "backend.core.ouroboros.governance.provider_availability.collect_provider_availability",
-        lambda *a, **k: SimpleNamespace(dw_healthy=True, dw_reason="healthy"),
+        lambda *a, **k: SimpleNamespace(dw_healthy=True, dw_reason="direct_completion:healthy"),
     )
     assert L._dw_rt_denied() is False
 

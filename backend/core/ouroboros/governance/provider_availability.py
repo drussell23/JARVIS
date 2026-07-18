@@ -189,17 +189,38 @@ def _resolve_claude(
 
 
 def _resolve_dw(*, ledger) -> tuple[bool, str]:
-    """Read-only DW direct-streaming surface health + forensic reason."""
-    record = ledger.verdict_for(SurfaceKind.DIRECT_STREAMING)
-    if record is None:
-        # No evidence of a problem → legacy-safe healthy.
+    """Read-only DW availability = usable on EITHER the streaming surface OR the
+    ``complete_sync`` (``DIRECT_COMPLETION``) surface + forensic reason.
+
+    ``complete_sync`` exists precisely because ``DIRECT_STREAMING`` (SSE) is
+    chronically degraded, and it is the primary DW path in that case. Gating DW
+    availability on ``DIRECT_STREAMING`` ALONE marked DW "down" whenever SSE
+    degraded — even with a HEALTHY completion surface — so routing cascaded
+    everything to Claude (bt-2026-07-18-110439: SSE ``transport_degraded`` +
+    completion ``healthy`` → Claude ``RATE_LIMITED`` → ``all_providers_exhausted``,
+    0 ops reached APPLY). DW is available if ANY usable DW surface exists; the
+    reason names the winning surface, or the streaming reason when neither is
+    usable (so the historical forensic label is preserved for the true-outage
+    case). Fold-in of DIRECT_COMPLETION mirrors the caveat the availability map
+    flagged. NEVER raises (the caller wraps it)."""
+    _usable = (SurfaceVerdict.HEALTHY, SurfaceVerdict.UPSTREAM_DEGRADED)
+    stream = ledger.verdict_for(SurfaceKind.DIRECT_STREAMING)
+    completion = ledger.verdict_for(SurfaceKind.DIRECT_COMPLETION)
+    # No evidence on either surface → legacy-safe healthy.
+    if stream is None and completion is None:
         return True, "unknown"
-    verdict = record.verdict
-    if verdict in (SurfaceVerdict.HEALTHY, SurfaceVerdict.UPSTREAM_DEGRADED):
-        # UPSTREAM_DEGRADED: DW upstream is slow but its transport is usable —
-        # and when Claude is down it is the only funded lane, so still "usable".
-        return True, verdict.value
-    return False, verdict.value
+    # Streaming usable → healthy (byte-identical to the legacy streaming-healthy
+    # path: reason is the bare verdict value).
+    if stream is not None and stream.verdict in _usable:
+        return True, stream.verdict.value
+    # SSE degraded/absent but complete_sync usable → DW is still reachable.
+    if completion is not None and completion.verdict in _usable:
+        return True, "direct_completion:%s" % completion.verdict.value
+    # Neither usable → true DW outage. Report the streaming reason (the historical
+    # forensic label) when present, else the completion reason.
+    if stream is not None:
+        return False, stream.verdict.value
+    return False, completion.verdict.value  # type: ignore[union-attr]
 
 
 def _resolve_kimi() -> "tuple[bool, str]":
