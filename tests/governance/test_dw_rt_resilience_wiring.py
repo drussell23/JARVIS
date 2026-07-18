@@ -85,7 +85,10 @@ def test_403_entitlement_blocked_prunes_catalog(monkeypatch):
     _run(p._handle_rt_http_failure(
         status=403, body="blocked by a routing rule",
         model="Qwen/Qwen3.5-35B-A3B-FP8", caller_id="dream_engine"))
-    cache.reset.assert_called_once()   # next election re-derives from DW itself
+    # Surgical mark_blocked (not a coarse reset): the 403'd model is recorded as
+    # durable session ground truth so the next election avoids it, rather than a
+    # cache reset that re-fetches a catalog still listing it (the storm class).
+    cache.mark_blocked.assert_called_once_with("Qwen/Qwen3.5-35B-A3B-FP8")
 
 
 def test_403_that_is_not_entitlement_does_not_prune(monkeypatch):
@@ -95,7 +98,7 @@ def test_403_that_is_not_entitlement_does_not_prune(monkeypatch):
     monkeypatch.setattr(ef, "is_entitlement_blocked", lambda s, b: False)
     p = _provider()
     _run(p._handle_rt_http_failure(status=403, body="forbidden", model="m", caller_id="c"))
-    cache.reset.assert_not_called()
+    cache.mark_blocked.assert_not_called()
 
 
 def test_403_respects_fallback_master_switch(monkeypatch):
@@ -105,7 +108,7 @@ def test_403_respects_fallback_master_switch(monkeypatch):
     p = _provider()
     _run(p._handle_rt_http_failure(status=403, body="blocked by a routing rule",
                                    model="m", caller_id="c"))
-    cache.reset.assert_not_called()
+    cache.mark_blocked.assert_not_called()
 
 
 def test_403_does_not_flush_the_pool():

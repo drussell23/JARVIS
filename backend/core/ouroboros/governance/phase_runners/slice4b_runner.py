@@ -486,7 +486,7 @@ class Slice4bRunner(PhaseRunner):
                     await orch._record_ledger(
                         ctx, OperationState.FAILED,
                         {"reason": "predictive_suspend",
-                         **_runway_verdict.as_telemetry()},
+                         "runway": _runway_verdict.as_telemetry()},
                     )
                     return PhaseResult(
                         next_ctx=ctx, next_phase=None, status="fail",

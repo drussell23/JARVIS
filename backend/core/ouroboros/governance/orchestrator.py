@@ -10306,7 +10306,7 @@ class GovernedOrchestrator:
                         await self._record_ledger(
                             ctx, OperationState.FAILED,
                             {"reason": "predictive_suspend",
-                             **_runway_verdict.as_telemetry()},
+                             "runway": _runway_verdict.as_telemetry()},
                         )
                         return ctx
             except Exception:  # noqa: BLE001 — fail open into APPLY

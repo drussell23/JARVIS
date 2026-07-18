@@ -122,6 +122,16 @@ class EntitlementCatalogCache:
     def __init__(self) -> None:
         self._entitled_ids: FrozenSet[str] = frozenset()
         self._fetched_at_monotonic: float = 0.0
+        # Session-local ground-truth of models DW authoritatively 403'd for THIS
+        # account (Dynamic Capability Propagation, 2026-07-18). Distinct from the
+        # entitled allow-list: DW's /v1/models CATALOG lists a model as available
+        # while actual USE returns 403 (entitlement is finer-grained than the
+        # catalog listing). A plain cache reset re-fetches that catalog and
+        # re-adds the model → election re-picks it → 403 storm. Recording the
+        # observed 403 here lets election avoid the model regardless of what the
+        # catalog re-lists. Survives a reset() by design — it is not a cache of
+        # /v1/models, it is a record of DW's own denials.
+        self._blocked_ids: FrozenSet[str] = frozenset()
 
     def _is_stale(self) -> bool:
         if self._fetched_at_monotonic <= 0.0:
@@ -131,10 +141,10 @@ class EntitlementCatalogCache:
     async def get_entitled_ids(
         self, catalog_client: Any, *, force_refresh: bool = False,
     ) -> FrozenSet[str]:
-        """Return the cached entitled id set, refreshing from
-        *catalog_client* when stale, forced, or never hydrated."""
+        """Return the cached entitled id set (minus any 403-blocked models),
+        refreshing from *catalog_client* when stale, forced, or never hydrated."""
         if not force_refresh and self._entitled_ids and not self._is_stale():
-            return self._entitled_ids
+            return self._entitled_ids - self._blocked_ids
         try:
             snapshot = await catalog_client.fetch()
         except Exception as exc:  # noqa: BLE001 — never raise
@@ -146,12 +156,58 @@ class EntitlementCatalogCache:
             if ids:
                 self._entitled_ids = ids
                 self._fetched_at_monotonic = time.monotonic()
-        return self._entitled_ids
+        # Subtract observed 403s so a re-fetched catalog can never re-surface a
+        # model DW just denied (the storm-avoidance invariant).
+        return self._entitled_ids - self._blocked_ids
+
+    def cached_entitled_ids(self) -> FrozenSet[str]:
+        """SYNC peek at the last-fetched entitled set (minus 403-blocked models),
+        with NO catalog I/O. For hot-path election filters that cannot await —
+        empty when the catalog has never been hydrated (caller must fail open).
+        NEVER raises."""
+        try:
+            return self._entitled_ids - self._blocked_ids
+        except Exception:  # noqa: BLE001
+            return frozenset()
+
+    def mark_blocked(self, model_id: str) -> None:
+        """Record that DW authoritatively 403'd *model_id* for this account, so
+        every subsequent election avoids it — even after a cache reset re-fetches
+        a catalog that still lists it. Surgical (one model), synchronous, and
+        immediately reflected by :meth:`cached_entitled_ids`. NEVER raises."""
+        try:
+            mid = (model_id or "").strip()
+            if not mid:
+                return
+            if mid not in self._blocked_ids:
+                self._blocked_ids = self._blocked_ids | {mid}
+                self._entitled_ids = self._entitled_ids - {mid}
+        except Exception:  # noqa: BLE001
+            pass
+
+    def is_blocked(self, model_id: str) -> bool:
+        """True iff *model_id* was recorded as 403-blocked this session. NEVER
+        raises."""
+        try:
+            return (model_id or "").strip() in self._blocked_ids
+        except Exception:  # noqa: BLE001
+            return False
+
+    def blocked_ids(self) -> FrozenSet[str]:
+        """Read-only snapshot of the session's 403-blocked set. NEVER raises."""
+        return self._blocked_ids
 
     def reset(self) -> None:
-        """Test/operator hook — drop the cached set + staleness clock."""
+        """Test/operator hook — drop the cached entitled set + staleness clock.
+        Does NOT clear ``_blocked_ids`` (an observed 403 is ground truth that
+        must survive a catalog re-fetch); use :meth:`reset_blocked` for that."""
         self._entitled_ids = frozenset()
         self._fetched_at_monotonic = 0.0
+
+    def reset_blocked(self) -> None:
+        """Test hook — clear the 403-blocked set. Production code must not call
+        this (a 403 is durable ground truth for the session). NEVER raises."""
+        self._blocked_ids = frozenset()
 
 
 _process_cache = EntitlementCatalogCache()

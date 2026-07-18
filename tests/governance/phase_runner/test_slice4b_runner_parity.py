@@ -107,6 +107,14 @@ class _FakeConfig:
     approval_timeout_s: float = 60.0
     repair_engine: Any = None
 
+    @property
+    def execution_root(self) -> Path:
+        """Mirror production's lazy twin (OrchestratorConfig.execution_root):
+        with JARVIS_AUTO_COMMIT_WORKSPACE unset, effective_execution_root ==
+        project_root. The APPLY block reads this; without it the runner raised
+        AttributeError before reaching APPLY."""
+        return self.project_root
+
 
 @dataclass
 class _FakeApprovalProvider:
@@ -513,6 +521,95 @@ def test_slice4b_runner_bans_execution_authority_imports():
                 assert banned not in s, (
                     f"slice4b_runner.py must not import {banned}: {s}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# (16) Predictive Phase-Aware Checkpoint — the pre-APPLY gate fires end-to-end
+#
+# Proves the WIRING (not just the module): driving the real Slice4bRunner.run()
+# with a short wall runway + a warm per-phase EWMA makes the pre-APPLY gate
+# invoke the REAL phase_runway_gate + REAL fsm_checkpoint.capture_single_op and
+# return the predictive_suspend CANCELLED terminal BEFORE entering APPLY. This is
+# the seam the live soak could not exercise (no op reached APPLY there).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_predictive_gate_fires_before_apply(tmp_path, monkeypatch):
+    import time
+    from backend.core.ouroboros.governance import phase_runway_gate as prg
+
+    # Route checkpoint writes + workspace-stash root into tmp (never the real repo).
+    monkeypatch.setenv("JARVIS_CHECKPOINT_DIR", str(tmp_path / "ckpts"))
+    monkeypatch.setenv("JARVIS_FSM_WORKSPACE_ROOT", str(tmp_path))  # non-repo → empty stash
+    monkeypatch.setenv("JARVIS_PREDICTIVE_CHECKPOINT_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_PREDICTIVE_MIN_SAMPLES", "1")
+
+    # Warm the per-phase EWMA so the tail projects LONG, and pin a ~1s runway.
+    prg._reset_for_tests()
+    for _ in range(3):
+        prg.record_phase_duration("APPLY", 90.0)
+        prg.record_phase_duration("VERIFY", 120.0)
+    monkeypatch.setenv(
+        "OUROBOROS_BATTLE_WALL_DEADLINE_MONOTONIC", repr(time.monotonic() + 1.0),
+    )
+
+    orch = _orch(tmp_path)
+    ctx = _approve_ctx(tmp_path)  # SAFE_AUTO, at GATE → reaches the pre-APPLY gate
+
+    result = await Slice4bRunner(
+        orch, None, _candidate(tmp_path), RiskTier.SAFE_AUTO,
+    ).run(ctx)
+
+    # The gate suspended the op BEFORE APPLY.
+    assert result.status == "fail"
+    assert result.reason == "predictive_suspend"
+    assert result.next_ctx.phase is OperationPhase.CANCELLED
+    # It ran the REAL capture_single_op → a signed checkpoint landed on disk.
+    # (JARVIS_CHECKPOINT_DIR is used verbatim — no .ouroboros nesting.)
+    ckpt_dir = tmp_path / "ckpts"
+    written = list(ckpt_dir.glob("*.json")) if ckpt_dir.exists() else []
+    assert written, "predictive suspend must persist a resumable checkpoint"
+    # Ledger recorded the suspend with telemetry.
+    assert any(r[2].get("reason") == "predictive_suspend" for r in orch.ledger_records)
+    prg._reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_predictive_gate_proceeds_when_tail_fits(tmp_path, monkeypatch):
+    """Control: with an ample runway the gate does NOT suspend — the op advances
+    PAST the gate into APPLY. We prove that by driving run() until it reaches the
+    first post-gate APPLY collaborator the minimal fixture doesn't stub
+    (_live_work_apply_gate / _scoped_verify_runner / _emit_terminal_durability_probe):
+    reaching any of them means the predictive gate let the op through rather than
+    returning the CANCELLED terminal. (Completing those APPLY/VERIFY stubs is a
+    separate pre-existing fixture gap, out of scope here.)"""
+    import time
+    import pytest as _pytest
+    from backend.core.ouroboros.governance import phase_runway_gate as prg
+
+    monkeypatch.setenv("JARVIS_PREDICTIVE_CHECKPOINT_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_PREDICTIVE_MIN_SAMPLES", "1")
+    prg._reset_for_tests()
+    prg.record_phase_duration("APPLY", 1.0)
+    prg.record_phase_duration("VERIFY", 1.0)
+    monkeypatch.setenv(
+        "OUROBOROS_BATTLE_WALL_DEADLINE_MONOTONIC", repr(time.monotonic() + 3600.0),
+    )
+
+    orch = _orch(tmp_path)
+    ctx = _approve_ctx(tmp_path)
+    with _pytest.raises(
+        AttributeError,
+        match="_live_work_apply_gate|_scoped_verify_runner|_emit_terminal_durability_probe",
+    ):
+        await Slice4bRunner(
+            orch, None, _candidate(tmp_path), RiskTier.SAFE_AUTO,
+        ).run(ctx)
+    # Reaching a post-gate collaborator proves the op was NOT suspended: the op
+    # advanced into APPLY (its phase moved off GATE).
+    assert ctx.phase is OperationPhase.GATE  # the frozen input ctx is unchanged
+    prg._reset_for_tests()
 
 
 __all__ = []
