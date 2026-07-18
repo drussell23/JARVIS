@@ -1758,6 +1758,17 @@ class GovernedOrchestrator:
         # instance gets the same value without indirection.
         _max = int(os.environ.get("JARVIS_SESSION_LESSONS_MAX", "20"))
         self._session_lessons_max: int = max(5, _max)
+        # Slice 1 concurrency remediation (2026-07-18): serializes the COMPOUND
+        # lesson-buffer mutations (append+cap+rebind in _add_session_lesson; the
+        # convergence-negative clear+counter-reset) across the 3 BackgroundAgent-
+        # Pool workers sharing this singleton. threading.RLock (not asyncio.Lock)
+        # deliberately: the mutation sites are SYNC methods called from async
+        # code — an asyncio.Lock cannot be acquired there — and an RLock also
+        # covers the codebase's real threads (wall-clock watchdog, embed pool),
+        # which an asyncio.Lock would not. Mirrors in_flight_registry's RLock
+        # precedent. `with` context manager guarantees release on exceptions.
+        import threading as _threading
+        self._session_lessons_lock = _threading.RLock()
         self._convergence_check_interval: int = int(
             os.environ.get("JARVIS_LESSON_CONVERGENCE_CHECK_INTERVAL", "10")
         )
@@ -2405,9 +2416,13 @@ class GovernedOrchestrator:
         op_id:
             Originating operation — passed to SerpentFlow for block scoping.
         """
-        self._session_lessons.append((lesson_type, lesson_text))
-        if len(self._session_lessons) > self._session_lessons_max:
-            self._session_lessons = self._session_lessons[-self._session_lessons_max:]
+        # Slice 1: the append+cap+rebind must be one atomic unit — a concurrent
+        # worker's clear/rebind interleaving here could resurrect dropped lessons
+        # or exceed the cap. Lock guarantees release on exceptions.
+        with self._session_lessons_lock:
+            self._session_lessons.append((lesson_type, lesson_text))
+            if len(self._session_lessons) > self._session_lessons_max:
+                self._session_lessons = self._session_lessons[-self._session_lessons_max:]
 
         # Emit heartbeat to SerpentFlow / transports
         try:
@@ -9702,39 +9717,34 @@ class GovernedOrchestrator:
                     exc_info=True,
                 )
 
+            # ---- RR Pass B Slice 2b: ORDER_2_GOVERNANCE floor ----
+            # Single-source seam (Slice 1 drift repair, 2026-07-18): identical
+            # call on BOTH GATE paths — the drift audit found this floor wired
+            # ONLY in the extracted gate_runner, so this inline kill-switch path
+            # silently dropped the Order-2 governance floor.
+            try:
+                from backend.core.ouroboros.governance.meta.order2_classifier import (  # noqa: E501
+                    apply_order2_floor_safe as _apply_order2_floor_safe,
+                )
+                risk_tier = _apply_order2_floor_safe(
+                    risk_tier, list(ctx.target_files), op_id=ctx.op_id,
+                )
+            except Exception:  # noqa: BLE001 — import fault must never break GATE
+                logger.debug("[Orchestrator] ORDER_2 floor skipped", exc_info=True)
+
             # ── Slice 101 Phase 5: Proof Carrier (pre-APPLY proof artifact) ──
-            # Aggregates the available pre-APPLY signals (counterfactual
-            # rehearsal, cross-session coherence, MCP/credential scan) into ONE
-            # per-candidate proof-of-correctness artifact and self-publishes it
-            # to the IDE SSE stream (proof_carrier_built) for operator
-            # visibility. This is the observability aggregator over signals
-            # already individually gated — rehearsal via the risk-tier floor
-            # just above, credentials via the tool-emit scanner (Phase 4),
-            # boundary via the governance gate — so it raises visibility, not a
-            # redundant second gate. Master JARVIS_PROOF_CARRIER_ENABLED §33.1
-            # default-FALSE → DISABLED (zero cost) when off. NEVER raises.
+            # Single-source seam (Slice 1 drift repair): the shared
+            # emit_gate_proof_carrier helper is called identically on BOTH GATE
+            # paths. Master JARVIS_PROOF_CARRIER_ENABLED §33.1 default-FALSE →
+            # DISABLED (zero cost) when off. NEVER raises.
             try:
                 from backend.core.ouroboros.governance.proof_carrier_transport import (  # noqa: E501
-                    ProofVerdict as _ProofVerdict,
-                    build_proof_carrier as _build_proof_carrier,
+                    emit_gate_proof_carrier as _emit_gate_proof_carrier,
                 )
-                _proof = _build_proof_carrier(
+                _emit_gate_proof_carrier(
                     getattr(ctx, "op_id", "") or "",
                     list(getattr(ctx, "target_files", ()) or ()),
                 )
-                if _proof.verdict not in (
-                    _ProofVerdict.CLEAN, _ProofVerdict.DISABLED,
-                ):
-                    logger.info(
-                        "[Orchestrator] GATE proof_carrier op=%s verdict=%s "
-                        "source=%s mcp=%d rehearsal=%d drift=%s",
-                        getattr(ctx, "op_id", "?"),
-                        _proof.verdict.value,
-                        _proof.dominant_source.value,
-                        _proof.mcp_finding_count,
-                        _proof.rehearsal_concern_count,
-                        _proof.coherence_drift_level,
-                    )
             except Exception:  # noqa: BLE001 — proof artifact must never touch GATE
                 pass
 
@@ -10286,6 +10296,34 @@ class GovernedOrchestrator:
                 )
                 return ctx
 
+            # ── Predictive Phase-Aware Checkpoint (pre-APPLY) ──
+            # Mirror of the extracted Slice4bRunner gate: project the irreversible
+            # APPLY→VERIFY tail against the remaining wall runway (decoupled read).
+            # If it won't fit, gracefully self-suspend (signed checkpoint + atomic
+            # dirty-tree stash) so the op resumes next ignition instead of a
+            # hard-kill mid-APPLY. Fail-open: only terminate if the checkpoint
+            # persisted; otherwise fall through into APPLY.
+            try:
+                from backend.core.ouroboros.governance import phase_runway_gate as _prg
+                _runway_verdict = _prg.evaluate(ctx, _prg.PRE_APPLY_TAIL_PHASES)
+                if _runway_verdict.should_suspend:
+                    _ckpt_path = _prg.predictive_suspend(ctx, "APPLY", _runway_verdict)
+                    if _ckpt_path:
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code="predictive_suspend",
+                        )
+                        await self._record_ledger(
+                            ctx, OperationState.FAILED,
+                            {"reason": "predictive_suspend",
+                             "runway": _runway_verdict.as_telemetry()},
+                        )
+                        return ctx
+            except Exception:  # noqa: BLE001 — fail open into APPLY
+                logger.debug(
+                    "[Orchestrator] predictive checkpoint gate skipped", exc_info=True,
+                )
+
             # ---- Phase 7: APPLY ----
             ctx = ctx.advance(OperationPhase.APPLY)
 
@@ -10604,6 +10642,23 @@ class GovernedOrchestrator:
             else:
                 change_request = self._build_change_request(ctx, best_candidate)
                 _t_apply = time.monotonic()
+                # Priority F2 (Slice 1 drift repair, 2026-07-18): snapshot
+                # target_files content BEFORE the change_engine writes — the
+                # pre-state half of the diff_text evidence. The drift audit
+                # found this stamped ONLY in the extracted slice4b_runner, so
+                # this inline kill-switch path silently degraded
+                # no_new_credential_shapes to INSUFFICIENT. Mirrors
+                # slice4b_runner verbatim; best-effort, never raises.
+                try:
+                    from backend.core.ouroboros.governance.verification.evidence_capture import (  # noqa: E501
+                        stamp_target_files_pre_async,
+                    )
+                    await stamp_target_files_pre_async(ctx)
+                except Exception:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[Orchestrator] stamp_target_files_pre failed",
+                        exc_info=True,
+                    )
                 try:
                     # LR-B (spec 5.4): mark the on-disk single-file apply as a
                     # critical mutation so the operator-yield drains before it
@@ -10653,6 +10708,22 @@ class GovernedOrchestrator:
                 )
                 await self._publish_outcome(ctx, OperationState.FAILED, "change_engine_failed")
                 return ctx
+
+            # Priority F2 (Slice 1 drift repair): APPLY succeeded — capture full
+            # post-state evidence (target_files_post / test_files_post /
+            # diff_text) so the F1 gatherers find rich pre-stamped data. The
+            # drift audit found this ONLY in the extracted slice4b_runner.
+            # Mirrors it verbatim; best-effort, never raises.
+            try:
+                from backend.core.ouroboros.governance.verification.evidence_capture import (  # noqa: E501
+                    stamp_apply_evidence_post_async,
+                )
+                await stamp_apply_evidence_post_async(ctx)
+            except Exception:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[Orchestrator] stamp_apply_evidence_post failed",
+                    exc_info=True,
+                )
 
             # ---- Phase 7.5: INFRASTRUCTURE (deterministic post-APPLY hook) ----
             # Boundary Principle: the agentic layer wrote the file (e.g., requirements.txt).
@@ -12014,12 +12085,17 @@ class GovernedOrchestrator:
                             _pre_rate * 100, self._ops_before_lesson_success, self._ops_before_lesson,
                             _post_rate * 100, self._ops_after_lesson_success, self._ops_after_lesson,
                         )
-                        self._session_lessons.clear()
-                        # Reset counters so the metric starts fresh
-                        self._ops_before_lesson = self._ops_after_lesson
-                        self._ops_before_lesson_success = self._ops_after_lesson_success
-                        self._ops_after_lesson = 0
-                        self._ops_after_lesson_success = 0
+                        # Slice 1: clear + counter-reset is one atomic unit
+                        # under the lessons lock (a concurrent _add_session_
+                        # lesson interleaving mid-reset would corrupt the
+                        # convergence metric's epoch).
+                        with self._session_lessons_lock:
+                            self._session_lessons.clear()
+                            # Reset counters so the metric starts fresh
+                            self._ops_before_lesson = self._ops_after_lesson
+                            self._ops_before_lesson_success = self._ops_after_lesson_success
+                            self._ops_after_lesson = 0
+                            self._ops_after_lesson_success = 0
                     else:
                         logger.info(
                             "[Orchestrator] Session intelligence convergence OK: "

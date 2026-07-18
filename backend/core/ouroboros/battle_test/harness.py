@@ -641,6 +641,14 @@ class BattleTestHarness:
         # Publish session dir for downstream non-streaming callers
         # (e.g. CompactionCallerStrategy writes compaction_shadow.jsonl here).
         os.environ.setdefault("JARVIS_OUROBOROS_SESSION_DIR", str(self._session_dir))
+        # Slice 2 workspace-arming integrity (bt-2026-07-18-200502): publish the
+        # session id at the EARLIEST point it is final — Stage-B file-isolation
+        # stamps its ledger-sovereignty ownership marker at GLS-config
+        # construction, long before _boot_ledger_sovereignty_workspace's late
+        # setdefault ran. That marker carried session="" and the boot reaper
+        # treated the just-armed workspace as a dead session's debris and ate
+        # it (domino #1 of the armed-but-unusable APPLY-boundary kill chain).
+        os.environ.setdefault("JARVIS_OUROBOROS_SESSION_ID", str(self._session_id))
 
         # Battle-test utilities
         self._cost_tracker = CostTracker(
@@ -3499,14 +3507,31 @@ class BattleTestHarness:
         # Stage B unification: if file-isolation already created + exported
         # the unified worktree earlier (at GLS-config construction, before
         # this phase), reuse it instead of double-creating a second worktree.
+        # Slice 2 workspace-arming integrity (bt-2026-07-18-200502): the reuse
+        # check MUST validate the target is a REAL git work-area, not merely a
+        # directory — the boot reaper can eat the Stage-B worktree between
+        # arming and this phase, leaving a marker-only husk. Reusing (or
+        # leaving armed) a husk means every op dies fail-closed at the APPLY
+        # boundary ("armed but unusable"). Invalid → CLEAR the env (armed must
+        # imply usable) and fall through to a fresh create.
+        from backend.core.ouroboros.governance.autonomous_workspace import (
+            is_valid_git_work_area,
+        )
         _existing_ws = os.environ.get("JARVIS_AUTO_COMMIT_WORKSPACE", "")
-        if _existing_ws and Path(_existing_ws).is_dir():
+        if _existing_ws and is_valid_git_work_area(_existing_ws):
             self._auto_commit_workspace = Path(_existing_ws)
             logger.info(
                 "[ledger_sovereignty] reusing file-isolation worktree "
                 "%s (Stage B already created it)", _existing_ws,
             )
             return
+        if _existing_ws:
+            os.environ.pop("JARVIS_AUTO_COMMIT_WORKSPACE", None)
+            logger.warning(
+                "[ledger_sovereignty] STALE workspace env cleared: %r is not a "
+                "usable git work-area (reaped husk?) — re-creating fresh so the "
+                "session never runs armed-but-unusable", _existing_ws,
+            )
 
         # Session id MUST be exported BEFORE WorktreeManager.create
         # so the marker payload carries the correct value.
@@ -3548,8 +3573,26 @@ class BattleTestHarness:
                     "reap failed (non-fatal): %r", reap_err,
                 )
 
-            wt_path = await mgr.create(branch_name)
+            # Slice 2: self-heal the self-debris branch collision (an earlier
+            # arming stage's branch surviving a reaped worktree) instead of
+            # dying on "branch already exists" — the branch is session-nonced,
+            # so a same-name collision is provably our own debris.
+            wt_path = await mgr.create_or_reclaim(branch_name)
         except Exception as wt_err:  # noqa: BLE001 — fail-open
+            # Slice 2: fail-open must be GENUINELY open. If a stale/husk
+            # workspace env survives here, every op dies fail-closed at the
+            # APPLY boundary ("armed but unusable") — armed-but-broken is
+            # strictly worse than unarmed (unset → execution_root =
+            # project_root → APPLY proceeds under the documented
+            # no-workspace posture).
+            _stale = os.environ.get("JARVIS_AUTO_COMMIT_WORKSPACE", "")
+            if _stale and not is_valid_git_work_area(_stale):
+                os.environ.pop("JARVIS_AUTO_COMMIT_WORKSPACE", None)
+                logger.warning(
+                    "[ledger_sovereignty] cleared stale workspace env %r "
+                    "after create failure (never run armed-but-unusable)",
+                    _stale,
+                )
             logger.warning(
                 "[ledger_sovereignty] auto-commit worktree "
                 "create failed: %r — soak will proceed but "

@@ -310,6 +310,52 @@ class WorktreeManager:
         logger.info("WorktreeManager: created worktree at %s", wt_path)
         return wt_path
 
+    async def create_or_reclaim(self, branch_name: str) -> Path:
+        """:meth:`create`, self-healing the SELF-DEBRIS collision class.
+
+        Slice 2 workspace-arming integrity (2026-07-18, bt-2026-07-18-200502):
+        an earlier arming stage's worktree can be reaped mid-boot while its
+        BRANCH survives — the later ``create`` for the same session then dies
+        ``fatal: a branch named '<x>' already exists`` and the session runs
+        armed-but-unusable, killing every op at the APPLY boundary.
+
+        Because the branch name is session-nonced (``workspace_branch``:
+        session_id + collision-proof nonce), a colliding branch of the SAME
+        name is provably this session's own debris — no other session can mint
+        it. Reclaim: prune stale registrations, delete the debris branch,
+        remove a husk directory if present, then retry ``create`` exactly once.
+
+        CONTRACT: callers MUST pass a branch this session exclusively owns
+        (the nonced ``workspace_branch``). Never call with a shared or
+        human-owned branch name — reclaim deletes it. Raises like ``create``
+        when the retry also fails; any non-collision failure propagates
+        unchanged (no blanket retry)."""
+        try:
+            return await self.create(branch_name)
+        except RuntimeError as first_err:
+            if "already exists" not in str(first_err):
+                raise                       # not the collision class — no retry
+            logger.warning(
+                "WorktreeManager.create_or_reclaim: self-debris collision for "
+                "%r — pruning registrations, deleting debris branch, retrying "
+                "once (%s)", branch_name, first_err,
+            )
+            # 1) Clear stale administrative records (a registration whose dir
+            #    vanished blocks both branch-delete and re-add).
+            await self._run_git_capture(["worktree", "prune"])
+            # 2) Delete the debris branch (session-nonced — provably ours).
+            await self._run_git_capture(["branch", "-D", branch_name])
+            # 3) Remove a husk directory (e.g. marker-only leftovers) so
+            #    `git worktree add` doesn't refuse a non-empty target.
+            safe_name = branch_name.replace("/", "__").replace(" ", "_")
+            husk = self._worktree_base / safe_name
+            try:
+                if husk.is_dir() and not (husk / ".git").exists():
+                    shutil.rmtree(husk, ignore_errors=True)
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
+            return await self.create(branch_name)
+
     def _stamp_ownership_marker(
         self, wt_path: Path, branch_name: str,
     ) -> None:

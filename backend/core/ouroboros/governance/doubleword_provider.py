@@ -2149,6 +2149,64 @@ class DoublewordProvider:
             )
 
     def _resolve_effective_model(self, ctx: Any) -> str:
+        """Resolve the DW model for this call, then apply the entitlement filter
+        (Dynamic Capability Propagation, 2026-07-18) so a model DW has 403'd this
+        session is NEVER re-elected — the fix for the DreamEngine 403 storm where
+        blind re-election of a catalog-listed-but-unentitled model looped forever.
+        Thin wrapper over :meth:`_resolve_effective_model_raw` so the filter
+        covers EVERY resolution path with one seam. NEVER raises."""
+        return self._entitlement_filter(self._resolve_effective_model_raw(ctx))
+
+    def _entitlement_filter(self, model: str) -> str:
+        """If *model* was recorded as 403-blocked this session, substitute the
+        best still-entitled alternative (policy preference ∩ live catalog, minus
+        blocked); if the entitled set is cold, fall back to the first non-blocked
+        candidate in the policy preference order. Returns *model* unchanged when
+        it is not blocked, when nothing better is resolvable (fail-open — the 403
+        path then marks it and the NEXT election avoids it), or when the master
+        switch is off. Sync + NEVER raises (hot election path)."""
+        try:
+            if not model:
+                return model
+            from backend.core.ouroboros.governance.dw_entitlement_fallback import (
+                entitlement_fallback_enabled,
+                get_process_entitlement_cache,
+                select_fallback_model,
+                default_preference_order,
+            )
+            if not entitlement_fallback_enabled():
+                return model
+            cache = get_process_entitlement_cache()
+            if not cache.is_blocked(model):
+                return model
+            entitled = cache.cached_entitled_ids()          # sync peek, no I/O
+            order = default_preference_order()
+            alt = (
+                select_fallback_model(
+                    blocked_model_id=model,
+                    preference_order=order,
+                    entitled_ids=entitled,
+                )
+                if entitled else None
+            )
+            if alt is None:
+                # Entitled set cold (no catalog fetch yet) — pick the first
+                # policy-ranked candidate that is not itself blocked.
+                alt = next(
+                    (m for m in order if m and m != model and not cache.is_blocked(m)),
+                    None,
+                )
+            if alt:
+                logger.warning(
+                    "[DoublewordProvider] election avoided 403-blocked model=%s "
+                    "-> %s (dynamic capability propagation)", model, alt,
+                )
+                return alt
+            return model  # fail-open: nothing better resolvable
+        except Exception:  # noqa: BLE001 — election must never raise
+            return model
+
+    def _resolve_effective_model_raw(self, ctx: Any) -> str:
         """Resolve the DW model for this call.
 
         Resolution order (first match wins):
@@ -7469,27 +7527,32 @@ class DoublewordProvider:
             )
 
     def _prune_unentitled_model(self, model: str) -> None:
-        """Prune a 403-blocked model from the live entitled set.
+        """Record a 403-blocked model in the process-wide
+        ``EntitlementCatalogCache`` so it is never re-elected this session.
 
-        Delegates to the EXISTING process-wide ``EntitlementCatalogCache``
-        (``get_process_entitlement_cache``) — no second cache, no parallel RBAC
-        state. Its only mutation verb is ``reset()``, which invalidates the
-        cached entitled set so the NEXT ``get_entitled_ids`` re-fetches the
-        truth from DW's own /v1/models rather than trusting a stale local
-        guess. That is deliberately better than us subtracting the model
-        ourselves: DW remains the authority on its own RBAC, and the module's
-        TTL (``JARVIS_DW_ENTITLEMENT_CACHE_TTL_S``, default 1800s) still governs
-        re-probing if entitlements are provisioned later. NEVER raises."""
+        Delegates to the EXISTING singleton (``get_process_entitlement_cache``)
+        — no second cache, no parallel RBAC state. Uses the SURGICAL
+        ``mark_blocked(model)`` rather than the coarse ``reset()``:
+        ``reset()`` merely invalidated the cached set, so the next
+        ``get_entitled_ids`` re-fetched DW's ``/v1/models`` — which STILL LISTS
+        this model (the catalog lists it as available while actual USE 403s;
+        entitlement is finer-grained than the listing). That re-surfaced the
+        model → election re-picked it → the 59× 403 storm observed in
+        bt-2026-07-18-081903. ``mark_blocked`` records DW's authoritative denial
+        as durable session ground truth (surviving TTL re-fetches), so
+        ``_entitlement_filter`` avoids it on the very next election. DW remains
+        the RBAC authority — we are recording the 403 it actually returned, not
+        second-guessing it. NEVER raises."""
         try:
             from backend.core.ouroboros.governance.dw_entitlement_fallback import (
                 get_process_entitlement_cache,
             )
 
-            get_process_entitlement_cache().reset()
+            get_process_entitlement_cache().mark_blocked(model)
             logger.info(
-                "[DoublewordProvider] entitled-catalog cache reset after 403 "
-                "(model=%s) — next election re-derives the entitled set from "
-                "DW itself", model,
+                "[DoublewordProvider] model=%s recorded 403-blocked — pruned from "
+                "the election matrix for this session (dynamic capability "
+                "propagation); next election picks the next entitled model", model,
             )
         except Exception:  # noqa: BLE001
             logger.debug("[DoublewordProvider] entitlement prune skipped", exc_info=True)

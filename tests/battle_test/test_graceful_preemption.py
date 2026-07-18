@@ -63,19 +63,54 @@ def _init_repo(path):
     return path
 
 
-def test_git_safety_stashes_in_flight_changes(tmp_path):
+def _porcelain(repo):
+    return subprocess.run(
+        ["git", "-C", repo, "status", "--porcelain"], capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _stash_list(repo):
+    return subprocess.run(
+        ["git", "-C", repo, "stash", "list"], capture_output=True, text=True,
+    ).stdout
+
+
+def test_git_safety_snapshots_non_destructively(tmp_path):
+    """NON-DESTRUCTIVE contract: the dirty + untracked delta is snapshotted into
+    a recoverable [preemption-shield] stash entry AND left in place on disk
+    (the working tree is NOT cleared — the pre-2026-07-18 data-loss vector)."""
     repo = _init_repo(str(tmp_path / "r"))
     open(os.path.join(repo, "seed.txt"), "w").write("HALF-WRITTEN APPLY\n")
     open(os.path.join(repo, "newfile.py"), "w").write("x = 1\n")
-    assert gp.git_safety_stash(repo) == "stashed"
-    porcelain = subprocess.run(
-        ["git", "-C", repo, "status", "--porcelain"], capture_output=True, text=True,
-    ).stdout.strip()
-    assert porcelain == ""
-    stashes = subprocess.run(
-        ["git", "-C", repo, "stash", "list"], capture_output=True, text=True,
-    ).stdout
-    assert "preemption-shield" in stashes
+
+    out = gp.git_safety_stash(repo)
+    assert out.startswith("snapshot:"), out
+
+    # The working tree is PRESERVED — both the tracked edit and the untracked file.
+    assert _porcelain(repo) != "", "tree must NOT be cleared (was the data-loss bug)"
+    assert open(os.path.join(repo, "seed.txt")).read() == "HALF-WRITTEN APPLY\n"
+    assert os.path.isfile(os.path.join(repo, "newfile.py"))
+
+    # ...and the snapshot is recoverable via `git stash list`.
+    assert "preemption-shield" in _stash_list(repo)
+
+
+def test_git_safety_snapshot_recoverable_after_tree_cleaned(tmp_path):
+    """Belt-and-suspenders: even if the tree is later cleaned by something else
+    (a subsequent reset / worktree teardown), the tracked delta is recoverable
+    from the [preemption-shield] stash entry via apply. (Untracked files don't
+    need this path — the shield leaves them on disk in the first place.)"""
+    repo = _init_repo(str(tmp_path / "r"))
+    open(os.path.join(repo, "seed.txt"), "w").write("HALF-WRITTEN APPLY\n")
+    assert gp.git_safety_stash(repo).startswith("snapshot:")
+
+    # Simulate the tree being cleaned across the boundary by a LATER op.
+    subprocess.run(["git", "-C", repo, "checkout", "--", "seed.txt"], check=True)
+    assert "HALF-WRITTEN" not in open(os.path.join(repo, "seed.txt")).read()
+
+    # Recover the tracked delta from the shield's stash entry.
+    subprocess.run(["git", "-C", repo, "stash", "apply"], check=True)
+    assert open(os.path.join(repo, "seed.txt")).read() == "HALF-WRITTEN APPLY\n"
 
 
 def test_git_safety_clean_tree_is_noop(tmp_path):
@@ -88,7 +123,7 @@ def test_git_safety_clears_stale_index_lock(tmp_path):
     open(os.path.join(repo, "seed.txt"), "w").write("dirty\n")
     lock = os.path.join(repo, ".git", "index.lock")
     open(lock, "w").write("")
-    assert gp.git_safety_stash(repo) == "stashed"
+    assert gp.git_safety_stash(repo).startswith("snapshot:")
     assert not os.path.isfile(lock)
 
 

@@ -174,8 +174,34 @@ def apply_order2_floor(
     return current_tier
 
 
+def apply_order2_floor_safe(
+    current_tier: RiskTier,
+    target_files: Sequence[str],
+    op_id: str = "",
+    repo: str = "jarvis",
+) -> RiskTier:
+    """Single-source GATE seam (Slice 1 drift repair, 2026-07-18): the never-raise
+    wrapper both GATE paths call identically — the drift audit found the floor
+    wired ONLY in the extracted ``gate_runner``, so the inline kill-switch path
+    silently dropped the Order-2 governance floor. Logs the op-scoped transition;
+    any fault returns *current_tier* unchanged (fail-open to the pre-floor tier,
+    matching the legacy gate_runner try/except). NEVER raises."""
+    try:
+        _raised = apply_order2_floor(current_tier, list(target_files), repo=repo)
+        if _raised is not current_tier:
+            logger.info(
+                "[Orchestrator] GATE: ORDER_2 floor → %s→%s op=%s files=%d",
+                current_tier.name, _raised.name, op_id or "?", len(target_files),
+            )
+        return _raised
+    except Exception:  # noqa: BLE001 — the floor must never break GATE
+        logger.debug("[Orchestrator] ORDER_2 floor skipped", exc_info=True)
+        return current_tier
+
+
 __all__ = [
     "apply_order2_floor",
+    "apply_order2_floor_safe",
     "classify_order2_match",
     "is_enabled",
 ]

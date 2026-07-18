@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import os
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Tuple
 
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.op_context import OperationContext
@@ -340,6 +340,39 @@ def _apply_immediate_tier_decay(
     )
 
 
+def _apply_liquidity_elevation(
+    route: "ProviderRoute", reason: str, ctx: Any,
+) -> Tuple["ProviderRoute", str]:
+    """Dynamic Liquidity Pool — post-classification SPECULATIVE/BACKGROUND →
+    STANDARD elevation (the mirror of :func:`_apply_immediate_tier_decay`).
+
+    When the DW realtime transport is ENTIRELY entitlement-denied the DW-only
+    SPECULATIVE/BACKGROUND lanes starve (Manifesto §5 cost contract + a DW-RT
+    403 → no viable provider → EXHAUSTION at GENERATE). The Liquidity Pool
+    (``liquidity_pool.should_elevate``) issues a bounded, budget-gated,
+    instantly-revocable lease that elevates such an op to STANDARD (Claude-
+    capable) so background autonomy survives a DW outage — adaptive, not a static
+    escape valve. Preserves the ORIGINAL rationale as a reason suffix (mirrors
+    ``tier_decay:``). Fail-soft: any fault leaves the route unchanged."""
+    try:
+        if route not in (ProviderRoute.SPECULATIVE, ProviderRoute.BACKGROUND):
+            return route, reason
+        from backend.core.ouroboros.governance.liquidity_pool import (  # noqa: PLC0415
+            should_elevate,
+        )
+        cause = should_elevate(
+            route_value=route.value, op_id=str(getattr(ctx, "op_id", "") or ""),
+        )
+        if not cause:
+            return route, reason
+        return (
+            ProviderRoute.STANDARD,
+            f"liquidity_lease:{route.value}_to_standard:{cause}:{reason}",
+        )
+    except Exception:  # noqa: BLE001 — routing must never break
+        return route, reason
+
+
 # ---------------------------------------------------------------------------
 # Slice 231 — Telemetry-Driven Budget Synthesizer (Dynamic Allocation Kernel)
 # ---------------------------------------------------------------------------
@@ -500,6 +533,20 @@ class UrgencyRouter:
     _last_decision_reason: str = ""
 
     def classify(
+        self,
+        ctx: "OperationContext",
+    ) -> Tuple[ProviderRoute, str]:
+        """Classify an operation into a provider route, then apply the Dynamic
+        Liquidity Pool elevation (SPECULATIVE/BACKGROUND → STANDARD when DW-RT is
+        ENTIRELY entitlement-denied and the session budget is healthy). Thin
+        wrapper over :meth:`_classify_inner` so the elevation governs EVERY
+        classification path through one seam — the same way this method already
+        wraps the Priority 0-5 matrix. Fail-soft (elevation never breaks routing).
+        """
+        route, reason = self._classify_inner(ctx)
+        return _apply_liquidity_elevation(route, reason, ctx)
+
+    def _classify_inner(
         self,
         ctx: "OperationContext",
     ) -> Tuple[ProviderRoute, str]:

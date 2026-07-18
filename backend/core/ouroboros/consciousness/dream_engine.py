@@ -711,6 +711,20 @@ class DreamEngine:
             self._last_user_return = time.monotonic()
             return None
 
+        # Semantic Context Engineering (2026-07-18): hydrate the FRONTIER block
+        # async (sha-cached — zero git calls on repeat cycles) so the sync
+        # prompt builder can attach it. Fail-soft: "" → dream proceeds without
+        # frontier direction.
+        try:
+            from backend.core.ouroboros.governance.frontier_context import (  # noqa: PLC0415
+                frontier_context_async,
+            )
+            candidate["frontier_digest"] = await frontier_context_async(
+                repo_sha=str(candidate.get("repo_sha", "") or ""),
+            )
+        except Exception:  # noqa: BLE001 — hydration must never break a dream
+            candidate["frontier_digest"] = ""
+
         # Build prompt (TC23: capped)
         prompt = self._build_dream_prompt(candidate)
         prompt = self._truncate_prompt(prompt)
@@ -915,11 +929,49 @@ class DreamEngine:
         return _MODEL_CLASS_UNKNOWN
 
     def _build_dream_prompt(self, candidate: Dict[str, Any]) -> str:
-        """Build the speculative analysis prompt for J-Prime."""
+        """Build the speculative analysis prompt for J-Prime.
+
+        Semantic Context Engineering (2026-07-18): the prompt now hydrates two
+        bounded, deterministic, cached context blocks BEFORE the directive —
+
+          * ARCHITECTURAL INTENT (``north_star_context``): the PRD §6 A-level
+            "definition of DONE" table + the §-header outlines of the PRD and
+            the North Star Galaxy, so speculative hypotheses intentionally
+            ALIGN with feature progression (the Apple/GCP/DW/Claude alliance
+            roadmap) instead of merely hunting code rot.
+          * RECENT HUMAN FRONTIER (``frontier_context``, hydrated async into
+            ``candidate['frontier_digest']`` by the job runner): the modules
+            the human was actively building — dream attention picks up where
+            that work ended.
+
+        Both fail-soft to "" (byte-identical legacy directive when dark) and
+        are master-gated + char-capped; ``_truncate_prompt`` (TC23) remains the
+        downstream hard cap. NOT a RAG pipeline — plain deterministic extracts.
+        """
+        _context_blocks = []
+        try:
+            from backend.core.ouroboros.governance.north_star_context import (  # noqa: PLC0415
+                north_star_context,
+            )
+            _intent = north_star_context()
+            if _intent:
+                _context_blocks.append(_intent)
+        except Exception:  # noqa: BLE001 — hydration must never break a dream
+            pass
+        _frontier = str(candidate.get("frontier_digest", "") or "")
+        if _frontier:
+            _context_blocks.append(_frontier)
+        _context = ("\n\n".join(_context_blocks) + "\n\n") if _context_blocks else ""
+        _alignment = (
+            "Prefer an improvement that ADVANCES the architectural intent and "
+            "CONTINUES the recent human frontier above.  " if _context else ""
+        )
         return (
+            f"{_context}"
             f"Analyze the repository at SHA {candidate['repo_sha']} "
             f"for potential improvements in the '{candidate['prompt_family']}' "
-            f"category.  Suggest one concrete, small improvement with "
+            f"category.  {_alignment}"
+            f"Suggest one concrete, small improvement with "
             f"estimated effort, target files, risk assessment, and approach.  "
             f"Return JSON with keys: title, description, category, "
             f"priority_score, target_files, estimated_effort, "

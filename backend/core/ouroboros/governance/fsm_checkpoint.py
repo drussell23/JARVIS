@@ -713,6 +713,48 @@ def capture_inflight(*, base_dir: "Optional[str]" = None, reason: str = "wall_cl
     return n
 
 
+def capture_single_op(
+    context: Any, *, phase: "Optional[str]" = None,
+    reason: str = "predictive_phase_aware",
+    base_dir: "Optional[str]" = None,
+) -> "Optional[str]":
+    """PREDICTIVE PER-OP SUSPEND (mid-session): serialize exactly ONE op's ctx to
+    a signed checkpoint + snapshot the current dirty working-tree stash, WITHOUT
+    the session-wide registry sweep of :func:`capture_inflight`.
+
+    Used by the pre-phase runway gate (``phase_runway_gate``) to checkpoint an op
+    right before it would enter a phase it cannot finish within the remaining
+    runway — a native, graceful alternative to being hard-killed mid-phase. Unlike
+    ``capture_inflight`` this reads straight from the supplied ctx (not the
+    in-flight registry), so it is correct to call for one op while others keep
+    running, and does not depend on that op having registered.
+
+    DRY: composes the same three primitives ``capture_inflight`` uses —
+    :func:`capture_from_context`, :func:`_capture_workspace_stash` (atomic
+    ``git stash create -u``), :func:`write_checkpoint` (HMAC-signed atomic write).
+    Returns the checkpoint path on success, or None (fail-soft — the caller MUST
+    then proceed into the phase rather than strand the op). NEVER raises."""
+    try:
+        _phase = (phase or "").strip()
+        if not _phase:
+            _phase = str(getattr(getattr(context, "phase", None), "name", "") or "GENERATE")
+        cp = capture_from_context(context, phase=_phase, resume_reason=reason)
+        if cp is None:
+            return None
+        cp.workspace_stash_ref = _capture_workspace_stash()
+        path = write_checkpoint(cp, base_dir=base_dir)
+        if path:
+            logger.info(
+                "[fsm_checkpoint] PREDICTIVE SUSPEND op=%s phase=%s reason=%s "
+                "stash=%s -> signed checkpoint (resumes next ignition)",
+                cp.op_id, cp.phase, reason,
+                (cp.workspace_stash_ref[:12] if cp.workspace_stash_ref else "(clean)"),
+            )
+        return path
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def build_resume_envelope(
     cp: FSMCheckpoint, *, live_repo_sha: "Optional[str]" = None,
 ) -> Dict[str, Any]:

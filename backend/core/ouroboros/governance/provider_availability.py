@@ -73,6 +73,12 @@ class ProviderAvailabilitySnapshot:
     # Reserved for a future latency-variance-aware kernel (Slice 232). Unused
     # by the deterministic v1 synthesizer; defaults keep the schema additive.
     dw_latency_p95_s: Optional[float] = None
+    # Kimi K3 (Moonshot) third lane — structural parity with claude_/dw_ pairs.
+    # Additive with conservative defaults (inert unless resolved): the adapter is
+    # credential-gated + off by default, so "not available / unknown" is the
+    # legacy-safe steady state for every existing constructor + the fail-soft path.
+    kimi_available: bool = False
+    kimi_reason: str = "unknown"
 
 
 # Claude-lane unavailability reasons that are EXPECTED steady states — an
@@ -183,17 +189,53 @@ def _resolve_claude(
 
 
 def _resolve_dw(*, ledger) -> tuple[bool, str]:
-    """Read-only DW direct-streaming surface health + forensic reason."""
-    record = ledger.verdict_for(SurfaceKind.DIRECT_STREAMING)
-    if record is None:
-        # No evidence of a problem → legacy-safe healthy.
+    """Read-only DW availability = usable on EITHER the streaming surface OR the
+    ``complete_sync`` (``DIRECT_COMPLETION``) surface + forensic reason.
+
+    ``complete_sync`` exists precisely because ``DIRECT_STREAMING`` (SSE) is
+    chronically degraded, and it is the primary DW path in that case. Gating DW
+    availability on ``DIRECT_STREAMING`` ALONE marked DW "down" whenever SSE
+    degraded — even with a HEALTHY completion surface — so routing cascaded
+    everything to Claude (bt-2026-07-18-110439: SSE ``transport_degraded`` +
+    completion ``healthy`` → Claude ``RATE_LIMITED`` → ``all_providers_exhausted``,
+    0 ops reached APPLY). DW is available if ANY usable DW surface exists; the
+    reason names the winning surface, or the streaming reason when neither is
+    usable (so the historical forensic label is preserved for the true-outage
+    case). Fold-in of DIRECT_COMPLETION mirrors the caveat the availability map
+    flagged. NEVER raises (the caller wraps it)."""
+    _usable = (SurfaceVerdict.HEALTHY, SurfaceVerdict.UPSTREAM_DEGRADED)
+    stream = ledger.verdict_for(SurfaceKind.DIRECT_STREAMING)
+    completion = ledger.verdict_for(SurfaceKind.DIRECT_COMPLETION)
+    # No evidence on either surface → legacy-safe healthy.
+    if stream is None and completion is None:
         return True, "unknown"
-    verdict = record.verdict
-    if verdict in (SurfaceVerdict.HEALTHY, SurfaceVerdict.UPSTREAM_DEGRADED):
-        # UPSTREAM_DEGRADED: DW upstream is slow but its transport is usable —
-        # and when Claude is down it is the only funded lane, so still "usable".
-        return True, verdict.value
-    return False, verdict.value
+    # Streaming usable → healthy (byte-identical to the legacy streaming-healthy
+    # path: reason is the bare verdict value).
+    if stream is not None and stream.verdict in _usable:
+        return True, stream.verdict.value
+    # SSE degraded/absent but complete_sync usable → DW is still reachable.
+    if completion is not None and completion.verdict in _usable:
+        return True, "direct_completion:%s" % completion.verdict.value
+    # Neither usable → true DW outage. Report the streaming reason (the historical
+    # forensic label) when present, else the completion reason.
+    if stream is not None:
+        return False, stream.verdict.value
+    return False, completion.verdict.value  # type: ignore[union-attr]
+
+
+def _resolve_kimi() -> "tuple[bool, str]":
+    """Kimi K3 lane availability + forensic reason, mirroring ``_resolve_dw`` /
+    ``_resolve_claude``. Delegates to ``kimi_provider.resolve_kimi_availability``
+    (DRY — the credential/flag logic lives with the adapter). Fail-soft →
+    (False, 'unavailable') so an unresolved Kimi lane is never routed to. NEVER
+    raises."""
+    try:
+        from backend.core.ouroboros.governance.kimi_provider import (  # noqa: PLC0415
+            resolve_kimi_availability,
+        )
+        return resolve_kimi_availability()
+    except Exception:  # noqa: BLE001
+        return False, "unavailable"
 
 
 def collect_provider_availability(
@@ -231,11 +273,14 @@ def collect_provider_availability(
             persisted_reader=persisted_reader,
         )
         dw_ok, dw_reason = _resolve_dw(ledger=_ledger)
+        kimi_ok, kimi_reason = _resolve_kimi()
         return ProviderAvailabilitySnapshot(
             claude_available=claude_ok,
             claude_reason=claude_reason,
             dw_healthy=dw_ok,
             dw_reason=dw_reason,
+            kimi_available=kimi_ok,
+            kimi_reason=kimi_reason,
         )
     except Exception as exc:  # noqa: BLE001 — fail-soft; never starve dispatch
         return ProviderAvailabilitySnapshot(

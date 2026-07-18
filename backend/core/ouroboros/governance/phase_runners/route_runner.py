@@ -2,7 +2,8 @@
 
 Extracts the ROUTE phase body from ``orchestrator.py`` (roughly
 lines 2048–2141 / 2257) into a :class:`PhaseRunner` subclass behind
-``JARVIS_PHASE_RUNNER_ROUTE_EXTRACTED`` (default ``false``).
+``JARVIS_PHASE_RUNNER_ROUTE_EXTRACTED`` (default ``true`` — graduated
+2026-04-22/23; the inline twin remains as the kill-switch path).
 
 **Zero behavior change per slice.** Runner body is a verbatim
 transcription with ``self.`` → ``orch.`` substitutions.

@@ -2,7 +2,8 @@
 
 Extracts the CLASSIFY phase body from ``orchestrator.py`` lines 1235–1994
 into a :class:`PhaseRunner` subclass behind
-``JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED`` (default ``false``).
+``JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED`` (default ``true`` — graduated
+2026-04-22/23; the inline twin remains as the kill-switch path).
 
 **Zero behavior change per slice.** The runner body is a verbatim
 transcription of the inline block with ``self.`` → ``orch.``

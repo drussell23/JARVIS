@@ -1454,6 +1454,25 @@ class OperationContext:
         # new phase. Fail-soft: never lets an observer break the transition.
         _notify_phase_transition(getattr(self, "op_id", "") or "", new_phase.name)
 
+        # Predictive Phase-Aware Checkpointing — feed the just-COMPLETED phase's
+        # wall-clock duration into the per-phase EWMA at the ONE canonical
+        # transition choke (single source, all phases, no double-count). `self`
+        # is the pre-transition instance, so `self.phase` is the phase being LEFT
+        # and `self.phase_entered_at` its start. Lazy import + fully guarded so
+        # this can never break a transition (Watchdog Isolation stays intact —
+        # this only RECORDS latency; the suspend decision lives orchestrator-side).
+        try:
+            _entered = getattr(self, "phase_entered_at", None)
+            if isinstance(_entered, datetime):
+                _dur = (now - _entered).total_seconds()
+                if _dur >= 0.0:
+                    from backend.core.ouroboros.governance.phase_runway_gate import (  # noqa: PLC0415
+                        record_phase_duration as _record_phase_duration,
+                    )
+                    _record_phase_duration(self.phase.name, _dur)
+        except Exception:  # noqa: BLE001 — never let telemetry break a transition
+            pass
+
         return final
 
     def with_compute_context(self, compute_context: str) -> "OperationContext":

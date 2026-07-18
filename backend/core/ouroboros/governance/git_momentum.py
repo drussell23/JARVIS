@@ -294,6 +294,65 @@ def compute_recent_momentum(
     return _parse_git_log_output(result.stdout)
 
 
+def compute_recent_files(
+    project_root: Path,
+    max_commits: int = _DEFAULT_MAX_COMMITS,
+    timeout_s: float = _DEFAULT_TIMEOUT_S,
+) -> "List[str]":
+    """Recency-ordered UNIQUE file paths touched by the last *max_commits*
+    commits — the concrete FILE surface of the human frontier (Roadmap
+    Synthesizer, 2026-07-18). Same module + subprocess discipline as
+    :func:`compute_recent_momentum` (this module owns ALL git-log reads — DRY).
+
+    Uses ``--name-only --pretty=format:`` so output is bare paths, one per
+    line, most-recent commit first; duplicates keep their FIRST (most recent)
+    position. Returns ``[]`` on any failure — never raises. Paths are repo-
+    relative; existence on disk is the CALLER's concern (a recently-deleted
+    file legitimately appears here)."""
+    n = max(1, int(max_commits))
+    try:
+        result = subprocess.run(
+            ["git", "log", f"-{n}", "--name-only", "--pretty=format:"],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=float(timeout_s),
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    seen: "set[str]" = set()
+    out: "List[str]" = []
+    for ln in result.stdout.splitlines():
+        p = ln.strip()
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+async def compute_recent_files_async(
+    project_root: Path,
+    max_commits: int = _DEFAULT_MAX_COMMITS,
+    timeout_s: float = _DEFAULT_TIMEOUT_S,
+) -> "List[str]":
+    """Loop-safe twin of :func:`compute_recent_files` via the shared git-read
+    executor (mirrors :func:`compute_recent_momentum_async`). Returns ``[]`` on
+    any failure — never raises."""
+    try:
+        import asyncio  # noqa: PLC0415
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _get_git_read_executor(),
+            lambda: compute_recent_files(project_root, max_commits, timeout_s),
+        )
+    except Exception:  # noqa: BLE001 — read-only telemetry, never raises
+        return []
+
+
 def format_themes(snapshot: Optional[MomentumSnapshot]) -> List[str]:
     """Render a snapshot as the legacy ``_extract_git_themes`` theme list.
 

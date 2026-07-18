@@ -12,7 +12,8 @@ Wave 2 item (5) slice sequence (see `memory/project_wave2_scope_draft.md`):
 
 Each runner extracts its phase verbatim from the inline block in
 ``orchestrator.py::_run_pipeline()``, guarded by
-``JARVIS_PHASE_RUNNER_<PHASE>_EXTRACTED`` (default ``false``) until
+``JARVIS_PHASE_RUNNER_<PHASE>_EXTRACTED`` (default ``true`` — all nine
+graduated 2026-04-22/23; ``false`` is the per-phase kill switch) until
 parity-test proven and graduation-session-soak confirmed.
 """
 from __future__ import annotations

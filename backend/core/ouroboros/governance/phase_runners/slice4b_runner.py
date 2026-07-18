@@ -4,7 +4,8 @@ Wave 2 item (5) Slice 4b. Extracts orchestrator.py lines ~6141-7293
 (~1152 lines spanning APPROVE, APPLY with 7.5 INFRA, and VERIFY with
 8a scoped tests, 8b auto-commit, 8b2 hot-reload, 8c self-critique,
 8d visual VERIFY) into a single :class:`PhaseRunner` behind
-``JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED`` (default ``false``).
+``JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED`` (default ``true`` — graduated
+2026-04-22/23; the inline twin remains as the kill-switch path).
 
 **Zero behavior change per slice.** Verbatim transcription with
 ``self.`` → ``orch.`` substitutions.
@@ -462,6 +463,40 @@ class Slice4bRunner(PhaseRunner):
                 next_ctx=ctx, next_phase=None, status="fail",
                 reason="dry_run_session",
                 artifacts={"t_apply": _t_apply},
+            )
+
+        # ── Predictive Phase-Aware Checkpoint (pre-APPLY) ──
+        # Before the irreversible, latency-heavy APPLY→VERIFY tail, project it
+        # against the remaining wall runway (decoupled read — the watchdog stays
+        # blind). If it won't fit, gracefully self-suspend NOW: a signed
+        # checkpoint + atomic dirty-tree stash, so the op resumes on the next
+        # ignition instead of burning the runway and being hard-killed mid-APPLY
+        # (worst case a severed working tree). Fail-open: only terminate if the
+        # checkpoint actually persisted — otherwise fall through into APPLY, where
+        # the hard cap + the same atomic stash remain the backstop.
+        try:
+            from backend.core.ouroboros.governance import phase_runway_gate as _prg
+            _runway_verdict = _prg.evaluate(ctx, _prg.PRE_APPLY_TAIL_PHASES)
+            if _runway_verdict.should_suspend:
+                _ckpt_path = _prg.predictive_suspend(ctx, "APPLY", _runway_verdict)
+                if _ckpt_path:
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="predictive_suspend",
+                    )
+                    await orch._record_ledger(
+                        ctx, OperationState.FAILED,
+                        {"reason": "predictive_suspend",
+                         "runway": _runway_verdict.as_telemetry()},
+                    )
+                    return PhaseResult(
+                        next_ctx=ctx, next_phase=None, status="fail",
+                        reason="predictive_suspend",
+                        artifacts={"t_apply": _t_apply},
+                    )
+        except Exception:  # noqa: BLE001 — fail open into APPLY
+            logger.debug(
+                "[Orchestrator] predictive checkpoint gate skipped", exc_info=True,
             )
 
         # ==================== Phase 7: APPLY ====================

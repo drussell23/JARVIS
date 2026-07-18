@@ -16,9 +16,17 @@ existing partial-summary write) so it always completes inside the 30s window:
      tagged ``preempted`` vs. an operator interrupt — purely advisory.
   2. **Halt** the child worker processes (the ``ProcessPoolExecutor`` AST/Oracle
      pool) so no NEW file-touching work starts during teardown.
-  3. **Stash** any in-flight working-tree changes (``git stash -u``) so a partial
-     APPLY can't leave a corrupt tree — the work is fully recoverable from the
-     stash on the next boot, and a stray ``index.lock`` is cleared first.
+  3. **Snapshot** any in-flight working-tree changes NON-DESTRUCTIVELY
+     (``git stash create -u`` → ``git stash store``) so a partial APPLY is
+     recoverable WITHOUT clearing the operator's uncommitted work off disk — the
+     snapshot lands as a listable ``[preemption-shield]`` stash entry AND the
+     tree stays exactly as it was (a stray ``index.lock`` is cleared first).
+
+     Was ``git stash push -u`` (2026-07-18): ``push`` restores the tree to HEAD
+     as an intrinsic side effect, which silently wiped an operator's uncommitted
+     + untracked work off disk (recoverable only if they knew to ``git stash
+     apply`` the shield entry). ``create``+``store`` preserves the tree in place
+     — the data-loss vector is neutralized while recoverability is kept.
 
 Everything is bounded (hard per-step deadlines), gated
 (``JARVIS_PREEMPTION_SHIELD_ENABLED``, default true), idempotent (runs once), and
@@ -127,13 +135,22 @@ def _detect_repo_root() -> Optional[str]:
 
 
 def git_safety_stash(repo_root: Optional[str] = None) -> str:
-    """Stash in-flight working-tree changes so a partial APPLY can't corrupt the
-    tree. Clears a stray ``.git/index.lock`` first (a crashed git op leaves one,
-    which would block the stash). Returns a short status string for telemetry.
+    """NON-DESTRUCTIVELY snapshot in-flight working-tree changes so a partial
+    APPLY is recoverable WITHOUT clearing the operator's uncommitted work off
+    disk. Clears a stray ``.git/index.lock`` first (a crashed git op leaves one,
+    which would block the snapshot). Returns a short status string for telemetry
+    (``snapshot:<sha8>`` on success).
 
-    ``git stash`` (not commit) is deliberate: it leaves a clean tree, pollutes no
-    history, and the in-flight work is fully recoverable via ``git stash list``
-    on the next boot. Bounded + fail-soft; NEVER raises."""
+    Mechanism (2026-07-18): ``git stash create -u`` writes the dirty + untracked
+    delta to a dangling commit and returns its SHA **without touching the working
+    tree**; ``git stash store`` then registers that SHA as a listable
+    ``[preemption-shield]`` stash entry (still without touching the tree). So the
+    snapshot is recoverable via ``git stash list`` / ``apply`` AND the tree is
+    left exactly as it was. This replaces ``git stash push -u``, whose intrinsic
+    reset-to-HEAD side effect silently wiped uncommitted + untracked work off
+    disk. DRY: the ``create -u`` half reuses ``workspace_checkpoint.create_stash_ref``
+    (the same helper the FSM atomic-workspace checkpoint uses). Bounded +
+    fail-soft; NEVER raises."""
     if os.environ.get(_GIT_STASH_ENV, "true").strip().lower() in ("0", "false", "no", "off"):
         return "stash_disabled"
     try:
@@ -152,11 +169,28 @@ def git_safety_stash(repo_root: Optional[str] = None) -> str:
             return f"status_failed:{(status.stderr or '').strip()[:60]}"
         if not status.stdout.strip():
             return "tree_clean"
+        # NON-DESTRUCTIVE snapshot: create a dangling stash commit (tree stays put).
+        try:
+            from backend.core.ouroboros.governance.workspace_checkpoint import (
+                create_stash_ref,
+            )
+            sha = create_stash_ref(root)
+        except Exception:  # noqa: BLE001 — helper unavailable → degrade to no-snapshot
+            sha = None
+        if not sha:
+            # Tree raced clean, or git could not snapshot — never clear the tree.
+            return "snapshot_none"
         ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        res = _run_git(root, "stash", "push", "-u", "-m", f"[preemption-shield] in-flight {ts}")
-        if res.returncode == 0:
-            return "stashed"
-        return f"stash_failed:{(res.stderr or '').strip()[:60]}"
+        # Register the snapshot as a listable, apply-able stash entry WITHOUT
+        # modifying the working tree (unlike `stash push`).
+        store = _run_git(
+            root, "stash", "store", "-m", f"[preemption-shield] in-flight {ts}", sha,
+        )
+        if store.returncode == 0:
+            return f"snapshot:{sha[:8]}"
+        # store failed, but the dangling `create` commit still exists + the tree
+        # is intact — recovery is still possible by SHA; report it.
+        return f"snapshot_unstored:{sha[:8]}"
     except subprocess.TimeoutExpired:
         return "git_timeout"
     except Exception as exc:  # noqa: BLE001

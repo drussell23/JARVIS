@@ -2,7 +2,8 @@
 
 Extracts orchestrator.py lines ~2143-2254 (CONTEXT_EXPANSION body +
 advance to PLAN) into a :class:`PhaseRunner` behind
-``JARVIS_PHASE_RUNNER_CONTEXT_EXPANSION_EXTRACTED`` (default ``false``).
+``JARVIS_PHASE_RUNNER_CONTEXT_EXPANSION_EXTRACTED`` (default ``true`` —
+graduated 2026-04-22/23; the inline twin remains as the kill-switch path).
 
 ## What CONTEXT_EXPANSION does
 

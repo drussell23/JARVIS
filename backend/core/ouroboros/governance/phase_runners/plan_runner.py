@@ -2,7 +2,8 @@
 
 Extracts orchestrator.py lines ~2259-3012 (the PLAN phase body through
 pre-GENERATE cancellation check) into a :class:`PhaseRunner` behind
-``JARVIS_PHASE_RUNNER_PLAN_EXTRACTED`` (default ``false``).
+``JARVIS_PHASE_RUNNER_PLAN_EXTRACTED`` (default ``true`` — graduated
+2026-04-22/23; the inline twin remains as the kill-switch path).
 
 **Zero behavior change per slice.** Verbatim transcription with ``self.``
 → ``orch.`` substitutions and module-level helper references qualified

@@ -2,7 +2,8 @@
 
 Extracts orchestrator.py lines ~4693-5440 (the VALIDATE phase body
 through its advance-to-GATE transition) into a :class:`PhaseRunner`
-behind ``JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED`` (default ``false``).
+behind ``JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED`` (default ``true`` — graduated
+2026-04-22/23; the inline twin remains as the kill-switch path).
 
 **Zero behavior change per slice.** Verbatim transcription with
 ``self.`` → ``orch.`` substitutions.
