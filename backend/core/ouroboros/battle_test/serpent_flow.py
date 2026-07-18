@@ -5676,6 +5676,19 @@ class SerpentREPL:
                 except EOFError:
                     break
                 except KeyboardInterrupt:
+                    # Chat text bridge: Ctrl+C is the operator's abort
+                    # gesture for an in-flight conversational turn. The
+                    # optional hook triggers the multiplexer's
+                    # cancellation token (set by the harness when the
+                    # bridge mounts); the prompt loop itself continues
+                    # exactly as before. Defensive: a hook failure can
+                    # never take down the REPL.
+                    _cb = getattr(self, "on_interrupt", None)
+                    if _cb is not None:
+                        try:
+                            _cb()
+                        except Exception:  # noqa: BLE001
+                            pass
                     continue
                 except asyncio.CancelledError:
                     break

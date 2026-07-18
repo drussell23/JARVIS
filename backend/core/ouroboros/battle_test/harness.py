@@ -4069,8 +4069,69 @@ class BattleTestHarness:
             # Plugin-registered slash commands: /greet, /<plugin_cmd>, etc.
             # Returns True iff a plugin handled the command.
             pass
+        elif self._try_chat_text_bridge(command):
+            # Heuristic Intent Multiplexer (chat_text_bridge): bare
+            # operator text becomes a conversational turn through the
+            # canonical intent_classifier -> chat_repl_dispatcher ->
+            # executor chain. Non-blocking (the turn runs off-loop);
+            # Ctrl+C cancels via the REPL interrupt hook. Unknown
+            # SLASH commands still fall through to the debug log —
+            # a typo'd verb is not a conversation.
+            pass
         else:
             logger.debug("Unknown REPL command: %s", cmd)
+
+    # -- Chat text bridge (Heuristic Intent Multiplexer) -------------------
+
+    def _try_chat_text_bridge(self, command: str) -> bool:
+        """Route bare operator text into the conversational stack.
+
+        Returns True iff the multiplexer accepted the turn. Slash-
+        prefixed input NEVER routes here (an unknown ``/verb`` is a
+        typo for the did-you-mean surface, not a conversation). Sync +
+        O(1): ``submit()`` spawns the turn task and returns immediately
+        — the REPL prompt is never blocked on an LLM. NEVER raises."""
+        try:
+            text = (command or "").strip()
+            if not text or text.startswith("/"):
+                return False
+            mux = self._ensure_chat_text_mux()
+            if mux is None:
+                return False
+            return mux.submit(text) is not None
+        except Exception:  # noqa: BLE001 — REPL must survive anything
+            logger.debug("[ChatTextBridge] repl route degraded", exc_info=True)
+            return False
+
+    def _ensure_chat_text_mux(self):
+        """Lazily build + cache the ChatTextMultiplexer (None when the
+        bridge or chat master is off — cached either way so the flag
+        read happens once per session). Wires the REPL's Ctrl+C surface
+        to the cancellation token on first build. NEVER raises."""
+        if getattr(self, "_chat_text_mux_built", False):
+            return getattr(self, "_chat_text_mux", None)
+        mux = None
+        try:
+            from backend.core.ouroboros.governance.chat_text_bridge import (
+                build_chat_text_multiplexer,
+            )
+            mux = build_chat_text_multiplexer(
+                project_root=getattr(self, "project_root", None),
+                print_sink=self._repl_print,
+            )
+            if mux is not None:
+                repl = getattr(self, "_serpent_repl", None)
+                if repl is not None:
+                    # Additive hook: SerpentREPL invokes on_interrupt
+                    # on KeyboardInterrupt (Ctrl+C) — the token aborts
+                    # the in-flight generation, prompt comes back.
+                    repl.on_interrupt = mux.cancel_active
+        except Exception:  # noqa: BLE001
+            logger.debug("[ChatTextBridge] mux build degraded", exc_info=True)
+            mux = None
+        self._chat_text_mux = mux
+        self._chat_text_mux_built = True
+        return mux
 
     # -- REPL sub-commands ------------------------------------------------
 
@@ -7682,6 +7743,15 @@ class BattleTestHarness:
             pass
 
         # 0b. REPL + keyboard handler + SerpentFlow
+        try:
+            # Chat text bridge: cancel + await every in-flight
+            # conversational turn BEFORE the REPL stops — no orphaned
+            # tasks may outlive the bridge (chat_text_bridge mandate).
+            mux = getattr(self, "_chat_text_mux", None)
+            if mux is not None:
+                await mux.drain()
+        except Exception:
+            pass
         try:
             if hasattr(self, "_serpent_repl") and self._serpent_repl is not None:
                 await self._serpent_repl.stop()
