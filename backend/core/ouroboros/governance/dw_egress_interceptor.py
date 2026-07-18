@@ -163,6 +163,19 @@ def egress_char_ceiling(model: str) -> int:
 _BUILTIN_RULES: Dict[str, dict] = {
     # gpt-oss family: cannot disable reasoning -> must floor effort UP.
     "gpt-oss": {"floor_reasoning": True},
+    # Kimi K3 (Moonshot): sampling params are LOCKED server-side — sending any of
+    # them is a 400 validation error. Strip them declaratively at egress (the
+    # root-cause fix — never a try/except on the 400). Matches "kimi"/"moonshot"/
+    # "k3" model-id substrings. reasoning_effort is separately locked to "max"
+    # (a spend concern handled by Semantic Budget Routing, not a strip).
+    "kimi": {"strip": [
+        "temperature", "top_p", "n",
+        "presence_penalty", "frequency_penalty", "logprobs", "top_logprobs",
+    ]},
+    "moonshot": {"strip": [
+        "temperature", "top_p", "n",
+        "presence_penalty", "frequency_penalty", "logprobs", "top_logprobs",
+    ]},
 }
 
 

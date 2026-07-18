@@ -73,6 +73,12 @@ class ProviderAvailabilitySnapshot:
     # Reserved for a future latency-variance-aware kernel (Slice 232). Unused
     # by the deterministic v1 synthesizer; defaults keep the schema additive.
     dw_latency_p95_s: Optional[float] = None
+    # Kimi K3 (Moonshot) third lane — structural parity with claude_/dw_ pairs.
+    # Additive with conservative defaults (inert unless resolved): the adapter is
+    # credential-gated + off by default, so "not available / unknown" is the
+    # legacy-safe steady state for every existing constructor + the fail-soft path.
+    kimi_available: bool = False
+    kimi_reason: str = "unknown"
 
 
 # Claude-lane unavailability reasons that are EXPECTED steady states — an
@@ -196,6 +202,21 @@ def _resolve_dw(*, ledger) -> tuple[bool, str]:
     return False, verdict.value
 
 
+def _resolve_kimi() -> "tuple[bool, str]":
+    """Kimi K3 lane availability + forensic reason, mirroring ``_resolve_dw`` /
+    ``_resolve_claude``. Delegates to ``kimi_provider.resolve_kimi_availability``
+    (DRY — the credential/flag logic lives with the adapter). Fail-soft →
+    (False, 'unavailable') so an unresolved Kimi lane is never routed to. NEVER
+    raises."""
+    try:
+        from backend.core.ouroboros.governance.kimi_provider import (  # noqa: PLC0415
+            resolve_kimi_availability,
+        )
+        return resolve_kimi_availability()
+    except Exception:  # noqa: BLE001
+        return False, "unavailable"
+
+
 def collect_provider_availability(
     *,
     breaker=None,
@@ -231,11 +252,14 @@ def collect_provider_availability(
             persisted_reader=persisted_reader,
         )
         dw_ok, dw_reason = _resolve_dw(ledger=_ledger)
+        kimi_ok, kimi_reason = _resolve_kimi()
         return ProviderAvailabilitySnapshot(
             claude_available=claude_ok,
             claude_reason=claude_reason,
             dw_healthy=dw_ok,
             dw_reason=dw_reason,
+            kimi_available=kimi_ok,
+            kimi_reason=kimi_reason,
         )
     except Exception as exc:  # noqa: BLE001 — fail-soft; never starve dispatch
         return ProviderAvailabilitySnapshot(
