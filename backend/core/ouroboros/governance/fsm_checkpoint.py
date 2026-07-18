@@ -184,6 +184,12 @@ class FSMCheckpoint:
     # context, so the resume is demoted to PLAN to re-plan against current source
     # rather than fast-forwarding into corruption. Empty = drift-check skipped.
     repo_sha: str = ""
+    # Poison-Pill guard: how many times this checkpoint has been hydrated (a
+    # resume ATTEMPTED). Incremented + re-signed on disk BEFORE each re-inject,
+    # so a checkpoint that deterministically crashes the pipeline on resume can't
+    # loop forever — after the attempt ceiling it is shunted to the quarantine
+    # DLQ. Rides inside the HMAC-signed payload → the count is tamper-evident.
+    hydration_attempt_count: int = 0
     schema_version: int = _SCHEMA_VERSION
 
     def to_json(self) -> str:
@@ -381,6 +387,132 @@ def write_checkpoint(cp: FSMCheckpoint, *, base_dir: "Optional[str]" = None) -> 
         return path
     except Exception:  # noqa: BLE001
         return None
+
+
+# ---------------------------------------------------------------------------
+# Poison-Pill quarantine (2026-07-18)
+#
+# A checkpoint that deterministically CRASHES the pipeline on resume would loop
+# forever: hydrate → crash → reboot → hydrate the same checkpoint → crash …
+# This is NOT solved by a generic try/except (which would silently swallow the
+# fault and re-attempt anyway) but by a DETERMINISTIC counter: each hydration
+# increments hydration_attempt_count on disk (re-signed) BEFORE the re-inject, so
+# the increment survives even a hard crash mid-attempt. Past the ceiling the
+# checkpoint is shunted to a quarantine/ DLQ (the SAME move-to-subdir + HMAC-
+# signed-envelope pattern as expired/) and the loop proceeds to the next op —
+# pipeline survival over a single poisoned operation.
+# ---------------------------------------------------------------------------
+
+
+def hydration_max_attempts() -> int:
+    """Resume attempts before a checkpoint is quarantined as a poison pill
+    (env ``JARVIS_FSM_HYDRATION_MAX_ATTEMPTS``, default 3). NEVER raises."""
+    try:
+        raw = os.environ.get("JARVIS_FSM_HYDRATION_MAX_ATTEMPTS", "").strip()
+        n = int(raw) if raw else 3
+        return n if n >= 1 else 3
+    except Exception:  # noqa: BLE001
+        return 3
+
+
+def record_hydration_attempt(
+    cp: "FSMCheckpoint", *, base_dir: "Optional[str]" = None,
+) -> int:
+    """Increment ``hydration_attempt_count`` and PERSIST it (re-signed) before a
+    resume is attempted, so a crash mid-attempt cannot reset the count. Mutates
+    *cp* in place and returns the new count. On a write failure returns the
+    in-memory incremented count (still monotonic within the process). NEVER
+    raises."""
+    try:
+        cp.hydration_attempt_count = int(cp.hydration_attempt_count or 0) + 1
+    except Exception:  # noqa: BLE001
+        cp.hydration_attempt_count = 1
+    try:
+        write_checkpoint(cp, base_dir=base_dir)
+    except Exception:  # noqa: BLE001
+        pass
+    return cp.hydration_attempt_count
+
+
+def quarantine_dir(base_dir: "Optional[str]" = None) -> str:
+    """The poison-pill DLQ dir (``<checkpoints>/quarantine``). Created on demand.
+    NEVER raises."""
+    try:
+        d = os.path.join(checkpoint_dir(base_dir), "quarantine")
+        os.makedirs(d, exist_ok=True)
+        return d
+    except Exception:  # noqa: BLE001
+        return os.path.join(".ouroboros", "checkpoints", "quarantine")
+
+
+def quarantine_checkpoint(
+    cp: "FSMCheckpoint", *, reason: str, base_dir: "Optional[str]" = None,
+) -> "Optional[str]":
+    """Shunt a poison-pill checkpoint to the quarantine DLQ: re-sign it tagged
+    with the quarantine reason (inside the HMAC payload) into ``quarantine/`` and
+    remove it from the pending set, so it is never resumed again but stays
+    auditable (§8). Returns the quarantine path, or None on failure. NEVER
+    raises."""
+    try:
+        # Tag the state vector — carried inside the HMAC-signed payload (DRY:
+        # reuses the checkpoint envelope + signing; no separate DLQ schema).
+        try:
+            _lin = dict(cp.trace_lineage or {})
+            _lin["quarantined"] = True
+            _lin["quarantine_reason"] = str(reason)
+            _lin["quarantine_attempts"] = int(cp.hydration_attempt_count or 0)
+            cp.trace_lineage = _lin
+        except Exception:  # noqa: BLE001
+            pass
+        d = quarantine_dir(base_dir)
+        payload_json = cp.to_json()
+        sig = _sign(payload_json, _checkpoint_key(base_dir))
+        wrapper = json.dumps(
+            {"schema": _SCHEMA_VERSION, "payload": payload_json, "hmac": sig}
+        )
+        path = os.path.join(d, "%s.json" % cp.op_id)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(wrapper)
+        os.replace(tmp, path)
+        # Remove from the pending set (best-effort) so it is not re-hydrated.
+        try:
+            pending_path = os.path.join(checkpoint_dir(base_dir), "%s.json" % cp.op_id)
+            if os.path.isfile(pending_path):
+                os.remove(pending_path)
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning(
+            "[fsm_checkpoint] QUARANTINED op=%s attempts=%d reason=%s -> "
+            "poison-pill DLQ (quarantine/); pipeline proceeds to the next op",
+            cp.op_id, int(cp.hydration_attempt_count or 0), reason,
+        )
+        return path
+    except Exception:  # noqa: BLE001
+        logger.debug("[fsm_checkpoint] quarantine write failed", exc_info=True)
+        return None
+
+
+def list_quarantined(*, base_dir: "Optional[str]" = None) -> List[FSMCheckpoint]:
+    """Read the quarantine DLQ (HMAC-verified). Observability only — these are
+    NEVER resumed. NEVER raises."""
+    out: List[FSMCheckpoint] = []
+    try:
+        d = quarantine_dir(base_dir)
+        key = _checkpoint_key(base_dir)
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                raw = json.loads(open(os.path.join(d, name), encoding="utf-8").read())
+                payload = raw.get("payload", "")
+                if _verify(payload, raw.get("hmac", ""), key):
+                    out.append(FSMCheckpoint.from_json(payload))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def _checkpoint_ttl_s() -> float:

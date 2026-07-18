@@ -1265,6 +1265,28 @@ class UnifiedIntakeRouter:
             # scheduling each re-inject and consuming the checkpoint on success.
             _pending = _ckpt.list_pending()
             for _cp in _pending:
+                # Poison-Pill guard (DETERMINISTIC, not a swallow): persist the
+                # incremented hydration count BEFORE attempting the resume, so a
+                # checkpoint that crashes the pipeline on resume can't loop
+                # forever. Past the ceiling it is shunted to the quarantine DLQ
+                # and the loop proceeds to the next op — pipeline survival.
+                try:
+                    _attempt = _ckpt.record_hydration_attempt(_cp)
+                    if _attempt > _ckpt.hydration_max_attempts():
+                        _ckpt.quarantine_checkpoint(
+                            _cp, reason="hydration_attempts_exhausted",
+                        )
+                        logger.warning(
+                            "Router: QUARANTINED poison-pill op=%s after %d "
+                            "resume attempts -> DLQ; proceeding to next op",
+                            _cp.op_id, _attempt - 1,
+                        )
+                        continue
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "Router: hydration-attempt guard faulted op=%s",
+                        getattr(_cp, "op_id", "?"), exc_info=True,
+                    )
                 try:
                     _env = _ckpt.build_resume_envelope(_cp)
                     await _reinject(_env)
