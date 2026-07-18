@@ -180,7 +180,7 @@ def effective_execution_root(project_root: Any) -> Path:
     try:
         candidate = Path(override)
         if candidate.is_dir():
-            if (candidate / ".git").exists():
+            if is_valid_git_work_area(candidate):
                 return candidate
             raise ExecutionRootInvalid(override, "no .git in workspace dir")
         raise ExecutionRootInvalid(override, "not a directory")
@@ -188,6 +188,24 @@ def effective_execution_root(project_root: Any) -> Path:
         raise
     except (OSError, ValueError) as exc:  # ENAMETOOLONG, NUL bytes, …
         raise ExecutionRootInvalid(override, repr(exc)) from exc
+
+
+def is_valid_git_work_area(path: Any) -> bool:
+    """THE C1 validity rule as a reusable predicate: a usable execution
+    workspace is a directory containing ``.git`` (FILE for linked worktrees,
+    DIR for full checkouts). Extracted for the ARMING layer (Slice 2 workspace-
+    arming integrity, 2026-07-18): bt-2026-07-18-200502 proved a workspace can
+    be reaped between arming and APPLY, leaving ``JARVIS_AUTO_COMMIT_WORKSPACE``
+    pointing at a marker-only husk — every op then died fail-closed at the APPLY
+    boundary. Armers MUST validate with this predicate (and clear the env when
+    it fails) so "armed" always implies "usable"; the read side
+    (:func:`effective_execution_root`) keeps failing LOUD as designed. NEVER
+    raises — any probe fault is "not valid"."""
+    try:
+        p = Path(path)
+        return p.is_dir() and (p / ".git").exists()
+    except Exception:  # noqa: BLE001 — defensive
+        return False
 
 
 def workspace_branch(session_id: str) -> str:
