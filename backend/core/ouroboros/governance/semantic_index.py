@@ -2453,6 +2453,74 @@ class SemanticIndex:
                 self._vectors = vectors
                 self._centroid = centroid
                 self._built_at = built_at
+            # Part B graduation root-cause (2026-07-18): the npz cache stores
+            # vectors/corpus/centroid but NO cluster state, and this reload
+            # left ``self._clusters = []`` — so every cache-warm boot (the
+            # COMMON path, incl. the process-isolated build whose parent
+            # reloads the worker's cache) served ``stats().clusters == ()``
+            # forever. The DomainEntropyEngine's ONLY data source is that
+            # cluster distribution, so the curiosity stack was structurally
+            # dark on warm boots. Recompute clusters HERE from the vectors we
+            # just loaded, via the SAME build machinery (auto-K k-means +
+            # ClusterInfo records + telemetry — zero duplicated logic), under
+            # the same POSTMORTEM-exclusion subset rule the build applies.
+            # Respect _cluster_mode() exactly like build(); NEVER raises —
+            # any failure keeps the legacy centroid-only behavior.
+            try:
+                if _cluster_mode() == "kmeans" and vectors:
+                    include_pm = _postmortem_in_centroid()
+                    subset_members: "List[CorpusItem]" = []
+                    subset_vectors: "List[List[float]]" = []
+                    for it, vec in zip(corpus, vectors):
+                        if it.source == SOURCE_POSTMORTEM and not include_pm:
+                            continue
+                        subset_members.append(it)
+                        subset_vectors.append(vec)
+                    if subset_vectors:
+                        re_clusters, re_labels = self._compute_clusters_for_build(
+                            subset_members, subset_vectors,
+                        )
+                        if re_clusters:
+                            _telemetry = self._last_cluster_telemetry or {}
+                            with self._lock:
+                                self._corpus_centroid_members = subset_members
+                                self._centroid_vectors_subset = subset_vectors
+                                self._clusters = re_clusters
+                                self._cluster_labels = re_labels
+                                # stats() serves cluster telemetry from the
+                                # SEPARATE self._stats record (build-populated)
+                                # — mirror build's fill so every consumer
+                                # (DomainEntropyEngine reads stats().clusters)
+                                # sees the rehydrated set.
+                                self._stats.cluster_mode = "kmeans"
+                                self._stats.cluster_count = len(re_clusters)
+                                self._stats.clusters = [
+                                    self._cluster_info_to_summary_dict(c)
+                                    for c in re_clusters
+                                ]
+                                self._stats.kmeans_silhouette = float(
+                                    _telemetry.get("silhouette", 0.0),
+                                )
+                                self._stats.kmeans_inertia = float(
+                                    _telemetry.get("inertia", 0.0),
+                                )
+                                self._stats.kmeans_converged = bool(
+                                    _telemetry.get("converged", False),
+                                )
+                                self._stats.kmeans_iter_count = int(
+                                    _telemetry.get("iter_count", 0),
+                                )
+                            logger.info(
+                                "[SemanticIndex] cache reload REHYDRATED %d "
+                                "cluster(s) from %d cached vector(s) — the "
+                                "curiosity/entropy stack has live zones on a "
+                                "warm boot", len(re_clusters), len(subset_vectors),
+                            )
+            except Exception:  # noqa: BLE001 — clusters are an enhancement,
+                logger.debug(                # never break the cache reload
+                    "[SemanticIndex] cache-reload cluster rehydration failed",
+                    exc_info=True,
+                )
             return True
         except Exception:  # noqa: BLE001 — fail-closed: keep the current centroid
             logger.debug("[SemanticIndex] cache reload failed", exc_info=True)
