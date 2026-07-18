@@ -3,7 +3,8 @@
 Slice 1 of Wave 2 item (5) — PhaseRunner extraction. Extracts the
 ~60-line terminal block at ``orchestrator.py`` line 7073–7132 into a
 :class:`PhaseRunner` subclass behind
-``JARVIS_PHASE_RUNNER_COMPLETE_EXTRACTED`` (default ``false``).
+``JARVIS_PHASE_RUNNER_COMPLETE_EXTRACTED`` (default ``true`` — graduated
+2026-04-22/23; the inline twin remains as the kill-switch path).
 
 **Zero behavior change per slice.** The runner body is a verbatim
 transcription of the inline block. Parity tests

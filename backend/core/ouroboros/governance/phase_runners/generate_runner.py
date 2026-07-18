@@ -6,7 +6,8 @@ forward-progress detector + productivity detector + Iron Gate suite
 (exploration ledger, ASCII strict, config format, dependency-file
 integrity, multi-file coverage) + retry feedback composition + L2
 escape terminals) into a single :class:`PhaseRunner` behind
-``JARVIS_PHASE_RUNNER_GENERATE_EXTRACTED`` (default ``false``).
+``JARVIS_PHASE_RUNNER_GENERATE_EXTRACTED`` (default ``true`` — graduated
+2026-04-22/23; the inline twin remains as the kill-switch path).
 
 **Zero behavior change per slice.** Verbatim transcription with
 ``self.`` → ``orch.`` substitutions. Scripted extraction via

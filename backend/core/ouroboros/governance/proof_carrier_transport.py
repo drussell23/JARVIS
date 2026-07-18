@@ -538,6 +538,29 @@ def format_proof_panel(
     return "\n".join(lines)
 
 
+def emit_gate_proof_carrier(op_id: str, target_files: list) -> None:
+    """Single-source GATE seam (Slice 1 drift repair, 2026-07-18): build the
+    pre-APPLY proof artifact and log a non-clean verdict. Called identically from
+    BOTH GATE paths (inline ``orchestrator`` + extracted ``gate_runner``) so the
+    Slice-101 Proof Carrier can never again exist on only one twin — the drift
+    audit found it inline-only, i.e. DEAD on the default (extracted) path.
+    Observability aggregator only (build_proof_carrier self-publishes the
+    ``proof_carrier_built`` SSE); master ``JARVIS_PROOF_CARRIER_ENABLED`` §33.1
+    default-FALSE → zero cost when off. NEVER raises."""
+    try:
+        _proof = build_proof_carrier(str(op_id or ""), list(target_files or ()))
+        if _proof.verdict not in (ProofVerdict.CLEAN, ProofVerdict.DISABLED):
+            logger.info(
+                "[Orchestrator] GATE proof_carrier op=%s verdict=%s source=%s "
+                "mcp=%d rehearsal=%d drift=%s",
+                op_id or "?", _proof.verdict.value, _proof.dominant_source.value,
+                _proof.mcp_finding_count, _proof.rehearsal_concern_count,
+                _proof.coherence_drift_level,
+            )
+    except Exception:  # noqa: BLE001 — proof artifact must never touch GATE
+        pass
+
+
 # AST pins
 
 

@@ -700,30 +700,30 @@ class GATERunner(PhaseRunner):
         # ---- RR Pass B Slice 2b: ORDER_2_GOVERNANCE floor ----
         # Runs AFTER the MIN_RISK_TIER floor so paranoia/quiet-hours
         # can't accidentally lower an Order-2 op below itself.
-        # Default-off behind dual flag (Slice 1 manifest + Slice 2
-        # risk-class). When either flag is off, this block is a
-        # no-op. See memory/project_reverse_russian_doll_pass_b.md
+        # Single-source seam (Slice 1 drift repair): identical call on
+        # BOTH GATE paths. See memory/project_reverse_russian_doll_pass_b.md
         # §4.2 + tests/governance/test_order2_classifier.py.
         try:
             from backend.core.ouroboros.governance.meta.order2_classifier import (
-                apply_order2_floor,
+                apply_order2_floor_safe,
             )
-            _order2_tier = apply_order2_floor(
-                risk_tier, list(ctx.target_files), repo="jarvis",
+            risk_tier = apply_order2_floor_safe(
+                risk_tier, list(ctx.target_files), op_id=ctx.op_id,
             )
-            if _order2_tier is not risk_tier:
-                logger.info(
-                    "[Orchestrator] GATE: ORDER_2 floor → %s→%s "
-                    "op=%s files=%d",
-                    risk_tier.name, _order2_tier.name, ctx.op_id,
-                    len(ctx.target_files),
-                )
-                risk_tier = _order2_tier
-        except Exception:
-            logger.debug(
-                "[Orchestrator] ORDER_2 floor skipped",
-                exc_info=True,
+        except Exception:  # noqa: BLE001 — import fault must never break GATE
+            logger.debug("[Orchestrator] ORDER_2 floor skipped", exc_info=True)
+
+        # ---- Slice 101 Phase 5: Proof Carrier (pre-APPLY proof artifact) ----
+        # Single-source seam (Slice 1 drift repair): the drift audit found this
+        # inline-only — DEAD on this (default) extracted path. Master
+        # JARVIS_PROOF_CARRIER_ENABLED §33.1 default-FALSE. NEVER raises.
+        try:
+            from backend.core.ouroboros.governance.proof_carrier_transport import (
+                emit_gate_proof_carrier,
             )
+            emit_gate_proof_carrier(ctx.op_id, list(ctx.target_files))
+        except Exception:  # noqa: BLE001 — proof artifact must never touch GATE
+            pass
 
         # ---- Phase 5a-green: SAFE_AUTO diff preview ----
         if risk_tier is RiskTier.SAFE_AUTO and _human_is_watching():

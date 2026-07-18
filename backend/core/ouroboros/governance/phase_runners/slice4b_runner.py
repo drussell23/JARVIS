@@ -4,7 +4,8 @@ Wave 2 item (5) Slice 4b. Extracts orchestrator.py lines ~6141-7293
 (~1152 lines spanning APPROVE, APPLY with 7.5 INFRA, and VERIFY with
 8a scoped tests, 8b auto-commit, 8b2 hot-reload, 8c self-critique,
 8d visual VERIFY) into a single :class:`PhaseRunner` behind
-``JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED`` (default ``false``).
+``JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED`` (default ``true`` — graduated
+2026-04-22/23; the inline twin remains as the kill-switch path).
 
 **Zero behavior change per slice.** Verbatim transcription with
 ``self.`` → ``orch.`` substitutions.

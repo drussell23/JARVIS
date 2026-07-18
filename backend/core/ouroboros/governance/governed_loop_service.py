@@ -3247,6 +3247,33 @@ class GovernedLoopService:
         """Check if cancellation was requested for this operation."""
         return op_id in self._cancel_requested
 
+    def _try_claim_file_ops(self, target_files) -> "tuple[Optional[list], Optional[str]]":
+        """Slice 1 TOCTOU remediation (2026-07-18): the file-scope in-flight
+        check AND the claim as ONE atomic synchronous check-and-set.
+
+        The legacy submit path checked ``_canonical in self._active_file_ops``
+        ~40 lines BEFORE the add-loop that claimed the locks. Correct today only
+        because no ``await`` sits between them under cooperative asyncio — any
+        future await inserted in that window would let two workers both pass the
+        check and double-apply the same file, defeating the split-brain guard.
+        This method is deliberately SYNCHRONOUS (structurally cannot yield the
+        event loop between evaluation and mutation) and all-or-nothing: on any
+        conflict NOTHING is claimed.
+
+        Returns ``(claimed_canonical_paths, None)`` on success or
+        ``(None, conflicting_path)`` on conflict. The caller MUST release the
+        claimed paths in its ``finally`` (unchanged legacy discard loop)."""
+        import pathlib as _pl_claim
+        _canonicals: list = []
+        for _fp in target_files or ():
+            _canonicals.append(str(_pl_claim.Path(_fp).resolve()))
+        for _c in _canonicals:
+            if _c in self._active_file_ops:
+                return None, _c            # all-or-nothing: nothing claimed
+        for _c in _canonicals:
+            self._active_file_ops.add(_c)
+        return _canonicals, None
+
     async def submit(
         self,
         ctx: OperationContext,
@@ -3339,26 +3366,28 @@ class GovernedLoopService:
             await self._emit_terminal_events(ctx=ctx, result=result)
             return result
 
-        # Gate: file-scope in-flight lock (before acquiring — prevents self-cancel)
-        import pathlib as _pl_gate
-        for _fp in ctx.target_files:
-            _canonical = str(_pl_gate.Path(_fp).resolve())
-            if _canonical in self._active_file_ops:
-                logger.warning(
-                    "[GovernedLoop] File-scope lock: %r already in-flight — "
-                    "rejecting op %s to prevent split-brain apply",
-                    _canonical,
-                    ctx.op_id,
-                )
-                result = OperationResult(
-                    op_id=ctx.op_id,
-                    terminal_phase=OperationPhase.CANCELLED,
-                    reason_code="file_in_flight",
-                    trigger_source=trigger_source,
-                    terminal_class="DEGRADED",
-                )
-                await self._emit_terminal_events(ctx=ctx, result=result)
-                return result
+        # Gate: file-scope in-flight lock (before acquiring — prevents self-cancel).
+        # Slice 1 TOCTOU remediation: check-and-claim is ONE atomic synchronous
+        # operation (_try_claim_file_ops) — the event loop structurally cannot
+        # yield between evaluation and mutation. All-or-nothing: on conflict
+        # nothing is claimed; on success the finally below releases the claim.
+        _locked_files, _lock_conflict = self._try_claim_file_ops(ctx.target_files)
+        if _locked_files is None:
+            logger.warning(
+                "[GovernedLoop] File-scope lock: %r already in-flight — "
+                "rejecting op %s to prevent split-brain apply",
+                _lock_conflict,
+                ctx.op_id,
+            )
+            result = OperationResult(
+                op_id=ctx.op_id,
+                terminal_phase=OperationPhase.CANCELLED,
+                reason_code="file_in_flight",
+                trigger_source=trigger_source,
+                terminal_class="DEGRADED",
+            )
+            await self._emit_terminal_events(ctx=ctx, result=result)
+            return result
 
         # Execute pipeline
         self._active_ops.add(dedupe_key)
@@ -3377,14 +3406,17 @@ class GovernedLoopService:
             metadata=_op_registry_metadata(ctx),
         )
         # --- Proactive Drive telemetry hook (entry) ---
-        _pds = getattr(self, "_proactive_drive_service", None)
-        if _pds is not None:
-            _pds.record_sample("jarvis", depth=len(self._active_ops), latency_ms=0.0)
-        _locked_files: list = []
-        for _fp in ctx.target_files:
-            _canonical = str(__import__("pathlib").Path(_fp).resolve())
-            self._active_file_ops.add(_canonical)
-            _locked_files.append(_canonical)
+        # Slice 1: guarded — file locks are already claimed above, so nothing
+        # between the claim and the releasing try/finally may raise (a raise
+        # here would leak the claim for the session).
+        try:
+            _pds = getattr(self, "_proactive_drive_service", None)
+            if _pds is not None:
+                _pds.record_sample("jarvis", depth=len(self._active_ops), latency_ms=0.0)
+        except Exception:  # noqa: BLE001 — best-effort telemetry
+            logger.debug("[GovernedLoop] proactive-drive sample skipped", exc_info=True)
+        # (file locks claimed atomically by _try_claim_file_ops above;
+        #  _locked_files released in the finally below — legacy discard loop.)
         try:
             assert self._orchestrator is not None
             # Stamp pipeline_deadline exactly once — shared budget for all downstream phases
