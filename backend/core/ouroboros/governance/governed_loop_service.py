@@ -215,6 +215,61 @@ def _provider_construction_gate(
 # construction (the substrate's helpers already are).
 
 
+# ---------------------------------------------------------------------------
+# Phase-transition tracking wiring (2026-07-18)
+#
+# The in-flight registry recorded only the registration-time phase (CLASSIFY),
+# so a checkpoint of an op that had advanced to GENERATE serialized a stale
+# CLASSIFY and resume couldn't fast-forward. Rather than sprinkle
+# update_phase_safely() across every orchestrator phase-runner, register ONE
+# observer on the state machine's own transition method (OperationContext.advance)
+# — every legal transition auto-mirrors into the registry.
+#
+# The wiring lives HERE, at the pipeline-orchestration layer (the GLS already
+# imports BOTH op_context and in_flight_registry), and NOT inside
+# in_flight_registry — an AST authority-asymmetry pin forbids the registry from
+# importing op_context (the deliberate observability→state-machine no-cycle
+# invariant). This composition direction (GLS → both) respects it.
+# ---------------------------------------------------------------------------
+
+_phase_tracking_wired = False
+
+
+def _mirror_phase_transition(op_id: str, phase_name: str) -> None:
+    """Observer body: mirror an advance() transition into the in-flight registry.
+    Touches only ops already registered (update_phase no-ops for unknown ids)."""
+    try:
+        from backend.core.ouroboros.governance.in_flight_registry import (  # noqa: E501,PLC0415
+            update_phase_safely,
+        )
+        update_phase_safely(op_id, phase_name=phase_name)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _wire_phase_transition_tracking() -> bool:
+    """Idempotently register the phase-mirror observer on OperationContext. No
+    lock needed — ``register_phase_transition_observer`` dedups per-callable, so
+    a concurrent double-call registers exactly one observer. NEVER raises."""
+    global _phase_tracking_wired
+    if _phase_tracking_wired:
+        return True
+    try:
+        from backend.core.ouroboros.governance.op_context import (  # noqa: E501,PLC0415
+            register_phase_transition_observer,
+        )
+        register_phase_transition_observer(_mirror_phase_transition)
+        _phase_tracking_wired = True
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reset_phase_tracking_for_tests() -> None:
+    global _phase_tracking_wired
+    _phase_tracking_wired = False
+
+
 def _register_op_in_flight_safely(
     op_id: str,
     *,
@@ -228,6 +283,10 @@ def _register_op_in_flight_safely(
         )
     except Exception:  # noqa: BLE001
         return False
+    # Arm the advance()-transition observer (idempotent) so the registry tracks
+    # the LIVE phase, not just this registration-time phase — otherwise
+    # capture_inflight serializes a stale CLASSIFY. One bool check after op #1.
+    _wire_phase_transition_tracking()
     return register_op_safely(
         op_id,
         ctx_ref=ctx_ref,

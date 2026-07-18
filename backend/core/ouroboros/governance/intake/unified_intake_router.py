@@ -1266,15 +1266,27 @@ class UnifiedIntakeRouter:
             _pending = _ckpt.list_pending()
             for _cp in _pending:
                 try:
-                    await _reinject(_ckpt.build_resume_envelope(_cp))
+                    _env = _ckpt.build_resume_envelope(_cp)
+                    await _reinject(_env)
                     _ckpt.mark_resumed(_cp.op_id)
-                    logger.info(
-                        "Router: RESUMED suspended op=%s phase=%s (%d exploration "
-                        "records preserved -> Venom fast-forward)",
-                        _cp.op_id,
-                        _cp.phase,
-                        len(_cp.exploration_records),
-                    )
+                    if _env.get("drifted"):
+                        # Git-drift: HEAD moved while suspended → demoted to
+                        # re-PLAN, stale exploration dropped (context-corruption
+                        # guard), rather than fast-forwarding into dead code.
+                        logger.warning(
+                            "Router: RESUMED suspended op=%s DEMOTED %s->%s "
+                            "(repo drift: checkpoint sha=%s != live HEAD; stale "
+                            "exploration dropped, re-planning against current source)",
+                            _cp.op_id, _cp.phase, _env.get("resume_phase"),
+                            str(_cp.repo_sha)[:10],
+                        )
+                    else:
+                        logger.info(
+                            "Router: RESUMED suspended op=%s phase=%s (%d exploration "
+                            "records preserved -> Venom fast-forward)",
+                            _cp.op_id, _env.get("resume_phase"),
+                            len(_cp.exploration_records),
+                        )
                 except Exception:  # noqa: BLE001
                     logger.warning(
                         "Router: FSM resume re-inject failed op=%s -- left pending",
