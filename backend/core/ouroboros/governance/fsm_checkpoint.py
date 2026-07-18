@@ -190,6 +190,13 @@ class FSMCheckpoint:
     # loop forever — after the attempt ceiling it is shunted to the quarantine
     # DLQ. Rides inside the HMAC-signed payload → the count is tamper-evident.
     hydration_attempt_count: int = 0
+    # Atomic Workspace Checkpoint: raw ``git stash create`` SHA of the dirty
+    # working-tree delta at suspend time. Bound INSIDE the HMAC payload (tamper-
+    # evident). On hydration the delta is re-applied by this SHA, so an op
+    # suspended MID-MUTATION resumes against its own uncommitted changes even if
+    # the tree was cleaned across the boundary (rollback / worktree teardown /
+    # a cloud node's fresh checkout). Empty = the tree was clean at suspend.
+    workspace_stash_ref: str = ""
     schema_version: int = _SCHEMA_VERSION
 
     def to_json(self) -> str:
@@ -591,6 +598,72 @@ def list_pending(*, base_dir: "Optional[str]" = None) -> List[FSMCheckpoint]:
     return out
 
 
+def workspace_stash_enabled() -> bool:
+    """``JARVIS_FSM_WORKSPACE_STASH_ENABLED`` (default ON). When on, a dirty
+    working tree is snapshotted (``git stash create``) at suspend and re-applied
+    at hydration — Atomic Workspace Checkpointing. NEVER raises."""
+    return os.environ.get(
+        "JARVIS_FSM_WORKSPACE_STASH_ENABLED", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def workspace_root() -> str:
+    """The git working-tree root the in-flight ops mutate. Env
+    ``JARVIS_FSM_WORKSPACE_ROOT`` (for tests) else the process cwd. NEVER
+    raises."""
+    try:
+        raw = os.environ.get("JARVIS_FSM_WORKSPACE_ROOT", "").strip()
+        return raw or os.getcwd()
+    except Exception:  # noqa: BLE001
+        return "."
+
+
+def restore_workspace_stash(stash_ref: str) -> bool:
+    """HYDRATE: re-apply a suspended op's dirty working-tree delta by its raw
+    ``git stash`` SHA (from the checkpoint payload) via the shared sync helper
+    (DRY). Returns True on a clean apply; False (fail-soft) if stashing is
+    disabled, the ref is empty/invalid, or the apply conflicts (e.g. the delta
+    is already present because the tree was never cleaned) — the op resumes
+    regardless. NEVER raises."""
+    if not workspace_stash_enabled() or not stash_ref:
+        return False
+    try:
+        from backend.core.ouroboros.governance.workspace_checkpoint import (  # noqa: PLC0415
+            apply_stash_ref,
+        )
+        ok = apply_stash_ref(workspace_root(), stash_ref)
+        if ok:
+            logger.warning(
+                "[fsm_checkpoint] atomic workspace RESTORED stash=%s "
+                "(dirty-tree delta re-applied — op resumes mid-mutation)",
+                str(stash_ref)[:12],
+            )
+        return ok
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _capture_workspace_stash() -> str:
+    """Snapshot the dirty working tree ONCE per suspend via the shared sync
+    stash helper (DRY — no VC logic here). Returns the raw SHA, or "" when the
+    tree is clean / stashing disabled / git fails. NEVER raises."""
+    if not workspace_stash_enabled():
+        return ""
+    try:
+        from backend.core.ouroboros.governance.workspace_checkpoint import (  # noqa: PLC0415
+            create_stash_ref,
+        )
+        ref = create_stash_ref(workspace_root()) or ""
+        if ref:
+            logger.info(
+                "[fsm_checkpoint] atomic workspace stash created sha=%s "
+                "(dirty working-tree delta snapshotted for resume)", ref[:12],
+            )
+        return ref
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def capture_inflight(*, base_dir: "Optional[str]" = None, reason: str = "wall_clock_cap") -> int:
     """SUSPEND: on graceful shutdown (wall-clock cap / SIGTERM preemption), read the
     in-flight registry and serialize a signed checkpoint for each active op (from its
@@ -602,7 +675,12 @@ def capture_inflight(*, base_dir: "Optional[str]" = None, reason: str = "wall_cl
         from backend.core.ouroboros.governance.in_flight_registry import (  # noqa: PLC0415
             get_default_registry,
         )
-        for rec in get_default_registry().snapshot():
+        _records = list(get_default_registry().snapshot())
+        # Atomic Workspace Checkpoint: snapshot the dirty tree ONCE (session-wide,
+        # not per-op) and stamp the same ref on every in-flight checkpoint. Only
+        # bother if there IS something to suspend.
+        _workspace_stash = _capture_workspace_stash() if _records else ""
+        for rec in _records:
             try:
                 ctx = getattr(rec, "ctx_ref", None)
                 if ctx is None:
@@ -611,6 +689,8 @@ def capture_inflight(*, base_dir: "Optional[str]" = None, reason: str = "wall_cl
                     ctx, phase=getattr(rec, "last_phase_name", "") or "GENERATE",
                     resume_reason=reason,
                 )
+                if cp is not None:
+                    cp.workspace_stash_ref = _workspace_stash
                 if cp is not None and write_checkpoint(cp, base_dir=base_dir):
                     n += 1
                     logger.info(

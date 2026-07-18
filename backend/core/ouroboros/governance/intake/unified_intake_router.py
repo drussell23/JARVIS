@@ -1264,6 +1264,23 @@ class UnifiedIntakeRouter:
             # hydrate_pending_checkpoints wants a sync ingest_fn; bridge to async by
             # scheduling each re-inject and consuming the checkpoint on success.
             _pending = _ckpt.list_pending()
+            # Atomic Workspace Checkpoint restore (before any re-inject): re-apply
+            # each distinct dirty-tree stash ONCE, so an op suspended mid-mutation
+            # resumes against its own uncommitted delta even if the tree was
+            # cleaned across the boundary. Fail-soft (already-present/conflict is
+            # fine — the op resumes regardless).
+            _applied_stashes: set = set()
+            for _cp in _pending:
+                _ws_ref = getattr(_cp, "workspace_stash_ref", "") or ""
+                if _ws_ref and _ws_ref not in _applied_stashes:
+                    _applied_stashes.add(_ws_ref)
+                    try:
+                        _ckpt.restore_workspace_stash(_ws_ref)
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "Router: workspace stash restore faulted ref=%s",
+                            _ws_ref[:12], exc_info=True,
+                        )
             for _cp in _pending:
                 # Poison-Pill guard (DETERMINISTIC, not a swallow): persist the
                 # incremented hydration count BEFORE attempting the resume, so a
