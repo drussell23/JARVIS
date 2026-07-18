@@ -6207,6 +6207,10 @@ class ToolLoopCoordinator:
         # reserve threshold).
         _final_nudge_issued: bool = False
         _enforcement_rounds_used: int = 0  # Slice 233 — bounded parse-gate denials
+        # Stateful Tool Masking — bounded in-loop rejections of a premature final
+        # candidate (emitted before the exploration floor). Forces exploration in
+        # the SAME loop instead of a post-hoc Iron-Gate reject + fresh GENERATE.
+        _premature_candidate_rejections: int = 0
         raw: str = ""
         while True:
             round_index += 1
@@ -6361,9 +6365,59 @@ class ToolLoopCoordinator:
                 except Exception:  # noqa: BLE001
                     pass
 
-            raw = await generate_fn(current_prompt)
+            # ── Stateful Tool Masking (lever 1): withhold the write-tool
+            # advertisement while below the exploration floor, so the model is
+            # not offered mutation tools before it has gathered state. Fail-open
+            # (any fault → the full prompt). The candidate gate below is the
+            # load-bearing enforcement; this only reduces wasted premature-write
+            # rounds. ──
+            _prompt_for_model = current_prompt
+            try:
+                from backend.core.ouroboros.governance.tool_masking import (
+                    masked_prompt as _tm_masked_prompt,
+                )
+                _prompt_for_model = _tm_masked_prompt(
+                    current_prompt,
+                    explore_count=_cumulative_explore_calls,
+                    floor=_epistemic_exploration_floor(),
+                )
+            except Exception:  # noqa: BLE001 — fail-open to the full prompt
+                _prompt_for_model = current_prompt
+
+            raw = await generate_fn(_prompt_for_model)
             tool_calls = parse_fn(raw)
             if tool_calls is None:
+                # ── Stateful Tool Masking (lever 2, load-bearing): a FINAL patch
+                # emitted before the exploration floor is the premature-patch
+                # class the Iron Gate rejects post-hoc (a whole GENERATE_RETRY).
+                # Reject it IN-LOOP and force exploration in the SAME loop —
+                # deterministic, no fresh GENERATE. Bounded by a cap + the final-
+                # write reserve so a model that refuses to explore still finalizes
+                # (falling back to the legacy Iron-Gate rejection). Fail-open. ──
+                try:
+                    from backend.core.ouroboros.governance.tool_masking import (
+                        tool_masking_enabled as _tm_enabled2,
+                        tool_mask_reject_cap as _tm_cap,
+                        exploration_force_notice as _tm_notice,
+                    )
+                    _floor = _epistemic_exploration_floor()
+                    if (_tm_enabled2()
+                            and _cumulative_explore_calls < _floor
+                            and _premature_candidate_rejections < _tm_cap()
+                            and (deadline - time.monotonic()) > plan.final_write_reserve_s):
+                        _premature_candidate_rejections += 1
+                        current_prompt += _tm_notice(_cumulative_explore_calls, _floor)
+                        logger.warning(
+                            "[ToolLoop] op=%s premature final candidate with "
+                            "%d/%d exploration calls — REJECTED in-loop, forcing "
+                            "exploration (reject %d/%d)",
+                            op_id[:12] if op_id else "?",
+                            _cumulative_explore_calls, _floor,
+                            _premature_candidate_rejections, _tm_cap(),
+                        )
+                        continue
+                except Exception:  # noqa: BLE001 — fail-open to legacy accept
+                    pass
                 self._finalize_run(op_id)
                 return raw, records   # Final non-tool response
 
