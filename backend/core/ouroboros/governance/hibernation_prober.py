@@ -307,7 +307,31 @@ class HibernationProber:
         history, derive it from a low quantile (p25) of past dark-window
         durations — don't ping before the grid plausibly recovers. Below
         ``min_samples`` (or gate off) → the static ``initial_delay_s``. Fully
-        fail-soft: any error falls back to the static default."""
+        fail-soft: any error falls back to the static default.
+
+        Circadian Resilience (2026-07-18): the provider's own DECLARED reset
+        horizon (rate-limit headers via the liquidity ledger — Retry-After /
+        tokens-reset, skew-safe relative deltas) outranks any statistical
+        prior: the provider TOLD us when liquidity returns. Used when present,
+        clamped to [initial, max_delay]; absent/fault → the existing logic."""
+        try:
+            from backend.core.ouroboros.governance.provider_liquidity_ledger import (  # noqa: E501,PLC0415
+                max_seconds_to_reset,
+            )
+            _declared = max_seconds_to_reset()
+            if _declared is not None and _declared > 0:
+                hinted = min(
+                    max(float(_declared), self._initial_delay_s),
+                    self._max_delay_s,
+                )
+                logger.info(
+                    "[HibernationProber] first probe seeded from DECLARED "
+                    "provider reset horizon: %.1fs (declared %.1fs)",
+                    hinted, _declared,
+                )
+                return hinted
+        except Exception:  # noqa: BLE001 — hint is advisory, never load-bearing
+            pass
         if not _recovery_prior_enabled():
             return self._initial_delay_s
         try:

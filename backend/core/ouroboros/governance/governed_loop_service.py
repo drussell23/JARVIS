@@ -6227,6 +6227,26 @@ class GovernedLoopService:
                         logger.exception(
                             "[GLS] idle_watchdog.freeze failed under hibernation"
                         )
+                # Circadian Resilience (2026-07-18): persist the FSM state +
+                # atomic workspace stash at hibernation ENTRY — the exact
+                # capture_inflight primitive the wall-clock/predictive gates
+                # use (DRY). Survives a process death during the dark window:
+                # next ignition (or the wake hydration below) resumes from
+                # signed checkpoints instead of losing in-flight work. Sync +
+                # fail-soft by capture_inflight's own contract (NEVER raises).
+                try:
+                    from backend.core.ouroboros.governance.fsm_checkpoint import (  # noqa: PLC0415,E501
+                        capture_inflight as _hib_capture,
+                    )
+                    _n = _hib_capture(reason=f"provider_hibernation:{reason}"[:80])
+                    logger.info(
+                        "[GLS] hibernation checkpoint: %d in-flight op(s) "
+                        "suspended to signed checkpoints (+ workspace stash)", _n,
+                    )
+                except Exception:  # noqa: BLE001 — never break the transition
+                    logger.exception(
+                        "[GLS] hibernation capture_inflight failed"
+                    )
 
             async def _wake_bridge(*, reason: str) -> None:
                 # Unfreeze first so the watchdog resets its clock before
@@ -6270,6 +6290,25 @@ class GovernedLoopService:
                             logger.exception(
                                 "[GLS] resurrection re-ingest failed under wake"
                             )
+                # Circadian Resilience (2026-07-18): re-hydrate the signed FSM
+                # checkpoints written at hibernation entry — the SAME
+                # _hydrate_fsm_checkpoints seam the boot ignition uses (DRY),
+                # so suspended ops fsm_resume mid-session the moment liquidity
+                # returns instead of waiting for the next boot. Idempotent
+                # (hydration consumes pending checkpoint files). Fail-soft.
+                try:
+                    _router_ref = getattr(self, "_intake_router", None)
+                    _hydrate = getattr(
+                        _router_ref, "_hydrate_fsm_checkpoints", None,
+                    )
+                    if _hydrate is not None:
+                        await _hydrate()
+                        logger.info(
+                            "[GLS] wake hydration: pending FSM checkpoints "
+                            "re-injected (fsm_resume on restored liquidity)",
+                        )
+                except Exception:  # noqa: BLE001 — never break wake
+                    logger.exception("[GLS] wake checkpoint hydration failed")
 
             try:
                 _ctrl_for_hooks.register_hibernation_hooks(

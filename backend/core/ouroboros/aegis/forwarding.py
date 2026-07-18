@@ -693,6 +693,34 @@ async def forward_request(
             )
 
         final_status = upstream_resp.status
+        # Circadian Resilience (2026-07-18): this proxy is the ONE point that
+        # sees EVERY upstream response's rate-limit telemetry (the SDK clients
+        # never surface headers, and this hop previously STRIPPED them).
+        # (a) Record the declared liquidity (tokens-remaining / reset /
+        #     retry-after) into the cross-process ProviderLiquidityLedger so
+        #     the SensorGovernor can shed BULK load BEFORE a 429 and the
+        #     HibernationProber can seed its wake horizon. Fail-soft telemetry.
+        # (b) Pass the telemetry headers through to the client (whitelist —
+        #     hop-by-hop headers still stripped).
+        _liq_headers = {}
+        try:
+            from backend.core.ouroboros.governance.provider_liquidity_ledger import (  # noqa: E501,PLC0415
+                provider_for_upstream,
+                record_headers,
+            )
+            record_headers(
+                provider_for_upstream(str(request.path)),
+                dict(upstream_resp.headers),
+                status=upstream_resp.status,
+            )
+            for _hk, _hv in upstream_resp.headers.items():
+                _lk = _hk.lower()
+                if (_lk.startswith("anthropic-ratelimit-")
+                        or _lk.startswith("x-ratelimit-")
+                        or _lk in ("retry-after",)):
+                    _liq_headers[_hk] = _hv
+        except Exception:  # noqa: BLE001 — telemetry must never break the proxy
+            _liq_headers = {}
         # Build the StreamResponse — mirror upstream content-type so
         # SSE / JSON pass through cleanly.
         client_resp = web.StreamResponse(
@@ -704,6 +732,7 @@ async def forward_request(
                 "Cache-Control": upstream_resp.headers.get(
                     "Cache-Control", "no-store",
                 ),
+                **_liq_headers,
             },
         )
         # Disable aiohttp's response compression — pass-through must

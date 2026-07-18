@@ -426,6 +426,37 @@ def _default_topology_state_fn() -> Tuple[str, ...]:
         return ()
 
 
+def liquidity_backpressure_enabled() -> bool:
+    """Circadian Resilience (2026-07-18) — provider-liquidity-aware pause for
+    low-urgency sensors. ``JARVIS_LIQUIDITY_BACKPRESSURE_ENABLED`` (default
+    ``true``, mirroring the topology-backpressure precedent — it is purely
+    protective: it only PAUSES BACKGROUND/SPECULATIVE emission while a
+    provider's DECLARED remaining-token runway is below the forecast floor,
+    preventing the 429 storm instead of reacting to it). IMMEDIATE/STANDARD/
+    COMPLEX are untouched. Hot-revert via ``=false``. NEVER raises."""
+    try:
+        return os.environ.get(
+            "JARVIS_LIQUIDITY_BACKPRESSURE_ENABLED", "true",
+        ).strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _default_liquidity_state_fn() -> bool:
+    """Default reader for the provider-liquidity ledger: True iff ANY provider
+    declared a token runway below the floor (see
+    ``provider_liquidity_ledger.any_runway_exhausted``). Ledger missing /
+    module unimportable → False (fail-open — shaping never blocks on missing
+    telemetry). NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.provider_liquidity_ledger import (
+            any_runway_exhausted,
+        )
+        return any_runway_exhausted()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _curiosity_multiplier_for(
     cluster_id: Optional[str],
 ) -> Tuple[float, Optional[str]]:
@@ -501,6 +532,7 @@ class SensorGovernor:
             Callable[[], Tuple[str, ...]]
         ] = None,
         operator_active_fn: Optional[Callable[[], bool]] = None,
+        liquidity_state_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._specs: Dict[str, SensorBudgetSpec] = {}
         # Per-sensor deques of emission timestamps (monotonic seconds)
@@ -515,6 +547,15 @@ class SensorGovernor:
         # tuple of blocked model_ids; truthy → throttle BG/SPEC caps.
         self._topology_state_fn = (
             topology_state_fn or _default_topology_state_fn
+        )
+        # Circadian Resilience (2026-07-18) — provider-liquidity
+        # backpressure. Returns True when ANY provider's DECLARED token
+        # runway (from the rate-limit headers captured in the liquidity
+        # ledger) is below the forecast floor → BG/SPEC requests are
+        # PAUSED preemptively, before a 429 ever fires. Injectable for
+        # tests; defaults to the ledger's any_runway_exhausted.
+        self._liquidity_state_fn = (
+            liquidity_state_fn or _default_liquidity_state_fn
         )
         # Task 7 (spec §5.4) — operator-active hard-zero. When set and
         # JARVIS_OPERATOR_YIELD_ENABLED is on, request_budget() returns
@@ -618,6 +659,24 @@ class SensorGovernor:
         except Exception:  # noqa: BLE001
             return False
         return bool(blocked)
+
+    def _liquidity_blocking(self, urgency: Urgency) -> bool:
+        """Circadian Resilience — predicate for "should this request be PAUSED
+        on declared provider liquidity?". True iff the master flag is on AND
+        urgency is BACKGROUND/SPECULATIVE (high-urgency lanes keep their
+        runway — that is the point of shedding bulk) AND the injected
+        ``liquidity_state_fn`` reports an exhausted runway. Preemptive: fires
+        on the DECLARED remaining-token headers from 200 OK responses, BEFORE
+        any 429. The state-fn may raise — swallowed → False (fail-open on
+        missing telemetry). NEVER raises."""
+        if not liquidity_backpressure_enabled():
+            return False
+        if urgency not in (Urgency.BACKGROUND, Urgency.SPECULATIVE):
+            return False
+        try:
+            return bool(self._liquidity_state_fn())
+        except Exception:  # noqa: BLE001
+            return False
 
     def _weighted_cap(
         self,
@@ -773,6 +832,29 @@ class SensorGovernor:
             if brake:
                 gcap = max(1, int(gcap * emergency_reduction_pct()))
             gremaining = max(0, gcap - gcount)
+
+            # Circadian Resilience — PREEMPTIVE liquidity pause. When a
+            # provider's DECLARED remaining-token runway (200-OK rate-limit
+            # headers via the liquidity ledger) is below the forecast floor,
+            # BACKGROUND/SPECULATIVE emission is PAUSED outright — before a
+            # 429 ever fires — guaranteeing the remaining runway to the
+            # CRITICAL/IMMEDIATE lanes. Self-releasing: the ledger's verdict
+            # expires at the declared reset horizon, so the next request
+            # after reset passes without operator action.
+            if self._liquidity_blocking(urgency):
+                decision = BudgetDecision(
+                    allowed=False, sensor_name=sensor_name, urgency=urgency,
+                    posture=posture, weighted_cap=weighted_cap,
+                    current_count=current, remaining=remaining,
+                    reason_code="governor.liquidity_backpressure",
+                    emergency_brake=brake, global_cap=gcap,
+                    global_count=gcount,
+                    topology_blocked=topology_blocked,
+                    curiosity_multiplier=cur_mult,
+                    curiosity_cluster_id=cur_cid,
+                )
+                self._decisions.append(decision)
+                return decision
 
             # Slice 3c — when the cap was reduced by topology AND the
             # reduction is what exhausted the per-sensor budget, stamp
