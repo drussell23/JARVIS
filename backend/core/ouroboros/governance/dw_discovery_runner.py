@@ -209,6 +209,39 @@ async def run_discovery(
                 exc_info=True,
             )
 
+        # Step 1.4b: REASONING-EFFORT COMPLIANCE (2026-07-18).
+        # The entitlement probe maps WHETHER a model is callable (403/2xx); it
+        # sends a bare payload and so leaves the third capability dimension
+        # blank — whether the model honors reasoning_effort="none" or floors it
+        # (the gpt-oss-120b class that returns empty content when told not to
+        # think). That was learned only REACTIVELY, by burning a real op. This
+        # proactively probes it for the newly-catalogued (unprofiled) models —
+        # skipping any the entitlement probe just DENIED (a 403 model isn't
+        # callable to test) — and records floors into the EXISTING reasoning
+        # profile so the provider never sends effort=none to a model that
+        # rejects it. Bounded, fail-soft; never crashes discovery.
+        try:
+            _denied_set = set(_denied)
+            _rc_targets = [
+                str(getattr(m, "model_id", "") or "")
+                for m in snapshot.models
+                if str(getattr(m, "model_id", "") or "") not in _denied_set
+            ]
+            _floored, _rc_clean = await probe_reasoning_compliance(
+                session=session, base_url=base_url, api_key=api_key,
+                model_ids=_rc_targets,
+            )
+            if _floored or _rc_clean:
+                diagnostics.append(
+                    f"reasoning_compliance:floored={len(_floored)}"
+                    f":clean={len(_rc_clean)}"
+                )
+        except Exception:  # noqa: BLE001 — never crash discovery
+            logger.debug(
+                "[DiscoveryRunner] reasoning-compliance probe failed",
+                exc_info=True,
+            )
+
     # Step 1.5: Slice G — modality verification (metadata + probes)
     # Runs BEFORE classify so the ledger is populated with verdicts
     # the classifier can consult. Gated by master flag — when off,
@@ -545,6 +578,136 @@ async def probe_rt_entitlement(
         len(model_ids) - len(cleared) - len(denied), len(model_ids),
     )
     return denied, cleared
+
+
+def _reasoning_compliance_probe_enabled() -> bool:
+    """Master — ``JARVIS_DW_REASONING_COMPLIANCE_PROBE_ENABLED`` (default true)."""
+    return (
+        os.environ.get("JARVIS_DW_REASONING_COMPLIANCE_PROBE_ENABLED", "true") or ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+async def probe_reasoning_compliance(
+    *,
+    session: Any,
+    base_url: str,
+    api_key: str,
+    model_ids: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    """Map each model's ``reasoning_effort`` compliance — the third capability
+    dimension the entitlement probe leaves blank.
+
+    A reasoning model that CANNOT disable its chain-of-thought (the
+    ``gpt-oss-120b`` class) errors when sent ``reasoning_effort="none"`` and
+    then returns empty content on real ops. This sends ONE minimal completion
+    composed via the provider's own ``_reasoning_request_params(effort="none")``
+    (DRY — the single source of truth for the wire schema) and, on an
+    unambiguous reasoning-rejection error, records a floor into the EXISTING
+    ``ReasoningProfile`` so the provider stops under-spending effort on it.
+
+    Discipline mirrors ``probe_rt_entitlement`` — only UNAMBIGUOUS evidence is
+    written; a transient / 5xx / non-reasoning 4xx records NOTHING. Probes only
+    models NOT already profiled (the reasoning profile persists, so this is a
+    one-time cost per newly-catalogued model). Returns ``(floored, clean)``.
+    NEVER raises.
+    """
+    floored: List[str] = []
+    clean: List[str] = []
+    if not _reasoning_compliance_probe_enabled() or not model_ids or not api_key:
+        return floored, clean
+    try:
+        from backend.core.ouroboros.governance.dw_reasoning_profile import (
+            error_indicates_reasoning_rejection,
+            get_reasoning_profile,
+            reasoning_profile_enabled,
+        )
+    except Exception:  # noqa: BLE001
+        return floored, clean
+    if not reasoning_profile_enabled():
+        return floored, clean
+    profile = get_reasoning_profile()
+    # One-time per model: skip anything already carrying a learned floor.
+    targets = [
+        str(m) for m in model_ids
+        if str(m) and profile.learned_min_effort(str(m)) is None
+    ]
+    if not targets:
+        return floored, clean
+    # Lazy import of the wire-schema helper (avoids a provider import cycle at
+    # module load; the probe path can afford the one-time import).
+    try:
+        from backend.core.ouroboros.governance.doubleword_provider import (
+            _reasoning_request_params,
+        )
+    except Exception:  # noqa: BLE001
+        return floored, clean
+
+    timeout_s = _envf_probe("JARVIS_DW_REASONING_PROBE_TIMEOUT_S", 20.0)
+    max_conc = int(_envf_probe("JARVIS_DW_REASONING_PROBE_CONCURRENCY", 4.0))
+    sem = asyncio.Semaphore(max(1, max_conc))
+    url = f"{(base_url or '').rstrip('/')}/chat/completions"
+
+    async def _probe(model_id: str) -> None:
+        if not model_id:
+            return
+        # DRY: the exact wire schema the provider composes; carry only the
+        # wire-valid knob (extra_body/SDK-only keys would 400 on a raw POST).
+        _params = _reasoning_request_params(effort="none", model=model_id)
+        _wire = {k: v for k, v in _params.items() if k == "reasoning_effort"}
+        payload = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "ok"}],
+            "max_tokens": 1,
+            **_wire,
+        }
+        try:
+            async with sem:
+                async with session.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=timeout_s,
+                ) as resp:
+                    status = int(resp.status)
+                    body = await resp.text()
+        except Exception:  # noqa: BLE001 — ambiguous → record NOTHING
+            logger.debug(
+                "[ReasoningProbe] model=%s inconclusive — no floor", model_id,
+                exc_info=True,
+            )
+            return
+        if status >= 400 and error_indicates_reasoning_rejection(body):
+            # The model rejected effort=none → it CANNOT run reasoning-free.
+            profile.record_reasoning_floor(model_id)
+            floored.append(model_id)
+        elif 200 <= status < 300:
+            # Honored effort=none → no floor needed (reasoning-free capable).
+            clean.append(model_id)
+        # else: 403 (entitlement's job), 5xx/429/timeout, or a non-reasoning
+        # 4xx → ambiguous for THIS dimension; record nothing.
+
+    try:
+        await asyncio.gather(
+            *(_probe(str(m)) for m in targets), return_exceptions=True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[ReasoningProbe] gather failed", exc_info=True)
+        return floored, clean
+
+    if floored:
+        logger.info(
+            "[ReasoningProbe] %d model(s) require a reasoning floor (reject "
+            "effort=none): %s", len(floored), floored,
+        )
+    logger.info(
+        "[ReasoningProbe] reasoning-effort compliance mapped: %d floored, "
+        "%d reasoning-free-capable (of %d newly probed)",
+        len(floored), len(clean), len(targets),
+    )
+    return floored, clean
 
 
 def _failed_result(
@@ -1271,6 +1434,8 @@ __all__ = [
     "catalog_discovery_enabled",
     "get_heavy_probe_budget",
     "get_ttft_observer",
+    "probe_reasoning_compliance",
+    "probe_rt_entitlement",
     "reset_boot_state_for_tests",
     "run_discovery",
 ]
