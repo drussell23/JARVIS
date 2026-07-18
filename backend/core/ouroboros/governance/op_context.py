@@ -49,6 +49,59 @@ from backend.core.ouroboros.governance.operation_id import generate_operation_id
 from backend.core.ouroboros.governance.risk_engine import RiskTier
 from backend.core.ouroboros.governance.routing_policy import RoutingDecision
 
+import logging as _logging
+
+_logger = _logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Phase-transition lifecycle event (2026-07-18)
+#
+# ``advance()`` is the ONE method every legal FSM phase transition flows through
+# (it validates PHASE_TRANSITIONS). It fires a lifecycle event here so observers
+# can track the live phase WITHOUT sprinkling per-phase calls across the
+# orchestrator. The in-flight registry registers an observer (via
+# in_flight_registry.wire_phase_transition_tracking) that mirrors each transition
+# into the registry — so fsm_checkpoint.capture_inflight serializes the EXACT
+# current phase (not the stale registration-time phase).
+#
+# op_context stays PURE: it owns only the observer LIST and fires blindly; it
+# imports nothing from the observability substrate, so the state-machine →
+# observability direction the in_flight_registry deliberately avoids is never
+# introduced here either. Registration is one-way (observer side imports us).
+# ---------------------------------------------------------------------------
+
+from typing import Callable, List
+
+_PHASE_TRANSITION_OBSERVERS: "List[Callable[[str, str], None]]" = []
+
+
+def register_phase_transition_observer(cb: "Callable[[str, str], None]") -> None:
+    """Register a ``(op_id, phase_name) -> None`` callback fired on every
+    ``advance()`` transition. Idempotent per-callable (a duplicate registration
+    is ignored). NEVER raises."""
+    try:
+        if cb not in _PHASE_TRANSITION_OBSERVERS:
+            _PHASE_TRANSITION_OBSERVERS.append(cb)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _reset_phase_transition_observers_for_tests() -> None:
+    _PHASE_TRANSITION_OBSERVERS.clear()
+
+
+def _notify_phase_transition(op_id: str, phase_name: str) -> None:
+    """Fire all registered observers. Fully fail-soft — an observer fault must
+    NEVER break the state-machine transition it is merely witnessing."""
+    if not op_id or not _PHASE_TRANSITION_OBSERVERS:
+        return
+    for _cb in list(_PHASE_TRANSITION_OBSERVERS):
+        try:
+            _cb(op_id, phase_name)
+        except Exception:  # noqa: BLE001
+            _logger.debug("[op_context] phase-transition observer faulted", exc_info=True)
+
 
 class ArchitecturalCycleError(ValueError):
     """Raised when dependency_edges contains a directed cycle.
@@ -1394,7 +1447,14 @@ class OperationContext:
         new_hash = _compute_hash(fields_for_hash)
 
         # Final instance with correct hash
-        return dataclasses.replace(intermediate, context_hash=new_hash)
+        final = dataclasses.replace(intermediate, context_hash=new_hash)
+
+        # Lifecycle event — fire AFTER the transition is fully built + validated,
+        # so observers (the in-flight registry's phase mirror) see the committed
+        # new phase. Fail-soft: never lets an observer break the transition.
+        _notify_phase_transition(getattr(self, "op_id", "") or "", new_phase.name)
+
+        return final
 
     def with_compute_context(self, compute_context: str) -> "OperationContext":
         """Return a new context tagged with a compute_context.

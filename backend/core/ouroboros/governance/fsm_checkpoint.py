@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +178,12 @@ class FSMCheckpoint:
     # instantly TTL-expired (epoch 0).
     created_at: float = field(default_factory=time.time)
     resume_reason: str = ""
+    # Repository HEAD sha at suspend time. On resume, the hydrator compares this
+    # against the LIVE HEAD; if the repo moved (a merge/commit landed while the op
+    # was suspended), the op's stored exploration/partial-completion is stale code
+    # context, so the resume is demoted to PLAN to re-plan against current source
+    # rather than fast-forwarding into corruption. Empty = drift-check skipped.
+    repo_sha: str = ""
     schema_version: int = _SCHEMA_VERSION
 
     def to_json(self) -> str:
@@ -257,6 +263,77 @@ def _build_trace_lineage(context: Any, op_id: str) -> Dict[str, Any]:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# Git-drift mitigation (2026-07-18)
+#
+# A checkpoint records the repo HEAD at suspend time. If a commit/merge lands
+# while the op is suspended (the real-world async mutation the operator flagged),
+# the op's preserved exploration + partial-completion describe CODE THAT NO
+# LONGER EXISTS. Fast-forwarding straight back into GENERATE with that stale
+# context is exactly the corruption to avoid. So the hydrator compares stored vs
+# live HEAD and, on drift, DEMOTES the resume phase to PLAN (re-plan against
+# current source) and drops the stale exploration/partial context.
+# ---------------------------------------------------------------------------
+
+# Ordered pipeline phases for the demotion comparison. Only the linear spine is
+# needed (retry/terminal phases never checkpoint a resumable forward position).
+_PHASE_ORDER: Dict[str, int] = {
+    "CLASSIFY": 0, "ROUTE": 1, "CONTEXT_EXPANSION": 2, "PLAN": 3,
+    "GENERATE": 4, "VALIDATE": 5, "GATE": 6, "APPROVE": 7, "APPLY": 8,
+    "VERIFY": 9,
+}
+_DRIFT_DEMOTION_FLOOR = "PLAN"
+
+
+def drift_demotion_enabled() -> bool:
+    """``JARVIS_FSM_RESUME_DRIFT_DEMOTION_ENABLED`` (default ON). Fail-soft."""
+    return os.environ.get(
+        "JARVIS_FSM_RESUME_DRIFT_DEMOTION_ENABLED", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def current_repo_sha(repo_path: "Optional[str]" = None) -> "Optional[str]":
+    """Live ``git rev-parse HEAD`` (or None on any error). The single git-HEAD
+    read for the checkpoint layer — capture stamps it, hydrate compares it."""
+    try:
+        import subprocess  # noqa: PLC0415
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=repo_path or os.getcwd(),
+        )
+        if result.returncode == 0:
+            sha = result.stdout.strip()
+            return sha or None
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def resolve_resume_phase(
+    cp: "FSMCheckpoint", *, live_repo_sha: "Optional[str]" = None,
+) -> "Tuple[str, bool]":
+    """Return ``(effective_phase, drifted)`` for a resuming checkpoint.
+
+    No stored sha, drift-demotion disabled, or live HEAD unreadable → resume at
+    the stored phase unchanged (fail-soft: a missing HEAD must not corrupt a
+    legitimate fast-forward). Stored sha != live HEAD AND the stored phase is
+    PAST the PLAN floor → demote to PLAN so the op re-plans against current code.
+    Drift at/before PLAN needs no demotion (already re-planning).
+    """
+    stored = str(getattr(cp, "repo_sha", "") or "")
+    phase = str(getattr(cp, "phase", "") or "")
+    if not drift_demotion_enabled() or not stored:
+        return phase, False
+    live = live_repo_sha if live_repo_sha is not None else current_repo_sha()
+    if not live or live == stored:
+        return phase, False
+    floor = _PHASE_ORDER[_DRIFT_DEMOTION_FLOOR]
+    if _PHASE_ORDER.get(phase, -1) > floor:
+        return _DRIFT_DEMOTION_FLOOR, True
+    return phase, True
+
+
 def capture_from_context(context: Any, *, phase: str, tool_history: "Optional[List[Dict[str, Any]]]" = None,
                          exploration_records: "Optional[List[Dict[str, Any]]]" = None,
                          resume_reason: str = "wall_clock_cap") -> "Optional[FSMCheckpoint]":
@@ -280,6 +357,7 @@ def capture_from_context(context: Any, *, phase: str, tool_history: "Optional[Li
             trace_lineage=_build_trace_lineage(context, op_id),
             created_at=time.time(),
             resume_reason=str(resume_reason),
+            repo_sha=current_repo_sha() or "",
         )
     except Exception:  # noqa: BLE001
         return None
@@ -423,26 +501,41 @@ def capture_inflight(*, base_dir: "Optional[str]" = None, reason: str = "wall_cl
     return n
 
 
-def build_resume_envelope(cp: FSMCheckpoint) -> Dict[str, Any]:
-    """Build a resume intake envelope from a verified checkpoint. Carries the
-    preserved tool/exploration context (Seamless Venom Hydration) so the model
-    FAST-FORWARDS -- it does not re-read files it already explored last window; the
-    Iron Gate credits the preserved exploration and generation picks up where it
-    left off."""
-    return {
+def build_resume_envelope(
+    cp: FSMCheckpoint, *, live_repo_sha: "Optional[str]" = None,
+) -> Dict[str, Any]:
+    """Build a resume intake envelope from a verified checkpoint. Normally
+    carries the preserved tool/exploration context (Seamless Venom Hydration) so
+    the model FAST-FORWARDS — it does not re-read files it already explored last
+    window; the Iron Gate credits the preserved exploration and generation picks
+    up where it left off.
+
+    GIT-DRIFT GUARD: if the repo HEAD moved since the checkpoint was taken
+    (:func:`resolve_resume_phase`), the preserved exploration/partial describe
+    stale code, so the op is DEMOTED to PLAN and that stale context is DROPPED —
+    the op re-plans against current source instead of fast-forwarding into
+    corruption. The goal, target files, intake evidence and trace lineage always
+    survive (they are what the op IS, not what it explored)."""
+    effective_phase, drifted = resolve_resume_phase(cp, live_repo_sha=live_repo_sha)
+    env: Dict[str, Any] = {
         "op_id": cp.op_id,
         "description": cp.goal_description,
         "target_files": list(cp.target_files),
         "source": "fsm_resume",
         "resume": True,
-        "resume_phase": cp.phase,
-        "tool_history": list(cp.tool_history),
-        "exploration_records": list(cp.exploration_records),
+        "resume_phase": effective_phase,
+        # Stale-context-safe: on drift, the exploration/partial/tool history are
+        # against code that no longer exists → dropped so the re-PLAN is clean.
+        "tool_history": [] if drifted else list(cp.tool_history),
+        "exploration_records": [] if drifted else list(cp.exploration_records),
+        "partial_completion": "" if drifted else cp.partial_completion,
         "intake_evidence_json": cp.intake_evidence_json,
         "provider_route": cp.provider_route,
-        "partial_completion": cp.partial_completion,
         "trace_lineage": dict(cp.trace_lineage or {}),
+        "repo_sha": cp.repo_sha,
+        "drifted": drifted,
     }
+    return env
 
 
 def hydrate_pending_checkpoints(ingest_fn: Any, *, base_dir: "Optional[str]" = None) -> int:
