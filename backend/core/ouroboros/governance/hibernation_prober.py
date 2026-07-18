@@ -393,6 +393,26 @@ class HibernationProber:
                     stable = await self._verify_grid_stability(
                         self._last_healthy_provider, healthy_name,
                     )
+                    # Circadian Resilience (2026-07-18) — the Liquidity Ping
+                    # guard: the carry-proof above IS the minimal token request,
+                    # and its response refreshed the liquidity ledger through
+                    # the Aegis capture. Before waking (which triggers the heavy
+                    # fsm_resume hydration + git-stash re-apply), verify the
+                    # ledger no longer declares an exhausted runway — a provider
+                    # that answered one probe on a sliver of quota must not lure
+                    # the DAG awake into an immediate double-fault 429. Fail-
+                    # open: no/expired telemetry → wake as legacy.
+                    _liq_blocked = False
+                    if stable and self._liquidity_still_exhausted():
+                        stable = False
+                        _liq_blocked = True
+                        self._last_result = "liquidity_not_replenished"
+                        logger.info(
+                            "[HibernationProber] %s stable but the liquidity "
+                            "ledger still declares an exhausted runway — "
+                            "staying dark until tokens replenish",
+                            healthy_name,
+                        )
                     if stable:
                         self._last_result = f"woken_by:{healthy_name}"
                         self._wake_count += 1
@@ -409,7 +429,8 @@ class HibernationProber:
                         )
                         await self._wake(healthy_name)
                         return
-                    self._last_result = "flapping_grid"
+                    if not _liq_blocked:
+                        self._last_result = "flapping_grid"
 
                 delay = min(delay * 2.0, self._max_delay_s)
                 logger.debug(
@@ -424,6 +445,20 @@ class HibernationProber:
         except Exception:  # noqa: BLE001
             self._last_result = "crash"
             logger.exception("[HibernationProber] probe loop crashed")
+
+    def _liquidity_still_exhausted(self) -> bool:
+        """The Liquidity Ping guard's ledger check: True iff the provider
+        telemetry (refreshed by the carry-proof's own response) STILL declares
+        an exhausted token runway. Fail-open — missing/expired telemetry or an
+        unimportable ledger → False (wake as legacy, never strand the organism
+        on absent data). NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.provider_liquidity_ledger import (  # noqa: E501,PLC0415
+                any_runway_exhausted,
+            )
+            return any_runway_exhausted()
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _probe_any(self) -> Optional[str]:
         """Probe every provider in order; return the name of the first healthy one.

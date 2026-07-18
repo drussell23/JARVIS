@@ -278,3 +278,69 @@ def test_provider_classification():
     assert pll.provider_for_upstream("api.anthropic.com/v1/messages") == "anthropic"
     assert pll.provider_for_upstream("/chat/completions") == "doubleword"
     assert pll.provider_for_upstream("") == "unknown"
+
+
+# ===========================================================================
+# E. Liquidity Ping guard — wake yields until tokens replenish
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_wake_yields_until_liquidity_replenishes(monkeypatch):
+    """Double-fault-429 neutralization: the provider answers the carry-proof
+    (stable) but the ledger still declares an exhausted runway → the prober
+    STAYS DARK. When the ledger shows replenished tokens, the next probe
+    wakes."""
+    from backend.core.ouroboros.governance.supervisor_controller import (
+        AutonomyMode as _AM,
+        SupervisorOuroborosController,
+    )
+    from backend.core.ouroboros.governance.hibernation_prober import (
+        HibernationProber,
+    )
+
+    ctrl = SupervisorOuroborosController()
+    ctrl._mode = _AM.GOVERNED
+    await ctrl.enter_hibernation("test: quota dark window")
+
+    class _Provider:
+        name = "mock"
+        async def health_probe(self):
+            return True                              # always answers (stable sliver)
+
+    monkeypatch.setenv("JARVIS_HIBERNATION_PROBE_INITIAL_S", "0.05")
+    prober = HibernationProber(controller=ctrl, providers=[_Provider()])
+    # Carry-proof always passes; the LEDGER is the gate under test.
+    async def _stable(*a, **k):
+        return True
+    monkeypatch.setattr(prober, "_verify_grid_stability", _stable)
+
+    exhausted = {"v": True}
+    monkeypatch.setattr(prober, "_liquidity_still_exhausted", lambda: exhausted["v"])
+
+    await prober.start()
+    # Phase 1: runway still exhausted → several probes, NO wake.
+    await asyncio.sleep(0.4)
+    assert ctrl.mode is _AM.HIBERNATION, "must stay dark on unreplenished runway"
+    assert prober._last_result == "liquidity_not_replenished"
+
+    # Phase 2: tokens replenish → next probe wakes.
+    exhausted["v"] = False
+    for _ in range(60):
+        await asyncio.sleep(0.05)
+        if ctrl.mode is not _AM.HIBERNATION:
+            break
+    assert ctrl.mode is not _AM.HIBERNATION, "must wake once runway replenishes"
+
+
+def test_liquidity_guard_fails_open_without_ledger(monkeypatch, tmp_path):
+    """No telemetry (ledger absent) → the guard must NOT strand the organism."""
+    from backend.core.ouroboros.governance.hibernation_prober import (
+        HibernationProber,
+    )
+    monkeypatch.setenv(
+        "JARVIS_PROVIDER_LIQUIDITY_PATH", str(tmp_path / "absent.json"),
+    )
+    pll._reset_for_tests()
+    prober = HibernationProber(controller=None, providers=[])
+    assert prober._liquidity_still_exhausted() is False
