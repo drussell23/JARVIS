@@ -464,6 +464,40 @@ class Slice4bRunner(PhaseRunner):
                 artifacts={"t_apply": _t_apply},
             )
 
+        # ── Predictive Phase-Aware Checkpoint (pre-APPLY) ──
+        # Before the irreversible, latency-heavy APPLY→VERIFY tail, project it
+        # against the remaining wall runway (decoupled read — the watchdog stays
+        # blind). If it won't fit, gracefully self-suspend NOW: a signed
+        # checkpoint + atomic dirty-tree stash, so the op resumes on the next
+        # ignition instead of burning the runway and being hard-killed mid-APPLY
+        # (worst case a severed working tree). Fail-open: only terminate if the
+        # checkpoint actually persisted — otherwise fall through into APPLY, where
+        # the hard cap + the same atomic stash remain the backstop.
+        try:
+            from backend.core.ouroboros.governance import phase_runway_gate as _prg
+            _runway_verdict = _prg.evaluate(ctx, _prg.PRE_APPLY_TAIL_PHASES)
+            if _runway_verdict.should_suspend:
+                _ckpt_path = _prg.predictive_suspend(ctx, "APPLY", _runway_verdict)
+                if _ckpt_path:
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="predictive_suspend",
+                    )
+                    await orch._record_ledger(
+                        ctx, OperationState.FAILED,
+                        {"reason": "predictive_suspend",
+                         **_runway_verdict.as_telemetry()},
+                    )
+                    return PhaseResult(
+                        next_ctx=ctx, next_phase=None, status="fail",
+                        reason="predictive_suspend",
+                        artifacts={"t_apply": _t_apply},
+                    )
+        except Exception:  # noqa: BLE001 — fail open into APPLY
+            logger.debug(
+                "[Orchestrator] predictive checkpoint gate skipped", exc_info=True,
+            )
+
         # ==================== Phase 7: APPLY ====================
         ctx = ctx.advance(OperationPhase.APPLY)
 

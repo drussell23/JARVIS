@@ -10286,6 +10286,34 @@ class GovernedOrchestrator:
                 )
                 return ctx
 
+            # ── Predictive Phase-Aware Checkpoint (pre-APPLY) ──
+            # Mirror of the extracted Slice4bRunner gate: project the irreversible
+            # APPLY→VERIFY tail against the remaining wall runway (decoupled read).
+            # If it won't fit, gracefully self-suspend (signed checkpoint + atomic
+            # dirty-tree stash) so the op resumes next ignition instead of a
+            # hard-kill mid-APPLY. Fail-open: only terminate if the checkpoint
+            # persisted; otherwise fall through into APPLY.
+            try:
+                from backend.core.ouroboros.governance import phase_runway_gate as _prg
+                _runway_verdict = _prg.evaluate(ctx, _prg.PRE_APPLY_TAIL_PHASES)
+                if _runway_verdict.should_suspend:
+                    _ckpt_path = _prg.predictive_suspend(ctx, "APPLY", _runway_verdict)
+                    if _ckpt_path:
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code="predictive_suspend",
+                        )
+                        await self._record_ledger(
+                            ctx, OperationState.FAILED,
+                            {"reason": "predictive_suspend",
+                             **_runway_verdict.as_telemetry()},
+                        )
+                        return ctx
+            except Exception:  # noqa: BLE001 — fail open into APPLY
+                logger.debug(
+                    "[Orchestrator] predictive checkpoint gate skipped", exc_info=True,
+                )
+
             # ---- Phase 7: APPLY ----
             ctx = ctx.advance(OperationPhase.APPLY)
 
