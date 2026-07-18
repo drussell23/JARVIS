@@ -179,6 +179,36 @@ def north_star_context(repo_root: "Optional[str]" = None) -> str:
         return ""
 
 
+def a_level_criteria(repo_root: "Optional[str]" = None) -> "Tuple[Tuple[str, str], ...]":
+    """STRUCTURED extraction of the PRD §6 A-level criteria table:
+    ``((dimension, criterion), ...)`` rows. The Roadmap Synthesizer pairs these
+    with the git frontier to synthesize gap-closing steps — same deterministic
+    file read + section scan as :func:`north_star_context` (no RAG). Empty tuple
+    when the doc/section is absent (fail-soft). NEVER raises."""
+    try:
+        root = Path(repo_root or os.environ.get("JARVIS_REPO_ROOT", "."))
+        try:
+            text = _prd_path(root).read_text(errors="replace")
+        except OSError:
+            return ()
+        section = _section(text, r"^## 6\. Target State", max_lines=40)
+        rows = []
+        for ln in section.splitlines():
+            ln = ln.strip()
+            if not ln.startswith("|"):
+                continue
+            cells = [c.strip() for c in ln.strip("|").split("|")]
+            if len(cells) < 2 or not cells[0] or not cells[1]:
+                continue
+            # Skip the header + separator rows.
+            if cells[0].lower() in ("dimension",) or set(cells[0]) <= {"-", " ", ":"}:
+                continue
+            rows.append((cells[0], cells[1]))
+        return tuple(rows)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
 def _reset_cache_for_tests() -> None:
     """Test helper. NEVER raises."""
     try:

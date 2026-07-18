@@ -318,6 +318,66 @@ class IntakeLayerService:
             logger.debug("[IntakeLayer] dream engine resolution faulted", exc_info=True)
         return None
 
+    def _start_epistemic_planner(self, router: Any) -> None:
+        """Autonomous Epistemic Planning (Part C, 2026-07-18): spawn the bounded
+        periodic planning loop. Each cycle calls
+        ``epistemic_planner.plan_and_route_once(router)`` — deterministic gap
+        synthesis (frontier × PRD §6) fed through the EXISTING conception
+        bridge, so steps compete on EV and land in intake or incubation.
+
+        §33.1: master ``JARVIS_EPISTEMIC_PLANNER_ENABLED`` default FALSE — when
+        off, NO task is spawned (byte-identical boot). Interval
+        ``JARVIS_EPISTEMIC_PLANNER_INTERVAL_S`` (default 1800s, floor 300).
+        Emitted envelopes flow through ``router.ingest`` → the same governor /
+        dedup / priority lanes as every sensor (no bypass). Fail-soft: any
+        wiring or cycle fault logs and never breaks intake. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.epistemic_planner import (
+                epistemic_planner_enabled,
+                plan_and_route_once,
+            )
+            if not epistemic_planner_enabled():
+                logger.info(
+                    "[IntakeLayer] Epistemic planner master off — autonomous "
+                    "sub-roadmap synthesis dormant (§33.1 soak-gate arming)",
+                )
+                return
+            try:
+                _interval = max(300.0, float(os.environ.get(
+                    "JARVIS_EPISTEMIC_PLANNER_INTERVAL_S", "1800",
+                )))
+            except (TypeError, ValueError):
+                _interval = 1800.0
+
+            async def _planner_loop() -> None:
+                while True:
+                    try:
+                        n = await plan_and_route_once(router)
+                        if n:
+                            logger.info(
+                                "[IntakeLayer] Epistemic planner cycle: %d "
+                                "sub-roadmap step(s) submitted", n,
+                            )
+                    except Exception:  # noqa: BLE001 — cycle fault ≠ loop death
+                        logger.debug(
+                            "[IntakeLayer] epistemic planner cycle degraded",
+                            exc_info=True,
+                        )
+                    await asyncio.sleep(_interval)
+
+            self._epistemic_planner_task = asyncio.create_task(
+                _planner_loop(), name="epistemic-planner",
+            )
+            logger.info(
+                "[IntakeLayer] Epistemic planner ARMED: gap synthesis every "
+                "%.0fs -> conception bridge (EV-scored route/incubate)",
+                _interval,
+            )
+        except Exception:  # noqa: BLE001 — wiring is fail-soft by contract
+            logger.debug(
+                "[IntakeLayer] epistemic planner wiring skipped", exc_info=True,
+            )
+
     def _start_conception_bridge(self, router: Any) -> None:
         """Gap 3 — register the conception proposal bridge as a DreamEngine
         blueprint observer, so ranked blueprints route themselves into the
@@ -1277,6 +1337,14 @@ class IntakeLayerService:
         # ``auto_proposed`` envelopes. Event-driven (DreamEngine observer),
         # master-off by default. Composition only — the bridge owns no queue.
         self._start_conception_bridge(router)
+
+        # Autonomous Epistemic Planning (Part C, 2026-07-18) — the planner
+        # periodically synthesizes gap-closing sub-roadmap blueprints
+        # (frontier × PRD §6 A-level criteria) and feeds them through the SAME
+        # conception bridge (EV-scored: route or incubate). §33.1 master
+        # JARVIS_EPISTEMIC_PLANNER_ENABLED default FALSE — inert until the
+        # soak-gate arming; composition only, owns no queue/state.
+        self._start_epistemic_planner(router)
 
         # A1-T2 — event-driven router-ready valve. The router is now attached
         # (self._gls._intake_router set above) AND its dispatch loop is live.
