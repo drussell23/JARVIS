@@ -468,6 +468,66 @@ def _entitlement_probe_enabled() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+async def _probe_request_headers(
+    *, api_key: str, op_tag: str,
+) -> "Optional[Dict[str, str]]":
+    """Auth headers for a probe POST to ``/v1/chat/completions``.
+
+    This endpoint is the Aegis FORWARDING path, which requires a per-call lease
+    (unlike the catalog's ``/v1/models`` passthrough that ``DwCatalogClient``
+    hits with session auth alone). Under Aegis the caller's direct ``api_key`` is
+    scrubbed server-side (=""), so a raw ``Bearer {api_key}`` is empty and the
+    guard ``if not api_key`` used to make BOTH probes silently INERT on the
+    production transport — the catalog got mapped but entitlement/reasoning never
+    did. This composes the SAME session-vault + per-call-lease flow
+    ``complete_sync`` uses (aegis_provider_bridge), so the probes actually run
+    under Aegis. Non-Aegis → raw Bearer. Returns None when no usable auth exists
+    (the caller then skips — never emits an unauthenticated/lease-less probe that
+    would 401 and pollute the signal). NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.aegis import client as _aegis_client
+        if _aegis_client.is_enabled():
+            from backend.core.ouroboros.governance.aegis_provider_bridge import (
+                acquire_call_lease as _acquire_lease,
+                dw_session_auth_header as _session_auth,
+                merge_lease_into_session_headers as _merge_lease,
+            )
+            headers = await _session_auth()
+            if not headers.get("Authorization"):
+                return None
+            headers["Content-Type"] = "application/json"
+            try:
+                lease = await _acquire_lease(
+                    op_id=f"dw-probe:{op_tag}", route="standard",
+                    estimated_cost_usd=0.0002,
+                )
+            except Exception:  # noqa: BLE001 — lease infra hiccup → skip, don't 401
+                return None
+            return _merge_lease(headers, lease)
+    except Exception:  # noqa: BLE001
+        pass
+    if api_key:
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+    return None
+
+
+def _probe_auth_available(api_key: str) -> bool:
+    """True iff SOME probe auth is obtainable — a direct key, or Aegis. Lets the
+    probe guards drop the ``not api_key`` short-circuit that made them inert
+    under Aegis (where the direct key is intentionally empty)."""
+    if api_key:
+        return True
+    try:
+        from backend.core.ouroboros.aegis import client as _aegis_client
+        return bool(_aegis_client.is_enabled())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _envf_probe(name: str, default: float) -> float:
     try:
         raw = (os.environ.get(name, "") or "").strip()
@@ -507,7 +567,7 @@ async def probe_rt_entitlement(
     """
     denied: List[str] = []
     cleared: List[str] = []
-    if not _entitlement_probe_enabled() or not model_ids or not api_key:
+    if not _entitlement_probe_enabled() or not model_ids or not _probe_auth_available(api_key):
         return denied, cleared
 
     timeout_s = _envf_probe("JARVIS_DW_ENTITLEMENT_PROBE_TIMEOUT_S", 20.0)
@@ -525,6 +585,11 @@ async def probe_rt_entitlement(
     async def _probe(model_id: str) -> None:
         if not model_id:
             return
+        headers = await _probe_request_headers(
+            api_key=api_key, op_tag=f"entitlement:{model_id}",
+        )
+        if headers is None:
+            return  # no usable auth (e.g. Aegis lease unavailable) → skip
         payload = {
             "model": model_id,
             "messages": [{"role": "user", "content": "ok"}],
@@ -533,13 +598,7 @@ async def probe_rt_entitlement(
         try:
             async with sem:
                 async with session.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=timeout_s,
+                    url, headers=headers, json=payload, timeout=timeout_s,
                 ) as resp:
                     status = int(resp.status)
                     await resp.read()  # drain so the connection is reusable
@@ -613,7 +672,11 @@ async def probe_reasoning_compliance(
     """
     floored: List[str] = []
     clean: List[str] = []
-    if not _reasoning_compliance_probe_enabled() or not model_ids or not api_key:
+    if (
+        not _reasoning_compliance_probe_enabled()
+        or not model_ids
+        or not _probe_auth_available(api_key)
+    ):
         return floored, clean
     try:
         from backend.core.ouroboros.governance.dw_reasoning_profile import (
@@ -650,6 +713,11 @@ async def probe_reasoning_compliance(
     async def _probe(model_id: str) -> None:
         if not model_id:
             return
+        headers = await _probe_request_headers(
+            api_key=api_key, op_tag=f"reasoning:{model_id}",
+        )
+        if headers is None:
+            return  # no usable auth → skip
         # DRY: the exact wire schema the provider composes; carry only the
         # wire-valid knob (extra_body/SDK-only keys would 400 on a raw POST).
         _params = _reasoning_request_params(effort="none", model=model_id)
@@ -663,13 +731,7 @@ async def probe_reasoning_compliance(
         try:
             async with sem:
                 async with session.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=timeout_s,
+                    url, headers=headers, json=payload, timeout=timeout_s,
                 ) as resp:
                     status = int(resp.status)
                     body = await resp.text()
