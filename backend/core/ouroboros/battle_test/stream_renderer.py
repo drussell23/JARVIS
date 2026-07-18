@@ -45,12 +45,59 @@ from typing import Any, Optional
 logger = logging.getLogger("Ouroboros.StreamRenderer")
 
 _STREAMING_ENV_VAR = "JARVIS_UI_STREAMING_ENABLED"
+_FLOW_MODE_ENV_VAR = "JARVIS_UI_STREAMING_FLOW_MODE_ENABLED"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 def streaming_enabled() -> bool:
     """Env gate read. Default: ON (``1``). Flip to ``0`` for batch mode."""
     return os.environ.get(_STREAMING_ENV_VAR, "1").strip().lower() in _TRUTHY
+
+
+def flow_mode_enabled() -> bool:
+    """§41.3 #27 — progressive-streaming flow mode (unwrap the Live cage).
+
+    When ON, completed markdown blocks are committed ABOVE the Live region
+    into terminal scrollback as they stream (CC-style progressive flow);
+    the Live cage holds only the current in-progress block. When OFF
+    (default, §33.1), the legacy behavior is byte-identical: the whole
+    stream lives inside the tail-truncated Live region and long
+    generations scroll out of the cage without accumulating in scrollback.
+    """
+    return os.environ.get(_FLOW_MODE_ENV_VAR, "0").strip().lower() in _TRUTHY
+
+
+def find_commit_boundary(text: str, start: int = 0) -> int:
+    """Return the index up to which ``text`` can be safely committed to
+    scrollback: just past the LAST complete blank line that sits OUTSIDE
+    a fenced code block, at or after ``start``. Returns ``start`` when no
+    safe boundary exists yet.
+
+    Contract: ``start`` must be a previous return value of this function
+    (or 0) — boundaries are only ever emitted at closed-fence points, so
+    scanning ``text[start:]`` with fence-closed initial state is always
+    correct and the scan cost is O(new content), not O(stream length).
+
+    Pure, deterministic, NEVER raises. A trailing line without ``\\n`` is
+    still in flight and never a boundary; blank lines inside an open
+    ```` ``` ````/``~~~`` fence never split the block (a partial fenced
+    code block must stay whole in the Live region until it seals).
+    """
+    try:
+        fence_open = False
+        boundary = start
+        pos = start
+        for line in text[start:].splitlines(keepends=True):
+            end = pos + len(line)
+            stripped = line.strip()
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                fence_open = not fence_open
+            elif not fence_open and stripped == "" and line.endswith("\n"):
+                boundary = end
+            pos = end
+        return boundary
+    except Exception:  # noqa: BLE001 — presentation layer never raises
+        return start
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +179,11 @@ class StreamRenderer:
         self._first_token_mono: Optional[float] = None
         self._token_count: int = 0
         self._dropped_count: int = 0
+        # §41.3 #27 flow mode — offset of the buffer prefix already
+        # committed to scrollback above the Live region. Snapshotted from
+        # the env gate at start() so one op never splits across modes.
+        self._flow_mode: bool = False
+        self._committed_offset: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -165,6 +217,8 @@ class StreamRenderer:
         self._dropped_count = 0
         self._first_token_mono = None
         self._start_mono = time.monotonic()
+        self._flow_mode = flow_mode_enabled()
+        self._committed_offset = 0
 
         # Obtain the running loop. The queue MUST be bound to the same
         # loop that will run the consumer, else put_nowait raises.
@@ -278,11 +332,22 @@ class StreamRenderer:
         if self._live is not None:
             try:
                 from rich.markdown import Markdown
-                # Final render: tail slice only. Rich Live's viewport shows
-                # at most the visible terminal area, so re-parsing the full
-                # buffer would pay O(N) cost to render content that never
-                # reaches pixels.
-                self._live.update(Markdown(self._buffer[-_RENDER_TAIL_CHARS:]))  # type: ignore[attr-defined]
+                if self._flow_mode:
+                    # §41.3 #27 — final commit: land the uncommitted
+                    # remainder in scrollback and clear the cage, so the
+                    # ENTIRE stream persists in terminal history with no
+                    # tail truncation.
+                    remainder = self._buffer[self._committed_offset:]
+                    if remainder.strip():
+                        self._live.console.print(Markdown(remainder))  # type: ignore[attr-defined]
+                    self._committed_offset = len(self._buffer)
+                    self._live.update(Markdown(""))  # type: ignore[attr-defined]
+                else:
+                    # Final render: tail slice only. Rich Live's viewport
+                    # shows at most the visible terminal area, so re-parsing
+                    # the full buffer would pay O(N) cost to render content
+                    # that never reaches pixels.
+                    self._live.update(Markdown(self._buffer[-_RENDER_TAIL_CHARS:]))  # type: ignore[attr-defined]
                 self._live.stop()  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
                 logger.debug(
@@ -309,6 +374,8 @@ class StreamRenderer:
         # Clear state so the renderer instance is reusable across ops.
         self._queue = None
         self._buffer = ""
+        self._committed_offset = 0
+        self._flow_mode = False
         self._op_id = ""
         self._provider = ""
         self._first_token_mono = None
@@ -474,7 +541,24 @@ class StreamRenderer:
             return
         try:
             from rich.markdown import Markdown
-            self._live.update(Markdown(self._buffer[-_RENDER_TAIL_CHARS:]))  # type: ignore[attr-defined]
+            if self._flow_mode:
+                # §41.3 #27 — commit completed blocks ABOVE the Live region
+                # into scrollback (Rich routes console.print above an active
+                # Live display), then render only the in-progress tail in
+                # the cage. Long generations accumulate in scrollback
+                # instead of scrolling out of the tail-truncated widget.
+                boundary = find_commit_boundary(
+                    self._buffer, self._committed_offset,
+                )
+                if boundary > self._committed_offset:
+                    chunk = self._buffer[self._committed_offset:boundary]
+                    if chunk.strip():
+                        self._live.console.print(Markdown(chunk))  # type: ignore[attr-defined]
+                    self._committed_offset = boundary
+                tail = self._buffer[self._committed_offset:]
+                self._live.update(Markdown(tail[-_RENDER_TAIL_CHARS:]))  # type: ignore[attr-defined]
+            else:
+                self._live.update(Markdown(self._buffer[-_RENDER_TAIL_CHARS:]))  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
             logger.debug(
                 "[StreamRender] Live.update failed", exc_info=True,
