@@ -203,6 +203,53 @@ def test_probe_never_raises_on_session_fault(fresh_reasoning_profile):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Aegis edge case — the probes RUN when the direct api_key is scrubbed
+# (the wired-but-inert-under-production condition this fixes)
+# ---------------------------------------------------------------------------
+
+
+def test_probe_runs_under_aegis_with_empty_direct_key(fresh_reasoning_profile, monkeypatch):
+    # Under Aegis the caller's direct api_key is "" (scrubbed server-side). The
+    # probe must STILL run, authenticating via the Aegis session vault + lease —
+    # not silently no-op on the `not api_key` guard.
+    import backend.core.ouroboros.governance.dw_discovery_runner as DR
+
+    async def _fake_headers(*, api_key, op_tag):
+        # Simulate the Aegis path resolving real auth despite empty direct key.
+        return {"Authorization": "Bearer AEGIS_INJECTED", "X-JARVIS-Lease": "lease-tok"}
+    monkeypatch.setattr(DR, "_probe_request_headers", _fake_headers)
+    monkeypatch.setattr(DR, "_probe_auth_available", lambda api_key: True)
+
+    session = _FakeSession({"inkling": (400, "reasoning cannot be disabled")})
+    floored, _ = _run(DR.probe_reasoning_compliance(
+        session=session, base_url="http://dw", api_key="",   # <-- scrubbed
+        model_ids=["inkling"],
+    ))
+    assert floored == ["inkling"]                       # ran despite empty key
+    assert session.calls[0]  # a probe was actually issued
+    assert fresh_reasoning_profile.learned_min_effort("inkling") is not None
+
+
+def test_probe_skips_when_aegis_lease_unavailable(fresh_reasoning_profile, monkeypatch):
+    # If auth can't be assembled (e.g. Aegis lease infra hiccup), the probe
+    # SKIPS rather than firing a doomed lease-less request that 401s and
+    # pollutes the signal.
+    import backend.core.ouroboros.governance.dw_discovery_runner as DR
+
+    async def _no_headers(*, api_key, op_tag):
+        return None
+    monkeypatch.setattr(DR, "_probe_request_headers", _no_headers)
+    monkeypatch.setattr(DR, "_probe_auth_available", lambda api_key: True)
+
+    session = _FakeSession({"m": (400, "reasoning cannot be disabled")})
+    floored, clean = _run(DR.probe_reasoning_compliance(
+        session=session, base_url="http://dw", api_key="", model_ids=["m"],
+    ))
+    assert session.calls == []                          # nothing issued
+    assert floored == [] and clean == []
+
+
 def test_unentitled_model_yields_cached_403_state(monkeypatch):
     monkeypatch.setenv("JARVIS_DW_ENTITLEMENT_PROBE_ENABLED", "true")
     prof = TP.get_transport_profile()
