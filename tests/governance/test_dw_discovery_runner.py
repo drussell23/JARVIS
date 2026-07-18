@@ -262,10 +262,16 @@ async def test_run_discovery_registers_newly_quarantined(
 ) -> None:
     """Models with both param_count_b AND pricing missing → ambiguous
     → registered as quarantined in the ledger."""
+    # NOTE (2026-07-18): the earlier fixture used ``moonshotai/Kimi-K2.6`` as an
+    # "ambiguous" example, but Slice 82's curated ``_KNOWN_MODEL_PARAMS_B`` now
+    # resolves ``kimi-k2`` → 1000B (Kimi K2 genuinely is a ~1T MoE), so it is
+    # correctly NON-ambiguous and NOT quarantined. Use ids that carry NO
+    # parseable size token AND are not in the curated known-params list.
     body = {"data": [
-        {"id": "moonshotai/Kimi-K2.6"},                # ambiguous
+        {"id": "acme/mystery-model"},                  # ambiguous (unknown vendor)
         {"id": "vendor/no-suffix-id"},                 # ambiguous
         {"id": "Qwen/Qwen3.5-397B-A17B"},              # has params
+        {"id": "moonshotai/Kimi-K2.6"},                # curated → NOT ambiguous
     ]}
     session = _mock_session(body)
     result = await run_discovery(
@@ -275,13 +281,14 @@ async def test_run_discovery_registers_newly_quarantined(
         ledger=isolated_ledger,
         cache_path=isolated_cache,
     )
-    assert "moonshotai/Kimi-K2.6" in result.newly_quarantined
+    assert "acme/mystery-model" in result.newly_quarantined
     assert "vendor/no-suffix-id" in result.newly_quarantined
     # Ledger now knows about them
-    assert isolated_ledger.is_quarantined("moonshotai/Kimi-K2.6") is True
+    assert isolated_ledger.is_quarantined("acme/mystery-model") is True
     assert isolated_ledger.is_quarantined("vendor/no-suffix-id") is True
-    # Non-ambiguous model NOT in newly_quarantined
+    # Models with a resolvable param count (parsed OR curated) are NOT ambiguous.
     assert "Qwen/Qwen3.5-397B-A17B" not in result.newly_quarantined
+    assert "moonshotai/Kimi-K2.6" not in result.newly_quarantined
 
 
 # ---------------------------------------------------------------------------
