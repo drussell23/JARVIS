@@ -95,7 +95,13 @@ def _isolate() -> Iterator[None]:
 
 
 class TestRegistrySafeWireHelpers:
-    def test_register_master_off_is_noop(self):
+    def test_register_master_off_is_noop(self, monkeypatch):
+        # Registration is inert only when NEITHER consumer wants the registry:
+        # the reaper (master, §33.1 default-off) AND FSM suspend-checkpointing
+        # (default-ON, disabled here to isolate the pure no-op). The decoupled
+        # activation — checkpoint-on populates the registry even with master off
+        # — is proven in test_checkpoint_resume_registration_activation.py.
+        monkeypatch.setenv("JARVIS_FSM_CHECKPOINT_ENABLED", "false")
         assert register_op_safely("op-x") is False
         assert get_default_registry().size() == 0
 
@@ -112,13 +118,12 @@ class TestRegistrySafeWireHelpers:
         assert rec is not None
         assert ("provider", "claude") in rec.metadata
 
-    def test_unregister_master_off_is_noop(self):
-        # Populate via the underlying registry directly.
+    def test_unregister_master_off_is_noop(self, monkeypatch):
+        # Both consumers off → the safe wrapper short-circuits, BUT the entry is
+        # still there because the bare register WAS called directly.
+        monkeypatch.setenv("JARVIS_FSM_CHECKPOINT_ENABLED", "false")
         r = get_default_registry()
         r.register("op-x")
-        # Master OFF — the safe wrapper short-circuits, BUT the
-        # entry is still there because the bare register WAS
-        # called.
         assert unregister_op_safely("op-x") is False
         assert r.size() == 1
 
@@ -216,10 +221,11 @@ class TestWiringPresence:
             )
             assert callable(getattr(gls_mod, name))
 
-    def test_module_helpers_are_master_off_byte_identical(self):
-        """The helpers MUST return False under master-OFF
-        without touching the registry — the live loop's hot
-        path must not depend on the registry being available."""
+    def test_module_helpers_are_master_off_byte_identical(self, monkeypatch):
+        """The helpers MUST return False when NEITHER consumer wants the registry
+        (reaper master-off AND FSM checkpointing off) without touching it — the
+        live loop's hot path must not depend on the registry being available."""
+        monkeypatch.setenv("JARVIS_FSM_CHECKPOINT_ENABLED", "false")
         assert (
             gls_mod._register_op_in_flight_safely("op-x") is False
         )

@@ -88,6 +88,41 @@ def master_enabled() -> bool:
     return os.environ.get(_MASTER_FLAG, "false").lower() == "true"
 
 
+# The registry has TWO independent consumers:
+#   * the ConvergenceReaper (gated by master_enabled() / §33.1 default-FALSE — it
+#     reads the registry as authoritative only when explicitly graduated), and
+#   * FSM suspend-checkpointing (fsm_checkpoint.capture_inflight), which reads
+#     this registry as its DATA SOURCE to serialize in-flight ops at a graceful
+#     stop, and is default-ON via JARVIS_FSM_CHECKPOINT_ENABLED.
+#
+# Coupling registry POPULATION to the reaper's flag transitively disabled the
+# default-ON suspend feature: bt-2026-07-17-234137 hit session exhaustion with 7
+# ops mid-GENERATE, but every register_op_safely() had no-op'd, so
+# capture_inflight() read an EMPTY registry and checkpointed 0 ops -- nothing to
+# resume next boot. Population must therefore be active whenever EITHER consumer
+# needs it. The reaper still independently self-gates on reaper_enabled() before
+# any action, so populating the registry never makes it load-bearing.
+_FSM_CHECKPOINT_FLAG = "JARVIS_FSM_CHECKPOINT_ENABLED"
+
+
+def _checkpoint_wants_registry() -> bool:
+    """True iff FSM suspend-checkpointing (default-ON) needs the registry
+    populated so ``capture_inflight`` can serialize in-flight ops at a graceful
+    stop. NEVER raises."""
+    return os.environ.get(_FSM_CHECKPOINT_FLAG, "true").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def registration_active() -> bool:
+    """Register/unregister/update ops when EITHER consumer needs the registry —
+    the reaper (``master_enabled``) OR FSM suspend-checkpointing
+    (``_checkpoint_wants_registry``). Decouples population from the reaper's
+    advisory-by-default flag so the default-ON suspend feature is actually fed.
+    """
+    return master_enabled() or _checkpoint_wants_registry()
+
+
 # ---------------------------------------------------------------------------
 # Phase enum (descriptive — not authoritative)
 # ---------------------------------------------------------------------------
@@ -690,7 +725,7 @@ def register_op_safely(
     ``GovernedLoopService`` — the loop's hot path stays
     one-liner-readable.
     """
-    if not master_enabled():
+    if not registration_active():
         return False
     try:
         result = get_default_registry().register(
@@ -720,7 +755,7 @@ def unregister_op_safely(op_id: str) -> bool:
     Drop-in for the four ``_active_ops.discard`` sites in
     ``GovernedLoopService``.
     """
-    if not master_enabled():
+    if not registration_active():
         return False
     try:
         return get_default_registry().unregister(op_id)
@@ -739,7 +774,7 @@ def update_phase_safely(op_id: str, *, phase_name: str) -> bool:
     Master-FALSE → silent no-op. Master-ON → composes default
     registry. NEVER raises. Returns ``True`` if the op was
     registered (and the phase swapped)."""
-    if not master_enabled():
+    if not registration_active():
         return False
     try:
         return get_default_registry().update_phase(
