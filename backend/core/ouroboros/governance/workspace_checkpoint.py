@@ -69,6 +69,62 @@ _MAX_CHECKPOINTS = _env_int("JARVIS_MAX_CHECKPOINTS", 20)
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
+# ---------------------------------------------------------------------------
+# Synchronous stash helpers (2026-07-18) — the SYNC siblings of the async
+# WorkspaceCheckpointManager, for the sync signal-handler suspend path
+# (fsm_checkpoint.capture_inflight) and the cross-reboot restore path (which
+# applies a RAW SHA from the FSM payload — the async manager's restore_checkpoint
+# only knows in-memory checkpoint_ids and cannot survive a reboot). ALL git-stash
+# version-control logic lives here in ONE module (no VC logic in fsm_checkpoint).
+# ---------------------------------------------------------------------------
+
+
+def create_stash_ref(
+    project_root: "os.PathLike | str", *, timeout_s: Optional[float] = None,
+) -> Optional[str]:
+    """``git stash create -u`` — a NON-DESTRUCTIVE snapshot of the dirty working
+    tree (index + untracked). Returns the raw stash-commit SHA, or None when the
+    tree is CLEAN (nothing to snapshot) or git fails/times out. The delta stays
+    in the working tree (create, not push), so this only SNAPSHOTS — it never
+    reverts. NEVER raises."""
+    import subprocess  # noqa: PLC0415
+    to = timeout_s if timeout_s is not None else _env_float("JARVIS_CHECKPOINT_TIMEOUT_S", 8.0)
+    try:
+        proc = subprocess.run(
+            ["git", "stash", "create", "-u"],
+            cwd=str(project_root), capture_output=True, text=True, timeout=to,
+        )
+        if proc.returncode != 0:
+            return None
+        sha = (proc.stdout or "").strip()
+        return sha if sha and _SHA_RE.fullmatch(sha) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def apply_stash_ref(
+    project_root: "os.PathLike | str", stash_ref: str,
+    *, timeout_s: Optional[float] = None,
+) -> bool:
+    """``git stash apply <sha>`` — re-apply a stash-create snapshot's delta onto
+    the working tree by RAW SHA (survives a reboot; no in-memory stash list
+    needed, per the module docstring). Returns True on a clean apply. NEVER
+    raises. A conflict / already-applied delta returns False (the caller treats
+    that as fail-soft — the op resumes regardless)."""
+    if not stash_ref or not _SHA_RE.fullmatch(str(stash_ref)):
+        return False
+    import subprocess  # noqa: PLC0415
+    to = timeout_s if timeout_s is not None else _env_float("JARVIS_CHECKPOINT_TIMEOUT_S", 8.0)
+    try:
+        proc = subprocess.run(
+            ["git", "stash", "apply", str(stash_ref)],
+            cwd=str(project_root), capture_output=True, text=True, timeout=to,
+        )
+        return proc.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @dataclass
 class Checkpoint:
     checkpoint_id: str
