@@ -292,13 +292,90 @@ class ThresholdAutoTuner:
             return self.threshold
 
 
+_LAG_DEGRADED = {"active": False}
+
+
+def loop_lag_degraded() -> bool:
+    """Consumed by the telemetry ring to throttle verbosity while the
+    event loop is congested. NEVER raises."""
+    return _LAG_DEGRADED["active"]
+
+
+def _lag_threshold_ms() -> float:
+    try:
+        return max(10.0, min(1000.0, float(os.environ.get(
+            "JARVIS_LOOP_LAG_THRESHOLD_MS", "50",
+        ))))
+    except (TypeError, ValueError):
+        return 50.0
+
+
+class LoopLagWatchdog:
+    """Measures event-loop scheduling jitter and routes a spike as a
+    DEGRADATION identical to a thermal spike (mandate 3 — DRY: the
+    SAME degradation-state discipline the ThermalGovernor uses). On a
+    lag > threshold the telemetry ring throttles its verbosity to
+    protect primary terminal interaction; a settled loop restores.
+
+    ``lag_source`` is injected (production: an awaited call_soon round-
+    trip); ``publish`` mirrors the thermal publisher onto the attach
+    pub/sub. Reads ONLY monotonic time — watchdog-isolation invariant.
+    """
+
+    def __init__(
+        self,
+        *,
+        lag_source: Optional[Callable[[], float]] = None,
+        publish: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self._lag = lag_source
+        self._publish = publish or (lambda _s: None)
+        self.state = "nominal"
+        self.stats: Dict[str, int] = {"degradations": 0, "restorations": 0}
+
+    def observe_lag_ms(self, lag_ms: float) -> None:
+        """One jitter sample in. Applies/lifts loop-lag degradation
+        through the SAME state discipline as thermal. NEVER raises."""
+        try:
+            hot = float(lag_ms) > _lag_threshold_ms()
+            if hot and not _LAG_DEGRADED["active"]:
+                _LAG_DEGRADED["active"] = True
+                self.state = "lag_degraded"
+                self.stats["degradations"] += 1
+                logger.warning(
+                    "[SovereignGovernor] LOOP LAG %.1fms > %.0fms — "
+                    "telemetry verbosity throttled",
+                    lag_ms, _lag_threshold_ms(),
+                )
+                self._safe_publish("lag_degraded")
+            elif not hot and _LAG_DEGRADED["active"]:
+                _LAG_DEGRADED["active"] = False
+                self.state = "nominal"
+                self.stats["restorations"] += 1
+                logger.info(
+                    "[SovereignGovernor] loop lag settled (%.1fms) — "
+                    "telemetry restored", lag_ms,
+                )
+                self._safe_publish("nominal")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _safe_publish(self, name: str) -> None:
+        try:
+            self._publish(name)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 __all__ = [
     "THERMAL_CRITICAL",
     "THERMAL_FAIR",
     "THERMAL_NOMINAL",
     "THERMAL_SERIOUS",
+    "LoopLagWatchdog",
     "ThermalGovernor",
     "ThresholdAutoTuner",
+    "loop_lag_degraded",
     "evolution_permitted",
     "threshold_state_path",
     "tuned_threshold",
