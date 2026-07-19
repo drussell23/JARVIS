@@ -18,6 +18,7 @@ dependencies = []
 # `python3 scripts/ouroboros_battle_test.py` resolve into the same bootstrap.
 ov = "backend.core.ouroboros.cli.ov:main"
 jarvis = "backend.core.ouroboros.cli.jarvis_thin:main"
+trinity = "backend.core.ouroboros.cli.trinity_launcher:main"
 
 [tool.setuptools.packages.find]
 # Scope discovery to the two import roots the CLI needs so setuptools does not
