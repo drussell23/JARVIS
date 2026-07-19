@@ -73,6 +73,7 @@ SOURCE_ASK_HUMAN_Q = "ask_human_q"
 SOURCE_ASK_HUMAN_A = "ask_human_a"
 SOURCE_POSTMORTEM = "postmortem"
 SOURCE_VOICE = "voice"
+SOURCE_BARGE_IN = "barge_in"
 
 _ALLOWED_SOURCES = frozenset({
     SOURCE_TUI_USER,
@@ -80,6 +81,7 @@ _ALLOWED_SOURCES = frozenset({
     SOURCE_ASK_HUMAN_A,
     SOURCE_POSTMORTEM,
     SOURCE_VOICE,
+    SOURCE_BARGE_IN,
 })
 
 # Source-category groupings used by subheader rendering. Each group gets
@@ -90,7 +92,64 @@ _SUBHEADER_ORDER: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("### TUI user intent", (SOURCE_TUI_USER, SOURCE_VOICE)),
     ("### Clarifications (recent)", (SOURCE_ASK_HUMAN_Q, SOURCE_ASK_HUMAN_A)),
     ("### Prior op closure (postmortem)", (SOURCE_POSTMORTEM,)),
+    ("### Delivery interruptions", (SOURCE_BARGE_IN,)),
 )
+
+def record_barge_in(
+    full_text: str,
+    delivered_chars: int,
+    cause: str = "barge_in",
+    *,
+    op_id: str = "",
+) -> bool:
+    """Semantic Interruption Awareness (operator-authorized 2026-07-18):
+    admit ONE structured barge-in marker so the model structurally
+    knows its spoken narration was CUT OFF — otherwise the next
+    GENERATE hallucinates having delivered the full payload.
+
+    The marker is a discrete system token carrying the approximate
+    truncation point and the undelivered tail (bounded), rendered into
+    the CONTEXT_EXPANSION prompt under ``### Delivery interruptions``.
+    Flows through the SAME sanitize → cap → ring path as every other
+    turn (Tier -1 sanitizer included — the undelivered tail is model-
+    authored text re-entering a prompt). Returns True iff recorded.
+    NEVER raises.
+    """
+    try:
+        if not _is_enabled():
+            return False
+        full_text = str(full_text or "")
+        if not full_text.strip():
+            return False
+        n = len(full_text)
+        delivered = max(0, min(n, int(delivered_chars)))
+        pct = int(round(100.0 * delivered / n)) if n else 0
+        tail = full_text[delivered:][:160]
+        marker = (
+            "[SYSTEM: OPERATOR_BARGE_IN_DETECTED — spoken narration "
+            f"truncated at ~{pct}% ({delivered}/{n} chars, "
+            f"cause={str(cause or 'barge_in')[:32]}). UNDELIVERED tail: "
+            f"“{tail}”. Do not assume the operator heard the "
+            "full message.]"
+        )
+        bridge = get_default_bridge()
+        # Closed role vocabulary is ("user", "assistant") — the marker
+        # describes the ASSISTANT's own truncated delivery; the
+        # [SYSTEM: …] prefix carries the semantic class.
+        bridge.record_turn(
+            role="assistant",
+            text=marker,
+            source=SOURCE_BARGE_IN,
+            op_id=str(op_id or ""),
+        )
+        return True
+    except Exception:  # pragma: no cover — defensive (NEVER raises)
+        logger.debug(
+            "[ConversationBridge] record_barge_in dropped by internal error",
+            exc_info=True,
+        )
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Env configuration

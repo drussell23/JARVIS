@@ -559,6 +559,101 @@ def _sample_pixel(
     return kind, inside / n, theta
 
 
+def _min_component_px() -> int:
+    try:
+        return max(0, int(os.environ.get(
+            "JARVIS_OV_CREST_MIN_COMPONENT_PX", "12",
+        )))
+    except (TypeError, ValueError):
+        return 12
+
+
+def _min_apex_row_px() -> int:
+    try:
+        return max(0, int(os.environ.get(
+            "JARVIS_OV_CREST_MIN_ROW_PX", "3",
+        )))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _prune_sparse_geometry(
+    pixels: "Dict[Tuple[int, int], Any]",
+) -> "Dict[Tuple[int, int], Any]":
+    """Geometry Polish (operator mandate 2026-07-18): two mathematical
+    density clips on the raster — no terminal overwrites, no per-glyph
+    hacks.
+
+    1. **Detached-component clip**: any 8-connected pixel cluster
+       smaller than ``JARVIS_OV_CREST_MIN_COMPONENT_PX`` is removed
+       (the largest component ALWAYS survives — the body can never
+       delete itself on a tiny terminal).
+    2. **Apex row-density clip**: walking inward from the top and
+       bottom edges, rows thinner than ``JARVIS_OV_CREST_MIN_ROW_PX``
+       are shed until the first dense row — the 1-pixel tail whisker
+       that read as floating debris. Interior thin rows are untouched
+       (gaps between coil arcs are design, not debris).
+
+    Pure; NEVER raises; returns the input on any fault.
+    """
+    try:
+        if not pixels:
+            return pixels
+        coords = set(pixels.keys())
+        # -- (1) connected components (8-neighbour) --
+        min_comp = _min_component_px()
+        seen: set = set()
+        components = []
+        for start in coords:
+            if start in seen:
+                continue
+            stack, comp = [start], set()
+            while stack:
+                p = stack.pop()
+                if p in seen:
+                    continue
+                seen.add(p)
+                comp.add(p)
+                x, y = p
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        q = (x + dx, y + dy)
+                        if q in coords and q not in seen:
+                            stack.append(q)
+            components.append(comp)
+        if components:
+            largest = max(components, key=len)
+            keep = set().union(*(
+                c for c in components
+                if c is largest or len(c) >= min_comp
+            ))
+        else:
+            keep = coords
+        # -- (2) apex row-density clip (edges inward only) --
+        min_row = _min_apex_row_px()
+        if min_row > 0 and keep:
+            rows_px: Dict[int, int] = {}
+            for (_x, y) in keep:
+                rows_px[y] = rows_px.get(y, 0) + 1
+            ys = sorted(rows_px)
+            shed: set = set()
+            for y in ys:                       # top edge inward
+                if rows_px[y] < min_row:
+                    shed.add(y)
+                else:
+                    break
+            for y in reversed(ys):             # bottom edge inward
+                if rows_px[y] < min_row:
+                    shed.add(y)
+                else:
+                    break
+            if len(shed) < len(ys):            # never shed the whole mark
+                keep = {p for p in keep if p[1] not in shed}
+        return {p: v for p, v in pixels.items() if p in keep}
+    except Exception:  # noqa: BLE001
+        return pixels
+
+
 @functools.lru_cache(maxsize=8)
 def _generate_pixels_cached(clamped_cols: int, rows: int) -> PixelFrame:
     geo = _Geometry.for_size(clamped_cols, rows)
@@ -583,6 +678,7 @@ def _generate_pixels_cached(clamped_cols: int, rows: int) -> PixelFrame:
             )
             pixels[(x, py)] = (rgb, delay)  # type: ignore[assignment]
             max_delay = max(max_delay, delay)
+    pixels = _prune_sparse_geometry(pixels)
     return PixelFrame(
         cols=clamped_cols, rows=rows, px_rows=px_rows,
         pixels=pixels, max_delay_s=max_delay,
@@ -616,7 +712,12 @@ def pixels_to_text(
         from rich.text import Text
         cutoff = float("inf") if elapsed is None else elapsed
         text = Text()
-        for cy in range(pf.rows):
+        # Trim rows emptied by the sparse-geometry clip (a leading
+        # blank line is dead space above the emblem, not margin).
+        occupied = [py // 2 for py in {p[1] for p in pf.pixels}]
+        cy_lo = min(occupied) if occupied else 0
+        cy_hi = max(occupied) if occupied else pf.rows - 1
+        for cy in range(cy_lo, cy_hi + 1):
             for x in range(pf.cols):
                 top = pf.pixels.get((x, cy * 2))
                 bot = pf.pixels.get((x, cy * 2 + 1))
@@ -642,7 +743,7 @@ def pixels_to_text(
                 else:
                     br, bg_, bb = bot[0]  # type: ignore[index]
                     text.append("▄", style=f"rgb({br},{bg_},{bb})")
-            if cy < pf.rows - 1:
+            if cy < cy_hi:
                 text.append("\n")
         return text
     except Exception:  # noqa: BLE001

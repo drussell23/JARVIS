@@ -143,8 +143,11 @@ def test_ceremony_prints_persistent_emblem_pin():
     # After the Live (transient) closes, the FULL crest prints into
     # scrollback BEFORE the cooled header.
     assert "PERSISTENT EMBLEM" in body
+    # rindex: the viewport guard (2026-07-18) adds an EARLIER static
+    # emblem+header pair for undersized terminals; the pin protects the
+    # NORMAL ceremony ordering (emblem into scrollback, THEN header).
     assert body.index("self._console.print(self._render_crest_text(") < \
-        body.index("self._print_cooled_header()")
+        body.rindex("self._print_cooled_header()")
 
 
 def test_conductor_renders_via_auto_dispatch_pin():

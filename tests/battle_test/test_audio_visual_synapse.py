@@ -164,7 +164,14 @@ class _FakeHandle:
 
 
 class TestAudioVisualSynapse:
-    async def test_wake_without_duplex_answers_unavailable(self):
+    async def test_wake_without_duplex_answers_unavailable(
+        self, sock_dir, monkeypatch,
+    ):
+        # Isolate from any LIVE supervisor socket on this machine — the
+        # broker path (v2) would otherwise genuinely acquire a lease.
+        monkeypatch.setenv(
+            "JARVIS_AUDIO_IPC_SOCKET", str(sock_dir / "absent.sock"),
+        )
         out: list = []
         syn = AudioVisualSynapse(out.append, handle_resolver=lambda: None)
         await syn.handle_cmd("wake")
