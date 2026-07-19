@@ -308,3 +308,121 @@ class TestBiometricEvolution:
         _sid, name, emb = enrolled
         assert emb.dtype == np.float32 and emb.size in (192, 512)
         assert name                                        # a real human name
+
+
+# ---------------------------------------------------------------------------
+# Production scorer — startup-race concurrency proof (2026-07-19)
+# ---------------------------------------------------------------------------
+
+
+class TestBiometricWarmupQueue:
+    def _scorer(self, load_delay_s, dim=192):
+        import asyncio as aio
+        from backend.core.ouroboros.governance.comms.duplex.biometric_scorer import (  # noqa: E501
+            XVectorScorer,
+        )
+        import time as _t
+        base = np.linspace(0.1, 1.0, dim).astype(np.float32)
+
+        def _slow_load():
+            _t.sleep(load_delay_s)      # blocking IN THE EXECUTOR only
+            return "encoder"
+
+        def _embed(_enc, window):
+            # deterministic: embedding == baseline → cosine 1.0
+            return base.copy()
+
+        return XVectorScorer(
+            load_fn=_slow_load,
+            embed_fn=_embed,
+            enrollment_loader=lambda: (1, "Derek J. Russell", base),
+        )
+
+    async def test_wake_200ms_before_load_completes_queued_not_lost(self):
+        """MANDATE 4 VERBATIM: chunk arrives 200ms before the encoder
+        finishes loading → safely queued (BIOMETRIC_WARMUP_WAIT), the
+        event loop stays unblocked, the backlog drains on READY, and
+        the queued chunk scores — zero data loss."""
+        from backend.core.ouroboros.governance.comms.duplex.biometric_scorer import (  # noqa: E501
+            STATE_LOADING,
+            STATE_READY,
+        )
+        scorer = self._scorer(load_delay_s=0.4)
+        await scorer.start_loading()
+        await asyncio.sleep(0.2)                       # 200ms into the load
+        assert scorer.state == STATE_LOADING           # still warming
+        window = np.ones(24000, dtype=np.float32)
+        heartbeat = {"ticks": 0}
+
+        async def _pulse():
+            for _ in range(20):
+                heartbeat["ticks"] += 1
+                await asyncio.sleep(0.02)
+
+        pulse = asyncio.get_running_loop().create_task(_pulse())
+        conf, is_owner = await scorer.verify(window)   # the racing wake
+        await pulse
+        assert scorer.state == STATE_READY
+        assert scorer.stats["queued_during_warmup"] == 1
+        assert scorer.stats["drained"] == 1            # zero loss
+        assert conf > 0.99 and is_owner is True        # scored correctly
+        # The main loop was NEVER blocked while we waited:
+        assert heartbeat["ticks"] >= 10
+        await scorer.stop()
+
+    async def test_ready_path_scores_inline_no_queue(self):
+        scorer = self._scorer(load_delay_s=0.0)
+        await scorer.start_loading()
+        for _ in range(50):
+            if scorer.state == "READY":
+                break
+            await asyncio.sleep(0.02)
+        conf, owner = await scorer.verify(np.ones(1000, dtype=np.float32))
+        assert conf > 0.99 and owner
+        assert scorer.stats["queued_during_warmup"] == 0
+        assert scorer.last_embedding is not None       # evolution seam fed
+        await scorer.stop()
+
+    async def test_permanent_load_failure_fails_closed(self):
+        from backend.core.ouroboros.governance.comms.duplex.biometric_scorer import (  # noqa: E501
+            STATE_FAILED,
+            XVectorScorer,
+        )
+
+        def _boom():
+            raise FileNotFoundError("no encoder")
+
+        scorer = XVectorScorer(load_fn=_boom, embed_fn=lambda e, w: None,
+                               enrollment_loader=lambda: None)
+        await scorer.start_loading()
+        for _ in range(50):
+            if scorer.state == STATE_FAILED:
+                break
+            await asyncio.sleep(0.02)
+        assert await scorer.verify(np.ones(100)) == (0.0, False)
+        await scorer.stop()
+
+    async def test_queue_overflow_drops_closed_never_blocks(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_BIOMETRIC_WARMUP_QUEUE", "1")
+        scorer = self._scorer(load_delay_s=0.5)
+        await scorer.start_loading()
+        w = np.ones(100, dtype=np.float32)
+        t1 = asyncio.get_running_loop().create_task(scorer.verify(w))
+        await asyncio.sleep(0.05)
+        t2 = asyncio.get_running_loop().create_task(scorer.verify(w))
+        r2 = await asyncio.wait_for(t2, timeout=1.0)
+        assert r2 == (0.0, False)                      # overflow fail-closed
+        r1 = await asyncio.wait_for(t1, timeout=2.0)
+        assert r1[0] > 0.99                            # first still served
+        assert scorer.stats["queue_overflow_dropped"] == 1
+        await scorer.stop()
+
+    def test_production_seams_pin(self):
+        src = (
+            _REPO / "backend/core/ouroboros/governance/comms/duplex/"
+            "biometric_scorer.py"
+        ).read_text()
+        assert "enc.eval()" in src                     # eval mode
+        assert "torch.no_grad()" in src                # 24/7 tape hygiene
+        assert "run_in_executor" in src                # never a sleep-wait
+        assert "time.sleep" not in src.replace("_t.sleep", "")
