@@ -3010,18 +3010,30 @@ _loaded_env_files = _load_environment_files()
 # =============================================================================
 def _detect_best_port(start: int, end: int) -> int:
     """
-    Find the first available port in range.
+    Find the first available port in range — resilient to a cold-boot
+    network stack (Phase 3, Resilient Startup mandate).
 
-    Uses socket binding test to verify availability.
+    Delegates to the bounded-retry ``resilient_detect_port`` which
+    distinguishes EADDRINUSE (advance) from EADDRNOTAVAIL/transient
+    (the loopback stack isn't up yet → bounded backoff retry), so a
+    supervisor launched by launchd at boot doesn't fall back to an
+    unverified port. Fail-soft to the legacy one-shot scan if the helper
+    can't be imported.
     """
-    for port in range(start, end + 1):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", port))
-                return port
-        except OSError:
-            continue
-    return start  # Fallback to start of range
+    try:
+        from backend.core.ouroboros.cli.port_binder import (
+            resilient_detect_port,
+        )
+        return resilient_detect_port(start, end)
+    except Exception:
+        for port in range(start, end + 1):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("127.0.0.1", port))
+                    return port
+            except OSError:
+                continue
+        return start  # Fallback to start of range
 
 def _discover_venv() -> Optional[Path]:
     """Discover virtual environment path."""

@@ -410,6 +410,85 @@ def check_subsystem_models() -> List[CheckResult]:
     return out
 
 
+def _mic_authorization() -> Optional[str]:
+    """Non-invasive macOS microphone TCC status WITHOUT prompting:
+    ``authorized`` / ``denied`` / ``notDetermined`` / ``restricted``, or
+    None if it can't be determined (non-macOS / pyobjc absent). NEVER
+    raises, NEVER triggers a consent dialog."""
+    try:
+        from AVFoundation import (            # type: ignore
+            AVCaptureDevice, AVMediaTypeAudio,
+        )
+        # 0 notDetermined, 1 restricted, 2 denied, 3 authorized.
+        status = AVCaptureDevice.authorizationStatusForMediaType_(
+            AVMediaTypeAudio)
+        return {0: "notDetermined", 1: "restricted",
+                2: "denied", 3: "authorized"}.get(int(status), "unknown")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _screen_authorization() -> Optional[bool]:
+    """Non-invasive screen-recording TCC preflight (``CGPreflightScreen
+    CaptureAccess`` — checks WITHOUT prompting). True/False, or None if
+    unavailable. NEVER raises, NEVER prompts."""
+    try:
+        import Quartz                          # type: ignore
+        fn = getattr(Quartz, "CGPreflightScreenCaptureAccess", None)
+        if fn is None:
+            return None
+        return bool(fn())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def check_tcc_consent() -> List[CheckResult]:
+    """TCC Privacy Handshake (mandate 2, fail-soft). Config-aware: mic is
+    only checked when voice is enabled, screen only when vision is. A
+    denial is a WARN that names the graceful downgrade — NOT a FAIL (the
+    daemon runs degraded, it never crashes)."""
+    out: List[CheckResult] = []
+
+    if _env_true("JARVIS_AUDIO_BUS_ENABLED"):
+        mic = _mic_authorization()
+        if mic is None:
+            out.append(CheckResult(
+                "tcc-microphone", Status.SKIPPED,
+                detail="consent state undeterminable (pyobjc/AVFoundation "
+                       "unavailable) — will resolve at first app launch"))
+        elif mic == "authorized":
+            out.append(CheckResult("tcc-microphone", Status.READY,
+                                   detail="microphone consent granted"))
+        elif mic in ("denied", "restricted"):
+            out.append(CheckResult(
+                "tcc-microphone", Status.WARN,
+                detail=f"microphone TCC {mic} — voice DOWNGRADES to "
+                       "text-only mode (no crash); grant it in System "
+                       "Settings › Privacy › Microphone to enable voice"))
+        else:  # notDetermined
+            out.append(CheckResult(
+                "tcc-microphone", Status.READY,
+                detail="microphone consent not yet requested — the app "
+                       "prompts on first launch"))
+
+    if _env_true("JARVIS_VISION_LOOP_ENABLED"):
+        screen = _screen_authorization()
+        if screen is None:
+            out.append(CheckResult(
+                "tcc-screen", Status.SKIPPED,
+                detail="consent state undeterminable — resolves at launch"))
+        elif screen:
+            out.append(CheckResult("tcc-screen", Status.READY,
+                                   detail="screen-recording consent granted"))
+        else:
+            out.append(CheckResult(
+                "tcc-screen", Status.WARN,
+                detail="screen-recording TCC not granted — visual awareness "
+                       "DISABLED (no crash); grant it in System Settings › "
+                       "Privacy › Screen Recording"))
+    return out
+
+
 def check_redis() -> Optional[CheckResult]:
     """Config-aware dependency probe: only if REDIS_ENABLED. A REAL
     non-blocking TCP connect (root-cause), not a library import."""
@@ -460,6 +539,8 @@ async def run_doctor() -> DoctorReport:
     if redis is not None:
         report.add(redis)
     for r in check_subsystem_models():
+        report.add(r)
+    for r in check_tcc_consent():
         report.add(r)
     return report
 

@@ -35,6 +35,9 @@ _HELP = """trinity — the JARVIS + O+V ecosystem, one command
   trinity up        start the backend detached; keep the terminal free
   trinity app       launch the native JARVIS-Apple product surface too
   trinity doctor    validate the environment before boot
+  trinity install   install background persistence (LaunchAgent + .app);
+                    runs `doctor` first and aborts on FAIL
+  trinity uninstall remove the background service
   trinity status     what's running (backend / sockets / native app)
   trinity down       gracefully stop the resident backend
   trinity help       this message
@@ -176,6 +179,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if verb == "doctor":
         from backend.core.ouroboros.cli.trinity_doctor import doctor_main
         return doctor_main(console)
+    if verb in ("install", "uninstall"):
+        from backend.core.ouroboros.cli.trinity_installer import installer_main
+        return installer_main([verb], console)
     if verb == "status":
         return _status(console)
     if verb == "down":
