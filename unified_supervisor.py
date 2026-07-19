@@ -179,6 +179,15 @@ if _is_cli_mode:
         _script_content = f'''#!/usr/bin/env python3
 import os, sys, signal, subprocess, time
 
+# Phase 0 (2026-07-19): centralized .env — loaded ONCE, at the highest
+# bootstrap point, BEFORE any heavy ML/vision import. override=False
+# so the real environment / launchd plist ALWAYS wins over the file.
+try:
+    from backend.core.env_bootstrap import load_env_once as _load_env_once
+    _load_env_once()
+except Exception:  # noqa: BLE001 — config is optional, boot is not
+    pass
+
 # Full signal immunity
 for s in range(1, 32):
     try:
@@ -85699,7 +85708,24 @@ class JarvisSystemKernel:
     # =========================================================================
 
     async def _ensure_frontend_start_task(self, caller: str = "unknown") -> asyncio.Task:
-        """Create or reuse the single frontend startup task."""
+        """Create or reuse the single frontend startup task.
+
+        Phase 0 gate (2026-07-19): the browser/React auto-launch is
+        OFF by default (JARVIS_FRONTEND_AUTOLAUNCH); a resident daemon
+        must not pop a browser. When off, a completed no-op task is
+        returned so callers awaiting it never block."""
+        try:
+            from backend.core.env_bootstrap import (
+                frontend_autolaunch_enabled as _fe_autolaunch,
+            )
+            if not _fe_autolaunch():
+                _noop = create_safe_task(
+                    self._frontend_autolaunch_disabled_noop(),
+                    name="frontend-autolaunch-disabled",
+                )
+                return _noop
+        except Exception:  # noqa: BLE001
+            pass
         async with self._frontend_start_lock:
             task = self._frontend_start_task
             if task is None or task.done():
@@ -87223,6 +87249,12 @@ class JarvisSystemKernel:
         except Exception as e:
             self.logger.error(f"[Frontend] Failed to start: {e}")
             return False
+
+    async def _frontend_autolaunch_disabled_noop(self) -> bool:
+        """Completed no-op task returned when JARVIS_FRONTEND_AUTOLAUNCH
+        is off — callers awaiting the start task never block, and no
+        browser/React process is ever spawned."""
+        return False
 
     async def _stop_frontend(self) -> None:
         """
