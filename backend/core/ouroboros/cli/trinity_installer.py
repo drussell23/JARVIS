@@ -87,16 +87,75 @@ def supervisor_plist_path(agents_dir: Optional[Path] = None) -> Path:
 # LaunchAgent (mandate 2 — venv-targeted, resilient, idempotent)
 # ---------------------------------------------------------------------------
 
+def _venv_has_module(module: str, python: Path,
+                     runner: Optional[Callable[..., Any]] = None) -> bool:
+    """Is ``module`` importable in the hermetic venv? Uses
+    ``importlib.util.find_spec`` so it NEVER imports the package (no torch
+    tensor load — zero cost). NEVER raises."""
+    run = runner or subprocess.run          # late-bound (patchable in tests)
+    try:
+        if not python.exists():
+            return False
+        r = run(
+            [str(python), "-c",
+             "import importlib.util,sys;"
+             f"sys.exit(0 if importlib.util.find_spec({module!r}) else 1)"],
+            capture_output=True, timeout=20)
+        return getattr(r, "returncode", 1) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def coherent_subsystem_env(
+    python: Path, *, runner: Optional[Callable[..., Any]] = None,
+) -> dict:
+    """Venv↔runtime coherence (Phase 8): the daemon may only ENABLE a
+    subsystem whose dependencies are actually installed in the hermetic
+    venv. Probes the venv and returns the toggle overrides that keep the
+    running config in lock-step with the sharded install — so a lean
+    (core-only) venv never tries to bring up voice/vision and crash. When
+    the venv can't be probed, returns ``{}`` (no override — ``.env``
+    stands). NEVER raises."""
+    try:
+        if not python.exists():
+            return {}
+        has_voice = (_venv_has_module("torch", python, runner=runner)
+                     and _venv_has_module("speechbrain", python, runner=runner))
+        has_vision = _venv_has_module("cv2", python, runner=runner)
+        return {
+            "JARVIS_VOICE_ENABLED": "true" if has_voice else "false",
+            "JARVIS_AUDIO_BUS_ENABLED": "true" if has_voice else "false",
+            "JARVIS_VISION_ENABLED": "true" if has_vision else "false",
+            "JARVIS_VISION_LOOP_ENABLED": "true" if has_vision else "false",
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def build_supervisor_plist(*, python: Optional[Path] = None) -> dict:
     """The launchd definition for the resident supervisor. Deployment
     immutability (mandate 2): the daemon targets ONLY the hermetic
     ``~/.jarvis/venv`` interpreter — no ``sys.executable`` fallback, so a
     global ``pip install`` from another project can never drift the
-    24/7 runtime out from under it."""
+    24/7 runtime out from under it. Subsystem toggles are stamped to
+    COHERE with what the venv actually contains (Phase 8)."""
     py = python or localized_python()
     root = _repo_root()
     logs = _log_dir()
     venv_bin = str(py.parent)
+    env = {
+        # venv bin first so the localized interpreter + its console
+        # scripts win; repo on PYTHONPATH so `backend.*` imports.
+        "PATH": f"{venv_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONPATH": str(root),
+        "VIRTUAL_ENV": str(py.parent.parent),
+        "OUROBOROS_BATTLE_HEADLESS": "1",
+    }
+    # Only enable subsystems whose deps are installed (prevents a lean
+    # venv from booting into a voice/vision import crash). launchd sets
+    # these in the process env; load_env_once(override=False) then leaves
+    # them authoritative over .env.
+    env.update(coherent_subsystem_env(py))
     return {
         "Label": SUPERVISOR_LABEL,
         "ProgramArguments": [str(py), str(root / "unified_supervisor.py")],
@@ -108,14 +167,7 @@ def build_supervisor_plist(*, python: Optional[Path] = None) -> dict:
         "ProcessType": "Background",
         "StandardOutPath": str(logs / "supervisor.out.log"),
         "StandardErrorPath": str(logs / "supervisor.err.log"),
-        "EnvironmentVariables": {
-            # venv bin first so the localized interpreter + its console
-            # scripts win; repo on PYTHONPATH so `backend.*` imports.
-            "PATH": f"{venv_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
-            "PYTHONPATH": str(root),
-            "VIRTUAL_ENV": str(py.parent.parent),
-            "OUROBOROS_BATTLE_HEADLESS": "1",
-        },
+        "EnvironmentVariables": env,
     }
 
 

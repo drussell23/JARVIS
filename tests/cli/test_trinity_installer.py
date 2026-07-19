@@ -357,3 +357,52 @@ def test_install_aborts_if_port_never_clears(tmp_path, monkeypatch):
     assert "contended" in report.reason
     # NEVER bootstrapped over a live holder.
     assert not any("bootstrap" in str(b) for b in booted)
+
+
+# ---------------------------------------------------------------------------
+# PHASE 8 — venv↔runtime coherence: daemon enables only installed subsystems
+# ---------------------------------------------------------------------------
+
+def test_lean_venv_stamps_subsystems_off(tmp_path, monkeypatch):
+    """A lean (core-only) venv → the plist forces voice/vision OFF so the
+    daemon never boots into a torch import it doesn't have."""
+    venv = tmp_path / ".jarvis" / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    monkeypatch.setenv("JARVIS_VENV_DIR", str(venv))
+    # Probe reports torch/speechbrain/cv2 ABSENT (rc=1).
+    def _runner(argv, **kw):
+        return type("R", (), {"returncode": 1})()
+    monkeypatch.setattr(inst.subprocess, "run", _runner)
+    env = inst.build_supervisor_plist()["EnvironmentVariables"]
+    assert env["JARVIS_AUDIO_BUS_ENABLED"] == "false"
+    assert env["JARVIS_VISION_LOOP_ENABLED"] == "false"
+
+
+def test_full_venv_stamps_subsystems_on(tmp_path, monkeypatch):
+    venv = tmp_path / ".jarvis" / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    monkeypatch.setenv("JARVIS_VENV_DIR", str(venv))
+    def _runner(argv, **kw):
+        return type("R", (), {"returncode": 0})()   # all deps present
+    monkeypatch.setattr(inst.subprocess, "run", _runner)
+    env = inst.build_supervisor_plist()["EnvironmentVariables"]
+    assert env["JARVIS_AUDIO_BUS_ENABLED"] == "true"
+    assert env["JARVIS_VISION_LOOP_ENABLED"] == "true"
+
+
+def test_coherence_noop_when_venv_absent(tmp_path, monkeypatch):
+    """No venv on disk → no override; .env stands (find_spec never runs)."""
+    monkeypatch.setenv("JARVIS_VENV_DIR", str(tmp_path / "gone"))
+    env = inst.build_supervisor_plist()["EnvironmentVariables"]
+    assert "JARVIS_AUDIO_BUS_ENABLED" not in env      # coherence skipped
+
+
+def test_venv_has_module_uses_find_spec_not_import():
+    """Zero-load: the probe must use importlib find_spec, never `import
+    torch` (which would load tensors)."""
+    from pathlib import Path
+    src = Path(inst.__file__).read_text()
+    assert "find_spec" in src
+    assert "import torch" not in src
