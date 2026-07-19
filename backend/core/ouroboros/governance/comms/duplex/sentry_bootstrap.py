@@ -282,6 +282,17 @@ class BiometricGateAdapter:
                         return True             # verified; no hot-die math
                     from .biometric_evolution import evolve_if_confident  # noqa: E501,PLC0415
                     emb = getattr(getattr(self, "scorer_ref", None), "last_embedding", None) or getattr(self, "last_embedding", None)
+                    # VBIA→PAVA handoff: the drift matrix shapes HOW
+                    # MUCH this clean-passing sample teaches (never
+                    # whether it gates — VBIA already decided that).
+                    _pava = getattr(self, "pava", None)
+                    if _pava is not None and emb is not None:
+                        import os as _os  # noqa: PLC0415
+                        _base = float(_os.environ.get("JARVIS_BIOMETRIC_EVOLUTION_ALPHA", "0.02"))
+                        _alpha = await _pava.modulated_alpha(window, _base)
+                        if _alpha <= 0.0:
+                            return True         # spoof/drift veto on learning
+                        _os.environ["JARVIS_BIOMETRIC_EVOLUTION_ALPHA"] = str(_alpha)
                     if emb is not None and evolve_if_confident(conf, emb):
                         self.stats["evolutions"] = (
                             self.stats.get("evolutions", 0) + 1
