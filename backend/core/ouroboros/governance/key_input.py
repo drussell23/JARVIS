@@ -708,6 +708,14 @@ class InputController:
         self._original_termios: Optional[Any] = None
         self._fd: int = -1
         self._atexit_registered: bool = False
+        # Self-pipe wakeup (teardown-leak root fix, 2026-07-18): the
+        # reader thread selects on [stdin, wake_r]; stop() writes ONE
+        # byte to wake_w so the thread returns IMMEDIATELY instead of
+        # waiting out the select timeout — under a saturated shutdown
+        # executor that latency blew the stop() shield and leaked the
+        # reader task into loop-close ("Task was destroyed" wall).
+        self._wake_r: int = -1
+        self._wake_w: int = -1
 
     # -- public API ------------------------------------------------------
 
@@ -762,6 +770,10 @@ class InputController:
             )
             return False
         self._stop_event = asyncio.Event()
+        try:
+            self._wake_r, self._wake_w = os.pipe()
+        except OSError:
+            self._wake_r = self._wake_w = -1
         self._wire_action_dispatch()
         self._task = loop.create_task(self._reader_loop())
         return True
@@ -770,6 +782,13 @@ class InputController:
         """Stop the reader task + restore termios. Idempotent."""
         if self._stop_event is not None:
             self._stop_event.set()
+        # Wake the select-blocked reader thread NOW (self-pipe) — the
+        # stop shield below must never race the select timeout.
+        if self._wake_w >= 0:
+            try:
+                os.write(self._wake_w, b"\x00")
+            except OSError:
+                pass
         task = self._task
         self._task = None
         if task is not None and not task.done():
@@ -783,6 +802,14 @@ class InputController:
                     "[InputController] reader stop exception",
                     exc_info=True,
                 )
+        for attr in ("_wake_r", "_wake_w"):
+            fd = getattr(self, attr)
+            setattr(self, attr, -1)
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         self._exit_raw_mode()
 
     # -- internals -------------------------------------------------------
@@ -912,9 +939,19 @@ class InputController:
             if self._fd < 0:
                 return b""
             import select
+            watch = [self._fd]
+            if self._wake_r >= 0:
+                watch.append(self._wake_r)
             ready, _w, _x = select.select(
-                [self._fd], [], [], _READ_SELECT_TIMEOUT_S,
+                watch, [], [], _READ_SELECT_TIMEOUT_S,
             )
+            if self._wake_r >= 0 and self._wake_r in ready:
+                # stop() poked the self-pipe — drain + return NOW.
+                try:
+                    os.read(self._wake_r, 64)
+                except OSError:
+                    pass
+                return b""
             if not ready:
                 return b""            # timeout — loop re-checks stop event
             return os.read(self._fd, n)

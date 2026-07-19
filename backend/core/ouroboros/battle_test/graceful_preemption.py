@@ -96,21 +96,46 @@ def halt_child_workers() -> int:
         import psutil  # reused harness dependency
     except Exception:  # noqa: BLE001
         return 0
+    # Orderly drain FIRST (2026-07-18): registered ProcessPoolExecutors
+    # shut down gracefully so their workers exit clean and the
+    # multiprocessing resource_tracker unregisters each semaphore
+    # exactly once — the KeyError-wall class dies at its source.
+    try:
+        from backend.core.ouroboros.governance.executor_registry import (
+            shutdown_all as _drain_pools,
+        )
+        _drain_pools()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         me = psutil.Process()
         kids = me.children(recursive=True)
-        for c in kids:
+
+        def _is_resource_tracker(proc) -> bool:
+            # NEVER kill multiprocessing's janitor: killing it forces a
+            # relaunch with an empty registry, and every later
+            # unregister prints a raw KeyError traceback to stderr.
+            # It exits on its own once its pipe closes at process end.
+            try:
+                return any(
+                    "resource_tracker" in part for part in proc.cmdline()
+                )
+            except Exception:  # noqa: BLE001
+                return False
+
+        targets = [c for c in kids if not _is_resource_tracker(c)]
+        for c in targets:
             try:
                 c.terminate()
             except Exception:  # noqa: BLE001
                 pass
-        _, alive = psutil.wait_procs(kids, timeout=_CHILD_TERM_GRACE_S)
+        _, alive = psutil.wait_procs(targets, timeout=_CHILD_TERM_GRACE_S)
         for c in alive:
             try:
                 c.kill()
             except Exception:  # noqa: BLE001
                 pass
-        return len(kids)
+        return len(targets)
     except Exception:  # noqa: BLE001
         return 0
 

@@ -524,6 +524,13 @@ def _get_pool() -> ProcessPoolExecutor:
                 initargs=_initargs,
             )
             try:
+                from backend.core.ouroboros.governance.executor_registry import (  # noqa: PLC0415,E501
+                    register as _reg_pool,
+                )
+                _reg_pool(_pool)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
                 from backend.core.ouroboros.governance.child_reaper import (
                     register_cleanup,
                 )

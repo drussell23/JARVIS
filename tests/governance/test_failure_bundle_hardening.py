@@ -110,6 +110,7 @@ class TestCockpitCostCap:
 class _FdHolder:
     def __init__(self, fd: int) -> None:
         self._fd = fd
+        self._wake_r = -1          # mirrors InputController's self-pipe field
 
 
 class TestBoundedRead:

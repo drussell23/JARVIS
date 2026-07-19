@@ -576,6 +576,13 @@ def _get_fs_process_pool():
                 else:
                     max_tasks = None
                 _FS_PROCESS_POOL = ProcessPoolExecutor(**pool_kwargs)
+                try:
+                    from backend.core.ouroboros.governance.executor_registry import (  # noqa: PLC0415,E501
+                        register as _reg_pool,
+                    )
+                    _reg_pool(_FS_PROCESS_POOL)
+                except Exception:  # noqa: BLE001
+                    pass
                 atexit.register(shutdown_fs_process_pool)
                 # Slice 23 — fold this pool's hard-reap into the child_reaper
                 # cascade so a shutdown/OOM-triggered teardown (graceful,
