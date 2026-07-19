@@ -202,11 +202,12 @@ def _boundary_margin() -> float:
 
 
 def _vbia_threshold() -> float:
+    """Ignition Calibration: env override wins; else the auto-tuner's
+    persisted boundary; else 0.70. NEVER raises."""
     try:
-        return max(0.1, min(0.99, float(os.environ.get(
-            "JARVIS_TIER1_VBIA_THRESHOLD", "0.70",
-        ))))
-    except (TypeError, ValueError):
+        from .sovereign_governor import tuned_threshold  # noqa: PLC0415
+        return tuned_threshold(0.70)
+    except Exception:  # noqa: BLE001
         return 0.70
 
 
@@ -276,6 +277,9 @@ class BiometricGateAdapter:
                 # teaches the profile (slow EMA in the enrollment's
                 # native x-vector space; strict tensor guards inside).
                 try:
+                    from .sovereign_governor import evolution_permitted  # noqa: E501,PLC0415
+                    if not evolution_permitted():
+                        return True             # verified; no hot-die math
                     from .biometric_evolution import evolve_if_confident  # noqa: E501,PLC0415
                     emb = getattr(getattr(self, "scorer_ref", None), "last_embedding", None) or getattr(self, "last_embedding", None)
                     if emb is not None and evolve_if_confident(conf, emb):

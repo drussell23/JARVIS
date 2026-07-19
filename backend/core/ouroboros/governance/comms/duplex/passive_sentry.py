@@ -114,6 +114,10 @@ class PassiveSentry:
         self._window_audio: List[np.ndarray] = []
         self._blank_until = 0.0
         self._matched_word: Optional[str] = None
+        #: Thermal load-shed (SovereignGovernor): >1 = evaluate every
+        #: Nth chunk while hot; the ear stays ajar at reduced duty.
+        self.chunk_stride = 1
+        self._stride_i = 0
         self.stats = {
             "triggers": 0, "mirage_suppressed": 0, "matches": 0,
             "vbia_pass": 0, "vbia_fail": 0, "leases": 0,
@@ -154,6 +158,11 @@ class PassiveSentry:
     def feed_chunk(self, chunk: "np.ndarray") -> None:
         """One live chunk in. Drives the whole FSM; NEVER raises."""
         try:
+            stride = max(1, int(getattr(self, "chunk_stride", 1)))
+            if stride > 1 and self.state == STATE_PASSIVE:
+                self._stride_i = (self._stride_i + 1) % stride
+                if self._stride_i:
+                    return                      # thermal shed: skip eval
             if self.state == STATE_RECOGNIZING:
                 if (
                     self._clock() - self._window_opened_at
