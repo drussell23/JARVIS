@@ -103,10 +103,17 @@ class ProposalQueue:
         self.stats: Dict[str, int] = {
             "submitted": 0, "held_flow": 0, "presented": 0,
             "ttl_evicted": 0, "spatial_evicted": 0, "deduped": 0,
+            "slot_evicted": 0,
         }
 
     def submit(self, insight: Any, spaces: List[int], dhash: str) -> bool:
-        """Enqueue a proposal (semantic dedup on summary+spaces).
+        """Enqueue a proposal. Semantic dedup on summary+spaces.
+
+        Amortized Presentation Slot (mandate 2 — the Alert Avalanche
+        Guard): at most ONE proposal is ever held. A FRESHER insight
+        arriving while the slot is occupied SILENTLY EVICTS the older
+        one and takes its place — a returning operator faces exactly
+        one current prompt, never a stacked backlog of stale [Y/n]s.
         NEVER raises."""
         try:
             summary = self._summ(insight)
@@ -115,6 +122,10 @@ class ProposalQueue:
                     if p.summary() == summary and p.spaces == spaces:
                         self.stats["deduped"] += 1
                         return False
+                # Single-slot amortization: newest wins.
+                if self._q:
+                    self._q.clear()
+                    self.stats["slot_evicted"] += 1
                 self._seq += 1
                 self._q.append(Proposal(
                     insight, list(spaces), str(dhash),
