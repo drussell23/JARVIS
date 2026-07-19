@@ -3132,9 +3132,17 @@ async def event_stream_device(device_id: str, request: Request):
 
     inner = es.sse_stream(last_ack=last_ack, channels=channels)
     manager = get_device_manager()
+    # Last-Event-ID (SSE-native, mandate 1) drives the catch-up replay
+    # from the circular buffer — no heavy REST refetch on reconnect.
+    _leid = None
+    if last_event_id is not None:
+        try:
+            _leid = int(last_event_id)
+        except (TypeError, ValueError):
+            _leid = None
 
     return StreamingResponse(
-        manager.device_stream(str(device_id), inner),
+        manager.device_stream(str(device_id), inner, last_event_id=_leid),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
