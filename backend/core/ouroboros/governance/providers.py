@@ -3040,6 +3040,32 @@ Rules:
     return "\n\n".join(parts)
 
 
+async def _context_prune_gate(prompt: str, provider_hint: str) -> str:
+    """CONTEXT_PRUNE gate at the Expansion→Generate assembly seam.
+
+    ONE helper, FOUR call sites (Claude + DW twin paths, lean + full
+    builders) — the Slice-1 single-source discipline so the twin paths
+    can never drift. Applies the semantic sliding window
+    (context_pruner.prune_prompt_text) against the ACTIVE provider's
+    resolved window. Master-off or under-threshold = byte-identical
+    passthrough. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.context_pruner import (
+            context_prune_enabled,
+            prune_prompt_text,
+            resolve_context_limit,
+        )
+        if not context_prune_enabled():
+            return prompt
+        pruned, _tel = await prune_prompt_text(
+            prompt,
+            limit_tokens=resolve_context_limit(provider=provider_hint),
+        )
+        return pruned
+    except Exception:  # noqa: BLE001 — the gate never breaks generation
+        return prompt
+
+
 def _should_use_lean_prompt(
     ctx: "OperationContext",
     tools_enabled: bool,
@@ -5593,6 +5619,9 @@ class PrimeProvider:
                 prompt = _build_codegen_prompt(context, **_prompt_kwargs)
             else:
                 prompt = _prompt_result
+        # CONTEXT_PRUNE gate — the lean/full builders converge HERE;
+        # one call covers both (context_pruner, 2026-07-18).
+        prompt = await _context_prune_gate(prompt, "claude")
         accumulated_chars = len(prompt)
         tool_rounds = 0
         start = time.monotonic()
@@ -8973,6 +9002,9 @@ class ClaudeProvider:
                 stable_prefix_out=_p2a_stable_prefix,
             )
         )
+        # CONTEXT_PRUNE gate — DW twin of the Claude-path call (the ONE
+        # shared helper; context_pruner, 2026-07-18).
+        prompt_text = await _context_prune_gate(prompt_text, "doubleword")
         # Build messages array for multi-turn conversation
         messages: List[Dict[str, Any]] = [{"role": "user", "content": prompt_text}]
         accumulated_chars = len(prompt_text)

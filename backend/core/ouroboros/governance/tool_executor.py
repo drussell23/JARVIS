@@ -464,6 +464,31 @@ def _format_tool_result(call: "ToolCall", result: "ToolResult") -> str:
     raw_output = result.output or ""
     safe_name = call.name.replace("\n", "\\n").replace("\r", "\\r")
 
+    # Ballistic Payload Interceptor (context_pruner, 2026-07-18): the
+    # static byte cap below is blind to the ACTIVE model's window — a
+    # single massive read (minified bundle, giant log) can still spike
+    # the context. Token-aware interception fires FIRST, before the
+    # payload merges into FSM state; head+tail survive with a forensic
+    # digest so the model can re-read surgically. Master-off = inert.
+    try:
+        from backend.core.ouroboros.governance.context_pruner import (
+            ballistic_intercept,
+            context_prune_enabled,
+            resolve_context_limit,
+        )
+        if context_prune_enabled():
+            raw_output, _bt = ballistic_intercept(
+                raw_output,
+                limit_tokens=resolve_context_limit(
+                    provider=os.environ.get(
+                        "JARVIS_ACTIVE_PROVIDER_HINT", "",
+                    ),
+                ),
+                label=f"tool:{safe_name}",
+            )
+    except Exception:  # noqa: BLE001 — interceptor faults never break tools
+        pass
+
     # Smart truncation: keep head + tail for context when output exceeds cap
     if len(raw_output) > cap:
         head_size = int(cap * 0.7)
