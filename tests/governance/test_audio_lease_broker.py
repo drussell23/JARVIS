@@ -361,3 +361,303 @@ class TestRemoteAudioLease:
         finally:
             await syn.stop()
             await b.stop()
+
+
+# ---------------------------------------------------------------------------
+# (4) Lease Preemption + Push-to-Talk (operator-authorized 2026-07-18)
+# ---------------------------------------------------------------------------
+
+
+class TestLeasePreemption:
+    async def test_force_wake_revokes_incumbent_gracefully(
+        self, sock_dir, fast_ttl,
+    ):
+        """Second terminal asserts acquire_preempt: incumbent gets
+        reason=preempted over the return channel, challenger is
+        granted, and the hardware stays ARMED through the transfer
+        (single continuous stream — no disarm/re-arm glitch)."""
+        spy = _ArmSpy()
+        b = await _server(sock_dir, spy)
+        f1: list = []
+        f2: list = []
+        c1 = AudioStateClient(path=sock_dir / "a.sock", on_message=f1.append)
+        c2 = AudioStateClient(path=sock_dir / "a.sock", on_message=f2.append)
+        try:
+            assert await c1.connect() and await c2.connect()
+            c1.send_lease("acquire")
+            await _wait_for(lambda: spy.armed)
+            c2.send_lease("acquire_preempt")
+            assert await _wait_for(lambda: any(
+                f.get("reason") == "preempted" for f in f1
+            ))
+            assert await _wait_for(lambda: any(
+                f.get("granted") is True for f in f2
+            ))
+            assert spy.calls == [True]           # armed ONCE, continuous
+            assert b.lease_stats["preempts"] == 1
+        finally:
+            await c1.close()
+            await c2.close()
+            await b.stop()
+
+    async def test_ptt_is_ephemeral_full_cycle(self, sock_dir, fast_ttl):
+        """ptt_start preempts + arms; ptt_end fully releases (disarm).
+        A standing lease never disarms on a stray ptt_end."""
+        spy = _ArmSpy()
+        b = await _server(sock_dir, spy)
+        frames: list = []
+        c = AudioStateClient(path=sock_dir / "a.sock", on_message=frames.append)
+        try:
+            assert await c.connect()
+            c.send_lease("ptt_start")
+            assert await _wait_for(lambda: spy.armed)
+            grant = [f for f in frames if f.get("granted")][0]
+            assert grant["ptt"] is True
+            c.send_lease("ptt_end")
+            assert await _wait_for(lambda: not spy.armed)
+            assert spy.calls == [True, False]
+            assert b.lease_stats["ptt_sessions"] == 1
+        finally:
+            await c.close()
+            await b.stop()
+
+    async def test_stray_ptt_end_never_disarms_standing_lease(
+        self, sock_dir, fast_ttl,
+    ):
+        spy = _ArmSpy()
+        b = await _server(sock_dir, spy)
+        c = AudioStateClient(path=sock_dir / "a.sock")
+        try:
+            assert await c.connect()
+            c.send_lease("acquire")              # standing, not PTT
+            assert await _wait_for(lambda: spy.armed)
+            c.send_lease("ptt_end")
+            await asyncio.sleep(0.4)
+            assert spy.armed is True             # defensive bracket
+        finally:
+            await c.close()
+            await b.stop()
+
+    async def test_remote_lease_maps_preempted_to_held(
+        self, sock_dir, fast_ttl, monkeypatch,
+    ):
+        """The revoked terminal's presentation truth: HELD (the ov
+        toolbar renders 'held by another terminal') and NO auto-
+        re-acquire mic war."""
+        monkeypatch.setenv(
+            "JARVIS_AUDIO_IPC_SOCKET", str(sock_dir / "a.sock"),
+        )
+        spy = _ArmSpy()
+        b = await _server(sock_dir, spy)
+        s1: list = []
+        s2: list = []
+        lease1 = RemoteAudioLease(s1.append)
+        lease2 = RemoteAudioLease(s2.append)
+        try:
+            assert await lease1.acquire()
+            assert await lease2.acquire(preempt=True)
+            assert await _wait_for(lambda: "HELD" in s1)
+            assert lease1.active is False        # no mic war
+            assert lease2.active is True
+        finally:
+            await lease1.release()
+            await lease2.release()
+            await b.stop()
+
+
+# ---------------------------------------------------------------------------
+# (5) TTS interruption — FLUSH / ducking
+# ---------------------------------------------------------------------------
+
+
+class TestFlush:
+    async def test_holder_flush_invokes_seam_and_broadcasts_idle(
+        self, sock_dir, fast_ttl,
+    ):
+        spy = _ArmSpy()
+        flushes: list = []
+        b = AudioStateBroadcaster(
+            path=sock_dir / "a.sock", on_lease_change=spy,
+            on_flush=lambda: flushes.append(1),
+        )
+        assert await b.start()
+        frames: list = []
+        c = AudioStateClient(path=sock_dir / "a.sock", on_message=frames.append)
+        try:
+            assert await c.connect()
+            c.send_lease("acquire")
+            await _wait_for(lambda: spy.armed)
+            c.send_lease("flush")
+            assert await _wait_for(lambda: flushes)
+            assert await _wait_for(lambda: any(
+                f.get("kind") == "AUDIO_IDLE" for f in frames
+            ))
+            assert b.lease_stats["flushes"] == 1
+        finally:
+            await c.close()
+            await b.stop()
+
+    async def test_bystander_flush_ignored(self, sock_dir, fast_ttl):
+        spy = _ArmSpy()
+        flushes: list = []
+        b = AudioStateBroadcaster(
+            path=sock_dir / "a.sock", on_lease_change=spy,
+            on_flush=lambda: flushes.append(1),
+        )
+        assert await b.start()
+        c1 = AudioStateClient(path=sock_dir / "a.sock")
+        c2 = AudioStateClient(path=sock_dir / "a.sock")
+        try:
+            assert await c1.connect() and await c2.connect()
+            c1.send_lease("acquire")
+            await _wait_for(lambda: spy.armed)
+            c2.send_lease("flush")               # NOT the holder
+            await asyncio.sleep(0.4)
+            assert flushes == []
+        finally:
+            await c1.close()
+            await c2.close()
+            await b.stop()
+
+    def test_arbiter_flush_halts_everything(self):
+        from backend.core.ouroboros.governance.comms.duplex.arbiter import (
+            VoiceDuplexArbiter,
+        )
+        from backend.core.ouroboros.governance.comms.duplex.protocols import (
+            Priority,
+            SpeechRequest,
+            VoiceState,
+        )
+
+        class _Playback:
+            def __init__(self) -> None:
+                self.preempts = 0
+
+            def preempt(self) -> None:
+                self.preempts += 1
+
+            async def play(self, _text: str) -> None:
+                await asyncio.sleep(3600)
+
+        pb = _Playback()
+        arb = VoiceDuplexArbiter(pb)
+        arb.submit(SpeechRequest("queued line", Priority.PROACTIVE_INFO))
+        arb._state = VoiceState.KAREN_SPEAKING
+        arb.flush()
+        assert pb.preempts == 1
+        assert arb.state == VoiceState.LISTENING
+        assert all(len(q) == 0 for q in arb._queues.values())
+
+    def test_attach_ui_ducking_predicate_and_held_toolbar(self):
+        from backend.core.ouroboros.cli.ov import AttachUI
+        ui = AttachUI()
+        for state, ducks in (
+            ("LISTENING", False), ("THINKING", True),
+            ("SPEAKING", True), ("OFFLINE", False),
+        ):
+            ui.on_audio_state(state)
+            assert ui.should_flush_on_input() is ducks
+        ui.on_audio_state("HELD")
+        assert "held by another terminal" in ui.toolbar()
+        assert ui.prompt() == "ov › "
+
+
+# ---------------------------------------------------------------------------
+# (6) Hardware Topology Survival — MANDATE 4 VERBATIM
+# ---------------------------------------------------------------------------
+
+
+class TestHardwareTopologySurvival:
+    def _arbiter_with_dying_stream(self):
+        from backend.core.ouroboros.governance.comms.duplex.arbiter import (
+            VoiceDuplexArbiter,
+        )
+
+        class _DyingPlayback:
+            def preempt(self) -> None:
+                pass
+
+            async def play(self, _text: str) -> None:
+                raise OSError("CoreAudio: device vanished (-10851)")
+
+        from backend.core.ouroboros.governance.comms.duplex.protocols import (
+            ArbiterConfig,
+        )
+        cfg = ArbiterConfig(
+            enabled=True, barge_in_enabled=True, proactive_enabled=True,
+        )
+        return VoiceDuplexArbiter(_DyingPlayback(), config=cfg)
+
+    async def test_stream_read_failure_reports_fault_and_loop_survives(self):
+        """Mock an audio stream failure during playback: the arbiter
+        reports through on_hardware_fault, resets its FSM, and its run
+        loop keeps draining — no crash, no wedge."""
+        from backend.core.ouroboros.governance.comms.duplex.protocols import (
+            Priority,
+            SpeechRequest,
+            VoiceState,
+        )
+        arb = self._arbiter_with_dying_stream()
+        faults: list = []
+        arb.on_hardware_fault = faults.append
+        run = asyncio.get_running_loop().create_task(arb.run())
+        try:
+            arb.submit(SpeechRequest("hello", Priority.PROACTIVE_INFO))
+            assert await _wait_for(lambda: faults, timeout=3.0)
+            assert "vanished" in str(faults[0])
+            assert arb.state == VoiceState.LISTENING   # FSM reset
+            assert arb.hardware_fault_count == 1
+            # Loop alive: a second submit is processed (faults again).
+            arb.submit(SpeechRequest("again", Priority.PROACTIVE_INFO))
+            assert await _wait_for(lambda: len(faults) == 2, timeout=3.0)
+        finally:
+            await arb.stop()
+            run.cancel()
+            try:
+                await run
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def test_device_vanish_mid_lease_fails_safe_end_to_end(
+        self, sock_dir, fast_ttl, monkeypatch,
+    ):
+        """The full survival chain: active remote lease + supervisor
+        stream fault → holder revoked (reason=hw_fault), hardware seam
+        disarmed, HW_FAULT broadcast, TUI renders UNAVAILABLE, and the
+        supervisor's loop keeps serving new clients."""
+        monkeypatch.setenv(
+            "JARVIS_AUDIO_IPC_SOCKET", str(sock_dir / "a.sock"),
+        )
+        spy = _ArmSpy()
+        b = await _server(sock_dir, spy)
+        states: list = []
+        lease = RemoteAudioLease(states.append)
+        try:
+            assert await lease.acquire()
+            assert await _wait_for(lambda: spy.armed)
+            # The arbiter's fault reporter fires (Bluetooth dropped):
+            b.publish_hardware_fault("CoreAudio: device vanished (-10851)")
+            assert await _wait_for(
+                lambda: states and states[-1] == "UNAVAILABLE", timeout=3.0,
+            )
+            assert await _wait_for(lambda: not spy.armed, timeout=3.0)
+            assert lease.active is False
+            assert b.lease_stats["hw_faults"] == 1
+            # Supervisor loop alive — serves a fresh client.
+            c2 = AudioStateClient(path=sock_dir / "a.sock")
+            assert await c2.connect()
+            await c2.close()
+        finally:
+            await lease.release()
+            await b.stop()
+
+    def test_bootstrap_wires_fault_reporter_pin(self):
+        src = (
+            _REPO / "backend/audio/audio_pipeline_bootstrap.py"
+        ).read_text()
+        assert src.count("on_hardware_fault") >= 2   # lease + pre-mount paths
+        assert "publish_hardware_fault" in src
+        assert "on_flush=_on_flush" in src
+
+
+_REPO = Path(__file__).resolve().parents[2]

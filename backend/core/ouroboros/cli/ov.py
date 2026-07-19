@@ -277,10 +277,16 @@ class AttachUI:
     _PROMPTS = {
         "OFFLINE": "ov › ",
         "UNAVAILABLE": "ov › ",
+        "HELD": "ov › ",
         "LISTENING": "🎙 Karen › ",
         "HEARING": "🎙 Karen (hearing you) › ",
         "THINKING": "💭 Karen (thinking) › ",
         "SPEAKING": "🗣 Karen (speaking) › ",
+    }
+
+    _TOOLBAR_NOTES = {
+        "HELD": "voice: held by another terminal ('wake!' to take it)",
+        "UNAVAILABLE": "voice: unavailable (no audio plane)",
     }
 
     def __init__(self) -> None:
@@ -294,11 +300,20 @@ class AttachUI:
         return self._PROMPTS.get(self.audio_state, "ov › ")
 
     def toolbar(self) -> str:
-        audio = (
-            f" · voice: {self.audio_state.lower()}"
-            if self.audio_state != "OFFLINE" else " · voice: off ('wake')"
-        )
+        note = self._TOOLBAR_NOTES.get(self.audio_state)
+        if note is not None:
+            audio = f" · {note}"
+        elif self.audio_state == "OFFLINE":
+            audio = " · voice: off ('wake')"
+        else:
+            audio = f" · voice: {self.audio_state.lower()}"
         return f" ov attach — organism live{audio} · 'detach' to leave"
+
+    def should_flush_on_input(self) -> bool:
+        """Ducking predicate: the operator typed a NEW command while
+        Karen is composing or speaking — outbound audio yields to the
+        human instantly. NEVER raises."""
+        return self.audio_state in ("THINKING", "SPEAKING")
 
     def on_audio_state(self, state: str) -> None:
         """The synapse landing point — morph + repaint. NEVER raises."""
@@ -399,6 +414,18 @@ async def _split_plane_loop(
             if low in ("wake", "voice", "listen"):
                 client.send_audio("wake")
                 continue
+            if low in ("wake!", "force-wake", "force wake"):
+                client.send_audio("force_wake")
+                continue
+            if low == "ptt":
+                client.send_audio("ptt")
+                continue
+            if low in ("ptt stop", "ptt-stop", "ptt off"):
+                client.send_audio("ptt_stop")
+                continue
+            if low in ("flush", "shh", "hush"):
+                client.send_audio("flush")
+                continue
             if low in ("mute", "sleep"):
                 client.send_audio("sleep")
                 continue
@@ -406,6 +433,12 @@ async def _split_plane_loop(
                 client.send_audio("barge")
                 continue
             if text:
+                # TTS interruption (ducking): a new operator command
+                # while Karen is composing/speaking flushes her
+                # outbound buffer FIRST — the human always owns the
+                # floor.
+                if ui.should_flush_on_input():
+                    client.send_audio("flush")
                 client.send_input(text)
 
 
