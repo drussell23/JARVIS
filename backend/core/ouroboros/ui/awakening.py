@@ -380,6 +380,18 @@ class AwakeningConductor:
             if reader_cm is not None:
                 reader_cm.__exit__(None, None, None)
 
+        # PERSISTENT EMBLEM (2026-07-18 operator report): transient=True
+        # erased the crest at ceremony end — the mark vanished, leaving
+        # partial-erase artifacts. The final full crest now prints INTO
+        # SCROLLBACK once, deterministically, before the cooled header:
+        # the identity stays on screen for the whole session.
+        try:
+            self._console.print(self._render_crest_text(
+                frame, frame.max_delay_s + 1.0, tier,
+            ))
+        except Exception:  # noqa: BLE001
+            pass
+
         self._print_cooled_header()
 
     async def _cool_down(self, frame: CrestFrame, tier: ColorTier, live: Live) -> None:
@@ -404,11 +416,12 @@ class AwakeningConductor:
         """Render the crest as revealed so far -- cells whose ``delay_s``
         has elapsed draw solid; everything else is blank space. Draws
         tail-to-head purely as a function of the (test-injectable) clock."""
-        # DRY (2026-07-18): THE one frame→Text renderer lives in
-        # crest.frame_to_text — this ceremony passes the reveal clock;
-        # static consumers (collision emblem) pass elapsed=None.
-        from .crest import frame_to_text
-        return frame_to_text(frame, tier, elapsed=elapsed)
+        # DRY (2026-07-18): renderer dispatch lives in
+        # crest.render_crest_auto — half-block pixels on capable
+        # terminals, quadrant fallback; the reveal clock threads
+        # through either path.
+        from .crest import render_crest_auto
+        return render_crest_auto(frame, tier, elapsed=elapsed)
 
     def _poll_keys(self, poll: Callable[[], bytes]) -> None:
         """Read whatever is available this tick. Esc/CR/LF request a skip;
