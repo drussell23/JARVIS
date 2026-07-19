@@ -229,6 +229,18 @@ async def wire_conversation_pipeline(
                                 "[Bootstrap] Karen duplex lazy-mounted on lease",
                             )
                         if handle.karen is not None:
+                            # Hardware Topology Survival: the arbiter's
+                            # stream-fault reporter routes into the
+                            # broker's fail-safe (revoke + disarm +
+                            # HW_FAULT broadcast). Late-bound so a
+                            # lazy-mounted duplex is covered too.
+                            try:
+                                handle.karen.arbiter.on_hardware_fault = (
+                                    lambda exc: handle.audio_ipc.publish_hardware_fault(str(exc))  # noqa: E501
+                                    if handle.audio_ipc is not None else None
+                                )
+                            except Exception:
+                                pass
                             await handle.karen.start()
                             logger.info("[Bootstrap] audio lease ARMED")
                     else:
@@ -242,8 +254,20 @@ async def wire_conversation_pipeline(
                         "[Bootstrap] lease arm/disarm degraded", exc_info=True,
                     )
 
+            def _on_flush() -> None:
+                # TTS interruption (ducking): instantaneous outbound
+                # halt on the arbiter's own flush seam. Sync + inline.
+                try:
+                    if handle.karen is not None:
+                        handle.karen.arbiter.flush()
+                except Exception:
+                    logger.debug(
+                        "[Bootstrap] lease flush degraded", exc_info=True,
+                    )
+
             handle.audio_ipc = AudioStateBroadcaster(
                 on_lease_change=_on_lease_change,
+                on_flush=_on_flush,
             )
             if not await handle.audio_ipc.start():
                 handle.audio_ipc = None
@@ -270,6 +294,17 @@ async def wire_conversation_pipeline(
             handle.karen = build_karen_duplex(handle.tts_engine)
             await handle.karen.start()
             set_default_karen(handle.karen)
+            # Hardware Topology Survival — same fault route as the
+            # lease-armed path (a pre-mounted duplex is equally exposed
+            # to device vanish).
+            try:
+                if handle.audio_ipc is not None:
+                    handle.karen.arbiter.on_hardware_fault = (
+                        lambda exc: handle.audio_ipc.publish_hardware_fault(str(exc))  # noqa: E501
+                        if handle.audio_ipc is not None else None
+                    )
+            except Exception:
+                pass
             logger.info("[Bootstrap] Karen full-duplex control layer mounted")
         except Exception as e:
             handle.karen = None

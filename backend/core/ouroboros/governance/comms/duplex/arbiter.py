@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
-from typing import Deque, Dict, Optional
+from typing import Callable, Deque, Dict, Optional
 
 from .protocols import (
     ArbiterConfig, PlaybackHandle, Priority, SpeechRequest, VoiceState,
@@ -35,6 +35,15 @@ class VoiceDuplexArbiter:
         self.shed_count = 0
         self.coalesced_count = 0
         self._filler_idx = 0
+        #: Hardware Topology Survival seam (operator-authorized
+        #: 2026-07-18): playback stream faults (CoreAudio device
+        #: vanished, Bluetooth drop) were swallowed by _speak's
+        #: except — the fault EXISTED but died silently. The bootstrap
+        #: injects a reporter here; the arbiter loop itself always
+        #: survives the fault (state resets in finally, run() keeps
+        #: draining). Sync callable; never awaited on the audio path.
+        self.on_hardware_fault: Optional[Callable[[BaseException], None]] = None
+        self.hardware_fault_count = 0
 
     @property
     def state(self) -> VoiceState:
@@ -109,8 +118,21 @@ class VoiceDuplexArbiter:
             await self._play_task
         except asyncio.CancelledError:
             pass
-        except Exception:  # noqa: BLE001
-            logger.debug("[Arbiter] playback failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001
+            # Stream-layer fault (device vanished mid-play). Report to
+            # the injected sentinel — NEVER let the reporter's own
+            # fault kill the audio loop (the finally below always
+            # resets the FSM; the arbiter keeps running).
+            self.hardware_fault_count += 1
+            logger.warning("[Arbiter] playback stream fault: %s", exc)
+            cb = self.on_hardware_fault
+            if cb is not None:
+                try:
+                    cb(exc)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[Arbiter] fault reporter degraded", exc_info=True,
+                    )
         finally:
             self._play_task = None
             if self._state == VoiceState.KAREN_SPEAKING:
@@ -137,6 +159,29 @@ class VoiceDuplexArbiter:
                 self._wake.set()                  # resume draining the queue
         except Exception:  # noqa: BLE001
             logger.debug("[Arbiter] on_user_speech_end failed", exc_info=True)
+
+    def flush(self) -> None:
+        """Instantaneous outbound-audio halt (TTS interruption /
+        ducking, operator-authorized 2026-07-18): preempt the playback
+        buffer, cancel the play task, drop EVERY queued utterance, and
+        reset the FSM to LISTENING. Sync + non-blocking so the IPC
+        lane can invoke it inline. Idempotent; NEVER raises."""
+        try:
+            self._playback.preempt()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self._play_task is not None:
+                self._play_task.cancel()
+            for p in self._queues:
+                self._queues[p].clear()
+            if self._state in (
+                VoiceState.KAREN_SPEAKING, VoiceState.THINKING,
+            ):
+                self._state = VoiceState.LISTENING
+            self._active_priority = None
+        except Exception:  # noqa: BLE001
+            logger.debug("[Arbiter] flush degraded", exc_info=True)
 
     async def stop(self) -> None:
         # Clean shutdown: cancel any active playback so no blocked play task

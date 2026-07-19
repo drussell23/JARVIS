@@ -60,11 +60,15 @@ COCKPIT_ATTACH_SCHEMA_VERSION = "cockpit_attach.v2"
 #: requested but no duplex handle mounted in this process.
 AUDIO_STATES = (
     "OFFLINE", "UNAVAILABLE", "LISTENING", "HEARING", "THINKING",
-    "SPEAKING",
+    "SPEAKING", "HELD",
 )
 
-#: Closed taxonomy of TUI→daemon audio commands.
-AUDIO_CMDS = ("wake", "sleep", "barge")
+#: Closed taxonomy of TUI→daemon audio commands. v2.1: force_wake
+#: preempts an incumbent terminal; ptt/ptt_stop bracket an ephemeral
+#: push-to-talk hold; flush halts outbound audio (ducking).
+AUDIO_CMDS = (
+    "wake", "sleep", "barge", "force_wake", "ptt", "ptt_stop", "flush",
+)
 
 _TRUTHY = ("1", "true", "yes", "on")
 

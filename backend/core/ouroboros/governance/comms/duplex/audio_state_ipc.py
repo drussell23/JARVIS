@@ -71,7 +71,13 @@ logger = logging.getLogger(__name__)
 AUDIO_IPC_SCHEMA_VERSION = "audio_ipc.v2"
 
 #: Closed lease-command vocabulary (the upstream control lane).
-LEASE_CMDS = ("acquire", "release", "heartbeat")
+#: v2.1 (operator-authorized 2026-07-18): ``acquire_preempt`` revokes
+#: the incumbent (FORCE_WAKE); ``ptt_start``/``ptt_end`` bracket an
+#: ephemeral push-to-talk hold; ``flush`` halts outbound audio.
+LEASE_CMDS = (
+    "acquire", "release", "heartbeat",
+    "acquire_preempt", "ptt_start", "ptt_end", "flush",
+)
 
 
 def lease_ttl_s() -> float:
@@ -92,9 +98,10 @@ EVENT_VAD_INACTIVE = "VAD_INACTIVE"
 EVENT_TTS_GENERATING = "TTS_GENERATING"
 EVENT_AUDIO_PLAYING = "AUDIO_PLAYING"
 EVENT_AUDIO_IDLE = "AUDIO_IDLE"
+EVENT_HW_FAULT = "HW_FAULT"
 EVENT_KINDS = (
     EVENT_VAD_ACTIVE, EVENT_VAD_INACTIVE, EVENT_TTS_GENERATING,
-    EVENT_AUDIO_PLAYING, EVENT_AUDIO_IDLE,
+    EVENT_AUDIO_PLAYING, EVENT_AUDIO_IDLE, EVENT_HW_FAULT,
 )
 
 
@@ -147,6 +154,7 @@ class AudioStateBroadcaster:
         *,
         path: Optional[Path] = None,
         on_lease_change: Optional[Callable[[bool], Any]] = None,
+        on_flush: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._path = Path(path) if path is not None else socket_path()
         self._server: Optional[asyncio.AbstractServer] = None
@@ -165,12 +173,16 @@ class AudioStateBroadcaster:
         # holder is identified by its StreamWriter; the deadline is a
         # raw ``time.monotonic()`` instant (watchdog isolation).
         self._on_lease_change = on_lease_change
+        self._on_flush = on_flush
         self._lease_holder: Optional[asyncio.StreamWriter] = None
         self._lease_deadline: float = 0.0
         self._lease_watchdog: Optional[asyncio.Task] = None
+        self._lease_is_ptt = False
         self.lease_stats: Dict[str, int] = {
             "acquires": 0, "denials": 0, "releases": 0,
             "expiries": 0, "drop_releases": 0, "heartbeats": 0,
+            "preempts": 0, "ptt_sessions": 0, "flushes": 0,
+            "hw_faults": 0,
         }
 
     # ---- lifecycle ----
@@ -324,6 +336,11 @@ class AudioStateBroadcaster:
         elif kind == EVENT_AUDIO_IDLE:
             self._state["tts_generating"] = False
             self._state["audio_playing"] = False
+        elif kind == EVENT_HW_FAULT:
+            # Device vanished — every presentation boolean is a lie now.
+            self._state["vad_active"] = False
+            self._state["tts_generating"] = False
+            self._state["audio_playing"] = False
 
     def _enqueue(self, msg: Dict[str, Any]) -> None:
         self._recent.append(msg)
@@ -394,6 +411,7 @@ class AudioStateBroadcaster:
             return
         self._lease_holder = None
         self._lease_deadline = 0.0
+        self._lease_is_ptt = False
         logger.info("[AudioIPC] lease released (%s) — audio disarmed", reason)
         await self._invoke_lease_change(False)
 
@@ -437,23 +455,96 @@ class AudioStateBroadcaster:
                     "type": "lease", "granted": False, "reason": "released",
                 })
             return
-        # acquire
-        if self._lease_holder is not None and self._lease_holder is not writer:
-            self.lease_stats["denials"] += 1
-            self._reply(writer, {
-                "type": "lease", "granted": False, "reason": "held",
-            })
+        if cmd == "flush":
+            # TTS interruption / ducking — holder-only (a bystander
+            # terminal must not silence Karen for the operator who
+            # holds the floor).
+            if writer is self._lease_holder:
+                self.lease_stats["flushes"] += 1
+                await self._invoke_flush()
+                self.publish_event(EVENT_AUDIO_IDLE)
             return
-        first_acquire = self._lease_holder is None
+        if cmd == "ptt_end":
+            # Ephemeral hold ends → FULL release (disarm). A non-PTT
+            # lease ignores ptt_end (defensive: mismatched brackets
+            # never disarm a standing lease).
+            if writer is self._lease_holder and self._lease_is_ptt:
+                self.lease_stats["releases"] += 1
+                await self._release_lease(reason="ptt_end")
+                self._reply(writer, {
+                    "type": "lease", "granted": False, "reason": "released",
+                })
+            return
+        # acquire / acquire_preempt / ptt_start
+        preempting = cmd in ("acquire_preempt", "ptt_start")
+        incumbent = self._lease_holder
+        if incumbent is not None and incumbent is not writer:
+            if not preempting:
+                self.lease_stats["denials"] += 1
+                self._reply(writer, {
+                    "type": "lease", "granted": False, "reason": "held",
+                })
+                return
+            # Graceful revocation over the return channel: the
+            # incumbent's TUI morphs to "held by another terminal".
+            # The hardware stays ARMED through the transfer — one
+            # continuous stream, no disarm/re-arm glitch.
+            self.lease_stats["preempts"] += 1
+            self._reply(incumbent, {
+                "type": "lease", "granted": False, "reason": "preempted",
+            })
+        first_arm = incumbent is None
         self._lease_holder = writer
         self._lease_deadline = time.monotonic() + ttl
+        self._lease_is_ptt = cmd == "ptt_start"
+        if self._lease_is_ptt:
+            self.lease_stats["ptt_sessions"] += 1
         self.lease_stats["acquires"] += 1
-        if first_acquire:
+        if first_arm:
             await self._invoke_lease_change(True)
             self._start_lease_watchdog()
         self._reply(writer, {
             "type": "lease", "granted": True, "ttl_s": ttl,
+            "ptt": self._lease_is_ptt,
         })
+
+    async def _invoke_flush(self) -> None:
+        """Fused invoke of the supervisor's outbound-audio halt seam.
+        NEVER raises."""
+        cb = self._on_flush
+        if cb is None:
+            return
+        try:
+            result = cb()
+            if asyncio.iscoroutine(result):
+                await asyncio.wait_for(result, timeout=lease_ttl_s())
+        except asyncio.TimeoutError:
+            logger.warning("[AudioIPC] flush callback timed out")
+        except Exception:  # noqa: BLE001
+            logger.debug("[AudioIPC] flush callback degraded", exc_info=True)
+
+    def publish_hardware_fault(self, detail: str = "") -> None:
+        """Hardware Topology Survival: the active audio device vanished
+        mid-lease (Bluetooth drop, CoreAudio stream death). Fail-safe
+        sequence — revoke the holder over the return channel (reason
+        ``hw_fault``), disarm via the lease seam (the bootstrap's
+        closure tears down the dead stream), and broadcast the fault
+        event so EVERY subscriber renders the truth. Thread-safe
+        (callable from the arbiter's fault reporter on any task);
+        NEVER raises — the supervisor loop must survive any device
+        topology change."""
+        try:
+            self.lease_stats["hw_faults"] += 1
+            holder = self._lease_holder
+            if holder is not None:
+                self._reply(holder, {
+                    "type": "lease", "granted": False, "reason": "hw_fault",
+                    "detail": str(detail or "")[:200],
+                })
+                self._schedule_lease_release(reason="hardware_fault")
+            self.publish_event(EVENT_HW_FAULT)
+        except Exception:  # noqa: BLE001
+            logger.debug("[AudioIPC] hw-fault publish degraded", exc_info=True)
 
     def _start_lease_watchdog(self) -> None:
         if self._lease_watchdog is not None and not self._lease_watchdog.done():
@@ -682,6 +773,7 @@ __all__ = [
     "AudioStateClient",
     "EVENT_AUDIO_IDLE",
     "EVENT_AUDIO_PLAYING",
+    "EVENT_HW_FAULT",
     "EVENT_KINDS",
     "EVENT_TTS_GENERATING",
     "EVENT_VAD_ACTIVE",

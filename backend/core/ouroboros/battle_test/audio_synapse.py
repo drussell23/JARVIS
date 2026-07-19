@@ -95,9 +95,12 @@ class RemoteAudioLease:
         self._denied_reason: Optional[str] = None
         self.active: bool = False
 
-    async def acquire(self) -> bool:
-        """Connect + negotiate. False (with UNAVAILABLE published by
-        the CALLER, keeping one honesty seam) when the supervisor is
+    async def acquire(self, *, preempt: bool = False, ptt: bool = False) -> bool:
+        """Connect + negotiate. ``preempt`` sends ``acquire_preempt``
+        (FORCE_WAKE — revokes an incumbent terminal); ``ptt`` opens an
+        ephemeral push-to-talk hold (always preempting; closed by
+        :meth:`ptt_end`). False (with UNAVAILABLE published by the
+        CALLER, keeping one honesty seam) when the supervisor is
         absent, refuses, or times out. NEVER raises."""
         try:
             from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (  # noqa: E501,PLC0415
@@ -109,7 +112,10 @@ class RemoteAudioLease:
             if not await client.connect():
                 return False
             self._client = client
-            if not client.send_lease("acquire"):
+            cmd = "ptt_start" if ptt else (
+                "acquire_preempt" if preempt else "acquire"
+            )
+            if not client.send_lease(cmd):
                 await client.close()
                 self._client = None
                 return False
@@ -154,8 +160,25 @@ class RemoteAudioLease:
                         # stalled) — mirror its fail-safe honestly.
                         self.active = False
                         self._publish_safe("OFFLINE")
+                    elif reason == "preempted" and self.active:
+                        # Revoked over the heartbeat return channel:
+                        # another terminal asserted FORCE_WAKE/PTT.
+                        # Morph honestly; do NOT auto-re-acquire (that
+                        # would be two terminals fighting a mic war).
+                        self.active = False
+                        self._publish_safe("HELD")
+                    elif reason == "hw_fault" and self.active:
+                        # The audio device vanished under the lease —
+                        # supervisor already disarmed; render truth.
+                        self.active = False
+                        self._publish_safe("UNAVAILABLE")
             elif mtype == "event" and self.active:
-                state = _EVENT_MAP.get(str(msg.get("kind", "")))
+                kind = str(msg.get("kind", ""))
+                if kind == "HW_FAULT":
+                    self.active = False
+                    self._publish_safe("UNAVAILABLE")
+                    return
+                state = _EVENT_MAP.get(kind)
                 if state is not None:
                     self._publish_safe(state)
         except Exception:  # noqa: BLE001
@@ -180,6 +203,28 @@ class RemoteAudioLease:
             if self.active:
                 self.active = False
                 self._publish_safe("OFFLINE")
+
+    def flush(self) -> bool:
+        """Ducking: halt the supervisor's outbound audio NOW (holder-
+        only server-side). Non-blocking. NEVER raises."""
+        try:
+            client = self._client
+            if client is None or not self.active:
+                return False
+            return bool(client.send_lease("flush"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def ptt_end(self) -> bool:
+        """Close an ephemeral push-to-talk hold (full release server-
+        side). NEVER raises."""
+        try:
+            client = self._client
+            if client is None:
+                return False
+            return bool(client.send_lease("ptt_end"))
+        except Exception:  # noqa: BLE001
+            return False
 
     async def release(self) -> None:
         """Release + teardown. Idempotent; NEVER raises."""
@@ -254,29 +299,46 @@ class AudioVisualSynapse:
             cmd = str(cmd or "").strip().lower()
             if cmd == "wake":
                 await self._wake()
+            elif cmd == "force_wake":
+                await self._wake(preempt=True)
             elif cmd == "sleep":
                 await self._sleep()
             elif cmd == "barge":
                 await self._barge()
+            elif cmd == "ptt":
+                await self._wake(preempt=True, ptt=True)
+            elif cmd == "ptt_stop":
+                remote = self._remote
+                if remote is not None and remote.ptt_end():
+                    self._remote = None
+                    self._armed = False
+                    self._safe_publish("OFFLINE")
+            elif cmd == "flush":
+                await self._flush()
         except Exception:  # noqa: BLE001
             logger.debug("[AudioSynapse] cmd degraded", exc_info=True)
 
-    async def _wake(self) -> None:
+    async def _wake(self, *, preempt: bool = False, ptt: bool = False) -> None:
         handle = self._resolve()
-        if handle is None:
+        if handle is None or preempt or ptt:
             # No LOCAL duplex — the supervisor owns the hardware plane.
             # Tri-State broker path: negotiate a cross-process audio
-            # lease over audio_state_ipc. Only when the supervisor is
+            # lease over audio_state_ipc (preempt/ptt are inherently
+            # cross-process verbs — floor arbitration lives at the
+            # supervisor's lease table). Only when the supervisor is
             # absent/refusing does the TUI see UNAVAILABLE — honesty,
             # never a fake LISTENING.
             if broker_enabled():
                 remote = RemoteAudioLease(self._publish)
-                if await remote.acquire():
+                if await remote.acquire(preempt=preempt, ptt=ptt):
                     self._remote = remote
                     self._armed = True
                     return
-            self._safe_publish("UNAVAILABLE")
-            return
+            if handle is None:
+                self._safe_publish("UNAVAILABLE")
+                return
+            # Preempt/ptt asked but no supervisor: fall through to the
+            # local handle (single-terminal case — nothing to preempt).
         try:
             await handle.start()
         except Exception:  # noqa: BLE001
@@ -305,6 +367,23 @@ class AudioVisualSynapse:
                     "[AudioSynapse] duplex stop degraded", exc_info=True,
                 )
         self._safe_publish("OFFLINE")
+
+    async def _flush(self) -> None:
+        """Ducking — halt outbound audio wherever the lease lives:
+        remote lease → wire flush; local handle → the arbiter's own
+        flush seam. NEVER raises."""
+        remote = self._remote
+        if remote is not None:
+            remote.flush()
+            return
+        handle = self._resolve()
+        arbiter = getattr(handle, "arbiter", None)
+        flush = getattr(arbiter, "flush", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception:  # noqa: BLE001
+                logger.debug("[AudioSynapse] local flush degraded", exc_info=True)
 
     async def _barge(self) -> None:
         """Operator barge-in from the TUI — the text-plane equivalent
