@@ -3103,6 +3103,48 @@ async def event_stream_sse(request: Request):
     )
 
 
+@router.get("/api/stream/{device_id}")
+async def event_stream_device(device_id: str, request: Request):
+    """Device-aware SSE (2026-07-19) — the native Swift client's
+    endpoint. Composes the EXISTING ``sse_stream`` (same replay/channel
+    semantics as the web ``/api/stream/sse``) behind the device-aware
+    multiplexer, which routes per ``device_id`` and prunes abruptly-
+    dropped native connections (Zombie Guard). Legacy ``/api/stream/
+    sse`` is untouched — web + terminal clients keep working."""
+    from backend.core.event_stream import (
+        get_event_stream, set_event_stream_ws_manager,
+    )
+    from backend.api.device_stream_manager import get_device_manager
+
+    es = get_event_stream()
+    if es._ws_manager is None:
+        set_event_stream_ws_manager(get_ws_manager())
+
+    last_ack = int(request.query_params.get("last_ack", "0"))
+    last_event_id = request.headers.get("Last-Event-ID")
+    if last_event_id:
+        try:
+            last_ack = max(last_ack, int(last_event_id))
+        except ValueError:
+            pass
+    channels_param = request.query_params.get("channels", "")
+    channels = set(channels_param.split(",")) if channels_param else None
+
+    inner = es.sse_stream(last_ack=last_ack, channels=channels)
+    manager = get_device_manager()
+
+    return StreamingResponse(
+        manager.device_stream(str(device_id), inner),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "X-Device-Id": str(device_id),
+        },
+    )
+
+
 @router.post("/api/stream/command")
 async def event_stream_command(request: Request):
     """
