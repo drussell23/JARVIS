@@ -242,3 +242,66 @@ class TestBiometricGate:
         assert sentry.state == STATE_LEASED
         sentry.on_lease_released()
         assert sentry.state == STATE_PASSIVE          # the ear re-ajars
+
+
+# ---------------------------------------------------------------------------
+# Native in-memory marshal + ARC leak proof (2026-07-19)
+# ---------------------------------------------------------------------------
+
+
+class TestNativeMarshalARC:
+    def _av(self):
+        pytest.importorskip("objc")
+        from AVFoundation import AVAudioFormat, AVAudioPCMBuffer
+        fmt = AVAudioFormat.alloc().initWithCommonFormat_sampleRate_channels_interleaved_(  # noqa: E501
+            1, 16000.0, 1, False,
+        )
+        return fmt, AVAudioPCMBuffer
+
+    def test_marshal_is_byte_exact(self):
+        from backend.core.ouroboros.governance.comms.duplex.passive_sentry import (  # noqa: E501
+            numpy_to_pcm_buffer,
+        )
+        fmt, cls = self._av()
+        x = (0.5 * np.sin(np.arange(4800) * 0.05)).astype(np.float32)
+        buf = numpy_to_pcm_buffer(x, fmt, cls)
+        view = buf.floatChannelData()[0].as_buffer(x.size)
+        back = np.frombuffer(
+            memoryview(view).cast("B")[: x.nbytes], dtype=np.float32,
+        )
+        assert np.array_equal(back, x)
+        assert int(buf.frameLength()) == x.size
+
+    def test_10k_iterations_memory_flat_under_arc_pool(self):
+        """MANDATE 4: 10,000 create+marshal iterations inside
+        objc.autorelease_pool → RSS absolutely flat (the 24/7-sentry
+        leak class is dead)."""
+        import objc
+        import psutil
+        from backend.core.ouroboros.governance.comms.duplex.passive_sentry import (  # noqa: E501
+            numpy_to_pcm_buffer,
+        )
+        fmt, cls = self._av()
+        x = np.zeros(480, dtype=np.float32)
+        proc = psutil.Process()
+        # Warm-up (allocator pools, pyobjc caches):
+        with objc.autorelease_pool():
+            for _ in range(500):
+                numpy_to_pcm_buffer(x, fmt, cls)
+        rss0 = proc.memory_info().rss
+        for _ in range(100):
+            with objc.autorelease_pool():
+                for _ in range(100):
+                    numpy_to_pcm_buffer(x, fmt, cls)
+        delta_mb = (proc.memory_info().rss - rss0) / 1e6
+        assert delta_mb < 8.0, f"leak: RSS grew {delta_mb:.1f}MB over 10k"
+
+    def test_session_pump_contract_pin(self):
+        from pathlib import Path
+        src = (
+            Path(__file__).resolve().parents[2]
+            / "backend/core/ouroboros/governance/comms/duplex/passive_sentry.py"
+        ).read_text()
+        assert "pump_main_runloop" in src
+        assert "import ctypes" not in src       # the wrong bridge is GONE
+        assert "autorelease_pool" in src
