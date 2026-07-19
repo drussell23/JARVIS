@@ -419,6 +419,39 @@ def generate_crest(
         return CrestFrame(0, 0, (), 0.0, "generation error")
 
 
+def crest_fill_mode() -> str:
+    """``JARVIS_OV_CREST_FILL`` — ``bg`` (default) paints FULL-BLOCK
+    cells as background-colored spaces, ``glyph`` keeps legacy
+    foreground blocks.
+
+    WHY bg (2026-07-18 operator report): terminal profiles with line
+    spacing > 1.0 leave a leading gap between rows that foreground
+    block glyphs cannot span — the coil renders as separated "bricks".
+    Background color fills the ENTIRE line box (leading included) on
+    every mainstream terminal, so interior strokes read solid on ANY
+    profile. Partial quadrant cells keep foreground glyphs — they carry
+    the anti-aliased silhouette and cannot be bg-painted without
+    filling their transparent quadrants."""
+    mode = os.environ.get("JARVIS_OV_CREST_FILL", "bg").strip().lower()
+    return mode if mode in ("bg", "glyph") else "bg"
+
+
+def render_cell(cell: CrestCell, tier: ColorTier) -> Tuple[str, str]:
+    """Resolve one cell to ``(char, style)`` under the fill mode.
+
+    Full blocks under ``bg`` fill → a SPACE painted with the cell color
+    as background (solid across line-spacing gaps); everything else
+    (edge quadrants, sub-C256 tiers) → the legacy foreground glyph."""
+    if (
+        crest_fill_mode() == "bg"
+        and cell.glyph == "█"
+        and tier >= ColorTier.C256
+    ):
+        r, g, b = cell.rgb
+        return " ", f"on rgb({r},{g},{b})"
+    return cell.glyph, style_for_cell(cell, tier)
+
+
 def style_for_cell(cell: CrestCell, tier: ColorTier) -> str:
     """Resolve one cell's Rich style for the tier. TRUECOLOR/C256 carry the
     per-cell gradient (Rich downgrades 24-bit for 256 terminals); STANDARD
@@ -432,4 +465,4 @@ def style_for_cell(cell: CrestCell, tier: ColorTier) -> str:
     return accent
 
 
-__all__ = ["CrestCell", "CrestFrame", "generate_crest", "style_for_cell"]
+__all__ = ["CrestCell", "CrestFrame", "crest_fill_mode", "generate_crest", "render_cell", "style_for_cell"]

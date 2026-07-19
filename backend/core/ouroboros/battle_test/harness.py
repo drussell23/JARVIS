@@ -526,6 +526,10 @@ def build_awakening_for_cockpit(
 
     briefing_tasks: List[Any] = []
 
+    # Mutable cell — the conductor doesn't exist yet when the sink is
+    # defined; the postlude routing binds late through it.
+    _conductor_ref: List[Any] = []
+
     def _speak_sink(line: str) -> None:
         try:
             from backend.core.ouroboros.governance.comms.duplex.karen_duplex_factory import (
@@ -537,11 +541,19 @@ def build_awakening_for_cockpit(
                 return
         except Exception:  # noqa: BLE001
             pass
+        rendered = f"  \U0001f4ad Karen ▸ “{line}”"
+        # Karen postlude (2026-07-18): while the ceremony is live, Rich
+        # routes prints ABOVE the crest — Karen photobombed her own
+        # awakening. Queue on the conductor; it renders the line on the
+        # clean post-ceremony screen. A late (slow-synth) line falls
+        # through and prints directly — both orderings covered.
         try:
-            console.print(
-                f"  \U0001f4ad Karen ▸ “{line}”",
-                style="muted", markup=False,
-            )
+            if _conductor_ref and _conductor_ref[0].queue_postlude(rendered):
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            console.print(rendered, style="muted", markup=False)
         except Exception:  # noqa: BLE001
             pass
 
@@ -580,6 +592,7 @@ def build_awakening_for_cockpit(
         on_ignition=_on_ignition, context_provider=_context_line,
     )
     conductor._briefing_tasks = briefing_tasks  # keep references (no GC)
+    _conductor_ref.append(conductor)            # late-bind the postlude sink
     return conductor
 
 
