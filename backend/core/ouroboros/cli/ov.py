@@ -97,18 +97,23 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
 
 
 def _default_status_provider() -> Optional[str]:
-    """Best-effort one-line digest of the most recent session.
+    """Best-effort digest of recent sessions (authority-free, read-only).
 
-    Reads the existing :class:`LastSessionSummary` (authority-free, read-only).
-    Returns ``None`` when there is no prior session or the digest is
-    unavailable -- callers render a friendly fallback. NEVER raises.
+    Reads :meth:`LastSessionSummary.operator_digest_sync` — the
+    OPERATOR-plane surface, deliberately ungated by
+    ``JARVIS_LAST_SESSION_SUMMARY_ENABLED`` (that flag governs the
+    organism's prompt-injection authority, not a human's explicit query;
+    routing status through the autonomy gate was the wired-but-inert
+    root cause: sessions on disk, "no prior session found" on screen).
+    Returns ``None`` when no parseable prior session exists -- callers
+    render a friendly fallback. NEVER raises.
     """
     try:
         from backend.core.ouroboros.governance.last_session_summary import (
             get_default_summary,
         )
 
-        text = get_default_summary().format_for_prompt_sync()
+        text = get_default_summary().operator_digest_sync()
         if isinstance(text, str) and text.strip():
             return text.strip()
         return None
