@@ -182,6 +182,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if verb in ("install", "uninstall"):
         from backend.core.ouroboros.cli.trinity_installer import installer_main
         return installer_main([verb], console)
+    if verb in ("release", "build"):
+        from backend.core.ouroboros.cli.trinity_release import release_main
+        return release_main([verb], console)
     if verb == "status":
         return _status(console)
     if verb == "down":

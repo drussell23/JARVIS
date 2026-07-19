@@ -489,6 +489,21 @@ def check_tcc_consent() -> List[CheckResult]:
     return out
 
 
+def check_xcode_tools() -> CheckResult:
+    """Xcode Command Line Tools presence (xcrun + codesign) — the
+    prerequisite for the `trinity release` cryptographic pipeline. Reused
+    by the release preflight (DRY). NEVER raises."""
+    missing = [t for t in ("xcrun", "codesign", "ditto")
+               if shutil.which(t) is None]
+    if missing:
+        return CheckResult(
+            "xcode-tools", Status.FAIL,
+            detail=f"missing {', '.join(missing)} — install with: "
+                   "xcode-select --install")
+    return CheckResult("xcode-tools", Status.READY,
+                       detail="xcrun + codesign + ditto present")
+
+
 def check_redis() -> Optional[CheckResult]:
     """Config-aware dependency probe: only if REDIS_ENABLED. A REAL
     non-blocking TCP connect (root-cause), not a library import."""
