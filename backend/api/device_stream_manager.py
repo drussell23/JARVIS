@@ -26,11 +26,92 @@ NEVER raises out of the registry operations.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import re
+import threading
 import time
-from typing import Any, AsyncIterator, Dict, Optional, Set
+from collections import deque
+from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("Jarvis.DeviceStream")
+
+# SSE frame ``id:`` extractor — the seq the Last-Event-ID header echoes.
+_ID_RE = re.compile(r"^id:\s*(\d+)", re.MULTILINE)
+
+
+def _rehydration_cap() -> int:
+    try:
+        return max(16, int(os.environ.get(
+            "JARVIS_SSE_REHYDRATION_BUFFER", "512",
+        )))
+    except (TypeError, ValueError):
+        return 512
+
+
+def _frame_seq(frame: str) -> Optional[int]:
+    """The SSE ``id:`` sequence of a frame, or None (keepalives have
+    no id). NEVER raises."""
+    try:
+        m = _ID_RE.search(frame)
+        return int(m.group(1)) if m else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class RehydrationBuffer:
+    """Thread-safe circular cache of the last N id-bearing SSE frames.
+    Ephemeral, tied to the multiplexer lifecycle (mandate 3 — no DB).
+    NEVER raises."""
+
+    def __init__(self, *, cap: Optional[int] = None) -> None:
+        self._cap = cap or _rehydration_cap()
+        self._buf: Deque[Tuple[int, str]] = deque(maxlen=self._cap)
+        self._lock = threading.Lock()
+
+    def append(self, frame: str) -> None:
+        try:
+            seq = _frame_seq(frame)
+            if seq is None:
+                return                          # keepalives are not cached
+            with self._lock:
+                self._buf.append((seq, frame))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def oldest_seq(self) -> Optional[int]:
+        with self._lock:
+            return self._buf[0][0] if self._buf else None
+
+    def newest_seq(self) -> Optional[int]:
+        with self._lock:
+            return self._buf[-1][0] if self._buf else None
+
+    def replay_after(self, last_event_id: int) -> Tuple[List[str], bool]:
+        """Frames with seq > ``last_event_id``, and a ``too_old`` flag.
+
+        ``too_old`` is True when the client's cursor has fallen OUT of
+        the buffer (the oldest cached seq is already past
+        last_event_id+1) — the caller emits STATE_RESET instead of a
+        torn partial replay. NEVER raises."""
+        try:
+            with self._lock:
+                if not self._buf:
+                    return [], False            # empty buffer: nothing missed
+                oldest = self._buf[0][0]
+                # The client saw up to last_event_id; it needs
+                # last_event_id+1 onward. If that is older than what we
+                # still hold, the gap is unrecoverable.
+                too_old = (last_event_id + 1) < oldest
+                if too_old:
+                    return [], True
+                return (
+                    [f for s, f in self._buf if s > last_event_id],
+                    False,
+                )
+        except Exception:  # noqa: BLE001
+            return [], True                     # fail toward a clean reset
 
 
 class DeviceRegistration:
@@ -57,9 +138,13 @@ class DeviceStreamManager:
         self._clock = clock
         self._hb_timeout = heartbeat_timeout_s
         self._devices: Dict[str, DeviceRegistration] = {}
+        #: Shared circular rehydration cache — every routed device's
+        #: frames land here so a reconnecting client can catch up.
+        self._rehydration = RehydrationBuffer()
         self.stats: Dict[str, int] = {
             "connects": 0, "drops_write_fault": 0,
             "drops_heartbeat": 0, "reconnects": 0,
+            "replayed_frames": 0, "state_resets": 0,
         }
 
     # ---- lifecycle ----
@@ -114,13 +199,42 @@ class DeviceStreamManager:
         inner_stream: AsyncIterator[str],
         *,
         heartbeat_interval_s: float = 15.0,
+        last_event_id: Optional[int] = None,
     ) -> AsyncIterator[str]:
-        """Wrap the EXISTING sse_stream generator with device routing +
-        dead-stream pruning. A write fault propagating out of the inner
-        stream, or a heartbeat gap, DEREGISTERS the device and stops
-        the generator — the orphaned stream is released. NEVER raises
-        past the generator boundary (a fault ends the stream cleanly)."""
+        """Wrap the EXISTING sse_stream generator with device routing,
+        Last-Event-ID catch-up replay, and dead-stream pruning.
+
+        On reconnect (``last_event_id`` set) the missed frames are
+        replayed from the circular buffer FIRST, then the client
+        attaches to the live inner stream — with no duplicate payloads
+        (live frames at/below the replay cursor are skipped). A cursor
+        that has fallen out of the buffer emits a single
+        ``STATE_RESET`` event. NEVER raises past the generator
+        boundary."""
         self.register(device_id)
+        replay_cursor = -1
+        # ---- Seamless Network Handoff: catch-up replay (mandate 2) ----
+        if last_event_id is not None:
+            frames, too_old = self._rehydration.replay_after(last_event_id)
+            if too_old:
+                self.stats["state_resets"] += 1
+                logger.info(
+                    "[DeviceStream] %s cursor %d fell out of buffer — "
+                    "STATE_RESET", device_id, last_event_id,
+                )
+                yield ("event: STATE_RESET\ndata: "
+                       + json.dumps({"reason": "cursor_expired",
+                                     "last_event_id": last_event_id})
+                       + "\n\n")
+                replay_cursor = last_event_id
+            else:
+                for f in frames:
+                    self.stats["replayed_frames"] += 1
+                    seq = _frame_seq(f)
+                    if seq is not None:
+                        replay_cursor = max(replay_cursor, seq)
+                    self.beat(device_id)
+                    yield f
         # Background pump: drain the inner stream into a queue so a
         # heartbeat-window timeout NEVER cancels the inner generator
         # (cancelling it repeatedly would corrupt it — the root cause
@@ -154,6 +268,14 @@ class DeviceStreamManager:
                                             BrokenPipeError)):
                             raise exc              # → fault-prune path
                         break                      # clean end of inner
+                    # Cache every id-bearing frame for future
+                    # reconnects (mandate 2 — the circular buffer).
+                    self._rehydration.append(frame)
+                    # No duplicates on catch-up: skip a live frame the
+                    # replay already delivered.
+                    seq = _frame_seq(frame)
+                    if seq is not None and seq <= replay_cursor:
+                        continue
                     # Real data resets the liveness clock (a keepalive
                     # is US probing, not the client acking).
                     self.beat(device_id)
@@ -209,6 +331,7 @@ def reset_device_manager() -> None:
 __all__ = [
     "DeviceRegistration",
     "DeviceStreamManager",
+    "RehydrationBuffer",
     "get_device_manager",
     "reset_device_manager",
 ]
