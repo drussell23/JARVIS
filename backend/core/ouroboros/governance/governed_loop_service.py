@@ -2161,6 +2161,32 @@ class GovernedLoopService:
                     self._chronos_task = _aio_chr.create_task(
                         _chronos_heartbeat_loop(),
                     )
+
+                    # Residency Telemetry (2026-07-19, pre-soak): the
+                    # loop instruments ITSELF — RSS / UDS conns / loop
+                    # lag every 5 min → bounded rotating JSONL. Own
+                    # task on the Orchestrator lifecycle; a leak shows
+                    # as monotone rss_delta over the 24h soak.
+                    try:
+                        from backend.core.ouroboros.governance.residency_telemetry import (  # noqa: E501
+                            ResidencyTelemetry,
+                        )
+
+                        def _uds_conns() -> int:
+                            n = 0
+                            for _attr in (
+                                "_cockpit_attach_bridge", "audio_ipc",
+                            ):
+                                _b = getattr(self, _attr, None)
+                                n += int(getattr(_b, "client_count", 0) or 0)
+                            return n
+
+                        self._residency_telemetry = ResidencyTelemetry(
+                            conn_source=_uds_conns,
+                        )
+                        self._residency_telemetry.start()
+                    except Exception:  # noqa: BLE001
+                        self._residency_telemetry = None
                     logger.info(
                         "[GovernedLoop] Chronos heartbeat scheduled (%.0fs; "
                         "non-volatile uptime ledger active)", _chronos_hb_s(),
