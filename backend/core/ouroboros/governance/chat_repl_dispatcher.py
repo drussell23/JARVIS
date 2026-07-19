@@ -54,7 +54,7 @@ import enum
 import logging
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Protocol
+from typing import Any, List, Optional, Protocol
 
 from backend.core.ouroboros.governance.conversation_orchestrator import (
     ChatRoutingDecision,
@@ -296,6 +296,7 @@ class ChatReplDispatcher:
         self,
         line: str,
         session_id: Optional[str] = None,
+        verdict_override: Optional[Any] = None,
     ) -> ChatReplResult:
         """Dispatch a single operator input line.
 
@@ -303,6 +304,12 @@ class ChatReplDispatcher:
           * ``"/chat <message>"`` or ``"/chat history|why|clear|help"``
           * Bare ``"<message>"`` (treated as a new turn)
           * Empty / whitespace → :class:`ChatReplStatus.EMPTY`
+
+        ``verdict_override`` (additive seam, chat_text_bridge): a
+        pre-computed ``IntentClassification`` threaded verbatim to the
+        orchestrator's dispatch — the code-shape re-weighted verdict.
+        ``None`` (all legacy callers) is byte-identical. Applies only
+        to message dispatch, never to ``/chat`` subcommands.
         """
         sid = session_id or self.default_session_id
         if not line or not line.strip():
@@ -327,10 +334,14 @@ class ChatReplDispatcher:
             # Treat as the message body — falls through to dispatch so
             # natural-language "/chat why is X?" doesn't get misparsed
             # as the ``why`` subcommand.
-            return self._dispatch_message(tail, sid)
+            return self._dispatch_message(
+                tail, sid, verdict_override=verdict_override,
+            )
 
         # Bare text path.
-        return self._dispatch_message(stripped, sid)
+        return self._dispatch_message(
+            stripped, sid, verdict_override=verdict_override,
+        )
 
     @staticmethod
     def _args_match_subcommand(sub: str, args: str) -> bool:
@@ -369,7 +380,9 @@ class ChatReplDispatcher:
     ) -> ChatReplResult:
         """Convenience for SerpentFlow when the operator has explicitly
         opted into chat mode and types without the slash prefix."""
-        return self._dispatch_message(text or "", session_id)
+        return self._dispatch_message(
+            text or "", session_id or self.default_session_id,
+        )
 
     # ---- subcommands ----
 
@@ -438,10 +451,17 @@ class ChatReplDispatcher:
     # ---- message dispatch ----
 
     def _dispatch_message(
-        self, message: str, session_id: str,
+        self,
+        message: str,
+        session_id: str,
+        verdict_override: Optional[Any] = None,
     ) -> ChatReplResult:
         orch = self._orch()
-        turn, decision = orch.dispatch(message, session_id=session_id)
+        turn, decision = orch.dispatch(
+            message,
+            session_id=session_id,
+            verdict_override=verdict_override,
+        )
 
         rendered = render_decision(turn, decision)
 

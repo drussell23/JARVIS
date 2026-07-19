@@ -356,6 +356,44 @@ def _parse_summary_impl(
 # ---------------------------------------------------------------------------
 
 
+def _render_operator_line(r: SessionRecord) -> str:
+    """One compact ``ov status`` line per session. Pure; NEVER raises.
+
+    Shape: ``bt-... — stop_reason after Xm · ops A/C/F · $T · apply=... ·
+    verify=P/T · commit=hash`` — apply/verify/commit segments render only
+    when the session carried them (v1.1a fields are optional)."""
+    try:
+        mins = r.duration_s / 60.0
+        dur = f"{mins:.0f}m" if mins >= 1.0 else f"{r.duration_s:.0f}s"
+        parts = [
+            f"{r.session_id} — {r.stop_reason or 'unknown'} after {dur}",
+            (
+                f"ops {r.stats_attempted} att / {r.stats_completed} done"
+                f" / {r.stats_failed} failed"
+            ),
+            f"${r.cost_total:.2f}",
+        ]
+        if r.last_apply_mode and r.last_apply_mode != "none":
+            files = (
+                f" ({r.last_apply_files} file(s))"
+                if r.last_apply_files is not None else ""
+            )
+            parts.append(f"apply={r.last_apply_mode}{files}")
+        if (
+            r.last_verify_tests_passed is not None
+            and r.last_verify_tests_total is not None
+        ):
+            parts.append(
+                f"verify={r.last_verify_tests_passed}"
+                f"/{r.last_verify_tests_total}"
+            )
+        if r.last_commit_hash:
+            parts.append(f"commit={r.last_commit_hash[:10]}")
+        return " · ".join(parts)
+    except Exception:  # noqa: BLE001
+        return f"{getattr(r, 'session_id', '?')} — (render degraded)"
+
+
 def _render_session(record: SessionRecord) -> str:
     """Render one SessionRecord as a dense one-line string + optional note.
 
@@ -462,6 +500,41 @@ def _lex_max_session_dirs_worker(
     return filtered[:n]
 
 
+def _mtime_max_session_dirs_worker(
+    sessions_root_str: str, active: Optional[str], n: int,
+) -> List[str]:
+    """Recency-ordered sibling of :func:`_lex_max_session_dirs_worker`
+    for the OPERATOR plane. Lex-max assumes homogeneous ``bt-<stamp>``
+    naming, but sandbox lineages (``bt-iso-*``) lexicographically shadow
+    newer ``bt-2026-*`` dirs (``i`` > ``2``) — an operator asking ``ov
+    status`` wants what ran MOST RECENTLY, so order by the
+    ``summary.json`` mtime (the moment the session actually closed).
+    The autonomy plane keeps lex-max untouched. Same self-skip +
+    summary-exists filter semantics."""
+    sessions_root = Path(sessions_root_str)
+    try:
+        candidates = [
+            p for p in sessions_root.iterdir()
+            if p.is_dir() and p.name.startswith("bt-")
+        ]
+    except OSError:
+        return []
+
+    stamped: List[Tuple[float, str]] = []
+    for p in candidates:
+        if active and p.name == active:
+            continue
+        summary = p / "summary.json"
+        try:
+            if not summary.is_file():
+                continue
+            stamped.append((summary.stat().st_mtime, str(p)))
+        except OSError:
+            continue
+    stamped.sort(key=lambda t: t[0], reverse=True)
+    return [path for _mt, path in stamped[:n]]
+
+
 # ---------------------------------------------------------------------------
 # LastSessionSummary
 # ---------------------------------------------------------------------------
@@ -537,6 +610,30 @@ class LastSessionSummary:
             return []
         return [Path(p) for p in result]
 
+    async def _mtime_max_session_dirs(self, n: int) -> List[Path]:
+        """Recency-ordered sibling of :meth:`_lex_max_session_dirs`
+        (operator plane — see :func:`_mtime_max_session_dirs_worker`).
+        Same offload + fail-soft discipline."""
+        sessions_root = self._sessions_dir()
+        if not sessions_root.exists() or not sessions_root.is_dir():
+            return []
+        active = get_active_session_id()
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            offload,
+            is_offload_error,
+        )
+        result = await offload(
+            _mtime_max_session_dirs_worker,
+            str(sessions_root), active, max(0, n),
+        )
+        if is_offload_error(result):
+            logger.debug(
+                "[LastSessionSummary] _mtime_max_session_dirs offload "
+                "failed — degrading to empty list",
+            )
+            return []
+        return [Path(p) for p in result]
+
     async def load(self, n_sessions: Optional[int] = None) -> List[SessionRecord]:
         """Load up to ``n_sessions`` most-recent session summaries.
 
@@ -546,12 +643,32 @@ class LastSessionSummary:
         """
         if not _is_enabled():
             return []
+        return await self._load_ungated(n_sessions)
+
+    async def _load_ungated(
+        self,
+        n_sessions: Optional[int] = None,
+        *,
+        order: str = "lex",
+    ) -> List[SessionRecord]:
+        """The parse core of :meth:`load` WITHOUT the autonomy-plane
+        master gate. Two callers, two authorities: :meth:`load` (the
+        CONTEXT_EXPANSION injection path) applies ``_is_enabled()``
+        first — that flag governs what the ORGANISM may read into its
+        own prompt; :meth:`operator_digest` (the ``ov status`` path)
+        calls this directly — an explicit human query for session
+        history is operator-plane and needs no autonomy flag. Same
+        directories, same parser, same stats — zero duplicated logic.
+        """
         target_n = n_sessions if n_sessions is not None else _n_sessions()
         if target_n <= 0:
             return []
         target_n = min(target_n, _HARD_MAX_SESSIONS)
 
-        dirs = await self._lex_max_session_dirs(target_n)
+        if order == "mtime":
+            dirs = await self._mtime_max_session_dirs(target_n)
+        else:
+            dirs = await self._lex_max_session_dirs(target_n)
         if not dirs:
             return []
 
@@ -675,6 +792,61 @@ class LastSessionSummary:
             "[LastSessionSummary] format_for_prompt_sync called from "
             "within a running event loop — degrading to None",
         )
+        return None
+
+    # ------------------------------------------------------------------
+    # Operator-plane digest (ov status)
+    # ------------------------------------------------------------------
+
+    async def operator_digest(
+        self, n_sessions: Optional[int] = None,
+    ) -> Optional[str]:
+        """Compact human digest of recent sessions for ``ov status``.
+
+        OPERATOR-plane: bypasses the autonomy master gate by design —
+        ``JARVIS_LAST_SESSION_SUMMARY_ENABLED`` governs the organism's
+        prompt-injection authority, not a human's right to read their
+        own session history (the wired-but-inert ``ov status`` root
+        cause: 50+ session dirs on disk, "no prior session found" on
+        screen). Session count from ``JARVIS_OV_STATUS_SESSIONS``
+        (default 3, clamped to the hard max). Returns ``None`` when no
+        parseable session exists. NEVER raises."""
+        try:
+            if n_sessions is None:
+                try:
+                    n_sessions = max(1, int(os.environ.get(
+                        "JARVIS_OV_STATUS_SESSIONS", "3",
+                    )))
+                except (TypeError, ValueError):
+                    n_sessions = 3
+            records = await self._load_ungated(n_sessions, order="mtime")
+            if not records:
+                return None
+            return "\n".join(
+                _render_operator_line(r) for r in records
+            )
+        except Exception:  # noqa: BLE001 — status must never crash ov
+            logger.debug(
+                "[LastSessionSummary] operator_digest degraded",
+                exc_info=True,
+            )
+            return None
+
+    def operator_digest_sync(
+        self, n_sessions: Optional[int] = None,
+    ) -> Optional[str]:
+        """Synchronous bridge to :meth:`operator_digest` (``ov status``
+        runs before any event loop exists). NEVER raises; degrades to
+        ``None`` from within a running loop — mirrors
+        :meth:`format_for_prompt_sync`."""
+        import asyncio as _asyncio
+        try:
+            _asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                return _asyncio.run(self.operator_digest(n_sessions))
+            except Exception:  # noqa: BLE001
+                return None
         return None
 
     # ------------------------------------------------------------------

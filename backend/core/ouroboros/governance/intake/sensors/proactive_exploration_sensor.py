@@ -563,6 +563,22 @@ class ProactiveExplorationSensor:
             )
             return emitted
 
+        # Observability closure (2026-07-18): the reader path was
+        # SILENT on every zero-emission outcome (empty collector,
+        # cooldown, below-floor), indistinguishable from never having
+        # run. One unconditional verdict line per scan when the reader
+        # is armed — decision histogram makes the starvation point
+        # legible without a debugger.
+        _decision_hist: dict = {}
+        for _r in rankings:
+            _key = str(getattr(_r.decision, "value", _r.decision))
+            _decision_hist[_key] = _decision_hist.get(_key, 0) + 1
+        logger.info(
+            "[ExplorationSensor] curiosity-reader scan — rankings=%d "
+            "decisions=%s",
+            len(rankings), _decision_hist or "{}",
+        )
+
         for ranking in rankings:
             if ranking.decision is not (
                 CuriosityRankingDecision.SURFACED

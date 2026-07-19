@@ -116,7 +116,13 @@ class DomainEntropyReport:
 
 @dataclass(frozen=True)
 class CuriosityScanReport:
-    """Outcome of one proactive scan + governed-emission cycle."""
+    """Outcome of one proactive scan + governed-emission cycle.
+
+    ``zero_cause`` (additive, 2026-07-18 observability closure): when
+    ``emitted == 0`` this carries ONE value from the closed
+    :data:`SCAN_ZERO_CAUSES` taxonomy so a silent scan is a classified
+    verdict, not an absence of evidence. ``""`` when emitted > 0 (or on
+    pre-taxonomy records — the schema is additive)."""
 
     master_enabled: bool
     normalized_entropy: float
@@ -125,7 +131,27 @@ class CuriosityScanReport:
     emitted: int
     ingest_results: Tuple[str, ...]
     diagnostic: str
+    zero_cause: str = ""
     schema_version: str = DOMAIN_ENTROPY_SCHEMA_VERSION
+
+
+#: Closed zero-cause taxonomy — WHY a scan emitted nothing. Ordered by
+#: where the pipeline starved (data → budget → construction → transport
+#: → admission). A dashboard/test can rely on exactly these values.
+ZERO_CAUSE_DISABLED = "master_disabled"
+ZERO_CAUSE_NO_ZONES = "no_zones"                 # index empty / no sparse zones
+ZERO_CAUSE_BUDGET = "budget_zero"                # cognitive-load shed to 0
+ZERO_CAUSE_NO_ENVELOPES = "no_envelopes"         # zone→envelope construction dry
+ZERO_CAUSE_ROUTER_MISSING = "router_missing"     # no intake router wired
+ZERO_CAUSE_INGEST_REJECTED = "ingest_rejected"   # router refused every envelope
+SCAN_ZERO_CAUSES = (
+    ZERO_CAUSE_DISABLED,
+    ZERO_CAUSE_NO_ZONES,
+    ZERO_CAUSE_BUDGET,
+    ZERO_CAUSE_NO_ENVELOPES,
+    ZERO_CAUSE_ROUTER_MISSING,
+    ZERO_CAUSE_INGEST_REJECTED,
+)
 
 
 def _disabled_entropy_report() -> DomainEntropyReport:
@@ -345,6 +371,7 @@ async def run_curiosity_scan_once(
             master_enabled=False, normalized_entropy=0.0, zones_identified=0,
             budget=0, emitted=0, ingest_results=(),
             diagnostic="domain entropy engine disabled",
+            zero_cause=ZERO_CAUSE_DISABLED,
         )
     report = compute_domain_entropy(clusters=clusters, now_unix=now_unix)
     budget = exploration_budget(load_report=load_report)
@@ -361,12 +388,38 @@ async def run_curiosity_scan_once(
             except Exception as exc:  # noqa: BLE001 — one bad ingest never aborts the scan
                 logger.debug("[DomainEntropy] ingest failed: %s", exc)
                 results.append("error")
+
+    # Observability closure (2026-07-18): a zero-emission scan was
+    # SILENT — indistinguishable from the scan never running (the exact
+    # blind spot that cost a graduation soak). Classify WHY it emitted
+    # nothing (closed taxonomy, starvation-ordered: data → budget →
+    # construction → transport → admission) and log the verdict
+    # UNCONDITIONALLY when the master is on — one line per sensor
+    # cadence, structured + grep-able.
+    zero_cause = ""
+    if emitted == 0:
+        if not report.sparse_zones:
+            zero_cause = ZERO_CAUSE_NO_ZONES
+        elif budget <= 0:
+            zero_cause = ZERO_CAUSE_BUDGET
+        elif not envelopes:
+            zero_cause = ZERO_CAUSE_NO_ENVELOPES
+        elif router is None:
+            zero_cause = ZERO_CAUSE_ROUTER_MISSING
+        else:
+            zero_cause = ZERO_CAUSE_INGEST_REJECTED
+
+    ingest_hist: dict = {}
+    for r in results:
+        ingest_hist[r] = ingest_hist.get(r, 0) + 1
     diag = (
         f"entropy_norm={report.normalized_entropy:.3f} "
-        f"zones={len(report.sparse_zones)} budget={budget} emitted={emitted}"
+        f"zones={len(report.sparse_zones)} budget={budget} "
+        f"envelopes={len(envelopes)} emitted={emitted}"
+        + (f" zero_cause={zero_cause}" if zero_cause else "")
+        + (f" ingest={ingest_hist}" if ingest_hist else "")
     )
-    if emitted > 0:
-        logger.info("[DomainEntropy] proactive scan — %s", diag)
+    logger.info("[DomainEntropy] proactive scan — %s", diag)
     return CuriosityScanReport(
         master_enabled=True,
         normalized_entropy=report.normalized_entropy,
@@ -375,4 +428,5 @@ async def run_curiosity_scan_once(
         emitted=emitted,
         ingest_results=tuple(results),
         diagnostic=diag,
+        zero_cause=zero_cause,
     )

@@ -61,6 +61,7 @@ class PipelineHandle:
     _bargein_vad_consumer: object = None  # stored for unregister on shutdown
     karen: object = None  # Sprint 3: full-duplex control layer (env-gated mount)
     voice_build: object = None  # Sprint 4: voice->build bridge (env-gated mount)
+    audio_ipc: object = None  # 2026-07-18: audio-state UDS broadcaster (ov CLI subscribes)
 
     def get_status(self) -> dict:
         """Aggregate status from all components."""
@@ -172,8 +173,19 @@ async def wire_conversation_pipeline(
                 # legacy barge-in controller and Karen's arbiter — no second loop.
                 # handle.karen resolves at frame-time (mounted just below).
                 karen_vad=lambda s: (
-                    handle.karen.on_vad(s) if handle.karen is not None else None
-                ),
+                    (
+                        handle.karen.on_vad(s)
+                        if handle.karen is not None else None
+                    ),
+                    # Same per-frame VAD decision feeds the audio-state
+                    # IPC (edge-coalesced inside publish_vad) — the ov
+                    # cockpit sees VAD_ACTIVE/INACTIVE with no second
+                    # VAD loop. Late-bound like handle.karen.
+                    (
+                        handle.audio_ipc.publish_vad(bool(s))
+                        if handle.audio_ipc is not None else None
+                    ),
+                )[0],
             )
             audio_bus.register_mic_consumer(handle._bargein_vad_consumer)
             logger.info("[Bootstrap] BargeInController registered on AudioBus")
@@ -183,6 +195,29 @@ async def wire_conversation_pipeline(
 
     except Exception as e:
         logger.warning(f"[Bootstrap] TurnDetector/BargeIn skipped: {e}")
+
+    # 3a-ipc. Audio-state IPC broadcaster (operator-signed 2026-07-18):
+    #     the supervisor owns the audio hardware plane; the ov cockpit
+    #     subscribes to STATE over this UDS instead of binding audio.
+    #     Read-only telemetry export — a bind failure never touches the
+    #     pipeline. VAD edges publish through the SAME per-frame decision
+    #     that drives barge-in + Karen (DRY — no second VAD loop).
+    try:
+        from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (
+            AudioStateBroadcaster,
+            audio_ipc_enabled,
+        )
+        if audio_ipc_enabled():
+            handle.audio_ipc = AudioStateBroadcaster()
+            if not await handle.audio_ipc.start():
+                handle.audio_ipc = None
+            else:
+                logger.info("[Bootstrap] Audio-state IPC broadcaster mounted")
+        else:
+            handle.audio_ipc = None
+    except Exception as e:
+        handle.audio_ipc = None
+        logger.warning(f"[Bootstrap] audio-state IPC skipped: {e}")
 
     # 3b. Karen full-duplex control layer (Sprint 3) — env-gated adaptive mount.
     #     Default OFF: the pipeline pays zero voice-allocation overhead and its
@@ -246,6 +281,49 @@ async def wire_conversation_pipeline(
         except Exception as e:
             handle.voice_build = None
             logger.warning(f"[Bootstrap] voice->build mount skipped: {e}")
+
+    # 4c. Audio-state IPC transcript + speech hooks (2026-07-18).
+    #     Composes — never replaces — the existing forks:
+    #       * user turns: chained _on_turn_text wrapper publishes the
+    #         final transcript to the IPC THEN forwards to whatever fork
+    #         was already installed (voice->build stays untouched);
+    #       * Karen lines: submit_speech is wrapped to publish the line
+    #         (role=karen) + TTS_GENERATING before the arbiter enqueue.
+    #     Fault-isolated: hook failures degrade silently; the audio
+    #     pipeline is byte-identical when the broadcaster is absent.
+    if handle.audio_ipc is not None:
+        try:
+            _ipc = handle.audio_ipc
+            if handle.conversation_pipeline is not None:
+                _prev_fork = getattr(
+                    handle.conversation_pipeline, "_on_turn_text", None,
+                )
+
+                async def _ipc_turn_fork(text, *a, **kw):
+                    try:
+                        _ipc.publish_transcript("user", str(text), final=True)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if _prev_fork is not None:
+                        return await _prev_fork(text, *a, **kw)
+                    return None
+
+                handle.conversation_pipeline._on_turn_text = _ipc_turn_fork
+            if handle.karen is not None:
+                _prev_submit = handle.karen.submit_speech
+
+                def _ipc_submit_speech(text, *a, **kw):
+                    try:
+                        _ipc.publish_transcript("karen", str(text), final=True)
+                        _ipc.publish_event("TTS_GENERATING")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return _prev_submit(text, *a, **kw)
+
+                handle.karen.submit_speech = _ipc_submit_speech
+            logger.info("[Bootstrap] audio-state IPC transcript hooks wired")
+        except Exception as e:
+            logger.warning(f"[Bootstrap] audio-state IPC hooks skipped: {e}")
 
     # 5. ModeDispatcher
     try:
@@ -338,6 +416,15 @@ async def shutdown(handle: PipelineHandle) -> None:
 
     # 0b. Karen voice->build bridge (Sprint 4) — drop the ref, no async teardown needed.
     handle.voice_build = None
+
+    # 0c. Audio-state IPC broadcaster — close clients + unlink the socket
+    #     so a later boot never sees a stale sock file.
+    if getattr(handle, "audio_ipc", None) is not None:
+        try:
+            await asyncio.wait_for(handle.audio_ipc.stop(), timeout=_timeout)
+        except Exception as e:
+            logger.debug(f"[Bootstrap] audio-state IPC stop error: {e}")
+        handle.audio_ipc = None
 
     # 1. ModeDispatcher
     if handle.mode_dispatcher is not None:

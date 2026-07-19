@@ -222,6 +222,7 @@ class ConversationOrchestrator:
         self,
         message: str,
         session_id: str = "default",
+        verdict_override: Optional[IntentClassification] = None,
     ) -> Tuple[ChatTurn, ChatRoutingDecision]:
         """Classify ``message`` and emit a :class:`ChatRoutingDecision`.
 
@@ -234,8 +235,19 @@ class ConversationOrchestrator:
           * For empty / whitespace input, the decision is ``"noop"``
             so the renderer can short-circuit without consuming
             session capacity.
+
+        ``verdict_override`` (additive seam, chat_text_bridge): a
+        caller-supplied :class:`IntentClassification` — e.g. the
+        code-shape re-weighted verdict — replaces the inline
+        ``classify()`` call. ``None`` (every legacy caller) keeps the
+        pre-seam behavior byte-identical. The override travels the
+        SAME turn/decision path, so ``/chat why`` audits it verbatim
+        (its ``reasons`` carry the re-weight evidence).
         """
-        verdict = classify(message)
+        verdict = (
+            verdict_override if verdict_override is not None
+            else classify(message)
+        )
         now = self._clock()
         turn_id = self._mint_turn_id()
 
