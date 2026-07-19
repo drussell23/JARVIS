@@ -356,9 +356,7 @@ class ChatTextMultiplexer:
                 self._safe_print(self._CANCEL_LINE)
                 return None
             result = await work
-            rendered = getattr(result, "rendered_text", None)
-            if rendered:
-                self._safe_print(str(rendered))
+            self._render_result(result)
             return result
         except asyncio.CancelledError:
             # drain()/shutdown cancelled us — propagate after tidying.
@@ -375,6 +373,42 @@ class ChatTextMultiplexer:
                     await token_wait
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
+
+    def _render_result(self, result: Any) -> None:
+        """Answer-first rendering (design language §3, 2026-07-18).
+
+        A REAL executor answer renders as Karen's voice line + speaks
+        through the mounted duplex; the routing-decision telemetry stays
+        available via ``/chat why`` instead of dumping on the surface.
+        Sentinel responses (the logging safe-default's ``logged-…`` /
+        bounded-failure ``error-…`` tokens) keep the legacy decision
+        render — in dev mode the telemetry IS the product. NEVER raises."""
+        try:
+            response = getattr(result, "executor_response", None)
+            status = getattr(
+                getattr(result, "status", None), "value", "",
+            )
+            is_real_answer = (
+                status == "EXECUTOR_OK"
+                and isinstance(response, str)
+                and response.strip()
+                and not response.startswith(("logged-", "error-"))
+            )
+            if is_real_answer:
+                self._safe_print(f"\U0001f4ad Karen ▸ {response.strip()}")
+                try:
+                    from backend.core.ouroboros.governance.karen_answer_engine import (  # noqa: E501
+                        speak_answer,
+                    )
+                    speak_answer(response)
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            rendered = getattr(result, "rendered_text", None)
+            if rendered:
+                self._safe_print(str(rendered))
+        except Exception:  # noqa: BLE001
+            logger.debug("[ChatTextBridge] render degraded", exc_info=True)
 
     def _safe_print(self, line: str) -> None:
         try:
@@ -412,8 +446,24 @@ def build_chat_text_multiplexer(
             from backend.core.ouroboros.governance.chat_repl_claude_executor import (  # noqa: E501
                 build_chat_repl_dispatcher_with_claude,
             )
+            # Karen Answer Engine (2026-07-18): the REAL provider —
+            # grounded in organism state, narrated through the print
+            # sink, routed via the rt_gate policy lane. Only consulted
+            # when JARVIS_CHAT_EXECUTOR_CLAUDE_ENABLED arms the Claude
+            # leg; the safe-default logging chain is untouched otherwise.
+            _karen_provider = None
+            try:
+                from backend.core.ouroboros.governance.karen_answer_engine import (  # noqa: E501
+                    KarenQueryProvider,
+                )
+                _karen_provider = KarenQueryProvider(
+                    progress_sink=print_sink,
+                )
+            except Exception:  # noqa: BLE001
+                _karen_provider = None
             d = build_chat_repl_dispatcher_with_claude(
                 project_root=project_root,
+                claude_provider=_karen_provider,
             )
         if d is None:
             return None
