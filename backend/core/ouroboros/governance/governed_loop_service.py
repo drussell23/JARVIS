@@ -2081,6 +2081,27 @@ class GovernedLoopService:
                         _chr_snap.get("unsupervised_interval_days", 0.0),
                     )
 
+                    # Proactive Cross-Space Coordinator (2026-07-19):
+                    # rides the SAME heartbeat cadence — no new poll
+                    # loop. Master-gated OFF; a headless daemon (no
+                    # windowserver) is a silent no-op. Fail-soft: a
+                    # coordinator fault never touches the heartbeat.
+                    _proactive_coord = None
+                    try:
+                        from backend.core.ouroboros.governance.comms.duplex.proactive_coordinator import (  # noqa: E501
+                            ProactiveCrossSpaceCoordinator,
+                            proactive_enabled as _proactive_on,
+                        )
+                        if _proactive_on():
+                            _proactive_coord = ProactiveCrossSpaceCoordinator()
+                            self._proactive_coordinator = _proactive_coord
+                            logger.info(
+                                "[GovernedLoop] proactive cross-space "
+                                "coordinator armed on heartbeat cadence",
+                            )
+                    except Exception:  # noqa: BLE001
+                        _proactive_coord = None
+
                     async def _chronos_heartbeat_loop() -> None:
                         _iv = _chronos_hb_s()
                         while True:
@@ -2090,6 +2111,8 @@ class GovernedLoopService:
                                     now_unix=_t_chr.time(),
                                     now_monotonic=_t_chr.monotonic(),
                                 )
+                                if _proactive_coord is not None:
+                                    _proactive_coord.tick()
                             except _aio_chr.CancelledError:
                                 break
                             except Exception:  # noqa: BLE001
