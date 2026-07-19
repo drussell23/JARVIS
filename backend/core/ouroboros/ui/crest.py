@@ -20,7 +20,7 @@ import functools
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .theme import ColorTier, Token, style_for
 
@@ -451,6 +451,68 @@ def generate_crest(
         return _generate_cached(clamped, needed_rows, int(tier))
     except Exception:  # noqa: BLE001 -- never raise into a render path
         return CrestFrame(0, 0, (), 0.0, "generation error")
+
+
+def frame_to_text(
+    frame: "CrestFrame", tier: ColorTier, *, elapsed: Optional[float] = None,
+) -> "Any":
+    """Render a crest frame to a Rich ``Text`` (fill-mode + feather
+    aware). ``elapsed=None`` renders the FULL crest (the static emblem
+    — collision surfaces, banners); a float renders the partial reveal
+    (the animated ceremony). THE one frame→Text renderer — the
+    AwakeningConductor and every static consumer compose it (DRY).
+    NEVER raises; degrades to an empty Text."""
+    try:
+        from rich.text import Text
+        if not frame.cells or frame.cols <= 0 or frame.rows <= 0:
+            return Text("")
+        cutoff = float("inf") if elapsed is None else elapsed
+        grid = {
+            (c.x, c.y): c for c in frame.cells if c.delay_s <= cutoff
+        }
+        text = Text()
+        for y in range(frame.rows):
+            for x in range(frame.cols):
+                cell = grid.get((x, y))
+                if cell is None:
+                    text.append(" ")
+                else:
+                    ch, style = render_cell(cell, tier)
+                    text.append(ch, style=style)
+            if y < frame.rows - 1:
+                text.append("\n")
+        return text
+    except Exception:  # noqa: BLE001
+        try:
+            from rich.text import Text
+            return Text("")
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+def print_static_crest(console: "Any") -> bool:
+    """The static emblem — the mark that ALWAYS greets ``ov`` (operator
+    law, 2026-07-18), including on the already-awake collision surface.
+    Full crest, no animation (animation is the BIRTH; the static mark
+    is the EMBLEM). Returns True when rendered; degrades silently on
+    non-TTY / NONE tier / tiny terminals. NEVER raises."""
+    try:
+        from .theme import detect_tier, supports_unicode
+        if not supports_unicode():
+            return False
+        tier = detect_tier(console)
+        if tier <= ColorTier.NONE:
+            return False
+        size = console.size
+        frame = generate_crest(
+            size.width, size.height, tier=tier, unicode_ok=True,
+        )
+        if frame.unavailable_reason:
+            return False
+        console.print(frame_to_text(frame, tier))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def crest_fill_mode() -> str:

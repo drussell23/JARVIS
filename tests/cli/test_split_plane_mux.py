@@ -118,7 +118,7 @@ def test_daemon_death_races_the_prompt():
     body = body[:body.index("\nasync def _legacy_pump_loop")]
     assert "_watch_disconnect" in body
     assert "FIRST_COMPLETED" in body               # never hangs on a dead daemon
-    assert "prompt_task.cancel()" in body
+    assert "_reap_task(prompt_task)" in body   # reaper cancels + retrieves
 
 
 def test_persona_host_line_present():
@@ -142,3 +142,79 @@ def test_line_renderer_resolves_stdout_dynamically():
     body = src[src.index("def _print_line"):][:700]
     assert "print(text)" in body
     assert "console.print" not in body
+
+
+# ---------------------------------------------------------------------------
+# (3) Clean detach — the dirty-KeyboardInterrupt class is dead
+# ---------------------------------------------------------------------------
+
+
+async def test_reap_consumes_keyboard_interrupt_task():
+    """The 2026-07-18 report: an abandoned prompt task finished with
+    KeyboardInterrupt → asyncio dumped 'Task exception was never
+    retrieved' over the clean goodbye. _reap_task must consume it so
+    the GC has nothing to complain about."""
+    import gc
+    from backend.core.ouroboros.cli.ov import _reap_task
+
+    complaints = []
+    loop = asyncio.get_running_loop()
+    old_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _l, ctx: complaints.append(ctx))
+    try:
+        class _FakeKI(BaseException):
+            """KeyboardInterrupt-shaped (BaseException, not Exception) —
+            a REAL KI in a task nukes the test runner itself, which is
+            precisely the sharpness of the original bug. Retrieval
+            semantics are identical for any BaseException."""
+
+        async def _boom():
+            raise _FakeKI
+
+        task = asyncio.ensure_future(_boom())
+        await asyncio.sleep(0.05)              # let it finish dirty
+        await _reap_task(task)                 # consume the corpse
+        del task
+        gc.collect()
+        await asyncio.sleep(0.05)
+        assert not any(
+            "never retrieved" in str(c.get("message", "")) for c in complaints
+        )
+    finally:
+        loop.set_exception_handler(old_handler)
+
+
+async def test_reap_cancels_pending_task():
+    from backend.core.ouroboros.cli.ov import _reap_task
+    task = asyncio.ensure_future(asyncio.sleep(30))
+    await _reap_task(task)
+    assert task.cancelled()
+
+
+def test_split_plane_reaps_on_every_exit_path():
+    src = _src()
+    body = src[src.index("async def _split_plane_loop"):]
+    body = body[:body.index("\nasync def _legacy_pump_loop")]
+    assert body.count("_reap_task(") >= 4          # KI-wait, daemon-death, EOF paths
+    assert "except (KeyboardInterrupt, asyncio.CancelledError):" in body
+
+
+def test_collision_surface_renders_the_emblem():
+    """Operator law: the crest ALWAYS greets `ov` — including the
+    already-awake collision card (static emblem, no animation)."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    src = (root / "scripts/ouroboros_battle_test.py").read_text()
+    idx = src.index("⏺ the organism is already awake")
+    region = src[max(0, idx - 3000):idx]
+    assert "print_static_crest" in region
+
+
+def test_static_emblem_renders_full_crest():
+    from backend.core.ouroboros.ui.crest import frame_to_text, generate_crest
+    from backend.core.ouroboros.ui.theme import ColorTier
+    f = generate_crest(80, 30, tier=ColorTier.TRUECOLOR, unicode_ok=True)
+    text = frame_to_text(f, ColorTier.TRUECOLOR)          # elapsed=None = FULL
+    assert len(text.plain.strip()) > 200                  # the whole mark
+    partial = frame_to_text(f, ColorTier.TRUECOLOR, elapsed=0.01)
+    assert len(partial.plain.strip()) < len(text.plain.strip())

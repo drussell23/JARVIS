@@ -818,6 +818,17 @@ def _single_flight_preflight(*, quiet: bool = False) -> None:
                 release_boot_mux()
             except Exception:  # noqa: BLE001
                 pass
+            # THE EMBLEM ALWAYS GREETS `ov` (operator law 2026-07-18):
+            # the static crest renders above the already-awake card too
+            # — animation is the birth; the mark is the identity.
+            try:
+                from backend.core.ouroboros.ui.crest import (
+                    print_static_crest,
+                )
+                from backend.core.ouroboros.ui.theme import build_console
+                print_static_crest(build_console())
+            except Exception:  # noqa: BLE001 — emblem never blocks the card
+                pass
             _pid = violators[0][1]
             _held = ""
             _h = _read_lock_holder(_PROJECT_ROOT)
