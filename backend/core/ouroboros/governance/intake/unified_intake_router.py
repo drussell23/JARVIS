@@ -1411,6 +1411,13 @@ class UnifiedIntakeRouter:
             _stamp_provenance(envelope.causal_id, _provenance_origin_for(envelope))
         except Exception:  # noqa: BLE001
             pass
+        # 0-qos. QoS Escalation pump — the intake loop's own activity IS
+        # the aging clock (no tickers): each ingest tick opportunistically
+        # re-admits ONE starved envelope whose weight breached threshold
+        # under healthy liquidity. Fire-and-forget + reentrancy-guarded;
+        # a pump failure never touches this envelope's path.
+        self._maybe_pump_qos_starvation()
+
         # 1. Dedup check
         if self._is_duplicate(envelope):
             return "deduplicated"
@@ -1447,7 +1454,31 @@ class UnifiedIntakeRouter:
         # Off mode: skip entirely (pre-Arc-A behavior).
         gov_mode = _intake_governor_mode()
         if gov_mode != "off":
-            gov_decision = self._consult_governor(envelope)
+            # QoS Escalation (Aging) — one-shot grant pre-empts the
+            # weighted cap for a starved envelope whose aged weight
+            # breached the threshold under healthy liquidity. The grant
+            # bypasses ONLY this consult; dedup / backpressure /
+            # file-conflict / risk cage all still applied above/below.
+            _qos_granted = False
+            try:
+                from backend.core.ouroboros.governance.qos_starvation import (  # noqa: PLC0415, E501
+                    get_default_ledger as _qos_ledger,
+                    qos_escalation_enabled as _qos_enabled,
+                )
+                if _qos_enabled() and _qos_ledger().consume_grant(
+                    envelope.causal_id,
+                ):
+                    _qos_granted = True
+                    logger.info(
+                        "[Router] governor consult PRE-EMPTED by QoS "
+                        "escalation grant: envelope=%s source=%s",
+                        envelope.causal_id[:16], envelope.source,
+                    )
+            except Exception:  # noqa: BLE001 — QoS must never break intake
+                pass
+            gov_decision = (
+                None if _qos_granted else self._consult_governor(envelope)
+            )
             if gov_decision is not None and not gov_decision.allowed:
                 if gov_mode == "enforce":
                     logger.info(
@@ -1459,6 +1490,19 @@ class UnifiedIntakeRouter:
                         gov_decision.weighted_cap,
                         gov_decision.current_count,
                     )
+                    # Starvation shunt (mandate 2): a throttled
+                    # low-urgency envelope parks with a timestamp and
+                    # ages toward escalation instead of vanishing.
+                    try:
+                        from backend.core.ouroboros.governance.qos_starvation import (  # noqa: PLC0415, E501
+                            get_default_ledger as _qos_ledger2,
+                        )
+                        _qos_ledger2().shunt(
+                            envelope,
+                            reason=str(gov_decision.reason_code),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                     return "governor_throttled"
                 # shadow: would have denied but allow through
                 logger.info(
@@ -1753,6 +1797,52 @@ class UnifiedIntakeRouter:
     # ------------------------------------------------------------------
     # Slice 5 Arc A — SensorGovernor consultation helpers
     # ------------------------------------------------------------------
+
+    def _maybe_pump_qos_starvation(self) -> None:
+        """Schedule ONE starved-envelope re-ingest when escalation
+        conditions hold (aged weight ≥ threshold, liquidity healthy,
+        pledge ratio unspent). Reentrancy-guarded so the pumped ingest's
+        own tick cannot cascade. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.qos_starvation import (
+                get_default_ledger,
+                qos_escalation_enabled,
+            )
+            if not qos_escalation_enabled():
+                return
+            if getattr(self, "_qos_pump_inflight", False):
+                return
+            ledger = get_default_ledger()
+            entry = ledger.try_escalate()
+            if entry is None:
+                return
+            self._qos_pump_inflight = True
+
+            async def _pump() -> None:
+                try:
+                    result = await self.ingest(entry.envelope)
+                    logger.info(
+                        "[Router] QoS escalation re-ingest: envelope=%s "
+                        "result=%s",
+                        entry.causal_id[:16], result,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[Router] QoS escalation re-ingest degraded",
+                        exc_info=True,
+                    )
+                finally:
+                    self._qos_pump_inflight = False
+
+            import asyncio as _asyncio
+            _asyncio.get_running_loop().create_task(_pump())
+        except RuntimeError:
+            # No running loop (sync test context) — clear the guard so a
+            # later async tick can pump.
+            self._qos_pump_inflight = False
+        except Exception:  # noqa: BLE001
+            self._qos_pump_inflight = False
+            logger.debug("[Router] QoS pump degraded", exc_info=True)
 
     def _consult_governor(self, envelope: IntentEnvelope) -> Optional[Any]:
         """Return a BudgetDecision (or None on any failure).

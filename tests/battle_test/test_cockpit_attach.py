@@ -1,0 +1,393 @@
+"""Cockpit Attach Bridge — hydration + bi-directional + BrokenPipe spine.
+
+CLI item #6 mandates:
+  1. Native IPC, no tail -f cosplay — the tests run the REAL UDS server
+     + client pair.
+  2. **State Hydration Protocol** — the FIRST frame carries FSM status,
+     active ops, and liquidity; the client renders instantly.
+  3. Bi-directional — operator input frames reach the daemon's on_input
+     sink (wired to _handle_repl_command → verbs + chat bridge).
+  4. **BrokenPipe resilience (headline)** — a SIGKILL'd / vanished
+     attach terminal is a dropped subscriber; the daemon's publisher
+     never raises, never blocks, and keeps serving remaining clients.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import stat
+
+import pytest
+
+from backend.core.ouroboros.battle_test import cockpit_attach as ca
+
+
+@pytest.fixture()
+def sock():
+    """Short socket path (AF_UNIX ~104-char sun_path cap on macOS)."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+    d = tempfile.mkdtemp(prefix="catt")
+    try:
+        yield Path(d) / "a.sock"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _providers():
+    return dict(
+        status_provider=lambda: {
+            "phase": "GENERATE", "phase_detail": "47s",
+            "cost_spent_usd": 0.42, "cost_budget_usd": 3.0,
+        },
+        ops_provider=lambda: ["op-019f-alpha", "op-019f-beta"],
+        liquidity_provider=lambda: {
+            "providers": {"anthropic": {"tokens_remaining": 11_000_000}},
+            "any_exhausted": False,
+        },
+    )
+
+
+async def _server(sock, on_input=None):
+    b = ca.CockpitAttachBridge(
+        path=sock, on_input=on_input, **_providers(),
+    )
+    assert await b.start() is True
+    return b
+
+
+class _Sink:
+    def __init__(self) -> None:
+        self.hydrations = []
+        self.lines = []
+
+    def on_hydration(self, m):
+        self.hydrations.append(m)
+
+    def on_line(self, t):
+        self.lines.append(t)
+
+
+async def _client(sock, sink):
+    c = ca.CockpitAttachClient(
+        path=sock, on_hydration=sink.on_hydration, on_line=sink.on_line,
+    )
+    return c, await c.connect()
+
+
+# ---------------------------------------------------------------------------
+# (1) Hydration protocol — instant state, never a blank screen
+# ---------------------------------------------------------------------------
+
+
+async def test_hydration_is_first_frame_with_full_state(sock):
+    b = await _server(sock)
+    try:
+        sink = _Sink()
+        c, ok = await _client(sock, sink)
+        assert ok is True
+        assert len(sink.hydrations) == 1          # BEFORE any FSM tick
+        h = sink.hydrations[0]
+        assert h["schema_version"] == ca.COCKPIT_ATTACH_SCHEMA_VERSION
+        assert h["status"]["phase"] == "GENERATE"
+        assert h["status"]["cost_spent_usd"] == 0.42
+        assert h["ops"] == ["op-019f-alpha", "op-019f-beta"]
+        assert h["liquidity"]["providers"]["anthropic"][
+            "tokens_remaining"] == 11_000_000
+        await c.close()
+    finally:
+        await b.stop()
+
+
+async def test_hydration_providers_pulled_fresh_per_connect(sock):
+    calls = {"n": 0}
+
+    def _status():
+        calls["n"] += 1
+        return {"phase": f"TICK-{calls['n']}"}
+
+    b = ca.CockpitAttachBridge(path=sock, status_provider=_status)
+    assert await b.start()
+    try:
+        s1, s2 = _Sink(), _Sink()
+        c1, _ = await _client(sock, s1)
+        c2, _ = await _client(sock, s2)
+        assert s1.hydrations[0]["status"]["phase"] == "TICK-1"
+        assert s2.hydrations[0]["status"]["phase"] == "TICK-2"   # not cached
+        await c1.close()
+        await c2.close()
+    finally:
+        await b.stop()
+
+
+async def test_broken_provider_degrades_not_dies(sock):
+    def _boom():
+        raise RuntimeError("provider exploded")
+
+    b = ca.CockpitAttachBridge(path=sock, status_provider=_boom)
+    assert await b.start()
+    try:
+        sink = _Sink()
+        c, ok = await _client(sock, sink)
+        assert ok is True                          # handshake survived
+        assert sink.hydrations[0]["status"] == {}
+        await c.close()
+    finally:
+        await b.stop()
+
+
+# ---------------------------------------------------------------------------
+# (2) Downstream streaming — the _repl_print mirror
+# ---------------------------------------------------------------------------
+
+
+async def test_published_lines_stream_to_client(sock):
+    b = await _server(sock)
+    try:
+        sink = _Sink()
+        c, ok = await _client(sock, sink)
+        assert ok
+        b.publish_line("⏺ apply — 2 file(s)")
+        b.publish_line("⎿ verify: 4/4")
+        for _ in range(50):
+            if len(sink.lines) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert sink.lines == ["⏺ apply — 2 file(s)", "⎿ verify: 4/4"]
+        await c.close()
+    finally:
+        await b.stop()
+
+
+# ---------------------------------------------------------------------------
+# (3) Bi-directional — operator input reaches the daemon sink
+# ---------------------------------------------------------------------------
+
+
+async def test_input_frames_reach_daemon_sink(sock):
+    received = []
+    b = await _server(sock, on_input=received.append)
+    try:
+        sink = _Sink()
+        c, ok = await _client(sock, sink)
+        assert ok
+        assert c.send_input("/liquidity") is True
+        assert c.send_input("what are you working on?") is True
+        for _ in range(50):
+            if len(received) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert received == ["/liquidity", "what are you working on?"]
+        await c.close()
+    finally:
+        await b.stop()
+
+
+async def test_input_sink_exception_never_kills_session(sock):
+    def _bad(_t):
+        raise RuntimeError("sink exploded")
+
+    b = await _server(sock, on_input=_bad)
+    try:
+        sink = _Sink()
+        c, ok = await _client(sock, sink)
+        assert ok
+        c.send_input("boom")
+        await asyncio.sleep(0.1)
+        # Session survived — a publish still arrives.
+        b.publish_line("still alive")
+        for _ in range(50):
+            if sink.lines:
+                break
+            await asyncio.sleep(0.02)
+        assert sink.lines == ["still alive"]
+        await c.close()
+    finally:
+        await b.stop()
+
+
+async def test_malformed_input_frame_ignored(sock):
+    received = []
+    b = await _server(sock, on_input=received.append)
+    try:
+        reader, writer = await asyncio.open_unix_connection(path=str(sock))
+        await reader.readline()                    # consume hydration
+        writer.write(b"{never json\n")
+        writer.write(
+            json.dumps({"type": "input", "text": "ok"}).encode() + b"\n"
+        )
+        for _ in range(50):
+            if received:
+                break
+            await asyncio.sleep(0.02)
+        assert received == ["ok"]
+        writer.close()
+    finally:
+        await b.stop()
+
+
+# ---------------------------------------------------------------------------
+# (4) HEADLINE — BrokenPipe / ConnectionReset resilience
+# ---------------------------------------------------------------------------
+
+
+async def test_vanished_terminal_is_dropped_and_organism_continues(sock):
+    """A SIGKILL'd `ov attach` (abrupt socket close) must cost the
+    daemon exactly one subscriber — publishes keep flowing to the
+    survivors and NOTHING raises into the FSM loop."""
+    b = await _server(sock)
+    try:
+        survivor = _Sink()
+        c_live, ok1 = await _client(sock, survivor)
+        reader, writer = await asyncio.open_unix_connection(path=str(sock))
+        await reader.readline()                    # raw client hydrated
+        assert ok1 and b.client_count == 2
+
+        # Abrupt death — no goodbye, transport torn down.
+        writer.transport.abort()
+        await asyncio.sleep(0.05)
+
+        # The organism keeps publishing; the survivor keeps receiving.
+        for i in range(3):
+            b.publish_line(f"line-{i}")
+        for _ in range(50):
+            if len(survivor.lines) >= 3:
+                break
+            await asyncio.sleep(0.02)
+        assert survivor.lines == ["line-0", "line-1", "line-2"]
+        for _ in range(50):
+            if b.client_count == 1:
+                break
+            await asyncio.sleep(0.02)
+        assert b.client_count == 1                 # corpse reaped
+        assert b.stats["dropped"] >= 1
+        await c_live.close()
+    finally:
+        await b.stop()
+
+
+async def test_broken_pipe_writer_dropped_without_raise(sock):
+    """Direct fault injection: a writer whose write() raises
+    BrokenPipeError is dropped mid-broadcast; the publish call NEVER
+    raises and remaining clients still receive."""
+    b = await _server(sock)
+    try:
+        sink = _Sink()
+        c, ok = await _client(sock, sink)
+        assert ok
+
+        class _BrokenWriter:
+            def is_closing(self):
+                return False
+
+            def write(self, _data):
+                raise BrokenPipeError("gone")
+
+            def close(self):
+                pass
+
+        b._clients.add(_BrokenWriter())            # type: ignore[arg-type]
+        b.publish_line("survives")                 # must not raise
+        for _ in range(50):
+            if sink.lines:
+                break
+            await asyncio.sleep(0.02)
+        assert sink.lines == ["survives"]
+        assert b.client_count == 1                 # broken writer gone
+        await c.close()
+    finally:
+        await b.stop()
+
+
+async def test_connection_reset_writer_dropped_without_raise(sock):
+    b = await _server(sock)
+    try:
+        class _ResetWriter:
+            def is_closing(self):
+                return False
+
+            def write(self, _data):
+                raise ConnectionResetError("reset by peer")
+
+            def close(self):
+                pass
+
+        b._clients.add(_ResetWriter())             # type: ignore[arg-type]
+        b.publish_line("no raise")                 # must not raise
+        assert b.client_count == 0
+    finally:
+        await b.stop()
+
+
+async def test_publish_with_no_clients_is_free(sock):
+    b = await _server(sock)
+    try:
+        b.publish_line("into the void")            # no clients, no raise
+        assert b.stats["lines_published"] == 0     # short-circuited
+    finally:
+        await b.stop()
+
+
+# ---------------------------------------------------------------------------
+# (5) Client degradation + hygiene
+# ---------------------------------------------------------------------------
+
+
+async def test_dead_socket_degrades_fast(sock):
+    import time as _time
+    c = ca.CockpitAttachClient(path=sock.parent / "nope.sock")
+    t0 = _time.monotonic()
+    assert await c.connect() is False
+    assert _time.monotonic() - t0 < 1.5
+
+
+async def test_daemon_exit_marks_client_disconnected(sock):
+    b = await _server(sock)
+    sink = _Sink()
+    c, ok = await _client(sock, sink)
+    assert ok and c.connected
+    await b.stop()
+    for _ in range(50):
+        if not c.connected:
+            break
+        await asyncio.sleep(0.02)
+    assert c.connected is False
+    assert c.send_input("late") is False           # detached pipe refuses
+    await c.close()
+
+
+async def test_socket_perms_and_unlink(sock):
+    b = await _server(sock)
+    assert stat.S_IMODE(os.stat(sock).st_mode) == 0o600
+    await b.stop()
+    assert not sock.exists()
+
+
+# ---------------------------------------------------------------------------
+# (6) Wiring pins
+# ---------------------------------------------------------------------------
+
+
+def _read(rel: str) -> str:
+    from pathlib import Path
+    return (Path(__file__).resolve().parents[2] / rel).read_text()
+
+
+def test_harness_mounts_bridge_and_mirrors_chokepoint():
+    src = _read("backend/core/ouroboros/battle_test/harness.py")
+    assert "_start_cockpit_attach_bridge" in src
+    body = src[src.index("def _repl_print"):][:2000]
+    assert "publish_line" in body                  # chokepoint mirror
+    assert "_handle_repl_command" in src[
+        src.index("def _start_cockpit_attach_bridge"):][:4000]
+
+
+def test_ov_attach_is_real_not_stub():
+    src = _read("backend/core/ouroboros/cli/ov.py")
+    assert "CockpitAttachClient" in src
+    assert "run_attach" in src
+    assert "coming soon" not in src
+    assert "follow-up sprint" not in src
+    assert "no organism awake" in src              # degradation message

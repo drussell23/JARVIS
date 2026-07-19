@@ -738,7 +738,29 @@ async def forward_request(
         # Disable aiohttp's response compression — pass-through must
         # not re-encode the body.
         client_resp.enable_chunked_encoding()
-        await client_resp.prepare(request)
+        try:
+            await client_resp.prepare(request)
+        except (ConnectionResetError, ConnectionError) as exc:
+            # Graceful Transport Teardown (2026-07-18): the LOCAL client
+            # (an SDK cancel/retry) closed its socket in the window
+            # between our upstream response arriving and headers going
+            # out ("Cannot write to closing transport"). Release the
+            # UPSTREAM connection cleanly (no half-read leaks into the
+            # pool), one DEBUG line, and re-raise the reset family — the
+            # daemon's handler catch answers 499 without an ERROR
+            # traceback ever reaching the operator terminal.
+            try:
+                upstream_resp.release()
+            except Exception:  # noqa: BLE001
+                try:
+                    upstream_resp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            logger.debug(
+                "[AegisForward] client vanished before headers "
+                "(benign teardown): %s", exc,
+            )
+            raise
 
         guillotine_fired = False
         client_disconnected = False

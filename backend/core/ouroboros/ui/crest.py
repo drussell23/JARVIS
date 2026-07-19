@@ -46,7 +46,32 @@ _REF = dict(
     v_stroke=2.7,
 )
 _GAP_CENTER = math.radians(90)
-_SS = 3
+
+
+def _ss() -> int:
+    """Supersampling factor per quadrant (``JARVIS_OV_CREST_SS``,
+    default 5 — raised from 3 in the 2026-07-18 sharpening pass:
+    25 samples/quadrant smooths edge staircasing). Clamped [2, 8]."""
+    try:
+        return max(2, min(8, int(os.environ.get("JARVIS_OV_CREST_SS", "5"))))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _coverage_threshold() -> float:
+    """Subpixel coverage fraction that turns a quadrant ON
+    (``JARVIS_OV_CREST_COVERAGE``, default 0.42 — slightly below the
+    old hard 0.5 so edge quadrants fill instead of fraying; the coil
+    reads as a solid professional stroke). Clamped [0.2, 0.8]."""
+    try:
+        return max(0.2, min(0.8, float(
+            os.environ.get("JARVIS_OV_CREST_COVERAGE", "0.42"),
+        )))
+    except (TypeError, ValueError):
+        return 0.42
+
+
+_SS = 5   # legacy alias — sampling reads _ss() at render time
 
 _STOPS = [
     (0, (125, 255, 106)), (60, (91, 227, 75)), (150, (139, 92, 246)),
@@ -94,7 +119,7 @@ def _clamp_cols(measured: int) -> Tuple[int, int, int]:
     read as "below minimum").
     """
     lo = int(os.environ.get("JARVIS_OV_CREST_MIN_COLS", "46"))
-    hi = int(os.environ.get("JARVIS_OV_CREST_MAX_COLS", "72"))
+    hi = int(os.environ.get("JARVIS_OV_CREST_MAX_COLS", "88"))
     clamped = max(lo, min(measured, hi))
     return lo, hi, clamped
 
@@ -274,10 +299,11 @@ def _classify(px: float, py: float, geo: _Geometry) -> Tuple[Optional[str], Opti
     """Hard classification of one subpixel center-region (majority of SSxSS)."""
     votes = {"eye": 0, "head": 0, "coil": 0, "v": 0}
     theta: Optional[float] = None
-    for sy in range(_SS):
-        for sx in range(_SS):
-            spx = px + (sx + 0.5) / _SS * 0.5
-            spy = py + ((sy + 0.5) / _SS * 0.5) * _REF_ASPECT
+    ss = _ss()
+    for sy in range(ss):
+        for sx in range(ss):
+            spx = px + (sx + 0.5) / ss * 0.5
+            spy = py + ((sy + 0.5) / ss * 0.5) * _REF_ASPECT
             if _sample_eye(spx, spy, geo):
                 votes["eye"] += 1
             elif _sample_head(spx, spy, geo):
@@ -287,8 +313,8 @@ def _classify(px: float, py: float, geo: _Geometry) -> Tuple[Optional[str], Opti
                 theta = math.atan2(-(spy - geo.cy), spx - geo.cx)
             elif _sample_v(spx, spy, geo):
                 votes["v"] += 1
-    n = _SS * _SS
-    inside = sum(votes.values()) >= n / 2.0       # 0.5 coverage threshold
+    n = ss * ss
+    inside = sum(votes.values()) >= n * _coverage_threshold()
     if not inside:
         return None, None
     k = max(_PRIORITY, key=lambda kk: votes[kk])
@@ -393,6 +419,39 @@ def generate_crest(
         return CrestFrame(0, 0, (), 0.0, "generation error")
 
 
+def crest_fill_mode() -> str:
+    """``JARVIS_OV_CREST_FILL`` — ``bg`` (default) paints FULL-BLOCK
+    cells as background-colored spaces, ``glyph`` keeps legacy
+    foreground blocks.
+
+    WHY bg (2026-07-18 operator report): terminal profiles with line
+    spacing > 1.0 leave a leading gap between rows that foreground
+    block glyphs cannot span — the coil renders as separated "bricks".
+    Background color fills the ENTIRE line box (leading included) on
+    every mainstream terminal, so interior strokes read solid on ANY
+    profile. Partial quadrant cells keep foreground glyphs — they carry
+    the anti-aliased silhouette and cannot be bg-painted without
+    filling their transparent quadrants."""
+    mode = os.environ.get("JARVIS_OV_CREST_FILL", "bg").strip().lower()
+    return mode if mode in ("bg", "glyph") else "bg"
+
+
+def render_cell(cell: CrestCell, tier: ColorTier) -> Tuple[str, str]:
+    """Resolve one cell to ``(char, style)`` under the fill mode.
+
+    Full blocks under ``bg`` fill → a SPACE painted with the cell color
+    as background (solid across line-spacing gaps); everything else
+    (edge quadrants, sub-C256 tiers) → the legacy foreground glyph."""
+    if (
+        crest_fill_mode() == "bg"
+        and cell.glyph == "█"
+        and tier >= ColorTier.C256
+    ):
+        r, g, b = cell.rgb
+        return " ", f"on rgb({r},{g},{b})"
+    return cell.glyph, style_for_cell(cell, tier)
+
+
 def style_for_cell(cell: CrestCell, tier: ColorTier) -> str:
     """Resolve one cell's Rich style for the tier. TRUECOLOR/C256 carry the
     per-cell gradient (Rich downgrades 24-bit for 256 terminals); STANDARD
@@ -406,4 +465,4 @@ def style_for_cell(cell: CrestCell, tier: ColorTier) -> str:
     return accent
 
 
-__all__ = ["CrestCell", "CrestFrame", "generate_crest", "style_for_cell"]
+__all__ = ["CrestCell", "CrestFrame", "crest_fill_mode", "generate_crest", "render_cell", "style_for_cell"]

@@ -86,10 +86,12 @@ def test_geometry_scales_with_width():
     assert len(large.cells) > len(small.cells) * 1.5
 
 
-def test_hard_clamp_at_72():
+def test_hard_clamp_at_default_max():
+    # 2026-07-18 sharpening pass: default max raised 72 -> 88 (still
+    # terminal-clamped; env-overridable via JARVIS_OV_CREST_MAX_COLS).
     f = gen(cols=200)
-    assert f.cols == 72
-    assert max(c.x for c in f.cells) < 72
+    assert f.cols == 88
+    assert max(c.x for c in f.cells) < 88
 
 
 def test_env_min_clamp(monkeypatch):

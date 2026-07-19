@@ -12,7 +12,7 @@ Subcommands::
     ov run [flags]     headless autonomous session  (-> --headless)
     ov daemon [flags]  alias for a headless run
     ov status          last-session digest (no boot)
-    ov attach          (follow-up sprint) attach to a running organism
+    ov attach          attach to a running organism (hydrated live view + input)
     ov help            usage
 
 Everything after the verb forwards verbatim to the bootstrap, e.g.
@@ -23,16 +23,16 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 from backend.core.ouroboros.ui.theme import build_console
 
 _VERBS = {"cockpit", "run", "daemon", "status", "attach"}
 _HELP_TOKENS = {"help", "--help", "-h"}
 
-_ATTACH_MESSAGE = (
-    "ov attach (detach / reattach to a running organism) lands in a follow-up "
-    "sprint. Use `ov` for the live cockpit, or `ov daemon` to run headless."
+_NO_ORGANISM_MESSAGE = (
+    "no organism awake — nothing to attach to. Start one with `ov` "
+    "(cockpit) or `ov daemon` (headless)."
 )
 
 _HELP_TEXT = """ov -- Ouroboros + Venom, autonomous engineering organism
@@ -41,7 +41,7 @@ _HELP_TEXT = """ov -- Ouroboros + Venom, autonomous engineering organism
   ov run [flags]      headless autonomous session
   ov daemon [flags]   alias for a headless run
   ov status           last-session digest (no boot)
-  ov attach           (coming soon) attach to a running organism
+  ov attach           attach this terminal to the running organism
   ov help             this message
 
 All flags after the verb forward to the battle-test bootstrap, e.g.
@@ -86,7 +86,7 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
     if verb == "status":
         return Invocation("status")
     if verb == "attach":
-        return Invocation("attach", message=_ATTACH_MESSAGE)
+        return Invocation("attach")
     # cockpit (explicit or defaulted)
     return Invocation("cockpit", rest)
 
@@ -138,6 +138,138 @@ def status_digest(provider: Optional[Callable[[], Optional[str]]] = None) -> str
 
 
 # ---------------------------------------------------------------------------
+# ov attach — dumb terminal over the Cockpit Attach Bridge (CLI item #6)
+# ---------------------------------------------------------------------------
+
+
+def _render_hydration(console: Any, payload: dict) -> None:
+    """Instant-state render — the operator NEVER stares at a blank
+    screen waiting for the next FSM tick. Pure presentation; the daemon
+    is the single source of truth. NEVER raises."""
+    try:
+        status = payload.get("status") or {}
+        liq = payload.get("liquidity") or {}
+        ops = payload.get("ops") or []
+        phase = status.get("phase", "IDLE")
+        detail = status.get("phase_detail", "")
+        cost = status.get("cost_spent_usd", 0.0)
+        budget = status.get("cost_budget_usd", 0.0)
+        console.print(
+            f"⏺ attached — phase: {phase}"
+            + (f" {detail}" if detail else "")
+            + f" · cost: ${cost:.2f}/${budget:.2f}",
+            markup=False, highlight=False,
+        )
+        if ops:
+            console.print(
+                f"⎿ active ops: {', '.join(str(o) for o in ops[:4])}",
+                markup=False, highlight=False,
+            )
+        providers = liq.get("providers") or {}
+        for name, row in list(providers.items())[:3]:
+            tokens = row.get("tokens_remaining")
+            tok_txt = f"{tokens:,} tokens" if tokens is not None else "undeclared"
+            console.print(
+                f"⎿ liquidity {name}: {tok_txt}",
+                markup=False, highlight=False,
+            )
+        if liq.get("any_exhausted"):
+            console.print("⚠ a provider runway is dry", markup=False)
+        console.print(
+            "⎿ type verbs or plain text · Ctrl+C detaches (the organism "
+            "keeps running)", markup=False, highlight=False,
+        )
+    except Exception:
+        pass
+
+
+def run_attach(console: Any) -> int:
+    """``ov attach`` — hydrate, stream, and pipe stdin upstream.
+
+    The client is a DUMB terminal: every rendered line arrives already
+    conformed by the daemon's PresentationRouter chokepoint. Detach
+    (Ctrl+C / EOF / daemon exit) never touches the organism."""
+    import asyncio
+
+    async def _session() -> int:
+        from backend.core.ouroboros.battle_test.cockpit_attach import (
+            CockpitAttachClient,
+        )
+
+        def _print_line(text: str) -> None:
+            try:
+                console.print(text, markup=False, highlight=False)
+            except Exception:
+                pass
+
+        hydrated = asyncio.Event()
+
+        def _on_hydration(payload: dict) -> None:
+            _render_hydration(console, payload)
+            hydrated.set()
+
+        client = CockpitAttachClient(
+            on_hydration=_on_hydration, on_line=_print_line,
+        )
+        if not await client.connect():
+            console.print(_NO_ORGANISM_MESSAGE, markup=False, highlight=False)
+            return 1
+
+        # stdin pump — blocking reads off-loop; EOF or detach ends it.
+        async def _stdin_pump() -> None:
+            while client.connected:
+                try:
+                    line = await asyncio.to_thread(sys.stdin.readline)
+                except Exception:
+                    break
+                if not line:               # EOF — operator closed stdin
+                    break
+                text = line.strip()
+                if text and not client.send_input(text):
+                    break
+
+        pump = asyncio.get_running_loop().create_task(_stdin_pump())
+        try:
+            while client.connected:
+                await asyncio.sleep(0.25)
+            console.print(
+                "⎿ organism went away — detached", markup=False,
+                highlight=False,
+            )
+        except KeyboardInterrupt:
+            console.print(
+                "⎿ detached (the organism keeps running)", markup=False,
+                highlight=False,
+            )
+        finally:
+            pump.cancel()
+            try:
+                await pump
+            except (asyncio.CancelledError, Exception):
+                pass
+            await client.close()
+        return 0
+
+    try:
+        return asyncio.run(_session())
+    except KeyboardInterrupt:
+        try:
+            console.print(
+                "⎿ detached (the organism keeps running)", markup=False,
+                highlight=False,
+            )
+        except Exception:
+            pass
+        return 0
+    except Exception as exc:
+        try:
+            console.print(f"ov attach: failed ({exc})", markup=False)
+        except Exception:
+            pass
+        return 1
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -156,8 +288,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         console.print(_HELP_TEXT, markup=False, highlight=False)
         return 0
     if inv.action == "attach":
-        console.print(inv.message, markup=False, highlight=False)
-        return 0
+        return run_attach(console)
     if inv.action == "status":
         console.print(status_digest(), markup=False, highlight=False)
         return 0
@@ -170,13 +301,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         PresentationMode.COCKPIT.value if inv.action == "cockpit"
         else PresentationMode.SOAK.value
     )
+
+    # Cinematic Boot Mux (COCKPIT only): silence the TTY structurally
+    # BEFORE the chatty bootstrap import chain runs. The awakening (or
+    # the single-flight collision surface) releases it; a fatal boot
+    # flushes the hidden buffer (Dead-Man's Switch) so forensics
+    # survive the ambition.
+    _mux_engaged = False
+    if inv.action == "cockpit":
+        try:
+            from backend.core.ouroboros.ui.boot_mux import engage_boot_mux
+            _mux_engaged = engage_boot_mux()
+        except Exception:  # noqa: BLE001 — degrade to the noisy legacy boot
+            _mux_engaged = False
+
     try:
         from scripts.ouroboros_battle_test import main as battle_main
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"ov: failed to load bootstrap: {exc}", markup=False)
-        return 1
-    battle_main(inv.delegate_argv)
-    return 0
+        battle_main(inv.delegate_argv)
+        return 0
+    except SystemExit as exc:
+        # 75 (EX_TEMPFAIL) is the single-flight collision — an EXPECTED
+        # presentation outcome whose surface already released the mux
+        # cleanly; only genuinely-unexpected nonzero exits flush.
+        if _mux_engaged and exc.code not in (0, None, 75):
+            _deadman_flush()
+        raise
+    except BaseException as exc:
+        if _mux_engaged:
+            _deadman_flush()
+        console.print(
+            f"ov: fatal during boot ({type(exc).__name__}: {exc}) — "
+            "buffered logs flushed above",
+            markup=False,
+        )
+        raise
+
+
+def _deadman_flush() -> None:
+    """Dead-Man's Switch — NEVER raises."""
+    try:
+        from backend.core.ouroboros.ui.boot_mux import release_boot_mux
+        release_boot_mux(flush_to_tty=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 if __name__ == "__main__":

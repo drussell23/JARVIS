@@ -896,7 +896,17 @@ class TestFailureSensor:
         try:
             import sys as _sys
 
-            print(TESTWATCHER_READY_MARKER, file=_sys.stdout, flush=True)
+            # Cockpit silence (2026-07-18): the raw-stdout marker exists
+            # for soak harness greps; on the operator's product surface
+            # it is boot noise that stomps the awakening Live region.
+            # The logger.info below is the cockpit-safe twin (the
+            # ERROR-only console threshold absorbs it; session logs
+            # keep it).
+            from backend.core.ouroboros.ui.presentation_mode import (
+                is_cockpit as _is_cockpit,
+            )
+            if not _is_cockpit():
+                print(TESTWATCHER_READY_MARKER, file=_sys.stdout, flush=True)
         except Exception:  # noqa: BLE001 -- marker is best-effort
             pass
         logger.info("%s", TESTWATCHER_READY_MARKER)

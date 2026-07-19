@@ -27,13 +27,13 @@ import os
 import select
 import sys
 import time
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.text import Text
 
-from .crest import CrestFrame, generate_crest, style_for_cell
+from .crest import CrestFrame, generate_crest, render_cell, style_for_cell
 from .theme import (
     ColorTier,
     Token,
@@ -168,6 +168,13 @@ class AwakeningConductor:
         self._skip_requested = False
         self._ignited = False
         self._header_printed = False
+        # Karen postlude (2026-07-18): the boot briefing's console
+        # fallback used to print WHILE the Live crest drew — Rich routes
+        # prints above an active Live, so Karen photobombed her own
+        # ceremony. Lines queued here render AFTER the ceremony closes;
+        # the ceremony_active flag tells the sink which path to take.
+        self.ceremony_active: bool = False
+        self._postlude: List[str] = []
 
         #: Resize proof (Mandate 4 / SIGWINCH): count of in-flight crest
         #: regenerations triggered by a mid-trace console size change, and
@@ -184,9 +191,34 @@ class AwakeningConductor:
         """Request an immediate jump to cool-down. Idempotent."""
         self._skip_requested = True
 
+    def queue_postlude(self, line: str) -> bool:
+        """Queue a line to render right AFTER the ceremony closes.
+        Returns False when the ceremony is already over — the caller
+        prints it itself (both orderings covered: a fast local briefing
+        lands mid-ceremony and queues; a slow DW synthesis lands after
+        and prints directly). NEVER raises."""
+        try:
+            if not self.ceremony_active:
+                return False
+            self._postlude.append(str(line))
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _flush_postlude(self) -> None:
+        """Render queued briefing lines on the clean post-ceremony
+        screen. NEVER raises."""
+        try:
+            lines, self._postlude = self._postlude, []
+            for line in lines:
+                self._console.print(line, style="muted", markup=False)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def run(self) -> None:
         """Play the whole ceremony. NEVER raises -- falls back to the plain
         path on any exception encountered anywhere in the animated path."""
+        self.ceremony_active = True
         try:
             frame = self._generate_frame()
             if self._should_go_plain(frame):
@@ -204,6 +236,9 @@ class AwakeningConductor:
                 logger.debug(
                     "[awakening] plain fallback also failed", exc_info=True,
                 )
+        finally:
+            self.ceremony_active = False
+            self._flush_postlude()
 
     # ------------------------------------------------------------------
     # Guards
@@ -379,7 +414,13 @@ class AwakeningConductor:
                 if cell is None:
                     text.append(" ")
                 else:
-                    text.append(cell.glyph, style=style_for_cell(cell, tier))
+                    # Fill-mode-aware cell resolution (crest.render_cell):
+                    # interior full blocks paint as BACKGROUND-colored
+                    # spaces — solid across terminal line-spacing gaps
+                    # (the 2026-07-18 "brick wall" report); edge quadrants
+                    # keep foreground glyphs for the silhouette.
+                    ch, style = render_cell(cell, tier)
+                    text.append(ch, style=style)
             if y < frame.rows - 1:
                 text.append("\n")
         return text
