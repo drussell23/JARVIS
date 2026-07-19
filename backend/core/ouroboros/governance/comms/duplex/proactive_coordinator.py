@@ -142,6 +142,17 @@ def native_windows_by_space() -> Dict[int, List[dict]]:
         wins = Quartz.CGWindowListCopyWindowInfo(
             Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID,
         ) or []
+        # SkyLight true-Space attribution FIRST (2026-07-19): native
+        # Mission-Control Space IDs. Returns None when the private API
+        # is unavailable/vanished → the PID heuristic below runs
+        # (Dynamic Symbol Resolution degradation, mandate 2).
+        try:
+            from .skylight_spaces import true_windows_by_space  # noqa: PLC0415
+            true = true_windows_by_space(list(wins))
+            if true:
+                return true
+        except Exception:  # noqa: BLE001
+            pass
         by_space: Dict[int, List[dict]] = {}
         pid_space: Dict[Any, int] = {}
         next_space = 2
