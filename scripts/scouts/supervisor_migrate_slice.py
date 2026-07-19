@@ -22,7 +22,8 @@ from pathlib import Path
 
 REPO = Path(".").resolve()
 SRC = REPO / "unified_supervisor.py"
-QMOD = REPO / "backend/core/quarantine/supervisor_slice1.py"
+import os as _os
+QMOD = REPO / _os.environ.get("JARVIS_QUARANTINE_SLICE_MODULE", "backend/core/quarantine/supervisor_slice1.py")
 REPORT = REPO / ".jarvis/supervisor_liveness_report.json"
 
 apply_n = 0
@@ -50,7 +51,7 @@ def external_consumers(name: str) -> int:
         return 999
 
 verified, vetoed = [], []
-for c in cands[:max(apply_n, 12)]:
+for c in cands[:max(apply_n, 60)]:
     n = external_consumers(c["name"])
     (verified if n == 0 else vetoed).append({**c, "external_files": n})
     print(f"  {'OK  ' if n == 0 else 'VETO'} {c['name']:40s} span={c['span']:4d} external_files={n}")
@@ -94,7 +95,7 @@ for lo, hi, name in sorted(removals, reverse=True):
               f"supervisor_slice1.py — revived on demand via symbol net")
     lines[lo - 1:hi] = [marker]
 
-net_map = {t["name"]: f"backend.core.quarantine.supervisor_slice1:{t['name']}"
+net_map = {t["name"]: str(QMOD.with_suffix("")).replace("/", ".") + f":{t['name']}"
            for t in targets}
 net_block = (
     "\n\n# ── Quarantine symbol net (Migration Slice 1, 2026-07-19) ──\n"
