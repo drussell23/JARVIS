@@ -34,6 +34,7 @@ Design invariants:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -63,6 +64,33 @@ def _enabled() -> bool:
     ).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _queue_max() -> int:
+    try:
+        return max(16, int(os.environ.get("JARVIS_GOVERNANCE_SSE_QUEUE", "256")))
+    except (TypeError, ValueError):
+        return 256
+
+
+def _conflate_threshold() -> int:
+    """A drained batch larger than this is CONFLATED into one summary
+    frame instead of forwarded 1:1 (the buffer-bloat guard)."""
+    try:
+        return max(1, int(os.environ.get(
+            "JARVIS_GOVERNANCE_SSE_CONFLATE_THRESHOLD", "10")))
+    except (TypeError, ValueError):
+        return 10
+
+
+def _drain_window_s() -> float:
+    """Coalescing window — after the first event the pump waits this long
+    for more to arrive so a burst drains as one batch."""
+    try:
+        return max(0.0, float(os.environ.get(
+            "JARVIS_GOVERNANCE_SSE_DRAIN_WINDOW_S", "0.05")))
+    except (TypeError, ValueError):
+        return 0.05
+
+
 class GovernanceSSEBridge:
     """Forwards O+V TrinityEventBus events onto the EventStream governance
     channel. One instance per backend process. Every method NEVER
@@ -73,8 +101,18 @@ class GovernanceSSEBridge:
         self._sub_ids: List[str] = []
         self._bus: Any = None
         self._installed = False
+        # ---- Async backpressure (Buffer Bloat Guard, mandate 2) ----
+        # The bus handler NEVER broadcasts inline; it enqueues into a
+        # bounded queue drained by a single pump. Under a flood the pump
+        # CONFLATES a whole batch into ONE summary frame, so 200 rapid
+        # autonomy events can't fan out into 200 TCP writes and bloat /
+        # BrokenPipe the EventStream generator.
+        self._queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue(
+            maxsize=_queue_max())
+        self._pump_task: Optional[asyncio.Task] = None
         self.stats: Dict[str, int] = {
             "forwarded": 0, "dropped_no_stream": 0, "forward_errors": 0,
+            "enqueued": 0, "conflated": 0, "batches": 0, "queue_overflow": 0,
         }
 
     @property
@@ -106,9 +144,14 @@ class GovernanceSSEBridge:
                                  pattern, exc_info=True)
             self._installed = bool(self._sub_ids)
             if self._installed:
+                # Start the single drain pump (backpressure worker).
+                if self._pump_task is None or self._pump_task.done():
+                    self._pump_task = asyncio.get_event_loop().create_task(
+                        self._pump(), name="governance-sse-pump")
                 logger.info(
                     "[GovernanceSSE] live — O+V→JARVIS-Apple wire up "
-                    "(%d topic patterns)", len(self._sub_ids),
+                    "(%d topic patterns, backpressure queue=%d)",
+                    len(self._sub_ids), _queue_max(),
                 )
             return self._installed
         except Exception:  # noqa: BLE001
@@ -116,30 +159,113 @@ class GovernanceSSEBridge:
             return False
 
     async def _on_event(self, event: Any) -> None:
-        """TrinityEventBus handler: translate the O+V event into a
-        governance SSE frame and broadcast it. Fault-isolated — a
-        forward failure is counted, never raised."""
+        """TrinityEventBus handler — NEVER broadcasts inline. It renders +
+        ENQUEUES onto the bounded backpressure queue; the pump does the
+        actual (rate-limited, conflating) broadcast. A full queue conflates
+        by dropping the oldest so a flood can never block the bus. Fault-
+        isolated; NEVER raises."""
         try:
-            from backend.core.event_stream import get_event_stream_if_initialized
-            es = get_event_stream_if_initialized()
-            if es is None:
-                self.stats["dropped_no_stream"] += 1
-                return
             payload = self._render(event)
-            sent = await es.broadcast_event(_SSE_CHANNEL, payload)
-            if sent > 0:
-                self.stats["forwarded"] += 1
-            else:
-                # No native client attached — cheap no-op, not an error.
-                self.stats["dropped_no_stream"] += 1
+            self.stats["enqueued"] += 1
+            try:
+                self._queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                # Buffer bloat guard: shed the oldest, keep the newest —
+                # under sustained flood we favor freshness over completeness.
+                try:
+                    self._queue.get_nowait()
+                    self._queue.put_nowait(payload)
+                    self.stats["queue_overflow"] += 1
+                except Exception:  # noqa: BLE001
+                    self.stats["queue_overflow"] += 1
         except Exception:  # noqa: BLE001
             self.stats["forward_errors"] += 1
-            logger.debug("[GovernanceSSE] forward degraded", exc_info=True)
+            logger.debug("[GovernanceSSE] enqueue degraded", exc_info=True)
+
+    async def _pump(self) -> None:
+        """Single drain worker (the backpressure heart). Awaits one event,
+        coalesces the burst behind it within a short window, then EITHER
+        forwards the batch (small) or CONFLATES it into one summary daemon
+        frame (flood > threshold) — decoupling the bus from the TCP writes.
+        NEVER raises out of the loop."""
+        window = _drain_window_s()
+        threshold = _conflate_threshold()
+        while True:
+            try:
+                first = await self._queue.get()
+                batch = [first]
+                # Coalesce everything that arrives within the window.
+                if window > 0:
+                    try:
+                        await asyncio.sleep(window)
+                    except asyncio.CancelledError:
+                        raise
+                while True:
+                    try:
+                        batch.append(self._queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                await self._flush_batch(batch, threshold)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                self.stats["forward_errors"] += 1
+                logger.debug("[GovernanceSSE] pump degraded", exc_info=True)
+
+    async def _flush_batch(
+        self, batch: List[Dict[str, Any]], threshold: int,
+    ) -> None:
+        """Broadcast a drained batch. ≤ threshold → 1:1; > threshold →
+        ONE conflated summary frame (buffer-bloat guard). NEVER raises."""
+        try:
+            from backend.core.event_stream import (
+                get_event_stream_if_initialized,
+            )
+            es = get_event_stream_if_initialized()
+            if es is None:
+                self.stats["dropped_no_stream"] += len(batch)
+                return
+            self.stats["batches"] += 1
+            frames: List[Dict[str, Any]]
+            if len(batch) > threshold:
+                # Conflate: one summary + a pointer to the latest op.
+                self.stats["conflated"] += len(batch)
+                frames = [self._conflated_frame(batch)]
+            else:
+                frames = batch
+            for payload in frames:
+                sent = await es.broadcast_event(_SSE_CHANNEL, payload)
+                if sent > 0:
+                    self.stats["forwarded"] += 1
+                else:
+                    self.stats["dropped_no_stream"] += 1
+        except Exception:  # noqa: BLE001
+            self.stats["forward_errors"] += 1
+            logger.debug("[GovernanceSSE] flush degraded", exc_info=True)
+
+    @staticmethod
+    def _conflated_frame(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Collapse a flood into ONE daemon frame carrying the count + the
+        most-recent op — protecting the SSE generator from the storm."""
+        from backend.api.sse_contract import daemon_payload
+        n = len(batch)
+        latest = batch[-1] if batch else {}
+        return daemon_payload(
+            command_id=str(latest.get("command_id") or "batch"),
+            narration_text=f"{n} background operations",
+            narration_priority="low",
+            source_brain="ouroboros",
+            extra={"type": "ov_activity_batch", "conflated": n,
+                   "latest": latest},
+        )
 
     @staticmethod
     def _render(event: Any) -> Dict[str, Any]:
-        """Map a TrinityEvent → the native client's governance frame.
+        """Map a TrinityEvent → a DaemonEvent-shaped payload (mandate 2 —
+        the exact Swift ``DaemonEvent`` Codable contract:
+        ``command_id / narration_text / narration_priority / source_brain``).
         Defensive against partial/duck-typed events. NEVER raises."""
+        from backend.api.sse_contract import daemon_payload
         topic = ""
         inner: Dict[str, Any] = {}
         op_id = ""
@@ -151,23 +277,32 @@ class GovernanceSSEBridge:
                 op_id = str(raw.get("op_id", "") or "")
         except Exception:  # noqa: BLE001
             pass
-        # A stable, self-describing frame the Swift client can render as
-        # "O+V is doing X". ``type`` names the render family; the raw O+V
-        # payload rides along untouched for detail views.
-        return {
-            "type": "ov_activity",
-            "topic": topic,
-            "event": topic.split(".")[-1] if topic else "activity",
-            "op_id": op_id,
-            "source": "ouroboros",
-            "detail": inner,
-        }
+        verb = topic.split(".")[-1] if topic else "activity"
+        # Failures narrate at higher priority so the HUD surfaces them.
+        prio = "high" if (inner.get("success") is False
+                          or "fail" in verb or "error" in verb) else "normal"
+        return daemon_payload(
+            command_id=op_id or "ouroboros",
+            narration_text=f"O+V: {verb}" + (f" ({op_id})" if op_id else ""),
+            narration_priority=prio,
+            source_brain="ouroboros",
+            extra={"type": "ov_activity", "topic": topic, "event": verb,
+                   "op_id": op_id, "detail": inner},
+        )
 
     async def uninstall(self) -> None:
-        """Release every subscription. Idempotent; NEVER raises."""
+        """Release every subscription + stop the pump. Idempotent; NEVER
+        raises."""
         bus, self._bus = self._bus, None
         subs, self._sub_ids = self._sub_ids, []
         self._installed = False
+        pump, self._pump_task = self._pump_task, None
+        if pump is not None and not pump.done():
+            pump.cancel()
+            try:
+                await pump
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         if bus is None:
             return
         for sub_id in subs:

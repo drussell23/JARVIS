@@ -60,6 +60,27 @@ def _frame_seq(frame: str) -> Optional[int]:
         return None
 
 
+def _adapt_enabled() -> bool:
+    return os.environ.get(
+        "JARVIS_SSE_JARVISKIT_CONTRACT", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _adapt_frame(frame: str) -> str:
+    """Translate a local EventStream frame into the JARVISKit SSE dialect
+    (``event:<type>`` + flat ``data:``) for the native client. A frame
+    that isn't a typed governance/daemon frame passes through unchanged.
+    NEVER raises."""
+    try:
+        if not _adapt_enabled():
+            return frame
+        from backend.api.sse_contract import eventstream_frame_to_jarviskit
+        adapted = eventstream_frame_to_jarviskit(frame)
+        return adapted if adapted is not None else frame
+    except Exception:  # noqa: BLE001
+        return frame
+
+
 class RehydrationBuffer:
     """Thread-safe circular cache of the last N id-bearing SSE frames.
     Ephemeral, tied to the multiplexer lifecycle (mandate 3 — no DB).
@@ -268,6 +289,13 @@ class DeviceStreamManager:
                                             BrokenPipeError)):
                             raise exc              # → fault-prune path
                         break                      # clean end of inner
+                    # Serialization-contract enforcement (Phase 10): the
+                    # native Swift SSEClient needs an ``event:<type>`` line
+                    # + a FLAT data payload; the local EventStream emits a
+                    # bare ``id:``/``data:{seq,ch,ts,d}`` envelope. Translate
+                    # typed frames to the JARVISKit dialect here, at the
+                    # native-app boundary (non-typed frames pass through).
+                    frame = _adapt_frame(frame)
                     # Cache every id-bearing frame for future
                     # reconnects (mandate 2 — the circular buffer).
                     self._rehydration.append(frame)
