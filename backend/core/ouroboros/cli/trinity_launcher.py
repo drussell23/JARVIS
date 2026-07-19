@@ -7,6 +7,8 @@ command that starts the tri-partite organism cleanly:
     trinity            boot the backend (Mind+Body) + attach the ov cockpit
     trinity up         start the backend detached; return the prompt
     trinity app        also launch the native JARVIS-Apple product surface
+    trinity doctor     validate the environment before boot (ports, ghost
+                       sockets, config-gated deps + models)
     trinity status     what's running (backend / sockets / native app)
     trinity down       graceful stop of the resident backend
     trinity help       usage
@@ -32,6 +34,7 @@ _HELP = """trinity — the JARVIS + O+V ecosystem, one command
   trinity           boot the backend + attach the ov cockpit (default)
   trinity up        start the backend detached; keep the terminal free
   trinity app       launch the native JARVIS-Apple product surface too
+  trinity doctor    validate the environment before boot
   trinity status     what's running (backend / sockets / native app)
   trinity down       gracefully stop the resident backend
   trinity help       this message
@@ -170,6 +173,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if verb in ("help", "--help", "-h"):
         console.print(_HELP, markup=False, highlight=False)
         return 0
+    if verb == "doctor":
+        from backend.core.ouroboros.cli.trinity_doctor import doctor_main
+        return doctor_main(console)
     if verb == "status":
         return _status(console)
     if verb == "down":
