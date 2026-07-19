@@ -564,7 +564,7 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
             # organism may be idle BECAUSE it is dry. The one exception
             # to the breadcrumb's minimalism.
             if snap.liquidity_exhausted:
-                tok = f"⛲ {snap.liquidity_provider or 'provider'} dry"
+                tok = f"⚠ {snap.liquidity_provider or 'provider'} dry"
                 if (
                     snap.liquidity_reset_s is not None
                     and snap.liquidity_reset_s > 0
@@ -628,7 +628,7 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
     # declared runway is dry (restraint: healthy = invisible). Reset
     # horizon in minutes when the provider declared one.
     if snap.liquidity_exhausted:
-        liq_txt = f"⛲ {snap.liquidity_provider or 'provider'} dry"
+        liq_txt = f"⚠ {snap.liquidity_provider or 'provider'} dry"
         if snap.liquidity_reset_s is not None and snap.liquidity_reset_s > 0:
             liq_txt += f" ~{max(1, int(snap.liquidity_reset_s / 60))}m"
         parts.append(liq_txt)

@@ -4137,13 +4137,13 @@ class BattleTestHarness:
                 )
                 lines.append(
                     f"  {name}: {tok_txt} · {reset_txt} · "
-                    f"last_status={status} · runway={verdict}"
+                    f"status: {status} · runway: {verdict}"
                 )
             lines.append(
-                f"  floor={min_tokens_floor():,} tokens · "
-                f"any_exhausted={any_runway_exhausted()}"
+                f"  floor: {min_tokens_floor():,} tokens · "
+                f"exhausted: {'yes' if any_runway_exhausted() else 'no'}"
                 + (
-                    f" · max_reset={int(max_seconds_to_reset() or 0)}s"
+                    f" · longest reset: {int(max_seconds_to_reset() or 0)}s"
                     if any_runway_exhausted() else ""
                 )
             )
@@ -4282,7 +4282,20 @@ class BattleTestHarness:
     # -- REPL sub-commands ------------------------------------------------
 
     def _repl_print(self, msg: str) -> None:
-        """Print to SerpentFlow console if available, else log."""
+        """Print to SerpentFlow console if available, else log.
+
+        THE design-language chokepoint (OV_DESIGN_LANGUAGE.md §6): every
+        REPL verb, chat turn, and IPC render funnels here, so routing
+        this one seam through the PresentationRouter conforms the whole
+        operator plane — glyph ration, telemetry recast, density. The
+        AST sentinel pins this wiring."""
+        try:
+            from backend.core.ouroboros.battle_test.presentation_router import (
+                get_default_router,
+            )
+            msg = get_default_router().route_block(msg)
+        except Exception:  # noqa: BLE001 — router must never eat output
+            pass
         sf = getattr(self, "_serpent_flow", None)
         if sf is not None:
             sf.console.print(msg, highlight=False)

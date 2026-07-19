@@ -53,14 +53,14 @@ def test_segment_renders_when_dry(ledger):
     snap = StatusLineBuilder().snapshot()
     assert snap.liquidity_exhausted is True
     assert snap.liquidity_provider == "anthropic"
-    assert "⛲ anthropic dry" in _format_plain(snap, compact=False)
+    assert "⚠ anthropic dry" in _format_plain(snap, compact=False)
 
 
 def test_segment_silent_when_healthy(ledger):
     ledger(tokens=9_000_000)
     snap = StatusLineBuilder().snapshot()
     assert snap.liquidity_exhausted is False
-    assert "⛲" not in _format_plain(snap, compact=False)
+    assert "⚠" not in _format_plain(snap, compact=False)
 
 
 def test_segment_surfaces_on_idle_breadcrumb(ledger):
@@ -76,7 +76,7 @@ def test_segment_master_off(ledger, monkeypatch):
     monkeypatch.setenv("JARVIS_STATUS_LIQUIDITY_SEGMENT_ENABLED", "0")
     snap = StatusLineBuilder().snapshot()
     assert snap.liquidity_exhausted is False
-    assert "⛲" not in _format_plain(snap, compact=False)
+    assert "⚠" not in _format_plain(snap, compact=False)
 
 
 def test_segment_reset_minutes_render(ledger):
@@ -112,16 +112,16 @@ def test_verb_renders_provider_rows(ledger):
     joined = "\n".join(lines)
     assert "anthropic" in joined
     assert "12,000,000 tokens" in joined
-    assert "runway=ok" in joined
-    assert "any_exhausted=False" in joined
+    assert "runway: ok" in joined
+    assert "exhausted: no" in joined
 
 
 def test_verb_marks_dry_runway(ledger):
     ledger(tokens=100)
     lines = _run_verb()
     joined = "\n".join(lines)
-    assert "runway=DRY" in joined
-    assert "any_exhausted=True" in joined
+    assert "runway: DRY" in joined
+    assert "exhausted: yes" in joined
 
 
 def test_verb_survives_empty_ledger(tmp_path, monkeypatch):

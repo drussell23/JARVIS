@@ -241,6 +241,15 @@ _GLYPHS: Mapping[str, tuple] = {
     "cross": ("✗", "X"),    # failed
     "arrow": ("›", ">"),    # prompt / pointer
     "rule": ("─", "-"),     # hairline
+    # Design-language semantic ration (OV_DESIGN_LANGUAGE.md §2) —
+    # the SIX operator-plane glyphs, each with an ASCII degradation
+    # so 16-color/none terminals keep identical geometry.
+    "action": ("⏺", "*"),   # an actor did/does something
+    "detail": ("⎿", "-"),   # continuation under an action
+    "voice": ("💭", "K:"),  # the organism speaking
+    "human": ("🗣", "you:"),  # the operator's words echoed
+    "warn": ("⚠", "!"),     # operator-notable degradation
+    "audio": ("🎙", "mic"),  # live audio-plane state
 }
 
 
