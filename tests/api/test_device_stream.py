@@ -135,9 +135,10 @@ class TestBackendWiring:
         assert '@router.get("/api/stream/{device_id}")' in src   # native path
         assert '@router.get("/api/stream/sse")' in src           # legacy KEPT
         assert '@router.post("/api/stream/command")' in src      # command KEPT
-        body = src[src.index('"/api/stream/{device_id}"'):][:1400]
+        body = src[src.index('"/api/stream/{device_id}"'):][:2200]
         assert "get_device_manager" in body                      # multiplexer
         assert "es.sse_stream" in body                           # DRY reuse
+        assert "install_governance_sse_bridge" in body           # O+V→Apple wire
 
 
 # ---------------------------------------------------------------------------

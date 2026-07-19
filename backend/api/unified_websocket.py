@@ -3120,6 +3120,20 @@ async def event_stream_device(device_id: str, request: Request):
     if es._ws_manager is None:
         set_event_stream_ws_manager(get_ws_manager())
 
+    # O+V ↔ JARVIS-Apple wire (2026-07-19): self-arm the governance→SSE
+    # bridge the instant a native client attaches. Both buses are
+    # guaranteed live here (EventStream just resolved; the governed loop
+    # owns the TrinityEventBus), the call is idempotent, and it costs
+    # nothing while no phone is watching. This is what makes O+V's
+    # autonomous activity actually reach the device.
+    try:
+        from backend.api.governance_sse_bridge import (
+            install_governance_sse_bridge,
+        )
+        await install_governance_sse_bridge()
+    except Exception:  # noqa: BLE001 — never block the stream on the bridge
+        pass
+
     last_ack = int(request.query_params.get("last_ack", "0"))
     last_event_id = request.headers.get("Last-Event-ID")
     if last_event_id:
