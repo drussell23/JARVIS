@@ -143,6 +143,51 @@ class PeerConsensus:
             return {"outcome": OUTCOME_ERROR, "payload": _FALLBACK_MESSAGE}
 
 
+def peer_consensus_enabled() -> bool:
+    """Master gate — default OFF (§33.1: inter-agent LLM dialogue that
+    spends tokens graduates). NEVER raises."""
+    return os.environ.get(
+        "JARVIS_PEER_CONSENSUS_ENABLED", "",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def should_yield_to_karen(command: str) -> bool:
+    """Daniel's yield decision: a query whose semantic class is
+    engineering/codebase AND carries technical depth is Karen's to
+    diagnose. Reuses the EXISTING persona classifier (DRY) — no new
+    routing table. NEVER raises."""
+    try:
+        from .ambient import classify_persona, PERSONA_KAREN  # noqa: PLC0415
+        low = str(command or "").lower()
+        # Depth markers — a shallow "what's the weather" never yields.
+        technical = any(w in low for w in (
+            "code", "bug", "error", "stack", "trace", "deadlock",
+            "refactor", "test", "exception", "why does", "debug",
+            "regression", "fix the", "function", "class", "import",
+        ))
+        # Persona routing: the command's semantic class → Karen's plane.
+        engineering = classify_persona(
+            "engineering" if technical else "system",
+        ) == PERSONA_KAREN
+        return bool(technical and engineering)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def build_live_peer_consensus(
+    *,
+    karen_diagnose: Optional[Callable[..., Awaitable[str]]] = None,
+) -> Optional["PeerConsensus"]:
+    """Mount a PeerConsensus for a live surface, or ``None`` when the
+    master gate is down. NEVER raises."""
+    try:
+        if not peer_consensus_enabled():
+            return None
+        return PeerConsensus(karen_diagnose=karen_diagnose)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 __all__ = [
     "OUTCOME_ERROR",
     "OUTCOME_LOCK_INTERCEPTED",
@@ -150,4 +195,7 @@ __all__ = [
     "OUTCOME_TIMEOUT",
     "ConsensusSession",
     "PeerConsensus",
+    "build_live_peer_consensus",
+    "peer_consensus_enabled",
+    "should_yield_to_karen",
 ]

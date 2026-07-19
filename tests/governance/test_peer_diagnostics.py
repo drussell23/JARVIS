@@ -155,3 +155,51 @@ class TestDepthBoundedConsensus:
         r = await pc.daniel_yields_to_karen(pc.new_session(), "q")
         assert r["outcome"] == "error_fallback"
         assert r["payload"]                           # graceful message
+
+
+# ---------------------------------------------------------------------------
+# Live-surface wiring (2026-07-19)
+# ---------------------------------------------------------------------------
+
+
+class TestLiveWiring:
+    def test_qos_master_gate(self, monkeypatch):
+        from backend.core.ouroboros.governance.comms.duplex.qos_sensor import (
+            build_live_qos_sensor, qos_enabled,
+        )
+        monkeypatch.delenv("JARVIS_QOS_SENSOR_ENABLED", raising=False)
+        assert qos_enabled() is False
+        assert build_live_qos_sensor() is None       # nothing mounted
+        monkeypatch.setenv("JARVIS_QOS_SENSOR_ENABLED", "true")
+        assert build_live_qos_sensor(emit_signal=lambda e: None) is not None
+
+    def test_harness_wires_qos_on_repl_input_pin(self):
+        from pathlib import Path
+        src = (
+            Path(__file__).resolve().parents[2]
+            / "backend/core/ouroboros/battle_test/harness.py"
+        ).read_text()
+        body = src[src.index("async def _handle_repl_command"):][:1400]
+        assert "build_live_qos_sensor" in body
+        assert "observe_command" in body
+        assert "_qos_emit_signal" in src              # intake routing seam
+        assert "_qos_note_override" in src            # SIGINT override hook
+
+    def test_yield_decision_technical_vs_shallow(self):
+        from backend.core.ouroboros.governance.comms.duplex.peer_consensus import (  # noqa: E501
+            should_yield_to_karen,
+        )
+        assert should_yield_to_karen("why does the orchestrator deadlock") is True
+        assert should_yield_to_karen("fix the import error in providers.py") is True
+        assert should_yield_to_karen("what time is it") is False
+        assert should_yield_to_karen("what's the weather") is False
+
+    def test_peer_consensus_master_gate(self, monkeypatch):
+        from backend.core.ouroboros.governance.comms.duplex.peer_consensus import (  # noqa: E501
+            build_live_peer_consensus, peer_consensus_enabled,
+        )
+        monkeypatch.delenv("JARVIS_PEER_CONSENSUS_ENABLED", raising=False)
+        assert peer_consensus_enabled() is False
+        assert build_live_peer_consensus() is None
+        monkeypatch.setenv("JARVIS_PEER_CONSENSUS_ENABLED", "true")
+        assert build_live_peer_consensus() is not None
