@@ -174,6 +174,46 @@ def get_installed_finder() -> Optional[QuarantineFinder]:
     return _INSTALLED
 
 
+def attach_symbol_net(
+    module_globals: Dict[str, object],
+    symbol_map: Dict[str, str],
+) -> None:
+    """Symbol-level breach net (Migration Slice 1): Tier-A candidates
+    live INSIDE the monolith, so module-level meta_path interception
+    can't see ``unified_supervisor.CacheStatisticsTracker``. PEP 562:
+    install a module ``__getattr__`` that resolves a migrated symbol
+    from its quarantine module, emits the SAME breach beacon, and
+    caches it back into the module globals (one beacon per symbol per
+    process). Composes with any pre-existing __getattr__. NEVER
+    raises on install; unmapped names raise AttributeError exactly as
+    before."""
+    try:
+        prior = module_globals.get("__getattr__")
+        mod_name = str(module_globals.get("__name__", "?"))
+
+        def _net(name: str):
+            target = symbol_map.get(name)
+            if target is None:
+                if callable(prior):
+                    return prior(name)
+                raise AttributeError(
+                    f"module {mod_name!r} has no attribute {name!r}"
+                )
+            qmod, _, qsym = target.rpartition(":")
+            logger.critical(
+                "[QUARANTINE_BREACH] Module revived at runtime: "
+                "%s.%s ← %s (dynamic consumer missed by the sweep — "
+                "graduate it back)", mod_name, name, qmod,
+            )
+            revived = getattr(importlib.import_module(qmod), qsym or name)
+            module_globals[name] = revived      # one beacon per symbol
+            return revived
+
+        module_globals["__getattr__"] = _net
+    except Exception:  # noqa: BLE001
+        logger.debug("[Quarantine] symbol net install degraded", exc_info=True)
+
+
 __all__ = [
     "QUARANTINE_SCHEMA_VERSION",
     "QuarantineFinder",
