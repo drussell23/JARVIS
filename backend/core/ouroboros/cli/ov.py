@@ -301,13 +301,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         PresentationMode.COCKPIT.value if inv.action == "cockpit"
         else PresentationMode.SOAK.value
     )
+
+    # Cinematic Boot Mux (COCKPIT only): silence the TTY structurally
+    # BEFORE the chatty bootstrap import chain runs. The awakening (or
+    # the single-flight collision surface) releases it; a fatal boot
+    # flushes the hidden buffer (Dead-Man's Switch) so forensics
+    # survive the ambition.
+    _mux_engaged = False
+    if inv.action == "cockpit":
+        try:
+            from backend.core.ouroboros.ui.boot_mux import engage_boot_mux
+            _mux_engaged = engage_boot_mux()
+        except Exception:  # noqa: BLE001 — degrade to the noisy legacy boot
+            _mux_engaged = False
+
     try:
         from scripts.ouroboros_battle_test import main as battle_main
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"ov: failed to load bootstrap: {exc}", markup=False)
-        return 1
-    battle_main(inv.delegate_argv)
-    return 0
+        battle_main(inv.delegate_argv)
+        return 0
+    except SystemExit as exc:
+        if _mux_engaged and exc.code not in (0, None):
+            _deadman_flush()
+        raise
+    except BaseException as exc:
+        if _mux_engaged:
+            _deadman_flush()
+        console.print(
+            f"ov: fatal during boot ({type(exc).__name__}: {exc}) — "
+            "buffered logs flushed above",
+            markup=False,
+        )
+        raise
+
+
+def _deadman_flush() -> None:
+    """Dead-Man's Switch — NEVER raises."""
+    try:
+        from backend.core.ouroboros.ui.boot_mux import release_boot_mux
+        release_boot_mux(flush_to_tty=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 if __name__ == "__main__":

@@ -156,6 +156,6 @@ def test_cockpit_collision_surface_present():
 
 def test_collision_surface_speaks_design_language():
     src = _src()
-    idx = src.index("the organism is already awake")
+    idx = src.index("⏺ the organism is already awake")
     body = src[max(0, idx - 200):idx + 1500]
     assert "⏺" in body and "⎿" in body      # rationed glyphs only

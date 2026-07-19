@@ -808,6 +808,16 @@ def _single_flight_preflight(*, quiet: bool = False) -> None:
         except Exception:
             _is_cockpit = False
         if _is_cockpit:
+            # The collision surface IS a presentation moment — hand the
+            # TTY over cleanly (no dead-man dump; the buffered boot
+            # chatter stays in boot.log where it belongs).
+            try:
+                from backend.core.ouroboros.ui.boot_mux import (
+                    release_boot_mux,
+                )
+                release_boot_mux()
+            except Exception:  # noqa: BLE001
+                pass
             _pid = violators[0][1]
             _held = ""
             _h = _read_lock_holder(_PROJECT_ROOT)

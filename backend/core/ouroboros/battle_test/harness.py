@@ -2243,6 +2243,15 @@ class BattleTestHarness:
             from backend.core.ouroboros.ui.presentation_mode import is_cockpit
             if not is_cockpit():
                 return None  # SOAK -- skip console construction entirely
+            # Cinematic Boot Mux handoff: the presentation plane asserts
+            # control HERE — the TTY was structurally black from the ov
+            # entry until this instant; the crest is the first thing an
+            # operator ever sees. NEVER raises; no-op when not engaged.
+            try:
+                from backend.core.ouroboros.ui.boot_mux import release_boot_mux
+                release_boot_mux()
+            except Exception:  # noqa: BLE001
+                pass
             from backend.core.ouroboros.ui import theme as _ov_theme
             console = _ov_theme.build_console(
                 emoji=True, highlight=False, force_terminal=True,
