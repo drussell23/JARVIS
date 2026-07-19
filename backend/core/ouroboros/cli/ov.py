@@ -222,6 +222,114 @@ def _render_hydration(console: Any, payload: dict) -> None:
         pass
 
 
+def _can_run_split_plane() -> bool:
+    """Split-plane needs a real TTY on stdin AND prompt_toolkit — piped
+    / scripted attaches degrade to the legacy pump. NEVER raises."""
+    try:
+        if not sys.stdin.isatty():
+            return False
+        import prompt_toolkit  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+async def _split_plane_loop(client: Any, console: Any) -> None:
+    """The Split-Plane Multiplexer (operator mandate 2026-07-18).
+
+    prompt_toolkit's ``PromptSession`` + ``patch_stdout`` IS the
+    thread-safe split-plane mux (DRY — the same solved mechanism
+    SerpentFlow's REPL trusts): the ``ov ›`` prompt permanently owns
+    the bottom of the TTY on an ASYNC loop (no sleep-blockers, no
+    blocking reads); a daemon telemetry line arriving MID-
+    KEYSTROKE is intercepted by patch_stdout, the stdin buffer is
+    hidden, the line renders on the scrolling plane above, and the
+    active input buffer is restored on the bottom line — keystrokes
+    can never be split or corrupted (pinned by the concurrent-I/O
+    test). The prompt task races a connection watch so a daemon death
+    mid-typing detaches instantly instead of hanging on the prompt.
+    """
+    import asyncio
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.patch_stdout import patch_stdout
+
+    # Persona-host moment: the persistent interactive surface opens
+    # with Karen as the host — the visual seam between the scrolling
+    # daemon history above and the command plane below.
+    console.print(
+        "\U0001f4ad Karen ▸ attached — I'm listening. verbs or plain "
+        "words both work · 'detach' leaves the organism running",
+        markup=False, highlight=False,
+    )
+
+    session: Any = PromptSession()
+
+    async def _watch_disconnect() -> None:
+        while client.connected:
+            await asyncio.sleep(0.25)
+
+    with patch_stdout(raw=True):
+        while client.connected:
+            prompt_task = asyncio.ensure_future(
+                session.prompt_async("ov › "),
+            )
+            watch_task = asyncio.ensure_future(_watch_disconnect())
+            done, _pending = await asyncio.wait(
+                {prompt_task, watch_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if watch_task in done and prompt_task not in done:
+                # Daemon died mid-typing — never hang on the prompt.
+                prompt_task.cancel()
+                try:
+                    await prompt_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                break
+            watch_task.cancel()
+            try:
+                await watch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            try:
+                line = prompt_task.result()
+            except (EOFError, KeyboardInterrupt):
+                break
+            text = (line or "").strip()
+            if text.lower() in ("detach", "exit", "quit"):
+                break
+            if text:
+                client.send_input(text)
+
+
+async def _legacy_pump_loop(client: Any) -> None:
+    """Non-TTY fallback: the original blocking-read-off-loop pump."""
+    import asyncio
+
+    async def _stdin_pump() -> None:
+        while client.connected:
+            try:
+                line = await asyncio.to_thread(sys.stdin.readline)
+            except Exception:
+                break
+            if not line:                   # EOF — operator closed stdin
+                break
+            text = line.strip()
+            if text and not client.send_input(text):
+                break
+
+    pump = asyncio.get_running_loop().create_task(_stdin_pump())
+    try:
+        while client.connected:
+            await asyncio.sleep(0.25)
+    finally:
+        pump.cancel()
+        try:
+            await pump
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 def run_attach(console: Any) -> int:
     """``ov attach`` — hydrate, stream, and pipe stdin upstream.
 
@@ -236,8 +344,12 @@ def run_attach(console: Any) -> int:
         )
 
         def _print_line(text: str) -> None:
+            # Builtin print() resolves sys.stdout DYNAMICALLY — under the
+            # split-plane's patch_stdout this routes daemon telemetry
+            # above the pinned prompt; the pre-bound Rich console would
+            # bypass the patch and corrupt the input line.
             try:
-                console.print(text, markup=False, highlight=False)
+                print(text)
             except Exception:
                 pass
 
@@ -254,38 +366,22 @@ def run_attach(console: Any) -> int:
             console.print(_NO_ORGANISM_MESSAGE, markup=False, highlight=False)
             return 1
 
-        # stdin pump — blocking reads off-loop; EOF or detach ends it.
-        async def _stdin_pump() -> None:
-            while client.connected:
-                try:
-                    line = await asyncio.to_thread(sys.stdin.readline)
-                except Exception:
-                    break
-                if not line:               # EOF — operator closed stdin
-                    break
-                text = line.strip()
-                if text and not client.send_input(text):
-                    break
-
-        pump = asyncio.get_running_loop().create_task(_stdin_pump())
         try:
-            while client.connected:
-                await asyncio.sleep(0.25)
-            console.print(
-                "⎿ organism went away — detached", markup=False,
-                highlight=False,
-            )
+            if _can_run_split_plane():
+                await _split_plane_loop(client, console)
+            else:
+                await _legacy_pump_loop(client)
+            if not client.connected:
+                console.print(
+                    "⎿ organism went away — detached", markup=False,
+                    highlight=False,
+                )
         except KeyboardInterrupt:
             console.print(
                 "⎿ detached (the organism keeps running)", markup=False,
                 highlight=False,
             )
         finally:
-            pump.cancel()
-            try:
-                await pump
-            except (asyncio.CancelledError, Exception):
-                pass
             await client.close()
         return 0
 
