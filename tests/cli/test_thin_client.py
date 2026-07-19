@@ -291,3 +291,87 @@ class TestRouting:
         assert "run_cockpit_thin(console)" in src
         assert "thin_client_enabled()" in src
         assert '"--legacy-boot" not in inv.delegate_argv' in src
+
+
+# ---------------------------------------------------------------------------
+# (6) Stateful KeepAlive Handoff + Circadian Log Janitor (2026-07-18)
+# ---------------------------------------------------------------------------
+
+
+class TestStatefulKeepAlive:
+    def test_keepalive_is_the_successful_exit_dict_never_a_boolean(self):
+        """MANDATE 4: the plist's KeepAlive MUST be the dict form —
+        {'SuccessfulExit': False} — so a clean idle exit(0) SLEEPS
+        while a crash is revived. A blind boolean would pin the
+        organism in a restart loop against the host OS."""
+        plist = thin_client.build_agent_plist()
+        ka = plist["KeepAlive"]
+        assert isinstance(ka, dict) and not isinstance(ka, bool)
+        assert ka == {"SuccessfulExit": False}
+
+    def test_plist_serialization_preserves_dict_structure(self, sock_dir):
+        import plistlib
+        thin_client.install_agent(
+            agents_dir=sock_dir, runner=lambda *a, **k: None,
+        )
+        raw = thin_client.agent_plist_path(sock_dir).read_bytes()
+        loaded = plistlib.loads(raw)
+        assert loaded["KeepAlive"] == {"SuccessfulExit": False}
+        # XML sanity: the dict serialized as <dict>, not <true/>.
+        assert b"<dict>" in raw and b"SuccessfulExit" in raw
+
+    def test_clean_completion_exits_zero_pin(self):
+        src = (_REPO / "scripts/ouroboros_battle_test.py").read_text()
+        tail = src[src.rindex("os.execv(sys.executable"):]
+        assert "sys.exit(0)" in tail       # explicit launchd handoff
+
+
+class TestCircadianLogJanitor:
+    def test_oversized_log_rotates_via_stdlib_machinery(
+        self, sock_dir, monkeypatch,
+    ):
+        monkeypatch.setenv("JARVIS_OV_DAEMON_LOG_MAX_BYTES", "2048")
+        monkeypatch.setenv("JARVIS_OV_DAEMON_LOG_BACKUPS", "3")
+        log = sock_dir / "ov-daemon.log"
+        log.write_bytes(b"x" * 4096)
+        assert thin_client.rollover_daemon_log(log) is True
+        assert (sock_dir / "ov-daemon.log.1").exists()
+        assert (sock_dir / "ov-daemon.log.1").stat().st_size == 4096
+        assert not log.exists() or log.stat().st_size == 0
+
+    def test_healthy_log_untouched(self, sock_dir, monkeypatch):
+        monkeypatch.setenv("JARVIS_OV_DAEMON_LOG_MAX_BYTES", "2048")
+        log = sock_dir / "ov-daemon.log"
+        log.write_bytes(b"y" * 100)
+        assert thin_client.rollover_daemon_log(log) is False
+        assert log.read_bytes() == b"y" * 100
+        assert not (sock_dir / "ov-daemon.log.1").exists()
+
+    def test_backup_count_bounds_total_disk(self, sock_dir, monkeypatch):
+        monkeypatch.setenv("JARVIS_OV_DAEMON_LOG_MAX_BYTES", "1024")
+        monkeypatch.setenv("JARVIS_OV_DAEMON_LOG_BACKUPS", "2")
+        log = sock_dir / "ov-daemon.log"
+        for _ in range(5):                 # five oversized generations
+            log.write_bytes(b"z" * 2048)
+            thin_client.rollover_daemon_log(log)
+        survivors = sorted(p.name for p in sock_dir.iterdir())
+        assert "ov-daemon.log.3" not in survivors     # oldest fell off
+        assert len([s for s in survivors if s.startswith("ov-daemon")]) <= 3
+
+    def test_spawn_and_install_invoke_the_janitor_pin(self):
+        src = (
+            _REPO / "backend/core/ouroboros/cli/thin_client.py"
+        ).read_text()
+        spawn = src[src.index("def spawn_daemon"):][:1200]
+        install = src[src.index("def install_agent"):][:1500]
+        assert "rollover_daemon_log(" in spawn
+        assert src[src.index("def install_agent"):].count(
+            "rollover_daemon_log(",
+        ) >= 2                              # both launchd sinks
+        assert "rollover_daemon_log" in install
+
+    def test_silent_boot_fallback_rotates_pin(self):
+        src = (
+            _REPO / "backend/core/ouroboros/governance/silent_boot.py"
+        ).read_text()
+        assert "RotatingFileHandler(" in src

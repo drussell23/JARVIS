@@ -6,8 +6,19 @@ re-parsing), status/attach/help are handled without booting the organism.
 """
 from __future__ import annotations
 
+import pytest
+
 from backend.core.ouroboros.cli import ov
 from backend.core.ouroboros.cli.ov import resolve
+
+
+@pytest.fixture(autouse=True)
+def _restore_presentation_env():
+    # ov.main() writes JARVIS_OV_PRESENTATION during boot-action tests;
+    # restore process env so later suites never inherit a leaked mode.
+    yield
+    import os as _os
+    _os.environ.pop("JARVIS_OV_PRESENTATION", None)
 
 
 class TestResolveSubcommands:

@@ -2233,6 +2233,16 @@ def main(argv: "list[str] | None" = None) -> None:
         # argv[0] is the interpreter, argv[1] is this script, then the original CLI flags.
         os.execv(sys.executable, [sys.executable, *sys.argv])
 
+    # Stateful KeepAlive Handoff (operator-authorized 2026-07-18): every
+    # CLEAN completion — idle_timeout, budget_exhausted, wall_clock_cap,
+    # operator shutdown — exits 0 EXPLICITLY. Under the resident
+    # launchd agent (KeepAlive.SuccessfulExit=false) this lets the
+    # organism SLEEP on intentional exit instead of entering a
+    # CPU-burning restart loop against the host OS; the thin client's
+    # cold-boot path revives it on the next operator touch. Crashes
+    # (tracebacks, os._exit(75) wedges) exit nonzero and ARE revived.
+    sys.exit(0)
+
 
 if __name__ == "__main__":
     main()

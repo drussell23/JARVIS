@@ -12,6 +12,13 @@ from backend.core.ouroboros.cli import ov as ov_cli
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.delenv("JARVIS_OV_PRESENTATION", raising=False)
+    yield
+    # ov.main() mutates os.environ DURING the test (mode declaration) —
+    # monkeypatch can't see that write, so restore explicitly or the
+    # mode leaks into every later suite in the process (the silent_boot
+    # cockpit-threshold cross-pollution, 2026-07-18).
+    import os as _os
+    _os.environ.pop("JARVIS_OV_PRESENTATION", None)
 
 
 def _capture_delegation(monkeypatch):

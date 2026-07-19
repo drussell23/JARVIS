@@ -152,6 +152,60 @@ def daemon_log_path() -> Path:
     return repo_root() / ".jarvis" / "logs" / "ov-daemon.log"
 
 
+def _log_max_bytes() -> int:
+    try:
+        return max(1024, int(os.environ.get(
+            "JARVIS_OV_DAEMON_LOG_MAX_BYTES", str(50 * 1024 * 1024),
+        )))
+    except (TypeError, ValueError):
+        return 50 * 1024 * 1024
+
+
+def _log_backups() -> int:
+    try:
+        return max(1, int(os.environ.get(
+            "JARVIS_OV_DAEMON_LOG_BACKUPS", "3",
+        )))
+    except (TypeError, ValueError):
+        return 3
+
+
+def rollover_daemon_log(path: Optional[Path] = None) -> bool:
+    """Circadian Log Janitor for the RAW daemon sinks (the streams
+    launchd / Popen capture BELOW the logging layer). Uses the
+    standard ``RotatingFileHandler`` machinery (``shouldRollover`` /
+    ``doRollover`` — never manual byte manipulation) at each
+    spawn/boot boundary: oversized logs shift to ``.1``/``.2``/``.3``
+    and the oldest falls off. Caveat, stated honestly: a stream fd
+    HELD OPEN by launchd keeps writing to the rotated inode until the
+    next daemon start — the bound is therefore max_bytes × (backups+2)
+    per sink, never unbounded. NEVER raises."""
+    import logging as _logging
+    import logging.handlers as _lh
+    target = path or daemon_log_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        handler = _lh.RotatingFileHandler(
+            str(target),
+            maxBytes=_log_max_bytes(),
+            backupCount=_log_backups(),
+            encoding="utf-8",
+            delay=True,                    # never touches a healthy file
+        )
+        probe = _logging.LogRecord(
+            "ov.janitor", _logging.INFO, __file__, 0, "", (), None,
+        )
+        try:
+            if handler.shouldRollover(probe):
+                handler.doRollover()
+                return True
+            return False
+        finally:
+            handler.close()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def spawn_daemon(
     *, spawner: Callable[..., Any] = subprocess.Popen,
 ) -> Optional[int]:
@@ -161,6 +215,7 @@ def spawn_daemon(
     try:
         log = daemon_log_path()
         log.parent.mkdir(parents=True, exist_ok=True)
+        rollover_daemon_log(log)           # janitor at every ignition
         env = dict(os.environ)
         # The resident organism serves cockpits — give it the cockpit
         # session economics unless the operator overrode them.
@@ -311,7 +366,12 @@ def install_agent(
     try:
         path = agent_plist_path(agents_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
-        (repo_root() / ".jarvis" / "logs").mkdir(parents=True, exist_ok=True)
+        log_dir = repo_root() / ".jarvis" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # Janitor the launchd sinks at (re)install so an accumulated
+        # history never rides into the resident era unbounded.
+        rollover_daemon_log(log_dir / "ov-daemon.out.log")
+        rollover_daemon_log(log_dir / "ov-daemon.err.log")
         with open(path, "wb") as fh:
             plistlib.dump(build_agent_plist(), fh)
         try:
