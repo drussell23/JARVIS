@@ -4418,6 +4418,15 @@ class BattleTestHarness:
             _q = getattr(self, "_qos_sensor", None)
             if _q is not None:
                 _q.observe_override(kind)
+            # Attenuation: an override CONFIRMS the pending frustration
+            # as a definitive negative in the preference ledger.
+            try:
+                from backend.core.ouroboros.governance.comms.duplex.preference_ledger import (  # noqa: E501
+                    get_default_ledger,
+                )
+                get_default_ledger().confirm_override()
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             pass
 

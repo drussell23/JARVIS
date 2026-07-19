@@ -305,6 +305,19 @@ class StrategicDirectionService:
         )
         if causal_lineage_block:
             body = f"{body}\n\n{causal_lineage_block}"
+        # Dynamic Scaffolding Bias (2026-07-19): inject verified
+        # operational patterns from the preference ledger so future
+        # generations lean toward strategies that empirically satisfied
+        # the operator. Fail-soft; empty until the ledger has proof.
+        try:
+            from backend.core.ouroboros.governance.comms.duplex.preference_ledger import (  # noqa: E501
+                get_default_ledger,
+            )
+            _bias = get_default_ledger().format_for_prompt()
+            if _bias:
+                body = f"{body}\n\n{_bias}"
+        except Exception:  # noqa: BLE001
+            pass
         return body
 
     def _render_avoidance_section(self) -> str:

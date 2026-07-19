@@ -330,6 +330,22 @@ class ChatTextMultiplexer:
     # ---- turn execution ----
 
     async def _run(self, text: str) -> Optional[Any]:
+        # PeerConsensus mount (2026-07-19): Daniel yields a structural/
+        # engineering query to Karen (depth-bounded, one round-trip).
+        # Gated + fail-soft; a shallow query never yields. The dispatch
+        # below still runs — consensus ENRICHES, never replaces.
+        try:
+            from backend.core.ouroboros.governance.comms.duplex.peer_consensus import (  # noqa: E501
+                build_live_peer_consensus, should_yield_to_karen,
+            )
+            _pc = build_live_peer_consensus()
+            if _pc is not None and should_yield_to_karen(text):
+                _sess = _pc.new_session()
+                _r = await _pc.daniel_yields_to_karen(_sess, text)
+                logger.info("[PeerConsensus] Daniel→Karen yield: %s",
+                            _r.get("outcome"))
+        except Exception:  # noqa: BLE001
+            pass
         verdict = weighted_classify(text)
         work = asyncio.ensure_future(asyncio.to_thread(
             self._dispatcher.handle,
