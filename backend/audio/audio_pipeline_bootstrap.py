@@ -208,7 +208,43 @@ async def wire_conversation_pipeline(
             audio_ipc_enabled,
         )
         if audio_ipc_enabled():
-            handle.audio_ipc = AudioStateBroadcaster()
+            # Tri-State broker lease seam (operator-authorized
+            # 2026-07-18): a remote `wake` (ov attach → daemon broker)
+            # arms the SUPERVISOR-owned duplex; disarm stops it. The
+            # closure late-binds `handle` (karen mounts at 3b, AFTER
+            # this) and lazy-builds over the SAME factory when voice
+            # wasn't pre-mounted — sovereignty never leaves this
+            # process; the broadcaster only relays the verb.
+            async def _on_lease_change(armed: bool) -> None:
+                try:
+                    if armed:
+                        if handle.karen is None and handle.tts_engine is not None:
+                            from backend.core.ouroboros.governance.comms.duplex.karen_duplex_factory import (  # noqa: E501
+                                build_karen_duplex,
+                                set_default_karen,
+                            )
+                            handle.karen = build_karen_duplex(handle.tts_engine)
+                            set_default_karen(handle.karen)
+                            logger.info(
+                                "[Bootstrap] Karen duplex lazy-mounted on lease",
+                            )
+                        if handle.karen is not None:
+                            await handle.karen.start()
+                            logger.info("[Bootstrap] audio lease ARMED")
+                    else:
+                        if handle.karen is not None:
+                            await handle.karen.stop()
+                            logger.info(
+                                "[Bootstrap] audio lease DISARMED (fail-safe)",
+                            )
+                except Exception:
+                    logger.warning(
+                        "[Bootstrap] lease arm/disarm degraded", exc_info=True,
+                    )
+
+            handle.audio_ipc = AudioStateBroadcaster(
+                on_lease_change=_on_lease_change,
+            )
             if not await handle.audio_ipc.start():
                 handle.audio_ipc = None
             else:

@@ -30,6 +30,29 @@ Authority invariant: pure presentation telemetry. No audio capture, no
 mutation surface, no policy imports. Socket is chmod 0600 (same-user
 only). Master ``JARVIS_AUDIO_IPC_ENABLED`` (default on — §7 Absolute
 Observability; the socket exports state, never grants control).
+
+Tri-State IPC Audio Broker (v2, operator-authorized 2026-07-18): the
+transport gains an upstream **lease lane** — the ONE narrow control
+surface, and it still never moves audio bytes:
+
+  * ``{"type":"lease","cmd":"acquire"|"release"|"heartbeat"}`` from a
+    client negotiates the audio-arming lease. Single-holder; a second
+    client is answered ``{"type":"lease","granted":false,
+    "reason":"held"}``. Grants carry ``ttl_s`` so the client derives
+    its own heartbeat cadence (no hardcoded numbers on the wire's far
+    side).
+  * **Orphaned-mic protection**: the lease DIES two independent ways —
+    (a) the holder's socket drops (daemon SIGKILL = broken pipe →
+    instant release), and (b) heartbeats stop while the socket wedges
+    open (a monotonic-deadline watchdog sweeps at TTL/2 and expires
+    the lease). Either path invokes the injected ``on_lease_change
+    (False)`` so the supervisor disarms the hardware and fails safe.
+    The watchdog reads ONLY ``time.monotonic()`` + its own deadline —
+    never pipeline state (the Slice-47 watchdog-isolation invariant).
+  * The supervisor stays sovereign: ``on_lease_change`` is an injected
+    callable the BOOTSTRAP owns; this module never imports or touches
+    karen_duplex / hardware. Lease grant ≠ hardware promise — the
+    supervisor may still refuse in its callback.
 """
 from __future__ import annotations
 
@@ -45,7 +68,21 @@ from typing import Any, Callable, Deque, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
 
-AUDIO_IPC_SCHEMA_VERSION = "audio_ipc.v1"
+AUDIO_IPC_SCHEMA_VERSION = "audio_ipc.v2"
+
+#: Closed lease-command vocabulary (the upstream control lane).
+LEASE_CMDS = ("acquire", "release", "heartbeat")
+
+
+def lease_ttl_s() -> float:
+    """``JARVIS_AUDIO_LEASE_TTL_S`` (default 5.0, clamped [1, 60]) —
+    the heartbeat deadline. A dead daemon releases the mic within one
+    TTL. NEVER raises."""
+    try:
+        raw = float(os.environ.get("JARVIS_AUDIO_LEASE_TTL_S", "5.0"))
+    except (TypeError, ValueError):
+        raw = 5.0
+    return max(1.0, min(60.0, raw))
 
 _TRUTHY = ("1", "true", "yes", "on")
 
@@ -105,7 +142,12 @@ class AudioStateBroadcaster:
     a slow or dead client is dropped, never awaited inline.
     """
 
-    def __init__(self, *, path: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        *,
+        path: Optional[Path] = None,
+        on_lease_change: Optional[Callable[[bool], Any]] = None,
+    ) -> None:
         self._path = Path(path) if path is not None else socket_path()
         self._server: Optional[asyncio.AbstractServer] = None
         self._clients: Set[asyncio.StreamWriter] = set()
@@ -117,6 +159,19 @@ class AudioStateBroadcaster:
         }
         self._utterance: Optional[Dict[str, Any]] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # ---- lease lane (v2) ----
+        # ``on_lease_change(armed)`` is the supervisor's injected
+        # arm/disarm seam (sync or async — both awaited safely). The
+        # holder is identified by its StreamWriter; the deadline is a
+        # raw ``time.monotonic()`` instant (watchdog isolation).
+        self._on_lease_change = on_lease_change
+        self._lease_holder: Optional[asyncio.StreamWriter] = None
+        self._lease_deadline: float = 0.0
+        self._lease_watchdog: Optional[asyncio.Task] = None
+        self.lease_stats: Dict[str, int] = {
+            "acquires": 0, "denials": 0, "releases": 0,
+            "expiries": 0, "drop_releases": 0, "heartbeats": 0,
+        }
 
     # ---- lifecycle ----
 
@@ -149,6 +204,15 @@ class AudioStateBroadcaster:
     async def stop(self) -> None:
         """Close server + clients, unlink the socket. NEVER raises."""
         try:
+            await self._release_lease(reason="server_stop")
+            wd = self._lease_watchdog
+            self._lease_watchdog = None
+            if wd is not None and not wd.done():
+                wd.cancel()
+                try:
+                    await wd
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
             if self._server is not None:
                 self._server.close()
                 try:
@@ -292,10 +356,150 @@ class AudioStateBroadcaster:
 
     def _drop_client(self, w: asyncio.StreamWriter) -> None:
         self._clients.discard(w)
+        # Orphaned-mic protection path (a): the holder's socket died —
+        # SIGKILL'd daemon, broken pipe, hard reset. Release the
+        # hardware IMMEDIATELY; never wait for the heartbeat expiry.
+        if w is self._lease_holder:
+            self.lease_stats["drop_releases"] += 1
+            self._schedule_lease_release(reason="holder_dropped")
         try:
             w.close()
         except Exception:  # noqa: BLE001
             pass
+
+    # ---- lease lane (v2) --------------------------------------------------
+
+    @property
+    def lease_held(self) -> bool:
+        return self._lease_holder is not None
+
+    def _schedule_lease_release(self, *, reason: str) -> None:
+        """Fire-and-forget release from sync contexts (client drop).
+        NEVER raises."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            self._lease_holder = None
+            return
+        try:
+            loop.create_task(self._release_lease(reason=reason))
+        except RuntimeError:
+            self._lease_holder = None
+
+    async def _release_lease(self, *, reason: str) -> None:
+        """Disarm the supervisor's audio plane + clear the holder.
+        Idempotent; NEVER raises — the supervisor process must survive
+        ANY fault in the disarm callback (mandate 4: no hang, no
+        crash, mic never left hot)."""
+        if self._lease_holder is None:
+            return
+        self._lease_holder = None
+        self._lease_deadline = 0.0
+        logger.info("[AudioIPC] lease released (%s) — audio disarmed", reason)
+        await self._invoke_lease_change(False)
+
+    async def _invoke_lease_change(self, armed: bool) -> None:
+        cb = self._on_lease_change
+        if cb is None:
+            return
+        try:
+            result = cb(armed)
+            if asyncio.iscoroutine(result):
+                # Bounded: a wedged arm/disarm callback must never hang
+                # the broadcaster loop (the supervisor's own timeout
+                # discipline applies inside; this is the outer fuse).
+                await asyncio.wait_for(result, timeout=lease_ttl_s())
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[AudioIPC] lease callback timed out (armed=%s)", armed,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[AudioIPC] lease callback degraded (armed=%s)",
+                armed, exc_info=True,
+            )
+
+    async def _handle_lease_frame(
+        self, cmd: str, writer: asyncio.StreamWriter,
+    ) -> None:
+        """One lease negotiation step. Replies only to the requesting
+        client (grants are private; STATE stays broadcast)."""
+        ttl = lease_ttl_s()
+        if cmd == "heartbeat":
+            if writer is self._lease_holder:
+                self._lease_deadline = time.monotonic() + ttl
+                self.lease_stats["heartbeats"] += 1
+            return
+        if cmd == "release":
+            if writer is self._lease_holder:
+                self.lease_stats["releases"] += 1
+                await self._release_lease(reason="client_release")
+                self._reply(writer, {
+                    "type": "lease", "granted": False, "reason": "released",
+                })
+            return
+        # acquire
+        if self._lease_holder is not None and self._lease_holder is not writer:
+            self.lease_stats["denials"] += 1
+            self._reply(writer, {
+                "type": "lease", "granted": False, "reason": "held",
+            })
+            return
+        first_acquire = self._lease_holder is None
+        self._lease_holder = writer
+        self._lease_deadline = time.monotonic() + ttl
+        self.lease_stats["acquires"] += 1
+        if first_acquire:
+            await self._invoke_lease_change(True)
+            self._start_lease_watchdog()
+        self._reply(writer, {
+            "type": "lease", "granted": True, "ttl_s": ttl,
+        })
+
+    def _start_lease_watchdog(self) -> None:
+        if self._lease_watchdog is not None and not self._lease_watchdog.done():
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        self._lease_watchdog = loop.create_task(self._lease_watchdog_loop())
+
+    async def _lease_watchdog_loop(self) -> None:
+        """Orphaned-mic protection path (b): heartbeats stopped while
+        the socket wedged open. Sweeps at TTL/2; reads ONLY
+        ``time.monotonic()`` + the deadline — never pipeline state
+        (Slice-47 watchdog isolation: a watchdog coupled to the system
+        it guards deadlocks with it)."""
+        try:
+            while self._lease_holder is not None:
+                await asyncio.sleep(lease_ttl_s() / 2.0)
+                if (
+                    self._lease_holder is not None
+                    and time.monotonic() > self._lease_deadline
+                ):
+                    self.lease_stats["expiries"] += 1
+                    holder = self._lease_holder
+                    await self._release_lease(reason="heartbeat_expired")
+                    self._reply(holder, {
+                        "type": "lease", "granted": False,
+                        "reason": "expired",
+                    })
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.debug("[AudioIPC] lease watchdog degraded", exc_info=True)
+
+    def _reply(self, writer: asyncio.StreamWriter, msg: Dict[str, Any]) -> None:
+        """Best-effort unicast to one client. NEVER raises."""
+        try:
+            if writer.is_closing():
+                return
+            writer.write(
+                (json.dumps(msg, separators=(",", ":")) + "\n").encode(),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ----------------------------------------------------------------------
 
     def _handshake_payload(self) -> Dict[str, Any]:
         return {
@@ -307,6 +511,7 @@ class AudioStateBroadcaster:
                 dict(self._utterance) if self._utterance is not None else None
             ),
             "recent": list(self._recent),
+            "lease": {"held": self.lease_held},
         }
 
     async def _on_client(
@@ -320,11 +525,22 @@ class AudioStateBroadcaster:
             writer.write(handshake)
             await writer.drain()
             self._clients.add(writer)
-            # Hold the connection open; EOF (client gone) unregisters.
+            # Upstream lane: newline-JSON lease frames. Anything
+            # malformed or off-vocabulary is IGNORED (the export lane
+            # stays authority-free; lease is the one narrow verb set).
+            # EOF (client gone) unregisters + drop-releases the lease.
             while True:
-                data = await reader.read(4096)
-                if not data:
+                line = await reader.readline()
+                if not line:
                     break
+                try:
+                    frame = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if frame.get("type") == "lease":
+                    cmd = str(frame.get("cmd", "")).strip().lower()
+                    if cmd in LEASE_CMDS:
+                        await self._handle_lease_frame(cmd, writer)
         except Exception:  # noqa: BLE001
             pass
         finally:
@@ -415,6 +631,23 @@ class AudioStateClient:
         finally:
             self.connected = False
 
+    def send_lease(self, cmd: str) -> bool:
+        """Pipe one lease frame upstream (``acquire`` / ``release`` /
+        ``heartbeat``). Non-blocking; False when detached or the
+        command is off-vocabulary. NEVER raises."""
+        try:
+            cmd = str(cmd or "").strip().lower()
+            if cmd not in LEASE_CMDS:
+                return False
+            w = self._writer
+            if not self.connected or w is None or w.is_closing():
+                return False
+            frame = {"type": "lease", "cmd": cmd}
+            w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     async def close(self) -> None:
         """Idempotent teardown. NEVER raises."""
         self.connected = False
@@ -453,6 +686,8 @@ __all__ = [
     "EVENT_TTS_GENERATING",
     "EVENT_VAD_ACTIVE",
     "EVENT_VAD_INACTIVE",
+    "LEASE_CMDS",
     "audio_ipc_enabled",
+    "lease_ttl_s",
     "socket_path",
 ]
