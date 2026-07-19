@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import deque
 from typing import Callable, Deque, Dict, Optional
 
@@ -44,6 +45,20 @@ class VoiceDuplexArbiter:
         #: draining). Sync callable; never awaited on the audio path.
         self.on_hardware_fault: Optional[Callable[[BaseException], None]] = None
         self.hardware_fault_count = 0
+        #: Semantic Interruption Awareness (operator-authorized
+        #: 2026-07-18): when a barge-in / flush cuts Karen off
+        #: mid-utterance, the injected reporter receives
+        #: ``(full_text, est_delivered_chars, cause)`` so the prompt
+        #: plane can tell the LLM it was CUT OFF — otherwise the model
+        #: hallucinates having delivered the full payload. Truncation
+        #: is estimated from elapsed speech time × chars/sec
+        #: (``JARVIS_TTS_CHARS_PER_S``, default 15.0 — human-paced
+        #: synthesis; no per-engine hardcoding).
+        self.on_interruption: Optional[
+            Callable[[str, int, str], None]
+        ] = None
+        self._active_text: str = ""
+        self._speak_started_mono: float = 0.0
 
     @property
     def state(self) -> VoiceState:
@@ -113,6 +128,8 @@ class VoiceDuplexArbiter:
     async def _speak(self, req: SpeechRequest) -> None:
         self._state = VoiceState.KAREN_SPEAKING
         self._active_priority = req.priority
+        self._active_text = req.text
+        self._speak_started_mono = asyncio.get_event_loop().time()
         self._play_task = asyncio.create_task(self._playback.play(req.text))
         try:
             await self._play_task
@@ -139,12 +156,40 @@ class VoiceDuplexArbiter:
                 self._state = VoiceState.LISTENING
             self._active_priority = None
 
+    def _report_interruption(self, cause: str) -> None:
+        """Estimate the truncation point of the active utterance and
+        report it (Semantic Interruption Awareness). NEVER raises."""
+        try:
+            text = self._active_text
+            if not text:
+                return
+            self._active_text = ""
+            try:
+                rate = float(os.environ.get("JARVIS_TTS_CHARS_PER_S", "15.0"))
+            except (TypeError, ValueError):
+                rate = 15.0
+            rate = max(1.0, min(60.0, rate))
+            try:
+                elapsed = max(
+                    0.0,
+                    asyncio.get_event_loop().time() - self._speak_started_mono,
+                )
+            except Exception:  # noqa: BLE001
+                elapsed = 0.0
+            delivered = max(0, min(len(text), int(elapsed * rate)))
+            cb = self.on_interruption
+            if cb is not None:
+                cb(text, delivered, cause)
+        except Exception:  # noqa: BLE001
+            logger.debug("[Arbiter] interruption report degraded", exc_info=True)
+
     async def on_user_speech_start(self) -> None:
         """Barge-in trigger. Preempts Karen and holds the floor. Never raises."""
         if not self._config.barge_in_enabled:
             return
         try:
             if self._state == VoiceState.KAREN_SPEAKING:
+                self._report_interruption("vad_barge_in")
                 self._playback.preempt()          # kill playback (idempotent)
                 if self._play_task is not None:
                     self._play_task.cancel()
@@ -166,6 +211,8 @@ class VoiceDuplexArbiter:
         buffer, cancel the play task, drop EVERY queued utterance, and
         reset the FSM to LISTENING. Sync + non-blocking so the IPC
         lane can invoke it inline. Idempotent; NEVER raises."""
+        if self._state == VoiceState.KAREN_SPEAKING:
+            self._report_interruption("operator_flush")
         try:
             self._playback.preempt()
         except Exception:  # noqa: BLE001

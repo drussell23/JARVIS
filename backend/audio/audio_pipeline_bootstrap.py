@@ -215,6 +215,19 @@ async def wire_conversation_pipeline(
             # this) and lazy-builds over the SAME factory when voice
             # wasn't pre-mounted — sovereignty never leaves this
             # process; the broadcaster only relays the verb.
+            def _wire_interruption_reporter() -> None:
+                # Semantic Interruption Awareness: barge-in/flush cuts
+                # route the truncation estimate into ConversationBridge
+                # so the next GENERATE knows the narration was cut off.
+                try:
+                    from backend.core.ouroboros.governance.conversation_bridge import (  # noqa: E501
+                        record_barge_in,
+                    )
+                    if handle.karen is not None:
+                        handle.karen.arbiter.on_interruption = record_barge_in
+                except Exception:
+                    pass
+
             async def _on_lease_change(armed: bool) -> None:
                 try:
                     if armed:
@@ -241,6 +254,7 @@ async def wire_conversation_pipeline(
                                 )
                             except Exception:
                                 pass
+                            _wire_interruption_reporter()
                             await handle.karen.start()
                             logger.info("[Bootstrap] audio lease ARMED")
                     else:
@@ -303,6 +317,13 @@ async def wire_conversation_pipeline(
                         lambda exc: handle.audio_ipc.publish_hardware_fault(str(exc))  # noqa: E501
                         if handle.audio_ipc is not None else None
                     )
+            except Exception:
+                pass
+            try:
+                from backend.core.ouroboros.governance.conversation_bridge import (  # noqa: E501
+                    record_barge_in as _rbi,
+                )
+                handle.karen.arbiter.on_interruption = _rbi
             except Exception:
                 pass
             logger.info("[Bootstrap] Karen full-duplex control layer mounted")

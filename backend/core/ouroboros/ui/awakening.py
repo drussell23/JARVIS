@@ -327,6 +327,25 @@ class AwakeningConductor:
         except Exception:  # noqa: BLE001
             self._last_size = None
 
+        # Viewport guard (operator paste 2026-07-18): Rich's transient
+        # Live can only ERASE rows still inside the viewport — when the
+        # animated frame (crest + header) is taller than the terminal,
+        # rows scroll out mid-ceremony and the erase leaves stale crest
+        # fragments duplicated in scrollback (the "floating ▀▀▀▀▄▄
+        # pairs" artifact). If the frame can't fit with margin, skip
+        # the animation structurally and print the static emblem once —
+        # never a raw-ANSI overwrite hack.
+        try:
+            if self._last_size is not None:
+                _rows_needed = frame.rows + 6      # crest + header lines
+                if self._last_size[1] < _rows_needed:
+                    from .crest import render_crest_auto as _rca
+                    self._console.print(_rca(frame, tier))
+                    self._print_cooled_header()
+                    return
+        except Exception:  # noqa: BLE001
+            pass
+
         reader_cm: Optional[_StdinKeyReader] = None
         poll = self._key_source
         if poll is None:
