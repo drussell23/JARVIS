@@ -172,6 +172,13 @@ class QoSSensor:
                 requires_human_ack=False,
             )
             self._emit(envelope)
+            # DRY: the SAME envelope feeds the preference ledger's
+            # attenuation engine — no second telemetry wrapper.
+            try:
+                from .preference_ledger import get_default_ledger  # noqa: PLC0415
+                get_default_ledger().record_frustration(envelope)
+            except Exception:  # noqa: BLE001
+                pass
             self.stats["emitted"] += 1
             logger.info("[QoS] %s → UX_DEGRADATION_EVENT emitted", cause)
             return True
