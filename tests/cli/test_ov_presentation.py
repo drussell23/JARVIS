@@ -27,10 +27,33 @@ def _capture_delegation(monkeypatch):
 
 
 def test_cockpit_sets_cockpit_mode_before_delegating(monkeypatch):
+    # Thin-Client Split (2026-07-18): bare `ov` no longer boots the
+    # organism in-process by default — the legacy delegation contract
+    # is preserved behind the master flag / --legacy-boot.
+    monkeypatch.setenv("JARVIS_OV_THIN_CLIENT", "false")
     seen = _capture_delegation(monkeypatch)
     assert ov_cli.main([]) == 0
     assert seen["mode_env"] == "cockpit"
     assert seen["argv"] == []
+
+
+def test_bare_ov_routes_thin_by_default(monkeypatch, tmp_path):
+    # Default bare `ov` = presentation shell: no in-process delegation;
+    # with no daemon and a failing spawner it degrades with exit 1 and
+    # NEVER imports the bootstrap.
+    monkeypatch.setenv(
+        "JARVIS_ATTACH_IPC_SOCKET", str(tmp_path / "absent.sock"),
+    )
+    monkeypatch.setenv("JARVIS_OV_BOOT_WAIT_S", "5")
+    seen = _capture_delegation(monkeypatch)
+    from backend.core.ouroboros.cli import thin_client
+
+    def _no_spawn(*a, **k):
+        raise OSError("spawn disabled in unit test")
+
+    monkeypatch.setattr(thin_client, "spawn_daemon", lambda **k: None)
+    assert ov_cli.main([]) == 1
+    assert "argv" not in seen or seen.get("argv") is None  # never delegated
 
 
 def test_run_forces_soak(monkeypatch):

@@ -72,9 +72,13 @@ _NO_ORGANISM_MESSAGE = (
 
 _HELP_TEXT = """ov -- Ouroboros + Venom, autonomous engineering organism
 
-  ov                  boot the organism + live cockpit (default)
-  ov run [flags]      headless autonomous session
+  ov                  instant cockpit — attach to the organism
+                      (cold-boots one in the background if needed;
+                      --legacy-boot forces the old in-process boot)
+  ov run [flags]      headless autonomous session (foreground)
   ov daemon [flags]   alias for a headless run
+  ov daemon --install    install the resident organism (launchd agent)
+  ov daemon --uninstall  remove the resident organism
   ov status           last-session digest (no boot)
   ov attach           attach this terminal to the running organism
   ov version          version + milestone
@@ -120,6 +124,10 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
     else:
         verb, rest = "cockpit", list(tokens)
 
+    if verb == "daemon" and "--install" in rest:
+        return Invocation("daemon_install")
+    if verb == "daemon" and "--uninstall" in rest:
+        return Invocation("daemon_uninstall")
     if verb in ("run", "daemon"):
         return Invocation("headless", ["--headless", *rest])
     if verb == "status":
@@ -553,6 +561,61 @@ def run_attach(console: Any) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Thin-client cockpit — the sub-second `ov`
+# ---------------------------------------------------------------------------
+
+
+def run_cockpit_thin(console: Any) -> int:
+    """The presentation-shell cockpit: instant crest, zero-trust
+    probe, seamless attach — cold-booting a detached organism when
+    none is home. The operator NEVER sees a traceback here."""
+    import asyncio
+
+    # The emblem law: the mark ALWAYS greets `ov` — instantly, before
+    # any daemon work.
+    try:
+        from backend.core.ouroboros.ui.crest import print_static_crest
+        print_static_crest(console)
+    except Exception:
+        pass
+    console.print(version_line(), markup=False, highlight=False)
+
+    async def _session() -> int:
+        from backend.core.ouroboros.cli.thin_client import ensure_daemon
+
+        def _status(line: str) -> None:
+            try:
+                console.print(line, markup=False, highlight=False)
+            except Exception:
+                pass
+
+        if not await ensure_daemon(on_status=_status):
+            _status(
+                "⚠ the organism did not come up — `ov daemon` in another "
+                "terminal shows the full boot, or check the daemon log.",
+            )
+            return 1
+        return 0
+
+    try:
+        rc = asyncio.run(_session())
+    except KeyboardInterrupt:
+        console.print(
+            "⎿ cancelled — any background ignition continues; `ov` again "
+            "to attach", markup=False, highlight=False,
+        )
+        return 0
+    except Exception:
+        return 1
+    if rc != 0:
+        return rc
+    # Warm path from here — identical surface to `ov attach` (DRY:
+    # same hydration card, same split-plane, same PresentationRouter-
+    # conformed stream, same audio verbs).
+    return run_attach(console)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -578,6 +641,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if inv.action == "status":
         console.print(status_digest(), markup=False, highlight=False)
         return 0
+    if inv.action in ("daemon_install", "daemon_uninstall"):
+        from backend.core.ouroboros.cli.thin_client import (
+            install_agent,
+            uninstall_agent,
+        )
+        msg = (
+            install_agent() if inv.action == "daemon_install"
+            else uninstall_agent()
+        )
+        console.print(msg, markup=False, highlight=False)
+        return 0
+
+    # ── Thin-Client Split (operator-authorized 2026-07-18) ──────────
+    # Bare `ov` is a PRESENTATION SHELL: crest + zero-trust probe +
+    # attach. The organism runs in a separate execution boundary
+    # (detached daemon), so the prompt is sub-second regardless of
+    # domain-layer boot cost. `--legacy-boot` (or the env master off)
+    # restores the in-process organism below.
+    if inv.action == "cockpit" and "--legacy-boot" not in inv.delegate_argv:
+        from backend.core.ouroboros.cli.thin_client import thin_client_enabled
+        if thin_client_enabled():
+            return run_cockpit_thin(console)
 
     # cockpit / headless -> the one shared bootstrap (DRY). The facade's ONLY
     # added responsibility: declare the presentation skin (spec §3.4).

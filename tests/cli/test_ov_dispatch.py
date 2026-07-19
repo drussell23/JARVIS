@@ -79,9 +79,18 @@ class TestMainWithoutBoot:
         assert ov.main(["help"]) == 0
         assert "ov" in capsys.readouterr().out.lower()
 
-    def test_attach_without_organism_degrades_cleanly(self, capsys) -> None:
+    def test_attach_without_organism_degrades_cleanly(
+        self, capsys, monkeypatch, tmp_path,
+    ) -> None:
         # No daemon socket in a unit environment: bounded connect fails
         # -> exit 1 + the "no organism awake" guidance (never a hang).
+        # Socket path pinned to an absent tmp target so a REAL organism
+        # running on this machine can't be attached by the test (the
+        # 2026-07-18 live-daemon collision: the test pumped the
+        # operator's live cockpit stream forever).
+        monkeypatch.setenv(
+            "JARVIS_ATTACH_IPC_SOCKET", str(tmp_path / "absent.sock"),
+        )
         assert ov.main(["attach"]) == 1
         assert "no organism awake" in capsys.readouterr().out.lower()
 
