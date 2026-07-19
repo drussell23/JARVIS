@@ -118,6 +118,12 @@ class StatusSnapshot:
     # Route / provider badge
     route: str = ""                    # "complex" / "standard" / "background" / ...
     provider: str = ""                 # "claude" / "dw" / "prime" / ""
+    # Circadian liquidity (item #5) — populated ONLY when a provider's
+    # declared token runway is exhausted (presentation restraint: the
+    # healthy state renders nothing).
+    liquidity_exhausted: bool = False
+    liquidity_provider: str = ""       # first exhausted provider name
+    liquidity_reset_s: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +193,7 @@ class StatusLineBuilder:
         idle_elapsed, idle_timeout = self._sample_idle()
         primary_op, extra_ops = self._sample_ops()
         route, provider = self._sample_route_and_provider(primary_op)
+        liq_exhausted, liq_provider, liq_reset = self._sample_liquidity()
 
         # §37 Slice 5 — feed cost-band-crossing observer.
         # Chatter-suppression is structural in the observer; this call
@@ -214,6 +221,9 @@ class StatusLineBuilder:
             extra_op_count=extra_ops,
             route=route,
             provider=provider,
+            liquidity_exhausted=liq_exhausted,
+            liquidity_provider=liq_provider,
+            liquidity_reset_s=liq_reset,
         )
 
     def render_plain(self) -> str:
@@ -399,6 +409,32 @@ class StatusLineBuilder:
 
         return (primary_phase, detail)
 
+    def _sample_liquidity(self) -> tuple:
+        """Circadian liquidity sample (item #5) — reads the file-backed
+        ProviderLiquidityLedger the Aegis proxy hydrates on every
+        upstream response. Restraint contract: returns the exhausted
+        triple ONLY when some provider's declared runway is dry; the
+        healthy state samples as (False, "", None) and renders nothing.
+        Master ``JARVIS_STATUS_LIQUIDITY_SEGMENT_ENABLED`` (default on).
+        NEVER raises."""
+        try:
+            if os.environ.get(
+                "JARVIS_STATUS_LIQUIDITY_SEGMENT_ENABLED", "1",
+            ).strip().lower() in ("0", "false", "no", "off"):
+                return (False, "", None)
+            from backend.core.ouroboros.governance.provider_liquidity_ledger import (  # noqa: E501
+                _load,
+                liquidity,
+                runway_exhausted,
+            )
+            for name in sorted((_load().get("providers") or {})):
+                if runway_exhausted(name):
+                    _tokens, secs = liquidity(name)
+                    return (True, str(name), secs)
+            return (False, "", None)
+        except Exception:  # noqa: BLE001 — status line never breaks
+            return (False, "", None)
+
     def _sample_route_and_provider(self, op_id: str) -> tuple:
         """Pull route + provider for the primary op. Both optional."""
         if not op_id or self._gls is None:
@@ -519,11 +555,23 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
             and isinstance(snap.phase, str)
             and snap.phase.upper() in ("IDLE", "")
         ):
-            return format_idle_breadcrumb(
+            crumb = format_idle_breadcrumb(
                 cost_spent=snap.cost_spent_usd,
                 cost_budget=snap.cost_budget_usd,
                 op_id=snap.primary_op_id or "",
             )
+            # A dry provider runway is MOST relevant while idle — the
+            # organism may be idle BECAUSE it is dry. The one exception
+            # to the breadcrumb's minimalism.
+            if snap.liquidity_exhausted:
+                tok = f"⛲ {snap.liquidity_provider or 'provider'} dry"
+                if (
+                    snap.liquidity_reset_s is not None
+                    and snap.liquidity_reset_s > 0
+                ):
+                    tok += f" ~{max(1, int(snap.liquidity_reset_s / 60))}m"
+                crumb = f"{crumb} · {tok}" if crumb else tok
+            return crumb
     except Exception:  # noqa: BLE001 — defensive
         pass
 
@@ -575,6 +623,15 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
     if idle_fr >= (warn_threshold_pct() / 100.0):
         idle_txt += " ⚠"
     parts.append(idle_txt)
+
+    # Circadian liquidity (item #5) — renders ONLY when a provider's
+    # declared runway is dry (restraint: healthy = invisible). Reset
+    # horizon in minutes when the provider declared one.
+    if snap.liquidity_exhausted:
+        liq_txt = f"⛲ {snap.liquidity_provider or 'provider'} dry"
+        if snap.liquidity_reset_s is not None and snap.liquidity_reset_s > 0:
+            liq_txt += f" ~{max(1, int(snap.liquidity_reset_s / 60))}m"
+        parts.append(liq_txt)
 
     if not compact and snap.primary_op_id:
         op_txt = f"Op: {_short_op_id(snap.primary_op_id)}"

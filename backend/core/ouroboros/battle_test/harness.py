@@ -1457,6 +1457,16 @@ class BattleTestHarness:
                         await self._serpent_repl.start()
                     except Exception as _repl_exc:
                         logger.debug("SerpentREPL not available: %s", _repl_exc)
+                    # Audio-state IPC subscriber (cockpit-only): the
+                    # supervisor owns the audio plane; the cockpit
+                    # renders its state feed. Bounded connect — a dead
+                    # daemon degrades to text-only, no UI-loop impact.
+                    try:
+                        await self._start_audio_ipc_client()
+                    except Exception:  # noqa: BLE001 — optional surface
+                        logger.debug(
+                            "audio IPC client mount degraded", exc_info=True,
+                        )
             elif hasattr(self, "_tui_console") and self._tui_console is not None:
                 self._tui_console.show_controls_bar()
             if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:
@@ -4065,6 +4075,12 @@ class BattleTestHarness:
             # /infer — Rich table of inferred directions;
             # /infer accept <id> / reject <id> / stats
             self._repl_cmd_infer(command.strip())
+        elif cmd == "/liquidity" or cmd.startswith("/liquidity "):
+            # /liquidity — circadian provider-runway dashboard (item #5):
+            # per-provider declared tokens + reset horizons from the
+            # ProviderLiquidityLedger, exhaustion verdicts, and the
+            # LiquidityPool lease economy.
+            self._repl_cmd_liquidity()
         elif await self._try_dispatch_plugin_command(command.strip()):
             # Plugin-registered slash commands: /greet, /<plugin_cmd>, etc.
             # Returns True iff a plugin handled the command.
@@ -4080,6 +4096,136 @@ class BattleTestHarness:
             pass
         else:
             logger.debug("Unknown REPL command: %s", cmd)
+
+    def _repl_cmd_liquidity(self) -> None:
+        """``/liquidity`` — circadian provider-runway dashboard.
+
+        Pure composition over the Circadian Resilience organs: the
+        file-backed ProviderLiquidityLedger (hydrated by Aegis on every
+        upstream response), its exhaustion verdicts, and the
+        LiquidityPool lease economy. Read-only; NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.provider_liquidity_ledger import (  # noqa: E501
+                _load,
+                any_runway_exhausted,
+                liquidity,
+                max_seconds_to_reset,
+                min_tokens_floor,
+                runway_exhausted,
+            )
+            providers = (_load().get("providers") or {})
+            lines = ["Provider liquidity (declared by upstream headers):"]
+            if not providers:
+                lines.append(
+                    "  (no telemetry recorded yet — the ledger fills on "
+                    "the first proxied provider response)"
+                )
+            for name in sorted(providers):
+                tokens, secs = liquidity(name)
+                entry = providers.get(name) or {}
+                status = entry.get("last_status", "?")
+                tok_txt = (
+                    f"{tokens:,} tokens" if tokens is not None
+                    else "tokens undeclared"
+                )
+                reset_txt = (
+                    f"reset in {int(secs)}s" if secs is not None
+                    else "no reset horizon"
+                )
+                verdict = (
+                    "DRY" if runway_exhausted(name) else "ok"
+                )
+                lines.append(
+                    f"  {name}: {tok_txt} · {reset_txt} · "
+                    f"last_status={status} · runway={verdict}"
+                )
+            lines.append(
+                f"  floor={min_tokens_floor():,} tokens · "
+                f"any_exhausted={any_runway_exhausted()}"
+                + (
+                    f" · max_reset={int(max_seconds_to_reset() or 0)}s"
+                    if any_runway_exhausted() else ""
+                )
+            )
+            # Lease economy — best-effort (pool may not be constructed).
+            try:
+                from backend.core.ouroboros.governance.liquidity_pool import (
+                    get_default_pool,
+                )
+                pool = get_default_pool()
+                snap = getattr(pool, "snapshot", None)
+                if callable(snap):
+                    s = snap()
+                    lines.append(f"  lease pool: {s}")
+            except Exception:  # noqa: BLE001 — optional surface
+                pass
+            for ln in lines:
+                self._repl_print(ln)
+        except Exception as exc:  # noqa: BLE001 — REPL must survive
+            self._repl_print(f"/liquidity: degraded ({exc})")
+
+    # -- Audio-state IPC subscriber (cockpit render plane) -----------------
+
+    async def _start_audio_ipc_client(self) -> None:
+        """Mount the audio-state UDS subscriber (COCKPIT only).
+
+        State-reconciliation contract: the handshake's
+        ``active_utterance`` renders IMMEDIATELY — opening a new ov
+        terminal while Karen is mid-sentence shows the ongoing
+        transcript without a fresh prompt. A missing/refused socket
+        (daemon offline) degrades silently to text-only mode; the
+        bounded connect never touches the UI loop. NEVER raises."""
+        try:
+            from backend.core.ouroboros.ui.presentation_mode import is_cockpit
+            if not is_cockpit():
+                return
+            from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (  # noqa: E501
+                AudioStateClient,
+                audio_ipc_enabled,
+            )
+            if not audio_ipc_enabled():
+                return
+
+            def _on_handshake(msg: dict) -> None:
+                utt = msg.get("active_utterance") or None
+                if utt and str(utt.get("text_so_far", "")).strip():
+                    role = utt.get("role", "karen")
+                    glyph = "💭 Karen" if role == "karen" else "🗣 you"
+                    self._repl_print(
+                        f"{glyph} (mid-sentence) ▸ {utt['text_so_far']}"
+                    )
+                state = msg.get("state") or {}
+                if state.get("audio_playing") or state.get("tts_generating"):
+                    self._repl_print("🎙 Karen voice channel active")
+
+            def _on_message(msg: dict) -> None:
+                mtype = msg.get("type")
+                if mtype == "transcript":
+                    if not msg.get("final"):
+                        return                # partials stay off the scrollback
+                    role = msg.get("role", "")
+                    glyph = "💭 Karen" if role == "karen" else "🗣 you"
+                    chunk = str(msg.get("chunk", "")).strip()
+                    if chunk:
+                        self._repl_print(f"{glyph} ▸ {chunk}")
+                elif mtype == "event" and msg.get("kind") == "VAD_ACTIVE":
+                    self._repl_print("🎙 listening…")
+
+            client = AudioStateClient(
+                on_handshake=_on_handshake, on_message=_on_message,
+            )
+            if await client.connect():
+                self._audio_ipc_client = client
+                logger.info(
+                    "[AudioIPC] cockpit subscribed to supervisor audio state",
+                )
+            else:
+                self._audio_ipc_client = None
+                logger.debug(
+                    "[AudioIPC] supervisor socket unavailable — text-only",
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug("[AudioIPC] client mount degraded", exc_info=True)
 
     # -- Chat text bridge (Heuristic Intent Multiplexer) -------------------
 
@@ -7750,6 +7896,12 @@ class BattleTestHarness:
             mux = getattr(self, "_chat_text_mux", None)
             if mux is not None:
                 await mux.drain()
+        except Exception:
+            pass
+        try:
+            ipc_client = getattr(self, "_audio_ipc_client", None)
+            if ipc_client is not None:
+                await ipc_client.close()
         except Exception:
             pass
         try:
