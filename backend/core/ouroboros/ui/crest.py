@@ -453,6 +453,217 @@ def generate_crest(
         return CrestFrame(0, 0, (), 0.0, "generation error")
 
 
+def crest_renderer() -> str:
+    """``JARVIS_OV_CREST_RENDERER`` — ``halfblock`` (default, 2026-07-18
+    fidelity pass) or ``quadrant`` (legacy).
+
+    HALFBLOCK is a renderer-class upgrade: each terminal cell renders
+    ``▀`` with INDEPENDENT foreground (upper pixel) and background
+    (lower pixel) colors — 1×2 true pixels per cell with full per-pixel
+    color (the chafa/timg technique). That enables genuine coverage-
+    based alpha anti-aliasing (edge pixels blend toward the dark
+    canvas — real AA, not luminance smearing) and per-pixel gradient +
+    scale banding so the coil reads as a snake's body, not a lumpy
+    ring. Quadrant glyphs give 2×2 binary subcells but only ONE color
+    per cell — the structural ceiling the operator's screenshots hit."""
+    mode = os.environ.get(
+        "JARVIS_OV_CREST_RENDERER", "halfblock",
+    ).strip().lower()
+    return mode if mode in ("halfblock", "quadrant") else "halfblock"
+
+
+def _band_strength() -> float:
+    """Scale-banding amplitude along the coil (``JARVIS_OV_CREST_BANDS``
+    amplitude, default 0.10 — subtle segmentation that reads as scales).
+    0 disables. Clamped [0, 0.3]."""
+    try:
+        return min(0.3, max(0.0, float(
+            os.environ.get("JARVIS_OV_CREST_BAND_AMP", "0.10"),
+        )))
+    except (TypeError, ValueError):
+        return 0.10
+
+
+_BAND_COUNT = 26   # bands around the full coil — segment cadence
+
+
+@dataclass(frozen=True)
+class PixelFrame:
+    """Half-block pixel raster: ``cols`` cell columns × ``px_rows``
+    (= cell rows × 2) pixel rows. ``pixels[(x, py)] = (rgb, delay_s)``."""
+
+    cols: int
+    rows: int                 # CELL rows (px_rows == rows * 2)
+    px_rows: int
+    pixels: Dict[Tuple[int, int], Tuple[Tuple[int, int, int], float]]
+    max_delay_s: float
+
+
+def _pixel_color_and_delay(
+    kind: str, theta: Optional[float], py_frac: float, geo: _Geometry,
+) -> Tuple[Tuple[float, float, float], float]:
+    """Base color + reveal delay for one pixel — the SAME palette,
+    gradient and delay formulas as the cell path, plus coil scale
+    banding. Pure."""
+    if kind == "eye":
+        return tuple(float(c) for c in _EYE_RGB), 1.55
+    if kind == "head":
+        return tuple(float(c) for c in _HEAD_RGB), 1.42
+    if kind == "v":
+        t = max(0.0, min(1.0, py_frac))
+        color = tuple(
+            float(_V_TOP_RGB[k] + t * (_V_BOT_RGB[k] - _V_TOP_RGB[k]))
+            for k in range(3)
+        )
+        return color, 1.78 + 0.5 * t
+    # coil
+    th = theta if theta is not None else 0.0
+    frac = _ang_norm(th - geo.tail_tip) / (2 * math.pi)
+    color = _grad(frac)
+    amp = _band_strength()
+    if amp > 0.0:
+        band = 1.0 + amp * math.sin(th * _BAND_COUNT)
+        color = tuple(min(255.0, c * band) for c in color)
+    return tuple(float(c) for c in color), 0.05 + 1.30 * frac
+
+
+def _sample_pixel(
+    px0: float, py0: float, geo: _Geometry, ss: int,
+) -> Tuple[Optional[str], float, Optional[float]]:
+    """Sample ONE half-block pixel (1.0 cell wide × 1 physical-px tall)
+    with ss×ss subsamples. Returns (kind, coverage 0..1, theta)."""
+    votes = {"eye": 0, "head": 0, "coil": 0, "v": 0}
+    theta: Optional[float] = None
+    for sy in range(ss):
+        for sx in range(ss):
+            spx = px0 + (sx + 0.5) / ss
+            spy = py0 + ((sy + 0.5) / ss) * _REF_ASPECT
+            if _sample_eye(spx, spy, geo):
+                votes["eye"] += 1
+            elif _sample_head(spx, spy, geo):
+                votes["head"] += 1
+            elif _sample_coil(spx, spy, geo):
+                votes["coil"] += 1
+                theta = math.atan2(-(spy - geo.cy), spx - geo.cx)
+            elif _sample_v(spx, spy, geo):
+                votes["v"] += 1
+    n = ss * ss
+    inside = sum(votes.values())
+    if inside == 0:
+        return None, 0.0, None
+    kind = max(_PRIORITY, key=lambda kk: votes[kk])
+    return kind, inside / n, theta
+
+
+@functools.lru_cache(maxsize=8)
+def _generate_pixels_cached(clamped_cols: int, rows: int) -> PixelFrame:
+    geo = _Geometry.for_size(clamped_cols, rows)
+    ss = _ss()
+    pixels: Dict[Tuple[int, int], Tuple[Tuple[int, int, int], float]] = {}
+    max_delay = 0.0
+    px_rows = rows * 2
+    v_span = max(1e-6, geo.v_top + geo.v_bot)
+    for py in range(px_rows):
+        py0 = float(py) * _REF_ASPECT
+        for x in range(clamped_cols):
+            kind, coverage, theta = _sample_pixel(float(x), py0, geo, ss)
+            if kind is None or coverage < 0.06:
+                continue
+            py_frac = (py * _REF_ASPECT - (geo.cy - geo.v_top)) / v_span
+            base, delay = _pixel_color_and_delay(kind, theta, py_frac, geo)
+            # TRUE anti-aliasing: coverage-alpha blend toward the dark
+            # canvas (gamma-softened so edges taper, not smear).
+            alpha = coverage ** 0.75
+            rgb = tuple(
+                max(0, min(255, round(c * alpha))) for c in base
+            )
+            pixels[(x, py)] = (rgb, delay)  # type: ignore[assignment]
+            max_delay = max(max_delay, delay)
+    return PixelFrame(
+        cols=clamped_cols, rows=rows, px_rows=px_rows,
+        pixels=pixels, max_delay_s=max_delay,
+    )
+
+
+def generate_crest_pixels(
+    measured_cols: int, measured_rows: int,
+) -> Optional[PixelFrame]:
+    """Half-block raster sized like :func:`generate_crest` (same clamps
+    + row fit). None when the terminal can't fit it. NEVER raises."""
+    try:
+        lo, _hi, clamped = _clamp_cols(measured_cols)
+        if measured_cols < lo:
+            return None
+        rows = _Geometry.rows_needed(clamped)
+        if measured_rows < rows + 2:
+            return None
+        return _generate_pixels_cached(clamped, rows)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def pixels_to_text(
+    pf: "PixelFrame", *, elapsed: Optional[float] = None,
+) -> "Any":
+    """PixelFrame → Rich Text of ``▀`` cells (fg=upper px, bg=lower px).
+    ``elapsed=None`` = the full emblem; float = partial reveal. NEVER
+    raises; degrades to empty Text."""
+    try:
+        from rich.text import Text
+        cutoff = float("inf") if elapsed is None else elapsed
+        text = Text()
+        for cy in range(pf.rows):
+            for x in range(pf.cols):
+                top = pf.pixels.get((x, cy * 2))
+                bot = pf.pixels.get((x, cy * 2 + 1))
+                if top is not None and top[1] > cutoff:
+                    top = None
+                if bot is not None and bot[1] > cutoff:
+                    bot = None
+                if top is None and bot is None:
+                    text.append(" ")
+                elif top is not None and bot is not None:
+                    tr, tg, tb = top[0]
+                    br, bg_, bb = bot[0]
+                    text.append(
+                        "▀",
+                        style=(
+                            f"rgb({tr},{tg},{tb}) on "
+                            f"rgb({br},{bg_},{bb})"
+                        ),
+                    )
+                elif top is not None:
+                    tr, tg, tb = top[0]
+                    text.append("▀", style=f"rgb({tr},{tg},{tb})")
+                else:
+                    br, bg_, bb = bot[0]  # type: ignore[index]
+                    text.append("▄", style=f"rgb({br},{bg_},{bb})")
+            if cy < pf.rows - 1:
+                text.append("\n")
+        return text
+    except Exception:  # noqa: BLE001
+        try:
+            from rich.text import Text
+            return Text("")
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+def render_crest_auto(
+    frame: "CrestFrame", tier: ColorTier, *, elapsed: Optional[float] = None,
+) -> "Any":
+    """THE renderer dispatch: half-block pixels on capable terminals
+    (C256+ and renderer=halfblock), quadrant glyphs otherwise. Both
+    paths honor the reveal clock. NEVER raises."""
+    try:
+        if crest_renderer() == "halfblock" and tier >= ColorTier.C256:
+            pf = _generate_pixels_cached(frame.cols, frame.rows)
+            return pixels_to_text(pf, elapsed=elapsed)
+    except Exception:  # noqa: BLE001
+        pass
+    return frame_to_text(frame, tier, elapsed=elapsed)
+
+
 def frame_to_text(
     frame: "CrestFrame", tier: ColorTier, *, elapsed: Optional[float] = None,
 ) -> "Any":
@@ -509,7 +720,7 @@ def print_static_crest(console: "Any") -> bool:
         )
         if frame.unavailable_reason:
             return False
-        console.print(frame_to_text(frame, tier))
+        console.print(render_crest_auto(frame, tier))
         return True
     except Exception:  # noqa: BLE001
         return False
