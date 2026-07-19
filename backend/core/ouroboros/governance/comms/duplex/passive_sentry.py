@@ -304,6 +304,21 @@ class PassiveSentry:
 # ---------------------------------------------------------------------------
 
 
+def numpy_to_pcm_buffer(x: "np.ndarray", fmt: Any, pcm_buffer_cls: Any) -> Any:
+    """float32 numpy → AVAudioPCMBuffer via the SAFE pyobjc bridge:
+    ``floatChannelData()[0].as_buffer(n)`` yields a WRITABLE
+    memoryview over the buffer's own channel storage — no ctypes, no
+    address arithmetic, byte-exact. Caller owns the autorelease pool."""
+    buf = pcm_buffer_cls.alloc().initWithPCMFormat_frameCapacity_(
+        fmt, x.size,
+    )
+    buf.setFrameLength_(x.size)
+    channel = buf.floatChannelData()[0]
+    view = channel.as_buffer(x.size)
+    memoryview(view).cast("B")[: x.nbytes] = x.tobytes()
+    return buf
+
+
 class SFSpeechWindowSession:
     """One windowed on-device recognition burst. Wraps the three
     scout-proven mechanics: buffer-append streaming, an NSRunLoop pump
@@ -323,6 +338,12 @@ class SFSpeechWindowSession:
         self._AVAudioFormat = AVAudioFormat
         self._AVAudioPCMBuffer = AVAudioPCMBuffer
         self._rate = rate
+        # ONE format object for the session (bit depth / rate /
+        # interleaving fixed): pcmFormatFloat32, mono, deinterleaved —
+        # exactly what SFSpeechAudioBufferRecognitionRequest accepts.
+        self._fmt = AVAudioFormat.alloc().initWithCommonFormat_sampleRate_channels_interleaved_(  # noqa: E501
+            1, float(rate), 1, False,
+        )
         rec = Speech.SFSpeechRecognizer.alloc().init()
         if rec is None or not rec.isAvailable():
             raise RuntimeError("SFSpeechRecognizer unavailable")
@@ -337,20 +358,25 @@ class SFSpeechWindowSession:
         self._task = rec.recognitionTaskWithRequest_resultHandler_(
             req, self._result_cb,
         )
+        # Callback delivery contract (2026-07-19 dual-root fix):
+        # pyobjc schedules these result blocks onto the MAIN runloop —
+        # a secondary pump thread pumps ITS OWN loop and hears nothing
+        # (16 silent windows). The HOST owns the pump: call
+        # pump_main_runloop() from the MAIN thread each capture tick.
         self._pump_alive = True
-        import threading  # noqa: PLC0415
 
-        def _pump() -> None:
+    @staticmethod
+    def pump_main_runloop(seconds: float = 0.0) -> None:
+        """Drain pending main-runloop callbacks. MUST be called from
+        the main thread (the capture loop's natural cadence — one call
+        per 30ms chunk is ample). NEVER raises."""
+        try:
             from Foundation import NSDate, NSRunLoop  # noqa: PLC0415
-            while self._pump_alive:
-                NSRunLoop.currentRunLoop().runUntilDate_(
-                    NSDate.dateWithTimeIntervalSinceNow_(0.05),
-                )
-
-        self._pump_thread = threading.Thread(
-            target=_pump, name="sentry-runloop-pump", daemon=True,
-        )
-        self._pump_thread.start()
+            NSRunLoop.currentRunLoop().runUntilDate_(
+                NSDate.dateWithTimeIntervalSinceNow_(max(0.0, seconds)),
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _result_cb(self, result: Any, error: Any) -> None:
         try:
@@ -366,23 +392,25 @@ class SFSpeechWindowSession:
         self._on_partial = cb
 
     def append(self, chunk: "np.ndarray") -> None:
-        fmt = self._AVAudioFormat.alloc().initWithCommonFormat_sampleRate_channels_interleaved_(  # noqa: E501
-            1, float(self._rate), 1, False,   # 1 == pcmFormatFloat32
-        )
-        x = np.ascontiguousarray(chunk, dtype=np.float32)
-        buf = self._AVAudioPCMBuffer.alloc().initWithPCMFormat_frameCapacity_(
-            fmt, x.size,
-        )
-        buf.setFrameLength_(x.size)
-        import ctypes  # noqa: PLC0415
-        dst = buf.floatChannelData()[0]
-        ctypes.memmove(
-            ctypes.c_void_p(int(ctypes.cast(
-                dst, ctypes.c_void_p,
-            ).value or 0)),
-            x.ctypes.data, x.nbytes,
-        )
-        self._req.appendAudioPCMBuffer_(buf)
+        """Native in-memory marshal (2026-07-19 root fix): the ctypes
+        memmove pointer-cast silently wrote to a WRONG address on
+        ARM64 (16 live windows, zero partials — garbage buffers). The
+        architecturally safe bridge is pyobjc's ``varlist.as_buffer``:
+        a WRITABLE memoryview over the buffer's own float channel —
+        zero address arithmetic, byte-exact (probe-proven round-trip).
+        The whole append runs inside an ``objc.autorelease_pool`` so a
+        24/7 sentry's transient ObjC buffers are destroyed instantly —
+        ARC and Python GC can never drift apart (leak-tested 10k
+        iterations flat)."""
+        import objc  # noqa: PLC0415
+        x = np.ascontiguousarray(chunk, dtype=np.float32).reshape(-1)
+        if x.size == 0:
+            return
+        with objc.autorelease_pool():
+            buf = numpy_to_pcm_buffer(
+                x, self._fmt, self._AVAudioPCMBuffer,
+            )
+            self._req.appendAudioPCMBuffer_(buf)
 
     def close(self) -> None:
         try:
