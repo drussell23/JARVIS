@@ -132,7 +132,11 @@ def _clamp_cols(measured: int) -> Tuple[int, int, int]:
     """
     lo = int(os.environ.get("JARVIS_OV_CREST_MIN_COLS", "46"))
     hi = int(os.environ.get("JARVIS_OV_CREST_MAX_COLS", "88"))
-    clamped = max(lo, min(measured, hi))
+    # Strict bounding-box margin (operator finding 2026-07-18): a crest
+    # exactly as wide as the terminal auto-wraps its last cell onto the
+    # next line — every row sheds one detached artifact block. One
+    # column of right margin kills the whole off-by-one wrap class.
+    clamped = max(lo, min(measured - 1, hi))
     return lo, hi, clamped
 
 
@@ -701,6 +705,38 @@ def frame_to_text(
             return ""
 
 
+def blit_text(console: "Any", text: "Any") -> bool:
+    """Double-buffered blit: render ``text`` to an OFF-SCREEN ANSI
+    buffer first, then write the whole frame to the TTY in a single
+    ``write`` + flush. Eliminates tearing/flicker from incremental
+    segment writes (mandate: no raw cursor-jump hacks — one atomic
+    frame). Coordinates are already bounded by :func:`_clamp_cols`'s
+    terminal-size margin. Returns False (no partial output) on any
+    fault. NEVER raises."""
+    try:
+        from rich.console import Console
+        import io
+        size = console.size
+        buf = io.StringIO()
+        offscreen = Console(
+            file=buf,
+            width=size.width,
+            force_terminal=True,
+            color_system=getattr(console, "_color_system_name", None)
+            or "truecolor",
+            highlight=False,
+        )
+        offscreen.print(text)
+        frame = buf.getvalue()
+        if not frame:
+            return False
+        console.file.write(frame)
+        console.file.flush()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def print_static_crest(console: "Any") -> bool:
     """The static emblem — the mark that ALWAYS greets ``ov`` (operator
     law, 2026-07-18), including on the already-awake collision surface.
@@ -720,7 +756,12 @@ def print_static_crest(console: "Any") -> bool:
         )
         if frame.unavailable_reason:
             return False
-        console.print(render_crest_auto(frame, tier))
+        emblem = render_crest_auto(frame, tier)
+        # Single-frame blit (double-buffered); Rich print fallback keeps
+        # the emblem law ("the mark ALWAYS greets ov") even when the
+        # console's file surface is exotic.
+        if not blit_text(console, emblem):
+            console.print(emblem)
         return True
     except Exception:  # noqa: BLE001
         return False

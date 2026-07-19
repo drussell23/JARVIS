@@ -4339,11 +4339,21 @@ class BattleTestHarness:
                     return
                 loop.create_task(self._handle_repl_command(text))
 
+            # Audio-Visual Synapse (v2): attached terminals arm/disarm
+            # the karen_duplex plane and receive the audio FSM. Pure
+            # adapter — the duplex handle keeps sole audio authority.
+            from backend.core.ouroboros.battle_test.audio_synapse import (
+                AudioVisualSynapse,
+            )
             bridge = CockpitAttachBridge(
                 status_provider=_status_provider,
                 ops_provider=_ops_provider,
                 liquidity_provider=_liquidity_provider,
                 on_input=_on_input,
+                on_audio=lambda cmd: self._dispatch_audio_cmd(cmd),
+            )
+            self._audio_synapse = AudioVisualSynapse(
+                bridge.publish_audio_state,
             )
             if await bridge.start():
                 self._cockpit_attach_bridge = bridge
@@ -4352,6 +4362,18 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] mount degraded", exc_info=True)
             self._cockpit_attach_bridge = None
+
+    def _dispatch_audio_cmd(self, cmd: str) -> None:
+        """Bridge on_audio sink → synapse coroutine. Scheduled, never
+        inline in the read loop. NEVER raises."""
+        try:
+            synapse = getattr(self, "_audio_synapse", None)
+            if synapse is None:
+                return
+            loop = asyncio.get_running_loop()
+            loop.create_task(synapse.handle_cmd(cmd))
+        except Exception:  # noqa: BLE001
+            logger.debug("[AudioSynapse] dispatch degraded", exc_info=True)
 
     # -- Audio-state IPC subscriber (cockpit render plane) -----------------
 
@@ -8112,6 +8134,12 @@ class BattleTestHarness:
             ipc_client = getattr(self, "_audio_ipc_client", None)
             if ipc_client is not None:
                 await ipc_client.close()
+        except Exception:
+            pass
+        try:
+            synapse = getattr(self, "_audio_synapse", None)
+            if synapse is not None:
+                await synapse.stop()
         except Exception:
             pass
         try:

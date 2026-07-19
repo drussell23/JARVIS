@@ -261,7 +261,62 @@ async def _reap_task(task: Any) -> None:
         pass
 
 
-async def _split_plane_loop(client: Any, console: Any) -> None:
+class AttachUI:
+    """The rigid Footer/Header state of the attached TUI.
+
+    Owns the audio-FSM presentation binding (operator mandate: Dynamic
+    UI Morphing). ``prompt()`` and ``toolbar()`` are the dynamic
+    callables handed to the ONE persistent ``PromptSession`` — prompt
+    duplication died with per-iteration prompt construction; the
+    session re-evaluates these on every repaint, so a state change
+    repaints the footer WITHOUT touching the active keystroke buffer.
+    ``on_audio_state`` is loop-safe: it mutates state then invalidates
+    the app so prompt_toolkit repaints on its own schedule.
+    """
+
+    _PROMPTS = {
+        "OFFLINE": "ov › ",
+        "UNAVAILABLE": "ov › ",
+        "LISTENING": "🎙 Karen › ",
+        "HEARING": "🎙 Karen (hearing you) › ",
+        "THINKING": "💭 Karen (thinking) › ",
+        "SPEAKING": "🗣 Karen (speaking) › ",
+    }
+
+    def __init__(self) -> None:
+        self.audio_state: str = "OFFLINE"
+        self._app_ref: Any = None
+
+    def bind_app(self, app: Any) -> None:
+        self._app_ref = app
+
+    def prompt(self) -> str:
+        return self._PROMPTS.get(self.audio_state, "ov › ")
+
+    def toolbar(self) -> str:
+        audio = (
+            f" · voice: {self.audio_state.lower()}"
+            if self.audio_state != "OFFLINE" else " · voice: off ('wake')"
+        )
+        return f" ov attach — organism live{audio} · 'detach' to leave"
+
+    def on_audio_state(self, state: str) -> None:
+        """The synapse landing point — morph + repaint. NEVER raises."""
+        try:
+            state = str(state or "").strip().upper()
+            if not state or state == self.audio_state:
+                return
+            self.audio_state = state
+            app = self._app_ref
+            if app is not None:
+                app.invalidate()
+        except Exception:
+            pass
+
+
+async def _split_plane_loop(
+    client: Any, console: Any, ui: Optional["AttachUI"] = None,
+) -> None:
     """The Split-Plane Multiplexer (operator mandate 2026-07-18).
 
     prompt_toolkit's ``PromptSession`` + ``patch_stdout`` IS the
@@ -285,11 +340,21 @@ async def _split_plane_loop(client: Any, console: Any) -> None:
     # daemon history above and the command plane below.
     console.print(
         "\U0001f4ad Karen ▸ attached — I'm listening. verbs or plain "
-        "words both work · 'detach' leaves the organism running",
+        "words both work · 'wake' arms my voice · "
+        "'detach' leaves the organism running",
         markup=False, highlight=False,
     )
 
-    session: Any = PromptSession()
+    ui = ui or AttachUI()
+    # ONE persistent session, dynamic prompt + rigid footer toolbar:
+    # both are callables re-evaluated on every repaint, so an
+    # audio_state frame morphs the footer via app.invalidate() while
+    # the active keystroke buffer stays untouched (mandate 4).
+    session: Any = PromptSession(
+        message=lambda: ui.prompt(),
+        bottom_toolbar=lambda: ui.toolbar(),
+    )
+    ui.bind_app(session.app)
 
     async def _watch_disconnect() -> None:
         while client.connected:
@@ -298,7 +363,7 @@ async def _split_plane_loop(client: Any, console: Any) -> None:
     with patch_stdout(raw=True):
         while client.connected:
             prompt_task = asyncio.ensure_future(
-                session.prompt_async("ov › "),
+                session.prompt_async(),
             )
             watch_task = asyncio.ensure_future(_watch_disconnect())
             try:
@@ -326,8 +391,20 @@ async def _split_plane_loop(client: Any, console: Any) -> None:
                 await _reap_task(prompt_task)
                 break
             text = (line or "").strip()
-            if text.lower() in ("detach", "exit", "quit"):
+            low = text.lower()
+            if low in ("detach", "exit", "quit"):
                 break
+            # Audio Control Plane verbs — routed on the audio lane,
+            # never as chat text (the daemon synapse owns the duplex).
+            if low in ("wake", "voice", "listen"):
+                client.send_audio("wake")
+                continue
+            if low in ("mute", "sleep"):
+                client.send_audio("sleep")
+                continue
+            if low == "barge":
+                client.send_audio("barge")
+                continue
             if text:
                 client.send_input(text)
 
@@ -384,13 +461,21 @@ def run_attach(console: Any) -> int:
                 pass
 
         hydrated = asyncio.Event()
+        ui = AttachUI()
 
         def _on_hydration(payload: dict) -> None:
             _render_hydration(console, payload)
+            try:
+                state = (payload.get("audio") or {}).get("state", "")
+                if state:
+                    ui.on_audio_state(str(state))
+            except Exception:
+                pass
             hydrated.set()
 
         client = CockpitAttachClient(
             on_hydration=_on_hydration, on_line=_print_line,
+            on_audio_state=ui.on_audio_state,
         )
         if not await client.connect():
             console.print(_NO_ORGANISM_MESSAGE, markup=False, highlight=False)
@@ -398,7 +483,7 @@ def run_attach(console: Any) -> int:
 
         try:
             if _can_run_split_plane():
-                await _split_plane_loop(client, console)
+                await _split_plane_loop(client, console, ui)
             else:
                 await _legacy_pump_loop(client)
             if not client.connected:

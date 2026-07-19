@@ -80,7 +80,11 @@ def canonical_glyph_chars() -> frozenset:
 
 
 #: Structure/typography set — allowed everywhere, not rationed (§2).
-TYPOGRAPHIC_CHARS = frozenset("·✓✗›─")
+# ``▸`` is the Karen speaker mark (``💭 Karen ▸ …``) — registered
+# typography since 2026-07-18 (it renders on the chat bridge, the
+# attach persona-host line, and the answer engine; the sentinel was
+# right to flag it unregistered).
+TYPOGRAPHIC_CHARS = frozenset("·✓✗›─▸")
 
 #: Legacy semantic marks → their canonical meaning. Aliased, not merely
 #: stripped — the SIGNAL survives the sweep even where old emitters
