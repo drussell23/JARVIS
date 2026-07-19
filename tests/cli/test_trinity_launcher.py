@@ -16,15 +16,19 @@ class TestTrinityRouting:
         rc = tl.main(["help"])
         assert rc == 0
 
-    def test_status_reports_backend(self, monkeypatch):
+    def test_status_runs_active_health_handshake(self, monkeypatch):
+        """`trinity status` now delegates to the Active IPC Health
+        Handshake (Phase 7) — reports a supervisor health state and exits
+        non-zero when not HEALTHY."""
         console = _Console()
-        monkeypatch.setattr(tl, "build_console", lambda: console, raising=False)
         monkeypatch.setattr("backend.core.ouroboros.ui.theme.build_console",
                             lambda: console)
-        monkeypatch.setattr(tl, "_backend_alive", lambda: False)
+        # No daemon running in the test env → DOWN, rc 1.
+        from backend.core.ouroboros.cli import trinity_status as st
+        monkeypatch.setattr(st, "supervisor_pid", lambda *a, **k: None)
         rc = tl.main(["status"])
-        assert rc == 0
-        assert any("backend" in l for l in console.lines)
+        assert rc == 1                                # not HEALTHY
+        assert any("supervisor" in l for l in console.lines)
 
     def test_up_spawns_when_absent(self, monkeypatch):
         console = _Console()

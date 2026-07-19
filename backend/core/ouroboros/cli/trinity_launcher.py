@@ -126,16 +126,11 @@ def _launch_native_app(console) -> bool:
 
 
 def _status(console) -> int:
-    alive = _backend_alive()
-    console.print(
-        f"⏺ backend: {'LIVE' if alive else 'not running'}", markup=False,
-    )
-    sock = _backend_socket()
-    console.print(
-        f"⎿ attach socket: {'present' if sock.exists() else 'absent'} "
-        f"({sock})", markup=False,
-    )
-    return 0
+    """Active IPC Health Handshake (Phase 7): PID + live TCP/UDS probe →
+    HEALTHY / ZOMBIE / DOWN. Detects a live-but-deadlocked daemon that a
+    plain PID check would falsely report as running."""
+    from backend.core.ouroboros.cli.trinity_status import status_main
+    return status_main(console)
 
 
 def _down(console) -> int:
