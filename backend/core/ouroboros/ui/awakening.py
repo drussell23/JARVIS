@@ -404,26 +404,11 @@ class AwakeningConductor:
         """Render the crest as revealed so far -- cells whose ``delay_s``
         has elapsed draw solid; everything else is blank space. Draws
         tail-to-head purely as a function of the (test-injectable) clock."""
-        if not frame.cells or frame.cols <= 0 or frame.rows <= 0:
-            return Text("")
-        grid = {(c.x, c.y): c for c in frame.cells if c.delay_s <= elapsed}
-        text = Text()
-        for y in range(frame.rows):
-            for x in range(frame.cols):
-                cell = grid.get((x, y))
-                if cell is None:
-                    text.append(" ")
-                else:
-                    # Fill-mode-aware cell resolution (crest.render_cell):
-                    # interior full blocks paint as BACKGROUND-colored
-                    # spaces — solid across terminal line-spacing gaps
-                    # (the 2026-07-18 "brick wall" report); edge quadrants
-                    # keep foreground glyphs for the silhouette.
-                    ch, style = render_cell(cell, tier)
-                    text.append(ch, style=style)
-            if y < frame.rows - 1:
-                text.append("\n")
-        return text
+        # DRY (2026-07-18): THE one frame→Text renderer lives in
+        # crest.frame_to_text — this ceremony passes the reveal clock;
+        # static consumers (collision emblem) pass elapsed=None.
+        from .crest import frame_to_text
+        return frame_to_text(frame, tier, elapsed=elapsed)
 
     def _poll_keys(self, poll: Callable[[], bytes]) -> None:
         """Read whatever is available this tick. Esc/CR/LF request a skip;

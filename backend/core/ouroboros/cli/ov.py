@@ -234,6 +234,33 @@ def _can_run_split_plane() -> bool:
         return False
 
 
+async def _reap_task(task: Any) -> None:
+    """Retrieve a task's outcome on EVERY exit path — the 2026-07-18
+    dirty-detach class: an abandoned prompt task finishing with its own
+    KeyboardInterrupt made asyncio dump 'Task exception was never
+    retrieved' over the clean goodbye. Cancel if pending, then consume
+    the result/exception so nothing is left for the GC to complain
+    about. NEVER raises."""
+    import asyncio
+    try:
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except BaseException:  # noqa: BLE001 — incl. KeyboardInterrupt
+            pass
+        # Belt: mark a completed task's exception as retrieved.
+        if task.done() and not task.cancelled():
+            try:
+                task.exception()
+            except BaseException:  # noqa: BLE001
+                pass
+    except Exception:
+        pass
+
+
 async def _split_plane_loop(client: Any, console: Any) -> None:
     """The Split-Plane Multiplexer (operator mandate 2026-07-18).
 
@@ -274,26 +301,29 @@ async def _split_plane_loop(client: Any, console: Any) -> None:
                 session.prompt_async("ov › "),
             )
             watch_task = asyncio.ensure_future(_watch_disconnect())
-            done, _pending = await asyncio.wait(
-                {prompt_task, watch_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            try:
+                done, _pending = await asyncio.wait(
+                    {prompt_task, watch_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # Ctrl+C landed in the WAIT itself — reap BOTH tasks
+                # (retrieving any KeyboardInterrupt the prompt task
+                # finished with) so the goodbye stays clean: no
+                # 'Task exception was never retrieved' ever again.
+                await _reap_task(prompt_task)
+                await _reap_task(watch_task)
+                break
             if watch_task in done and prompt_task not in done:
                 # Daemon died mid-typing — never hang on the prompt.
-                prompt_task.cancel()
-                try:
-                    await prompt_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                await _reap_task(prompt_task)
+                await _reap_task(watch_task)
                 break
-            watch_task.cancel()
-            try:
-                await watch_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await _reap_task(watch_task)
             try:
                 line = prompt_task.result()
             except (EOFError, KeyboardInterrupt):
+                await _reap_task(prompt_task)
                 break
             text = (line or "").strip()
             if text.lower() in ("detach", "exit", "quit"):
