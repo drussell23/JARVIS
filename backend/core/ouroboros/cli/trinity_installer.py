@@ -44,7 +44,7 @@ import plistlib
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional
 
 # No hardcoding — every identity/path is env-overridable with a default.
 SUPERVISOR_LABEL = os.environ.get("JARVIS_SUPERVISOR_LABEL", "com.jarvis.supervisor")
@@ -71,31 +71,6 @@ def localized_python() -> Path:
     return Path(os.path.expanduser(base)) / "bin" / "python"
 
 
-def resolve_supervisor_python() -> Tuple[Path, str]:
-    """The interpreter the LaunchAgent should ACTUALLY target — adaptive,
-    so a machine without the localized venv still gets a bootable daemon
-    (mandate 2 — edge case: local/dev install before the venv is built).
-
-    Precedence: explicit ``JARVIS_VENV_PYTHON`` → the localized venv if it
-    exists on disk → the currently-running interpreter (``sys.executable``,
-    e.g. the pyenv/conda python that is running trinity right now). Returns
-    ``(path, source)`` where source ∈ {``localized_venv``, ``current``}.
-    NEVER raises."""
-    import sys
-    override = os.environ.get("JARVIS_VENV_PYTHON")
-    if override:
-        p = Path(os.path.expanduser(override))
-        return p, ("localized_venv" if "jarvis" in str(p) else "override")
-    ideal = localized_python()
-    try:
-        if ideal.exists():
-            return ideal, "localized_venv"
-    except Exception:
-        pass
-    # Fall back to the interpreter that is demonstrably working right now.
-    return Path(sys.executable), "current"
-
-
 def _log_dir() -> Path:
     return _repo_root() / ".jarvis" / "logs"
 
@@ -113,11 +88,12 @@ def supervisor_plist_path(agents_dir: Optional[Path] = None) -> Path:
 # ---------------------------------------------------------------------------
 
 def build_supervisor_plist(*, python: Optional[Path] = None) -> dict:
-    """The launchd definition for the resident supervisor. All paths
-    resolved at generation time; nothing machine-hardcoded. The
-    interpreter is resolved ADAPTIVELY (localized venv when present, else
-    the working interpreter) so the generated daemon is always bootable."""
-    py = python or resolve_supervisor_python()[0]
+    """The launchd definition for the resident supervisor. Deployment
+    immutability (mandate 2): the daemon targets ONLY the hermetic
+    ``~/.jarvis/venv`` interpreter — no ``sys.executable`` fallback, so a
+    global ``pip install`` from another project can never drift the
+    24/7 runtime out from under it."""
+    py = python or localized_python()
     root = _repo_root()
     logs = _log_dir()
     venv_bin = str(py.parent)
@@ -322,6 +298,168 @@ def generate_app_bundle(dest: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Stateful Pre-Flight Teardown (mandate 2 — contention resolution)
+# ---------------------------------------------------------------------------
+
+def _install_port() -> int:
+    try:
+        p = int(os.environ.get("JARVIS_BACKEND_PORT", "0") or "0")
+        return p if p > 0 else 8010
+    except ValueError:
+        return 8010
+
+
+def _attach_socket() -> Optional[Path]:
+    try:
+        from backend.core.ouroboros.battle_test.cockpit_attach import (
+            attach_socket_path,
+        )
+        return attach_socket_path()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _supervisor_cmdline_pids() -> List[int]:
+    """PIDs of live ``unified_supervisor.py`` processes (own user), via
+    ``pgrep -f`` — catches a supervisor that is starting but not yet
+    holding the port. NEVER raises."""
+    import shutil as _sh
+    if _sh.which("pgrep") is None:
+        return []
+    try:
+        r = subprocess.run(["pgrep", "-f", "unified_supervisor.py"],
+                           capture_output=True, text=True, timeout=5)
+        return [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+@dataclass
+class TeardownReport:
+    clean: bool = False
+    terminated: List[int] = field(default_factory=list)
+    escalated: List[int] = field(default_factory=list)
+    detail: str = ""
+
+
+def preflight_teardown(
+    *,
+    port: Optional[int] = None,
+    socket_path: Optional[Path] = None,
+    holder_fn: Optional[Callable[[int], Any]] = None,
+    socket_holder_fn: Optional[Callable[[Path], Any]] = None,
+    extra_pids_fn: Optional[Callable[[], List[int]]] = None,
+    signaller: Callable[[int, int], None] = os.kill,
+    sleeper: Optional[Callable[[float], None]] = None,
+    max_wait_s: float = 10.0,
+    poll_interval_s: float = 0.4,
+) -> TeardownReport:
+    """Resolve TCP/UDS contention BEFORE ``launchctl bootstrap`` (mandate
+    2). Identifies whoever holds the backend port / attach socket / runs
+    ``unified_supervisor.py`` (DRY — reuses the doctor's ``lsof -F``
+    ``find_port_holder``/``find_socket_holder``), sends a graceful
+    ``SIGTERM``, waits for them to yield, and escalates to ``SIGKILL``
+    only if they refuse. Returns a report whose ``clean`` is True ONLY
+    when the port + socket are verified free. NEVER raises."""
+    import signal as _sig
+    import time as _time
+    rep = TeardownReport()
+    try:
+        # DRY — the exact lsof-based identification built for the doctor.
+        from backend.core.ouroboros.cli.trinity_doctor import (
+            find_port_holder, find_socket_holder,
+        )
+        hfn = holder_fn or find_port_holder
+        sfn = socket_holder_fn or find_socket_holder
+        sleep = sleeper or _time.sleep
+        prt = port if port is not None else _install_port()
+        sock = socket_path if socket_path is not None else _attach_socket()
+        me = os.getpid()
+
+        def _current_pids() -> List[int]:
+            pids = set()
+            h = hfn(prt)
+            if h is not None and getattr(h, "pid", None):
+                pids.add(h.pid)
+            if sock is not None:
+                sh = sfn(sock)
+                if sh is not None and getattr(sh, "pid", None):
+                    pids.add(sh.pid)
+            for extra in ((extra_pids_fn or _supervisor_cmdline_pids)() or []):
+                pids.add(extra)
+            pids.discard(me)                 # never signal ourselves
+            return sorted(pids)
+
+        def _clean() -> bool:
+            if hfn(prt) is not None:
+                return False
+            if sock is not None and sfn(sock) is not None:
+                return False
+            return True
+
+        initial = _current_pids()
+        if not initial and _clean():
+            rep.clean = True
+            rep.detail = f"port {prt} + socket already clear"
+            return rep
+
+        # 1) Graceful SIGTERM to every contender.
+        for pid in initial:
+            try:
+                signaller(pid, _sig.SIGTERM)
+                rep.terminated.append(pid)
+            except ProcessLookupError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 2) Wait (bounded) for them to yield the port/socket.
+        waited = 0.0
+        while waited < max_wait_s:
+            if _clean():
+                break
+            sleep(poll_interval_s)
+            waited += poll_interval_s
+
+        # 3) Escalate to SIGKILL only for the stubborn.
+        if not _clean():
+            for pid in _current_pids():
+                try:
+                    signaller(pid, _sig.SIGKILL)
+                    rep.escalated.append(pid)
+                except ProcessLookupError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+            waited = 0.0
+            while waited < max_wait_s:
+                if _clean():
+                    break
+                sleep(poll_interval_s)
+                waited += poll_interval_s
+
+        # 4) A stale UDS inode (SIGKILL leftover) → unlink (reuse thin_client).
+        if sock is not None:
+            try:
+                from backend.core.ouroboros.cli.thin_client import (
+                    clean_stale_socket,
+                )
+                if sock.exists() and sfn(sock) is None:
+                    clean_stale_socket(sock)
+            except Exception:  # noqa: BLE001
+                pass
+
+        rep.clean = _clean()
+        rep.detail = (f"port {prt} cleared"
+                      if rep.clean else f"port {prt} STILL contended")
+        return rep
+    except Exception as exc:  # noqa: BLE001
+        rep.clean = False
+        rep.detail = f"teardown error: {exc}"
+        return rep
+
+
+# ---------------------------------------------------------------------------
 # Orchestration (mandate 3 — doctor gate FIRST)
 # ---------------------------------------------------------------------------
 
@@ -343,10 +481,18 @@ def run_install(
     runner: Callable[..., Any] = subprocess.run,
     skip_doctor: bool = False,
     doctor_report: Any = None,
+    require_venv: bool = True,
+    venv_check: Optional[Callable[[], bool]] = None,
+    teardown_fn: Optional[Callable[..., Any]] = None,
+    holder_fn: Optional[Callable[[int], Any]] = None,
+    socket_holder_fn: Optional[Callable[[Path], Any]] = None,
+    signaller: Callable[[int, int], None] = os.kill,
+    sleeper: Optional[Callable[[float], None]] = None,
 ) -> InstallReport:
     """Full Thin-Bundle install. MANDATE 3: run ``trinity doctor`` FIRST
-    and ABORT on any FAIL before generating a single asset. NEVER
-    raises."""
+    and ABORT on any FAIL before generating a single asset. MANDATE 2:
+    require the hermetic venv, and clear TCP/UDS contention (Stateful
+    Pre-Flight Teardown) before ``launchctl bootstrap``. NEVER raises."""
     report = InstallReport()
     try:
         # ---- Gate: environmental preflight must pass (DRY — run_doctor) ----
@@ -373,15 +519,51 @@ def run_install(
         else:
             report.doctor_ok = True
 
-        # ---- Generate assets (only reached when the gate passed) ----
+        # ---- Hermetic gate (mandate 2): the daemon runs ONLY from the
+        # isolated venv. No venv → direct the operator to build it; never
+        # silently fall back to a shared/global interpreter. ----
+        if require_venv:
+            check = venv_check
+            if check is None:
+                from backend.core.ouroboros.cli.trinity_env import venv_exists
+                check = venv_exists
+            if not check():
+                report.aborted = True
+                report.reason = ("hermetic venv missing — run "
+                                 "`trinity bootstrap-env` first (deployment "
+                                 "immutability: the daemon must not run from "
+                                 "a shared interpreter)")
+                return report
+
+        # ---- Generate the plist (targets the hermetic venv) ----
         report.plist_path = write_supervisor_plist(
             agents_dir=agents_dir, python=python)
-        report.messages.append(install_supervisor_agent(
-            agents_dir=agents_dir, python=python, runner=runner))
         if app_dest is not None:
             report.app_path = generate_app_bundle(app_dest)
             report.messages.append(
                 f"⏺ Thin-Bundle app generated — {report.app_path}")
+
+        # ---- Stateful Pre-Flight Teardown (mandate 2): clear TCP/UDS
+        # contention BEFORE launchctl bootstrap so the daemon never dies on
+        # EADDRINUSE. ----
+        td = (teardown_fn or preflight_teardown)(
+            holder_fn=holder_fn, socket_holder_fn=socket_holder_fn,
+            signaller=signaller, sleeper=sleeper)
+        if td.terminated or td.escalated:
+            report.messages.append(
+                f"⏺ pre-flight teardown: SIGTERM {td.terminated}"
+                + (f", SIGKILL {td.escalated}" if td.escalated else "")
+                + " — " + td.detail)
+        if not td.clean:
+            report.aborted = True
+            report.reason = (f"port/socket still contended after teardown "
+                             f"({td.detail}) — refusing to bootstrap over a "
+                             "live holder")
+            return report
+
+        # ---- Load the agent (only once the path is verified clean) ----
+        report.messages.append(install_supervisor_agent(
+            agents_dir=agents_dir, python=python, runner=runner))
         return report
     except Exception as exc:
         report.aborted = True

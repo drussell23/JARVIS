@@ -31,44 +31,19 @@ def test_plist_has_keepalive_dict_and_runatload(tmp_path, monkeypatch):
     assert p["ProcessType"] == "Background"
 
 
-def test_plist_targets_the_localized_venv_python(tmp_path, monkeypatch):
+def test_plist_targets_the_hermetic_venv_strictly(tmp_path, monkeypatch):
+    """Deployment immutability: the daemon targets ONLY the hermetic venv
+    path — no sys.executable fallback — regardless of on-disk presence."""
+    import sys
     venv = tmp_path / ".jarvis" / "venv"
-    # The localized venv EXISTS → it is preferred over the fallback.
-    (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    monkeypatch.delenv("JARVIS_VENV_PYTHON", raising=False)
     monkeypatch.setenv("JARVIS_VENV_DIR", str(venv))
     p = inst.build_supervisor_plist()
     prog = p["ProgramArguments"]
-    assert prog[0] == str(venv / "bin" / "python")       # localized venv
+    assert prog[0] == str(venv / "bin" / "python")       # hermetic venv
+    assert prog[0] != sys.executable                     # NOT the global one
     assert prog[1].endswith("unified_supervisor.py")
-    # env points PATH at the venv bin + PYTHONPATH at the repo
     assert str(venv / "bin") in p["EnvironmentVariables"]["PATH"]
-
-
-def test_interpreter_adaptive_fallback_when_no_venv(tmp_path, monkeypatch):
-    """The real local-install edge case: no localized venv yet → resolve
-    to the CURRENTLY-RUNNING interpreter so the daemon is still bootable
-    (not a dead path)."""
-    import sys
-    monkeypatch.delenv("JARVIS_VENV_PYTHON", raising=False)
-    monkeypatch.setenv("JARVIS_VENV_DIR", str(tmp_path / "does_not_exist"))
-    py, source = inst.resolve_supervisor_python()
-    assert source == "current"
-    assert py == Path(sys.executable)                    # the working python
-    # And the plist targets that working interpreter, not a dead path.
-    prog = inst.build_supervisor_plist()["ProgramArguments"]
-    assert prog[0] == sys.executable
-
-
-def test_interpreter_prefers_localized_venv_when_present(tmp_path, monkeypatch):
-    venv = tmp_path / ".jarvis" / "venv"
-    (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").write_text("#!/bin/sh\n")
-    monkeypatch.delenv("JARVIS_VENV_PYTHON", raising=False)
-    monkeypatch.setenv("JARVIS_VENV_DIR", str(venv))
-    py, source = inst.resolve_supervisor_python()
-    assert source == "localized_venv"
-    assert py == venv / "bin" / "python"
 
 
 def test_write_plist_is_idempotent_and_valid_xml(tmp_path, monkeypatch):
@@ -190,6 +165,10 @@ def test_install_aborts_on_doctor_fail_no_assets(tmp_path, monkeypatch):
     assert not (tmp_path / "dist").exists()
 
 
+def _clean_teardown(**kw):
+    return inst.TeardownReport(clean=True, detail="clear")
+
+
 def test_install_proceeds_when_doctor_ok(tmp_path, monkeypatch):
     agents = tmp_path / "LaunchAgents"
     monkeypatch.setenv("JARVIS_VENV_DIR", str(tmp_path / "venv"))
@@ -198,11 +177,25 @@ def test_install_proceeds_when_doctor_ok(tmp_path, monkeypatch):
     report = inst.run_install(
         agents_dir=agents, app_dest=tmp_path / "dist",
         doctor_report=ok, runner=lambda *a, **k: type("R", (), {"returncode": 0})(),
+        venv_check=lambda: True,                 # hermetic venv present
+        teardown_fn=_clean_teardown,             # port already clear
     )
     assert report.aborted is False
     assert report.doctor_ok is True
     assert report.plist_path is not None and report.plist_path.exists()
     assert report.app_path is not None and report.app_path.exists()
+
+
+def test_install_aborts_when_hermetic_venv_missing(tmp_path, monkeypatch):
+    """Deployment immutability: no venv → abort with a bootstrap-env
+    directive, NEVER silently fall back to a shared interpreter."""
+    ok = _FakeReport(True, [_FakeCheck("python-runtime", "READY")])
+    report = inst.run_install(
+        agents_dir=tmp_path / "LA", app_dest=tmp_path / "dist",
+        doctor_report=ok, venv_check=lambda: False,
+    )
+    assert report.aborted is True
+    assert "bootstrap-env" in report.reason
 
 
 # ---------------------------------------------------------------------------
@@ -259,3 +252,108 @@ def test_installer_source_thin_no_pyinstaller_torch_bundling():
     src = Path(inst.__file__).read_text()
     assert "PyInstaller" not in src
     assert "py2app" not in src
+
+
+# ---------------------------------------------------------------------------
+# MANDATE 4 — Stateful Pre-Flight Teardown: supervisor holds 8010 → SIGTERM
+# → port clears → install proceeds without EADDRINUSE
+# ---------------------------------------------------------------------------
+
+class _Holder:
+    def __init__(self, pid): self.pid = pid; self.command = "python"; self.name = ""
+
+
+def test_preflight_teardown_identifies_pid_sigterms_and_clears(monkeypatch):
+    """The mandate-4 core: a live unified_supervisor holds port 8010. The
+    teardown must ID the PID via the doctor's lsof logic, SIGTERM it, watch
+    the port clear, and report clean — no EADDRINUSE."""
+    import signal
+    # Port holder: pid 4242 until it is signalled, then gone.
+    state = {"alive": True}
+    def _holder(port):
+        return _Holder(4242) if state["alive"] else None
+    def _sock_holder(path):
+        return None
+    signals = []
+    def _signaller(pid, sig):
+        signals.append((pid, sig))
+        if sig == signal.SIGTERM and pid == 4242:
+            state["alive"] = False               # process yields on SIGTERM
+    slept = []
+
+    rep = inst.preflight_teardown(
+        port=8010, socket_path=None,
+        holder_fn=_holder, socket_holder_fn=_sock_holder,
+        extra_pids_fn=lambda: [],
+        signaller=_signaller, sleeper=lambda s: slept.append(s),
+    )
+    assert 4242 in rep.terminated                # identified + signalled
+    assert (4242, signal.SIGTERM) in signals     # graceful SIGTERM first
+    assert not rep.escalated                     # yielded → no SIGKILL
+    assert rep.clean is True                     # port verified free
+
+
+def test_preflight_teardown_escalates_to_sigkill_if_stubborn(monkeypatch):
+    import signal
+    def _holder(port):
+        return _Holder(999)                      # NEVER yields
+    def _signaller(pid, sig):
+        pass
+    rep = inst.preflight_teardown(
+        port=8010, socket_path=None, holder_fn=_holder,
+        socket_holder_fn=lambda p: None, extra_pids_fn=lambda: [],
+        signaller=_signaller, sleeper=lambda s: None, max_wait_s=1.0,
+        poll_interval_s=0.2)
+    assert 999 in rep.terminated
+    assert 999 in rep.escalated                  # SIGTERM ignored → SIGKILL
+    assert rep.clean is False                    # still held → honest report
+
+
+def test_install_runs_teardown_before_bootstrap(tmp_path, monkeypatch):
+    """Integration: run_install fires the teardown and only bootstraps
+    once the port is clean (no EADDRINUSE at launchd load)."""
+    import signal
+    monkeypatch.setenv("JARVIS_VENV_DIR", str(tmp_path / "venv"))
+    ok = _FakeReport(True, [_FakeCheck("python-runtime", "READY")])
+    state = {"alive": True}
+    order = []
+    def _holder(port):
+        return _Holder(7777) if state["alive"] else None
+    def _signaller(pid, sig):
+        order.append(("SIGTERM" if sig == signal.SIGTERM else "SIG", pid))
+        state["alive"] = False
+    def _runner(argv, **kw):
+        if "bootstrap" in argv:
+            order.append(("bootstrap", 0))
+            assert not state["alive"]            # port cleared BEFORE bootstrap
+        return type("R", (), {"returncode": 0})()
+
+    report = inst.run_install(
+        agents_dir=tmp_path / "LA", doctor_report=ok,
+        venv_check=lambda: True, holder_fn=_holder,
+        socket_holder_fn=lambda p: None, signaller=_signaller,
+        sleeper=lambda s: None, runner=_runner,
+    )
+    assert report.aborted is False
+    # SIGTERM happened before the launchctl bootstrap.
+    kinds = [o[0] for o in order]
+    assert "SIGTERM" in kinds and "bootstrap" in kinds
+    assert kinds.index("SIGTERM") < kinds.index("bootstrap")
+
+
+def test_install_aborts_if_port_never_clears(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_VENV_DIR", str(tmp_path / "venv"))
+    ok = _FakeReport(True, [_FakeCheck("python-runtime", "READY")])
+    def _stuck_teardown(**kw):
+        return inst.TeardownReport(clean=False, terminated=[9], escalated=[9],
+                                   detail="port 8010 STILL contended")
+    booted = []
+    report = inst.run_install(
+        agents_dir=tmp_path / "LA", doctor_report=ok, venv_check=lambda: True,
+        teardown_fn=_stuck_teardown,
+        runner=lambda *a, **k: booted.append(a) or type("R", (), {"returncode": 0})(),
+    )
+    assert report.aborted is True
+    assert "contended" in report.reason
+    # NEVER bootstrapped over a live holder.
+    assert not any("bootstrap" in str(b) for b in booted)

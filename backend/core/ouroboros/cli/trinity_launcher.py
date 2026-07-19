@@ -35,8 +35,9 @@ _HELP = """trinity — the JARVIS + O+V ecosystem, one command
   trinity up        start the backend detached; keep the terminal free
   trinity app       launch the native JARVIS-Apple product surface too
   trinity doctor    validate the environment before boot
+  trinity bootstrap-env  build the hermetic ~/.jarvis/venv (isolated deps)
   trinity install   install background persistence (LaunchAgent + .app);
-                    runs `doctor` first and aborts on FAIL
+                    runs `doctor` + pre-flight teardown; needs the venv
   trinity uninstall remove the background service
   trinity status     what's running (backend / sockets / native app)
   trinity down       gracefully stop the resident backend
@@ -179,6 +180,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if verb == "doctor":
         from backend.core.ouroboros.cli.trinity_doctor import doctor_main
         return doctor_main(console)
+    if verb == "bootstrap-env":
+        from backend.core.ouroboros.cli.trinity_env import env_main
+        return env_main([verb], console)
     if verb in ("install", "uninstall"):
         from backend.core.ouroboros.cli.trinity_installer import installer_main
         return installer_main([verb], console)
