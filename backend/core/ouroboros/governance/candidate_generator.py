@@ -229,6 +229,7 @@ def autarky_should_wait_and_retry(
 
 def should_cascade_to_claude(
     *, has_fallback: bool, claude_breaker_open: bool, enabled: bool,
+    route_masked: bool = False,
 ) -> bool:
     """Pure decision: should the sentinel actually cascade to the Claude fallback
     after DW exhaustion? Cascade ONLY when a fallback is configured AND it is not
@@ -236,12 +237,49 @@ def should_cascade_to_claude(
     (Claude known-dead), suppress the cascade (→ caller routes to the immortal
     DW-retry / degrade branch). When *enabled* is False (kill switch), legacy
     behavior: cascade iff a fallback exists. No env / breaker reads here — the
-    caller injects both — so this stays deterministic + unit-testable. Pure."""
+    caller injects both — so this stays deterministic + unit-testable. Pure.
+
+    ``route_masked`` (Pre-emptive Route Masking, 2026-07-18): the caller
+    evaluated the COST CONTRACT (cost_contract_assertion.
+    classify_route_compatibility — the SAME policy the dispatch-time
+    assert enforces) BEFORE building the pool. True = this route may not
+    buy Claude (BG/SPEC non-read-only) — the cascade is omitted
+    ENTIRELY, so the envelope exhausts its cheap pool natively instead
+    of detonating a CostContractViolation mid-dispatch (the violent
+    abort whose transport teardown bled onto the cockpit). Checked
+    FIRST: a masked route never cascades, breaker state irrelevant."""
+    if route_masked:
+        return False
     if not has_fallback:
         return False
     if enabled and claude_breaker_open:
         return False  # Claude lane is dead — do not poison the op via it
     return True
+
+
+def claude_route_masked(context: Any) -> bool:
+    """Pre-emptive Route Masking predicate — pure composition over the
+    cost contract's OWN classifier (zero duplicated budget rules).
+    True iff dispatching *context* to Claude would violate the
+    contract (BG/SPEC and not read-only). Consulted when BUILDING the
+    fallback pool; the dispatch-time assert stays as defense-in-depth.
+    NEVER raises (unknown metadata → not masked, the assert still
+    guards)."""
+    try:
+        from backend.core.ouroboros.governance.cost_contract_assertion import (
+            classify_route_compatibility,
+            cost_contract_runtime_assert_enabled,
+        )
+        if not cost_contract_runtime_assert_enabled():
+            return False           # contract off → legacy pool shape
+        verdict = classify_route_compatibility(
+            provider_route=getattr(context, "provider_route", ""),
+            provider_tier="claude",
+            is_read_only=getattr(context, "is_read_only", False),
+        )
+        return verdict == "violation"
+    except Exception:  # noqa: BLE001
+        return False
 
 # Complexity-aware multipliers applied on top of _TIER0_BUDGET_FRACTION.
 # Higher complexity => more time for DW 397B code generation.
@@ -4893,6 +4931,11 @@ class CandidateGenerator:
         if (
             fallback_tolerance == "cascade_to_claude"
             and dw_transport_degraded_preflight()
+            # Pre-emptive Route Masking (2026-07-18): the sever-cascade
+            # is ALSO a Claude purchase — same contract consult as the
+            # exhaustion cascade; a masked route falls through to the
+            # DW path and exhausts cheaply instead.
+            and not claude_route_masked(context)
         ):
             logger.info(
                 "[CandidateGenerator] Slice 76 pre-flight: DW DIRECT_STREAMING "
@@ -5860,11 +5903,21 @@ class CandidateGenerator:
             _claude_lane_open = _cascade_breaker_open()
         except Exception:  # noqa: BLE001 — advisory; never block dispatch
             _claude_lane_open = False
+        _route_masked = claude_route_masked(context)
         _do_cascade = should_cascade_to_claude(
             has_fallback=self._fallback is not None,
             claude_breaker_open=_claude_lane_open,
             enabled=cascade_breaker_consult_enabled(),
+            route_masked=_route_masked,
         )
+        if _route_masked and self._fallback is not None:
+            logger.info(
+                "[CandidateGenerator] route MASKED — claude omitted from "
+                "fallback pool by cost contract (route=%s read_only=%s "
+                "op=%s); exhausting cheap pool natively",
+                getattr(context, "provider_route", "?"),
+                getattr(context, "is_read_only", False), op_id_short,
+            )
         if not _do_cascade and self._fallback is not None and _claude_lane_open:
             logger.warning(
                 "[CandidateGenerator] Slice238 cascade-to-claude SUPPRESSED: "
