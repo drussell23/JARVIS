@@ -99,9 +99,11 @@ class SemanticGaze:
         self._hash = frame_hash or self._default_hash
         self._vlm = vlm if vlm is not None else self._default_vlm
         self._speak = speak or self._default_speak
-        self._last_hash: Optional[str] = None
-        self._cached_state: str = ""
-        self._cached_at: float = 0.0
+        # Unified Epistemic Bus (2026-07-19): the cache lives at the
+        # orchestrator root, NOT in this persona FSM — every gaze
+        # instance shares one pointer (split-brain cure).
+        from .epistemic_bus import get_default_bus  # noqa: PLC0415
+        self._bus = get_default_bus()
         self.stats: Dict[str, int] = {
             "dormant": 0, "thermal_locks": 0, "cache_hits": 0,
             "vlm_calls": 0, "captures": 0,
@@ -163,6 +165,22 @@ class SemanticGaze:
         from .ambient import say_with_persona  # noqa: PLC0415
         return await say_with_persona(text, persona)
 
+    @staticmethod
+    def _referential(command: str) -> bool:
+        """True when the command REFERS to prior visual context rather
+        than requesting a fresh look ("that error", "patch this",
+        "fix it")."""
+        import re  # noqa: PLC0415
+        tokens = set(re.findall(r"[a-z']+", str(command or "").lower()))
+        return bool(tokens & {"that", "it", "this", "same", "those"})
+
+    @staticmethod
+    def _force_recapture(command: str) -> bool:
+        """Explicit re-look verbs override inheritance ("look AGAIN",
+        "refresh")."""
+        low = str(command or "").lower()
+        return any(w in low for w in ("again", "refresh", "re-look", "now"))
+
     # ---- the gaze ----
 
     async def request(self, command: str) -> Dict[str, Any]:
@@ -184,6 +202,22 @@ class SemanticGaze:
                     "verdict": VERDICT_THERMAL_LOCKED,
                     "semantic_state": _THERMAL_WARNING,
                 }
+            shared_pre = self._bus.inherit_visual()
+            if (
+                shared_pre is not None
+                and self._referential(command)
+                and not self._force_recapture(command)
+            ):
+                # Cross-persona inheritance: "Karen, patch THAT" — a
+                # REFERENTIAL command points at the shared memory; the
+                # pointer is fresh; Quartz is NOT re-triggered. Fresh-
+                # look commands ("look at the screen") always capture
+                # so spatial invalidation can see a Space swap.
+                self.stats["cache_hits"] += 1
+                return {
+                    "verdict": VERDICT_CACHED,
+                    "semantic_state": shared_pre["semantic_state"],
+                }
             import inspect  # noqa: PLC0415
             frame = self._capture()
             if inspect.isawaitable(frame):
@@ -193,24 +227,28 @@ class SemanticGaze:
                 return {"verdict": VERDICT_DORMANT, "semantic_state": ""}
             self.stats["captures"] += 1
             h = self._hash(frame)
-            if h == self._last_hash and self._cached_state:
-                # Delta pruning: the screen did not structurally
-                # change — the VLM is bypassed entirely.
+            shared = self._bus.inherit_visual()
+            if shared is not None and shared["frame_hash"] == h:
+                # Delta pruning against the SHARED pointer: unchanged
+                # screen → VLM bypassed, every persona answers from
+                # the same epistemic state.
                 self.stats["cache_hits"] += 1
                 return {
                     "verdict": VERDICT_CACHED,
-                    "semantic_state": self._cached_state,
+                    "semantic_state": shared["semantic_state"],
                 }
-            self._last_hash = h
+            if shared is not None:
+                # Catastrophic delta: Space swap / IDE closed — the
+                # remembered screen is gone; flush before re-looking.
+                self._bus.spatial_invalidate(h)
             if self._vlm is None:
                 return {"verdict": VERDICT_DORMANT, "semantic_state": ""}
             state = await self._vlm(frame, command)
-            self._cached_state = str(state or "")
-            self._cached_at = time.time()
+            self._bus.deposit_visual(str(state or ""), h)
             self.stats["vlm_calls"] += 1
             return {
                 "verdict": VERDICT_ANALYZED,
-                "semantic_state": self._cached_state,
+                "semantic_state": str(state or ""),
             }
         except Exception:  # noqa: BLE001
             logger.debug("[SemanticGaze] request degraded", exc_info=True)

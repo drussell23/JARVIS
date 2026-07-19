@@ -74,6 +74,7 @@ SOURCE_ASK_HUMAN_A = "ask_human_a"
 SOURCE_POSTMORTEM = "postmortem"
 SOURCE_VOICE = "voice"
 SOURCE_BARGE_IN = "barge_in"
+SOURCE_VISUAL = "visual"
 
 _ALLOWED_SOURCES = frozenset({
     SOURCE_TUI_USER,
@@ -82,6 +83,7 @@ _ALLOWED_SOURCES = frozenset({
     SOURCE_POSTMORTEM,
     SOURCE_VOICE,
     SOURCE_BARGE_IN,
+    SOURCE_VISUAL,
 })
 
 # Source-category groupings used by subheader rendering. Each group gets
@@ -93,6 +95,7 @@ _SUBHEADER_ORDER: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("### Clarifications (recent)", (SOURCE_ASK_HUMAN_Q, SOURCE_ASK_HUMAN_A)),
     ("### Prior op closure (postmortem)", (SOURCE_POSTMORTEM,)),
     ("### Delivery interruptions", (SOURCE_BARGE_IN,)),
+    ("### Visual context (shared gaze)", (SOURCE_VISUAL,)),
 )
 
 def record_barge_in(
@@ -148,6 +151,28 @@ def record_barge_in(
             "[ConversationBridge] record_barge_in dropped by internal error",
             exc_info=True,
         )
+        return False
+
+
+def record_visual_state(semantic_state: str, *, persona: str = "daniel",
+                        op_id: str = "") -> bool:
+    """Unified Epistemic Bus lane (2026-07-19): the shared gaze's VLM
+    semantic state, bridged so the ContextCompactor carries it into
+    the LLM window for WHICHEVER persona speaks next. Bounded; same
+    Tier -1 sanitize path. NEVER raises."""
+    try:
+        if not _is_enabled():
+            return False
+        text = str(semantic_state or "").strip()
+        if not text:
+            return False
+        marker = f"[VISUAL:{str(persona)[:12]}] {text[:600]}"
+        get_default_bridge().record_turn(
+            role="assistant", text=marker,
+            source=SOURCE_VISUAL, op_id=str(op_id or ""),
+        )
+        return True
+    except Exception:  # pragma: no cover
         return False
 
 
