@@ -208,3 +208,103 @@ class TestTotalGate:
         ).read_text()
         assert "RemoteAudioLease" in src                  # the CLI wake path
         assert "acquire()" in src
+
+
+# ---------------------------------------------------------------------------
+# Rolling Biometric Evolution (E2E Sovereignty, 2026-07-19)
+# ---------------------------------------------------------------------------
+
+
+class TestBiometricEvolution:
+    def _seed_db(self, tmp_path, dim=192):
+        import sqlite3
+        db = tmp_path / "learning.db"
+        con = sqlite3.connect(db)
+        con.execute(
+            "CREATE TABLE speaker_profiles (speaker_id INTEGER, "
+            "speaker_name TEXT, voiceprint_embedding BLOB, "
+            "embedding_dimension INTEGER, total_samples INTEGER)",
+        )
+        base = np.linspace(0.1, 1.0, dim).astype(np.float32)
+        con.execute(
+            "INSERT INTO speaker_profiles VALUES (1, 'Derek J. Russell', "
+            "?, ?, 272)", (base.tobytes(), dim),
+        )
+        con.commit(); con.close()
+        return str(db), base
+
+    def test_high_confidence_pass_evolves_baseline_shape_preserved(
+        self, tmp_path, monkeypatch,
+    ):
+        """MANDATE 4 VERBATIM: high-confidence wake chunk → baseline
+        voiceprint tensor updated in memory, shape UNCORRUPTED."""
+        from backend.core.ouroboros.governance.comms.duplex import (
+            biometric_evolution as be,
+        )
+        monkeypatch.setenv("JARVIS_BIOMETRIC_EVOLUTION_ALPHA", "0.05")
+        db, base = self._seed_db(tmp_path)
+        new = np.ones(192, dtype=np.float32)
+        assert be.evolve_if_confident(0.95, new, db_path=db) is True
+        sid, name, evolved = be.load_enrollment(db)
+        assert name == "Derek J. Russell"
+        assert evolved.shape == base.shape                 # UNCORRUPTED
+        assert evolved.dtype == np.float32
+        expected = 0.95 * base + 0.05 * new
+        assert np.allclose(evolved, expected, atol=1e-6)   # exact EMA law
+        import sqlite3
+        n = sqlite3.connect(db).execute(
+            "SELECT total_samples FROM speaker_profiles",
+        ).fetchone()[0]
+        assert n == 273                                    # sample counted
+
+    def test_marginal_confidence_never_teaches(self, tmp_path):
+        from backend.core.ouroboros.governance.comms.duplex import (
+            biometric_evolution as be,
+        )
+        db, base = self._seed_db(tmp_path)
+        assert be.evolve_if_confident(
+            0.75, np.ones(192, dtype=np.float32), db_path=db,
+        ) is False
+        _s, _n, after = be.load_enrollment(db)
+        assert np.array_equal(after, base)                 # untouched
+
+    def test_shape_mismatch_aborts_no_corruption(self, tmp_path):
+        from backend.core.ouroboros.governance.comms.duplex import (
+            biometric_evolution as be,
+        )
+        db, base = self._seed_db(tmp_path)
+        assert be.evolve_if_confident(
+            0.95, np.ones(64, dtype=np.float32), db_path=db,
+        ) is False
+        _s, _n, after = be.load_enrollment(db)
+        assert np.array_equal(after, base)
+
+    def test_nonfinite_blend_rejected(self):
+        from backend.core.ouroboros.governance.comms.duplex import (
+            biometric_evolution as be,
+        )
+        base = np.ones(192, dtype=np.float32)
+        bad = np.full(192, np.inf, dtype=np.float32)
+        assert be.blend_profile(base, bad) is None
+
+    def test_normalization_preserves_length_and_energy_shape(self):
+        from backend.core.ouroboros.governance.comms.duplex import (
+            biometric_evolution as be,
+        )
+        rng = np.random.default_rng(5)
+        x = rng.standard_normal(16000).astype(np.float32) * 0.1
+        y = be.normalize_acoustics(x)
+        assert y.shape == x.shape and np.all(np.isfinite(y))
+
+    def test_real_enrollment_resolves_dynamically(self):
+        """Against the OPERATOR'S actual store (read-only) — the
+        dynamic resolver finds the real 192-dim x-vector."""
+        from backend.core.ouroboros.governance.comms.duplex import (
+            biometric_evolution as be,
+        )
+        enrolled = be.load_enrollment()
+        if enrolled is None:
+            pytest.skip("no enrollment on this machine")
+        _sid, name, emb = enrolled
+        assert emb.dtype == np.float32 and emb.size in (192, 512)
+        assert name                                        # a real human name

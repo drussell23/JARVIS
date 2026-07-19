@@ -259,10 +259,31 @@ class BiometricGateAdapter:
     async def verify(self, window: Any) -> bool:
         """The sentry's injected verifier. NEVER raises."""
         try:
+            # Dynamic Acoustic Normalization pre-filter (E2E
+            # Sovereignty 2026-07-19): strip the static room/channel
+            # response before ANY scoring — shifting acoustics stop
+            # masquerading as identity drift.
+            try:
+                from .biometric_evolution import normalize_acoustics  # noqa: E501,PLC0415
+                window = normalize_acoustics(window)
+            except Exception:  # noqa: BLE001
+                pass
             conf, is_owner = await self._scorer(window)
             thr, margin = _vbia_threshold(), _boundary_margin()
             if conf >= thr + margin and is_owner:
                 self.stats["clear_pass"] += 1
+                # Rolling Biometric Evolution: a HIGH-confidence pass
+                # teaches the profile (slow EMA in the enrollment's
+                # native x-vector space; strict tensor guards inside).
+                try:
+                    from .biometric_evolution import evolve_if_confident  # noqa: E501,PLC0415
+                    emb = getattr(self, "last_embedding", None)
+                    if emb is not None and evolve_if_confident(conf, emb):
+                        self.stats["evolutions"] = (
+                            self.stats.get("evolutions", 0) + 1
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
                 return True
             if conf < thr - margin or not is_owner:
                 self.stats["clear_fail"] += 1
@@ -370,6 +391,23 @@ def mount_passive_sentry(
 
         sentry.capture = DeferredCaptureAllocator(_open_capture)
         sentry.capture.ensure()
+
+        # Monolith fold (E2E Sovereignty): the recognition callbacks
+        # land on the MAIN runloop — pump it from the supervisor's own
+        # asyncio loop (main thread) so the loop needs NO scratchpad
+        # host and survives native launchd ignition.
+        async def _pump_loop() -> None:
+            from .passive_sentry import SFSpeechWindowSession  # noqa: PLC0415
+            while True:
+                SFSpeechWindowSession.pump_main_runloop(0.0)
+                await asyncio.sleep(0.03)
+
+        try:
+            sentry.pump_task = asyncio.get_running_loop().create_task(
+                _pump_loop(),
+            )
+        except RuntimeError:
+            sentry.pump_task = None
         logger.info(
             "[Sentry] mounted (capture=%s)", sentry.capture.state,
         )
