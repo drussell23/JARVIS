@@ -22,6 +22,14 @@ Protocol (newline-delimited JSON, schema ``cockpit_attach.v1``):
     stdin from the attached terminal, routed into the harness's
     ``_handle_repl_command`` — the FULL verb set plus the bare-text
     chat bridge, not a chat-only side channel.
+  * **Audio orchestration (v2, the Audio-Visual Synapse)** — upstream
+    ``{"type":"audio","cmd":"wake"|"sleep"|"barge"}`` arms / disarms /
+    interrupts the daemon's karen_duplex voice plane; downstream
+    ``{"type":"audio_state","state":...}`` streams the audio FSM
+    (``OFFLINE`` / ``UNAVAILABLE`` / ``LISTENING`` / ``HEARING`` /
+    ``THINKING`` / ``SPEAKING``) so the attached TUI can morph its
+    prompt in real time. The hydration payload carries the CURRENT
+    audio state (late joiners never render a stale footer).
 
 Bulletproof contract (mandate 4): the daemon-side publisher is strictly
 non-blocking and per-client fail-drop — ``BrokenPipeError`` /
@@ -45,7 +53,18 @@ from typing import Any, Callable, Dict, Optional, Set
 
 logger = logging.getLogger("Ouroboros.CockpitAttach")
 
-COCKPIT_ATTACH_SCHEMA_VERSION = "cockpit_attach.v1"
+COCKPIT_ATTACH_SCHEMA_VERSION = "cockpit_attach.v2"
+
+#: Closed taxonomy of daemon→TUI audio FSM states (the morphing
+#: vocabulary). OFFLINE = voice plane not armed; UNAVAILABLE = wake
+#: requested but no duplex handle mounted in this process.
+AUDIO_STATES = (
+    "OFFLINE", "UNAVAILABLE", "LISTENING", "HEARING", "THINKING",
+    "SPEAKING",
+)
+
+#: Closed taxonomy of TUI→daemon audio commands.
+AUDIO_CMDS = ("wake", "sleep", "barge")
 
 _TRUTHY = ("1", "true", "yes", "on")
 
@@ -94,19 +113,23 @@ class CockpitAttachBridge:
         ops_provider: Optional[Callable[[], Any]] = None,
         liquidity_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         on_input: Optional[Callable[[str], None]] = None,
+        on_audio: Optional[Callable[[str], None]] = None,
         path: Optional[Path] = None,
     ) -> None:
         self._status = status_provider or (lambda: {})
         self._ops = ops_provider or (lambda: [])
         self._liquidity = liquidity_provider or (lambda: {})
         self._on_input = on_input or (lambda _t: None)
+        self._on_audio = on_audio or (lambda _c: None)
         self._path = Path(path) if path is not None else attach_socket_path()
         self._server: Optional[asyncio.AbstractServer] = None
         self._clients: Set[asyncio.StreamWriter] = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._audio_state: str = "OFFLINE"
         self.stats: Dict[str, int] = {
             "connects": 0, "dropped": 0, "lines_published": 0,
-            "inputs_received": 0,
+            "inputs_received": 0, "audio_cmds": 0,
+            "audio_states_published": 0,
         }
 
     # ---- lifecycle ----
@@ -178,6 +201,7 @@ class CockpitAttachBridge:
             "status": _safe(self._status, {}),
             "ops": _safe(self._ops, []),
             "liquidity": _safe(self._liquidity, {}),
+            "audio": {"state": self._audio_state},
         }
 
     # ---- publish (the harness _repl_print mirror) ----
@@ -205,6 +229,32 @@ class CockpitAttachBridge:
                 loop.call_soon_threadsafe(self._broadcast, msg)
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] publish degraded", exc_info=True)
+
+    def publish_audio_state(self, state: str) -> None:
+        """Stream one audio-FSM state to every attached terminal
+        (edge-coalesced: republishing the current state is a no-op).
+        The state is also retained for hydration so a late joiner's
+        footer is never stale. Thread-safe; NEVER raises."""
+        try:
+            state = str(state or "").strip().upper()
+            if state not in AUDIO_STATES or state == self._audio_state:
+                return
+            self._audio_state = state
+            self.stats["audio_states_published"] += 1
+            msg = {"type": "audio_state", "state": state, "ts": time.time()}
+            loop = self._loop
+            if loop is None or loop.is_closed() or not self._clients:
+                return
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                self._broadcast(msg)
+            else:
+                loop.call_soon_threadsafe(self._broadcast, msg)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] audio publish degraded", exc_info=True)
 
     def _broadcast(self, msg: Dict[str, Any]) -> None:
         data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
@@ -256,7 +306,8 @@ class CockpitAttachBridge:
                     frame = json.loads(line)
                 except (ValueError, TypeError):
                     continue
-                if frame.get("type") == "input":
+                ftype = frame.get("type")
+                if ftype == "input":
                     text = str(frame.get("text", "")).strip()
                     if text:
                         self.stats["inputs_received"] += 1
@@ -265,6 +316,17 @@ class CockpitAttachBridge:
                         except Exception:  # noqa: BLE001
                             logger.debug(
                                 "[CockpitAttach] input sink degraded",
+                                exc_info=True,
+                            )
+                elif ftype == "audio":
+                    cmd = str(frame.get("cmd", "")).strip().lower()
+                    if cmd in AUDIO_CMDS:
+                        self.stats["audio_cmds"] += 1
+                        try:
+                            self._on_audio(cmd)
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "[CockpitAttach] audio sink degraded",
                                 exc_info=True,
                             )
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -296,11 +358,13 @@ class CockpitAttachClient:
         *,
         on_hydration: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_line: Optional[Callable[[str], None]] = None,
+        on_audio_state: Optional[Callable[[str], None]] = None,
         path: Optional[Path] = None,
     ) -> None:
         self._path = Path(path) if path is not None else attach_socket_path()
         self._on_hydration = on_hydration or (lambda _m: None)
         self._on_line = on_line or (lambda _t: None)
+        self._on_audio_state = on_audio_state or (lambda _s: None)
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._read_task: Optional[asyncio.Task] = None
@@ -329,6 +393,23 @@ class CockpitAttachClient:
             return True
         except Exception:  # noqa: BLE001
             await self.close()
+            return False
+
+    def send_audio(self, cmd: str) -> bool:
+        """Pipe one audio-orchestration command upstream (``wake`` /
+        ``sleep`` / ``barge``). Non-blocking; False when detached or
+        the command is outside the closed taxonomy. NEVER raises."""
+        try:
+            cmd = str(cmd or "").strip().lower()
+            if cmd not in AUDIO_CMDS:
+                return False
+            w = self._writer
+            if not self.connected or w is None or w.is_closing():
+                return False
+            frame = {"type": "audio", "cmd": cmd}
+            w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+            return True
+        except Exception:  # noqa: BLE001
             return False
 
     def send_input(self, text: str) -> bool:
@@ -360,8 +441,13 @@ class CockpitAttachClient:
                     frame = json.loads(line)
                 except (ValueError, TypeError):
                     continue
-                if frame.get("type") == "line":
+                ftype = frame.get("type")
+                if ftype == "line":
                     self._safe_cb_text(self._on_line, str(frame.get("text", "")))
+                elif ftype == "audio_state":
+                    self._safe_cb_text(
+                        self._on_audio_state, str(frame.get("state", "")),
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -404,6 +490,8 @@ class CockpitAttachClient:
 
 
 __all__ = [
+    "AUDIO_CMDS",
+    "AUDIO_STATES",
     "COCKPIT_ATTACH_SCHEMA_VERSION",
     "CockpitAttachBridge",
     "CockpitAttachClient",

@@ -87,12 +87,26 @@ def _verify(payload_json: str, signature: str, key: bytes) -> bool:
 # thought that re-enters the LLM). Observability only -- authority-free, never raises.
 
 def emit_handshake(line: str) -> None:
-    """Emit one Atomic Hydration Handshake line to BOTH the logger and stdout.
-    Best-effort on every leg -- observability never breaks suspend/resume."""
+    """Emit one Atomic Hydration Handshake line — logger ALWAYS (the
+    session debug.log carries full crypto-forensic fidelity); raw stdout
+    ONLY outside cockpit mode. The raw-write leg deliberately bypasses
+    every logging layer for soak forensics, which is exactly why it was
+    bleeding un-conformed ``[HYDRATION-HANDSHAKE]`` telemetry into the
+    operator presentation plane (operator finding 2026-07-18): zero raw
+    telemetry may hit the cockpit Body. Best-effort on every leg --
+    observability never breaks suspend/resume."""
     try:
         logger.info(line)
     except Exception:  # noqa: BLE001
         pass
+    try:
+        from backend.core.ouroboros.ui.presentation_mode import (  # noqa: PLC0415
+            is_cockpit,
+        )
+        if is_cockpit():
+            return
+    except Exception:  # noqa: BLE001
+        pass                    # mode unresolvable → legacy raw write
     try:
         import sys  # noqa: PLC0415
         sys.stdout.write(line + "\n")
