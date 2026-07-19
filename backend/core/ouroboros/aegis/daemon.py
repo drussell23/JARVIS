@@ -250,14 +250,31 @@ def _make_llm_handler(endpoint):
         )
 
         async def _do_forward() -> web.StreamResponse:
-            response, _ = await forward_request(
-                request=request,
-                endpoint=endpoint,
-                K=request.app[_K_HMAC_KEY],
-                nonce_ledger=request.app[_K_NONCE_LEDGER],
-                budget=request.app[_K_BUDGET],
-            )
-            return response
+            try:
+                response, _ = await forward_request(
+                    request=request,
+                    endpoint=endpoint,
+                    K=request.app[_K_HMAC_KEY],
+                    nonce_ledger=request.app[_K_NONCE_LEDGER],
+                    budget=request.app[_K_BUDGET],
+                )
+                return response
+            except (ConnectionResetError, ConnectionError) as exc:
+                # Benign client-disconnect class (2026-07-18): the LOCAL
+                # caller (an SDK retry/cancel) closed its socket while we
+                # were preparing/streaming the response. This is a
+                # dropped subscriber, NOT a fault — before this catch,
+                # aiohttp's web_protocol logged a FULL ERROR traceback
+                # ("Cannot write to closing transport") onto the
+                # operator's cockpit terminal. One DEBUG line, done.
+                # (aiohttp's ClientConnectionResetError subclasses
+                # ConnectionResetError — caught here without importing
+                # the aiohttp-private name.)
+                logger.debug(
+                    "[aegis] client disconnected mid-response (benign): %s",
+                    exc,
+                )
+                return web.Response(status=499)   # nginx-style client-closed
 
         # QoS admission — bound concurrent forwards and, only under saturation,
         # admit in X-JARVIS-QoS-Tier priority order (critical event-loop traffic
