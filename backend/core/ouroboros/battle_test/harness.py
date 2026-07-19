@@ -1190,6 +1190,15 @@ class BattleTestHarness:
         _running_loop = asyncio.get_event_loop()
 
         def _harness_loop_exception_handler(loop_, ctx_):
+            # Interpreter finalization guard (operator paste 2026-07-18):
+            # during shutdown the QueueHandler's copy.copy(record) dies
+            # with "ImportError: sys.meta_path is None" and logging
+            # itself prints a '--- Logging error ---' WALL per leaked
+            # task — pure noise from a dying process. Drop silently;
+            # every pre-finalization leak still logs normally.
+            import sys as _sys
+            if _sys.is_finalizing() or _sys.meta_path is None:
+                return
             msg = ctx_.get("message", "Unhandled exception in event loop")
             exc = ctx_.get("exception")
             extras = " | ".join(
@@ -6449,6 +6458,19 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001 — never let watchdog arm crash signal handler
             pass
 
+        # Quiesce gate (operator paste 2026-07-18): refuse NEW op
+        # dequeues from this instant — the signal→GLS.stop window let
+        # workers start fresh synthesis AFTER the SESSION COMPLETE
+        # banner (EXHAUSTION storm on a dying organism). In-flight ops
+        # keep their finish/checkpoint contract.
+        try:
+            _gls = getattr(self, "_governed_loop_service", None)
+            _pool = getattr(_gls, "background_pool", None)
+            if _pool is not None:
+                _pool.request_quiesce()
+        except Exception:  # noqa: BLE001
+            pass
+
         # Autonomous FSM Suspend (signal/preemption path) — checkpoint in-flight ops
         # BEFORE the async cleanup, so an external SIGTERM reap / GCP Spot preemption
         # (not just the internal wall-event race) resumes on the next ignition.
@@ -8156,6 +8178,18 @@ class BattleTestHarness:
         try:
             if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:
                 await self._keyboard_handler.stop()
+        except Exception:
+            pass
+        # TrinityEventBus teardown (leak-wall root fix 2026-07-18): the
+        # bus's processor/cleanup/transport loops were NEVER stopped by
+        # the harness — every one of them surfaced as a "Task was
+        # destroyed but it is pending" wall at loop close. Bounded:
+        # a wedged bus must never hang the exit cinematic.
+        try:
+            from backend.core.trinity_event_bus import (
+                shutdown_trinity_event_bus,
+            )
+            await asyncio.wait_for(shutdown_trinity_event_bus(), timeout=5.0)
         except Exception:
             pass
         try:

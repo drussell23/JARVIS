@@ -922,6 +922,13 @@ class TheSimulator:
 
                 # v95.12: Register executors for cleanup
                 register_executor_for_cleanup(self._process_pool, "simulator_process_pool", is_process_pool=True)
+                try:
+                    from backend.core.ouroboros.governance.executor_registry import (  # noqa: PLC0415,E501
+                        register as _reg_pool,
+                    )
+                    _reg_pool(self._process_pool)
+                except Exception:  # noqa: BLE001
+                    pass
                 register_executor_for_cleanup(self._thread_pool, "simulator_thread_pool")
 
                 self._initialized = True

@@ -366,6 +366,7 @@ class BackgroundAgentPool:
         self._ops: Dict[str, BackgroundOp] = {}
         self._workers: List[asyncio.Task] = []  # type: ignore[type-arg]
         self._running: bool = False
+        self._quiesced: bool = False
 
         # Pause gate for HIBERNATION_MODE. Default set == "not paused".
         # Workers await this before dequeuing; pause() clears it, resume()
@@ -497,6 +498,17 @@ class BackgroundAgentPool:
             self._pool_size,
             self._queue_size,
         )
+
+    def request_quiesce(self) -> None:
+        """Session-ending gate (operator paste 2026-07-18): the moment
+        a shutdown signal lands, workers must not START new operations
+        — the observed failure was fresh '🧬 synthesizing' + an
+        EXHAUSTION storm firing AFTER the SESSION COMPLETE banner, in
+        the window between the signal and ``stop()``. In-flight ops
+        still finish/checkpoint (that contract is untouched); only NEW
+        dequeues are refused. Sync + signal-handler-safe; idempotent;
+        NEVER raises."""
+        self._quiesced = True
 
     async def stop(self) -> None:
         """Cancel all workers, drain the queue, and mark pending ops as cancelled.
@@ -1048,7 +1060,7 @@ class BackgroundAgentPool:
         """
         logger.debug("Worker %d started", worker_id)
         try:
-            while self._running:
+            while self._running and not self._quiesced:
                 # Dynamic Fleet Topology: cooperative retire when the live
                 # target shrank below this worker's id (mesh topology says
                 # fewer lanes than workers). Never mid-op -- only between
