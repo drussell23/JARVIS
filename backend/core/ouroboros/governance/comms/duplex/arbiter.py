@@ -130,7 +130,14 @@ class VoiceDuplexArbiter:
         self._active_priority = req.priority
         self._active_text = req.text
         self._speak_started_mono = asyncio.get_event_loop().time()
-        self._play_task = asyncio.create_task(self._playback.play(req.text))
+        try:
+            play_coro = self._playback.play(
+                req.text, persona=getattr(req, "persona", "karen"),
+            )
+        except TypeError:
+            # Legacy playback handles without a persona lane.
+            play_coro = self._playback.play(req.text)
+        self._play_task = asyncio.create_task(play_coro)
         try:
             await self._play_task
         except asyncio.CancelledError:

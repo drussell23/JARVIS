@@ -72,11 +72,23 @@ class KarenDuplexHandle:
         pipeline's mic/barge-in VAD signal."""
         self.bridge.feed(is_speech)
 
-    def submit_speech(self, text: str, priority: Priority = Priority.PROACTIVE_INFO) -> None:
-        """Enqueue a synthesized Karen line. Non-blocking; gated + coalesced by
-        the arbiter."""
+    def submit_speech(
+        self,
+        text: str,
+        priority: Priority = Priority.PROACTIVE_INFO,
+        *,
+        semantic_class: str = "engineering",
+    ) -> None:
+        """Enqueue a synthesized line. Non-blocking; gated + coalesced
+        by the arbiter. ``semantic_class`` routes the persona lane
+        (ambient.classify_persona — system/managerial → Daniel,
+        codebase/engineering → Karen); callers state WHAT the payload
+        is, never WHICH voice to use."""
         try:
-            self.arbiter.submit(SpeechRequest(text, priority))
+            from .ambient import classify_persona  # noqa: PLC0415
+            self.arbiter.submit(SpeechRequest(
+                text, priority, persona=classify_persona(semantic_class),
+            ))
         except Exception:  # noqa: BLE001
             logger.debug("[Duplex] submit_speech failed", exc_info=True)
 
