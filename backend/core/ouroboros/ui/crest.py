@@ -73,6 +73,18 @@ def _coverage_threshold() -> float:
 
 _SS = 5   # legacy alias — sampling reads _ss() at render time
 
+
+def _edge_feather() -> float:
+    """Boundary-cell luminance factor (``JARVIS_OV_CREST_FEATHER``,
+    default 0.65 — dimmed edges read as native terminal anti-aliasing).
+    ``1.0`` disables. Clamped [0.2, 1.0]; NEVER raises."""
+    try:
+        return min(1.0, max(0.2, float(
+            os.environ.get("JARVIS_OV_CREST_FEATHER", "0.65"),
+        )))
+    except (TypeError, ValueError):
+        return 0.65
+
 _STOPS = [
     (0, (125, 255, 106)), (60, (91, 227, 75)), (150, (139, 92, 246)),
     (210, (177, 108, 234)), (285, (212, 192, 74)), (360, (125, 255, 106)),
@@ -363,6 +375,28 @@ def _render_cells(geo: _Geometry) -> List[CrestCell]:
     for (x, y) in [k for k, v in raw.items() if v[0] in _DOTS]:
         if not any((x + dx, y + dy) in raw for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))):
             del raw[(x, y)]
+
+    # Topological edge feathering (2026-07-18): boundary cells — fewer
+    # than 4 populated orthogonal neighbors — scale their luminance by
+    # the feather factor. Dimmed edges read as anti-aliasing on the
+    # terminal grid; interior cells keep the full gradient. Clip-safe
+    # by construction (round of a [0,1]-scaled channel never exceeds
+    # the source, never drops below 0).
+    feather = _edge_feather()
+    if feather < 1.0:
+        boundary = [
+            key for key in raw
+            if sum(
+                (key[0] + dx, key[1] + dy) in raw
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+            ) < 4
+        ]
+        for key in boundary:
+            glyph, kind, color, delay = raw[key]
+            dimmed = tuple(
+                max(0, min(255, round(c * feather))) for c in color
+            )
+            raw[key] = (glyph, kind, dimmed, delay)  # type: ignore[assignment]
 
     return [
         CrestCell(x=x, y=y, glyph=glyph, kind=kind, rgb=color, delay_s=delay)
