@@ -528,10 +528,27 @@ class PythonBridge: ObservableObject {
     }
 
     private func loadCredentials() -> HUDCredentials? {
+        let env = ProcessInfo.processInfo.environment
+
+        // LOCAL-FIRST (Phase 9, 2026-07-19): the HUD runs on the SAME Mac as
+        // unified_supervisor, so by default it connects DIRECTLY to the local
+        // backend on localhost:8010 — no Vercel relay (which is blocked). The
+        // local /api/stream/token + /api/stream/{id} + /api/command endpoints
+        // are loopback-trusted, so a placeholder device id/secret is fine.
+        // Set JARVIS_HUD_FORCE_CLOUD=1 to fall back to the cloud path.
+        let forceCloud = (env["JARVIS_HUD_FORCE_CLOUD"] ?? "") == "1"
+        if !forceCloud {
+            let localURL = env["JARVIS_LOCAL_BACKEND_URL"] ?? "http://localhost:8010"
+            let id = env["JARVIS_DEVICE_ID"] ?? "mac-local"
+            let secret = env["JARVIS_DEVICE_SECRET"] ?? "local"
+            print("[JARVIS] LOCAL-FIRST: connecting to \(localURL) (device: \(id))")
+            return HUDCredentials(deviceId: id, deviceSecret: secret, baseURL: localURL)
+        }
+
         // Priority: Environment → brainstem/.env file (no Keychain — avoids password prompts)
-        if let id = ProcessInfo.processInfo.environment["JARVIS_DEVICE_ID"],
-           let secret = ProcessInfo.processInfo.environment["JARVIS_DEVICE_SECRET"] {
-            let url = ProcessInfo.processInfo.environment["JARVIS_VERCEL_URL"] ?? "https://jarvis-cloud-five.vercel.app"
+        if let id = env["JARVIS_DEVICE_ID"],
+           let secret = env["JARVIS_DEVICE_SECRET"] {
+            let url = env["JARVIS_VERCEL_URL"] ?? "https://jarvis-cloud-five.vercel.app"
             print("[JARVIS] Credentials from environment for device: \(id)")
             return HUDCredentials(deviceId: id, deviceSecret: secret, baseURL: url)
         }

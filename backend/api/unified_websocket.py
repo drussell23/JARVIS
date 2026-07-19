@@ -3194,6 +3194,60 @@ async def event_stream_command(request: Request):
 
 
 # ============================================================================
+# HUD ↔ unified_supervisor LOCAL-FIRST bridge (Phase 9, 2026-07-19)
+# The native macOS JARVIS HUD speaks a cloud-shaped contract; Vercel is
+# blocked, so these loopback-trusted endpoints let it connect DIRECTLY to
+# this local backend on :8010. Pure translation lives in
+# backend/api/hud_local_bridge.py; command routing REUSES handle_post_command.
+# ============================================================================
+
+@router.post("/api/stream/token")
+async def local_stream_token(request: Request):
+    """Local-first stream token — loopback only. The device SSE endpoint on
+    this host is loopback-trusted (no token validation), so we issue a
+    trivial local token, letting the Swift client connect unchanged."""
+    from fastapi.responses import JSONResponse
+    from backend.api.hud_local_bridge import (
+        is_loopback_host, build_stream_token_response,
+    )
+    host = request.client.host if request.client else ""
+    if not is_loopback_host(host):
+        return JSONResponse({"error": "loopback_only"}, status_code=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    return build_stream_token_response(payload)
+
+
+@router.post("/api/command")
+async def local_command(request: Request):
+    """Local-first command endpoint (Swift CommandSender contract). Bridges
+    to the EXISTING es.handle_post_command — no duplicate command logic.
+    Loopback only."""
+    from fastapi.responses import JSONResponse
+    from backend.api.hud_local_bridge import (
+        is_loopback_host, translate_hud_command, shape_command_response,
+    )
+    host = request.client.host if request.client else ""
+    if not is_loopback_host(host):
+        return JSONResponse({"error": "loopback_only"}, status_code=403)
+    from backend.core.event_stream import (
+        get_event_stream, set_event_stream_ws_manager,
+    )
+    es = get_event_stream()
+    if es._ws_manager is None:
+        set_event_stream_ws_manager(get_ws_manager())
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"status": "error", "success": False, "error": "invalid_json"}
+    frame = translate_hud_command(payload)
+    response = await es.handle_post_command(frame)
+    return shape_command_response(response, frame.get("command_id"))
+
+
+# ============================================================================
 # Full-Duplex Voice Conversation WebSocket (Layer 6b)
 # ============================================================================
 
