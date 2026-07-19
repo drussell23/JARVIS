@@ -2090,10 +2090,50 @@ class GovernedLoopService:
                     try:
                         from backend.core.ouroboros.governance.comms.duplex.proactive_coordinator import (  # noqa: E501
                             ProactiveCrossSpaceCoordinator,
+                            build_proactive_sink,
+                            native_windows_by_space,
                             proactive_enabled as _proactive_on,
                         )
                         if _proactive_on():
-                            _proactive_coord = ProactiveCrossSpaceCoordinator()
+                            # WIRE 2 — present sink → the EXISTING
+                            # SerpentFlow [Y/n] alert surface; WIRE 3 —
+                            # approved reconciliations graduate into the
+                            # backlog via the unified intake router
+                            # under SignalSource.CROSS_SPACE.
+                            def _emit_alert(**kw: Any) -> None:
+                                flow = getattr(self, "_serpent_flow", None)
+                                if flow is not None and hasattr(
+                                    flow, "emit_proactive_alert",
+                                ):
+                                    flow.emit_proactive_alert(**kw)
+
+                            def _backlog_emit(
+                                summary: str, spaces: list,
+                            ) -> None:
+                                try:
+                                    from backend.core.ouroboros.governance.intent.signals import (  # noqa: E501
+                                        SignalSource,
+                                    )
+                                    router = getattr(
+                                        self, "_intake_router", None,
+                                    )
+                                    submit = getattr(
+                                        router, "submit_backlog_intent", None,
+                                    ) or getattr(router, "emit", None)
+                                    if submit is not None:
+                                        submit(
+                                            summary,
+                                            source=SignalSource.CROSS_SPACE,
+                                        )
+                                except Exception:  # noqa: BLE001
+                                    pass
+
+                            _proactive_coord = ProactiveCrossSpaceCoordinator(
+                                windows_source=native_windows_by_space,
+                                present_sink=build_proactive_sink(
+                                    _emit_alert, backlog_emit=_backlog_emit,
+                                ),
+                            )
                             self._proactive_coordinator = _proactive_coord
                             logger.info(
                                 "[GovernedLoop] proactive cross-space "

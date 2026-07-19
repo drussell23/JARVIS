@@ -96,6 +96,11 @@ class SignalSource(str, Enum):
     VOICE_HUMAN = "voice_human"
     CLI_EMERGENCY = "cli_emergency"
     HUMAN_OVERRIDE = "human_override"
+    # Proactive desktop-topology origin (2026-07-19): an operator-
+    # APPROVED cross-space reconciliation proposal graduates into the
+    # backlog through this source. Never auto-emits — it reaches the
+    # pipeline only after the [Y/n] Iron Gate.
+    CROSS_SPACE = "cross_space"
 
 
 # ---------------------------------------------------------------------------

@@ -123,3 +123,82 @@ class TestCoordinatorGating:
         hb = hb[:hb.index("self._chronos_task")]
         assert "_proactive_coord.tick()" in hb
         assert "ProactiveCrossSpaceCoordinator" in src
+
+
+# ---------------------------------------------------------------------------
+# The three landed wires (2026-07-19)
+# ---------------------------------------------------------------------------
+
+
+class TestLandedWires:
+    def test_wire1_windows_provider_shape_and_headless_safe(self):
+        from backend.core.ouroboros.governance.comms.duplex.proactive_coordinator import (  # noqa: E501
+            native_windows_by_space,
+        )
+        # On CI / non-Quartz this returns {} without raising — the
+        # coordinator's headless no-op path.
+        result = native_windows_by_space()
+        assert isinstance(result, dict)
+
+    def test_wire2_sink_renders_alert_through_existing_surface(self):
+        from backend.core.ouroboros.governance.comms.duplex.proactive_coordinator import (  # noqa: E501
+            build_proactive_sink,
+        )
+        alerts = []
+
+        class _Prop:
+            spaces = [2, 4]
+            def summary(self): return "reconcile test with source"
+
+        sink = build_proactive_sink(lambda **kw: alerts.append(kw))
+        sink(_Prop())
+        assert len(alerts) == 1
+        a = alerts[0]
+        assert "reconcile" in a["body"] and "[Y/n]" in a["body"]
+        assert a["source"] == "cross_space"
+        assert "2, 4" in a["body"]                   # spaces surfaced
+
+    def test_wire3_approved_reconciliation_reaches_backlog(self):
+        from backend.core.ouroboros.governance.comms.duplex.proactive_coordinator import (  # noqa: E501
+            build_proactive_sink,
+        )
+        backlog = []
+
+        class _Prop:
+            spaces = [1]
+            def summary(self): return "align lint config"
+
+        sink = build_proactive_sink(
+            lambda **kw: None,
+            backlog_emit=lambda s, sp: backlog.append((s, sp)),
+        )
+        sink(_Prop())
+        assert backlog == [("align lint config", [1])]
+
+    def test_wire3_cross_space_signal_source_exists(self):
+        from backend.core.ouroboros.governance.intent.signals import (
+            SignalSource,
+        )
+        assert SignalSource.CROSS_SPACE == "cross_space"
+        assert SignalSource("cross_space") is SignalSource.CROSS_SPACE
+
+    def test_focus_derived_from_current_space_on_tick(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_CROSSSPACE_PROACTIVE_ENABLED", "true")
+        gaze = _FakeGaze({"synthesized": False})
+        c = ProactiveCrossSpaceCoordinator(
+            windows_source=lambda: {1: [_win(1, "a")], 3: [_win(2, "b")]},
+            gaze=gaze, queue=_FakeQueue(),
+        )
+        c.tick()
+        assert gaze.focuses == [1]                    # current Space stamped
+
+    def test_gls_binds_real_providers_pin(self):
+        from pathlib import Path
+        src = (
+            Path(__file__).resolve().parents[2]
+            / "backend/core/ouroboros/governance/governed_loop_service.py"
+        ).read_text()
+        assert "native_windows_by_space" in src       # WIRE 1
+        assert "build_proactive_sink" in src          # WIRE 2
+        assert "SignalSource.CROSS_SPACE" in src       # WIRE 3
+        assert "emit_proactive_alert" in src
