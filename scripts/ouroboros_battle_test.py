@@ -111,7 +111,7 @@ import textwrap
 import time
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # Python 3.9 compat: patch packages_distributions before any library touches it
 if not hasattr(_metadata, "packages_distributions"):
@@ -290,6 +290,68 @@ def _is_orphaned_session_spawn_worker(proc) -> bool:
         return False
 
 
+def _read_lock_holder(
+    project_root: "Optional[Path]" = None,
+) -> "Optional[tuple]":
+    """Read the single-flight lock and return ``(pid, age_s, alive)``,
+    or ``None`` when absent/corrupt/self-owned.
+
+    THE shared authority for "who holds the organism right now" —
+    consumed by BOTH the zombie reaper (incumbent immunity) and the
+    single-flight preflight (conflict detection), so the two can never
+    again disagree about legitimacy (the 2026-07-18 class: the reaper
+    SIGTERM'd a healthy incumbent, then the preflight rejected the
+    launcher against the dying incumbent's still-fresh lock — one ``ov``
+    keystroke murdered the live soak AND locked the operator out).
+    NEVER raises."""
+    import json as _json
+    try:
+        root = Path(project_root) if project_root is not None else _PROJECT_ROOT
+        lock_path = root / ".jarvis" / "intake_router.lock"
+        if not lock_path.exists():
+            return None
+        data = _json.loads(lock_path.read_text())
+        pid = int(data.get("pid", 0))
+        ts = float(data.get("ts", 0.0))
+        if not pid or pid == os.getpid():
+            return None
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            # The PID EXISTS (kernel refused the signal, not the lookup)
+            # — treating this as dead was a latent bug in the old inline
+            # parse: a root-owned holder would have been "adopted over".
+            alive = True
+        age_s = (time.time() - ts) if ts > 0 else float("inf")
+        return (pid, age_s, alive)
+    except (ValueError, OSError, KeyError, TypeError):
+        return None
+
+
+def _lock_stale_ttl_s() -> float:
+    try:
+        return float(os.environ.get("JARVIS_INTAKE_LOCK_STALE_TTL_S", "7200"))
+    except (TypeError, ValueError):
+        return 7200.0
+
+
+def _live_incumbent_pid(
+    project_root: "Optional[Path]" = None,
+) -> "Optional[int]":
+    """PID of a LIVE, FRESH single-flight lock holder — the legitimate
+    incumbent organism — else None. NEVER raises."""
+    holder = _read_lock_holder(project_root)
+    if holder is None:
+        return None
+    pid, age_s, alive = holder
+    if alive and age_s <= _lock_stale_ttl_s():
+        return pid
+    return None
+
+
 def _reap_zombies(*, quiet: bool = False) -> "set[int]":
     """Detect and reap any lingering ouroboros_battle_test.py processes.
 
@@ -356,11 +418,26 @@ def _reap_zombies(*, quiet: bool = False) -> "set[int]":
                 return True
         return False
 
+    # Incumbent immunity (2026-07-18): a battle-test holding a LIVE,
+    # FRESH single-flight lock is the legitimate organism, not a zombie.
+    # Reaping it here and then bouncing off its lock in the preflight
+    # was the one-keystroke murder/lockout class. True zombies (dead-PID
+    # locks, lockless strays, wedged-TTL holders) still die below.
+    incumbent = _live_incumbent_pid()
+
     victims: list = []
     for proc in psutil.process_iter(["pid", "ppid", "cmdline", "uids", "create_time"]):
         try:
             pid = proc.info["pid"]
             if pid == my_pid or pid == my_ppid:
+                continue
+            if incumbent is not None and pid == incumbent:
+                if not quiet:
+                    print(
+                        f"  {_DIM}[reaper] incumbent organism excluded "
+                        f"(PID {pid} holds a live single-flight lock)"
+                        f"{_RESET}"
+                    )
                 continue
             cmdline = proc.info.get("cmdline") or []
             # Two victim classes: (1) lingering battle-test mains by
@@ -660,8 +737,6 @@ def _single_flight_preflight(*, quiet: bool = False) -> None:
     proceeds). The conflict-path REJECTED block is ERROR-class telemetry
     and prints unconditionally — no mode can suppress it.
     """
-    from pathlib import Path as _Path
-    import json as _json
     import subprocess as _subprocess
 
     self_pid = os.getpid()
@@ -697,46 +772,69 @@ def _single_flight_preflight(*, quiet: bool = False) -> None:
     # lock path pointed at the wrong ``.jarvis`` dir (the run-#14 class of bug:
     # cwd-relative roots in the soak pipeline). ``_PROJECT_ROOT`` is the same
     # root every other lock-path site here uses (e.g. the stale-lock sweep).
-    project_root = _PROJECT_ROOT
-    lock_path = project_root / ".jarvis" / "intake_router.lock"
-    if lock_path.exists():
-        try:
-            data = _json.loads(lock_path.read_text())
-            holder_pid = int(data.get("pid", 0))
-            holder_ts = float(data.get("ts", 0.0))
-            if holder_pid and holder_pid != self_pid:
-                # Is the holder alive?
-                try:
-                    os.kill(holder_pid, 0)
-                    alive = True
-                except (ProcessLookupError, PermissionError):
-                    alive = False
-                # Is the lock fresh? (TTL check)
-                _stale_ttl_raw = os.environ.get(
-                    "JARVIS_INTAKE_LOCK_STALE_TTL_S", "7200",
+    # DRY (2026-07-18): the SAME _read_lock_holder authority the zombie
+    # reaper consults for incumbent immunity — the two surfaces can never
+    # again disagree about who legitimately owns the organism.
+    holder = _read_lock_holder(_PROJECT_ROOT)
+    if holder is not None:
+        holder_pid, age_s, alive = holder
+        _stale_ttl = _lock_stale_ttl_s()
+        if alive and age_s <= _stale_ttl:
+            violators.append(("lock", holder_pid))
+        elif alive and age_s > _stale_ttl:
+            # Happy-path chatter (launch proceeds) — the only
+            # print this guard gates on ``quiet``.
+            if not quiet:
+                print(
+                    f"  {_DIM}[single-flight] adopting wedged lock "
+                    f"(PID={holder_pid} alive, age={age_s:.0f}s > "
+                    f"TTL={_stale_ttl:.0f}s — Py_FinalizeEx-class "
+                    f"zombie pattern){_RESET}"
                 )
-                try:
-                    _stale_ttl = float(_stale_ttl_raw)
-                except (TypeError, ValueError):
-                    _stale_ttl = 7200.0
-                age_s = time.time() - holder_ts if holder_ts > 0 else 0.0
-                fresh = age_s <= _stale_ttl
-                if alive and fresh:
-                    violators.append(("lock", holder_pid))
-                elif alive and not fresh:
-                    # Happy-path chatter (launch proceeds) — the only
-                    # print this guard gates on ``quiet``.
-                    if not quiet:
-                        print(
-                            f"  {_DIM}[single-flight] adopting wedged lock "
-                            f"(PID={holder_pid} alive, age={age_s:.0f}s > "
-                            f"TTL={_stale_ttl:.0f}s — Py_FinalizeEx-class "
-                            f"zombie pattern){_RESET}"
-                        )
-        except (ValueError, OSError, KeyError):
-            pass  # corrupt lock — IntakeRouter._cleanup_stale_lock will handle
 
     if violators:
+        # COCKPIT collision surface (2026-07-18, design language §3):
+        # an operator typing ``ov`` while the organism is already awake
+        # is not an error condition — it is a status moment. Render the
+        # incumbent + live session digest + the paths forward, instead
+        # of a raw rejection wall. SOAK/headless keeps the terse
+        # diagnostic (wrappers parse exit 75).
+        _is_cockpit = False
+        try:
+            from backend.core.ouroboros.ui.presentation_mode import (
+                is_cockpit as _is_cockpit_fn,
+            )
+            _is_cockpit = _is_cockpit_fn()
+        except Exception:
+            _is_cockpit = False
+        if _is_cockpit:
+            _pid = violators[0][1]
+            _held = ""
+            _h = _read_lock_holder(_PROJECT_ROOT)
+            if _h is not None and _h[1] not in (None, float("inf")):
+                _held = f" · up ~{max(1, int(_h[1] / 60))}m"
+            print()
+            print(
+                f"  {_BOLD}⏺ the organism is already awake{_RESET}"
+                f"{_DIM} — pid {_pid}{_held}{_RESET}"
+            )
+            try:
+                from backend.core.ouroboros.cli.ov import status_digest
+                for _ln in status_digest().splitlines()[:3]:
+                    print(f"  {_DIM}⎿ {_ln}{_RESET}")
+            except Exception:
+                pass
+            print(
+                f"  {_DIM}⎿ watch: tail -f .ouroboros/sessions/<id>/debug.log"
+                f" · stop: kill {_pid}{_RESET}"
+            )
+            print(
+                f"  {_DIM}⎿ force a second organism: "
+                f"JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED=false (budget/locks "
+                f"will contend){_RESET}"
+            )
+            print()
+            sys.exit(75)
         print()
         print(
             f"  {_RED}[single-flight] REJECTED — concurrent battle-test detected{_RESET}"
