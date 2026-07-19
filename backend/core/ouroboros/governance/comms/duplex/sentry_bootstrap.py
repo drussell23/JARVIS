@@ -277,7 +277,7 @@ class BiometricGateAdapter:
                 # native x-vector space; strict tensor guards inside).
                 try:
                     from .biometric_evolution import evolve_if_confident  # noqa: E501,PLC0415
-                    emb = getattr(self, "last_embedding", None)
+                    emb = getattr(getattr(self, "scorer_ref", None), "last_embedding", None) or getattr(self, "last_embedding", None)
                     if emb is not None and evolve_if_confident(conf, emb):
                         self.stats["evolutions"] = (
                             self.stats.get("evolutions", 0) + 1
@@ -352,7 +352,35 @@ def mount_passive_sentry(
             RemoteAudioLease,
         )
 
+        # Production x-vector scorer (final integration 2026-07-19):
+        # async encoder load — the mic arms NOW, wake-words landing
+        # mid-warmup queue in the Deferred-Evaluation lane. Fail-soft
+        # to the injected scorer (tests) or fail-closed default.
+        _xvec = None
+        if scorer is None:
+            try:
+                from .biometric_scorer import XVectorScorer  # noqa: PLC0415
+                _xvec = XVectorScorer()
+                await_start = getattr(_xvec, "start_loading", None)
+                if await_start is not None:
+                    import asyncio as _aio  # noqa: PLC0415
+                    try:
+                        _aio.get_running_loop().create_task(await_start())
+                    except RuntimeError:
+                        _xvec = None
+                scorer = _xvec.verify if _xvec is not None else None
+            except Exception:  # noqa: BLE001
+                _xvec = None
         gate_adapter = BiometricGateAdapter(scorer)
+        if _xvec is not None:
+            # Rolling-Evolution seam: the adapter reads the scorer's
+            # freshest embedding after a clear pass.
+            gate_adapter.last_embedding = None
+
+            class _EmbeddingMirror:
+                def __get__(self, obj, owner=None):
+                    return _xvec.last_embedding
+            gate_adapter.scorer_ref = _xvec
 
         async def _lease() -> bool:
             # DRY: the EXACT CLI-wake pathway — the sentry is a
