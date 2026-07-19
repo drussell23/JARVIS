@@ -260,6 +260,25 @@ class CockpitAttachBridge:
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] audio publish degraded", exc_info=True)
 
+    def publish_thermal(self, state: str) -> None:
+        """Sovereign Governor lane: thermal posture to every attached
+        client (jarvis topology + ov). Thread-safe; NEVER raises."""
+        try:
+            msg = {"type": "thermal", "state": str(state), "ts": time.time()}
+            loop = self._loop
+            if loop is None or loop.is_closed() or not self._clients:
+                return
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                self._broadcast(msg)
+            else:
+                loop.call_soon_threadsafe(self._broadcast, msg)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _broadcast(self, msg: Dict[str, Any]) -> None:
         data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         for w in list(self._clients):
@@ -363,12 +382,14 @@ class CockpitAttachClient:
         on_hydration: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_line: Optional[Callable[[str], None]] = None,
         on_audio_state: Optional[Callable[[str], None]] = None,
+        on_thermal: Optional[Callable[[str], None]] = None,
         path: Optional[Path] = None,
     ) -> None:
         self._path = Path(path) if path is not None else attach_socket_path()
         self._on_hydration = on_hydration or (lambda _m: None)
         self._on_line = on_line or (lambda _t: None)
         self._on_audio_state = on_audio_state or (lambda _s: None)
+        self._on_thermal = on_thermal or (lambda _s: None)
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._read_task: Optional[asyncio.Task] = None
@@ -451,6 +472,10 @@ class CockpitAttachClient:
                 elif ftype == "audio_state":
                     self._safe_cb_text(
                         self._on_audio_state, str(frame.get("state", "")),
+                    )
+                elif ftype == "thermal":
+                    self._safe_cb_text(
+                        self._on_thermal, str(frame.get("state", "")),
                     )
         except asyncio.CancelledError:
             raise

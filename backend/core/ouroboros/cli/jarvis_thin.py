@@ -26,8 +26,16 @@ class TopologyMap:
     def __init__(self) -> None:
         self.state: Dict[str, Any] = {
             "phase": "?", "cost": None, "audio": "OFFLINE",
-            "lease_held": False, "ops": [],
+            "lease_held": False, "ops": [], "thermal": "nominal",
         }
+
+    def on_thermal(self, state: str) -> None:
+        try:
+            s = str(state or "").strip().lower()
+            if s:
+                self.state["thermal"] = s
+        except Exception:  # noqa: BLE001
+            pass
 
     def on_hydration(self, payload: dict) -> None:
         try:
@@ -80,6 +88,11 @@ class TopologyMap:
             if cost and cost[0] is not None else "—"
         )
         ops = ", ".join(str(o) for o in self.state["ops"]) or "none"
+        thermal = self.state.get("thermal", "nominal")
+        thermal_row = (
+            "│ ⚠ [THERMAL DEGRADATION ACTIVE] · " + thermal + "        │\n"
+            if thermal in ("serious", "critical") else ""
+        )
         return (
             "╭─ agentic topology ─────────────────────────╮\n"
             f"│ JARVIS (Daniel · system)  {daniel:<17s}│\n"
@@ -87,6 +100,7 @@ class TopologyMap:
             f"│ audio lease: {lease:<6s} · fsm: {audio:<12s}│\n"
             f"│ organism: {self.state['phase']:<8s} cost {cost_txt:<12s}│\n"
             f"│ active ops: {ops[:30]:<30s}│\n"
+            + thermal_row +
             "╰────────────────────────────────────────────╯"
         )
 
