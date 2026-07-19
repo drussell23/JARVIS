@@ -21,6 +21,16 @@ from backend.core.ouroboros.governance.comms.duplex.pava_handoff import (
     IgnitionReporter,
     PavaDriftModulator,
 )
+from backend.core.ouroboros.governance.comms.duplex import epistemic_bus as _eb
+
+
+@pytest.fixture(autouse=True)
+def _fresh_epistemic_bus():
+    # The bus is a process-wide root pointer (by design) — tests must
+    # never inherit a previous test's gaze.
+    _eb.reset_default_bus()
+    yield
+    _eb.reset_default_bus()
 
 
 class TestSemanticGating:
