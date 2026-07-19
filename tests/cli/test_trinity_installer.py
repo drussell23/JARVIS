@@ -33,6 +33,9 @@ def test_plist_has_keepalive_dict_and_runatload(tmp_path, monkeypatch):
 
 def test_plist_targets_the_localized_venv_python(tmp_path, monkeypatch):
     venv = tmp_path / ".jarvis" / "venv"
+    # The localized venv EXISTS → it is preferred over the fallback.
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
     monkeypatch.setenv("JARVIS_VENV_DIR", str(venv))
     p = inst.build_supervisor_plist()
     prog = p["ProgramArguments"]
@@ -40,6 +43,32 @@ def test_plist_targets_the_localized_venv_python(tmp_path, monkeypatch):
     assert prog[1].endswith("unified_supervisor.py")
     # env points PATH at the venv bin + PYTHONPATH at the repo
     assert str(venv / "bin") in p["EnvironmentVariables"]["PATH"]
+
+
+def test_interpreter_adaptive_fallback_when_no_venv(tmp_path, monkeypatch):
+    """The real local-install edge case: no localized venv yet → resolve
+    to the CURRENTLY-RUNNING interpreter so the daemon is still bootable
+    (not a dead path)."""
+    import sys
+    monkeypatch.delenv("JARVIS_VENV_PYTHON", raising=False)
+    monkeypatch.setenv("JARVIS_VENV_DIR", str(tmp_path / "does_not_exist"))
+    py, source = inst.resolve_supervisor_python()
+    assert source == "current"
+    assert py == Path(sys.executable)                    # the working python
+    # And the plist targets that working interpreter, not a dead path.
+    prog = inst.build_supervisor_plist()["ProgramArguments"]
+    assert prog[0] == sys.executable
+
+
+def test_interpreter_prefers_localized_venv_when_present(tmp_path, monkeypatch):
+    venv = tmp_path / ".jarvis" / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    monkeypatch.delenv("JARVIS_VENV_PYTHON", raising=False)
+    monkeypatch.setenv("JARVIS_VENV_DIR", str(venv))
+    py, source = inst.resolve_supervisor_python()
+    assert source == "localized_venv"
+    assert py == venv / "bin" / "python"
 
 
 def test_write_plist_is_idempotent_and_valid_xml(tmp_path, monkeypatch):

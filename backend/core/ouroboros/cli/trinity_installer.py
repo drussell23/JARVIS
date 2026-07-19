@@ -44,7 +44,7 @@ import plistlib
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 # No hardcoding — every identity/path is env-overridable with a default.
 SUPERVISOR_LABEL = os.environ.get("JARVIS_SUPERVISOR_LABEL", "com.jarvis.supervisor")
@@ -71,6 +71,31 @@ def localized_python() -> Path:
     return Path(os.path.expanduser(base)) / "bin" / "python"
 
 
+def resolve_supervisor_python() -> Tuple[Path, str]:
+    """The interpreter the LaunchAgent should ACTUALLY target — adaptive,
+    so a machine without the localized venv still gets a bootable daemon
+    (mandate 2 — edge case: local/dev install before the venv is built).
+
+    Precedence: explicit ``JARVIS_VENV_PYTHON`` → the localized venv if it
+    exists on disk → the currently-running interpreter (``sys.executable``,
+    e.g. the pyenv/conda python that is running trinity right now). Returns
+    ``(path, source)`` where source ∈ {``localized_venv``, ``current``}.
+    NEVER raises."""
+    import sys
+    override = os.environ.get("JARVIS_VENV_PYTHON")
+    if override:
+        p = Path(os.path.expanduser(override))
+        return p, ("localized_venv" if "jarvis" in str(p) else "override")
+    ideal = localized_python()
+    try:
+        if ideal.exists():
+            return ideal, "localized_venv"
+    except Exception:
+        pass
+    # Fall back to the interpreter that is demonstrably working right now.
+    return Path(sys.executable), "current"
+
+
 def _log_dir() -> Path:
     return _repo_root() / ".jarvis" / "logs"
 
@@ -89,8 +114,10 @@ def supervisor_plist_path(agents_dir: Optional[Path] = None) -> Path:
 
 def build_supervisor_plist(*, python: Optional[Path] = None) -> dict:
     """The launchd definition for the resident supervisor. All paths
-    resolved at generation time; nothing machine-hardcoded."""
-    py = python or localized_python()
+    resolved at generation time; nothing machine-hardcoded. The
+    interpreter is resolved ADAPTIVELY (localized venv when present, else
+    the working interpreter) so the generated daemon is always bootable."""
+    py = python or resolve_supervisor_python()[0]
     root = _repo_root()
     logs = _log_dir()
     venv_bin = str(py.parent)
@@ -242,17 +269,27 @@ def _thin_launcher_script() -> str:
     it execs the localized venv's ``trinity`` (mandate 1, Thin-Bundle).
     Resolves the venv at RUN time so the bundle is machine-portable."""
     venv_dir = os.environ.get("JARVIS_VENV_DIR", "$HOME/.jarvis/venv")
+    repo = str(_repo_root())
     return (
         "#!/bin/bash\n"
         "# Thin-Bundle launcher — heavy deps live in the venv, not here.\n"
+        "# Adaptive interpreter: localized venv → trinity on PATH → any\n"
+        "# python3 that can import the package. Never a hard fail.\n"
         f'VENV="{venv_dir}"\n'
-        'PY="$VENV/bin/python"\n'
-        'if [ ! -x "$PY" ]; then\n'
-        '  osascript -e \'display notification "Run: trinity install" '
-        'with title "JARVIS venv missing"\' 2>/dev/null\n'
+        f'REPO="{repo}"\n'
+        'cd "$REPO" 2>/dev/null\n'
+        'if [ -x "$VENV/bin/python" ]; then\n'
+        '  exec "$VENV/bin/python" -m backend.core.ouroboros.cli.'
+        'trinity_launcher up\n'
+        'elif command -v trinity >/dev/null 2>&1; then\n'
+        '  exec trinity up\n'
+        'elif command -v python3 >/dev/null 2>&1; then\n'
+        '  exec python3 -m backend.core.ouroboros.cli.trinity_launcher up\n'
+        'else\n'
+        '  osascript -e \'display notification "No interpreter found — run '
+        'trinity install" with title "JARVIS"\' 2>/dev/null\n'
         '  exit 1\n'
         'fi\n'
-        'exec "$PY" -m backend.core.ouroboros.cli.trinity_launcher up\n'
     )
 
 
