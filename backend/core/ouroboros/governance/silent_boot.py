@@ -409,8 +409,23 @@ def _configure_locked(
         file_handler = None
     if file_handler is None:
         try:
-            file_handler = logging.FileHandler(
-                str(log_path), encoding="utf-8",
+            # Circadian Log Janitor (2026-07-18): the legacy fallback
+            # now rotates too — a resident organism must NEVER write
+            # unbounded logs (same env knobs as the primary pipeline:
+            # JARVIS_TELEMETRY_LOG_MAX_BYTES / _BACKUPS).
+            import logging.handlers as _lh
+            from backend.core.ouroboros.governance.headless_telemetry import (
+                _DEFAULT_BACKUPS,
+                _DEFAULT_MAX_BYTES,
+                _FLAG_BACKUPS,
+                _FLAG_MAX_BYTES,
+                _env_int,
+            )
+            file_handler = _lh.RotatingFileHandler(
+                str(log_path),
+                maxBytes=_env_int(_FLAG_MAX_BYTES, _DEFAULT_MAX_BYTES),
+                backupCount=_env_int(_FLAG_BACKUPS, _DEFAULT_BACKUPS),
+                encoding="utf-8",
             )
             file_handler.setLevel(logging.DEBUG)
             file_handler.setFormatter(_formatter)
