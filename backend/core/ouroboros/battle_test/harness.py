@@ -4128,6 +4128,25 @@ class BattleTestHarness:
         Supports: stop, shutdown, cost, pause, resume, status, ops,
         /risk, /budget, /goal, /plan.
         """
+        # QoS Sensor (2026-07-19): Daniel self-evaluates his live input
+        # surface — a rapid semantic re-ask emits a UX_DEGRADATION_EVENT
+        # into O+V's intake. Lazy-mounted, master-gated, fail-soft: a
+        # sensor fault NEVER perturbs command handling. Verbs/control
+        # commands are exempt (not assistance the user re-asks).
+        try:
+            if not hasattr(self, "_qos_sensor"):
+                from backend.core.ouroboros.governance.comms.duplex.qos_sensor import (  # noqa: E501
+                    build_live_qos_sensor,
+                )
+                self._qos_sensor = build_live_qos_sensor(
+                    emit_signal=self._qos_emit_signal,
+                )
+            _q = getattr(self, "_qos_sensor", None)
+            if _q is not None and not command.strip().startswith(("/", "!")):
+                _q.observe_command(command)
+        except Exception:  # noqa: BLE001
+            pass
+
         cmd = command.strip().lower()
         if cmd in ("stop", "shutdown"):
             self._shutdown_event.set()
@@ -4371,6 +4390,36 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] mount degraded", exc_info=True)
             self._cockpit_attach_bridge = None
+
+    def _qos_emit_signal(self, envelope: Any) -> None:
+        """Route a UX_DEGRADATION_EVENT into O+V's intake — the SAME
+        router every sensor uses (DRY). Fail-soft. NEVER raises."""
+        try:
+            gls = getattr(self, "_governed_loop_service", None)
+            router = None
+            for _attr in ("_intake_router", "intake_router", "_router"):
+                router = getattr(gls, _attr, None)
+                if router is not None:
+                    break
+            submit = (
+                getattr(router, "submit_envelope", None)
+                or getattr(router, "ingest", None)
+                or getattr(router, "emit", None)
+            )
+            if submit is not None:
+                submit(envelope)
+        except Exception:  # noqa: BLE001
+            logger.debug("[QoS] emit routing degraded", exc_info=True)
+
+    def _qos_note_override(self, kind: str = "sigint") -> None:
+        """Operational-override hook (SIGINT / lease seizure) → QoS.
+        Called from the shutdown/interrupt path. NEVER raises."""
+        try:
+            _q = getattr(self, "_qos_sensor", None)
+            if _q is not None:
+                _q.observe_override(kind)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _dispatch_audio_cmd(self, cmd: str) -> None:
         """Bridge on_audio sink → synapse coroutine. Scheduled, never

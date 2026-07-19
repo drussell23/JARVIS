@@ -180,4 +180,54 @@ class QoSSensor:
             return False
 
 
-__all__ = ["QoSSensor", "UX_DEGRADATION_EVENT"]
+def qos_enabled() -> bool:
+    """Master gate — default OFF (§33.1: a surface that emits
+    autonomous fix signals from user behavior graduates). NEVER
+    raises."""
+    return os.environ.get(
+        "JARVIS_QOS_SENSOR_ENABLED", "",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def build_live_qos_sensor(
+    *,
+    emit_signal: Optional[Callable[[Any], None]] = None,
+    context_provider: Optional[Callable[[], List[str]]] = None,
+) -> Optional["QoSSensor"]:
+    """Mount a QoS sensor for a live input surface, or ``None`` when
+    the master gate is down (nothing instantiated). Production
+    ``emit_signal`` routes into the unified intake router; the context
+    provider pulls recent dialogue from ConversationBridge. NEVER
+    raises."""
+    try:
+        if not qos_enabled():
+            return None
+
+        def _default_context() -> List[str]:
+            try:
+                from backend.core.ouroboros.governance.conversation_bridge import (  # noqa: E501,PLC0415
+                    get_default_bridge,
+                )
+                snap = get_default_bridge().snapshot()
+                turns = getattr(snap, "turns", snap) if snap else []
+                return [
+                    f"{getattr(t, 'role', '?')}: {getattr(t, 'text', str(t))[:120]}"
+                    for t in list(turns)[-8:]
+                ]
+            except Exception:  # noqa: BLE001
+                return []
+
+        return QoSSensor(
+            emit_signal=emit_signal,
+            context_provider=context_provider or _default_context,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+__all__ = [
+    "QoSSensor",
+    "UX_DEGRADATION_EVENT",
+    "build_live_qos_sensor",
+    "qos_enabled",
+]
