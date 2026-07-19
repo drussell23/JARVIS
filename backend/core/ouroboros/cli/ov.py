@@ -27,8 +27,43 @@ from typing import Any, Callable, List, Optional, Sequence
 
 from backend.core.ouroboros.ui.theme import build_console
 
-_VERBS = {"cockpit", "run", "daemon", "status", "attach"}
+_VERBS = {"cockpit", "run", "daemon", "status", "attach", "version"}
 _HELP_TOKENS = {"help", "--help", "-h"}
+_VERSION_TOKENS = {"version", "--version", "-V"}
+
+#: Milestone name — paired with the pyproject version at render time.
+#: Minted per release; the number itself is NEVER duplicated here.
+RELEASE_NAME = "unchained"
+
+
+def resolve_version() -> str:
+    """``0.1.0`` — dynamically from installed metadata, falling back to
+    the repo's pyproject.toml (editable/dev checkouts), then to the
+    honest ``0.0.0+unknown``. NEVER raises."""
+    try:
+        from importlib.metadata import version as _dist_version
+        return _dist_version("ouroboros-ov")
+    except Exception:
+        pass
+    try:
+        import tomllib
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[4]
+        data = tomllib.loads((root / "pyproject.toml").read_text())
+        v = str(data.get("project", {}).get("version", "")).strip()
+        if v:
+            return v
+    except Exception:
+        pass
+    return "0.0.0+unknown"
+
+
+def version_line() -> str:
+    """``ov 0.1.0 “unchained” — ouroboros + venom``. NEVER raises."""
+    try:
+        return f"ov {resolve_version()} “{RELEASE_NAME}” — ouroboros + venom"
+    except Exception:
+        return "ov — ouroboros + venom"
 
 _NO_ORGANISM_MESSAGE = (
     "no organism awake — nothing to attach to. Start one with `ov` "
@@ -42,6 +77,7 @@ _HELP_TEXT = """ov -- Ouroboros + Venom, autonomous engineering organism
   ov daemon [flags]   alias for a headless run
   ov status           last-session digest (no boot)
   ov attach           attach this terminal to the running organism
+  ov version          version + milestone
   ov help             this message
 
 All flags after the verb forward to the battle-test bootstrap, e.g.
@@ -75,6 +111,9 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
 
     if tokens and tokens[0] in _HELP_TOKENS:
         return Invocation("help")
+
+    if tokens and tokens[0] in _VERSION_TOKENS:
+        return Invocation("version")
 
     if tokens and tokens[0] in _VERBS:
         verb, rest = tokens[0], list(tokens[1:])
@@ -286,6 +325,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if inv.action == "help":
         console.print(_HELP_TEXT, markup=False, highlight=False)
+        return 0
+    if inv.action == "version":
+        console.print(version_line(), markup=False, highlight=False)
         return 0
     if inv.action == "attach":
         return run_attach(console)

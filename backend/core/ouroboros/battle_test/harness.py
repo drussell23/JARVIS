@@ -13,6 +13,7 @@ dependencies.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import atexit
 import logging
 import os
@@ -29,6 +30,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from backend.core.ouroboros.battle_test.cost_tracker import CostTracker
 from backend.core.ouroboros.battle_test.idle_watchdog import IdleWatchdog
 from backend.core.ouroboros.battle_test.session_recorder import SessionRecorder
+
+from backend.core.ouroboros.ui.boot_labels import ui_label as _ui_label
 
 logger = logging.getLogger(__name__)
 
@@ -1044,8 +1047,71 @@ class BattleTestHarness:
     # Main lifecycle
     # ------------------------------------------------------------------
 
+    @contextlib.asynccontextmanager
+    async def _exit_cinematic_scope(self):
+        """Teardown lifecycle handler (Unified Boot/Exit Polish, 2026-07-18).
+
+        ONE scope over the whole run: every termination sequence —
+        clean shutdown, SIGINT/SIGTERM (the Ticket-B handlers set the
+        shutdown event, so run() unwinds through this same finally; no
+        second signal handler is installed, preserving watchdog purity)
+        — exits through a single conformed presentation line via the
+        _repl_print chokepoint (PresentationRouter + attach mirror
+        inherit it automatically). Missing/abnormal data degrades to
+        the professional default with zero secondary tracebacks.
+        COCKPIT-only; SOAK teardown is byte-identical.
+        """
+        try:
+            yield
+        finally:
+            self._emit_exit_cinematic()
+
+    def _emit_exit_cinematic(self) -> None:
+        """`organism rests · N changes landed · $X · Ym` — composed from
+        the session's own live counters (the same sources the summary
+        writer reads). NEVER raises; missing data → the default line."""
+        try:
+            from backend.core.ouroboros.ui.presentation_mode import is_cockpit
+            if not is_cockpit():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        line = "⏺ organism rests · session closed"
+        try:
+            parts = ["⏺ organism rests"]
+            gls = getattr(self, "_governed_loop_service", None)
+            completed = len(getattr(gls, "_completed_ops", {}) or {})
+            if completed:
+                parts.append(
+                    f"{completed} change{'s' if completed != 1 else ''} landed"
+                )
+            cost = getattr(
+                getattr(self, "_cost_tracker", None), "total_cost", None,
+            )
+            if isinstance(cost, (int, float)) and cost > 0:
+                parts.append(f"${cost:.2f}")
+            started = getattr(self, "_started_at", None)
+            if started:
+                mins = max(0.0, (time.time() - float(started)) / 60.0)
+                parts.append(f"{mins:.0f}m" if mins >= 1 else "<1m")
+            if len(parts) > 1:
+                line = " · ".join(parts)
+        except Exception:  # noqa: BLE001 — the default line stands
+            pass
+        try:
+            self._repl_print(line)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def run(self) -> None:
-        """Main lifecycle method: boot, wait for stop signal, shutdown, report."""
+        """Main lifecycle: the whole session inside the exit-cinematic
+        lifecycle scope — clean exits, SIGINT/SIGTERM unwinds, and
+        fatals all leave through one conformed goodbye line."""
+        async with self._exit_cinematic_scope():
+            await self._run_inner()
+
+    async def _run_inner(self) -> None:
+        """Boot, wait for stop signal, shutdown, report."""
         self._started_at = time.time()
 
         # D1 silent boot — route INFO/DEBUG to session_dir/debug.log,
@@ -2559,6 +2625,7 @@ class BattleTestHarness:
     # Boot methods (all overridable for test mocking)
     # ------------------------------------------------------------------
 
+    @_ui_label("oracle · codebase index")
     async def boot_oracle(self) -> None:
         """Import + construct TheOracle, defer ``initialize()`` to a
         background task by default.
@@ -2611,6 +2678,7 @@ class BattleTestHarness:
         except Exception as exc:
             logger.warning("Oracle failed to boot: %s", exc)
 
+    @_ui_label("governance stack")
     async def boot_governance_stack(self) -> None:
         """Create GovernanceConfig and call create_governance_stack()."""
         try:
@@ -2955,6 +3023,7 @@ class BattleTestHarness:
         except Exception as exc:
             logger.warning("Governance stack failed to boot: %s", exc)
 
+    @_ui_label("governed loop · the organism")
     async def boot_governed_loop_service(self) -> None:
         """Create GovernedLoopConfig, GovernedLoopService, and start()."""
         try:
@@ -3651,6 +3720,7 @@ class BattleTestHarness:
             wt_path, branch_name, self._session_id,
         )
 
+    @_ui_label("provider tiers")
     async def boot_jarvis_tiers(self) -> None:
         """Import and start PredictiveRegressionEngine (Tier 3).
 
@@ -3707,6 +3777,7 @@ class BattleTestHarness:
             pass
         return None
 
+    @_ui_label("intake · 17 senses")
     async def boot_intake(self) -> None:
         """Create IntakeLayerConfig, IntakeLayerService, and start()."""
         try:

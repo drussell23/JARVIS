@@ -173,14 +173,18 @@ class WakeSequenceRenderer:
 
             check = theme.mark("check")
             dot = theme.mark("dot")
+            from .boot_labels import resolve_label
             for name, active in self._model.phases():
+                # Design language §3 — the product surface renders the
+                # reflected human label, never the raw timer mark.
+                label = resolve_label(name)
                 line = Text()
                 if active:
                     line.append(f"{dot} ", style="accent")
-                    line.append(name, style="body")
+                    line.append(label, style="body")
                 else:
                     line.append(f"{check} ", style="muted")
-                    line.append(name, style="muted")
+                    line.append(label, style="muted")
                 parts.append(line)
 
             if self._model.is_live:
