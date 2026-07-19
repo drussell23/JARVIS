@@ -90,7 +90,8 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Any, List, Optional
+import time
+from typing import Any, Dict, Tuple, List, Optional
 
 from backend.core.ouroboros.ui.presentation_mode import (
     PresentationMode,
@@ -132,6 +133,66 @@ _CONFIG_LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 # Flag accessors
 # ---------------------------------------------------------------------------
+
+
+class _CockpitErrorFormatter(logging.Formatter):
+    """One conformed line per ERROR on the cockpit console.
+
+    ``⚠ <logger-tail> · <message first line, ≤160 chars> — detail in
+    session log``. The session file handler always carries the full
+    record; the operator surface never gets a telemetry wall."""
+
+    _MAX = 160
+
+    def format(self, record: logging.LogRecord) -> str:  # noqa: A003
+        try:
+            tail = (record.name or "").rsplit(".", 1)[-1] or "system"
+            msg = record.getMessage().splitlines()[0].strip()
+            if len(msg) > self._MAX:
+                msg = msg[: self._MAX - 1].rstrip() + "…"
+            return f"⚠ {tail} · {msg} — detail in session log"
+        except Exception:  # noqa: BLE001
+            try:
+                return f"⚠ {record.getMessage()[:160]}"
+            except Exception:  # noqa: BLE001
+                return "⚠ error (unformattable record)"
+
+
+class _CockpitConsoleFilter(logging.Filter):
+    """Two console protections for the cockpit:
+
+    * records marked ``file_only=True`` (via ``extra=``) never reach
+      the terminal — the sink for forensic walls (watchdog tombstones)
+      that belong in the session log;
+    * repeat-dedup: the same (logger, message-prefix) within the window
+      renders ONCE (the EXHAUSTION storms repeated near-identical walls
+      every few seconds). NEVER raises — a filter fault admits the
+      record (fail-open: losing dedup beats losing an error)."""
+
+    _WINDOW_S = 30.0
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._seen: Dict[Tuple[str, str], float] = {}
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        try:
+            if getattr(record, "file_only", False):
+                return False
+            key = (record.name, record.getMessage()[:80])
+            now = time.monotonic()
+            last = self._seen.get(key)
+            self._seen[key] = now
+            if last is not None and (now - last) < self._WINDOW_S:
+                return False
+            if len(self._seen) > 256:
+                cutoff = now - self._WINDOW_S
+                self._seen = {
+                    k: t for k, t in self._seen.items() if t >= cutoff
+                }
+            return True
+        except Exception:  # noqa: BLE001
+            return True
 
 
 def _get_registry() -> Any:
@@ -393,10 +454,22 @@ def _configure_locked(
         )
         term_handler = logging.StreamHandler(stream=sys.stderr)
         term_handler.setLevel(threshold)
-        term_handler.setFormatter(logging.Formatter(
-            # Terse format — matches CC's restraint
-            "%(levelname)s %(message)s",
-        ))
+        if str(_resolved_mode).lower().endswith("cockpit") or (
+            getattr(_resolved_mode, "value", "") == "cockpit"
+        ):
+            # Cockpit ERROR conformance (2026-07-18): an ERROR that
+            # legitimately reaches the operator must arrive as ONE
+            # design-language line, not a multi-KV telemetry wall (the
+            # EXHAUSTION dumps that stomped the ceremony). Compact
+            # formatter + repeat-dedup + file_only rejection; the FULL
+            # record always lands in the session file handler.
+            term_handler.setFormatter(_CockpitErrorFormatter())
+            term_handler.addFilter(_CockpitConsoleFilter())
+        else:
+            term_handler.setFormatter(logging.Formatter(
+                # Terse format — matches CC's restraint
+                "%(levelname)s %(message)s",
+            ))
         setattr(term_handler, _HANDLER_MARKER, True)
         root.addHandler(term_handler)
     except Exception:  # noqa: BLE001 — defensive

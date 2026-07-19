@@ -318,10 +318,23 @@ class BoundedShutdownWatchdog:
             #       [ShutdownWatchdog.TOMBSTONE] CRITICAL lines that
             #       land in debug.log via the harness file handler
             try:
-                import faulthandler as _fh
-                _fh.dump_traceback(file=sys.stderr)
+                # Cockpit hygiene (2026-07-18): the full-thread stderr
+                # dump belongs to soak forensics; on the product
+                # surface it buried the goodbye under 200 lines of
+                # tombstones. Sinks (2)+(3) keep EVERY byte in the
+                # tombstone file + session log regardless of mode.
+                from backend.core.ouroboros.ui.presentation_mode import (
+                    is_cockpit as _is_cockpit_dump,
+                )
+                if not _is_cockpit_dump():
+                    import faulthandler as _fh
+                    _fh.dump_traceback(file=sys.stderr)
             except Exception:  # noqa: BLE001
-                pass
+                try:
+                    import faulthandler as _fh
+                    _fh.dump_traceback(file=sys.stderr)
+                except Exception:  # noqa: BLE001
+                    pass
 
             try:
                 _tombstone_dir = os.environ.get(
@@ -372,10 +385,16 @@ class BoundedShutdownWatchdog:
                             _stack_str = "".join(
                                 _tb.format_list(_stack)
                             )
+                            # file_only: the cockpit console filter
+                            # (silent_boot._CockpitConsoleFilter) drops
+                            # these from the operator surface; the
+                            # session file handler + soak console keep
+                            # full fidelity (filter installed cockpit-only).
                             logger.critical(
                                 "[ShutdownWatchdog.TOMBSTONE] "
                                 "thread_id=%d\n%s",
                                 _tid, _stack_str,
+                                extra={"file_only": True},
                             )
                         except Exception:  # noqa: BLE001
                             continue

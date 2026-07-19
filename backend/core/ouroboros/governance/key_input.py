@@ -114,6 +114,22 @@ from typing import (
 
 logger = logging.getLogger(__name__)
 
+#: Select timeout for the bounded stdin read (seconds). The teardown
+#: latency ceiling for the reader thread — env-tunable, clamped in use.
+def _resolve_read_select_timeout() -> float:
+    """Env-tunable, clamped [0.05, 2.0]; malformed values fall back to
+    0.5 — module import is NEVER blocked by a bad env string."""
+    try:
+        raw = float(os.environ.get(
+            "JARVIS_KEY_INPUT_SELECT_TIMEOUT_S", "0.5",
+        ))
+    except (TypeError, ValueError):
+        raw = 0.5
+    return max(0.05, min(2.0, raw))
+
+
+_READ_SELECT_TIMEOUT_S = _resolve_read_select_timeout()
+
 
 KEY_INPUT_SCHEMA_VERSION: str = "key_input.1"
 
@@ -880,11 +896,27 @@ class InputController:
             self._exit_raw_mode()
 
     def _blocking_read(self, n: int) -> bytes:
-        """Blocking read of up to ``n`` bytes from stdin. Runs in
-        executor thread. Returns empty bytes on EOF or error."""
+        """Bounded read of up to ``n`` bytes from stdin. Runs in an
+        executor thread. Returns empty bytes on EOF/error/timeout.
+
+        2026-07-18 teardown-wedge root cause: an UNBOUNDED ``os.read``
+        on the DEFAULT executor blocks until a keypress; task
+        cancellation cannot unblock it, so ``loop.shutdown_default_
+        executor()`` joined the thread forever → BoundedShutdownWatchdog
+        os._exit(75) + tombstone dump on the operator's terminal. The
+        read is now select-bounded: the thread wakes at most
+        ``_READ_SELECT_TIMEOUT_S`` after data-or-stop, the reader loop
+        re-checks its stop event, and the executor drains cleanly at
+        shutdown. No fd tricks, no daemon-thread leaks."""
         try:
             if self._fd < 0:
                 return b""
+            import select
+            ready, _w, _x = select.select(
+                [self._fd], [], [], _READ_SELECT_TIMEOUT_S,
+            )
+            if not ready:
+                return b""            # timeout — loop re-checks stop event
             return os.read(self._fd, n)
         except Exception:  # noqa: BLE001 — defensive
             return b""
