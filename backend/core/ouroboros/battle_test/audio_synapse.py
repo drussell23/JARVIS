@@ -46,12 +46,169 @@ _FSM_MAP = {
 }
 
 
+#: Supervisor event kinds → attach-protocol AUDIO_STATES (the remote
+#: lane's morphing vocabulary; IDLE while armed reads LISTENING).
+_EVENT_MAP = {
+    "VAD_ACTIVE": "HEARING",
+    "VAD_INACTIVE": "LISTENING",
+    "TTS_GENERATING": "THINKING",
+    "AUDIO_PLAYING": "SPEAKING",
+    "AUDIO_IDLE": "LISTENING",
+}
+
+
 def _poll_interval_s() -> float:
     try:
         raw = float(os.environ.get("JARVIS_AUDIO_SYNAPSE_POLL_S", "0.15"))
     except (TypeError, ValueError):
         raw = 0.15
     return max(0.05, min(1.0, raw))
+
+
+def broker_enabled() -> bool:
+    """``JARVIS_AUDIO_BROKER_ENABLED`` (default on) — the cross-process
+    lane is fail-soft: no supervisor socket → honest UNAVAILABLE, same
+    as before the broker existed. NEVER raises."""
+    return os.environ.get(
+        "JARVIS_AUDIO_BROKER_ENABLED", "1",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+class RemoteAudioLease:
+    """Daemon-side half of the Tri-State broker: negotiate the audio
+    lease with the supervisor over the EXISTING ``audio_state_ipc``
+    transport, heartbeat while armed, and map the supervisor's
+    hardware FSM events into attach-protocol states.
+
+    Strictly a broker (mandate 1): no audio bytes, no hardware, no
+    duplex import. If the supervisor vanishes mid-conversation the
+    read loop ends → ``OFFLINE`` is published and the heartbeat task
+    reaps itself; the supervisor's own drop-release disarms the mic.
+    """
+
+    def __init__(self, publish: Callable[[str], None]) -> None:
+        self._publish = publish
+        self._client: Any = None
+        self._hb_task: Optional[asyncio.Task] = None
+        self._ttl_s: float = 5.0
+        self._granted = asyncio.Event()
+        self._denied_reason: Optional[str] = None
+        self.active: bool = False
+
+    async def acquire(self) -> bool:
+        """Connect + negotiate. False (with UNAVAILABLE published by
+        the CALLER, keeping one honesty seam) when the supervisor is
+        absent, refuses, or times out. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (  # noqa: E501,PLC0415
+                AudioStateClient,
+                lease_ttl_s,
+            )
+            self._ttl_s = lease_ttl_s()
+            client = AudioStateClient(on_message=self._on_message)
+            if not await client.connect():
+                return False
+            self._client = client
+            if not client.send_lease("acquire"):
+                await client.close()
+                self._client = None
+                return False
+            try:
+                await asyncio.wait_for(
+                    self._granted.wait(), timeout=self._ttl_s,
+                )
+            except asyncio.TimeoutError:
+                await self.release()
+                return False
+            if self._denied_reason is not None:
+                await self.release()
+                return False
+            self.active = True
+            self._hb_task = asyncio.get_running_loop().create_task(
+                self._heartbeat_loop(),
+            )
+            self._publish_safe("LISTENING")
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug("[AudioSynapse] remote acquire degraded", exc_info=True)
+            await self.release()
+            return False
+
+    def _on_message(self, msg: dict) -> None:
+        try:
+            mtype = msg.get("type")
+            if mtype == "lease":
+                if msg.get("granted"):
+                    ttl = msg.get("ttl_s")
+                    if isinstance(ttl, (int, float)) and ttl > 0:
+                        self._ttl_s = float(ttl)
+                    self._denied_reason = None
+                    self._granted.set()
+                else:
+                    reason = str(msg.get("reason", "denied"))
+                    if reason in ("expired", "held"):
+                        self._denied_reason = reason
+                        self._granted.set()
+                    if reason == "expired" and self.active:
+                        # Supervisor expired us (our heartbeats
+                        # stalled) — mirror its fail-safe honestly.
+                        self.active = False
+                        self._publish_safe("OFFLINE")
+            elif mtype == "event" and self.active:
+                state = _EVENT_MAP.get(str(msg.get("kind", "")))
+                if state is not None:
+                    self._publish_safe(state)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _heartbeat_loop(self) -> None:
+        """TTL/3 cadence — three misses inside one deadline window
+        would be needed to lose a healthy lease. Ends itself (and
+        reports OFFLINE) the moment the transport dies."""
+        try:
+            while self.active:
+                client = self._client
+                if client is None or not client.connected:
+                    break
+                client.send_lease("heartbeat")
+                await asyncio.sleep(self._ttl_s / 3.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            if self.active:
+                self.active = False
+                self._publish_safe("OFFLINE")
+
+    async def release(self) -> None:
+        """Release + teardown. Idempotent; NEVER raises."""
+        self.active = False
+        task = self._hb_task
+        self._hb_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        client = self._client
+        self._client = None
+        if client is not None:
+            try:
+                client.send_lease("release")
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _publish_safe(self, state: str) -> None:
+        try:
+            self._publish(state)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class AudioVisualSynapse:
@@ -73,6 +230,7 @@ class AudioVisualSynapse:
         self._resolve = handle_resolver or self._default_resolver
         self._watch_task: Optional[asyncio.Task] = None
         self._armed = False
+        self._remote: Optional[RemoteAudioLease] = None
 
     @staticmethod
     def _default_resolver() -> Any:
@@ -106,9 +264,17 @@ class AudioVisualSynapse:
     async def _wake(self) -> None:
         handle = self._resolve()
         if handle is None:
-            # Honest surface: this process has no mounted duplex (the
-            # supervisor owns the hardware plane) — the TUI must render
-            # that truth, never a fake LISTENING.
+            # No LOCAL duplex — the supervisor owns the hardware plane.
+            # Tri-State broker path: negotiate a cross-process audio
+            # lease over audio_state_ipc. Only when the supervisor is
+            # absent/refusing does the TUI see UNAVAILABLE — honesty,
+            # never a fake LISTENING.
+            if broker_enabled():
+                remote = RemoteAudioLease(self._publish)
+                if await remote.acquire():
+                    self._remote = remote
+                    self._armed = True
+                    return
             self._safe_publish("UNAVAILABLE")
             return
         try:
@@ -124,6 +290,12 @@ class AudioVisualSynapse:
     async def _sleep(self) -> None:
         self._armed = False
         await self._stop_watch()
+        remote = self._remote
+        self._remote = None
+        if remote is not None:
+            await remote.release()
+            self._safe_publish("OFFLINE")
+            return
         handle = self._resolve()
         if handle is not None:
             try:
@@ -197,10 +369,16 @@ class AudioVisualSynapse:
                 pass
 
     async def stop(self) -> None:
-        """Teardown — disarm + reap the watch. NEVER raises."""
+        """Teardown — disarm + reap watch AND remote lease (the
+        supervisor's drop-release is the backstop, but a clean daemon
+        exit releases explicitly). NEVER raises."""
         try:
             self._armed = False
             await self._stop_watch()
+            remote = self._remote
+            self._remote = None
+            if remote is not None:
+                await remote.release()
         except Exception:  # noqa: BLE001
             pass
 
@@ -211,4 +389,4 @@ class AudioVisualSynapse:
             logger.debug("[AudioSynapse] publish degraded", exc_info=True)
 
 
-__all__ = ["AudioVisualSynapse"]
+__all__ = ["AudioVisualSynapse", "RemoteAudioLease", "broker_enabled"]
