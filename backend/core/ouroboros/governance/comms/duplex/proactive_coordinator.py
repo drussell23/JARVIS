@@ -91,6 +91,12 @@ class ProactiveCrossSpaceCoordinator:
                 return {"active": False, "reason": "gate_off"}
             self.stats["ticks"] += 1
             windows = self._windows() or {}
+            # WIRE 3 — focus derivation: the CURRENT Space (the one
+            # holding on-screen windows, id 1 by the provider's
+            # convention) is stamped fresh every tick, so the temporal
+            # decay clock advances without a separate focus-event hook.
+            if 1 in windows and windows[1]:
+                self.note_focus(1)
             gaze = self._get_gaze()
             result = gaze.tick(windows)
             queue = self._get_queue()
@@ -122,4 +128,75 @@ class ProactiveCrossSpaceCoordinator:
             return {"active": False, "reason": "error"}
 
 
-__all__ = ["ProactiveCrossSpaceCoordinator", "proactive_enabled"]
+def native_windows_by_space() -> Dict[int, List[dict]]:
+    """WIRE 1 — the native per-Space window provider. Reuses the SAME
+    ``CGWindowListCopyWindowInfo`` API the vision stack already owns
+    (no duplicated capture): on-screen normal-layer windows are the
+    CURRENT Space (id 1); off-screen normal windows bucket by owner
+    PID into pseudo-Spaces (the app-grouping heuristic
+    macos_space_detector uses). Raw window dicts flow straight into
+    the ghost filter unchanged. Empty on any headless/non-macOS host —
+    NEVER raises."""
+    try:
+        import Quartz  # noqa: PLC0415
+        wins = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID,
+        ) or []
+        by_space: Dict[int, List[dict]] = {}
+        pid_space: Dict[Any, int] = {}
+        next_space = 2
+        for w in wins:
+            if w.get("kCGWindowLayer", 0) != 0:
+                continue                       # skip menubar/dock layers
+            if w.get("kCGWindowIsOnscreen", False):
+                by_space.setdefault(1, []).append(dict(w))
+            else:
+                pid = w.get("kCGWindowOwnerPID")
+                sid = pid_space.get(pid)
+                if sid is None:
+                    sid = next_space
+                    pid_space[pid] = sid
+                    next_space += 1
+                by_space.setdefault(sid, []).append(dict(w))
+        return by_space
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def build_proactive_sink(
+    emit_alert: Callable[..., None],
+    *,
+    backlog_emit: Optional[Callable[[str, List[int]], None]] = None,
+) -> Callable[[Any], None]:
+    """WIRE 2+3 — the present sink. Renders the proposal through the
+    EXISTING SerpentFlow ``emit_proactive_alert`` (the [Y/n] surface,
+    DRY) AND, when a ``backlog_emit`` is provided, graduates an
+    approved reconciliation into O+V's backlog under
+    ``SignalSource.CROSS_SPACE``. Returns a ``present_sink(proposal)``
+    callable. NEVER raises."""
+    def _sink(proposal: Any) -> None:
+        try:
+            summary = getattr(proposal, "summary", lambda: str(proposal))()
+            spaces = list(getattr(proposal, "spaces", []) or [])
+            emit_alert(
+                title="Cross-space reconciliation",
+                body=(
+                    f"{summary} (Spaces {', '.join(map(str, spaces))}). "
+                    "Approve to add to the backlog? [Y/n]"
+                ),
+                severity="notice",
+                source="cross_space",
+            )
+            if backlog_emit is not None:
+                backlog_emit(summary, spaces)
+        except Exception:  # noqa: BLE001
+            logger.debug("[Proactive] sink degraded", exc_info=True)
+    return _sink
+
+
+__all__ = [
+    "ProactiveCrossSpaceCoordinator",
+    "build_proactive_sink",
+    "native_windows_by_space",
+    "proactive_enabled",
+]
