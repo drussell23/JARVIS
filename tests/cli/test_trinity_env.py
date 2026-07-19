@@ -102,7 +102,7 @@ def test_missing_requirements_aborts_cleanly(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_REQUIREMENTS", str(tmp_path / "nope.txt"))
     report = env.bootstrap_env(creator=_fake_creator, runner=lambda *a, **k: _R(0))
     assert report.ok is False
-    assert "requirements not found" in report.reason
+    assert "not found" in report.reason              # missing req file → clean abort
 
 
 def test_venv_exists_false_when_absent():
@@ -122,3 +122,120 @@ def test_uses_native_venv_module_not_bash():
     assert not re.search(r"""\[\s*['"](docker|conda|bash|sh)['"]""", full)
     assert "os.system" not in full
     assert "import docker" not in full
+
+
+# ---------------------------------------------------------------------------
+# PHASE 6 — Configuration-Aware Dependency Sharding
+# ---------------------------------------------------------------------------
+
+def _make_shards(tmp_path):
+    """Author fake shard files in an isolated dir."""
+    d = tmp_path / "deploy" / "requirements"
+    d.mkdir(parents=True)
+    (d / "requirements-core.txt").write_text("fastapi==1.0\nnumpy==2.0\n")
+    (d / "requirements-voice.txt").write_text("torch==2.12.0\nspeechbrain==1.0\n")
+    (d / "requirements-vision.txt").write_text("opencv-python==4.10\n")
+    return d
+
+
+@pytest.fixture
+def _shards(tmp_path, monkeypatch):
+    d = _make_shards(tmp_path)
+    monkeypatch.setenv("JARVIS_REQUIREMENTS_DIR", str(d))
+    monkeypatch.delenv("JARVIS_REQUIREMENTS", raising=False)  # not single-file
+    # Clear ALL toggle aliases so tests set state explicitly.
+    for k in ("JARVIS_VOICE_ENABLED", "JARVIS_AUDIO_BUS_ENABLED",
+              "JARVIS_VISION_ENABLED", "JARVIS_VISION_LOOP_ENABLED"):
+        monkeypatch.delenv(k, raising=False)
+    return d
+
+
+def test_both_toggles_false_excludes_ml_shards(_shards, monkeypatch):
+    """MANDATE 4: voice=false + vision=false → the pip command installs
+    ONLY core; torch/speechbrain/opencv are strictly excluded."""
+    monkeypatch.setenv("JARVIS_VOICE_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_VISION_ENABLED", "false")
+
+    files = env.resolve_requirement_files()
+    names = [f.name for f in files]
+    assert names == ["requirements-core.txt"]            # core ONLY
+    assert "requirements-voice.txt" not in names
+    assert "requirements-vision.txt" not in names
+
+    # The actual pip argv carries only core — no ML file.
+    args = env.build_pip_requirement_args(files)
+    joined = " ".join(args)
+    assert "requirements-core.txt" in joined
+    assert "voice" not in joined and "vision" not in joined
+
+
+def test_voice_toggle_appends_voice_shard(_shards, monkeypatch):
+    monkeypatch.setenv("JARVIS_VOICE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_VISION_ENABLED", "false")
+    names = [f.name for f in env.resolve_requirement_files()]
+    assert names == ["requirements-core.txt", "requirements-voice.txt"]
+    assert "requirements-vision.txt" not in names
+
+
+def test_vision_toggle_appends_vision_shard(_shards, monkeypatch):
+    monkeypatch.setenv("JARVIS_VISION_ENABLED", "true")
+    names = [f.name for f in env.resolve_requirement_files()]
+    assert "requirements-vision.txt" in names
+    assert "requirements-voice.txt" not in names
+
+
+def test_audio_bus_alias_activates_voice(_shards, monkeypatch):
+    """The REAL .env flag is JARVIS_AUDIO_BUS_ENABLED — it must also
+    activate the voice shard (alias coverage)."""
+    monkeypatch.setenv("JARVIS_AUDIO_BUS_ENABLED", "true")
+    names = [f.name for f in env.resolve_requirement_files()]
+    assert "requirements-voice.txt" in names
+
+
+def test_vision_loop_alias_activates_vision(_shards, monkeypatch):
+    monkeypatch.setenv("JARVIS_VISION_LOOP_ENABLED", "true")
+    names = [f.name for f in env.resolve_requirement_files()]
+    assert "requirements-vision.txt" in names
+
+
+def test_core_always_present(_shards, monkeypatch):
+    # Even with everything off, core is unconditional.
+    active = [s.name for s in env.resolve_active_shards()]
+    assert "core" in active
+
+
+def test_bootstrap_uses_only_active_shards_in_pip(_shards, monkeypatch):
+    """End-to-end: voice off → the pip subprocess NEVER sees torch's file."""
+    monkeypatch.setenv("JARVIS_VOICE_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_VISION_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_VENV_DIR", str(_shards.parent.parent / ".venv"))
+    seen = []
+
+    def _creator(path):
+        (path / "bin").mkdir(parents=True, exist_ok=True)
+        (path / "bin" / "python").write_text("#!/bin/sh\n")
+        (path / "bin" / "python").chmod(0o755)
+
+    def _runner(argv, **kw):
+        seen.append(argv)
+        return type("R", (), {"returncode": 0, "stderr": ""})()
+
+    rep = env.bootstrap_env(creator=_creator, runner=_runner)
+    assert rep.ok is True
+    pip_installs = [c for c in seen if "install" in c and "-r" in c]
+    assert pip_installs
+    argv = pip_installs[0]
+    flat = " ".join(argv)
+    assert "requirements-core.txt" in flat
+    assert "requirements-voice.txt" not in flat      # torch NOT installed
+    assert "requirements-vision.txt" not in flat
+
+
+def test_shard_reuses_doctor_env_true(_shards, monkeypatch):
+    """DRY (mandate 3): the shard gate must use the doctor's _env_true —
+    same truthy vocabulary (on/yes/1/true)."""
+    from backend.core.ouroboros.cli.trinity_doctor import _env_true
+    monkeypatch.setenv("JARVIS_VOICE_ENABLED", "on")     # doctor accepts 'on'
+    assert _env_true("JARVIS_VOICE_ENABLED") is True
+    names = [f.name for f in env.resolve_requirement_files()]
+    assert "requirements-voice.txt" in names             # 'on' → active

@@ -73,6 +73,94 @@ def requirements_path() -> Path:
         return Path(__file__).resolve().parents[4] / "requirements.txt"
 
 
+# ---------------------------------------------------------------------------
+# Configuration-Aware Dependency Sharding (Phase 6)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Shard:
+    """One dependency shard. ``toggles`` are the ``.env`` flags that
+    activate it (enabled if ANY is true); ``always`` shards install
+    unconditionally. No hardcoding — filenames + toggles are declarative."""
+    name: str
+    filename: str
+    toggles: tuple = ()
+    always: bool = False
+
+
+#: The dependency graph, sharded by subsystem. Voice/vision carry the
+#: heavy aarch64-compile-risk ML; core is the lightweight control plane +
+#: semantic stack. Toggle aliases cover BOTH the mandate's names and the
+#: real ``.env`` flags (voice ↔ audio-bus, vision ↔ vision-loop).
+_SHARDS = (
+    Shard("core", "requirements-core.txt", always=True),
+    Shard("voice", "requirements-voice.txt",
+          toggles=("JARVIS_VOICE_ENABLED", "JARVIS_AUDIO_BUS_ENABLED")),
+    Shard("vision", "requirements-vision.txt",
+          toggles=("JARVIS_VISION_ENABLED", "JARVIS_VISION_LOOP_ENABLED")),
+)
+
+
+def shard_dir() -> Path:
+    """Directory holding the sharded requirement files. Env-overridable."""
+    override = os.environ.get("JARVIS_REQUIREMENTS_DIR")
+    if override:
+        return Path(os.path.expanduser(override))
+    try:
+        from backend.core.ouroboros.cli.thin_client import repo_root
+        base = repo_root()
+    except Exception:  # noqa: BLE001
+        base = Path(__file__).resolve().parents[4]
+    return base / "deploy" / "requirements"
+
+
+def _shard_enabled(shard: Shard) -> bool:
+    """Is this shard active? Core is always on; a subsystem shard is on
+    when ANY of its toggles is asserted. DRY (mandate 3): reuses the
+    doctor's exact boolean evaluation ``_env_true``."""
+    if shard.always:
+        return True
+    try:
+        from backend.core.ouroboros.cli.trinity_doctor import _env_true
+    except Exception:  # noqa: BLE001
+        def _env_true(name: str) -> bool:   # fail-safe mirror
+            return os.environ.get(name, "").strip().lower() in (
+                "1", "true", "yes", "on")
+    return any(_env_true(t) for t in shard.toggles)
+
+
+def resolve_active_shards() -> List[Shard]:
+    """The shards this configuration activates (mandate 2 — config-aware).
+    NEVER raises."""
+    try:
+        return [s for s in _SHARDS if _shard_enabled(s)]
+    except Exception:  # noqa: BLE001
+        return [s for s in _SHARDS if s.always]
+
+
+def resolve_requirement_files() -> List[Path]:
+    """Existing on-disk requirement files for every active shard, in
+    install order (core first). Skips a shard whose file is absent so a
+    partial checkout never hard-fails. NEVER raises."""
+    out: List[Path] = []
+    d = shard_dir()
+    for s in resolve_active_shards():
+        p = d / s.filename
+        if p.exists():
+            out.append(p)
+    return out
+
+
+def build_pip_requirement_args(files: List[Path]) -> List[str]:
+    """Flatten requirement files into ``-r f1 -r f2 …`` pip arguments.
+    The ML shards are simply ABSENT from this list when their subsystem
+    is toggled off — that is the payload optimization (mandate 4)."""
+    args: List[str] = []
+    for f in files:
+        args.extend(["-r", str(f)])
+    return args
+
+
 def _default_creator(path: Path) -> None:
     """Native venv construction (mandate 1)."""
     import venv
@@ -100,14 +188,39 @@ def bootstrap_env(
     raises."""
     rep = BootstrapReport()
     creator = creator or _default_creator
-    req = requirements or requirements_path()
     final = venv_dir()
     tmp = venv_tmp_dir()
     backup = venv_backup_dir()
     try:
-        if not req.exists():
-            rep.reason = f"requirements not found at {req}"
+        # Mandate 2: parse .env FIRST so shard toggles are authoritative.
+        try:
+            from backend.core.env_bootstrap import load_env_once
+            load_env_once()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ---- Resolve the install payload (config-aware sharding) ----
+        # Precedence: explicit ``requirements`` arg / JARVIS_REQUIREMENTS
+        # single-file override (back-compat) → else the toggled shards.
+        req_files: List[Path] = []
+        if requirements is not None:
+            req_files = [requirements]
+        elif os.environ.get("JARVIS_REQUIREMENTS"):
+            req_files = [requirements_path()]
+        else:
+            req_files = resolve_requirement_files()
+        if not req_files:
+            rep.reason = (f"no requirement shards found in {shard_dir()} — "
+                          "run the migration or set JARVIS_REQUIREMENTS")
             return rep
+        missing = [str(f) for f in req_files if not f.exists()]
+        if missing:
+            rep.reason = f"requirement file(s) not found: {', '.join(missing)}"
+            return rep
+        active = [s.name for s in resolve_active_shards()]
+        rep.messages.append(
+            f"⏺ install payload: shards={active} "
+            f"({len(req_files)} requirement file(s))")
         # Clean any stale staging from a prior crashed run.
         if tmp.exists():
             shutil.rmtree(tmp, ignore_errors=True)
@@ -121,11 +234,13 @@ def bootstrap_env(
             shutil.rmtree(tmp, ignore_errors=True)
             return rep
 
-        # 2) pip install into the isolated interpreter.
+        # 2) pip install into the isolated interpreter — ONLY the active
+        # shards (mandate 2/4: toggled-off ML is never in the argv).
         if upgrade_pip:
             runner([str(tmp_py), "-m", "pip", "install", "--upgrade", "pip"],
                    capture_output=True, text=True, timeout=600)
-        r = runner([str(tmp_py), "-m", "pip", "install", "-r", str(req)],
+        pip_req_args = build_pip_requirement_args(req_files)
+        r = runner([str(tmp_py), "-m", "pip", "install", *pip_req_args],
                    capture_output=True, text=True, timeout=3600)
         if getattr(r, "returncode", 1) != 0:
             # Mandate 2: pip failed → discard TEMP, live venv UNTOUCHED.
@@ -180,10 +295,19 @@ def env_main(argv: Optional[List[str]] = None, console=None) -> int:
         if console is None:
             from backend.core.ouroboros.ui.theme import build_console
             console = build_console()
+        # Parse .env so the shard preview reflects the real toggles.
+        try:
+            from backend.core.env_bootstrap import load_env_once
+            load_env_once()
+        except Exception:  # noqa: BLE001
+            pass
+        shards = [s.name for s in resolve_active_shards()]
+        skipped = [s.name for s in _SHARDS if s.name not in shards]
         console.print(
-            f"⏺ building hermetic venv at {venv_dir()} "
-            f"(from {requirements_path().name}) — this can take several "
-            "minutes on first run…", markup=False)
+            f"⏺ building hermetic venv at {venv_dir()} — shards: {shards}"
+            + (f" (skipping {skipped} — toggled off)" if skipped else "")
+            + ". Core installs always; heavy ML only when its subsystem is "
+            "enabled. This can take several minutes…", markup=False)
         rep = bootstrap_env()
         for m in rep.messages:
             console.print(m, markup=False)
@@ -204,6 +328,8 @@ def env_main(argv: Optional[List[str]] = None, console=None) -> int:
 
 
 __all__ = [
-    "venv_dir", "venv_tmp_dir", "venv_python", "venv_exists",
-    "requirements_path", "bootstrap_env", "BootstrapReport", "env_main",
+    "venv_dir", "venv_tmp_dir", "venv_backup_dir", "venv_python",
+    "venv_exists", "requirements_path", "bootstrap_env", "BootstrapReport",
+    "env_main", "Shard", "shard_dir", "resolve_active_shards",
+    "resolve_requirement_files", "build_pip_requirement_args",
 ]

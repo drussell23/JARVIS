@@ -1,0 +1,24 @@
+# Trinity Configuration-Aware Dependency Shard
+# Generated migration 2026-07-19 — do not hand-edit the split;
+# `trinity bootstrap-env` installs core always + voice/vision by toggle.
+# VOICE — installed only when JARVIS_VOICE_ENABLED/AUDIO_BUS true.
+audioread==3.1.0
+HyperPyYAML==1.2.2
+librosa==0.11.0
+llvmlite==0.46.0
+numba==0.64.0
+faster-whisper==1.2.1
+openai-whisper==20250625
+pooch==1.8.2
+pvporcupine==4.0.0
+PyAudio==0.2.14
+safetensors==0.7.0
+sentencepiece==0.2.1
+sounddevice==0.5.3
+soundfile==0.13.1
+soxr==1.0.0
+speechbrain==1.0.3
+torch==2.12.0
+torchaudio==2.12.0
+transformers>=5.7.0,<6
+webrtcvad==2.0.10
