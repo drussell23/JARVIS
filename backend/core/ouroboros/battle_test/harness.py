@@ -3088,6 +3088,14 @@ class BattleTestHarness:
                     "[Harness] StatusLineBuilder registration failed: %s",
                     exc, exc_info=True,
                 )
+            # Cockpit Attach Bridge (CLI item #6) — mounted in BOTH
+            # modes: attaching an ov terminal to a HEADLESS soak is the
+            # flagship use case. Hydration providers compose existing
+            # organs (StatusLineBuilder snapshot, GLS active ops, the
+            # liquidity ledger); downstream = the _repl_print chokepoint
+            # mirror (design-language conformed); upstream = the FULL
+            # _handle_repl_command verb surface incl. the chat bridge.
+            await self._start_cockpit_attach_bridge()
 
             # ── Boot-time orphan scan (Priority 2F resume) ────────────
             # Non-blocking: logs one INFO line if orphans exist so the
@@ -4164,6 +4172,94 @@ class BattleTestHarness:
         except Exception as exc:  # noqa: BLE001 — REPL must survive
             self._repl_print(f"/liquidity: degraded ({exc})")
 
+    # -- Cockpit Attach Bridge (CLI item #6) --------------------------------
+
+    async def _start_cockpit_attach_bridge(self) -> None:
+        """Mount the ov-attach UDS bridge. Fail-soft: a bind failure
+        leaves the organism running unattachable. NEVER raises."""
+        try:
+            from backend.core.ouroboros.battle_test.cockpit_attach import (
+                CockpitAttachBridge,
+                attach_enabled,
+            )
+            if not attach_enabled():
+                return
+
+            def _status_provider() -> dict:
+                try:
+                    from backend.core.ouroboros.battle_test.status_line import (
+                        get_status_line_builder,
+                    )
+                    b = get_status_line_builder()
+                    if b is None:
+                        return {}
+                    snap = b.snapshot()
+                    return {
+                        "phase": snap.phase,
+                        "phase_detail": snap.phase_detail,
+                        "cost_spent_usd": snap.cost_spent_usd,
+                        "cost_budget_usd": snap.cost_budget_usd,
+                        "idle_elapsed_s": snap.idle_elapsed_s,
+                        "primary_op_id": snap.primary_op_id,
+                        "route": snap.route,
+                        "provider": snap.provider,
+                        "liquidity_exhausted": snap.liquidity_exhausted,
+                    }
+                except Exception:  # noqa: BLE001
+                    return {}
+
+            def _ops_provider() -> list:
+                try:
+                    gls = getattr(self, "_governed_loop_service", None)
+                    active = getattr(gls, "_active_ops", None) or {}
+                    return [str(k)[:24] for k in list(active)[:8]]
+                except Exception:  # noqa: BLE001
+                    return []
+
+            def _liquidity_provider() -> dict:
+                try:
+                    from backend.core.ouroboros.governance.provider_liquidity_ledger import (  # noqa: E501
+                        _load,
+                        any_runway_exhausted,
+                        liquidity,
+                    )
+                    providers = {}
+                    for name in (_load().get("providers") or {}):
+                        tokens, secs = liquidity(name)
+                        providers[name] = {
+                            "tokens_remaining": tokens,
+                            "seconds_to_reset": secs,
+                        }
+                    return {
+                        "providers": providers,
+                        "any_exhausted": any_runway_exhausted(),
+                    }
+                except Exception:  # noqa: BLE001
+                    return {}
+
+            def _on_input(text: str) -> None:
+                # Upstream operator text → the FULL REPL surface (verbs
+                # + bare-text chat bridge). Scheduled, never inline.
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    return
+                loop.create_task(self._handle_repl_command(text))
+
+            bridge = CockpitAttachBridge(
+                status_provider=_status_provider,
+                ops_provider=_ops_provider,
+                liquidity_provider=_liquidity_provider,
+                on_input=_on_input,
+            )
+            if await bridge.start():
+                self._cockpit_attach_bridge = bridge
+            else:
+                self._cockpit_attach_bridge = None
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] mount degraded", exc_info=True)
+            self._cockpit_attach_bridge = None
+
     # -- Audio-state IPC subscriber (cockpit render plane) -----------------
 
     async def _start_audio_ipc_client(self) -> None:
@@ -4295,6 +4391,14 @@ class BattleTestHarness:
             )
             msg = get_default_router().route_block(msg)
         except Exception:  # noqa: BLE001 — router must never eat output
+            pass
+        # Cockpit Attach mirror: every conformed line ALSO streams to
+        # attached ov terminals. Non-blocking, per-client fail-drop.
+        try:
+            bridge = getattr(self, "_cockpit_attach_bridge", None)
+            if bridge is not None:
+                bridge.publish_line(msg)
+        except Exception:  # noqa: BLE001
             pass
         sf = getattr(self, "_serpent_flow", None)
         if sf is not None:
@@ -7915,6 +8019,12 @@ class BattleTestHarness:
             ipc_client = getattr(self, "_audio_ipc_client", None)
             if ipc_client is not None:
                 await ipc_client.close()
+        except Exception:
+            pass
+        try:
+            attach_bridge = getattr(self, "_cockpit_attach_bridge", None)
+            if attach_bridge is not None:
+                await attach_bridge.stop()
         except Exception:
             pass
         try:

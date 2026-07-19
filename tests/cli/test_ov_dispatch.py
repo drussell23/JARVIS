@@ -44,10 +44,12 @@ class TestResolveSubcommands:
     def test_status_action(self) -> None:
         assert resolve(["status"]).action == "status"
 
-    def test_attach_is_stub_with_message(self) -> None:
+    def test_attach_resolves_to_real_action(self) -> None:
+        # CLI item #6 (2026-07-18): attach is REAL — a hydrated live
+        # session over the CockpitAttachBridge, no stub message.
         inv = resolve(["attach"])
         assert inv.action == "attach"
-        assert inv.message  # non-empty "coming soon" notice
+        assert inv.message == ""
 
     def test_help_variants(self) -> None:
         for a in (["help"], ["--help"], ["-h"]):
@@ -77,9 +79,11 @@ class TestMainWithoutBoot:
         assert ov.main(["help"]) == 0
         assert "ov" in capsys.readouterr().out.lower()
 
-    def test_attach_returns_zero_and_explains(self, capsys) -> None:
-        assert ov.main(["attach"]) == 0
-        assert "attach" in capsys.readouterr().out.lower()
+    def test_attach_without_organism_degrades_cleanly(self, capsys) -> None:
+        # No daemon socket in a unit environment: bounded connect fails
+        # -> exit 1 + the "no organism awake" guidance (never a hang).
+        assert ov.main(["attach"]) == 1
+        assert "no organism awake" in capsys.readouterr().out.lower()
 
     def test_status_returns_zero(self, capsys) -> None:
         assert ov.main(["status"]) == 0
