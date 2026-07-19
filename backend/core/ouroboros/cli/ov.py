@@ -320,7 +320,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         battle_main(inv.delegate_argv)
         return 0
     except SystemExit as exc:
-        if _mux_engaged and exc.code not in (0, None):
+        # 75 (EX_TEMPFAIL) is the single-flight collision — an EXPECTED
+        # presentation outcome whose surface already released the mux
+        # cleanly; only genuinely-unexpected nonzero exits flush.
+        if _mux_engaged and exc.code not in (0, None, 75):
             _deadman_flush()
         raise
     except BaseException as exc:

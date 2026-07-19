@@ -125,6 +125,23 @@ def test_engage_idempotent_and_master_off(monkeypatch):
     assert bm.get_boot_mux().engage() is False  # master off: never engages
 
 
+def test_deadman_after_clean_release_is_silent(monkeypatch):
+    """The 020746 report: collision surface released cleanly, then the
+    expected sys.exit(75) hit ov's fatal wrapper — the dead-man call on
+    an already-released mux must NOT dump onto the clean screen."""
+    mux, _fake_out, fake_err = _engage_with_fakes(monkeypatch)
+    sys.stderr.write("boot chatter destined for boot.log only\n")
+    mux.release()                               # clean presentation handoff
+    mux.release(flush_to_tty=True)              # late dead-man — one-shot
+    assert "dead-man flush" not in fake_err.getvalue()
+    assert "boot chatter destined" not in fake_err.getvalue()
+
+
+def test_ov_exempts_collision_exit_from_deadman():
+    src = _read("backend/core/ouroboros/cli/ov.py")
+    assert "exc.code not in (0, None, 75)" in src
+
+
 def test_release_idempotent_and_never_raises():
     mux = bm.get_boot_mux()
     mux.release()                               # never engaged — no-op

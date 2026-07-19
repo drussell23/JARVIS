@@ -835,8 +835,8 @@ def _single_flight_preflight(*, quiet: bool = False) -> None:
             except Exception:
                 pass
             print(
-                f"  {_DIM}⎿ watch: tail -f .ouroboros/sessions/<id>/debug.log"
-                f" · stop: kill {_pid}{_RESET}"
+                f"  {_DIM}⎿ attach: ov attach (live view + input) · "
+                f"stop: kill {_pid}{_RESET}"
             )
             print(
                 f"  {_DIM}⎿ force a second organism: "

@@ -124,6 +124,7 @@ class BootMux:
         self._lock = threading.RLock()
         self.capturing = False
         self._engaged = False
+        self._released = False
         self._buffer: List[str] = []
         self._log_fh: Optional[Any] = None
         self._real_stdout: Optional[Any] = None
@@ -182,6 +183,15 @@ class BootMux:
             with self._lock:
                 if not self._engaged:
                     return
+                # ONE-SHOT (2026-07-18 operator report): after a CLEAN
+                # release (awakening / collision surface), a later
+                # dead-man call — e.g. the collision path's expected
+                # sys.exit(75) propagating through ov's fatal wrapper —
+                # must NOT dump the buffer onto the clean screen; it was
+                # already consigned to boot.log where it belongs.
+                if self._released:
+                    return
+                self._released = True
                 if flush_to_tty and self._buffer:
                     real = self._real_stderr or sys.__stderr__
                     if real is None:
