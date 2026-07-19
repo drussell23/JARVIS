@@ -309,6 +309,23 @@ async def wire_conversation_pipeline(
                     "[Bootstrap] ambient wake observer skipped",
                     exc_info=True,
                 )
+            # PASSIVE_SENTRY final mount (2026-07-19): the total gate
+            # lives INSIDE mount_passive_sentry — when
+            # JARVIS_PASSIVE_SENTRY_ENABLED is down, zero sentry
+            # imports/threads/deques/runloops are instantiated.
+            try:
+                from backend.core.ouroboros.governance.comms.duplex.sentry_bootstrap import (  # noqa: E501
+                    mount_passive_sentry,
+                )
+                handle.passive_sentry = mount_passive_sentry(
+                    broadcaster=handle.audio_ipc,
+                    mic_register=lambda cb: audio_bus.register_mic_consumer(cb),
+                )
+            except Exception:
+                handle.passive_sentry = None
+                logger.debug(
+                    "[Bootstrap] passive sentry mount skipped", exc_info=True,
+                )
         else:
             handle.audio_ipc = None
     except Exception as e:
