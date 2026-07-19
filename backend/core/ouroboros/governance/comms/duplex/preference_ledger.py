@@ -271,10 +271,26 @@ class PreferenceLedger:
                 self._dirty = False
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload, separators=(",", ":")))
-            os.replace(tmp, self._path)         # atomic
+            # Atomic write-replace (mandate 1): write the WHOLE payload
+            # to a sibling, flush+fsync so the bytes are on disk, THEN
+            # os.replace — a sudden power/AppNap/terminal kill leaves
+            # either the old file or the new, NEVER a torn state. If the
+            # tmp write itself dies, the live ledger is untouched.
+            data = json.dumps(payload, separators=(",", ":"))
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())           # bytes durably on disk
+            os.replace(tmp, self._path)         # atomic swap
         except Exception:  # noqa: BLE001
             logger.debug("[Ledger] write degraded", exc_info=True)
+            # Never leave a stray half-written .tmp behind.
+            try:
+                tmp = self._path.with_suffix(".tmp")
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:  # noqa: BLE001
+                pass
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:

@@ -140,14 +140,33 @@ class ResidencyTelemetry:
             r = rss_mb()
             if self._first_rss is None:
                 self._first_rss = r
+            lag = await loop_lag_ms()
+            # Loop-Lag Watchdog (DRY: routes through SovereignGovernor's
+            # degradation discipline). A spike throttles THIS ring's
+            # verbosity to protect terminal interaction.
+            try:
+                from backend.core.ouroboros.governance.comms.duplex.sovereign_governor import (  # noqa: E501
+                    LoopLagWatchdog, loop_lag_degraded,
+                )
+                if not hasattr(self, "_lag_watchdog"):
+                    self._lag_watchdog = LoopLagWatchdog()
+                self._lag_watchdog.observe_lag_ms(lag)
+                _throttled = loop_lag_degraded()
+            except Exception:  # noqa: BLE001
+                _throttled = False
             row = {
                 "ts": time.time(),
                 "rss_mb": r,
                 "rss_delta_mb": round(r - (self._first_rss or r), 2),
-                "uds_conns": self._safe_conns(),
-                "loop_lag_ms": await loop_lag_ms(),
+                "loop_lag_ms": lag,
                 "sample": self._samples,
             }
+            if not _throttled:
+                # Full verbosity when the loop is healthy; throttled
+                # rows shed the non-essential fields under congestion.
+                row["uds_conns"] = self._safe_conns()
+            else:
+                row["throttled"] = True
             self._samples += 1
             self.last = row
             h = self._get_handler()
