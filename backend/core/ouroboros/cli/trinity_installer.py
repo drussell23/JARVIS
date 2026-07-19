@@ -150,6 +150,14 @@ def build_supervisor_plist(*, python: Optional[Path] = None) -> dict:
         "PYTHONPATH": str(root),
         "VIRTUAL_ENV": str(py.parent.parent),
         "OUROBOROS_BATTLE_HEADLESS": "1",
+        # SERVICE MODE (Phase 8): the resident body is HEADLESS — no
+        # visible Chrome loading experience (JARVIS-Apple is the face), no
+        # auto-launched web frontend. SLIM keeps it lean (GCP handles heavy
+        # inference). The app connects over localhost SSE.
+        "JARVIS_SERVICE_MODE": "1",
+        "JARVIS_FRONTEND_AUTOLAUNCH": "0",
+        "JARVIS_ENABLE_SLIM_MODE": os.environ.get(
+            "JARVIS_ENABLE_SLIM_MODE", "SLIM"),
     }
     # Only enable subsystems whose deps are installed (prevents a lean
     # venv from booting into a voice/vision import crash). launchd sets
@@ -158,12 +166,21 @@ def build_supervisor_plist(*, python: Optional[Path] = None) -> dict:
     env.update(coherent_subsystem_env(py))
     return {
         "Label": SUPERVISOR_LABEL,
-        "ProgramArguments": [str(py), str(root / "unified_supervisor.py")],
+        # Headless service boot: skip Docker + GCP so a background daemon
+        # never blocks on / crashes booting the container/cloud planes.
+        "ProgramArguments": [
+            str(py), str(root / "unified_supervisor.py"),
+            "--skip-docker", "--skip-gcp",
+        ],
         "WorkingDirectory": str(root),
         # Resilient Startup (mandate 2): relaunch on crash / lost boot
         # race; RunAtLoad brings it up at login. No sleep()-to-wait.
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
+        # Crash-loop guard: if a boot keeps failing, launchd waits this
+        # long between relaunches instead of hammering a constrained Mac.
+        "ThrottleInterval": int(os.environ.get(
+            "JARVIS_SUPERVISOR_THROTTLE_S", "30")),
         "ProcessType": "Background",
         "StandardOutPath": str(logs / "supervisor.out.log"),
         "StandardErrorPath": str(logs / "supervisor.err.log"),
@@ -223,14 +240,35 @@ def install_supervisor_agent(
             pass
         # 2) Write the fresh plist atomically.
         path = write_supervisor_plist(agents_dir=agents_dir, python=python)
-        # 3) Load it.
+        # 3) Load it — and CHECK the result. launchctl returns a non-zero
+        # rc WITHOUT raising, so the previous "always success" was a lie
+        # (the agent silently failed to load). Capture rc + stderr, then
+        # VERIFY the agent is actually registered.
         try:
-            runner(["launchctl", "bootstrap", f"gui/{uid}", str(path)],
-                   capture_output=True, timeout=10)
+            r = runner(["launchctl", "bootstrap", f"gui/{uid}", str(path)],
+                       capture_output=True, text=True, timeout=10)
         except Exception:
-            return (f"⏺ supervisor agent written to {path} — load it with: "
-                    f"launchctl bootstrap gui/$UID {path}")
-        return f"⏺ resident supervisor installed ({SUPERVISOR_LABEL}) — {path}"
+            return (f"⚠ supervisor agent written to {path} but launchctl "
+                    f"could not run — load it with: launchctl bootstrap "
+                    f"gui/$UID {path}")
+        rc = getattr(r, "returncode", 1)
+        err = (getattr(r, "stderr", "") or "").strip()
+        # Verify actual registration (the authoritative check).
+        loaded = False
+        try:
+            v = runner(["launchctl", "print", f"gui/{uid}/{SUPERVISOR_LABEL}"],
+                       capture_output=True, text=True, timeout=10)
+            loaded = getattr(v, "returncode", 1) == 0
+        except Exception:
+            loaded = rc == 0
+        if loaded:
+            return (f"⏺ resident supervisor installed + verified loaded "
+                    f"({SUPERVISOR_LABEL}) — {path}")
+        return (f"⚠ supervisor plist written to {path} but launchctl "
+                f"bootstrap did NOT load it (rc={rc}"
+                + (f", {err}" if err else "") + "). Common cause: a stale "
+                "agent — try `trinity uninstall` then `trinity install`, or "
+                f"load manually: launchctl bootstrap gui/$UID {path}")
     except Exception as exc:
         return f"⚠ supervisor install failed: {exc}"
 

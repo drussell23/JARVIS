@@ -85,19 +85,44 @@ def _backend_alive() -> bool:
         return False
 
 
+def _service_env() -> dict:
+    """Env for a HEADLESS service boot of the JARVIS body — no visible
+    Chrome loading experience (JARVIS-Apple is the face), no web frontend,
+    SLIM. Prefers the hermetic venv interpreter."""
+    env = dict(os.environ)
+    env.setdefault("JARVIS_ENABLE_SLIM_MODE", "SLIM")
+    env["JARVIS_SERVICE_MODE"] = "1"
+    env["JARVIS_FRONTEND_AUTOLAUNCH"] = "0"
+    env["OUROBOROS_BATTLE_HEADLESS"] = "1"
+    return env
+
+
+def _service_python() -> str:
+    """The hermetic venv interpreter if present, else the current one."""
+    try:
+        from backend.core.ouroboros.cli.trinity_env import venv_python, venv_exists
+        if venv_exists():
+            return str(venv_python())
+    except Exception:
+        pass
+    return sys.executable
+
+
 def _spawn_backend() -> Optional[int]:
-    """Start unified_supervisor detached (survives this terminal),
-    logs to .jarvis/logs/. Returns pid or None. NEVER raises."""
+    """Start the JARVIS body detached in HEADLESS SERVICE MODE (no splash /
+    Chrome / Docker / GCP), logs to .jarvis/logs/. Returns pid or None.
+    NEVER raises."""
     try:
         log_dir = _repo_root() / ".jarvis" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log = log_dir / "trinity-backend.log"
         with open(log, "ab") as sink:
             proc = subprocess.Popen(
-                [sys.executable, str(_repo_root() / "unified_supervisor.py")],
+                [_service_python(), str(_repo_root() / "unified_supervisor.py"),
+                 "--skip-docker", "--skip-gcp"],
                 cwd=str(_repo_root()),
                 stdout=sink, stderr=sink, stdin=subprocess.DEVNULL,
-                start_new_session=True, env=dict(os.environ),
+                start_new_session=True, env=_service_env(),
             )
         return proc.pid
     except Exception:

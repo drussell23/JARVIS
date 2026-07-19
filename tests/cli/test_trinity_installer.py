@@ -406,3 +406,46 @@ def test_venv_has_module_uses_find_spec_not_import():
     src = Path(inst.__file__).read_text()
     assert "find_spec" in src
     assert "import torch" not in src
+
+
+# ---------------------------------------------------------------------------
+# PHASE 8b — headless SERVICE MODE daemon + honest bootstrap verification
+# ---------------------------------------------------------------------------
+
+def test_plist_boots_headless_service_mode(tmp_path, monkeypatch):
+    """The daemon must boot the body HEADLESS: --skip-docker/--skip-gcp +
+    JARVIS_SERVICE_MODE (no Chrome splash) + frontend off."""
+    monkeypatch.setenv("JARVIS_VENV_DIR", str(tmp_path / "venv"))
+    p = inst.build_supervisor_plist()
+    prog = p["ProgramArguments"]
+    assert "--skip-docker" in prog and "--skip-gcp" in prog
+    env = p["EnvironmentVariables"]
+    assert env["JARVIS_SERVICE_MODE"] == "1"          # no visible Chrome UI
+    assert env["JARVIS_FRONTEND_AUTOLAUNCH"] == "0"   # no web frontend
+    assert env["JARVIS_ENABLE_SLIM_MODE"]             # lean
+
+
+def test_install_reports_failure_when_bootstrap_does_not_load(tmp_path, monkeypatch):
+    """The silent-success bug: launchctl bootstrap returns non-zero WITHOUT
+    raising, and print shows the agent isn't loaded → install must say so,
+    not falsely claim success."""
+    monkeypatch.setenv("JARVIS_VENV_DIR", str(tmp_path / "venv"))
+
+    def _runner(argv, **kw):
+        if "bootstrap" in argv:
+            return type("R", (), {"returncode": 5, "stderr": "Bootstrap failed: 5"})()
+        if "print" in argv:
+            return type("R", (), {"returncode": 1, "stderr": ""})()  # NOT loaded
+        return type("R", (), {"returncode": 0, "stderr": ""})()
+
+    msg = inst.install_supervisor_agent(agents_dir=tmp_path / "LA", runner=_runner)
+    assert "did NOT load" in msg or "not" in msg.lower()
+    assert "installed + verified" not in msg           # never a false success
+
+
+def test_install_confirms_when_agent_verified_loaded(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_VENV_DIR", str(tmp_path / "venv"))
+    def _runner(argv, **kw):
+        return type("R", (), {"returncode": 0, "stderr": ""})()  # all succeed
+    msg = inst.install_supervisor_agent(agents_dir=tmp_path / "LA", runner=_runner)
+    assert "verified loaded" in msg

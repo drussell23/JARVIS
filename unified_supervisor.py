@@ -85596,6 +85596,25 @@ class JarvisSystemKernel:
         Returns:
             True (non-blocking, always succeeds with graceful degradation)
         """
+        # SERVICE MODE (Phase 8): when the JARVIS body runs as a headless,
+        # trinity-managed background service, JARVIS-Apple (the native app)
+        # is the interactive face — so the visible Chrome loading experience
+        # is skipped entirely. No splash window, no browser process is
+        # spawned; the backend still boots and serves on 8010 for the app
+        # to connect over SSE. Honors the phase's non-blocking, always-
+        # succeeds contract. Gated by JARVIS_SERVICE_MODE (default off), so
+        # the normal interactive desktop boot is byte-identical.
+        if _get_env_bool("JARVIS_SERVICE_MODE", False):
+            self.logger.info(
+                "[Kernel] Phase 0: SERVICE MODE — skipping visible loading "
+                "experience (headless body; JARVIS-Apple is the face)"
+            )
+            try:
+                _os.environ["JARVIS_SUPERVISOR_LOADING"] = "0"
+            except Exception:
+                pass
+            return True
+
         self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
         self.logger.info("[Kernel] Phase 0: Loading Experience (v118.0)")
         self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
