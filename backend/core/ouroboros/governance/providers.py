@@ -3040,6 +3040,54 @@ Rules:
     return "\n\n".join(parts)
 
 
+#: Complexity → reservation multiplier (upper-bound spend fractions of
+#: the per-op cap; env-tunable, unknown → 1.0 fail-closed). Calibrated
+#: from live per-op costs: trivial ops land $0.01–0.05, simple
+#: $0.03–0.10 — a flat worst-case reservation starved the cockpit.
+_RESERVATION_COMPLEXITY_MULT = {
+    "trivial": ("JARVIS_RESERVE_MULT_TRIVIAL", 0.15),
+    "simple": ("JARVIS_RESERVE_MULT_SIMPLE", 0.30),
+    "light": ("JARVIS_RESERVE_MULT_SIMPLE", 0.30),
+    "moderate": ("JARVIS_RESERVE_MULT_MODERATE", 0.60),
+    "standard": ("JARVIS_RESERVE_MULT_MODERATE", 0.60),
+    "complex": ("JARVIS_RESERVE_MULT_COMPLEX", 1.0),
+    "heavy_code": ("JARVIS_RESERVE_MULT_COMPLEX", 1.0),
+}
+
+#: Reservation floor — a scaled estimate never drops below this
+#: (actual-usage reconciliation still bills the true cost).
+_RESERVATION_FLOOR_ENV = "JARVIS_RESERVE_FLOOR_USD"
+
+
+def _scale_reservation_by_complexity(
+    reservation_usd: float, complexity: str,
+) -> float:
+    """Scale the per-op budget reservation by declared complexity.
+    Unknown/blank complexity keeps the full worst case (fail-closed —
+    misdeclared metadata can never under-reserve to zero, and the
+    session ledger reconciles to ACTUAL spend after the call). Pure;
+    NEVER raises."""
+    try:
+        row = _RESERVATION_COMPLEXITY_MULT.get(
+            str(complexity or "").strip().lower(),
+        )
+        if row is None:
+            return reservation_usd
+        env_name, default_mult = row
+        try:
+            mult = float(os.environ.get(env_name, str(default_mult)))
+        except (TypeError, ValueError):
+            mult = default_mult
+        mult = min(1.0, max(0.05, mult))
+        try:
+            floor = float(os.environ.get(_RESERVATION_FLOOR_ENV, "0.02"))
+        except (TypeError, ValueError):
+            floor = 0.02
+        return max(floor, reservation_usd * mult)
+    except Exception:  # noqa: BLE001
+        return reservation_usd
+
+
 async def _context_prune_gate(prompt: str, provider_hint: str) -> str:
     """CONTEXT_PRUNE gate at the Expansion→Generate assembly seam.
 
@@ -8941,6 +8989,19 @@ class ClaudeProvider:
                         )
                     else:
                         _reservation_usd = float(_cumulative_cap_usd)
+                    # Complexity-scaled reservation (2026-07-18 root
+                    # cause): a FLAT worst-case reservation made a
+                    # trivial one-file op demand the same $0.50 as a
+                    # heavy multi-file generation — structurally
+                    # unaffordable inside the default cockpit budget
+                    # (est=$0.5000 > remaining=$0.4995 → instant
+                    # session_exhausted). The estimate now scales with
+                    # the op's declared complexity; unknown complexity
+                    # keeps the conservative worst case (fail-closed).
+                    _reservation_usd = _scale_reservation_by_complexity(
+                        _reservation_usd,
+                        getattr(context, "task_complexity", "") or "",
+                    )
                     _sba_acquire(
                         op_id=_ctx_op_id_str,
                         signal_source=getattr(

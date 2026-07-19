@@ -1329,12 +1329,30 @@ def main(argv: "list[str] | None" = None) -> None:
           Signed-off-by: JARVIS Ouroboros <ouroboros@jarvis.local>{_RESET}
         """),
     )
+    # Presentation-aware session budget default (2026-07-18 root cause:
+    # bare `ov` died in 4 minutes — the $0.50 SOAK default collided with
+    # the $0.50 worst-case per-op Claude reservation, so the FIRST op
+    # was structurally unaffordable → 3 refusals → hibernation →
+    # session_exhausted. A product cockpit must afford real work out of
+    # the box; soak/CI keeps the conservative cap.
+    _cockpit_boot = (os.environ.get(
+        "JARVIS_OV_PRESENTATION", "",
+    ).strip().lower() == "cockpit")
+    _default_cap = (
+        os.environ.get("JARVIS_COCKPIT_COST_CAP", "2.50")
+        if _cockpit_boot
+        else os.environ.get("OUROBOROS_BATTLE_COST_CAP", "0.50")
+    )
     parser.add_argument(
         "--cost-cap",
         type=float,
-        default=float(os.environ.get("OUROBOROS_BATTLE_COST_CAP", "0.50")),
+        default=float(_default_cap),
         metavar="USD",
-        help="Session budget in USD (env: OUROBOROS_BATTLE_COST_CAP, default: 0.50)",
+        help=(
+            "Session budget in USD (cockpit default 2.50 via "
+            "JARVIS_COCKPIT_COST_CAP; soak default 0.50 via "
+            "OUROBOROS_BATTLE_COST_CAP)"
+        ),
     )
     parser.add_argument(
         "--idle-timeout",
