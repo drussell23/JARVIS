@@ -27,13 +27,18 @@ class SpeechRequest:
     priority: Priority
     coalesce_key: str = ""   # same key → keep only the latest
     op_id: str = ""
+    #: Persona lane (ambient OS 2026-07-19): "karen" (engineering, the
+    #: default plane of this codebase) or "daniel" (system/managerial).
+    #: Assigned by ambient.classify_persona from the payload's semantic
+    #: class — never a hardcoded toggle.
+    persona: str = "karen"
 
 
 @runtime_checkable
 class PlaybackHandle(Protocol):
     """The audio floor. Sprint 3 wraps unified_voice_orchestrator; Sprint 1
     uses FakePlayback."""
-    async def play(self, text: str) -> None: ...
+    async def play(self, text: str, *, persona: str = "karen") -> None: ...
     def preempt(self) -> None: ...
     @property
     def is_active(self) -> bool: ...

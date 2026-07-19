@@ -287,6 +287,28 @@ async def wire_conversation_pipeline(
                 handle.audio_ipc = None
             else:
                 logger.info("[Bootstrap] Audio-state IPC broadcaster mounted")
+            # Ambient Phase 2 (2026-07-19): NSWorkspace wake observer →
+            # conditional Daniel briefing with the Coffee-Shop guard.
+            # Dormant without pyobjc; gated JARVIS_AMBIENT_WAKE_ENABLED
+            # (default off — §33.1 graduation contract for a surface
+            # that SPEAKS unprompted).
+            try:
+                if os.getenv(
+                    "JARVIS_AMBIENT_WAKE_ENABLED", "",
+                ).strip().lower() in ("1", "true", "yes", "on"):
+                    from backend.core.ouroboros.governance.comms.duplex.ambient import (  # noqa: E501
+                        SystemWakeObserver,
+                    )
+                    handle.wake_observer = SystemWakeObserver()
+                    if handle.wake_observer.start():
+                        logger.info(
+                            "[Bootstrap] ambient wake observer armed",
+                        )
+            except Exception:
+                logger.debug(
+                    "[Bootstrap] ambient wake observer skipped",
+                    exc_info=True,
+                )
         else:
             handle.audio_ipc = None
     except Exception as e:

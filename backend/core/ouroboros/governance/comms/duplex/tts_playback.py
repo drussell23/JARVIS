@@ -45,9 +45,16 @@ class ArbiterTTSPlayback:
     def is_active(self) -> bool:
         return self._active
 
-    async def play(self, text: str) -> None:
+    async def play(self, text: str, *, persona: str = "karen") -> None:
         """Speak ``text`` through the streaming TTS engine, cancellable via
-        :meth:`preempt`. Returns when playback completes OR is preempted."""
+        :meth:`preempt`. Returns when playback completes OR is preempted.
+
+        ``persona`` (ambient OS 2026-07-19) rides the ``source`` tag as
+        ``<source>:persona=<id>`` — engines that understand the lane
+        route the voice; legacy engines see an opaque source string.
+        With NO engine mounted, the native macOS ``say`` binding
+        delivers the persona voice directly (the silent-handle path
+        stays silent only for Karen's default plane)."""
         if not text or self._engine is None:
             return
         speak_stream = getattr(self._engine, "speak_stream", None)
@@ -56,7 +63,11 @@ class ArbiterTTSPlayback:
         self._cancel = asyncio.Event()
         self._active = True
         try:
-            await speak_stream(text, cancel_event=self._cancel, source=self._source)
+            await speak_stream(
+                text,
+                cancel_event=self._cancel,
+                source=f"{self._source}:persona={persona}",
+            )
         except asyncio.CancelledError:
             # Arbiter cancelled the play task (barge-in path also cancels) —
             # signal the engine so it stops too, then propagate cleanly.
