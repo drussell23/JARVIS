@@ -3120,6 +3120,20 @@ async def event_stream_device(device_id: str, request: Request):
     if es._ws_manager is None:
         set_event_stream_ws_manager(get_ws_manager())
 
+    # O+V ↔ JARVIS-Apple wire (2026-07-19): self-arm the governance→SSE
+    # bridge the instant a native client attaches. Both buses are
+    # guaranteed live here (EventStream just resolved; the governed loop
+    # owns the TrinityEventBus), the call is idempotent, and it costs
+    # nothing while no phone is watching. This is what makes O+V's
+    # autonomous activity actually reach the device.
+    try:
+        from backend.api.governance_sse_bridge import (
+            install_governance_sse_bridge,
+        )
+        await install_governance_sse_bridge()
+    except Exception:  # noqa: BLE001 — never block the stream on the bridge
+        pass
+
     last_ack = int(request.query_params.get("last_ack", "0"))
     last_event_id = request.headers.get("Last-Event-ID")
     if last_event_id:
@@ -3177,6 +3191,65 @@ async def event_stream_command(request: Request):
 
     response = await es.handle_post_command(payload)
     return response
+
+
+# ============================================================================
+# HUD ↔ unified_supervisor LOCAL-FIRST bridge (Phase 9, 2026-07-19)
+# The native macOS JARVIS HUD speaks a cloud-shaped contract; Vercel is
+# blocked, so these loopback-trusted endpoints let it connect DIRECTLY to
+# this local backend on :8010. Pure translation lives in
+# backend/api/hud_local_bridge.py; command routing REUSES handle_post_command.
+# ============================================================================
+
+@router.post("/api/stream/token")
+async def local_stream_token(request: Request):
+    """Local-first stream token — loopback only. The device SSE endpoint on
+    this host is loopback-trusted (no token validation), so we issue a
+    trivial local token, letting the Swift client connect unchanged."""
+    from fastapi.responses import JSONResponse
+    from backend.api.hud_local_bridge import (
+        is_loopback_host, build_stream_token_response,
+    )
+    host = request.client.host if request.client else ""
+    if not is_loopback_host(host):
+        return JSONResponse({"error": "loopback_only"}, status_code=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    return build_stream_token_response(payload)
+
+
+@router.post("/api/command")
+async def local_command(request: Request):
+    """Local-first command endpoint (Swift CommandSender contract). Bridges
+    to the EXISTING es.handle_post_command — no duplicate command logic.
+    Loopback only."""
+    from fastapi.responses import JSONResponse
+    from backend.api.hud_local_bridge import (
+        is_loopback_host, translate_hud_command, shape_command_response,
+        broadcast_command_response,
+    )
+    host = request.client.host if request.client else ""
+    if not is_loopback_host(host):
+        return JSONResponse({"error": "loopback_only"}, status_code=403)
+    from backend.core.event_stream import (
+        get_event_stream, set_event_stream_ws_manager,
+    )
+    es = get_event_stream()
+    if es._ws_manager is None:
+        set_event_stream_ws_manager(get_ws_manager())
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"status": "error", "success": False, "error": "invalid_json"}
+    frame = translate_hud_command(payload)
+    command_id = frame.get("command_id")
+    response = await es.handle_post_command(frame)
+    # Stream the answer back over SSE (token + complete) so the HUD speaks
+    # it — the POST only acknowledges; the response rides the event channel.
+    await broadcast_command_response(es, command_id, response)
+    return shape_command_response(response, command_id)
 
 
 # ============================================================================

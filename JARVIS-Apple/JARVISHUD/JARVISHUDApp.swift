@@ -147,20 +147,37 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             // Panel does NOT auto-show for commands — the organism responds
             // via voice only. Panel is only for explicit "show yourself" / Cmd+Shift+J.
 
+            // ============================================================
+            // UNIFIED COMMAND ROUTING (Phase 11): route the raw command to
+            // whichever backend is actually live — the local brainstem IPC
+            // when it's running, else the connected EXTERNAL backend over
+            // the verified SSE/HTTP path (AppState.sendCommand → /api/
+            // command). One command, whichever body is alive — no
+            // "still starting" dead-end when running against
+            // unified_supervisor. Swift stays a DUMB PIPE either way (no
+            // Tier-0 logic, no app resolution, no hardcoded routing).
+            // ============================================================
             guard BrainstemLauncher.shared.isRunning else {
-                print("[JARVIS] Backend not running — cannot execute command")
-                self.speak("Backend is still starting. Try again in a moment.")
+                // External-backend mode: send over the SSE/HTTP path. The
+                // response streams back via the SSE event channel and is
+                // spoken by AppState's stream handler.
+                if self.appState.pythonBridge.connectionStatus == .connected {
+                    print("[JARVIS] → external backend (SSE/HTTP): \(command)")
+                    Task { @MainActor in
+                        do {
+                            try await self.appState.pythonBridge.sendCommand(
+                                command, intentHint: "voice")
+                        } catch {
+                            print("[JARVIS] external command failed: \(error)")
+                            self.speak("I couldn't reach the backend.")
+                        }
+                    }
+                } else {
+                    print("[JARVIS] Backend not connected — cannot execute command")
+                    self.speak("Backend is still starting. Try again in a moment.")
+                }
                 return
             }
-
-            // ============================================================
-            // DUMB PIPE: Swift HUD is the mouth and ears, NOT the brain.
-            // Send the raw command + screenshot to the brainstem and let
-            // Ouroboros handle everything: app discovery, navigation,
-            // multi-step tasks, VLA, reasoning — the full pipeline.
-            // No Tier 0 logic in Swift. No app name resolution.
-            // No hardcoded routing. The organism figures it out.
-            // ============================================================
 
             print("[JARVIS] → Brainstem: \(command)")
 

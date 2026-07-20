@@ -64,6 +64,17 @@ final class BrainstemLauncher {
             return
         }
 
+        // EXTERNAL-BACKEND MODE (Phase 11): when the HUD is run against an
+        // already-running unified_supervisor (localhost:8010), do NOT spawn
+        // the HUD's own brainstem — that would collide on ports/creds and
+        // fork the backend. The HUD just connects to the external backend
+        // (SSE + /api/command). Set JARVIS_HUD_EXTERNAL_BACKEND=1 in the
+        // Xcode scheme's environment to enable.
+        if (ProcessInfo.processInfo.environment["JARVIS_HUD_EXTERNAL_BACKEND"] ?? "") == "1" {
+            print("[Brainstem] JARVIS_HUD_EXTERNAL_BACKEND=1 — connecting to the external backend (localhost:8010), NOT spawning a local brainstem")
+            return
+        }
+
         // Kill stale processes from previous Xcode runs that didn't clean up.
         // When Xcode kills the HUD, the child Python process can survive as an orphan.
         killStaleProcesses()

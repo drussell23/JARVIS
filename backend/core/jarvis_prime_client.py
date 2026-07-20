@@ -49,6 +49,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Callable, Awaitable
 logger = logging.getLogger(__name__)
 
 
+def _dw_failover_enabled() -> bool:
+    """Master switch for the Slice-A DoubleWord provider failover (default
+    ON). Set JARVIS_UCP_DW_FAILOVER=0 to disable. NEVER raises."""
+    return os.environ.get(
+        "JARVIS_UCP_DW_FAILOVER", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
 # =============================================================================
 # Repo Map Enricher - Intelligent Context Injection for Coding Questions
 # =============================================================================
@@ -1246,6 +1254,48 @@ class JarvisPrimeClient:
 
             except Exception as e:
                 logger.warning(f"[JarvisPrimeClient] UnifiedModelServing error: {e}, falling back")
+
+        # ── Slice A: Provider-Agnostic DoubleWord failover ──────────────────
+        # UnifiedModelServing (Prime + Claude) is exhausted here — e.g. the
+        # Anthropic credit-balance 400 that made JARVIS answer "still starting
+        # up". Before the legacy path, reroute the SAME prompt to DoubleWord
+        # through the localized anti-corruption adapter (which sanitizes the
+        # Claude-dialect payload → DW-native and reuses complete_sync + its
+        # leases). Makes text generation provider-independent. Gated + fail-
+        # soft; NEVER a hard dependency.
+        if _dw_failover_enabled():
+            try:
+                from backend.core.doubleword_ucp_adapter import (
+                    DoubleWordUCPAdapter,
+                )
+                _dw_start = time.monotonic()
+                _dw_text = await DoubleWordUCPAdapter().complete(
+                    {"prompt": prompt, "system_prompt": system_prompt or ""}
+                )
+                if _dw_text and _dw_text.strip():
+                    _dw_ms = (time.monotonic() - _dw_start) * 1000.0
+                    logger.info(
+                        "[JarvisPrimeClient] DoubleWord failover answered "
+                        "(%d chars, %.0fms) — provider-independent",
+                        len(_dw_text), _dw_ms,
+                    )
+                    _dw_result = CompletionResponse(
+                        success=True,
+                        content=_dw_text,
+                        backend="doubleword:ucp_failover",
+                        latency_ms=_dw_ms,
+                        tokens_used=0,
+                        cost_estimate=0.0,
+                    )
+                    if enrichment_metadata:
+                        _dw_result.metadata["enrichment"] = enrichment_metadata
+                    _dw_result.metadata["fallback_used"] = True
+                    _dw_result.metadata["provider_failover"] = "doubleword"
+                    return _dw_result
+            except Exception as _dwe:
+                logger.warning(
+                    "[JarvisPrimeClient] DoubleWord failover failed: %s — "
+                    "continuing to legacy routing", _dwe)
 
         # Legacy routing: Decide initial mode
         mode, reason = self.decide_mode()

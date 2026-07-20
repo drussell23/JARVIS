@@ -200,6 +200,10 @@ class EventStreamProtocol:
         self._channels = dict(DEFAULT_CHANNELS)
         self._sync_task: Optional[asyncio.Task] = None
         self._shutdown = False
+        # Count of live SSE generators (they hold no ClientSession — they
+        # poll the replay buffer). broadcast_event commits when this is >0
+        # so SSE-only clients (the native HUD) actually receive events.
+        self._sse_consumers = 0
         logger.info("[EventStream] Protocol initialized (v%d, %d channels)",
                      PROTOCOL_VERSION, len(self._channels))
 
@@ -443,22 +447,29 @@ class EventStreamProtocol:
         Only sessions subscribed to this channel receive it.
         Drop policy is applied per-session.
         """
-        if not self._sessions:
+        # SSE-only consumers (the native HUD) register NO WebSocket session
+        # — they poll the replay buffer directly in sse_stream. So an active
+        # SSE stream is reason enough to broadcast; without this, every
+        # server-initiated event (O+V telemetry, command responses) silently
+        # dropped for SSE clients.
+        if not self._sessions and self._sse_consumers == 0:
             return 0
 
         config = self._channels.get(channel)
         sent = 0
 
-        # Commit to replay buffer once (not per-session)
-        # Only if at least one session wants this channel and it isn't dropped
-        should_commit = False
-        for session in self._sessions.values():
-            if session.legacy_mode:
-                continue
-            if channel in session.subscribed_channels:
-                if not config or not self._should_drop(config, session, payload):
-                    should_commit = True
-                    break
+        # Commit to the replay buffer once. Commit if ANY SSE consumer is
+        # streaming (they read the buffer for their channel), OR if a WS
+        # session wants this channel and it isn't dropped.
+        should_commit = self._sse_consumers > 0
+        if not should_commit:
+            for session in self._sessions.values():
+                if session.legacy_mode:
+                    continue
+                if channel in session.subscribed_channels:
+                    if not config or not self._should_drop(config, session, payload):
+                        should_commit = True
+                        break
 
         seq = 0
         if should_commit:
@@ -484,6 +495,11 @@ class EventStreamProtocol:
             if ok:
                 sent += 1
 
+        # Count SSE consumers as recipients when the event was committed —
+        # they will read it from the replay buffer. Lets callers (e.g. the
+        # governance bridge) see the event as delivered, not dropped.
+        if should_commit and self._sse_consumers > 0:
+            sent += self._sse_consumers
         return sent
 
     def _should_drop(
@@ -591,6 +607,10 @@ class EventStreamProtocol:
         if channels is None:
             channels = set(self._channels.keys())
 
+        # Register as a live SSE consumer so broadcast_event commits to the
+        # replay buffer (this generator polls it). Decremented in finally.
+        self._sse_consumers += 1
+
         # Replay missed events
         entries = await self._replay_buffer.replay_from(last_ack, channels)
         for entry in entries:
@@ -655,6 +675,7 @@ class EventStreamProtocol:
                 seq = frame.get("seq", 0)
                 yield f"id: {seq}\ndata: {json.dumps(frame)}\n\n"
         finally:
+            self._sse_consumers = max(0, self._sse_consumers - 1)
             feed_task.cancel()
             try:
                 await feed_task

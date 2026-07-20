@@ -89,7 +89,7 @@ def _boot_wait_s() -> float:
 # ---------------------------------------------------------------------------
 
 
-async def probe_socket(path: Path) -> str:
+async def probe_socket(path: Path, timeout: Optional[float] = None) -> str:
     """Classify the attach socket with a REAL bounded connect:
 
     * ``"live"``   — something accepted (a daemon is home)
@@ -97,14 +97,17 @@ async def probe_socket(path: Path) -> str:
       (ghost of a violently-killed daemon)
     * ``"absent"`` — no inode at all
 
-    NEVER raises; NEVER hangs (micro-timeout)."""
+    ``timeout`` overrides the env default for a STRICT live-validation
+    bound (Phase 7 health handshake). Non-invasive: opens, confirms, and
+    immediately closes the transport — no lingering connection on the
+    daemon's multiplexer. NEVER raises; NEVER hangs."""
     try:
         if not path.exists():
             return "absent"
         try:
             _r, w = await asyncio.wait_for(
                 asyncio.open_unix_connection(path=str(path)),
-                timeout=_probe_timeout_s(),
+                timeout=timeout if timeout is not None else _probe_timeout_s(),
             )
             try:
                 w.close()
@@ -118,6 +121,85 @@ async def probe_socket(path: Path) -> str:
             return "stale"
     except Exception:  # noqa: BLE001
         return "stale" if path.exists() else "absent"
+
+
+async def probe_tcp(host: str, port: int, timeout: float = 2.0) -> str:
+    """TCP companion to ``probe_socket`` — a REAL bounded, non-invasive
+    connect to prove a listener's event loop is live:
+
+    * ``"live"``    — the connection was accepted
+    * ``"refused"`` — ConnectionRefusedError (nothing/dead bound the port)
+    * ``"timeout"`` — no response within ``timeout`` (deadlocked loop)
+
+    Opens, confirms, immediately closes — leaves no dangling connection.
+    NEVER raises."""
+    try:
+        try:
+            _r, w = await asyncio.wait_for(
+                asyncio.open_connection(host=host, port=port),
+                timeout=timeout,
+            )
+            try:
+                w.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return "live"
+        except asyncio.TimeoutError:
+            return "timeout"
+        except (ConnectionRefusedError, ConnectionResetError):
+            return "refused"
+        except OSError:
+            return "refused"
+    except Exception:  # noqa: BLE001
+        return "refused"
+
+
+async def probe_http(
+    host: str, port: int, timeout: float = 2.0,
+    path: str = "/observability/health",
+) -> str:
+    """APPLICATION-level liveness probe. A bare TCP connect proves only
+    that the KERNEL accepted the socket — a deadlocked event loop still
+    completes the handshake at the kernel layer. So this sends a real
+    HTTP request and awaits a response within ``timeout``:
+
+    * ``"live"``    — an HTTP response came back (the loop is processing)
+    * ``"timeout"`` — connected, but the app never answered (ZOMBIE: the
+      event loop is wedged / never bound its handlers)
+    * ``"refused"`` — nothing/dead bound the port
+
+    Non-invasive: sends ``Connection: close`` and closes the transport —
+    no lingering connection on the server. NEVER raises."""
+    writer = None
+    try:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host=host, port=port), timeout=timeout)
+        except asyncio.TimeoutError:
+            return "timeout"
+        except (ConnectionRefusedError, ConnectionResetError, OSError):
+            return "refused"
+        try:
+            req = (f"GET {path} HTTP/1.0\r\nHost: {host}\r\n"
+                   "Connection: close\r\n\r\n")
+            writer.write(req.encode())
+            await asyncio.wait_for(writer.drain(), timeout=timeout)
+            data = await asyncio.wait_for(reader.read(64), timeout=timeout)
+            # Any bytes back = the app's event loop answered → live. Empty
+            # read = connected but the loop produced nothing → wedged.
+            return "live" if data else "timeout"
+        except asyncio.TimeoutError:
+            return "timeout"          # accepted but no app response → ZOMBIE
+        except (ConnectionResetError, OSError):
+            return "refused"
+    except Exception:  # noqa: BLE001
+        return "refused"
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def clean_stale_socket(path: Path) -> bool:
@@ -430,6 +512,8 @@ __all__ = [
     "ensure_daemon",
     "install_agent",
     "probe_socket",
+    "probe_tcp",
+    "probe_http",
     "repo_root",
     "spawn_daemon",
     "thin_client_enabled",

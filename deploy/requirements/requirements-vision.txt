@@ -1,0 +1,5 @@
+# Trinity Configuration-Aware Dependency Shard
+# Generated migration 2026-07-19 — do not hand-edit the split;
+# `trinity bootstrap-env` installs core always + voice/vision by toggle.
+# VISION — installed only when JARVIS_VISION_ENABLED/LOOP true.
+opencv-python==4.10.0.84

@@ -139,6 +139,23 @@ if _filter not in _existing_warnings:
     _early_os.environ['PYTHONWARNINGS'] = f"{_existing_warnings},{_filter}" if _existing_warnings else _filter
 del _existing_warnings, _filter
 
+# =============================================================================
+# --headless FAST-PATH (Slice D): the converged ASGI organism.
+# =============================================================================
+# Fires HERE — at module load, AFTER the BLAS/warning guards (numpy-safe) but
+# BEFORE the heavy interactive-supervisor imports below — so the API binds +
+# serves port 8010 INSTANTLY instead of waiting minutes on the desktop boot.
+# The converged app then hydrates the Topographical DAG (Oracle → GovernedLoop
+# → OuroborosDaemon actor) + runs the DoubleWord failover self-test in the
+# background → SYSTEM_READY. Reuses Slices A–C wholesale (DRY).
+if __name__ == '__main__' and '--headless' in _early_sys.argv:
+    try:
+        from backend.api.converged_headless import main as _headless_main
+    except Exception as _hexc:  # noqa: BLE001
+        print(f"[Kernel] --headless converged boot import failed: {_hexc}")
+        raise SystemExit(1)
+    raise SystemExit(_headless_main())
+
 # Check if this is a CLI command that needs signal protection
 _cli_flags = ('--restart', '--shutdown', '--status', '--cleanup', '--takeover')
 _is_cli_mode = any(flag in _early_sys.argv for flag in _cli_flags)
@@ -3010,18 +3027,30 @@ _loaded_env_files = _load_environment_files()
 # =============================================================================
 def _detect_best_port(start: int, end: int) -> int:
     """
-    Find the first available port in range.
+    Find the first available port in range — resilient to a cold-boot
+    network stack (Phase 3, Resilient Startup mandate).
 
-    Uses socket binding test to verify availability.
+    Delegates to the bounded-retry ``resilient_detect_port`` which
+    distinguishes EADDRINUSE (advance) from EADDRNOTAVAIL/transient
+    (the loopback stack isn't up yet → bounded backoff retry), so a
+    supervisor launched by launchd at boot doesn't fall back to an
+    unverified port. Fail-soft to the legacy one-shot scan if the helper
+    can't be imported.
     """
-    for port in range(start, end + 1):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", port))
-                return port
-        except OSError:
-            continue
-    return start  # Fallback to start of range
+    try:
+        from backend.core.ouroboros.cli.port_binder import (
+            resilient_detect_port,
+        )
+        return resilient_detect_port(start, end)
+    except Exception:
+        for port in range(start, end + 1):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("127.0.0.1", port))
+                    return port
+            except OSError:
+                continue
+        return start  # Fallback to start of range
 
 def _discover_venv() -> Optional[Path]:
     """Discover virtual environment path."""
@@ -85584,6 +85613,25 @@ class JarvisSystemKernel:
         Returns:
             True (non-blocking, always succeeds with graceful degradation)
         """
+        # SERVICE MODE (Phase 8): when the JARVIS body runs as a headless,
+        # trinity-managed background service, JARVIS-Apple (the native app)
+        # is the interactive face — so the visible Chrome loading experience
+        # is skipped entirely. No splash window, no browser process is
+        # spawned; the backend still boots and serves on 8010 for the app
+        # to connect over SSE. Honors the phase's non-blocking, always-
+        # succeeds contract. Gated by JARVIS_SERVICE_MODE (default off), so
+        # the normal interactive desktop boot is byte-identical.
+        if _get_env_bool("JARVIS_SERVICE_MODE", False):
+            self.logger.info(
+                "[Kernel] Phase 0: SERVICE MODE — skipping visible loading "
+                "experience (headless body; JARVIS-Apple is the face)"
+            )
+            try:
+                _os.environ["JARVIS_SUPERVISOR_LOADING"] = "0"
+            except Exception:
+                pass
+            return True
+
         self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
         self.logger.info("[Kernel] Phase 0: Loading Experience (v118.0)")
         self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
@@ -94098,6 +94146,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
         metavar="HOST",
         help="Backend server host (default: 0.0.0.0)",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Converged headless organism (Slice D): bind + serve the API "
+             "INSTANTLY, then hydrate the Topographical DAG + run the "
+             "DoubleWord failover self-test in the background. No desktop UI.",
+    )
     network.add_argument(
         "--websocket-port",
         type=int,
@@ -97897,6 +97952,19 @@ def main() -> int:
     # Parse arguments
     parser = create_argument_parser()
     args = parser.parse_args()
+
+    # --headless (Slice D): the converged ASGI organism. Binds + serves the
+    # router INSTANTLY, then hydrates the Topographical DAG (Oracle →
+    # GovernedLoop → OuroborosDaemon actor) + runs the DoubleWord failover
+    # loopback self-test in the background → SYSTEM_READY. Bypasses the heavy
+    # interactive desktop boot entirely (no Chrome, no blocking ML init).
+    if getattr(args, "headless", False):
+        try:
+            from backend.api.converged_headless import main as _headless_main
+            return _headless_main()
+        except Exception as _hexc:  # noqa: BLE001
+            print(f"[Kernel] --headless converged boot failed: {_hexc}")
+            return 1
 
     # Run async main
     exit_code = 1  # Default to failure

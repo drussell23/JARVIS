@@ -55,6 +55,10 @@ class TestResolveSubcommands:
     def test_status_action(self) -> None:
         assert resolve(["status"]).action == "status"
 
+    def test_system_resolves_to_observability_panel(self) -> None:
+        # Slice G: `ov system` → the passive System Observability cockpit.
+        assert resolve(["system"]).action == "system"
+
     def test_attach_resolves_to_real_action(self) -> None:
         # CLI item #6 (2026-07-18): attach is REAL — a hydrated live
         # session over the CockpitAttachBridge, no stub message.

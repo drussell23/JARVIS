@@ -116,6 +116,7 @@ class CockpitAttachBridge:
         status_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         ops_provider: Optional[Callable[[], Any]] = None,
         liquidity_provider: Optional[Callable[[], Dict[str, Any]]] = None,
+        replay_provider: Optional[Callable[[], Any]] = None,
         on_input: Optional[Callable[[str], None]] = None,
         on_audio: Optional[Callable[[str], None]] = None,
         path: Optional[Path] = None,
@@ -123,6 +124,10 @@ class CockpitAttachBridge:
         self._status = status_provider or (lambda: {})
         self._ops = ops_provider or (lambda: [])
         self._liquidity = liquidity_provider or (lambda: {})
+        # Slice H: zero-authority pull of the TrinityEventBus replay buffer —
+        # the chronological critical telemetry flushed to a client on connect
+        # so a late attach reconciles the DAG history, not just the snapshot.
+        self._replay = replay_provider or (lambda: [])
         self._on_input = on_input or (lambda _t: None)
         self._on_audio = on_audio or (lambda _c: None)
         self._path = Path(path) if path is not None else attach_socket_path()
@@ -279,6 +284,30 @@ class CockpitAttachBridge:
         except Exception:  # noqa: BLE001
             pass
 
+    def publish_telemetry(self, payload: Dict[str, Any]) -> None:
+        """Control-plane lane: push ONE structured telemetry frame (DAG
+        hydration / DoubleWord failover / Ouroboros Actor) to every attached
+        client. Consumed by the ``ov system`` observability panel. Mirrors
+        ``publish_thermal`` (thread-safe, cross-loop marshalled). NEVER raises."""
+        try:
+            if not isinstance(payload, dict):
+                return
+            msg: Dict[str, Any] = {"type": "telemetry", "ts": time.time()}
+            msg.update(payload)
+            loop = self._loop
+            if loop is None or loop.is_closed() or not self._clients:
+                return
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                self._broadcast(msg)
+            else:
+                loop.call_soon_threadsafe(self._broadcast, msg)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _broadcast(self, msg: Dict[str, Any]) -> None:
         data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         for w in list(self._clients):
@@ -313,6 +342,19 @@ class CockpitAttachBridge:
             ).encode()
             writer.write(hydration)
             await writer.drain()
+            # Slice H — Atomic State Flush: yield the buffered critical
+            # telemetry history to THIS client BEFORE it joins the live
+            # broadcast set, so historical always precedes live (no interleave).
+            try:
+                for frame in (self._replay() or []):
+                    writer.write((json.dumps(frame, separators=(",", ":"))
+                                  + "\n").encode())
+                await writer.drain()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self._drop(writer)
+                return
+            except Exception:  # noqa: BLE001
+                pass
             self._clients.add(writer)
             self.stats["connects"] += 1
             logger.info(

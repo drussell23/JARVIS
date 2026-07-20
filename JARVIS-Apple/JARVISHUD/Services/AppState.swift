@@ -89,8 +89,24 @@ class PythonBridge: ObservableObject {
     @Published var voiceTranscript: String = ""
     @Published var screenLockTriggered: Bool = false
 
+    /// Slice F — the Adaptive UI State Machine. Driven purely by daemon SSE
+    /// telemetry (no timers). Views gate the command input on
+    /// `systemStatus.isInputEnabled`, show the init overlay on
+    /// `systemStatus.showsInitializationOverlay`, and render the amber
+    /// autonomy-offline indicator on `systemStatus.isAutonomyOffline`.
+    let systemStatus = SystemStatusStore()
+    private var statusCancellables = Set<AnyCancellable>()
+
     // TTS callback — wired by AppState to VoiceManager
     var onSpeak: ((String, SpeechPriority) -> Void)?
+
+    init() {
+        // Re-publish the nested store's changes so `@ObservedObject` views that
+        // observe the bridge also refresh when the lifecycle transitions.
+        systemStatus.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &statusCancellables)
+    }
 
     // Internal networking
     private var sseClient: SSEClient?
@@ -332,6 +348,10 @@ class PythonBridge: ObservableObject {
         detailedConnectionState = "Connected to JARVIS Cloud"
         hudState = .idle
         consecutiveFailures = 0
+        // Slice F: a fresh stream starts pre-telemetry. `connecting` keeps the
+        // input ENABLED (fail-soft) — a backend that is already ready and thus
+        // re-emits nothing can never strand the user behind a spinner.
+        systemStatus.reset()
 
         if !hasGreeted {
             hasGreeted = true
@@ -406,6 +426,12 @@ class PythonBridge: ObservableObject {
     private func handleDaemon(_ data: DaemonEvent) {
         lastMessage = data.narrationText
         detailedConnectionState = "[\(data.sourceBrain)] \(data.narrationText)"
+
+        // Slice F: fold the backend lifecycle telemetry into the Adaptive UI
+        // State Machine. SYSTEM_HYDRATING → init overlay; SYSTEM_DEGRADED /
+        // OUROBOROS_FAULT → unlock the chat input + amber indicator. Purely
+        // event-driven — no timers, no polling.
+        systemStatus.apply(lifecycleRaw: data.lifecycle, narration: data.narrationText)
 
         // Daemon narrations are logged but NOT spoken — JARVIS only speaks
         // in response to user commands. This prevents unsolicited chatter
@@ -528,10 +554,27 @@ class PythonBridge: ObservableObject {
     }
 
     private func loadCredentials() -> HUDCredentials? {
+        let env = ProcessInfo.processInfo.environment
+
+        // LOCAL-FIRST (Phase 9, 2026-07-19): the HUD runs on the SAME Mac as
+        // unified_supervisor, so by default it connects DIRECTLY to the local
+        // backend on localhost:8010 — no Vercel relay (which is blocked). The
+        // local /api/stream/token + /api/stream/{id} + /api/command endpoints
+        // are loopback-trusted, so a placeholder device id/secret is fine.
+        // Set JARVIS_HUD_FORCE_CLOUD=1 to fall back to the cloud path.
+        let forceCloud = (env["JARVIS_HUD_FORCE_CLOUD"] ?? "") == "1"
+        if !forceCloud {
+            let localURL = env["JARVIS_LOCAL_BACKEND_URL"] ?? "http://localhost:8010"
+            let id = env["JARVIS_DEVICE_ID"] ?? "mac-local"
+            let secret = env["JARVIS_DEVICE_SECRET"] ?? "local"
+            print("[JARVIS] LOCAL-FIRST: connecting to \(localURL) (device: \(id))")
+            return HUDCredentials(deviceId: id, deviceSecret: secret, baseURL: localURL)
+        }
+
         // Priority: Environment → brainstem/.env file (no Keychain — avoids password prompts)
-        if let id = ProcessInfo.processInfo.environment["JARVIS_DEVICE_ID"],
-           let secret = ProcessInfo.processInfo.environment["JARVIS_DEVICE_SECRET"] {
-            let url = ProcessInfo.processInfo.environment["JARVIS_VERCEL_URL"] ?? "https://jarvis-cloud-five.vercel.app"
+        if let id = env["JARVIS_DEVICE_ID"],
+           let secret = env["JARVIS_DEVICE_SECRET"] {
+            let url = env["JARVIS_VERCEL_URL"] ?? "https://jarvis-cloud-five.vercel.app"
             print("[JARVIS] Credentials from environment for device: \(id)")
             return HUDCredentials(deviceId: id, deviceSecret: secret, baseURL: url)
         }
