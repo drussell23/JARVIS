@@ -259,6 +259,13 @@ class GovernanceSSEBridge:
                    "latest": latest},
         )
 
+    #: Backend lifecycle discriminators the native HUD's Adaptive UI State
+    #: Machine (Slice F) reacts to. Forwarded verbatim as ``lifecycle`` so the
+    #: Swift ``SystemStatusStore`` can transition deterministically.
+    _LIFECYCLE_TYPES = frozenset({
+        "SYSTEM_HYDRATING", "SYSTEM_READY", "SYSTEM_DEGRADED", "OUROBOROS_FAULT",
+    })
+
     @staticmethod
     def _render(event: Any) -> Dict[str, Any]:
         """Map a TrinityEvent → a DaemonEvent-shaped payload (mandate 2 —
@@ -274,10 +281,41 @@ class GovernanceSSEBridge:
             raw = getattr(event, "payload", None)
             if isinstance(raw, dict):
                 inner = raw
-                op_id = str(raw.get("op_id", "") or "")
+                op_id = str(raw.get("op_id", "") or raw.get("command_id", "") or "")
         except Exception:  # noqa: BLE001
             pass
         verb = topic.split(".")[-1] if topic else "activity"
+        raw_type = str(inner.get("type", "") or "")
+
+        # An explicitly-narrated lifecycle/system event (SYSTEM_HYDRATING,
+        # SYSTEM_READY, SYSTEM_DEGRADED, OUROBOROS_FAULT, PROVIDER_DEGRADED,
+        # FAILOVER_PROVEN, PACKAGE_RECOVERY …) already carries its own rich
+        # narration + a ``type`` discriminator. Forward BOTH untouched (Slice F
+        # root-cause fix): the previous code overwrote them with a generic
+        # "O+V: hydration", so the native HUD was structurally blind to the
+        # organism's boot lifecycle. The ``lifecycle`` key drives the Swift
+        # Adaptive UI State Machine; the rich text drives the overlay.
+        explicit = str(inner.get("narration_text", "") or "")
+        if explicit:
+            extra: Dict[str, Any] = {"type": raw_type or "ov_activity",
+                                     "topic": topic, "event": verb, "op_id": op_id}
+            if raw_type in GovernanceSSEBridge._LIFECYCLE_TYPES:
+                extra["lifecycle"] = raw_type
+            # Forward select structured detail for richer consumers (ignored by
+            # the Codable's four required keys, so wire-safe).
+            for k in ("state", "reason", "provider", "recovered", "module",
+                      "outcome", "exhausted", "next_backoff_s"):
+                if k in inner:
+                    extra[k] = inner[k]
+            return daemon_payload(
+                command_id=op_id or "ouroboros",
+                narration_text=explicit,
+                narration_priority=str(inner.get("narration_priority", "") or "normal"),
+                source_brain=str(inner.get("source_brain", "") or "ouroboros"),
+                extra=extra,
+            )
+
+        # Generic, un-narrated O+V activity (governance topics) — unchanged.
         # Failures narrate at higher priority so the HUD surfaces them.
         prio = "high" if (inner.get("success") is False
                           or "fail" in verb or "error" in verb) else "normal"

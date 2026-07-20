@@ -198,3 +198,46 @@ async def test_no_stream_no_crash(monkeypatch):
     await gsb.install_governance_sse_bridge()
     await bus.fire(_Event("autonomy.op_completed", {"op_id": "x"}))
     await _drain()  # pump runs, no stream → no crash
+
+
+# ---------------------------------------------------------------------------
+# Slice F — lifecycle telemetry forwards the discriminator + rich narration
+# ---------------------------------------------------------------------------
+
+def test_render_forwards_lifecycle_discriminator_and_narration():
+    """A SYSTEM_HYDRATING event must reach the HUD as a daemon frame carrying
+    the ``lifecycle`` discriminator + its own rich narration — NOT overwritten
+    with a generic "O+V: hydration". This is what the native Adaptive UI State
+    Machine reacts to."""
+    ev = _Event("ouroboros.hydration", {
+        "type": "SYSTEM_HYDRATING", "op_id": "hydration",
+        "narration_text": "Waking Ouroboros…", "narration_priority": "normal",
+        "source_brain": "supervisor", "state": "hydrating"})
+    payload = gsb.GovernanceSSEBridge._render(ev)
+    assert payload["lifecycle"] == "SYSTEM_HYDRATING"
+    assert payload["narration_text"] == "Waking Ouroboros…"   # NOT "O+V: hydration"
+    assert payload["source_brain"] == "supervisor"
+    assert payload["state"] == "hydrating"
+    # Swift DaemonEvent required keys still present + string-typed.
+    for k in ("command_id", "narration_text", "narration_priority", "source_brain"):
+        assert isinstance(payload[k], str)
+
+
+def test_render_forwards_degraded_and_fault_lifecycles():
+    for raw in ("SYSTEM_DEGRADED", "OUROBOROS_FAULT", "SYSTEM_READY"):
+        ev = _Event("ouroboros.system", {
+            "type": raw, "narration_text": f"n:{raw}",
+            "narration_priority": "high", "source_brain": "supervisor"})
+        p = gsb.GovernanceSSEBridge._render(ev)
+        assert p["lifecycle"] == raw
+        assert p["narration_text"] == f"n:{raw}"
+
+
+def test_render_generic_activity_has_no_lifecycle_key():
+    """A plain governance op (no narration_text) keeps the legacy generic
+    rendering and carries NO lifecycle discriminator."""
+    ev = _Event("autonomy.op_completed", {"op_id": "op-9", "success": True})
+    p = gsb.GovernanceSSEBridge._render(ev)
+    assert "lifecycle" not in p
+    assert p["type"] == "ov_activity"
+    assert p["narration_text"].startswith("O+V:")

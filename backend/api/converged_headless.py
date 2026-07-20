@@ -181,6 +181,14 @@ def main() -> int:
     for p in (str(repo), str(repo / "backend")):
         if p not in sys.path:
             sys.path.insert(0, p)
+    # Load .env so real credentials (DOUBLEWORD_API_KEY, Aegis config, …) are
+    # present — without this the DoubleWord self-test degrades on "API key not
+    # set" even when the key IS in .env. DRY: same loader trinity_env uses.
+    try:
+        from backend.core.env_bootstrap import load_env_once
+        load_env_once()
+    except Exception:  # noqa: BLE001
+        pass
     os.environ.setdefault("JARVIS_SERVICE_MODE", "1")
     os.environ.setdefault("JARVIS_ENABLE_SLIM_MODE", "SLIM")
     os.environ.setdefault("OUROBOROS_BATTLE_HEADLESS", "1")

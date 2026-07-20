@@ -126,12 +126,28 @@ public struct DaemonEvent: Codable, Sendable {
     public let narrationText: String
     public let narrationPriority: String
     public let sourceBrain: String
+    /// Slice F — the backend lifecycle discriminator (``SYSTEM_HYDRATING`` /
+    /// ``SYSTEM_READY`` / ``SYSTEM_DEGRADED`` / ``OUROBOROS_FAULT``) forwarded
+    /// by the SSE bridge. Optional: ordinary daemon narrations omit it, so
+    /// this is fully backward-compatible with existing frames.
+    public let lifecycle: String?
+
+    public init(commandId: String, narrationText: String,
+                narrationPriority: String, sourceBrain: String,
+                lifecycle: String? = nil) {
+        self.commandId = commandId
+        self.narrationText = narrationText
+        self.narrationPriority = narrationPriority
+        self.sourceBrain = sourceBrain
+        self.lifecycle = lifecycle
+    }
 
     enum CodingKeys: String, CodingKey {
         case commandId = "command_id"
         case narrationText = "narration_text"
         case narrationPriority = "narration_priority"
         case sourceBrain = "source_brain"
+        case lifecycle
     }
 }
 
