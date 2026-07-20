@@ -121,7 +121,6 @@ struct LoadingHUDView: View {
         }
         .onAppear {
             startLoadingAnimation()
-            setupRealtimeObservers()
             print("🚀 LoadingHUDView initialized with reactive progress tracking")
         }
         .onReceive(appState.pythonBridge.$loadingProgress) { newProgress in
@@ -237,25 +236,11 @@ struct LoadingHUDView: View {
         }
     }
 
-    private func setupRealtimeObservers() {
-        // 🚀 ROBUST: Set up a timer to poll bridge properties if needed
-        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { timer in
-            // Fires on the main run loop it was scheduled on — assume MainActor
-            // isolation to touch the isolated view state synchronously, and
-            // return a Sendable flag so the non-Sendable `timer` never crosses
-            // the isolation boundary.
-            let complete = MainActor.assumeIsolated { () -> Bool in
-                // Force UI update if progress changed but didn't trigger
-                if CGFloat(appState.pythonBridge.loadingProgress) != progress {
-                    updateProgress(appState.pythonBridge.loadingProgress)
-                }
-                return appState.pythonBridge.loadingComplete
-            }
-            if complete {
-                timer.invalidate()
-            }
-        }
-    }
+    // NOTE: the former `setupRealtimeObservers()` poll timer was removed — it
+    // duplicated the reactive `.onReceive($loadingProgress/$loadingComplete)`
+    // observers above (which deliver on the MainActor), so it was redundant AND
+    // the only reason the file needed `MainActor.assumeIsolated`. Reactive
+    // observation is the root-cause-correct, non-polling mechanism.
 
     private func playCompletionAnimation() {
         loadingState = .complete
@@ -280,6 +265,10 @@ struct MatrixTransitionView: View {
     @State private var columns: [[MatrixCharacter]] = []
     @State private var opacity: Double = 0.3
     @State private var windowSize: CGSize = .zero
+    /// The animation frame loop — a MainActor-native structured task so column
+    /// mutation is isolation-correct BY CONSTRUCTION (no runtime assertion) and
+    /// is cancelled when the view disappears (no leaked run-loop timer).
+    @State private var animationTask: Task<Void, Never>?
 
     var body: some View {
         GeometryReader { geometry in
@@ -310,12 +299,17 @@ struct MatrixTransitionView: View {
                     opacity = 1.0
                 }
 
-                // Fade out
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                // Fade out — native concurrency, no DispatchQueue.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(2.0))
                     withAnimation(.easeOut(duration: 0.5)) {
                         opacity = 0
                     }
                 }
+            }
+            .onDisappear {
+                animationTask?.cancel()
+                animationTask = nil
             }
         }
     }
@@ -349,10 +343,13 @@ struct MatrixTransitionView: View {
     private func startMatrixAnimation(windowSize: CGSize) {
         let maxY = windowSize.height + 100
 
-        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
-            // Fires on the main run loop — assume MainActor isolation to mutate
-            // the isolated @State columns synchronously.
-            MainActor.assumeIsolated {
+        // Structured MainActor frame loop: the body runs ON the MainActor by
+        // construction, so mutating the isolated @State `columns` is safe
+        // WITHOUT any runtime `assumeIsolated` assertion, and the loop is
+        // cancelled deterministically in `.onDisappear` (no leaked timer).
+        animationTask?.cancel()
+        animationTask = Task { @MainActor in
+            while !Task.isCancelled {
                 for i in 0..<columns.count {
                     for j in 0..<columns[i].count {
                         columns[i][j].y += 2
@@ -362,6 +359,11 @@ struct MatrixTransitionView: View {
                             columns[i][j].y = -20
                         }
                     }
+                }
+                do {
+                    try await Task.sleep(for: .milliseconds(50))
+                } catch {
+                    break   // cancelled
                 }
             }
         }
