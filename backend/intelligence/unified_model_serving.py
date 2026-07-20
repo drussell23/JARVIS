@@ -185,6 +185,7 @@ class ModelProvider(Enum):
     PRIME_LOCAL = "prime_local"  # Local GGUF model
     PRIME_CLOUD_RUN = "prime_cloud_run"  # Cloud Run deployment
     CLAUDE = "claude"
+    DOUBLEWORD = "doubleword"  # Slice A: Tier-0 397B via localized UCP adapter (complete_sync)
     FALLBACK = "fallback"
 
 
