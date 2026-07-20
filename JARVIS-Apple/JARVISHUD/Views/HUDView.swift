@@ -220,22 +220,22 @@ struct HUDView: View {
             print("   Connection status: \(pythonBridge.connectionStatus)")
             updateStatusFromConnection()
         }
-        .onChange(of: pythonBridge.connectionStatus) { newStatus in
+        .onChange(of: pythonBridge.connectionStatus) { _, _ in
             updateStatusFromConnection()
         }
-        .onChange(of: pythonBridge.hudState) { newState in
+        .onChange(of: pythonBridge.hudState) { _, newState in
             hudState = newState
         }
-        .onChange(of: pythonBridge.transcriptMessages) { newMessages in
+        .onChange(of: pythonBridge.transcriptMessages) { _, newMessages in
             transcriptMessages = newMessages
         }
-        .onChange(of: pythonBridge.voiceState) { newState in
+        .onChange(of: pythonBridge.voiceState) { _, newState in
             updateVoiceStatus(from: newState)
         }
-        .onChange(of: pythonBridge.voiceTranscript) { newTranscript in
+        .onChange(of: pythonBridge.voiceTranscript) { _, newTranscript in
             currentTranscript = newTranscript
         }
-        .onChange(of: pythonBridge.screenLockTriggered) { isTriggered in
+        .onChange(of: pythonBridge.screenLockTriggered) { _, isTriggered in
             if isTriggered {
                 triggerScreenLockAnimation()
             }
@@ -250,12 +250,23 @@ struct HUDView: View {
         // Start countdown timer
         screenLockCountdown = 3
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
-            if screenLockCountdown > 0 {
-                screenLockCountdown -= 1
-            } else {
+            // The timer fires on the main run loop it was scheduled on, so the
+            // MainActor-isolated view state is safe to touch synchronously.
+            // Return a Sendable flag so the non-Sendable `timer` never crosses
+            // the isolation boundary.
+            let expired = MainActor.assumeIsolated { () -> Bool in
+                if screenLockCountdown > 0 {
+                    screenLockCountdown -= 1
+                    return false
+                }
+                return true
+            }
+            if expired {
                 timer.invalidate()
-                // Hide animation after countdown
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                // Hide animation after the countdown — native concurrency,
+                // no DispatchQueue.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(0.5))
                     withAnimation(.easeOut(duration: 0.5)) {
                         showScreenLockAnimation = false
                     }

@@ -636,6 +636,7 @@ class PythonBridge: ObservableObject {
 
 // MARK: - VoiceManager (TTS via AVSpeechSynthesizer — Daniel voice)
 
+@MainActor
 final class VoiceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published var isSpeaking: Bool = false
     @Published var isListening: Bool = false
@@ -666,8 +667,11 @@ final class VoiceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegat
         synthesizer.speak(utterance)
     }
 
+    // AVSpeechSynthesizerDelegate callbacks arrive on an unspecified queue, so
+    // this stays nonisolated and hops to the MainActor natively (no
+    // DispatchQueue) to mutate the isolated UI state.
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
             self?.isSpeaking = false
         }
     }

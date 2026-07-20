@@ -408,8 +408,12 @@ final class BrainstemLauncher {
                 return
             }
 
-            // Continue receiving
-            self.startReceiveLoop(conn)
+            // Continue receiving. The receive handler runs on the background
+            // ipcQueue, so hop to the MainActor natively (NWConnection is
+            // Sendable) to re-enter the isolated loop.
+            Task { @MainActor in
+                self.startReceiveLoop(conn)
+            }
         }
     }
 

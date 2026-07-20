@@ -240,13 +240,18 @@ struct LoadingHUDView: View {
     private func setupRealtimeObservers() {
         // 🚀 ROBUST: Set up a timer to poll bridge properties if needed
         Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { timer in
-            // Force UI update if progress changed but didn't trigger
-            if CGFloat(appState.pythonBridge.loadingProgress) != progress {
-                updateProgress(appState.pythonBridge.loadingProgress)
+            // Fires on the main run loop it was scheduled on — assume MainActor
+            // isolation to touch the isolated view state synchronously, and
+            // return a Sendable flag so the non-Sendable `timer` never crosses
+            // the isolation boundary.
+            let complete = MainActor.assumeIsolated { () -> Bool in
+                // Force UI update if progress changed but didn't trigger
+                if CGFloat(appState.pythonBridge.loadingProgress) != progress {
+                    updateProgress(appState.pythonBridge.loadingProgress)
+                }
+                return appState.pythonBridge.loadingComplete
             }
-
-            // Stop timer when complete
-            if appState.pythonBridge.loadingComplete {
+            if complete {
                 timer.invalidate()
             }
         }
@@ -285,7 +290,7 @@ struct MatrixTransitionView: View {
                     for column in columns {
                         for char in column {
                             let point = CGPoint(x: char.x, y: char.y)
-                            var text = Text(char.character)
+                            let text = Text(char.character)
                                 .font(.system(size: 16, design: .monospaced))
                                 .foregroundColor(char.isLead ? .jarvisGreen : Color.jarvisGreen.opacity(0.5))
 
@@ -344,14 +349,18 @@ struct MatrixTransitionView: View {
     private func startMatrixAnimation(windowSize: CGSize) {
         let maxY = windowSize.height + 100
 
-        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { timer in
-            for i in 0..<columns.count {
-                for j in 0..<columns[i].count {
-                    columns[i][j].y += 2
+        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
+            // Fires on the main run loop — assume MainActor isolation to mutate
+            // the isolated @State columns synchronously.
+            MainActor.assumeIsolated {
+                for i in 0..<columns.count {
+                    for j in 0..<columns[i].count {
+                        columns[i][j].y += 2
 
-                    // Reset to top when off-screen
-                    if columns[i][j].y > maxY {
-                        columns[i][j].y = -20
+                        // Reset to top when off-screen
+                        if columns[i][j].y > maxY {
+                            columns[i][j].y = -20
+                        }
                     }
                 }
             }

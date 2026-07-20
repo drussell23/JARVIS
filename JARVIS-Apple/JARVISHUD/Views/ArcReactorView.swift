@@ -105,7 +105,7 @@ struct ArcReactorView: View {
         .onAppear {
             startAnimations()
         }
-        .onChange(of: state) { newState in
+        .onChange(of: state) { _, newState in
             updateReactorForState(newState)
         }
         .onTapGesture {
