@@ -74,6 +74,7 @@ class SelfTestResult:
     provider: str = ""
     answer_preview: str = ""
     error: str = ""
+    recovered: bool = False                  # DoubleWord answered only after self-heal
     ledger: Dict[str, str] = field(default_factory=dict)
 
 
@@ -87,11 +88,16 @@ class LoopbackSelfTest:
         *,
         dw_provider: Optional[Any] = None,
         bus_publish: Optional[Callable[[str, Dict[str, Any]], Awaitable[Any]]] = None,
+        recovery: Optional[Any] = None,
         prompt: str = "Diagnostic self-test — reply with a short greeting.",
         system_prompt: str = "You are JARVIS. This is an internal boot self-test.",
     ) -> None:
         self._dw_provider = dw_provider
         self._bus_publish = bus_publish
+        # The Self-Healing engine (Slice E). When wired, a ModuleNotFoundError
+        # on the backup provider triggers a scoped pip-install + hot reload
+        # BEFORE degrading. ``None`` → the missing dep is an ordinary degrade.
+        self._recovery = recovery
         self._prompt = prompt
         self._system_prompt = system_prompt
 
@@ -116,12 +122,10 @@ class LoopbackSelfTest:
         from backend.core.doubleword_ucp_adapter import DoubleWordUCPAdapter
         return DoubleWordUCPAdapter().as_provider()
 
-    async def run(self) -> SelfTestResult:
-        """Run the loopback failover proof. NEVER raises."""
-        from backend.core.active_failover import (
-            Provider, generate_with_failover, is_retriable_provider_error,
-        )
-        result = SelfTestResult()
+    async def _attempt_failover(self) -> Any:
+        """One provider-chain attempt: simulated Anthropic credit-400 primary →
+        real DoubleWord adapter. Returns the FailoverResult (never raises)."""
+        from backend.core.active_failover import Provider, generate_with_failover
 
         async def _simulated_primary(_ctx: Any) -> str:
             # Intentionally simulate the live primary-provider exception so
@@ -132,32 +136,90 @@ class LoopbackSelfTest:
             Provider(name="anthropic_simulated", call=_simulated_primary),
             self._dw(),
         ]
+        return await generate_with_failover(
+            {"prompt": self._prompt, "system_prompt": self._system_prompt},
+            providers)
+
+    def _is_proven(self, fo: Any) -> bool:
+        return bool(getattr(fo, "ok", False)
+                    and getattr(fo, "provider", "") == "doubleword"
+                    and (getattr(fo, "text", "") or "").strip())
+
+    async def _mark_proven(self, result: SelfTestResult, fo: Any,
+                           *, recovered: bool) -> SelfTestResult:
+        result.state = SelfTestState.FAILOVER_PROVEN
+        result.provider = "doubleword"
+        result.recovered = recovered
+        result.answer_preview = fo.text.strip()[:80]
+        result.ledger["doubleword"] = "ready:recovered" if recovered else "ready"
+        logger.info("[SelfTest] FAILOVER_PROVEN%s — DoubleWord answered ('%s…')",
+                    " (self-healed)" if recovered else "", result.answer_preview)
+        await self._publish({
+            "type": "FAILOVER_PROVEN", "provider": "doubleword",
+            "answer_preview": result.answer_preview, "recovered": recovered,
+            "narration_text": ("DoubleWord failover proven live (self-healed a "
+                               "missing dependency) — provider-independent command "
+                               "loop" if recovered else
+                               "DoubleWord failover proven live — provider-"
+                               "independent command loop"),
+            "narration_priority": "normal", "source_brain": "supervisor",
+        })
+        return result
+
+    async def _try_self_heal(self, fo: Any) -> Optional[Any]:
+        """Slice E: if the backup provider failed on a missing transitive dep
+        and a recovery engine is wired, self-heal (scoped pip-install + hot
+        reload) and RE-RUN the failover once. Returns the new FailoverResult on
+        a successful heal+retry, else ``None`` (caller degrades). NEVER raises."""
+        if self._recovery is None:
+            return None
+        from backend.api.package_recovery import extract_missing_module, RecoveryState
+        module = extract_missing_module(getattr(fo, "error", "") or "")
+        if not module:
+            return None
+        logger.info("[SelfTest] backup provider missing '%s' — invoking Dynamic "
+                    "Package Recovery before degrading", module)
+        rec = await self._recovery.recover(module)
+        await self._publish({
+            "type": "PACKAGE_RECOVERY", "module": rec.module, "spec": rec.spec,
+            "outcome": rec.state.value, "detail": rec.detail[:200],
+            "narration_text": (f"Self-healed missing dependency '{rec.module}' — "
+                               "re-attempting DoubleWord failover"
+                               if rec.state is RecoveryState.RECOVERED else
+                               f"Package recovery for '{rec.module}': {rec.state.value}"),
+            "narration_priority": "normal" if rec.ok else "high",
+            "source_brain": "supervisor",
+        })
+        if rec.state is not RecoveryState.RECOVERED:
+            return None
+        # Secondary attempt — the module is now importable.
         try:
-            fo = await generate_with_failover(
-                {"prompt": self._prompt, "system_prompt": self._system_prompt},
-                providers)
+            return await self._attempt_failover()
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def run(self) -> SelfTestResult:
+        """Run the loopback failover proof. NEVER raises."""
+        result = SelfTestResult()
+        try:
+            fo = await self._attempt_failover()
         except Exception as exc:  # noqa: BLE001 — router never raises, belt+braces
             result.state = SelfTestState.FAILED
             result.error = str(exc)
             await self._publish({"type": "SELFTEST_FAILED", "error": str(exc)})
             return result
 
-        if fo.ok and fo.provider == "doubleword" and fo.text.strip():
-            # DoubleWord actually answered — the failover is PROVEN live.
-            result.state = SelfTestState.FAILOVER_PROVEN
-            result.provider = "doubleword"
-            result.answer_preview = fo.text.strip()[:80]
-            result.ledger["doubleword"] = "ready"
-            logger.info("[SelfTest] FAILOVER_PROVEN — DoubleWord answered "
-                        "('%s…')", result.answer_preview)
-            await self._publish({
-                "type": "FAILOVER_PROVEN", "provider": "doubleword",
-                "answer_preview": result.answer_preview,
-                "narration_text": "DoubleWord failover proven live — "
-                                  "provider-independent command loop",
-                "narration_priority": "normal", "source_brain": "supervisor",
-            })
-            return result
+        if self._is_proven(fo):
+            # DoubleWord answered on the first pass — proven live.
+            return await self._mark_proven(result, fo, recovered=False)
+
+        # Self-Healing (Slice E): intercept a missing transitive dep on the
+        # backup provider and recover BEFORE degrading.
+        healed = await self._try_self_heal(fo)
+        if healed is not None and self._is_proven(healed):
+            return await self._mark_proven(result, healed, recovered=True)
+        if healed is not None:
+            fo = healed   # recovery ran but DW still didn't answer — classify it
 
         # DoubleWord did not fulfil — classify: auth/entitlement → degrade
         # (keep serving); anything else → surfaced FAILED (still non-fatal).

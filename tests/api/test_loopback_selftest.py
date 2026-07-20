@@ -96,6 +96,113 @@ async def _noop(): return None
 
 
 # ---------------------------------------------------------------------------
+# Slice E — Dynamic Package Recovery drives ModuleNotFoundError → FAILOVER_PROVEN
+# ---------------------------------------------------------------------------
+
+def _healing_dw_provider():
+    """A DoubleWord provider that raises ModuleNotFoundError('uuid6') on the
+    FIRST attempt (dep missing) and answers on the SECOND (dep self-healed)."""
+    state = {"n": 0}
+    async def _call(ctx):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise ModuleNotFoundError("No module named 'uuid6'")
+        return "Good to see you, Sir."
+    return af.Provider(name="doubleword", call=_call), state
+
+
+def _faked_recovery():
+    """A fully-faked Self-Healing engine: records the pip argv, never touches
+    the network, and reports the module importable after 'install'."""
+    from backend.api import package_recovery as prmod
+    calls = []
+    class _Run:
+        returncode = 0
+        stderr = ""
+    def _runner(argv, **kw):
+        calls.append(argv)
+        return _Run()
+    eng = prmod.DynamicPackageRecovery(runner=_runner, import_probe=lambda m: True)
+    return eng, calls
+
+
+@pytest.mark.asyncio
+async def test_selftest_self_heals_missing_dep_then_proves_failover():
+    """The engine catches ModuleNotFoundError, triggers the isolated injection
+    subprocess, hot-reloads, and the SECOND DoubleWord attempt proves the
+    failover — no human, no manual pip."""
+    events = []
+    async def _bus(topic, data): events.append(data)
+    dw, dw_state = _healing_dw_provider()
+    recovery, pip_calls = _faked_recovery()
+
+    st = lst.LoopbackSelfTest(dw_provider=dw, recovery=recovery, bus_publish=_bus)
+    result = await st.run()
+
+    assert result.state is lst.SelfTestState.FAILOVER_PROVEN
+    assert result.recovered is True
+    assert result.ledger["doubleword"] == "ready:recovered"
+    assert dw_state["n"] == 2                       # failed once, then answered
+    assert pip_calls and "uuid6" in pip_calls[0]    # injection subprocess fired
+    # telemetry surfaced BOTH the recovery and the proof.
+    assert any(d["type"] == "PACKAGE_RECOVERY" for d in events)
+    assert any(d["type"] == "FAILOVER_PROVEN" and d.get("recovered") for d in events)
+
+
+@pytest.mark.asyncio
+async def test_selftest_degrades_when_dep_not_in_allowlist():
+    """A missing dep NOT in the governed allowlist is refused (supply-chain
+    guard) → no install, graceful degrade — the primary loop stays live."""
+    async def _call(ctx):
+        raise ModuleNotFoundError("No module named 'sketchypkg'")
+    dw = af.Provider("doubleword", _call)
+    from backend.api import package_recovery as prmod
+    pip_calls = []
+    recovery = prmod.DynamicPackageRecovery(
+        runner=lambda argv, **kw: pip_calls.append(argv),
+        import_probe=lambda m: True)
+    st = lst.LoopbackSelfTest(dw_provider=dw, recovery=recovery, bus_publish=lambda t, d: _noop())
+    result = await st.run()
+    assert result.state is lst.SelfTestState.DEGRADED
+    assert not pip_calls                            # NEVER installed an unknown pkg
+
+
+def test_converged_boot_self_heals_to_system_ready():
+    """MANDATE 4 — end-to-end: the converged --headless boot catches the
+    missing uuid6, self-heals via the injection subprocess, reloads, completes
+    the DoubleWord self-test, and transitions to SYSTEM_READY / FAILOVER_PROVEN."""
+    from fastapi.testclient import TestClient
+    from backend.api import converged_headless as ch
+    from backend.api import progressive_hydration as ph
+
+    async def _ok(): return None
+    subs = [ph.Subsystem("stub", _ok)]
+    dw, _ = _healing_dw_provider()
+    recovery, pip_calls = _faked_recovery()
+
+    app = ch.create_converged_app(
+        subsystems=subs, dw_provider=dw, recovery=recovery,
+        run_selftest=True, mount_router=False)
+
+    @app.post("/api/command")
+    async def _cmd():
+        return {"status": "accepted"}
+
+    with TestClient(app) as client:
+        assert client.post("/api/command").status_code == 200   # binds instantly
+        import time; deadline = time.time() + 3
+        final = {}
+        while time.time() < deadline:
+            final = client.get("/api/system/status").json()
+            if final["system_state"] == "ready":
+                break
+            time.sleep(0.1)
+        assert final["system_state"] == "ready"           # SYSTEM_READY after heal
+        assert final["selftest"] == "failover_proven"     # DW proven post-recovery
+    assert pip_calls and "uuid6" in pip_calls[0]           # the heal really ran
+
+
+# ---------------------------------------------------------------------------
 # MANDATE 4 — converged boot: hydration OK + self-test proven → SYSTEM_READY
 # ---------------------------------------------------------------------------
 

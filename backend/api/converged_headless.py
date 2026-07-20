@@ -93,15 +93,23 @@ def create_converged_app(
     *,
     subsystems: Optional[List[Any]] = None,
     dw_provider: Optional[Any] = None,
+    recovery: Optional[Any] = None,
     run_selftest: bool = True,
     mount_router: bool = True,
 ):
     """The converged --headless FastAPI app. Binds instantly; hydrates the
-    DAG + runs the loopback self-test in the background → SYSTEM_READY."""
+    DAG + runs the loopback self-test (with Dynamic Package Recovery) in the
+    background → SYSTEM_READY."""
     from fastapi import FastAPI
     from backend.api.progressive_hydration import HydrationOrchestrator
 
     orch = HydrationOrchestrator(subsystems or default_subsystems())
+    # Self-Healing engine (Slice E): wired by default so a missing transitive
+    # dep on the DoubleWord backup self-heals instead of degrading. Injectable
+    # (tests pass a fully-faked engine; None disables recovery entirely).
+    if recovery is None and run_selftest:
+        from backend.api.package_recovery import default_recovery
+        recovery = default_recovery()
 
     @asynccontextmanager
     async def lifespan(app: "FastAPI"):
@@ -114,7 +122,8 @@ def create_converged_app(
             if run_selftest:
                 try:
                     from backend.api.loopback_selftest import LoopbackSelfTest
-                    selftest = await LoopbackSelfTest(dw_provider=dw_provider).run()
+                    selftest = await LoopbackSelfTest(
+                        dw_provider=dw_provider, recovery=recovery).run()
                     app.state.selftest = selftest
                 except Exception:  # noqa: BLE001
                     logger.warning("[Converged] self-test degraded", exc_info=True)
