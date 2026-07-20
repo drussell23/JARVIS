@@ -26,25 +26,50 @@ from typing import Any, List, Optional
 logger = logging.getLogger("Jarvis.HeadlessApp")
 
 
-async def _load_ouroboros_daemon() -> None:
-    """Best-effort O+V hydration loader. Attempts to arm the governance
-    SSE bridge + (when a governed loop context exists) awaken the
-    OuroborosDaemon. Any failure raises to the orchestrator's OOM guard —
-    it is caught there, degrading O+V while the command loop stays live."""
-    # Arm the O+V→HUD telemetry bridge (idempotent, self-arms on the bus).
+async def _load_governance_bridge() -> None:
+    """Arm the O+V→HUD telemetry bridge (idempotent, self-arms on the
+    TrinityEventBus). A prerequisite for O+V telemetry reaching the HUD."""
     from backend.api.governance_sse_bridge import install_governance_sse_bridge
     await install_governance_sse_bridge()
-    # NOTE: full OuroborosDaemon.awaken() needs the supervisor kernel
-    # context (governed_loop/oracle). In the standalone headless app it is
-    # armed lazily by the supervisor when present; here we ensure the
-    # bridge is live so O+V telemetry reaches the HUD the moment O+V runs.
+
+
+def _build_ouroboros_daemon() -> Any:
+    """Best-effort OuroborosDaemon factory (mandate 3 — the same
+    construction the supervisor uses; args default to None when the kernel
+    context isn't present, exactly as unified_supervisor's Zone-7 boot
+    does). In the standalone headless app the kernel isn't fully wired, so
+    awaken() may fault — the Actor shell isolates that."""
+    from backend.core.ouroboros.daemon import OuroborosDaemon
+    from backend.core.ouroboros.daemon_config import DaemonConfig
+    # Same construction as unified_supervisor's Zone-7 boot — every kernel
+    # handle defaults to None when the context isn't wired (standalone).
+    return OuroborosDaemon(
+        oracle=None, fleet=None, bg_pool=None, intake_router=None,
+        event_stream=None, proactive_drive=None, doubleword=None, gls=None,
+        config=DaemonConfig.from_env(),
+    )
+
+
+async def _load_ouroboros_actor() -> None:
+    """Awaken O+V inside the Actor-Model Fault Isolation shell (Slice C).
+    A fault in an autonomous loop is caught by the Actor, emits
+    OUROBOROS_FAULT, and auto-restarts with backoff — never reaching the
+    ASGI loop. Depends (in the DAG) on the telemetry bridge being up."""
+    from backend.api.ouroboros_actor import OuroborosActor
+    actor = OuroborosActor(_build_ouroboros_daemon)
+    actor.start()   # isolated background task; returns immediately
 
 
 def _default_subsystems() -> List["Any"]:
+    """The O+V hydration DAG: the telemetry bridge first, then the
+    OuroborosDaemon (in its Actor shell) which depends on it."""
     from backend.api.progressive_hydration import Subsystem
     return [
         Subsystem(name="governance_bridge", label="O+V telemetry bridge",
-                  loader=_load_ouroboros_daemon),
+                  loader=_load_governance_bridge),
+        Subsystem(name="ouroboros_daemon", label="OuroborosDaemon (Actor)",
+                  loader=_load_ouroboros_actor,
+                  depends_on=("governance_bridge",)),
     ]
 
 

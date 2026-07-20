@@ -50,10 +50,41 @@ class HydrationState(str, Enum):
 @dataclass
 class Subsystem:
     """One heavy component to hydrate in the background. ``loader`` is an
-    async no-arg callable; a raise is caught fail-soft."""
+    async no-arg callable; a raise is caught fail-soft. ``depends_on`` names
+    subsystems that MUST reach ``ok`` before this one runs (the DAG edge) —
+    e.g. OuroborosDaemon depends on oracle + governed_loop + memory bus."""
     name: str
     loader: Callable[[], Awaitable[None]]
     label: str = ""
+    depends_on: tuple = ()
+
+
+def topological_order(subsystems: List[Subsystem]) -> List[Subsystem]:
+    """Dependency-resolved order (Kahn). Raises ``ValueError`` on a cycle;
+    unknown deps are ignored (they simply gate nothing). Deterministic:
+    ties break on declaration order."""
+    by_name = {s.name: s for s in subsystems}
+    indeg = {s.name: 0 for s in subsystems}
+    adj: Dict[str, List[str]] = {s.name: [] for s in subsystems}
+    for s in subsystems:
+        for dep in s.depends_on:
+            if dep in by_name:
+                adj[dep].append(s.name)
+                indeg[s.name] += 1
+    # Ready set in declaration order for determinism.
+    ready = [s.name for s in subsystems if indeg[s.name] == 0]
+    out: List[str] = []
+    while ready:
+        n = ready.pop(0)
+        out.append(n)
+        for m in adj[n]:
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                ready.append(m)
+    if len(out) != len(subsystems):
+        raise ValueError("dependency cycle in hydration graph: "
+                         + ",".join(sorted(set(by_name) - set(out))))
+    return [by_name[n] for n in out]
 
 
 BusPublish = Callable[[str, Dict[str, Any]], Awaitable[Any]]
@@ -131,8 +162,32 @@ class HydrationOrchestrator:
             message="Backend online — hydrating O+V + heavy subsystems…",
             progress=0, total=total)
 
+        # DAG: resolve dependency order so a subsystem only runs once its
+        # deps are up (mandate 2a — oracle/governed_loop before O+V).
+        try:
+            ordered = topological_order(self._subsystems)
+        except ValueError as exc:
+            logger.warning("[Hydration] %s — running in declared order", exc)
+            ordered = list(self._subsystems)
+
         degraded = False
-        for i, sub in enumerate(self._subsystems, start=1):
+        for i, sub in enumerate(ordered, start=1):
+            # Verify every dependency reached ``ok`` before invoking this
+            # subsystem. A missing/degraded dep SKIPS it fail-soft (a
+            # dependent must NOT run against an un-ready kernel).
+            unmet = [d for d in sub.depends_on
+                     if self.results.get(d) != "ok"]
+            if unmet:
+                degraded = True
+                self.results[sub.name] = f"skipped: deps not ready {unmet}"
+                logger.warning("[Hydration] %s SKIPPED — deps not ready: %s",
+                               sub.name, unmet)
+                await self._emit(
+                    "SYSTEM_DEGRADED", subsystem=sub.name, progress=i,
+                    total=total, unmet_deps=unmet,
+                    message=f"{sub.label or sub.name} skipped — "
+                            f"dependency not ready: {', '.join(unmet)}")
+                continue
             await self._emit(
                 "SYSTEM_HYDRATING", subsystem=sub.name, progress=i, total=total,
                 message=f"Loading {sub.label or sub.name} ({i}/{total})…")
