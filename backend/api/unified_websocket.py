@@ -3228,6 +3228,7 @@ async def local_command(request: Request):
     from fastapi.responses import JSONResponse
     from backend.api.hud_local_bridge import (
         is_loopback_host, translate_hud_command, shape_command_response,
+        broadcast_command_response,
     )
     host = request.client.host if request.client else ""
     if not is_loopback_host(host):
@@ -3243,8 +3244,12 @@ async def local_command(request: Request):
     except Exception:
         return {"status": "error", "success": False, "error": "invalid_json"}
     frame = translate_hud_command(payload)
+    command_id = frame.get("command_id")
     response = await es.handle_post_command(frame)
-    return shape_command_response(response, frame.get("command_id"))
+    # Stream the answer back over SSE (token + complete) so the HUD speaks
+    # it — the POST only acknowledges; the response rides the event channel.
+    await broadcast_command_response(es, command_id, response)
+    return shape_command_response(response, command_id)
 
 
 # ============================================================================

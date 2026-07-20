@@ -121,7 +121,57 @@ def shape_command_response(
         return {"status": "accepted", "command_id": command_id, "success": True}
 
 
+def extract_response_text(response: Any) -> str:
+    """Pull the human answer text out of the command handler's return dict,
+    tolerating the several shapes ws_manager handlers use. NEVER raises."""
+    if not isinstance(response, dict):
+        return str(response or "").strip()
+    # Direct text-bearing keys, most-specific first.
+    for k in ("spoken_response", "response", "text", "message", "reply",
+              "content", "answer", "narration_text"):
+        v = response.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # One level of nesting (data/result/payload).
+    for outer in ("data", "result", "payload"):
+        inner = response.get(outer)
+        if isinstance(inner, dict):
+            nested = extract_response_text(inner)
+            if nested:
+                return nested
+    return ""
+
+
+async def broadcast_command_response(
+    es: Any, command_id: Optional[str], response: Any,
+) -> bool:
+    """Stream the command answer back over SSE as ``token`` + ``complete``
+    events (the exact Swift TokenEvent/CompleteEvent contract) so the HUD
+    accumulates + speaks it. The cloud path used Redis for this; locally we
+    reuse EventStream.broadcast_event. NEVER raises; returns True if it
+    emitted."""
+    try:
+        text = extract_response_text(response)
+        if not text or not command_id:
+            return False
+        cid = str(command_id)
+        # One token carrying the full answer (the HUD accumulates by
+        # command_id), then a complete to finalize + trigger speech.
+        await es.broadcast_event("command", {
+            "type": "token", "command_id": cid, "token": text,
+            "source_brain": "jarvis", "sequence": 0,
+        })
+        await es.broadcast_event("command", {
+            "type": "complete", "command_id": cid, "source_brain": "jarvis",
+            "token_count": 1, "latency_ms": 0,
+        })
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 __all__ = [
     "is_loopback_host", "build_stream_token_response",
     "translate_hud_command", "shape_command_response",
+    "extract_response_text", "broadcast_command_response",
 ]

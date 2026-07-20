@@ -23,9 +23,13 @@ class TestTrinityRouting:
         console = _Console()
         monkeypatch.setattr("backend.core.ouroboros.ui.theme.build_console",
                             lambda: console)
-        # No daemon running in the test env → DOWN, rc 1.
+        # Deterministic: inject a DOWN report so the test never depends on
+        # whether a real backend happens to be listening on :8010.
         from backend.core.ouroboros.cli import trinity_status as st
-        monkeypatch.setattr(st, "supervisor_pid", lambda *a, **k: None)
+        async def _down():
+            return st.HealthReport(state=st.Health.DOWN, pid=None,
+                                   detail="not running", recommendation="install")
+        monkeypatch.setattr(st, "active_health_handshake", lambda **k: _down())
         rc = tl.main(["status"])
         assert rc == 1                                # not HEALTHY
         assert any("supervisor" in l for l in console.lines)
