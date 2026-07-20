@@ -27,7 +27,7 @@ from typing import Any, Callable, List, Optional, Sequence
 
 from backend.core.ouroboros.ui.theme import build_console
 
-_VERBS = {"cockpit", "run", "daemon", "status", "attach", "system", "version"}
+_VERBS = {"cockpit", "run", "daemon", "status", "attach", "system", "hive", "version"}
 _HELP_TOKENS = {"help", "--help", "-h"}
 _VERSION_TOKENS = {"version", "--version", "-V"}
 
@@ -136,6 +136,8 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
         return Invocation("attach")
     if verb == "system":
         return Invocation("system")
+    if verb == "hive":
+        return Invocation("hive")
     # cockpit (explicit or defaulted)
     return Invocation("cockpit", rest)
 
@@ -643,6 +645,28 @@ def run_system(console: Any) -> int:
         return 1
 
 
+def run_hive(console: Any) -> int:
+    """Attach the live Agent Hive feed to the running headless daemon over the
+    Cockpit Attach UDS — a read-only, chronological projection of the real O+V
+    pipeline (Trinity + IDE SSE fabrics, unified by the Hive Aggregator).
+    Passive listener; graceful reconnect. NEVER raises out to the terminal."""
+    import asyncio
+    try:
+        from backend.core.ouroboros.cli.ov_hive_panel import run_hive_panel
+    except Exception as exc:  # noqa: BLE001
+        try:
+            console.print(f"ov hive unavailable: {exc}", markup=False)
+        except Exception:  # noqa: BLE001
+            pass
+        return 1
+    try:
+        return asyncio.run(run_hive_panel(console=console))
+    except KeyboardInterrupt:
+        return 0
+    except Exception:  # noqa: BLE001
+        return 1
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -668,6 +692,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_attach(console)
     if inv.action == "system":
         return run_system(console)
+    if inv.action == "hive":
+        return run_hive(console)
     if inv.action == "status":
         console.print(status_digest(), markup=False, highlight=False)
         return 0

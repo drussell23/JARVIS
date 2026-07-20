@@ -150,6 +150,40 @@ async def _start_control_plane(app: Any, orch: Any) -> Any:
                         pass
         except Exception:  # noqa: BLE001
             pass
+
+        # --- Hive Aggregator (Step 1): read-only fan-in over the fragmented
+        # fabrics → Universal Envelope → relayed to the cockpit so `ov hive`
+        # projects the REAL O+V pipeline. Attaches read-only (mandate 1); never
+        # mutates a source bus. ---
+        try:
+            from backend.api.hive_aggregator import HiveAggregator
+            from backend.core.trinity_event_bus import get_event_bus_if_exists
+            try:
+                from backend.core.ouroboros.governance.ide_observability_stream import (
+                    get_default_broker,
+                )
+                _broker = get_default_broker()
+            except Exception:  # noqa: BLE001
+                _broker = None
+            agg = HiveAggregator(bus=get_event_bus_if_exists(), sse_broker=_broker)
+            await agg.start()
+            app.state.hive_aggregator = agg
+
+            async def _relay_hive() -> None:
+                try:
+                    async for env in agg.feed():
+                        bridge.publish_telemetry(
+                            {"hive": True, **env.to_bus_payload()})
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    pass
+
+            app.state.hive_relay = asyncio.create_task(_relay_hive(), name="hive-relay")
+            logger.info("[Converged] hive aggregator up — `ov hive` can project the pipeline")
+        except Exception:  # noqa: BLE001
+            logger.debug("[Converged] hive aggregator degraded", exc_info=True)
+
         logger.info("[Converged] control plane up — `ov system` can attach")
         return bridge
     except Exception:  # noqa: BLE001
@@ -248,6 +282,19 @@ def create_converged_app(
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            relay = getattr(app.state, "hive_relay", None)
+            if relay is not None and not relay.done():
+                relay.cancel()
+                try:
+                    await relay
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            agg = getattr(app.state, "hive_aggregator", None)
+            if agg is not None:
+                try:
+                    await agg.stop()
+                except Exception:  # noqa: BLE001
                     pass
             bridge = getattr(app.state, "control_plane", None)
             if bridge is not None:
