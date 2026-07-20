@@ -72,6 +72,66 @@ def default_subsystems() -> List[Any]:
 # the converged app
 # ---------------------------------------------------------------------------
 
+async def _start_control_plane(app: Any, orch: Any) -> Any:
+    """Start the Cockpit Attach UDS control plane so `ov system` can attach to
+    the headless daemon (DRY — reuse the Phase-0 bridge + socket). The status
+    provider is a zero-authority pull of the live snapshot; lifecycle events are
+    forwarded as structured telemetry frames. Returns the bridge or None."""
+    try:
+        from backend.core.ouroboros.battle_test.cockpit_attach import CockpitAttachBridge
+
+        def _snapshot() -> dict:
+            try:
+                st = getattr(getattr(app, "state", None), "selftest", None)
+                return {
+                    "phase": getattr(getattr(app, "state", None), "system_state", "booting").upper(),
+                    "system_state": getattr(getattr(app, "state", None), "system_state", "booting"),
+                    "hydration": orch.snapshot(),
+                    "selftest": (st.state.value if st is not None else "pending"),
+                }
+            except Exception:  # noqa: BLE001
+                return {}
+
+        bridge = CockpitAttachBridge(status_provider=_snapshot)
+        started = await bridge.start()
+        if not started:
+            return None
+        app.state.control_plane = bridge
+
+        # Forward lifecycle telemetry (the exact frames the HUD reacts to) to
+        # every attached ov-system cockpit. No new protocol (mandate 3).
+        try:
+            from backend.core.trinity_event_bus import get_event_bus_if_exists
+            bus = get_event_bus_if_exists()
+            if bus is not None:
+                async def _forward(event: Any) -> None:
+                    try:
+                        payload = getattr(event, "payload", None) or {}
+                        if not isinstance(payload, dict):
+                            return
+                        frame = {"lifecycle": payload.get("type", ""),
+                                 "narration_text": payload.get("narration_text", ""),
+                                 **_snapshot()}
+                        if payload.get("provider"):
+                            frame["provider"] = payload["provider"]
+                        bridge.publish_telemetry(frame)
+                    except Exception:  # noqa: BLE001
+                        pass
+                for topic in ("ouroboros.hydration", "ouroboros.system",
+                              "ouroboros.fault", "ouroboros.selftest"):
+                    try:
+                        await bus.subscribe(topic, _forward)
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info("[Converged] control plane up — `ov system` can attach")
+        return bridge
+    except Exception:  # noqa: BLE001
+        logger.debug("[Converged] control plane degraded", exc_info=True)
+        return None
+
+
 async def _emit_system_ready(state: str, detail: dict) -> None:
     try:
         from backend.core.trinity_event_bus import get_event_bus_if_exists
@@ -114,6 +174,19 @@ def create_converged_app(
     @asynccontextmanager
     async def lifespan(app: "FastAPI"):
         async def _boot() -> None:
+            # 0a. Initialize the TrinityEventBus singleton FIRST. Without this
+            #     the process has no bus, so every _publish (hydration / self-
+            #     test / SYSTEM_READY) — and the governance→HUD SSE forwarder —
+            #     silently no-ops into the void. Creating it here lights up ALL
+            #     live telemetry: HUD SSE + the ov-system control plane.
+            try:
+                from backend.core.trinity_event_bus import get_trinity_event_bus
+                await get_trinity_event_bus()
+            except Exception:  # noqa: BLE001
+                logger.debug("[Converged] event bus init degraded", exc_info=True)
+            # 0b. Control plane — bring the `ov system` cockpit UDS up so an
+            #     operator can watch the DAG hydrate + the self-test run live.
+            await _start_control_plane(app, orch)
             # 1. Topographical Hydration DAG (fault-isolated).
             await orch.hydrate()
             # 2. Loopback Self-Test — prove the DoubleWord failover on
@@ -150,6 +223,12 @@ def create_converged_app(
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            bridge = getattr(app.state, "control_plane", None)
+            if bridge is not None:
+                try:
+                    await bridge.stop()
+                except Exception:  # noqa: BLE001
                     pass
 
     app = FastAPI(title="JARVIS Converged Headless", lifespan=lifespan)

@@ -279,6 +279,30 @@ class CockpitAttachBridge:
         except Exception:  # noqa: BLE001
             pass
 
+    def publish_telemetry(self, payload: Dict[str, Any]) -> None:
+        """Control-plane lane: push ONE structured telemetry frame (DAG
+        hydration / DoubleWord failover / Ouroboros Actor) to every attached
+        client. Consumed by the ``ov system`` observability panel. Mirrors
+        ``publish_thermal`` (thread-safe, cross-loop marshalled). NEVER raises."""
+        try:
+            if not isinstance(payload, dict):
+                return
+            msg: Dict[str, Any] = {"type": "telemetry", "ts": time.time()}
+            msg.update(payload)
+            loop = self._loop
+            if loop is None or loop.is_closed() or not self._clients:
+                return
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                self._broadcast(msg)
+            else:
+                loop.call_soon_threadsafe(self._broadcast, msg)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _broadcast(self, msg: Dict[str, Any]) -> None:
         data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         for w in list(self._clients):

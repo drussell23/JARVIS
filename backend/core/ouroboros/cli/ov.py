@@ -27,7 +27,7 @@ from typing import Any, Callable, List, Optional, Sequence
 
 from backend.core.ouroboros.ui.theme import build_console
 
-_VERBS = {"cockpit", "run", "daemon", "status", "attach", "version"}
+_VERBS = {"cockpit", "run", "daemon", "status", "attach", "system", "version"}
 _HELP_TOKENS = {"help", "--help", "-h"}
 _VERSION_TOKENS = {"version", "--version", "-V"}
 
@@ -134,6 +134,8 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
         return Invocation("status")
     if verb == "attach":
         return Invocation("attach")
+    if verb == "system":
+        return Invocation("system")
     # cockpit (explicit or defaulted)
     return Invocation("cockpit", rest)
 
@@ -616,6 +618,32 @@ def run_cockpit_thin(console: Any) -> int:
 
 
 # ---------------------------------------------------------------------------
+# ov system — the System Observability Panel (Slice G)
+# ---------------------------------------------------------------------------
+
+
+def run_system(console: Any) -> int:
+    """Attach the async System Observability cockpit to the running headless
+    daemon over the Cockpit Attach UDS. Passive listener; graceful reconnect on
+    daemon restart. NEVER raises out to the terminal."""
+    import asyncio
+    try:
+        from backend.core.ouroboros.cli.ov_system_panel import run_system_panel
+    except Exception as exc:  # noqa: BLE001
+        try:
+            console.print(f"ov system unavailable: {exc}", markup=False)
+        except Exception:  # noqa: BLE001
+            pass
+        return 1
+    try:
+        return asyncio.run(run_system_panel(console=console))
+    except KeyboardInterrupt:
+        return 0
+    except Exception:  # noqa: BLE001
+        return 1
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -638,6 +666,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     if inv.action == "attach":
         return run_attach(console)
+    if inv.action == "system":
+        return run_system(console)
     if inv.action == "status":
         console.print(status_digest(), markup=False, highlight=False)
         return 0
