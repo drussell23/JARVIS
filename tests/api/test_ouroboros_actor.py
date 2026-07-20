@@ -107,7 +107,7 @@ def test_actor_wired_in_app_keeps_server_up_on_ouroboros_fault():
     """Full mandate-4 integration: the Actor faults in the background; the
     ASGI server stays up and /api/command still returns 200."""
     from fastapi.testclient import TestClient
-    from backend.api import headless_app
+    from backend.api import converged_headless as headless_app
 
     started = {}
     async def _load_ouroboros():
@@ -122,13 +122,13 @@ def test_actor_wired_in_app_keeps_server_up_on_ouroboros_fault():
     async def _noop(): return None
 
     subs = [ph.Subsystem("ouroboros", _load_ouroboros, label="OuroborosDaemon")]
-    app = headless_app.create_headless_app(subsystems=subs, mount_router=False)
+    app = headless_app.create_converged_app(subsystems=subs, mount_router=False, run_selftest=False)
 
     @app.post("/api/command")
     async def _cmd():
         return {"status": "accepted"}
 
     with TestClient(app) as client:
-        assert client.get("/api/hydration/status").status_code == 200
+        assert client.get("/api/system/status").status_code == 200
         # Server did NOT crash on the O+V fault.
         assert client.post("/api/command").status_code == 200

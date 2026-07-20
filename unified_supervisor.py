@@ -139,6 +139,23 @@ if _filter not in _existing_warnings:
     _early_os.environ['PYTHONWARNINGS'] = f"{_existing_warnings},{_filter}" if _existing_warnings else _filter
 del _existing_warnings, _filter
 
+# =============================================================================
+# --headless FAST-PATH (Slice D): the converged ASGI organism.
+# =============================================================================
+# Fires HERE — at module load, AFTER the BLAS/warning guards (numpy-safe) but
+# BEFORE the heavy interactive-supervisor imports below — so the API binds +
+# serves port 8010 INSTANTLY instead of waiting minutes on the desktop boot.
+# The converged app then hydrates the Topographical DAG (Oracle → GovernedLoop
+# → OuroborosDaemon actor) + runs the DoubleWord failover self-test in the
+# background → SYSTEM_READY. Reuses Slices A–C wholesale (DRY).
+if __name__ == '__main__' and '--headless' in _early_sys.argv:
+    try:
+        from backend.api.converged_headless import main as _headless_main
+    except Exception as _hexc:  # noqa: BLE001
+        print(f"[Kernel] --headless converged boot import failed: {_hexc}")
+        raise SystemExit(1)
+    raise SystemExit(_headless_main())
+
 # Check if this is a CLI command that needs signal protection
 _cli_flags = ('--restart', '--shutdown', '--status', '--cleanup', '--takeover')
 _is_cli_mode = any(flag in _early_sys.argv for flag in _cli_flags)
@@ -94129,6 +94146,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
         metavar="HOST",
         help="Backend server host (default: 0.0.0.0)",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Converged headless organism (Slice D): bind + serve the API "
+             "INSTANTLY, then hydrate the Topographical DAG + run the "
+             "DoubleWord failover self-test in the background. No desktop UI.",
+    )
     network.add_argument(
         "--websocket-port",
         type=int,
@@ -97928,6 +97952,19 @@ def main() -> int:
     # Parse arguments
     parser = create_argument_parser()
     args = parser.parse_args()
+
+    # --headless (Slice D): the converged ASGI organism. Binds + serves the
+    # router INSTANTLY, then hydrates the Topographical DAG (Oracle →
+    # GovernedLoop → OuroborosDaemon actor) + runs the DoubleWord failover
+    # loopback self-test in the background → SYSTEM_READY. Bypasses the heavy
+    # interactive desktop boot entirely (no Chrome, no blocking ML init).
+    if getattr(args, "headless", False):
+        try:
+            from backend.api.converged_headless import main as _headless_main
+            return _headless_main()
+        except Exception as _hexc:  # noqa: BLE001
+            print(f"[Kernel] --headless converged boot failed: {_hexc}")
+            return 1
 
     # Run async main
     exit_code = 1  # Default to failure

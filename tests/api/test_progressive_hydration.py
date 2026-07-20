@@ -81,14 +81,14 @@ async def test_runtimeerror_also_fail_soft():
 def test_asgi_lifespan_oom_server_stays_up_and_serves_200():
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
-    from backend.api import headless_app
+    from backend.api import converged_headless as headless_app
 
     # Inject a subsystem that OOMs during background hydration.
     async def _oom():
         raise MemoryError("simulated OOM")
     subs = [ph.Subsystem("ouroboros_daemon", _oom, label="OuroborosDaemon")]
 
-    app = headless_app.create_headless_app(subsystems=subs, mount_router=False)
+    app = headless_app.create_converged_app(subsystems=subs, mount_router=False, run_selftest=False)
 
     # A stub command endpoint (stands in for the real /api/command — proves
     # the server keeps serving despite the failed hydration).
@@ -99,7 +99,7 @@ def test_asgi_lifespan_oom_server_stays_up_and_serves_200():
     # TestClient runs the FastAPI lifespan (startup schedules hydration).
     with TestClient(app) as client:
         # The app bound + serves instantly even while hydration runs/fails.
-        r_status = client.get("/api/hydration/status")
+        r_status = client.get("/api/system/status")
         assert r_status.status_code == 200
         # The command endpoint is live — server did NOT crash on the OOM.
         r_cmd = client.post("/api/command")
@@ -107,5 +107,5 @@ def test_asgi_lifespan_oom_server_stays_up_and_serves_200():
         assert r_cmd.json()["status"] == "accepted"
         # Give the background hydration a beat, then confirm it degraded.
         import time as _t; _t.sleep(0.3)
-        final = client.get("/api/hydration/status").json()
+        final = client.get("/api/system/status").json()["hydration"]
         assert final["state"] in ("degraded", "hydrating")   # never crashed
