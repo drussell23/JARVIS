@@ -33,7 +33,8 @@ import re
 import threading
 import time
 from collections import deque
-from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Set, Tuple
+from typing import (Any, AsyncIterator, Callable, Deque, Dict, List, Optional,
+                    Set, Tuple)
 
 logger = logging.getLogger("Jarvis.DeviceStream")
 
@@ -221,6 +222,7 @@ class DeviceStreamManager:
         *,
         heartbeat_interval_s: float = 15.0,
         last_event_id: Optional[int] = None,
+        cold_start_frames: Optional[Callable[[], List[str]]] = None,
     ) -> AsyncIterator[str]:
         """Wrap the EXISTING sse_stream generator with device routing,
         Last-Event-ID catch-up replay, and dead-stream pruning.
@@ -231,9 +233,20 @@ class DeviceStreamManager:
         (live frames at/below the replay cursor are skipped). A cursor
         that has fallen out of the buffer emits a single
         ``STATE_RESET`` event. NEVER raises past the generator
-        boundary."""
+        boundary.
+
+        Slice I — SSE Replay Parity: on a COLD BOOT (no ``Last-Event-ID``)
+        or a cursor-expired ``STATE_RESET``, the frame ring only holds what
+        flowed while a client was attached — the critical DAG-hydration
+        lifecycle fired at boot before any HUD connected. So ``cold_start_frames``
+        (the TrinityEventBus ``get_replay_snapshot()`` history, formatted as
+        HUD daemon frames) is flushed to reconcile state BEFORE live — exact
+        parity with the UDS bridge. These reconciliation frames carry no
+        ``id:`` (idempotent in the HUD state machine) so they never perturb
+        the Last-Event-ID cursor."""
         self.register(device_id)
         replay_cursor = -1
+        need_cold_flush = (last_event_id is None)   # fresh client → full state
         # ---- Seamless Network Handoff: catch-up replay (mandate 2) ----
         if last_event_id is not None:
             frames, too_old = self._rehydration.replay_after(last_event_id)
@@ -248,6 +261,7 @@ class DeviceStreamManager:
                                      "last_event_id": last_event_id})
                        + "\n\n")
                 replay_cursor = last_event_id
+                need_cold_flush = True             # cursor gone → full reconcile
             else:
                 for f in frames:
                     self.stats["replayed_frames"] += 1
@@ -256,6 +270,17 @@ class DeviceStreamManager:
                         replay_cursor = max(replay_cursor, seq)
                     self.beat(device_id)
                     yield f
+        # ---- Slice I: cold-boot / cursor-expired state reconciliation from
+        #      the TrinityEventBus replay buffer (parity with the UDS bridge) --
+        if need_cold_flush and cold_start_frames is not None:
+            try:
+                cold = cold_start_frames() or []
+            except Exception:  # noqa: BLE001 — never break the stream on it
+                cold = []
+            for f in cold:
+                self.stats["replayed_frames"] += 1
+                self.beat(device_id)
+                yield f
         # Background pump: drain the inner stream into a queue so a
         # heartbeat-window timeout NEVER cancels the inner generator
         # (cancelling it repeatedly would corrupt it — the root cause

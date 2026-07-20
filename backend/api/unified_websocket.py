@@ -3155,8 +3155,33 @@ async def event_stream_device(device_id: str, request: Request):
         except (TypeError, ValueError):
             _leid = None
 
+    # Slice I — SSE Replay Parity: on a cold boot / cursor-expired reconnect,
+    # reconcile the fresh HUD from the TrinityEventBus critical-telemetry
+    # history (DAG hydration / faults / failover) that fired BEFORE any client
+    # connected. DRY: reuse GovernanceSSEBridge._render (the live lifecycle→
+    # daemon-frame formatter the Swift SystemStatusStore already decodes) +
+    # get_replay_snapshot() + the canonical render_jarviskit_frame. Emitted
+    # WITHOUT an id: line so these idempotent reconciliation frames never move
+    # the Last-Event-ID cursor.
+    def _bus_lifecycle_frames() -> list:
+        try:
+            from backend.core.trinity_event_bus import get_event_bus_if_exists
+            from backend.api.governance_sse_bridge import GovernanceSSEBridge
+            from backend.api.sse_contract import render_jarviskit_frame
+            bus = get_event_bus_if_exists()
+            if bus is None:
+                return []
+            frames = []
+            for e in bus.get_replay_snapshot():
+                payload = GovernanceSSEBridge._render(e)
+                frames.append(render_jarviskit_frame(None, "daemon", payload))
+            return frames
+        except Exception:  # noqa: BLE001 — never block the stream on it
+            return []
+
     return StreamingResponse(
-        manager.device_stream(str(device_id), inner, last_event_id=_leid),
+        manager.device_stream(str(device_id), inner, last_event_id=_leid,
+                              cold_start_frames=_bus_lifecycle_frames),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
