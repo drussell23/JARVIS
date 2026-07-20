@@ -84,7 +84,7 @@ huggingface-hub>=0.19.4  # For Claude API integration
 
 # Voice Activity & Wake Word Detection
 webrtcvad>=2.0.10  # Voice activity detection
-pvporcupine>=3.0.0  # Wake word detection (requires PICOVOICE_ACCESS_KEY)
+pvporcupine>=4.0.3  # Wake word detection (requires PICOVOICE_ACCESS_KEY)
 
 # Schema Validation
 jsonschema>=4.20.0  # JSON schema validation for config and API
