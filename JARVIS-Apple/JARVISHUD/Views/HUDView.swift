@@ -47,6 +47,9 @@ struct HUDView: View {
     @State private var currentTranscript: String = ""  // Real-time voice transcript
     @State private var showScreenLockAnimation: Bool = false  // Screen lock animation overlay
     @State private var screenLockCountdown: Int = 3  // Countdown timer for screen lock
+    /// The countdown as a MainActor-native structured task (no run-loop timer,
+    /// no assumeIsolated); cancelled on re-trigger and on view disappear.
+    @State private var screenLockTask: Task<Void, Never>?
     @State private var showVisionPrompt: Bool = false  // Vision command prompt
     @State private var visionCommandText: String = ""  // Vision command input
     @State private var visionAnalyzing: Bool = false  // Vision analysis in progress
@@ -240,6 +243,10 @@ struct HUDView: View {
                 triggerScreenLockAnimation()
             }
         }
+        .onDisappear {
+            screenLockTask?.cancel()
+            screenLockTask = nil
+        }
     }
 
     private func triggerScreenLockAnimation() {
@@ -247,30 +254,29 @@ struct HUDView: View {
             showScreenLockAnimation = true
         }
 
-        // Start countdown timer
+        // Countdown as a MainActor-native structured task: the state mutation
+        // is isolation-correct BY CONSTRUCTION (no run-loop timer, no
+        // assumeIsolated assertion). Cancellation (re-trigger / disappear) ends
+        // it deterministically via the thrown CancellationError from sleep.
         screenLockCountdown = 3
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
-            // The timer fires on the main run loop it was scheduled on, so the
-            // MainActor-isolated view state is safe to touch synchronously.
-            // Return a Sendable flag so the non-Sendable `timer` never crosses
-            // the isolation boundary.
-            let expired = MainActor.assumeIsolated { () -> Bool in
-                if screenLockCountdown > 0 {
-                    screenLockCountdown -= 1
-                    return false
+        screenLockTask?.cancel()
+        screenLockTask = Task { @MainActor in
+            while screenLockCountdown > 0 {
+                do {
+                    try await Task.sleep(for: .seconds(1))
+                } catch {
+                    return   // cancelled
                 }
-                return true
+                screenLockCountdown -= 1
             }
-            if expired {
-                timer.invalidate()
-                // Hide animation after the countdown — native concurrency,
-                // no DispatchQueue.
-                Task { @MainActor in
-                    try? await Task.sleep(for: .seconds(0.5))
-                    withAnimation(.easeOut(duration: 0.5)) {
-                        showScreenLockAnimation = false
-                    }
-                }
+            // Hide the animation after the countdown.
+            do {
+                try await Task.sleep(for: .seconds(0.5))
+            } catch {
+                return
+            }
+            withAnimation(.easeOut(duration: 0.5)) {
+                showScreenLockAnimation = false
             }
         }
     }
