@@ -55,4 +55,4 @@ pytest-metadata==3.1.1
 anyio==4.12.0
 redis>=4.2.0             # cost_tracker streaming (inert without a server)
 fastapi==0.124.2         # MCP HTTP transport (guarded)
-uvicorn==0.38.0          # telemetry broker (guarded)
+uvicorn==0.51.0          # telemetry broker (guarded)
