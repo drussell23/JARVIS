@@ -92,14 +92,44 @@ async def _start_control_plane(app: Any, orch: Any) -> Any:
             except Exception:  # noqa: BLE001
                 return {}
 
-        bridge = CockpitAttachBridge(status_provider=_snapshot)
+        def _lifecycle_frame(payload: dict) -> dict:
+            """Turn a lifecycle event payload into a control-plane telemetry
+            frame (shared by the live forwarder + the replay flush — DRY)."""
+            frame = {"lifecycle": payload.get("type", ""),
+                     "narration_text": payload.get("narration_text", ""),
+                     **_snapshot()}
+            if payload.get("provider"):
+                frame["provider"] = payload["provider"]
+            return frame
+
+        # Slice H: on connect, flush the bus replay buffer (the critical
+        # telemetry history) to the new cockpit so a LATE attach reconciles the
+        # DAG hydration + failover history, not just the current snapshot.
+        def _replay_frames() -> list:
+            try:
+                from backend.core.trinity_event_bus import get_event_bus_if_exists
+                b = get_event_bus_if_exists()
+                if b is None:
+                    return []
+                out = []
+                for e in b.get_replay_snapshot():
+                    p = getattr(e, "payload", None) or {}
+                    if isinstance(p, dict):
+                        out.append({"type": "telemetry", "replay": True,
+                                    **_lifecycle_frame(p)})
+                return out
+            except Exception:  # noqa: BLE001
+                return []
+
+        bridge = CockpitAttachBridge(status_provider=_snapshot,
+                                     replay_provider=_replay_frames)
         started = await bridge.start()
         if not started:
             return None
         app.state.control_plane = bridge
 
-        # Forward lifecycle telemetry (the exact frames the HUD reacts to) to
-        # every attached ov-system cockpit. No new protocol (mandate 3).
+        # Forward LIVE lifecycle telemetry (the exact frames the HUD reacts to)
+        # to every attached ov-system cockpit. No new protocol (mandate 3).
         try:
             from backend.core.trinity_event_bus import get_event_bus_if_exists
             bus = get_event_bus_if_exists()
@@ -109,12 +139,7 @@ async def _start_control_plane(app: Any, orch: Any) -> Any:
                         payload = getattr(event, "payload", None) or {}
                         if not isinstance(payload, dict):
                             return
-                        frame = {"lifecycle": payload.get("type", ""),
-                                 "narration_text": payload.get("narration_text", ""),
-                                 **_snapshot()}
-                        if payload.get("provider"):
-                            frame["provider"] = payload["provider"]
-                        bridge.publish_telemetry(frame)
+                        bridge.publish_telemetry(_lifecycle_frame(payload))
                     except Exception:  # noqa: BLE001
                         pass
                 for topic in ("ouroboros.hydration", "ouroboros.system",

@@ -116,6 +116,7 @@ class CockpitAttachBridge:
         status_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         ops_provider: Optional[Callable[[], Any]] = None,
         liquidity_provider: Optional[Callable[[], Dict[str, Any]]] = None,
+        replay_provider: Optional[Callable[[], Any]] = None,
         on_input: Optional[Callable[[str], None]] = None,
         on_audio: Optional[Callable[[str], None]] = None,
         path: Optional[Path] = None,
@@ -123,6 +124,10 @@ class CockpitAttachBridge:
         self._status = status_provider or (lambda: {})
         self._ops = ops_provider or (lambda: [])
         self._liquidity = liquidity_provider or (lambda: {})
+        # Slice H: zero-authority pull of the TrinityEventBus replay buffer —
+        # the chronological critical telemetry flushed to a client on connect
+        # so a late attach reconciles the DAG history, not just the snapshot.
+        self._replay = replay_provider or (lambda: [])
         self._on_input = on_input or (lambda _t: None)
         self._on_audio = on_audio or (lambda _c: None)
         self._path = Path(path) if path is not None else attach_socket_path()
@@ -337,6 +342,19 @@ class CockpitAttachBridge:
             ).encode()
             writer.write(hydration)
             await writer.drain()
+            # Slice H — Atomic State Flush: yield the buffered critical
+            # telemetry history to THIS client BEFORE it joins the live
+            # broadcast set, so historical always precedes live (no interleave).
+            try:
+                for frame in (self._replay() or []):
+                    writer.write((json.dumps(frame, separators=(",", ":"))
+                                  + "\n").encode())
+                await writer.drain()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self._drop(writer)
+                return
+            except Exception:  # noqa: BLE001
+                pass
             self._clients.add(writer)
             self.stats["connects"] += 1
             logger.info(

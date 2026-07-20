@@ -356,6 +356,17 @@ class Subscription:
     created_at: datetime = field(default_factory=datetime.now)
     active: bool = True
 
+    # --- Slice H: Temporal Replay Buffer (state reconciliation) ---
+    #: While True the subscriber is being reconciled from the replay buffer —
+    #: live events are HELD in ``pending_live`` so historical always precedes
+    #: live (atomic state flush). Flipped False once reconciliation completes.
+    priming: bool = False
+    #: Live events that arrived mid-reconciliation, drained after the flush.
+    pending_live: List[TrinityEvent] = field(default_factory=list)
+    #: event_ids already delivered via replay — so a live re-delivery of the
+    #: same event during the hand-off window is suppressed (exactly-once).
+    replayed_ids: Set[str] = field(default_factory=set)
+
     def matches(self, topic: str) -> bool:
         """Check if topic matches pattern."""
         # Convert MQTT-style wildcards to regex
@@ -866,6 +877,28 @@ class TrinityEventBus:
         # Dead letter queue
         self._dlq: Deque[TrinityEvent] = deque(maxlen=1000)
 
+        # --- Slice H: Temporal Replay Buffer (in-memory state reconciliation) ---
+        # A bounded ring of the most-recent CRITICAL telemetry (DAG hydration,
+        # Ouroboros faults, failover states) so a client (ov panel / HUD) that
+        # attaches long after hydration is reconciled instantly — no disk, no
+        # SQLite (mandate 1). Every publisher inherits this automatically since
+        # the append lives inside publish() (mandate 3).
+        try:
+            _replay_max = max(1, int(os.environ.get("JARVIS_EVENT_REPLAY_MAXLEN", "150")))
+        except (TypeError, ValueError):
+            _replay_max = 150
+        self._replay_buffer: Deque[TrinityEvent] = deque(maxlen=_replay_max)
+        self._replay_lock = asyncio.Lock()
+        # Prefixes of the critical telemetry to cache. Env-overridable
+        # (comma-separated) — no hardcoding.
+        _default_prefixes = ("ouroboros.hydration", "ouroboros.system",
+                             "ouroboros.fault", "ouroboros.selftest",
+                             "ouroboros.recovery")
+        _raw_prefixes = os.environ.get("JARVIS_EVENT_REPLAY_TOPICS", "").strip()
+        self._replay_prefixes: Tuple[str, ...] = tuple(
+            p.strip() for p in _raw_prefixes.split(",") if p.strip()
+        ) or _default_prefixes
+
         # Components
         self._store = EventStore()
         self._transport = CrossRepoTransport(local_repo)
@@ -985,6 +1018,12 @@ class TrinityEventBus:
         if persist:
             await self._store.append(event)
 
+        # Slice H: cache CRITICAL telemetry in the in-memory replay ring so a
+        # late-attaching subscriber can reconcile state. deque.append is atomic;
+        # chronological order is preserved by append order.
+        if self._is_replay_eligible(event.topic):
+            self._replay_buffer.append(event)
+
         # Add to local queue
         queue = self._queues[event.priority]
         try:
@@ -1083,12 +1122,62 @@ class TrinityEventBus:
             priority_filter=priority_filter,
         )
 
+        # Slice H — Atomic State Flush: snapshot the matching replay events and
+        # register the subscription as PRIMING under the SAME lock, so no live
+        # event can be delivered to it until reconciliation completes. Handlers
+        # are executed OUTSIDE the lock (matching _deliver_event discipline —
+        # never await a handler while holding _subscription_lock).
         async with self._subscription_lock:
+            replay: List[TrinityEvent] = [
+                e for e in self._replay_buffer
+                if sub.matches(e.topic)
+                and (sub.source_filter is None or sub.source_filter == e.source)
+                and (sub.priority_filter is None or sub.priority_filter == e.priority)
+            ]
+            if replay:
+                sub.priming = True
+                sub.replayed_ids = {e.event_id for e in replay}
             self._subscriptions.append(sub)
             self._metrics.active_subscriptions = len(self._subscriptions)
 
-        logger.debug(f"[TrinityEventBus] Subscribed to '{pattern}' (id={sub.subscription_id[:8]})")
+        # Flush the historical events in chronological order (the deque is
+        # append-ordered) BEFORE any live event reaches the handler.
+        if replay:
+            for e in replay:
+                await self._execute_handler(sub, e)
+            # Reconciliation done — drain any live events that arrived while
+            # priming (held by _deliver_event), then open the live flow.
+            async with self._subscription_lock:
+                pending = sub.pending_live
+                sub.pending_live = []
+                sub.priming = False
+            for e in pending:
+                if e.event_id in sub.replayed_ids:
+                    sub.replayed_ids.discard(e.event_id)   # already replayed
+                    continue
+                await self._execute_handler(sub, e)
+            sub.replayed_ids.clear()
+
+        logger.debug(f"[TrinityEventBus] Subscribed to '{pattern}' (id={sub.subscription_id[:8]})"
+                     f"{f' + reconciled {len(replay)} events' if replay else ''}")
         return sub.subscription_id
+
+    def _is_replay_eligible(self, topic: str) -> bool:
+        """Is ``topic`` critical telemetry worth caching for state
+        reconciliation (DAG hydration / Ouroboros faults / failover)?"""
+        return any(topic.startswith(p) for p in self._replay_prefixes)
+
+    def get_replay_snapshot(self, prefix: Optional[str] = None) -> List[TrinityEvent]:
+        """Chronological snapshot of the buffered critical telemetry (Slice H).
+        Used by the UDS / SSE attach layer to flush history to a late-joining
+        client. ``list(deque)`` is an atomic snapshot. NEVER raises."""
+        try:
+            snap = list(self._replay_buffer)
+        except Exception:  # noqa: BLE001
+            return []
+        if prefix:
+            snap = [e for e in snap if e.topic.startswith(prefix)]
+        return snap
 
     async def unsubscribe(self, subscription_id: str) -> bool:
         """Unsubscribe by ID."""
@@ -1235,12 +1324,23 @@ class TrinityEventBus:
     async def _deliver_event(self, event: TrinityEvent) -> None:
         """Deliver event to matching subscribers."""
         async with self._subscription_lock:
-            matching = [
-                sub for sub in self._subscriptions
-                if sub.active and sub.matches(event.topic)
-                and (sub.source_filter is None or sub.source_filter == event.source)
-                and (sub.priority_filter is None or sub.priority_filter == event.priority)
-            ]
+            matching = []
+            for sub in self._subscriptions:
+                if not (sub.active and sub.matches(event.topic)
+                        and (sub.source_filter is None or sub.source_filter == event.source)
+                        and (sub.priority_filter is None or sub.priority_filter == event.priority)):
+                    continue
+                # Slice H: a subscriber still reconciling from the replay buffer
+                # HOLDS live events until its flush completes — historical is
+                # always delivered before live. Suppress a live re-delivery of
+                # an event already replayed to this sub (exactly-once hand-off).
+                if sub.priming:
+                    sub.pending_live.append(event)
+                    continue
+                if event.event_id in sub.replayed_ids:
+                    sub.replayed_ids.discard(event.event_id)
+                    continue
+                matching.append(sub)
 
         # Check if this is a response to a pending request
         request_id = event.metadata.get("request_id")
