@@ -122,7 +122,11 @@ class JARVISPanel: NSPanel {
             self.animator().setFrame(offscreenFrame, display: true)
             self.animator().alphaValue = 0
         }, completionHandler: {
-            self.orderOut(nil)
+            // AppKit animation completion is delivered on the main thread; assume
+            // MainActor isolation to call the isolated NSWindow API synchronously.
+            MainActor.assumeIsolated {
+                self.orderOut(nil)
+            }
         })
     }
 

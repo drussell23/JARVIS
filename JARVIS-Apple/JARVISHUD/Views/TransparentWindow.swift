@@ -77,7 +77,12 @@ class TransparentWindow: NSWindow {
             context.duration = 0.3
             self.animator().alphaValue = 0.0
         }, completionHandler: {
-            self.orderOut(nil)
+            // The AppKit animation completion handler is delivered on the main
+            // thread; assume the MainActor isolation to call the isolated
+            // NSWindow API synchronously (native concurrency — no DispatchQueue).
+            MainActor.assumeIsolated {
+                self.orderOut(nil)
+            }
         })
     }
 }

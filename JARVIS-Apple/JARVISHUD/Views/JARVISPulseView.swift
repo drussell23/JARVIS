@@ -67,7 +67,7 @@ struct JARVISPulseView: View {
                 startPulseAnimation()
             }
         }
-        .onChange(of: isActive) { newValue in
+        .onChange(of: isActive) { _, newValue in
             if newValue {
                 startPulseAnimation()
             } else {
