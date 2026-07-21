@@ -7,8 +7,6 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		0388804F72E33D93A46133CD /* HiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AA0EEB915FE35B80EF20332 /* HiveView.swift */; };
-		06D502DFC999554F266755F0 /* HiveModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBDC348AD32CAABD24231398 /* HiveModels.swift */; };
 		08C77D9CDE005FF673F81A84 /* ActiveCommandView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 34F82AD2C9BC90F1C2C04004 /* ActiveCommandView.swift */; };
 		18B2C64EE92544B8575B5EEC /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4784C00A28BAB42B47C1A4F1 /* AppState.swift */; };
 		2522BF54B9B8951CD6B796B7 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2445A32150108499C49E55C8 /* Assets.xcassets */; };
@@ -20,20 +18,15 @@
 		6A6DE9BC09C7393AC5D3BFDA /* JARVISHUDApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F9345DF8825258B0773BAA5 /* JARVISHUDApp.swift */; };
 		787D831FBA5AA3338F9BC38C /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E75506CB26E637E4674ED069 /* PairingView.swift */; };
 		7E167813DA477376FA50A02A /* WakeWordListener.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62C68475EAAD735E3FB66AAE /* WakeWordListener.swift */; };
-		7E79E5BB0EEEF7212B45B901 /* ThreadStateBadge.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB10F7569E5FD59E870789E2 /* ThreadStateBadge.swift */; };
-		7FE1D191F843B69BAC681AA5 /* HiveMessageRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65BEAB93C18B642877CB83C9 /* HiveMessageRow.swift */; };
 		8343F8E9601E5B1F4058448D /* TransparentWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F2D54D7706047B14362D0D6 /* TransparentWindow.swift */; };
 		8870023BBC6B975AB2B4A378 /* StatusView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 853E0D7E9218220610520FB8 /* StatusView.swift */; };
 		8CA64BEF2D84BA9055DCC700 /* JARVISPulseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15DC284C7811731206FA7AF5 /* JARVISPulseView.swift */; };
-		9309C6591D76A7857900908B /* HiveThreadCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3DD3D29E041FE7A95F16A2DD /* HiveThreadCard.swift */; };
 		95909137A4CE7F24654D6776 /* JARVISKit in Frameworks */ = {isa = PBXBuildFile; productRef = 31F47BC187C21A0EAA566686 /* JARVISKit */; };
 		9675A57D67D07E9D157B8468 /* JARVISPhoneApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 698E4531C1F4FD5A0215C9B1 /* JARVISPhoneApp.swift */; };
 		993234F1A4D7A1BCA27374BB /* BrainstemLauncher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6A777442955E499D4E22D3B /* BrainstemLauncher.swift */; };
 		99C3D3109F5801D5ED6F638A /* HapticEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 266CC1C8FBBB302AD623A3D9 /* HapticEngine.swift */; };
 		9FC588C57049591237CF032F /* HUDView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A0A5C4460F31FD5CB53DD10 /* HUDView.swift */; };
 		A0BD7790CE0BF3EDAC6D6372 /* ArcReactorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26744ECD2240E57AF517188D /* ArcReactorView.swift */; };
-		A36CA2D04B6BBCDFEA2D173E /* HiveStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53029485E893544085E69B43 /* HiveStore.swift */; };
-		A63B5E1267F63190B03CBC6F /* CognitiveStateBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37EC52A931B080037F0A8B22 /* CognitiveStateBar.swift */; };
 		ADEA3EDEC8E9800EB2E4B351 /* JARVISKit in Frameworks */ = {isa = PBXBuildFile; productRef = 15EECA930D551D91AC5C18B4 /* JARVISKit */; };
 		B382A284A476CA2ACA805D56 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4A8BD3E8642F43ADBDD9BB1 /* SettingsView.swift */; };
 		D3F64926FE39007A1202CB78 /* ScreenCaptureService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F97771D9894460348ABB0ED /* ScreenCaptureService.swift */; };
@@ -54,14 +47,10 @@
 		26744ECD2240E57AF517188D /* ArcReactorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArcReactorView.swift; sourceTree = "<group>"; };
 		34F82AD2C9BC90F1C2C04004 /* ActiveCommandView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActiveCommandView.swift; sourceTree = "<group>"; };
 		363CFA575B249D1A15B71B0E /* PRQueueView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PRQueueView.swift; sourceTree = "<group>"; };
-		37EC52A931B080037F0A8B22 /* CognitiveStateBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CognitiveStateBar.swift; sourceTree = "<group>"; };
-		3DD3D29E041FE7A95F16A2DD /* HiveThreadCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HiveThreadCard.swift; sourceTree = "<group>"; };
 		419C0FA1835D967E34A0FA5F /* CommandInputView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandInputView.swift; sourceTree = "<group>"; };
 		4784C00A28BAB42B47C1A4F1 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		496ADA6BEACAC0F28324C87E /* JARVISWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JARVISWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		53029485E893544085E69B43 /* HiveStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HiveStore.swift; sourceTree = "<group>"; };
 		62C68475EAAD735E3FB66AAE /* WakeWordListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WakeWordListener.swift; sourceTree = "<group>"; };
-		65BEAB93C18B642877CB83C9 /* HiveMessageRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HiveMessageRow.swift; sourceTree = "<group>"; };
 		698E4531C1F4FD5A0215C9B1 /* JARVISPhoneApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISPhoneApp.swift; sourceTree = "<group>"; };
 		6A73D85D2FBC6659D4A47810 /* JARVISHUD.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JARVISHUD.entitlements; sourceTree = "<group>"; };
 		7A0A5C4460F31FD5CB53DD10 /* HUDView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HUDView.swift; sourceTree = "<group>"; };
@@ -70,7 +59,6 @@
 		7F97771D9894460348ABB0ED /* ScreenCaptureService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureService.swift; sourceTree = "<group>"; };
 		853E0D7E9218220610520FB8 /* StatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusView.swift; sourceTree = "<group>"; };
 		899F7DC5BF2FA227AA8CEA81 /* LivingBorderWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LivingBorderWindow.swift; sourceTree = "<group>"; };
-		9AA0EEB915FE35B80EF20332 /* HiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HiveView.swift; sourceTree = "<group>"; };
 		A6A777442955E499D4E22D3B /* BrainstemLauncher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrainstemLauncher.swift; sourceTree = "<group>"; };
 		AF2D1789D766C67E4B4A3D2A /* JARVISHUD.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JARVISHUD.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B91850E89902256710524BEA /* LoadingHUDView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadingHUDView.swift; sourceTree = "<group>"; };
@@ -82,9 +70,7 @@
 		DD88BEB46021CA8E341A9460 /* JARVISWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISWatchApp.swift; sourceTree = "<group>"; };
 		E4A8BD3E8642F43ADBDD9BB1 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		E75506CB26E637E4674ED069 /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingView.swift; sourceTree = "<group>"; };
-		EBDC348AD32CAABD24231398 /* HiveModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HiveModels.swift; sourceTree = "<group>"; };
 		F9DDA2DD8564AAF0325735CC /* WatchSessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSessionManager.swift; sourceTree = "<group>"; };
-		FB10F7569E5FD59E870789E2 /* ThreadStateBadge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadStateBadge.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -142,17 +128,12 @@
 			isa = PBXGroup;
 			children = (
 				26744ECD2240E57AF517188D /* ArcReactorView.swift */,
-				37EC52A931B080037F0A8B22 /* CognitiveStateBar.swift */,
 				BE156A6B63F5362F9FD12522 /* CompactHeaderBar.swift */,
-				65BEAB93C18B642877CB83C9 /* HiveMessageRow.swift */,
-				3DD3D29E041FE7A95F16A2DD /* HiveThreadCard.swift */,
-				9AA0EEB915FE35B80EF20332 /* HiveView.swift */,
 				7A0A5C4460F31FD5CB53DD10 /* HUDView.swift */,
 				BD8C21EBA8B80C1A39D30C8A /* JARVISPanel.swift */,
 				15DC284C7811731206FA7AF5 /* JARVISPulseView.swift */,
 				899F7DC5BF2FA227AA8CEA81 /* LivingBorderWindow.swift */,
 				B91850E89902256710524BEA /* LoadingHUDView.swift */,
-				FB10F7569E5FD59E870789E2 /* ThreadStateBadge.swift */,
 				7F2D54D7706047B14362D0D6 /* TransparentWindow.swift */,
 			);
 			path = Views;
@@ -184,7 +165,6 @@
 			children = (
 				4784C00A28BAB42B47C1A4F1 /* AppState.swift */,
 				A6A777442955E499D4E22D3B /* BrainstemLauncher.swift */,
-				53029485E893544085E69B43 /* HiveStore.swift */,
 				7F97771D9894460348ABB0ED /* ScreenCaptureService.swift */,
 				62C68475EAAD735E3FB66AAE /* WakeWordListener.swift */,
 			);
@@ -212,7 +192,6 @@
 		60EB61052FAABA85FE48EEDA /* Models */ = {
 			isa = PBXGroup;
 			children = (
-				EBDC348AD32CAABD24231398 /* HiveModels.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -426,14 +405,8 @@
 				18B2C64EE92544B8575B5EEC /* AppState.swift in Sources */,
 				A0BD7790CE0BF3EDAC6D6372 /* ArcReactorView.swift in Sources */,
 				993234F1A4D7A1BCA27374BB /* BrainstemLauncher.swift in Sources */,
-				A63B5E1267F63190B03CBC6F /* CognitiveStateBar.swift in Sources */,
 				4E11F20BF61331B7C669DA94 /* CompactHeaderBar.swift in Sources */,
 				9FC588C57049591237CF032F /* HUDView.swift in Sources */,
-				7FE1D191F843B69BAC681AA5 /* HiveMessageRow.swift in Sources */,
-				06D502DFC999554F266755F0 /* HiveModels.swift in Sources */,
-				A36CA2D04B6BBCDFEA2D173E /* HiveStore.swift in Sources */,
-				9309C6591D76A7857900908B /* HiveThreadCard.swift in Sources */,
-				0388804F72E33D93A46133CD /* HiveView.swift in Sources */,
 				DC553908F1A143513C3F8D48 /* JARVISColors.swift in Sources */,
 				6A6DE9BC09C7393AC5D3BFDA /* JARVISHUDApp.swift in Sources */,
 				4F5C877D32A55EC0E8F6F224 /* JARVISPanel.swift in Sources */,
@@ -441,7 +414,6 @@
 				FBBDB0313A52CEA7D67AFF62 /* LivingBorderWindow.swift in Sources */,
 				F2372C4356B52F4C5EE16B1C /* LoadingHUDView.swift in Sources */,
 				D3F64926FE39007A1202CB78 /* ScreenCaptureService.swift in Sources */,
-				7E79E5BB0EEEF7212B45B901 /* ThreadStateBadge.swift in Sources */,
 				8343F8E9601E5B1F4058448D /* TransparentWindow.swift in Sources */,
 				7E167813DA477376FA50A02A /* WakeWordListener.swift in Sources */,
 			);

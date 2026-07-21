@@ -10,10 +10,12 @@ import SwiftUI
 
 // HUDState and TranscriptMessage are defined in AppState.swift
 
-/// Tab selection for the main HUD content area
+/// Tab selection for the main HUD content area.
+/// The Hive tab moved to the `ov` developer cockpit (`ov hive`) — the HUD
+/// stays user↔JARVIS. The header Picker renders only when >1 case exists,
+/// so adding a future tab here restores the segmented control automatically.
 enum HUDTab: String, CaseIterable {
     case chat = "Chat"
-    case hive = "Hive"
 }
 
 /// Voice interaction state
@@ -55,7 +57,6 @@ struct HUDView: View {
     @State private var visionAnalyzing: Bool = false  // Vision analysis in progress
     @State private var visionResult: String? = nil  // Last vision result
     @State private var hudTab: HUDTab = .chat  // Segmented tab selection
-    var hiveStore: HiveStore  // Hive event store (injected from App)
 
     // Use shared PythonBridge from AppState (persisted from LoadingHUDView)
     @EnvironmentObject var appState: AppState
@@ -173,11 +174,6 @@ struct HUDView: View {
                     )
                     .padding(.horizontal, 20)
                     .padding(.bottom, 16)
-                } else {
-                    HiveView(hiveStore: hiveStore)
-                        .layoutPriority(1)
-                        .padding(.horizontal, 20)
-                        .padding(.bottom, 16)
                 }
             }
 
@@ -747,5 +743,5 @@ struct VisionCommandPrompt: View {
 }
 
 #Preview {
-    HUDView(hiveStore: HiveStore())
+    HUDView()
 }

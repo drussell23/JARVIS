@@ -1,6 +1,6 @@
 // JARVISHUD/Views/JARVISPanel.swift
 // The JARVIS Panel — slides in from the right when summoned.
-// Contains all SwiftUI content: header, tabs, chat, hive, command input.
+// Contains all SwiftUI content: header, chat, command input.
 // Frosted glass via NSVisualEffectView. Standard NSPanel behavior.
 
 import AppKit
