@@ -588,6 +588,58 @@ def _attribution_test_only_notify_floor(
     return risk_tier, advisory
 
 
+# Targeted Locality Bounding / Epistemic Humility (2026-07-21) —
+# companion to the two attribution floors above, wired at the SAME two
+# GATE call sites (gate_runner is the shipping path). When the
+# OperationAdvisor's blast-radius scan resolved to provenance=unknown
+# at CLASSIFY (global budget exhausted on a cold cache AND the bounded
+# localized fallback could not resolve — bt-2026-07-21-205755), the
+# advisor recorded an escalation in the advisor_locality epistemic
+# ledger instead of fabricating blast=50. This floor converts that
+# recorded uncertainty into a NOTIFY_APPLY minimum: the op stays
+# appealable (operator-visible diff + delay), never silently green,
+# never blocked on data nobody collected. Stricter-wins; never
+# downgrades; fail-soft.
+def _advisor_epistemic_notify_floor(
+    ctx: Any,
+    risk_tier: RiskTier,
+) -> Tuple[RiskTier, Optional[str]]:
+    """Floor an epistemically-uncertain op at NOTIFY_APPLY.
+
+    Reads the advisor_locality epistemic ledger (non-destructive so
+    both GATE twins + GENERATE retries observe the same state). Gated
+    by ``JARVIS_ADVISOR_EPISTEMIC_NOTIFY_ENABLED`` (default TRUE).
+    Returns ``(possibly-escalated tier, note|None)`` — the note is
+    non-None whenever the ledger carries an escalation, even if the
+    tier was already strict enough (caller logs for visibility).
+    """
+    try:
+        from backend.core.ouroboros.governance.advisor_locality import (
+            ESCALATION_NOTIFY_APPLY,
+            epistemic_notify_enabled,
+            peek_blast_epistemics,
+        )
+        if not epistemic_notify_enabled():
+            return risk_tier, None
+        rec = peek_blast_epistemics(getattr(ctx, "op_id", "") or "")
+    except Exception:  # noqa: BLE001 — floor is protective, never fatal
+        return risk_tier, None
+    if not rec or rec.get("escalation") != ESCALATION_NOTIFY_APPLY:
+        return risk_tier, None
+    if risk_tier.value < RiskTier.NOTIFY_APPLY.value:
+        return (
+            RiskTier.NOTIFY_APPLY,
+            "advisor_epistemic: blast radius UNKNOWN at CLASSIFY "
+            "(cold-cache scans unresolved) — floored at NOTIFY_APPLY "
+            "for operator visibility",
+        )
+    return (
+        risk_tier,
+        "advisor_epistemic: blast radius UNKNOWN at CLASSIFY "
+        "(tier already >= NOTIFY_APPLY; no change)",
+    )
+
+
 # Contiguous, grep-discoverable terminal reason marker (single
 # source — referenced by the breaker's ctx.advance + ledger payload;
 # never split across string-concat lines so log/forensic greps and
@@ -9457,6 +9509,19 @@ class GovernedOrchestrator:
                         logger.info(
                             "[Attribution] notify: %s op=%s",
                             _attr_test_only, ctx.op_id,
+                        )
+
+                    # Epistemic Humility floor (inline twin; shipping
+                    # path is gate_runner). An op whose blast radius
+                    # resolved to provenance=unknown at CLASSIFY is
+                    # floored at NOTIFY_APPLY — uncertainty surfaces
+                    # to the operator, never a silent green. Fail-soft.
+                    risk_tier, _epi_note = _advisor_epistemic_notify_floor(
+                        ctx, risk_tier,
+                    )
+                    if _epi_note:
+                        logger.info(
+                            "[Advisor] gate: %s op=%s", _epi_note, ctx.op_id,
                         )
 
                     # Stable structured line — always emitted. Fields are

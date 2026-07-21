@@ -470,15 +470,19 @@ async def test_advise_async_dispatches_to_dedicated_executor(
     (tmp_path / "a.py").write_text("import x\n")
     advisor = OperationAdvisor(tmp_path)
 
-    # Monkey-patch _compute_blast_radius to record the thread name
+    # Monkey-patch _compute_blast_radius_ex (the primary scan seam
+    # since the Targeted Locality Bounding repair, 2026-07-21 — the
+    # count-only _compute_blast_radius is now a thin back-compat
+    # wrapper advise() no longer routes through) to record the
+    # thread name.
     captured = {}
-    original = advisor._compute_blast_radius
+    original = advisor._compute_blast_radius_ex
 
     def _spy(*args, **kwargs):
         captured["thread_name"] = threading.current_thread().name
         return original(*args, **kwargs)
 
-    advisor._compute_blast_radius = _spy  # type: ignore[method-assign]
+    advisor._compute_blast_radius_ex = _spy  # type: ignore[method-assign]
     await advisor.advise_async(("x.py",), "test", "op-test")
 
     assert "thread_name" in captured

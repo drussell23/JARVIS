@@ -580,13 +580,14 @@ class TestASTPins:
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.AsyncFunctionDef)
-                and node.name == "_compute_blast_radius_async"
+                and node.name == "_compute_blast_radius_async_ex"
             ):
                 target_fn = node
                 break
         assert target_fn is not None, (
-            "_compute_blast_radius_async missing — Slice 12S core "
-            "method was renamed/removed"
+            "_compute_blast_radius_async_ex missing — Slice 12S core "
+            "method (primary scan seam since the Targeted Locality "
+            "Bounding repair, 2026-07-21) was renamed/removed"
         )
         # Look for the call inside the function body.
         found = False
@@ -631,7 +632,7 @@ class TestASTPins:
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.AsyncFunctionDef)
-                and node.name == "_compute_blast_radius_async"
+                and node.name == "_compute_blast_radius_async_ex"
             ):
                 target_fn = node
                 break

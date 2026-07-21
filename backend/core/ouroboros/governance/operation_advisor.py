@@ -30,6 +30,28 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Targeted Locality Bounding + Epistemic Humility (2026-07-21) — the
+# degraded-scan strategy layer. Owns the provenance vocabulary, the
+# O(K) neighborhood derivation (reusing reverse_dep_resolver's
+# canonical import extractor — no duplicated graph logic), the
+# cold-root memo, and the epistemic ledger the GATE NOTIFY_APPLY
+# floor consumes. No import cycle: advisor_locality depends only on
+# bounded_walker + reverse_dep_resolver.
+from backend.core.ouroboros.governance.advisor_locality import (
+    ESCALATION_NOTIFY_APPLY,
+    MEASURED_PROVENANCES,
+    PROVENANCE_LOCAL_LOWER_BOUND,
+    PROVENANCE_MEASURED,
+    PROVENANCE_SYNTHETIC,
+    PROVENANCE_UNKNOWN,
+    derive_locality_roots,
+    is_cold_root,
+    iter_locality_files,
+    locality_bounding_enabled,
+    note_cold_root,
+    record_blast_epistemics,
+)
+
 logger = logging.getLogger(__name__)
 
 # Master enable. JARVIS_OPERATION_ADVISOR_ENABLED is a unified passthrough ALIAS: when explicitly
@@ -93,6 +115,18 @@ _BLAST_RADIUS_CACHE_MAX_ENTRIES: int = int(
 _BLAST_RADIUS_CACHE_SHARED: "Dict[Tuple[frozenset, str], Tuple[float, int]]" = {}
 import threading as _threading  # local alias — keep top-level import block clean
 _BLAST_RADIUS_CACHE_LOCK: "_threading.Lock" = _threading.Lock()
+
+# Targeted Locality Bounding (2026-07-21) — provenance side-store for
+# cached counts. Same key + lock + eviction cadence as the value cache
+# (the value cache's SHAPE is pinned by tests that introspect
+# ``self._blast_radius_cache``, so provenance rides in a sibling dict
+# rather than widening the tuple). Only MEASURED-class results
+# ("measured" / "localized_lower_bound") are ever cached — an
+# epistemically-unknown result is NEVER written (the old code cached
+# the fabricated conservative cap here, poisoning every op on the same
+# key for the TTL; the cold-root memo in ``advisor_locality`` now
+# carries the "this tree is cold" signal instead).
+_BLAST_PROVENANCE_SHARED: "Dict[Tuple[frozenset, str], str]" = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1038,6 +1072,14 @@ class Advisory:
     git_volatility: float = 0.0          # 0.0–1.0 churn hotspot score of the targets
     memory_pressure: str = "ok"          # host RAM headroom level at evaluation time
     safety_plan: List[str] = field(default_factory=list)  # Phase 3 prerequisite de-risk steps
+    # Targeted Locality Bounding (2026-07-21): evidence provenance of
+    # blast_radius — "measured" | "localized_lower_bound" | "unknown" |
+    # "synthetic_cap". "unknown" means BOTH the global and localized
+    # scans failed to resolve; blast_radius is then a NEUTRAL 0 that
+    # contributed no risk factor and can never satisfy a BLOCK
+    # predicate (epistemic humility — the GATE floors such ops at
+    # NOTIFY_APPLY via the advisor_locality epistemic ledger).
+    blast_provenance: str = "measured"
 
     def render_safety_plan(self) -> str:
         """Render the prerequisite safety plan as an advisory clause for the prompt context."""
@@ -1327,8 +1369,17 @@ class OperationAdvisor:
         """
         _advisor_busy_incr()
         try:
-            blast_radius = await self._compute_blast_radius_async(
-                target_files, root=repo_root, scoped_symbols=scoped_symbols,
+            # Targeted Locality Bounding (2026-07-21): the _ex variant
+            # additionally returns evidence provenance. Threading it
+            # through closes a latent Slice 21 Fix B bypass — the old
+            # code injected a budget-exhausted FABRICATED cap without
+            # any synthetic label, so fabricated data could satisfy
+            # the hard-BLOCK predicates measured evidence gates.
+            blast_radius, blast_provenance = (
+                await self._compute_blast_radius_async_ex(
+                    target_files, root=repo_root,
+                    scoped_symbols=scoped_symbols,
+                )
             )
         finally:
             _advisor_busy_decr()
@@ -1340,6 +1391,7 @@ class OperationAdvisor:
             repo_root=repo_root,
             _precomputed_blast_radius=blast_radius,
             scoped_symbols=scoped_symbols,
+            _precomputed_blast_provenance=blast_provenance,
         )
 
     async def _compute_blast_radius_async(
@@ -1349,6 +1401,22 @@ class OperationAdvisor:
         root: Optional[Path] = None,
         scoped_symbols: Tuple[str, ...] = (),
     ) -> int:
+        """Back-compat count-only wrapper around
+        :meth:`_compute_blast_radius_async_ex` (which additionally
+        returns evidence provenance). Same value, same caching, same
+        telemetry."""
+        count, _prov = await self._compute_blast_radius_async_ex(
+            target_files, root=root, scoped_symbols=scoped_symbols,
+        )
+        return count
+
+    async def _compute_blast_radius_async_ex(
+        self,
+        target_files: Tuple[str, ...],
+        *,
+        root: Optional[Path] = None,
+        scoped_symbols: Tuple[str, ...] = (),
+    ) -> Tuple[int, str]:
         """Slice 12S cooperative-async sibling of
         :meth:`_compute_blast_radius`.
 
@@ -1377,7 +1445,7 @@ class OperationAdvisor:
         # in-memory (no disk I/O), so it cannot starve the loop.
         cg = self._maybe_symbol_blast_radius(scoped_symbols)
         if cg is not None:
-            return cg
+            return cg, PROVENANCE_MEASURED
 
         from backend.core.ouroboros.governance.bounded_walker import (  # noqa: E501
             blast_radius_conservative_cap,
@@ -1417,10 +1485,13 @@ class OperationAdvisor:
         now = time.monotonic()
         with _BLAST_RADIUS_CACHE_LOCK:
             cached = _BLAST_RADIUS_CACHE_SHARED.get(cache_key)
+            _cached_prov = _BLAST_PROVENANCE_SHARED.get(
+                cache_key, PROVENANCE_MEASURED,
+            )
         if cached is not None:
             computed_at, result = cached
             if now - computed_at < _BLAST_RADIUS_CACHE_TTL_S:
-                return result
+                return result, _cached_prov
 
         # Oracle-graph shortcut — synchronous, fast, identical to sync.
         if (
@@ -1436,8 +1507,11 @@ class OperationAdvisor:
                         _BLAST_RADIUS_CACHE_SHARED[cache_key] = (
                             now, oracle_count,
                         )
+                        _BLAST_PROVENANCE_SHARED[cache_key] = (
+                            PROVENANCE_MEASURED
+                        )
                         self._evict_blast_radius_cache_if_oversized()
-                    return oracle_count
+                    return oracle_count, PROVENANCE_MEASURED
             except Exception:  # noqa: BLE001 — defensive
                 logger.debug(
                     "[Advisor] Oracle blast query failed for "
@@ -1456,8 +1530,36 @@ class OperationAdvisor:
         if not target_modules:
             with _BLAST_RADIUS_CACHE_LOCK:
                 _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, 0)
+                _BLAST_PROVENANCE_SHARED[cache_key] = PROVENANCE_MEASURED
                 self._evict_blast_radius_cache_if_oversized()
-            return 0
+            return 0, PROVENANCE_MEASURED
+
+        # ── Targeted Locality Bounding — cold-root shortcut ──
+        # A root that recently exhausted a global scan budget is
+        # remembered (advisor_locality cold-root memo, TTL-bounded).
+        # Going straight to the O(K) localized path skips re-paying
+        # the 40s traversal burn the soak observed per cold op.
+        if locality_bounding_enabled() and is_cold_root(scan_root):
+            logger.info(
+                "[Advisor] blast_radius_cold_root_shortcut root=%s — "
+                "skipping global scan (recent budget exhaustion), "
+                "using targeted locality bounding (mode=cooperative_async)",
+                str(scan_root),
+            )
+            local = await self._localized_blast_lower_bound_async(
+                target_files, target_modules, scan_root,
+            )
+            if local is not None:
+                with _BLAST_RADIUS_CACHE_LOCK:
+                    _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, local)
+                    _BLAST_PROVENANCE_SHARED[cache_key] = (
+                        PROVENANCE_LOCAL_LOWER_BOUND
+                    )
+                    self._evict_blast_radius_cache_if_oversized()
+                return local, PROVENANCE_LOCAL_LOWER_BOUND
+            # Localized fallback unresolved on a known-cold tree:
+            # epistemic humility — neutral, uncached, never fabricated.
+            return 0, PROVENANCE_UNKNOWN
 
         # Bounded-scan config — identical to sync path.
         _scan_start = time.monotonic()
@@ -1521,20 +1623,64 @@ class OperationAdvisor:
 
         _elapsed_ms = (time.monotonic() - _scan_start) * 1000.0
         if _budget_exhausted:
+            # Targeted Locality Bounding (2026-07-21) — the global O(N)
+            # scan proved too cold to finish. Remember the root (so the
+            # NEXT op skips straight here), then pivot to the bounded
+            # O(K) localized neighborhood scan instead of fabricating
+            # the conservative cap (bt-2026-07-21-205755: 39-43s burns
+            # then blast=50 presented as measured evidence).
+            note_cold_root(scan_root)
             try:
                 logger.info(
                     "[Advisor] blast_radius_scan_budget_exhausted "
                     "root=%s targets=%d files_examined=%d "
                     "importers_found_partial=%d elapsed_ms=%.1f "
-                    "conservative_cap=%d — returning cap "
-                    "(bias=caution, mode=cooperative_async)",
+                    "conservative_cap=%d — pivoting to targeted "
+                    "locality bounding (mode=cooperative_async)",
                     str(scan_root), len(target_modules),
                     _files_examined, importers, _elapsed_ms,
                     _conservative_cap,
                 )
             except Exception:  # noqa: BLE001
                 pass
+            if locality_bounding_enabled():
+                local = await self._localized_blast_lower_bound_async(
+                    target_files, target_modules, scan_root,
+                    partial_importers=importers,
+                )
+                if local is not None:
+                    with _BLAST_RADIUS_CACHE_LOCK:
+                        _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, local)
+                        _BLAST_PROVENANCE_SHARED[cache_key] = (
+                            PROVENANCE_LOCAL_LOWER_BOUND
+                        )
+                        self._evict_blast_radius_cache_if_oversized()
+                    return local, PROVENANCE_LOCAL_LOWER_BOUND
+                # Epistemic humility: even the localized scan could not
+                # resolve. Neutral count, NEVER cached (the old code
+                # cached the fabricated cap here, poisoning the key
+                # for the TTL), provenance "unknown" → advise() adds
+                # no risk factor and the GATE floors at NOTIFY_APPLY.
+                logger.info(
+                    "[Advisor] blast_radius_epistemic_unknown root=%s "
+                    "targets=%d — localized fallback unresolved; "
+                    "returning NEUTRAL (no fabricated risk; "
+                    "NOTIFY_APPLY floor engages at GATE) "
+                    "(mode=cooperative_async)",
+                    str(scan_root), len(target_modules),
+                )
+                return 0, PROVENANCE_UNKNOWN
+            # Locality master OFF — legacy conservative cap, but now
+            # HONESTLY labeled synthetic (Slice 21 Fix B discipline):
+            # a fabricated cap may contribute caution, never satisfy a
+            # hard-BLOCK predicate. (The pre-fix code returned it
+            # unlabeled — the Fix B bypass this repair closes.)
             importers = _conservative_cap
+            with _BLAST_RADIUS_CACHE_LOCK:
+                _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, importers)
+                _BLAST_PROVENANCE_SHARED[cache_key] = PROVENANCE_SYNTHETIC
+                self._evict_blast_radius_cache_if_oversized()
+            return importers, PROVENANCE_SYNTHETIC
         else:
             try:
                 logger.debug(
@@ -1549,8 +1695,155 @@ class OperationAdvisor:
 
         with _BLAST_RADIUS_CACHE_LOCK:
             _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, importers)
+            _BLAST_PROVENANCE_SHARED[cache_key] = PROVENANCE_MEASURED
             self._evict_blast_radius_cache_if_oversized()
-        return importers
+        return importers, PROVENANCE_MEASURED
+
+    def _localized_blast_lower_bound(
+        self,
+        target_files: Tuple[str, ...],
+        target_modules: "set",
+        scan_root: Path,
+        *,
+        partial_importers: int = 0,
+    ) -> Optional[int]:
+        """Targeted Locality Bounding — bounded O(K) importer scan (sync).
+
+        Derives the target's dependency neighborhood via
+        :func:`advisor_locality.derive_locality_roots` (package dirs +
+        direct-importee dirs resolved through the canonical
+        ``reverse_dep_resolver.extract_module_imports`` + test dirs)
+        and counts importers ONLY there, under a shared budget
+        (``JARVIS_ADVISOR_LOCALITY_TIMEOUT_S`` /
+        ``_MAX_SCANNED`` / ``_MAX_ROOTS``).
+
+        Returns a MEASURED LOWER BOUND on the importer count (max'd
+        with any partial count the exhausted global scan already
+        found — max, not sum, since the neighborhoods may overlap),
+        capped at the conservative cap for downstream calibration
+        comparability. Returns ``None`` when the neighborhood cannot
+        be derived or ZERO Python files could be examined — the
+        epistemic-unknown signal. NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.governance.bounded_walker import (
+                blast_radius_conservative_cap,
+                blast_radius_max_bytes_per_file,
+                bounded_read_text,
+                default_skip_dirs,
+            )
+            _t0 = time.monotonic()
+            roots = derive_locality_roots(target_files, scan_root)
+            if not roots:
+                return None
+            _per_file_bytes = blast_radius_max_bytes_per_file()
+            _cap = blast_radius_conservative_cap()
+            _skip = default_skip_dirs()
+            importers = 0
+            files_examined = 0
+            for path_str in iter_locality_files(roots, skip_dirs=_skip):
+                if not path_str.endswith(".py"):
+                    continue
+                files_examined += 1
+                content = bounded_read_text(
+                    Path(path_str), max_bytes=_per_file_bytes,
+                )
+                if content is None:
+                    continue
+                if any(mod in content for mod in target_modules):
+                    importers += 1
+                if importers >= _cap:
+                    break
+            if files_examined == 0:
+                return None
+            result = min(max(importers, partial_importers), _cap)
+            logger.info(
+                "[Advisor] blast_radius_localized_scan root=%s roots=%d "
+                "files_examined=%d importers_lower_bound=%d "
+                "elapsed_ms=%.1f (mode=sync)",
+                str(scan_root), len(roots), files_examined, result,
+                (time.monotonic() - _t0) * 1000.0,
+            )
+            return result
+        except Exception:  # noqa: BLE001 — locality pivot is fail-soft
+            logger.debug(
+                "[Advisor] localized blast scan failed (sync) — "
+                "treating as unresolved", exc_info=True,
+            )
+            return None
+
+    async def _localized_blast_lower_bound_async(
+        self,
+        target_files: Tuple[str, ...],
+        target_modules: "set",
+        scan_root: Path,
+        *,
+        partial_importers: int = 0,
+    ) -> Optional[int]:
+        """Cooperative-async twin of :meth:`_localized_blast_lower_bound`.
+
+        Same neighborhood, same budgets, same lower-bound semantics.
+        Iteration shape mirrors the Slice 12S/12T discipline: the
+        walker is consumed via ``cooperative_yield_every_n_async`` so
+        the event loop ticks between batches, and per-file reads run
+        on the dedicated ``advisor-blast`` executor (isolation
+        contract — never the contested default pool). NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.governance.bounded_walker import (
+                blast_radius_conservative_cap,
+                blast_radius_max_bytes_per_file,
+                default_skip_dirs,
+            )
+            from backend.core.ouroboros.governance.event_loop_governance import (  # noqa: E501
+                cooperative_yield_every_n_async,
+            )
+            _t0 = time.monotonic()
+            roots = derive_locality_roots(target_files, scan_root)
+            if not roots:
+                return None
+            loop = asyncio.get_running_loop()
+            _blast_executor = _get_advisor_blast_executor()
+            _per_file_bytes = blast_radius_max_bytes_per_file()
+            _cap = blast_radius_conservative_cap()
+            _skip = default_skip_dirs()
+            importers = 0
+            files_examined = 0
+            async for path_str in cooperative_yield_every_n_async(
+                iter_locality_files(roots, skip_dirs=_skip),
+            ):
+                if not path_str.endswith(".py"):
+                    continue
+                files_examined += 1
+                content = await loop.run_in_executor(
+                    _blast_executor,
+                    _read_bounded_text_for_blast,
+                    path_str,
+                    _per_file_bytes,
+                )
+                if content is None:
+                    continue
+                if any(mod in content for mod in target_modules):
+                    importers += 1
+                if importers >= _cap:
+                    break
+            if files_examined == 0:
+                return None
+            result = min(max(importers, partial_importers), _cap)
+            logger.info(
+                "[Advisor] blast_radius_localized_scan root=%s roots=%d "
+                "files_examined=%d importers_lower_bound=%d "
+                "elapsed_ms=%.1f (mode=cooperative_async)",
+                str(scan_root), len(roots), files_examined, result,
+                (time.monotonic() - _t0) * 1000.0,
+            )
+            return result
+        except Exception:  # noqa: BLE001 — locality pivot is fail-soft
+            logger.debug(
+                "[Advisor] localized blast scan failed (async) — "
+                "treating as unresolved", exc_info=True,
+            )
+            return None
 
     def advise(
         self,
@@ -1563,6 +1856,7 @@ class OperationAdvisor:
         scoped_symbols: Tuple[str, ...] = (),
         intake_evidence_json: str = "",
         _blast_is_synthetic: bool = False,
+        _precomputed_blast_provenance: Optional[str] = None,
     ) -> Advisory:
         """Evaluate an operation and return advisory judgment.
 
@@ -1656,19 +1950,60 @@ class OperationAdvisor:
             _scoped = extract_scoped_symbols(intake_evidence_json)
         if _precomputed_blast_radius is not None:
             blast_radius = _precomputed_blast_radius
+            # Provenance resolution (Targeted Locality Bounding,
+            # 2026-07-21): the synthetic marker (Slice 12T background-
+            # tier skip) wins; else the caller's provenance (the
+            # cooperative async path threads the _ex result through);
+            # else assume a legacy caller injected a real measurement.
+            if _blast_is_synthetic:
+                blast_provenance = PROVENANCE_SYNTHETIC
+            else:
+                blast_provenance = (
+                    _precomputed_blast_provenance or PROVENANCE_MEASURED
+                )
         else:
-            blast_radius = self._compute_blast_radius(
+            blast_radius, blast_provenance = self._compute_blast_radius_ex(
                 target_files, root=repo_root, scoped_symbols=_scoped,
             )
-        if not is_read_only and blast_radius >= _BLAST_RADIUS_WARN:
+            if _blast_is_synthetic:
+                blast_provenance = PROVENANCE_SYNTHETIC
+        # Real measurement (hard-BLOCK eligible) vs assumed/unknown.
+        # A localized lower bound IS measurement: a neighborhood already
+        # showing >= N importers proves >= N importers globally
+        # (same-or-sharper — the gate is never weakened by locality).
+        _blast_measured = blast_provenance in MEASURED_PROVENANCES
+        _blast_unknown = blast_provenance == PROVENANCE_UNKNOWN
+        if not is_read_only and _blast_unknown:
+            # Epistemic humility: BOTH the global and localized scans
+            # failed to resolve (severe cache coldness). State the
+            # uncertainty, fabricate NOTHING — no risk factor is
+            # appended (neutral), no BLOCK predicate can fire (count
+            # is 0), and the epistemic ledger entry below floors the
+            # op at NOTIFY_APPLY at the GATE (operator-visible, never
+            # an unappealable block on data nobody collected).
+            reasons.append(
+                "Blast radius UNKNOWN: global scan budget exhausted on "
+                "a cold cache and the localized dependency-neighborhood "
+                "fallback could not resolve — risk NOT fabricated "
+                "(epistemic humility); GATE floors this op at "
+                "NOTIFY_APPLY for operator visibility"
+            )
+        elif not is_read_only and blast_radius >= _BLAST_RADIUS_WARN:
             # Slice 21 Fix B — the reason string states what we KNOW. A
             # synthetic conservative cap (scan skipped) must never be
             # narrated as a measured import count.
-            if _blast_is_synthetic:
+            if blast_provenance == PROVENANCE_SYNTHETIC:
                 reasons.append(
                     f"Blast radius unmeasured: conservative cap "
                     f"{blast_radius} assumed (heavy scan skipped for "
                     f"background tier)"
+                )
+            elif blast_provenance == PROVENANCE_LOCAL_LOWER_BOUND:
+                reasons.append(
+                    f"High blast radius (localized lower bound): at "
+                    f"least {blast_radius} files in the targets' "
+                    f"dependency neighborhood import them (global scan "
+                    f"budget exhausted; bounded locality measurement)"
                 )
             else:
                 reasons.append(
@@ -1763,7 +2098,12 @@ class OperationAdvisor:
         # keeps every real guarantee, and the op is no longer killed on data
         # nobody collected.
         if not is_read_only and test_coverage == 0 and blast_radius >= 20:
-            if _blast_is_synthetic:
+            # Targeted Locality Bounding (2026-07-21): the measured-
+            # evidence requirement generalizes from the synthetic flag
+            # to provenance — "measured" and "localized_lower_bound"
+            # (real measurement, same-or-sharper) may BLOCK; synthetic
+            # caps and epistemically-unknown values never can.
+            if not _blast_measured:
                 if decision == AdvisoryDecision.RECOMMEND:
                     decision = AdvisoryDecision.CAUTION
                 reasons.append(
@@ -1783,7 +2123,7 @@ class OperationAdvisor:
         if (not is_read_only and blast_radius >= 10 and test_coverage < 0.5
                 and mem_level in ("high", "critical")):
             if (test_coverage <= 0.0 and decision != AdvisoryDecision.BLOCK
-                    and not _blast_is_synthetic):
+                    and _blast_measured):
                 decision = AdvisoryDecision.BLOCK
                 reasons.append("BLOCKED (Adaptive Armor): high blast + zero coverage + memory pressure")
             elif decision in (AdvisoryDecision.RECOMMEND,):
@@ -1823,12 +2163,31 @@ class OperationAdvisor:
             git_volatility=git_volatility,
             memory_pressure=mem_level,
             safety_plan=safety_plan,
+            blast_provenance=blast_provenance,
         )
 
+        # Epistemic ledger (Targeted Locality Bounding, 2026-07-21):
+        # an epistemically-unknown blast radius on a MUTATING op is
+        # recorded so BOTH GATE paths (inline orchestrator +
+        # gate_runner) floor the op at NOTIFY_APPLY — uncertainty is
+        # surfaced to the operator, never converted into a fabricated
+        # block or a silent green. Telemetry-only; fail-soft.
+        if _blast_unknown and not is_read_only and op_id:
+            record_blast_epistemics(
+                op_id,
+                provenance=PROVENANCE_UNKNOWN,
+                escalation=ESCALATION_NOTIFY_APPLY,
+                detail=(
+                    "blast radius unresolved after global budget "
+                    "exhaustion + localized fallback (cold caches)"
+                ),
+            )
+
         logger.info(
-            "[Advisor] %s (risk=%.2f, blast=%d, coverage=%.0f%%, entropy=%.0f%%, "
+            "[Advisor] %s (risk=%.2f, blast=%d, blast_prov=%s, "
+            "coverage=%.0f%%, entropy=%.0f%%, "
             "read_only=%s) reasons=%d op=%s",
-            decision.value, risk_score, blast_radius,
+            decision.value, risk_score, blast_radius, blast_provenance,
             test_coverage * 100, chronic_entropy * 100,
             is_read_only, len(reasons), op_id,
         )
@@ -1915,6 +2274,21 @@ class OperationAdvisor:
         root: Optional[Path] = None,
         scoped_symbols: Tuple[str, ...] = (),
     ) -> int:
+        """Back-compat count-only wrapper around
+        :meth:`_compute_blast_radius_ex` (which additionally returns
+        evidence provenance). Same value, same caching, same telemetry."""
+        count, _prov = self._compute_blast_radius_ex(
+            target_files, root=root, scoped_symbols=scoped_symbols,
+        )
+        return count
+
+    def _compute_blast_radius_ex(
+        self,
+        target_files: Tuple[str, ...],
+        *,
+        root: Optional[Path] = None,
+        scoped_symbols: Tuple[str, ...] = (),
+    ) -> Tuple[int, str]:
         """Count files that import the targets. AST-based, deterministic.
 
         ``root`` (B.2.0) — scan tree. Defaults to ``self._project_root`` when
@@ -1950,7 +2324,7 @@ class OperationAdvisor:
         # unresolved symbol).
         cg = self._maybe_symbol_blast_radius(scoped_symbols)
         if cg is not None:
-            return cg
+            return cg, PROVENANCE_MEASURED
 
         scan_root = root if root is not None else self._project_root
 
@@ -1963,10 +2337,13 @@ class OperationAdvisor:
         now = time.monotonic()
         with _BLAST_RADIUS_CACHE_LOCK:
             cached = _BLAST_RADIUS_CACHE_SHARED.get(cache_key)
+            _cached_prov = _BLAST_PROVENANCE_SHARED.get(
+                cache_key, PROVENANCE_MEASURED,
+            )
         if cached is not None:
             computed_at, result = cached
             if now - computed_at < _BLAST_RADIUS_CACHE_TTL_S:
-                return result
+                return result, _cached_prov
             # Expired — fall through to recompute.
 
         # PR-A: Oracle-graph blast (gated, fallback to legacy on miss).
@@ -1982,8 +2359,9 @@ class OperationAdvisor:
                 if oracle_count is not None:
                     with _BLAST_RADIUS_CACHE_LOCK:
                         _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, oracle_count)
+                        _BLAST_PROVENANCE_SHARED[cache_key] = PROVENANCE_MEASURED
                         self._evict_blast_radius_cache_if_oversized()
-                    return oracle_count
+                    return oracle_count, PROVENANCE_MEASURED
                 # else: Oracle didn't have the node → fall through to legacy
             except Exception:  # noqa: BLE001 — defensive: Oracle errors must NEVER block advise
                 logger.debug(
@@ -2002,8 +2380,31 @@ class OperationAdvisor:
         if not target_modules:
             with _BLAST_RADIUS_CACHE_LOCK:
                 _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, 0)
+                _BLAST_PROVENANCE_SHARED[cache_key] = PROVENANCE_MEASURED
                 self._evict_blast_radius_cache_if_oversized()
-            return 0
+            return 0, PROVENANCE_MEASURED
+
+        # ── Targeted Locality Bounding — cold-root shortcut (sync twin
+        # of the cooperative-async path; see that site for rationale) ──
+        if locality_bounding_enabled() and is_cold_root(scan_root):
+            logger.info(
+                "[Advisor] blast_radius_cold_root_shortcut root=%s — "
+                "skipping global scan (recent budget exhaustion), "
+                "using targeted locality bounding (mode=sync)",
+                str(scan_root),
+            )
+            local = self._localized_blast_lower_bound(
+                target_files, target_modules, scan_root,
+            )
+            if local is not None:
+                with _BLAST_RADIUS_CACHE_LOCK:
+                    _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, local)
+                    _BLAST_PROVENANCE_SHARED[cache_key] = (
+                        PROVENANCE_LOCAL_LOWER_BOUND
+                    )
+                    self._evict_blast_radius_cache_if_oversized()
+                return local, PROVENANCE_LOCAL_LOWER_BOUND
+            return 0, PROVENANCE_UNKNOWN
 
         # Slice 12H — bounded legacy fallback. The prior loop ran
         # ``scan_root.rglob("*.py")`` with no scan / wall-clock bound
@@ -2099,24 +2500,57 @@ class OperationAdvisor:
 
         _elapsed_ms = (time.monotonic() - _scan_start) * 1000.0
         if _budget_exhausted:
-            # Conservative return — bias toward caution, NOT false
-            # safety. Operator binding: "If the scan budget is
-            # exhausted, return a conservative high blast-radius
-            # value, e.g. existing cap 50, and log/record
-            # 'blast_radius_scan_budget_exhausted'."
+            # Targeted Locality Bounding (2026-07-21, sync twin) — the
+            # global O(N) scan proved too cold to finish. Remember the
+            # root, then pivot to the bounded O(K) localized scan
+            # instead of fabricating the conservative cap. See the
+            # cooperative-async twin for the full rationale
+            # (bt-2026-07-21-205755).
+            note_cold_root(scan_root)
             try:
                 logger.info(
                     "[Advisor] blast_radius_scan_budget_exhausted "
                     "root=%s targets=%d files_examined=%d "
                     "importers_found_partial=%d elapsed_ms=%.1f "
-                    "conservative_cap=%d — returning cap (bias=caution)",
+                    "conservative_cap=%d — pivoting to targeted "
+                    "locality bounding (mode=sync)",
                     str(scan_root), len(target_modules),
                     _files_examined, importers, _elapsed_ms,
                     _conservative_cap,
                 )
             except Exception:  # noqa: BLE001
                 pass
+            if locality_bounding_enabled():
+                local = self._localized_blast_lower_bound(
+                    target_files, target_modules, scan_root,
+                    partial_importers=importers,
+                )
+                if local is not None:
+                    with _BLAST_RADIUS_CACHE_LOCK:
+                        _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, local)
+                        _BLAST_PROVENANCE_SHARED[cache_key] = (
+                            PROVENANCE_LOCAL_LOWER_BOUND
+                        )
+                        self._evict_blast_radius_cache_if_oversized()
+                    return local, PROVENANCE_LOCAL_LOWER_BOUND
+                # Epistemic humility: unresolved — neutral, uncached,
+                # never fabricated (sync twin of the async site).
+                logger.info(
+                    "[Advisor] blast_radius_epistemic_unknown root=%s "
+                    "targets=%d — localized fallback unresolved; "
+                    "returning NEUTRAL (no fabricated risk; "
+                    "NOTIFY_APPLY floor engages at GATE) (mode=sync)",
+                    str(scan_root), len(target_modules),
+                )
+                return 0, PROVENANCE_UNKNOWN
+            # Locality master OFF — legacy conservative cap, HONESTLY
+            # labeled synthetic (Slice 21 Fix B discipline).
             importers = _conservative_cap
+            with _BLAST_RADIUS_CACHE_LOCK:
+                _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, importers)
+                _BLAST_PROVENANCE_SHARED[cache_key] = PROVENANCE_SYNTHETIC
+                self._evict_blast_radius_cache_if_oversized()
+            return importers, PROVENANCE_SYNTHETIC
         else:
             try:
                 logger.debug(
@@ -2134,8 +2568,9 @@ class OperationAdvisor:
         # ceiling not the primary freshness mechanism.
         with _BLAST_RADIUS_CACHE_LOCK:
             _BLAST_RADIUS_CACHE_SHARED[cache_key] = (now, importers)
+            _BLAST_PROVENANCE_SHARED[cache_key] = PROVENANCE_MEASURED
             self._evict_blast_radius_cache_if_oversized()
-        return importers
+        return importers, PROVENANCE_MEASURED
 
     def _evict_blast_radius_cache_if_oversized(self) -> None:
         """Drop the oldest entries until the cache fits.
@@ -2156,8 +2591,14 @@ class OperationAdvisor:
             try:
                 oldest = next(iter(cache))
                 del cache[oldest]
+                _BLAST_PROVENANCE_SHARED.pop(oldest, None)
             except (StopIteration, KeyError):
                 break
+        # Defensive: drop provenance orphans (keys whose value entry is
+        # gone — e.g. tests clearing _BLAST_RADIUS_CACHE_SHARED directly).
+        if len(_BLAST_PROVENANCE_SHARED) > len(cache):
+            for key in [k for k in _BLAST_PROVENANCE_SHARED if k not in cache]:
+                _BLAST_PROVENANCE_SHARED.pop(key, None)
 
     def _compute_test_coverage(
         self,
@@ -2356,6 +2797,50 @@ def register_flags(registry: Any) -> int:
             ),
             example="/private/tmp/eval-clones:/var/jarvis/scratch",
             since="v3.7 Phase 2 Phase B.2.0 (2026-05-12)",
+        ),
+        FlagSpec(
+            name="JARVIS_ADVISOR_LOCALITY_BOUNDING_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Targeted Locality Bounding master. When the global "
+                "blast-radius scan exhausts its budget on a cold cache, "
+                "the Advisor pivots to a bounded O(K) localized scan of "
+                "the targets' dependency neighborhood (package dirs + "
+                "direct importees via reverse_dep_resolver + test dirs) "
+                "instead of fabricating the conservative cap. OFF "
+                "restores the legacy cap return, honestly labeled "
+                "synthetic_cap (never hard-BLOCK eligible). Knobs: "
+                "JARVIS_ADVISOR_LOCALITY_TIMEOUT_S (5.0), _MAX_SCANNED "
+                "(4000), _MAX_ROOTS (16), JARVIS_ADVISOR_COLD_ROOT_TTL_S "
+                "(300)."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/advisor_locality.py"
+            ),
+            example="false",
+            since="Advisor degraded-scan repair (2026-07-21)",
+        ),
+        FlagSpec(
+            name="JARVIS_ADVISOR_EPISTEMIC_NOTIFY_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Epistemic Humility GATE floor. When the Advisor's "
+                "blast radius resolves to provenance=unknown (global + "
+                "localized scans both exhausted on cold caches), the op "
+                "is floored at NOTIFY_APPLY on BOTH GATE paths — "
+                "uncertainty surfaces to the operator instead of "
+                "becoming a fabricated blast=50 risk payload or a "
+                "silent green. Stricter-wins; never downgrades."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/advisor_locality.py"
+            ),
+            example="false",
+            since="Advisor degraded-scan repair (2026-07-21)",
         ),
     ]
 

@@ -165,6 +165,15 @@ class _HighBlastAdvisor(OperationAdvisor):
     def _compute_blast_radius(self, target_files: Tuple[str, ...], **_) -> int:
         return self._fake_blast
 
+    # Targeted Locality Bounding repair (2026-07-21): advise() now
+    # routes through the provenance-carrying _ex seam — the double
+    # reports its fixed value as MEASURED so the hard-BLOCK predicate
+    # stays exercised exactly as before.
+    def _compute_blast_radius_ex(
+        self, target_files: Tuple[str, ...], **_,
+    ) -> Tuple[int, str]:
+        return self._fake_blast, "measured"
+
     def _compute_test_coverage(self, target_files: Tuple[str, ...], **_) -> float:
         return self._fake_coverage
 

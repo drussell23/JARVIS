@@ -465,6 +465,26 @@ class GATERunner(PhaseRunner):
                         _attr_test_only, ctx.op_id,
                     )
 
+                # Epistemic Humility floor (extracted path — SHIPPING;
+                # mirrors the orchestrator.py inline twin). An op whose
+                # blast radius resolved to provenance=unknown at
+                # CLASSIFY (cold-cache global + localized scans both
+                # unresolved) is floored at NOTIFY_APPLY via the
+                # advisor_locality epistemic ledger — uncertainty
+                # surfaces to the operator instead of a fabricated
+                # blast=50 payload or a silent green. Stricter-wins;
+                # fail-soft.
+                from backend.core.ouroboros.governance.orchestrator import (
+                    _advisor_epistemic_notify_floor,
+                )
+                risk_tier, _epi_note = _advisor_epistemic_notify_floor(
+                    ctx, risk_tier,
+                )
+                if _epi_note:
+                    logger.info(
+                        "[Advisor] gate: %s op=%s", _epi_note, ctx.op_id,
+                    )
+
                 _pattern_names = (
                     ",".join(sorted({f.pattern for f in _guardian_findings}))
                     if _guardian_findings else "none"

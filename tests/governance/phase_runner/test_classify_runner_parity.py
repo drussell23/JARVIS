@@ -335,10 +335,19 @@ async def test_narrator_starts_trace_on_success(ctx, tmp_path):
     # parity with the inline block).
     records = orch._reasoning_narrator.classify_records
     assert records, "record_classify should have fired"
-    assert records[0][0] == ctx.op_id
+    assert all(r[0] == ctx.op_id for r in records)
     # risk_tier.value for RiskTier.SAFE_AUTO is 1 (int); the inline
     # code uses `.value` if present. Runner must match.
-    assert records[0][1] in (RiskTier.SAFE_AUTO.value, "SAFE_AUTO")
+    #
+    # Environment-robustness fix (2026-07-21): when local `.jarvis`
+    # adaptive-learning state leaks chronic entropy into the advisor,
+    # BOTH paths (inline + runner, verbatim parity) voice the advisory
+    # via record_classify FIRST (e.g. 'caution') before the risk-tier
+    # record. Indexing records[0] made this test host-state-sensitive;
+    # the parity property is that a tier-valued record EXISTS.
+    assert any(
+        r[1] in (RiskTier.SAFE_AUTO.value, "SAFE_AUTO") for r in records
+    ), f"no risk-tier record among {records!r}"
 
 
 @pytest.mark.asyncio
