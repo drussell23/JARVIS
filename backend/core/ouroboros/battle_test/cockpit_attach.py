@@ -176,17 +176,25 @@ class CockpitAttachBridge:
             return False
 
     async def stop(self) -> None:
-        """Close server + subscribers, unlink socket. NEVER raises."""
+        """Close server + subscribers, unlink socket. NEVER raises.
+
+        Order is load-bearing on Python 3.12+: ``Server.wait_closed()``
+        now genuinely waits for every in-flight client handler (the 3.9-3.11
+        behavior returned immediately), so clients must be DROPPED FIRST —
+        with an attached ``ov`` terminal, the old order hangs shutdown
+        forever. Bounded as belt-and-braces: never-hangs is this module's
+        law even if a handler wedges."""
         try:
+            for w in list(self._clients):
+                self._drop(w)
             if self._server is not None:
                 self._server.close()
                 try:
-                    await self._server.wait_closed()
+                    await asyncio.wait_for(self._server.wait_closed(),
+                                           timeout=2.0)
                 except Exception:  # noqa: BLE001
                     pass
                 self._server = None
-            for w in list(self._clients):
-                self._drop(w)
             try:
                 if self._path.exists():
                     self._path.unlink()

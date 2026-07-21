@@ -24,13 +24,33 @@ from backend.core.ouroboros.cli import thin_client
 
 def _serving_handler(reader, writer):
     """Mirror of the REAL CockpitAttachBridge accept path: hydration frame
-    written immediately on connect."""
+    written immediately on connect. Closes its writer on exit — on Python
+    3.12+ ``Server.wait_closed()`` genuinely waits for in-flight handlers,
+    so a fixture that leaves its writer open deadlocks test teardown (the
+    exact hang the CI matrix caught on its maiden 3.12 run)."""
     try:
         writer.write(b'{"type":"hydration","status":{}}\n')
     except Exception:
         pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 _REPO = Path(__file__).resolve().parents[2]
+
+
+async def _shutdown_server(server):
+    """Bounded server teardown. Python 3.12 fixed ``Server.wait_closed()``
+    to wait for ALL in-flight connections — a fixture whose handler
+    deliberately never serves (the backlog-accept pin) can therefore never
+    satisfy it. Bound + suppress: cleanup never becomes the test."""
+    server.close()
+    try:
+        await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+    except Exception:
+        pass
 
 
 @pytest.fixture()
@@ -57,8 +77,7 @@ class TestZeroTrustProbe:
         try:
             assert await thin_client.probe_socket(path) == "live"
         finally:
-            server.close()
-            await server.wait_closed()
+            await _shutdown_server(server)
 
     async def test_ghost_socket_classified_stale(self, sock_dir):
         """A bound-then-abandoned UDS inode: exists on disk, nothing
@@ -169,8 +188,7 @@ class TestStaleSocketDeadlock:
             assert ok is True
             assert spawns == []            # warm path never cold-boots
         finally:
-            server.close()
-            await server.wait_closed()
+            await _shutdown_server(server)
 
 
 # ---------------------------------------------------------------------------
@@ -409,8 +427,7 @@ class TestHandshakeDepthProbe:
             assert await thin_client.probe_socket(
                 path, timeout=0.3, deep=True) == "booting"
         finally:
-            server.close()
-            await server.wait_closed()
+            await _shutdown_server(server)
 
     async def test_deep_probe_live_when_served(self, sock_dir):
         path = sock_dir / "served.sock"
@@ -421,8 +438,7 @@ class TestHandshakeDepthProbe:
             assert await thin_client.probe_socket(
                 path, timeout=1.0, deep=True) == "live"
         finally:
-            server.close()
-            await server.wait_closed()
+            await _shutdown_server(server)
 
     async def test_refused_socket_backoff_retries_no_false_positive(
         self, sock_dir, monkeypatch,
@@ -509,5 +525,4 @@ class TestHandshakeDepthProbe:
             assert spawns == []                # never raced a second ignition
             assert path.exists()               # never cleaned the socket
         finally:
-            server.close()
-            await server.wait_closed()
+            await _shutdown_server(server)

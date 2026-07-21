@@ -1,0 +1,63 @@
+# ov surface — hive fabrics · cockpit · doctor · chat lane (Slice D)
+#
+# The root problem this closes: five PRs of ov front-door surface were
+# guarded by ~356 unit tests that NO workflow ever ran — protection with
+# no trigger (the CI-shaped wired-but-inert class). This lane runs them
+# on every PR and main push.
+#
+# Design invariants:
+#   * KEYLESS + HERMETIC — no API keys, no network calls in tests, no
+#     torch/chroma; the dependency set is the EMPIRICALLY-derived minimum
+#     in ci/requirements-ov-surface.txt (single source of truth).
+#   * NO PATH FILTER — the suite costs ~11s; path-filtering would skip
+#     cross-cutting breakage (a trinity_event_bus change breaking the
+#     hive aggregator). Cheap and always-on beats clever and blind.
+#   * SUITE LIST IS DATA — ci/ov-surface-suites.txt is the one list,
+#     consumable locally the same way CI consumes it:
+#       python -m pytest $(cat ci/ov-surface-suites.txt)
+#   * pytest.ini at the repo root supplies asyncio_mode=auto — CI adds
+#     no config of its own, so local green == CI green.
+
+name: ov surface
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ov-surface-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ov-surface-tests:
+    name: ov surface (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # .python-version pins 3.11 for dev; 3.12 rides along to catch
+        # version drift before it lands on anyone's machine.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: ci/requirements-ov-surface.txt
+
+      - name: Install the empirically-minimal lane
+        run: python -m pip install -q -r ci/requirements-ov-surface.txt
+
+      - name: Run the ov-surface suites
+        run: |
+          python -m pytest $(cat ci/ov-surface-suites.txt | tr '\n' ' ') \
+            -q --tb=short -p no:cacheprovider

@@ -1,0 +1,10 @@
+# The ov-surface CI lane — EMPIRICALLY derived minimal set (clean-venv,
+# 2026-07-20): these five packages run all ~356 ov/hive/cockpit/doctor/
+# chat-lane unit tests. No API keys, no torch/chroma/fastembed, no
+# network. If a suite gains a dependency, CI fails naming the module —
+# add it HERE (single source of truth), never inline in the workflow.
+pytest>=8
+pytest-asyncio>=0.23
+pydantic>=2
+rich>=13
+aiofiles>=23
