@@ -155,6 +155,16 @@ class ConsciousnessBridge:
         """
         if self._consciousness is None:
             return
+        # Idempotency chokepoint: an op may cross BOTH terminal seams (GLS
+        # _emit_terminal_events for inline ops, _bg_unregister_active for
+        # background-pool ops) — reputation must ingest exactly once.
+        seen = getattr(self, "_ingested_op_ids", None)
+        if seen is None:
+            seen = self._ingested_op_ids = []
+        if op_id in seen:
+            return
+        seen.append(op_id)
+        del seen[:-512]
         try:
             # Signature-drift fix (Hive Step 2): the engine's sole write path
             # is ``ingest_outcome(op_id)`` — it reads the op ledger itself

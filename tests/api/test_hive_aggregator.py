@@ -432,13 +432,27 @@ async def test_bus_storm_compresses_to_one_frame(monkeypatch):
 
 def test_gls_terminal_path_calls_consciousness_outcome_hook():
     """record_operation_outcome had ZERO callers (the MemoryEngine's sole
-    write path never ran live). Pin the new GLS terminal-seam caller."""
+    write path never ran live). BOTH terminal seams must call it — the shared
+    _emit_terminal_events (inline ops) AND _bg_unregister_active (BG-pool ops
+    never cross the former: the twin-path drift class, proven live when the
+    first single-seam wiring stayed silent on a BG op)."""
+    import ast as _ast
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[2]
-    calls = _module_calls(
-        root / "backend" / "core" / "ouroboros" / "governance"
-        / "governed_loop_service.py")
-    assert "record_operation_outcome" in calls
+    path = (root / "backend" / "core" / "ouroboros" / "governance"
+            / "governed_loop_service.py")
+    tree = _ast.parse(open(path, encoding="utf-8").read())
+
+    def _calls_within(func_name):
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef))                     and node.name == func_name:
+                return {sub.func.attr for sub in _ast.walk(node)
+                        if isinstance(sub, _ast.Call)
+                        and isinstance(sub.func, _ast.Attribute)}
+        return set()
+
+    assert "record_operation_outcome" in _calls_within("_emit_terminal_events")
+    assert "record_operation_outcome" in _calls_within("_bg_unregister_active")
 
 
 @pytest.mark.asyncio
@@ -462,3 +476,26 @@ async def test_bridge_outcome_forwards_ledger_authoritative_signature():
     await bridge.record_operation_outcome(
         op_id="op-x", files_changed=["a.py"], success=True, failure_reason=None)
     assert calls == ["op-x"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_outcome_ingests_exactly_once_per_op():
+    """An op may cross BOTH terminal seams — reputation ingests ONCE."""
+    from backend.core.ouroboros.governance.consciousness_bridge import (
+        ConsciousnessBridge,
+    )
+
+    calls = []
+
+    class _Memory:
+        async def ingest_outcome(self, op_id):
+            calls.append(op_id)
+
+    class _Consciousness:
+        _memory = _Memory()
+
+    bridge = ConsciousnessBridge(consciousness=_Consciousness())
+    for _ in range(3):   # inline seam + BG seam + a retry
+        await bridge.record_operation_outcome(
+            op_id="op-dup", files_changed=[], success=True, failure_reason=None)
+    assert calls == ["op-dup"]
