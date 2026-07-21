@@ -4385,6 +4385,18 @@ class BattleTestHarness:
             )
             if await bridge.start():
                 self._cockpit_attach_bridge = bridge
+                # Hive Step 1: the harness IS the live pipeline host (16
+                # sensors + GovernedLoop run in THIS process), so `ov hive`
+                # must project from here too — the SAME read-only relay the
+                # converged --headless organism starts (DRY, mandate 3).
+                try:
+                    from backend.api.hive_aggregator import start_hive_relay
+                    pair = await start_hive_relay(bridge.publish_telemetry)
+                    if pair is not None:
+                        self._hive_aggregator, self._hive_relay_task = pair
+                except Exception:  # noqa: BLE001
+                    logger.debug("[CockpitAttach] hive relay degraded",
+                                 exc_info=True)
             else:
                 self._cockpit_attach_bridge = None
         except Exception:  # noqa: BLE001
@@ -8220,6 +8232,19 @@ class BattleTestHarness:
             synapse = getattr(self, "_audio_synapse", None)
             if synapse is not None:
                 await synapse.stop()
+        except Exception:
+            pass
+        try:
+            relay = getattr(self, "_hive_relay_task", None)
+            if relay is not None and not relay.done():
+                relay.cancel()
+                try:
+                    await relay
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            hive_agg = getattr(self, "_hive_aggregator", None)
+            if hive_agg is not None:
+                await hive_agg.stop()
         except Exception:
             pass
         try:

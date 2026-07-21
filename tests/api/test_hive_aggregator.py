@@ -183,3 +183,86 @@ def test_trinity_swarm_lifecycle_maps_to_swarm_envelope():
     assert env.subsystem == "swarm"
     assert env.trace_id == "op1"
     assert env.ts == 5.0
+
+
+# ---------------------------------------------------------------------------
+# start_hive_relay — the ONE shared host wiring (converged organism + harness).
+# Both hosts must call it on their live path (the wired-but-inert checklist).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_start_hive_relay_publishes_hive_tagged_frames():
+    """The relay helper attaches read-only + republishes every envelope to the
+    cockpit publish surface tagged ``hive: True`` (what ov_hive_panel folds)."""
+    from backend.api.hive_aggregator import start_hive_relay
+
+    bus, broker = _MockTrinityBus(), _MockSseBroker()
+    published = []
+    pair = await start_hive_relay(published.append, bus=bus, sse_broker=broker)
+    assert pair is not None
+    agg, task = pair
+    await asyncio.sleep(0.01)
+    await bus.fire("intake.signal_accepted", {"sensor": "test_failure", "ts": 1.0}, "e1")
+    await broker.publish(_SseEvent("gate_evaluated", "op9",
+                                   {"narration_text": "gate PASS", "ts": 2.0}, "e2"))
+    await asyncio.sleep(0.2)
+    assert len(published) == 2
+    assert all(f.get("hive") is True for f in published)
+    # bridge-compat keys survive the relay (governance_sse_bridge._render reads these)
+    assert all("narration_text" in f and "source_brain" in f for f in published)
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+    await agg.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_hive_relay_degrades_to_none_not_raise():
+    """A publish surface that explodes at start must yield None, never raise."""
+    from backend.api import hive_aggregator as mod
+
+    class _Boom:
+        def __init__(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    orig = mod.HiveAggregator
+    mod.HiveAggregator = _Boom
+    try:
+        pair = await mod.start_hive_relay(lambda f: None, bus=None, sse_broker=None)
+        assert pair is None
+    finally:
+        mod.HiveAggregator = orig
+
+
+def _calls_in_function(path, func_name):
+    """All function/attr names called inside ``func_name`` of the module at path."""
+    import ast as _ast
+    tree = _ast.parse(open(path, encoding="utf-8").read())
+    names = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and node.name == func_name:
+            for sub in _ast.walk(node):
+                if isinstance(sub, _ast.Call):
+                    f = sub.func
+                    if isinstance(f, _ast.Name):
+                        names.add(f.id)
+                    elif isinstance(f, _ast.Attribute):
+                        names.add(f.attr)
+    return names
+
+
+def test_both_pipeline_hosts_wire_the_hive_relay():
+    """AST wiring pin: the converged --headless organism AND the battle-test
+    harness (the process where the 16 sensors + GovernedLoop actually run)
+    both call start_hive_relay on their cockpit-boot path. Kills the
+    wired-but-inert class: an aggregator in a process with no pipeline
+    traffic proves nothing."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    assert "start_hive_relay" in _calls_in_function(
+        root / "backend" / "api" / "converged_headless.py", "_start_control_plane")
+    assert "start_hive_relay" in _calls_in_function(
+        root / "backend" / "core" / "ouroboros" / "battle_test" / "harness.py",
+        "_start_cockpit_attach_bridge")

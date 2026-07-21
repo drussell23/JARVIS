@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, AsyncIterator, List, Optional
+from typing import Any, AsyncIterator, List, Optional, Tuple
 
 from backend.api.hive_envelope import (
     HiveTelemetryEnvelope, from_ide_sse_event, from_trinity_event,
@@ -226,4 +226,62 @@ class HiveAggregator:
         self._tasks = []
 
 
-__all__ = ["HiveAggregator"]
+_UNSET = object()
+
+
+async def start_hive_relay(
+    publish: Any,
+    *,
+    bus: Any = _UNSET,
+    sse_broker: Any = _UNSET,
+) -> Optional[Tuple[HiveAggregator, "asyncio.Task"]]:
+    """Start a read-only :class:`HiveAggregator` and relay its unified feed to ONE
+    cockpit publish surface (``CockpitAttachBridge.publish_telemetry``) as
+    ``hive``-tagged frames.
+
+    This is the shared wiring for EVERY pipeline host — the converged
+    ``--headless`` organism AND the battle-test harness — so ``ov hive``
+    projects the pipeline from whichever process owns the cockpit socket
+    (DRY, mandate 3). Sources default to the process-local fabrics; both are
+    injectable for tests. Read-only (mandate 1). NEVER raises — returns
+    ``None`` when degraded.
+    """
+    try:
+        if bus is _UNSET:
+            try:
+                from backend.core.trinity_event_bus import get_event_bus_if_exists
+                bus = get_event_bus_if_exists()
+            except Exception:  # noqa: BLE001
+                bus = None
+        if sse_broker is _UNSET:
+            try:
+                from backend.core.ouroboros.governance.ide_observability_stream import (
+                    get_default_broker,
+                )
+                sse_broker = get_default_broker()
+            except Exception:  # noqa: BLE001
+                sse_broker = None
+        agg = HiveAggregator(bus=bus, sse_broker=sse_broker)
+        await agg.start()
+
+        async def _relay() -> None:
+            try:
+                async for env in agg.feed():
+                    try:
+                        publish({"hive": True, **env.to_bus_payload()})
+                    except Exception:  # noqa: BLE001
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
+
+        task = asyncio.create_task(_relay(), name="hive-relay")
+        logger.info("[HiveAgg] relay up — `ov hive` can project this pipeline")
+        return agg, task
+    except Exception:  # noqa: BLE001
+        logger.debug("[HiveAgg] relay start degraded", exc_info=True)
+        return None
+
+
+__all__ = ["HiveAggregator", "start_hive_relay"]
