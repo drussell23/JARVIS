@@ -294,15 +294,25 @@ def test_seed_has_bounded_skip_flag():
 # ---------------------------------------------------------------------------
 
 
-def test_advise_async_increments_counter_during_call():
+def test_advise_async_increments_counter_during_call(monkeypatch):
     """End-to-end: invoking advise_async must reflect in the counter
     DURING the call, and decrement back to 0 after.
+
+    Pinned to the LEGACY executor path (cooperative master OFF): the
+    sampling point below lives inside ``advise()``, which the legacy
+    path wraps whole in incr/decr. The cooperative default (Slice 12S
+    graduated) brackets only the scan phase
+    (``_compute_blast_radius_async_ex``) — advise() itself runs after
+    the decrement there, so this test's spy would sample 0 on that
+    path even though the counter wiring is alive (see
+    ``test_cooperative_scan_phase_holds_busy_counter`` companion).
     """
     from backend.core.ouroboros.governance.operation_advisor import (
         OperationAdvisor,
         get_advisor_busy_count,
         _advisor_busy_decr,
     )
+    monkeypatch.setenv("JARVIS_ADVISOR_BLAST_COOPERATIVE_ENABLED", "false")
     while get_advisor_busy_count() > 0:
         _advisor_busy_decr()
 
@@ -338,6 +348,45 @@ def test_advise_async_increments_counter_during_call():
     assert get_advisor_busy_count() == 0, (
         "Counter must return to 0 after advise_async completes (finally fired)"
     )
+
+
+def test_cooperative_scan_phase_holds_busy_counter(tmp_path):
+    """Cooperative DEFAULT path (Slice 12S): the busy counter must be
+    >= 1 during the blast-SCAN phase — the disk-I/O window Oracle's
+    ``_oracle_index_loop`` yield check actually cares about — and
+    return to 0 after. Companion to the legacy-path test above."""
+    from backend.core.ouroboros.governance.operation_advisor import (
+        OperationAdvisor,
+        get_advisor_busy_count,
+        _advisor_busy_decr,
+    )
+    while get_advisor_busy_count() > 0:
+        _advisor_busy_decr()
+
+    (tmp_path / "a.py").write_text("import x\n")
+    advisor = OperationAdvisor(project_root=tmp_path)
+    sampled = {"value": 0}
+    original = advisor._compute_blast_radius_async_ex
+
+    async def _spy(*args, **kwargs):
+        sampled["value"] = get_advisor_busy_count()
+        return await original(*args, **kwargs)
+
+    advisor._compute_blast_radius_async_ex = _spy  # type: ignore[method-assign]
+
+    async def _go():
+        return await advisor.advise_async(
+            target_files=("x.py",),
+            description="task-88f-coop-spy",
+            op_id="op-coop-spy",
+        )
+
+    asyncio.run(_go())
+    assert sampled["value"] >= 1, (
+        "Busy counter must be held during the cooperative scan phase "
+        f"(Task #88f contract); got {sampled['value']}"
+    )
+    assert get_advisor_busy_count() == 0
 
 
 def test_advise_async_decrements_on_exception():

@@ -388,13 +388,15 @@ class TestPart2BackgroundTierSkip:
         carry the injected value as ``Advisory.blast_radius``."""
         adv = OperationAdvisor(project_root=fake_repo)
         scan_calls = {"n": 0}
-        original = adv._compute_blast_radius
+        # Spy the primary scan seam (_compute_blast_radius_ex since
+        # the Targeted Locality Bounding repair, 2026-07-21).
+        original = adv._compute_blast_radius_ex
 
         def _spy(*args, **kwargs):
             scan_calls["n"] += 1
             return original(*args, **kwargs)
 
-        adv._compute_blast_radius = _spy  # type: ignore[method-assign]
+        adv._compute_blast_radius_ex = _spy  # type: ignore[method-assign]
 
         result = adv.advise(
             target_files=("mypkg/target.py",),
@@ -418,13 +420,15 @@ class TestPart2BackgroundTierSkip:
         non-background callers."""
         adv = OperationAdvisor(project_root=fake_repo)
         scan_calls = {"n": 0}
-        original = adv._compute_blast_radius
+        # Spy the primary scan seam (_compute_blast_radius_ex since
+        # the Targeted Locality Bounding repair, 2026-07-21).
+        original = adv._compute_blast_radius_ex
 
         def _spy(*args, **kwargs):
             scan_calls["n"] += 1
             return original(*args, **kwargs)
 
-        adv._compute_blast_radius = _spy  # type: ignore[method-assign]
+        adv._compute_blast_radius_ex = _spy  # type: ignore[method-assign]
 
         adv.advise(
             target_files=("mypkg/target.py",),
@@ -591,7 +595,7 @@ class TestPart3ASTPin:
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.AsyncFunctionDef)
-                and node.name == "_compute_blast_radius_async"
+                and node.name == "_compute_blast_radius_async_ex"
             ):
                 target_fn = node
                 break

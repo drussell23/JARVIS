@@ -491,7 +491,7 @@ class TestBlastRadiusAstPins(unittest.TestCase):
     def test_blast_radius_calls_iter_bounded_files(self) -> None:
         tree = _parse_module(_ADVISOR_FILE)
         m = self._find_method(
-            tree, "OperationAdvisor", "_compute_blast_radius",
+            tree, "OperationAdvisor", "_compute_blast_radius_ex",
         )
         names = []
         for sub in _ast.walk(m):
@@ -509,7 +509,7 @@ class TestBlastRadiusAstPins(unittest.TestCase):
     def test_blast_radius_calls_bounded_read_text(self) -> None:
         tree = _parse_module(_ADVISOR_FILE)
         m = self._find_method(
-            tree, "OperationAdvisor", "_compute_blast_radius",
+            tree, "OperationAdvisor", "_compute_blast_radius_ex",
         )
         names = []
         for sub in _ast.walk(m):
@@ -531,7 +531,7 @@ class TestBlastRadiusAstPins(unittest.TestCase):
         directory-level skip."""
         tree = _parse_module(_ADVISOR_FILE)
         m = self._find_method(
-            tree, "OperationAdvisor", "_compute_blast_radius",
+            tree, "OperationAdvisor", "_compute_blast_radius_ex",
         )
         for sub in _ast.walk(m):
             if not isinstance(sub, _ast.Call):
@@ -553,7 +553,7 @@ class TestBlastRadiusAstPins(unittest.TestCase):
         previously did."""
         tree = _parse_module(_ADVISOR_FILE)
         m = self._find_method(
-            tree, "OperationAdvisor", "_compute_blast_radius",
+            tree, "OperationAdvisor", "_compute_blast_radius_ex",
         )
         for sub in _ast.walk(m):
             if not isinstance(sub, _ast.Call):

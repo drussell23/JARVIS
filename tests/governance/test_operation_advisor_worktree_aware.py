@@ -551,6 +551,17 @@ def test_ast_pin_orchestrator_calls_resolver_before_advise() -> None:
     tree = ast.parse(orchestrator_src)
     resolver_called = False
     advise_with_repo_root = False
+    # B2 fail-closed evolution (post-pin): the call sites migrated from
+    # the bare ``resolve_envelope_repo_root`` to its strictly-stronger
+    # wrapper ``guard_envelope_repo_root`` (same resolver underneath via
+    # ``envelope_repo_root_status``, PLUS the REJECTED→raise fail-closed
+    # arm that kills the silent shared-tree fallback). Either shape
+    # satisfies the structural invariant "the envelope repo_root is
+    # resolved through the validation contract before advising".
+    _resolver_shapes = (
+        "resolve_envelope_repo_root",
+        "guard_envelope_repo_root",
+    )
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             fn = node.func
@@ -559,7 +570,7 @@ def test_ast_pin_orchestrator_calls_resolver_before_advise() -> None:
                 name = fn.id
             elif isinstance(fn, ast.Attribute):
                 name = fn.attr
-            if name == "resolve_envelope_repo_root":
+            if name in _resolver_shapes:
                 resolver_called = True
             # Shape 1: direct advise call with repo_root kwarg
             if name == "advise":
@@ -579,8 +590,9 @@ def test_ast_pin_orchestrator_calls_resolver_before_advise() -> None:
                 if any(kw.arg == "repo_root" for kw in node.keywords):
                     advise_with_repo_root = True
     assert resolver_called, (
-        "orchestrator.py never calls resolve_envelope_repo_root — "
-        "B.2.0 wiring missing"
+        "orchestrator.py never calls resolve_envelope_repo_root or its "
+        "B2 fail-closed wrapper guard_envelope_repo_root — B.2.0 "
+        "wiring missing"
     )
     assert advise_with_repo_root, (
         "orchestrator.py never passes repo_root= to advise() — "
@@ -590,25 +602,79 @@ def test_ast_pin_orchestrator_calls_resolver_before_advise() -> None:
 
 
 def test_ast_pin_orchestrator_no_source_branch_for_worktree_aware() -> None:
-    """Orchestrator must NOT special-case any envelope source string
-    to enable the worktree-aware path. The resolver itself is
-    source-agnostic; bypassing it via an ``if source == ...`` branch
-    upstream would defeat the discipline."""
+    """The WORKTREE-AWARE ADVISORY path must NOT be gated on any
+    envelope source string. The resolver is source-agnostic; wrapping
+    its call site in an ``if source == ...`` branch would defeat the
+    discipline.
+
+    Scope correction (2026-07-21): the original whole-module Compare
+    ban predates Slices 64/66/67/72/78, which SANCTIONED
+    ``signal_source == "swe_bench_pro"`` branches for benchmark-lane
+    VALIDATE / VERIFY / APPLY semantics (advisory test-gate, write
+    root, target-existence + patch-domain Iron Gates). Those are
+    deliberate and out of this pin's jurisdiction. The invariant this
+    pin protects is precise: NO call to the repo-root resolution
+    contract (``guard_envelope_repo_root`` /
+    ``resolve_envelope_repo_root``) may sit under an ``if`` whose test
+    compares against a benchmark-source string — enforced via
+    ancestor-If inspection instead of a module-wide ban.
+    """
     from backend.core.ouroboros.governance import orchestrator
     src = Path(orchestrator.__file__).read_text()
     tree = ast.parse(src)
     forbidden = ("swe_bench_pro", "swebp/")
+
+    parents: dict = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Compare):
-            for left in (node.left, *node.comparators):
-                if isinstance(left, ast.Constant) and isinstance(left.value, str):
-                    for needle in forbidden:
-                        if needle in left.value.lower():
-                            raise AssertionError(
-                                f"orchestrator.py compares against "
-                                f"{left.value!r} — possible "
-                                f"category-special-case branch."
-                            )
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def _compares_forbidden(subtree: ast.AST) -> bool:
+        for n in ast.walk(subtree):
+            if isinstance(n, ast.Compare):
+                for part in (n.left, *n.comparators):
+                    if (
+                        isinstance(part, ast.Constant)
+                        and isinstance(part.value, str)
+                    ):
+                        low = part.value.lower()
+                        if any(needle in low for needle in forbidden):
+                            return True
+        return False
+
+    resolver_calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = (
+                fn.attr if isinstance(fn, ast.Attribute)
+                else fn.id if isinstance(fn, ast.Name)
+                else ""
+            )
+            if name in (
+                "guard_envelope_repo_root",
+                "resolve_envelope_repo_root",
+            ):
+                resolver_calls.append(node)
+
+    assert resolver_calls, (
+        "orchestrator.py never resolves the envelope repo_root — "
+        "B.2.0 wiring missing (companion pin covers the advise "
+        "threading)"
+    )
+
+    for call in resolver_calls:
+        cursor = parents.get(call)
+        while cursor is not None:
+            if isinstance(cursor, ast.If) and _compares_forbidden(
+                cursor.test,
+            ):
+                raise AssertionError(
+                    f"repo-root resolution at line {call.lineno} is "
+                    f"GATED by a benchmark-source comparison — the "
+                    f"worktree-aware path must stay source-agnostic."
+                )
+            cursor = parents.get(cursor)
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +686,12 @@ def test_register_flags_returns_two_specs() -> None:
     """B.2.0 seeds: JARVIS_ADVISOR_WORKTREE_AWARE_ENABLED (BOOL,
     GRADUATED to default-TRUE 2026-05-13)
     + JARVIS_ADVISOR_WORKTREE_ROOT_ALLOWLIST (STR, default empty,
-    opt-in for non-project_root worktrees)."""
+    opt-in for non-project_root worktrees).
+
+    Targeted Locality Bounding repair (2026-07-21) added two more:
+    JARVIS_ADVISOR_LOCALITY_BOUNDING_ENABLED +
+    JARVIS_ADVISOR_EPISTEMIC_NOTIFY_ENABLED (both BOOL default-TRUE).
+    """
     captured: list = []
 
     class _Capturer:
@@ -628,10 +699,12 @@ def test_register_flags_returns_two_specs() -> None:
             captured.append(spec)
 
     count = register_flags(_Capturer())
-    assert count == 2
+    assert count == 4
     names = {s.name for s in captured}
     assert ADVISOR_WORKTREE_AWARE_ENABLED_ENV_VAR in names
     assert ADVISOR_WORKTREE_ROOT_ALLOWLIST_ENV_VAR in names
+    assert "JARVIS_ADVISOR_LOCALITY_BOUNDING_ENABLED" in names
+    assert "JARVIS_ADVISOR_EPISTEMIC_NOTIFY_ENABLED" in names
 
 
 def test_register_flags_master_graduated_to_default_true_2026_05_13() -> None:
@@ -845,13 +918,20 @@ def test_classify_runner_threads_repo_root_through_advise_async() -> None:
             else func.id if isinstance(func, _ast.Name)
             else None
         )
-        if name == "resolve_envelope_repo_root":
+        # B2 fail-closed evolution: guard_envelope_repo_root wraps the
+        # resolver (envelope_repo_root_status → resolve) and ADDS the
+        # REJECTED→raise arm — either shape satisfies the invariant.
+        if name in (
+            "resolve_envelope_repo_root",
+            "guard_envelope_repo_root",
+        ):
             resolver_called = True
         if name == "advise_async":
             advise_async_sites.append(node)
 
     assert resolver_called, (
-        "classify_runner.py never calls resolve_envelope_repo_root — "
+        "classify_runner.py never calls resolve_envelope_repo_root or "
+        "its B2 fail-closed wrapper guard_envelope_repo_root — "
         "envelope-evidence-driven worktree-aware advisory wiring is "
         "missing.  This was the gap that made stage-1 wiring soak "
         "v11 advise() starve even after Phase 0 graduation."
