@@ -11,3 +11,4 @@ tests/governance/test_chat_repl_dispatcher.py
 tests/governance/test_intent_classifier.py
 tests/governance/test_conversation_orchestrator.py
 tests/core/test_intent_classifier.py
+tests/api/test_hive_council_layer.py

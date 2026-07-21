@@ -397,9 +397,11 @@ def test_flag_registry_delegate_reaches_emitter():
 
     reg = _Reg()
     n = register_flags(reg)
-    assert n == 5 and len(reg.specs) == 5
+    # 5 emitter flags + 4 council flags (Step 3)
+    assert n == 9 and len(reg.specs) == 9
     names = {s.name for s in reg.specs}
     assert "JARVIS_HIVE_EMITTERS_ENABLED" in names
+    assert "JARVIS_HIVE_COUNCIL_ENABLED" in names
 
 
 @pytest.mark.asyncio

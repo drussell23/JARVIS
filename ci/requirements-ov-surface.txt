@@ -8,3 +8,5 @@ pytest-asyncio>=0.23
 pydantic>=2
 rich>=13
 aiofiles>=23
+uuid6>=2024.1
+numpy>=1.26
