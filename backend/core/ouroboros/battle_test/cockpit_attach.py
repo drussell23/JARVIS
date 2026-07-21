@@ -116,6 +116,7 @@ class CockpitAttachBridge:
         status_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         ops_provider: Optional[Callable[[], Any]] = None,
         liquidity_provider: Optional[Callable[[], Dict[str, Any]]] = None,
+        fabrics_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         replay_provider: Optional[Callable[[], Any]] = None,
         on_input: Optional[Callable[[str], None]] = None,
         on_audio: Optional[Callable[[str], None]] = None,
@@ -124,6 +125,10 @@ class CockpitAttachBridge:
         self._status = status_provider or (lambda: {})
         self._ops = ops_provider or (lambda: [])
         self._liquidity = liquidity_provider or (lambda: {})
+        # ov doctor edge 4: hive-fabric attachment stats (trinity subs /
+        # sse / emitter). Pull-model like every other provider — consulted
+        # fresh at each handshake, zero authority.
+        self._fabrics = fabrics_provider or (lambda: {})
         # Slice H: zero-authority pull of the TrinityEventBus replay buffer —
         # the chronological critical telemetry flushed to a client on connect
         # so a late attach reconciles the DAG history, not just the snapshot.
@@ -210,6 +215,7 @@ class CockpitAttachBridge:
             "status": _safe(self._status, {}),
             "ops": _safe(self._ops, []),
             "liquidity": _safe(self._liquidity, {}),
+            "fabrics": _safe(self._fabrics, {}),
             "audio": {"state": self._audio_state},
         }
 
