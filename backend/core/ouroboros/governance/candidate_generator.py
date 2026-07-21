@@ -1952,6 +1952,10 @@ class FailureMode(Enum):
     CONTENT_FAILURE = auto()    # Bad output, infra healthy — no penalty
     CONTEXT_OVERFLOW = auto()   # Tool loop prompt exceeded char limit — immediate fallback
     TRANSIENT_TRANSPORT = auto()  # HTTP/2 disconnect, premature stream close — seconds
+    TEMPORAL_SHED = auto()      # Temporal Veto fast-fail — NOT a DW health fact;
+    #                             zero primary penalty, zero retry, immediate cascade.
+    #                             The op's budget was too tight for any DW lane; the
+    #                             NEXT op with a normal budget must still use DW.
 
 
 # Mode-specific recovery parameters for exponential backoff.
@@ -1967,6 +1971,9 @@ _RECOVERY_PARAMS: dict[FailureMode, dict[str, float]] = {
     # fallback to Tier 1 with zero backoff penalty (same profile as
     # CONTENT_FAILURE). No timeout ETA penalty on the FSM.
     FailureMode.CONTEXT_OVERFLOW: {"base_s": 0.0,  "max_s": 0.0},
+    # TEMPORAL_SHED: a routing refusal (deadline vs batch plane), not an
+    # infra failure — no backoff, DW immediately eligible for the next op.
+    FailureMode.TEMPORAL_SHED:   {"base_s": 0.0,  "max_s": 0.0},
     # TRANSIENT_TRANSPORT: HTTP/2 GOAWAY, RemoteProtocolError, ClosedResourceError.
     # The transport layer flapped (often a single dropped connection in a keep-alive
     # pool) but the upstream API is healthy. A 5s base backs off to 30s after 4
@@ -2470,6 +2477,13 @@ class FailbackStateMachine:
         """
         exc_type = type(exc).__name__
         msg = str(exc).lower()
+
+        # Temporal Veto fast-fail shed — checked FIRST (before the generic
+        # DoublewordInfraError status walk: it subclasses that type with
+        # status 0, which would otherwise fall through to the TIMEOUT
+        # default and earn DW an undeserved penalty + retry).
+        if exc_type == "TemporalBudgetShedError" or "temporal_load_shed" in msg:
+            return FailureMode.TEMPORAL_SHED
 
         # DoublewordInfraError carries a status code
         if exc_type == "DoublewordInfraError":
@@ -4089,7 +4103,13 @@ class CandidateGenerator:
                             mode.name, type(rt_exc).__name__, rt_exc,
                             self._remaining_seconds(deadline),
                         )
-                        if mode is not FailureMode.CONTENT_FAILURE:
+                        if mode not in (
+                            FailureMode.CONTENT_FAILURE,
+                            # A temporal shed is OUR routing refusal, not a DW
+                            # health fact — penalizing DW here would rotate the
+                            # funded primary out because ONE op ran tight.
+                            FailureMode.TEMPORAL_SHED,
+                        ):
                             self.fsm.record_primary_failure(mode=mode)
                             self._record_tier0_failure()
                             if self._latency_tracker is not None:
