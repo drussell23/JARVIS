@@ -4210,6 +4210,11 @@ class BattleTestHarness:
             # ProviderLiquidityLedger, exhaustion verdicts, and the
             # LiquidityPool lease economy.
             self._repl_cmd_liquidity()
+        elif cmd == "/doctor probe" or cmd == "doctor probe":
+            # ov doctor --live: the synthetic tool probe (trace-context
+            # isolated — zero state mutation anywhere) fired in-daemon;
+            # verdict relayed to every attached terminal.
+            await self._repl_cmd_doctor_probe()
         elif await self._try_dispatch_plugin_command(command.strip()):
             # Plugin-registered slash commands: /greet, /<plugin_cmd>, etc.
             # Returns True iff a plugin handled the command.
@@ -4225,6 +4230,30 @@ class BattleTestHarness:
             pass
         else:
             logger.debug("Unknown REPL command: %s", cmd)
+
+    async def _repl_cmd_doctor_probe(self) -> None:
+        """/doctor probe — ov doctor --live's in-daemon half. Fires ONE
+        real read-only web_search through the REAL ToolBackend under the
+        synthetic trace context (doctor_probe.py); the emitted actor_edge
+        frame + this verdict line travel back over the cockpit UDS to the
+        watching doctor. Fail-soft; NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.doctor_probe import (
+                run_synthetic_tool_probe,
+            )
+            self._repl_print("[doctor] synthetic probe firing (web_search, "
+                             "trace-isolated — no state mutation)")
+            verdict = await run_synthetic_tool_probe()
+            self._repl_print(
+                f"[doctor] probe {verdict.get('op_id', '?')}: "
+                f"status={verdict.get('status')} "
+                f"{verdict.get('duration_ms', 0):.0f}ms "
+                f"{verdict.get('detail', '')}".rstrip())
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self._repl_print(f"[doctor] probe failed: {exc}")
+            except Exception:  # noqa: BLE001
+                pass
 
     def _repl_cmd_liquidity(self) -> None:
         """``/liquidity`` — circadian provider-runway dashboard.
@@ -4373,10 +4402,27 @@ class BattleTestHarness:
             from backend.core.ouroboros.battle_test.audio_synapse import (
                 AudioVisualSynapse,
             )
+            def _fabrics_provider() -> dict:
+                # ov doctor edge 4 — hive-fabric attachment truth, read
+                # fresh from the live aggregator at each handshake.
+                try:
+                    agg = getattr(self, "_hive_aggregator", None)
+                    if agg is None:
+                        return {}
+                    return {
+                        "trinity_subs": len(getattr(agg, "_sub_ids", []) or []),
+                        "sse": getattr(agg, "_sse_sub", None) is not None,
+                        "emitter": getattr(agg, "_emitter", None) is not None,
+                        "stats": dict(getattr(agg, "stats", {}) or {}),
+                    }
+                except Exception:  # noqa: BLE001
+                    return {}
+
             bridge = CockpitAttachBridge(
                 status_provider=_status_provider,
                 ops_provider=_ops_provider,
                 liquidity_provider=_liquidity_provider,
+                fabrics_provider=_fabrics_provider,
                 on_input=_on_input,
                 on_audio=lambda cmd: self._dispatch_audio_cmd(cmd),
             )

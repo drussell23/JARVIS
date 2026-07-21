@@ -27,7 +27,8 @@ from typing import Any, Callable, List, Optional, Sequence
 
 from backend.core.ouroboros.ui.theme import build_console
 
-_VERBS = {"cockpit", "run", "daemon", "status", "attach", "system", "hive", "version"}
+_VERBS = {"cockpit", "run", "daemon", "status", "attach", "system", "hive",
+          "doctor", "version"}
 _HELP_TOKENS = {"help", "--help", "-h"}
 _VERSION_TOKENS = {"version", "--version", "-V"}
 
@@ -80,6 +81,8 @@ _HELP_TEXT = """ov -- Ouroboros + Venom, autonomous engineering organism
   ov daemon --install    install the resident organism (launchd agent)
   ov daemon --uninstall  remove the resident organism
   ov status           last-session digest (no boot)
+  ov doctor [--live]  8-edge connectivity matrix; --live fires the
+                      trace-isolated synthetic tool probe end-to-end
   ov attach           attach this terminal to the running organism
   ov version          version + milestone
   ov help             this message
@@ -138,6 +141,8 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
         return Invocation("system")
     if verb == "hive":
         return Invocation("hive")
+    if verb == "doctor":
+        return Invocation("doctor", list(rest))
     # cockpit (explicit or defaulted)
     return Invocation("cockpit", rest)
 
@@ -694,6 +699,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_system(console)
     if inv.action == "hive":
         return run_hive(console)
+    if inv.action == "doctor":
+        try:
+            from backend.core.ouroboros.cli.ov_doctor import run_doctor
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"ov doctor unavailable: {exc}", markup=False)
+            return 1
+        return run_doctor(console, live="--live" in inv.delegate_argv)
     if inv.action == "status":
         console.print(status_digest(), markup=False, highlight=False)
         return 0

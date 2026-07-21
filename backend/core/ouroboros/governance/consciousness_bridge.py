@@ -155,6 +155,20 @@ class ConsciousnessBridge:
         """
         if self._consciousness is None:
             return
+        # Trace Context Isolation (ov doctor --live): a synthetic probe must
+        # traverse the observability fabrics but NEVER mutate state — the
+        # MemoryEngine write path short-circuits structurally on the flag.
+        try:
+            from backend.core.ouroboros.governance.doctor_probe import (
+                is_synthetic_trace,
+            )
+            if is_synthetic_trace(op_id=op_id):
+                logger.debug(
+                    "[ConsciousnessBridge] synthetic probe %s — state "
+                    "write skipped (trace-context guard)", op_id)
+                return
+        except Exception:  # noqa: BLE001
+            pass
         # Idempotency chokepoint: an op may cross BOTH terminal seams (GLS
         # _emit_terminal_events for inline ops, _bg_unregister_active for
         # background-pool ops) — reputation must ingest exactly once.
