@@ -4133,6 +4133,32 @@ class GovernedLoopService:
                 except Exception as _mcp_exc:
                     logger.debug("[GovernedLoop] MCP hook error: %s", _mcp_exc)
 
+            # ---- ConsciousnessBridge outcome hook (Hive Step 2 root-cause
+            # fix): record_operation_outcome had ZERO callers — the
+            # MemoryEngine's sole write path (file reputations) never ran in
+            # the live loop. The harness injects the bridge onto this service
+            # (harness._start_consciousness wiring); absent → clean no-op.
+            # Fire-and-forget with a bound, mirroring the MCP hooks above.
+            _cb = getattr(self, "_consciousness_bridge", None)
+            if _cb is not None and getattr(_cb, "is_active", False):
+                try:
+                    await asyncio.wait_for(
+                        _cb.record_operation_outcome(
+                            op_id=ctx.op_id,
+                            files_changed=list(
+                                getattr(terminal_ctx, "target_files", None) or ()),
+                            success=(terminal_ctx.phase
+                                     is OperationPhase.COMPLETE),
+                            failure_reason=getattr(
+                                terminal_ctx, "failure_class", None),
+                        ),
+                        timeout=5.0,
+                    )
+                except Exception as _cb_exc:
+                    logger.debug(
+                        "[GovernedLoop] consciousness outcome hook error: %s",
+                        _cb_exc)
+
             return result
 
         finally:

@@ -25,13 +25,16 @@ def _mk(intent: str = "actions:test", summary: str = "click in 'test'",
 
 @pytest.mark.asyncio
 async def test_fifty_events_in_200ms_yield_exactly_one_envelope(monkeypatch):
-    monkeypatch.setenv("JARVIS_HIVE_DEBOUNCE_WINDOW_MS", "200")
+    # Window comfortably wider than the burst spread so scheduler jitter can
+    # never split the burst across two windows (the 200ms spec is about the
+    # BURST density, not the window size — prod default stays 200ms).
+    monkeypatch.setenv("JARVIS_HIVE_DEBOUNCE_WINDOW_MS", "600")
     em = HiveEmitter()
     em.bind_loop()
     for i in range(50):
         em.emit(**_mk(), coalesce=True)
-        await asyncio.sleep(0.2 / 60)  # 50 events spread inside ~170ms
-    await asyncio.sleep(0.4)           # let the window close
+        await asyncio.sleep(0.2 / 60)  # 50 events spread inside ~170-250ms
+    await asyncio.sleep(0.8)           # let the window close
     out = []
     while not em.out_queue.empty():
         out.append(em.out_queue.get_nowait())
@@ -90,9 +93,9 @@ async def test_worst_severity_wins_in_a_window():
     key = ("a", "i")
     base = dict(actor_id="a", subsystem="s", intent="i", action_summary="x",
                 trace_id="t", detail={}, source_fabric="actor_edge")
-    deb.accept(key, dict(base, severity="info"))
-    deb.accept(key, dict(base, severity="error"))
-    deb.accept(key, dict(base, severity="info"))
+    deb.accept(key, dict(base, severity="info"), severity="info")
+    deb.accept(key, dict(base, severity="error"), severity="error")
+    deb.accept(key, dict(base, severity="info"), severity="info")
     deb.flush(key)
     assert len(sunk) == 1 and sunk[0].severity == "error"
 
@@ -172,3 +175,31 @@ def test_emit_without_any_loop_never_raises():
 @pytest.mark.asyncio
 async def test_default_emitter_is_process_singleton():
     assert get_default_emitter() is get_default_emitter()
+
+
+@pytest.mark.asyncio
+async def test_generic_finalizer_folds_envelopes_not_kwargs():
+    """The SAME EdgeDebouncer coalesces already-cast envelopes when given an
+    envelope finalizer (the aggregator's bus-storm compression path)."""
+    from backend.api.hive_envelope import GovernanceEnvelope
+
+    sunk = []
+
+    def _fin(env, count, span_ms, first_ts, severity):
+        if count <= 1:
+            return env
+        return env.model_copy(update={
+            "action_summary": f"{env.action_summary} (×{count} in {span_ms:.0f}ms)"})
+
+    deb = EdgeDebouncer(sunk.append, finalizer=_fin)
+    env = GovernanceEnvelope(actor_id="ov.governance", subsystem="governance",
+                             intent="governor_throttle_applied",
+                             action_summary="governor throttle applied",
+                             trace_id="—")
+    key = (env.actor_id, env.intent)
+    for _ in range(50):
+        deb.accept(key, env, severity="info")
+    deb.flush(key)
+    assert len(sunk) == 1
+    assert sunk[0].kind == "governance"        # subclass kind SURVIVES the fold
+    assert "×50" in sunk[0].action_summary

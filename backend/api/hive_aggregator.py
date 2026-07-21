@@ -72,6 +72,34 @@ class HiveAggregator:
         #: silent actors (MCP/web/voice/contexts/ghost-hands/vision/memory)
         #: emit. Already-envelope — drained read-only, no cast needed.
         self._emitter = emitter
+        #: Bus-storm compression (Step 2): non-actor fabrics coalesce identical
+        #: (actor, intent) bursts through the SAME EdgeDebouncer implementation
+        #: the emitter uses (mandate 3) — the finalizer amends the FIRST
+        #: envelope rather than rebuilding it, so subclass kinds survive.
+        self._bus_coalescer: Optional[Any] = None
+        import os
+        if os.environ.get("JARVIS_HIVE_BUS_COALESCE_ENABLED",
+                          "true").strip().lower() == "true":
+            try:
+                from backend.api.hive_emitter import EdgeDebouncer
+
+                def _bus_finalizer(env: Any, count: int, span_ms: float,
+                                   first_ts: float, severity: str) -> Any:
+                    if count <= 1:
+                        return env
+                    try:
+                        return env.model_copy(update={
+                            "action_summary": (f"{env.action_summary} "
+                                               f"(×{count} in {span_ms:.0f}ms)"),
+                            "severity": severity,
+                        })
+                    except Exception:  # noqa: BLE001
+                        return env
+
+                self._bus_coalescer = EdgeDebouncer(
+                    self._fan_in_direct, finalizer=_bus_finalizer)
+            except Exception:  # noqa: BLE001
+                self._bus_coalescer = None
         #: Late-binding source resolution: when ``bus`` is None at start (the
         #: TrinityEventBus singleton is created lazily, often AFTER cockpit
         #: boot), a resolver lets the aggregator re-attach the moment the bus
@@ -205,8 +233,25 @@ class HiveAggregator:
 
     def _fan_in(self, env: HiveTelemetryEnvelope) -> None:
         """Push a normalized envelope into the shared fan-in queue. Non-blocking
-        (drop-oldest on overflow) so no source ever blocks another."""
+        (drop-oldest on overflow) so no source ever blocks another.
+
+        Bus-storm compression: identical (actor, intent) bursts from the
+        NON-actor fabrics (the live governor-throttle storm class: 50+
+        identical frames in one second) coalesce through the SAME EdgeDebouncer
+        windows the emitter uses — actor_edge envelopes were already debounced
+        at the edge and pass straight through."""
         self.stats["captured"] += 1
+        if (self._bus_coalescer is not None
+                and env.source_fabric != "actor_edge"):
+            try:
+                self._bus_coalescer.accept((env.actor_id, env.intent), env,
+                                           severity=env.severity)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        self._fan_in_direct(env)
+
+    def _fan_in_direct(self, env: HiveTelemetryEnvelope) -> None:
         try:
             self._raw.put_nowait(env)
         except asyncio.QueueFull:
@@ -278,6 +323,11 @@ class HiveAggregator:
     async def stop(self) -> None:
         """Detach cleanly (read-only teardown). NEVER raises."""
         self._running = False
+        if self._bus_coalescer is not None:
+            try:
+                self._bus_coalescer.flush_all()
+            except Exception:  # noqa: BLE001
+                pass
         if self._bus is not None:
             for sub_id in self._sub_ids:
                 try:

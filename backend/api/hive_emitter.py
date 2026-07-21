@@ -117,20 +117,32 @@ def _clean_detail(detail: Optional[Dict[str, Any]], max_len: int) -> Dict[str, A
 # ---------------------------------------------------------------------------
 
 class _Window:
-    __slots__ = ("first_ts", "last_ts", "count", "envelope_kwargs", "handle",
+    __slots__ = ("first_ts", "last_ts", "count", "item", "handle",
                  "worst_severity")
 
-    def __init__(self, kwargs: Dict[str, Any]) -> None:
+    def __init__(self, item: Any, severity: str) -> None:
         now = time.time()
         self.first_ts = now
         self.last_ts = now
         self.count = 1
-        self.envelope_kwargs = kwargs
+        self.item = item
         self.handle: Optional[asyncio.TimerHandle] = None
-        self.worst_severity = kwargs.get("severity", "info")
+        self.worst_severity = severity
 
 
 _SEV_RANK = {"info": 0, "success": 1, "warn": 2, "error": 3}
+
+
+def _actor_kwargs_finalizer(kwargs: Dict[str, Any], count: int, span_ms: float,
+                            first_ts: float, severity: str) -> Any:
+    """Default finalizer: build ONE ActorEnvelope from the first event's
+    kwargs, amended with the burst arithmetic."""
+    kw = dict(kwargs)
+    if count > 1:
+        kw["action_summary"] = (
+            f"{kw['action_summary']} (×{count} in {span_ms:.0f}ms)")
+    kw["severity"] = severity
+    return ActorEnvelope(coalesced_n=count, span_ms=span_ms, ts=first_ts, **kw)
 
 
 class EdgeDebouncer:
@@ -138,17 +150,25 @@ class EdgeDebouncer:
 
     Loop-confined: every mutation happens on the bound event loop (the emitter
     marshals cross-thread callers), so no locks. A window opens on the first
-    event of a key, folds subsequent events, and flushes ONE envelope when the
+    event of a key, folds subsequent events, and flushes ONE item when the
     window timer fires or ``flush()`` closes it early (sequence completion).
 
     Adaptive width (AIMD-flavored): a window that closes at/over the high-water
     count doubles the key's next window (up to the ceiling); a window that
     closes with a single event halves it (down to the base). Storms compress
     harder; sparse keys stay near-realtime.
+
+    Generic over the folded item via the injectable ``finalizer(first_item,
+    count, span_ms, first_ts, worst_severity) -> obj|None``: the emitter folds
+    raw emit kwargs into an ActorEnvelope (default), the aggregator folds
+    already-cast bus envelopes (bus-storm compression) — ONE window/adaptive
+    implementation for both (mandate 3).
     """
 
-    def __init__(self, sink: Callable[[ActorEnvelope], None]) -> None:
+    def __init__(self, sink: Callable[[Any], None],
+                 finalizer: Optional[Callable] = None) -> None:
         self._sink = sink
+        self._finalizer = finalizer or _actor_kwargs_finalizer
         self._windows: Dict[Tuple[str, str], _Window] = {}
         self._widths: Dict[Tuple[str, str], float] = {}
         self.base_ms = _env_float("JARVIS_HIVE_DEBOUNCE_WINDOW_MS", 200.0)
@@ -156,21 +176,19 @@ class EdgeDebouncer:
         self.high_water = _env_int("JARVIS_HIVE_DEBOUNCE_HIGHWATER", 25)
         self.stats = {"opened": 0, "folded": 0, "flushed": 0}
 
-    def accept(self, key: Tuple[str, str], kwargs: Dict[str, Any]) -> None:
-        """Fold one event into its key's window (opening one if needed)."""
+    def accept(self, key: Tuple[str, str], item: Any,
+               severity: str = "info") -> None:
+        """Fold one event into its key's window (opening one if needed).
+        The FIRST item is the semantic anchor; later ones bump count/severity."""
         win = self._windows.get(key)
         if win is not None:
             win.count += 1
             win.last_ts = time.time()
-            # keep FIRST summary (the semantic anchor), worst severity, last detail
-            sev = kwargs.get("severity", "info")
-            if _SEV_RANK.get(sev, 0) > _SEV_RANK.get(win.worst_severity, 0):
-                win.worst_severity = sev
-            if kwargs.get("detail"):
-                win.envelope_kwargs["detail"] = kwargs["detail"]
+            if _SEV_RANK.get(severity, 0) > _SEV_RANK.get(win.worst_severity, 0):
+                win.worst_severity = severity
             self.stats["folded"] += 1
             return
-        win = _Window(dict(kwargs))
+        win = _Window(item, severity)
         self._windows[key] = win
         self.stats["opened"] += 1
         width = self._widths.get(key, self.base_ms) / 1000.0
@@ -201,17 +219,13 @@ class EdgeDebouncer:
             self._widths[key] = min(cur * 2, self.max_ms)
         elif win.count <= 1:
             self._widths[key] = max(cur / 2, self.base_ms)
-        kw = win.envelope_kwargs
         span_ms = max(0.0, (win.last_ts - win.first_ts) * 1000.0)
-        if win.count > 1:
-            kw["action_summary"] = (
-                f"{kw['action_summary']} (×{win.count} in {span_ms:.0f}ms)")
-        kw["severity"] = win.worst_severity
         try:
-            env = ActorEnvelope(coalesced_n=win.count, span_ms=span_ms,
-                                ts=win.first_ts, **kw)
-            self._sink(env)
-            self.stats["flushed"] += 1
+            out = self._finalizer(win.item, win.count, span_ms,
+                                  win.first_ts, win.worst_severity)
+            if out is not None:
+                self._sink(out)
+                self.stats["flushed"] += 1
         except Exception:  # noqa: BLE001
             pass
 
@@ -308,7 +322,8 @@ class HiveEmitter:
 
     def _accept(self, kwargs: Dict[str, Any], coalesce: bool) -> None:
         if coalesce:
-            self._debouncer.accept((kwargs["actor_id"], kwargs["intent"]), kwargs)
+            self._debouncer.accept((kwargs["actor_id"], kwargs["intent"]),
+                                   kwargs, severity=kwargs.get("severity", "info"))
             return
         try:
             env = ActorEnvelope(**kwargs)
