@@ -65,11 +65,31 @@ class BargeInDetector:
         self._monitor = asyncio.create_task(
             self._monitor_loop(), name="barge_in_monitor",
         )
+        # Hive Step 2: TTS lifecycle emit (metadata only). Fail-soft.
+        try:
+            from backend.api.hive_emitter import hive_emit
+            hive_emit(actor_id="voice.tts", subsystem="voice",
+                      intent="tts_speaking",
+                      summary="TTS playback started",
+                      severity="info", trace_id="voice")
+        except Exception:  # noqa: BLE001
+            pass
 
     async def stop_tts(self) -> None:
         """Called when TTS finishes normally."""
+        was_active = self._tts_active
         self._tts_active = False
         self._tts_proc = None
+        if was_active:
+            try:
+                from backend.api.hive_emitter import hive_emit
+                hive_emit(actor_id="voice.tts", subsystem="voice",
+                          intent="tts_speaking",
+                          summary=(f"TTS playback finished "
+                                   f"({time.time() - self._tts_start:.1f}s)"),
+                          severity="info", trace_id="voice")
+            except Exception:  # noqa: BLE001
+                pass
         if self._monitor and not self._monitor.done():
             self._monitor.cancel()
             try:

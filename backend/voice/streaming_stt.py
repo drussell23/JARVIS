@@ -346,6 +346,25 @@ class StreamingSTTEngine:
                     audio_duration_ms=(len(audio) / self._sample_rate) * 1000,
                 )
                 await self._transcript_queue.put(event)
+                # Hive Step 2: STT completion emit — CONTENT-FREE (char count
+                # + confidence only; the transcript itself never rides).
+                # Finals only; partials coalesce via the edge debouncer.
+                try:
+                    from backend.api.hive_emitter import hive_emit
+                    hive_emit(
+                        actor_id="voice.stt", subsystem="voice",
+                        intent="transcript_partial" if is_partial else "transcript_final",
+                        summary=(f"{'partial' if is_partial else 'final'} "
+                                 f"transcript: {len(text)} chars "
+                                 f"conf={confidence:.2f}"),
+                        severity="info", trace_id="voice",
+                        coalesce=bool(is_partial),
+                        detail={"chars": len(text),
+                                "confidence": round(float(confidence), 3),
+                                "audio_ms": round(event.audio_duration_ms, 0)},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
         except Exception as e:
             logger.warning(f"[StreamingSTT] Transcription error: {e}")

@@ -28,6 +28,16 @@ from backend.api.hive_envelope import (
 
 logger = logging.getLogger("Jarvis.HiveAggregator")
 
+
+def _env_float(name: str, default: float) -> float:
+    """Env-tunable float with junk-value fallback (repo idiom). NEVER raises."""
+    import os
+    try:
+        raw = os.environ.get(name, "")
+        return float(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
 #: TrinityEventBus source families the aggregator listens on (read-only). It does
 #: NOT subscribe to its own relay topic, so there is no feedback loop.
 _TRINITY_PATTERNS = (
@@ -50,12 +60,23 @@ class HiveAggregator:
         *,
         bus: Optional[Any] = None,
         sse_broker: Optional[Any] = None,
+        bus_resolver: Optional[Any] = None,
+        emitter: Optional[Any] = None,
         raw_max: int = 4096,
         out_max: int = 4096,
         sort_window_s: float = 0.02,
     ) -> None:
         self._bus = bus
         self._broker = sse_broker
+        #: Third fabric (Step 2): the process-local HiveEmitter edge where the
+        #: silent actors (MCP/web/voice/contexts/ghost-hands/vision/memory)
+        #: emit. Already-envelope — drained read-only, no cast needed.
+        self._emitter = emitter
+        #: Late-binding source resolution: when ``bus`` is None at start (the
+        #: TrinityEventBus singleton is created lazily, often AFTER cockpit
+        #: boot), a resolver lets the aggregator re-attach the moment the bus
+        #: materializes instead of silently losing that fabric forever.
+        self._bus_resolver = bus_resolver
         self._sort_window_s = sort_window_s
         self._raw: "asyncio.Queue[HiveTelemetryEnvelope]" = asyncio.Queue(maxsize=raw_max)
         #: The unified, chronologically-ordered feed the TUI consumes.
@@ -75,14 +96,12 @@ class HiveAggregator:
         self._running = True
         # TrinityEventBus: native subscribe on each source family.
         if self._bus is not None:
-            for pattern in _TRINITY_PATTERNS:
-                try:
-                    sub_id = await self._bus.subscribe(pattern, self._on_trinity)
-                    if sub_id:
-                        self._sub_ids.append(sub_id)
-                except Exception:  # noqa: BLE001
-                    logger.debug("[HiveAgg] trinity subscribe degraded pattern=%s", pattern,
-                                 exc_info=True)
+            await self._subscribe_trinity()
+        elif self._bus_resolver is not None:
+            # The bus doesn't exist yet — poll the resolver with adaptive
+            # backoff and attach the moment it materializes (fixes the
+            # trinity_subs=0 boot-ordering gap).
+            self._tasks.append(asyncio.ensure_future(self._bus_reattach_loop()))
         # IDE SSE broker: native subscribe + a stream_iter pump task.
         if self._broker is not None:
             try:
@@ -91,10 +110,54 @@ class HiveAggregator:
                     self._tasks.append(asyncio.ensure_future(self._pump_sse()))
             except Exception:  # noqa: BLE001
                 logger.debug("[HiveAgg] sse subscribe degraded", exc_info=True)
+        # HiveEmitter edge (Step 2): drain the actor-emission queue read-only.
+        if self._emitter is not None:
+            try:
+                self._emitter.bind_loop()
+                self._tasks.append(asyncio.ensure_future(self._pump_emitter()))
+            except Exception:  # noqa: BLE001
+                logger.debug("[HiveAgg] emitter attach degraded", exc_info=True)
         # The single fan-in drainer (coalesce → sort → emit).
         self._tasks.append(asyncio.ensure_future(self._drainer()))
-        logger.info("[HiveAgg] listening — trinity_subs=%d sse=%s",
-                    len(self._sub_ids), self._sse_sub is not None)
+        logger.info("[HiveAgg] listening — trinity_subs=%d sse=%s emitter=%s",
+                    len(self._sub_ids), self._sse_sub is not None,
+                    self._emitter is not None)
+
+    async def _subscribe_trinity(self) -> None:
+        """Native read-only subscribe on each Trinity source family. NEVER raises."""
+        for pattern in _TRINITY_PATTERNS:
+            try:
+                sub_id = await self._bus.subscribe(pattern, self._on_trinity)
+                if sub_id:
+                    self._sub_ids.append(sub_id)
+            except Exception:  # noqa: BLE001
+                logger.debug("[HiveAgg] trinity subscribe degraded pattern=%s", pattern,
+                             exc_info=True)
+
+    async def _bus_reattach_loop(self) -> None:
+        """Adaptive late-attach: the TrinityEventBus singleton is created lazily
+        by whichever subsystem needs it first — often AFTER the cockpit (and this
+        aggregator) boots. Poll the injected resolver with exponential backoff
+        (cheap: one function call per tick) and subscribe the moment the bus
+        exists. Exits after attaching. NEVER raises out."""
+        delay = _env_float("JARVIS_HIVE_BUS_REATTACH_MIN_S", 1.0)
+        ceiling = _env_float("JARVIS_HIVE_BUS_REATTACH_MAX_S", 30.0)
+        while self._running and self._bus is None:
+            try:
+                bus = self._bus_resolver()
+            except Exception:  # noqa: BLE001
+                bus = None
+            if bus is not None:
+                self._bus = bus
+                await self._subscribe_trinity()
+                logger.info("[HiveAgg] trinity bus materialized — re-attached "
+                            "(subs=%d)", len(self._sub_ids))
+                return
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+            delay = min(delay * 2, ceiling)
 
     async def _on_trinity(self, event: Any) -> None:
         """TrinityEventBus handler (read-only). Casts + fans in. NEVER raises."""
@@ -127,6 +190,18 @@ class HiveAggregator:
             raise
         except Exception:  # noqa: BLE001
             logger.debug("[HiveAgg] sse pump ended", exc_info=True)
+
+    async def _pump_emitter(self) -> None:
+        """Drain the HiveEmitter edge (already-envelope) into the fan-in.
+        Read-only: the emitter never learns who consumes it. NEVER raises out."""
+        try:
+            while self._running:
+                env = await self._emitter.out_queue.get()
+                self._fan_in(env)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.debug("[HiveAgg] emitter pump ended", exc_info=True)
 
     def _fan_in(self, env: HiveTelemetryEnvelope) -> None:
         """Push a normalized envelope into the shared fan-in queue. Non-blocking
@@ -247,10 +322,15 @@ async def start_hive_relay(
     ``None`` when degraded.
     """
     try:
+        resolver = None
         if bus is _UNSET:
             try:
                 from backend.core.trinity_event_bus import get_event_bus_if_exists
                 bus = get_event_bus_if_exists()
+                # Late-binding: the singleton is often created AFTER cockpit
+                # boot — hand the aggregator the resolver so it re-attaches
+                # the moment the bus materializes (trinity_subs=0 fix).
+                resolver = get_event_bus_if_exists
             except Exception:  # noqa: BLE001
                 bus = None
         if sse_broker is _UNSET:
@@ -261,7 +341,13 @@ async def start_hive_relay(
                 sse_broker = get_default_broker()
             except Exception:  # noqa: BLE001
                 sse_broker = None
-        agg = HiveAggregator(bus=bus, sse_broker=sse_broker)
+        try:
+            from backend.api.hive_emitter import get_default_emitter
+            emitter = get_default_emitter()
+        except Exception:  # noqa: BLE001
+            emitter = None
+        agg = HiveAggregator(bus=bus, sse_broker=sse_broker,
+                             bus_resolver=resolver, emitter=emitter)
         await agg.start()
 
         async def _relay() -> None:

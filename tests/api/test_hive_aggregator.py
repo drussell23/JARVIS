@@ -266,3 +266,131 @@ def test_both_pipeline_hosts_wire_the_hive_relay():
     assert "start_hive_relay" in _calls_in_function(
         root / "backend" / "core" / "ouroboros" / "battle_test" / "harness.py",
         "_start_cockpit_attach_bridge")
+
+
+@pytest.mark.asyncio
+async def test_trinity_bus_late_materialization_reattaches(monkeypatch):
+    """trinity_subs=0 residual fix: when the TrinityEventBus singleton doesn't
+    exist at cockpit boot, the aggregator polls the injected resolver and
+    attaches the MOMENT the bus materializes — that fabric's frames then flow."""
+    monkeypatch.setenv("JARVIS_HIVE_BUS_REATTACH_MIN_S", "0.01")
+    monkeypatch.setenv("JARVIS_HIVE_BUS_REATTACH_MAX_S", "0.02")
+    holder = {"bus": None}
+    agg = HiveAggregator(bus=None, sse_broker=None,
+                         bus_resolver=lambda: holder["bus"], sort_window_s=0.0)
+    await agg.start()
+    await asyncio.sleep(0.05)          # loop is polling; bus still absent
+    assert agg._sub_ids == []
+    holder["bus"] = bus = _MockTrinityBus()   # the singleton materializes late
+    await asyncio.sleep(0.1)
+    assert len(agg._sub_ids) > 0        # re-attached
+    await bus.fire("intake.signal_accepted", {"ts": 1.0}, "late-1")
+    await asyncio.sleep(0.05)
+    got = await agg.drain_available()
+    assert any(e.source_fabric == "trinity" for e in got)
+    await agg.stop()
+
+
+@pytest.mark.asyncio
+async def test_no_resolver_means_no_reattach_loop():
+    """Explicit bus=None WITHOUT a resolver (unit-test/injection posture) must
+    not spin any background polling."""
+    agg = HiveAggregator(bus=None, sse_broker=None, sort_window_s=0.0)
+    await agg.start()
+    # only the drainer task exists — no re-attach loop
+    assert len(agg._tasks) == 1
+    await agg.stop()
+
+
+# ---------------------------------------------------------------------------
+# Step 2: the HiveEmitter edge is the aggregator's THIRD fabric
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_three_fabric_merge_includes_actor_edge():
+    """Trinity + IDE-SSE + the actor edge all fold into ONE chronological feed."""
+    from backend.api.hive_emitter import HiveEmitter
+
+    bus, broker = _MockTrinityBus(), _MockSseBroker()
+    em = HiveEmitter()
+    agg = HiveAggregator(bus=bus, sse_broker=broker, emitter=em,
+                         sort_window_s=0.03)
+    await agg.start()
+    await asyncio.sleep(0.01)
+    await bus.fire("intake.signal_accepted", {"ts": 1.0}, "t1")
+    await broker.publish(_SseEvent("gate_evaluated", "op1", {"ts": 2.0}, "s1"))
+    em.emit(actor_id="mcp.gmail_send", subsystem="mcp", intent="tool_call",
+            summary="mcp_gmail_send success 812ms 2048B", trace_id="op1")
+    await asyncio.sleep(0.2)
+    got = await agg.drain_available()
+    fabrics = {e.source_fabric for e in got}
+    assert fabrics == {"trinity", "ide_sse", "actor_edge"}
+    # chronological: actor edge stamped now-time sorts last
+    assert [e.source_fabric for e in sorted(got, key=lambda e: e.ts)][:2] == \
+        ["trinity", "ide_sse"]
+    await agg.stop()
+
+
+# ---------------------------------------------------------------------------
+# Step 2 wiring pins: every silent-actor shim is ON its live path
+# ---------------------------------------------------------------------------
+
+def _module_calls(path):
+    import ast as _ast
+    tree = _ast.parse(open(path, encoding="utf-8").read())
+    names = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call):
+            f = node.func
+            if isinstance(f, _ast.Name):
+                names.add(f.id)
+            elif isinstance(f, _ast.Attribute):
+                names.add(f.attr)
+    return names
+
+
+def test_all_silent_actor_shims_are_wired():
+    """AST wiring pin (the wired-but-inert checklist): each mapped seam calls
+    hive_emit on its live path."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    sites = [
+        "backend/core/ouroboros/governance/tool_executor.py",     # MCP/web
+        "backend/ghost_hands/orchestrator.py",                    # actuation
+        "backend/core_contexts/facade.py",                        # 5 contexts
+        "backend/voice/jarvis_agent_voice.py",                    # wake
+        "backend/voice/streaming_stt.py",                         # STT
+        "backend/voice/barge_in_detector.py",                     # TTS
+        "backend/vision/realtime/frame_pipeline.py",              # perception
+        "backend/core/ouroboros/consciousness/memory_engine.py",  # memory
+    ]
+    missing = [s for s in sites if "hive_emit" not in _module_calls(root / s)]
+    assert not missing, f"hive_emit shim missing from: {missing}"
+
+
+def test_ghost_hands_flushes_its_coalescing_window():
+    """Sequence-completion contract: the task-complete path flushes the
+    per-action window (otherwise burst envelopes lag by a full window)."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    calls = _module_calls(root / "backend" / "ghost_hands" / "orchestrator.py")
+    assert "hive_flush" in calls
+
+
+def test_flag_registry_delegate_reaches_emitter():
+    """hive_flags (in the walked governance package) must forward to the ONE
+    source of truth in backend.api.hive_emitter."""
+    from backend.core.ouroboros.governance.hive_flags import register_flags
+
+    class _Reg:
+        def __init__(self):
+            self.specs = []
+
+        def register(self, spec):
+            self.specs.append(spec)
+
+    reg = _Reg()
+    n = register_flags(reg)
+    assert n == 5 and len(reg.specs) == 5
+    names = {s.name for s in reg.specs}
+    assert "JARVIS_HIVE_EMITTERS_ENABLED" in names

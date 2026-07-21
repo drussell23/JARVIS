@@ -89,6 +89,26 @@ _LEGACY_AGENT_MAP: Dict[str, str] = {
 }
 
 
+def _hive_emit_dispatch(tier: str, handler: str, ok: bool,
+                        goal: str, task_type: str) -> None:
+    """Hive Step 2: the 5 core contexts were log-only — invisible to every
+    observability fabric. One emit per dispatch outcome at the ONE chokepoint
+    every context invocation flows through. Fail-soft; NEVER raises."""
+    try:
+        from backend.api.hive_emitter import hive_emit
+        hive_emit(
+            actor_id=f"context.{handler}", subsystem="context",
+            intent=f"dispatch_{tier}",
+            summary=f"{handler} handled: {goal[:80]}" if ok
+            else f"no handler for: {goal[:80]} (capability gap emitted)",
+            severity="info" if ok else "warn",
+            trace_id=task_type or "—",
+            detail={"tier": tier, "task_type": task_type, "ok": ok},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def dispatch(
     goal: str,
     task_type: str = "",
@@ -122,6 +142,7 @@ async def dispatch(
         try:
             result = await _execute_context(context_name, goal, task_type, command, step)
             if result is not None:
+                _hive_emit_dispatch("1", context_name, True, goal, task_type)
                 return result
             # Context returned None — fall through to Tier 2
             logger.info(
@@ -137,12 +158,14 @@ async def dispatch(
     # ── Tier 2: Legacy Agents (Peripheral Nervous System) ──────────────
     legacy_result = await _try_legacy_agent(goal, task_type, effective_command)
     if legacy_result is not None:
+        _hive_emit_dispatch("2", "legacy_agent", True, goal, task_type)
         return legacy_result
 
     # ── Tier 3: Ouroboros Neuroplasticity (Pillar 6) ───────────────────
     # Both Core Contexts AND Legacy Agents failed to handle this intent.
     # Emit a CapabilityGapEvent — the organism doesn't know how to do this YET.
     await _emit_capability_gap(goal, task_type, effective_command)
+    _hive_emit_dispatch("3", "none", False, goal, task_type)
 
     # Return None — the caller should tell the user "I'm learning how to do this"
     return None
