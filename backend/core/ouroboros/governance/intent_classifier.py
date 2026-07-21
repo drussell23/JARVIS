@@ -89,6 +89,7 @@ class ChatIntent(str, enum.Enum):
     EXPLORATION = "EXPLORATION"
     EXPLANATION = "EXPLANATION"
     CONTEXT_PASTE = "CONTEXT_PASTE"
+    SOCIAL = "SOCIAL"               # L0 zero-entropy greeting/ack — no model
 
 
 @dataclass(frozen=True)
@@ -196,6 +197,38 @@ _INDENT_LINE = re.compile(r"^[ \t]{2,}\S", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
+# L0 zero-entropy social gate
+# ---------------------------------------------------------------------------
+
+# Anchored FULL-match: a greeting/ack word, optionally addressed to the
+# organism, optionally punctuated. "hi karen" matches; "hi, can you fix
+# the build" never does (unanchored tail text kills the match).
+_L0_SOCIAL = re.compile(
+    r"^\s*(?:"
+    r"hi|hiya|hey|heya|hello|yo|sup|howdy|greetings|"
+    r"gm|gn|good\s+(?:morning|afternoon|evening|night)|"
+    r"thanks|thank\s+you|thx|ty|"
+    r"ok|okay|kk|cool|nice|great|awesome|perfect|"
+    r"bye|goodbye|later|cya|"
+    r"ping|test"
+    r")"
+    r"(?:[\s,!.]+(?:karen|jarvis|ov|there))?"
+    r"[\s!.,?]*$",
+    re.IGNORECASE,
+)
+
+
+def _l0_max_chars() -> int:
+    """Entropy ceiling for the L0 gate (env-tunable, junk-safe)."""
+    import os
+    try:
+        raw = os.environ.get("JARVIS_CHAT_L0_MAX_CHARS", "")
+        return int(raw) if raw else 24
+    except (TypeError, ValueError):
+        return 24
+
+
+# ---------------------------------------------------------------------------
 # Classifier
 # ---------------------------------------------------------------------------
 
@@ -226,6 +259,19 @@ def classify(message: str) -> IntentClassification:
         return IntentClassification(
             intent=ChatIntent.EXPLANATION, confidence=0.0,
             reasons=("empty",), truncated=truncated,
+        )
+
+    # ---- L0 zero-entropy social gate (before EVERYTHING) ----
+    # An ultra-low-entropy greeting/ack carries no routable signal; the
+    # old path defaulted it into claude_query at conf=0.00 — the most
+    # expensive lane for the least information. Deterministic, anchored,
+    # length-bounded: the pipeline short-circuits without waking any
+    # model or touching a provider.
+    stripped = text.strip()
+    if len(stripped) <= _l0_max_chars() and _L0_SOCIAL.match(stripped):
+        return IntentClassification(
+            intent=ChatIntent.SOCIAL, confidence=1.0,
+            reasons=("l0_social_short_circuit",), truncated=truncated,
         )
 
     # ---- CONTEXT_PASTE first ----

@@ -654,3 +654,71 @@ def test_chat_action_executor_protocol_method_names():
     assert expected.issubset(actual), (
         f"Protocol shape changed; missing: {expected - actual}"
     )
+
+
+# ---------------------------------------------------------------------------
+# L0 zero-entropy social short-circuit (Slice A companion)
+# ---------------------------------------------------------------------------
+
+
+class TestL0SocialShortCircuit:
+    def test_hello_jarvis_classifies_social_conf_1(self):
+        from backend.core.ouroboros.governance.intent_classifier import (
+            ChatIntent, classify,
+        )
+        v = classify("hello jarvis")
+        assert v.intent is ChatIntent.SOCIAL
+        assert v.confidence == 1.0
+        assert "l0_social_short_circuit" in v.reasons
+
+    def test_greeting_variants_gate_and_substance_never_does(self):
+        from backend.core.ouroboros.governance.intent_classifier import (
+            ChatIntent, classify,
+        )
+        for msg in ("hi karen", "hey", "thanks!", "ok", "good morning",
+                    "yo ov", "ping"):
+            assert classify(msg).intent is ChatIntent.SOCIAL, msg
+        # substance must NEVER gate — anchored + length-bounded
+        for msg in ("hi, can you fix the build", "hello world program please",
+                    "thanks — now run the tests", "okay let's deploy"):
+            assert classify(msg).intent is not ChatIntent.SOCIAL, msg
+
+    def test_hello_jarvis_bypasses_llm_router_entirely(self):
+        """MANDATE: the L0 gate short-circuits BEFORE any executor/provider
+        is evaluated — a greeting yields a deterministic zero-cost reply
+        with the LLM executor untouched (no claude_query, no dispatch)."""
+        from backend.core.ouroboros.governance.conversation_orchestrator import (
+            ConversationOrchestrator,
+        )
+
+        class _ExplodingExecutor:
+            """Any provider call = test failure."""
+            def dispatch_backlog(self, *a, **k):
+                raise AssertionError("backlog dispatched for a greeting")
+
+            def spawn_subagent(self, *a, **k):
+                raise AssertionError("subagent spawned for a greeting")
+
+            def query_claude(self, *a, **k):
+                raise AssertionError("claude_query fired for a greeting")
+
+            def attach_context(self, *a, **k):
+                raise AssertionError("context attach fired for a greeting")
+
+        from backend.core.ouroboros.governance.chat_repl_dispatcher import (
+            ChatReplDispatcher,
+        )
+        orch = ConversationOrchestrator()
+        turn, decision = orch.dispatch("hello jarvis", session_id="s1")
+        assert decision.action == "social_ack"
+        assert decision.payload.get("reply")          # deterministic ack minted
+        disp = ChatReplDispatcher(orchestrator=orch)
+        disp.executor = _ExplodingExecutor()
+        result = disp._invoke_executor(turn, decision)
+        assert result == decision.payload["reply"]     # zero-cost passthrough
+
+    def test_social_reply_is_stable_per_message(self):
+        from backend.core.ouroboros.governance.conversation_orchestrator import (
+            _social_reply,
+        )
+        assert _social_reply("hi karen") == _social_reply("hi karen")

@@ -518,6 +518,12 @@ class ChatReplDispatcher:
         """Route the decision to the right executor method. Slice 3
         only invokes the executor when one is wired; Slice 4 wires
         a concrete impl."""
+        # L0 social short-circuit: the deterministic reply was minted at
+        # the orchestrator — return it directly. Deliberately ABOVE the
+        # executor gate: zero-cost even when no executor is wired, and no
+        # provider path can ever be evaluated for a SOCIAL turn.
+        if decision.action == "social_ack":
+            return str(decision.payload.get("reply", "") or "Hey.")
         executor = self.executor
         if executor is None:
             return None
