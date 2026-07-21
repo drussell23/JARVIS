@@ -138,14 +138,30 @@ class CouncilVoice:
         base = self._base_url or dw._base_url
         return session, base
 
-    async def _headers(self) -> Dict[str, str]:
+    async def _headers(self, caller_id: str = "hive_council") -> Dict[str, str]:
         if self._auth_fn is not None:
             out = self._auth_fn()
             return await out if asyncio.iscoroutine(out) else out
         from backend.core.ouroboros.governance.doubleword_provider import (
             _aegis_dw_session_auth_header, _dw_apply_zdr,
         )
-        return _dw_apply_zdr(dict(await _aegis_dw_session_auth_header()))
+        auth = dict(await _aegis_dw_session_auth_header())
+        # Aegis call lease — the SAME admission step the GENERATE tier
+        # performs before every RT post. In-harness, unleased calls are
+        # rejected by the governor (the live-fire 4xx); out-of-harness the
+        # lease helpers no-op/fail-soft and plain session auth suffices
+        # (proven 200 by direct diagnostic).
+        try:
+            from backend.core.ouroboros.governance.doubleword_provider import (
+                _aegis_acquire_call_lease, _aegis_merge_lease_headers,
+            )
+            lease = await _aegis_acquire_call_lease(
+                op_id=f"council-{caller_id}"[:48], route="background",
+                estimated_cost_usd=0.05)
+            auth = _aegis_merge_lease_headers(auth, lease)
+        except Exception:  # noqa: BLE001 — lease is harness-context enrichment
+            pass
+        return _dw_apply_zdr(auth)
 
     # -- the RT SSE turn ----------------------------------------------------
 
@@ -154,7 +170,7 @@ class CouncilVoice:
         import aiohttp
 
         session, base = await self._resolve_session_and_url()
-        headers = await self._headers()
+        headers = await self._headers(caller_id)
         body: Dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -227,8 +243,9 @@ class CouncilVoice:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — timeout OR transport fault
-            logger.info("[CouncilVoice] RT turn degraded (%s) — cascading "
-                        "to Claude", type(exc).__name__)
+            logger.info("[CouncilVoice] RT turn degraded (%s: %s) — "
+                        "cascading to Claude", type(exc).__name__,
+                        str(exc)[:160])
         self.stats["fallback_calls"] += 1
         if self._claude is None:
             from backend.core.ouroboros.governance.providers import (
