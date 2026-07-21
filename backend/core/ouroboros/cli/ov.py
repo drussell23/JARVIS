@@ -705,6 +705,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as exc:  # noqa: BLE001
             console.print(f"ov doctor unavailable: {exc}", markup=False)
             return 1
+        known = {"--live"}
+        for arg in inv.delegate_argv:
+            if arg not in known:
+                hint = next((k for k in known
+                             if k.startswith(arg) or arg.startswith(k)), None)
+                console.print(
+                    f"unknown flag {arg!r}"
+                    + (f" — did you mean {hint!r}?" if hint else
+                       f" (known: {', '.join(sorted(known))})"),
+                    markup=False, highlight=False)
+                return 64          # EX_USAGE — refuse, never silently ignore
         return run_doctor(console, live="--live" in inv.delegate_argv)
     if inv.action == "status":
         console.print(status_digest(), markup=False, highlight=False)

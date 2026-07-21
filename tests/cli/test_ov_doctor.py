@@ -305,3 +305,25 @@ def test_version_skew_synthesizer_names_the_remedy():
     ]))
     remedy = [ln for ln in lines if "restart it" in ln]
     assert remedy and "kill 4765" in remedy[0]
+
+
+def test_typoed_flag_is_refused_with_hint(capsys=None):
+    """'ov doctor --liv' must NEVER silently run the wrong thing — refuse
+    with a did-you-mean hint and EX_USAGE."""
+    from backend.core.ouroboros.cli.ov import main
+
+    lines = []
+
+    class _C:
+        def print(self, msg, **kw):
+            lines.append(str(msg))
+
+    import backend.core.ouroboros.cli.ov as ov_mod
+    orig = ov_mod.build_console
+    ov_mod.build_console = lambda: _C()
+    try:
+        rc = main(["doctor", "--liv"])
+    finally:
+        ov_mod.build_console = orig
+    assert rc == 64
+    assert any("did you mean '--live'" in ln for ln in lines)
