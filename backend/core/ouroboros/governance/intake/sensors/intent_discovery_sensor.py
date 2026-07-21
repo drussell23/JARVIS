@@ -374,6 +374,7 @@ class IntentDiscoverySensor:
                 model=_DW_MODEL,
                 caller_id="intent_discovery_sensor",
                 response_format={"type": "json_object"},
+                sla="strict",   # deadline-bound cognition → RT tier (2026-07-21)
                 max_tokens=_DW_MAX_TOKENS,
             )
         except Exception as exc:

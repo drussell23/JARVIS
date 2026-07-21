@@ -5554,6 +5554,7 @@ class DoublewordProvider:
             model=_caller_model,
             caller_id="ouroboros_plan",
             max_tokens=4000,
+            sla="strict",   # PLAN guides live GENERATE → RT tier (2026-07-21)
         )
         return result or ""
 
@@ -7274,14 +7275,23 @@ class DoublewordProvider:
         caller_id: str = "ouroboros_cognition",
         response_format: Optional[Dict] = None,
         max_tokens: Optional[int] = None,
+        sla: Optional[str] = None,
     ) -> str:
-        """Direct inference via Doubleword batch API without OperationContext.
+        """Direct inference without OperationContext — now SLA-ROUTED.
 
-        Intended for cognition layers (Synthesis Engine, Architecture Agent)
-        that need 397B inference without governance pipeline overhead.
+        ``sla`` (Dynamic SLA Routing, 2026-07-21):
+          * ``"strict"`` — deadline-bound cognition (SemanticTriage,
+            IntentDiscovery, Synthesis, Architecture): routes to the
+            Realtime SSE tier via ``cognition_lanes.rt_prompt`` — Aegis
+            call lease, output clamp, bounded turn with explicit stream
+            eviction, Claude cascade, all behind the Cognitive Concurrency
+            Semaphore (RT tier is structurally un-stampede-able).
+          * ``"bulk"`` / ``None`` — the legacy batch plane below, unchanged
+            byte-for-byte (idle-cycle pre-computation is what the batch
+            discount is FOR; un-migrated callers keep exact behavior).
 
-        Runs the full 4-stage batch cycle synchronously (upload → create →
-        poll → retrieve) and returns the raw text response.
+        Batch path: runs the full 4-stage batch cycle synchronously
+        (upload → create → poll → retrieve) and returns the raw text.
 
         Parameters
         ----------
@@ -7308,6 +7318,20 @@ class DoublewordProvider:
         ValueError
             If DOUBLEWORD_API_KEY is not configured.
         """
+        # ---- Dynamic SLA Routing (2026-07-21) ----
+        if sla == "strict":
+            from backend.core.ouroboros.governance.cognition_lanes import (
+                rt_prompt,
+            )
+            return await rt_prompt(
+                prompt,
+                model=model or self._model,
+                caller_id=caller_id,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                dw_provider=self,
+            )
+        # ---- legacy batch plane (sla None / "bulk") — unchanged ----
         # Slice 27 Phase 2 — Aegis-unified auth bridge.
         # ``self._api_key`` may be empty (post-Aegis env_scrub at boot) —
         # Aegis is the secure credential broker that injects the real
