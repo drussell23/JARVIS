@@ -129,7 +129,7 @@ async def test_active_speaker_mutex_serializes_deliberations(monkeypatch):
     await cd.start()
     cd.on_envelope(_env(intent="x"))
     cd.on_envelope(_env(intent="y"))
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(1.2)     # first convene pays backend.hive import cost
     await cd.stop()
     assert len(spans) == 2
     (a0, a1), (b0, b1) = sorted(spans)
@@ -230,5 +230,160 @@ def test_flag_delegate_reaches_council_flags():
 
     reg = _Reg()
     n = register_flags(reg)
-    assert n == 9
+    assert n == 11
     assert "JARVIS_HIVE_COUNCIL_ENABLED" in reg.names
+
+
+# ---------------------------------------------------------------------------
+# RT re-laning: CouncilVoice — eviction, cascade, hydration (the mandate test)
+# ---------------------------------------------------------------------------
+
+
+class _FakeClaude:
+    """Mirrors ClaudeProvider.prompt_only's contract."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def prompt_only(self, prompt, *, caller_id="", max_tokens=None,
+                          timeout_s=60.0, **kw):
+        self.calls.append(prompt)
+        return json.dumps({"reasoning": "fallback speech", "confidence": 0.8,
+                           "validate_verdict": "approve"})
+
+
+@pytest.mark.asyncio
+async def test_rt_timeout_evicts_socket_and_cascades_to_claude(monkeypatch):
+    """MANDATE: a stalled DW RT stream is EXPLICITLY evicted (server observes
+    the disconnect) before the Claude fallback fires."""
+    import aiohttp
+    from aiohttp import web
+
+    monkeypatch.setenv("JARVIS_HIVE_COUNCIL_RT_TIMEOUT_S", "0.4")
+    server_state = {"connected": 0, "disconnected": 0}
+
+    async def _stall(request):
+        server_state["connected"] += 1
+        resp = web.StreamResponse()
+        resp.headers["Content-Type"] = "text/event-stream"
+        await resp.prepare(request)
+        try:
+            await resp.write(b'data: {"choices":[{"delta":{"content":"par"}}]}\n\n')
+            # stall CONTENT, but heartbeat the socket: a TCP server only
+            # observes a dead peer on WRITE — each keepalive probe makes the
+            # client's eviction visible the moment it happens.
+            for _ in range(600):
+                await asyncio.sleep(0.05)
+                await resp.write(b": keepalive\n\n")
+        except (ConnectionResetError, asyncio.CancelledError, Exception):
+            server_state["disconnected"] += 1     # the EVICTION, observed
+            raise
+        return resp
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", _stall)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+
+    from backend.api.hive_council_layer import CouncilVoice
+    claude = _FakeClaude()
+    session = aiohttp.ClientSession()
+    try:
+        voice = CouncilVoice(claude=claude, session=session,
+                             base_url=f"http://127.0.0.1:{port}/v1",
+                             auth_headers_fn=lambda: {})
+        out = await voice.prompt_only("deliberate on telemetry",
+                                      model="m", max_tokens=100)
+        await asyncio.sleep(0.2)             # let the server observe the abort
+        assert voice.stats["rt_evictions"] == 1      # timeout → explicit close
+        assert server_state["connected"] == 1
+        assert server_state["disconnected"] == 1     # socket eviction PROVEN
+        assert claude.calls == ["deliberate on telemetry"]   # cascade fired
+        assert "fallback speech" in out
+        assert voice.stats["fallback_ok"] == 1
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_rt_happy_path_streams_without_fallback(monkeypatch):
+    import aiohttp
+    from aiohttp import web
+
+    monkeypatch.setenv("JARVIS_HIVE_COUNCIL_RT_TIMEOUT_S", "5")
+
+    async def _serve(request):
+        body = await request.json()
+        assert body["stream"] is True
+        assert body["service_tier"] == "priority"    # the REALTIME lane
+        resp = web.StreamResponse()
+        resp.headers["Content-Type"] = "text/event-stream"
+        await resp.prepare(request)
+        for piece in ("hel", "lo"):
+            await resp.write(
+                f'data: {{"choices":[{{"delta":{{"content":"{piece}"}}}}]}}\n\n'
+                .encode())
+        await resp.write(b"data: [DONE]\n\n")
+        return resp
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", _serve)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+
+    from backend.api.hive_council_layer import CouncilVoice
+    claude = _FakeClaude()
+    session = aiohttp.ClientSession()
+    try:
+        voice = CouncilVoice(claude=claude, session=session,
+                             base_url=f"http://127.0.0.1:{port}/v1",
+                             auth_headers_fn=lambda: {})
+        out = await voice.prompt_only("hi", model="m")
+        assert out == "hello"
+        assert voice.stats["rt_ok"] == 1
+        assert claude.calls == []            # no fallback on the happy path
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_deliberation_prompt_contains_hydrated_telemetry(
+    monkeypatch, tmp_path,
+):
+    """MANDATE: the envelope's detail payload reaches the persona prompt —
+    the council's own 'zero specialist telemetry' ticket, closed."""
+    monkeypatch.setenv("JARVIS_HIVE_COUNCIL_ENABLED", "true")
+    prompts = []
+
+    class _CapturingDW:
+        async def prompt_only(self, prompt, **kw):
+            prompts.append(prompt)
+            return _persona_json("ok", verdict="approve")
+
+    cd = CouncilDeliberator(doubleword=_CapturingDW(),
+                            emit_fn=lambda **k: None,
+                            state_dir=Path(tmp_path))
+    await cd.start()
+    cd.on_envelope(_env(
+        summary="operation terminal: fallback_failed",
+        detail={"failure_class": "provider_exhausted", "duration_ms": 4123,
+                "provider": "doubleword"}))
+    for _ in range(80):
+        await asyncio.sleep(0.05)
+        if cd.stats["completed"]:
+            break
+    await cd.stop()
+    assert cd.stats["completed"] == 1
+    observe_prompt = prompts[0]
+    # concrete metrics from the envelope's detail payload, in the prompt:
+    assert "provider_exhausted" in observe_prompt
+    assert "4123" in observe_prompt
+    assert "operation terminal: fallback_failed" in observe_prompt

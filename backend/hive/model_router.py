@@ -37,10 +37,19 @@ class HiveModelRouter:
 
     # Per-state generation parameters (max_tokens, temperature).
     # BASELINE intentionally zeroed — no model invocation needed.
+    # Token caps env-tunable (2026-07-21): a FLOW turn streaming the full
+    # 10k default on the 397B legitimately exceeds any realtime per-turn
+    # bound — deadline-driven callers (the council) tune these down.
     _STATE_PARAMS: Dict[CognitiveState, Dict[str, Any]] = {
         CognitiveState.BASELINE: {"max_tokens": 0, "temperature": 0},
-        CognitiveState.REM: {"max_tokens": 4000, "temperature": 0.3},
-        CognitiveState.FLOW: {"max_tokens": 10000, "temperature": 0.2},
+        CognitiveState.REM: {
+            "max_tokens": int(os.environ.get(
+                "JARVIS_HIVE_REM_MAX_TOKENS", "4000") or 4000),
+            "temperature": 0.3},
+        CognitiveState.FLOW: {
+            "max_tokens": int(os.environ.get(
+                "JARVIS_HIVE_FLOW_MAX_TOKENS", "10000") or 10000),
+            "temperature": 0.2},
     }
 
     def __init__(self) -> None:
