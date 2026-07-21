@@ -144,6 +144,19 @@ async def probe_edge_socket() -> Tuple[EdgeVerdict, str]:
         )
         path = attach_socket_path()
         state = await probe_socket(path, timeout=_edge_timeout_s(), deep=True)
+        if state == "booting":
+            # Slice-A patience, applied to diagnosis: a boot-starved daemon
+            # is a WAIT state, not a verdict. Re-probe with the same
+            # jittered-backoff deep handshake the ignite path uses, under a
+            # doctor-bounded window — a transient never reads as a fault.
+            from backend.core.ouroboros.cli.thin_client import await_socket
+            try:
+                raw = os.environ.get("JARVIS_DOCTOR_BOOT_WAIT_S", "")
+                boot_wait = float(raw) if raw else 20.0
+            except (TypeError, ValueError):
+                boot_wait = 20.0
+            if await await_socket(path, deadline_s=boot_wait):
+                state = "live"
         mapping = {
             "live": (EdgeState.OK, "hydration served"),
             "booting": (EdgeState.DEGRADED,
@@ -452,12 +465,23 @@ async def run_live_probe() -> EdgeVerdict:
         # and only those daemons have the /doctor probe verb. An older
         # daemon gets NOTHING injected (no blind 45s wait, no unknown-verb
         # noise) — the doctor skips with the remedy instead.
+        # Read-timeout and old-daemon are DIFFERENT worlds: a starved boot
+        # serves nothing yet (wait and re-run), a genuinely old daemon
+        # serves hydration WITHOUT the fabrics signature (restart it).
+        # Conflating them misdiagnosed a current daemon as stale.
+        hydration: Optional[Dict[str, Any]] = None
         try:
             first = await asyncio.wait_for(
                 r.readline(), timeout=_edge_timeout_s())
-            hydration = json.loads(first.decode())
+            if first:
+                hydration = json.loads(first.decode())
         except Exception:  # noqa: BLE001
-            hydration = {}
+            hydration = None
+        if hydration is None:
+            return EdgeVerdict(
+                "9 live probe", EdgeState.DEGRADED,
+                "hydration not served within the bound (boot-starved?) — "
+                "re-run `ov doctor --live` in a moment")
         if "fabrics" not in hydration:
             return EdgeVerdict(
                 "9 live probe", EdgeState.SKIPPED,
