@@ -356,6 +356,21 @@ class MemoryEngine:
         success = terminal[-1].state == OperationState.APPLIED
         blast_radius = len(target_files)
         self._update_file_reputation(target_files, success, blast_radius)
+        # Hive Step 2: the memory engine's reputation writes were invisible to
+        # every fabric. Per-op emit (low frequency by construction). Fail-soft.
+        try:
+            from backend.api.hive_emitter import hive_emit
+            hive_emit(
+                actor_id="consciousness.memory_engine",
+                subsystem="consciousness", intent="reputation_update",
+                summary=(f"file reputation updated: {blast_radius} file(s), "
+                         f"outcome={'applied' if success else 'failed'}"),
+                severity="info" if success else "warn",
+                trace_id=str(op_id),
+                detail={"files": blast_radius, "applied": success},
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Read paths

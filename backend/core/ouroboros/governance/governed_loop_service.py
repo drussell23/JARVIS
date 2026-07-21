@@ -4297,6 +4297,32 @@ class GovernedLoopService:
             outcome_source="governed_loop",
         )
 
+        # ---- ConsciousnessBridge outcome hook (Hive Step 2 root-cause fix).
+        # record_operation_outcome had ZERO callers — the MemoryEngine's sole
+        # write path (file reputations) never ran in the live loop. This seam
+        # is deliberately INSIDE _emit_terminal_events: every terminal path —
+        # inline AND the background-pool dispatcher (the twin-path drift class
+        # that left the first wiring silent on BG ops) — crosses here exactly
+        # once. Bridge absent → clean no-op. Fire-and-forget with a bound.
+        _cb = getattr(self, "_consciousness_bridge", None)
+        if _cb is not None and getattr(_cb, "is_active", False):
+            try:
+                _tp = getattr(result.terminal_phase, "name",
+                              str(result.terminal_phase))
+                await asyncio.wait_for(
+                    _cb.record_operation_outcome(
+                        op_id=ctx.op_id,
+                        files_changed=list(ctx.target_files or ()),
+                        success=(_tp == "COMPLETE"),
+                        failure_reason=failure_class or None,
+                    ),
+                    timeout=5.0,
+                )
+            except Exception as _cb_exc:
+                logger.debug(
+                    "[GovernedLoop] consciousness outcome hook error: %s",
+                    _cb_exc)
+
         # CR4: Violent Ephemeral Teardown -- reap the GPU J-Prime node the instant
         # the A1 DAG reaches terminal (PR opened OR fail-closed). Zero idle GPU.
         # Double-gated (lifecycle + violent-teardown) + fail-soft; default-OFF
@@ -6035,6 +6061,24 @@ class GovernedLoopService:
                 self._fsm_contexts.pop(op_id, None)
                 # P2 Slice 3 — registry parity (master-gated).
                 _unregister_op_in_flight_safely(op_id)
+                # ── ConsciousnessBridge outcome hook, BG seam (Hive Step 2).
+                # BG-pool ops NEVER cross _emit_terminal_events (the twin-path
+                # class), so the MemoryEngine ingest fires from this absolute
+                # bottom too — same Slice 12R rationale as the telemetry seal
+                # below. The engine reads the op ledger itself, so op_id alone
+                # is the full contract; the bridge dedupes ops that crossed
+                # the inline seam already. Fire-and-forget; NEVER raises.
+                try:
+                    _cb = getattr(self, "_consciousness_bridge", None)
+                    if _cb is not None and getattr(_cb, "is_active", False):
+                        asyncio.get_running_loop().create_task(
+                            _cb.record_operation_outcome(
+                                op_id=op_id, files_changed=[],
+                                success=False, failure_reason=None),
+                            name=f"consciousness-outcome-{op_id[:16]}",
+                        )
+                except Exception:  # noqa: BLE001 — cleanup path must not crash
+                    pass
                 # ── Slice 12R Phase 1 — Telemetry seal ──
                 # This is the ABSOLUTE BOTTOM of the BG-op
                 # lifecycle: every op that ever registered passes

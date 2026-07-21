@@ -110,6 +110,16 @@ class RoutingEnvelope(HiveTelemetryEnvelope):
     provider: Optional[str] = None
 
 
+class ActorEnvelope(HiveTelemetryEnvelope):
+    """A silent-actor emission (Step 2): MCP tools, web, voice, core contexts,
+    ghost-hands actuation, perception, memory. ``coalesced_n > 1`` means the
+    Edge-Level Debouncer folded a burst of granular events into this ONE
+    semantic envelope (``span_ms`` covers first→last)."""
+    kind: Literal["actor"] = "actor"
+    coalesced_n: int = 1
+    span_ms: float = 0.0
+
+
 # ---------------------------------------------------------------------------
 # Read-only source adapters (mandate 1 — cast, never mutate/republish)
 # ---------------------------------------------------------------------------

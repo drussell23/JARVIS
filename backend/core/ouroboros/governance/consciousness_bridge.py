@@ -155,16 +155,27 @@ class ConsciousnessBridge:
         """
         if self._consciousness is None:
             return
+        # Idempotency chokepoint: an op may cross BOTH terminal seams (GLS
+        # _emit_terminal_events for inline ops, _bg_unregister_active for
+        # background-pool ops) — reputation must ingest exactly once.
+        seen = getattr(self, "_ingested_op_ids", None)
+        if seen is None:
+            seen = self._ingested_op_ids = []
+        if op_id in seen:
+            return
+        seen.append(op_id)
+        del seen[:-512]
         try:
-            await self._consciousness._memory.ingest_outcome(
-                op_id=op_id,
-                files=files_changed,
-                success=success,
-                failure_reason=failure_reason,
-            )
+            # Signature-drift fix (Hive Step 2): the engine's sole write path
+            # is ``ingest_outcome(op_id)`` — it reads the op ledger itself
+            # (authoritative). The old kwargs call TypeError'd on EVERY
+            # invocation and was swallowed here, so file reputations never
+            # updated. files_changed/success/failure_reason stay in this
+            # method's signature as caller-context for the debug line only.
+            await self._consciousness._memory.ingest_outcome(op_id)
             logger.debug(
-                "[ConsciousnessBridge] Recorded outcome for %s: success=%s",
-                op_id, success,
+                "[ConsciousnessBridge] Recorded outcome for %s: success=%s "
+                "files=%d", op_id, success, len(files_changed or ()),
             )
         except Exception as exc:
             logger.debug("[ConsciousnessBridge] record_operation_outcome error: %s", exc)

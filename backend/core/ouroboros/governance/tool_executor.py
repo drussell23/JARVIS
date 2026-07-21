@@ -6878,6 +6878,30 @@ class ToolLoopCoordinator:
                         duration_ms=_dur_ms,
                         status=_nstatus,
                     )
+                    # ── Hive Step 2: MCP/web tool calls reach NO observability
+                    # fabric (narration goes to the TUI transport, not the SSE
+                    # broker; the confidence observer skips MCP entirely).
+                    # Metadata-only emit at the edge — payloads never ride.
+                    if tc.name.startswith("mcp_") or tc.name.startswith("web_"):
+                        try:
+                            from backend.api.hive_emitter import hive_emit
+                            _hsub = "mcp" if tc.name.startswith("mcp_") else "web"
+                            _hbytes = len((tool_result.output or "").encode())
+                            hive_emit(
+                                actor_id=f"{_hsub}.{tc.name.split('_', 1)[1]}",
+                                subsystem=_hsub, intent="tool_call",
+                                summary=(f"{tc.name} {_nstatus} "
+                                         f"{_dur_ms:.0f}ms {_hbytes}B"),
+                                severity=("info" if _nstatus == "success"
+                                          else "warn"),
+                                trace_id=str(op_id or "—"),
+                                detail={"tool": tc.name, "status": _nstatus,
+                                        "duration_ms": round(_dur_ms, 1),
+                                        "output_bytes": _hbytes,
+                                        "round": round_index},
+                            )
+                        except Exception:  # noqa: BLE001 — telemetry never breaks tools
+                            pass
                     # ── Antivenom Vector 2: tool-output injection scan ──
                     # Scan tool output for prompt-injection patterns
                     # BEFORE formatting into the generation prompt.

@@ -86,7 +86,8 @@ class _MockSseBroker:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_multiplexer_merges_both_streams_in_chronological_order():
+async def test_multiplexer_merges_both_streams_in_chronological_order(monkeypatch):
+    monkeypatch.setenv("JARVIS_HIVE_BUS_COALESCE_ENABLED", "false")
     bus, broker = _MockTrinityBus(), _MockSseBroker()
     agg = HiveAggregator(bus=bus, sse_broker=broker, sort_window_s=0.05)
     await agg.start()
@@ -129,7 +130,8 @@ async def test_multiplexer_merges_both_streams_in_chronological_order():
 
 
 @pytest.mark.asyncio
-async def test_read_only_never_publishes_back_to_sources():
+async def test_read_only_never_publishes_back_to_sources(monkeypatch):
+    monkeypatch.setenv("JARVIS_HIVE_BUS_COALESCE_ENABLED", "false")
     """Mandate 1: the aggregator must be a pure listener — it must not call any
     publish method on the source bus/broker."""
     bus, broker = _MockTrinityBus(), _MockSseBroker()
@@ -145,7 +147,8 @@ async def test_read_only_never_publishes_back_to_sources():
 
 
 @pytest.mark.asyncio
-async def test_neither_stream_blocks_the_other_under_load():
+async def test_neither_stream_blocks_the_other_under_load(monkeypatch):
+    monkeypatch.setenv("JARVIS_HIVE_BUS_COALESCE_ENABLED", "false")
     """Fan-in stays live even if one source floods: blast 200 Trinity events;
     a lone SSE event must still make it through the merge."""
     bus, broker = _MockTrinityBus(), _MockSseBroker()
@@ -191,9 +194,10 @@ def test_trinity_swarm_lifecycle_maps_to_swarm_envelope():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_start_hive_relay_publishes_hive_tagged_frames():
+async def test_start_hive_relay_publishes_hive_tagged_frames(monkeypatch):
     """The relay helper attaches read-only + republishes every envelope to the
     cockpit publish surface tagged ``hive: True`` (what ov_hive_panel folds)."""
+    monkeypatch.setenv("JARVIS_HIVE_BUS_COALESCE_ENABLED", "false")
     from backend.api.hive_aggregator import start_hive_relay
 
     bus, broker = _MockTrinityBus(), _MockSseBroker()
@@ -266,3 +270,232 @@ def test_both_pipeline_hosts_wire_the_hive_relay():
     assert "start_hive_relay" in _calls_in_function(
         root / "backend" / "core" / "ouroboros" / "battle_test" / "harness.py",
         "_start_cockpit_attach_bridge")
+
+
+@pytest.mark.asyncio
+async def test_trinity_bus_late_materialization_reattaches(monkeypatch):
+    """trinity_subs=0 residual fix: when the TrinityEventBus singleton doesn't
+    exist at cockpit boot, the aggregator polls the injected resolver and
+    attaches the MOMENT the bus materializes — that fabric's frames then flow."""
+    monkeypatch.setenv("JARVIS_HIVE_BUS_COALESCE_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_HIVE_BUS_REATTACH_MIN_S", "0.01")
+    monkeypatch.setenv("JARVIS_HIVE_BUS_REATTACH_MAX_S", "0.02")
+    holder = {"bus": None}
+    agg = HiveAggregator(bus=None, sse_broker=None,
+                         bus_resolver=lambda: holder["bus"], sort_window_s=0.0)
+    await agg.start()
+    await asyncio.sleep(0.05)          # loop is polling; bus still absent
+    assert agg._sub_ids == []
+    holder["bus"] = bus = _MockTrinityBus()   # the singleton materializes late
+    await asyncio.sleep(0.1)
+    assert len(agg._sub_ids) > 0        # re-attached
+    await bus.fire("intake.signal_accepted", {"ts": 1.0}, "late-1")
+    await asyncio.sleep(0.05)
+    got = await agg.drain_available()
+    assert any(e.source_fabric == "trinity" for e in got)
+    await agg.stop()
+
+
+@pytest.mark.asyncio
+async def test_no_resolver_means_no_reattach_loop():
+    """Explicit bus=None WITHOUT a resolver (unit-test/injection posture) must
+    not spin any background polling."""
+    agg = HiveAggregator(bus=None, sse_broker=None, sort_window_s=0.0)
+    await agg.start()
+    # only the drainer task exists — no re-attach loop
+    assert len(agg._tasks) == 1
+    await agg.stop()
+
+
+# ---------------------------------------------------------------------------
+# Step 2: the HiveEmitter edge is the aggregator's THIRD fabric
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_three_fabric_merge_includes_actor_edge(monkeypatch):
+    """Trinity + IDE-SSE + the actor edge all fold into ONE chronological feed."""
+    monkeypatch.setenv("JARVIS_HIVE_BUS_COALESCE_ENABLED", "false")
+    from backend.api.hive_emitter import HiveEmitter
+
+    bus, broker = _MockTrinityBus(), _MockSseBroker()
+    em = HiveEmitter()
+    agg = HiveAggregator(bus=bus, sse_broker=broker, emitter=em,
+                         sort_window_s=0.03)
+    await agg.start()
+    await asyncio.sleep(0.01)
+    await bus.fire("intake.signal_accepted", {"ts": 1.0}, "t1")
+    await broker.publish(_SseEvent("gate_evaluated", "op1", {"ts": 2.0}, "s1"))
+    em.emit(actor_id="mcp.gmail_send", subsystem="mcp", intent="tool_call",
+            summary="mcp_gmail_send success 812ms 2048B", trace_id="op1")
+    await asyncio.sleep(0.2)
+    got = await agg.drain_available()
+    fabrics = {e.source_fabric for e in got}
+    assert fabrics == {"trinity", "ide_sse", "actor_edge"}
+    # chronological: actor edge stamped now-time sorts last
+    assert [e.source_fabric for e in sorted(got, key=lambda e: e.ts)][:2] == \
+        ["trinity", "ide_sse"]
+    await agg.stop()
+
+
+# ---------------------------------------------------------------------------
+# Step 2 wiring pins: every silent-actor shim is ON its live path
+# ---------------------------------------------------------------------------
+
+def _module_calls(path):
+    import ast as _ast
+    tree = _ast.parse(open(path, encoding="utf-8").read())
+    names = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call):
+            f = node.func
+            if isinstance(f, _ast.Name):
+                names.add(f.id)
+            elif isinstance(f, _ast.Attribute):
+                names.add(f.attr)
+    return names
+
+
+def test_all_silent_actor_shims_are_wired():
+    """AST wiring pin (the wired-but-inert checklist): each mapped seam calls
+    hive_emit on its live path."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    sites = [
+        "backend/core/ouroboros/governance/tool_executor.py",     # MCP/web
+        "backend/ghost_hands/orchestrator.py",                    # actuation
+        "backend/core_contexts/facade.py",                        # 5 contexts
+        "backend/voice/jarvis_agent_voice.py",                    # wake
+        "backend/voice/streaming_stt.py",                         # STT
+        "backend/voice/barge_in_detector.py",                     # TTS
+        "backend/vision/realtime/frame_pipeline.py",              # perception
+        "backend/core/ouroboros/consciousness/memory_engine.py",  # memory
+    ]
+    missing = [s for s in sites if "hive_emit" not in _module_calls(root / s)]
+    assert not missing, f"hive_emit shim missing from: {missing}"
+
+
+def test_ghost_hands_flushes_its_coalescing_window():
+    """Sequence-completion contract: the task-complete path flushes the
+    per-action window (otherwise burst envelopes lag by a full window)."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    calls = _module_calls(root / "backend" / "ghost_hands" / "orchestrator.py")
+    assert "hive_flush" in calls
+
+
+def test_flag_registry_delegate_reaches_emitter():
+    """hive_flags (in the walked governance package) must forward to the ONE
+    source of truth in backend.api.hive_emitter."""
+    from backend.core.ouroboros.governance.hive_flags import register_flags
+
+    class _Reg:
+        def __init__(self):
+            self.specs = []
+
+        def register(self, spec):
+            self.specs.append(spec)
+
+    reg = _Reg()
+    n = register_flags(reg)
+    assert n == 5 and len(reg.specs) == 5
+    names = {s.name for s in reg.specs}
+    assert "JARVIS_HIVE_EMITTERS_ENABLED" in names
+
+
+@pytest.mark.asyncio
+async def test_bus_storm_compresses_to_one_frame(monkeypatch):
+    """The live governor-throttle storm class: 50+ identical bus frames in one
+    second → ONE feed frame (×N), with the envelope's subclass kind preserved.
+    Actor-edge envelopes (already debounced at the edge) pass straight through."""
+    monkeypatch.setenv("JARVIS_HIVE_BUS_COALESCE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_HIVE_DEBOUNCE_WINDOW_MS", "30")
+    broker = _MockSseBroker()
+    agg = HiveAggregator(bus=None, sse_broker=broker, sort_window_s=0.0)
+    await agg.start()
+    await asyncio.sleep(0.01)
+    for i in range(50):
+        await broker.publish(_SseEvent("governor_throttle_applied", "",
+                                       {"narration_text": "governor throttle applied",
+                                        "ts": 1.0 + i * 0.001}, f"g{i}"))
+    await asyncio.sleep(0.25)
+    got = await agg.drain_available()
+    throttle = [e for e in got if e.intent == "governor_throttle_applied"]
+    assert len(throttle) == 1
+    assert "×50" in throttle[0].action_summary
+    assert throttle[0].kind == "governance"     # subclass survived the fold
+    await agg.stop()
+
+
+# ---------------------------------------------------------------------------
+# Step 2 root-cause fix: the severed MemoryEngine outcome chain
+# ---------------------------------------------------------------------------
+
+def test_gls_terminal_path_calls_consciousness_outcome_hook():
+    """record_operation_outcome had ZERO callers (the MemoryEngine's sole
+    write path never ran live). BOTH terminal seams must call it — the shared
+    _emit_terminal_events (inline ops) AND _bg_unregister_active (BG-pool ops
+    never cross the former: the twin-path drift class, proven live when the
+    first single-seam wiring stayed silent on a BG op)."""
+    import ast as _ast
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    path = (root / "backend" / "core" / "ouroboros" / "governance"
+            / "governed_loop_service.py")
+    tree = _ast.parse(open(path, encoding="utf-8").read())
+
+    def _calls_within(func_name):
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef))                     and node.name == func_name:
+                return {sub.func.attr for sub in _ast.walk(node)
+                        if isinstance(sub, _ast.Call)
+                        and isinstance(sub.func, _ast.Attribute)}
+        return set()
+
+    assert "record_operation_outcome" in _calls_within("_emit_terminal_events")
+    assert "record_operation_outcome" in _calls_within("_bg_unregister_active")
+
+
+@pytest.mark.asyncio
+async def test_bridge_outcome_forwards_ledger_authoritative_signature():
+    """Signature-drift kill: the bridge must call ingest_outcome(op_id) — the
+    old kwargs call TypeError'd on EVERY invocation (silently swallowed)."""
+    from backend.core.ouroboros.governance.consciousness_bridge import (
+        ConsciousnessBridge,
+    )
+
+    calls = []
+
+    class _Memory:
+        async def ingest_outcome(self, op_id):    # the REAL engine signature
+            calls.append(op_id)
+
+    class _Consciousness:
+        _memory = _Memory()
+
+    bridge = ConsciousnessBridge(consciousness=_Consciousness())
+    await bridge.record_operation_outcome(
+        op_id="op-x", files_changed=["a.py"], success=True, failure_reason=None)
+    assert calls == ["op-x"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_outcome_ingests_exactly_once_per_op():
+    """An op may cross BOTH terminal seams — reputation ingests ONCE."""
+    from backend.core.ouroboros.governance.consciousness_bridge import (
+        ConsciousnessBridge,
+    )
+
+    calls = []
+
+    class _Memory:
+        async def ingest_outcome(self, op_id):
+            calls.append(op_id)
+
+    class _Consciousness:
+        _memory = _Memory()
+
+    bridge = ConsciousnessBridge(consciousness=_Consciousness())
+    for _ in range(3):   # inline seam + BG seam + a retry
+        await bridge.record_operation_outcome(
+            op_id="op-dup", files_changed=[], success=True, failure_reason=None)
+    assert calls == ["op-dup"]

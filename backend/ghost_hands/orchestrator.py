@@ -839,6 +839,25 @@ class GhostHandsOrchestrator:
 
                 self._stats["total_actions_executed"] += 1
 
+                # Hive Step 2: per-action emit, COALESCED per task — a burst
+                # of granular UI actions folds into ONE semantic envelope
+                # (flushed at task completion below). Never breaks actuation.
+                try:
+                    from backend.api.hive_emitter import hive_emit
+                    hive_emit(
+                        actor_id="ghost_hands.orchestrator",
+                        subsystem="actuation",
+                        intent=f"actions:{task.name}",
+                        summary=(f"{action.action_type.name.lower()} "
+                                 f"in '{task.name}'"),
+                        severity="info" if success else "warn",
+                        trace_id=task.name, coalesce=True,
+                        detail={"action": action.action_type.name,
+                                "ok": bool(success)},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
             # Task completed
             if report.actions_failed == 0:
                 task.state = GhostTaskState.COMPLETED
@@ -871,6 +890,28 @@ class GhostHandsOrchestrator:
             f"[GHOST-HANDS] Task '{task.name}' completed: "
             f"{report.actions_succeeded}/{report.actions_executed} actions succeeded"
         )
+
+        # Hive Step 2: sequence-completion emit + flush of this task's
+        # coalesced per-action window — the feed shows ONE line per burst
+        # plus the semantic task outcome. Telemetry never breaks actuation.
+        try:
+            from backend.api.hive_emitter import hive_emit, hive_flush
+            hive_flush("ghost_hands.orchestrator", f"actions:{task.name}")
+            hive_emit(
+                actor_id="ghost_hands.orchestrator", subsystem="actuation",
+                intent="task_complete",
+                summary=(f"ghost task '{task.name}': "
+                         f"{report.actions_succeeded}/{report.actions_executed} "
+                         f"actions ok in {report.total_duration_ms:.0f}ms"),
+                severity=("success" if report.actions_failed == 0 else "warn"),
+                trace_id=task.name,
+                detail={"executed": report.actions_executed,
+                        "succeeded": report.actions_succeeded,
+                        "failed": report.actions_failed,
+                        "duration_ms": round(report.total_duration_ms, 1)},
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         return report
 

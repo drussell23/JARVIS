@@ -30,6 +30,8 @@ _SUB_COLOR = {
     "routing": "blue", "training": "green", "mesh": "bright_magenta",
     "consciousness": "bright_blue", "perception": "bright_cyan",
     "actuation": "bright_yellow", "mcp": "bright_green", "persona": "white",
+    # Step 2 silent-actor fabrics
+    "voice": "bright_red", "web": "bright_green", "context": "bright_white",
 }
 
 

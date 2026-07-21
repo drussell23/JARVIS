@@ -313,6 +313,16 @@ class JARVISAgentVoice(MLEnhancedVoiceSystem):
                 # Wake word detected, activate
                 logger.info("Wake word detected, activating JARVIS")
                 self.running = True
+                # Hive Step 2: voice was silent to every fabric. Metadata
+                # only — the spoken text NEVER rides. Fail-soft.
+                try:
+                    from backend.api.hive_emitter import hive_emit
+                    hive_emit(actor_id="voice.wake", subsystem="voice",
+                              intent="wake_word",
+                              summary="wake word detected — JARVIS activated",
+                              severity="success", trace_id="voice")
+                except Exception:  # noqa: BLE001
+                    pass
 
         # Check for mode switches
         if "system control" in text.lower() or "control my mac" in text.lower():

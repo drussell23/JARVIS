@@ -285,6 +285,17 @@ class FramePipeline:
             )
         else:
             logger.info("FramePipeline started — mock mode (no SCK capture)")
+        # Hive Step 2: perception state transition (the per-frame hot path
+        # emits COALESCED below — this is the semantic start line). Fail-soft.
+        try:
+            from backend.api.hive_emitter import hive_emit
+            hive_emit(actor_id="vision.frame_pipeline", subsystem="perception",
+                      intent="stream_state",
+                      summary=("frame capture started "
+                               + ("(SCK)" if self._use_sck else "(mock)")),
+                      severity="info", trace_id="vision")
+        except Exception:  # noqa: BLE001
+            pass
 
     async def stop(self) -> None:
         """Stop the pipeline and cancel the capture task if running."""
@@ -365,6 +376,19 @@ class FramePipeline:
         recent content.
         """
         self._latest_frame = frame
+        # Hive Step 2: per-frame emit, COALESCED — the 15-60fps hot path folds
+        # into ONE envelope per debounce window ("×N in Wms"), and the adaptive
+        # window widens under sustained capture. Cross-thread safe (SCK SHM
+        # capture runs on a daemon thread; the emitter marshals). Fail-soft.
+        try:
+            from backend.api.hive_emitter import hive_emit
+            hive_emit(actor_id="vision.frame_pipeline", subsystem="perception",
+                      intent="frames", coalesce=True,
+                      summary=f"frame #{frame.frame_number} changed → enqueued",
+                      severity="info", trace_id="vision",
+                      detail={"frame": frame.frame_number})
+        except Exception:  # noqa: BLE001
+            pass
         if self._frame_queue.full():
             try:
                 dropped = self._frame_queue.get_nowait()
