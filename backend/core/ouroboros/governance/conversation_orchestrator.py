@@ -63,6 +63,27 @@ from backend.core.ouroboros.governance.intent_classifier import (
 logger = logging.getLogger(__name__)
 
 
+# L0 social acks — deterministic, zero-cost, persona-consistent. Selection
+# is a stable hash of the message text: the same greeting always gets the
+# same reply (auditable), different greetings vary. No provider is touched.
+_SOCIAL_ACKS: Tuple[str, ...] = (
+    "Hey. I'm listening — verbs or plain words both work.",
+    "Hi — the organism's live. What do you need?",
+    "Here. Type a verb, or just tell me what's on your mind.",
+    "Standing by — `/help` shows the verbs if you want them.",
+)
+
+
+def _social_reply(message: str) -> str:
+    """Stable per-message pick from the ack rotation. NEVER raises."""
+    try:
+        import hashlib
+        digest = hashlib.sha256(message.strip().lower().encode()).digest()
+        return _SOCIAL_ACKS[digest[0] % len(_SOCIAL_ACKS)]
+    except Exception:  # noqa: BLE001
+        return _SOCIAL_ACKS[0]
+
+
 # Per-session ring-buffer cap. Long conversations stay observable
 # without unbounded memory.
 MAX_TURNS_PER_SESSION: int = 32
@@ -371,6 +392,22 @@ class ConversationOrchestrator:
                 reasons=verdict.reasons,
                 payload={},
                 reason="empty input",
+                truncated=verdict.truncated,
+            )
+
+        if verdict.intent is ChatIntent.SOCIAL:
+            # L0 short-circuit: deterministic zero-cost ack. The reply is
+            # chosen here (stable per message text) so the executor layer
+            # stays a pure print — no provider, no session snapshot, no
+            # token spend anywhere downstream.
+            return ChatRoutingDecision(
+                action="social_ack",
+                intent=verdict.intent,
+                confidence=verdict.confidence,
+                reasons=verdict.reasons,
+                payload={"message": clipped,
+                         "reply": _social_reply(clipped)},
+                reason="L0 zero-entropy social gate",
                 truncated=verdict.truncated,
             )
 

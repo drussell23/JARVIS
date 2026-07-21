@@ -82,11 +82,14 @@ def test_low_confidence_floor_pinned():
     assert LOW_CONFIDENCE_FLOOR == 0.40
 
 
-def test_chat_intent_has_four_values():
-    """Pin: PRD §9 P2 says three routing buckets + one for paste-as-
-    context. Adding a fifth requires a new slice + design doc."""
+def test_chat_intent_has_five_values():
+    """Pin: PRD §9 P2's three routing buckets + paste-as-context, plus the
+    operator-authorized L0 SOCIAL gate (2026-07-20 — zero-entropy greetings
+    short-circuit deterministically, no model). Adding a SIXTH requires a
+    new slice + design doc."""
     assert {i.name for i in ChatIntent} == {
         "ACTION_REQUEST", "EXPLORATION", "EXPLANATION", "CONTEXT_PASTE",
+        "SOCIAL",
     }
 
 

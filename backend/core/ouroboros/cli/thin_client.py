@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import os
 import plistlib
+import random
 import subprocess
 import sys
 import time
@@ -89,13 +90,23 @@ def _boot_wait_s() -> float:
 # ---------------------------------------------------------------------------
 
 
-async def probe_socket(path: Path, timeout: Optional[float] = None) -> str:
+async def probe_socket(
+    path: Path, timeout: Optional[float] = None, *, deep: bool = False,
+) -> str:
     """Classify the attach socket with a REAL bounded connect:
 
-    * ``"live"``   — something accepted (a daemon is home)
-    * ``"stale"``  — inode exists but connection refused/timed out
+    * ``"live"``    — something accepted (a daemon is home). With
+      ``deep=True``, ONLY when the server actually *served* its first
+      frame within the bound — the same application-level contract
+      ``CockpitAttachClient.connect`` consumes.
+    * ``"booting"`` — (deep only) the connection was accepted but no
+      frame arrived within the bound. This is NOT a ghost: a UDS
+      ``listen()`` backlog completes handshakes at the KERNEL level
+      even while a boot-starved event loop has yet to run ``accept()``
+      or write the hydration line. Callers must WAIT, never clean.
+    * ``"stale"``   — inode exists but connection refused/timed out
       (ghost of a violently-killed daemon)
-    * ``"absent"`` — no inode at all
+    * ``"absent"``  — no inode at all
 
     ``timeout`` overrides the env default for a STRICT live-validation
     bound (Phase 7 health handshake). Non-invasive: opens, confirms, and
@@ -104,21 +115,35 @@ async def probe_socket(path: Path, timeout: Optional[float] = None) -> str:
     try:
         if not path.exists():
             return "absent"
+        bound = timeout if timeout is not None else _probe_timeout_s()
         try:
-            _r, w = await asyncio.wait_for(
+            r, w = await asyncio.wait_for(
                 asyncio.open_unix_connection(path=str(path)),
-                timeout=timeout if timeout is not None else _probe_timeout_s(),
+                timeout=bound,
             )
-            try:
-                w.close()
-            except Exception:  # noqa: BLE001
-                pass
-            return "live"
         except (
             ConnectionRefusedError, ConnectionResetError,
             asyncio.TimeoutError, OSError,
         ):
             return "stale"
+        try:
+            if not deep:
+                return "live"
+            # Handshake depth: connection-established is a kernel fact;
+            # readiness is an APPLICATION fact. Demand the first served
+            # byte (the hydration frame's head) within the bound.
+            try:
+                first = await asyncio.wait_for(r.read(1), timeout=bound)
+            except asyncio.TimeoutError:
+                return "booting"
+            except (ConnectionResetError, OSError):
+                return "stale"
+            return "live" if first else "booting"
+        finally:
+            try:
+                w.close()
+            except Exception:  # noqa: BLE001
+                pass
     except Exception:  # noqa: BLE001
         return "stale" if path.exists() else "absent"
 
@@ -323,27 +348,57 @@ def spawn_daemon(
         return None
 
 
+def _backoff_min_s() -> float:
+    try:
+        raw = os.environ.get("JARVIS_OV_PROBE_BACKOFF_MIN_S", "")
+        return float(raw) if raw else 0.1
+    except (TypeError, ValueError):
+        return 0.1
+
+
+def _backoff_max_s() -> float:
+    try:
+        raw = os.environ.get("JARVIS_OV_PROBE_BACKOFF_MAX_S", "")
+        return float(raw) if raw else 2.0
+    except (TypeError, ValueError):
+        return 2.0
+
+
 async def await_socket(
     path: Path,
     *,
     on_tick: Optional[Callable[[float], None]] = None,
     deadline_s: Optional[float] = None,
 ) -> bool:
-    """Wait (bounded) for the daemon's bridge to bind, re-probing with
-    the zero-trust connect. ``on_tick(elapsed)`` drives the waking
+    """Wait (bounded) for the daemon's bridge to genuinely SERVE — each
+    re-probe is the deep application handshake (``probe_socket(deep=True)``),
+    never mere socket existence or a kernel-backlog accept, so ``True``
+    here can never be a weaker claim than what attach itself consumes.
+
+    Polling is a jittered exponential backoff (full jitter: each sleep is
+    ``uniform(min, delay)`` with ``delay`` doubling to an env-tunable
+    ceiling) — resource-frugal against a boot-starved daemon and never a
+    thundering probe train. ``on_tick(elapsed)`` drives the waking
     breadcrumb. NEVER raises."""
     deadline = deadline_s if deadline_s is not None else _boot_wait_s()
     start = time.monotonic()
+    delay = _backoff_min_s()
+    ceiling = max(_backoff_max_s(), delay)
     try:
         while (time.monotonic() - start) < deadline:
-            if await probe_socket(path) == "live":
+            if await probe_socket(path, deep=True) == "live":
                 return True
             if on_tick is not None:
                 try:
                     on_tick(time.monotonic() - start)
                 except Exception:  # noqa: BLE001
                     pass
-            await asyncio.sleep(0.5)
+            remaining = deadline - (time.monotonic() - start)
+            if remaining <= 0:
+                break
+            sleep_for = min(random.uniform(_backoff_min_s(), delay), remaining)
+            await asyncio.sleep(sleep_for)
+            delay = min(delay * 2, ceiling)
         return False
     except asyncio.CancelledError:
         raise
@@ -372,9 +427,28 @@ async def ensure_daemon(
             attach_socket_path,
         )
         path = attach_socket_path()
-        state = await probe_socket(path)
+        state = await probe_socket(path, deep=True)
         if state == "live":
             return True
+        if state == "booting":
+            # A daemon is home but boot-starved — its socket must NOT be
+            # cleaned and no second ignition raced. Wait for it to serve.
+            _say("⏺ organism already waking — waiting for it to serve")
+            last_beat_b = [-10.0]
+
+            def _tick_b(elapsed: float) -> None:
+                if elapsed - last_beat_b[0] >= 5.0:
+                    last_beat_b[0] = elapsed
+                    _say(f"⎿ organism waking · {int(elapsed)}s")
+
+            if await await_socket(path, on_tick=_tick_b):
+                _say("⏺ organism live — attaching")
+                return True
+            _say(
+                "⚠ the waking organism never served — "
+                "tail " + str(daemon_log_path()),
+            )
+            return False
         if state == "stale":
             _say("⎿ ghost socket from a dead organism — cleaning")
             clean_stale_socket(path)

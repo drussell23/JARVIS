@@ -21,6 +21,15 @@ import pytest
 
 from backend.core.ouroboros.cli import thin_client
 
+
+def _serving_handler(reader, writer):
+    """Mirror of the REAL CockpitAttachBridge accept path: hydration frame
+    written immediately on connect."""
+    try:
+        writer.write(b'{"type":"hydration","status":{}}\n')
+    except Exception:
+        pass
+
 _REPO = Path(__file__).resolve().parents[2]
 
 
@@ -99,13 +108,12 @@ class TestStaleSocketDeadlock:
 
         def _fake_popen(argv, **kw):
             spawns.append((argv, kw))
-            # The "daemon" comes up: bind a REAL listener at the path.
-            srv = socket_mod.socket(
-                socket_mod.AF_UNIX, socket_mod.SOCK_STREAM,
-            )
-            srv.bind(str(path))
-            srv.listen(1)
-            spawns.append(srv)             # keep alive for the test
+            # The "daemon" comes up SERVING (the real cockpit contract:
+            # hydration on accept) — a bare listen() backlog would now be
+            # correctly classified "booting" by the deep probe, never live.
+            spawns.append(asyncio.ensure_future(
+                asyncio.start_unix_server(_serving_handler, path=str(path)),
+            ))
             return _FakeProc()
 
         status: list = []
@@ -147,8 +155,11 @@ class TestStaleSocketDeadlock:
     ):
         path = sock_dir / "a.sock"
         monkeypatch.setenv("JARVIS_ATTACH_IPC_SOCKET", str(path))
+        # Fixture mirrors the REAL cockpit contract: the server writes its
+        # hydration frame immediately on accept. (The old silent-accept
+        # fixture encoded the very false-positive the deep probe kills.)
         server = await asyncio.start_unix_server(
-            lambda r, w: None, path=str(path),
+            _serving_handler, path=str(path),
         )
         spawns: list = []
         try:
@@ -375,3 +386,128 @@ class TestCircadianLogJanitor:
             _REPO / "backend/core/ouroboros/governance/silent_boot.py"
         ).read_text()
         assert "RotatingFileHandler(" in src
+
+
+# ---------------------------------------------------------------------------
+# (4) Handshake-depth readiness — the ignite→attach race (Slice A)
+# ---------------------------------------------------------------------------
+
+
+class TestHandshakeDepthProbe:
+    async def test_backlog_accept_is_booting_not_live(self, sock_dir):
+        """THE root-cause pin: a UDS listen() backlog completes handshakes at
+        the kernel level even when the application never serves. The shallow
+        probe says "live" (kernel truth); the DEEP probe must say "booting"
+        (application truth) — the exact false-positive that printed
+        'organism live — attaching' then 'nothing to attach to'."""
+        path = sock_dir / "boot.sock"
+        server = await asyncio.start_unix_server(
+            lambda r, w: None, path=str(path),   # accepts, never serves
+        )
+        try:
+            assert await thin_client.probe_socket(path) == "live"
+            assert await thin_client.probe_socket(
+                path, timeout=0.3, deep=True) == "booting"
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def test_deep_probe_live_when_served(self, sock_dir):
+        path = sock_dir / "served.sock"
+        server = await asyncio.start_unix_server(
+            _serving_handler, path=str(path),
+        )
+        try:
+            assert await thin_client.probe_socket(
+                path, timeout=1.0, deep=True) == "live"
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def test_refused_socket_backoff_retries_no_false_positive(
+        self, sock_dir, monkeypatch,
+    ):
+        """Mandate: a socket inode that refuses connections must be retried
+        with jittered exponential backoff — never a false-positive True,
+        never an exception."""
+        monkeypatch.setenv("JARVIS_OV_PROBE_BACKOFF_MIN_S", "0.02")
+        monkeypatch.setenv("JARVIS_OV_PROBE_BACKOFF_MAX_S", "0.08")
+        path = sock_dir / "refused.sock"
+        s = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+        s.bind(str(path))
+        s.close()                              # inode remains; ECONNREFUSED
+        probes = []
+        real_probe = thin_client.probe_socket
+
+        async def _counting_probe(p, timeout=None, *, deep=False):
+            probes.append(deep)
+            return await real_probe(p, timeout, deep=deep)
+
+        monkeypatch.setattr(thin_client, "probe_socket", _counting_probe)
+        ok = await thin_client.await_socket(path, deadline_s=0.5)
+        assert ok is False                     # graceful, no exception
+        assert len(probes) >= 3                # backoff retried, not one-shot
+        assert all(probes)                     # every retry used the DEEP probe
+
+    async def test_backoff_delays_grow_with_jitter(self, sock_dir, monkeypatch):
+        """The polling cadence must widen (exponential ceiling) — no fixed-
+        interval probe train against a booting daemon."""
+        monkeypatch.setenv("JARVIS_OV_PROBE_BACKOFF_MIN_S", "0.01")
+        monkeypatch.setenv("JARVIS_OV_PROBE_BACKOFF_MAX_S", "0.16")
+        sleeps = []
+        real_sleep = asyncio.sleep
+
+        async def _spy_sleep(d):
+            sleeps.append(d)
+            await real_sleep(0)                # don't actually wait
+
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.thin_client.asyncio.sleep", _spy_sleep)
+        path = sock_dir / "nothing.sock"       # absent → probes fast
+        await thin_client.await_socket(path, deadline_s=0.2)
+        assert len(sleeps) >= 3
+        # ceiling-bounded always (deadline clamping can only SHRINK a sleep)
+        assert all(d <= 0.16 + 1e-9 for d in sleeps)
+        # first window is degenerate uniform(min, min) — exactly the floor
+        assert abs(sleeps[0] - 0.01) < 1e-9
+        # growth: the sampling window widens past the first doubling, so the
+        # envelope must exceed the 0.01–0.02 band eventually
+        assert max(sleeps) > 0.02
+
+    async def test_ensure_daemon_waits_for_booting_never_cleans(
+        self, sock_dir, monkeypatch,
+    ):
+        """A boot-starved daemon (accepting, not yet serving) must be WAITED
+        for — its socket never cleaned, no second ignition raced."""
+        monkeypatch.setenv("JARVIS_ATTACH_IPC_SOCKET",
+                           str(sock_dir / "b.sock"))
+        monkeypatch.setenv("JARVIS_OV_PROBE_TIMEOUT_S", "0.2")
+        monkeypatch.setenv("JARVIS_OV_BOOT_WAIT_S", "5")   # clamp floor
+        monkeypatch.setenv("JARVIS_OV_PROBE_BACKOFF_MIN_S", "0.02")
+        monkeypatch.setenv("JARVIS_OV_PROBE_BACKOFF_MAX_S", "0.1")
+        path = sock_dir / "b.sock"
+        served = {"on": False}
+
+        def _handler(reader, writer):
+            if served["on"]:
+                _serving_handler(reader, writer)
+
+        server = await asyncio.start_unix_server(_handler, path=str(path))
+        spawns: list = []
+
+        async def _flip():                      # daemon "finishes booting"
+            await asyncio.sleep(0.3)
+            served["on"] = True
+
+        try:
+            flip = asyncio.ensure_future(_flip())
+            ok = await thin_client.ensure_daemon(
+                spawner=lambda *a, **k: spawns.append(a),
+            )
+            await flip
+            assert ok is True                  # waited through boot
+            assert spawns == []                # never raced a second ignition
+            assert path.exists()               # never cleaned the socket
+        finally:
+            server.close()
+            await server.wait_closed()
