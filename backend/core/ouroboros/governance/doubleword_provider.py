@@ -45,6 +45,7 @@ import time
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from backend.core.ouroboros.governance.op_context import (
@@ -1154,7 +1155,122 @@ def _dw_hedge_supersedes(context: Any, model_id: str = "") -> bool:
         return False
 
 
-def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
+# ---------------------------------------------------------------------------
+# Temporal Veto (The Iron Gate, 2026-07-21) + Fast-Fail Load Shed
+# ---------------------------------------------------------------------------
+# The temporal impedance mismatch: a caller enforcing a tight client-side
+# bound (RepairEngine's 45s per-iter wait_for; any sla="strict" consumer)
+# could still have its op elected onto the BATCH plane by the Slice-36
+# ladder — a mail slot whose p95 can exceed the caller's entire budget.
+# The caller then kills the await at its bound, the batch keeps cooking
+# (billed), and the iteration dies as provider_iter_timeout: a silent
+# soak-killer. The veto is a DEADLINE-AWARE route invalidation evaluated
+# at the ONE dispatch seam: a deadline-bound op whose remaining budget
+# cannot safely absorb a batch cycle must never structurally reach the
+# batch plane. If DW's RT lane is ALSO unusable at that moment, the
+# router must not enter a doomed await — it FAST-FAIL sheds with a typed
+# error that rides the existing DoublewordInfraError cascade to Claude,
+# preserving the remaining budget for the tier that can spend it.
+
+
+def dw_temporal_veto_enabled() -> bool:
+    """Master for the deadline-aware batch veto. Default TRUE. NEVER raises."""
+    try:
+        return os.environ.get(
+            "JARVIS_DW_TEMPORAL_VETO_ENABLED", "true",
+        ).strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def dw_fast_fail_shed_enabled() -> bool:
+    """Master for the pre-RT fast-fail load shed (veto + RT-unusable →
+    immediate typed cascade instead of a doomed attempt). Default TRUE.
+    NEVER raises."""
+    try:
+        return os.environ.get(
+            "JARVIS_DW_FAST_FAIL_SHED_ENABLED", "true",
+        ).strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _dw_batch_safe_ceiling_s() -> float:
+    """The minimum remaining budget (seconds) an op must hold before the
+    batch plane is a safe election. ADAPTIVE, not hardcoded: the floor is
+    env-tunable (``JARVIS_DW_BATCH_SAFE_CEILING_S``, default 50 — vetoes
+    the 45s repair per-iter class while sparing the 60s BACKGROUND
+    read-only stall budget), raised dynamically by the observed batch
+    latency estimate × a safety multiplier (``JARVIS_DW_BATCH_TTFT_S`` ×
+    ``JARVIS_DW_BATCH_CEILING_SAFETY_MULT``, default 3.0) so a slow batch
+    lane widens its own exclusion zone with zero config change. NEVER
+    raises."""
+    try:
+        raw = os.environ.get("JARVIS_DW_BATCH_SAFE_CEILING_S", "").strip()
+        floor = float(raw) if raw else 50.0
+        if floor <= 0:
+            return 0.0  # explicit 0 → veto disabled via ceiling
+        try:
+            mult = float(os.environ.get(
+                "JARVIS_DW_BATCH_CEILING_SAFETY_MULT", "3.0") or 3.0)
+        except Exception:  # noqa: BLE001
+            mult = 3.0
+        adaptive = _dw_batch_ttft_estimate_s() * (mult if mult > 0 else 3.0)
+        return max(floor, adaptive)
+    except Exception:  # noqa: BLE001
+        return 50.0
+
+
+def _dw_remaining_budget_s(deadline: Any) -> Optional[float]:
+    """Seconds remaining until ``deadline``, or None when the op carries no
+    temporal bound (None / unrecognized shape). Accepts the orchestrator's
+    datetime (aware or naive-UTC) and duck-typed deadline objects exposing
+    ``remaining_s()`` / ``remaining()``. NEVER raises."""
+    try:
+        if deadline is None:
+            return None
+        for _attr in ("remaining_s", "remaining"):
+            _fn = getattr(deadline, _attr, None)
+            if callable(_fn):
+                try:
+                    return float(_fn())
+                except Exception:  # noqa: BLE001
+                    continue
+        if isinstance(deadline, datetime):
+            _now = (
+                datetime.now(timezone.utc)
+                if deadline.tzinfo is not None
+                else datetime.utcnow()
+            )
+            return (deadline - _now).total_seconds()
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _dw_temporal_veto(context: Any, remaining_budget_s: Optional[float]) -> bool:
+    """THE veto predicate: True when this op must never reach the batch
+    plane. Fires when (a) the op is deadline-bound with remaining budget
+    below the safe batch ceiling, or (b) the context is explicitly
+    stamped ``sla="strict"`` (future subsystems declare intent without
+    threading a deadline). An op with NO temporal bound is never vetoed —
+    fire-and-forget work keeps the batch discount. NEVER raises."""
+    try:
+        if not dw_temporal_veto_enabled():
+            return False
+        if str(getattr(context, "sla", "") or "").strip().lower() == "strict":
+            return True
+        if remaining_budget_s is None:
+            return False
+        ceiling = _dw_batch_safe_ceiling_s()
+        return ceiling > 0 and remaining_budget_s < ceiling
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _slice36_should_force_batch(
+    context: Any, *, model_id: str = "", remaining_budget_s: Optional[float] = None,
+) -> bool:
     """Slice 36 — adaptive transport selector decision.
 
     ``model_id`` (Slice 175): the resolved target DW model, so the predictive branch queries
@@ -1178,6 +1294,22 @@ def _slice36_should_force_batch(context: Any, *, model_id: str = "") -> bool:
     failure (returns False = preserve legacy RT behavior).
     """
     try:
+        # Temporal Veto (Iron Gate) — FIRST evaluation, supersedes everything
+        # including the sentinel command: a deadline-bound op whose remaining
+        # budget cannot absorb a batch cycle must never be force-batched, no
+        # matter what the reactive/predictive ladder wants. (Sentinel probes
+        # carry no deadline, so their ContextVar command is unaffected.)
+        if _dw_temporal_veto(context, remaining_budget_s):
+            logger.info(
+                "[TemporalVeto] force-batch VETOED: op=%s route=%s "
+                "remaining=%.1fs < ceiling=%.1fs (deadline-bound op shall "
+                "not enter the mail slot)",
+                (getattr(context, "op_id", "?") or "?")[:16],
+                getattr(context, "provider_route", "?"),
+                remaining_budget_s if remaining_budget_s is not None else -1.0,
+                _dw_batch_safe_ceiling_s(),
+            )
+            return False
         # Slice 192 — THE PROACTIVE HIERARCHY (supersedes ALL reactive force-batch). When the
         # transport-hedge is active and no STORM is forecast, RACE instead of force-batching —
         # this explicitly OVERRIDES the cold-start timer (184), the warm-boot ledger flags (179),
@@ -1707,6 +1839,52 @@ class SovereignBatchTimeoutError(DoublewordInfraError):
         )
         self.elapsed_s = elapsed_s
         self.deadline_s = deadline_s
+
+
+class TemporalBudgetShedError(DoublewordInfraError):
+    """Temporal Veto (Iron Gate) — Fast-Fail load shed.
+
+    Raised by ``_dispatch_internal`` when a deadline-bound op (remaining
+    budget below the safe batch ceiling, or ``sla="strict"``) is vetoed off
+    the batch plane AND no DW realtime lane can serve it — RT disabled,
+    the model marked RT-unavailable in the transport profile, or the
+    persisted ledger showing the stream actively rupturing. Rather than
+    hang in a doomed await (the RepairEngine 45s-vs-batch impedance
+    mismatch), the router refuses INSTANTLY so the remaining budget is
+    preserved for the Claude fallback tier.
+
+    Subclasses ``DoublewordInfraError`` so it rides the existing
+    non-retriable re-raise path to the CandidateGenerator FSM (the same
+    proven route a 403 takes). ``status_code=0`` — this is OUR routing
+    refusal, never a vendor fact: it must not trip vendor breakers,
+    poison the transport profile, or count as a DW health failure. The
+    message carries the ``temporal_load_shed`` marker the FSM classifier
+    maps to ``FailureMode.TEMPORAL_SHED`` (zero primary penalty, zero
+    retry, immediate cascade).
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        model_id: str = "",
+        remaining_s: Optional[float] = None,
+        ceiling_s: Optional[float] = None,
+    ) -> None:
+        super().__init__(
+            f"temporal_load_shed: {reason} "
+            f"(remaining={remaining_s if remaining_s is not None else -1.0:.1f}s "
+            f"ceiling={ceiling_s if ceiling_s is not None else -1.0:.1f}s)",
+            status_code=0,
+            model_id=model_id,
+        )
+        self.remaining_s = remaining_s
+        self.ceiling_s = ceiling_s
+
+    def is_transient(self) -> bool:
+        """A shed is deterministic for the same (budget, RT-state) — an
+        immediate retry re-sheds. Never transient-retriable on DW."""
+        return False
 
 
 class BatchStalledError(SovereignBatchTimeoutError):
@@ -3566,8 +3744,17 @@ class DoublewordProvider:
         # in this method's scope (defined only in submit_batch / _generate_realtime), so this
         # threw NameError on every RT op since Slice 175 — caught + mislabeled as a vendor
         # live_transport rupture. Resolve it natively in scope.
+        # ── Temporal Veto (Iron Gate) — evaluated ONCE at the dispatch seam,
+        # threaded through every batch-election site below. Centralized here
+        # so RepairEngine and every future sla="strict" subsystem is
+        # protected with zero call-site logic (they just pass an honest
+        # deadline).
+        _veto_remaining = _dw_remaining_budget_s(deadline)
+        _dispatch_model = self._resolve_effective_model(context)
+        _temporal_veto = _dw_temporal_veto(context, _veto_remaining)
         _slice36_force_batch = _slice36_should_force_batch(
-            context, model_id=self._resolve_effective_model(context),
+            context, model_id=_dispatch_model,
+            remaining_budget_s=_veto_remaining,
         )
         if _slice36_force_batch:
             # Slice 171 — surface the Slice 170 capital save (records iff Claude was
@@ -3585,7 +3772,13 @@ class DoublewordProvider:
         # Slice 189 Phase 2 — STORM cost-optimizer. Before any RT attempt, consult the EXISTING
         # predictive cortex (172-176). If a platform-wide rupture STORM is forecast, racing the
         # RT path is pure waste (it will rupture) — force batch-only, saving the hedge spend.
-        if not _slice36_force_batch and self._s189_storm_forces_batch(context):
+        # Temporal Veto guard: a deadline-bound op cannot ride out a storm in
+        # the mail slot — it sheds to Claude below instead.
+        if (
+            not _slice36_force_batch
+            and not _temporal_veto
+            and self._s189_storm_forces_batch(context)
+        ):
             _slice36_force_batch = True
 
         # Iron Gate alignment override — when the exploration gate will demand
@@ -3619,6 +3812,51 @@ class DoublewordProvider:
                         _slice36_force_batch = False
             except Exception:  # noqa: BLE001 — fail-soft; preserve batch on error
                 pass
+
+        # ── Fast-Fail Load Shed (Temporal Veto edge case) ──────────────
+        # The veto has forced this op off the batch plane. If DW's RT lane
+        # is ALSO structurally unusable right now — disabled, the model
+        # marked RT-unavailable in the transport profile (403 entitlement),
+        # or the persisted ledger showing the stream actively rupturing —
+        # then NO DW lane can serve within the budget. Do not enter a
+        # doomed await: refuse instantly with the typed shed error so the
+        # CandidateGenerator cascades to Claude with the budget intact.
+        if _temporal_veto and dw_fast_fail_shed_enabled():
+            _rt_unusable_reason = ""
+            if not self._realtime_enabled:
+                _rt_unusable_reason = "rt_disabled"
+            if not _rt_unusable_reason:
+                try:
+                    from backend.core.ouroboros.governance.dw_transport_profile import (  # noqa: E501
+                        TRANSPORT_REALTIME as _shed_rt,
+                        get_transport_profile as _shed_profile,
+                    )
+                    if _shed_profile().is_unavailable(_dispatch_model, _shed_rt):
+                        _rt_unusable_reason = "rt_model_unavailable"
+                except Exception:  # noqa: BLE001 — profile probe never blocks RT
+                    pass
+            if not _rt_unusable_reason:
+                try:
+                    if _dw_streaming_warm_degraded():
+                        _rt_unusable_reason = "rt_stream_rupturing"
+                except Exception:  # noqa: BLE001
+                    pass
+            if _rt_unusable_reason:
+                logger.warning(
+                    "[TemporalVeto] FAST-FAIL LOAD SHED: op=%s route=%s "
+                    "remaining=%.1fs — batch vetoed AND RT unusable (%s) → "
+                    "shedding to fallback tier with budget intact (model=%s)",
+                    (getattr(context, "op_id", "?") or "?")[:16],
+                    getattr(context, "provider_route", "?"),
+                    _veto_remaining if _veto_remaining is not None else -1.0,
+                    _rt_unusable_reason, _dispatch_model,
+                )
+                raise TemporalBudgetShedError(
+                    _rt_unusable_reason,
+                    model_id=_dispatch_model,
+                    remaining_s=_veto_remaining,
+                    ceiling_s=_dw_batch_safe_ceiling_s(),
+                )
 
         # A1-DIAG: dispatch-level topology diagnostic (env-gated, preemption-proof).
         # Captures the RT vs batch branch decision BEFORE it executes, so a SPOT
@@ -3658,7 +3896,10 @@ class DoublewordProvider:
             # concurrently; take the winner; an RT rupture is SWALLOWED so batch still wins —
             # the op NEVER waits for the rupture. Reuses _generate_realtime + _generate_via_batch
             # (no duplication). Gated; off → the legacy sequential RT-then-fallback below.
-            if self._s189_transport_hedge_active():
+            # Temporal Veto guard: a deadline-bound op must not launch a batch
+            # arm at all — pure RT below; a rupture then sheds at the batch
+            # chokepoint instead of silently landing in the mail slot.
+            if self._s189_transport_hedge_active() and not _temporal_veto:
                 from backend.core.ouroboros.governance.dw_transport_hedge import hedged_race
                 from backend.core.ouroboros.governance.dw_immortal import (
                     hedge_to_batch_on_rupture as _s189_is_rupture,
@@ -3874,6 +4115,30 @@ class DoublewordProvider:
                     raise  # Non-retriable: propagate to CandidateGenerator FSM
 
         # Batch mode: 4-stage async batch API (fallback from real-time, or explicit opt-in)
+        # ── Temporal Veto TERMINAL CHOKEPOINT ──────────────────────────
+        # Every batch entry in this dispatcher funnels through this ONE
+        # call: force-batch, RT-disabled, the Slice-181 rupture hedge, and
+        # the 429/503 fallback. A deadline-bound op reaching here means
+        # every realtime avenue is exhausted — entering the mail slot now
+        # guarantees the caller's wait_for kills the await while the batch
+        # keeps cooking (billed). Shed instead: the typed error rides the
+        # existing non-retriable cascade to Claude with the budget intact.
+        if _temporal_veto:
+            logger.warning(
+                "[TemporalVeto] batch chokepoint SHED: op=%s route=%s "
+                "remaining=%.1fs < ceiling=%.1fs — RT avenues exhausted, "
+                "refusing the mail slot → fallback tier (model=%s)",
+                (getattr(context, "op_id", "?") or "?")[:16],
+                getattr(context, "provider_route", "?"),
+                _veto_remaining if _veto_remaining is not None else -1.0,
+                _dw_batch_safe_ceiling_s(), _dispatch_model,
+            )
+            raise TemporalBudgetShedError(
+                "batch_chokepoint_rt_exhausted",
+                model_id=_dispatch_model,
+                remaining_s=_veto_remaining,
+                ceiling_s=_dw_batch_safe_ceiling_s(),
+            )
         t0 = time.monotonic()
         self._last_error_status = 0  # reset before attempt
 
