@@ -199,7 +199,8 @@ async def test_live_probe_observes_synthetic_frame(sock_dir, monkeypatch):
     monkeypatch.setenv("JARVIS_DOCTOR_LIVE_WAIT_S", "5")
 
     async def _daemon(reader, writer):
-        writer.write(b'{"type":"hydration","status":{}}\n')
+        writer.write(
+            b'{"type":"hydration","status":{},"fabrics":{"sse":true}}\n')
         line = await reader.readline()
         frame = json.loads(line.decode())
         assert frame == {"type": "input", "text": "/doctor probe"}
@@ -233,7 +234,8 @@ async def test_live_probe_degrades_when_probe_ran_but_no_frame(
     monkeypatch.setenv("JARVIS_DOCTOR_LIVE_WAIT_S", "1")
 
     async def _daemon(reader, writer):
-        writer.write(b'{"type":"hydration","status":{}}\n')
+        writer.write(
+            b'{"type":"hydration","status":{},"fabrics":{"sse":true}}\n')
         await reader.readline()
         writer.write(b'{"type":"line","text":"[doctor] probe x: status=y"}\n')
         await writer.drain()
@@ -256,3 +258,50 @@ def test_render_never_raises_on_minimal_console():
 
     ov_doctor.render_report(_C(), DoctorReport(verdicts=[
         EdgeVerdict("1 process", EdgeState.OK, "pid 1")]))
+
+
+@pytest.mark.asyncio
+async def test_live_probe_capability_gated_on_old_daemon(sock_dir, monkeypatch):
+    """An old daemon (no fabrics signature in hydration) gets NOTHING
+    injected — instant SKIPPED with the restart remedy, no blind wait."""
+    path = sock_dir / "cockpit_attach.sock"
+    monkeypatch.setenv("JARVIS_ATTACH_IPC_SOCKET", str(path))
+    received = []
+
+    async def _old_daemon(reader, writer):
+        writer.write(b'{"type":"hydration","status":{}}\n')   # no fabrics
+        await writer.drain()
+        line = await reader.readline()
+        if line:
+            received.append(line)
+
+    server = await asyncio.start_unix_server(_old_daemon, path=str(path))
+    try:
+        t0 = asyncio.get_running_loop().time()
+        v = await ov_doctor.run_live_probe()
+        elapsed = asyncio.get_running_loop().time() - t0
+        assert v.state is EdgeState.SKIPPED
+        assert "predates /doctor probe" in v.detail
+        assert elapsed < 3.0                    # instant, not a 45s wait
+        assert received == []                   # NOTHING was injected
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def test_version_skew_synthesizer_names_the_remedy():
+    lines = []
+
+    class _C:
+        def print(self, msg, **kw):
+            lines.append(str(msg))
+
+    ov_doctor.render_report(_C(), DoctorReport(verdicts=[
+        EdgeVerdict("1 process", EdgeState.OK, "pid 4765"),
+        EdgeVerdict("4 hive fabrics", EdgeState.DEGRADED,
+                    "no fabrics block (older daemon?)"),
+        EdgeVerdict("9 live probe", EdgeState.SKIPPED,
+                    "daemon predates /doctor probe"),
+    ]))
+    remedy = [ln for ln in lines if "restart it" in ln]
+    assert remedy and "kill 4765" in remedy[0]

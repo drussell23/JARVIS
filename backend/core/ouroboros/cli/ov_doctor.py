@@ -253,48 +253,62 @@ def _verdicts_from_hydration(
     return out
 
 
-async def _fetch_json(path: str) -> Optional[Any]:
-    """Minimal bounded HTTP/1.1 GET → parsed JSON body. NEVER raises."""
+async def _http_get(path: str) -> Tuple[Optional[int], Optional[Any]]:
+    """Minimal bounded HTTP/1.1 GET → (status_code, parsed_json|None).
+
+    ``(None, None)`` means the SERVER is unreachable (refused/timeout) —
+    a different fault class than a reachable server returning 404 (path
+    not mounted, e.g. a daemon predating the endpoint). NEVER raises."""
     host, port = _channel_host_port()
     try:
         r, w = await asyncio.wait_for(
             asyncio.open_connection(host=host, port=port),
             timeout=_edge_timeout_s(),
         )
-        try:
-            req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
-                   "Connection: close\r\n\r\n")
-            w.write(req.encode())
-            await w.drain()
-            raw = await asyncio.wait_for(
-                r.read(262144), timeout=_edge_timeout_s())
-            head, _, body = raw.partition(b"\r\n\r\n")
-            if b" 200 " not in head.split(b"\r\n", 1)[0]:
-                return None
-            # tolerate chunked encoding by scanning for the JSON braces
-            text = body.decode(errors="replace").strip()
-            start = text.find("{")
-            end = text.rfind("}")
-            if start < 0 or end <= start:
-                return None
-            return json.loads(text[start:end + 1])
-        finally:
-            try:
-                w.close()
-            except Exception:  # noqa: BLE001
-                pass
     except Exception:  # noqa: BLE001
-        return None
+        return None, None
+    try:
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+               "Connection: close\r\n\r\n")
+        w.write(req.encode())
+        await w.drain()
+        raw = await asyncio.wait_for(
+            r.read(262144), timeout=_edge_timeout_s())
+        status_line = raw.split(b"\r\n", 1)[0]
+        try:
+            code = int(status_line.split()[1])
+        except Exception:  # noqa: BLE001
+            code = 0
+        _head, _, body = raw.partition(b"\r\n\r\n")
+        if code != 200:
+            return code, None
+        # tolerate chunked encoding by scanning for the JSON braces
+        text = body.decode(errors="replace").strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return code, None
+        return code, json.loads(text[start:end + 1])
+    except Exception:  # noqa: BLE001
+        return None, None
+    finally:
+        try:
+            w.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def probe_edge_sensors() -> EdgeVerdict:
     """Edge 5: /channel/health — the REAL Gap-4 schema: top-level
     ``status`` + per-sensor blocks under ``*_sensor`` keys."""
-    data = await _fetch_json("/channel/health")
-    if data is None:
+    code, data = await _http_get("/channel/health")
+    if code is None:
         return EdgeVerdict("5 sensors", EdgeState.ABSENT,
                            "channel server unreachable "
                            f"({':'.join(map(str, _channel_host_port()))})")
+    if data is None:
+        return EdgeVerdict("5 sensors", EdgeState.DEGRADED,
+                           f"server up, /channel/health returned {code}")
     healthy = str(data.get("status", "")).lower() == "healthy"
     sensor_blocks = {k: v for k, v in data.items()
                      if k.endswith("_sensor") and isinstance(v, dict)}
@@ -310,10 +324,15 @@ async def probe_edge_sensors() -> EdgeVerdict:
 
 async def probe_edge_liveness() -> EdgeVerdict:
     """Edge 7: /observability/liveness (static ∩ runtime capabilities)."""
-    data = await _fetch_json("/observability/liveness")
-    if data is None:
+    code, data = await _http_get("/observability/liveness")
+    if code is None:
         return EdgeVerdict("7 liveness", EdgeState.ABSENT,
-                           "liveness endpoint unreachable")
+                           "channel server unreachable")
+    if data is None:
+        return EdgeVerdict(
+            "7 liveness", EdgeState.ABSENT,
+            f"server up, path not mounted ({code}) — daemon predates "
+            "the endpoint or the router is disabled")
     caps = data.get("capabilities") or data.get("liveness") or data
     if isinstance(caps, dict) and caps:
         dormant = [k for k, v in caps.items()
@@ -428,11 +447,22 @@ async def run_live_probe() -> EdgeVerdict:
         return EdgeVerdict("9 live probe", EdgeState.SEVERED,
                            f"could not attach: {str(exc)[:60]}")
     try:
-        # consume hydration first, then request the probe over the input lane
+        # consume hydration first — it is ALSO the capability signature:
+        # only daemons carrying tonight's code serve a ``fabrics`` block,
+        # and only those daemons have the /doctor probe verb. An older
+        # daemon gets NOTHING injected (no blind 45s wait, no unknown-verb
+        # noise) — the doctor skips with the remedy instead.
         try:
-            await asyncio.wait_for(r.readline(), timeout=_edge_timeout_s())
+            first = await asyncio.wait_for(
+                r.readline(), timeout=_edge_timeout_s())
+            hydration = json.loads(first.decode())
         except Exception:  # noqa: BLE001
-            pass
+            hydration = {}
+        if "fabrics" not in hydration:
+            return EdgeVerdict(
+                "9 live probe", EdgeState.SKIPPED,
+                "daemon predates /doctor probe (no fabrics capability "
+                "signature) — restart the organism to enable the live loop")
         w.write((json.dumps(
             {"type": "input", "text": "/doctor probe"},
             separators=(",", ":")) + "\n").encode())
@@ -518,6 +548,23 @@ def render_report(console: Any, report: DoctorReport) -> None:
         else:
             console.print(
                 f"● first broken edge: {broken.edge} — {broken.detail}",
+                markup=False, highlight=False)
+        # Version-skew synthesizer: the "older daemon" signature (edges 4/7/9
+        # each carrying a predates-hint) collapses into ONE actionable remedy
+        # instead of three puzzling rows.
+        stale_signs = [v for v in report.verdicts
+                       if "predates" in v.detail or "older daemon" in v.detail]
+        if stale_signs:
+            pid = ""
+            for v in report.verdicts:
+                if v.edge.startswith("1 ") and "pid" in v.detail:
+                    pid = v.detail.split("pid", 1)[1].strip().split(",")[0]
+                    break
+            console.print(
+                f"⚕ the running organism predates this client "
+                f"({len(stale_signs)} edge(s) affected) — restart it"
+                + (f" (kill {pid}; then `ov`)" if pid else " (`ov`)")
+                + " to load current capabilities",
                 markup=False, highlight=False)
     except Exception:  # noqa: BLE001
         for v in report.verdicts:
