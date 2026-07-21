@@ -266,6 +266,7 @@ _SENTINEL_PROPAGATED_VARS: Tuple[str, ...] = (
     "JARVIS_TOPOLOGY_WEIGHT_LIVE_TRANSPORT",
     "JARVIS_TOPOLOGY_WEIGHT_LIVE_HTTP_5XX",
     "JARVIS_TOPOLOGY_WEIGHT_LIVE_HTTP_429",
+    "JARVIS_TOPOLOGY_WEIGHT_LIVE_HTTP_4XX_QUOTA",
     "JARVIS_TOPOLOGY_WEIGHT_LIVE_PARSE_ERROR",
     "JARVIS_TOPOLOGY_WEIGHT_HEAVY_PROBE_FAIL",
     "JARVIS_TOPOLOGY_WEIGHT_LIGHT_PROBE_FAIL",
@@ -480,6 +481,11 @@ class FailureSource(str, enum.Enum):
     LIVE_TRANSPORT = "live_transport"              # 1.0
     LIVE_HTTP_5XX = "live_http_5xx"                # 1.0
     LIVE_HTTP_429 = "live_http_429"                # 0.5 (transient, upstream-handled)
+    # 2026-07-21 (the council's live finding): a 4xx whose body is ECONOMIC
+    # (credits/quota/billing). Weight 3.0 = single-occurrence trip, like a
+    # stream stall — a wallet refusal is definitive, not a streak candidate;
+    # classifying it as LIVE_TRANSPORT made quota death look like latency.
+    LIVE_HTTP_4XX_QUOTA = "live_http_4xx_quota"    # 3.0
     LIVE_PARSE_ERROR = "live_parse_error"          # 1.0
     HEAVY_PROBE_FAIL = "heavy_probe_fail"          # 1.5
     LIGHT_PROBE_FAIL = "light_probe_fail"          # 1.0
@@ -510,6 +516,7 @@ _DEFAULT_FAILURE_WEIGHTS: Dict[FailureSource, float] = {
     FailureSource.LIVE_TRANSPORT: 1.0,
     FailureSource.LIVE_HTTP_5XX: 1.0,
     FailureSource.LIVE_HTTP_429: 0.5,
+    FailureSource.LIVE_HTTP_4XX_QUOTA: 3.0,
     FailureSource.LIVE_PARSE_ERROR: 1.0,
     FailureSource.HEAVY_PROBE_FAIL: 1.5,
     FailureSource.LIGHT_PROBE_FAIL: 1.0,
