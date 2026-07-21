@@ -325,6 +325,7 @@ class FeatureSynthesisEngine:
             prompt=prompt,
             caller_id="synthesis_engine",
             response_format=SYNTHESIS_JSON_SCHEMA,
+            sla="strict",   # deadline-bound cognition → RT tier (2026-07-21)
         )
         return self._parse_model_response(response, snapshot)
 

@@ -120,152 +120,31 @@ class CouncilVoice:
         self.stats = {"rt_calls": 0, "rt_ok": 0, "rt_evictions": 0,
                       "fallback_calls": 0, "fallback_ok": 0}
 
-    # -- lazy production resolution (all injectable for tests) --------------
-
-    def _resolve_dw(self) -> Any:
-        if self._dw is None:
-            from backend.core.ouroboros.governance.doubleword_provider import (
-                DoublewordProvider,
-            )
-            self._dw = DoublewordProvider()
-        return self._dw
-
-    async def _resolve_session_and_url(self) -> Tuple[Any, str]:
-        if self._session is not None and self._base_url is not None:
-            return self._session, self._base_url
-        dw = self._resolve_dw()
-        session = self._session or await dw._get_session()
-        base = self._base_url or dw._base_url
-        return session, base
-
-    async def _headers(self, caller_id: str = "hive_council") -> Dict[str, str]:
-        if self._auth_fn is not None:
-            out = self._auth_fn()
-            return await out if asyncio.iscoroutine(out) else out
-        from backend.core.ouroboros.governance.doubleword_provider import (
-            _aegis_dw_session_auth_header, _dw_apply_zdr,
-        )
-        auth = dict(await _aegis_dw_session_auth_header())
-        # Aegis call lease — the SAME admission step the GENERATE tier
-        # performs before every RT post. In-harness, unleased calls are
-        # rejected by the governor (the live-fire 4xx); out-of-harness the
-        # lease helpers no-op/fail-soft and plain session auth suffices
-        # (proven 200 by direct diagnostic).
-        try:
-            from backend.core.ouroboros.governance.doubleword_provider import (
-                _aegis_acquire_call_lease, _aegis_merge_lease_headers,
-            )
-            lease = await _aegis_acquire_call_lease(
-                op_id=f"council-{caller_id}"[:48], route="background",
-                estimated_cost_usd=0.05)
-            auth = _aegis_merge_lease_headers(auth, lease)
-        except Exception:  # noqa: BLE001 — lease is harness-context enrichment
-            pass
-        return _dw_apply_zdr(auth)
-
-    # -- the RT SSE turn ----------------------------------------------------
-
-    async def _rt_call(self, prompt: str, model: str, caller_id: str,
-                       max_tokens: Optional[int], bound_s: float) -> str:
-        import aiohttp
-
-        session, base = await self._resolve_session_and_url()
-        headers = await self._headers(caller_id)
-        body: Dict[str, Any] = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": True,
-            "service_tier": "priority",
-        }
-        if max_tokens:
-            body["max_tokens"] = int(max_tokens)
-        resp_holder: List[Any] = [None]
-
-        async def _consume() -> str:
-            pieces: List[str] = []
-            async with session.post(
-                f"{base}/chat/completions", json=body, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=bound_s + 10),
-            ) as resp:
-                resp_holder[0] = resp
-                if resp.status >= 300:
-                    raise RuntimeError(
-                        f"rt status {resp.status}: "
-                        f"{(await resp.text())[:120]}")
-                async for raw in resp.content:
-                    line = raw.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        delta = (json.loads(data)["choices"][0]
-                                 .get("delta") or {})
-                        piece = delta.get("content")
-                        if piece:
-                            pieces.append(piece)
-                    except Exception:  # noqa: BLE001 — tolerate keepalives
-                        continue
-            return "".join(pieces)
-
-        self.stats["rt_calls"] += 1
-        try:
-            text = await asyncio.wait_for(_consume(), timeout=bound_s)
-            self.stats["rt_ok"] += 1
-            return text
-        except asyncio.TimeoutError:
-            # EXPLICIT SOCKET EVICTION: abort the in-flight SSE stream so
-            # server-side generation (and billing) stops NOW — before any
-            # fallback token is spent. wait_for's cancellation alone would
-            # eventually release the connection; close() makes it immediate
-            # and observable.
-            resp = resp_holder[0]
-            if resp is not None:
-                try:
-                    resp.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            self.stats["rt_evictions"] += 1
-            raise CouncilVoiceTimeout(
-                f"rt turn exceeded {bound_s:.0f}s (stream evicted)")
-
     # -- the prompt_only contract (what PersonaEngine calls) ----------------
 
     async def prompt_only(self, prompt: str, *, model: Optional[str] = None,
                           caller_id: str = "hive_council",
                           max_tokens: Optional[int] = None,
                           **_kw: Any) -> str:
-        rt_bound = _env_float("JARVIS_HIVE_COUNCIL_RT_TIMEOUT_S", 90.0)
-        # Output discipline (defense in depth beside the router's env caps):
-        # a deliberation turn is reasoned JSON, not long-form — clamping
-        # output is what makes 3 sequential RT turns fit the consensus brake
-        # (3 × (TTFT + ~2k tokens) ≪ 240s), and it cuts the $/deliberation.
-        clamp = _env_int("JARVIS_HIVE_COUNCIL_MAX_OUTPUT_TOKENS", 2000)
-        if clamp > 0:
-            max_tokens = min(int(max_tokens or clamp), clamp)
-        try:
-            return await self._rt_call(
-                prompt, model or "", caller_id, max_tokens, rt_bound)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — timeout OR transport fault
-            logger.info("[CouncilVoice] RT turn degraded (%s: %s) — "
-                        "cascading to Claude", type(exc).__name__,
-                        str(exc)[:160])
-        self.stats["fallback_calls"] += 1
-        if self._claude is None:
-            from backend.core.ouroboros.governance.providers import (
-                ClaudeProvider,
-            )
-            self._claude = ClaudeProvider(
-                api_key=os.getenv("ANTHROPIC_API_KEY", ""))
-        text = await self._claude.prompt_only(
-            prompt, caller_id=caller_id, max_tokens=max_tokens,
-            timeout_s=_env_float("JARVIS_HIVE_COUNCIL_FALLBACK_TIMEOUT_S",
-                                 60.0))
-        self.stats["fallback_ok"] += 1
-        return text
+        """Delegates to the ONE shared RT primitive (cognition_lanes.rt_prompt
+        — semaphore, lease, clamp, eviction, cascade), carrying the council's
+        own knobs. No second copy of the lane logic exists (mandate 3)."""
+        from backend.core.ouroboros.governance.cognition_lanes import rt_prompt
+        return await rt_prompt(
+            prompt,
+            model=model or "",
+            caller_id=caller_id,
+            max_tokens=max_tokens,
+            timeout_s=_env_float("JARVIS_HIVE_COUNCIL_RT_TIMEOUT_S", 90.0),
+            clamp_tokens=_env_int("JARVIS_HIVE_COUNCIL_MAX_OUTPUT_TOKENS",
+                                  2000),
+            dw_provider=self._dw,
+            session=self._session,
+            base_url=self._base_url,
+            auth_headers_fn=self._auth_fn,
+            claude=self._claude,
+            call_stats=self.stats,
+        )
 
 
 class _AdvisoryLoop:
