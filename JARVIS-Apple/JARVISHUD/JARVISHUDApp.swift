@@ -16,7 +16,6 @@ struct JARVISHUDApp: App {
 @MainActor
 class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelegate {
     let appState = AppState()
-    let hiveStore = HiveStore()
     let wakeWord = WakeWordListener()
     private let tts = AVSpeechSynthesizer()
 
@@ -49,7 +48,6 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                 guard let self = self else { return }
                 self.appState.pythonBridge.onBackendReady()
             }
-            BrainstemLauncher.shared.hiveStore = self.hiveStore
             BrainstemLauncher.shared.start()
             self.appState.boot()
 
@@ -75,20 +73,15 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                 return event
             }
 
-            // Wire border color to Hive cognitive state
+            // Wire border color to backend connectivity. (The cognitive-state
+            // tint rode the Hive relay, which was never live and now feeds the
+            // `ov` cockpit instead — connectivity is the honest signal here.)
             Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 Task { @MainActor in
-                    let state: BorderState
-                    if self.appState.pythonBridge.connectionStatus == .disconnected {
-                        state = .offline
-                    } else {
-                        switch self.hiveStore.cognitiveState {
-                        case .flow: state = .flow
-                        case .rem: state = .rem
-                        default: state = .baseline
-                        }
-                    }
+                    let state: BorderState =
+                        self.appState.pythonBridge.connectionStatus == .disconnected
+                        ? .offline : .baseline
                     self.borderWindow?.updateState(state)
                 }
             }
@@ -448,7 +441,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
 
         // Panel — created once, shown/hidden on demand
         if panel == nil {
-            let hudView = HUDView(hiveStore: hiveStore)
+            let hudView = HUDView()
                 .environmentObject(appState)
             panel = JARVISPanel(contentView: AnyView(hudView))
         }

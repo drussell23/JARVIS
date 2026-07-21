@@ -57,15 +57,19 @@ struct CompactHeaderBar: View {
 
             Spacer()
 
-            // Right: Segmented control
-            Picker("", selection: $hudTab) {
-                ForEach(HUDTab.allCases, id: \.self) { tab in
-                    Text(tab.rawValue).tag(tab)
+            // Right: Segmented control — only meaningful with >1 tab. Renders
+            // adaptively so a future HUDTab case restores it with zero edits
+            // here (the Hive tab moved to the `ov` cockpit).
+            if HUDTab.allCases.count > 1 {
+                Picker("", selection: $hudTab) {
+                    ForEach(HUDTab.allCases, id: \.self) { tab in
+                        Text(tab.rawValue).tag(tab)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 140)
+                .padding(.trailing, 20)
             }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 140)
-            .padding(.trailing, 20)
         }
         .frame(height: 44)
         .background(Color.black.opacity(0.2))
