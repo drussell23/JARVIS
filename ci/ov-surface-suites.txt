@@ -1,0 +1,13 @@
+tests/api/test_hive_aggregator.py
+tests/api/test_hive_emitter.py
+tests/cli/test_thin_client.py
+tests/cli/test_ov_doctor.py
+tests/cli/test_ov_dispatch.py
+tests/cli/test_ov_system_panel.py
+tests/cli/test_ov_presentation.py
+tests/battle_test/test_cockpit_attach.py
+tests/governance/test_doctor_probe.py
+tests/governance/test_chat_repl_dispatcher.py
+tests/governance/test_intent_classifier.py
+tests/governance/test_conversation_orchestrator.py
+tests/core/test_intent_classifier.py
