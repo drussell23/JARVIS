@@ -12,12 +12,20 @@ from typing import Any
 
 
 def register_flags(registry: Any) -> int:
+    n = 0
     try:
         from backend.api.hive_emitter import register_flags as _rf
         _rf(registry)
-        return 5
+        n += 5
     except Exception:  # noqa: BLE001
-        return 0
+        pass
+    try:
+        from backend.api.hive_council_layer import register_flags as _cf
+        _cf(registry)
+        n += 4
+    except Exception:  # noqa: BLE001
+        pass
+    return n
 
 
 __all__ = ["register_flags"]

@@ -112,6 +112,11 @@ class HiveAggregator:
         self._running = False
         self._tasks: List[asyncio.Task] = []
         self._sub_ids: List[str] = []
+        #: Read-only feed observers (Step 3 layer-2 deliberator). See tap().
+        self._taps: List[Any] = []
+        #: Owned children stopped with the aggregator (e.g. the council
+        #: deliberator) — anything exposing ``async stop()``.
+        self._children: List[Any] = []
         self._sse_sub: Any = None
         self.stats = {"captured": 0, "emitted": 0, "dropped_raw": 0, "dropped_out": 0}
 
@@ -286,7 +291,25 @@ class HiveAggregator:
             except Exception:  # noqa: BLE001
                 logger.debug("[HiveAgg] drainer degraded", exc_info=True)
 
+    def attach_child(self, child: Any) -> None:
+        """Adopt a component whose lifecycle ends with this aggregator's
+        (``async stop()`` contract). Keeps host teardown single-seam."""
+        self._children.append(child)
+
+    def tap(self, callback: Any) -> None:
+        """Register a READ-ONLY observer of the unified feed (Step 3: the
+        persona-council deliberator listens here). Callbacks are sync,
+        bounded by construction (fire-and-forget, exceptions swallowed),
+        and can never consume, reorder, or block the primary out_queue —
+        the relay stays the sole queue consumer (CQRS intact)."""
+        self._taps.append(callback)
+
     def _emit(self, env: HiveTelemetryEnvelope) -> None:
+        for cb in self._taps:
+            try:
+                cb(env)
+            except Exception:  # noqa: BLE001 — a tap can never hurt the feed
+                pass
         try:
             self.out_queue.put_nowait(env)
             self.stats["emitted"] += 1
@@ -323,6 +346,12 @@ class HiveAggregator:
     async def stop(self) -> None:
         """Detach cleanly (read-only teardown). NEVER raises."""
         self._running = False
+        for child in self._children:
+            try:
+                await child.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self._children = []
         if self._bus_coalescer is not None:
             try:
                 self._bus_coalescer.flush_all()
@@ -399,6 +428,22 @@ async def start_hive_relay(
         agg = HiveAggregator(bus=bus, sse_broker=sse_broker,
                              bus_resolver=resolver, emitter=emitter)
         await agg.start()
+
+        # Step 3 (default-OFF): the layer-2 persona-council deliberator taps
+        # the unified feed read-only and speaks back through the emission
+        # edge. Wired here so BOTH hosts get it (DRY); a council fault can
+        # never touch the feed.
+        try:
+            from backend.api.hive_council_layer import (
+                CouncilDeliberator, council_enabled,
+            )
+            if council_enabled():
+                council = CouncilDeliberator()
+                if await council.start():
+                    agg.tap(council.on_envelope)
+                    agg.attach_child(council)
+        except Exception:  # noqa: BLE001
+            logger.debug("[HiveAgg] council layer degraded", exc_info=True)
 
         async def _relay() -> None:
             try:
