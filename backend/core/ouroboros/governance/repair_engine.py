@@ -28,7 +28,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Set, Tuple
 
@@ -1866,6 +1866,17 @@ class RepairEngine:
         _effective_timeout_s = max(
             1.0, min(_per_iter_bound, _remaining_pipeline_s),
         )
+        # Temporal Veto (Iron Gate, 2026-07-21) — the deadline the provider
+        # receives must be the TRUTH. Historically we passed the pipeline
+        # deadline while enforcing the narrower per-iter wait_for below, so
+        # the provider believed it had minutes and could elect the BATCH
+        # plane — then this client-side bound killed the await at 45s while
+        # the batch kept cooking (billed): the provider_iter_timeout soak-
+        # killer. Tightening the deadline to the effective bound lets the
+        # provider's centralized Temporal Veto exclude the batch plane (and
+        # fast-fail shed to Claude when RT is also down) with ZERO veto
+        # logic at this call site. Still ≤ pipeline_deadline by construction.
+        _provider_deadline = _now + timedelta(seconds=_effective_timeout_s)
         # Adaptive Epistemic Feedback Matrix (T2): thread the signature-driven
         # temperature override into the provider generate call. Passed only when the
         # caller supplied a non-None value AND it differs from the implicit provider
@@ -1877,17 +1888,17 @@ class RepairEngine:
             if temperature is not None:
                 try:
                     return await self._prime.generate(
-                        ctx, pipeline_deadline,
+                        ctx, _provider_deadline,
                         repair_context=repair_context,
                         temperature=temperature,
                     )
                 except TypeError:
                     # Provider does not accept temperature — fall back to legacy shape.
                     return await self._prime.generate(
-                        ctx, pipeline_deadline, repair_context=repair_context,
+                        ctx, _provider_deadline, repair_context=repair_context,
                     )
             return await self._prime.generate(
-                ctx, pipeline_deadline, repair_context=repair_context,
+                ctx, _provider_deadline, repair_context=repair_context,
             )
 
         try:

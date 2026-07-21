@@ -15,3 +15,4 @@ tests/api/test_hive_council_layer.py
 tests/governance/test_quota_taxonomy.py
 tests/governance/test_cognition_lanes.py
 tests/governance/test_dw_priority_tier.py
+tests/governance/test_dw_temporal_veto.py

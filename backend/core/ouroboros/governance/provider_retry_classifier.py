@@ -208,6 +208,11 @@ _FAILURE_MODE_DEFAULT: dict = {
     "CONTENT_FAILURE":      RetryDecision.RETRY_TRANSIENT,
     "CONTEXT_OVERFLOW":     RetryDecision.RETRY_TRANSIENT,
     "TRANSIENT_TRANSPORT":  RetryDecision.RETRY_TRANSIENT,
+    # Temporal Veto fast-fail shed (Iron Gate, 2026-07-21): a routing
+    # refusal, not a provider fault. Retrying the same provider with the
+    # same shrinking budget is a hard inequality — it CANNOT succeed;
+    # the op must cascade to the fallback tier immediately.
+    "TEMPORAL_SHED":        RetryDecision.TERMINAL_STRUCTURAL,
 }
 
 
