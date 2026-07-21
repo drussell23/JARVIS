@@ -15,6 +15,18 @@ from backend.core.ouroboros.cli.ov_doctor import (
 )
 
 
+async def _shutdown_server(server):
+    """Bounded server teardown. Python 3.12 fixed ``Server.wait_closed()``
+    to wait for ALL in-flight connections — a fixture whose handler
+    deliberately never serves (the backlog-accept pin) can therefore never
+    satisfy it. Bound + suppress: cleanup never becomes the test."""
+    server.close()
+    try:
+        await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+    except Exception:
+        pass
+
+
 @pytest.fixture()
 def sock_dir():
     d = Path(tempfile.mkdtemp(prefix="ovdoc-"))
@@ -214,6 +226,7 @@ async def test_live_probe_observes_synthetic_frame(sock_dir, monkeypatch):
         }
         writer.write((json.dumps(hive_frame) + "\n").encode())
         await writer.drain()
+        writer.close()
 
     server = await asyncio.start_unix_server(_daemon, path=str(path))
     try:
@@ -221,8 +234,7 @@ async def test_live_probe_observes_synthetic_frame(sock_dir, monkeypatch):
         assert v.state is EdgeState.OK
         assert "synthetic actor_edge frame observed" in v.detail
     finally:
-        server.close()
-        await server.wait_closed()
+        await _shutdown_server(server)
 
 
 @pytest.mark.asyncio
@@ -239,7 +251,10 @@ async def test_live_probe_degrades_when_probe_ran_but_no_frame(
         await reader.readline()
         writer.write(b'{"type":"line","text":"[doctor] probe x: status=y"}\n')
         await writer.drain()
-        await asyncio.sleep(2)
+        try:
+            await asyncio.sleep(2)
+        finally:
+            writer.close()
 
     server = await asyncio.start_unix_server(_daemon, path=str(path))
     try:
@@ -247,8 +262,7 @@ async def test_live_probe_degrades_when_probe_ran_but_no_frame(
         assert v.state is EdgeState.DEGRADED
         assert "no synthetic actor_edge frame" in v.detail
     finally:
-        server.close()
-        await server.wait_closed()
+        await _shutdown_server(server)
 
 
 def test_render_never_raises_on_minimal_console():
@@ -274,6 +288,7 @@ async def test_live_probe_capability_gated_on_old_daemon(sock_dir, monkeypatch):
         line = await reader.readline()
         if line:
             received.append(line)
+        writer.close()
 
     server = await asyncio.start_unix_server(_old_daemon, path=str(path))
     try:
@@ -285,8 +300,7 @@ async def test_live_probe_capability_gated_on_old_daemon(sock_dir, monkeypatch):
         assert elapsed < 3.0                    # instant, not a 45s wait
         assert received == []                   # NOTHING was injected
     finally:
-        server.close()
-        await server.wait_closed()
+        await _shutdown_server(server)
 
 
 def test_version_skew_synthesizer_names_the_remedy():
