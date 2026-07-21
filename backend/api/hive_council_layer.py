@@ -236,7 +236,14 @@ class CouncilVoice:
                           caller_id: str = "hive_council",
                           max_tokens: Optional[int] = None,
                           **_kw: Any) -> str:
-        rt_bound = _env_float("JARVIS_HIVE_COUNCIL_RT_TIMEOUT_S", 45.0)
+        rt_bound = _env_float("JARVIS_HIVE_COUNCIL_RT_TIMEOUT_S", 90.0)
+        # Output discipline (defense in depth beside the router's env caps):
+        # a deliberation turn is reasoned JSON, not long-form — clamping
+        # output is what makes 3 sequential RT turns fit the consensus brake
+        # (3 × (TTFT + ~2k tokens) ≪ 240s), and it cuts the $/deliberation.
+        clamp = _env_int("JARVIS_HIVE_COUNCIL_MAX_OUTPUT_TOKENS", 2000)
+        if clamp > 0:
+            max_tokens = min(int(max_tokens or clamp), clamp)
         try:
             return await self._rt_call(
                 prompt, model or "", caller_id, max_tokens, rt_bound)
