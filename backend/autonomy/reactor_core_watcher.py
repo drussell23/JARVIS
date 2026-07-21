@@ -458,9 +458,12 @@ class ReactorCoreWatcher:
 
         logger.info(f"[ReactorCoreWatcher] Uploading to GCS: {gcs_path}")
 
-        # Use gsutil for upload
+        # gcloud storage (NOT gsutil — leaves the default gcloud bundle
+        # March 2027). Parallel composite uploads are automatic (the old
+        # `-m` flag has no equivalent and no need); credentials remain the
+        # host's gcloud auth, identical to the gsutil behavior it replaces.
         proc = await asyncio.create_subprocess_exec(
-            "gsutil", "-m", "cp", str(model_path), gcs_path,
+            "gcloud", "storage", "cp", str(model_path), gcs_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -468,7 +471,7 @@ class ReactorCoreWatcher:
 
         if proc.returncode != 0:
             error = stderr.decode() if stderr else "Unknown error"
-            raise Exception(f"gsutil failed: {error}")
+            raise Exception(f"gcloud storage cp failed: {error}")
 
         logger.info(f"[ReactorCoreWatcher] Uploaded to: {gcs_path}")
         return gcs_path

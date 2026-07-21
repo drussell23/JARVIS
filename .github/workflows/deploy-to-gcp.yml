@@ -127,8 +127,10 @@ jobs:
             ]
           }
           EOF
-          # gsutil is available with setup-gcloud; lifecycle set is idempotent.
-          gsutil lifecycle set lifecycle.json ${DEPLOYMENT_BUCKET} || echo "⚠️  Could not set lifecycle policy (continuing)"
+          # gcloud storage (NOT gsutil — leaves the default gcloud bundle
+          # March 2027, and setup-gcloud images will stop shipping it).
+          # buckets update is idempotent like lifecycle set was.
+          gcloud storage buckets update ${DEPLOYMENT_BUCKET} --lifecycle-file=lifecycle.json || echo "⚠️  Could not set lifecycle policy (continuing)"
 
           # Upload deployment package
           echo "📤 Uploading deployment package..."
