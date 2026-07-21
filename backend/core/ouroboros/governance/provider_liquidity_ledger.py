@@ -190,6 +190,13 @@ def record_headers(
             except (OSError, ValueError):
                 payload = {}
             providers = payload.get("providers") or {}
+            # Carry the quota-outage state across header refreshes — a
+            # wholesale row replace must never silently clear an economic
+            # flag (only its TTL may).
+            prior = providers.get(str(provider or "unknown").lower()) or {}
+            for k in ("quota_exhausted_until", "quota_reason"):
+                if k in prior:
+                    entry[k] = prior[k]
             providers[str(provider or "unknown").lower()] = entry
             payload = {
                 "schema_version": PROVIDER_LIQUIDITY_SCHEMA_VERSION,
@@ -262,12 +269,79 @@ def liquidity(provider: str) -> "Tuple[Optional[int], Optional[float]]":
         return None, None
 
 
+def _quota_ttl_s() -> float:
+    try:
+        raw = os.environ.get("JARVIS_QUOTA_EXHAUSTION_TTL_S", "")
+        return float(raw) if raw else 1800.0
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+def record_quota_exhaustion(provider: str, reason: str = "",
+                            *, now: "Optional[float]" = None) -> bool:
+    """Flip *provider* into the QUOTA-OUTAGE state (the council's 2026-07-21
+    finding: economic death must be a ledger state, not a transport streak).
+    TTL-bounded (env ``JARVIS_QUOTA_EXHAUSTION_TTL_S``, 1800s) so a topped-up
+    wallet self-heals without manual clearing. MERGES into the provider row
+    (never clobbers header telemetry). NEVER raises."""
+    try:
+        t = float(now if now is not None else time.time())
+        path = _ledger_path()
+        with _LOCK:
+            payload: Dict[str, Any] = {}
+            try:
+                payload = json.loads(path.read_text())
+            except (OSError, ValueError):
+                payload = {}
+            providers = payload.get("providers") or {}
+            row = dict(providers.get(str(provider or "unknown").lower()) or {})
+            row["quota_exhausted_until"] = t + _quota_ttl_s()
+            row["quota_reason"] = str(reason)[:160]
+            providers[str(provider or "unknown").lower()] = row
+            payload = {
+                "schema_version": PROVIDER_LIQUIDITY_SCHEMA_VERSION,
+                "providers": providers,
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, sort_keys=True))
+            os.replace(tmp, path)
+        logger.warning("[LiquidityLedger] QUOTA OUTAGE recorded provider=%s "
+                       "ttl=%.0fs reason=%s", provider, _quota_ttl_s(),
+                       str(reason)[:80])
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[LiquidityLedger] quota record degraded", exc_info=True)
+        return False
+
+
+def quota_exhausted(provider: str, *, now: "Optional[float]" = None) -> bool:
+    """True iff *provider* is inside a recorded quota-outage window. NEVER
+    raises; unknown/expired → False."""
+    try:
+        payload = _load()
+        row = (payload.get("providers") or {}).get(
+            str(provider or "unknown").lower()) or {}
+        until = row.get("quota_exhausted_until")
+        if until is None:
+            return False
+        t = float(now if now is not None else time.time())
+        return t < float(until)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def runway_exhausted(provider: str, forecast_tokens: "Optional[int]" = None) -> bool:
     """True iff *provider* declared fewer remaining tokens than the forecast
     (default: the min-tokens floor) AND the reset horizon has not yet passed.
     Unknown/expired telemetry → False (fail-open: shaping never blocks on
     missing data). NEVER raises."""
     try:
+        # QUOTA-OUTAGE folds in at the READER (2026-07-21): every existing
+        # consumer (SBA preflight, cascade eligibility, ov doctor edge 6)
+        # respects the economic state with zero further wiring.
+        if quota_exhausted(provider):
+            return True
         tokens, secs = liquidity(provider)
         if tokens is None:
             return False

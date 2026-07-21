@@ -1286,6 +1286,19 @@ def _note_dw_live_transport_degraded(diagnostic: str = "", model_id: str = "") -
         pass
 
 
+def _record_quota_outage_safely(provider: str, reason: str) -> None:
+    """Flip the liquidity ledger's quota-outage state for *provider*
+    (2026-07-21 council finding). Fire-and-forget: taxonomy accounting can
+    never perturb the dispatch error path. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.provider_liquidity_ledger import (
+            record_quota_exhaustion,
+        )
+        record_quota_exhaustion(provider, reason=str(reason)[:160])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _record_dw_failure_signal(model_id: str, failure_source: Any) -> None:
     """Slice 176 — fuse a classified NON-transport DW FailureSource into the predictive
     cortex as a weighted failure vector (economic 429 / upstream 5xx+parse / stall), per
@@ -1296,6 +1309,7 @@ def _record_dw_failure_signal(model_id: str, failure_source: Any) -> None:
         from backend.core.ouroboros.governance.topology_sentinel import FailureSource
         _kind = {
             FailureSource.LIVE_HTTP_429: "economic",   # quota / rate-limit — imminent lockdown
+            FailureSource.LIVE_HTTP_4XX_QUOTA: "economic",  # wallet death (council finding)
             FailureSource.LIVE_HTTP_5XX: "upstream",    # server error — localized
             FailureSource.LIVE_PARSE_ERROR: "upstream",  # malformed/empty completion
             FailureSource.LIVE_STREAM_STALL: "transport",  # stalled stream — transport class
@@ -5473,8 +5487,17 @@ class CandidateGenerator:
                     # the unmasked status.
                     failure_source = FailureSource.LIVE_TRANSPORT
                 elif _status_code is not None:
-                    # Structured HTTP status drives classification
-                    if _status_code == 429:
+                    # Structured HTTP status drives classification.
+                    # QUOTA FIRST (the council's 2026-07-21 finding): a 4xx
+                    # whose body is economic is a wallet state — before this
+                    # branch it fell to LIVE_TRANSPORT and read as latency.
+                    from backend.core.ouroboros.governance.economic_router import (  # noqa: E501
+                        classify_http_failure_source as _econ_classify,
+                        )
+                    if _econ_classify(_status_code, err_str) is not None:
+                        failure_source = FailureSource.LIVE_HTTP_4XX_QUOTA
+                        _record_quota_outage_safely("doubleword", err_str)
+                    elif _status_code == 429:
                         failure_source = FailureSource.LIVE_HTTP_429
                     elif _status_code in (500, 502, 503, 504):
                         failure_source = FailureSource.LIVE_HTTP_5XX
@@ -5492,11 +5515,19 @@ class CandidateGenerator:
                 else:
                     # No status_code attribute → fall back to regex on
                     # str(exc) (legacy path for non-DW exceptions).
+                    from backend.core.ouroboros.governance.economic_router import (  # noqa: E501
+                        classify_http_failure_source as _econ_classify,
+                        )
                     if (
                         "stream" in err_lower
                         and ("stall" in err_lower or "timeout" in err_lower)
                     ) or "streamtimeouterror" in err_lower:
                         failure_source = FailureSource.LIVE_STREAM_STALL
+                    elif _econ_classify(None, err_str) is not None:
+                        # Economic body with no structured status (e.g. an
+                        # SDK BadRequestError repr) — same wallet taxonomy.
+                        failure_source = FailureSource.LIVE_HTTP_4XX_QUOTA
+                        _record_quota_outage_safely("doubleword", err_str)
                     elif "429" in err_str:
                         failure_source = FailureSource.LIVE_HTTP_429
                     elif "5" in err_str[:5] and (
@@ -8786,6 +8817,12 @@ class CandidateGenerator:
                                     _s127_get_ccb().record_economic_exhaustion(
                                         f"claude_lane_economic:{_s127_block}",
                                     )
+                                    # Council finding (2026-07-21): the
+                                    # economic state also lands in the
+                                    # liquidity LEDGER so every runway
+                                    # consumer sees the dead wallet.
+                                    _record_quota_outage_safely(
+                                        "anthropic", str(inner_exc)[:160])
                         except Exception:  # noqa: BLE001 — never block cascade
                             pass
                         # Telemetry — every classification is logged,

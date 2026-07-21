@@ -123,12 +123,69 @@ def is_hard_economic_block(error_text: Optional[str]) -> Optional[str]:
         "402", "balance too low", "balance is too low", "credit balance",
         "add credits", "purchase credit", "upgrade or purchase",
         "insufficient", "payment",
+        # 2026-07-21 (the council's live finding): quota/billing phrasings —
+        # providers word economic death many ways; all of them are a wallet
+        # state, never a network state.
+        "quota", "billing",
     )
     if any(m in t for m in _markers_402):
         return "402"
     if "429" in t or "rate limit" in t or "too many requests" in t or "ratelimit" in t:
         return "429"
     return None
+
+
+class QuotaExhaustionError(Exception):
+    """A provider refused for ECONOMIC reasons (credits/quota/billing) —
+    definitively non-retryable by transient-fault machinery: no backoff can
+    refill a wallet. Discovered-in-production class (the council's first RT
+    consensus, 2026-07-21): HTTP 400 quota bodies were falling into
+    LIVE_TRANSPORT and tripping network-latency breakers."""
+
+    def __init__(self, message: str, *, provider: str = "",
+                 econ_code: str = "402") -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.econ_code = econ_code
+
+
+def normalize_economic_error(
+    error_text: "Optional[str]",
+    status_code: "Optional[int]" = None,
+    *,
+    provider: str = "",
+) -> "Optional[QuotaExhaustionError]":
+    """THE centralized normalization (mandate 3 — one parser, no copies).
+
+    Returns a :class:`QuotaExhaustionError` iff the failure is semantically
+    economic: the body matches the hard-block markers AND the status (when
+    known) is one that providers use for economic refusals (400 Bad Request,
+    402 Payment Required, 422 Unprocessable). A plain 400 without economic
+    phrasing returns None — NEVER a blanket 4xx catch (mandate 1). 429 is
+    deliberately excluded: rate-limit is a time problem, not a wallet
+    problem, and keeps its own taxonomy. NEVER raises."""
+    try:
+        if status_code is not None and status_code not in (400, 402, 422):
+            return None
+        if is_hard_economic_block(error_text) != "402":
+            return None
+        return QuotaExhaustionError(
+            str(error_text)[:300], provider=provider, econ_code="402")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def classify_http_failure_source(
+    status_code: "Optional[int]",
+    error_text: "Optional[str]",
+) -> "Optional[str]":
+    """The PURE seam decision for the status→FailureSource classifier:
+    returns ``"live_http_4xx_quota"`` when a 4xx carries an economic body,
+    else None (caller falls through to its existing taxonomy). Keeps the
+    classification site a one-line insert and this logic unit-testable."""
+    return ("live_http_4xx_quota"
+            if normalize_economic_error(error_text, status_code) is not None
+            else None)
 
 
 def estimate_tokens(prompt_chars: int) -> int:
