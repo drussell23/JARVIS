@@ -41,7 +41,7 @@ CLASSIFY -> ROUTE -> [CONTEXT_EXPANSION] -> [PLAN] -> GENERATE -> VALIDATE -> GA
 
 | Tier | Provider | Cost | Notes |
 |------|----------|------|-------|
-| 0 | DoubleWord 397B (3-tier: RT SSE + webhook + adaptive poll) | $0.10/$0.40/M | 16384 max_tokens, RT default, preferred |
+| 0 | DoubleWord 397B (3-tier: RT SSE + webhook + adaptive poll) | RT $0.39/$2.45 · async $0.29/$1.84 · batch $0.19/$1.23 /M | 16384 max_tokens, RT default, preferred. (Corrected 2026-07-21: the old $0.10/$0.40 figure was the 35B-dottxt BATCH rate — a 4-6× understatement for the 397B.) |
 | 1 | Claude (Anthropic API) | $3/$15/M | Extended thinking + prompt caching, 60s fallback cap |
 | 2 | J-Prime (GCP self-hosted) | VM cost only | When available |
 

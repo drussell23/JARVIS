@@ -39,6 +39,7 @@ feed, the aggregator, or the pipeline.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -74,6 +75,173 @@ def _env_int(name: str, default: int) -> int:
 def _trigger_severities() -> Tuple[str, ...]:
     raw = os.environ.get("JARVIS_HIVE_COUNCIL_TRIGGER_SEVERITIES", "warn,error")
     return tuple(s.strip() for s in raw.split(",") if s.strip())
+
+
+class CouncilVoiceTimeout(Exception):
+    """RT deliberation turn exceeded its per-call bound (pre-fallback)."""
+
+
+class CouncilVoice:
+    """The council's voice — ``prompt_only``-shaped, natively on Doubleword's
+    REALTIME SSE surface (the same ``/v1/chat/completions`` lane the primary
+    GENERATE tier uses), with a timeout-triggered Claude-streaming fallback.
+
+    Root-cause re-laning (not a polling wrapper): the batch plane's queue
+    latency structurally cannot fit 3 sequential deliberation turns inside
+    the consensus brake — proven live twice (outage AND healthy-DW). The RT
+    lane is Doubleword's documented tier for bounded work
+    (``service_tier: "priority"``).
+
+    ZOMBIE-BILLING GUARD (explicit socket eviction): on per-call timeout the
+    in-flight SSE response is explicitly ``close()``d — aborting the TCP
+    stream server-side — BEFORE the Claude fallback is invoked. An aborted
+    RT stream stops generation and billing (industry SSE semantics); a
+    cancelled batch job does not — which is exactly why the lane, and not a
+    bigger timeout, is the fix.
+
+    NO retry-exhaustion on the primary: one bounded RT attempt, then the
+    cascade — the practitioner-standard ordered-fallback shape.
+    """
+
+    def __init__(
+        self,
+        *,
+        dw_provider: Any = None,
+        claude: Any = None,
+        base_url: Optional[str] = None,
+        session: Any = None,
+        auth_headers_fn: Any = None,
+    ) -> None:
+        self._dw = dw_provider
+        self._claude = claude
+        self._base_url = base_url
+        self._session = session
+        self._auth_fn = auth_headers_fn
+        self.stats = {"rt_calls": 0, "rt_ok": 0, "rt_evictions": 0,
+                      "fallback_calls": 0, "fallback_ok": 0}
+
+    # -- lazy production resolution (all injectable for tests) --------------
+
+    def _resolve_dw(self) -> Any:
+        if self._dw is None:
+            from backend.core.ouroboros.governance.doubleword_provider import (
+                DoublewordProvider,
+            )
+            self._dw = DoublewordProvider()
+        return self._dw
+
+    async def _resolve_session_and_url(self) -> Tuple[Any, str]:
+        if self._session is not None and self._base_url is not None:
+            return self._session, self._base_url
+        dw = self._resolve_dw()
+        session = self._session or await dw._get_session()
+        base = self._base_url or dw._base_url
+        return session, base
+
+    async def _headers(self) -> Dict[str, str]:
+        if self._auth_fn is not None:
+            out = self._auth_fn()
+            return await out if asyncio.iscoroutine(out) else out
+        from backend.core.ouroboros.governance.doubleword_provider import (
+            _aegis_dw_session_auth_header, _dw_apply_zdr,
+        )
+        return _dw_apply_zdr(dict(await _aegis_dw_session_auth_header()))
+
+    # -- the RT SSE turn ----------------------------------------------------
+
+    async def _rt_call(self, prompt: str, model: str, caller_id: str,
+                       max_tokens: Optional[int], bound_s: float) -> str:
+        import aiohttp
+
+        session, base = await self._resolve_session_and_url()
+        headers = await self._headers()
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+            "service_tier": "priority",
+        }
+        if max_tokens:
+            body["max_tokens"] = int(max_tokens)
+        resp_holder: List[Any] = [None]
+
+        async def _consume() -> str:
+            pieces: List[str] = []
+            async with session.post(
+                f"{base}/chat/completions", json=body, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=bound_s + 10),
+            ) as resp:
+                resp_holder[0] = resp
+                if resp.status >= 300:
+                    raise RuntimeError(
+                        f"rt status {resp.status}: "
+                        f"{(await resp.text())[:120]}")
+                async for raw in resp.content:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        delta = (json.loads(data)["choices"][0]
+                                 .get("delta") or {})
+                        piece = delta.get("content")
+                        if piece:
+                            pieces.append(piece)
+                    except Exception:  # noqa: BLE001 — tolerate keepalives
+                        continue
+            return "".join(pieces)
+
+        self.stats["rt_calls"] += 1
+        try:
+            text = await asyncio.wait_for(_consume(), timeout=bound_s)
+            self.stats["rt_ok"] += 1
+            return text
+        except asyncio.TimeoutError:
+            # EXPLICIT SOCKET EVICTION: abort the in-flight SSE stream so
+            # server-side generation (and billing) stops NOW — before any
+            # fallback token is spent. wait_for's cancellation alone would
+            # eventually release the connection; close() makes it immediate
+            # and observable.
+            resp = resp_holder[0]
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self.stats["rt_evictions"] += 1
+            raise CouncilVoiceTimeout(
+                f"rt turn exceeded {bound_s:.0f}s (stream evicted)")
+
+    # -- the prompt_only contract (what PersonaEngine calls) ----------------
+
+    async def prompt_only(self, prompt: str, *, model: Optional[str] = None,
+                          caller_id: str = "hive_council",
+                          max_tokens: Optional[int] = None,
+                          **_kw: Any) -> str:
+        rt_bound = _env_float("JARVIS_HIVE_COUNCIL_RT_TIMEOUT_S", 45.0)
+        try:
+            return await self._rt_call(
+                prompt, model or "", caller_id, max_tokens, rt_bound)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — timeout OR transport fault
+            logger.info("[CouncilVoice] RT turn degraded (%s) — cascading "
+                        "to Claude", type(exc).__name__)
+        self.stats["fallback_calls"] += 1
+        if self._claude is None:
+            from backend.core.ouroboros.governance.providers import (
+                ClaudeProvider,
+            )
+            self._claude = ClaudeProvider(
+                api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+        text = await self._claude.prompt_only(
+            prompt, caller_id=caller_id, max_tokens=max_tokens,
+            timeout_s=_env_float("JARVIS_HIVE_COUNCIL_FALLBACK_TIMEOUT_S",
+                                 60.0))
+        self.stats["fallback_ok"] += 1
+        return text
 
 
 class _AdvisoryLoop:
@@ -133,19 +301,18 @@ class CouncilDeliberator:
         from backend.api.hive_emitter import hive_emit
         hive_emit(**kwargs)
 
-    def _resolve_dw(self) -> Any:
-        """Lazy Doubleword resolution — the SAME provider the persona engine
-        was written against (async ``prompt_only``). NEVER raises."""
+    def _resolve_voice(self) -> Any:
+        """Lazy voice resolution: the injected ``doubleword`` object when
+        given (tests / custom lanes), else the RT-native :class:`CouncilVoice`
+        with its Claude cascade — the re-laned production default. NEVER
+        raises."""
         if self._dw is not None:
             return self._dw
         try:
-            from backend.core.ouroboros.governance.doubleword_provider import (
-                DoublewordProvider,
-            )
-            self._dw = DoublewordProvider()
+            self._dw = CouncilVoice()
             return self._dw
         except Exception:  # noqa: BLE001
-            logger.debug("[Council] doubleword unavailable", exc_info=True)
+            logger.debug("[Council] voice unavailable", exc_info=True)
             return None
 
     def _build_service(self) -> Any:
@@ -155,7 +322,7 @@ class CouncilDeliberator:
         from backend.hive.hive_service import HiveService
         from backend.hive.hud_relay_agent import HudRelayAgent
 
-        dw = self._resolve_dw()
+        dw = self._resolve_voice()
         if dw is None:
             return None
         state_dir = self._state_dir or Path(
@@ -261,6 +428,44 @@ class CouncilDeliberator:
                            f"{getattr(env, 'intent', '?')}"),
             cognitive_state=CognitiveState.FLOW,   # thread-carried: no FSM poke
         )
+        # DYNAMIC CONTEXT HYDRATION — the council's own first request, honored:
+        # its debut OBSERVE correctly noted "zero specialist telemetry". Root
+        # cause: the event-driven path projects the triggering log INTO the
+        # thread (_on_agent_log → add_message); our direct drive skipped that
+        # native step. Restore it: the envelope's summary + detail payload —
+        # sanitized through the SAME Step-2 edge helpers (scalars only,
+        # secrets redacted) — becomes the thread's Tier-1 telemetry message,
+        # so personas reason over concrete metrics, never raw untrusted blobs.
+        try:
+            from backend.api.hive_emitter import _clean_detail, _clean_text
+            from backend.hive.thread_models import AgentLogMessage
+
+            sev_map = {"warn": "warning", "error": "error",
+                       "success": "info", "info": "info"}
+            telemetry = {
+                "summary": _clean_text(
+                    str(getattr(env, "action_summary", "") or ""), 240),
+                "subsystem": str(getattr(env, "subsystem", "?"))[:32],
+                "intent": str(getattr(env, "intent", "?"))[:64],
+                "actor_id": str(getattr(env, "actor_id", "?"))[:64],
+                "trace_id": str(getattr(env, "trace_id", "—"))[:64],
+                "source_fabric": str(getattr(env, "source_fabric", "?"))[:24],
+                **_clean_detail(getattr(env, "detail", None) or {}, 160),
+            }
+            self._service.thread_manager.add_message(
+                thread.thread_id,
+                AgentLogMessage(
+                    thread_id=thread.thread_id,
+                    agent_name=telemetry["actor_id"],
+                    trinity_parent="jarvis",     # Body telemetry by origin
+                    severity=sev_map.get(
+                        str(getattr(env, "severity", "info")), "info"),
+                    category=telemetry["intent"],
+                    payload=telemetry,
+                ),
+            )
+        except Exception:  # noqa: BLE001 — hydration is enrichment, never a gate
+            logger.debug("[Council] context hydration degraded", exc_info=True)
         self._service.thread_manager.transition(
             thread.thread_id, ThreadState.DEBATING)
         self.stats["convened"] += 1
@@ -346,6 +551,16 @@ def register_flags(registry: Any) -> None:
                      source_file="backend/api/hive_council_layer.py",
                      example="JARVIS_HIVE_COUNCIL_COOLDOWN_S=300",
                      description="Per-(actor,intent) trigger cooldown"),
+            FlagSpec(name="JARVIS_HIVE_COUNCIL_RT_TIMEOUT_S", type=FlagType.FLOAT,
+                     default=45.0, category=Category.EXPERIMENTAL,
+                     source_file="backend/api/hive_council_layer.py",
+                     example="JARVIS_HIVE_COUNCIL_RT_TIMEOUT_S=30",
+                     description="Per-turn DW realtime bound; timeout evicts the stream and cascades to Claude"),
+            FlagSpec(name="JARVIS_HIVE_COUNCIL_FALLBACK_TIMEOUT_S", type=FlagType.FLOAT,
+                     default=60.0, category=Category.EXPERIMENTAL,
+                     source_file="backend/api/hive_council_layer.py",
+                     example="JARVIS_HIVE_COUNCIL_FALLBACK_TIMEOUT_S=90",
+                     description="Claude fallback per-turn bound"),
         ):
             registry.register(spec)
     except Exception:  # noqa: BLE001

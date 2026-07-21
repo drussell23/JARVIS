@@ -397,8 +397,8 @@ def test_flag_registry_delegate_reaches_emitter():
 
     reg = _Reg()
     n = register_flags(reg)
-    # 5 emitter flags + 4 council flags (Step 3)
-    assert n == 9 and len(reg.specs) == 9
+    # 5 emitter flags + 6 council flags (Step 3 + RT re-laning)
+    assert n == 11 and len(reg.specs) == 11
     names = {s.name for s in reg.specs}
     assert "JARVIS_HIVE_EMITTERS_ENABLED" in names
     assert "JARVIS_HIVE_COUNCIL_ENABLED" in names

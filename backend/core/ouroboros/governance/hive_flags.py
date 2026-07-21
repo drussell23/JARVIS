@@ -22,7 +22,7 @@ def register_flags(registry: Any) -> int:
     try:
         from backend.api.hive_council_layer import register_flags as _cf
         _cf(registry)
-        n += 4
+        n += 6
     except Exception:  # noqa: BLE001
         pass
     return n
