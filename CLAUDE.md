@@ -41,7 +41,7 @@ CLASSIFY -> ROUTE -> [CONTEXT_EXPANSION] -> [PLAN] -> GENERATE -> VALIDATE -> GA
 
 | Tier | Provider | Cost | Notes |
 |------|----------|------|-------|
-| 0 | DoubleWord 397B (3-tier: RT SSE + webhook + adaptive poll) | RT $0.39/$2.45 · async $0.29/$1.84 · batch $0.19/$1.23 /M | 16384 max_tokens, RT default, preferred. (Corrected 2026-07-21: the old $0.10/$0.40 figure was the 35B-dottxt BATCH rate — a 4-6× understatement for the 397B.) |
+| 0 | DoubleWord 397B (3-tier: RT SSE + webhook + adaptive poll) | RT $0.39/$2.45 · async $0.29/$1.84 · batch $0.19/$1.23 /M | 16384 max_tokens, RT default, preferred. (Corrected 2026-07-21: the old $0.10/$0.40 figure was the 35B-dottxt BATCH rate — a 4-6× understatement for the 397B.) **The RT tier requires `service_tier:"priority"` in the request body** — without it DW serves the default async tier (~66s TTFT, the 0-APPLY soak class). Injected at the ONE seam `apply_rt_service_tier` (master `JARVIS_DW_SERVICE_TIER_ENABLED`, tier `JARVIS_DW_RT_SERVICE_TIER`, per-model rejection cache); batch bodies never carry it. |
 | 1 | Claude (Anthropic API) | $3/$15/M | Extended thinking + prompt caching, 60s fallback cap |
 | 2 | J-Prime (GCP self-hosted) | VM cost only | When available |
 

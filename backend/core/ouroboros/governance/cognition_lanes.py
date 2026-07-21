@@ -160,8 +160,17 @@ async def rt_prompt(
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": True,
-            "service_tier": "priority",
         }
+        # Tier selector via the ONE canonical seam (provider helper honors
+        # the master flag, env tier override, and the per-model rejection
+        # cache); literal fallback keeps this lane standalone-injectable.
+        try:
+            from backend.core.ouroboros.governance.doubleword_provider import (
+                apply_rt_service_tier,
+            )
+            body = apply_rt_service_tier(body, model)
+        except Exception:  # noqa: BLE001 — provider import must never gate RT
+            body["service_tier"] = "priority"
         if max_tokens:
             body["max_tokens"] = int(max_tokens)
         if response_format:

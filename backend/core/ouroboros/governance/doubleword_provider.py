@@ -706,6 +706,113 @@ class _DWToolForcingRejectedError(Exception):
     """
 
 
+# ---------------------------------------------------------------------------
+# Priority-Tier Injection (2026-07-21) — the missing ``service_tier`` selector
+# ---------------------------------------------------------------------------
+# ROOT CAUSE of the 66s-TTFT soak deaths (STAGE_RT_HTTP_POST p50=66,775ms,
+# 0 APPLY across 6 capability soaks): DW routes /v1/chat/completions to its
+# REALTIME (priority) tier only when the body carries service_tier="priority".
+# Without it, every "RT" request rode the DEFAULT async tier (~1min TTFT) —
+# the Slice-36 batch-preference machinery grew around a tier we never asked
+# to leave. cognition_lanes (the council's voice) proved the priority tier
+# live: 3 sequential calls in ~70s wall. This helper is the ONE place the
+# tier param is decided; every realtime-plane body composes it, no batch
+# body ever does (the 2× batch discount is what that plane is FOR).
+
+#: Per-process cache: models whose endpoint rejected the service_tier param
+#: (unknown-parameter 400/422). Prevents re-sending a knob the grid refuses.
+_DW_TIER_PARAM_REJECTED: set = set()
+
+#: One-shot INFO latch so the soak log carries positive proof the priority
+#: tier is being requested (vs silently riding the async tier for months).
+_DW_TIER_FIRST_INJECT_LOGGED: list = []
+
+
+def dw_service_tier_enabled() -> bool:
+    """Master for realtime-plane service-tier injection. Default TRUE. NEVER raises."""
+    try:
+        return os.environ.get(
+            "JARVIS_DW_SERVICE_TIER_ENABLED", "true",
+        ).strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _dw_rt_service_tier() -> str:
+    """The tier requested on the realtime plane (env-tunable, default
+    ``priority`` per DW docs). Empty string disables injection. NEVER raises."""
+    try:
+        return os.environ.get("JARVIS_DW_RT_SERVICE_TIER", "priority").strip()
+    except Exception:  # noqa: BLE001
+        return "priority"
+
+
+def _dw_tier_param_known_unsupported(model_id: str) -> bool:
+    """True if this model/endpoint previously rejected service_tier. NEVER raises."""
+    try:
+        return (model_id or "") in _DW_TIER_PARAM_REJECTED
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def apply_rt_service_tier(body: dict, model_id: str) -> dict:
+    """Stamp the realtime-plane tier selector onto a /chat/completions body.
+
+    The ONE decision seam (DRY): _generate_realtime (SSE + non-streaming),
+    complete_sync (heavy fn / Functions lane), stream_health_probe, and
+    cognition_lanes.rt_prompt all compose this. Batch bodies (submit_batch,
+    prompt_only bulk) MUST NOT — batch pricing is the point of that plane.
+    Skips when the master is off, the tier is empty, the caller already set
+    one, or the model's endpoint is cached as rejecting the param. NEVER
+    raises; always returns the body.
+    """
+    try:
+        if not dw_service_tier_enabled():
+            return body
+        tier = _dw_rt_service_tier()
+        if not tier or "service_tier" in body:
+            return body
+        if _dw_tier_param_known_unsupported(model_id):
+            return body
+        body["service_tier"] = tier
+        if not _DW_TIER_FIRST_INJECT_LOGGED:
+            _DW_TIER_FIRST_INJECT_LOGGED.append(True)
+            logger.info(
+                "[DWServiceTier] realtime plane requesting service_tier=%s "
+                "(model=%s) — priority tier ACTIVE", tier, model_id or "-",
+            )
+    except Exception:  # noqa: BLE001 — never perturb payload build
+        pass
+    return body
+
+
+def _dw_note_tier_param_rejection(
+    model_id: str, status: int, err_body: str,
+) -> bool:
+    """ADAPTIVE learn at the RT error seams: if the endpoint rejected the
+    service_tier param itself (unknown-parameter 400/422 naming it), cache
+    the model so the next attempt omits the knob instead of looping the
+    rejection. A 4xx that does NOT name service_tier (quota, entitlement,
+    schema) is someone else's fact — untouched. Returns True iff learned.
+    NEVER raises."""
+    try:
+        if status not in (400, 422):
+            return False
+        if "service_tier" not in (err_body or "").lower():
+            return False
+        if (model_id or "") in _DW_TIER_PARAM_REJECTED:
+            return True
+        _DW_TIER_PARAM_REJECTED.add(model_id or "")
+        logger.warning(
+            "[DWServiceTier] endpoint rejected service_tier param "
+            "(model=%s status=%s) — omitting on retry; RT rides the "
+            "default tier for this model", model_id or "-", status,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ============================================================================
 # Slice 36 — Adaptive Transport Selector
 # ============================================================================
@@ -4433,6 +4540,12 @@ class DoublewordProvider:
                 except Exception:  # noqa: BLE001
                     pass  # I2: sanitize/estimate bug never blocks valid request
 
+            # Priority-Tier Injection (2026-07-21) — request the REALTIME
+            # tier explicitly. Without this the grid served the default
+            # async tier (~66s TTFT, the 0-APPLY soak class). After the
+            # egress interceptor so a model sanitize-rule can't strip it.
+            body = apply_rt_service_tier(body, _effective_model)
+
             # PR D — Native tool forcing (JARVIS_DW_NATIVE_TOOL_FORCING_ENABLED).
             # Read the epistemic exploration state stamped by tool_executor.py's
             # producer. If the model still needs to call exploration tools, inject
@@ -4642,6 +4755,13 @@ class DoublewordProvider:
                                     _rp_learn(_effective_model, body.get("reasoning_effort", ""), err_body)
                                 except Exception:  # noqa: BLE001
                                     pass
+                                # Priority-Tier ADAPTIVE learn — if the grid
+                                # rejected the service_tier param itself, cache
+                                # the model; the CG retry rebuilds the body and
+                                # the helper omits the knob.
+                                _dw_note_tier_param_rejection(
+                                    _effective_model, resp.status, err_body,
+                                )
                                 # PR D C2 — fail-soft on 400 rejection of native tool schemas.
                                 # Cache and re-raise private sentinel; caller strips tools + retries.
                                 if resp.status == 400 and _tool_forced:
@@ -5129,6 +5249,10 @@ class DoublewordProvider:
                                     _effective_model, resp.status,
                                 )
                                 err_body = await resp.text()
+                                # Priority-Tier ADAPTIVE learn (see streaming seam).
+                                _dw_note_tier_param_rejection(
+                                    _effective_model, resp.status, err_body,
+                                )
                                 # PR D C2 — fail-soft on 400 rejection of native tool schemas.
                                 if resp.status == 400 and _tool_forced:
                                     _dw_mark_tool_forcing_unsupported(_effective_model)
@@ -7510,6 +7634,9 @@ class DoublewordProvider:
         NEVER raises: resilience handling must not mask the real provider error
         that the caller is about to receive.
         """
+        # Priority-Tier ADAPTIVE learn — an unknown-parameter 400/422 naming
+        # service_tier caches the model so the next attempt omits the knob.
+        _dw_note_tier_param_rejection(model, status, body)
         try:
             if status in (502, 503, 504):
                 from backend.core.ouroboros.governance.dw_client_lifecycle import (
@@ -7811,6 +7938,11 @@ class DoublewordProvider:
             except Exception:  # noqa: BLE001 — never block a valid request
                 pass
 
+        # Priority-Tier Injection (2026-07-21) — complete_sync IS the
+        # latency-critical realtime plane (DreamEngine RT tier, heavy fn
+        # lane, CompactionCaller); request the priority tier explicitly.
+        body = apply_rt_service_tier(body, effective_model)
+
         session = await self._get_session()
         t0 = time.monotonic()
 
@@ -8046,6 +8178,9 @@ class DoublewordProvider:
                 "temperature": 0.0,
                 "stream": True,
             }
+            # Priority-Tier Injection — probe the tier we actually generate
+            # on, else stability verdicts describe the wrong (async) lane.
+            body = apply_rt_service_tier(body, self._model)
             tokens = 0
             async with session.post(
                 f"{self._base_url}/chat/completions",
