@@ -28,6 +28,16 @@ from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 _ENABLED_ENV = "JARVIS_SWE_BENCH_TARGET_EXISTENCE_GUARD_ENABLED"
 
+# Universal mode (2026-07-21 — soak bt-2026-07-21-230753): the benchmark-only
+# gating left host self-development ops unguarded, so a candidate carrying a
+# write-root-DOUBLED path sailed to APPLY and hard-ENOENT'd inside the
+# ChangeEngine. Universal mode extends the gate to ALL ops with one semantic
+# difference: host self-dev legitimately CREATES new files, so a missing
+# target is only a steering error when its parent directory ALSO fails to
+# exist inside the write root (a genuinely new file lands in an existing
+# package; the doubled-path garbage class never does).
+_UNIVERSAL_ENABLED_ENV = "JARVIS_TARGET_EXISTENCE_GATE_UNIVERSAL"
+
 
 def guard_enabled() -> bool:
     """Master flag — default TRUE (graduates on for the scored soak).
@@ -36,6 +46,13 @@ def guard_enabled() -> bool:
     (the candidate flows straight to APPLY and ENOENTs as before).
     """
     raw = os.environ.get(_ENABLED_ENV, "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def universal_guard_enabled() -> bool:
+    """Universal-mode master — default TRUE. Falsey restores benchmark-only
+    gating (non-benchmark candidates flow ungated to APPLY as before)."""
+    raw = os.environ.get(_UNIVERSAL_ENABLED_ENV, "true").strip().lower()
     return raw not in ("0", "false", "no", "off")
 
 
@@ -89,41 +106,107 @@ def _resolves_inside_and_exists(rel_path: str, write_root: Path) -> bool:
         return False
 
 
+def _parent_resolves_inside_and_exists(rel_path: str, write_root: Path) -> bool:
+    """True iff ``rel_path``'s PARENT directory resolves inside ``write_root``
+    AND exists on disk — the new-file lane predicate for universal mode.
+
+    A genuinely new file lands in an existing package directory; the
+    doubled-path / garbage class always implies a nonexistent parent chain.
+    Escapes are treated as missing (mirrors ``_resolves_inside_and_exists``).
+    Never raises.
+    """
+    try:
+        root = write_root.resolve()
+        parent = (root / rel_path).resolve().parent
+    except (OSError, RuntimeError, ValueError):
+        return False
+    try:
+        parent.relative_to(root)
+    except ValueError:
+        return False  # parent escaped the worktree
+    try:
+        return parent.is_dir()
+    except OSError:
+        return False
+
+
 def find_missing_targets(
-    candidates: Sequence[Any], write_root: Optional[Path],
+    candidates: Sequence[Any],
+    write_root: Optional[Path],
+    *,
+    allow_new_files: bool = False,
 ) -> List[str]:
     """Return the sorted unique target paths that don't exist under write_root.
 
-    ``write_root`` is the benchmark worktree (from ``_swe_bench_write_root``).
-    When it is ``None`` (no per-op write root resolved) the guard is INERT —
-    we cannot know the repo layout, so we never block. Pure; never raises.
+    ``write_root`` is the benchmark worktree (from ``_swe_bench_write_root``)
+    or, in universal mode, the effective execution root. When it is ``None``
+    (no per-op write root resolved) the guard is INERT — we cannot know the
+    repo layout, so we never block. Pure; never raises.
+
+    ``allow_new_files`` (universal mode, keyword-only; default ``False`` =
+    benchmark semantics byte-identical): when TRUE a nonexistent target is
+    acceptable IF its parent directory exists inside the write root — the
+    legitimate host-self-dev new-file lane. A missing target whose parent
+    chain is ALSO missing (the doubled-path class) is flagged either way.
     """
     if write_root is None:
         return []
     missing: set = set()
     for cand in candidates or ():
         for rel in _candidate_target_paths(cand):
-            if not _resolves_inside_and_exists(rel, write_root):
-                missing.add(rel)
+            if _resolves_inside_and_exists(rel, write_root):
+                continue
+            if allow_new_files and _parent_resolves_inside_and_exists(
+                rel, write_root,
+            ):
+                continue
+            missing.add(rel)
     return sorted(missing)
 
 
-def build_retry_feedback(missing: Sequence[str]) -> str:
-    """The self-correcting GENERATE_RETRY payload shown back to the model."""
+def build_retry_feedback(
+    missing: Sequence[str], *, benchmark: bool = True,
+) -> str:
+    """The self-correcting GENERATE_RETRY payload shown back to the model.
+
+    ``benchmark`` (keyword-only; default ``True`` = the original Slice 72
+    wording, byte-identical for existing callers) selects the lane-correct
+    narrative: benchmark ops get the third-party-repo steering text;
+    universal-mode host ops get path-hygiene steering (the doubled-prefix /
+    phantom-parent class) that does NOT wrongly tell the model it is outside
+    the host framework.
+    """
     paths = ", ".join(f"'{p}'" for p in missing) or "'<unknown>'"
+    if benchmark:
+        return (
+            "## PREVIOUS GENERATION REJECTED — TARGET FILE DOES NOT EXIST\n\n"
+            f"The proposed target file(s) {paths} do not exist within the current "
+            "isolated problem repository. You are working on a THIRD-PARTY project, "
+            "NOT the host framework — paths like 'backend/core/...' belong to the "
+            "host system and are out of bounds.\n\n"
+            "INSTRUCTIONS FOR RETRY:\n"
+            "- Your modifications MUST target files that already exist in THIS repo.\n"
+            "- Call search_code / glob_files / list_dir to locate the real file that\n"
+            "  implements the behavior described in the problem statement BEFORE\n"
+            "  emitting any patch.\n"
+            "- Emit the patch against the exact repo-relative path you confirmed\n"
+            "  exists via exploration — do not guess a host-framework path.\n"
+        )
     return (
-        "## PREVIOUS GENERATION REJECTED — TARGET FILE DOES NOT EXIST\n\n"
-        f"The proposed target file(s) {paths} do not exist within the current "
-        "isolated problem repository. You are working on a THIRD-PARTY project, "
-        "NOT the host framework — paths like 'backend/core/...' belong to the "
-        "host system and are out of bounds.\n\n"
+        "## PREVIOUS GENERATION REJECTED — TARGET PATH DOES NOT RESOLVE\n\n"
+        f"The proposed target file(s) {paths} neither exist in the repository "
+        "nor land inside an existing package directory. This usually means the "
+        "path was malformed — e.g. it repeats the repository root's own path "
+        "prefix, embeds an absolute filesystem prefix, or points into a "
+        "directory tree that does not exist.\n\n"
         "INSTRUCTIONS FOR RETRY:\n"
-        "- Your modifications MUST target files that already exist in THIS repo.\n"
-        "- Call search_code / glob_files / list_dir to locate the real file that\n"
-        "  implements the behavior described in the problem statement BEFORE\n"
-        "  emitting any patch.\n"
-        "- Emit the patch against the exact repo-relative path you confirmed\n"
-        "  exists via exploration — do not guess a host-framework path.\n"
+        "- Emit CLEAN repo-relative paths only (e.g. 'backend/pkg/module.py') —\n"
+        "  never absolute paths and never paths containing the repository's own\n"
+        "  directory name as a prefix.\n"
+        "- To modify existing code, call read_file / search_code / list_dir to\n"
+        "  confirm the exact repo-relative path BEFORE emitting the patch.\n"
+        "- To create a NEW file, place it inside a directory that already\n"
+        "  exists in the repository.\n"
     )
 
 

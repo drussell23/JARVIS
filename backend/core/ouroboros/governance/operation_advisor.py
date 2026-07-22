@@ -1799,11 +1799,23 @@ class OperationAdvisor:
                 cooperative_yield_every_n_async,
             )
             _t0 = time.monotonic()
-            roots = derive_locality_roots(target_files, scan_root)
-            if not roots:
-                return None
             loop = asyncio.get_running_loop()
             _blast_executor = _get_advisor_blast_executor()
+            # Event Loop Unblocking (2026-07-21, soak bt-2026-07-21-230753):
+            # root derivation does cold-FS pathlib stat probes (.is_file /
+            # .is_dir on target parents + importees) plus a bounded read +
+            # AST parse — a 5.4s SidecarProfiler STUCK_FRAME showed a single
+            # cold stat can wedge the loop. Dispatch the WHOLE derivation to
+            # the dedicated advisor-blast executor (Task #88f isolation
+            # contract — never the contested default pool).
+            roots = await loop.run_in_executor(
+                _blast_executor,
+                derive_locality_roots,
+                target_files,
+                scan_root,
+            )
+            if not roots:
+                return None
             _per_file_bytes = blast_radius_max_bytes_per_file()
             _cap = blast_radius_conservative_cap()
             _skip = default_skip_dirs()

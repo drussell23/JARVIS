@@ -49,6 +49,7 @@ from backend.core.ouroboros.governance.ascii_strict_gate import (
 )
 from backend.core.ouroboros.governance.target_existence_guard import (
     guard_enabled as _target_guard_enabled,
+    universal_guard_enabled as _target_guard_universal_enabled,
     find_missing_targets as _find_missing_targets,
     build_retry_feedback as _target_missing_retry_feedback,
     missing_target_error_message as _target_missing_error_message,
@@ -6755,20 +6756,46 @@ class GovernedOrchestrator:
                     # self-correcting feedback instead of crashing APPLY. INERT
                     # for every non-swe_bench op (host self-dev legitimately
                     # creates new files) and when write_root can't be resolved.
-                    if (
+                    # Universal mode (2026-07-21, soak bt-2026-07-21-230753):
+                    # the benchmark-only gating left host self-dev ops
+                    # unguarded, so a write-root-DOUBLED candidate path
+                    # sailed to APPLY and hard-ENOENT'd in the ChangeEngine.
+                    # Universal mode gates ALL ops with the new-file lane
+                    # preserved (allow_new_files: a missing target is only a
+                    # steering error when its PARENT dir is also missing).
+                    # Write root: benchmark keeps _swe_bench_write_root;
+                    # host ops use the canonical Slice 11 execution-root seam
+                    # (the SAME root ChangeEngine._effective_write_root
+                    # resolves, so gate and engine provably agree). The
+                    # existence stats run OFF-LOOP via asyncio.to_thread —
+                    # a cold-FS stat must never starve the event loop.
+                    _tg_is_benchmark = (
                         getattr(ctx, "signal_source", "") == "swe_bench_pro"
-                        and _target_guard_enabled()
+                    )
+                    if (
+                        (_tg_is_benchmark and _target_guard_enabled())
+                        or (not _tg_is_benchmark
+                            and _target_guard_universal_enabled())
                     ):
-                        _tg_write_root = self._swe_bench_write_root(ctx)
-                        _tg_missing = _find_missing_targets(
-                            generation.candidates, _tg_write_root,
+                        _tg_write_root = (
+                            self._swe_bench_write_root(ctx)
+                            if _tg_is_benchmark
+                            else self._config.execution_root
+                        )
+                        _tg_missing = await asyncio.to_thread(
+                            _find_missing_targets,
+                            generation.candidates,
+                            _tg_write_root,
+                            allow_new_files=not _tg_is_benchmark,
                         )
                         if _tg_missing:
                             logger.warning(
                                 "[Orchestrator] Iron Gate — target_file_missing: "
-                                "%s not in worktree %s op=%s (attempt=%d)",
+                                "%s not in worktree %s op=%s (attempt=%d, "
+                                "lane=%s)",
                                 ",".join(_tg_missing), _tg_write_root,
                                 ctx.op_id[:12], attempt + 1,
+                                "benchmark" if _tg_is_benchmark else "universal",
                             )
                             generation = None
                             raise RuntimeError(
@@ -7681,12 +7708,21 @@ class GovernedOrchestrator:
                         # Slice 72 — target file doesn't exist in the worktree.
                         # Surface the host-vs-worktree steering correction so the
                         # model re-explores and targets a real repo file.
+                        # Universal mode (2026-07-21): lane-correct wording —
+                        # host self-dev ops get path-hygiene steering (doubled
+                        # prefix / phantom parent), not third-party-repo text.
                         _tg_paths = [
                             p.strip()
                             for p in _err_str[len(_TARGET_MISSING_PREFIX):].split(",")
                             if p.strip()
                         ]
-                        _error_feedback = _target_missing_retry_feedback(_tg_paths)
+                        _error_feedback = _target_missing_retry_feedback(
+                            _tg_paths,
+                            benchmark=(
+                                getattr(ctx, "signal_source", "")
+                                == "swe_bench_pro"
+                            ),
+                        )
                     elif _err_str.startswith("ascii_corruption"):
                         # Extract the specific offending lines from the rejected
                         # candidate so the model sees its own bad code in context

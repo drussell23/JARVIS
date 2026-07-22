@@ -116,9 +116,22 @@ def _orch_src() -> str:
 
 def test_orchestrator_invokes_target_guard_gated_on_swe_bench():
     src = _orch_src()
-    assert "_find_missing_targets(" in src, "gate must call the guard helper"
+    # Universal mode (2026-07-21): the guard call is dispatched OFF-LOOP via
+    # asyncio.to_thread(_find_missing_targets, ...) — the helper is now a
+    # to_thread argument, not a direct call expression. Accept either shape
+    # so the pin survives formatting, but require the helper reference AND
+    # the off-loop dispatch.
+    assert (
+        "_find_missing_targets(" in src or "_find_missing_targets," in src
+    ), "gate must call the guard helper"
+    assert "asyncio.to_thread(" in src, (
+        "existence stats must run off-loop (universal-gate mandate)"
+    )
     assert "_target_guard_enabled()" in src, "gate must honor the master flag"
-    # Gated on the swe_bench source so host self-dev (new files) is untouched.
+    # Universal-mode master — ALL ops gated, new-file lane preserved.
+    assert "_target_guard_universal_enabled()" in src
+    assert "allow_new_files=" in src
+    # Benchmark lane still keyed on the swe_bench source (strict semantics).
     assert 'signal_source", "") == "swe_bench_pro"' in src
     # Routed through the GENERATE_RETRY error path (raises, sets generation=None).
     assert "_target_missing_error_message(" in src
