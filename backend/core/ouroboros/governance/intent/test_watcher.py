@@ -483,6 +483,30 @@ class TestWatcher:
             if path.endswith(".py") and path not in seen:
                 seen.add(path)
                 changed.append(path)
+        # List-and-Watch reconciliation (2026-07-22): a failing test
+        # COMMITTED just before boot (soak bt-2026-07-22-061753's
+        # tracked probe; any restart landing on a red HEAD) is invisible
+        # to the working-tree diff above — it is clean. The last
+        # ``JARVIS_TESTWATCHER_HYDRATION_COMMIT_DEPTH`` commits' change
+        # surface (``git diff --name-only HEAD~N HEAD``) is bounded by
+        # construction (a commit touches few files — never the 449-entry
+        # pytest-cache flood) and reconstructs exactly that blind spot.
+        # Same ground-truth + fail-soft discipline; the downstream
+        # ``poll_once`` re-confirms LIVE so a green committed change
+        # emits nothing. Depth 0 restores byte-identical legacy behavior.
+        try:
+            _depth = int(os.environ.get(
+                "JARVIS_TESTWATCHER_HYDRATION_COMMIT_DEPTH", "1",
+            ))
+        except (TypeError, ValueError):
+            _depth = 1
+        if _depth > 0:
+            for path in await _git(
+                "diff", "--name-only", f"HEAD~{_depth}", "HEAD",
+            ):
+                if path.endswith(".py") and path not in seen:
+                    seen.add(path)
+                    changed.append(path)
         return changed
 
     # ------------------------------------------------------------------
