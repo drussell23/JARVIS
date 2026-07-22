@@ -78,6 +78,14 @@ class PromotionOutcome:
     state: str
     shas: Tuple[str, ...] = ()
     detail: str = ""
+    # In-Memory Object Surgery (2026-07-22): True when the change could
+    # not land on HEAD directly but WAS landed on an
+    # ``ouroboros/pending/<op>`` ref via non-destructive object surgery
+    # (clean in-memory merge or Orange-gated semantic reconciliation).
+    # A pending outcome is NOT a failure — call sites exempt it from
+    # the fail path; the quiescence fast-forwarder (or a human review)
+    # completes the integration asynchronously.
+    pending: bool = False
 
 
 async def _derive_operator_root(
@@ -294,12 +302,68 @@ async def run_workspace_promotion(
         if _rel and _hash:
             _baseline_map[str(_rel)] = str(_hash)
 
+    # Quiescence sweep first: any earlier op's pending ref whose touched
+    # paths went quiet may fast-forward now (git-proven --ff-only,
+    # clean-tree-at-paths, LiveWork-quiescent). Import failure disables
+    # the lander; a sweep hiccup alone must NOT (separate fault domains).
+    land_pending_ref = None
+    try:
+        from backend.core.ouroboros.governance.pending_ref_lander import (
+            land_pending_ref as _lpr,
+            try_quiescence_fastforward as _tqf,
+        )
+        land_pending_ref = _lpr
+        try:
+            await _tqf(mgr, project_root)
+        except Exception:  # noqa: BLE001 — sweep is opportunistic
+            logger.debug(
+                "[WorkspacePromoter] quiescence sweep failed",
+                exc_info=True,
+            )
+    except Exception:  # noqa: BLE001 — lander unavailable
+        pass
+
     try:
         result = await mgr.promote_commits(
             project_root, _branch, [committed_hash],
             baseline_hashes=_baseline_map,
         )
     except PromotionError as exc:
+        # ── In-Memory Object Surgery fallback (2026-07-22) ──
+        # A dirty/diverged target no longer dead-ends: the verified
+        # commit lands on ``ouroboros/pending/<op>`` via pure object-
+        # database surgery (merge-tree --write-tree; optional DW-RT
+        # semantic reconciliation, Orange-gated). ZERO working-tree /
+        # index / HEAD / WIP contact — the stash hazard class is
+        # structurally absent. Unresolvable → the legacy typed refusal.
+        if (
+            land_pending_ref is not None
+            and exc.state in ("target_dirty", "conflict_aborted")
+        ):
+            try:
+                _land = await land_pending_ref(
+                    mgr, project_root, committed_hash, op_id,
+                )
+            except Exception:  # noqa: BLE001 — fail-soft to refusal
+                _land = None
+            if _land is not None and _land.landed:
+                logger.info(
+                    "[WorkspacePromoter] op=%s %s: direct landing "
+                    "refused (%s) — parked on %s (%s); quiescence "
+                    "fast-forward or human review completes it",
+                    op_id, _land.state, exc.state, _land.ref,
+                    _land.commit[:12],
+                )
+                return PromotionOutcome(
+                    True, False, _land.state,
+                    shas=(_land.commit,),
+                    detail=(
+                        "direct=%s pending_ref=%s conflicts=%d"
+                        % (exc.state, _land.ref,
+                           len(_land.conflicted_paths))
+                    ),
+                    pending=True,
+                )
         return await _fail(exc.state, exc.detail)
     except Exception as exc:  # noqa: BLE001 — fail CLOSED, never crash 8b
         return await _fail(

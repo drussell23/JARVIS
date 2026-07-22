@@ -11542,7 +11542,13 @@ class GovernedOrchestrator:
             )
             # Slice 14: true durable-write probe after 8b, every branch.
             self._emit_terminal_durability_probe(ctx, _committed_hash, _promo)
-            if _promo.attempted and not _promo.promoted:
+            # In-Memory Object Surgery (2026-07-22, inline twin): a
+            # PENDING outcome (parked on ouroboros/pending/<op>) is NOT
+            # a failure — mirrors the slice4b_runner exemption.
+            if (
+                _promo.attempted and not _promo.promoted
+                and not getattr(_promo, "pending", False)
+            ):
                 if _serpent: _serpent.update_phase("POSTMORTEM")
                 ctx = ctx.advance(
                     OperationPhase.POSTMORTEM,
