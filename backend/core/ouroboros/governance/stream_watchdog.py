@@ -35,7 +35,7 @@ import json
 import logging
 import os
 import time
-from typing import Awaitable, Callable, Optional, Union
+from typing import Any, Awaitable, Callable, Optional, Union
 
 from backend.core.ouroboros.governance.stream_rupture import (
     StreamRuptureError,
@@ -89,6 +89,27 @@ def watchdog_itl_s() -> float:
         return stream_inter_chunk_timeout_s()
     except Exception:  # noqa: BLE001
         return 30.0
+
+
+def fast_abort_response(response: Any) -> bool:
+    """Surgically tear down the single TCP socket behind an aiohttp response —
+    the watchdog fast-abort. Mirrors ``BoundedCancellationGuard._fire_abort``
+    (Slice 7b): ``transport.abort()`` severs ONE file descriptor, never a
+    pool-wide close. Wire this into a provider's rupture path so a stalled
+    socket is cut instantly instead of leaking until request-total timeout.
+    Gated by ``watchdog_enabled``; returns True if aborted; NEVER raises."""
+    if not watchdog_enabled() or response is None:
+        return False
+    try:
+        conn = getattr(response, "connection", None)
+        transport = getattr(conn, "transport", None) if conn is not None else None
+        if transport is not None and hasattr(transport, "abort"):
+            transport.abort()
+            logger.debug("[StreamWatchdog] fast-abort: severed stalled DW socket")
+            return True
+    except Exception:  # noqa: BLE001 — a failed abort must not mask the stall
+        logger.debug("[StreamWatchdog] fast_abort_response failed", exc_info=True)
+    return False
 
 
 def _fire_abort(abort_fn: Optional[Callable[[], None]]) -> None:

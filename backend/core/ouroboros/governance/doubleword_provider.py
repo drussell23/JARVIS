@@ -5104,6 +5104,20 @@ class DoublewordProvider:
                                 except asyncio.TimeoutError:
                                     _rupt_elapsed = time.monotonic() - _ttft_request_start_monotonic
                                     _rupt_phase = "ttft" if not _sse_has_tokens else "inter_chunk"
+                                    # Adaptive Stream Watchdog fast-abort (2026-07-22):
+                                    # sever the stalled TCP socket surgically BEFORE
+                                    # unwinding, so the wedged FD is cut instantly instead
+                                    # of leaking until request-total timeout. The
+                                    # StreamRuptureError raised below is classified transient
+                                    # and absorbed by the @with_transient_absorb retry on the
+                                    # standard/immediate path (5xx Resiliency Matrix, DRY).
+                                    try:
+                                        from backend.core.ouroboros.governance.stream_watchdog import (  # noqa: E501,PLC0415
+                                            fast_abort_response as _dw_fast_abort,
+                                        )
+                                        _dw_fast_abort(resp)
+                                    except Exception:  # noqa: BLE001 — abort never masks the stall
+                                        pass
                                     logger.error(
                                         "[DoublewordProvider] STREAM RUPTURE "
                                         "(phase=%s): no chunk for %.0fs "
