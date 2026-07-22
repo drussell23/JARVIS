@@ -11203,18 +11203,37 @@ class GovernedOrchestrator:
                         # current_op_family/risk/route fields ride on
                         # ctx; defensive getattr in case ctx schema
                         # ever drifts.
-                        _aa_ctx = _aa_gather(
-                            current_op_family=str(getattr(
-                                ctx, "op_family", "",
-                            ) or ""),
-                            current_risk_tier=str(getattr(
-                                ctx, "risk_tier", "",
-                            ) or ""),
-                            current_route=str(getattr(
-                                ctx, "provider_route", "",
-                            ) or ""),
-                            posture="",
-                            include_oracle=True,
+                        # Event-loop unblocking (2026-07-22, soak
+                        # bt-2026-07-22-022146): gather_context reads
+                        # the postmortem ledger line-by-line from disk
+                        # (list_recent_postmortems) — a 5.0s cold-FS
+                        # STUCK_FRAME when run on the loop. Dispatch
+                        # the whole sync gather to the dedicated
+                        # advisor-blast executor (Task #88f isolation
+                        # pool — DRY, no new executor).
+                        from backend.core.ouroboros.governance.operation_advisor import (  # noqa: E501
+                            _get_advisor_blast_executor as _aa_pool,
+                        )
+                        _aa_of = str(getattr(ctx, "op_family", "") or "")
+                        _aa_rt = str(getattr(ctx, "risk_tier", "") or "")
+                        _aa_route = str(getattr(
+                            ctx, "provider_route", "",
+                        ) or "")
+
+                        def _aa_gather_offloaded(
+                            _of=_aa_of, _rt=_aa_rt, _route=_aa_route,
+                        ):
+                            return _aa_gather(
+                                current_op_family=_of,
+                                current_risk_tier=_rt,
+                                current_route=_route,
+                                posture="",
+                                include_oracle=True,
+                            )
+
+                        _aa_ctx = await asyncio.get_running_loop(
+                        ).run_in_executor(
+                            _aa_pool(), _aa_gather_offloaded,
                         )
                         _aa_action = _aa_propose(_aa_ctx)
                         if (
@@ -14270,6 +14289,41 @@ class GovernedOrchestrator:
         last_phase_reached: ChangePhase = ChangePhase.PLAN
         last_risk_tier: Optional[RiskTier] = None
         last_error: Optional[str] = None
+
+        # Bounded Fan-Out pre-write rejection (Transactional Op-Scoping,
+        # 2026-07-22): under an armed flush-freeze, a transaction wider
+        # than the fan-out ceiling is REJECTED before its first byte —
+        # never started, never half-applied, never rollback-churned. The
+        # per-file engine consult would deny file N+1 anyway; failing the
+        # batch here keeps 2PC from beginning a structurally doomed
+        # transaction. Fail-soft: any consult error skips the guard.
+        try:
+            from backend.core.ouroboros.governance import (
+                apply_flush_freeze as _aff,
+            )
+            if (
+                _aff.flush_freeze_enabled()
+                and len(files) > _aff.max_files_per_op()
+            ):
+                logger.warning(
+                    "[Orchestrator] Multi-file apply REJECTED pre-write: "
+                    "%d files exceeds the op-scoped fan-out ceiling %d "
+                    "(op=%s) — %s",
+                    len(files), _aff.max_files_per_op(), ctx.op_id,
+                    _aff.FANOUT_DENIAL_REASON,
+                )
+                return ChangeResult(
+                    op_id=ctx.op_id,
+                    success=False,
+                    phase_reached=ChangePhase.PLAN,
+                    rolled_back=False,
+                    error=_aff.FANOUT_DENIAL_REASON,
+                )
+        except Exception:  # noqa: BLE001 — guard is protective, never fatal
+            logger.debug(
+                "[Orchestrator] fan-out pre-write guard skipped",
+                exc_info=True,
+            )
 
         for idx, (fp, fc) in enumerate(files):
             # Build an absolute target path anchored at the project root.

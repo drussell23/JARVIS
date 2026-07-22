@@ -467,9 +467,30 @@ class MetaSensor:
         if not meta_sensor_enabled():
             return []
         findings: List[DormancyFinding] = []
+        # Event-loop unblocking (2026-07-22): detector evaluate() reads
+        # the postmortem ledger from disk (list_recent_postmortems —
+        # the bt-2026-07-22-022146 5.0s STUCK_FRAME class). Dispatch
+        # each pure-function evaluate to the dedicated advisor-blast
+        # executor (Task #88f isolation pool — DRY, no new executor);
+        # fail-soft to the legacy on-loop call if the pool is
+        # unavailable (import error → sensor still functions).
+        try:
+            from backend.core.ouroboros.governance.operation_advisor import (  # noqa: E501
+                _get_advisor_blast_executor as _blast_pool,
+            )
+            _pool = _blast_pool()
+            _loop = asyncio.get_running_loop()
+        except Exception:  # noqa: BLE001 — degraded: evaluate on-loop
+            _pool = None
+            _loop = None
         for detector in list_dormancy_detectors():
             try:
-                finding = detector.evaluate()
+                if _pool is not None and _loop is not None:
+                    finding = await _loop.run_in_executor(
+                        _pool, detector.evaluate,
+                    )
+                else:
+                    finding = detector.evaluate()
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "[MetaSensor] detector %s raised — skipped",
