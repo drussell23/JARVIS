@@ -220,6 +220,19 @@ class LeaseReaper:
             op_id = rec.op_id
             # Always free the expired lease slot first.
             unregister_op_safely(op_id)
+            # Universal Lock Release: a re-queued op must NOT stay locked out of
+            # ingress. Revoke its target locks / in-flight flags BEFORE re-queue
+            # so the sensor doesn't suppress the re-dispatch (the sensor-side
+            # wedge, soak bt-2026-07-22-174240). DRY — the same central bridge
+            # the TrinityEventBus terminal observer uses.
+            try:
+                from backend.core.ouroboros.governance.terminal_lock_releaser import (  # noqa: E501
+                    release_locks_for_op as _release_locks,
+                )
+                _tf = getattr(getattr(rec, "ctx_ref", None), "target_files", None)
+                _release_locks(op_id, _tf)
+            except Exception:  # noqa: BLE001 — cleanup never blocks the sweep
+                pass
             count = self._requeue_counts.get(op_id, 0)
             if count >= self._max_requeue:
                 logger.warning(

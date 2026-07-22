@@ -588,6 +588,19 @@ class TestFailureSensor:
         # fs.changed run for ``_HYDRATION_DEDUP_TTL_S``.
         self._hydrated_keys: Dict[str, float] = {}
         self._boot_hydrated: bool = False
+        # Universal Terminal-State Lock Releaser: register as an ingress-lock
+        # surface so ANY terminal op-state (the TrinityEventBus terminal
+        # observer, or a LeaseReaper re-queue) auto-revokes this sensor's target
+        # locks via the existing ``release_target``. This closes the sensor-side
+        # wedge (soak bt-2026-07-22-174240) — ``release_target`` finally has a
+        # caller, driven by a central event bridge rather than scattered calls.
+        try:
+            from backend.core.ouroboros.governance.terminal_lock_releaser import (  # noqa: E501
+                get_terminal_lock_releaser as _get_tlr,
+            )
+            _get_tlr().register_surface(self)
+        except Exception:  # noqa: BLE001 — registration is resilience, never blocks init
+            pass
         # Slice 5 T2 (Run #15 autopsy L2, F2): set-based debounce
         # accumulator. Events never cancel the pending window — paths
         # aggregate and one scoped run covers the union.
