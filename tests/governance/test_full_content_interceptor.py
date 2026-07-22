@@ -121,6 +121,48 @@ async def test_small_file_no_regression() -> None:
     assert result.content == "def f(a, b):\n    return a + b\n"
 
 
+async def test_ghost_edit_detected_aborts_stitch(tmp_path) -> None:
+    """Optimistic State Hashing: an external process mutates the file WHILE the
+    swarm runs → the interceptor detects the drift at Fan-In and safely aborts
+    (never writes the stale stitch), signalling a requeue."""
+    p = tmp_path / "enterprise.py"
+    p.write_text(_BIG)
+
+    async def agent_fn(target: ChunkTarget, feedback: str) -> str:
+        # Simulate a concurrent external edit landing mid-swarm.
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write("\n# external process wrote here\n")
+        return _FIX[target.symbol]
+
+    result = await intercept_full_content(
+        _BIG, str(p), ["alpha", "beta", "gamma"], agent_fn,
+        op_id="op-ghost", max_turns=2,
+    )
+    # Drift caught → aborted, source returned untouched, requeue signalled.
+    assert result.drifted is True
+    assert result.strategy == "aborted_drift"
+    assert result.stitched is False
+    assert result.content == _BIG
+
+
+async def test_no_ghost_edit_stitches_normally(tmp_path) -> None:
+    """Control: a stable on-disk file stitches normally (drift guard is a
+    no-op when the source never changes)."""
+    p = tmp_path / "enterprise.py"
+    p.write_text(_BIG)
+
+    async def agent_fn(target: ChunkTarget, feedback: str) -> str:
+        return _FIX[target.symbol]
+
+    result = await intercept_full_content(
+        _BIG, str(p), ["alpha", "beta", "gamma"], agent_fn,
+        op_id="op-stable", max_turns=2,
+    )
+    assert result.drifted is False
+    assert result.strategy == "agentic_swarm"
+    assert set(result.converged_nodes) == {"alpha", "beta", "gamma"}
+
+
 async def test_strategy_outcome_logger_writes_sqlite_on_terminal() -> None:
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     outcome_logger = StrategyOutcomeLogger(conn)

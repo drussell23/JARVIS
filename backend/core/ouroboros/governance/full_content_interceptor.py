@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
@@ -71,6 +72,21 @@ def _enabled() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _disk_sha(file_path: str) -> Optional[str]:
+    """Fast SHA-256 of the on-disk file, or ``None`` if it is not a readable
+    real path (e.g. a synthetic/in-memory path in a test). Never raises.
+
+    Optimistic State Hashing (Ghost-Edit Protection): the interceptor snapshots
+    this at the exact moment of interception and re-checks it before returning
+    the stitched result — if an external process mutated the file while the
+    swarm ran, the stitch was built on a stale base and MUST be aborted."""
+    try:
+        with open(file_path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except (OSError, ValueError):
+        return None
+
+
 # whole_file_fn() -> Awaitable[str]  — the legacy whole-file generator.
 WholeFileFn = Callable[[], Awaitable[str]]
 # rag_agent_fn(target, rag_context) -> Awaitable[str] — the RAG-fallback repair.
@@ -85,6 +101,7 @@ class InterceptResult:
     converged_nodes: List[str] = field(default_factory=list)
     rag_recovered_nodes: List[str] = field(default_factory=list)
     dropped_nodes: List[str] = field(default_factory=list)
+    drifted: bool = False                          # Ghost-Edit: source drifted → stitch aborted
 
 
 async def intercept_full_content(
@@ -109,6 +126,11 @@ async def intercept_full_content(
         return InterceptResult(strategy="whole", content=content, stitched=False)
 
     # ── MASSIVE file: whole-file FORBIDDEN — build AST targets ──
+    # Optimistic State Hashing (Ghost-Edit Protection): snapshot the on-disk
+    # file state at the exact moment of interception. Re-checked before the
+    # stitch is returned (below) — abort + requeue on drift, never write over
+    # an external mutation.
+    entry_disk_sha = _disk_sha(file_path)
     targets: List[ChunkTarget] = []
     for sym in symbols or []:
         try:
@@ -177,6 +199,25 @@ async def intercept_full_content(
                 except SyntaxError:
                     recovered = False
         (rag_recovered if recovered else dropped).append(sym)
+
+    # ── Ghost-Edit re-check: the on-disk source must not have drifted under
+    # us during the swarm. A stitch built on a stale base would silently
+    # corrupt the file, so on drift we abort + signal a requeue (never write).
+    exit_disk_sha = _disk_sha(file_path)
+    if (
+        entry_disk_sha is not None
+        and exit_disk_sha is not None
+        and entry_disk_sha != exit_disk_sha
+    ):
+        logger.warning(
+            "[FullContentInterceptor] %s: GHOST EDIT detected (source drifted "
+            "%s→%s during swarm) — aborting stitch, requeue op",
+            file_path, entry_disk_sha[:8], exit_disk_sha[:8],
+        )
+        return InterceptResult(
+            strategy="aborted_drift", content=source, stitched=False,
+            drifted=True, dropped_nodes=list(symbols or []),
+        )
 
     logger.info(
         "[FullContentInterceptor] %s (%d lines): agentic swarm — converged=%d "
