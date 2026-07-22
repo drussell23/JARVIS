@@ -53,18 +53,20 @@ from backend.core.ouroboros.governance import provider_retry_classifier
 
 
 class TestRetryDecisionClosedTaxonomy(unittest.TestCase):
-    """The 4-value closed taxonomy is structural — adding a 5th
+    """The 5-value closed taxonomy is structural — adding a 6th
     member requires a paired test update + Circuit Breaker
     (Slice 7c) trip-table extension. This pin catches accidental
-    expansion."""
+    expansion. ``TRANSIENT_NETWORK`` (Dynamic 5xx Resiliency Matrix,
+    2026-07-22) is the 5th member; its trip-table branch is wired
+    alongside ``RETRY_TRANSIENT`` in ``circuit_breaker._apply_trip_table``."""
 
-    def test_retry_decision_has_exactly_four_members(self) -> None:
+    def test_retry_decision_has_exactly_five_members(self) -> None:
         members = list(RetryDecision)
         self.assertEqual(
-            len(members), 4,
-            f"RetryDecision is a CLOSED taxonomy of 4 values; found "
+            len(members), 5,
+            f"RetryDecision is a CLOSED taxonomy of 5 values; found "
             f"{len(members)} members: {[m.name for m in members]}. "
-            f"If you need a 5th decision, extend the Circuit "
+            f"If you need a 6th decision, extend the Circuit "
             f"Breaker (Slice 7c) trip-table in the same PR.",
         )
 
@@ -75,6 +77,7 @@ class TestRetryDecisionClosedTaxonomy(unittest.TestCase):
             "TERMINAL_STRUCTURAL",
             "TERMINAL_QUOTA",
             "TERMINAL_CONFIG",
+            "TRANSIENT_NETWORK",
         }
         self.assertEqual(
             names, expected,
@@ -246,19 +249,22 @@ class TestHttpStatusTable(unittest.TestCase):
             RetryDecision.TERMINAL_QUOTA,
         )
 
-    def test_http_408_is_retry_transient(self) -> None:
-        # 408 Request Timeout — transient.
+    def test_http_408_is_transient_network(self) -> None:
+        # 408 Request Timeout — a transient network/gateway anomaly. Dynamic
+        # 5xx Resiliency Matrix (2026-07-22): routed to TRANSIENT_NETWORK so
+        # the orchestrator drives a backoff-retry that never terminally trips.
         self.assertEqual(
             classify(None, None, http_status=408),
-            RetryDecision.RETRY_TRANSIENT,
+            RetryDecision.TRANSIENT_NETWORK,
         )
 
-    def test_http_500_502_503_504_are_retry_transient(self) -> None:
+    def test_http_500_502_503_504_are_transient_network(self) -> None:
+        # All 5xx are transient network/gateway anomalies → TRANSIENT_NETWORK.
         for code in (500, 502, 503, 504):
             with self.subTest(http_status=code):
                 self.assertEqual(
                     classify(None, None, http_status=code),
-                    RetryDecision.RETRY_TRANSIENT,
+                    RetryDecision.TRANSIENT_NETWORK,
                 )
 
     def test_unmapped_http_status_falls_through(self) -> None:

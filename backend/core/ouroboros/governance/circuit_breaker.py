@@ -814,8 +814,18 @@ class CircuitBreaker:
             # In-window quota hit but below trip — back off with
             # full-jitter and let caller retry.
             return self._verdict_backoff()
-        # RETRY_TRANSIENT — count toward OPEN_TRANSIENT trip.
-        if decision == RetryDecision.RETRY_TRANSIENT:
+        # RETRY_TRANSIENT / TRANSIENT_NETWORK — count toward OPEN_TRANSIENT
+        # trip; NEVER terminal. A transient network / upstream-gateway blip
+        # (DoubleWord ``upstream_error``, 5xx, gateway timeout, 429-with-
+        # Retry-After) backs off with full-jitter and retries — it must never
+        # trip the session breaker to OPEN_TERMINAL. This is the containment
+        # half of the Dynamic 5xx Resiliency Matrix (2026-07-22): the taxonomy
+        # labels the blip transient, and this branch guarantees the breaker
+        # honors that label with a recoverable OPEN_TRANSIENT at worst.
+        if decision in (
+            RetryDecision.RETRY_TRANSIENT,
+            RetryDecision.TRANSIENT_NETWORK,
+        ):
             self._transient_window.add()
             transient_trip = _read_int(_TRANSIENT_TRIP_ENV, 3, minimum=1)
             if self._transient_window.count() >= transient_trip:
@@ -829,7 +839,7 @@ class CircuitBreaker:
                 state_after=self._state,
             )
         # Unknown decision (should not happen — RetryDecision is
-        # closed 4-value). Defensive RETRY_OK preserves legacy
+        # a closed taxonomy). Defensive RETRY_OK preserves legacy
         # semantics.
         return CircuitVerdict(
             action=VerdictAction.RETRY_OK,

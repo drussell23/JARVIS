@@ -2898,6 +2898,85 @@ def _is_l7_recoverable(exc: BaseException) -> bool:
         return False
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Dynamic 5xx Resiliency Matrix — DW transient-network absorb loop (2026-07-22)
+# ──────────────────────────────────────────────────────────────────────
+#
+# A transient DoubleWord blip (``upstream_error`` in a 400 body, any 5xx,
+# gateway timeout, or a 429 that carries ``Retry-After``) must be absorbed by a
+# bounded exponential-backoff-with-jitter retry on the PRIMARY generate call —
+# BEFORE the loop cascades to a (possibly dead) fallback and BEFORE the session
+# breaker can trip terminally. The empirical foil is bt-2026-07-22-082657, where
+# ONE transient ``upstream_error`` was mis-labeled ``terminal_quota`` and killed
+# the whole soak. The classification lives in ``provider_retry_classifier`` and
+# the jitter primitive is reused from ``circuit_breaker.full_jitter_delay``
+# (DRY — no new jitter maths here).
+
+
+def _dw_transient_max_retries() -> int:
+    """Bounded absorb-loop budget for a DW TRANSIENT_NETWORK blip on the
+    primary generate call (env ``JARVIS_DW_TRANSIENT_MAX_RETRIES``, default 2).
+    The breaker's own window still caps the worst case. Fail-soft to 2."""
+    try:
+        return max(0, int(os.environ.get("JARVIS_DW_TRANSIENT_MAX_RETRIES", "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _is_dw_transient_network(exc: Exception, http_status, retry_after_ts) -> bool:
+    """True when *exc* classifies TRANSIENT_NETWORK per the Dynamic 5xx
+    Resiliency Matrix (upstream_error / 5xx / gateway timeout / 429-with-
+    Retry-After). Uses the canonical taxonomy — never raises."""
+    try:
+        from backend.core.ouroboros.governance.provider_retry_classifier import (
+            classify, RetryDecision,
+        )
+        decision = classify(
+            failure_class=type(exc).__name__,
+            http_status=http_status,
+            failure_message=str(exc),
+            retry_after_present=retry_after_ts is not None,
+        )
+        return decision is RetryDecision.TRANSIENT_NETWORK
+    except Exception:  # noqa: BLE001 — classification never blocks the caller
+        return False
+
+
+def _dw_transient_backoff_s(attempt: int, retry_after_ts, *, remaining_s: float) -> float:
+    """Backoff before a DW transient retry. Prefers a server-directed
+    ``Retry-After`` timestamp when present, else AWS full-jitter exponential
+    backoff (reused from circuit_breaker). Clamped to a quarter of the
+    remaining op budget and a hard 30s ceiling. Async-sleepable; never raises."""
+    try:
+        base_s = float(os.environ.get("JARVIS_DW_TRANSIENT_BACKOFF_BASE_S", "1.5"))
+    except (TypeError, ValueError):
+        base_s = 1.5
+    try:
+        cap_s = float(os.environ.get("JARVIS_DW_TRANSIENT_BACKOFF_CAP_S", "12.0"))
+    except (TypeError, ValueError):
+        cap_s = 12.0
+    delay: Optional[float] = None
+    try:
+        if retry_after_ts is not None:
+            wait = float(retry_after_ts) - time.time()
+            if wait > 0:
+                delay = wait
+    except (TypeError, ValueError):
+        delay = None
+    if delay is None:
+        try:
+            from backend.core.ouroboros.governance.circuit_breaker import (
+                full_jitter_delay,
+            )
+            delay = full_jitter_delay(attempt, base_s=base_s, cap_s=cap_s)
+        except Exception:  # noqa: BLE001 — degrade to plain expo if helper absent
+            delay = min(cap_s, base_s * (2 ** max(0, attempt)))
+    budget_clamp = (
+        max(0.1, remaining_s * 0.25) if remaining_s and remaining_s > 0 else cap_s
+    )
+    return max(0.1, min(delay, budget_clamp, 30.0))
+
+
 class CandidateGenerator:
     """Orchestrates candidate generation with failover and concurrency control.
 
@@ -6601,39 +6680,76 @@ class CandidateGenerator:
         # stringifying it through RuntimeError(_dw_error).
         _structured_error: Optional[Exception] = None
         if getattr(self._tier0, "_realtime_enabled", False):
-            try:
-                result = await asyncio.wait_for(
-                    self._tier0.generate(context, deadline),
-                    timeout=_dw_timeout,
-                )
-                if result is not None and len(result.candidates) > 0:
-                    logger.info(
-                        "[CandidateGenerator] BACKGROUND: DW produced %d candidates "
-                        "in %.1fs ($%.4f)",
-                        len(result.candidates),
-                        result.generation_duration_s,
-                        getattr(result, "cost_usd", 0.0),
+            # Dynamic 5xx Resiliency Matrix (2026-07-22): absorb a transient
+            # upstream/network blip on the DW primary with a bounded
+            # exponential-backoff-with-jitter retry HERE — before cascading and
+            # before any terminal breaker trip. Async sleep only; the ASGI
+            # event loop is never dropped.
+            _dw_transient_budget = _dw_transient_max_retries()
+            _dw_attempt = 0
+            while True:
+                try:
+                    result = await asyncio.wait_for(
+                        self._tier0.generate(context, deadline),
+                        timeout=_dw_timeout,
                     )
-                    return result
-                _dw_error = "background_dw_empty_result"
-            except asyncio.TimeoutError:
-                _dw_error = f"background_dw_timeout:{_dw_timeout:.0f}s"
-            except Exception as exc:
-                _structured_error = exc  # Slice F preserves the object
-                # Build a richer _dw_error that surfaces status_code
-                # + a body excerpt when available (DoublewordInfraError),
-                # so legacy log-line consumers see ground truth too.
-                _status = getattr(exc, "status_code", None)
-                _body = getattr(exc, "response_body", "") or ""
-                if _status is not None:
-                    _dw_error = (
-                        f"background_dw_error:{type(exc).__name__}:"
-                        f"http_{_status}:{_body[:120]}"
+                    if result is not None and len(result.candidates) > 0:
+                        logger.info(
+                            "[CandidateGenerator] BACKGROUND: DW produced %d candidates "
+                            "in %.1fs ($%.4f)",
+                            len(result.candidates),
+                            result.generation_duration_s,
+                            getattr(result, "cost_usd", 0.0),
+                        )
+                        return result
+                    _dw_error = "background_dw_empty_result"
+                    break
+                except asyncio.TimeoutError:
+                    _dw_error = f"background_dw_timeout:{_dw_timeout:.0f}s"
+                    break
+                except Exception as exc:
+                    _structured_error = exc  # Slice F preserves the object
+                    # Build a richer _dw_error that surfaces status_code
+                    # + a body excerpt when available (DoublewordInfraError),
+                    # so legacy log-line consumers see ground truth too.
+                    _status = getattr(exc, "status_code", None)
+                    _body = getattr(exc, "response_body", "") or ""
+                    _retry_after_ts = getattr(exc, "ratelimit_reset_ts", None)
+                    # Transient network/upstream blip → absorb-and-retry (never
+                    # cascade to a dead fallback, never terminally trip).
+                    _budget_ok = (
+                        self._remaining_seconds(deadline) > _dw_timeout * 0.5
                     )
-                else:
-                    _dw_error = (
-                        f"background_dw_error:{type(exc).__name__}:{exc}"
-                    )
+                    if (
+                        _is_dw_transient_network(exc, _status, _retry_after_ts)
+                        and _dw_attempt < _dw_transient_budget
+                        and _budget_ok
+                    ):
+                        _delay = _dw_transient_backoff_s(
+                            _dw_attempt, _retry_after_ts,
+                            remaining_s=self._remaining_seconds(deadline),
+                        )
+                        logger.warning(
+                            "[CandidateGenerator] BACKGROUND: DW TRANSIENT_NETWORK "
+                            "(%s http_%s) — full-jitter backoff %.1fs, retry %d/%d "
+                            "[%s] (absorbed; no cascade, no terminal trip)",
+                            type(exc).__name__, _status, _delay,
+                            _dw_attempt + 1, _dw_transient_budget,
+                            getattr(context, "op_id", "?")[:16],
+                        )
+                        await asyncio.sleep(_delay)
+                        _dw_attempt += 1
+                        continue
+                    if _status is not None:
+                        _dw_error = (
+                            f"background_dw_error:{type(exc).__name__}:"
+                            f"http_{_status}:{_body[:120]}"
+                        )
+                    else:
+                        _dw_error = (
+                            f"background_dw_error:{type(exc).__name__}:{exc}"
+                        )
+                    break
         else:
             # Legacy batch path
             try:
@@ -8813,6 +8929,17 @@ class CandidateGenerator:
                             failure_mode=_inner_mode.name,
                             failure_message=str(inner_exc),
                             economic_reclassify=_s127_econ_on,
+                            # Dynamic 5xx Resiliency Matrix (2026-07-22): thread
+                            # the provider HTTP status + Retry-After presence
+                            # into the taxonomy (previously omitted). A 5xx /
+                            # upstream_error / 429-with-Retry-After now
+                            # classifies TRANSIENT_NETWORK instead of falling
+                            # through to a terminal decision.
+                            http_status=getattr(inner_exc, "status_code", None),
+                            retry_after_present=(
+                                getattr(inner_exc, "ratelimit_reset_ts", None)
+                                is not None
+                            ),
                         )
                         # Slice 127 Phase 2 — per-provider economic breaker.
                         # The fallback IS the Claude/Anthropic lane; when this

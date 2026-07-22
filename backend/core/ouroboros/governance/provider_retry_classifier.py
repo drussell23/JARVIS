@@ -107,21 +107,34 @@ class RetryDecision(str, enum.Enum):
         Examples: HTTP 401 / 403 / 404, missing model,
         invalid API key.
 
+      * ``TRANSIENT_NETWORK`` — a transient NETWORK / upstream-gateway
+        anomaly that a brief retry absorbs invisibly: the DoubleWord
+        router's ``upstream_error`` (its upstream GPU provider rejected
+        the request), gateway timeouts, all 5xx, and a rate-limit that
+        carries a ``Retry-After`` header (the server told us WHEN to
+        retry). Distinct from ``RETRY_TRANSIENT`` so the orchestrator can
+        drive an exponential-backoff-with-jitter retry loop that NEVER
+        trips the session breaker terminally — the empirical foil from
+        bt-2026-07-22-082657, where a single transient ``upstream_error``
+        was mis-labeled ``terminal_quota`` and killed the whole soak.
+
     The downstream Circuit Breaker maps each decision to a state
     transition:
 
       RETRY_TRANSIENT     → CLOSED (count toward OPEN_TRANSIENT trip)
+      TRANSIENT_NETWORK   → CLOSED (count toward OPEN_TRANSIENT trip; never terminal)
       TERMINAL_STRUCTURAL → OPEN_TERMINAL (1× trip)
       TERMINAL_QUOTA      → OPEN_TERMINAL (Nth within window)
       TERMINAL_CONFIG     → OPEN_TERMINAL (1× trip)
 
-    The 4-value cardinality is AST-pinned in
+    The 5-value cardinality is AST-pinned in
     ``tests/governance/test_provider_retry_classifier.py``."""
 
     RETRY_TRANSIENT     = "retry_transient"
     TERMINAL_STRUCTURAL = "terminal_structural"
     TERMINAL_QUOTA      = "terminal_quota"
     TERMINAL_CONFIG     = "terminal_config"
+    TRANSIENT_NETWORK   = "transient_network"
 
 
 # ============================================================================
@@ -168,10 +181,44 @@ _TERMINAL_QUOTA_CLASSES: frozenset = frozenset({
 
 _HTTP_STATUS_TERMINAL_CONFIG: frozenset = frozenset({401, 403, 404})
 _HTTP_STATUS_TERMINAL_QUOTA: frozenset = frozenset({429})
-# HTTP 5xx and 408 (Request Timeout) are transient.
-_HTTP_STATUS_RETRY_TRANSIENT: frozenset = frozenset({
+# HTTP 5xx and 408 (Request Timeout) are transient NETWORK / gateway
+# anomalies — a brief backoff-retry absorbs them. Routed to the dedicated
+# TRANSIENT_NETWORK class (not RETRY_TRANSIENT) so the orchestrator drives a
+# backoff-with-jitter loop that never terminally trips the session breaker.
+_HTTP_STATUS_TRANSIENT_NETWORK: frozenset = frozenset({
     408, 500, 502, 503, 504,
 })
+
+
+# Case-insensitive substrings in a provider failure MESSAGE that mark a
+# transient upstream/gateway anomaly regardless of the HTTP status code. The
+# DoubleWord router surfaces its upstream GPU-provider rejection as an
+# ``upstream_error`` in a 400 body — a 4xx status that is nonetheless
+# retryable, so status alone under-classifies it. Matched only against the
+# public error text, never against secrets.
+_TRANSIENT_NETWORK_MESSAGE_MARKERS: tuple = (
+    "upstream_error",
+    "upstream provider rejected",
+    "bad gateway",
+    "gateway timeout",
+    "service unavailable",
+    "temporarily unavailable",
+    "connection reset",
+    "connection aborted",
+)
+
+
+def _is_transient_network_message(message: Optional[str]) -> bool:
+    """True when *message* carries a transient upstream/gateway marker.
+
+    Pure string check over public error text; never raises, never inspects
+    secrets. Used to route the DoubleWord ``upstream_error`` (a retryable 400)
+    to ``TRANSIENT_NETWORK`` before the HTTP-status table under-classifies it.
+    """
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(marker in lowered for marker in _TRANSIENT_NETWORK_MESSAGE_MARKERS)
 
 
 # ============================================================================
@@ -268,6 +315,7 @@ def classify(
     http_status: Optional[int] = None,
     failure_message: Optional[str] = None,
     economic_reclassify: bool = False,
+    retry_after_present: bool = False,
 ) -> RetryDecision:
     """Classify a provider failure into a closed RetryDecision.
 
@@ -358,14 +406,30 @@ def classify(
         if failure_class in _TERMINAL_QUOTA_CLASSES:
             return RetryDecision.TERMINAL_QUOTA
 
+    # Priority 1.5: transient upstream/gateway MESSAGE markers. The DoubleWord
+    # router's ``upstream_error`` arrives as a 400 body — a 4xx status the HTTP
+    # table below would under-classify — yet it is a retryable upstream blip.
+    # Catch it here (after the terminal registries, before the status table) so
+    # it routes to TRANSIENT_NETWORK and drives the backoff-retry loop instead
+    # of a terminal breaker trip.
+    if _is_transient_network_message(failure_message):
+        return RetryDecision.TRANSIENT_NETWORK
+
     # Priority 2: HTTP status table (dispositive when present).
     if http_status is not None:
         if http_status in _HTTP_STATUS_TERMINAL_CONFIG:
             return RetryDecision.TERMINAL_CONFIG
         if http_status in _HTTP_STATUS_TERMINAL_QUOTA:
+            # 429 with a ``Retry-After`` header is a SERVER-DIRECTED backoff —
+            # the server told us WHEN to retry, so it is transient, not a
+            # terminal quota wall. Only a 429 WITHOUT Retry-After is the
+            # effectively-terminal quota refusal (Dynamic 5xx Resiliency
+            # Matrix, 2026-07-22).
+            if retry_after_present:
+                return RetryDecision.TRANSIENT_NETWORK
             return RetryDecision.TERMINAL_QUOTA
-        if http_status in _HTTP_STATUS_RETRY_TRANSIENT:
-            return RetryDecision.RETRY_TRANSIENT
+        if http_status in _HTTP_STATUS_TRANSIENT_NETWORK:
+            return RetryDecision.TRANSIENT_NETWORK
 
     # Priority 3: FailureMode default table.
     if failure_mode and failure_mode in _FAILURE_MODE_DEFAULT:

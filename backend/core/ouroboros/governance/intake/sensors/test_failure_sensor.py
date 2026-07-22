@@ -245,6 +245,46 @@ def boot_hydration_enabled() -> bool:
     ).lower() in ("true", "1", "yes")
 
 
+# --- Test-Cache-First boot hydration (state-hashing blind-spot fix) --------
+#
+# The working-tree/Merkle hydration above keys on CONTENT CHANGE: a red test
+# whose file hash is unchanged since the last snapshot (``walk_changed=0``) is
+# invisible to it — the failure predates the snapshot, so no ``fs.changed``
+# fires and the git-diff finds a clean tree. That is a *persistent
+# environmental defect*, and pytest already persists it in its own
+# ``.pytest_cache/v/cache/lastfailed`` ledger (survives process restarts).
+#
+# This layer reads that ledger BEFORE the hash diff and seeds a repair for
+# each unresolved red — independent of whether any file hash changed. It emits
+# through the SAME ``process_failures`` -> ``handle_signals`` -> ``router.ingest``
+# sink every other path uses (DRY), treating the cache as the FIRST observation
+# of each failure so the 2-consecutive-runs stability contract is honored with
+# the cache standing in for the prior run it recorded.
+
+
+def cache_first_hydration_enabled() -> bool:
+    """Re-read ``JARVIS_TEST_FAILURE_CACHE_FIRST_ENABLED`` (default true).
+
+    Not cached so tests can monkeypatch per-case (same pattern as
+    ``boot_hydration_enabled``). OFF -> byte-identical legacy boot (the
+    git-diff working-tree hydration only, no pytest-cache consultation).
+    """
+    return os.environ.get(
+        "JARVIS_TEST_FAILURE_CACHE_FIRST_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _cache_first_max_files() -> int:
+    """Bound the cache-first synthetic seed count (default 16) so a large
+    persisted red suite cannot flood intake at boot. Fail-soft to 16."""
+    try:
+        return max(
+            1, int(os.environ.get("JARVIS_TEST_FAILURE_CACHE_FIRST_MAX_FILES", "16"))
+        )
+    except (TypeError, ValueError):
+        return 16
+
+
 _HYDRATION_DEDUP_TTL_S: float = float(
     os.environ.get("JARVIS_TESTWATCHER_HYDRATION_DEDUP_TTL_S", "120")
 )
@@ -755,6 +795,107 @@ class TestFailureSensor:
             return False
         return True
 
+    def _pytest_lastfailed_path(self) -> Path:
+        """Path to pytest's persisted ``lastfailed`` ledger under the repo
+        root — the SAME ``.git``-anchored root the git-diff + scoped resolver
+        use (``_repo_root``), so the cache and the failure loci agree."""
+        return self._repo_root() / ".pytest_cache" / "v" / "cache" / "lastfailed"
+
+    def _read_pytest_lastfailed(self) -> List[str]:
+        """Read pytest's ``lastfailed`` cache -> list of failing node-ids.
+
+        The file is a JSON object mapping ``nodeid -> true`` for every test
+        that failed in pytest's most recent run (pytest's own persisted
+        ground truth). Missing / unreadable / malformed -> ``[]``. Only
+        truthy, path-shaped keys are kept. Never raises.
+        """
+        path = self._pytest_lastfailed_path()
+        try:
+            if not path.is_file():
+                return []
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(data, dict):
+            return []
+        return [str(k) for k, v in data.items() if v and ".py" in str(k)]
+
+    async def hydrate_from_pytest_cache(self) -> int:
+        """Test-Cache-First boot hydration — seed persistent reds the hash
+        diff cannot see (``walk_changed=0``).
+
+        An event-driven sensor keyed on file-hash change is blind to a red
+        test whose source did NOT change since the last snapshot: the failure
+        predates the snapshot, so no ``fs.changed`` fires and the git-diff
+        hydration finds a clean tree. That is a persistent ENVIRONMENTAL
+        defect — and pytest already records it. This layer reads pytest's own
+        ``lastfailed`` ledger and constructs synthetic failure signals for each
+        unresolved red, independent of any hash diff.
+
+        DRY: emits through the SAME ``process_failures`` ->
+        ``handle_signals`` -> ``router.ingest`` sink every other path uses.
+        The cache is treated as the FIRST observation of each failure (streak
+        seeded to 1, never downgrading a higher live streak), so a single
+        ``process_failures`` pass promotes it past the 2-consecutive-runs
+        stability threshold — the cache standing in for the prior run it
+        persisted. Each seeded file is recorded in ``_hydrated_keys`` so a
+        redundant live ``fs.changed`` for it is de-duped.
+
+        Gated ``JARVIS_TEST_FAILURE_CACHE_FIRST_ENABLED`` (default true);
+        OFF / no watcher / empty cache -> 0 with no side effects. Fail-soft:
+        any error logs at DEBUG and returns the count so far.
+        """
+        if not cache_first_hydration_enabled() or self._watcher is None:
+            return 0
+        reds = self._read_pytest_lastfailed()
+        if not reds:
+            return 0
+        cap = _cache_first_max_files()
+        now = time.monotonic()
+        failures: List[TestFailure] = []
+        streaks = getattr(self._watcher, "_failure_streak", None)
+        for nodeid in reds[:cap]:
+            test_file = nodeid.split("::", 1)[0]
+            # The cache IS the prior observation → seed streak to 1 so one
+            # process_failures pass reaches the stable (>=2) threshold. Never
+            # downgrade an existing (higher) live streak.
+            if isinstance(streaks, dict):
+                streaks[nodeid] = max(streaks.get(nodeid, 0), 1)
+            failures.append(
+                TestFailure(
+                    test_id=nodeid,
+                    file_path=test_file,
+                    error_text=(
+                        "pytest lastfailed cache: persistent unresolved failure"
+                    ),
+                )
+            )
+            self._hydrated_keys[test_file] = now
+        if not failures:
+            return 0
+        try:
+            if attribution_enabled():
+                await prewarm_module_map(self._watcher.repo_path)
+        except Exception:
+            logger.debug("[CacheFirstHydration] prewarm failed", exc_info=True)
+        try:
+            signals = self._watcher.process_failures(failures)
+        except Exception:
+            logger.debug(
+                "[CacheFirstHydration] process_failures failed", exc_info=True
+            )
+            return 0
+        ingested = 0
+        if signals:
+            results = await self.handle_signals(signals)
+            ingested = sum(1 for r in results if r is not None)
+            logger.info(
+                "[CacheFirstHydration] %d persistent red(s) from pytest cache "
+                "-> %d stable signal(s) ingested (merkle-diff-independent)",
+                len(failures), len(signals),
+            )
+        return ingested
+
     async def hydrate_on_boot(self) -> int:
         """Reconstruct + scope-run tests for pre-boot working-tree changes.
 
@@ -772,19 +913,30 @@ class TestFailureSensor:
         any error logs at DEBUG and returns the count so far -- boot is never
         crashed.
         """
-        if not boot_hydration_enabled() or self._watcher is None:
+        if self._watcher is None:
             return 0
+        ingested = 0
+        # Test-Cache-First layer (independent gate): seed persistent reds the
+        # working-tree/Merkle hash diff cannot see (walk_changed=0), BEFORE the
+        # git-diff hydration consults any file hash.
+        try:
+            ingested += await self.hydrate_from_pytest_cache()
+        except Exception:
+            logger.debug("[BootHydration] cache-first layer failed", exc_info=True)
+        # Working-tree differential hydration (git diff HEAD) — its own gate.
+        if not boot_hydration_enabled():
+            self._boot_hydrated = True
+            return ingested
         try:
             changed = await self._watcher.diff_working_tree()
         except Exception:
             logger.debug("[BootHydration] diff_working_tree failed", exc_info=True)
-            return 0
+            return ingested
         if not changed:
             logger.debug("[BootHydration] clean working tree -- nothing to hydrate")
             self._boot_hydrated = True
-            return 0
+            return ingested
 
-        ingested = 0
         now = time.monotonic()
         for rel in changed:
             try:
