@@ -4156,6 +4156,21 @@ class GovernedLoopService:
                     await _intake.release_op(ctx.op_id)
                 except Exception:
                     pass
+            # Universal Terminal-State Lock Releaser: the GUARANTEED terminal
+            # seam. Every op — promoted, failed, tombstoned, conflict-aborted —
+            # exits through here, so bridging it to the central releaser revokes
+            # the ingress-side target locks (TestFailureSensor ``_pending_target_keys``)
+            # that ``release_op`` above does NOT clear. Closes the sensor-side
+            # wedge (soak bt-2026-07-22-174240). Best-effort; never leaks.
+            try:
+                from backend.core.ouroboros.governance.terminal_lock_releaser import (  # noqa: E501
+                    release_locks_for_op as _release_ingress_locks,
+                )
+                _release_ingress_locks(
+                    ctx.op_id, getattr(ctx, "target_files", None),
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # Phase 4: clean up per-op FSM context
             self._fsm_contexts.pop(ctx.op_id, None)
             self._fsm_checkpoint_seq.pop(ctx.op_id, None)
