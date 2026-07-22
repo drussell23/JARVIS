@@ -80,6 +80,43 @@ class PromotionOutcome:
     detail: str = ""
 
 
+async def _derive_operator_root(
+    mgr: "WorktreeManager", exec_root: Path,
+) -> Optional[Path]:
+    """The operator checkout that owns ``exec_root``, from git topology.
+
+    A linked worktree's ``git rev-parse --git-common-dir`` resolves to
+    ``<operator>/.git`` (the shared object store lives under the primary
+    checkout); its parent IS the operator root. A primary checkout's
+    common dir is its own ``.git`` — the caller treats that as
+    "genuinely same root". Read-time, env-free, hardcode-free. Returns
+    ``None`` on any git failure (fail-soft — caller falls back to the
+    legacy noop). NEVER raises.
+    """
+    try:
+        rc, out, _err = await mgr._run_git_rc(
+            exec_root, ["rev-parse", "--git-common-dir"],
+        )
+        common = (out or "").strip()
+        if rc != 0 or not common:
+            return None
+        common_path = Path(common)
+        if not common_path.is_absolute():
+            common_path = (exec_root / common_path)
+        common_path = Path(os.path.realpath(common_path))
+        # <operator>/.git → operator root is its parent. Defensive: a
+        # bare/odd layout that doesn't end in .git is not derivable.
+        if common_path.name != ".git":
+            return None
+        return common_path.parent
+    except Exception:  # noqa: BLE001 — derivation is fail-soft
+        logger.debug(
+            "[WorkspacePromoter] operator-root derivation failed for %s",
+            exec_root, exc_info=True,
+        )
+        return None
+
+
 async def run_workspace_promotion(
     orch: Any,
     ctx: Any,
@@ -98,11 +135,41 @@ async def run_workspace_promotion(
 
     project_root = Path(orch._config.project_root)
     exec_root = Path(orch._config.execution_root)
+
+    mgr = manager if manager is not None else WorktreeManager(
+        repo_root=project_root,
+    )
+
     if exec_root == Path(os.path.realpath(project_root)) or (
         exec_root == project_root
     ):
-        # Legacy posture: the commit already landed in the operator tree.
-        return PromotionOutcome(False, False, "noop_same_root")
+        # Isolation-collapsed posture (2026-07-22, soak
+        # bt-2026-07-22-042548): FileIsolation
+        # (autonomous_workspace.resolve_loop_project_root) routes the
+        # LOOP's project_root INTO the sovereignty worktree at arming,
+        # so config carries worktree == worktree and the OPERATOR tree
+        # vanishes from every config field — the old "noop_same_root"
+        # early-return made promotion structurally unreachable (it
+        # silently skipped on every op of every isolation-armed soak).
+        # Git itself still knows the operator checkout: a linked
+        # worktree's ``--git-common-dir`` lives under it. Derive the
+        # TRUE promotion target from git topology at read time —
+        # env-free, hardcode-free, and inert for a genuinely-primary
+        # checkout (whose common dir is its own ``.git``).
+        _derived = await _derive_operator_root(mgr, exec_root)
+        if _derived is None or _derived == Path(
+            os.path.realpath(exec_root)
+        ):
+            # Genuinely the primary checkout — commit already lives on
+            # the operator tree; nothing to promote.
+            return PromotionOutcome(False, False, "noop_same_root")
+        logger.info(
+            "[WorkspacePromoter] isolation-collapsed config detected — "
+            "derived operator root %s from worktree git topology "
+            "(exec_root=%s)",
+            _derived, exec_root,
+        )
+        project_root = _derived
 
     op_id = getattr(ctx, "op_id", "")
     comm = getattr(getattr(orch, "_stack", None), "comm", None)
@@ -193,9 +260,7 @@ async def run_workspace_promotion(
                 % list(_stale)[:3],
             )
 
-    mgr = manager if manager is not None else WorktreeManager(
-        repo_root=project_root,
-    )
+    # (mgr constructed above, before the operator-root derivation.)
 
     # Branch discovery from the workspace checkout itself — self-contained,
     # no coupling to session-id/nonce derivation.

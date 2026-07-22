@@ -11923,8 +11923,11 @@ class GovernedOrchestrator:
                     coverage_after=getattr(ctx, "coverage_after", 0.0),
                     complexity_before=getattr(ctx, "complexity_before", 0.0),
                     complexity_after=getattr(ctx, "complexity_after", 0.0),
-                    lint_before=getattr(ctx, "lint_before", 0),
-                    lint_after=getattr(ctx, "lint_after", 0),
+                    # RSI-score signature drift fix (2026-07-22 — inline
+                    # twin of complete_runner; keyword names are
+                    # lint_violations_*).
+                    lint_violations_before=getattr(ctx, "lint_before", 0),
+                    lint_violations_after=getattr(ctx, "lint_after", 0),
                     blast_radius_total=getattr(ctx, "blast_radius_total", 0),
                 )
                 logger.info("[RSI Score] op=%s composite=%.4f", ctx.op_id, _score.composite)
