@@ -833,6 +833,48 @@ class WorktreeManager:
         except OSError as exc:
             return 127, "", str(exc)
 
+    async def _run_git_rc_ex(
+        self,
+        root: Path,
+        args: Sequence[str],
+        *,
+        stdin_data: "Optional[bytes]" = None,
+        extra_env: "Optional[Dict[str, str]]" = None,
+    ) -> Tuple[int, str, str]:
+        """``_run_git_rc`` with per-SPAWN stdin + env overrides.
+
+        Added for the pending-ref object-surgery plumbing (2026-07-22):
+        ``hash-object --stdin`` needs a stdin channel, and the
+        throwaway-index weave needs ``GIT_INDEX_FILE`` scoped to ONE
+        subprocess — mutating ``os.environ`` around awaits would leak
+        the override into every concurrently spawned git call on the
+        loop (race). The env copy is per-spawn; nothing global changes.
+        """
+        cmd = ["git", "-C", str(root), *args]
+        env = None
+        if extra_env:
+            env = dict(os.environ)
+            env.update(extra_env)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=(
+                    asyncio.subprocess.PIPE
+                    if stdin_data is not None else None
+                ),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            out, err = await proc.communicate(input=stdin_data)
+            return (
+                proc.returncode or 0,
+                out.decode(errors="replace"),
+                err.decode(errors="replace"),
+            )
+        except OSError as exc:
+            return 127, "", str(exc)
+
     @staticmethod
     def _baseline_exempt_dirty(
         target: Path,

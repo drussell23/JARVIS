@@ -1490,7 +1490,15 @@ class Slice4bRunner(PhaseRunner):
             # after 8b resolves — the true written state, on EVERY branch
             # (a refused promotion registers written=False explicitly).
             orch._emit_terminal_durability_probe(ctx, _committed_hash, _promo)
-            if _promo.attempted and not _promo.promoted:
+            # In-Memory Object Surgery (2026-07-22): a PENDING outcome
+            # (change parked on ouroboros/pending/<op> via
+            # non-destructive object surgery) is NOT a failure — the
+            # quiescence fast-forwarder or a human review completes the
+            # integration; the op proceeds as applied+committed.
+            if (
+                _promo.attempted and not _promo.promoted
+                and not getattr(_promo, "pending", False)
+            ):
                 return PhaseResult(
                     next_ctx=ctx, next_phase=None, status="fail",
                     reason="promotion_failed:%s" % _promo.state,
