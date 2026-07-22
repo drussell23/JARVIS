@@ -3715,6 +3715,180 @@ class CandidateGenerator:
             "provider_override_unavailable:gcp-jprime:no_endpoint"
         )
 
+    def _swarm_routing_enabled(self) -> bool:
+        """Dynamic toggle (env ``JARVIS_SWARM_ROUTING_ENABLED``, default OFF) —
+        WORKSPACE_PROMOTION-style, no code mutation to flip. Off → the
+        short-circuit is a strict no-op and the standard generation route is
+        byte-identical."""
+        return os.environ.get(
+            "JARVIS_SWARM_ROUTING_ENABLED", "false",
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+    def _read_source_for_swarm(self, rel_or_abs: str) -> Optional[str]:
+        """Read a target file's current on-disk content (repo_root-joined).
+        Returns None on any miss → the short-circuit declines. Never raises."""
+        try:
+            repo_root = getattr(self, "_repo_root", None)
+            path = rel_or_abs
+            if repo_root and not os.path.isabs(rel_or_abs):
+                path = os.path.join(repo_root, rel_or_abs)
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _swarm_frames_from_ctx(self, context: OperationContext) -> Tuple[str, ...]:
+        """Best-effort extraction of failing-test traceback frames from the
+        op's intake evidence (feeds the resolver's deterministic pass). Empty
+        on any miss — the resolver then falls to the goal-keyword pass."""
+        raw = getattr(context, "intake_evidence_json", "") or ""
+        if not raw:
+            return ()
+        try:
+            import json as _json
+            data = _json.loads(raw)
+        except (ValueError, TypeError):
+            return ()
+        if not isinstance(data, dict):
+            return ()
+        for key in ("traceback_frames", "traceback", "frames"):
+            v = data.get(key)
+            if isinstance(v, (list, tuple)):
+                return tuple(str(x) for x in v)
+            if isinstance(v, str) and v.strip():
+                return (v,)
+        return ()
+
+    async def _maybe_swarm_short_circuit(
+        self, context: OperationContext, deadline: datetime,
+    ) -> Optional[GenerationResult]:
+        """Route a CONFIRMED big-file op through the Agentic Swarm interceptor,
+        returning a ``GenerationResult`` that short-circuits normal generation.
+
+        Returns ``None`` — falling through to the standard route BYTE-IDENTICAL —
+        whenever the dynamic flag is off, the route is cost-optimized, the file
+        is small, the swarm stack is unavailable, or the ``TargetSymbolResolver``
+        FAILS CLOSED (no confident target). Structured concurrency: a parent
+        cancellation/timeout is re-raised cleanly so the interceptor's swarm
+        tasks + DW sockets (its awaited children) tear down with no ghost tasks.
+        """
+        if not self._swarm_routing_enabled():
+            return None
+        route = (getattr(context, "provider_route", "") or "standard").lower()
+        if route in ("background", "speculative"):
+            return None  # cost-optimized routes never fan out a swarm
+        target_files = tuple(getattr(context, "target_files", ()) or ())
+        if not target_files:
+            return None
+        path = target_files[0]
+        source = self._read_source_for_swarm(path)
+        if source is None:
+            return None
+        try:
+            from backend.core.ouroboros.governance.chunked_generation import (
+                is_big_file,
+            )
+            from backend.core.ouroboros.governance.target_symbol_resolver import (
+                resolve_target_symbols,
+            )
+            from backend.core.ouroboros.governance.full_content_interceptor import (
+                intercept_full_content,
+            )
+            from backend.core.ouroboros.governance.agent_turn_adapter import (
+                ProductionAgentTurnFn,
+            )
+        except Exception:  # noqa: BLE001 — swarm stack absent → standard route
+            return None
+        if not is_big_file(source):
+            return None
+
+        res = resolve_target_symbols(
+            source=source, file_path=path,
+            traceback_frames=self._swarm_frames_from_ctx(context),
+            source_loci=target_files,
+            goal=getattr(context, "description", "") or "",
+        )
+        if not res.resolved:
+            logger.info(
+                "[CandidateGenerator] swarm: resolver FAIL-CLOSED for %s — "
+                "standard route preserved", path,
+            )
+            return None
+
+        try:
+            from backend.core.ouroboros.governance.providers import (
+                _CODEGEN_SYSTEM_PROMPT as _sys_prompt,
+            )
+        except Exception:  # noqa: BLE001
+            _sys_prompt = ""
+
+        agent = ProductionAgentTurnFn(
+            client=self._client,
+            tool_backend=None,                       # pure-completion node repair (v1)
+            repo_root=getattr(self, "_repo_root", "."),
+            op_id=getattr(context, "op_id", ""),
+            model_name=getattr(self._client, "_model", "") or "",  # client default, no hardcode
+            system_prompt=_sys_prompt,
+            parse_fn=lambda raw: None,               # single-shot node completion
+            max_turns=1,
+        )
+        t0 = time.monotonic()
+        try:
+            result = await intercept_full_content(
+                source, path, list(res.symbol_names), agent,
+                op_id=getattr(context, "op_id", ""),
+            )
+        except asyncio.CancelledError:
+            # Structured concurrency: awaiting the interceptor makes its swarm
+            # tasks + DW sockets children of THIS task; cancellation has already
+            # torn them down. Re-raise cleanly — NEVER swallow (no ghost tasks).
+            logger.info(
+                "[CandidateGenerator] swarm CANCELLED for %s — clean teardown", path,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 — any swarm fault → standard route
+            logger.warning(
+                "[CandidateGenerator] swarm error for %s: %s — standard route",
+                path, exc,
+            )
+            return None
+
+        if (
+            getattr(result, "drifted", False)
+            or not getattr(result, "stitched", False)
+            or not getattr(result, "content", "")
+        ):
+            logger.info(
+                "[CandidateGenerator] swarm no-stitch/drift for %s — standard route",
+                path,
+            )
+            return None
+
+        dur = time.monotonic() - t0
+        rationale = (
+            f"agentic swarm ({res.method}, conf={res.confidence:.2f}): "
+            f"primary={list(res.primary)} cluster={list(res.cluster)} "
+            f"converged={list(result.converged_nodes)} "
+            f"rag_recovered={list(result.rag_recovered_nodes)}"
+        )
+        logger.info(
+            "[CandidateGenerator] SWARM short-circuit LANDED for %s: %s [%.1fs]",
+            path, rationale, dur,
+        )
+        return GenerationResult(
+            candidates=(
+                {
+                    "candidate_id": f"swarm-{getattr(context, 'op_id', '')[:8]}",
+                    "file_path": path,
+                    "full_content": result.content,
+                    "rationale": rationale,
+                },
+            ),
+            provider_name="doubleword-agentic-swarm",
+            generation_duration_s=dur,
+            model_id=getattr(self._client, "_model", "") or "",
+        )
+
     async def _generate_dispatch(
         self,
         context: OperationContext,
@@ -3738,6 +3912,16 @@ class CandidateGenerator:
         _override_result = await self._honor_provider_override(context, deadline)
         if _override_result is not None:
             return _override_result
+
+        # ── Big-file Agentic Swarm short-circuit (default-OFF; fail-closed) ──
+        # When JARVIS_SWARM_ROUTING_ENABLED and the op targets a big file with a
+        # deterministically-resolvable symbol, route through the swarm
+        # interceptor instead of whole-file generation. Returns None (standard
+        # route, byte-identical) on the flag being off / small file / resolver
+        # fail-closed. CancelledError propagates (structured concurrency).
+        _swarm_result = await self._maybe_swarm_short_circuit(context, deadline)
+        if _swarm_result is not None:
+            return _swarm_result
 
         # ── Route-based dispatch (Manifesto §5 Tier 0: deterministic) ──
         _provider_route = getattr(context, "provider_route", "") or "standard"
