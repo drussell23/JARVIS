@@ -86,6 +86,19 @@ class BlockedPathError(Exception):
     """
 
 
+class PathTraversalError(BlockedPathError):
+    """A candidate write path escapes the sandboxed write root.
+
+    Path Canonicalization Sandbox (2026-07-21, soak bt-2026-07-21-230753):
+    raised when :func:`canonicalize_candidate_path` proves — via strict
+    ``realpath`` resolution, never string surgery — that an LLM-supplied
+    target resolves OUTSIDE the write root (``../`` climb, absolute host
+    path, symlink escape). Subclasses :class:`BlockedPathError` so every
+    existing fail-closed catch site handles it identically; the distinct
+    type gives callers + telemetry a precise traversal taxonomy.
+    """
+
+
 # Hardcoded — NO env off-switch. The immovability IS the security property
 # (mirrors the Immutable-Orange protocol). These are the governance files that
 # enforce safety; a compromised or hallucinating model must never be able to
@@ -106,6 +119,110 @@ _IMMUTABLE_GOVERNANCE_SENTINELS: frozenset = frozenset({
     "backend/core/ouroboros/governance/governed_loop_service",
     "backend/core/ouroboros/governance/intake/unified_intake_router",
 })
+
+
+# ---------------------------------------------------------------------------
+# Path Canonicalization Sandbox (2026-07-21 — soak bt-2026-07-21-230753)
+# ---------------------------------------------------------------------------
+# Root cause: _redirect_target joined ANY relative candidate path verbatim
+# onto the write root. A model payload that embedded the write root's own
+# path suffix (the soak case: the worktree's absolute path minus the home
+# prefix) therefore DOUBLED the root —
+#   <worktree>/Documents/repos/.../<worktree>/backend/soak_probes/x.py
+# — a path that is CONTAINED (passes assert_write_path_allowed) but
+# nonsensical, surfacing later as a hard APPLY ENOENT. The canonicalizer
+# below composes the target mathematically: pure Path-component alignment
+# against the resolved root (never str.replace / regex), iterative so
+# multiply-duplicated prefixes collapse, then a strict realpath containment
+# proof that raises PathTraversalError on any escape.
+
+_PATH_CANONICALIZATION_ENV = "JARVIS_CHANGE_PATH_CANONICALIZATION_ENABLED"
+
+# A root-suffix alignment must span at least this many path components to
+# count as prefix duplication. Guards against false positives on a genuine
+# repo file whose first component coincidentally matches the root's last
+# directory name (a 1-component overlap); the duplication class this kills
+# always re-enters through multiple components.
+_MIN_ROOT_SUFFIX_COMPONENTS = 2
+
+
+def _path_canonicalization_enabled() -> bool:
+    """Master flag — default TRUE. Falsey restores the legacy verbatim
+    ``root / rel`` join (the pre-repair behavior, doubling included)."""
+    raw = os.environ.get(_PATH_CANONICALIZATION_ENV, "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def canonicalize_candidate_path(raw: "Path | str", write_root: Path) -> Path:
+    """Compose an LLM-supplied target into a canonical path under *write_root*.
+
+    Strict ``pathlib`` mathematics — no string substitution:
+
+    1. Resolve *write_root* (``Path.resolve()`` — symlink- and ``..``-proof).
+    2. If *raw* is absolute and already under the root, take its
+       ``relative_to(root)`` parts; an absolute path NOT under the root
+       raises :class:`PathTraversalError` (the caller decides whether a
+       project-root rebase applies BEFORE calling this).
+    3. Iteratively strip prefix duplication: while the leading components of
+       the relative path equal a suffix (>= ``_MIN_ROOT_SUFFIX_COMPONENTS``
+       long, longest-match-first) of the resolved root's components, drop
+       them. This mathematically collapses every "root re-entry" shape —
+       full-root echo, home-stripped echo (the soak case), and repeated
+       duplication — regardless of how the model formatted the payload.
+    4. Re-join to the root, ``realpath``-resolve, and PROVE containment via
+       ``relative_to``; any escape (``..`` climb, symlink redirect) raises
+       :class:`PathTraversalError`. A path that degenerates to the root
+       itself (no file component left) also raises — it is not a writable
+       target.
+
+    Raises
+    ------
+    PathTraversalError
+        When the resolved candidate escapes *write_root*, resolves to the
+        root itself, or is an absolute path outside the root.
+    """
+    root = Path(write_root).resolve()
+    p = Path(str(raw).strip()).expanduser()
+
+    if p.is_absolute():
+        resolved_p = Path(os.path.realpath(os.path.abspath(str(p))))
+        try:
+            rel_parts = list(resolved_p.relative_to(root).parts)
+        except ValueError:
+            raise PathTraversalError(
+                f"absolute candidate path outside write_root: "
+                f"{resolved_p} not under {root}"
+            )
+    else:
+        rel_parts = [c for c in p.parts if c != "."]
+
+    root_parts = root.parts
+    stripped = True
+    while stripped and rel_parts:
+        stripped = False
+        max_k = min(len(root_parts), len(rel_parts))
+        for k in range(max_k, _MIN_ROOT_SUFFIX_COMPONENTS - 1, -1):
+            if tuple(rel_parts[:k]) == tuple(root_parts[-k:]):
+                del rel_parts[:k]
+                stripped = True
+                break
+
+    if not rel_parts:
+        raise PathTraversalError(
+            f"candidate path degenerates to the write_root itself "
+            f"(no file component): raw={str(raw)!r} root={root}"
+        )
+
+    candidate = root.joinpath(*rel_parts)
+    resolved = Path(os.path.realpath(os.path.abspath(str(candidate))))
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise PathTraversalError(
+            f"candidate path escapes write_root after resolution: "
+            f"{resolved} not under {root} (raw={str(raw)!r})"
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +282,11 @@ def assert_write_path_allowed(target: Path, write_root: Path) -> None:
         real = os.path.realpath(os.path.abspath(str(target)))
         root = os.path.realpath(os.path.abspath(str(write_root)))
 
-        # 1. Containment
+        # 1. Containment — a proven escape raises the precise traversal
+        #    taxonomy (PathTraversalError subclasses BlockedPathError, so
+        #    every existing fail-closed catch handles it identically).
         if not (real == root or real.startswith(root + os.sep)):
-            raise BlockedPathError(
+            raise PathTraversalError(
                 f"path escapes write_root: {real} not under {root}"
             )
 
@@ -596,8 +715,18 @@ class ChangeEngine:
         root and no env override). Absolute paths are rebased by their path
         relative to ``project_root``; relative paths are joined to the write
         root. A target NOT under ``project_root`` is left unchanged (defensive —
-        never silently cross-write elsewhere). NEVER raises — falls back to the
-        original target on any resolution error.
+        never silently cross-write elsewhere).
+
+        Path Canonicalization Sandbox (2026-07-21): the rebase-branch join is
+        now composed via :func:`canonicalize_candidate_path` — pure
+        Path-component mathematics that collapses write-root prefix
+        duplication (the bt-2026-07-21-230753 doubled-path APPLY ENOENT) and
+        PROVES containment. Raise contract: resolution errors still fall back
+        to the original target (legacy defensive behavior), but a PROVEN
+        sandbox escape raises :class:`PathTraversalError` — fail-closed
+        through ``execute``'s outer handler, never a silent cross-write.
+        Master ``JARVIS_CHANGE_PATH_CANONICALIZATION_ENABLED`` (default TRUE;
+        falsey restores the verbatim legacy join).
         """
         root = self._effective_write_root(request_write_root)
         try:
@@ -607,7 +736,11 @@ class ChangeEngine:
                 rel = target.resolve().relative_to(self._project_root.resolve())
             else:
                 rel = target
+            if _path_canonicalization_enabled():
+                return canonicalize_candidate_path(rel, root)
             return root / rel
+        except PathTraversalError:
+            raise  # proven escape — fail closed, never a silent cross-write
         except (ValueError, OSError):
             # Not under project_root (or unresolvable) — leave as-is.
             return target
@@ -731,6 +864,33 @@ class ChangeEngine:
                 success=False,
                 phase_reached=ChangePhase.PLAN,
                 error="POLICY_DENIED reason=generation_fenced",
+            )
+
+        # Atomic Flush & Freeze (2026-07-21) — the anti-cascade latch, same
+        # chokepoint doctrine as the generation fence above: once a prior
+        # successful APPLY has flushed its diff and spent the mutation
+        # budget, every further governed write short-circuits HERE, before
+        # any byte is staged, until a human reviews the parked diff.
+        # Master JARVIS_APPLY_FLUSH_FREEZE_ENABLED (default OFF).
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            apply_flush_freeze as _apply_flush_freeze,
+        )
+        if _apply_flush_freeze.flush_freeze_enabled() and (
+            _apply_flush_freeze.is_frozen()
+        ):
+            logger.warning(
+                "[ApplyFlushFreeze] mutation DENIED at ChangeEngine "
+                "(frozen pending review: %s) op=%s target=%s",
+                _apply_flush_freeze.freeze_snapshot().get(
+                    "frozen_reason", "?",
+                ),
+                op_id, request.target_file,
+            )
+            return ChangeResult(
+                op_id=op_id,
+                success=False,
+                phase_reached=ChangePhase.PLAN,
+                error=_apply_flush_freeze.FROZEN_DENIAL_REASON,
             )
 
         try:
@@ -1156,6 +1316,38 @@ class ChangeEngine:
                 failed_phase=None,
                 next_safe_action="none",
             )
+
+            # Atomic Flush & Freeze (2026-07-21) — the SUCCESS seam: the
+            # write is durable (2PC VERIFY passed, APPLIED recorded), so
+            # capture the mutation's git diff, persist + flush it through
+            # the HiveEmitter edge, and close the freeze latch (park
+            # further mutations pending human review). Fail-soft: a
+            # degraded capture/flush never un-succeeds the APPLY; the
+            # latch closes regardless inside flush_and_freeze.
+            if _apply_flush_freeze.flush_freeze_enabled():
+                try:
+                    _write_root = self._effective_write_root(
+                        getattr(request, "write_root", None),
+                    )
+                    _rel_target = str(target)
+                    try:
+                        _rel_target = str(
+                            target.relative_to(Path(_write_root).resolve())
+                        )
+                    except ValueError:
+                        pass
+                    await _apply_flush_freeze.flush_and_freeze(
+                        op_id,
+                        [_rel_target],
+                        Path(_write_root),
+                        goal=str(getattr(request, "goal", "") or ""),
+                    )
+                except Exception:  # noqa: BLE001 — never break the result
+                    logger.warning(
+                        "[ApplyFlushFreeze] post-APPLY hook degraded "
+                        "op=%s (APPLY result unaffected)",
+                        op_id, exc_info=True,
+                    )
 
             return ChangeResult(
                 op_id=op_id,
