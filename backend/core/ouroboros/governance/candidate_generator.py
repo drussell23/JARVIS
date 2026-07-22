@@ -2977,6 +2977,17 @@ def _dw_transient_backoff_s(attempt: int, retry_after_ts, *, remaining_s: float)
     return max(0.1, min(delay, budget_clamp, 30.0))
 
 
+try:
+    from backend.core.ouroboros.governance.transient_absorb import (
+        with_transient_absorb as _with_transient_absorb,
+    )
+except Exception:  # noqa: BLE001 — decorator is resilience; degrade to identity
+    def _with_transient_absorb(**_kw):  # type: ignore[misc]
+        def _identity(fn):
+            return fn
+        return _identity
+
+
 class CandidateGenerator:
     """Orchestrates candidate generation with failover and concurrency control.
 
@@ -7464,6 +7475,12 @@ class CandidateGenerator:
             classification,
         )
 
+    @_with_transient_absorb(
+        remaining_s=lambda self, context, deadline, **_k: self._remaining_seconds(
+            deadline
+        ),
+        label="_call_primary",
+    )
     async def _call_primary(
         self,
         context: OperationContext,
@@ -7472,6 +7489,13 @@ class CandidateGenerator:
         model_id: str = "",
     ) -> GenerationResult:
         """Call primary provider with concurrency and budget-capped deadline.
+
+        Wrapped by ``@with_transient_absorb`` (2026-07-22): a transient DW round
+        failure on the standard/immediate path — a watchdog fast-abort,
+        ``upstream_error``, 5xx, or 429-with-Retry-After — is absorbed by an
+        exponential-backoff retry of the whole primary attempt (budget-aware),
+        so big-file ReAct rounds self-heal instead of failing the round. The
+        decorator is a no-op when disabled / on a non-transient error.
 
         The primary gets at most ``_PRIMARY_BUDGET_FRACTION`` of the
         remaining time, guaranteeing ``_FALLBACK_MIN_RESERVE_S`` for the
