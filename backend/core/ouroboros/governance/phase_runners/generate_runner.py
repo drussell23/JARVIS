@@ -1640,6 +1640,60 @@ class GENERATERunner(PhaseRunner):
                             _target_missing_error_message(_tg_missing)
                         )
 
+                # Gate 4.5 — Source-domain purity (Slice 78, ported to the
+                # SHIPPING path 2026-07-22 runner-parity audit — this gate
+                # previously lived ONLY on the inline twin, so benchmark
+                # ops on the shipping runner lacked the "cheat the
+                # held-out suite" protection). For a swe_bench op, a
+                # candidate that modifies ONLY test files is caught HERE
+                # and routed to GENERATE_RETRY telling the model to fix
+                # the SOURCE defect instead. INERT for non-swe_bench ops
+                # (host self-dev legitimately authors tests; that lane is
+                # governed by the attribution NOTIFY floor at GATE).
+                # Naming-heuristic only so a source file is never
+                # misclassified as a test.
+                if getattr(ctx, "signal_source", "") == "swe_bench_pro":
+                    try:
+                        from backend.core.ouroboros.governance.patch_domain_guard import (  # noqa: E501
+                            PatchDomainGuard as _PatchDomainGuard,
+                        )
+                    except ImportError:
+                        _PatchDomainGuard = None  # type: ignore[assignment]
+                    if _PatchDomainGuard is not None:
+                        _domain_guard = _PatchDomainGuard()
+                        if _domain_guard.enabled:
+                            for _cand in generation.candidates:
+                                _mod_paths: List[str] = []
+                                if isinstance(_cand, dict):
+                                    if _cand.get("file_path"):
+                                        _mod_paths.append(
+                                            str(_cand["file_path"])
+                                        )
+                                    for _entry in (_cand.get("files") or []):
+                                        if (
+                                            isinstance(_entry, dict)
+                                            and _entry.get("file_path")
+                                        ):
+                                            _mod_paths.append(
+                                                str(_entry["file_path"])
+                                            )
+                                _dg_ok, _dg_reason, _dg_verdict = (
+                                    _domain_guard.check(_mod_paths, None)
+                                )
+                                if not _dg_ok:
+                                    logger.warning(
+                                        "[Orchestrator] Iron Gate — "
+                                        "patch_domain_test_only: candidate "
+                                        "modifies only tests [%s] op=%s",
+                                        ", ".join(_dg_verdict.test_files),
+                                        ctx.op_id[:12],
+                                    )
+                                    generation = None
+                                    raise RuntimeError(
+                                        _dg_reason
+                                        or "patch_domain_test_only"
+                                    )
+
                 # Gate 4 — Docstring multi-line collapse detection. Catches
                 # the regression where Claude rewrites a multi-line module
                 # or function docstring as a single-line literal containing

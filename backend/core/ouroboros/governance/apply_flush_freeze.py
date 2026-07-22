@@ -52,14 +52,16 @@ logger = logging.getLogger(__name__)
 
 
 _ENABLED_ENV = "JARVIS_APPLY_FLUSH_FREEZE_ENABLED"
-_MAX_MUTATIONS_ENV = "JARVIS_APPLY_FREEZE_MAX_MUTATIONS"
+_MAX_OPS_ENV = "JARVIS_APPLY_FREEZE_MAX_OPS"
+_MAX_FILES_PER_OP_ENV = "JARVIS_APPLY_FREEZE_MAX_FILES_PER_OP"
 _DIFF_MAX_BYTES_ENV = "JARVIS_APPLY_FREEZE_DIFF_MAX_BYTES"
 _ARTIFACT_DIR_ENV = "JARVIS_APPLY_FREEZE_ARTIFACT_DIR"
 _GIT_TIMEOUT_ENV = "JARVIS_APPLY_FREEZE_GIT_TIMEOUT_S"
 
-#: The ChangeEngine denial marker (grep-discoverable, mirrors the
+#: The ChangeEngine denial markers (grep-discoverable, mirror the
 #: generation_fence / mutation_budget POLICY_DENIED taxonomy).
 FROZEN_DENIAL_REASON = "POLICY_DENIED reason=apply_frozen_pending_review"
+FANOUT_DENIAL_REASON = "POLICY_DENIED reason=apply_fanout_ceiling"
 
 
 def flush_freeze_enabled() -> bool:
@@ -68,11 +70,46 @@ def flush_freeze_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
-def _max_mutations() -> int:
+def _max_ops() -> int:
+    """``JARVIS_APPLY_FREEZE_MAX_OPS`` — default 1. How many DISTINCT
+    base operations may acquire the latch token before the hard freeze.
+
+    Transactional Op-Scoping (2026-07-22): the original per-FILE
+    mutation budget collided with multi-file 2PC atomicity — soak
+    bt-2026-07-22-022146 landed+verified file 1 of a 2-file op, then
+    the budget denied file 2 and batch rollback correctly reverted
+    the whole transaction. The latch now aligns with the operation
+    boundary: files are siblings of a transaction, ops are the unit
+    the budget counts.
+    """
     try:
-        return max(1, int(os.environ.get(_MAX_MUTATIONS_ENV, "1").strip()))
+        return max(1, int(os.environ.get(_MAX_OPS_ENV, "1").strip()))
     except (TypeError, ValueError):
         return 1
+
+
+def max_files_per_op() -> int:
+    """``JARVIS_APPLY_FREEZE_MAX_FILES_PER_OP`` — default 5. Bounded
+    Fan-Out: the ceiling on sibling files a single op-scoped token
+    admits. Prevents a runaway mono-op from tunneling unlimited writes
+    through one authorization; files beyond the ceiling are rejected
+    pre-write (``FANOUT_DENIAL_REASON``), and the orchestrator's
+    multi-file batch path rejects oversized transactions BEFORE the
+    first byte so 2PC never starts a doomed batch.
+    """
+    try:
+        return max(1, int(
+            os.environ.get(_MAX_FILES_PER_OP_ENV, "5").strip()
+        ))
+    except (TypeError, ValueError):
+        return 5
+
+
+def base_op_id(op_id: str) -> str:
+    """The transaction key: the per-file suffix the orchestrator's
+    multi-file path appends (``{op_id}::{idx:02d}``) is stripped so
+    every sibling file of one atomic candidate shares one latch token."""
+    return (op_id or "").split("::", 1)[0]
 
 
 def _diff_max_bytes() -> int:
@@ -104,8 +141,15 @@ def _artifact_dir() -> Path:
 
 _LOCK = threading.Lock()
 _STATE: Dict[str, Any] = {
-    "mutations_flushed": 0,
-    "frozen": False,
+    # Transactional Op-Scoping (2026-07-22): the latch is OWNED by a base
+    # operation, not spent by a file count. ``owner_op_base`` is the
+    # transaction currently holding the token; its siblings pass (up to
+    # the fan-out ceiling); every other base op is denied. ``ops_acquired``
+    # counts distinct owners toward JARVIS_APPLY_FREEZE_MAX_OPS.
+    "owner_op_base": "",
+    "owner_files_flushed": 0,
+    "ops_acquired": 0,
+    "mutations_flushed": 0,     # global per-file counter (observability)
     "frozen_reason": "",
     "frozen_at_monotonic": 0.0,
     "last_op_id": "",
@@ -114,15 +158,59 @@ _STATE: Dict[str, Any] = {
 }
 
 
-def is_frozen() -> bool:
-    """True once the mutation budget is spent — consulted by
-    ``ChangeEngine.execute`` BEFORE any byte is staged. Thread-safe;
-    NEVER raises."""
+def is_frozen(op_id: str = "") -> bool:
+    """Op-aware latch consult — ``ChangeEngine.execute`` calls this
+    BEFORE any byte is staged, passing the (per-file) op_id.
+
+    Semantics (Transactional Op-Scoping, 2026-07-22):
+
+    * Latch unowned → open for everyone (``False``).
+    * Owned + caller is a SIBLING of the owner (same ``base_op_id``) →
+      pass while the owner is under the Bounded Fan-Out ceiling — the
+      multi-file 2PC atomicity contract completes; at/over the ceiling
+      the sibling is denied (runaway mono-op containment).
+    * Owned + caller is a DIFFERENT base op → denied IF the op budget
+      (``JARVIS_APPLY_FREEZE_MAX_OPS``, default 1) is spent; under a
+      multi-op budget the new op may take over the token at flush time,
+      so the consult passes it through.
+    * No/empty op_id (legacy callers) → conservative: frozen whenever
+      the latch is owned and the budget is spent.
+
+    Thread-safe; NEVER raises (fail-open on internal error — the rest
+    of the cage still stands; fail-closed here would wedge every APPLY
+    on a telemetry-layer bug).
+    """
     try:
+        caller_base = base_op_id(op_id)
         with _LOCK:
-            return bool(_STATE["frozen"])
+            owner = _STATE["owner_op_base"]
+            if not owner:
+                return False
+            if caller_base and caller_base == owner:
+                return (
+                    int(_STATE["owner_files_flushed"]) >= max_files_per_op()
+                )
+            return int(_STATE["ops_acquired"]) >= _max_ops()
     except Exception:  # noqa: BLE001
         return False
+
+
+def denial_reason(op_id: str = "") -> str:
+    """The taxonomy-correct POLICY_DENIED string for a denied consult:
+    a sibling over the ceiling gets the fan-out reason; a foreign op
+    gets the frozen-pending-review reason. NEVER raises."""
+    try:
+        caller_base = base_op_id(op_id)
+        with _LOCK:
+            if (
+                caller_base
+                and caller_base == _STATE["owner_op_base"]
+                and int(_STATE["owner_files_flushed"]) >= max_files_per_op()
+            ):
+                return FANOUT_DENIAL_REASON
+    except Exception:  # noqa: BLE001
+        pass
+    return FROZEN_DENIAL_REASON
 
 
 def freeze_snapshot() -> Dict[str, Any]:
@@ -137,7 +225,8 @@ def freeze_snapshot() -> Dict[str, Any]:
 def _reset_for_tests() -> None:
     with _LOCK:
         _STATE.update(
-            mutations_flushed=0, frozen=False, frozen_reason="",
+            owner_op_base="", owner_files_flushed=0, ops_acquired=0,
+            mutations_flushed=0, frozen_reason="",
             frozen_at_monotonic=0.0, last_op_id="", last_diff_sha8="",
             last_artifact="",
         )
@@ -310,8 +399,14 @@ async def flush_and_freeze(
                 "proceeds regardless", op_id, exc_info=True,
             )
     finally:
-        # 4. Freeze — the latch closes NO MATTER what degraded above.
+        # 4. Freeze — op-scoped token acquisition (Transactional
+        #    Op-Scoping, 2026-07-22). The latch closes to NEW base ops
+        #    NO MATTER what degraded above; siblings of the owning
+        #    transaction keep passing (up to the fan-out ceiling) so
+        #    the multi-file 2PC atomicity contract can complete.
         try:
+            caller_base = base_op_id(op_id)
+            newly_parked = False
             with _LOCK:
                 _STATE["mutations_flushed"] = (
                     int(_STATE["mutations_flushed"]) + 1
@@ -319,20 +414,37 @@ async def flush_and_freeze(
                 _STATE["last_op_id"] = op_id
                 _STATE["last_diff_sha8"] = summary["diff_sha8"]
                 _STATE["last_artifact"] = summary["artifact"]
-                if _STATE["mutations_flushed"] >= _max_mutations():
-                    _STATE["frozen"] = True
-                    _STATE["frozen_reason"] = (
-                        f"apply_mutation_budget_spent "
-                        f"({_STATE['mutations_flushed']}/"
-                        f"{_max_mutations()}) op={op_id}"
+                owner = _STATE["owner_op_base"]
+                if owner == caller_base and owner:
+                    _STATE["owner_files_flushed"] = (
+                        int(_STATE["owner_files_flushed"]) + 1
                     )
-                    _STATE["frozen_at_monotonic"] = time.monotonic()
-                summary["frozen"] = bool(_STATE["frozen"])
-            if summary["frozen"]:
+                else:
+                    # First landed file of a new transaction — acquire
+                    # (or, under a multi-op budget, take over) the token.
+                    _STATE["owner_op_base"] = caller_base
+                    _STATE["owner_files_flushed"] = 1
+                    _STATE["ops_acquired"] = (
+                        int(_STATE["ops_acquired"]) + 1
+                    )
+                    if int(_STATE["ops_acquired"]) >= _max_ops():
+                        _STATE["frozen_reason"] = (
+                            f"apply_op_budget_spent "
+                            f"({_STATE['ops_acquired']}/{_max_ops()}) "
+                            f"owner={caller_base} — siblings admitted "
+                            f"up to fan-out {max_files_per_op()}"
+                        )
+                        _STATE["frozen_at_monotonic"] = time.monotonic()
+                        newly_parked = True
+                summary["frozen"] = (
+                    int(_STATE["ops_acquired"]) >= _max_ops()
+                )
+            if newly_parked:
                 logger.warning(
-                    "[ApplyFlushFreeze] MUTATIONS PARKED — %s; every "
-                    "subsequent ChangeEngine.execute short-circuits to "
-                    "'%s' pending human review",
+                    "[ApplyFlushFreeze] MUTATIONS PARKED (op-scoped) — "
+                    "%s; every NEW base op short-circuits to '%s' "
+                    "pending human review; owner siblings complete the "
+                    "2PC transaction up to the fan-out ceiling",
                     freeze_snapshot().get("frozen_reason", ""),
                     FROZEN_DENIAL_REASON,
                 )
@@ -360,11 +472,15 @@ def register_flags(registry: Any) -> int:
                 "Atomic Flush & Freeze master. When ON, every successful "
                 "ChangeEngine APPLY captures its git diff, persists it, "
                 "flushes a high-priority HiveTelemetryEnvelope through the "
-                "existing HiveEmitter edge, and — after "
-                "JARVIS_APPLY_FREEZE_MAX_MUTATIONS (default 1) mutations — "
-                "PARKS all further mutations (POLICY_DENIED "
-                "reason=apply_frozen_pending_review) pending human review. "
-                "Default OFF; supervised validation soaks opt in."
+                "existing HiveEmitter edge, and acquires the op-scoped "
+                "latch token: after JARVIS_APPLY_FREEZE_MAX_OPS (default 1) "
+                "distinct base operations, all NEW ops are PARKED "
+                "(POLICY_DENIED reason=apply_frozen_pending_review) while "
+                "siblings of the owning transaction complete their 2PC "
+                "batch up to JARVIS_APPLY_FREEZE_MAX_FILES_PER_OP "
+                "(default 5; over-ceiling = apply_fanout_ceiling, and "
+                "oversized batches are rejected pre-write). Default OFF; "
+                "supervised validation soaks opt in."
             ),
             category=Category.SAFETY,
             source_file=(
@@ -385,11 +501,15 @@ def register_flags(registry: Any) -> int:
 
 
 __all__ = [
+    "FANOUT_DENIAL_REASON",
     "FROZEN_DENIAL_REASON",
+    "base_op_id",
     "capture_mutation_diff",
+    "denial_reason",
     "flush_and_freeze",
     "flush_freeze_enabled",
     "freeze_snapshot",
     "is_frozen",
+    "max_files_per_op",
     "register_flags",
 ]

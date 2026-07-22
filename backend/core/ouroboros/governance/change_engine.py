@@ -875,12 +875,19 @@ class ChangeEngine:
         from backend.core.ouroboros.governance import (  # noqa: PLC0415
             apply_flush_freeze as _apply_flush_freeze,
         )
+        # Transactional Op-Scoping (2026-07-22): the consult is op-aware —
+        # siblings of the owning transaction (same base op_id before the
+        # ``::NN`` multi-file suffix) pass so 2PC atomicity completes;
+        # foreign ops and over-ceiling siblings are denied with the
+        # taxonomy-correct reason.
         if _apply_flush_freeze.flush_freeze_enabled() and (
-            _apply_flush_freeze.is_frozen()
+            _apply_flush_freeze.is_frozen(op_id)
         ):
+            _denial = _apply_flush_freeze.denial_reason(op_id)
             logger.warning(
                 "[ApplyFlushFreeze] mutation DENIED at ChangeEngine "
-                "(frozen pending review: %s) op=%s target=%s",
+                "(%s: %s) op=%s target=%s",
+                _denial,
                 _apply_flush_freeze.freeze_snapshot().get(
                     "frozen_reason", "?",
                 ),
@@ -890,7 +897,7 @@ class ChangeEngine:
                 op_id=op_id,
                 success=False,
                 phase_reached=ChangePhase.PLAN,
-                error=_apply_flush_freeze.FROZEN_DENIAL_REASON,
+                error=_denial,
             )
 
         try:

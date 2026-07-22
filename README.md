@@ -30,6 +30,40 @@ A solo-built system. Every figure is `git`-tracked and reproducible (`git ls-fil
 
 ---
 
+## 🎯 O+V Execution Report Card (2026-07-22): C+ → B−/B
+
+Four instrumented soaks in 48 hours drove the autonomous-execution failure frontier from
+*"the pipeline blocks itself at CLASSIFY on fabricated evidence"* to **the organism's first
+verified autonomous code fix on the current stack** — it read a planted failing test
+(`assert -1 == 5`), generated the correct repair, applied it through the full governance
+cage, passed 2PC verification, and had its diff captured, telemetry-flushed, and parked for
+human review, entirely on the DoubleWord 397B realtime lane (TTFT p50 ~6.5s, **$0.018/soak,
+zero Claude spend**).
+
+**What failed → what killed it** (each soak exposed exactly one structural defect):
+
+| Soak | Died at | Root cause | Fix (merged) |
+|---|---|---|---|
+| 1 | CLASSIFY | Advisor **fabricated** `blast=50` on cold caches (cache-poisoning + a hard-BLOCK bypass) | Targeted Locality Bounding + Epistemic Humility (#70003) |
+| 2 | APPLY | Write-root **path doubling** → ENOENT on a garbage path | Path Canonicalization Sandbox + `PathTraversalError` (#70004) |
+| 3 | APPLY | Target gate **wired-but-inert** (inline twin only, never the shipping runner) + WAL **ghost signals** chasing shield-stashed files | Shipping-path Gate 3.5 + WAL Liveness Tombstoning + Sandboxed Ephemeral Instantiation (#70005) |
+| 4 | post-APPLY | Per-file freeze budget **rolled back its own success** (denied file 2 of an atomic 2-file op) | Transactional Op-Scoped Freeze (latch tracks the base op; siblings complete 2PC; fan-out ceiling 5) |
+
+**What worked without qualification**: the advisor plane after repair (0 false blocks across
+three soaks, honest localized measurement under the exact cold-cache conditions that used to
+wedge it) · DW `service_tier=priority` realtime economics · the Atomic Flush & Freeze
+containment envelope (diff captured + HiveEmitter flush demonstrated + cascade structurally
+parked, on its first live encounter) · four-soak root-cause discipline (every failure
+converted into a named, tested, merged fix — nothing patched around).
+
+**Path to A−/A+** (every remaining gap is enumerated — no unknowns left on the list):
+net-landed multi-file mutations under the op-scoped latch → AutoCommit + workspace promotion
+exercised live (`JARVIS_WORKSPACE_PROMOTION_ENABLED`) → multi-op sessions without the
+~20-minute op-flow dry-up → sustained multi-session cadence with human-reviewed parked
+diffs. Full campaign detail: `docs/architecture/OUROBOROS_VENOM_PRD.md` (v3.34 header).
+
+---
+
 ## Symbiotic AI-Native Manifesto: Trinity Ecosystem Unification
 
 This initiative is **not a software refactor**. It is the genesis of an autonomous, self-evolving **Artificial Intelligence Operating System**. The project explicitly rejects the rigid paradigms of traditional software engineering in favor of a symbiotic design: **the models and agents carry intelligence; the codebase is the nervous system** that connects senses, cognition, and safe execution.
