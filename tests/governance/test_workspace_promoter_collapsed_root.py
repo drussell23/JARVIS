@@ -175,6 +175,40 @@ async def test_derive_operator_root_non_repo_is_none(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 2b. LiveWork consult scans the DERIVED operator root, never the
+#     collapsed config root (soak bt-2026-07-22-050025: the consult saw
+#     the op's own 33s-old worktree write as human activity)
+# ---------------------------------------------------------------------------
+
+
+async def test_consult_receives_derived_operator_root(
+    operator_and_worktree, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operator, wt, committed = operator_and_worktree
+    monkeypatch.setenv("JARVIS_WORKSPACE_PROMOTION_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_PROMOTION_LIVE_WORK_CONSULT", "true")
+
+    seen: dict = {}
+
+    async def _recording_gate(ctx, best_candidate, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(active_hit=None)
+
+    orch = _orch(wt, wt)
+    orch._live_work_apply_gate = _recording_gate
+
+    outcome = await run_workspace_promotion(orch, _ctx(), committed, None)
+
+    assert outcome.promoted is True
+    assert "scan_root_override" in seen, (
+        "consult must receive the promotion target as its scan root"
+    )
+    assert Path(os.path.realpath(seen["scan_root_override"])) == Path(
+        os.path.realpath(operator)
+    ), "consult scanned the wrong tree (collapsed config root?)"
+
+
+# ---------------------------------------------------------------------------
 # 3. Atomic Promotion — Conflict Shedding on a diverged primary
 # ---------------------------------------------------------------------------
 

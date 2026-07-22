@@ -13182,6 +13182,7 @@ class GovernedOrchestrator:
         best_candidate: Dict[str, Any],
         *,
         max_wait_override_s: Optional[float] = None,
+        scan_root_override: Optional[Path] = None,
     ) -> _LiveWorkGateResult:
         """LiveWorkSensor APPLY gate with bounded defer-wait (Slice 10).
 
@@ -13241,7 +13242,15 @@ class GovernedOrchestrator:
         from backend.core.ouroboros.governance.state_drift import (
             should_block_apply as _should_block_apply,
         )
-        _lws = LiveWorkSensor(self._config.project_root)
+        # scan_root_override (2026-07-22, soak bt-2026-07-22-050025):
+        # "the target IS the tree it scans." Under the isolation-
+        # collapsed posture config.project_root IS the sovereignty
+        # worktree, so the PROMOTION consult saw the op's OWN 33s-old
+        # APPLY write as human activity and refused every promotion.
+        # The promoter now passes the git-topology-derived operator
+        # root; APPLY-time call sites keep the config root unchanged.
+        _lws_root = scan_root_override or self._config.project_root
+        _lws = LiveWorkSensor(_lws_root)
         _scan_targets: set[str] = set(ctx.target_files)
         for _cf, _ in self._iter_candidate_files(best_candidate):
             if _cf:

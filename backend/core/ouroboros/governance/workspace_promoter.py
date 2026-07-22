@@ -228,6 +228,12 @@ async def run_workspace_promotion(
             _gate_res = await orch._live_work_apply_gate(
                 ctx, best_candidate,
                 max_wait_override_s=_consult_budget_s,
+                # Consult contract: "the target IS the tree it scans" —
+                # the DERIVED operator root, never the collapsed config
+                # root (which is the worktree the op itself just wrote;
+                # soak bt-2026-07-22-050025 refused its own promotion
+                # as live_work_active on its own 33s-old APPLY write).
+                scan_root_override=project_root,
             )
             if getattr(_gate_res, "active_hit", None):
                 return await _fail(
