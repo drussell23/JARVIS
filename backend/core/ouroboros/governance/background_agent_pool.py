@@ -365,6 +365,9 @@ class BackgroundAgentPool:
         self._submit_counter: int = 0
         self._ops: Dict[str, BackgroundOp] = {}
         self._workers: List[asyncio.Task] = []  # type: ignore[type-arg]
+        # Lease-Based In-Flight Lock reaper (armed in start()). Sweeps expired
+        # op leases and re-queues wedged ops. None until started.
+        self._lease_reaper: Optional[Any] = None
         self._running: bool = False
         self._quiesced: bool = False
 
@@ -493,6 +496,31 @@ class BackgroundAgentPool:
                 "substrate will fall back to legacy direct-await",
                 exc_info=True,
             )
+        # Lease-Based In-Flight Lock reaper: sweeps expired op leases (a worker
+        # that hung past its lease or crashed without releasing) and RE-QUEUES
+        # the op through this pool's normal submit path for a fresh worker — the
+        # structural cure for the wedged-session anomaly (bt-2026-07-22-163424).
+        try:
+            from backend.core.ouroboros.governance.op_lease import (
+                LeaseReaper as _LeaseReaper,
+                lease_enabled as _lease_on,
+            )
+            if _lease_on() and self._lease_reaper is None:
+                async def _lease_requeue(rec: Any) -> None:
+                    ctx = getattr(rec, "ctx_ref", None)
+                    if ctx is None:
+                        return
+                    try:
+                        await self.submit(ctx)
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "[LeaseReaper] re-submit failed for %s",
+                            getattr(rec, "op_id", "?"), exc_info=True,
+                        )
+                self._lease_reaper = _LeaseReaper(_lease_requeue)
+                self._lease_reaper.start()
+        except Exception:  # noqa: BLE001 — reaper is resilience, never blocks boot
+            logger.debug("LeaseReaper arm failed at pool.start()", exc_info=True)
         logger.info(
             "Background agent pool started: pool_size=%d, queue_size=%d",
             self._pool_size,
@@ -520,6 +548,14 @@ class BackgroundAgentPool:
 
         self._running = False
         logger.info("Stopping background agent pool (%d workers)", len(self._workers))
+
+        # Tear down the lease reaper first so no re-queue races the shutdown.
+        if self._lease_reaper is not None:
+            try:
+                await self._lease_reaper.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._lease_reaper = None
 
         # Stage 1.6 — clear the process-wide bind BEFORE cancelling
         # workers so no new park-emit can racing the shutdown can
@@ -1152,13 +1188,25 @@ class BackgroundAgentPool:
                 # pool ops (bt-iso-1782942507). Symmetric unregister in the
                 # finally below.
                 _inflight_registered = False
+                # Lease-Based In-Flight Lock (2026-07-22): the worker registers
+                # its op with a bounded TTL lease and arms a heartbeat that
+                # renews it WHILE this coroutine is alive. If the worker hangs
+                # (past its lease) or crashes, the child heartbeat dies with it,
+                # the lease lapses, and the LeaseReaper re-queues the op — the
+                # structural cure for the 33-minute wedge (bt-2026-07-22-163424).
+                _lease_heartbeat = None
                 try:
                     from backend.core.ouroboros.governance.in_flight_registry import (  # noqa: PLC0415,E501
                         register_op_safely as _reg_op_safely,
                     )
+                    from backend.core.ouroboros.governance.op_lease import (  # noqa: PLC0415,E501
+                        initial_lease_deadline as _lease_deadline,
+                        spawn_lease_heartbeat as _spawn_lease_hb,
+                    )
                     _inflight_registered = _reg_op_safely(
                         _ctx_op_id or op.op_id,
                         ctx_ref=op.context,
+                        deadline_monotonic=_lease_deadline(),  # TTL lease
                         last_phase_name=getattr(
                             getattr(op.context, "phase", None), "name", "",
                         ),
@@ -1167,6 +1215,10 @@ class BackgroundAgentPool:
                             "pool_op_id": str(op.op_id),
                         },
                     )
+                    if _inflight_registered:
+                        _lease_heartbeat = _spawn_lease_hb(
+                            _ctx_op_id or op.op_id,
+                        )
                 except Exception:  # noqa: BLE001 -- registry is observability, never blocks pickup
                     _inflight_registered = False
 
@@ -1552,6 +1604,18 @@ class BackgroundAgentPool:
                                 unregister_op_safely as _unreg_op_safely,
                             )
                             _unreg_op_safely(_ctx_op_id or op.op_id)
+                        except Exception:  # noqa: BLE001 -- never leak the worker
+                            pass
+                    # Cancel the lease heartbeat symmetrically. On a clean exit
+                    # the lease is already unregistered above (no reap); on a
+                    # crash/cancel the finally still runs, stopping renewals so
+                    # a stale lease can lapse and be reaped/re-queued.
+                    if _lease_heartbeat is not None:
+                        try:
+                            from backend.core.ouroboros.governance.op_lease import (  # noqa: PLC0415,E501
+                                cancel_lease_heartbeat as _cancel_lease_hb,
+                            )
+                            await _cancel_lease_hb(_lease_heartbeat)
                         except Exception:  # noqa: BLE001 -- never leak the worker
                             pass
 
