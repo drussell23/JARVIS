@@ -411,6 +411,45 @@ class InFlightRegistry:
             )
             return None
 
+    def renew(
+        self,
+        op_id: str,
+        *,
+        new_deadline_monotonic: float,
+    ) -> Optional[OpInFlight]:
+        """Atomically extend an op's lease deadline (heartbeat renewal).
+
+        The TTL-lease counterpart of :meth:`update_phase`: swaps the record
+        with a fresh ``deadline_monotonic`` while preserving every other
+        field. A live worker's heartbeat calls this each interval so the
+        lease never expires *while the worker makes progress*. Returns the
+        new record, or ``None`` if the op wasn't registered (already
+        released / reaped — that ``None`` is the heartbeat's signal to
+        stop). Never raises."""
+        if not isinstance(op_id, str) or not op_id:
+            return None
+        try:
+            with self._lock:
+                existing = self._records.get(op_id)
+                if existing is None:
+                    return None
+                updated = OpInFlight(
+                    op_id=existing.op_id,
+                    started_at_monotonic=existing.started_at_monotonic,
+                    deadline_monotonic=float(new_deadline_monotonic),
+                    ctx_ref=existing.ctx_ref,
+                    last_phase_name=existing.last_phase_name,
+                    last_phase_at_monotonic=time.monotonic(),
+                    metadata=existing.metadata,
+                )
+                self._records[op_id] = updated
+                return updated
+        except Exception as err:  # noqa: BLE001
+            logger.debug(
+                "[in_flight_registry] renew failed for %s: %r", op_id, err,
+            )
+            return None
+
     def lookup(self, op_id: str) -> Optional[OpInFlight]:
         """Return the record for ``op_id`` or ``None`` if absent."""
         if not isinstance(op_id, str) or not op_id:
@@ -788,6 +827,28 @@ def update_phase_safely(op_id: str, *, phase_name: str) -> bool:
         return False
 
 
+def renew_op_safely(op_id: str, *, new_deadline_monotonic: float) -> bool:
+    """Lifecycle-site wrapper for :meth:`InFlightRegistry.renew`.
+
+    Master-FALSE → silent no-op returning ``False``. Master-ON → composes
+    the default registry and extends the op's lease. NEVER raises. Returns
+    ``True`` while the op is still registered (renewed); a ``False`` return
+    is the worker heartbeat's signal to stop (op already released or
+    reaped). Drop-in for a per-op heartbeat renewal loop."""
+    if not registration_active():
+        return False
+    try:
+        return get_default_registry().renew(
+            op_id, new_deadline_monotonic=new_deadline_monotonic,
+        ) is not None
+    except Exception as err:  # noqa: BLE001
+        logger.debug(
+            "[in_flight_registry] renew_op_safely swallowed for %s: %r",
+            op_id, err,
+        )
+        return False
+
+
 __all__ = [
     "IN_FLIGHT_REGISTRY_SCHEMA_VERSION",
     "InFlightPhase",
@@ -797,6 +858,7 @@ __all__ = [
     "master_enabled",
     "register_op_safely",
     "register_shipped_invariants",
+    "renew_op_safely",
     "reset_default_registry",
     "unregister_op_safely",
     "update_phase_safely",
