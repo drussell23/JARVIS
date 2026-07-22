@@ -1110,6 +1110,33 @@ class ChangeEngine:
             # execute() per file, so every per-file write funnels through here.
             self._pre_write_gate(target, signed_content, request)
 
+            # Sandboxed Ephemeral Instantiation (2026-07-22, soak
+            # bt-2026-07-22-005943): a legitimately-NEW module may land in
+            # a package directory the ephemeral worktree doesn't carry (a
+            # worktree is a checkout of HEAD — untracked scaffolding is
+            # absent by construction). At this point the target has passed
+            # the FULL canonical sandbox: Path Canonicalization
+            # (_redirect_target), containment + immutable-governance +
+            # protected-path (_pre_write_gate/assert_write_path_allowed) —
+            # so target.parent is PROVEN inside the write root and mkdir
+            # here can never scaffold outside the sandbox. Without this,
+            # write_text hard-ENOENTs on the missing parent chain.
+            try:
+                if not target.parent.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    logger.info(
+                        "[ChangeEngine] ephemeral parent chain instantiated "
+                        "(sandbox-contained) op=%s dir=%s",
+                        op_id, target.parent,
+                    )
+            except OSError as _mkdir_exc:
+                # Surface as the standard fail-closed path error — the
+                # outer handler records the op FAILED, bytes never land.
+                raise BlockedPathError(
+                    f"parent instantiation failed for {target.parent}: "
+                    f"{_mkdir_exc}"
+                )
+
             # Acquire file lock for the write
             async with self._lock_manager.acquire(
                 level=LockLevel.FILE_LOCK,

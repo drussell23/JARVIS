@@ -704,6 +704,51 @@ def _reanchor_base_on_value(
     return proposed, delta
 
 
+# ---------------------------------------------------------------------------
+# WAL Signal Liveness Tombstoning (2026-07-22)
+# ---------------------------------------------------------------------------
+
+_WAL_TARGET_LIVENESS_ENV = "JARVIS_WAL_TARGET_LIVENESS_ENABLED"
+
+
+def _wal_target_liveness_enabled() -> bool:
+    """Master flag — default TRUE. Falsey restores unconditional replay
+    (ghost signals wake the orchestrator as before)."""
+    raw = os.environ.get(_WAL_TARGET_LIVENESS_ENV, "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _all_targets_missing(
+    target_files: Any, observation_root: Any,
+) -> bool:
+    """True iff the signal is TARGETED (>=1 target file) AND every target
+    is absent from the observation root.
+
+    Conservative by design: an untargeted signal (empty/None — e.g.
+    SWE-bench envelopes carry no target_files by contract) is NEVER a
+    ghost; one live target keeps a multi-target signal actionable; any
+    path/stat error counts the target as PRESENT (never lose a real
+    signal to an I/O hiccup). Sync — callers dispatch via
+    ``asyncio.to_thread``. NEVER raises.
+    """
+    try:
+        targets = [str(t).strip() for t in (target_files or ()) if str(t).strip()]
+        if not targets:
+            return False
+        root = Path(observation_root)
+        for rel in targets:
+            try:
+                p = Path(rel)
+                candidate = p if p.is_absolute() else root / rel
+                if candidate.exists():
+                    return False
+            except OSError:
+                return False  # unknowable → treat as present
+        return True
+    except Exception:  # noqa: BLE001 — fail-soft: replay normally
+        return False
+
+
 def _compute_priority(
     envelope: "IntentEnvelope",
     dependency_credit: int = 0,
@@ -2768,6 +2813,45 @@ class UnifiedIntakeRouter:
         for entry in pending:
             try:
                 envelope = IE.from_dict(entry.envelope_dict)
+                # ── WAL Signal Liveness Tombstoning (2026-07-22) ──
+                # A replayed signal was recorded in a PREVIOUS session; by
+                # replay time its target files may have vanished (e.g. the
+                # preemption shield stashes UNTRACKED files at boot — soak
+                # bt-2026-07-22-005943 chased backend/soak_probes/
+                # soak_probe_math.py through a full GENERATE round when it
+                # existed in NO visible tree). When every target of a
+                # targeted signal is missing from the observation root,
+                # the entry is cleanly tombstoned (status update — the
+                # WAL's native exclusion mechanism, no bus rewrite) and
+                # never enqueued: the orchestrator is not woken for a
+                # ghost. Signals with no target_files (e.g. SWE-bench
+                # envelopes carry none by design) are never touched.
+                # Liveness stats run OFF-LOOP. Fail-soft: any check error
+                # replays the entry normally (never lose a real signal).
+                if _wal_target_liveness_enabled():
+                    try:
+                        _ghost = await asyncio.to_thread(
+                            _all_targets_missing,
+                            envelope.target_files,
+                            self._config.project_root,
+                        )
+                    except Exception:  # noqa: BLE001 — never lose a signal
+                        _ghost = False
+                    if _ghost:
+                        # WAL status vocabulary is CLOSED ('acked' |
+                        # 'dead_letter'); a benign ghost is RESOLVED, not
+                        # poison — 'acked' is the semantically correct
+                        # tombstone, and this log line carries the reason.
+                        self._wal.update_status(entry.lease_id, "acked")
+                        logger.warning(
+                            "Router: WAL TOMBSTONE (ghost target) — "
+                            "lease_id=%s source=%s targets=%s absent from "
+                            "observation root; signal resolved without "
+                            "waking the orchestrator",
+                            entry.lease_id, envelope.source,
+                            ",".join(envelope.target_files or ()),
+                        )
+                        continue
                 # WAL replay preserves whatever alignment metadata was
                 # already stashed in envelope.evidence from the original
                 # ingest — no need to re-score and pollute the replay path

@@ -106,26 +106,35 @@ def _resolves_inside_and_exists(rel_path: str, write_root: Path) -> bool:
         return False
 
 
-def _parent_resolves_inside_and_exists(rel_path: str, write_root: Path) -> bool:
-    """True iff ``rel_path``'s PARENT directory resolves inside ``write_root``
-    AND exists on disk — the new-file lane predicate for universal mode.
+def _new_file_lane_allows(rel_path: str, write_root: Path) -> bool:
+    """The universal-mode new-file predicate: ``rel_path`` resolves inside
+    ``write_root`` AND its ANCHOR (first path component) exists there.
 
-    A genuinely new file lands in an existing package directory; the
-    doubled-path / garbage class always implies a nonexistent parent chain.
-    Escapes are treated as missing (mirrors ``_resolves_inside_and_exists``).
-    Never raises.
+    Anchor semantics, not immediate-parent (2026-07-22 refinement): the
+    ChangeEngine's Sandboxed Ephemeral Instantiation legitimately scaffolds
+    nested NEW package dirs (``backend/new_pkg/sub/module.py`` under an
+    existing ``backend/``), so demanding an existing immediate parent would
+    contradict the engine and block real module scaffolding. The garbage
+    classes this lane must reject — write-root echoes (``Documents/...``),
+    absolute-prefix remnants, hallucinated top-level trees — always fail at
+    the FIRST component. A single-component path (``newfile.py``) anchors
+    on the root itself, which exists by definition. Escapes are rejected
+    (mirrors ``_resolves_inside_and_exists``). Never raises.
     """
     try:
         root = write_root.resolve()
-        parent = (root / rel_path).resolve().parent
+        resolved = (root / rel_path).resolve()
     except (OSError, RuntimeError, ValueError):
         return False
     try:
-        parent.relative_to(root)
+        rel = resolved.relative_to(root)
     except ValueError:
-        return False  # parent escaped the worktree
+        return False  # escaped the worktree
+    parts = rel.parts
+    if len(parts) <= 1:
+        return True  # anchors on the root itself
     try:
-        return parent.is_dir()
+        return (root / parts[0]).is_dir()
     except OSError:
         return False
 
@@ -145,9 +154,11 @@ def find_missing_targets(
 
     ``allow_new_files`` (universal mode, keyword-only; default ``False`` =
     benchmark semantics byte-identical): when TRUE a nonexistent target is
-    acceptable IF its parent directory exists inside the write root — the
-    legitimate host-self-dev new-file lane. A missing target whose parent
-    chain is ALSO missing (the doubled-path class) is flagged either way.
+    acceptable IF its anchor component exists inside the write root — the
+    legitimate host-self-dev new-file/new-package lane (the ChangeEngine
+    scaffolds the nested parents). A missing target whose FIRST component
+    is also missing (write-root echoes, absolute remnants, hallucinated
+    trees) is flagged either way.
     """
     if write_root is None:
         return []
@@ -156,9 +167,7 @@ def find_missing_targets(
         for rel in _candidate_target_paths(cand):
             if _resolves_inside_and_exists(rel, write_root):
                 continue
-            if allow_new_files and _parent_resolves_inside_and_exists(
-                rel, write_root,
-            ):
+            if allow_new_files and _new_file_lane_allows(rel, write_root):
                 continue
             missing.add(rel)
     return sorted(missing)

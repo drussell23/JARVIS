@@ -6772,22 +6772,37 @@ class GovernedOrchestrator:
                     _tg_is_benchmark = (
                         getattr(ctx, "signal_source", "") == "swe_bench_pro"
                     )
+                    _tg_missing = []
                     if (
                         (_tg_is_benchmark and _target_guard_enabled())
                         or (not _tg_is_benchmark
                             and _target_guard_universal_enabled())
                     ):
-                        _tg_write_root = (
-                            self._swe_bench_write_root(ctx)
-                            if _tg_is_benchmark
-                            else self._config.execution_root
-                        )
-                        _tg_missing = await asyncio.to_thread(
-                            _find_missing_targets,
-                            generation.candidates,
-                            _tg_write_root,
-                            allow_new_files=not _tg_is_benchmark,
-                        )
+                        # Fail-SOFT infrastructure resolution (mirrors the
+                        # SHIPPING generate_runner twin): a host that
+                        # cannot resolve a write root skips the check —
+                        # the deliberate raise stays OUTSIDE the try.
+                        try:
+                            _tg_write_root = (
+                                self._swe_bench_write_root(ctx)
+                                if _tg_is_benchmark
+                                else self._config.execution_root
+                            )
+                            _tg_missing = await asyncio.to_thread(
+                                _find_missing_targets,
+                                generation.candidates,
+                                _tg_write_root,
+                                allow_new_files=not _tg_is_benchmark,
+                            )
+                        except Exception:  # noqa: BLE001 — protective gate
+                            logger.debug(
+                                "[Orchestrator] Iron Gate — target-"
+                                "existence infrastructure unresolvable; "
+                                "gate skipped op=%s",
+                                ctx.op_id[:12], exc_info=True,
+                            )
+                            _tg_missing = []
+                            _tg_write_root = None
                         if _tg_missing:
                             logger.warning(
                                 "[Orchestrator] Iron Gate — target_file_missing: "
