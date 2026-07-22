@@ -69,6 +69,170 @@ def _overlay_max_files() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic Dependency Mounting (2026-07-22) — internal test-infra fidelity
+# ---------------------------------------------------------------------------
+# Soak bt-2026-07-22-065329: VALIDATE ran the candidate's scoped pytest in the
+# ephemeral sandbox and hit ``[python:FAIL] ... ouroboros_pytest_plugin`` — the
+# internal pytest plugin the suite registers via ``conftest.py``'s
+# ``pytest_plugins`` could not load in the isolated environment. The plugin is
+# TRACKED (present in the git-worktree sandbox), so the gap is environmental
+# fidelity (stale rewrite cache / working-tree-vs-HEAD drift / rsync-excluded
+# infra), not a structurally-missing file.
+#
+# Root-cause fix: at sandbox instantiation, DYNAMICALLY resolve the internal
+# test dependencies the suite declares (parse each ``conftest.py``'s
+# ``pytest_plugins`` list — NO hardcoded plugin names) and read-only-mount any
+# that the sandbox is MISSING via ``os.symlink`` to the LIVE repo file. Only
+# gaps are filled — an existing sandbox copy (the git-worktree's isolated,
+# writable tracked file) is NEVER overwritten, so the strict write-isolation
+# boundary holds: the sandbox's mutation targets are the repair candidates,
+# never these read-through test-infra symlinks (which pytest only imports).
+
+
+def _test_deps_mount_enabled() -> bool:
+    """``JARVIS_SANDBOX_MOUNT_TEST_DEPS_ENABLED`` (default ON). OFF restores
+    the pre-2026-07-22 behavior (no dynamic mount)."""
+    return os.environ.get(
+        "JARVIS_SANDBOX_MOUNT_TEST_DEPS_ENABLED", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _dotted_to_relpaths(module: str) -> "List[str]":
+    """Candidate repo-relative file paths for a dotted plugin module name.
+
+    ``tests.ouroboros_pytest_plugin`` → ``tests/ouroboros_pytest_plugin.py``
+    plus the package ``__init__.py`` ancestors that make the dotted import
+    resolvable (``tests/__init__.py``). Order matters — parents first so the
+    package is importable before the leaf. Pure; never raises."""
+    parts = module.split(".")
+    out: List[str] = []
+    # Package __init__.py ancestors (tests/__init__.py, tests/sub/__init__.py).
+    for i in range(1, len(parts)):
+        out.append("/".join(parts[:i]) + "/__init__.py")
+    out.append("/".join(parts) + ".py")           # the leaf module
+    out.append("/".join(parts) + "/__init__.py")  # or a package leaf
+    return out
+
+
+def resolve_internal_test_deps(repo_root: Path) -> "List[str]":
+    """Repo-relative internal test-infra paths the suite needs to import.
+
+    DYNAMIC discovery — parses every ``conftest.py`` under the repo's test
+    dirs for a top-level ``pytest_plugins = [...]`` list (the canonical
+    pytest registration seam) and maps each dotted name to its file path +
+    package ancestors. The declaring ``conftest.py`` files themselves are
+    included. Returns only paths that EXIST in the repo, deduped, sorted
+    (parents before leaves). No hardcoded plugin names. NEVER raises.
+    """
+    import ast as _ast
+
+    deps: List[str] = []
+    seen: set = set()
+
+    def _add(rel: str) -> None:
+        if rel and rel not in seen:
+            try:
+                if (repo_root / rel).is_file():
+                    seen.add(rel)
+                    deps.append(rel)
+            except OSError:
+                pass
+
+    try:
+        _test_dirs = frozenset(
+            n.strip() for n in os.environ.get(
+                "JARVIS_TEST_DIR_NAMES", "tests,test",
+            ).split(",") if n.strip()
+        )
+        conftests: List[Path] = []
+        for tdn in _test_dirs:
+            tdir = repo_root / tdn
+            try:
+                if tdir.is_dir():
+                    conftests.extend(sorted(tdir.rglob("conftest.py")))
+            except OSError:
+                continue
+        # A root conftest.py may also declare plugins.
+        _root_conftest = repo_root / "conftest.py"
+        if _root_conftest.is_file():
+            conftests.insert(0, _root_conftest)
+
+        for cf in conftests:
+            try:
+                tree = _ast.parse(
+                    cf.read_text(encoding="utf-8", errors="replace"),
+                    filename=str(cf),
+                )
+            except (OSError, SyntaxError, ValueError):
+                continue
+            _cf_rel = os.path.relpath(str(cf), str(repo_root)).replace("\\", "/")
+            declared = False
+            for node in _ast.walk(tree):
+                if not isinstance(node, _ast.Assign):
+                    continue
+                if not any(
+                    isinstance(t, _ast.Name) and t.id == "pytest_plugins"
+                    for t in node.targets
+                ):
+                    continue
+                if not isinstance(node.value, (_ast.List, _ast.Tuple)):
+                    continue
+                for elt in node.value.elts:
+                    if isinstance(elt, _ast.Constant) and isinstance(
+                        elt.value, str
+                    ):
+                        declared = True
+                        for rel in _dotted_to_relpaths(elt.value):
+                            _add(rel)
+            if declared:
+                _add(_cf_rel)  # the conftest that declares them
+    except Exception:  # noqa: BLE001 — discovery is fail-soft
+        _logger.debug("resolve_internal_test_deps failed", exc_info=True)
+    return deps
+
+
+def mount_internal_test_deps(
+    repo_root: Path, sandbox_root: Path,
+) -> "List[str]":
+    """Read-only-mount MISSING internal test deps into ``sandbox_root``.
+
+    For each resolved dep absent from the sandbox, create a symlink to the
+    LIVE repo file (read-through — pytest only imports it). An existing
+    sandbox copy is NEVER touched (preserves the git-worktree's isolated
+    writable tracked file → write-isolation boundary intact). Parent dirs
+    are created as real dirs. Returns the list of rel paths actually
+    mounted. Fail-soft per entry; NEVER raises."""
+    mounted: List[str] = []
+    if not _test_deps_mount_enabled():
+        return mounted
+    try:
+        for rel in resolve_internal_test_deps(repo_root):
+            src = repo_root / rel
+            dst = sandbox_root / rel
+            try:
+                if dst.exists() or dst.is_symlink():
+                    continue  # sandbox already has it — never overwrite
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(src, dst)
+                mounted.append(rel)
+            except OSError:
+                _logger.debug(
+                    "mount_internal_test_deps: symlink %s failed", rel,
+                    exc_info=True,
+                )
+                continue
+        if mounted:
+            _logger.info(
+                "repair_sandbox: mounted %d internal test dep(s) "
+                "read-only into sandbox (fidelity): %s",
+                len(mounted), ", ".join(mounted[:6]),
+            )
+    except Exception:  # noqa: BLE001 — mounting is fail-soft
+        _logger.debug("mount_internal_test_deps failed", exc_info=True)
+    return mounted
+
+
+# ---------------------------------------------------------------------------
 # Public exceptions
 # ---------------------------------------------------------------------------
 
@@ -301,6 +465,12 @@ class RepairSandbox:
                         )
             else:
                 self.baseline_fidelity = "head"
+            # Dynamic Dependency Mounting (2026-07-22): guarantee the
+            # internal test-infra (pytest_plugins) is importable in the
+            # sandbox regardless of strategy / working-tree drift.
+            await asyncio.to_thread(
+                mount_internal_test_deps, self._repo_root, tmpdir,
+            )
             _logger.debug("repair_sandbox: initialised via git worktree at %s", tmpdir)
             return
         except Exception as exc:
@@ -314,6 +484,9 @@ class RepairSandbox:
             # rsync copies the live tree directly — the baseline IS the
             # working tree, no overlay needed.
             self.baseline_fidelity = "working_tree"
+            await asyncio.to_thread(
+                mount_internal_test_deps, self._repo_root, tmpdir,
+            )
             _logger.debug("repair_sandbox: initialised via rsync at %s", tmpdir)
             return
         except Exception as exc:
@@ -641,6 +814,21 @@ class RepairSandbox:
         env["PYTHONPYCACHEPREFIX"] = str(sandbox / ".pycache")
         env["TMPDIR"] = str(sandbox / ".tmp")
         env["PYTEST_CACHE_DIR"] = str(sandbox / ".pytest_cache")
+        # Dynamic Dependency Mounting fidelity (2026-07-22): the SANDBOX
+        # root leads PYTHONPATH so a dotted ``pytest_plugins`` entry
+        # (``tests.ouroboros_pytest_plugin``) resolves against the
+        # sandbox's own (mounted) test infra, never a stale parent-env
+        # path. The sandbox 'backend' subdir follows (mirrors the repo's
+        # ``pythonpath = . backend`` pytest.ini contract). Prepended so
+        # sandbox paths win over any inherited PYTHONPATH.
+        _existing_pp = env.get("PYTHONPATH", "")
+        _sandbox_pp = os.pathsep.join(
+            [str(sandbox), str(sandbox / "backend")]
+        )
+        env["PYTHONPATH"] = (
+            _sandbox_pp + os.pathsep + _existing_pp
+            if _existing_pp else _sandbox_pp
+        )
 
         # Ensure scratch directories exist.
         (sandbox / ".tmp").mkdir(exist_ok=True)
