@@ -3114,6 +3114,49 @@ class GovernedLoopService:
             )
             self._cognitive_bus_subscription_ids = []
 
+        # ── Wire #2 — StrategyOutcomeLogger on the production TrinityEventBus ──
+        # Flushes big-file Agentic-Swarm extraction-strategy outcomes to SQLite
+        # on every op.terminal.* (off-loop, via run_in_executor). Only attached
+        # when swarm routing is enabled (no pending strategies exist otherwise,
+        # so it would be a no-op subscriber + a stray DB file on every boot).
+        # Fault-Tolerant Shield: a locked/unavailable SQLite DB logs an error
+        # telemetry event and boot continues UNINTERRUPTED — telemetry failure
+        # must never poison the orchestration boot.
+        self._strategy_outcome_logger = None
+        _swarm_on = os.environ.get(
+            "JARVIS_SWARM_ROUTING_ENABLED", "false",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if _swarm_on:
+            try:
+                from backend.core.trinity_event_bus import get_event_bus_if_exists
+                from backend.core.ouroboros.governance.chunked_generation_bridge import (
+                    StrategyOutcomeLogger,
+                )
+                _sbus = get_event_bus_if_exists()
+                if _sbus is not None:
+                    import sqlite3 as _sqlite3
+                    from pathlib import Path as _Path
+                    _db_dir = _Path(".jarvis")
+                    _db_dir.mkdir(parents=True, exist_ok=True)
+                    _conn = _sqlite3.connect(
+                        str(_db_dir / "chunk_strategy.db"), check_same_thread=False,
+                    )
+                    _sol = StrategyOutcomeLogger(_conn)
+                    await _sol.attach_to_bus(_sbus)
+                    self._strategy_outcome_logger = _sol
+                    _incr_observer_boot("strategy_outcome_logger")
+                    logger.info(
+                        "[GovernedLoop] Wire #2: StrategyOutcomeLogger attached "
+                        "to TrinityEventBus (swarm reinforcement → SQLite)",
+                    )
+            except Exception:  # noqa: BLE001 — telemetry attach NEVER fatal to boot
+                logger.warning(
+                    "[GovernedLoop] Wire #2: StrategyOutcomeLogger attach failed "
+                    "(non-fatal, boot continues)",
+                    exc_info=True,
+                )
+                self._strategy_outcome_logger = None
+
         # Slice 101 Phase 6 — Sleep Consolidation Daemon. Background async task
         # that runs the cross-session memory cascade (belief + postmortem-fusion
         # → consolidation → meta-prior calibration) OFF the hot path on an idle-
