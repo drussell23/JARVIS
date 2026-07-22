@@ -80,6 +80,14 @@ from backend.core.ouroboros.governance.ascii_strict_gate import (
     AsciiStrictGate,
     build_retry_feedback as _ascii_gate_retry_feedback,
 )
+from backend.core.ouroboros.governance.target_existence_guard import (
+    TARGET_MISSING_PREFIX as _TARGET_MISSING_PREFIX,
+    build_retry_feedback as _target_missing_retry_feedback,
+    find_missing_targets as _find_missing_targets,
+    guard_enabled as _target_guard_enabled,
+    missing_target_error_message as _target_missing_error_message,
+    universal_guard_enabled as _target_guard_universal_enabled,
+)
 from backend.core.ouroboros.governance.forward_progress import (
     candidate_content_hash,
 )
@@ -1565,6 +1573,73 @@ class GENERATERunner(PhaseRunner):
                         _dep_exc._dep_file_rejected_content = _rejected_content  # type: ignore[attr-defined]
                         raise _dep_exc
 
+                # Gate 3.5 — Target existence (Slice 72, UNIVERSALIZED +
+                # ported to the SHIPPING path 2026-07-22). HISTORY: this
+                # gate previously lived ONLY on the inline orchestrator
+                # twin, which stopped being the shipping GENERATE path when
+                # this runner graduated (2026-04-23) — the wired-but-inert
+                # trap. Soak bt-2026-07-22-005943 proved it: a candidate
+                # whose parent chain doesn't exist in the write tree sailed
+                # ungated to APPLY and hard-ENOENT'd in the ChangeEngine.
+                #
+                # Synchronized Root Injection: the gate consults the EXACT
+                # tree APPLY will write to — the same resolution the
+                # ChangeRequest carries (_swe_bench_write_root for
+                # benchmark ops; the Slice 11 execution_root seam
+                # otherwise, which is ChangeEngine._effective_write_root's
+                # fallback by construction). Existence stats run OFF-LOOP
+                # via asyncio.to_thread. Host lane keeps legitimate
+                # new-file creation (allow_new_files: a missing target is
+                # only a steering error when its PARENT dir is also
+                # missing). Benchmark semantics byte-identical strict.
+                _tg_is_benchmark = (
+                    getattr(ctx, "signal_source", "") == "swe_bench_pro"
+                )
+                _tg_missing: list = []
+                if (
+                    (_tg_is_benchmark and _target_guard_enabled())
+                    or (not _tg_is_benchmark
+                        and _target_guard_universal_enabled())
+                ):
+                    # Fail-SOFT infrastructure resolution: the gate is
+                    # protective, never fatal — a host that cannot resolve
+                    # a write root (parity-test fakes, degraded config)
+                    # skips the check rather than failing the candidate.
+                    # The deliberate target_file_missing raise below stays
+                    # OUTSIDE this try so it is never swallowed.
+                    try:
+                        _tg_write_root = (
+                            orch._swe_bench_write_root(ctx)
+                            if _tg_is_benchmark
+                            else orch._config.execution_root
+                        )
+                        _tg_missing = await asyncio.to_thread(
+                            _find_missing_targets,
+                            generation.candidates,
+                            _tg_write_root,
+                            allow_new_files=not _tg_is_benchmark,
+                        )
+                    except Exception:  # noqa: BLE001 — protective gate
+                        logger.debug(
+                            "[Orchestrator] Iron Gate — target-existence "
+                            "infrastructure unresolvable; gate skipped "
+                            "op=%s", ctx.op_id[:12], exc_info=True,
+                        )
+                        _tg_missing = []
+                        _tg_write_root = None
+                    if _tg_missing:
+                        logger.warning(
+                            "[Orchestrator] Iron Gate — target_file_missing: "
+                            "%s not in write root %s op=%s (lane=%s)",
+                            ",".join(_tg_missing), _tg_write_root,
+                            ctx.op_id[:12],
+                            "benchmark" if _tg_is_benchmark else "universal",
+                        )
+                        generation = None
+                        raise RuntimeError(
+                            _target_missing_error_message(_tg_missing)
+                        )
+
                 # Gate 4 — Docstring multi-line collapse detection. Catches
                 # the regression where Claude rewrites a multi-line module
                 # or function docstring as a single-line literal containing
@@ -2254,6 +2329,24 @@ class GENERATERunner(PhaseRunner):
                             "  tool_execution_records may you emit the final patch.\n"
                             "- Exploration is NOT optional. Patches without context corrupt code.\n"
                         )
+                elif _err_str.startswith(_TARGET_MISSING_PREFIX):
+                    # Gate 3.5 — target doesn't resolve in the write tree.
+                    # Lane-correct steering (2026-07-22): benchmark ops get
+                    # the third-party-repo text; host self-dev ops get
+                    # path-hygiene steering (phantom parent / malformed
+                    # prefix), never a wrong "you're outside the host" claim.
+                    _tg_paths = [
+                        p.strip()
+                        for p in _err_str[len(_TARGET_MISSING_PREFIX):].split(",")
+                        if p.strip()
+                    ]
+                    _error_feedback = _target_missing_retry_feedback(
+                        _tg_paths,
+                        benchmark=(
+                            getattr(ctx, "signal_source", "")
+                            == "swe_bench_pro"
+                        ),
+                    )
                 elif _err_str.startswith("ascii_corruption"):
                     # Extract the specific offending lines from the rejected
                     # candidate so the model sees its own bad code in context

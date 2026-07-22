@@ -228,6 +228,17 @@ def test_universal_gate_allows_new_file_in_existing_package(
     assert missing == []
 
 
+def test_universal_gate_allows_new_nested_package_under_anchor(
+    worktree: Path,
+) -> None:
+    """Anchor semantics (2026-07-22): a new nested package under an
+    EXISTING top-level dir is legitimate scaffolding — the ChangeEngine's
+    Sandboxed Ephemeral Instantiation creates the parents. Only a missing
+    ANCHOR (hallucinated top-level tree / root echo) flags."""
+    cand = {"file_path": "backend/new_pkg/sub/module.py"}
+    assert find_missing_targets([cand], worktree, allow_new_files=True) == []
+
+
 def test_universal_gate_allows_existing_file(worktree: Path) -> None:
     cand = {"file_path": "backend/soak_probes/existing.py"}
     assert find_missing_targets([cand], worktree, allow_new_files=True) == []
