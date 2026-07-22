@@ -99,7 +99,9 @@ def test_all_pattern_names_is_exhaustive():
     # pydantic_immutable_set / type_coercion_blindspot / loop_var_rebind_lost)
     # + 1 S6-closure regex pattern (shell_exec_introduced).
     # Task #7 added test_assertion_weakened (F8 closure): 21 → 22.
-    assert len(all_pattern_names()) == 22
+    # 2026-07-22 supply-chain response added dependency_pin_weakened +
+    # high_entropy_gutting (the promoted-lockfile-gutting fix): 22 → 24.
+    assert len(all_pattern_names()) == 24
 
 
 # ---------------------------------------------------------------------------
