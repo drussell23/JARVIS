@@ -1615,6 +1615,20 @@ try:  # pragma: no cover - import guard
 except Exception:  # noqa: BLE001
     logger.debug("[SemanticGuard] blindspot detectors unavailable — skipping", exc_info=True)
 
+# Supply-chain / diff-entropy detectors (2026-07-22) — the promoted
+# lockfile-gutting response. Same additive, fail-soft registration hook
+# as the blindspot detectors above; both are ``soft`` → notify_apply.
+try:  # pragma: no cover - import guard
+    from backend.core.ouroboros.governance.semantic_guardian_supplychain import (
+        SUPPLYCHAIN_PATTERNS as _SUPPLYCHAIN_PATTERNS,
+    )
+    for _sc_name, _sc_detector in _SUPPLYCHAIN_PATTERNS.items():
+        if _sc_name not in _PATTERNS:
+            _PATTERNS[_sc_name] = _sc_detector
+            _ALL_PATTERNS = tuple(_ALL_PATTERNS) + (_sc_name,)
+except Exception:  # noqa: BLE001
+    logger.debug("[SemanticGuard] supply-chain detectors unavailable — skipping", exc_info=True)
+
 
 # ---------------------------------------------------------------------------
 # Phase 7.1 — adapted-pattern boot-time merge
