@@ -4650,6 +4650,36 @@ class SerpentREPL:
             )
         except Exception:  # noqa: BLE001
             self._event_breadcrumb_router_task = None
+        # Live status-line badge ticker — seed the provider cache once (single
+        # read, shared with /provider), then rotate on its own async task,
+        # invalidating the prompt so the badge cycles without blocking input.
+        self._status_badge_ticker_task = None
+        try:
+            from backend.core.ouroboros.governance.status_badge_ticker import (
+                get_default_ticker, set_invalidate,
+            )
+            from backend.core.ouroboros.governance.provider_state_broker import (
+                build_provider_snapshot,
+            )
+            from backend.core.ouroboros.governance.dw_outage_forecaster import (
+                open_forecast_db,
+            )
+
+            def _invalidate_prompt() -> None:
+                try:
+                    from prompt_toolkit.application import get_app
+                    get_app().invalidate()
+                except Exception:  # noqa: BLE001 — no live app / not running
+                    pass
+
+            set_invalidate(_invalidate_prompt)
+            _ticker = get_default_ticker()
+            _seed = build_provider_snapshot(open_forecast_db())   # single read
+            if _seed.get("state") not in (None, "UNKNOWN"):
+                _ticker.on_provider_event(_seed)
+            self._status_badge_ticker_task = asyncio.ensure_future(_ticker.run())
+        except Exception:  # noqa: BLE001 — badge ticker is best-effort
+            self._status_badge_ticker_task = None
 
     async def _event_breadcrumb_router(self) -> None:
         """The ONE unified live event feed: subscribe once to the broker and
@@ -4749,6 +4779,15 @@ class SerpentREPL:
                     continue
                 try:
                     payload = dict(getattr(event, "payload", {}) or {})
+                    # Feed the live status-line badge ticker (same event source —
+                    # no separate poll). Provider-agnostic: any provider surfaces.
+                    try:
+                        from backend.core.ouroboros.governance.status_badge_ticker import (
+                            get_default_ticker,
+                        )
+                        get_default_ticker().on_provider_event(payload)
+                    except Exception:  # noqa: BLE001
+                        pass
                     text = format_provider_breadcrumb(payload)
                     healthy = payload.get("state") == "HEALTHY"
                     color = _C["neural"] if healthy else _C["heal"]
@@ -4838,7 +4877,7 @@ class SerpentREPL:
             self._shadow_breadcrumb_task = None
         # Tear down the provider-state resilience breadcrumb + watcher + the
         # unified event-feed router.
-        for _attr in ("_event_breadcrumb_router_task",
+        for _attr in ("_status_badge_ticker_task", "_event_breadcrumb_router_task",
                       "_provider_breadcrumb_task", "_provider_state_watcher_task"):
             _pt = getattr(self, _attr, None)
             if _pt is not None:
