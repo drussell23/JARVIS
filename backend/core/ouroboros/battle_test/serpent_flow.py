@@ -4671,6 +4671,13 @@ class SerpentREPL:
                 build_default_registry,
                 get_min_severity,
             )
+            try:
+                from backend.core.ouroboros.governance.event_history_buffer import (
+                    get_default_history,
+                )
+                _history = get_default_history()
+            except Exception:  # noqa: BLE001
+                _history = None
 
             reg = build_default_registry()
             coalescer = BreadcrumbCoalescer()
@@ -4683,11 +4690,16 @@ class SerpentREPL:
                     et = getattr(event, "event_type", "") or ""
                     if not et or reg.is_bespoke(et):
                         continue
-                    floor = get_min_severity()
-                    if floor >= 99:            # /breadcrumbs off
-                        continue
                     payload = dict(getattr(event, "payload", {}) or {})
                     desc = reg.describe(et)
+                    # Record EVERY event into history (for /breadcrumbs tail),
+                    # regardless of the live verbosity floor.
+                    if _history is not None:
+                        _history.append(et, payload, severity=desc.severity,
+                                        category=desc.category)
+                    floor = get_min_severity()
+                    if floor >= 99:            # /breadcrumbs off (live only; history kept)
+                        continue
                     if desc.severity < floor:
                         continue
                     key = str(payload.get("provider", payload.get("op_id", "")) or "")

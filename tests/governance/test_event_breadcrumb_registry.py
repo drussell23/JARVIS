@@ -114,3 +114,43 @@ def test_breadcrumbs_verb() -> None:
 
     assert "verbosity" in _strip(dispatch_breadcrumbs_command("/breadcrumbs help").text)
     set_min_severity("important")   # restore
+
+
+# ---------------------------------------------------------------------------
+# Event history buffer + /breadcrumbs tail
+# ---------------------------------------------------------------------------
+
+
+def test_history_buffer_ring_and_filters() -> None:
+    from backend.core.ouroboros.governance.event_history_buffer import EventHistoryBuffer
+    buf = EventHistoryBuffer(capacity=4)
+    buf.append("circuit_breaker_tripped", {"p": 1}, severity=SEV_CRITICAL, category="provider", ts=100)
+    buf.append("posture_changed", {"p": 2}, severity=SEV_INFO, category="posture", ts=101)
+    buf.append("governor_throttle_applied", {"p": 3}, severity=SEV_IMPORTANT, category="governance", ts=102)
+    buf.append("cost_band_crossed", {"p": 4}, severity=SEV_IMPORTANT, category="cost", ts=103)
+    buf.append("session_exhausted", {"p": 5}, severity=SEV_CRITICAL, category="session", ts=104)  # evicts oldest
+
+    assert buf.size() == 4                       # bounded ring
+    newest = buf.recent(10)
+    assert newest[0].event_type == "session_exhausted"   # newest first
+    assert all(r.event_type != "circuit_breaker_tripped" for r in newest)  # oldest evicted
+
+    crit = buf.recent(10, min_severity=SEV_CRITICAL)
+    assert [r.event_type for r in crit] == ["session_exhausted"]
+    cost = buf.recent(10, category="cost")
+    assert [r.event_type for r in cost] == ["cost_band_crossed"]
+
+
+def test_breadcrumbs_tail_renders_history() -> None:
+    from backend.core.ouroboros.governance.event_history_buffer import get_default_history
+    hist = get_default_history()
+    hist.clear()
+    hist.append("circuit_breaker_tripped",
+                {"provider": "doubleword", "to_state": "OPEN_TERMINAL", "terminal_reason_code": "quota"},
+                severity=SEV_CRITICAL, category="provider")
+    out = _strip(dispatch_breadcrumbs_command("/breadcrumbs tail 5").text)
+    assert "recent events" in out
+    assert "circuit breaker tripped" in out and "OPEN_TERMINAL" in out
+
+    empty = _strip(dispatch_breadcrumbs_command("/breadcrumbs tail memory").text)
+    assert "no events" in empty            # category filter with no matches

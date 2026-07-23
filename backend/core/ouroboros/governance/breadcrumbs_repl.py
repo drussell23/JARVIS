@@ -11,12 +11,21 @@ module-level ``dispatch_breadcrumbs_command``.
 from __future__ import annotations
 
 import shlex
+import time
 from dataclasses import dataclass
 
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
 _DIM = "\033[2m"
 _CYAN = "\033[36m"
+_RED = "\033[31m"
+_YELLOW = "\033[33m"
+
+_DEFAULT_TAIL = 20
+_MAX_TAIL = 200
+_SEV_WORDS = {"critical": 3, "important": 2, "info": 1, "verbose": 0, "all": 0}
+_ANSI_BY_SEV = {3: _RED + _BOLD, 2: _YELLOW, 1: _CYAN, 0: _DIM}
+_GLYPH_BY_SEV = {3: "✖", 2: "▲", 1: "·", 0: "·"}
 
 
 @dataclass(frozen=True)
@@ -38,8 +47,68 @@ _HELP = (
     f"    {_CYAN}/breadcrumbs important{_RESET}   {_DIM}+ throttles, drift, degradation (default){_RESET}\n"
     f"    {_CYAN}/breadcrumbs info{_RESET}        {_DIM}+ posture, plans, learning{_RESET}\n"
     f"    {_CYAN}/breadcrumbs all{_RESET}         {_DIM}everything (incl. unknown/new events){_RESET}\n"
-    f"    {_CYAN}/breadcrumbs{_RESET}             {_DIM}show the current level{_RESET}\n"
+    f"    {_CYAN}/breadcrumbs{_RESET}             {_DIM}show the current level{_RESET}\n\n"
+    f"  {_BOLD}Review:{_RESET}\n"
+    f"    {_CYAN}/breadcrumbs tail [N]{_RESET}   {_DIM}scroll back the last N events (max 200){_RESET}\n"
+    f"    {_CYAN}/breadcrumbs tail critical{_RESET}  {_DIM}filter the tail by severity{_RESET}\n"
+    f"    {_CYAN}/breadcrumbs tail <category>{_RESET} {_DIM}provider/governance/memory/cost/model/…{_RESET}\n"
 )
+
+
+def _fmt_age(ts: float, now: float) -> str:
+    d = max(0.0, now - ts)
+    if d < 90:
+        return f"{int(d)}s"
+    if d < 5400:
+        return f"{int(d / 60)}m"
+    return f"{d / 3600:.1f}h"
+
+
+def _render_tail(args) -> str:
+    """Scroll back the unified event history the live router feeds. Never raises."""
+    try:
+        from backend.core.ouroboros.governance.event_history_buffer import (
+            get_default_history,
+        )
+        from backend.core.ouroboros.governance.event_breadcrumb_registry import (
+            build_default_registry,
+        )
+    except Exception:  # noqa: BLE001
+        return f"  {_DIM}event history unavailable{_RESET}"
+
+    n, min_sev, category = _DEFAULT_TAIL, None, None
+    for a in args:
+        al = a.lower()
+        if al.isdigit():
+            n = min(_MAX_TAIL, max(1, int(al)))
+        elif al in _SEV_WORDS:
+            min_sev = _SEV_WORDS[al] if al != "all" else None
+        else:
+            category = al
+
+    hist = get_default_history()
+    recs = hist.recent(n, min_severity=min_sev, category=category)
+    if not recs:
+        filt = " matching filter" if (min_sev is not None or category) else ""
+        return f"  {_DIM}no events yet{filt} (history size {hist.size()}){_RESET}"
+
+    reg = build_default_registry()
+    now = time.time()
+    out = [
+        f"  {_BOLD}{_CYAN}recent events{_RESET} "
+        f"{_DIM}(newest first, {len(recs)} of {hist.size()} buffered){_RESET}"
+    ]
+    for rec in recs:
+        try:
+            _sev, text = reg.render(rec.event_type, rec.payload)
+            col = _ANSI_BY_SEV.get(rec.severity, _CYAN)
+            glyph = _GLYPH_BY_SEV.get(rec.severity, "·")
+            out.append(
+                f"    {_DIM}{_fmt_age(rec.ts, now):>4}{_RESET}  {col}{glyph}{_RESET} {text}"
+            )
+        except Exception:  # noqa: BLE001
+            out.append(f"    {_DIM}?  {rec.event_type}{_RESET}")
+    return "\n".join(out)
 
 
 def _matches(line: str) -> bool:
@@ -79,6 +148,8 @@ def dispatch_breadcrumbs_command(line: str) -> BreadcrumbsReplDispatchResult:
         return BreadcrumbsReplDispatchResult(ok=True, text=_status_text())
     if head in ("status",):
         return BreadcrumbsReplDispatchResult(ok=True, text=_status_text())
+    if head in ("tail", "history", "log"):
+        return BreadcrumbsReplDispatchResult(ok=True, text=_render_tail(args[1:]))
     if head in _LEVELS:
         try:
             from backend.core.ouroboros.governance.event_breadcrumb_registry import (
