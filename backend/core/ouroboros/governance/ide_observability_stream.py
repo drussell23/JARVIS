@@ -175,6 +175,14 @@ EVENT_TYPE_AWE_SOAK_LAUNCHED = "awe_soak_launched"
 EVENT_TYPE_AWE_SOAK_SUPPRESSED = "awe_soak_suppressed"
 EVENT_TYPE_AWE_SOAK_COMPLETE = "awe_soak_complete"
 EVENT_TYPE_AWE_SOAK_FAILED = "awe_soak_failed"
+# Autonomous Supervisor — the State-Reactive lifecycle manager. It auto-arms on
+# pending soak intent + DW DEGRADED (spawns the Sentinel subprocess), auto-disarms
+# when the queue clears (SIGTERM), self-heals the Sentinel on unexpected exit
+# (exponential backoff), and pipes the Sentinel's stdout/stderr in as telemetry.
+EVENT_TYPE_SUPERVISOR_ARMED = "supervisor_armed"
+EVENT_TYPE_SUPERVISOR_DISARMED = "supervisor_disarmed"
+EVENT_TYPE_SENTINEL_RESTARTED = "sentinel_restarted"
+EVENT_TYPE_SENTINEL_TELEMETRY = "sentinel_telemetry"
 
 # Slice 19 (Soak Budget & Compute Circuit-Breaker) — two events covering the
 # fail-closed boundary around an unattended graduation soak:
@@ -1662,6 +1670,10 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_AWE_SOAK_SUPPRESSED,             # AWE Trigger (2026-07-23 -- flap-guard suppressed a redundant edge)
     EVENT_TYPE_AWE_SOAK_COMPLETE,               # AWE Trigger (2026-07-23 -- detached soak reached terminal)
     EVENT_TYPE_AWE_SOAK_FAILED,                 # AWE Trigger (2026-07-23 -- detached soak raised)
+    EVENT_TYPE_SUPERVISOR_ARMED,                # Autonomous Supervisor (2026-07-23 -- intent-driven arm)
+    EVENT_TYPE_SUPERVISOR_DISARMED,             # Autonomous Supervisor (2026-07-23 -- queue-clear disarm)
+    EVENT_TYPE_SENTINEL_RESTARTED,              # Autonomous Supervisor (2026-07-23 -- watchdog self-heal restart)
+    EVENT_TYPE_SENTINEL_TELEMETRY,              # Autonomous Supervisor (2026-07-23 -- piped Sentinel stdout line)
 })
 
 

@@ -4696,6 +4696,21 @@ class SerpentREPL:
         except Exception:  # noqa: BLE001 — AWE arming is best-effort
             self._awe_trigger = None
 
+        # State-Reactive Autonomous Supervisor — the intent-driven lifecycle
+        # manager. At boot it queries the substrate; if a soak workload is pending
+        # AND DW is DEGRADED it autonomously spawns the Sentinel subprocess + arms
+        # the AWE listener, self-heals the Sentinel on crash, and disarms when the
+        # queue clears. Autonomy is the default (JARVIS_AUTONOMOUS_SUPERVISOR_ENABLED)
+        # but it stays fully inert until real intent exists. HITL = override only.
+        self._autonomous_supervisor = None
+        try:
+            from backend.core.ouroboros.governance.autonomous_supervisor import (
+                start_autonomous_supervisor,
+            )
+            self._autonomous_supervisor = start_autonomous_supervisor()
+        except Exception:  # noqa: BLE001 — supervisor is best-effort
+            self._autonomous_supervisor = None
+
     async def _event_breadcrumb_router(self) -> None:
         """The ONE unified live event feed: subscribe once to the broker and
         surface EVERY backend event through the descriptor registry — filtered by
@@ -4890,6 +4905,16 @@ class SerpentREPL:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._shadow_breadcrumb_task = None
+        # Tear down the Autonomous Supervisor (disarms the AWE listener + SIGTERMs
+        # the Sentinel subprocess + cancels its watchdog). Stop it before the AWE
+        # direct-override teardown since it may own its own AWE instance.
+        _sup = getattr(self, "_autonomous_supervisor", None)
+        if _sup is not None:
+            try:
+                await _sup.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._autonomous_supervisor = None
         # Tear down the AWE Trigger (cancels its watcher + any in-flight detached
         # soak). Owns its own tasks, so stop it before the task-tuple sweep.
         _awe = getattr(self, "_awe_trigger", None)
