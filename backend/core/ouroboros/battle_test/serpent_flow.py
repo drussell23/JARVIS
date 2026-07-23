@@ -4765,6 +4765,20 @@ class SerpentREPL:
                     key = str(payload.get("provider", payload.get("op_id", "")) or "")
                     if not coalescer.should_show(et, key):
                         continue
+                    # Sink redirect (DRY): when the Bipartite Async Layout is live,
+                    # this event auto-scrolls into Zone 1 (the Proactive Canvas)
+                    # instead of the flowing console — SAME formatting, framed sink.
+                    _canvas = None
+                    try:
+                        from backend.core.ouroboros.battle_test.bipartite_layout import (
+                            get_active_canvas,
+                        )
+                        _canvas = get_active_canvas()
+                    except Exception:  # noqa: BLE001
+                        _canvas = None
+                    if _canvas is not None:
+                        _canvas.emit(et, payload)
+                        continue
                     _sev, text = reg.render(et, payload)
                     self._flow.console.print(
                         f"  [{desc.color}]{desc.glyph} {text}[/{desc.color}]",
