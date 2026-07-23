@@ -72,6 +72,82 @@ def _enabled() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+_POLYGLOT_EXTS = frozenset({".json", ".yaml", ".yml", ".tsx", ".ts", ".jsx"})
+
+
+def _polyglot_enabled() -> bool:
+    return os.environ.get(
+        "JARVIS_POLYGLOT_ROUTER_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+async def _polyglot_intercept(
+    source: str,
+    file_path: str,
+    symbols: List[str],
+    agent_fn,
+    *,
+    op_id: str,
+    file_lines: int,
+    ext: str,
+    max_concurrency: Optional[int],
+) -> "InterceptResult":
+    """Route a non-Python big file through the Polyglot engine — native
+    per-language chunk/stitch/validate. Composes ``polyglot_repair`` (which
+    reuses swarm_concurrency + stitch_replacement) and adapts the swarm's
+    ``(ChunkTarget, feedback)->str`` agent to polyglot's ``(Chunk)->str``,
+    folding any TSX context header into the ChunkTarget prompt. Ghost-Edit
+    re-check parity. Never raises."""
+    from backend.core.ouroboros.governance.polyglot_chunker import (
+        ChunkerFactory,
+        build_context_bundled_target,
+        polyglot_repair,
+    )
+
+    strat = ChunkerFactory.for_file(file_path)
+    entry_disk_sha = _disk_sha(file_path)
+    record_pending_strategy(
+        op_id, strategy=f"polyglot_{strat.language}", file_lines=file_lines, ext=ext,
+    )
+
+    async def _poly_agent(chunk) -> str:
+        target = build_context_bundled_target(chunk, instruction=f"repair {chunk.name}")
+        return await agent_fn(target, "")
+
+    lock = await _lock_for(file_path)
+    async with lock:
+        result = await polyglot_repair(
+            source, file_path, list(symbols or []), _poly_agent,
+            max_concurrency=max_concurrency,
+        )
+
+    exit_disk_sha = _disk_sha(file_path)
+    if (
+        entry_disk_sha is not None
+        and exit_disk_sha is not None
+        and entry_disk_sha != exit_disk_sha
+    ):
+        logger.warning(
+            "[FullContentInterceptor] %s: GHOST EDIT during polyglot swarm — "
+            "aborting stitch, requeue op", file_path,
+        )
+        return InterceptResult(
+            strategy="aborted_drift", content=source, stitched=False,
+            drifted=True, dropped_nodes=list(symbols or []),
+        )
+
+    logger.info(
+        "[FullContentInterceptor] %s (%d lines): polyglot %s — converged=%d "
+        "dropped=%d (native chunk/stitch/validate)",
+        file_path, file_lines, strat.language, len(result.succeeded), len(result.failed),
+    )
+    return InterceptResult(
+        strategy=f"polyglot_{strat.language}", content=result.stitched,
+        stitched=bool(result.succeeded), converged_nodes=list(result.succeeded),
+        dropped_nodes=list(result.failed),
+    )
+
+
 def _disk_sha(file_path: str) -> Optional[str]:
     """Fast SHA-256 of the on-disk file, or ``None`` if it is not a readable
     real path (e.g. a synthetic/in-memory path in a test). Never raises.
@@ -124,6 +200,15 @@ async def intercept_full_content(
     if not _enabled() or not exceeds_ceiling(source):
         content = (await whole_file_fn()) if whole_file_fn else source
         return InterceptResult(strategy="whole", content=content, stitched=False)
+
+    # ── Extension-Dispatch: a non-.py big file routes to the Polyglot engine ──
+    # (.json/.yaml/.tsx/.ts) so the Python AST parser is never fed a non-Python
+    # file. Python (.py) falls through to the existing AST swarm, byte-identical.
+    if _polyglot_enabled() and ext.lower() in _POLYGLOT_EXTS:
+        return await _polyglot_intercept(
+            source, file_path, symbols, agent_fn, op_id=op_id,
+            file_lines=file_lines, ext=ext, max_concurrency=max_concurrency,
+        )
 
     # ── MASSIVE file: whole-file FORBIDDEN — build AST targets ──
     # Optimistic State Hashing (Ghost-Edit Protection): snapshot the on-disk

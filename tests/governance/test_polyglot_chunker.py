@@ -54,10 +54,12 @@ def test_factory_routes_by_extension() -> None:
     assert isinstance(ChunkerFactory.for_file("k8s/manifest.yaml"), YAMLTreeChunker)
     assert isinstance(ChunkerFactory.for_file("deploy.yml"), YAMLTreeChunker)
     assert isinstance(ChunkerFactory.for_file("mod.py"), PythonASTChunker)
-    # Unknown → universal fallback, NOT the Python parser.
+    from backend.core.ouroboros.governance.polyglot_chunker import TSXChunker
+    assert isinstance(ChunkerFactory.for_file("app.tsx"), TSXChunker)
+    assert isinstance(ChunkerFactory.for_file("hook.ts"), TSXChunker)
+    # Truly-unknown → universal fallback, NOT the Python parser.
     assert isinstance(ChunkerFactory.for_file("README.md"), RegexIndentationChunker)
     assert isinstance(ChunkerFactory.for_file("notes.txt"), RegexIndentationChunker)
-    assert isinstance(ChunkerFactory.for_file("app.tsx"), RegexIndentationChunker)
 
 
 def test_json_does_not_crash_python_parser() -> None:
@@ -154,3 +156,120 @@ def test_text_fallback_line_range_and_anchor() -> None:
     assert c2 is not None and "delta" in c2.source_code
     # Text always validates (no grammar to corrupt).
     assert RegexIndentationChunker().validate("anything at all {[}") is True
+
+
+# ---------------------------------------------------------------------------
+# (Mandated 1) TSX Semantic Context Bundling
+# ---------------------------------------------------------------------------
+
+_TSX = '''import React, { useState } from "react";
+import { fetchUser } from "./api";
+
+interface UserCardProps {
+  userId: string;
+  compact: boolean;
+}
+
+interface Unrelated {
+  foo: number;
+}
+
+type Theme = "light" | "dark";
+
+export function UserCard(props: UserCardProps) {
+  const [open, setOpen] = useState(false);
+  const theme: Theme = "light";
+  return <div className={theme}>{props.userId}</div>;
+}
+
+export function OtherComponent() {
+  return <span>hi</span>;
+}
+'''
+
+
+async def test_tsx_bundles_target_node_and_required_interface() -> None:
+    from backend.core.ouroboros.governance.polyglot_chunker import (
+        TSXChunker,
+        build_context_bundled_target,
+    )
+
+    strat = ChunkerFactory.for_file("components/UserCard.tsx")
+    assert isinstance(strat, TSXChunker)
+
+    chunk = strat.extract(_TSX, "UserCard.tsx", "UserCard")
+    assert chunk is not None
+    # The target node itself.
+    assert "function UserCard" in chunk.source_code
+    assert 'className={theme}' in chunk.source_code
+
+    # (1) The context header bundles the imports AND the REQUIRED interface/type
+    # defs the node references (UserCardProps, Theme) — zero context starvation.
+    hdr = chunk.context_header
+    assert "interface UserCardProps" in hdr
+    assert "type Theme" in hdr
+    assert 'import React' in hdr and 'from "./api"' in hdr
+    # ...but NOT the unrelated interface the node never references.
+    assert "Unrelated" not in hdr
+
+    # The ChunkTarget the swarm consumes carries BOTH node + context (read-only).
+    target = build_context_bundled_target(chunk, instruction="fix UserCard")
+    assert "UserCardProps" in target.prompt          # required interface present
+    assert "READ-ONLY CONTEXT" in target.prompt
+    assert target.chunk.source_code == chunk.source_code
+
+
+# ---------------------------------------------------------------------------
+# (Mandated 2) YAML Indentation Lock at Fan-In
+# ---------------------------------------------------------------------------
+
+
+async def test_yaml_indentation_lock_normalizes_llm_whitespace() -> None:
+    from backend.core.ouroboros.governance.polyglot_chunker import YAMLTreeChunker
+
+    yaml_src = (
+        "root:\n"
+        "  services:\n"
+        "    web:\n"
+        "      image: nginx\n"
+        "      port: 8080\n"
+        "  other:\n"
+        "    keep: true\n"
+    )
+    strat = YAMLTreeChunker()
+    # Deeply nested target at absolute indent 6.
+    chunk = strat.extract(yaml_src, "compose.yaml", "root.services.web.port")
+    assert chunk is not None
+    assert chunk.indent == 6                       # locked baseline captured
+
+    # The "LLM" returns the fix with WRONG leading whitespace (0-indented).
+    llm_body = "port: 9090"
+    stitched = strat.stitch(yaml_src, chunk, llm_body)
+    assert stitched is not None
+
+    # Indentation Lock normalized it to EXACTLY 6 spaces before grafting.
+    assert "      port: 9090\n" in stitched
+    assert "    port: 9090" not in stitched.replace("      port", "")  # no wrong depth
+
+    # The global YAML tree is intact + valid.
+    try:
+        import yaml
+        parsed = yaml.safe_load(stitched)
+        assert parsed["root"]["services"]["web"]["port"] == 9090
+        assert parsed["root"]["services"]["web"]["image"] == "nginx"
+        assert parsed["root"]["other"]["keep"] is True
+    except ImportError:
+        assert strat.validate(stitched) is True
+
+
+async def test_yaml_lock_handles_over_indented_multiline_block() -> None:
+    from backend.core.ouroboros.governance.polyglot_chunker import _normalize_to_indent
+
+    # A multi-line block the LLM over-indented by 10 spaces — relative structure
+    # must survive, absolute baseline re-locked to 4.
+    over = "          web:\n            image: nginx\n            port: 80"
+    normalized = _normalize_to_indent(over, 4)
+    lines = normalized.split("\n")
+    assert lines[0] == "    web:"                  # baseline locked to 4
+    assert lines[1] == "      image: nginx"        # relative +2 preserved
+    assert lines[2] == "      port: 80"

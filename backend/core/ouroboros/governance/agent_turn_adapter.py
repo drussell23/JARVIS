@@ -411,6 +411,14 @@ class ProductionAgentTurnFn:
             node = self._extract_node(raw or "", target)
             if not node:
                 return ""
+            # Polymorphic verify: a Python CodeChunk has no ``language`` attr →
+            # defaults to "python" (byte-identical AST gate). A polyglot Chunk
+            # (json/yaml/tsx) carries its language — its per-node output is NOT a
+            # Python function, so the whole-file structural validate at the
+            # polyglot stitch is the gate, not a Python AST parse here.
+            lang = getattr(getattr(target, "chunk", None), "language", "python")
+            if lang and lang != "python":
+                return node
             ok, _err = _verify_node_against_ast(node, target)
             return node if ok else ""
         except Exception:  # noqa: BLE001 — the drone's fault is isolated, not fatal
