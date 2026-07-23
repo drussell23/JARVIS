@@ -46,7 +46,13 @@ logger = logging.getLogger("Ouroboros.PolyglotChunker")
 class Chunk:
     """Standardized chunk — duck-types the #70020 CodeChunk so the existing
     ``stitch_replacement`` (reads ``start_line`` / ``end_line``) and the swarm
-    consume it unchanged. 1-indexed inclusive line range."""
+    consume it unchanged. 1-indexed inclusive line range.
+
+    ``context_header`` — read-only context bundled by the Chunker (e.g. TSX
+    imports + relevant interfaces) so the LLM has zero prop/hook context
+    starvation. It is NOT part of the stitched region.
+    ``indent`` — the locked absolute leading-indent depth (YAML), used by the
+    strategy's ``stitch`` to normalize the LLM's whitespace before grafting."""
     start_line: int
     end_line: int
     source_code: str
@@ -54,6 +60,8 @@ class Chunk:
     qualified_name: str = ""
     file_path: str = ""
     language: str = ""
+    context_header: str = ""
+    indent: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +352,27 @@ def _yaml_key_line_span(text: str, target_path: Sequence[str]) -> Optional[Tuple
     return (start_idx + 1, end_idx + 1)
 
 
+def _normalize_to_indent(body: str, indent: int) -> str:
+    """Indentation Lock: re-align *body* so its shallowest non-blank line sits at
+    exactly ``indent`` leading spaces, preserving RELATIVE internal indentation.
+    Mathematically guarantees the grafted block matches the locked YAML baseline
+    regardless of what leading whitespace the LLM produced (over- or under-
+    indented, tab-mixed). Never raises."""
+    lines = body.replace("\t", "  ").split("\n")
+    non_blank = [ln for ln in lines if ln.strip()]
+    if not non_blank:
+        return body
+    min_lead = min(len(ln) - len(ln.lstrip(" ")) for ln in non_blank)
+    pad = " " * max(0, int(indent))
+    out: List[str] = []
+    for ln in lines:
+        if not ln.strip():
+            out.append("")
+        else:
+            out.append(pad + ln[min_lead:])   # strip the block's own base, apply the lock
+    return "\n".join(out)
+
+
 class YAMLTreeChunker(BaseChunker):
     extensions = (".yaml", ".yml")
     language = "yaml"
@@ -354,10 +383,20 @@ class YAMLTreeChunker(BaseChunker):
             return None
         s, e = span
         lines = source.splitlines(keepends=True)
+        first = lines[s - 1] if s - 1 < len(lines) else ""
+        locked_indent = len(first) - len(first.lstrip(" "))   # absolute depth of the key
         return Chunk(
             start_line=s, end_line=e, source_code="".join(lines[s - 1:e]),
             name=target, qualified_name=target, file_path=file_path, language="yaml",
+            indent=locked_indent,
         )
+
+    def stitch(self, full_source: str, chunk: Chunk, new_body: str) -> Optional[str]:
+        """Indentation Lock at Fan-In: normalize the LLM's whitespace to the
+        stored ``chunk.indent`` BEFORE the line-based graft, so indentation drift
+        can never corrupt the global YAML tree."""
+        normalized = _normalize_to_indent(new_body, getattr(chunk, "indent", 0))
+        return super().stitch(full_source, chunk, normalized)
 
     def validate(self, text: str) -> bool:
         try:
@@ -369,6 +408,138 @@ class YAMLTreeChunker(BaseChunker):
             return True
         except Exception:  # noqa: BLE001
             return False
+
+
+# ---------------------------------------------------------------------------
+# TSX/JSX — structural scan + Semantic Context Bundling
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_TS_IMPORT_RE = _re.compile(r"^\s*import\s.+?;?\s*$", _re.MULTILINE)
+_TS_IDENT_RE = _re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+
+
+def _ts_definition_spans(source: str):
+    """Yield (name, start_idx, end_idx, text) for every top-level ``interface`` /
+    ``type`` / component-ish def, via brace/`;`-matched structural scan (no TS AST
+    available in-process — native line/brace scan, not regex-forcing). Never raises."""
+    out = []
+    for m in _re.finditer(
+        r"(?:export\s+)?(?:interface|type|function|const)\s+([A-Za-z_$][\w$]*)",
+        source,
+    ):
+        name = m.group(1)
+        kw = m.group(0)
+        start = m.start()
+        if "type " in kw and "=" in source[m.end(): m.end() + 200].split("\n", 1)[0]:
+            # `type X = ...;` — ends at the terminating semicolon at depth 0.
+            j = source.find("=", m.end())
+            depth = 0
+            k = j
+            while k < len(source):
+                c = source[k]
+                if c in "{[(":
+                    depth += 1
+                elif c in "}])":
+                    depth -= 1
+                elif c == ";" and depth == 0:
+                    break
+                k += 1
+            out.append((name, start, min(k + 1, len(source)), source[start:min(k + 1, len(source))]))
+        else:
+            # brace-bodied (interface/function/const-arrow-with-body).
+            brace = source.find("{", m.end())
+            if brace == -1:
+                continue
+            depth = 0
+            k = brace
+            while k < len(source):
+                c = source[k]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            out.append((name, start, min(k + 1, len(source)), source[start:min(k + 1, len(source))]))
+    return out
+
+
+class TSXChunker(BaseChunker):
+    extensions = (".tsx", ".jsx", ".ts")
+    language = "tsx"
+
+    def extract(self, source: str, file_path: str, target: str) -> Optional[Chunk]:
+        defs = _ts_definition_spans(source)
+        node = next((d for d in defs if d[0] == target), None)
+        if node is None:
+            return None
+        _name, start, end, node_text = node
+        lines = source.splitlines(keepends=True)
+        start_line = source.count("\n", 0, start) + 1
+        end_line = source.count("\n", 0, end - 1) + 1
+
+        # Semantic Context Bundling: imports + LOCAL interface/type defs whose
+        # names appear in the target node → zero prop/hook context starvation.
+        imports = [m.group(0).strip() for m in _TS_IMPORT_RE.finditer(source)]
+        referenced = {t for t in _TS_IDENT_RE.findall(node_text)}
+        relevant_types = [
+            text.strip() for (nm, s, e, text) in defs
+            if nm != target and nm in referenced
+            and _re.match(r"\s*(?:export\s+)?(?:interface|type)\b", text)
+        ]
+        header_parts: List[str] = []
+        if imports:
+            header_parts.append("// --- imports (read-only context) ---\n" + "\n".join(imports))
+        if relevant_types:
+            header_parts.append(
+                "// --- relevant type/interface defs (read-only context) ---\n"
+                + "\n\n".join(relevant_types)
+            )
+        context_header = "\n\n".join(header_parts)
+
+        return Chunk(
+            start_line=start_line, end_line=end_line,
+            source_code="".join(lines[start_line - 1:end_line]),
+            name=target, qualified_name=target, file_path=file_path,
+            language="tsx", context_header=context_header,
+        )
+
+    def validate(self, text: str) -> bool:
+        # No in-process TS parser — validate balanced braces/parens/brackets
+        # (the structural corruption class the stitch could introduce). Strings/
+        # comments are not fully tokenized; this is a structural sanity gate.
+        depth = {"{": 0, "(": 0, "[": 0}
+        pairs = {"}": "{", ")": "(", "]": "["}
+        for c in text:
+            if c in depth:
+                depth[c] += 1
+            elif c in pairs:
+                depth[pairs[c]] -= 1
+                if depth[pairs[c]] < 0:
+                    return False
+        return all(v == 0 for v in depth.values())
+
+
+def build_context_bundled_target(chunk: Chunk, *, instruction: str = ""):
+    """Compose the ``ChunkTarget`` the swarm consumes, folding a Chunk's
+    ``context_header`` into the ChunkTarget's ``prompt`` (read-only context) so
+    the downstream ProductionAgentTurnFn needs no change. DRY: the bundling lives
+    in the Chunker layer; the orchestrator just reads ``ChunkTarget``."""
+    from backend.core.ouroboros.governance.chunk_swarm import ChunkTarget
+    header = getattr(chunk, "context_header", "") or ""
+    prompt = ""
+    if header:
+        prompt = (
+            "READ-ONLY CONTEXT (do not modify or repeat — for reference only):\n"
+            f"{header}\n\n"
+        )
+    return ChunkTarget(
+        symbol=chunk.name, chunk=chunk,
+        instruction=instruction or f"repair {chunk.name}", prompt=prompt,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +583,7 @@ class RegexIndentationChunker(BaseChunker):
 
 class ChunkerFactory:
     _STRATEGIES: Tuple[BaseChunker, ...] = (
-        PythonASTChunker(), JSONTreeChunker(), YAMLTreeChunker(),
+        PythonASTChunker(), JSONTreeChunker(), YAMLTreeChunker(), TSXChunker(),
     )
     _FALLBACK = RegexIndentationChunker()
 
@@ -529,7 +700,9 @@ __all__ = [
     "PolyglotResult",
     "PythonASTChunker",
     "RegexIndentationChunker",
+    "TSXChunker",
     "YAMLTreeChunker",
+    "build_context_bundled_target",
     "polyglot_repair",
     "polymorphic_extract_target",
 ]
