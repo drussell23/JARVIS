@@ -208,6 +208,47 @@ async def test_restart_resumes_without_duplication(project, db_path):
     assert committed_after_crash.issubset(completed_ids(manifest_before))
 
 
+async def test_checkpoint_progress_surfaces_on_broker(project, db_path):
+    """The map-reduce immortality is VISIBLE: enqueue + run emit the progress
+    events (manifest / resume / per-chunk / run-complete) onto the real broker,
+    so the operator watches it tick live in /breadcrumbs."""
+    from backend.core.ouroboros.governance.ide_observability_stream import (
+        get_default_broker,
+        reset_default_broker,
+    )
+
+    reset_default_broker()
+    broker = get_default_broker()
+    sub = broker.subscribe()
+    seen: list = []
+
+    conn = sqlite3.connect(db_path)
+    res = await enqueue_soak_manifest(conn, project, priority=1)
+    iid = res["intent_id"]
+
+    async def swarm(chunk):
+        return "ok"
+
+    await run_checkpointed(conn, iid, swarm)
+    conn.close()
+
+    # Drain what the broker queued (subscribe() captured from enqueue onward).
+    for _ in range(200):
+        ev = None
+        try:
+            ev = sub.queue.get_nowait()
+        except Exception:  # noqa: BLE001 — empty
+            break
+        seen.append(getattr(ev, "event_type", ""))
+    broker.unsubscribe(sub)
+    reset_default_broker()
+
+    assert "soak_manifest_enqueued" in seen
+    assert "soak_resumed" in seen
+    assert seen.count("soak_chunk_committed") == 3   # one tick per chunk
+    assert "soak_run_complete" in seen
+
+
 async def test_resume_pending_skips_completed(project, db_path):
     conn = sqlite3.connect(db_path)
     res = await enqueue_soak_manifest(conn, project, priority=1)

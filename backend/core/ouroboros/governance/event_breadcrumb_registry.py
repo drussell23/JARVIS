@@ -279,6 +279,19 @@ def build_default_registry() -> EventBreadcrumbRegistry:
                                        f"backoff {p.get('backoff_s','?')}s): {p.get('reason','')}", "supervisor"),
         BreadcrumbDescriptor("sentinel_telemetry", "·", "bright_black", SEV_VERBOSE,
                              lambda p: str(p.get("line", "")).strip(), "supervisor"),
+        BreadcrumbDescriptor("soak_manifest_enqueued", "⚑", "cyan bold", SEV_IMPORTANT,
+                             lambda p: f"soak queued {str(p.get('intent_id',''))[:12]} — "
+                                       f"{p.get('chunk_count','?')} chunks", "soak"),
+        BreadcrumbDescriptor("soak_resumed", "↻", "cyan", SEV_IMPORTANT,
+                             lambda p: f"resume {str(p.get('intent_id',''))[:12]} — "
+                                       f"{p.get('done','?')}/{p.get('total','?')} done, "
+                                       f"{p.get('remaining','?')} to go", "soak"),
+        BreadcrumbDescriptor("soak_chunk_committed", "◈", "green", SEV_INFO,
+                             lambda p: f"chunk {p.get('done','?')}/{p.get('total','?')} "
+                                       f"✓ {p.get('symbol','?')} ({p.get('file_path','?')})", "soak"),
+        BreadcrumbDescriptor("soak_run_complete", "✓", "green bold", SEV_IMPORTANT,
+                             lambda p: f"soak run done — {p.get('processed','?')} committed, "
+                                       f"{p.get('failed','?')} failed, {p.get('skipped','?')} pre-done", "soak"),
     ]
     for d in seed:
         reg.register(d)

@@ -56,6 +56,20 @@ logger = logging.getLogger("Ouroboros.CheckpointManifest")
 MANIFEST_SCHEMA_VERSION = 1
 _INTENT_TABLE = "soak_intent_queue"
 
+
+def _emit_event(event_type: str, payload: dict) -> None:
+    """Surface checkpoint progress on the broker so the operator watches the
+    map-reduce tick live in ``/breadcrumbs`` (the Swarm's immortality made
+    VISIBLE, not just durable in SQLite). Best-effort; never raises."""
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            publish_task_event,
+        )
+        op_id = str(payload.get("intent_id", "soak")) or "soak"
+        publish_task_event(event_type, op_id, dict(payload))
+    except Exception:  # noqa: BLE001
+        pass
+
 _DEFAULT_EXTS = (".py",)
 
 
@@ -234,6 +248,9 @@ async def enqueue_soak_manifest(
     )
     if iid is None:
         return None
+    _emit_event("soak_manifest_enqueued", {
+        "intent_id": iid, "target": target, "chunk_count": len(chunks), "kind": kind,
+    })
     return {"intent_id": iid, "manifest": manifest, "chunk_count": len(chunks)}
 
 
@@ -360,7 +377,15 @@ async def run_checkpointed(
     if manifest is None:
         return summary
     summary.skipped = sorted(completed_ids(manifest))
-    for chunk in resume_pending(manifest):
+    pending = resume_pending(manifest)
+    total = len(summary.skipped) + len(pending)
+    done = len(summary.skipped)
+    # Resume breadcrumb — the operator sees exactly where the crash left off.
+    _emit_event("soak_resumed", {
+        "intent_id": intent_id, "total": total,
+        "done": done, "remaining": len(pending),
+    })
+    for chunk in pending:
         cid = str(chunk.get("chunk_id"))
         try:
             result = await swarm_fn(chunk)
@@ -370,8 +395,19 @@ async def run_checkpointed(
             continue
         if mark_chunk_complete(conn, intent_id, cid, result=str(result) if result is not None else ""):
             summary.processed.append(cid)
+            done += 1
+            # Per-chunk tick — the map-reduce progress made visible live.
+            _emit_event("soak_chunk_committed", {
+                "intent_id": intent_id, "chunk_id": cid,
+                "symbol": chunk.get("symbol", "?"), "file_path": chunk.get("file_path", "?"),
+                "done": done, "total": total,
+            })
         else:
             summary.failed.append(cid)
+    _emit_event("soak_run_complete", {
+        "intent_id": intent_id, "processed": len(summary.processed),
+        "failed": len(summary.failed), "skipped": len(summary.skipped), "total": total,
+    })
     return summary
 
 
