@@ -166,6 +166,15 @@ EVENT_TYPE_PROVIDER_STATE_CHANGED = "provider_state_changed"
 # to a cold boot (or failed). On Spot instances this defeats agile failover, so
 # it MUST be loud, not silent — surfaced to the operator via this SSE frame.
 EVENT_TYPE_GOLDEN_IMAGE_DEGRADED = "golden_image_degraded"
+# Autonomous Wake-and-Execute (AWE): on the DEGRADED→HEALTHY recovery edge the
+# trigger atomically claims the soak lock and detaches the definitive Agentic
+# Swarm soak. These four make that autonomous decision visible per Manifesto §7
+# (every autonomous decision is observable) — LAUNCHED at claim, SUPPRESSED when
+# the flap guard rejects a redundant edge, COMPLETE/FAILED on soak terminal.
+EVENT_TYPE_AWE_SOAK_LAUNCHED = "awe_soak_launched"
+EVENT_TYPE_AWE_SOAK_SUPPRESSED = "awe_soak_suppressed"
+EVENT_TYPE_AWE_SOAK_COMPLETE = "awe_soak_complete"
+EVENT_TYPE_AWE_SOAK_FAILED = "awe_soak_failed"
 
 # Slice 19 (Soak Budget & Compute Circuit-Breaker) — two events covering the
 # fail-closed boundary around an unattended graduation soak:
@@ -1649,6 +1658,10 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_SWARM_NODE_VAPORIZED,             # Swarm Phase 1d (2026-06-24 -- sandbox vaporized)
     EVENT_TYPE_SWARM_DEADLOCK,                    # Swarm Phase 1d (2026-06-24 -- deadlock shattered)
     EVENT_TYPE_SWARM_SENTINEL_BLOCK,             # Swarm Phase 1d (2026-06-24 -- Sentinel imperative block)
+    EVENT_TYPE_AWE_SOAK_LAUNCHED,                # AWE Trigger (2026-07-23 -- recovery-edge soak launch)
+    EVENT_TYPE_AWE_SOAK_SUPPRESSED,             # AWE Trigger (2026-07-23 -- flap-guard suppressed a redundant edge)
+    EVENT_TYPE_AWE_SOAK_COMPLETE,               # AWE Trigger (2026-07-23 -- detached soak reached terminal)
+    EVENT_TYPE_AWE_SOAK_FAILED,                 # AWE Trigger (2026-07-23 -- detached soak raised)
 })
 
 

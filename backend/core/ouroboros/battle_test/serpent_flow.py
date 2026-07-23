@@ -4681,6 +4681,21 @@ class SerpentREPL:
         except Exception:  # noqa: BLE001 — badge ticker is best-effort
             self._status_badge_ticker_task = None
 
+        # Autonomous Wake-and-Execute (AWE) Trigger — the Midnight-Recovery
+        # reflex. Consumes the SAME provider_state_changed feed and, on the
+        # DEGRADED→HEALTHY edge, atomically claims the soak lock and detaches the
+        # definitive Agentic Swarm soak so a 3 AM recovery is not lost to a
+        # passive human bottleneck. Opt-in (JARVIS_AWE_TRIGGER_ENABLED); returns
+        # None + stays inert when disabled. Best-effort.
+        self._awe_trigger = None
+        try:
+            from backend.core.ouroboros.governance.awe_trigger import (
+                start_awe_trigger,
+            )
+            self._awe_trigger = start_awe_trigger()
+        except Exception:  # noqa: BLE001 — AWE arming is best-effort
+            self._awe_trigger = None
+
     async def _event_breadcrumb_router(self) -> None:
         """The ONE unified live event feed: subscribe once to the broker and
         surface EVERY backend event through the descriptor registry — filtered by
@@ -4875,6 +4890,15 @@ class SerpentREPL:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._shadow_breadcrumb_task = None
+        # Tear down the AWE Trigger (cancels its watcher + any in-flight detached
+        # soak). Owns its own tasks, so stop it before the task-tuple sweep.
+        _awe = getattr(self, "_awe_trigger", None)
+        if _awe is not None:
+            try:
+                await _awe.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._awe_trigger = None
         # Tear down the provider-state resilience breadcrumb + watcher + the
         # unified event-feed router.
         for _attr in ("_status_badge_ticker_task", "_event_breadcrumb_router_task",
