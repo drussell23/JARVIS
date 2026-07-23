@@ -53,8 +53,22 @@ from backend.core.ouroboros.governance.soak_intent import (
 
 logger = logging.getLogger("Ouroboros.CheckpointManifest")
 
-MANIFEST_SCHEMA_VERSION = 1
+# Schema 2 adds the DLQ arrays (quarantined_chunks + chunk_retry_counts). Old
+# schema-1 manifests are read defensively (missing keys → empty), so a DB written
+# before the DLQ upgrades in place with no migration.
+MANIFEST_SCHEMA_VERSION = 2
 _INTENT_TABLE = "soak_intent_queue"
+
+_DEFAULT_MAX_STRIKES = 3
+
+
+def _max_strikes() -> int:
+    """3-strike DLQ threshold (env ``JARVIS_SOAK_CHUNK_MAX_STRIKES``). A chunk
+    that fails this many cumulative times is quarantined, not retried forever."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_SOAK_CHUNK_MAX_STRIKES", _DEFAULT_MAX_STRIKES)))
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_STRIKES
 
 
 def _emit_event(event_type: str, payload: dict) -> None:
@@ -182,6 +196,8 @@ def build_manifest(target: str, chunks: List[ChunkDescriptor], *, now: Optional[
         "created_ts": time.time() if now is None else float(now),
         "pending_chunks": [asdict(c) for c in chunks],
         "completed_chunks": [],
+        "quarantined_chunks": [],       # DLQ — poison chunks that struck out
+        "chunk_retry_counts": {},       # chunk_id -> cumulative failure count
     }
 
 
@@ -201,24 +217,34 @@ def deserialize_manifest(raw: Optional[str]) -> Optional[dict]:
         return None
 
 
-def completed_ids(manifest: dict) -> set:
+def _ids_of(manifest: dict, key: str) -> set:
     return {
         str(c.get("chunk_id"))
-        for c in (manifest or {}).get("completed_chunks", []) or []
+        for c in (manifest or {}).get(key, []) or []
         if isinstance(c, dict) and c.get("chunk_id")
     }
 
 
+def completed_ids(manifest: dict) -> set:
+    return _ids_of(manifest, "completed_chunks")
+
+
+def quarantined_ids(manifest: dict) -> set:
+    """Poison chunks that struck out — the DLQ. Structurally skipped on resume."""
+    return _ids_of(manifest, "quarantined_chunks")
+
+
 def resume_pending(manifest: dict) -> List[dict]:
     """The chunks still to do: every ``pending_chunks`` entry whose hash is NOT in
-    ``completed_chunks``. Structural idempotency — a resumed Swarm sees only the
-    remainder, never a duplicate. Never raises."""
+    ``completed_chunks`` NOR ``quarantined_chunks``. Structural idempotency — a
+    resumed Swarm sees only the remainder and moves INSTANTLY past a quarantined
+    poison chunk to the next pending one (no infinite retry). Never raises."""
     if not manifest:
         return []
-    done = completed_ids(manifest)
+    skip = completed_ids(manifest) | quarantined_ids(manifest)
     return [
         c for c in manifest.get("pending_chunks", []) or []
-        if isinstance(c, dict) and str(c.get("chunk_id")) not in done
+        if isinstance(c, dict) and str(c.get("chunk_id")) not in skip
     ]
 
 
@@ -337,6 +363,95 @@ def mark_chunk_complete(
             pass
 
 
+def mark_chunk_failed(
+    conn: Optional[sqlite3.Connection],
+    intent_id: str,
+    chunk_id: str,
+    *,
+    max_strikes: Optional[int] = None,
+    error: str = "",
+    now: Optional[float] = None,
+) -> str:
+    """Record ONE failed attempt on ``chunk_id`` (the chunk-level circuit breaker).
+    Atomically increments ``chunk_retry_counts[chunk_id]``; when the count reaches
+    ``max_strikes`` (default 3) the hash is moved ``pending_chunks`` →
+    ``quarantined_chunks`` (with its strike count + last error). Same
+    ``BEGIN IMMEDIATE`` read-modify-write as the commit path. Returns:
+    ``"quarantined"`` (struck out — DLQ'd), ``"retry"`` (still pending, count
+    bumped), ``"already"`` (already completed/quarantined — no-op), or ``"error"``.
+    Never raises."""
+    if conn is None:
+        return "error"
+    strikes_cap = _max_strikes() if max_strikes is None else max(1, int(max_strikes))
+    when = time.time() if now is None else float(now)
+    prev_isolation = getattr(conn, "isolation_level", "")
+    try:
+        ensure_intent_table(conn)
+        try:
+            conn.execute("PRAGMA busy_timeout=3000")
+        except sqlite3.Error:
+            pass
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                f"SELECT manifest_json FROM {_INTENT_TABLE} WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+            manifest = deserialize_manifest(row[0] if row else None)
+            if manifest is None:
+                conn.execute("ROLLBACK")
+                return "error"
+            if str(chunk_id) in (completed_ids(manifest) | quarantined_ids(manifest)):
+                conn.execute("ROLLBACK")
+                return "already"
+            pending = manifest.get("pending_chunks", []) or []
+            counts = dict(manifest.get("chunk_retry_counts", {}) or {})
+            n = int(counts.get(str(chunk_id), 0)) + 1
+            counts[str(chunk_id)] = n
+            manifest["chunk_retry_counts"] = counts
+            result = "retry"
+            if n >= strikes_cap:
+                # 3-strike DLQ: move the poison chunk out of the pending stream.
+                found = None
+                remaining = []
+                for c in pending:
+                    if isinstance(c, dict) and str(c.get("chunk_id")) == str(chunk_id):
+                        found = c
+                    else:
+                        remaining.append(c)
+                if found is not None:
+                    entry = dict(found)
+                    entry["strikes"] = n
+                    entry["quarantined_ts"] = when
+                    entry["last_error"] = str(error)[:200]
+                    manifest["pending_chunks"] = remaining
+                    manifest["quarantined_chunks"] = list(
+                        manifest.get("quarantined_chunks", []) or []
+                    ) + [entry]
+                    result = "quarantined"
+            conn.execute(
+                f"UPDATE {_INTENT_TABLE} SET manifest_json=? WHERE intent_id=?",
+                (serialize_manifest(manifest), intent_id),
+            )
+            conn.execute("COMMIT")
+            return result
+        except Exception:  # noqa: BLE001
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+    except sqlite3.Error:
+        logger.debug("[Checkpoint] mark_chunk_failed failed", exc_info=True)
+        return "error"
+    finally:
+        try:
+            conn.isolation_level = prev_isolation
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def read_manifest(
     conn: Optional[sqlite3.Connection], intent_id: str,
 ) -> Optional[dict]:
@@ -359,7 +474,8 @@ class CheckpointRunSummary:
     intent_id: str
     processed: List[str] = field(default_factory=list)   # chunk_ids done THIS run
     skipped: List[str] = field(default_factory=list)     # already-completed on entry
-    failed: List[str] = field(default_factory=list)      # raised this run (stay pending)
+    failed: List[str] = field(default_factory=list)      # struck this run (stay pending)
+    quarantined: List[str] = field(default_factory=list) # struck out this run → DLQ
 
 
 async def run_checkpointed(
@@ -377,21 +493,40 @@ async def run_checkpointed(
     if manifest is None:
         return summary
     summary.skipped = sorted(completed_ids(manifest))
+    already_quarantined = sorted(quarantined_ids(manifest))
     pending = resume_pending(manifest)
-    total = len(summary.skipped) + len(pending)
+    total = len(summary.skipped) + len(already_quarantined) + len(pending)
     done = len(summary.skipped)
-    # Resume breadcrumb — the operator sees exactly where the crash left off.
+    # Resume breadcrumb — the operator sees exactly where the crash left off,
+    # and that any prior poison chunks are already DLQ'd (instantly skipped).
     _emit_event("soak_resumed", {
-        "intent_id": intent_id, "total": total,
-        "done": done, "remaining": len(pending),
+        "intent_id": intent_id, "total": total, "done": done,
+        "remaining": len(pending), "quarantined": len(already_quarantined),
     })
+
+    def _strike(cid: str, chunk: dict, why: str) -> None:
+        """One failed attempt → the chunk-level circuit breaker. On the 3rd
+        strike the poison chunk is DLQ'd and reported; otherwise it stays pending
+        for a bounded retry on the next resume."""
+        state = mark_chunk_failed(conn, intent_id, cid, error=why)
+        if state == "quarantined":
+            summary.quarantined.append(cid)
+            _emit_event("soak_chunk_quarantined", {
+                "intent_id": intent_id, "chunk_id": cid,
+                "symbol": chunk.get("symbol", "?"), "file_path": chunk.get("file_path", "?"),
+                "reason": why[:120],
+            })
+            logger.warning("[Checkpoint] chunk %s QUARANTINED (poison): %s", cid, why)
+        else:
+            summary.failed.append(cid)
+
     for chunk in pending:
         cid = str(chunk.get("chunk_id"))
         try:
             result = await swarm_fn(chunk)
-        except Exception as exc:  # noqa: BLE001 — an isolated chunk failure stays pending
+        except Exception as exc:  # noqa: BLE001 — isolated failure → circuit breaker
             logger.debug("[Checkpoint] chunk %s failed: %s", cid, exc)
-            summary.failed.append(cid)
+            _strike(cid, chunk, f"{type(exc).__name__}: {exc}")
             continue
         if mark_chunk_complete(conn, intent_id, cid, result=str(result) if result is not None else ""):
             summary.processed.append(cid)
@@ -403,10 +538,12 @@ async def run_checkpointed(
                 "done": done, "total": total,
             })
         else:
-            summary.failed.append(cid)
+            _strike(cid, chunk, "commit_failed")
+    # Final ratio telemetry — "N completed, M quarantined" (Skip-and-Report).
     _emit_event("soak_run_complete", {
         "intent_id": intent_id, "processed": len(summary.processed),
-        "failed": len(summary.failed), "skipped": len(summary.skipped), "total": total,
+        "failed": len(summary.failed), "quarantined": len(summary.quarantined),
+        "skipped": len(summary.skipped), "total": total,
     })
     return summary
 
@@ -479,6 +616,8 @@ __all__ = [
     "deserialize_manifest",
     "enqueue_soak_manifest",
     "mark_chunk_complete",
+    "mark_chunk_failed",
+    "quarantined_ids",
     "read_manifest",
     "resume_pending",
     "run_checkpointed",

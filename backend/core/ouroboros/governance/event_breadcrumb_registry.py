@@ -291,7 +291,11 @@ def build_default_registry() -> EventBreadcrumbRegistry:
                                        f"✓ {p.get('symbol','?')} ({p.get('file_path','?')})", "soak"),
         BreadcrumbDescriptor("soak_run_complete", "✓", "green bold", SEV_IMPORTANT,
                              lambda p: f"soak run done — {p.get('processed','?')} committed, "
+                                       f"{p.get('quarantined','?')} quarantined, "
                                        f"{p.get('failed','?')} failed, {p.get('skipped','?')} pre-done", "soak"),
+        BreadcrumbDescriptor("soak_chunk_quarantined", "☠", "red bold", SEV_CRITICAL,
+                             lambda p: f"poison chunk DLQ'd ✗ {p.get('symbol','?')} "
+                                       f"({p.get('file_path','?')}) — {p.get('reason','3 strikes')}", "soak"),
     ]
     for d in seed:
         reg.register(d)
