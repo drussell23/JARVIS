@@ -107,15 +107,18 @@ async def run_agentic_repair(
     agent_fn: AgentTurnFn,
     *,
     max_turns: Optional[int] = None,
+    seam_validator: Optional[Callable[[str], Optional[str]]] = None,
 ) -> AgentOutcome:
     """One Agentic Super-Agent: a goal-bounded autonomous ReAct mini-loop —
-    Plan → Modify → Verify (local AST) → Refine — over its OWN AST node.
+    Plan → Modify → Verify (local AST + in-memory seam pre-compile) → Refine —
+    over its OWN AST node.
 
-    Each turn calls ``agent_fn`` (the real tool-loop worker in production) with
-    the accumulated verify feedback; the output is verified against the local
-    AST; on failure the specific error is fed back for self-correction; the loop
-    is hard-bounded by ``max_turns`` and emits ``agent_unconverged`` rather than
-    hanging or burning tokens. Never raises."""
+    Each turn calls ``agent_fn`` with the accumulated feedback. The output is
+    (1) trial-grafted + whole-file precompiled by ``seam_validator`` if provided
+    — a ``StitchCollisionError`` observation is fed back on a seam fracture so the
+    node can never corrupt the file — then (2) verified against the local AST for
+    symbol identity. The loop is hard-bounded by ``max_turns`` and emits
+    ``agent_unconverged`` rather than hanging. Never raises."""
     turns = max_turns if max_turns is not None else agent_max_turns()
     feedback = ""
     last_error = ""
@@ -129,6 +132,24 @@ async def run_agentic_repair(
                 f"({last_error}). Return ONLY the corrected function."
             )
             continue
+        # (1) In-memory Syntax Pre-Compiler at the seam: trial-graft + whole-file
+        # validate BEFORE anything reaches disk. A fracture routes a
+        # StitchCollisionError observation back for self-correction.
+        if seam_validator is not None:
+            seam_err = seam_validator(node)
+            if seam_err:
+                last_error = f"StitchCollisionError: {seam_err}"
+                feedback = (
+                    f"REFINE (turn {turn}): StitchCollisionError — your node is "
+                    f"valid alone but BREAKS the file when grafted at the seam: "
+                    f"{seam_err}. Return ONLY the corrected complete function so "
+                    f"the WHOLE file parses after insertion."
+                )
+                logger.warning(
+                    "[AgenticSuperAgent] %s turn %d SEAM FRACTURE: %s — refining "
+                    "(disk write blocked)", target.symbol, turn, seam_err,
+                )
+                continue
         ok, err = _verify_node_against_ast(node, target)
         if ok:
             logger.info(
@@ -178,8 +199,19 @@ async def swarm_agentic_repair(
     descending-line atomic fan-in). An agent that returns ``agent_unconverged``
     yields an empty node, so the swarm records it ``failed`` and leaves the file
     untouched at that node — the atomic invariant holds. Never raises."""
+    from backend.core.ouroboros.governance.stitch_precompiler import (
+        make_seam_validator,
+    )
+
     async def _agentic_generate(target: ChunkTarget) -> str:
-        outcome = await run_agentic_repair(target, agent_fn, max_turns=max_turns)
+        # In-memory Syntax Pre-Compiler: each turn's node is trial-grafted into
+        # the real full_source and precompiled BEFORE acceptance, so a seam
+        # fracture is caught + fed back (StitchCollisionError) and never reaches
+        # the real stitch / disk.
+        seam = make_seam_validator(full_source, file_path, target.chunk)
+        outcome = await run_agentic_repair(
+            target, agent_fn, max_turns=max_turns, seam_validator=seam,
+        )
         # Empty string → swarm marks this node failed (unconverged); a converged
         # node flows into the atomic descending-line stitch.
         return outcome.node or "" if outcome.converged else ""

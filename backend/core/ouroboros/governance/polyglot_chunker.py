@@ -81,6 +81,14 @@ class BaseChunker(ABC):
     def validate(self, text: str) -> bool:
         """Is the WHOLE stitched *text* structurally well-formed for this type?"""
 
+    def validate_detail(self, text: str) -> Optional[str]:
+        """The in-memory pre-compiler's error surface: ``None`` if valid, else a
+        human-readable syntax detail. Default derives from ``validate``; typed
+        strategies override to capture the exact parser error (line/message)."""
+        return None if self.validate(text) else (
+            f"{self.language} structural validation failed at the graft seam"
+        )
+
     def stitch(self, full_source: str, chunk: Chunk, new_body: str) -> Optional[str]:
         """Line-based replacement — DRY on the existing stitcher (language-
         agnostic). Never raises."""
@@ -128,6 +136,14 @@ class PythonASTChunker(BaseChunker):
             return True
         except SyntaxError:
             return False
+
+    def validate_detail(self, text: str) -> Optional[str]:
+        import ast
+        try:
+            ast.parse(text)
+            return None
+        except SyntaxError as exc:
+            return f"SyntaxError: {exc.msg} (line {exc.lineno}, offset {exc.offset})"
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +318,14 @@ class JSONTreeChunker(BaseChunker):
         except ValueError:
             return False
 
+    def validate_detail(self, text: str) -> Optional[str]:
+        import json
+        try:
+            json.loads(text)
+            return None
+        except ValueError as exc:
+            return f"JSONDecodeError: {exc}"
+
 
 # ---------------------------------------------------------------------------
 # YAML — indentation-structured key-path locator
@@ -408,6 +432,17 @@ class YAMLTreeChunker(BaseChunker):
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    def validate_detail(self, text: str) -> Optional[str]:
+        try:
+            import yaml  # type: ignore
+        except Exception:  # noqa: BLE001
+            return None if "\t" not in text else "YAMLError: tab in indentation"
+        try:
+            yaml.safe_load(text)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            return f"YAMLError: {str(exc).splitlines()[0] if str(exc) else type(exc).__name__}"
 
 
 # ---------------------------------------------------------------------------
