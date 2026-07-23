@@ -183,6 +183,14 @@ EVENT_TYPE_SUPERVISOR_ARMED = "supervisor_armed"
 EVENT_TYPE_SUPERVISOR_DISARMED = "supervisor_disarmed"
 EVENT_TYPE_SENTINEL_RESTARTED = "sentinel_restarted"
 EVENT_TYPE_SENTINEL_TELEMETRY = "sentinel_telemetry"
+# Checkpoint Intent Engine — the granular map-reduce progress the operator watches
+# live (like watching Claude work): a manifest queued, a crash-resume, each atomic
+# per-chunk commit ticking done/total, and the run terminal. Makes the Swarm's
+# functional immortality VISIBLE in /breadcrumbs, not just durable in SQLite.
+EVENT_TYPE_SOAK_MANIFEST_ENQUEUED = "soak_manifest_enqueued"
+EVENT_TYPE_SOAK_RESUMED = "soak_resumed"
+EVENT_TYPE_SOAK_CHUNK_COMMITTED = "soak_chunk_committed"
+EVENT_TYPE_SOAK_RUN_COMPLETE = "soak_run_complete"
 
 # Slice 19 (Soak Budget & Compute Circuit-Breaker) — two events covering the
 # fail-closed boundary around an unattended graduation soak:
@@ -1674,6 +1682,10 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_SUPERVISOR_DISARMED,             # Autonomous Supervisor (2026-07-23 -- queue-clear disarm)
     EVENT_TYPE_SENTINEL_RESTARTED,              # Autonomous Supervisor (2026-07-23 -- watchdog self-heal restart)
     EVENT_TYPE_SENTINEL_TELEMETRY,              # Autonomous Supervisor (2026-07-23 -- piped Sentinel stdout line)
+    EVENT_TYPE_SOAK_MANIFEST_ENQUEUED,          # Checkpoint Engine (2026-07-23 -- /enqueue_soak wrote a manifest)
+    EVENT_TYPE_SOAK_RESUMED,                    # Checkpoint Engine (2026-07-23 -- resume-from-hash, N already done)
+    EVENT_TYPE_SOAK_CHUNK_COMMITTED,            # Checkpoint Engine (2026-07-23 -- atomic per-chunk commit, done/total)
+    EVENT_TYPE_SOAK_RUN_COMPLETE,               # Checkpoint Engine (2026-07-23 -- map-reduce run terminal)
 })
 
 
