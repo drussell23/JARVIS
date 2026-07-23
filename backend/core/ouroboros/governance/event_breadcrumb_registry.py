@@ -269,6 +269,16 @@ def build_default_registry() -> EventBreadcrumbRegistry:
                              lambda p: f"flap guard held ({p.get('reason','lock held')})", "soak"),
         BreadcrumbDescriptor("awe_soak_complete", "✓", "green", SEV_IMPORTANT, _f_awe, "soak"),
         BreadcrumbDescriptor("awe_soak_failed", "✖", "red bold", SEV_CRITICAL, _f_awe, "soak"),
+        BreadcrumbDescriptor("supervisor_armed", "◆", "cyan bold", SEV_IMPORTANT,
+                             lambda p: f"armed — {p.get('pending','?')} pending, DW {p.get('provider_state','?')} "
+                                       f"→ Sentinel pid {p.get('pid','?')}", "supervisor"),
+        BreadcrumbDescriptor("supervisor_disarmed", "◇", "cyan", SEV_IMPORTANT,
+                             lambda p: f"disarmed — queue clear ({p.get('reason','soak complete')})", "supervisor"),
+        BreadcrumbDescriptor("sentinel_restarted", "↻", "yellow", SEV_IMPORTANT,
+                             lambda p: f"Sentinel self-healed (attempt {p.get('attempt','?')}, "
+                                       f"backoff {p.get('backoff_s','?')}s): {p.get('reason','')}", "supervisor"),
+        BreadcrumbDescriptor("sentinel_telemetry", "·", "bright_black", SEV_VERBOSE,
+                             lambda p: str(p.get("line", "")).strip(), "supervisor"),
     ]
     for d in seed:
         reg.register(d)

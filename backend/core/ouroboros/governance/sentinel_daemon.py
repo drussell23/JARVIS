@@ -230,4 +230,126 @@ __all__ = [
     "ProbeSignal",
     "SentinelResult",
     "run_sentinel",
+    "main",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Spawnable entry point — ``python -m backend.core.ouroboros.governance.sentinel_daemon``
+#
+# The Autonomous Supervisor spawns this via ``create_subprocess_exec`` and pipes
+# our stdout/stderr into the TUI's unified event router. This reuses the real
+# ``dw_deep_probe.staged_health_check`` as ``probe_fn`` and ``run_sentinel``
+# verbatim (DRY) — it just adds an OS-process wrapper + stdout logging (the
+# supervisor reads those lines). No git / filesystem-write / subprocess egress.
+# ---------------------------------------------------------------------------
+
+
+def _sentinel_log(msg: str) -> None:
+    """Emit a structured line to STDOUT (line-buffered) so the supervisor's
+    telemetry pump surfaces it in the TUI. Prefixed for the event router."""
+    import sys as _sys
+    print(f"[sentinel] {msg}", flush=True)
+    _sys.stdout.flush()
+
+
+def _build_staged_probe(model: str):
+    """Construct the real DW deep-probe (staged 2-pass) as a ``probe_fn`` — the
+    same egress the scratchpad daemon used, now DRY inside the module."""
+    from backend.core.ouroboros.governance.dw_deep_probe import staged_health_check
+
+    async def _dispatch(payload):
+        import aiohttp
+        import os as _os
+        key = _os.environ.get("DOUBLEWORD_API_KEY", "")
+        if not key and _os.path.exists(".env"):
+            for line in open(".env"):
+                if line.startswith("DOUBLEWORD_API_KEY="):
+                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+        payload = {**payload, "model": model}
+        session = aiohttp.ClientSession()
+        resp = await session.post(
+            "https://api.doubleword.ai/v1/chat/completions", json=payload,
+            headers={"Authorization": f"Bearer {key}", "Accept": "text/event-stream"},
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=15),
+        )
+        if resp.status != 200:
+            body = await resp.text()
+            await session.close()
+            raise RuntimeError(f"HTTP {resp.status}: {body[:100]}")
+
+        async def _readline():
+            line = await resp.content.readline()
+            if not line:
+                resp.release()
+                await session.close()
+            return line
+
+        return (_readline, resp)
+
+    async def _probe() -> "ProbeSignal":
+        try:
+            res = await staged_health_check(
+                dispatch_fn=_dispatch, model=model, ttft_bound_s=90.0,
+                itl_hard_s=8.0, itl_safe_s=2.0, pass2_max_tokens=150,
+                pass2_itl_safe_s=3.0,
+            )
+            p2 = res.pass2.reason if res.pass2 else "skipped"
+            _sentinel_log(
+                f"probe {'HEALTHY' if res.healthy else 'DEGRADED'} "
+                f"stage={res.stage} p1=({res.pass1.reason}) p2=({p2})"
+            )
+            ttft = None
+            if res.pass2 and res.pass2.ttft_s and res.pass2.ttft_s > 0:
+                ttft = res.pass2.ttft_s
+            elif res.pass1.ttft_s and res.pass1.ttft_s > 0:
+                ttft = res.pass1.ttft_s
+            err = None
+            if not res.healthy:
+                err = p2 if (res.pass2 and res.stage == "pass2_degraded") else res.pass1.reason
+            return ProbeSignal(healthy=res.healthy, pass1_ok=res.pass1.healthy,
+                               ttft_s=ttft, error_class=err)
+        except Exception as exc:  # noqa: BLE001 — a failed probe is just "still down"
+            _sentinel_log(f"probe error {type(exc).__name__}")
+            return ProbeSignal(healthy=False, pass1_ok=False,
+                               error_class=type(exc).__name__)
+
+    return _probe
+
+
+async def main() -> int:
+    """Headless recovery watch. Exit 0 on HEALTHY handoff, 2 on max-wait give-up.
+    (The supervisor's watchdog reads the exit code + provider_state to decide
+    whether an exit was the expected recovery handoff or an unexpected crash.)"""
+    import os as _os
+    from backend.core.ouroboros.governance.dw_outage_forecaster import open_forecast_db
+    from backend.core.ouroboros.governance.provider_state import get_provider_state
+
+    model = _os.environ.get("JARVIS_DW_SURFACE_PROBE_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8")
+    max_wait_s = float(_os.environ.get("DW_WATCH_MAX_WAIT_S", "10800"))
+    stability = int(_os.environ.get("DW_WATCH_STABILITY", "2"))
+
+    conn = open_forecast_db()
+    _sentinel_log(
+        f"headless Sentinel START model={model} base_stability={stability} "
+        f"max_wait={max_wait_s:.0f}s (SQLite IPC, adaptive hysteresis, zero git/exec)"
+    )
+    result = await run_sentinel(
+        conn, _build_staged_probe(model), provider="doubleword", forecast_conn=conn,
+        terminate=lambda: _sentinel_log("HEALTHY written → self-terminating (orchestrator owns launch)"),
+        max_wait_s=max_wait_s, stability=stability, adaptive_hysteresis=True,
+        pulse_enabled=True, pulse_interval_s=15.0,
+    )
+    st = get_provider_state(conn, "doubleword")
+    _sentinel_log(
+        f"exit recovered={result.recovered} probes={result.probes} "
+        f"state={st['state'] if st else '?'}"
+    )
+    return 0 if result.recovered else 2
+
+
+if __name__ == "__main__":  # pragma: no cover — exercised as a subprocess
+    import asyncio as _asyncio
+    import sys as _sys
+    _sys.exit(_asyncio.run(main()))
