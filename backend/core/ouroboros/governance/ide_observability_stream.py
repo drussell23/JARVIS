@@ -191,6 +191,10 @@ EVENT_TYPE_SOAK_MANIFEST_ENQUEUED = "soak_manifest_enqueued"
 EVENT_TYPE_SOAK_RESUMED = "soak_resumed"
 EVENT_TYPE_SOAK_CHUNK_COMMITTED = "soak_chunk_committed"
 EVENT_TYPE_SOAK_RUN_COMPLETE = "soak_run_complete"
+# AST Dead-Letter Queue: a poison chunk struck out (3-strike chunk-level circuit
+# breaker) and was quarantined — the Swarm skips it and reports the final ratio,
+# so a mathematically-impossible chunk can never stall the map-reduce forever.
+EVENT_TYPE_SOAK_CHUNK_QUARANTINED = "soak_chunk_quarantined"
 
 # Slice 19 (Soak Budget & Compute Circuit-Breaker) — two events covering the
 # fail-closed boundary around an unattended graduation soak:
@@ -1686,6 +1690,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_SOAK_RESUMED,                    # Checkpoint Engine (2026-07-23 -- resume-from-hash, N already done)
     EVENT_TYPE_SOAK_CHUNK_COMMITTED,            # Checkpoint Engine (2026-07-23 -- atomic per-chunk commit, done/total)
     EVENT_TYPE_SOAK_RUN_COMPLETE,               # Checkpoint Engine (2026-07-23 -- map-reduce run terminal)
+    EVENT_TYPE_SOAK_CHUNK_QUARANTINED,          # AST DLQ (2026-07-23 -- poison chunk struck out, quarantined)
 })
 
 

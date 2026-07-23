@@ -67,7 +67,7 @@ async def test_enqueue_generates_correct_manifest(project, db_path):
     # 3 top-level symbols: a_one, a_two (alpha.py) + B (beta.py).
     assert res["chunk_count"] == 3
     manifest = res["manifest"]
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
     assert len(manifest["pending_chunks"]) == 3
     assert manifest["completed_chunks"] == []
     symbols = sorted(c["symbol"] for c in manifest["pending_chunks"])
@@ -82,7 +82,7 @@ async def test_enqueue_generates_correct_manifest(project, db_path):
     raw = get_manifest_json(conn, res["intent_id"])
     conn.close()
     assert raw is not None
-    assert json.loads(raw)["schema_version"] == 1
+    assert json.loads(raw)["schema_version"] == 2
 
 
 async def test_manifest_serialization_is_deterministic(project):
@@ -108,7 +108,7 @@ async def test_enqueue_soak_verb_writes_manifest(project, db_path, monkeypatch):
     ).fetchall()
     conn.close()
     assert len(rows) == 1
-    assert json.loads(rows[0][0])["chunk_count" if False else "schema_version"] == 1
+    assert json.loads(rows[0][0])["schema_version"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +247,131 @@ async def test_checkpoint_progress_surfaces_on_broker(project, db_path):
     assert "soak_resumed" in seen
     assert seen.count("soak_chunk_committed") == 3   # one tick per chunk
     assert "soak_run_complete" in seen
+
+
+async def test_poison_chunk_quarantined_after_3_strikes(project, db_path):
+    """AST DLQ: a chunk that consistently fails is struck out after 3 attempts
+    (across resumes) and moved to quarantined_chunks — never retried forever."""
+    from backend.core.ouroboros.governance.checkpoint_manifest import quarantined_ids
+
+    conn = sqlite3.connect(db_path)
+    res = await enqueue_soak_manifest(conn, project, priority=1)
+    iid = res["intent_id"]
+    conn.close()
+
+    ids = [c["chunk_id"] for c in res["manifest"]["pending_chunks"]]
+    poison = ids[0]                       # this one always fails
+    healthy = set(ids[1:])
+
+    async def swarm(chunk):
+        if chunk["chunk_id"] == poison:
+            raise RuntimeError("context window blown")   # poison payload
+        return "ok"
+
+    # Three resumes (reboots). The healthy chunks commit on run 1; the poison
+    # chunk strikes once per run and is DLQ'd on the 3rd.
+    for run in range(3):
+        conn = sqlite3.connect(db_path)
+        summary = await run_checkpointed(conn, iid, swarm)
+        manifest = read_manifest(conn, iid)
+        conn.close()
+        if run < 2:
+            assert poison in summary.failed          # still pending, striking
+            assert poison not in quarantined_ids(manifest)
+        else:
+            assert poison in summary.quarantined     # 3rd strike → DLQ
+            assert poison in quarantined_ids(manifest)
+
+    # Healthy chunks all completed exactly once; poison is quarantined, not lost.
+    manifest = read_manifest(sqlite3.connect(db_path), iid)
+    assert {c["chunk_id"] for c in manifest["completed_chunks"]} == healthy
+    assert quarantined_ids(manifest) == {poison}
+    assert manifest["chunk_retry_counts"][poison] == 3
+    # The poison chunk carries its forensics in the DLQ.
+    q = manifest["quarantined_chunks"][0]
+    assert q["strikes"] == 3 and "context window blown" in q["last_error"]
+
+
+async def test_resume_skips_quarantined_instantly(project, db_path):
+    """Skip-and-Report: once quarantined, a poison chunk is structurally bypassed
+    on every subsequent resume — the swarm moves straight to pending work."""
+    conn = sqlite3.connect(db_path)
+    res = await enqueue_soak_manifest(conn, project, priority=1)
+    iid = res["intent_id"]
+    conn.close()
+    poison = res["manifest"]["pending_chunks"][0]["chunk_id"]
+
+    attempts: list = []
+
+    async def swarm(chunk):
+        attempts.append(chunk["chunk_id"])
+        if chunk["chunk_id"] == poison:
+            raise RuntimeError("poison")
+        return "ok"
+
+    for _ in range(3):                       # drive it to quarantine
+        conn = sqlite3.connect(db_path)
+        await run_checkpointed(conn, iid, swarm)
+        conn.close()
+
+    attempts.clear()
+    # A fresh resume AFTER quarantine must never touch the poison chunk again.
+    conn = sqlite3.connect(db_path)
+    summary = await run_checkpointed(conn, iid, swarm)
+    conn.close()
+    assert poison not in attempts, "quarantined chunk must be structurally skipped"
+    assert attempts == []                    # everything else was already done
+    # Final ratio is reportable: 2 completed, 1 quarantined.
+    manifest = read_manifest(sqlite3.connect(db_path), iid)
+    assert len(manifest["completed_chunks"]) == 2
+    assert len(manifest["quarantined_chunks"]) == 1
+
+
+async def test_quarantine_ratio_surfaces_on_broker(project, db_path):
+    """The final ratio ('N completed, M quarantined') + the DLQ event reach the
+    broker → visible in /breadcrumbs."""
+    from backend.core.ouroboros.governance.ide_observability_stream import (
+        get_default_broker,
+        reset_default_broker,
+    )
+
+    reset_default_broker()
+    broker = get_default_broker()
+    sub = broker.subscribe()
+
+    conn = sqlite3.connect(db_path)
+    res = await enqueue_soak_manifest(conn, project, priority=1)
+    iid = res["intent_id"]
+    poison = res["manifest"]["pending_chunks"][0]["chunk_id"]
+    conn.close()
+
+    async def swarm(chunk):
+        if chunk["chunk_id"] == poison:
+            raise RuntimeError("poison")
+        return "ok"
+
+    for _ in range(3):
+        conn = sqlite3.connect(db_path)
+        await run_checkpointed(conn, iid, swarm)
+        conn.close()
+
+    seen = []
+    complete_payloads = []
+    for _ in range(500):
+        try:
+            ev = sub.queue.get_nowait()
+        except Exception:  # noqa: BLE001
+            break
+        et = getattr(ev, "event_type", "")
+        seen.append(et)
+        if et == "soak_run_complete":
+            complete_payloads.append(getattr(ev, "payload", {}) or {})
+    broker.unsubscribe(sub)
+    reset_default_broker()
+
+    assert "soak_chunk_quarantined" in seen
+    assert any(p.get("quarantined") == 1 and p.get("processed", 0) >= 0
+               for p in complete_payloads), "run-complete carries the quarantine ratio"
 
 
 async def test_resume_pending_skips_completed(project, db_path):
