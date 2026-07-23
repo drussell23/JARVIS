@@ -157,6 +157,11 @@ EVENT_TYPE_CANCELLATION_OVERRUN_DETECTED = "cancellation_overrun_detected"
 EVENT_TYPE_PROVIDER_FAILURE_CLASSIFIED = "provider_failure_classified"
 EVENT_TYPE_CIRCUIT_BREAKER_STATE_CHANGE = "circuit_breaker_state_change"
 EVENT_TYPE_CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"
+# Sentinel recovery signal: the headless DW Sentinel's provider_state SQLite row
+# transitioned (DEGRADED↔HEALTHY). Carries the resilience snapshot (state, jitter,
+# adaptive threshold, ΔTTFT gradient, forecast TTR). One emission lights up both
+# the in-process TUI breadcrumb listener and the /observability/stream SSE (→ HUD).
+EVENT_TYPE_PROVIDER_STATE_CHANGED = "provider_state_changed"
 # Infra MTTR: the failover VM could not resolve its golden image and degraded
 # to a cold boot (or failed). On Spot instances this defeats agile failover, so
 # it MUST be loud, not silent — surfaced to the operator via this SSE frame.
@@ -1604,6 +1609,8 @@ _VALID_EVENT_TYPES = frozenset({
                                                   # before the streaming __aexit__ chain releases)
     EVENT_TYPE_PROVIDER_FAILURE_CLASSIFIED,      # Slice 7e (Provider Circuit Breaker — every
                                                   # provider failure that reaches Slice 7a classify())
+    EVENT_TYPE_PROVIDER_STATE_CHANGED,           # Sentinel recovery signal (DEGRADED↔HEALTHY +
+                                                  # resilience snapshot; feeds TUI breadcrumb + HUD SSE)
     EVENT_TYPE_CIRCUIT_BREAKER_STATE_CHANGE,     # Slice 7e (state machine transitions other than
                                                   # OPEN_TERMINAL trips)
     EVENT_TYPE_CIRCUIT_BREAKER_TRIPPED,           # Slice 7e (OPEN_TERMINAL trip — carries the
@@ -2884,6 +2891,31 @@ def publish_golden_image_degraded(
     except Exception:  # noqa: BLE001 — best-effort telemetry
         logger.debug(
             "[Stream] publish_golden_image_degraded exception", exc_info=True,
+        )
+        return None
+
+
+def publish_provider_state_changed(
+    detail: Mapping[str, Any],
+) -> Optional[str]:
+    """Best-effort publisher for ``provider_state_changed`` SSE frames — the
+    Sentinel's DEGRADED↔HEALTHY recovery signal + resilience snapshot (state,
+    jitter, adaptive threshold, ΔTTFT gradient, forecast TTR). Keyed by the
+    provider name (organism property, no op_id). One emission fans out to the
+    in-process TUI breadcrumb listener AND the /observability/stream SSE (→ HUD).
+    Returns the event_id, or None when disabled / invalid. NEVER raises."""
+    if not stream_enabled():
+        return None
+    try:
+        if not isinstance(detail, Mapping):
+            return None
+        key = str(detail.get("provider", "doubleword")) or "doubleword"
+        return get_default_broker().publish(
+            EVENT_TYPE_PROVIDER_STATE_CHANGED, key, dict(detail),
+        )
+    except Exception:  # noqa: BLE001 — best-effort telemetry
+        logger.debug(
+            "[Stream] publish_provider_state_changed exception", exc_info=True,
         )
         return None
 

@@ -4623,6 +4623,70 @@ class SerpentREPL:
             )
         except Exception:  # noqa: BLE001 — breadcrumb is best-effort
             self._shadow_breadcrumb_task = None
+        # Provider-state resilience breadcrumb — the Sentinel's DEGRADED↔HEALTHY
+        # transitions surfaced live inline (and onto the SSE/HUD). The watcher
+        # bridges the Sentinel's SQLite signal → broker; the listener prints it.
+        # Both best-effort + in-process; never block REPL boot.
+        self._provider_state_watcher_task = None
+        self._provider_breadcrumb_task = None
+        try:
+            from backend.core.ouroboros.governance.provider_state_broker import (
+                start_provider_state_watcher,
+            )
+            self._provider_state_watcher_task = start_provider_state_watcher()
+            self._provider_breadcrumb_task = asyncio.ensure_future(
+                self._provider_breadcrumb_listener()
+            )
+        except Exception:  # noqa: BLE001 — resilience breadcrumb is best-effort
+            self._provider_state_watcher_task = None
+            self._provider_breadcrumb_task = None
+
+    async def _provider_breadcrumb_listener(self) -> None:
+        """Surface a calm one-line breadcrumb when the DW Sentinel's provider
+        state transitions (DEGRADED↔HEALTHY). Subscribes IN-PROCESS to the same
+        :class:`StreamEventBroker` the ``/observability/stream`` SSE uses; the
+        ``/provider`` verb remains the full pull-view. Best-effort + fail-soft —
+        any error silently disables the breadcrumb."""
+        sub = None
+        broker = None
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                EVENT_TYPE_PROVIDER_STATE_CHANGED,
+                get_default_broker,
+            )
+            from backend.core.ouroboros.governance.provider_state_broker import (
+                format_provider_breadcrumb,
+            )
+
+            broker = get_default_broker()
+            sub = broker.subscribe()
+            if sub is None:
+                return
+            async for event in broker.stream_iter(sub, heartbeat_s=0):
+                if getattr(event, "event_type", "") != EVENT_TYPE_PROVIDER_STATE_CHANGED:
+                    continue
+                try:
+                    payload = dict(getattr(event, "payload", {}) or {})
+                    text = format_provider_breadcrumb(payload)
+                    healthy = payload.get("state") == "HEALTHY"
+                    color = _C["neural"] if healthy else _C["heal"]
+                    glyph = "✓" if healthy else "⚠"
+                    self._flow.console.print(
+                        f"  [{color}]{glyph} {text}[/{color}]",
+                        highlight=False,
+                    )
+                except Exception:  # noqa: BLE001 — one bad event never kills the loop
+                    continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — strictly best-effort
+            return
+        finally:
+            try:
+                if broker is not None and sub is not None:
+                    broker.unsubscribe(sub)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _shadow_breadcrumb_listener(self) -> None:
         """Slice 253 — surface a calm, non-blocking breadcrumb when a Shadow
@@ -4690,6 +4754,16 @@ class SerpentREPL:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._shadow_breadcrumb_task = None
+        # Tear down the provider-state resilience breadcrumb + watcher.
+        for _attr in ("_provider_breadcrumb_task", "_provider_state_watcher_task"):
+            _pt = getattr(self, _attr, None)
+            if _pt is not None:
+                _pt.cancel()
+                try:
+                    await _pt
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                setattr(self, _attr, None)
         # Stop the spinner invalidator first so its task doesn't
         # outlive the REPL session.
         try:
