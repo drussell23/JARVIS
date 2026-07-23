@@ -159,6 +159,77 @@ def record_recovery(
         return None
 
 
+_TTFT_TABLE = "provider_ttft"
+
+
+def _ensure_ttft_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {_TTFT_TABLE} ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "provider TEXT NOT NULL, ttft_s REAL NOT NULL, ts REAL NOT NULL)"
+    )
+    conn.commit()
+
+
+def record_probe_ttft(
+    conn: Optional[sqlite3.Connection], provider: str, ttft_s: float,
+    *, ts: Optional[float] = None, window_s: float = 1800.0,
+) -> None:
+    """Record a successful probe's Time-To-First-Token — the Health Gradient
+    signal. Prunes rows older than 2x the window (bounded). Never raises."""
+    if conn is None or ttft_s is None or float(ttft_s) < 0:
+        return
+    when = time.time() if ts is None else float(ts)
+    try:
+        _ensure_ttft_table(conn)
+        conn.execute(
+            f"INSERT INTO {_TTFT_TABLE} (provider, ttft_s, ts) VALUES (?, ?, ?)",
+            (provider, float(ttft_s), when),
+        )
+        conn.execute(
+            f"DELETE FROM {_TTFT_TABLE} WHERE ts < ?", (when - 2.0 * window_s,),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        logger.debug("[DWForecaster] record_probe_ttft failed", exc_info=True)
+
+
+def ttft_slope(
+    conn: Optional[sqlite3.Connection], provider: str = "doubleword",
+    *, window_s: float = 1800.0, now: Optional[float] = None, max_points: int = 6,
+) -> Optional[float]:
+    """Rolling derivative ΔTTFT (least-squares slope, TTFT-seconds per wall-
+    second) over the most recent successful probes. NEGATIVE ⇒ TTFT falling ⇒
+    the GPU cluster's VRAM is stabilizing. None with <2 points. Never raises."""
+    if conn is None:
+        return None
+    ref = time.time() if now is None else float(now)
+    cutoff = ref - window_s
+    try:
+        _ensure_ttft_table(conn)
+        rows = conn.execute(
+            f"SELECT ts, ttft_s FROM {_TTFT_TABLE} WHERE provider=? AND ts>=? "
+            f"ORDER BY ts DESC LIMIT ?",
+            (provider, cutoff, int(max_points)),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    if len(rows) < 2:
+        return None
+    pts = list(reversed(rows))                      # oldest → newest
+    x0 = pts[0][0]
+    xs = [r[0] - x0 for r in pts]
+    ys = [r[1] for r in pts]
+    n = len(xs)
+    sx, sy = sum(xs), sum(ys)
+    sxx = sum(x * x for x in xs)
+    sxy = sum(x * y for x, y in zip(xs, ys))
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return None
+    return (n * sxy - sx * sy) / denom
+
+
 def _completed_ttrs(conn: Optional[sqlite3.Connection]) -> List[float]:
     """Historical TTRs, oldest → newest. Empty on any trouble."""
     if conn is None:
@@ -391,6 +462,8 @@ __all__ = [
     "open_forecast_db",
     "predict_sleep_s",
     "record_outage_start",
+    "record_probe_ttft",
     "record_recovery",
+    "ttft_slope",
     "watch_for_recovery",
 ]
