@@ -28,6 +28,7 @@ Pure asyncio (no threads/processes); env-driven; never raises on the hot path.
 from __future__ import annotations
 
 import ast
+import inspect
 import logging
 import os
 from dataclasses import dataclass, field
@@ -134,22 +135,42 @@ async def run_agentic_repair(
             continue
         # (1) In-memory Syntax Pre-Compiler at the seam: trial-graft + whole-file
         # validate BEFORE anything reaches disk. A fracture routes a
-        # StitchCollisionError observation back for self-correction.
+        # StitchCollisionError (or RebaseCollisionError under the Rolling VFS)
+        # observation back for self-correction. The validator may be async (the
+        # Rolling VFS acquires the Sequential Compilation Lock).
         if seam_validator is not None:
             seam_err = seam_validator(node)
+            if inspect.isawaitable(seam_err):
+                seam_err = await seam_err
             if seam_err:
-                last_error = f"StitchCollisionError: {seam_err}"
+                # Preserve a pre-labeled error class (Rebase/Stitch); else label it.
+                last_error = (
+                    seam_err if seam_err.startswith(
+                        ("RebaseCollisionError", "StitchCollisionError")
+                    ) else f"StitchCollisionError: {seam_err}"
+                )
                 feedback = (
-                    f"REFINE (turn {turn}): StitchCollisionError — your node is "
-                    f"valid alone but BREAKS the file when grafted at the seam: "
-                    f"{seam_err}. Return ONLY the corrected complete function so "
-                    f"the WHOLE file parses after insertion."
+                    f"REFINE (turn {turn}): {last_error}. Your node broke the file "
+                    f"when grafted at the seam — return ONLY the corrected complete "
+                    f"definition so the WHOLE file parses after insertion."
                 )
                 logger.warning(
                     "[AgenticSuperAgent] %s turn %d SEAM FRACTURE: %s — refining "
-                    "(disk write blocked)", target.symbol, turn, seam_err,
+                    "(disk write blocked)", target.symbol, turn, last_error,
                 )
                 continue
+        # Local AST symbol check — Python only. A polyglot node (json/yaml/tsx)
+        # is not a Python function; its whole-file structural validate at the
+        # seam is the gate (mirrors the ProductionAgentTurnFn polymorphic verify).
+        _lang = getattr(getattr(target, "chunk", None), "language", "python")
+        if _lang and _lang != "python":
+            logger.info(
+                "[AgenticSuperAgent] %s CONVERGED in %d turn(s) (%s)",
+                target.symbol, turn, _lang,
+            )
+            return AgentOutcome(
+                symbol=target.symbol, status=STATUS_CONVERGED, node=node, turns=turn,
+            )
         ok, err = _verify_node_against_ast(node, target)
         if ok:
             logger.info(
@@ -199,18 +220,18 @@ async def swarm_agentic_repair(
     descending-line atomic fan-in). An agent that returns ``agent_unconverged``
     yields an empty node, so the swarm records it ``failed`` and leaves the file
     untouched at that node — the atomic invariant holds. Never raises."""
-    from backend.core.ouroboros.governance.stitch_precompiler import (
-        make_seam_validator,
-    )
+    from backend.core.ouroboros.governance.stitch_precompiler import RollingVFS
+
+    # ONE Rolling VFS shared across all agents: the Sequential Compilation Lock
+    # serializes the heavy in-memory parse (memory bounding under extreme
+    # map-reduce) while each agent rebases its graft onto the prior agents'
+    # committed state (cross-agent semantic collision → RebaseCollisionError).
+    vfs = RollingVFS(full_source, file_path)
 
     async def _agentic_generate(target: ChunkTarget) -> str:
-        # In-memory Syntax Pre-Compiler: each turn's node is trial-grafted into
-        # the real full_source and precompiled BEFORE acceptance, so a seam
-        # fracture is caught + fed back (StitchCollisionError) and never reaches
-        # the real stitch / disk.
-        seam = make_seam_validator(full_source, file_path, target.chunk)
         outcome = await run_agentic_repair(
-            target, agent_fn, max_turns=max_turns, seam_validator=seam,
+            target, agent_fn, max_turns=max_turns,
+            seam_validator=vfs.seam_validator_for(target.symbol),
         )
         # Empty string → swarm marks this node failed (unconverged); a converged
         # node flows into the atomic descending-line stitch.
