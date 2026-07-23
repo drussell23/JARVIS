@@ -110,6 +110,7 @@ class LiveStatusLineRender:
     swarm_segment: str
     status_segment: str
     combined: str
+    badge_segment: str = ""
     schema_version: str = LIVE_STATUS_LINE_SCHEMA_VERSION
 
 
@@ -163,6 +164,34 @@ def render_status_segment() -> str:
 
 
 # ===========================================================================
+# Provider resilience badge — the async ticker's current render
+# ===========================================================================
+
+
+def provider_badge_segment() -> str:
+    """Render the live provider resilience badge (the async ticker's current
+    rotating provider), truncated to the live terminal width. Empty when no
+    provider telemetry has arrived yet. NEVER raises — a defensive string only."""
+    try:
+        from backend.core.ouroboros.governance.status_badge_ticker import (
+            get_default_ticker,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        ticker = get_default_ticker()
+        if ticker.provider_count() == 0:
+            return ""
+        import shutil
+        width = shutil.get_terminal_size((80, 24)).columns
+        # The badge is one compact segment; cap it so it never dominates a wide
+        # bar, and let the ticker's own ellipsis-truncation handle narrow ones.
+        return ticker.render(min(max(8, width), 72))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# ===========================================================================
 # Compose — merge swarm digest with status segment
 # ===========================================================================
 
@@ -185,12 +214,14 @@ def compose(swarm_segment: object) -> LiveStatusLineRender:
     """
     swarm_safe = swarm_segment if isinstance(swarm_segment, str) else ""
     status_safe = render_status_segment()
-    parts = [s for s in (swarm_safe, status_safe) if s]
+    badge_safe = provider_badge_segment()
+    parts = [s for s in (swarm_safe, status_safe, badge_safe) if s]
     combined = "\n".join(parts)
     return LiveStatusLineRender(
         swarm_segment=swarm_safe,
         status_segment=status_safe,
         combined=combined,
+        badge_segment=badge_safe,
     )
 
 
