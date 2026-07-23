@@ -24,8 +24,6 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
     private var isTTSSpeaking = false
 
     private var borderWindow: LivingBorderWindow?
-    private var panel: JARVISPanel?
-    private var panelVisible = false
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
     private var subs = Set<AnyCancellable>()
@@ -51,27 +49,9 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             BrainstemLauncher.shared.start()
             self.appState.boot()
 
-            // Living Border + Panel setup — border always visible, panel hidden until summoned
+            // Living Border setup — the halo is always visible (JARVIS is ambient:
+            // just the green halo + the menu-bar icon; no panel to take over the screen).
             self.setupWindows()
-
-            // Global keyboard shortcut: Cmd+Shift+J toggles panel (system-wide)
-            // addGlobalMonitor catches keys even when another app is focused.
-            // Requires Accessibility permission (already granted for Ghost Hands).
-            NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-                if flags == [.command, .shift] && event.charactersIgnoringModifiers?.lowercased() == "j" {
-                    Task { @MainActor in self?.togglePanel() }
-                }
-            }
-            // Also add local monitor for when JARVIS panel itself is focused
-            NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-                if flags == [.command, .shift] && event.charactersIgnoringModifiers?.lowercased() == "j" {
-                    Task { @MainActor in self?.togglePanel() }
-                    return nil
-                }
-                return event
-            }
 
             // Wire border color to backend connectivity. (The cognitive-state
             // tint rode the Hive relay, which was never live and now feeds the
@@ -125,20 +105,16 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             guard let self else { return }
             print("[JARVIS] Voice command: \"\(command)\"")
 
-            // Panel control voice commands
+            // JARVIS is ambient — the halo + menu-bar icon are the whole HUD, there
+            // is no panel to summon. "Show yourself" acknowledges presence by voice
+            // rather than taking over the screen; everything operational lives in the
+            // O+V CLI/TUI.
             let lower = command.lowercased().trimmingCharacters(in: .whitespaces)
-
-            if lower.contains("show yourself") || lower.contains("show panel") || lower.contains("appear") {
-                Task { @MainActor in self.showHUD() }
+            if lower.contains("show yourself") || lower.contains("appear")
+                || lower.contains("are you there") || lower.contains("you there") {
+                self.speak("I'm online and listening.")
                 return
             }
-            if lower.contains("hide") || lower.contains("dismiss") || lower.contains("go away") || lower.contains("disappear") {
-                Task { @MainActor in self.hideHUD() }
-                return
-            }
-
-            // Panel does NOT auto-show for commands — the organism responds
-            // via voice only. Panel is only for explicit "show yourself" / Cmd+Shift+J.
 
             // ============================================================
             // UNIFIED COMMAND ROUTING (Phase 11): route the raw command to
@@ -329,12 +305,6 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         cmd.target = self
         menu.addItem(cmd)
 
-        let toggle = NSMenuItem(title: "Show JARVIS", action: #selector(toggleHUD), keyEquivalent: "j")
-        toggle.keyEquivalentModifierMask = [.command, .shift]
-        toggle.target = self
-        toggle.tag = 200
-        menu.addItem(toggle)
-
         menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit JARVIS", action: #selector(quitApp), keyEquivalent: "q")
@@ -380,7 +350,6 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         }
     }
 
-    @objc private func toggleHUD() { togglePanel() }
     @objc private func quitApp() { BrainstemLauncher.shared.stop(); ScreenCaptureService.shared.stopStream(); appState.pythonBridge.shutdown(); NSApp.terminate(nil) }
 
     // MARK: - Icon
@@ -431,38 +400,13 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         }
     }
 
-    // MARK: - Living Border + Panel
+    // MARK: - Living Border (the ambient halo — the whole visible HUD)
 
     private func setupWindows() {
-        // Border window — always on, always breathing
+        // Border window — always on, always breathing. This is the only visible
+        // surface; the operational UI lives in the O+V CLI/TUI.
         if borderWindow == nil {
             borderWindow = LivingBorderWindow()
         }
-
-        // Panel — created once, shown/hidden on demand
-        if panel == nil {
-            let hudView = HUDView()
-                .environmentObject(appState)
-            panel = JARVISPanel(contentView: AnyView(hudView))
-        }
-    }
-
-    private func showHUD() {
-        setupWindows()
-        guard let panel, !panelVisible else { return }
-        panelVisible = true
-        panel.showPanel()
-        statusMenu?.item(withTag: 200)?.title = "Hide JARVIS"
-    }
-
-    private func hideHUD() {
-        guard let panel, panelVisible else { return }
-        panelVisible = false
-        panel.hidePanel()
-        statusMenu?.item(withTag: 200)?.title = "Show JARVIS"
-    }
-
-    func togglePanel() {
-        if panelVisible { hideHUD() } else { showHUD() }
     }
 }
