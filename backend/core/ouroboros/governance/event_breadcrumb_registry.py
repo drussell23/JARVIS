@@ -213,6 +213,14 @@ def _f_confidence(p: dict) -> str:
     return f"model {p.get('model', '?')} conf={p.get('confidence', '?')}"
 
 
+def _f_awe(p: dict) -> str:
+    rid = str(p.get("run_id", "?"))
+    prov = str(p.get("provider", "doubleword"))
+    reason = str(p.get("reason", "") or "")
+    tail = f" — {reason}" if reason else ""
+    return f"{prov} recovery → soak {rid}{tail}".strip()
+
+
 def build_default_registry() -> EventBreadcrumbRegistry:
     reg = EventBreadcrumbRegistry()
     # These two already have tailored, prompt-aware bespoke listeners in the TUI.
@@ -256,6 +264,11 @@ def build_default_registry() -> EventBreadcrumbRegistry:
                              lambda p: f"{p.get('detail','trajectory drift')}", "integrity"),
         BreadcrumbDescriptor("decision_drift_detected", "▲", "yellow", SEV_IMPORTANT,
                              lambda p: f"{p.get('detail','decision drift')}", "integrity"),
+        BreadcrumbDescriptor("awe_soak_launched", "⚡", "green bold", SEV_CRITICAL, _f_awe, "soak"),
+        BreadcrumbDescriptor("awe_soak_suppressed", "·", "bright_black", SEV_INFO,
+                             lambda p: f"flap guard held ({p.get('reason','lock held')})", "soak"),
+        BreadcrumbDescriptor("awe_soak_complete", "✓", "green", SEV_IMPORTANT, _f_awe, "soak"),
+        BreadcrumbDescriptor("awe_soak_failed", "✖", "red bold", SEV_CRITICAL, _f_awe, "soak"),
     ]
     for d in seed:
         reg.register(d)
