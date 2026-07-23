@@ -32,7 +32,11 @@ STATUS_CLEARED = "cleared"
 
 
 def ensure_intent_table(conn: sqlite3.Connection) -> None:
-    """Idempotent DDL. Composes the #70021 DB (same file, distinct table)."""
+    """Idempotent DDL. Composes the #70021 DB (same file, distinct table).
+
+    ``manifest_json`` holds the AST-aware checkpoint manifest (the deterministic
+    per-chunk progress ledger — #70051). Added via additive migration so a DB
+    created before the checkpoint engine upgrades in place, never re-created."""
     conn.execute(
         f"CREATE TABLE IF NOT EXISTS {_INTENT_TABLE} ("
         "intent_id TEXT PRIMARY KEY, "
@@ -41,8 +45,17 @@ def ensure_intent_table(conn: sqlite3.Connection) -> None:
         "priority INTEGER NOT NULL DEFAULT 5, "
         "status TEXT NOT NULL DEFAULT 'pending', "
         "enqueued_ts REAL, "
-        "cleared_ts REAL)"
+        "cleared_ts REAL, "
+        "manifest_json TEXT)"
     )
+    # Additive migration: a table created before manifest_json existed gets the
+    # column now (PRAGMA-guarded so it runs at most once). Never raises.
+    try:
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({_INTENT_TABLE})").fetchall()}
+        if "manifest_json" not in cols:
+            conn.execute(f"ALTER TABLE {_INTENT_TABLE} ADD COLUMN manifest_json TEXT")
+    except sqlite3.Error:
+        logger.debug("[SoakIntent] manifest_json migration skipped", exc_info=True)
     conn.commit()
 
 
@@ -53,10 +66,12 @@ def enqueue_soak_intent(
     target: str = "",
     priority: int = 1,
     intent_id: Optional[str] = None,
+    manifest_json: Optional[str] = None,
     now: Optional[float] = None,
 ) -> Optional[str]:
-    """Record a pending high-priority soak workload. Returns the intent_id, or
-    ``None`` on failure. Never raises."""
+    """Record a pending high-priority soak workload. ``manifest_json`` carries the
+    AST-aware checkpoint manifest (deterministic per-chunk progress). Returns the
+    intent_id, or ``None`` on failure. Never raises."""
     if conn is None:
         return None
     iid = intent_id or uuid.uuid4().hex[:12]
@@ -65,14 +80,31 @@ def enqueue_soak_intent(
         ensure_intent_table(conn)
         conn.execute(
             f"INSERT OR IGNORE INTO {_INTENT_TABLE} "
-            f"(intent_id, kind, target, priority, status, enqueued_ts) "
-            f"VALUES (?, ?, ?, ?, '{STATUS_PENDING}', ?)",
-            (iid, kind, target, int(priority), when),
+            f"(intent_id, kind, target, priority, status, enqueued_ts, manifest_json) "
+            f"VALUES (?, ?, ?, ?, '{STATUS_PENDING}', ?, ?)",
+            (iid, kind, target, int(priority), when, manifest_json),
         )
         conn.commit()
         return iid
     except sqlite3.Error:
         logger.debug("[SoakIntent] enqueue failed", exc_info=True)
+        return None
+
+
+def get_manifest_json(
+    conn: Optional[sqlite3.Connection], intent_id: str,
+) -> Optional[str]:
+    """Read the raw manifest JSON for an intent row (or ``None``). Never raises."""
+    if conn is None:
+        return None
+    try:
+        ensure_intent_table(conn)
+        row = conn.execute(
+            f"SELECT manifest_json FROM {_INTENT_TABLE} WHERE intent_id=?",
+            (intent_id,),
+        ).fetchone()
+        return row[0] if row and row[0] else None
+    except sqlite3.Error:
         return None
 
 
@@ -145,5 +177,6 @@ __all__ = [
     "clear_soak_intent",
     "enqueue_soak_intent",
     "ensure_intent_table",
+    "get_manifest_json",
     "pending_soak_count",
 ]
