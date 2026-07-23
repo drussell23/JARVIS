@@ -58,24 +58,49 @@ async def run_sentinel(
     terminate: Optional[Callable[[], None]] = None,
     max_wait_s: float = 10800.0,
     stability: int = 2,
+    adaptive_hysteresis: bool = True,
+    jitter_window_s: float = 1800.0,
+    jitter_cap: int = 5,
+    jitter_now_fn: Optional[NowFn] = None,
 ) -> SentinelResult:
     """The read-only watch loop. The ONLY writes it performs are the two
     ``provider_state`` upserts (start → DEGRADED, recovery → HEALTHY). It issues
     NO git / os.system / subprocess / file-write call — those belong solely to
     the orchestrator (Single-Writer). On stable HEALTHY it writes HEALTHY and
-    calls ``terminate`` (the process then exits). Never raises."""
+    calls ``terminate`` (the process then exits).
+
+    Adaptive Hysteresis: the consecutive-pass requirement is recomputed each loop
+    as ``stability + jitter_index`` (clamped to ``jitter_cap``) from the
+    ``provider_jitter_events`` SQLite window — so a flapping (warm-up-jittering)
+    provider must clear a HIGHER bar, and the requirement decays back to
+    ``stability`` on its own as errors age out of the window. Never raises."""
     import asyncio as _asyncio
 
     now = now_fn or time.monotonic
     sleep = sleep_fn or _asyncio.sleep
+    jnow = jitter_now_fn or time.time
     fconn = forecast_conn if forecast_conn is not None else state_conn
+
+    def _required() -> int:
+        if not adaptive_hysteresis:
+            return stability
+        try:
+            from backend.core.ouroboros.governance.provider_jitter import (
+                required_consecutive_passes,
+            )
+            return required_consecutive_passes(
+                state_conn, provider, base=stability, cap=jitter_cap,
+                window_s=jitter_window_s, now=jnow(),
+            )
+        except Exception:  # noqa: BLE001
+            return stability
 
     t0 = now()
     mark_degraded(state_conn, provider, reason="sentinel_watch_start")
     logger.info(
         "[Sentinel] headless watch START provider=%s forecast_ttr≈%.0fs "
-        "stability=%d (read-only; SQLite IPC handoff)",
-        provider, forecast_ttr(fconn), stability,
+        "base_stability=%d adaptive=%s (read-only; SQLite IPC handoff)",
+        provider, forecast_ttr(fconn), stability, adaptive_hysteresis,
     )
     healthy_streak = 0
     probes = 0
@@ -88,20 +113,26 @@ async def run_sentinel(
         except Exception:  # noqa: BLE001 — a failed probe is just "still down"
             healthy = False
 
+        required = _required()   # Adaptive Hysteresis — recomputed each loop
         if healthy:
             healthy_streak += 1
-            if healthy_streak >= stability:
+            if healthy_streak >= required:
                 mark_healthy(
                     state_conn, provider,
-                    reason=f"staged_2pass_ok x{stability} (probe #{probes})",
+                    reason=f"staged_2pass_ok x{required} (jitter-adaptive, probe #{probes})",
                 )
                 logger.info(
-                    "[Sentinel] %s HEALTHY written to provider_state — "
-                    "terminating (Single-Writer handoff to orchestrator)", provider,
+                    "[Sentinel] %s HEALTHY written to provider_state after %d "
+                    "consecutive passes (required=%d, jitter-adaptive) — "
+                    "terminating (Single-Writer handoff)", provider, healthy_streak, required,
                 )
                 if terminate is not None:
                     terminate()
                 return SentinelResult(recovered=True, probes=probes, reason="healthy_written")
+            logger.info(
+                "[Sentinel] %s pass %d/%d (jitter-adaptive stability window held back)",
+                provider, healthy_streak, required,
+            )
         else:
             healthy_streak = 0
 
