@@ -4640,6 +4640,76 @@ class SerpentREPL:
         except Exception:  # noqa: BLE001 — resilience breadcrumb is best-effort
             self._provider_state_watcher_task = None
             self._provider_breadcrumb_task = None
+        # Unified event-feed router — ONE subscription surfacing the ENTIRE
+        # backend event surface (~149 broker types) via the descriptor registry,
+        # filtered by /breadcrumbs verbosity + de-flooded. Best-effort.
+        self._event_breadcrumb_router_task = None
+        try:
+            self._event_breadcrumb_router_task = asyncio.ensure_future(
+                self._event_breadcrumb_router()
+            )
+        except Exception:  # noqa: BLE001
+            self._event_breadcrumb_router_task = None
+
+    async def _event_breadcrumb_router(self) -> None:
+        """The ONE unified live event feed: subscribe once to the broker and
+        surface EVERY backend event through the descriptor registry — filtered by
+        the operator's ``/breadcrumbs`` verbosity floor and de-flooded by a
+        coalescer. Events that have a tailored bespoke listener (shadow-trap,
+        provider-state) are skipped here so there is no double-print; an
+        UNREGISTERED/new event still surfaces via the registry's heuristic. This
+        is the root-cause replacement for per-type listener clones — new backend
+        events light up the CLI with zero TUI code. Best-effort + fail-soft."""
+        sub = None
+        broker = None
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                get_default_broker,
+            )
+            from backend.core.ouroboros.governance.event_breadcrumb_registry import (
+                BreadcrumbCoalescer,
+                build_default_registry,
+                get_min_severity,
+            )
+
+            reg = build_default_registry()
+            coalescer = BreadcrumbCoalescer()
+            broker = get_default_broker()
+            sub = broker.subscribe()
+            if sub is None:
+                return
+            async for event in broker.stream_iter(sub, heartbeat_s=0):
+                try:
+                    et = getattr(event, "event_type", "") or ""
+                    if not et or reg.is_bespoke(et):
+                        continue
+                    floor = get_min_severity()
+                    if floor >= 99:            # /breadcrumbs off
+                        continue
+                    payload = dict(getattr(event, "payload", {}) or {})
+                    desc = reg.describe(et)
+                    if desc.severity < floor:
+                        continue
+                    key = str(payload.get("provider", payload.get("op_id", "")) or "")
+                    if not coalescer.should_show(et, key):
+                        continue
+                    _sev, text = reg.render(et, payload)
+                    self._flow.console.print(
+                        f"  [{desc.color}]{desc.glyph} {text}[/{desc.color}]",
+                        highlight=False,
+                    )
+                except Exception:  # noqa: BLE001 — one bad event never kills the loop
+                    continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — strictly best-effort
+            return
+        finally:
+            try:
+                if broker is not None and sub is not None:
+                    broker.unsubscribe(sub)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _provider_breadcrumb_listener(self) -> None:
         """Surface a calm one-line breadcrumb when the DW Sentinel's provider
@@ -4754,8 +4824,10 @@ class SerpentREPL:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._shadow_breadcrumb_task = None
-        # Tear down the provider-state resilience breadcrumb + watcher.
-        for _attr in ("_provider_breadcrumb_task", "_provider_state_watcher_task"):
+        # Tear down the provider-state resilience breadcrumb + watcher + the
+        # unified event-feed router.
+        for _attr in ("_event_breadcrumb_router_task",
+                      "_provider_breadcrumb_task", "_provider_state_watcher_task"):
             _pt = getattr(self, _attr, None)
             if _pt is not None:
                 _pt.cancel()
