@@ -288,6 +288,21 @@ class AIMDController:
         self._limit = max(self._floor, self._limit // self._md)
         return self._limit
 
+    def on_transient_fault(self) -> int:
+        """Yield-on-Fault: a ``[TransientAbsorb]`` DW degradation DURING scale-up
+        multiplicatively downscales concurrency (same as ``on_failure``) so the
+        recovering server is backed off — WITHOUT failing the global op. The
+        absorbed round retries at the lower limit; new sub-agent dispatch gates
+        on ``self.limit``, so in-flight agents drain and the herd shrinks."""
+        return self.on_failure()
+
+    def throttle_to_floor(self) -> int:
+        """Hard yield — collapse straight to the floor (1) on a SEVERE
+        degradation (repeated absorbs / a rupture storm), the fastest safe
+        retreat before a full re-ramp."""
+        self._limit = self._floor
+        return self._limit
+
     def reset(self) -> int:
         self._limit = self._floor
         return self._limit

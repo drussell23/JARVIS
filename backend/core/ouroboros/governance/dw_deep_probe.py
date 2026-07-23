@@ -76,9 +76,9 @@ class DeepProbeResult:
 
 
 def build_probe_payload(model: str, *, max_tokens: int = _MAX_TOKENS) -> dict:
-    """Aggressively minimal zero-shot probe body — forces inference, negligible
-    token spend. ``max_tokens`` is hard-capped so the cluster executes but the
-    generation is mathematically tiny (no background token bleed)."""
+    """Pass-1 body — aggressively minimal zero-shot probe. Forces inference,
+    negligible token spend. ``max_tokens`` hard-capped so the cluster executes
+    but the generation is mathematically tiny (no background token bleed)."""
     return {
         "model": model,
         "messages": [
@@ -89,6 +89,44 @@ def build_probe_payload(model: str, *, max_tokens: int = _MAX_TOKENS) -> dict:
         "temperature": 0.0,
         "stream": True,
     }
+
+
+def build_synthetic_workload_payload(model: str, *, max_tokens: int = 150) -> dict:
+    """Pass-2 body — a synthetic ReAct code-analysis workload that forces
+    ~150 SUSTAINED tokens. Five clean tokens prove the lane woke; they do NOT
+    prove it survives a 500-token ReAct loop. VRAM instability surfaces as ITL
+    creep UNDER context pressure — this payload manufactures that pressure so the
+    Sentinel can measure sustained ITL before handing off to the swarm."""
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a terse code reviewer."},
+            {"role": "user", "content": (
+                "List up to 8 short, numbered observations about correctness, "
+                "edge cases, and complexity of this function:\n\n"
+                "def topo_sort(scope, edges):\n"
+                "    graph = {}\n"
+                "    indeg = {r: 0 for r in scope}\n"
+                "    for a, b in edges:\n"
+                "        graph.setdefault(b, []).append(a)\n"
+                "        indeg[a] = indeg.get(a, 0) + 1\n"
+                "    q = deque(sorted(r for r in scope if indeg[r] == 0))\n"
+                "    out = []\n"
+                "    while q:\n"
+                "        n = q.popleft(); out.append(n)\n"
+                "        for m in sorted(graph[n]):\n"
+                "            indeg[m] -= 1\n"
+                "            if indeg[m] == 0: q.append(m)\n"
+                "    return out\n"
+            )},
+        ],
+        "max_tokens": int(max_tokens),
+        "temperature": 0.0,
+        "stream": True,
+    }
+
+
+PayloadBuilder = Callable[..., dict]
 
 
 # dispatch_fn(payload) -> an async readline (or a (readline, response) tuple for
@@ -104,6 +142,7 @@ async def deep_probe(
     itl_hard_s: Optional[float] = None,
     itl_safe_s: Optional[float] = None,
     max_tokens: int = _MAX_TOKENS,
+    payload_builder: Optional[PayloadBuilder] = None,
 ) -> DeepProbeResult:
     """Stream a minimal generation and grade the inference lane. Never raises.
 
@@ -116,7 +155,7 @@ async def deep_probe(
     ttft = ttft_bound_s if ttft_bound_s is not None else _env_float(_TTFT_ENV, _DEFAULT_TTFT_S)
     itl_hard = itl_hard_s if itl_hard_s is not None else _env_float(_ITL_HARD_ENV, _DEFAULT_ITL_HARD_S)
     itl_safe = itl_safe_s if itl_safe_s is not None else _env_float(_ITL_SAFE_ENV, _DEFAULT_ITL_SAFE_S)
-    payload = build_probe_payload(model, max_tokens=max_tokens)
+    payload = (payload_builder or build_probe_payload)(model, max_tokens=max_tokens)
 
     token_times: List[float] = []
 
@@ -179,6 +218,74 @@ async def deep_probe(
     )
 
 
+@dataclass
+class StagedHealthResult:
+    """Outcome of the 2-pass staged verification."""
+    healthy: bool
+    stage: str            # "both_passed" | "pass1_degraded" | "pass2_degraded"
+    pass1: DeepProbeResult
+    pass2: Optional[DeepProbeResult]
+
+
+async def staged_health_check(
+    *,
+    dispatch_fn: DispatchFn,
+    model: str = "",
+    pass1_max_tokens: int = _MAX_TOKENS,
+    pass2_max_tokens: int = 150,
+    ttft_bound_s: Optional[float] = None,
+    itl_hard_s: Optional[float] = None,
+    itl_safe_s: Optional[float] = None,
+    pass2_itl_safe_s: Optional[float] = None,
+) -> StagedHealthResult:
+    """Two-pass DW readiness gate — the anti-"fake recovery" check.
+
+    Pass 1: the lightweight 5-token TTFT probe (did the lane wake at all?).
+    Pass 2 (ONLY if pass 1 passed): a ~150-token synthetic ReAct workload that
+    proves DW SUSTAINS inter-token latency under moderate context pressure — the
+    VRAM-instability class a 5-token probe cannot surface. HEALTHY only if BOTH
+    pass; otherwise the caller stays WATCHING and aborts the swarm handoff.
+
+    ``pass2_itl_safe_s`` lets Pass 2 apply a distinct (typically looser, since a
+    real workload has natural ITL variance) sustained-ITL threshold. Never
+    raises."""
+    p1 = await deep_probe(
+        dispatch_fn=dispatch_fn, model=model, ttft_bound_s=ttft_bound_s,
+        itl_hard_s=itl_hard_s, itl_safe_s=itl_safe_s, max_tokens=pass1_max_tokens,
+    )
+    if not p1.healthy:
+        return StagedHealthResult(healthy=False, stage="pass1_degraded", pass1=p1, pass2=None)
+
+    p2 = await deep_probe(
+        dispatch_fn=dispatch_fn, model=model, ttft_bound_s=ttft_bound_s,
+        itl_hard_s=itl_hard_s,
+        itl_safe_s=(pass2_itl_safe_s if pass2_itl_safe_s is not None else itl_safe_s),
+        max_tokens=pass2_max_tokens, payload_builder=build_synthetic_workload_payload,
+    )
+    if not p2.healthy:
+        return StagedHealthResult(healthy=False, stage="pass2_degraded", pass1=p1, pass2=p2)
+    return StagedHealthResult(healthy=True, stage="both_passed", pass1=p1, pass2=p2)
+
+
+def make_staged_probe_fn(
+    dispatch_fn: Optional[DispatchFn] = None, **staged_kwargs: Any,
+) -> Callable[[], Awaitable[bool]]:
+    """Adapt :func:`staged_health_check` into the forecaster's ``probe_fn``
+    contract (``() -> Awaitable[bool]``) — the fortified Sentinel gate."""
+    df = dispatch_fn or _default_dw_stream_dispatch
+
+    async def _probe() -> bool:
+        res = await staged_health_check(dispatch_fn=df, **staged_kwargs)
+        logger.info(
+            "[DWDeepProbe] STAGED verdict=%s stage=%s p1=%s p2=%s",
+            "HEALTHY" if res.healthy else "DEGRADED", res.stage,
+            res.pass1.reason, (res.pass2.reason if res.pass2 else "skipped"),
+        )
+        return res.healthy
+
+    return _probe
+
+
 def make_deep_probe_fn(
     dispatch_fn: Optional[DispatchFn] = None, **probe_kwargs: Any,
 ) -> Callable[[], Awaitable[bool]]:
@@ -229,9 +336,13 @@ async def _default_dw_stream_dispatch(payload: dict) -> Any:
 
 __all__ = [
     "DeepProbeResult",
+    "StagedHealthResult",
     "VERDICT_DEGRADED",
     "VERDICT_HEALTHY",
     "build_probe_payload",
+    "build_synthetic_workload_payload",
     "deep_probe",
     "make_deep_probe_fn",
+    "make_staged_probe_fn",
+    "staged_health_check",
 ]
