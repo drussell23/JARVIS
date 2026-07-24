@@ -179,6 +179,44 @@ def all_personas() -> Tuple[Persona, ...]:
     return tuple(_PERSONAS.values())
 
 
+# -- Semantic Human-Routing (Slice 3) ---------------------------------------
+#
+# When @the-human posts, EXACTLY ONE resident is summoned — a lightweight
+# first-match keyword router (design-as-code, ordered by specificity).
+# Prevents chaotic multi-agent API pile-ons: one summon, one reply.
+
+import re as _re
+
+_HUMAN_ROUTES: Tuple[Tuple[Any, str], ...] = (
+    (_re.compile(r"\b(test|fail|suite|pytest|red|broke|crash)", _re.I),
+     "test_failure"),
+    (_re.compile(r"\b(predict|forecast|odds|probab|think|future|risk)",
+                 _re.I), "prophecy"),
+    (_re.compile(r"\b(review|check|verify|receipt|audit|approve)", _re.I),
+     "review"),
+    (_re.compile(r"\b(code|stitch|swarm|chunk|refactor|patch|file)",
+                 _re.I), "swarm"),
+    (_re.compile(r"\b(dream|idea|blueprint|imagine|night|sleep)", _re.I),
+     "dream"),
+    (_re.compile(r"\b(plan|design|architect|strategy)", _re.I), "plan"),
+    (_re.compile(r"\b(worker|queue|pool|backlog)", _re.I), "worker"),
+)
+
+
+def route_human_post(text: Any) -> str:
+    """Resolve which resident a human post summons ("" = none — the
+    post stands alone). First match wins; ONE resident, always.
+    NEVER raises."""
+    try:
+        s = str(text or "")
+        for pattern, resident in _HUMAN_ROUTES:
+            if pattern.search(s):
+                return resident
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def compose(agent_id: str, kind: str, facts: Dict[str, Any]) -> str:
     """Render a post body in the author's voice. Deterministic template
     pick (content-hash — no clocks, no RNG); every fact value is

@@ -520,6 +520,10 @@ async def _maybe_converse(stored: "MoltPost") -> None:
     try:
         if not converse_enabled() or stored.reply_to:
             return                     # recursion ban: replies are leaves
+        if stored.author_id == "operator":
+            return                     # human posts summon via the semantic
+                                       # router — never the ambient dice
+                                       # (anti-pile-on, Slice 3)
         import hashlib as _hashlib
         for resident, chance, rkind in _REACTIONS.get(stored.kind, ()):
             if resident == stored.author_id:
