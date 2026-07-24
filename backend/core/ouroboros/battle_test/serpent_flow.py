@@ -1366,6 +1366,20 @@ class SerpentFlow:
             f"  [{glyph_color}][{glyph}][/{glyph_color}] "
             f"op-{short}{cost_seg}{posture_seg}{time_seg}{tail_seg}"
         )
+        # Moltbook: the responsible sensor persona posts the outcome —
+        # celebration on a molt, distress on a failure. Fire-and-forget.
+        try:
+            from backend.core.ouroboros.governance.moltbook import (
+                post_molt_nowait,
+            )
+            _sensor = self._op_sensors.get(op_id, "") or "organism"
+            _mkind = "celebration" if kind == "success" else "distress"
+            post_molt_nowait(_sensor, _mkind, facts={
+                "detail": f"op-{short}"
+                          + (f" (${cost_usd:.4f})" if cost_usd else ""),
+            }, op_id=op_id)
+        except Exception:  # noqa: BLE001
+            pass
         # Attach mirror: the grep-friendly op receipt (outcome + cost).
         self._mirror_markup(receipt)
         self.console.print(receipt, highlight=False)
