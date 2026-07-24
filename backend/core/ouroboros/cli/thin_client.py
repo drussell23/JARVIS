@@ -104,8 +104,15 @@ async def probe_socket(
       ``listen()`` backlog completes handshakes at the KERNEL level
       even while a boot-starved event loop has yet to run ``accept()``
       or write the hydration line. Callers must WAIT, never clean.
-    * ``"stale"``   — inode exists but connection refused/timed out
-      (ghost of a violently-killed daemon)
+    * ``"stale"``   — inode exists but connection REFUSED/reset (ghost
+      of a violently-killed daemon). A connect *timeout* is NOT stale:
+      a starved-but-live organism's loop can miss the accept window
+      while the kernel backlog still exists — that classifies as
+      ``"booting"`` (wait, never clean). Only a kernel-level refusal
+      proves nobody is home. (Root cause of the 2026-07-23 class: a
+      starvation-lagged live soak was probed "stale", the CLI unlinked
+      its LIVE socket, and the organism became permanently unattachable
+      since the bridge binds once at boot.)
     * ``"absent"``  — no inode at all
 
     ``timeout`` overrides the env default for a STRICT live-validation
@@ -121,10 +128,12 @@ async def probe_socket(
                 asyncio.open_unix_connection(path=str(path)),
                 timeout=bound,
             )
-        except (
-            ConnectionRefusedError, ConnectionResetError,
-            asyncio.TimeoutError, OSError,
-        ):
+        except asyncio.TimeoutError:
+            # Timeout ≠ dead. A starved event loop misses the accept
+            # window while the listener still exists — treat exactly
+            # like an accepted-but-unserved handshake: WAIT, never clean.
+            return "booting"
+        except (ConnectionRefusedError, ConnectionResetError, OSError):
             return "stale"
         try:
             if not deep:
@@ -315,10 +324,13 @@ def rollover_daemon_log(path: Optional[Path] = None) -> bool:
 
 def spawn_daemon(
     *, spawner: Callable[..., Any] = subprocess.Popen,
-) -> Optional[int]:
+) -> Optional[Any]:
     """Launch the organism DETACHED (new session — it survives this
     terminal closing) with stdout+stderr piped to the daemon log.
-    Returns the child pid, or None on spawn failure. NEVER raises."""
+    Returns the child process HANDLE (``.pid`` / ``.poll()``), or None
+    on spawn failure — the handle makes an instant single-flight
+    rejection (exit 75) OBSERVABLE instead of a 120s blind socket
+    vigil. NEVER raises."""
     try:
         log = daemon_log_path()
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -343,7 +355,7 @@ def spawn_daemon(
                 start_new_session=True,
                 env=env,
             )
-        return getattr(proc, "pid", None)
+        return proc if getattr(proc, "pid", None) is not None else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -369,6 +381,7 @@ async def await_socket(
     *,
     on_tick: Optional[Callable[[float], None]] = None,
     deadline_s: Optional[float] = None,
+    child_poll: Optional[Callable[[], Optional[int]]] = None,
 ) -> bool:
     """Wait (bounded) for the daemon's bridge to genuinely SERVE — each
     re-probe is the deep application handshake (``probe_socket(deep=True)``),
@@ -378,16 +391,38 @@ async def await_socket(
     Polling is a jittered exponential backoff (full jitter: each sleep is
     ``uniform(min, delay)`` with ``delay`` doubling to an env-tunable
     ceiling) — resource-frugal against a boot-starved daemon and never a
-    thundering probe train. ``on_tick(elapsed)`` drives the waking
-    breadcrumb. NEVER raises."""
+    thundering probe train. The PROBE BOUND escalates with the backoff
+    (from the env default up to 3s): a live organism whose loop is lagged
+    past the quick bound is still recognized instead of being waited on
+    forever (the starved-organism misclassification class).
+
+    ``child_poll`` (Popen.poll of a just-ignited daemon) makes death
+    observable: the moment the child exits without the socket serving,
+    the wait stops after ONE final escalated probe — never a blind
+    full-deadline vigil over a corpse (the 117s-wait class; a
+    single-flight rejection exits within ~2s of ignition).
+
+    ``on_tick(elapsed)`` drives the waking breadcrumb. NEVER raises."""
     deadline = deadline_s if deadline_s is not None else _boot_wait_s()
     start = time.monotonic()
     delay = _backoff_min_s()
     ceiling = max(_backoff_max_s(), delay)
     try:
         while (time.monotonic() - start) < deadline:
-            if await probe_socket(path, deep=True) == "live":
+            bound = min(3.0, max(_probe_timeout_s(), delay))
+            if await probe_socket(path, timeout=bound, deep=True) == "live":
                 return True
+            if child_poll is not None:
+                try:
+                    if child_poll() is not None:
+                        # The ignited daemon is DEAD. One last escalated
+                        # probe (an incumbent may serve this same path),
+                        # then stop — the caller reads the exit code.
+                        return await probe_socket(
+                            path, timeout=3.0, deep=True,
+                        ) == "live"
+                except Exception:  # noqa: BLE001
+                    pass
             if on_tick is not None:
                 try:
                     on_tick(time.monotonic() - start)
@@ -404,6 +439,32 @@ async def await_socket(
         raise
     except Exception:  # noqa: BLE001
         return False
+
+
+def _live_incumbent() -> Optional[int]:
+    """PID of a live, fresh single-flight lock holder — the shared
+    reader in ``singleton_lock`` (one authority, zero disagreement
+    with the reaper/preflight). NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.singleton_lock import (
+            live_incumbent_pid,
+        )
+        return live_incumbent_pid(repo_root(), exclude_pid=os.getpid())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _mk_tick(say: Callable[[str], None]) -> Callable[[float], None]:
+    """The waking breadcrumb (≥5s cadence) — one builder for every
+    wait branch."""
+    last = [-10.0]
+
+    def _tick(elapsed: float) -> None:
+        if elapsed - last[0] >= 5.0:
+            last[0] = elapsed
+            say(f"⎿ organism waking · {int(elapsed)}s")
+
+    return _tick
 
 
 async def ensure_daemon(
@@ -434,14 +495,7 @@ async def ensure_daemon(
             # A daemon is home but boot-starved — its socket must NOT be
             # cleaned and no second ignition raced. Wait for it to serve.
             _say("⏺ organism already waking — waiting for it to serve")
-            last_beat_b = [-10.0]
-
-            def _tick_b(elapsed: float) -> None:
-                if elapsed - last_beat_b[0] >= 5.0:
-                    last_beat_b[0] = elapsed
-                    _say(f"⎿ organism waking · {int(elapsed)}s")
-
-            if await await_socket(path, on_tick=_tick_b):
+            if await await_socket(path, on_tick=_mk_tick(_say)):
                 _say("⏺ organism live — attaching")
                 return True
             _say(
@@ -450,23 +504,61 @@ async def ensure_daemon(
             )
             return False
         if state == "stale":
+            # NEVER unlink while a live single-flight incumbent exists:
+            # the bridge binds ONCE at boot, so cleaning a live-but-
+            # refusing organism's socket makes it permanently
+            # unattachable (the 2026-07-23 class). Only a dead/absent
+            # holder proves a true ghost.
+            incumbent = _live_incumbent()
+            if incumbent is not None:
+                _say(
+                    f"⏺ organism (PID {incumbent}) is alive but not "
+                    "serving — waiting, never cleaning a live socket"
+                )
+                if await await_socket(path, on_tick=_mk_tick(_say)):
+                    _say("⏺ organism live — attaching")
+                    return True
+                _say(
+                    f"⚠ organism PID {incumbent} is alive but its "
+                    "control plane never served — its loop may be "
+                    "starved; tail " + str(daemon_log_path()),
+                )
+                return False
             _say("⎿ ghost socket from a dead organism — cleaning")
             clean_stale_socket(path)
         _say("⏺ no organism awake — igniting one in the background")
-        if spawn_daemon(spawner=spawner) is None:
+        proc = spawn_daemon(spawner=spawner)
+        if proc is None:
             _say("⚠ ignition failed — see " + str(daemon_log_path()))
             return False
 
-        last_beat = [-10.0]
-
-        def _tick(elapsed: float) -> None:
-            if elapsed - last_beat[0] >= 5.0:
-                last_beat[0] = elapsed
-                _say(f"⎿ organism waking · {int(elapsed)}s")
-
-        if await await_socket(path, on_tick=_tick):
+        if await await_socket(
+            path, on_tick=_mk_tick(_say),
+            child_poll=getattr(proc, "poll", None),
+        ):
             _say("⏺ organism live — attaching")
             return True
+        rc = None
+        try:
+            rc = proc.poll()
+        except Exception:  # noqa: BLE001
+            pass
+        if rc == 75:                      # EX_TEMPFAIL — single-flight
+            incumbent = _live_incumbent()
+            who = f"PID {incumbent}" if incumbent else "another process"
+            _say(
+                f"⚠ ignition refused — {who} already holds the "
+                "single-flight organism lock, but its attach socket "
+                "is not serving. It may be starved or mid-boot; retry "
+                "shortly, or tail " + str(daemon_log_path()),
+            )
+            return False
+        if rc is not None:
+            _say(
+                f"⚠ ignition died (exit {rc}) before serving — "
+                "tail " + str(daemon_log_path()),
+            )
+            return False
         _say(
             "⚠ boot did not surface within the wait window — "
             "tail " + str(daemon_log_path()),

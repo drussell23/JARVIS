@@ -86,6 +86,18 @@ def attach_socket_path() -> Path:
     ))
 
 
+def _connect_patience_s() -> float:
+    """Total attach patience across escalating retries (client side).
+    A post-boot storm can lag hydration for seconds — the patience budget
+    absorbs it; a REFUSED socket still fails instantly."""
+    try:
+        return max(0.5, min(120.0, float(os.environ.get(
+            "JARVIS_ATTACH_CONNECT_PATIENCE_S", "12",
+        ))))
+    except (TypeError, ValueError):
+        return 12.0
+
+
 def _connect_timeout_s() -> float:
     try:
         return max(0.05, float(os.environ.get(
@@ -93,6 +105,20 @@ def _connect_timeout_s() -> float:
         )))
     except (TypeError, ValueError):
         return 0.5
+
+
+def _sentinel_interval_s() -> float:
+    """Socket self-heal cadence (0 disables). The bridge binds once at
+    boot; if ANY confused peer unlinks the inode (a CLI misclassifying
+    a starved organism as a ghost — the 2026-07-23 class — an operator
+    ``rm``, a tmp janitor), the organism silently becomes permanently
+    unattachable. The sentinel rebinds a vanished inode. NEVER raises."""
+    try:
+        return max(0.0, min(300.0, float(os.environ.get(
+            "JARVIS_ATTACH_SENTINEL_S", "10",
+        ))))
+    except (TypeError, ValueError):
+        return 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +163,7 @@ class CockpitAttachBridge:
         self._on_audio = on_audio or (lambda _c: None)
         self._path = Path(path) if path is not None else attach_socket_path()
         self._server: Optional[asyncio.AbstractServer] = None
+        self._sentinel_task: Optional[asyncio.Task] = None
         self._clients: Set[asyncio.StreamWriter] = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._audio_state: str = "OFFLINE"
@@ -169,6 +196,12 @@ class CockpitAttachBridge:
             except OSError:
                 pass
             logger.info("[CockpitAttach] bridge bound at %s", self._path)
+            if _sentinel_interval_s() > 0:
+                try:
+                    self._sentinel_task = asyncio.get_running_loop(
+                    ).create_task(self._socket_sentinel())
+                except Exception:  # noqa: BLE001
+                    self._sentinel_task = None
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("[CockpitAttach] bind failed: %s", exc)
@@ -185,6 +218,12 @@ class CockpitAttachBridge:
         forever. Bounded as belt-and-braces: never-hangs is this module's
         law even if a handler wedges."""
         try:
+            if self._sentinel_task is not None:
+                try:
+                    self._sentinel_task.cancel()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._sentinel_task = None
             for w in list(self._clients):
                 self._drop(w)
             if self._server is not None:
@@ -202,6 +241,56 @@ class CockpitAttachBridge:
                 pass
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] stop degraded", exc_info=True)
+
+    async def _socket_sentinel(self) -> None:
+        """Self-heal watchdog: while the bridge is up, verify the socket
+        inode still exists; if something unlinked it, REBIND at the same
+        path so the organism never becomes silently unattachable. Reads
+        only the filesystem + its own server handle (no app state — the
+        watchdog-isolation principle). NEVER raises; ends with stop()."""
+        try:
+            while True:
+                await asyncio.sleep(_sentinel_interval_s())
+                if self._server is None:      # stopped — sentinel ends
+                    return
+                try:
+                    if self._path.exists():
+                        continue
+                    logger.warning(
+                        "[CockpitAttach] socket inode VANISHED at %s — "
+                        "rebinding (self-heal)", self._path,
+                    )
+                    old = self._server
+                    self._server = None
+                    try:
+                        old.close()
+                        await asyncio.wait_for(
+                            old.wait_closed(), timeout=2.0,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._path.parent.mkdir(parents=True, exist_ok=True)
+                    self._server = await asyncio.start_unix_server(
+                        self._on_client, path=str(self._path),
+                    )
+                    try:
+                        os.chmod(self._path, 0o600)
+                    except OSError:
+                        pass
+                    logger.info(
+                        "[CockpitAttach] bridge REBOUND at %s", self._path,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[CockpitAttach] sentinel heal degraded",
+                        exc_info=True,
+                    )
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001
+            return
 
     @property
     def client_count(self) -> int:
@@ -452,7 +541,32 @@ class CockpitAttachClient:
         self.connected: bool = False
 
     async def connect(self) -> bool:
-        timeout = _connect_timeout_s()
+        """Escalating-patience attach. A fresh organism's post-boot storm
+        (sensor fan-out, executor warm-up) can lag hydration past a single
+        0.5s shot — which misdiagnosed a LIVE organism as absent (the
+        2026-07-23 attach-after-successful-boot failure). Timeout-class
+        failures retry with doubling bounds up to a total patience budget;
+        REFUSED/absent fails fast (waiting cannot conjure a dead listener).
+        NEVER raises."""
+        patience = _connect_patience_s()
+        bound = _connect_timeout_s()
+        spent = 0.0
+        while True:
+            t0 = time.monotonic()
+            outcome = await self._connect_once(bound)
+            if outcome == "ok":
+                return True
+            if outcome == "dead":
+                return False
+            spent += time.monotonic() - t0
+            if spent >= patience:
+                return False
+            bound = min(bound * 2, max(0.5, patience - spent))
+
+    async def _connect_once(self, timeout: float) -> str:
+        """One bounded attach attempt: ``"ok"`` / ``"slow"`` (timeout-class
+        — a starved loop, worth retrying) / ``"dead"`` (refused/absent —
+        retrying cannot help). NEVER raises."""
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_unix_connection(path=str(self._path)),
@@ -463,7 +577,7 @@ class CockpitAttachClient:
             )
             if not line:
                 await self.close()
-                return False
+                return "dead"
             frame = json.loads(line)
             if frame.get("type") == "hydration":
                 self._safe_cb(self._on_hydration, frame)
@@ -471,10 +585,17 @@ class CockpitAttachClient:
                 self._read_loop(),
             )
             self.connected = True
-            return True
+            return "ok"
+        except asyncio.TimeoutError:
+            await self.close()
+            return "slow"
+        except (FileNotFoundError, ConnectionRefusedError,
+                ConnectionResetError):
+            await self.close()
+            return "dead"
         except Exception:  # noqa: BLE001
             await self.close()
-            return False
+            return "dead"
 
     def send_audio(self, cmd: str) -> bool:
         """Pipe one audio-orchestration command upstream (``wake`` /

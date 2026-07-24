@@ -297,44 +297,33 @@ def _read_lock_holder(
     or ``None`` when absent/corrupt/self-owned.
 
     THE shared authority for "who holds the organism right now" —
-    consumed by BOTH the zombie reaper (incumbent immunity) and the
-    single-flight preflight (conflict detection), so the two can never
-    again disagree about legitimacy (the 2026-07-18 class: the reaper
+    consumed by the zombie reaper (incumbent immunity), the single-flight
+    preflight (conflict detection), AND the thin CLI's ensure_daemon
+    (never-clean-a-live-organism's-socket + exit-75 attribution), so no
+    two can disagree about legitimacy (the 2026-07-18 class: the reaper
     SIGTERM'd a healthy incumbent, then the preflight rejected the
     launcher against the dying incumbent's still-fresh lock — one ``ov``
     keystroke murdered the live soak AND locked the operator out).
-    NEVER raises."""
-    import json as _json
+    Implementation lives in ``battle_test.singleton_lock.read_lock_holder``
+    (promoted 2026-07-23 so the thin client shares it without importing
+    this heavy script). NEVER raises."""
     try:
+        from backend.core.ouroboros.battle_test.singleton_lock import (
+            read_lock_holder,
+        )
         root = Path(project_root) if project_root is not None else _PROJECT_ROOT
-        lock_path = root / ".jarvis" / "intake_router.lock"
-        if not lock_path.exists():
-            return None
-        data = _json.loads(lock_path.read_text())
-        pid = int(data.get("pid", 0))
-        ts = float(data.get("ts", 0.0))
-        if not pid or pid == os.getpid():
-            return None
-        try:
-            os.kill(pid, 0)
-            alive = True
-        except ProcessLookupError:
-            alive = False
-        except PermissionError:
-            # The PID EXISTS (kernel refused the signal, not the lookup)
-            # — treating this as dead was a latent bug in the old inline
-            # parse: a root-owned holder would have been "adopted over".
-            alive = True
-        age_s = (time.time() - ts) if ts > 0 else float("inf")
-        return (pid, age_s, alive)
-    except (ValueError, OSError, KeyError, TypeError):
+        return read_lock_holder(root, exclude_pid=os.getpid())
+    except Exception:  # noqa: BLE001
         return None
 
 
 def _lock_stale_ttl_s() -> float:
     try:
-        return float(os.environ.get("JARVIS_INTAKE_LOCK_STALE_TTL_S", "7200"))
-    except (TypeError, ValueError):
+        from backend.core.ouroboros.battle_test.singleton_lock import (
+            lock_stale_ttl_s,
+        )
+        return lock_stale_ttl_s()
+    except Exception:  # noqa: BLE001
         return 7200.0
 
 

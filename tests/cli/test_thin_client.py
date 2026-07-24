@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import shutil
+import time
 import socket as socket_mod
 import tempfile
 from pathlib import Path
@@ -526,3 +527,148 @@ class TestHandshakeDepthProbe:
             assert path.exists()               # never cleaned the socket
         finally:
             await _shutdown_server(server)
+
+
+# ---------------------------------------------------------------------------
+# Starved-organism honesty (the 2026-07-23 "ov takes forever then fails" class)
+# ---------------------------------------------------------------------------
+
+
+class TestStarvedOrganismHonesty:
+    """Root-cause spine for the 117s-blind-wait + live-socket-unlink chain:
+    a starvation-lagged LIVE soak was probed 'stale', the CLI unlinked its
+    live socket (bridge binds once → permanently unattachable), then a
+    rival ignition was single-flight-rejected (exit 75) while the CLI
+    blind-waited the full boot window over the corpse."""
+
+    async def test_connect_timeout_probes_booting_not_stale(
+        self, sock_dir, monkeypatch,
+    ):
+        """Timeout ≠ dead: a starved loop misses the accept window while
+        the listener still exists — must classify 'booting' (wait, never
+        clean), NEVER 'stale' (clean + race a second ignition)."""
+        path = sock_dir / "starved.sock"
+        path.write_bytes(b"")                  # inode exists
+
+        async def _hang(*_a, **_k):
+            await asyncio.sleep(60)
+
+        monkeypatch.setattr(
+            thin_client.asyncio, "open_unix_connection", _hang,
+        )
+        state = await thin_client.probe_socket(path, timeout=0.05, deep=True)
+        assert state == "booting"
+
+    async def test_stale_with_live_incumbent_never_cleans_never_spawns(
+        self, sock_dir, monkeypatch,
+    ):
+        """A refused socket + a LIVE single-flight lock holder = a live
+        organism that is not serving. The CLI must wait — never unlink
+        the live organism's socket, never ignite a rival."""
+        path = sock_dir / "attach.sock"
+        path.write_bytes(b"")                  # plain file → connect refused
+        monkeypatch.setattr(
+            thin_client, "attach_socket_path_for_test", None, raising=False,
+        )
+        import backend.core.ouroboros.battle_test.cockpit_attach as ca
+        monkeypatch.setattr(ca, "attach_socket_path", lambda: path)
+        monkeypatch.setattr(thin_client, "_live_incumbent", lambda: 4242)
+
+        waited = []
+
+        async def _fake_wait(_p, **_kw):
+            waited.append(True)
+            return False                        # never serves in this test
+
+        monkeypatch.setattr(thin_client, "await_socket", _fake_wait)
+        spawns, msgs = [], []
+        ok = await thin_client.ensure_daemon(
+            on_status=msgs.append,
+            spawner=lambda *a, **k: spawns.append(a),
+        )
+        assert ok is False
+        assert path.exists()                    # LIVE socket never unlinked
+        assert spawns == []                     # no rival ignition
+        assert waited                           # it waited instead
+        assert any("4242" in m for m in msgs)   # names the incumbent
+
+    async def test_child_exit_75_stops_wait_and_names_incumbent(
+        self, sock_dir, monkeypatch,
+    ):
+        """A single-flight-rejected ignition (exit 75) must stop the wait
+        within seconds and attribute the lock holder — never a blind
+        full-deadline vigil over a corpse."""
+        path = sock_dir / "attach.sock"        # absent → cold boot branch
+        import backend.core.ouroboros.battle_test.cockpit_attach as ca
+        monkeypatch.setattr(ca, "attach_socket_path", lambda: path)
+        monkeypatch.setattr(thin_client, "_live_incumbent", lambda: 555)
+        monkeypatch.setenv("JARVIS_OV_BOOT_WAIT_S", "30")
+
+        class _DeadChild:
+            pid = 999
+
+            def poll(self):
+                return 75
+
+        monkeypatch.setattr(
+            thin_client, "spawn_daemon", lambda **_kw: _DeadChild(),
+        )
+        msgs = []
+        t0 = time.monotonic()
+        ok = await thin_client.ensure_daemon(on_status=msgs.append)
+        elapsed = time.monotonic() - t0
+        assert ok is False
+        assert elapsed < 10.0                   # fast-fail, not 30s deadline
+        assert any("single-flight" in m for m in msgs)
+        assert any("555" in m for m in msgs)
+
+    async def test_child_death_other_rc_reports_exit_code(
+        self, sock_dir, monkeypatch,
+    ):
+        path = sock_dir / "attach.sock"
+        import backend.core.ouroboros.battle_test.cockpit_attach as ca
+        monkeypatch.setattr(ca, "attach_socket_path", lambda: path)
+        monkeypatch.setenv("JARVIS_OV_BOOT_WAIT_S", "30")
+
+        class _Crashed:
+            pid = 999
+
+            def poll(self):
+                return 1
+
+        monkeypatch.setattr(
+            thin_client, "spawn_daemon", lambda **_kw: _Crashed(),
+        )
+        msgs = []
+        ok = await thin_client.ensure_daemon(on_status=msgs.append)
+        assert ok is False
+        assert any("exit 1" in m for m in msgs)
+
+    async def test_await_socket_child_exit_final_probe_can_still_win(
+        self, sock_dir,
+    ):
+        """The final escalated probe after child death can still find an
+        INCUMBENT serving the same path — child death is not defeat."""
+        path = sock_dir / "incumbent.sock"
+        server = await asyncio.start_unix_server(
+            _serving_handler, path=str(path),
+        )
+        try:
+            ok = await thin_client.await_socket(
+                path, deadline_s=10.0, child_poll=lambda: 75,
+            )
+            assert ok is True                   # attached to the incumbent
+        finally:
+            await _shutdown_server(server)
+
+    def test_shared_lock_reader_promoted_and_delegated(self):
+        """DRY: one lock-reader authority in singleton_lock; the harness
+        script delegates to it (no second parser to drift)."""
+        from backend.core.ouroboros.battle_test import singleton_lock as sl
+        assert callable(sl.read_lock_holder)
+        assert callable(sl.live_incumbent_pid)
+        script = (
+            thin_client.repo_root() / "scripts" / "ouroboros_battle_test.py"
+        ).read_text()
+        assert "from backend.core.ouroboros.battle_test.singleton_lock import" in script
+        assert script.count('data = _json.loads(lock_path.read_text())') == 0
