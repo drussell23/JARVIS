@@ -104,3 +104,83 @@ async def dispatch_moltbook_command(line: str) -> MoltbookDispatchResult:
         return MoltbookDispatchResult(
             ok=False, text=f"  /moltbook degraded: {type(exc).__name__}",
         )
+
+
+# ---------------------------------------------------------------------------
+# ``/molt <text>`` — the operator posts as @the-human (Slice 3)
+# ---------------------------------------------------------------------------
+#
+# Wired through the EXISTING Zone 2 command deck (naming-cage verb; the
+# harness schedules dispatch via create_task, so typing a post never
+# blocks Zone 1 redraws — non-blocking by construction). The Semantic
+# Router summons EXACTLY ONE resident; the reply goes through the
+# Garnish choke queue (busy → deterministic template, instantly).
+
+
+@dataclass(frozen=True)
+class MoltDispatchResult:
+    ok: bool
+    text: str
+
+
+def matches_molt_command(line: str) -> bool:
+    s = str(line or "").strip().lower()
+    # 'molt' must never shadow 'moltbook'
+    if s.startswith("moltbook") or s.startswith("/moltbook"):
+        return False
+    return s == "molt" or s == "/molt" or \
+        s.startswith("molt ") or s.startswith("/molt ")
+
+
+async def dispatch_molt_command(line: str) -> MoltDispatchResult:
+    """Post as @the-human; summon the routed resident. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.moltbook import (
+            moltbook_enabled,
+            post_molt,
+        )
+        if not moltbook_enabled():
+            return MoltDispatchResult(
+                ok=False,
+                text="  moltbook is off (JARVIS_MOLTBOOK_ENABLED=0)",
+            )
+        parts = str(line or "").strip().split(None, 1)
+        text = parts[1].strip() if len(parts) > 1 else ""
+        if not text:
+            return MoltDispatchResult(
+                ok=False, text="  usage: /molt <what you want to say>",
+            )
+        posted = await post_molt("operator", "musing", text)
+        if posted is None:
+            return MoltDispatchResult(
+                ok=False, text="  /molt: the agora did not accept the post",
+            )
+        from backend.core.ouroboros.governance.moltbook_personas import (
+            persona_for,
+            route_human_post,
+        )
+        resident = route_human_post(text)
+        summon_note = ""
+        if resident:
+            from backend.core.ouroboros.governance.moltbook_garnish import (
+                garnish_or_template,
+            )
+            queued = garnish_or_template(
+                resident, "musing",
+                {"detail": text[:80], "orig": "@the-human"},
+                reply_to=posted.post_id,
+                thread_root=posted.post_id,
+            )
+            handle = persona_for(resident).handle
+            summon_note = (
+                f" · summoned {handle}"
+                f"{'' if queued else ' (template — garnish busy)'}"
+            )
+        return MoltDispatchResult(
+            ok=True,
+            text=f"  🐍 posted as @the-human · {posted.ref}{summon_note}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return MoltDispatchResult(
+            ok=False, text=f"  /molt degraded: {type(exc).__name__}",
+        )
