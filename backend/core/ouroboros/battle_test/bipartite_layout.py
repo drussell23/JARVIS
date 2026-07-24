@@ -174,7 +174,10 @@ class BipartiteLayout:
     def _visible_lines(self) -> List[str]:
         # Auto-scroll: keep only the last (height - frame chrome) lines.
         try:
-            budget = max(1, self._height - 4)   # panel top/bottom border + title + deck
+            chrome = 4 if os.environ.get("JARVIS_BIPARTITE_BORDER", "").strip().lower() in (
+                "1", "true", "yes", "on",
+            ) else 1
+            budget = max(1, self._height - chrome)   # frame chrome only when bordered
             snap = self._buffer.snapshot()
             return list(snap[-budget:])
         except Exception:  # noqa: BLE001
@@ -204,20 +207,27 @@ class BipartiteLayout:
             else:
                 body = Text("  idle — waiting for the organism to act", style="bright_black")
             n = self._buffer.line_count if hasattr(self._buffer, "line_count") else len(lines)
-            # State-reactive border (Style Guide §06): the accent reflects the
-            # organism's meta-state, mutated in place by the Reactive Theme.
-            border = "cyan"
-            try:
-                from backend.core.ouroboros.ui.theme import get_reactive_theme
-                border = get_reactive_theme().active_border_style() or "cyan"
-            except Exception:  # noqa: BLE001
+            # CC-style default (operator mandate 2026-07-23): BORDERLESS — the
+            # canvas is open flowing content; structure comes from typography,
+            # and the reactive state accent lives in the header's status dot.
+            # JARVIS_BIPARTITE_BORDER=1 restores the framed Panel (whose border
+            # then carries the reactive accent as before).
+            if os.environ.get("JARVIS_BIPARTITE_BORDER", "").strip().lower() in (
+                "1", "true", "yes", "on",
+            ):
                 border = "cyan"
-            return Panel(
-                body, title=self._title, title_align="left",
-                subtitle=f"[bright_black]{n} events[/bright_black]", subtitle_align="right",
-                box=ROUNDED, border_style=border, padding=(0, 1),
-                height=max(3, self._height - 3),
-            )
+                try:
+                    from backend.core.ouroboros.ui.theme import get_reactive_theme
+                    border = get_reactive_theme().active_border_style() or "cyan"
+                except Exception:  # noqa: BLE001
+                    border = "cyan"
+                return Panel(
+                    body, title=self._title, title_align="left",
+                    subtitle=f"[bright_black]{n} events[/bright_black]", subtitle_align="right",
+                    box=ROUNDED, border_style=border, padding=(0, 1),
+                    height=max(3, self._height - 3),
+                )
+            return body
         except Exception:  # noqa: BLE001
             try:
                 from rich.panel import Panel
@@ -381,6 +391,8 @@ def build_bipartite_application(
     on_accept: Callable[[str], Any],
     extra_key_bindings: Any = None,
     toolbar: Optional[Callable[[], str]] = None,
+    header: Optional[Callable[[], str]] = None,
+    header_height: int = 0,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
     window fed from ``mux.render_canvas_ansi()`` (re-rendered each frame, so
@@ -440,7 +452,22 @@ def build_bipartite_application(
         except Exception:  # noqa: BLE001
             pass
 
-    rows = [canvas, prompt]
+    rows = []
+    if header is not None and header_height > 0:
+        # The CC-style identity header (mini animated crest + version + path).
+        # Stateless render — the callable derives its animation phase from the
+        # clock, so the app's refresh_interval animates it with zero tasks.
+        def _header_fragments():
+            try:
+                return ANSI(str(header() or ""))
+            except Exception:  # noqa: BLE001
+                return ANSI("")
+
+        rows.append(Window(
+            content=FormattedTextControl(_header_fragments, focusable=False),
+            height=header_height, wrap_lines=False,
+        ))
+    rows += [canvas, prompt]
     if toolbar is not None:
         # A one-row morphing footer (e.g. the attach client's AttachUI.toolbar —
         # audio state, detach hint). Re-evaluated each repaint; a failing
@@ -459,7 +486,7 @@ def build_bipartite_application(
     app = Application(
         layout=PTLayout(root, focused_element=prompt),
         key_bindings=kb, full_screen=True, mouse_support=False,
-        refresh_interval=0.2,
+        refresh_interval=0.1,
     )
     _APP_REF["app"] = app
     mux.set_invalidate(app.invalidate)
@@ -538,6 +565,8 @@ async def run_bipartite_repl(
     toolbar: Optional[Callable[[], str]] = None,
     watch_alive: Optional[Callable[[], bool]] = None,
     seed: Optional[List[str]] = None,
+    header: Optional[Callable[[], str]] = None,
+    header_height: int = 0,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
     the live Zone-1 sink (so any producer — the daemon's event router OR the
@@ -552,7 +581,11 @@ async def run_bipartite_repl(
     import shutil
 
     size = shutil.get_terminal_size(fallback=(100, 30))
-    mux = BipartiteLayout(width=size.columns, height=size.lines, title=title)
+    mux = BipartiteLayout(
+        width=size.columns,
+        height=max(6, size.lines - max(0, header_height)),
+        title=title,
+    )
     set_active_canvas(mux)
     for ln in (seed or []):
         mux.push_raw(ln)
@@ -560,7 +593,7 @@ async def run_bipartite_repl(
     try:
         app = build_bipartite_application(
             mux, on_accept=on_accept, extra_key_bindings=extra_key_bindings,
-            toolbar=toolbar,
+            toolbar=toolbar, header=header, header_height=header_height,
         )
         if watch_alive is not None:
             watcher = asyncio.ensure_future(
