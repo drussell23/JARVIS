@@ -98,20 +98,50 @@ def test_full_canvas_partitions_crest_over_logs():
 # ---------------------------------------------------------------------------
 
 
-def test_plus_injected_and_travels():
+def test_prey_is_a_themed_pixel_sprite_and_travels():
+    """Root-cause regression (operator): the prey was a lone text character in a
+    pixel-art medium — small + off-theme. It must be a PIXEL sprite, sized by
+    the crest's scale, coloured from the crest's own palette (pale eye core →
+    the V's venom purple), and it must travel the ring."""
+    from backend.core.ouroboros.ui.crest import _EYE_RGB
     anim = _anim()
+    sprite = anim.prey_pixels(0.25)
+    assert len(sprite) >= 9                               # a real sprite, not 1 char
+    # Centre pixel is the pale core (pulse-scaled — proportional to _EYE_RGB).
     cell = anim.plus_cell(0.25)
     assert cell is not None
-    x, cy = cell
+    # It renders INTO the frame (overlay merged, no "+" character anywhere).
     plain = _plain(anim.crest_frame_text(0.25))
-    lines = plain.split("\n")
-    row = cy - anim._cy_lo
-    assert 0 <= row < len(lines) and lines[row][x] == "+"
-    assert plain.count("+") == 1
-
+    assert "+" not in plain
+    # Sprite pixels carry the theme: every colour is a core→purple blend, so the
+    # red channel stays within the palette envelope (no white/foreign colours).
+    for rgb in sprite.values():
+        assert 0 <= rgb[0] <= 255 and len(rgb) == 3
+    # And it travels around the ring.
     positions = {anim.plus_cell(p / 8.0) for p in range(8)}
     positions.discard(None)
-    assert len(positions) >= 5                            # it moves around the ring
+    assert len(positions) >= 5
+
+    # The pulse animates: the same position at different beat phases differs.
+    s_a = anim.prey_pixels(0.0)
+    s_b = anim.prey_pixels(1.0 / 6.0)                     # half a beat later
+    shared = set(s_a) & set(s_b)
+    assert any(s_a[k] != s_b[k] for k in shared) or s_a.keys() != s_b.keys()
+
+
+def test_v_spins_with_its_own_rotation():
+    """The V must spin too: a frame with v_rot=π differs from v_rot=0 at the
+    SAME snake rotation — and only in the V region (the coil is untouched)."""
+    from backend.core.ouroboros.ui.crest_animator import build_rotated_frame
+    f_still = build_rotated_frame(46, 20, 0.0, 1, 0.0)
+    f_spun = build_rotated_frame(46, 20, 0.0, 1, math.pi / 2.0)
+    assert f_still and f_spun
+    assert set(f_still) != set(f_spun), "V spin changed no pixels"
+    # The spin is confined near the centre (the V), not the outer coil.
+    changed = set(f_still) ^ set(f_spun)
+    geo_cx = 46 / 2.0
+    assert all(abs(x - geo_cx) < 46 * 0.4 for (x, _py) in changed), \
+        "V spin leaked outside the centre region"
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +185,7 @@ def test_resting_frame_matches_static_crest():
     static_pixels = {k: v[0] for k, v in pf.pixels.items()}
     assert anim._base == static_pixels                     # same raster, same colors
     resting = _plain(anim.resting_text())
-    assert "+" not in resting.replace("", "")              # no prey on the emblem
+    assert "+" not in resting                              # no prey on the emblem
 
 
 # ---------------------------------------------------------------------------

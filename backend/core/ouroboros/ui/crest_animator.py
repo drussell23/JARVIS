@@ -44,7 +44,10 @@ from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
 from .crest import (
+    _EYE_RGB,
     _GAP_CENTER,
+    _V_BOT_RGB,
+    _V_TOP_RGB,
     _REF_ASPECT,
     _Geometry,
     _ang_norm,
@@ -56,10 +59,9 @@ from .crest import (
 
 # rgb() functional notation (not a colour name) — passes the ui/ no-literal-
 # styling guard exactly as crest.py's per-pixel gradient styles do.
-_PLUS_STYLE = "bold rgb(250,250,250)"   # the white prey marker
 _LOG_RGB = "rgb(94,224,106)"            # venom-green boot logs
 
-_CACHE_VERSION = 3                      # bump to invalidate stale frame caches
+_CACHE_VERSION = 4                      # v4: V-spin baked into frames                      # bump to invalidate stale frame caches
 
 
 # ---- env knobs (no hardcoding) --------------------------------------------
@@ -103,6 +105,12 @@ def _min_laps() -> float:
     return _env_float("JARVIS_CREST_ANIM_MIN_LAPS", 1.0, 0.1, 10.0)
 
 
+def _v_spin_mult() -> float:
+    """V revolutions per snake lap (negative = counter-spin — the gear look).
+    ``0`` disables the spin. Env ``JARVIS_CREST_ANIM_V_SPIN``."""
+    return _env_float("JARVIS_CREST_ANIM_V_SPIN", -1.0, -4.0, 4.0)
+
+
 def _plus_lead_deg_env() -> float:
     """Angular offset of the ``+`` from the gap centre (0 = dead-centre of the
     open mouth's path — the classic prey position)."""
@@ -129,26 +137,30 @@ def animator_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _rotated_geometry(cols: int, rows: int, rot: float) -> _Geometry:
+def _rotated_geometry(
+    cols: int, rows: int, rot: float, v_rot: float = 0.0,
+) -> _Geometry:
     """The crest's geometry with the WHOLE snake rotated by ``rot`` radians —
     gap (mouth opening), head and tail all derive from ``gap_center``, so one
-    rotation moves the full anatomy. Pure."""
+    rotation moves the full anatomy — and the V spun by ``v_rot`` (the
+    ``_sample_v`` seam reads ``geo.v_rot``). Pure."""
     geo = _Geometry.for_size(cols, rows)
     geo.gap_center = _ang_norm(_GAP_CENTER + rot)
     geo.tail_tip = _ang_norm(geo.gap_center + geo.gap_half)
     geo.head_theta = _ang_norm(geo.gap_center - geo.gap_half)
+    geo.v_rot = v_rot
     return geo
 
 
 def build_rotated_frame(
-    cols: int, rows: int, rot: float, ss: int,
+    cols: int, rows: int, rot: float, ss: int, v_rot: float = 0.0,
 ) -> Dict[Tuple[int, int], Tuple[int, int, int]]:
     """Sample ONE fully-rotated frame through the crest's own pipeline
     (`_sample_pixel` → `_pixel_color_and_delay` → coverage-alpha →
     `_prune_sparse_geometry`). Pure + thread-safe (called via to_thread).
     Returns {(x, py): rgb}. Never raises — returns {} on any fault."""
     try:
-        geo = _rotated_geometry(cols, rows, rot)
+        geo = _rotated_geometry(cols, rows, rot, v_rot)
         v_span = max(1e-6, geo.v_top + geo.v_bot)
         px_rows = rows * 2
         pixels: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
@@ -169,18 +181,58 @@ def build_rotated_frame(
         return {}
 
 
-def _plus_cell_for(
+def _prey_center_px(
     cols: int, rows: int, rot: float, lead_rad: float,
-) -> Tuple[int, int]:
-    """The analytic (x, cell_row) of the ``+`` for a rotation — on the ring path
-    at the gap centre + lead (just ahead of the open mouth). Pure."""
+) -> Tuple[int, int, float]:
+    """The prey's centre in PIXEL-raster coordinates ``(x, py, scale)`` — on the
+    ring path at the gap centre + lead (just ahead of the open mouth). Pure."""
     geo = _rotated_geometry(cols, rows, rot)
     theta = _ang_norm(geo.gap_center + lead_rad)
     px = geo.cx + geo.r_mid * math.cos(theta)
     py_phys = geo.cy - geo.r_mid * math.sin(theta)
     x = max(0, min(cols - 1, round(px)))
-    cell_row = max(0, min(rows - 1, round(py_phys / _REF_ASPECT / 2.0)))
-    return (x, cell_row)
+    py = max(0, min(rows * 2 - 1, round(py_phys / _REF_ASPECT)))
+    return (x, py, geo.scale)
+
+
+def build_prey_sprite(
+    cols: int, rows: int, rot: float, lead_rad: float, pulse: float,
+) -> Dict[Tuple[int, int], Tuple[int, int, int]]:
+    """The ``+`` prey as a PIXEL sprite in the SAME half-block raster as the
+    snake (root cause of the old "small, off-theme" prey: a text character in a
+    pixel-art medium). A filled plus, sized by the crest's own ``scale``
+    (adaptive — grows with the emblem), coloured from the crest's OWN palette:
+    a pale eye-colour core fading to the V's venom purple, with a soft pulse
+    (``pulse`` in [0,1]) so it reads alive. Pure; never raises."""
+    try:
+        x0, py0, scale = _prey_center_px(cols, rows, rot, lead_rad)
+        arm = max(2, round(1.9 * scale))          # arm length (physical px)
+        thick = max(1, round(0.55 * scale))       # bar half-thickness
+        glow = 0.72 + 0.28 * pulse                # brightness pulse
+        core = _EYE_RGB                           # pale core (the eye colour)
+        edge = _V_TOP_RGB                         # venom purple (the V's hue)
+        far = _V_BOT_RGB
+        sprite: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
+        for dx in range(-arm, arm + 1):
+            for dy in range(-arm, arm + 1):
+                on_h = abs(dy) <= thick and abs(dx) <= arm
+                on_v = abs(dx) <= thick and abs(dy) <= arm
+                if not (on_h or on_v):
+                    continue
+                x, py = x0 + dx, py0 + dy
+                if not (0 <= x < cols and 0 <= py < rows * 2):
+                    continue
+                # radial blend: pale core → purple tip (the V's own gradient)
+                t = min(1.0, (abs(dx) + abs(dy)) / max(1.0, float(arm)))
+                mid = edge if t < 0.75 else far
+                rgb = tuple(
+                    max(0, min(255, round((core[i] + (mid[i] - core[i]) * t) * glow)))
+                    for i in range(3)
+                )
+                sprite[(x, py)] = rgb
+        return sprite
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _cache_key(cols: int, rows: int, n: int, ss: int) -> str:
@@ -189,6 +241,7 @@ def _cache_key(cols: int, rows: int, n: int, ss: int) -> str:
         os.environ.get("JARVIS_OV_CREST_BAND_AMP", ""),
         os.environ.get("JARVIS_OV_CREST_COVERAGE", ""),
         os.environ.get("JARVIS_OV_CREST_MIN_COMPONENT_PX", ""),
+        os.environ.get("JARVIS_CREST_ANIM_V_SPIN", ""),
     )
     return hashlib.sha256(repr(knobs).encode()).hexdigest()[:16]
 
@@ -306,6 +359,7 @@ class CrestAnimator:
                 rot = 2.0 * math.pi * k / self._n
                 frame = await asyncio.to_thread(
                     build_rotated_frame, self._cols, self._rows, rot, self._ss,
+                    _v_spin_mult() * rot,
                 )
                 if frame:
                     self._frames[k] = frame
@@ -346,32 +400,47 @@ class CrestAnimator:
     # -- the + prey (analytic, phase-shifted, rides the gap) -------------
 
     def plus_cell(self, phase: float) -> Optional[Tuple[int, int]]:
-        """The (x, cell_row) of the ``+`` for this phase — on the ring path in
+        """The prey's centre (x, cell_row) for this phase — on the ring path in
         the gap, just ahead of the open mouth. Never raises."""
         if not self.available:
             return None
         rot = 2.0 * math.pi * (phase % 1.0)
-        return _plus_cell_for(self._cols, self._rows, rot, self._plus_lead)
+        x, py, _s = _prey_center_px(self._cols, self._rows, rot, self._plus_lead)
+        return (x, py // 2)
+
+    def prey_pixels(self, phase: float) -> Dict[Tuple[int, int], Tuple[int, int, int]]:
+        """The prey sprite overlay for this phase — rendered LIVE (not baked into
+        cached frames) so its pulse animates even on a fully-cached ring. The
+        pulse beats three times per lap. Never raises."""
+        if not self.available:
+            return {}
+        ph = phase % 1.0
+        rot = 2.0 * math.pi * ph
+        pulse = 0.5 + 0.5 * math.sin(2.0 * math.pi * ph * 3.0)
+        return build_prey_sprite(self._cols, self._rows, rot, self._plus_lead, pulse)
 
     # -- rendering (independent of logs) ---------------------------------
 
     def _pixels_to_text(
         self,
         pixels: Dict[Tuple[int, int], Tuple[int, int, int]],
-        plus: Optional[Tuple[int, int]],
+        overlay: Optional[Dict[Tuple[int, int], Tuple[int, int, int]]] = None,
     ) -> Any:
         try:
             from rich.text import Text
         except Exception:  # noqa: BLE001
             return ""
         text = Text()
+        ov = overlay or {}
+
+        def _px(key):
+            v = ov.get(key)
+            return v if v is not None else pixels.get(key)
+
         for cy in range(self._cy_lo, self._cy_hi + 1):
             for x in range(self._cols):
-                if plus is not None and (x, cy) == plus:
-                    text.append("+", style=_PLUS_STYLE)
-                    continue
-                top = pixels.get((x, cy * 2))
-                bot = pixels.get((x, cy * 2 + 1))
+                top = _px((x, cy * 2))
+                bot = _px((x, cy * 2 + 1))
                 if top is None and bot is None:
                     text.append(" ")
                 elif top is not None and bot is not None:
@@ -397,12 +466,12 @@ class CrestAnimator:
                 return Text("")
             except Exception:  # noqa: BLE001
                 return ""
-        return self._pixels_to_text(self._frame_for(phase), self.plus_cell(phase))
+        return self._pixels_to_text(self._frame_for(phase), self.prey_pixels(phase))
 
     def resting_text(self) -> Any:
         """The TRUE static emblem (full-fidelity raster, no prey) — what the
         canvas freezes on. Byte-identical to the static crest's pixels."""
-        return self._pixels_to_text(self._base, None)
+        return self._pixels_to_text(self._base)
 
     # -- the bottom log partition (thread-safe) --------------------------
 
