@@ -580,29 +580,73 @@ def run_cockpit_thin(console: Any) -> int:
     none is home. The operator NEVER sees a traceback here."""
     import asyncio
 
-    # The emblem law: the mark ALWAYS greets `ov` — instantly, before
-    # any daemon work.
-    try:
-        from backend.core.ouroboros.ui.crest import print_static_crest
-        print_static_crest(console)
-    except Exception:
-        pass
-    console.print(version_line(), markup=False, highlight=False)
+    # The emblem law: the mark ALWAYS greets `ov`. With the Client-Side Boot
+    # Animator (default on, real TTY) the mark is the ANIMATED Snake-and-Plus
+    # crest — the green head + purple body chase a white `+` around the "V" — and
+    # the wake logs stream into its bottom partition (a rich.live.Live managed
+    # canvas, so async logs can never tear the emblem). Piped / disabled / tiny
+    # terminals get the static mark exactly as before. Kill-switch:
+    # JARVIS_CREST_ANIM_DISABLED=1.
+    from backend.core.ouroboros.ui.crest_animator import build_animator
+    _animator = build_animator(console)
+    if _animator is None:
+        try:
+            from backend.core.ouroboros.ui.crest import print_static_crest
+            print_static_crest(console)
+        except Exception:
+            pass
+        console.print(version_line(), markup=False, highlight=False)
 
     async def _session() -> int:
+        import asyncio as _aio
         from backend.core.ouroboros.cli.thin_client import ensure_daemon
 
         def _status(line: str) -> None:
+            if _animator is not None:
+                _animator.add_log(line)      # → the Live bottom partition
+            else:
+                try:
+                    console.print(line, markup=False, highlight=False)
+                except Exception:
+                    pass
+
+        if _animator is not None:
+            # Play the chase while the daemon wakes; on daemon-up the Live exits
+            # (freezing the final crest frame) and the warm attach surface prints
+            # below it — seamless handoff to the interactive prompt.
+            _animator.add_log(version_line())
+            _stop = _aio.Event()
+            _ok = {"v": False}
+
+            async def _boot() -> None:
+                try:
+                    _ok["v"] = await ensure_daemon(on_status=_status)
+                finally:
+                    _stop.set()
+
+            _boot_task = _aio.ensure_future(_boot())
             try:
-                console.print(line, markup=False, highlight=False)
+                await _animator.play(console, stop_event=_stop)
             except Exception:
                 pass
+            try:
+                await _boot_task
+            except Exception:
+                pass
+            ok = _ok["v"]
+        else:
+            ok = await ensure_daemon(on_status=_status)
 
-        if not await ensure_daemon(on_status=_status):
-            _status(
-                "⚠ the organism did not come up — `ov daemon` in another "
-                "terminal shows the full boot, or check the daemon log.",
-            )
+        if not ok:
+            # Print below the frozen crest (add_log would land after Live exit).
+            try:
+                console.print(
+                    "⚠ the organism did not come up — `ov daemon` in another "
+                    "terminal shows the full boot, or check the daemon log.",
+                    markup=False, highlight=False,
+                )
+            except Exception:
+                pass
             return 1
         return 0
 
