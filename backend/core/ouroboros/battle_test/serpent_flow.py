@@ -632,6 +632,12 @@ class SerpentFlow:
         self._idle_timeout_s = idle_timeout_s
         self._repo_path = repo_path or Path.cwd()
         self._started_at = time.time()
+        # Attach-cockpit markup mirror (2026-07-23) — injectable sink for
+        # every op-scoped rendered line (tool blocks, diffs, lifecycle).
+        # The harness wires this to CockpitAttachBridge.publish_markup so
+        # attached `ov` terminals see the SAME CC-style ⏺/⎿ activity the
+        # local console shows. None = local-only (byte-identical legacy).
+        self.markup_mirror: Optional[Callable[[str], None]] = None
 
         # Tracking
         self._completed: int = 0
@@ -1412,6 +1418,7 @@ class SerpentFlow:
         if op_id and op_id in self._active_ops:
             if not self._is_focused(op_id):
                 return
+            self._mirror_markup(f"  {text}")
             if self._borderless():
                 self._emit_fit(
                     f"  [{_C['dim']}]{self._result_glyph()}[/{_C['dim']}] {text}"
@@ -1423,7 +1430,22 @@ class SerpentFlow:
                 )
         else:
             # Out-of-band lines (system messages, banners) — always render
+            self._mirror_markup(f"  {text}")
             self.console.print(f"  {text}", highlight=False)
+
+    def _mirror_markup(self, line: str) -> None:
+        """Mirror ONE rendered markup line to the attach cockpit (when the
+        harness wired ``markup_mirror`` to the bridge). Width-agnostic: the
+        raw markup travels; each attached client fits it to its own canvas.
+        Best-effort — a mirror fault can never break the local render.
+        NEVER raises."""
+        m = self.markup_mirror
+        if m is None:
+            return
+        try:
+            m(line)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── Gap #3 Slice 3: op-block buffer integration helpers ──────
 

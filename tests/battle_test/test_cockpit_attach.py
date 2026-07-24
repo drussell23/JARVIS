@@ -507,3 +507,125 @@ async def test_connect_fails_fast_on_dead_socket(sock, monkeypatch):
     t0 = _time.monotonic()
     assert await c.connect() is False
     assert _time.monotonic() - t0 < 3.0        # fast, not 30s
+
+
+# ---------------------------------------------------------------------------
+# Tool-activity markup channel (CC-style ⏺/⎿ blocks + diffs → ov cockpit)
+# ---------------------------------------------------------------------------
+
+
+async def test_markup_frame_roundtrip(sock):
+    """publish_markup → typed frame → client on_markup, verbatim styled."""
+    b = await _server(sock)
+    try:
+        got_markup, got_lines = [], []
+        c = ca.CockpitAttachClient(
+            path=sock,
+            on_line=got_lines.append,
+            on_markup=got_markup.append,
+        )
+        assert await c.connect() is True
+        styled = "  [green]⏺ Bash[/green]([cyan]pytest tests/[/cyan])"
+        b.publish_markup(styled)
+        b.publish_line("plain chatter")
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if got_markup and got_lines:
+                break
+        assert got_markup == [styled]          # styled channel, verbatim
+        assert got_lines == ["plain chatter"]  # untyped channel untouched
+        c.close()
+    finally:
+        await b.stop()
+
+
+async def test_markup_gate_off_publishes_nothing(sock, monkeypatch):
+    monkeypatch.setenv("JARVIS_ATTACH_TOOL_ACTIVITY_ENABLED", "0")
+    b = await _server(sock)
+    try:
+        got = []
+        c = ca.CockpitAttachClient(path=sock, on_markup=got.append)
+        assert await c.connect() is True
+        b.publish_markup("[red]x[/red]")
+        b.publish_line("beacon")               # proves the pipe flows
+        lines = []
+        c._on_line = lines.append
+        b.publish_line("beacon2")
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if lines:
+                break
+        assert got == []                       # gated channel silent
+        c.close()
+    finally:
+        await b.stop()
+
+
+async def test_markup_degrades_to_on_line_without_handler(sock):
+    """A conservative client (no on_markup) still SEES the content —
+    delivered through on_line where it renders escaped, never dropped."""
+    b = await _server(sock)
+    try:
+        got_lines = []
+        c = ca.CockpitAttachClient(path=sock, on_line=got_lines.append)
+        assert await c.connect() is True
+        b.publish_markup("[green]+ added[/green]")
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if got_lines:
+                break
+        assert got_lines == ["[green]+ added[/green]"]
+        c.close()
+    finally:
+        await b.stop()
+
+
+def test_serpent_flow_op_line_mirrors_markup():
+    """The ONE render chokepoint mirrors every op-scoped line to the
+    bridge sink — and a sink fault can never break the local render."""
+    from backend.core.ouroboros.battle_test.serpent_flow import SerpentFlow
+    sf = SerpentFlow(session_id="t", branch_name="b")
+    mirrored = []
+    sf.markup_mirror = mirrored.append
+    sf._op_line("", "[dim]system banner[/dim]")     # out-of-band line
+    assert mirrored == ["  [dim]system banner[/dim]"]
+    # A crashing sink is swallowed — local render (and caller) unaffected.
+    sf.markup_mirror = lambda _l: (_ for _ in ()).throw(RuntimeError("gone"))
+    sf._op_line("", "still fine")                    # must not raise
+    # None (default) = zero-cost no-op
+    sf2 = SerpentFlow()
+    assert sf2.markup_mirror is None
+    sf2._op_line("", "local only")
+
+
+def test_harness_wires_mirror_to_bridge():
+    """Wiring invariant: the harness connects SerpentFlow.markup_mirror to
+    the bridge's publish_markup at the attach-bridge mount."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    harness_src = (
+        root / "backend/core/ouroboros/battle_test/harness.py"
+    ).read_text()
+    assert "sf.markup_mirror = bridge.publish_markup" in harness_src
+
+
+def test_ov_markup_renderer_fail_soft():
+    """Client-side: valid markup passes through; MALFORMED markup renders
+    escaped (inert) — the canvas can never crash on a bad frame."""
+    from backend.core.ouroboros.cli.ov import _render_markup_frame
+    from backend.core.ouroboros.battle_test.bipartite_layout import (
+        BipartiteLayout,
+        set_active_canvas,
+    )
+    mux = BipartiteLayout(width=100, height=20)
+    set_active_canvas(mux)
+    try:
+        _render_markup_frame("  [green]⏺ Bash[/green](ls)")
+        _render_markup_frame("  [bold]mismatched[/red]")   # raises in Rich
+        snap = mux._buffer.snapshot()
+        assert snap[0] == "  [green]⏺ Bash[/green](ls)"    # trusted verbatim
+        assert "\\[" in snap[1]                            # escaped, inert
+        ansi = mux.render_canvas_ansi()                    # renders w/o raising
+        assert "Bash" in ansi
+    finally:
+        set_active_canvas(None)

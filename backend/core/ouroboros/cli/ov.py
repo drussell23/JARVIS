@@ -66,6 +66,40 @@ def version_line() -> str:
     except Exception:
         return "ov — ouroboros + venom"
 
+def _render_markup_frame(text: str, console: Any = None) -> None:
+    """Render ONE daemon-composed styled line (the typed ``markup`` frame:
+    CC-style ⏺/⎿ tool blocks + numbered diffs). Unlike the untyped ``line``
+    frame (always escaped — inert DATA), markup frames carry daemon-authored
+    styling whose MODEL-controlled content was escaped at composition
+    (tool_render_view). Fail-soft: markup that does not parse renders
+    ESCAPED rather than dropped or crashing the canvas. NEVER raises."""
+    try:
+        from rich.text import Text as _RichText
+        from rich.markup import escape as _escape
+        raw = str(text)
+        try:
+            _RichText.from_markup(raw)          # validate before trusting
+            safe = raw
+        except Exception:  # noqa: BLE001 — malformed → inert fallback
+            safe = _escape(raw)
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            get_active_canvas,
+        )
+        canvas = get_active_canvas()
+        if canvas is not None:
+            canvas.push_raw(safe)
+            return
+        if console is not None:
+            console.print(safe, highlight=False)
+        else:
+            print(raw)
+    except Exception:  # noqa: BLE001
+        try:
+            print(str(text))
+        except Exception:  # noqa: BLE001
+            pass
+
+
 _NO_ORGANISM_MESSAGE = (
     "no organism awake — nothing to attach to. Start one with `ov` "
     "(cockpit) or `ov daemon` (headless)."
@@ -309,6 +343,11 @@ class AttachUI:
     def __init__(self) -> None:
         self.audio_state: str = "OFFLINE"
         self._app_ref: Any = None
+        # Latest heartbeat frame (the CC-style pulse) + arrival clock —
+        # rendered by toolbar() with client-side elapsed advance and a
+        # time-driven glyph (the pt refresh_interval animates it free).
+        self._heartbeat: Any = None
+        self._heartbeat_arrived: float = 0.0
 
     def bind_app(self, app: Any) -> None:
         self._app_ref = app
@@ -324,7 +363,32 @@ class AttachUI:
             audio = " · voice: off ('wake')"
         else:
             audio = f" · voice: {self.audio_state.lower()}"
+        # CC-style live pulse while the organism works — falls back to
+        # the idle line when inactive/stale. NEVER raises.
+        try:
+            from backend.core.ouroboros.battle_test.attach_heartbeat import (
+                format_heartbeat_line,
+            )
+            pulse = format_heartbeat_line(
+                self._heartbeat, arrival_mono=self._heartbeat_arrived,
+            )
+            if pulse:
+                return f"{pulse}{audio} · 'detach' to leave"
+        except Exception:
+            pass
         return f" ov attach — organism live{audio} · 'detach' to leave"
+
+    def on_telemetry(self, frame: Any) -> None:
+        """Telemetry lane landing point — retain heartbeat frames for
+        the toolbar pulse; other telemetry kinds pass untouched.
+        NEVER raises."""
+        try:
+            if isinstance(frame, dict) and frame.get("kind") == "heartbeat":
+                import time as _time
+                self._heartbeat = frame
+                self._heartbeat_arrived = _time.monotonic()
+        except Exception:
+            pass
 
     def should_flush_on_input(self) -> bool:
         """Ducking predicate: the operator typed a NEW command while
@@ -671,6 +735,8 @@ def run_attach(console: Any) -> int:
 
         client = CockpitAttachClient(
             on_hydration=_on_hydration, on_line=_print_line,
+            on_markup=lambda t: _render_markup_frame(t, console),
+            on_telemetry=ui.on_telemetry,
             on_audio_state=ui.on_audio_state,
         )
         if not await client.connect():

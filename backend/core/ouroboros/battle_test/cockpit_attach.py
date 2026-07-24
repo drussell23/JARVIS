@@ -17,7 +17,16 @@ Protocol (newline-delimited JSON, schema ``cockpit_attach.v1``):
   * **Downstream frames** — ``{"type":"line","text":...}``: every line
     the harness's ``_repl_print`` chokepoint emits (ALREADY conformed by
     the PresentationRouter — the attach surface inherits the design
-    language for free).
+    language for free). Clients render this frame ESCAPED (inert DATA).
+  * **Styled frames (v2.2, Tool Activity)** — ``{"type":"markup",
+    "text":...}``: DAEMON-COMPOSED Rich-markup lines mirrored from
+    SerpentFlow's op-scoped render chokepoint (``markup_mirror``) — the
+    CC-style ``⏺ Bash(...)`` / ``⏺ Update(path)`` + numbered-diff /
+    ``⎿ result`` blocks. The composition layer (tool_render_view)
+    escapes all MODEL-controlled content before wrapping in markup, so
+    the frame is styled chrome around inert data; clients render it
+    unescaped (with a validate-else-escape fail-soft). Master:
+    ``JARVIS_ATTACH_TOOL_ACTIVITY_ENABLED`` (default on).
   * **Upstream frames** — ``{"type":"input","text":...}``: operator
     stdin from the attached terminal, routed into the harness's
     ``_handle_repl_command`` — the FULL verb set plus the bare-text
@@ -105,6 +114,14 @@ def _connect_timeout_s() -> float:
         )))
     except (TypeError, ValueError):
         return 0.5
+
+
+def tool_activity_enabled() -> bool:
+    """Master gate for the typed ``markup`` frame (CC-style tool blocks /
+    diffs mirrored to attached cockpits). Default ON. NEVER raises."""
+    return os.environ.get(
+        "JARVIS_ATTACH_TOOL_ACTIVITY_ENABLED", "1",
+    ).strip().lower() in _TRUTHY
 
 
 def _sentinel_interval_s() -> float:
@@ -342,6 +359,36 @@ class CockpitAttachBridge:
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] publish degraded", exc_info=True)
 
+    def publish_markup(self, text: str) -> None:
+        """Broadcast one DAEMON-COMPOSED styled line (Rich markup) to every
+        attached terminal — the CC-style tool-activity channel (⏺ Bash /
+        ⏺ Update diffs / ⎿ results). TYPED separately from ``line`` so the
+        client can render it unescaped: the composition layer
+        (tool_render_view / serpent_flow) escapes all MODEL-controlled
+        content before wrapping it in markup, so the frame is styled chrome
+        around inert data. Untrusted/raw text must NEVER travel here — use
+        publish_line. Strictly non-blocking; thread-safe; NEVER raises."""
+        try:
+            if not self._clients or not tool_activity_enabled():
+                return
+            msg = {"type": "markup", "text": str(text), "ts": time.time()}
+            self.stats["markup_published"] = (
+                self.stats.get("markup_published", 0) + 1
+            )
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                self._broadcast(msg)
+            else:
+                loop.call_soon_threadsafe(self._broadcast, msg)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] markup publish degraded", exc_info=True)
+
     def publish_audio_state(self, state: str) -> None:
         """Stream one audio-FSM state to every attached terminal
         (edge-coalesced: republishing the current state is a no-op).
@@ -526,6 +573,8 @@ class CockpitAttachClient:
         *,
         on_hydration: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_line: Optional[Callable[[str], None]] = None,
+        on_markup: Optional[Callable[[str], None]] = None,
+        on_telemetry: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_audio_state: Optional[Callable[[str], None]] = None,
         on_thermal: Optional[Callable[[str], None]] = None,
         path: Optional[Path] = None,
@@ -533,6 +582,11 @@ class CockpitAttachClient:
         self._path = Path(path) if path is not None else attach_socket_path()
         self._on_hydration = on_hydration or (lambda _m: None)
         self._on_line = on_line or (lambda _t: None)
+        # Typed styled channel: daemon-composed tool blocks / diffs. When
+        # unset, markup frames degrade to the on_line callback (rendered
+        # escaped by conservative clients — never dropped).
+        self._on_markup = on_markup
+        self._on_telemetry = on_telemetry or (lambda _m: None)
         self._on_audio_state = on_audio_state or (lambda _s: None)
         self._on_thermal = on_thermal or (lambda _s: None)
         self._reader: Optional[asyncio.StreamReader] = None
@@ -646,6 +700,16 @@ class CockpitAttachClient:
                 ftype = frame.get("type")
                 if ftype == "line":
                     self._safe_cb_text(self._on_line, str(frame.get("text", "")))
+                elif ftype == "markup":
+                    # Daemon-composed styled line. No on_markup handler →
+                    # degrade to on_line (conservative clients escape it).
+                    cb = self._on_markup or self._on_line
+                    self._safe_cb_text(cb, str(frame.get("text", "")))
+                elif ftype == "telemetry":
+                    try:
+                        self._on_telemetry(dict(frame))
+                    except Exception:  # noqa: BLE001
+                        pass
                 elif ftype == "audio_state":
                     self._safe_cb_text(
                         self._on_audio_state, str(frame.get("state", "")),
