@@ -251,3 +251,66 @@ async def test_live_playback_interleaves_logs_without_blocking():
 def test_build_animator_gates_on_size():
     tiny = _render_console(width=20)
     assert build_animator(tiny) is None
+
+
+# ---------------------------------------------------------------------------
+# (6) the mini prey obeys the BIG logo's physical law (giant-plus regression)
+# ---------------------------------------------------------------------------
+
+
+def _prey_delta(cells: int, rot: float, monkeypatch, pack: str = "half"):
+    """The mini's prey pixels, isolated by differencing prey-off vs prey-on
+    frames (PSCALE=0 disables the prey entirely — the delta IS the prey)."""
+    from backend.core.ouroboros.ui.crest_animator import build_scaled_frame
+    monkeypatch.setenv("JARVIS_CREST_MINI_PREY_SCALE", "0")
+    f_off = build_scaled_frame(cells, rot, 3, 0.0, "aa", pack=pack)
+    monkeypatch.delenv("JARVIS_CREST_MINI_PREY_SCALE", raising=False)
+    f_on = build_scaled_frame(cells, rot, 3, 0.0, "aa", pack=pack)
+    assert f_on and f_off
+    return {k: v for k, v in f_on.items() if f_off.get(k) != v}
+
+
+def test_mini_prey_is_proportional_not_cell_sized(monkeypatch):
+    """Root-cause regression (operator 2026-07-23): the mini's + was sized off
+    the CELL grid (cells_w // 8 → 54%% of a 24-cell emblem) instead of the big
+    logo's physical law (1.9·scale ≈ 9%%). The prey must now be a small morsel
+    — never wider than a quarter of the emblem — yet still read as a plus."""
+    for cells in (16, 24, 28):
+        prey = _prey_delta(cells, 1.0, monkeypatch)
+        assert prey, f"prey vanished at cells={cells}"
+        xs = [k[0] for k in prey]
+        ys = [k[1] for k in prey]
+        w = max(xs) - min(xs) + 1
+        h = max(ys) - min(ys) + 1
+        assert w <= cells * 0.25, f"prey too wide at cells={cells}: {w}/{cells}"
+        assert h <= cells * 0.25, f"prey too tall at cells={cells}: {h}/{cells}"
+        assert w >= 2 and h >= 2, f"prey lost its plus shape at cells={cells}"
+
+
+def test_mini_prey_never_vanishes_at_smallest_icon(monkeypatch):
+    """Legibility guard: even at the 10-cell floor, where the mathematically
+    exact prey is sub-pixel, at least one prey pixel must land."""
+    assert _prey_delta(10, 2.0, monkeypatch)
+
+
+def test_mini_prey_carries_the_shared_palette(monkeypatch):
+    """The prey renders through the shared _prey_rgb law — a pale core with the
+    V's venom-purple family, never flat foreign colors."""
+    prey = _prey_delta(24, 0.0, monkeypatch)
+    assert any(r > 150 and g > 150 for (r, g, b) in prey.values())  # pale core
+    # every prey pixel keeps blue >= green ordering loosely violated only by
+    # the pale core — i.e. nothing pure-red/foreign enters the sprite.
+    assert all(b >= g * 0.5 for (r, g, b) in prey.values())
+
+
+def test_big_prey_sprite_unchanged_by_refactor():
+    """build_prey_sprite now routes through the shared laws — its output must
+    stay a themed plus: pale core, purple tips, plus-shaped extents."""
+    from backend.core.ouroboros.ui.crest_animator import build_prey_sprite
+    s = build_prey_sprite(60, 24, 1.0, 0.0, 1.0)
+    assert s
+    xs = [k[0] for k in s]
+    pys = [k[1] for k in s]
+    w, h = max(xs) - min(xs) + 1, max(pys) - min(pys) + 1
+    assert abs(w - h) <= 2                       # square-ish plus
+    assert any(r > 180 and g > 200 for (r, g, b) in s.values())   # pale core

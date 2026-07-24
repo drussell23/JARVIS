@@ -212,41 +212,49 @@ def _prey_center_px(
     return (x, py, geo.scale)
 
 
+def _prey_plus_hit(dx: float, dy: float, arm: float, thick: float) -> bool:
+    """The prey's SHAPE law — ONE filled plus, shared by every renderer (big
+    sprite AND mini rasterizer). ``arm``/``thick`` in the caller's units; the
+    predicate is unit-agnostic. Pure."""
+    return (abs(dy) <= thick and abs(dx) <= arm) or (abs(dx) <= thick and abs(dy) <= arm)
+
+
+def _prey_rgb(dx: float, dy: float, arm: float, glow: float) -> Tuple[int, int, int]:
+    """The prey's COLOR law — pale eye-colour core fading radially to the V's
+    venom purple, brightness-scaled by ``glow``. Shared by every renderer so
+    both logos carry the identical prey palette. Pure."""
+    core, edge, far = _EYE_RGB, _V_TOP_RGB, _V_BOT_RGB
+    t = min(1.0, (abs(dx) + abs(dy)) / max(1.0, float(arm)))
+    mid = edge if t < 0.75 else far
+    return tuple(  # type: ignore[return-value]
+        max(0, min(255, round((core[i] + (mid[i] - core[i]) * t) * glow)))
+        for i in range(3)
+    )
+
+
 def build_prey_sprite(
     cols: int, rows: int, rot: float, lead_rad: float, pulse: float,
 ) -> Dict[Tuple[int, int], Tuple[int, int, int]]:
     """The ``+`` prey as a PIXEL sprite in the SAME half-block raster as the
     snake (root cause of the old "small, off-theme" prey: a text character in a
     pixel-art medium). A filled plus, sized by the crest's own ``scale``
-    (adaptive — grows with the emblem), coloured from the crest's OWN palette:
-    a pale eye-colour core fading to the V's venom purple, with a soft pulse
-    (``pulse`` in [0,1]) so it reads alive. Pure; never raises."""
+    (adaptive — grows with the emblem), coloured from the crest's OWN palette
+    via the shared :func:`_prey_rgb` law, with a soft pulse (``pulse`` in
+    [0,1]) so it reads alive. Pure; never raises."""
     try:
         x0, py0, scale = _prey_center_px(cols, rows, rot, lead_rad)
         arm = max(2, round(1.9 * scale))          # arm length (physical px)
         thick = max(1, round(0.55 * scale))       # bar half-thickness
         glow = 0.72 + 0.28 * pulse                # brightness pulse
-        core = _EYE_RGB                           # pale core (the eye colour)
-        edge = _V_TOP_RGB                         # venom purple (the V's hue)
-        far = _V_BOT_RGB
         sprite: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
         for dx in range(-arm, arm + 1):
             for dy in range(-arm, arm + 1):
-                on_h = abs(dy) <= thick and abs(dx) <= arm
-                on_v = abs(dx) <= thick and abs(dy) <= arm
-                if not (on_h or on_v):
+                if not _prey_plus_hit(dx, dy, arm, thick):
                     continue
                 x, py = x0 + dx, py0 + dy
                 if not (0 <= x < cols and 0 <= py < rows * 2):
                     continue
-                # radial blend: pale core → purple tip (the V's own gradient)
-                t = min(1.0, (abs(dx) + abs(dy)) / max(1.0, float(arm)))
-                mid = edge if t < 0.75 else far
-                rgb = tuple(
-                    max(0, min(255, round((core[i] + (mid[i] - core[i]) * t) * glow)))
-                    for i in range(3)
-                )
-                sprite[(x, py)] = rgb
+                sprite[(x, py)] = _prey_rgb(dx, dy, arm, glow)
         return sprite
     except Exception:  # noqa: BLE001
         return {}
@@ -673,7 +681,8 @@ def build_scaled_frame(
     floor geometry (crest's own _sample_* + _pixel_color_and_delay — DRY) on an
     ANISOTROPIC grid: 2*cells_w subs across x, cells_w subs down y → after the
     2x2 quadrant pack the emblem is ROUND at cells_w x cells_w/2 cells. The +
-    prey is stamped through the same window transform. Pure; thread-safe;
+    prey is RASTERIZED through the same window transform from the big logo's
+    physical law (shared _prey_plus_hit/_prey_rgb — DRY). Pure; thread-safe;
     never raises — returns {} on any fault."""
     try:
         pf = generate_crest_pixels(src_cols, _Geometry.rows_needed(src_cols - 1) + 3)
@@ -747,23 +756,75 @@ def build_scaled_frame(
                     max(0, min(255, round(c * a))) for c in base
                 )
         out = _prune_sparse_geometry(out)
-        # The + prey — the gap centre, same window transform, pure palette.
-        theta = _ang_norm(geo.gap_center)
-        prey_r = geo.r_mid                                # SAME radius as the big logo's prey
-        px_p = geo.cx + prey_r * math.cos(theta)
-        py_p = geo.cy - prey_r * math.sin(theta)
-        qx0 = int((px_p - (cx_p - span / 2.0)) / px_pitch)
-        qy0 = int((py_p - (cy_p - span / 2.0)) / py_pitch)
-        qx0 -= qx0 % 2                                    # cell-align → clean pack
-        arm = max(2, cells_w // 8)
-        for dx in range(-2 * arm, 2 * arm + 1):
-            for dy in range(-arm, arm + 1):
-                if not ((dy == 0 and abs(dx) <= 2 * arm) or (abs(dx) <= 1 and abs(dy) <= arm)):
-                    continue
-                k = (qx0 + dx, qy0 + dy)
-                if 0 <= k[0] < sub_w and 0 <= k[1] < sub_h:
-                    core = abs(dx) <= 1 and dy == 0
-                    out[k] = tuple(_EYE_RGB) if core else tuple(_V_TOP_RGB)
+        # The + prey — the BIG logo's own PHYSICAL law (arm = 1.9·scale,
+        # thick = 0.55·scale — build_prey_sprite's exact numbers, ~9% of the
+        # emblem), rasterized through the SAME window transform + ss
+        # supersampling + aa feathering as the body. The old stamp sized off
+        # the CELL grid (cells_w // 8 → over HALF the emblem wide at 24 cells:
+        # the giant-plus bug) — a wrong-medium law. A shape-preserving
+        # legibility floor (arms ≥ 1.5 subs, bar ≥ 1 sub) keeps the plus
+        # READING as a plus at icon scale and converges to exact proportion as
+        # the mini grows. Pulse rides rot (3 beats/lap — prey_pixels' law) so
+        # baked frames stay clock-stateless yet alive.
+        pscale = _env_float("JARVIS_CREST_MINI_PREY_SCALE", 1.0, 0.0, 3.0)
+        if pscale > 0.0:
+            theta = _ang_norm(geo.gap_center)
+            px_p = geo.cx + geo.r_mid * math.cos(theta)   # SAME radius as the big prey
+            py_p = geo.cy - geo.r_mid * math.sin(theta)
+            max_pitch = max(px_pitch, py_pitch)
+            arm_p = max(1.9 * geo.scale * pscale, 1.5 * max_pitch)
+            thick_p = max(0.55 * geo.scale * pscale, 0.51 * max_pitch)
+            glow = 0.72 + 0.28 * (0.5 + 0.5 * math.sin(3.0 * rot))
+            cut = 0.22 if alpha == "sharp" else 0.06
+            gamma = 1.35 if alpha == "sharp" else 0.75
+            x_org, y_org = cx_p - span / 2.0, cy_p - span / 2.0
+            qx_lo = max(0, int((px_p - arm_p - x_org) / px_pitch) - 1)
+            qx_hi = min(sub_w - 1, int((px_p + arm_p - x_org) / px_pitch) + 1)
+            qy_lo = max(0, int((py_p - arm_p - y_org) / py_pitch) - 1)
+            qy_hi = min(sub_h - 1, int((py_p + arm_p - y_org) / py_pitch) + 1)
+            best_k, best_d = None, None
+            for qy in range(qy_lo, qy_hi + 1):
+                y0 = y_org + qy * py_pitch
+                for qx in range(qx_lo, qx_hi + 1):
+                    x0 = x_org + qx * px_pitch
+                    hits, rs, gs, bs = 0, 0, 0, 0
+                    for sy in range(ss):
+                        spy = y0 + (sy + 0.5) / ss * py_pitch
+                        for sx in range(ss):
+                            spx = x0 + (sx + 0.5) / ss * px_pitch
+                            if _prey_plus_hit(spx - px_p, spy - py_p, arm_p, thick_p):
+                                hits += 1
+                                # integrate the COLOR FIELD over the hits — a
+                                # point-sample at the sub centre misses the
+                                # narrow pale core when the grid straddles it
+                                # (the coarse-raster core-loss bug).
+                                r_, g_, b_ = _prey_rgb(
+                                    spx - px_p, spy - py_p, arm_p, glow,
+                                )
+                                rs, gs, bs = rs + r_, gs + g_, bs + b_
+                    dxc = x0 + px_pitch / 2.0 - px_p
+                    dyc = y0 + py_pitch / 2.0 - py_p
+                    d = dxc * dxc + dyc * dyc
+                    if best_d is None or d < best_d:
+                        best_d, best_k = d, (qx, qy)
+                    if not hits:
+                        continue
+                    coverage = hits / (ss * ss)
+                    if coverage < cut:
+                        continue
+                    a = coverage ** gamma
+                    out[(qx, qy)] = tuple(
+                        max(0, min(255, round(c / hits * a)))
+                        for c in (rs, gs, bs)
+                    )
+            if best_k is not None:
+                # STRUCTURAL core guarantee — the big sprite's integer loop
+                # always evaluates dx=dy=0 (the pale core); the mini's coarse
+                # grid can straddle it, losing the core to the purple mid-band.
+                # Mirror the guarantee: the sub nearest the true centre gets
+                # t=0 through the SAME shared law. Doubles as the never-vanish
+                # guard at degenerate sizes.
+                out[best_k] = _prey_rgb(0.0, 0.0, arm_p, glow)
         return out
     except Exception:  # noqa: BLE001
         return {}
