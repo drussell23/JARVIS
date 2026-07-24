@@ -459,6 +459,74 @@ def register_shipped_invariants() -> list:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Incumbent lock reader — THE shared authority for "who holds the organism"
+# ---------------------------------------------------------------------------
+#
+# Promoted here (2026-07-23) from scripts/ouroboros_battle_test.py so the
+# thin CLI client can consult it WITHOUT importing the heavy harness script.
+# Consumed by: the zombie reaper (incumbent immunity), the single-flight
+# preflight (conflict detection), and ensure_daemon (never-clean-a-live-
+# organism's-socket + exit-75 attribution). One reader, zero disagreement.
+
+
+def read_lock_holder(
+    project_root: Optional[Path] = None,
+    *,
+    exclude_pid: Optional[int] = None,
+) -> Optional[tuple]:
+    """Read the single-flight lock (``.jarvis/intake_router.lock``) and
+    return ``(pid, age_s, alive)``, or ``None`` when absent/corrupt or
+    when the holder is ``exclude_pid`` (self-ownership). NEVER raises."""
+    import json as _json
+    import time as _time
+    try:
+        root = Path(project_root) if project_root is not None else Path.cwd()
+        lock_path = root / ".jarvis" / "intake_router.lock"
+        if not lock_path.exists():
+            return None
+        data = _json.loads(lock_path.read_text())
+        pid = int(data.get("pid", 0))
+        ts = float(data.get("ts", 0.0))
+        if not pid or (exclude_pid is not None and pid == exclude_pid):
+            return None
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            # The PID EXISTS (kernel refused the signal, not the lookup).
+            alive = True
+        age_s = (_time.time() - ts) if ts > 0 else float("inf")
+        return (pid, age_s, alive)
+    except (ValueError, OSError, KeyError, TypeError):
+        return None
+
+
+def lock_stale_ttl_s() -> float:
+    try:
+        return float(os.environ.get("JARVIS_INTAKE_LOCK_STALE_TTL_S", "7200"))
+    except (TypeError, ValueError):
+        return 7200.0
+
+
+def live_incumbent_pid(
+    project_root: Optional[Path] = None,
+    *,
+    exclude_pid: Optional[int] = None,
+) -> Optional[int]:
+    """PID of a LIVE, FRESH single-flight lock holder — the legitimate
+    incumbent organism — else None. NEVER raises."""
+    holder = read_lock_holder(project_root, exclude_pid=exclude_pid)
+    if holder is None:
+        return None
+    pid, age_s, alive = holder
+    if alive and age_s <= lock_stale_ttl_s():
+        return pid
+    return None
+
+
 __all__ = [
     "SINGLETON_LOCK_SCHEMA_VERSION",
     "SingletonLockResult",
@@ -466,4 +534,7 @@ __all__ = [
     "default_lock_path",
     "register_shipped_invariants",
     "singleton_lock_enabled",
+    "read_lock_holder",
+    "lock_stale_ttl_s",
+    "live_incumbent_pid",
 ]

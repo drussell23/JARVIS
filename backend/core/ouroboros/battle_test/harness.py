@@ -3197,6 +3197,13 @@ class BattleTestHarness:
             # _handle_repl_command verb surface incl. the chat bridge.
             await self._start_cockpit_attach_bridge()
 
+            # Autonomy chain (AWE Trigger + Autonomous Supervisor) —
+            # mounted HERE, not in SerpentREPL.start(), so HEADLESS
+            # organisms arm it too (the wired-but-inert class: a REPL-
+            # coupled mount made Level-5 autonomy interactive-only —
+            # exactly backwards; HITL is the override, not the host).
+            self._start_autonomy_chain()
+
             # ── Boot-time orphan scan (Priority 2F resume) ────────────
             # Non-blocking: logs one INFO line if orphans exist so the
             # operator knows to run /resume list. Never prompts.
@@ -4321,6 +4328,31 @@ class BattleTestHarness:
                 self._repl_print(ln)
         except Exception as exc:  # noqa: BLE001 — REPL must survive
             self._repl_print(f"/liquidity: degraded ({exc})")
+
+    # -- Autonomy chain (AWE + Supervisor) ----------------------------------
+
+    def _start_autonomy_chain(self) -> None:
+        """Arm the AWE Trigger (DEGRADED→HEALTHY-edge soak launcher) and
+        the State-Reactive Autonomous Supervisor in BOTH modes. Each is
+        env-gated internally (JARVIS_AWE_TRIGGER_ENABLED /
+        JARVIS_AUTONOMOUS_SUPERVISOR_ENABLED) and returns None when off,
+        so this mount is inert-by-default and best-effort. NEVER raises."""
+        self._awe_trigger = None
+        self._autonomous_supervisor = None
+        try:
+            from backend.core.ouroboros.governance.awe_trigger import (
+                start_awe_trigger,
+            )
+            self._awe_trigger = start_awe_trigger()
+        except Exception:  # noqa: BLE001 — AWE arming is best-effort
+            self._awe_trigger = None
+        try:
+            from backend.core.ouroboros.governance.autonomous_supervisor import (
+                start_autonomous_supervisor,
+            )
+            self._autonomous_supervisor = start_autonomous_supervisor()
+        except Exception:  # noqa: BLE001 — supervisor is best-effort
+            self._autonomous_supervisor = None
 
     # -- Cockpit Attach Bridge (CLI item #6) --------------------------------
 
@@ -8291,6 +8323,20 @@ class BattleTestHarness:
             hive_agg = getattr(self, "_hive_aggregator", None)
             if hive_agg is not None:
                 await hive_agg.stop()
+        except Exception:
+            pass
+        try:
+            _sup = getattr(self, "_autonomous_supervisor", None)
+            if _sup is not None:
+                await _sup.stop()
+                self._autonomous_supervisor = None
+        except Exception:
+            pass
+        try:
+            _awe = getattr(self, "_awe_trigger", None)
+            if _awe is not None:
+                await _awe.stop()
+                self._awe_trigger = None
         except Exception:
             pass
         try:

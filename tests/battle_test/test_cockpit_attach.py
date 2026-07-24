@@ -391,3 +391,119 @@ def test_ov_attach_is_real_not_stub():
     assert "coming soon" not in src
     assert "follow-up sprint" not in src
     assert "no organism awake" in src              # degradation message
+
+
+# ---------------------------------------------------------------------------
+# Socket self-heal sentinel (the unlinked-live-socket class, 2026-07-23)
+# ---------------------------------------------------------------------------
+
+
+async def test_sentinel_rebinds_vanished_socket(sock, monkeypatch):
+    """If ANY confused peer unlinks the live socket inode (a CLI
+    misclassifying a starved organism as a ghost, an operator rm), the
+    sentinel must REBIND at the same path — the organism never becomes
+    permanently unattachable."""
+    monkeypatch.setenv("JARVIS_ATTACH_SENTINEL_S", "0.05")
+    b = await _server(sock)
+    try:
+        assert sock.exists()
+        sock.unlink()                          # the confused peer strikes
+        for _ in range(100):                   # ≤5s for the heal
+            await asyncio.sleep(0.05)
+            if sock.exists():
+                break
+        assert sock.exists(), "sentinel never rebound the socket"
+        # And the reborn socket genuinely SERVES (full client handshake).
+        sink = _Sink()
+        c = ca.CockpitAttachClient(
+            path=sock, on_hydration=sink.on_hydration, on_line=sink.on_line,
+        )
+        assert await c.connect() is True
+        c.close()
+    finally:
+        await b.stop()
+
+
+async def test_sentinel_stops_with_bridge(sock, monkeypatch):
+    """stop() must end the sentinel — no immortal task, and no resurrection
+    of a deliberately-stopped bridge's socket."""
+    monkeypatch.setenv("JARVIS_ATTACH_SENTINEL_S", "0.05")
+    b = await _server(sock)
+    await b.stop()
+    assert b._sentinel_task is None
+    await asyncio.sleep(0.2)
+    assert not sock.exists()                   # stop() unlinked; stayed gone
+
+
+def test_autonomy_chain_mounted_in_harness_not_repl():
+    """Wiring invariant (the wired-but-inert class): the AWE Trigger +
+    Autonomous Supervisor mount must live on the HARNESS boot path (both
+    modes), not inside SerpentREPL.start() where --headless never goes."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    harness_src = (
+        root / "backend/core/ouroboros/battle_test/harness.py"
+    ).read_text()
+    serpent_src = (
+        root / "backend/core/ouroboros/battle_test/serpent_flow.py"
+    ).read_text()
+    assert "def _start_autonomy_chain" in harness_src
+    assert "self._start_autonomy_chain()" in harness_src
+    assert "start_awe_trigger()" not in serpent_src
+    assert "start_autonomous_supervisor()" not in serpent_src
+
+
+def test_autonomy_chain_env_gated_inert(monkeypatch):
+    """With both masters off, the chain mounts as None (inert-by-default)."""
+    monkeypatch.setenv("JARVIS_AWE_TRIGGER_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_AUTONOMOUS_SUPERVISOR_ENABLED", "false")
+    from backend.core.ouroboros.battle_test.harness import BattleTestHarness
+    h = BattleTestHarness.__new__(BattleTestHarness)   # no heavy __init__
+    h._start_autonomy_chain()
+    assert h._awe_trigger is None
+    assert h._autonomous_supervisor is None
+
+
+# ---------------------------------------------------------------------------
+# Escalating-patience attach (post-boot-storm hydration lag, 2026-07-23)
+# ---------------------------------------------------------------------------
+
+
+async def test_connect_survives_slow_hydration(sock, monkeypatch):
+    """A live organism whose loop lags hydration past one 0.5s shot must
+    still attach — timeout-class failures retry with escalating bounds."""
+    monkeypatch.setenv("JARVIS_ATTACH_CONNECT_TIMEOUT_S", "0.3")
+    monkeypatch.setenv("JARVIS_ATTACH_CONNECT_PATIENCE_S", "10")
+
+    async def _laggy(reader, writer):
+        await asyncio.sleep(1.2)               # the post-boot storm
+        writer.write(b'{"type":"hydration","status":{}}\n')
+        await writer.drain()
+        try:
+            await reader.read(64)
+        except Exception:
+            pass
+
+    server = await asyncio.start_unix_server(_laggy, path=str(sock))
+    try:
+        sink = _Sink()
+        c = ca.CockpitAttachClient(
+            path=sock, on_hydration=sink.on_hydration, on_line=sink.on_line,
+        )
+        assert await c.connect() is True       # single-shot would have died
+        assert sink.hydrations
+        c.close()
+    finally:
+        server.close()
+
+
+async def test_connect_fails_fast_on_dead_socket(sock, monkeypatch):
+    """Waiting cannot conjure a dead listener: refused/absent must fail
+    in well under the patience budget."""
+    import time as _time
+    monkeypatch.setenv("JARVIS_ATTACH_CONNECT_PATIENCE_S", "30")
+    sock.write_bytes(b"")                      # plain file → refused
+    c = ca.CockpitAttachClient(path=sock)
+    t0 = _time.monotonic()
+    assert await c.connect() is False
+    assert _time.monotonic() - t0 < 3.0        # fast, not 30s

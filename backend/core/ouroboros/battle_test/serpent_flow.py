@@ -4682,34 +4682,13 @@ class SerpentREPL:
             self._status_badge_ticker_task = None
 
         # Autonomous Wake-and-Execute (AWE) Trigger — the Midnight-Recovery
-        # reflex. Consumes the SAME provider_state_changed feed and, on the
-        # DEGRADED→HEALTHY edge, atomically claims the soak lock and detaches the
-        # definitive Agentic Swarm soak so a 3 AM recovery is not lost to a
-        # passive human bottleneck. Opt-in (JARVIS_AWE_TRIGGER_ENABLED); returns
-        # None + stays inert when disabled. Best-effort.
+        # reflex — MOVED to BattleTestHarness._start_autonomy_chain (2026-07-23)
+        # together with the Autonomous Supervisor, so HEADLESS organisms arm the
+        # chain too (a REPL-coupled mount made Level-5 autonomy interactive-only —
+        # the wired-but-inert class). The harness owns the lifecycle now; these
+        # attrs stay None here so the legacy teardown below is a clean no-op.
         self._awe_trigger = None
-        try:
-            from backend.core.ouroboros.governance.awe_trigger import (
-                start_awe_trigger,
-            )
-            self._awe_trigger = start_awe_trigger()
-        except Exception:  # noqa: BLE001 — AWE arming is best-effort
-            self._awe_trigger = None
-
-        # State-Reactive Autonomous Supervisor — the intent-driven lifecycle
-        # manager. At boot it queries the substrate; if a soak workload is pending
-        # AND DW is DEGRADED it autonomously spawns the Sentinel subprocess + arms
-        # the AWE listener, self-heals the Sentinel on crash, and disarms when the
-        # queue clears. Autonomy is the default (JARVIS_AUTONOMOUS_SUPERVISOR_ENABLED)
-        # but it stays fully inert until real intent exists. HITL = override only.
         self._autonomous_supervisor = None
-        try:
-            from backend.core.ouroboros.governance.autonomous_supervisor import (
-                start_autonomous_supervisor,
-            )
-            self._autonomous_supervisor = start_autonomous_supervisor()
-        except Exception:  # noqa: BLE001 — supervisor is best-effort
-            self._autonomous_supervisor = None
 
     async def _event_breadcrumb_router(self) -> None:
         """The ONE unified live event feed: subscribe once to the broker and
