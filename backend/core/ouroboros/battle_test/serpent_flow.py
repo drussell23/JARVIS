@@ -752,8 +752,24 @@ class SerpentFlow:
             from backend.core.ouroboros.governance.inline_prompt_gate_renderer import (
                 attach_phase_boundary_renderer,
             )
+            def _prompt_print(msg: Any, **kw: Any) -> None:
+                # Attach mirror (cockpit completeness, 2026-07-23): the
+                # inline permission/approval prompts are the ONE surface
+                # a watching operator must never miss — an attached ov
+                # terminal can already ANSWER (/accept, /reject travel
+                # over send_input → _handle_repl_command); this makes
+                # the question visible there too. String renders mirror
+                # verbatim; rich objects stay local (frame protocol is
+                # line-based) — the queue/deadline lines are strings.
+                try:
+                    if isinstance(msg, str):
+                        self._mirror_markup(msg)
+                except Exception:  # noqa: BLE001
+                    pass
+                self.console.print(msg, **kw)
+
             self._unsub_inline_prompt_renderer: Callable[[], None] = (
-                attach_phase_boundary_renderer(self.console.print)
+                attach_phase_boundary_renderer(_prompt_print)
             )
         except Exception:
             self._unsub_inline_prompt_renderer = lambda: None
@@ -1233,6 +1249,11 @@ class SerpentFlow:
         if not self._is_focused(op_id):
             return
         short = _short_id(op_id)
+        # Attach mirror: the op-open action line — cockpits see a new op
+        # begin the moment the daemon does (width-agnostic form).
+        self._mirror_markup(
+            f"{self._action_glyph()} {sensor}  [{_C['dim']}]{short}[/{_C['dim']}]"
+        )
         if self._borderless():
             self._emit_fit(
                 f"{self._action_glyph()} {sensor}  [{_C['dim']}]{short}[/{_C['dim']}]"
@@ -1330,11 +1351,13 @@ class SerpentFlow:
                 f" [{_C['dim']}]·[/{_C['dim']}] "
                 f"[{_C['death']}]failed{_phase}: {failure_reason[:60]}[/{_C['death']}]"
             )
-        self.console.print(
+        receipt = (
             f"  [{glyph_color}][{glyph}][/{glyph_color}] "
-            f"op-{short}{cost_seg}{posture_seg}{time_seg}{tail_seg}",
-            highlight=False,
+            f"op-{short}{cost_seg}{posture_seg}{time_seg}{tail_seg}"
         )
+        # Attach mirror: the grep-friendly op receipt (outcome + cost).
+        self._mirror_markup(receipt)
+        self.console.print(receipt, highlight=False)
 
     def _close_op_block(self, op_id: str) -> None:
         """Print the bottom border of an op block with running stats.
@@ -1379,6 +1402,9 @@ class SerpentFlow:
             f"[red]💀 {self._failed}[/red] [dim]│[/dim] "
             f"💰 ${self._cost_total:.4f}/${self._cost_cap:.2f}"
         )
+        # Attach mirror: session tally at op close (width-agnostic — the
+        # local border chrome stays local; cockpits get the substance).
+        self._mirror_markup(f"  {stats}")
         label = f" {short} ── {stats} "
         vis = _visible_len(label)
         pad = max(2, w - vis - 2)
@@ -1591,6 +1617,16 @@ class SerpentFlow:
                                     op_active=op_id in self._active_ops,
                                     max_chars_per_line=80,
                                 )
+                                try:
+                                    from backend.core.ouroboros.battle_test.narrative_renderer import (  # noqa: E501
+                                        compose,
+                                    )
+                                    _r = compose(frame, max_chars_per_line=80)
+                                    if _r is not None and _r.markup:
+                                        # Attach mirror: 💭 intent narration.
+                                        self._mirror_markup(f"  {_r.markup}")
+                                except Exception:  # noqa: BLE001
+                                    pass
                                 break
                     except Exception:
                         pass
@@ -1844,11 +1880,13 @@ class SerpentFlow:
                 f" via [{_C['provider']}]{prov}[/{_C['provider']}]"
                 if prov else ""
             )
-            self.console.print(
+            gen_receipt = (
                 f"  [{_C['life']}][✓][/{_C['life']}] "
-                f"Generated {token_count} tokens{via_seg}",
-                highlight=False,
+                f"Generated {token_count} tokens{via_seg}"
             )
+            # Attach mirror: the synthesis receipt (tokens + provider).
+            self._mirror_markup(gen_receipt)
+            self.console.print(gen_receipt, highlight=False)
         # Reset state for the next synthesis cycle.
         self._stream_buffer = ""
         self._stream_token_count = 0
@@ -2695,6 +2733,25 @@ class SerpentFlow:
         import asyncio
         import time as _time
 
+        # Attach mirror: the Yellow-tier countdown is EXACTLY when a
+        # watching operator may want to intervene — one static notice
+        # (the Live overlay itself can't stream over the frame
+        # protocol; the diff arrives separately as ⏺ Update blocks).
+        try:
+            _short = _short_id(op_id)
+            _n = len(changes) if changes is not None else 0
+            self._mirror_markup(
+                f"  [{_C['heal']}]⏳ NOTIFY_APPLY op:{_short} — "
+                f"{_n} file(s), applying in {int(delay_s)}s "
+                f"({reason})[/{_C['heal']}]"
+            )
+            self._mirror_markup(
+                f"  [{_C['dim']}]⎿  /reject {_short} to cancel — "
+                f"diff follows as ⏺ Update[/{_C['dim']}]"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
         try:
             from backend.core.ouroboros.battle_test.diff_preview import (
                 DiffPreviewRenderer,
@@ -3448,6 +3505,13 @@ class SerpentFlow:
         _headless_reason = _headless_auto_approve_reason()
         if _headless_reason is not None:
             try:
+                # Attach mirror: a watching operator must SEE that the
+                # headless gate auto-approved (§7 — no silent decisions).
+                self._mirror_markup(
+                    f"  [{_C['life']}]✅ auto-approved (headless: "
+                    f"{_headless_reason})[/{_C['life']}]  "
+                    f"[{_C['dim']}]op:{short}[/{_C['dim']}]"
+                )
                 c.print(
                     f"  [{_C['life']}]✅ auto-approved (headless: "
                     f"{_headless_reason})[/{_C['life']}]  "
@@ -3489,6 +3553,22 @@ class SerpentFlow:
             width=min(c.width, 68),
             padding=(0, 1),
         )
+        # Attach mirror: the gate question as LINES (a Panel can't cross
+        # the frame protocol) + an honest note that the [Y/n] decision
+        # is awaited at the daemon's own terminal in interactive mode.
+        try:
+            self._mirror_markup(
+                f"  [{_C['heal']}]🔒 Iron Gate │ op:{short} — "
+                f"approval required[/{_C['heal']}]"
+            )
+            for _bl in body_lines:
+                self._mirror_markup(f"  {_bl}")
+            self._mirror_markup(
+                f"  [{_C['dim']}]⎿  awaiting [Y/n] at the daemon "
+                f"terminal[/{_C['dim']}]"
+            )
+        except Exception:  # noqa: BLE001
+            pass
         c.print()
         c.print(panel)
 
@@ -4759,6 +4839,17 @@ class SerpentREPL:
                     key = str(payload.get("provider", payload.get("op_id", "")) or "")
                     if not coalescer.should_show(et, key):
                         continue
+                    # Attach mirror (cockpit completeness, 2026-07-23): this
+                    # is THE single chokepoint for every registry-driven
+                    # event (posture, governor, sensors, soak progress…) —
+                    # one mirror here lights up all 149+ types on every
+                    # attached ov cockpit, present and future.
+                    _sev, text = reg.render(et, payload)
+                    styled = f"  [{desc.color}]{desc.glyph} {text}[/{desc.color}]"
+                    try:
+                        self._flow._mirror_markup(styled)
+                    except Exception:  # noqa: BLE001
+                        pass
                     # Sink redirect (DRY): when the Bipartite Async Layout is live,
                     # this event auto-scrolls into Zone 1 (the Proactive Canvas)
                     # instead of the flowing console — SAME formatting, framed sink.
@@ -4773,9 +4864,8 @@ class SerpentREPL:
                     if _canvas is not None:
                         _canvas.emit(et, payload)
                         continue
-                    _sev, text = reg.render(et, payload)
                     self._flow.console.print(
-                        f"  [{desc.color}]{desc.glyph} {text}[/{desc.color}]",
+                        styled,
                         highlight=False,
                     )
                 except Exception:  # noqa: BLE001 — one bad event never kills the loop
@@ -4830,8 +4920,15 @@ class SerpentREPL:
                     healthy = payload.get("state") == "HEALTHY"
                     color = _C["neural"] if healthy else _C["heal"]
                     glyph = "✓" if healthy else "⚠"
+                    styled = f"  [{color}]{glyph} {text}[/{color}]"
+                    try:
+                        # Attach mirror: provider failover (DW↔Claude↔J-Prime)
+                        # is exactly what a watching operator must see live.
+                        self._flow._mirror_markup(styled)
+                    except Exception:  # noqa: BLE001
+                        pass
                     self._flow.console.print(
-                        f"  [{color}]{glyph} {text}[/{color}]",
+                        styled,
                         highlight=False,
                     )
                 except Exception:  # noqa: BLE001 — one bad event never kills the loop
