@@ -469,7 +469,8 @@ def build_bipartite_application(
         ))
     # The CC input framing: a dim hairline above AND below the ❯ row.
     def _rule() -> Any:
-        return Window(height=1, char="─", style="fg:#1e2b28")
+        # Bright venom-purple hairlines (Style Guide brand) — visible framing.
+        return Window(height=1, char="─", style="fg:#a371f7")
 
     rows += [canvas, _rule(), prompt, _rule()]
     if toolbar is not None:
