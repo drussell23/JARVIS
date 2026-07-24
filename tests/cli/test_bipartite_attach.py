@@ -208,33 +208,33 @@ def test_cockpit_app_constructs_with_toolbar():
 # ---------------------------------------------------------------------------
 
 
-def test_mini_is_the_big_logo_downsampled():
-    """Root-cause regression (operator: 'the little logo doesn't look the same
-    as the big one'): the mini is a box-filter DOWNSCALE of the big crest's own
-    raster — same artwork, same palette — never a tiny geometry re-sample."""
+def test_mini_is_hand_authored_pixel_art():
+    """The CC method (operator mandate): the mini is DESIGNED at its size — a
+    frozen sprite. The lit pixel SET is identical in every frame (shape never
+    derived/moved at runtime); only the ring COLORS rotate."""
     from backend.core.ouroboros.ui.crest_animator import MiniCrest
-    mini = MiniCrest(cols=13, frame_count=4, ss=1, source_cols=60, source_rows=24)
-    assert mini.available and mini.rows >= 3
-    frame = mini._frame_now(0.0)
-    assert frame and len(frame) >= 20          # a real emblem, not a speck
-    # Palette fidelity: the mini carries BOTH brand families from the big logo —
-    # venom-green coil pixels AND purple V pixels.
-    greens = sum(1 for (r, g, b) in frame.values() if g > r and g > b)
-    purples = sum(1 for (r, g, b) in frame.values() if b > g)
-    assert greens >= 3 and purples >= 3
-    # Full-intensity colors (lit-only averaging — no empty-area dilution).
-    assert any(max(rgb) > 180 for rgb in frame.values())
+    mini = MiniCrest(frame_count=6)
+    assert mini.available and mini.rows >= 5 and mini.cols >= 12
+    shapes = {frozenset(f.keys()) for f in mini._frames}
+    assert len(shapes) == 1, "the sprite shape moved — it must be frozen art"
+    # And the paint rotates: at least two frames differ in colors.
+    assert any(mini._frames[0] != f for f in mini._frames[1:])
 
 
-def test_mini_animates_after_ring_completes():
-    from backend.core.ouroboros.ui.crest_animator import MiniCrest
-    mini = MiniCrest(cols=13, frame_count=4, ss=1, source_cols=60, source_rows=24)
-    asyncio.run(mini.ensure_frames())
-    assert mini._built >= 2
-    a = mini._frame_now(0.0)
-    b = mini._frame_now(999.25)               # a different clock → different pose
-    assert a is not None and b is not None
-    assert a != b                              # the downsampled ring rotates
+def test_mini_palette_and_features():
+    """Pure palette only (zero blends) + head/eye/V present in EVERY frame."""
+    from backend.core.ouroboros.ui.crest_animator import (
+        MiniCrest, _quant_palette, _v_family,
+    )
+    from backend.core.ouroboros.ui.crest import _EYE_RGB, _HEAD_RGB
+    mini = MiniCrest(frame_count=6)
+    pal = set(_quant_palette())
+    vfam = _v_family()
+    for f in mini._frames:
+        assert all(tuple(rgb) in pal for rgb in f.values())        # purity
+        vals = {tuple(rgb) for rgb in f.values()}
+        assert tuple(_HEAD_RGB) in vals and tuple(_EYE_RGB) in vals
+        assert vals & vfam                                          # the V lives
 
 
 def test_cockpit_header_contains_identity_and_path():
@@ -243,7 +243,7 @@ def test_cockpit_header_contains_identity_and_path():
         render_cockpit_header,
     )
     from rich.text import Text
-    mini = MiniCrest(cols=13, frame_count=4, ss=1, source_cols=60, source_rows=24)
+    mini = MiniCrest(frame_count=4)
     lines = [Text("O+V ov 0.1.0"), Text("● healthy"), Text("~/repos/jarvis")]
     ansi = render_cockpit_header(mini, lines, 100, now=0.0)
     import re
@@ -284,28 +284,3 @@ def test_app_constructs_with_header():
     assert app is not None and app.full_screen is True
 
 
-def test_quantizer_zero_out_of_palette_pixels():
-    """Hard-Edge Vector Quantizer mandate: every rendered mini pixel is a PURE
-    member of the crest's own palette — zero blends, zero dimmed transitions."""
-    from backend.core.ouroboros.ui.crest_animator import MiniCrest, _quant_palette
-    mini = MiniCrest(cols=16, frame_count=4, ss=1, source_cols=60, source_rows=24)
-    asyncio.run(mini.ensure_frames())
-    pal = set(_quant_palette())
-    for f in mini._frames:
-        if not f:
-            continue
-        offenders = [rgb for rgb in f.values() if tuple(rgb) not in pal]
-        assert offenders == [], f"blended colors leaked: {offenders[:4]}"
-
-
-def test_quantizer_v_survives_micro_scale():
-    """Feature-preserving dilation: the V-family purple is present in EVERY
-    frame at 16 cols — the V never collapses between grid coordinates."""
-    from backend.core.ouroboros.ui.crest_animator import MiniCrest, _v_family
-    mini = MiniCrest(cols=16, frame_count=4, ss=1, source_cols=60, source_rows=24)
-    asyncio.run(mini.ensure_frames())
-    vfam = _v_family()
-    for f in mini._frames:
-        if not f:
-            continue
-        assert any(tuple(rgb) in vfam for rgb in f.values()), "V vanished"

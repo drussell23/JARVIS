@@ -108,7 +108,7 @@ def _min_laps() -> float:
 def _v_spin_mult() -> float:
     """V revolutions per snake lap (negative = counter-spin — the gear look).
     ``0`` disables the spin. Env ``JARVIS_CREST_ANIM_V_SPIN``."""
-    return _env_float("JARVIS_CREST_ANIM_V_SPIN", -1.0, -4.0, 4.0)
+    return _env_float("JARVIS_CREST_ANIM_V_SPIN", 0.0, -4.0, 4.0)
 
 
 def _plus_lead_deg_env() -> float:
@@ -645,192 +645,116 @@ def _snap(rgb: Tuple[float, float, float], pal: List[Tuple[int, int, int]]) -> T
     return best
 
 
-class MiniCrest:
-    """The header logo — the BIG crest's artwork, downsampled (root cause of the
-    old blob: re-sampling the vector geometry at ~20 columns is below the
-    legibility threshold of the medium — a 1px ring + 3px V reads as mush; the
-    big logo is legible because it renders at full resolution). The mini is a
-    box-filter DOWNSCALE of the big animation frames — same shapes, same
-    palette, same spin, exactly the boot emblem in miniature (DRY: the frames
-    come from the boot animator's own disk-cached ring; nothing re-rendered).
+# ---------------------------------------------------------------------------
+# The hand-authored mini sprite — the CC method: designed AT its size, frozen.
+# Shape is pixel art (never derived at runtime); colors are painted from the
+# crest's OWN palette (DRY) and animation is GRADIENT ROTATION on the fixed
+# shape — colors move, pixels never do. Crisp forever.
+#   R ring (angle-painted from the pure gradient stops)   h head   e eye
+#   v V-upper   d V-lower
+# ---------------------------------------------------------------------------
 
-    Colors stay FULL intensity (average of lit source pixels only — never
-    diluted by empty box area), so the mini is bright and crisp. Animation
-    phase derives from the clock (stateless). Never raises."""
+_MINI_SPRITE: List[str] = [
+    "......RRhh.....",
+    "....RRRRheh....",
+    "...RRRR..hh....",
+    "..RRR..........",
+    ".RRR.vv..vv....",
+    ".RR..vv..vv.RR.",
+    ".RR...vddv..RR.",
+    ".RR....dd...RR.",
+    ".RR....dd...RR.",
+    ".RRR.......RRR.",
+    "..RRR.....RRR..",
+    "...RRRRRRRRR...",
+    "....RRRRRRR....",
+    "......RRR......",
+]
+
+
+class MiniCrest:
+    """The header logo — hand-authored pixel art at exact display resolution
+    (the CC method; every derived-downscale approach reads as mush because
+    small logos are DESIGNED, not derived). The frozen ``_MINI_SPRITE`` shape
+    never changes at runtime; the ring's gradient (pure palette stops, snapped
+    — zero blends) ROTATES around it for motion. All frames precompute at
+    construction in microseconds — no async build, no cache, no dependencies.
+    API-compatible with the previous MiniCrest. Never raises."""
 
     def __init__(
         self,
         *,
-        cols: Optional[int] = None,
+        cols: Optional[int] = None,            # accepted for API compat (fixed art)
         frame_count: Optional[int] = None,
-        ss: Optional[int] = None,
+        ss: Optional[int] = None,              # ignored — nothing is sampled
         speed_laps_per_s: Optional[float] = None,
-        source_cols: Optional[int] = None,
+        source_cols: Optional[int] = None,     # ignored — nothing is derived
         source_rows: Optional[int] = None,
     ) -> None:
-        import shutil
-        self._target = cols if cols is not None else _env_int(
-            "JARVIS_CREST_MINI_COLS", 16, 8, 32,
+        from .crest import _EYE_RGB, _HEAD_RGB, _V_BOT_RGB, _V_TOP_RGB, _grad
+        self._n = frame_count if frame_count is not None else _env_int(
+            "JARVIS_CREST_MINI_FRAMES", 24, 4, 48,
         )
-        self._n = frame_count if frame_count is not None else _frame_count_env()
-        self._ss = ss if ss is not None else _anim_ss()
         self._speed = speed_laps_per_s if speed_laps_per_s is not None else _env_float(
             "JARVIS_CREST_MINI_SPEED", 0.12, 0.01, 2.0,
         )
-        term = shutil.get_terminal_size(fallback=(100, 30))
-        self._term_w = source_cols if source_cols is not None else term.columns
-        self._term_h = source_rows if source_rows is not None else term.lines
-        pf = generate_crest_pixels(self._term_w, self._term_h)
-        if pf is None:
-            pf = generate_crest_pixels(100, 40)
-        self._pf = pf
-        self._frames: List[Optional[dict]] = [None] * max(1, self._n)
-        self._built = 0
-        self._builder_started = False
-        self._cols = self._target
-        self._out_rows = 0
-        if pf is not None:
-            static = {k: v[0] for k, v in pf.pixels.items()}
-            # The boot animator's disk-cached ring — the SAME artwork frames.
-            ring = _load_cached_ring(pf.cols, pf.rows, self._n, self._ss)
-            if ring:
-                self._frames = [self._downsample(f) for f in ring]
-                self._built = sum(1 for f in self._frames if f)
-            else:
-                self._frames[0] = self._downsample(static)
-                self._built = 1 if self._frames[0] else 0
-        for f in self._frames:
-            if f:
-                self._out_rows = max(self._out_rows, max(py for (_x, py) in f) // 2 + 1)
+        art = _MINI_SPRITE
+        self._h = len(art)
+        self._w = max(len(r) for r in art) if art else 0
+        pal = _quant_palette()
+        # Static (non-ring) paint + the ring path ordered by angle.
+        static: dict = {}
+        ring: List[Tuple[float, int, int]] = []
+        cx, cy = (self._w - 1) / 2.0, (self._h - 1) / 2.0
+        for y, row in enumerate(art):
+            for x, ch in enumerate(row):
+                if ch == "h":
+                    static[(x, y)] = tuple(_HEAD_RGB)
+                elif ch == "e":
+                    static[(x, y)] = tuple(_EYE_RGB)
+                elif ch == "v":
+                    static[(x, y)] = tuple(_V_TOP_RGB)
+                elif ch == "d":
+                    static[(x, y)] = tuple(_V_BOT_RGB)
+                elif ch == "R":
+                    theta = math.atan2(-(y - cy), x - cx)
+                    ring.append((_ang_norm(theta) / (2.0 * math.pi), x, y))
+        # Precompute EVERY frame: ring colors = pure gradient stops, rotated.
+        self._frames: List[dict] = []
+        for k in range(max(1, self._n)):
+            phase = k / max(1, self._n)
+            f = dict(static)
+            for (frac, x, y) in ring:
+                f[(x, y)] = _snap(_grad((frac + phase) % 1.0), pal)
+            self._frames.append(f)
+        self._built = len(self._frames)
+        self._builder_started = True
 
     @property
     def available(self) -> bool:
-        return self._built > 0
+        return bool(self._frames)
 
     @property
     def rows(self) -> int:
-        return max(1, self._out_rows)
+        return (self._h + 1) // 2
 
     @property
     def cols(self) -> int:
-        return self._cols
-
-    # -- the downscaler (box filter, lit-only average → full intensity) --
-
-    def _downsample(self, src: dict) -> dict:
-        """The Hard-Edge Vector Quantizer (operator mandate): terminals have no
-        true opacity, so averaging/premultiplied blending renders transition
-        colors as LITERAL mud. Instead: (1) binary alpha threshold — box
-        coverage ≥ 0.4 → 100% visible, else dropped, ZERO feathering; (2) strict
-        palette clamping — every visible cell SNAPS to the nearest pure color of
-        the crest's own palette (no blends, no dimming); (3) feature-preserving
-        bias — V-family cells threshold at 0.15 and dilate 1 cell so the V never
-        collapses between grid coordinates at micro scale. Pure; never raises."""
-        try:
-            if not src:
-                return {}
-            pal = _quant_palette()
-            vfam = _v_family()
-            xs = [x for (x, _py) in src]
-            pys = [py for (_x, py) in src]
-            x0, x1 = min(xs), max(xs)
-            y0, y1 = min(pys), max(pys)
-            w, h = (x1 - x0 + 1), (y1 - y0 + 1)
-            dst_w = max(4, self._target)
-            dst_h = max(4, round(dst_w * h / max(1, w)))
-            sx, sy = w / dst_w, h / dst_h
-            cover: dict = {}
-            vcover: dict = {}
-            color: dict = {}
-            for my in range(dst_h):
-                for mx in range(dst_w):
-                    bx0, by0 = x0 + mx * sx, y0 + my * sy
-                    bx1, by1 = x0 + (mx + 1) * sx, y0 + (my + 1) * sy
-                    lit = []
-                    for px in range(int(bx0), max(int(bx0) + 1, int(math.ceil(bx1)))):
-                        for py in range(int(by0), max(int(by0) + 1, int(math.ceil(by1)))):
-                            c = src.get((px, py))
-                            if c is not None and max(c) > 40:   # ignore AA fringe
-                                lit.append(c)
-                    if not lit:
-                        continue
-                    area = max(1.0, (math.ceil(bx1) - int(bx0)) * (math.ceil(by1) - int(by0)))
-                    n = len(lit)
-                    avg = (sum(c[0] for c in lit) / n, sum(c[1] for c in lit) / n,
-                           sum(c[2] for c in lit) / n)
-                    snapped = _snap(avg, pal)
-                    cover[(mx, my)] = n / area
-                    color[(mx, my)] = snapped
-                    if snapped in vfam:
-                        vcover[(mx, my)] = n / area
-            out: dict = {}
-            for k, cv in cover.items():
-                thresh = 0.15 if k in vcover else 0.4   # V bias — never collapses
-                if cv >= thresh:
-                    out[k] = color[k]
-            # 1-cell V dilation: a V cell pulls in 4-neighbours that carry ANY
-            # V coverage — guaranteed feature continuity at micro scale.
-            for (mx, my), cv in list(vcover.items()):
-                if (mx, my) not in out:
-                    continue
-                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                    nk = (mx + dx, my + dy)
-                    if nk not in out and vcover.get(nk, 0.0) > 0.05:
-                        out[nk] = color[nk]
-            return out
-        except Exception:  # noqa: BLE001
-            return {}
-
-    # -- fill the ring (reuses the boot animator's builder + shared cache) --
+        return self._w
 
     async def ensure_frames(self) -> None:
-        """Complete the mini ring by completing the BIG ring (the boot
-        animator's own builder + shared disk cache — one artwork, two sizes),
-        then downsampling each frame. Idempotent; off-loop; never raises."""
-        import asyncio
-        if self._builder_started or self._pf is None:
-            return
-        self._builder_started = True
-        try:
-            if all(f is not None for f in self._frames):
-                return
-            big = CrestAnimator(
-                cols=self._term_w, rows=self._term_h,
-                frame_count=self._n, ss=self._ss,
-            )
-            await big.ensure_frames()
-            for k, f in enumerate(big._frames):
-                if f and (k >= len(self._frames) or self._frames[k] is None):
-                    if k < len(self._frames):
-                        self._frames[k] = self._downsample(f)
-            self._built = sum(1 for f in self._frames if f)
-            for f in self._frames:
-                if f:
-                    self._out_rows = max(self._out_rows, max(py for (_x, py) in f) // 2 + 1)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            pass
+        """No-op — every frame precomputes at construction (API compat)."""
+        return
 
     def _frame_now(self, now: Optional[float] = None) -> Optional[dict]:
         import time as _time
         if not self._frames:
             return None
         t = _time.monotonic() if now is None else float(now)
-        phase = (t * self._speed) % 1.0
-        n = len(self._frames)
-        want = int(phase * n) % n
-        for off in range(n):
-            for idx in ((want - off) % n, (want + off) % n):
-                f = self._frames[idx]
-                if f is not None:
-                    return f
-        return None
+        return self._frames[int(((t * self._speed) % 1.0) * len(self._frames)) % len(self._frames)]
 
     def row_texts(self, now: Optional[float] = None) -> List[Any]:
-        """The mini as one Rich ``Text`` per cell row. The downsampled frames are
-        already trimmed to the artwork's bounding box — flush-left by
-        construction, stable while spinning. Never raises."""
+        """One Rich ``Text`` per cell row — the fixed sprite, current paint."""
         try:
             from rich.text import Text
         except Exception:  # noqa: BLE001
@@ -838,11 +762,10 @@ class MiniCrest:
         frame = self._frame_now(now)
         if not frame:
             return []
-        max_row = max(py for (_x, py) in frame) // 2
         rows: List[Any] = []
-        for cy in range(0, max_row + 1):
+        for cy in range((self._h + 1) // 2):
             t = Text()
-            for x in range(self._cols):
+            for x in range(self._w):
                 top = frame.get((x, cy * 2))
                 bot = frame.get((x, cy * 2 + 1))
                 if top is None and bot is None:
