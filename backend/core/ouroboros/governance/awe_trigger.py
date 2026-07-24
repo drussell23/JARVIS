@@ -42,6 +42,9 @@ import os
 import uuid
 from typing import Any, Awaitable, Callable, Optional
 
+from backend.core.ouroboros.governance.post_soak_verification import (
+    _default_git_porcelain,
+)
 from backend.core.ouroboros.governance.soak_execution_lock import (
     DEFAULT_LOCK_NAME,
     release_soak_lock,
@@ -368,6 +371,59 @@ def _default_client_factory() -> Any:
         return None
 
 
+class DirtyTreeRefusal(RuntimeError):
+    """AWE refused to launch because the working tree carried uncommitted work.
+
+    Raised (not returned) on purpose: :meth:`AWETrigger._run_soak` already
+    treats an exception as "soak did not happen" and RELEASES the execution
+    lock, so a later recovery edge against a clean tree can still run. A
+    silent return would hold the lock for the whole cooldown and swallow the
+    recovery window."""
+
+
+def _clean_tree_required() -> bool:
+    """Whether AWE refuses to launch onto a dirty working tree. Default ON.
+
+    An autonomous soak mutates real files and (with auto-commit armed) commits
+    them. Starting that on top of uncommitted human work is how a machine
+    commit swallows an operator's in-flight edit — the #70033 shape. Cheap
+    insurance: one read-only ``git status --porcelain``."""
+    return os.environ.get(
+        "JARVIS_AWE_REQUIRE_CLEAN_TREE", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _clean_tree_allowlist() -> tuple:
+    """Path prefixes permitted to be dirty, from ``JARVIS_AWE_CLEAN_TREE_ALLOW``
+    (comma-separated). Empty by default — strict. Exists so an operator can
+    permit e.g. the soak's own output directory on a resume without disarming
+    the invariant wholesale."""
+    raw = (os.environ.get("JARVIS_AWE_CLEAN_TREE_ALLOW", "") or "").strip()
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
+def _dirty_paths(git_status_fn: Callable[[], Any]) -> tuple:
+    """Porcelain lines → the offending paths, minus the allowlist. Fail-CLOSED
+    is wrong here and fail-open is wrong too, so: a git read that errors returns
+    [] from the shared helper (its documented behaviour), which we treat as
+    clean — the invariant is a guard against KNOWN dirt, not a proof of
+    cleanliness, and refusing every launch because git is unreadable would wedge
+    the recovery path entirely."""
+    allow = _clean_tree_allowlist()
+    out = []
+    try:
+        for line in git_status_fn() or []:
+            path = str(line)[3:].strip().strip('"')
+            if not path:
+                continue
+            if any(path.startswith(p) for p in allow):
+                continue
+            out.append(path)
+    except Exception:  # noqa: BLE001
+        return ()
+    return tuple(out)
+
+
 def build_manifest_aware_launch_fn(
     *,
     db_factory: Optional[DbFactory] = None,
@@ -375,6 +431,7 @@ def build_manifest_aware_launch_fn(
     fallback_fn: Optional[LaunchFn] = None,
     breadcrumb_fn: Optional[BreadcrumbFn] = None,
     max_priority: Optional[int] = None,
+    git_status_fn: Optional[Callable[[], Any]] = None,
 ) -> LaunchFn:
     """The substrate-aware dispatcher: inspect state, THEN choose the strategy.
 
@@ -395,7 +452,12 @@ def build_manifest_aware_launch_fn(
     ``repo_root`` for the manifest path is the intent's ``target``, not the
     repository root — see :class:`PendingIntent`. Both strategies breadcrumb
     which way they went, so the choice is visible in ``/breadcrumbs`` rather
-    than inferred. Never raises: any failure degrades to the fallback."""
+    than inferred.
+
+    Failure policy: every *dispatch* failure degrades to the fallback rather
+    than raising — EXCEPT the clean-tree invariant, which raises
+    :class:`DirtyTreeRefusal` by design so the trigger releases its execution
+    lock and a later edge against a clean tree can still run."""
     _db = db_factory or _default_db_factory
     _client = client_factory or _default_client_factory
     _fallback = fallback_fn or build_soak_subprocess_launch_fn()
@@ -409,6 +471,44 @@ def build_manifest_aware_launch_fn(
 
     async def _launch(run_id: str) -> Any:
         from backend.core.ouroboros.governance.soak_intent import next_pending_intent
+
+        # ── Clean-tree invariant ──────────────────────────────────────────
+        # Gate the WHOLE dispatch, not just the manifest branch: the generic
+        # soak mutates the repo too, so "don't run an autonomous mutator on
+        # top of uncommitted human work" applies identically to both.
+        if _clean_tree_required():
+            _git = git_status_fn or _default_git_porcelain
+            dirty = _dirty_paths(_git)
+            if dirty:
+                shown = ", ".join(dirty[:5]) + (" …" if len(dirty) > 5 else "")
+                _emit("refused_dirty_tree", {
+                    "run_id": run_id, "dirty_count": len(dirty),
+                    "dirty_sample": list(dirty[:5]),
+                })
+                logger.warning(
+                    "[AWE] REFUSING launch run_id=%s — working tree dirty "
+                    "(%d path(s): %s). Commit or stash, then the next recovery "
+                    "edge will run.", run_id, len(dirty), shown,
+                )
+                try:
+                    from backend.core.ouroboros.governance.moltbook import (
+                        post_molt_nowait,
+                    )
+                    post_molt_nowait(
+                        "@first-responder", "distress",
+                        facts={
+                            "what": "AWE refused the soak launch",
+                            "why": "working tree is dirty",
+                            "dirty_count": len(dirty),
+                            "sample": shown,
+                            "run_id": run_id,
+                        },
+                    )
+                except Exception:  # noqa: BLE001 — the agora is never load-bearing
+                    pass
+                raise DirtyTreeRefusal(
+                    f"working tree dirty ({len(dirty)} path(s)): {shown}"
+                )
 
         conn = None
         try:
@@ -507,6 +607,7 @@ def start_awe_trigger(
 __all__ = [
     "AWETrigger",
     "awe_enabled",
+    "DirtyTreeRefusal",
     "build_manifest_aware_launch_fn",
     "build_soak_subprocess_launch_fn",
     "build_swarm_coroutine_launch_fn",

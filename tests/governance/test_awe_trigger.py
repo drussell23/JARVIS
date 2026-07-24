@@ -194,7 +194,7 @@ def _seed_intent(db_path, *, intent_id, manifest_json, target, priority=1):
         conn.close()
 
 
-def _dispatcher(db_path, *, fallback, client=object(), crumbs=None):
+def _dispatcher(db_path, *, fallback, client=object(), crumbs=None, git_status_fn=None):
     from backend.core.ouroboros.governance.awe_trigger import (
         build_manifest_aware_launch_fn,
     )
@@ -203,6 +203,10 @@ def _dispatcher(db_path, *, fallback, client=object(), crumbs=None):
         client_factory=lambda: client,
         fallback_fn=fallback,
         breadcrumb_fn=(lambda et, p: crumbs.append((et, dict(p)))) if crumbs is not None else None,
+        # Pin a CLEAN tree by default. These are routing tests; without this
+        # they read the ambient repo porcelain and fail whenever the developer
+        # running them happens to have uncommitted work.
+        git_status_fn=git_status_fn or (lambda: []),
     )
 
 
@@ -334,3 +338,180 @@ async def test_priority_ordering_picks_the_urgent_intent(db_path):
     assert got.intent_id == "urgent"
     assert got.target == "/b"
     assert got.has_manifest is True
+
+
+# ---------------------------------------------------------------------------
+# Clean-tree invariant + the governance-shield ground truth.
+#
+# NOTE ON THE SHIELD: these assert that `backend/soak_probes/canary/` is
+# ALREADY permitted by the self-modification cage — no whitelist was added, and
+# none is needed. The cage matches `ouroboros/governance/` and friends by
+# substring; the canary matches nothing. The 22 blocked ops in session
+# bt-2026-07-24-045323 were sensor-sourced ops whose file sets touched the
+# caged surfaces, i.e. the cage doing its job. Pinning this so nobody later
+# "fixes" a block that was never blocking the canary.
+# ---------------------------------------------------------------------------
+
+
+def _engine():
+    from backend.core.ouroboros.governance.risk_engine import RiskEngine
+    return RiskEngine()
+
+
+def test_canary_paths_are_not_caged_by_self_mod_shield():
+    """(2) A file in backend/soak_probes/canary/ must NOT trip the self-mod or
+    kernel sentinels — the canary soak is permitted as-is."""
+    eng = _engine()
+    for path in (
+        "backend/soak_probes/canary/mathy.py",
+        "backend/soak_probes/canary/strings_util.py",
+        "backend/soak_probes/canary/widgets.py",
+    ):
+        assert not eng._matches_any([path], eng._self_mod_sentinels()), path
+        assert not eng._matches_any([path], eng._kernel_sentinels()), path
+
+
+def test_governance_paths_remain_caged():
+    """(1) The negative control: a core governance file DOES trip the shield.
+    If this ever goes green-by-passing, the cage has been hollowed out."""
+    eng = _engine()
+    caged = "backend/core/ouroboros/governance/orchestrator.py"
+    assert eng._matches_any([caged], eng._self_mod_sentinels())
+
+
+def test_self_mod_sentinel_env_hook_is_additive_only():
+    """The cage can be WIDENED by env but never narrowed — there is no
+    subtraction/whitelist mechanism, by contract."""
+    import os
+
+    eng = _engine()
+    base = set(eng._self_mod_sentinels())
+    os.environ["JARVIS_EXTRA_SELF_MOD_SENTINELS"] = "backend/soak_probes/"
+    try:
+        widened = set(eng._self_mod_sentinels())
+    finally:
+        os.environ.pop("JARVIS_EXTRA_SELF_MOD_SENTINELS", None)
+    assert base.issubset(widened), "env hook must never remove a sentinel"
+
+
+async def test_dirty_tree_aborts_the_soak_launch(db_path):
+    """(3) A dirty working tree makes AWE refuse — and it refuses by RAISING,
+    so the caller releases the execution lock for a later clean-tree edge."""
+    import json
+
+    from backend.core.ouroboros.governance.awe_trigger import DirtyTreeRefusal
+
+    _seed_intent(db_path, intent_id="canary03",
+                 manifest_json=json.dumps({"schema_version": 2, "pending_chunks": []}),
+                 target="/tmp/canary")
+
+    fallback_calls = []
+
+    async def fallback(run_id):
+        fallback_calls.append(run_id)
+        return "fallback-ran"
+
+    from backend.core.ouroboros.governance.awe_trigger import (
+        build_manifest_aware_launch_fn,
+    )
+    crumbs: list = []
+    launch = build_manifest_aware_launch_fn(
+        db_factory=lambda: sqlite3.connect(db_path),
+        client_factory=lambda: object(),
+        fallback_fn=fallback,
+        breadcrumb_fn=lambda et, p: crumbs.append((et, dict(p))),
+        # Real porcelain shape: XY + space + path.
+        git_status_fn=lambda: [" M backend/core/ouroboros/governance/orchestrator.py",
+                               "?? scratch.py"],
+    )
+
+    with pytest.raises(DirtyTreeRefusal):
+        await launch("run-dirty")
+
+    assert fallback_calls == [], "a dirty tree must not fall through to the soak"
+    strategies = [p.get("strategy") for et, p in crumbs if et == "awe_launch_strategy"]
+    assert strategies == ["refused_dirty_tree"]
+
+
+async def test_clean_tree_permits_the_launch(db_path):
+    """The positive half: an empty porcelain lets dispatch proceed normally."""
+    fallback_calls = []
+
+    async def fallback(run_id):
+        fallback_calls.append(run_id)
+        return "fallback-ran"
+
+    from backend.core.ouroboros.governance.awe_trigger import (
+        build_manifest_aware_launch_fn,
+    )
+    launch = build_manifest_aware_launch_fn(
+        db_factory=lambda: sqlite3.connect(db_path),
+        fallback_fn=fallback,
+        git_status_fn=lambda: [],
+    )
+    assert await launch("run-clean") == "fallback-ran"
+
+
+async def test_clean_tree_allowlist_permits_scoped_dirt(db_path, monkeypatch):
+    """An operator may permit specific prefixes without disarming the invariant."""
+    monkeypatch.setenv("JARVIS_AWE_CLEAN_TREE_ALLOW", "backend/soak_probes/")
+
+    async def fallback(run_id):
+        return "fallback-ran"
+
+    from backend.core.ouroboros.governance.awe_trigger import (
+        build_manifest_aware_launch_fn,
+    )
+    launch = build_manifest_aware_launch_fn(
+        db_factory=lambda: sqlite3.connect(db_path),
+        fallback_fn=fallback,
+        git_status_fn=lambda: [" M backend/soak_probes/canary/mathy.py"],
+    )
+    assert await launch("run-allow") == "fallback-ran"
+
+
+async def test_clean_tree_invariant_can_be_disarmed(db_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_AWE_REQUIRE_CLEAN_TREE", "false")
+
+    async def fallback(run_id):
+        return "fallback-ran"
+
+    from backend.core.ouroboros.governance.awe_trigger import (
+        build_manifest_aware_launch_fn,
+    )
+    launch = build_manifest_aware_launch_fn(
+        db_factory=lambda: sqlite3.connect(db_path),
+        fallback_fn=fallback,
+        git_status_fn=lambda: [" M anything.py"],
+    )
+    assert await launch("run-disarmed") == "fallback-ran"
+
+
+async def test_refusal_releases_the_lock_for_a_later_edge(db_path):
+    """End-to-end through the REAL trigger: a dirty-tree refusal must not wedge
+    the execution lock — the whole reason it raises instead of returning."""
+    from backend.core.ouroboros.governance.awe_trigger import (
+        build_manifest_aware_launch_fn,
+    )
+    from backend.core.ouroboros.governance.soak_execution_lock import read_soak_lock
+
+    async def _unused_fallback(run_id):   # correct coroutine shape, never called
+        raise AssertionError("fallback must not run on a dirty-tree refusal")
+
+    launch = build_manifest_aware_launch_fn(
+        db_factory=lambda: sqlite3.connect(db_path),
+        fallback_fn=_unused_fallback,
+        git_status_fn=lambda: [" M dirty.py"],
+    )
+    trigger = _make_trigger(db_path, launch, [])
+    fired = await trigger.on_state_event(
+        {"state": "HEALTHY", "previous_state": "DEGRADED"},
+    )
+    assert fired is True, "the edge claims the lock before the launcher runs"
+    # Let the detached soak coroutine reach its refusal + release.
+    await _wait_for(
+        lambda: (read_soak_lock(sqlite3.connect(db_path)) or {}).get("claimed") == 0,
+        timeout=3.0,
+    )
+    lock = read_soak_lock(sqlite3.connect(db_path))
+    assert lock is not None and lock["claimed"] == 0, "refusal must free the lock"
