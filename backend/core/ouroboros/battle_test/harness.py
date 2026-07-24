@@ -4448,6 +4448,19 @@ class BattleTestHarness:
                     return {}
 
             def _on_input(text: str) -> None:
+                # Operator Prompt Bridge FIRST (2026-07-23): while an
+                # interactive gate ([Y/n] Iron Gate, endorse) is pending,
+                # the next attached-terminal line IS the answer — HITL
+                # from every surface the operator watches. No pending
+                # prompt → declines instantly, text flows to the REPL.
+                try:
+                    from backend.core.ouroboros.battle_test.operator_prompt_bridge import (  # noqa: E501
+                        get_operator_prompt_bridge,
+                    )
+                    if get_operator_prompt_bridge().resolve(text):
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
                 # Upstream operator text → the FULL REPL surface (verbs
                 # + bare-text chat bridge). Scheduled, never inline.
                 try:

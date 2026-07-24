@@ -77,6 +77,17 @@ from backend.core.ouroboros.ui.theme import (  # noqa: E402
 )
 
 
+def _bridge_only_wait_s() -> float:
+    """How long the Iron Gate waits for a COCKPIT answer when no local
+    prompt surface exists (prompt_toolkit unavailable). Bounded so the
+    organism never wedges; on timeout the legacy behavior applies."""
+    try:
+        return max(1.0, min(600.0, float(os.environ.get(
+            "JARVIS_PROMPT_BRIDGE_ONLY_WAIT_S", "45"))))
+    except (TypeError, ValueError):
+        return 45.0
+
+
 def _resolve_repl_refresh_interval_s() -> float:
     """Bottom-toolbar refresh cadence in seconds. Env-configurable via
     ``JARVIS_REPL_REFRESH_INTERVAL_S`` (default 0.10 = 10fps spinner).
@@ -3464,6 +3475,94 @@ class SerpentFlow:
     # Iron Gate permission prompt
     # ══════════════════════════════════════════════════════════
 
+    async def _race_gate_answer(
+        self, bridge_fut: Optional["asyncio.Future"],
+    ) -> Optional[bool]:
+        """Race the LOCAL [Y/n] prompt against the Operator Prompt Bridge
+        (attached cockpits) — first answer wins, the loser is cancelled.
+
+        Edge lattice (every surface can die independently):
+        * local prompt raises (dead stdin — the Session-H OSError class)
+          → it drops OUT of the race; the bridge keeps waiting, bounded
+          by ``_bridge_only_wait_s`` so the organism never wedges.
+        * EOF/Ctrl-C on the local surface = explicit REJECTION (False).
+        * bridge disabled/absent → pure local behavior (legacy).
+        * everything dead/timed out → None (caller applies Session-H
+          auto-approve parity).
+
+        Sets ``self._gate_answered_via_cockpit`` for §7 attribution.
+        NEVER leaks pending tasks."""
+        self._gate_answered_via_cockpit = False
+        local_task: Optional["asyncio.Future"] = None
+        ctx = None
+        try:
+            try:
+                from prompt_toolkit import PromptSession
+                from prompt_toolkit.formatted_text import HTML
+                from prompt_toolkit.patch_stdout import patch_stdout
+                ctx = patch_stdout(raw=True)
+                ctx.__enter__()
+                local_task = asyncio.ensure_future(
+                    PromptSession().prompt_async(
+                        HTML("<b>  Apply this change? [Y/n] </b>"),
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — no local surface
+                local_task = None
+            race = {t for t in (local_task, bridge_fut) if t is not None}
+            deadline = (
+                None if local_task is not None else _bridge_only_wait_s()
+            )
+            while race:
+                done, _pending = await asyncio.wait(
+                    race, timeout=deadline,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:                      # bridge-only wait timed out
+                    return None
+                for w in done:
+                    race.discard(w)
+                    if bridge_fut is not None and w is bridge_fut:
+                        try:
+                            ans = str(w.result() or "").strip().lower()
+                        except Exception:  # noqa: BLE001 — cancelled/superseded
+                            continue
+                        self._gate_answered_via_cockpit = True
+                        return ans in ("", "y", "yes")
+                    try:
+                        ans = str(w.result() or "").strip().lower()
+                        return ans in ("", "y", "yes")
+                    except (EOFError, KeyboardInterrupt):
+                        # A REAL terminal's Ctrl-D/Ctrl-C is an explicit
+                        # rejection. EOF from a fake/piped stdin (tests,
+                        # daemonized edge) means NO local surface — the
+                        # bridge race continues, bounded.
+                        try:
+                            import sys as _sys
+                            _tty = bool(
+                                _sys.__stdin__ is not None
+                                and _sys.__stdin__.isatty()
+                            )
+                        except Exception:  # noqa: BLE001
+                            _tty = False
+                        if _tty:
+                            return False
+                        deadline = _bridge_only_wait_s()
+                        continue
+                    except Exception:  # noqa: BLE001 — dead stdin: race on
+                        deadline = _bridge_only_wait_s()
+                        continue
+            return None                            # every surface exhausted
+        finally:
+            for t in (local_task, ):
+                if t is not None and not t.done():
+                    t.cancel()
+            if ctx is not None:
+                try:
+                    ctx.__exit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+
     async def request_execution_permission(
         self,
         op_id: str,
@@ -3553,46 +3652,70 @@ class SerpentFlow:
             width=min(c.width, 68),
             padding=(0, 1),
         )
-        # Attach mirror: the gate question as LINES (a Panel can't cross
-        # the frame protocol) + an honest note that the [Y/n] decision
-        # is awaited at the daemon's own terminal in interactive mode.
+        # Attach mirror — CC-style gate block in O+V's voice (a Panel
+        # can't cross the frame protocol; ⏺/⎿ lines can). The prompt is
+        # ANSWERABLE from the cockpit via the Operator Prompt Bridge:
+        # the next attached-terminal line resolves the race below.
         try:
             self._mirror_markup(
-                f"  [{_C['heal']}]🔒 Iron Gate │ op:{short} — "
-                f"approval required[/{_C['heal']}]"
+                f"  [{_C['heal']}]⏺ Iron Gate[/{_C['heal']}]"
+                f"([{_C['dim']}]op:{short}[/{_C['dim']}]) — approval required"
             )
             for _bl in body_lines:
-                self._mirror_markup(f"  {_bl}")
+                self._mirror_markup(f"  [{_C['dim']}]⎿[/{_C['dim']}]  {_bl}")
             self._mirror_markup(
-                f"  [{_C['dim']}]⎿  awaiting [Y/n] at the daemon "
-                f"terminal[/{_C['dim']}]"
+                f"  [{_C['dim']}]⎿[/{_C['dim']}]  [bold]Apply this change? "
+                f"[Y/n][/bold] [{_C['dim']}]— reply y / n here, or at the "
+                f"daemon terminal[/{_C['dim']}]"
             )
         except Exception:  # noqa: BLE001
             pass
         c.print()
         c.print(panel)
 
-        # Step 3: Async [Y/n] prompt
+        # Step 3: Async [Y/n] prompt — RACED between the local terminal
+        # and the Operator Prompt Bridge (attached cockpits). First
+        # answer wins; the loser is cancelled. HITL from every surface.
+        answered_via = "terminal"
+        bridge_fut = None
         try:
-            from prompt_toolkit import PromptSession
-            from prompt_toolkit.formatted_text import HTML
-            from prompt_toolkit.patch_stdout import patch_stdout
-
-            session = PromptSession()
-            with patch_stdout(raw=True):
-                answer = await session.prompt_async(
-                    HTML("<b>  Apply this change? [Y/n] </b>"),
-                )
-            answer = answer.strip().lower()
-            approved = answer in ("", "y", "yes")
-        except ImportError:
-            c.print(
-                f"  [{_C['heal']}](prompt_toolkit unavailable — auto-approving)[/{_C['heal']}]",
-                highlight=False,
+            from backend.core.ouroboros.battle_test.operator_prompt_bridge import (  # noqa: E501
+                get_operator_prompt_bridge,
             )
-            approved = True
-        except (EOFError, KeyboardInterrupt):
+            bridge_fut = get_operator_prompt_bridge().begin(
+                f"iron-gate:{short}",
+            )
+        except Exception:  # noqa: BLE001
+            bridge_fut = None
+        try:
+            approved = await self._race_gate_answer(bridge_fut)
+            if approved is None:
+                approved = True        # every surface dead → Session-H parity
+            elif getattr(self, "_gate_answered_via_cockpit", False):
+                answered_via = "cockpit"
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
             approved = False
+        finally:
+            try:
+                from backend.core.ouroboros.battle_test.operator_prompt_bridge import (  # noqa: E501
+                    get_operator_prompt_bridge,
+                )
+                get_operator_prompt_bridge().end(bridge_fut)
+            except Exception:  # noqa: BLE001
+                pass
+        # Mirror the decision + which surface answered (§7: every
+        # human decision visible everywhere).
+        try:
+            _mark = "✅ approved" if approved else "⛔ rejected"
+            _col = _C["life"] if approved else _C["death"]
+            self._mirror_markup(
+                f"  [{_C['dim']}]⎿[/{_C['dim']}]  [{_col}]{_mark}"
+                f"[/{_col}] [{_C['dim']}]via {answered_via}[/{_C['dim']}]"
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         # Step 4: Decision artifact
         if approved:
