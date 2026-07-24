@@ -616,41 +616,62 @@ def build_animator(console: Any, *, plus_lead_deg: Optional[float] = None) -> Op
 
 
 class MiniCrest:
-    """A small ambient crest for the cockpit header — the same physically-
-    rotating snake, sized down (``build_rotated_frame`` has no minimum-width
-    clamp, so the mini raster composes the SAME pipeline). Animation phase is
-    derived from the CLOCK (``time.monotonic``), so rendering is stateless —
-    no tick task; prompt_toolkit's refresh interval animates it for free.
-    Headless-testable. Never raises."""
+    """The header logo — the BIG crest's artwork, downsampled (root cause of the
+    old blob: re-sampling the vector geometry at ~20 columns is below the
+    legibility threshold of the medium — a 1px ring + 3px V reads as mush; the
+    big logo is legible because it renders at full resolution). The mini is a
+    box-filter DOWNSCALE of the big animation frames — same shapes, same
+    palette, same spin, exactly the boot emblem in miniature (DRY: the frames
+    come from the boot animator's own disk-cached ring; nothing re-rendered).
+
+    Colors stay FULL intensity (average of lit source pixels only — never
+    diluted by empty box area), so the mini is bright and crisp. Animation
+    phase derives from the clock (stateless). Never raises."""
 
     def __init__(
         self,
         *,
         cols: Optional[int] = None,
         frame_count: Optional[int] = None,
-        ss: int = 2,
+        ss: Optional[int] = None,
         speed_laps_per_s: Optional[float] = None,
+        source_cols: Optional[int] = None,
+        source_rows: Optional[int] = None,
     ) -> None:
-        self._cols = cols if cols is not None else _env_int(
-            "JARVIS_CREST_MINI_COLS", 20, 12, 40,
+        import shutil
+        self._target = cols if cols is not None else _env_int(
+            "JARVIS_CREST_MINI_COLS", 13, 8, 32,
         )
-        self._rows = _Geometry.rows_needed(self._cols)
-        self._n = frame_count if frame_count is not None else _env_int(
-            "JARVIS_CREST_MINI_FRAMES", 16, 4, 48,
-        )
-        self._ss = ss
+        self._n = frame_count if frame_count is not None else _frame_count_env()
+        self._ss = ss if ss is not None else _anim_ss()
         self._speed = speed_laps_per_s if speed_laps_per_s is not None else _env_float(
             "JARVIS_CREST_MINI_SPEED", 0.12, 0.01, 2.0,
         )
+        term = shutil.get_terminal_size(fallback=(100, 30))
+        self._term_w = source_cols if source_cols is not None else term.columns
+        self._term_h = source_rows if source_rows is not None else term.lines
+        pf = generate_crest_pixels(self._term_w, self._term_h)
+        if pf is None:
+            pf = generate_crest_pixels(100, 40)
+        self._pf = pf
         self._frames: List[Optional[dict]] = [None] * max(1, self._n)
         self._built = 0
         self._builder_started = False
-        # Frame 0 built synchronously — small raster (~10-20ms), instant logo.
-        # CRISP mode: hard pixels, no AA mud (the CC-logo look).
-        f0 = build_rotated_frame(self._cols, self._rows, 0.0, self._ss, alpha="crisp")
-        if f0:
-            self._frames[0] = f0
-            self._built = 1
+        self._cols = self._target
+        self._out_rows = 0
+        if pf is not None:
+            static = {k: v[0] for k, v in pf.pixels.items()}
+            # The boot animator's disk-cached ring — the SAME artwork frames.
+            ring = _load_cached_ring(pf.cols, pf.rows, self._n, self._ss)
+            if ring:
+                self._frames = [self._downsample(f) for f in ring]
+                self._built = sum(1 for f in self._frames if f)
+            else:
+                self._frames[0] = self._downsample(static)
+                self._built = 1 if self._frames[0] else 0
+        for f in self._frames:
+            if f:
+                self._out_rows = max(self._out_rows, max(py for (_x, py) in f) // 2 + 1)
 
     @property
     def available(self) -> bool:
@@ -658,31 +679,77 @@ class MiniCrest:
 
     @property
     def rows(self) -> int:
-        return self._rows
+        return max(1, self._out_rows)
 
     @property
     def cols(self) -> int:
         return self._cols
 
+    # -- the downscaler (box filter, lit-only average → full intensity) --
+
+    def _downsample(self, src: dict) -> dict:
+        try:
+            if not src:
+                return {}
+            xs = [x for (x, _py) in src]
+            pys = [py for (_x, py) in src]
+            x0, x1 = min(xs), max(xs)
+            y0, y1 = min(pys), max(pys)
+            w, h = (x1 - x0 + 1), (y1 - y0 + 1)
+            dst_w = max(4, self._target)
+            dst_h = max(4, round(dst_w * h / max(1, w)))
+            sx, sy = w / dst_w, h / dst_h
+            out: dict = {}
+            for my in range(dst_h):
+                for mx in range(dst_w):
+                    bx0 = x0 + mx * sx
+                    by0 = y0 + my * sy
+                    bx1 = x0 + (mx + 1) * sx
+                    by1 = y0 + (my + 1) * sy
+                    lit = []
+                    for px in range(int(bx0), max(int(bx0) + 1, int(math.ceil(bx1)))):
+                        for py in range(int(by0), max(int(by0) + 1, int(math.ceil(by1)))):
+                            c = src.get((px, py))
+                            if c is not None:
+                                lit.append(c)
+                    area = max(1.0, (math.ceil(bx1) - int(bx0)) * (math.ceil(by1) - int(by0)))
+                    if lit and (len(lit) / area) >= 0.28:
+                        n = len(lit)
+                        out[(mx, my)] = (
+                            min(255, round(sum(c[0] for c in lit) / n)),
+                            min(255, round(sum(c[1] for c in lit) / n)),
+                            min(255, round(sum(c[2] for c in lit) / n)),
+                        )
+            return out
+        except Exception:  # noqa: BLE001
+            return {}
+
+    # -- fill the ring (reuses the boot animator's builder + shared cache) --
+
     async def ensure_frames(self) -> None:
-        """Fill the small ring off the event loop (progressive, idempotent)."""
+        """Complete the mini ring by completing the BIG ring (the boot
+        animator's own builder + shared disk cache — one artwork, two sizes),
+        then downsampling each frame. Idempotent; off-loop; never raises."""
         import asyncio
-        if self._builder_started:
+        if self._builder_started or self._pf is None:
             return
         self._builder_started = True
         try:
-            for k in range(self._n):
-                if self._frames[k] is not None:
-                    continue
-                rot = 2.0 * math.pi * k / self._n
-                v_rot = _v_spin_mult() * rot
-                frame = await asyncio.to_thread(
-                    build_rotated_frame, self._cols, self._rows, rot, self._ss, v_rot,
-                    "crisp",
-                )
-                if frame:
-                    self._frames[k] = frame
-                    self._built = sum(1 for f in self._frames if f is not None)
+            if all(f is not None for f in self._frames):
+                return
+            big = CrestAnimator(
+                cols=self._term_w, rows=self._term_h,
+                frame_count=self._n, ss=self._ss,
+            )
+            await big.ensure_frames()
+            for k, f in enumerate(big._frames):
+                if f and (k >= len(self._frames) or self._frames[k] is None):
+                    if k < len(self._frames):
+                        self._frames[k] = self._downsample(f)
+            self._built = sum(1 for f in self._frames if f)
+            for f in self._frames:
+                if f:
+                    self._out_rows = max(self._out_rows, max(py for (_x, py) in f) // 2 + 1)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -704,8 +771,9 @@ class MiniCrest:
         return None
 
     def row_texts(self, now: Optional[float] = None) -> List[Any]:
-        """The mini crest as one Rich ``Text`` per cell row (for side-by-side
-        header composition). Empty list when unavailable. Never raises."""
+        """The mini as one Rich ``Text`` per cell row. The downsampled frames are
+        already trimmed to the artwork's bounding box — flush-left by
+        construction, stable while spinning. Never raises."""
         try:
             from rich.text import Text
         except Exception:  # noqa: BLE001
@@ -713,23 +781,11 @@ class MiniCrest:
         frame = self._frame_now(now)
         if not frame:
             return []
-        occ = [py // 2 for (_x, py) in frame]
-        lo, hi = (min(occ), max(occ)) if occ else (0, self._rows - 1)
-        # Trim the raster's centering margins: the logo sits flush-left and the
-        # header text rides close beside it (the CC layout). Bounds are computed
-        # from a FIXED reference pose so the trim never jitters as it spins —
-        # use the whole ring's union when built, else this frame.
-        union = {x for f in self._frames if f for (x, _py) in f}
-        xs = sorted(union or {x for (x, _py) in frame})
-        x_lo, x_hi = (xs[0], xs[-1]) if xs else (0, self._cols - 1)
-        # Row bounds from the union too — the logo box is rock-stable as it spins.
-        occ_union = sorted({py // 2 for f in self._frames if f for (_x, py) in f})
-        if occ_union:
-            lo, hi = occ_union[0], occ_union[-1]
+        max_row = max(py for (_x, py) in frame) // 2
         rows: List[Any] = []
-        for cy in range(lo, hi + 1):
+        for cy in range(0, max_row + 1):
             t = Text()
-            for x in range(x_lo, x_hi + 1):
+            for x in range(self._cols):
                 top = frame.get((x, cy * 2))
                 bot = frame.get((x, cy * 2 + 1))
                 if top is None and bot is None:

@@ -22,6 +22,14 @@ import pytest
 from backend.core.ouroboros.cli.ov import _route_operator_line
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cache(tmp_path, monkeypatch):
+    """MiniCrest completes the BIG ring via CrestAnimator (shared disk cache) —
+    isolate it per-test so tests never read/pollute the user's real cache."""
+    monkeypatch.setenv("JARVIS_CREST_ANIM_CACHE_DIR", str(tmp_path / "crest_cache"))
+    yield
+
+
 class _FakeClient:
     def __init__(self) -> None:
         self.audio: list = []
@@ -200,21 +208,33 @@ def test_cockpit_app_constructs_with_toolbar():
 # ---------------------------------------------------------------------------
 
 
-def test_mini_crest_builds_below_static_min_and_animates():
-    """The mini logo works BELOW the static crest's 46-col minimum (it composes
-    build_rotated_frame directly, which has no clamp) and its clock-driven
-    render rotates with time."""
+def test_mini_is_the_big_logo_downsampled():
+    """Root-cause regression (operator: 'the little logo doesn't look the same
+    as the big one'): the mini is a box-filter DOWNSCALE of the big crest's own
+    raster — same artwork, same palette — never a tiny geometry re-sample."""
     from backend.core.ouroboros.ui.crest_animator import MiniCrest
-    mini = MiniCrest(cols=18, frame_count=4, ss=1)
-    assert mini.available and mini.rows >= 4
+    mini = MiniCrest(cols=13, frame_count=4, ss=1, source_cols=60, source_rows=24)
+    assert mini.available and mini.rows >= 3
+    frame = mini._frame_now(0.0)
+    assert frame and len(frame) >= 20          # a real emblem, not a speck
+    # Palette fidelity: the mini carries BOTH brand families from the big logo —
+    # venom-green coil pixels AND purple V pixels.
+    greens = sum(1 for (r, g, b) in frame.values() if g > r and g > b)
+    purples = sum(1 for (r, g, b) in frame.values() if b > g)
+    assert greens >= 3 and purples >= 3
+    # Full-intensity colors (lit-only averaging — no empty-area dilution).
+    assert any(max(rgb) > 180 for rgb in frame.values())
+
+
+def test_mini_animates_after_ring_completes():
+    from backend.core.ouroboros.ui.crest_animator import MiniCrest
+    mini = MiniCrest(cols=13, frame_count=4, ss=1, source_cols=60, source_rows=24)
     asyncio.run(mini.ensure_frames())
-    rows_a = mini.row_texts(now=0.0)
-    rows_b = mini.row_texts(now=4.0)          # later clock → different frame
-    assert rows_a and rows_b
-    a = "".join(getattr(r, "plain", "") for r in rows_a)
-    b = "".join(getattr(r, "plain", "") for r in rows_b)
-    # Physical rotation → the lit silhouette differs across clock times.
-    assert a != b or rows_a != rows_b
+    assert mini._built >= 2
+    a = mini._frame_now(0.0)
+    b = mini._frame_now(999.25)               # a different clock → different pose
+    assert a is not None and b is not None
+    assert a != b                              # the downsampled ring rotates
 
 
 def test_cockpit_header_contains_identity_and_path():
@@ -223,7 +243,7 @@ def test_cockpit_header_contains_identity_and_path():
         render_cockpit_header,
     )
     from rich.text import Text
-    mini = MiniCrest(cols=18, frame_count=4, ss=1)
+    mini = MiniCrest(cols=13, frame_count=4, ss=1, source_cols=60, source_rows=24)
     lines = [Text("O+V ov 0.1.0"), Text("● healthy"), Text("~/repos/jarvis")]
     ansi = render_cockpit_header(mini, lines, 100, now=0.0)
     import re
