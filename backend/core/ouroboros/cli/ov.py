@@ -684,16 +684,32 @@ def run_attach(console: Any) -> int:
                 # failure falls through to the proven split-plane loop (the
                 # cockpit can never brick the attach). Kill-switch:
                 # JARVIS_BIPARTITE_LAYOUT_DISABLED=1.
+                _why = ""
                 try:
                     from backend.core.ouroboros.battle_test.bipartite_layout import (
+                        bipartite_enabled,
                         should_run_bipartite,
                     )
                     if should_run_bipartite():
                         await _bipartite_attach_loop(client, console, ui)
                         _ran_cockpit = True
-                except Exception:
+                    elif not bipartite_enabled():
+                        _why = "kill-switch (JARVIS_BIPARTITE_LAYOUT_DISABLED)"
+                    else:
+                        _why = "stdout is not a real TTY"
+                except Exception as _exc:
                     _ran_cockpit = False
+                    _why = f"{type(_exc).__name__}: {str(_exc)[:80]}"
                 if not _ran_cockpit:
+                    # Observability over silent reroute (operator law): say WHY
+                    # the cockpit did not mount before falling back.
+                    try:
+                        console.print(
+                            f"⎿ cockpit fallback → legacy view ({_why or 'unknown'})",
+                            markup=False, highlight=False,
+                        )
+                    except Exception:
+                        pass
                     await _split_plane_loop(client, console, ui)
             else:
                 await _legacy_pump_loop(client)
