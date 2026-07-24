@@ -46,6 +46,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from .crest import (
     _EYE_RGB,
     _GAP_CENTER,
+    _sample_coil,
+    _sample_eye,
+    _sample_head,
+    _sample_v,
     _V_BOT_RGB,
     _V_TOP_RGB,
     _REF_ASPECT,
@@ -651,16 +655,96 @@ def _snap(rgb: Tuple[float, float, float], pal: List[Tuple[int, int, int]]) -> T
     return best
 
 
+def build_scaled_frame(
+    cells_w: int, rot: float, ss: int, v_rot: float = 0.0, alpha: str = "sharp",
+    src_cols: int = 47,
+) -> Dict[Tuple[int, int], Tuple[int, int, int]]:
+    """Aspect-TRUE mini frame for the quadrant medium. A terminal cell is 1:2,
+    so quadrant subpixels are 0.5w x 1h — a symmetric 2x2 pack of half-block
+    art renders OVAL (the squashed-logo bug). This samples the SAME quality-
+    floor geometry (crest's own _sample_* + _pixel_color_and_delay — DRY) on an
+    ANISOTROPIC grid: 2*cells_w subs across x, cells_w subs down y → after the
+    2x2 quadrant pack the emblem is ROUND at cells_w x cells_w/2 cells. The +
+    prey is stamped through the same window transform. Pure; thread-safe;
+    never raises — returns {} on any fault."""
+    try:
+        pf = generate_crest_pixels(src_cols, _Geometry.rows_needed(src_cols - 1) + 3)
+        if pf is None:
+            return {}
+        geo = _rotated_geometry(pf.cols, pf.rows, rot, v_rot)
+        xs = [x for (x, _py) in pf.pixels]
+        pys = [py for (_x, py) in pf.pixels]
+        if not xs:
+            return {}
+        pad = 1.5
+        x_lo, x_hi = min(xs) - pad, max(xs) + 1 + pad
+        y_lo, y_hi = min(pys) * _REF_ASPECT - pad, (max(pys) + 1) * _REF_ASPECT + pad
+        span = max(x_hi - x_lo, y_hi - y_lo)        # square physical window
+        cx_p, cy_p = (x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0
+        sub_w, sub_h = 2 * cells_w, cells_w          # 0.5w x 1h subs -> round
+        px_pitch, py_pitch = span / sub_w, span / sub_h
+        v_span = max(1e-6, geo.v_top + geo.v_bot)
+        out: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
+        for qy in range(sub_h):
+            y0 = cy_p - span / 2.0 + qy * py_pitch
+            for qx in range(sub_w):
+                x0 = cx_p - span / 2.0 + qx * px_pitch
+                votes = {"eye": 0, "head": 0, "coil": 0, "v": 0}
+                theta = None
+                spy = y0
+                for sy in range(ss):
+                    spy = y0 + (sy + 0.5) / ss * py_pitch
+                    for sx in range(ss):
+                        spx = x0 + (sx + 0.5) / ss * px_pitch
+                        if _sample_eye(spx, spy, geo):
+                            votes["eye"] += 1
+                        elif _sample_head(spx, spy, geo):
+                            votes["head"] += 1
+                        elif _sample_coil(spx, spy, geo):
+                            votes["coil"] += 1
+                            theta = math.atan2(-(spy - geo.cy), spx - geo.cx)
+                        elif _sample_v(spx, spy, geo):
+                            votes["v"] += 1
+                inside = sum(votes.values())
+                if inside == 0:
+                    continue
+                coverage = inside / (ss * ss)
+                if coverage < (0.22 if alpha == "sharp" else 0.06):
+                    continue
+                kind = max(votes, key=votes.get)
+                py_frac = (spy - (geo.cy - geo.v_top)) / v_span
+                base, _d = _pixel_color_and_delay(kind, theta, py_frac, geo)
+                a = coverage ** (1.35 if alpha == "sharp" else 0.75)
+                out[(qx, qy)] = tuple(
+                    max(0, min(255, round(c * a))) for c in base
+                )
+        out = _prune_sparse_geometry(out)
+        # The + prey — the gap centre, same window transform, pure palette.
+        theta = _ang_norm(geo.gap_center)
+        px_p = geo.cx + geo.r_mid * math.cos(theta)
+        py_p = geo.cy - geo.r_mid * math.sin(theta)
+        qx0 = int((px_p - (cx_p - span / 2.0)) / px_pitch)
+        qy0 = int((py_p - (cy_p - span / 2.0)) / py_pitch)
+        arm = max(1, cells_w // 12)
+        for dx in range(-2 * arm, 2 * arm + 1):
+            for dy in range(-arm, arm + 1):
+                if not ((dy == 0 and abs(dx) <= 2 * arm) or (abs(dx) <= 1 and abs(dy) <= arm)):
+                    continue
+                k = (qx0 + dx, qy0 + dy)
+                if 0 <= k[0] < sub_w and 0 <= k[1] < sub_h:
+                    core = abs(dx) <= 1 and dy == 0
+                    out[k] = tuple(_EYE_RGB) if core else tuple(_V_TOP_RGB)
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 class MiniCrest:
-    """The header logo — EXACTLY the big emblem (operator mandate: "the small
-    logo must look exactly the same as the big logo"). Every prior approach
-    (geometry re-sample, downscale, quantize, hand sprite) produced a DIFFERENT
-    logo. The only thing that looks exactly like the big crest is the big
-    crest — so the mini IS the real CrestAnimator at the crest's own minimum
-    legible size (the 46-col quality floor the crest itself defines): same
-    sampler, same anti-aliasing, same physical head-chasing-the-prey rotation,
-    same disk-cached ring, merely smaller. Zero parallel pipelines. Animation
-    phase derives from the clock (stateless). Never raises."""
+    """The header logo — the REAL emblem, aspect-true and CC-sized. Frames come
+    from :func:`build_scaled_frame` (the crest's own samplers on an anisotropic
+    grid matched to the quadrant medium), packed 2x2 via the crest's _QUAD
+    table. Round, sharp, physically rotating, prey included. The ring builds in
+    ~1s off-loop (no disk cache needed). Clock-stateless animation."""
 
     def __init__(
         self,
@@ -672,90 +756,91 @@ class MiniCrest:
         source_cols: Optional[int] = None,     # API compat
         source_rows: Optional[int] = None,     # API compat
     ) -> None:
-        # The crest's own minimum width is the floor of faithfulness; +1 for
-        # the clamp's right-margin. Env-tunable upward for a larger header.
-        base = _env_int("JARVIS_CREST_MINI_COLS", 47, 47, 88)
-        want = max(base, (cols or 0) + 0)
         self._speed = speed_laps_per_s if speed_laps_per_s is not None else _env_float(
             "JARVIS_CREST_MINI_SPEED", 0.10, 0.01, 2.0,
         )
-        rows_need = _Geometry.rows_needed(max(46, want - 1)) + 3
-        # Adaptive fidelity: fewer pixels for the same geometry → MORE
-        # subsamples per pixel; and a firmer edge (the big one's 3px AA taper
-        # collapses to 1 fuzzy px at this scale).
-        mini_ss = ss if ss is not None else _env_int("JARVIS_CREST_MINI_SS", 5, 2, 6)
-        edge = os.environ.get("JARVIS_CREST_MINI_EDGE", "sharp").strip().lower()
-        self._big = CrestAnimator(
-            cols=want, rows=rows_need,
-            frame_count=frame_count, ss=mini_ss,
-            plus_lead_deg=None,
-            alpha_mode=edge if edge in ("aa", "sharp", "crisp") else "sharp",
+        self._cells_w = cols if cols is not None else _env_int(
+            "JARVIS_CREST_MINI_CELLS", 16, 10, 28,
         )
-        # Trim bounds from the RESTING raster (stable across the spin).
-        self._x0 = self._x1 = self._y0 = self._y1 = 0
-        if self._big.available:
-            base_px = self._big._base
-            xs = [x for (x, _py) in base_px]
-            pys = [py for (_x, py) in base_px]
-            pad = 1
-            self._x0, self._x1 = max(0, min(xs) - pad), max(xs) + pad
-            self._y0, self._y1 = max(0, min(pys) - pad), max(pys) + pad
+        self._ss_mini = ss if ss is not None else _env_int("JARVIS_CREST_MINI_SS", 4, 2, 6)
+        edge = os.environ.get("JARVIS_CREST_MINI_EDGE", "sharp").strip().lower()
+        self._edge = edge if edge in ("aa", "sharp", "crisp") else "sharp"
+        self._n = frame_count if frame_count is not None else _env_int(
+            "JARVIS_CREST_MINI_FRAMES", 24, 4, 48,
+        )
+        self._frames: List[Optional[dict]] = [None] * max(1, self._n)
+        f0 = build_scaled_frame(self._cells_w, 0.0, self._ss_mini, 0.0, self._edge)
+        if f0:
+            self._frames[0] = f0
+        self._built = 1 if f0 else 0
+        self._builder_started = False
 
     @property
     def available(self) -> bool:
-        return self._big.available
+        return self._built > 0
 
     @property
     def rows(self) -> int:
-        return max(1, (self._y1 - self._y0 + 2) // 2)
+        return max(1, self._cells_w // 2)
 
     @property
     def cols(self) -> int:
-        w = max(1, self._x1 - self._x0 + 1)
-        if os.environ.get("JARVIS_CREST_MINI_PACK", "quad").strip().lower() != "half":
-            w = (w + 1) // 2
-        return w
+        return self._cells_w
 
     async def ensure_frames(self) -> None:
-        """Complete the ring via the big animator's OWN builder + shared disk
-        cache (per-size key — the second boot animates instantly)."""
-        await self._big.ensure_frames()
+        """Fill the ring off-loop (~20-60ms/frame → ~1s total). Idempotent."""
+        import asyncio
+        if self._builder_started:
+            return
+        self._builder_started = True
+        for k in range(self._n):
+            if self._frames[k] is not None:
+                continue
+            rot = 2.0 * math.pi * k / self._n
+            f = await asyncio.to_thread(
+                build_scaled_frame, self._cells_w, rot, self._ss_mini,
+                _v_spin_mult() * rot, self._edge,
+            )
+            if f:
+                self._frames[k] = f
+                self._built = sum(1 for x in self._frames if x)
 
-    def _phase(self, now: Optional[float]) -> float:
+    def _frame_now(self, now: Optional[float] = None) -> Optional[dict]:
         import time as _time
+        if not self._frames:
+            return None
         t = _time.monotonic() if now is None else float(now)
-        return (t * self._speed) % 1.0
+        n = len(self._frames)
+        want = int(((t * self._speed) % 1.0) * n) % n
+        for off in range(n):
+            for idx in ((want - off) % n, (want + off) % n):
+                if self._frames[idx] is not None:
+                    return self._frames[idx]
+        return None
 
     def row_texts(self, now: Optional[float] = None) -> List[Any]:
-        """The real emblem frame + prey, QUADRANT-PACKED 2x2 (reusing the
-        crest's own _QUAD glyph table — DRY): every artwork pixel still renders
-        individually at DOUBLE density, so the logo is half the size and
-        sharper per cell — CC's footprint with the big emblem's anatomy.
-        JARVIS_CREST_MINI_PACK=half restores the half-block size. Never raises."""
+        """Quadrant-pack the aspect-true subgrid (crest's _QUAD table — DRY):
+        every subpixel renders individually at 2x horizontal density. Never
+        raises."""
         try:
             from rich.text import Text
             from .crest import _QUAD
         except Exception:  # noqa: BLE001
             return []
-        if not self.available:
+        pixels = self._frame_now(now)
+        if not pixels:
             return []
-        phase = self._phase(now)
-        pixels = dict(self._big._frame_for(phase))
-        try:
-            pixels.update(self._big.prey_pixels(phase))
-        except Exception:  # noqa: BLE001
-            pass
-        if os.environ.get("JARVIS_CREST_MINI_PACK", "quad").strip().lower() == "half":
-            return self._rows_halfblock(pixels)
+        sub_w, sub_h = 2 * self._cells_w, self._cells_w
         rows: List[Any] = []
-        for qy in range(self._y0 // 2, self._y1 // 2 + 1):
+        for cy in range(sub_h // 2):
             t = Text()
-            for qx_i, qx in enumerate(range(self._x0, self._x1 + 1, 2)):
+            qy = cy * 2
+            for qx in range(0, sub_w, 2):
                 subs = [
-                    pixels.get((qx, qy * 2)),          # TL
-                    pixels.get((qx + 1, qy * 2)),      # TR
-                    pixels.get((qx, qy * 2 + 1)),      # BL
-                    pixels.get((qx + 1, qy * 2 + 1)),  # BR
+                    pixels.get((qx, qy)),
+                    pixels.get((qx + 1, qy)),
+                    pixels.get((qx, qy + 1)),
+                    pixels.get((qx + 1, qy + 1)),
                 ]
                 bits = 0
                 lit = []
@@ -771,29 +856,6 @@ class MiniCrest:
                 g = sum(c[1] for c in lit) // n
                 b = sum(c[2] for c in lit) // n
                 t.append(_QUAD.get(bits, "█"), style=f"rgb({r},{g},{b})")
-            rows.append(t)
-        return rows
-
-    def _rows_halfblock(self, pixels: dict) -> List[Any]:
-        from rich.text import Text
-        rows: List[Any] = []
-        for cy in range(self._y0 // 2, self._y1 // 2 + 1):
-            t = Text()
-            for x in range(self._x0, self._x1 + 1):
-                top = pixels.get((x, cy * 2))
-                bot = pixels.get((x, cy * 2 + 1))
-                if top is None and bot is None:
-                    t.append(" ")
-                elif top is not None and bot is not None:
-                    tr, tg, tb = top
-                    br, bg, bb = bot
-                    t.append("▀", style=f"rgb({tr},{tg},{tb}) on rgb({br},{bg},{bb})")
-                elif top is not None:
-                    tr, tg, tb = top
-                    t.append("▀", style=f"rgb({tr},{tg},{tb})")
-                else:
-                    br, bg, bb = bot
-                    t.append("▄", style=f"rgb({br},{bg},{bb})")
             rows.append(t)
         return rows
 
