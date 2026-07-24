@@ -4354,6 +4354,34 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001 — supervisor is best-effort
             self._autonomous_supervisor = None
 
+    async def _attach_heartbeat_loop(self, bridge: Any) -> None:
+        """Publish the CC-style status pulse to attached cockpits on a
+        ~1s cadence (JARVIS_ATTACH_HEARTBEAT_S; 0 disables). Pure pull
+        over existing organs (StatusLineBuilder + ThinkingProgress
+        observer) — zero new state. NEVER raises; dies with shutdown."""
+        try:
+            from backend.core.ouroboros.battle_test.attach_heartbeat import (
+                build_heartbeat_payload,
+                heartbeat_interval_s,
+            )
+            while True:
+                interval = heartbeat_interval_s()
+                if interval <= 0:
+                    await asyncio.sleep(5.0)     # disabled — re-check knob
+                    continue
+                try:
+                    if getattr(bridge, "client_count", 0) > 0:
+                        payload = build_heartbeat_payload()
+                        if payload is not None:
+                            bridge.publish_telemetry(payload)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001
+            return
+
     # -- Cockpit Attach Bridge (CLI item #6) --------------------------------
 
     async def _start_cockpit_attach_bridge(self) -> None:
@@ -4463,6 +4491,26 @@ class BattleTestHarness:
             )
             if await bridge.start():
                 self._cockpit_attach_bridge = bridge
+                # Tool-activity mirror (2026-07-23): wire SerpentFlow's
+                # op-scoped render chokepoint to the bridge's typed
+                # markup channel — attached `ov` cockpits see the SAME
+                # CC-style ⏺/⎿ tool blocks + diffs the local console
+                # renders (composition layer escapes model content).
+                try:
+                    sf = getattr(self, "_serpent_flow", None)
+                    if sf is not None:
+                        sf.markup_mirror = bridge.publish_markup
+                except Exception:  # noqa: BLE001
+                    pass
+                # Attach heartbeat (2026-07-23): ~1s CC-style pulse
+                # (verb · elapsed · ↓ tokens · provider) published on
+                # the telemetry lane; publish_telemetry no-ops with
+                # zero clients so an unattached organism pays nothing.
+                try:
+                    self._attach_heartbeat_task = asyncio.get_running_loop(
+                    ).create_task(self._attach_heartbeat_loop(bridge))
+                except Exception:  # noqa: BLE001
+                    self._attach_heartbeat_task = None
                 # Hive Step 1: the harness IS the live pipeline host (16
                 # sensors + GovernedLoop run in THIS process), so `ov hive`
                 # must project from here too — the SAME read-only relay the
@@ -8337,6 +8385,13 @@ class BattleTestHarness:
             if _awe is not None:
                 await _awe.stop()
                 self._awe_trigger = None
+        except Exception:
+            pass
+        try:
+            _hb = getattr(self, "_attach_heartbeat_task", None)
+            if _hb is not None:
+                _hb.cancel()
+                self._attach_heartbeat_task = None
         except Exception:
             pass
         try:

@@ -23,6 +23,16 @@ import pytest
 from backend.core.ouroboros.cli import thin_client
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_incumbent(monkeypatch):
+    """Hermeticity: ensure_daemon consults the REPO's real single-flight
+    lock via _live_incumbent — a warm daemon on the dev machine would
+    flip the ghost-clean branch under the tests' feet. Default to no
+    incumbent; tests that want one re-patch inside their own body."""
+    monkeypatch.setattr(thin_client, "_live_incumbent", lambda: None)
+    yield
+
+
 def _serving_handler(reader, writer):
     """Mirror of the REAL CockpitAttachBridge accept path: hydration frame
     written immediately on connect. Closes its writer on exit — on Python
