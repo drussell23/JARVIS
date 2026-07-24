@@ -515,3 +515,46 @@ async def test_refusal_releases_the_lock_for_a_later_edge(db_path):
     )
     lock = read_soak_lock(sqlite3.connect(db_path))
     assert lock is not None and lock["claimed"] == 0, "refusal must free the lock"
+
+
+async def test_dirty_tree_distress_post_is_not_empty(db_path, monkeypatch):
+    """The distress post must actually SAY something.
+
+    Regression pin: moltbook's voice templates interpolate a single `{detail}`
+    key and compose() defaults it to "" — so a post built from any other fact
+    key renders as the content-free 'hit a wall: . regrouping.' The refusal
+    notice exists to tell the operator WHY, so an empty body is a silent
+    failure dressed as a feature."""
+    from backend.core.ouroboros.governance import awe_trigger as at
+    from backend.core.ouroboros.governance.moltbook_personas import compose
+
+    captured = {}
+
+    def _fake_nowait(author_id, kind, body=None, **kw):
+        captured["author"] = author_id
+        captured["kind"] = kind
+        captured["facts"] = kw.get("facts") or {}
+
+    import backend.core.ouroboros.governance.moltbook as mb
+    monkeypatch.setattr(mb, "post_molt_nowait", _fake_nowait)
+
+    async def fallback(run_id):
+        return "fallback-ran"
+
+    launch = at.build_manifest_aware_launch_fn(
+        db_factory=lambda: sqlite3.connect(db_path),
+        fallback_fn=fallback,
+        git_status_fn=lambda: [" M backend/core/ouroboros/governance/orchestrator.py"],
+    )
+    with pytest.raises(at.DirtyTreeRefusal):
+        await launch("run-distress")
+
+    assert captured["kind"] == "distress"
+    facts = captured["facts"]
+    assert "detail" in facts, "without `detail` the rendered post is empty"
+
+    # Render through the REAL composer — the actual contract, not a proxy.
+    body = compose(captured["author"], "distress", facts)
+    assert body.strip(), "distress post rendered empty"
+    assert "hit a wall: . regrouping." != body.strip()
+    assert "orchestrator.py" in body, "the post must name the offending dirt"

@@ -496,9 +496,16 @@ def build_manifest_aware_launch_fn(
                     )
                     post_molt_nowait(
                         "@first-responder", "distress",
+                        # `detail` is the key the persona voice templates
+                        # interpolate ({detail}); compose() defaults it to ""
+                        # so any other key renders as an EMPTY post. The
+                        # extra keys ride along for structured consumers.
                         facts={
-                            "what": "AWE refused the soak launch",
-                            "why": "working tree is dirty",
+                            "detail": (
+                                f"refused the soak launch — working tree dirty "
+                                f"({len(dirty)} path(s): {shown}). commit or "
+                                f"stash and the next recovery edge runs"
+                            ),
                             "dirty_count": len(dirty),
                             "sample": shown,
                             "run_id": run_id,
