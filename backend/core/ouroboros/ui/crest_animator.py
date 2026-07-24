@@ -173,6 +173,8 @@ def build_rotated_frame(
                     continue
                 py_frac = (py * _REF_ASPECT - (geo.cy - geo.v_top)) / v_span
                 base, _d = _pixel_color_and_delay(kind, theta, py_frac, geo)
+                if alpha == "sharp" and coverage < 0.22:
+                    continue
                 if alpha == "crisp":
                     # Hard pixel art (the CC-logo look): at tiny scales the
                     # coverage-alpha AA dims nearly EVERY pixel (all edges) into
@@ -183,7 +185,7 @@ def build_rotated_frame(
                         max(0, min(255, round(c))) for c in base
                     )
                 else:
-                    a = coverage ** 0.75
+                    a = coverage ** (1.35 if alpha == "sharp" else 0.75)
                     pixels[(x, py)] = tuple(
                         max(0, min(255, round(c * a))) for c in base
                     )
@@ -313,6 +315,7 @@ class CrestAnimator:
         log_lines: int = 6,
         frame_count: Optional[int] = None,
         ss: Optional[int] = None,
+        alpha_mode: str = "aa",
     ) -> None:
         # Size exactly like the static crest (same clamps + row fit).
         self._pf = generate_crest_pixels(cols, rows)
@@ -320,6 +323,9 @@ class CrestAnimator:
         self._rows = self._pf.rows if self._pf else 0
         self._n = frame_count if frame_count is not None else _frame_count_env()
         self._ss = ss if ss is not None else _anim_ss()
+        self._alpha_mode = alpha_mode if alpha_mode in ("aa", "sharp", "crisp") else "aa"
+        # mode-distinct cache namespace (ss+100 per non-aa mode) — zero schema change
+        self._cache_ss = self._ss if self._alpha_mode == "aa" else self._ss + 100
         self._plus_lead = math.radians(
             plus_lead_deg if plus_lead_deg is not None else _plus_lead_deg_env()
         )
@@ -370,7 +376,7 @@ class CrestAnimator:
                 rot = 2.0 * math.pi * k / self._n
                 frame = await asyncio.to_thread(
                     build_rotated_frame, self._cols, self._rows, rot, self._ss,
-                    _v_spin_mult() * rot,
+                    _v_spin_mult() * rot, self._alpha_mode,
                 )
                 if frame:
                     self._frames[k] = frame
@@ -384,7 +390,7 @@ class CrestAnimator:
                 # kept so tests (and shutdown paths) can join it.
                 self._save_thread = threading.Thread(
                     target=_save_cached_ring,
-                    args=(self._cols, self._rows, self._n, self._ss,
+                    args=(self._cols, self._rows, self._n, self._cache_ss,
                           [f for f in self._frames if f is not None]),
                     daemon=True,
                 )
@@ -674,10 +680,16 @@ class MiniCrest:
             "JARVIS_CREST_MINI_SPEED", 0.10, 0.01, 2.0,
         )
         rows_need = _Geometry.rows_needed(max(46, want - 1)) + 3
+        # Adaptive fidelity: fewer pixels for the same geometry → MORE
+        # subsamples per pixel; and a firmer edge (the big one's 3px AA taper
+        # collapses to 1 fuzzy px at this scale).
+        mini_ss = ss if ss is not None else _env_int("JARVIS_CREST_MINI_SS", 5, 2, 6)
+        edge = os.environ.get("JARVIS_CREST_MINI_EDGE", "sharp").strip().lower()
         self._big = CrestAnimator(
             cols=want, rows=rows_need,
-            frame_count=frame_count, ss=ss,
+            frame_count=frame_count, ss=mini_ss,
             plus_lead_deg=None,
+            alpha_mode=edge if edge in ("aa", "sharp", "crisp") else "sharp",
         )
         # Trim bounds from the RESTING raster (stable across the spin).
         self._x0 = self._x1 = self._y0 = self._y1 = 0
