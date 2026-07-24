@@ -711,7 +711,10 @@ class MiniCrest:
 
     @property
     def cols(self) -> int:
-        return max(1, self._x1 - self._x0 + 1)
+        w = max(1, self._x1 - self._x0 + 1)
+        if os.environ.get("JARVIS_CREST_MINI_PACK", "quad").strip().lower() != "half":
+            w = (w + 1) // 2
+        return w
 
     async def ensure_frames(self) -> None:
         """Complete the ring via the big animator's OWN builder + shared disk
@@ -724,10 +727,14 @@ class MiniCrest:
         return (t * self._speed) % 1.0
 
     def row_texts(self, now: Optional[float] = None) -> List[Any]:
-        """The real emblem frame + the real prey overlay, trimmed to the
-        artwork box — one Rich Text per cell row. Never raises."""
+        """The real emblem frame + prey, QUADRANT-PACKED 2x2 (reusing the
+        crest's own _QUAD glyph table — DRY): every artwork pixel still renders
+        individually at DOUBLE density, so the logo is half the size and
+        sharper per cell — CC's footprint with the big emblem's anatomy.
+        JARVIS_CREST_MINI_PACK=half restores the half-block size. Never raises."""
         try:
             from rich.text import Text
+            from .crest import _QUAD
         except Exception:  # noqa: BLE001
             return []
         if not self.available:
@@ -735,9 +742,40 @@ class MiniCrest:
         phase = self._phase(now)
         pixels = dict(self._big._frame_for(phase))
         try:
-            pixels.update(self._big.prey_pixels(phase))   # the + rides along
+            pixels.update(self._big.prey_pixels(phase))
         except Exception:  # noqa: BLE001
             pass
+        if os.environ.get("JARVIS_CREST_MINI_PACK", "quad").strip().lower() == "half":
+            return self._rows_halfblock(pixels)
+        rows: List[Any] = []
+        for qy in range(self._y0 // 2, self._y1 // 2 + 1):
+            t = Text()
+            for qx_i, qx in enumerate(range(self._x0, self._x1 + 1, 2)):
+                subs = [
+                    pixels.get((qx, qy * 2)),          # TL
+                    pixels.get((qx + 1, qy * 2)),      # TR
+                    pixels.get((qx, qy * 2 + 1)),      # BL
+                    pixels.get((qx + 1, qy * 2 + 1)),  # BR
+                ]
+                bits = 0
+                lit = []
+                for i, c in enumerate(subs):
+                    if c is not None:
+                        bits |= 1 << (3 - i)
+                        lit.append(c)
+                if not bits:
+                    t.append(" ")
+                    continue
+                n = len(lit)
+                r = sum(c[0] for c in lit) // n
+                g = sum(c[1] for c in lit) // n
+                b = sum(c[2] for c in lit) // n
+                t.append(_QUAD.get(bits, "█"), style=f"rgb({r},{g},{b})")
+            rows.append(t)
+        return rows
+
+    def _rows_halfblock(self, pixels: dict) -> List[Any]:
+        from rich.text import Text
         rows: List[Any] = []
         for cy in range(self._y0 // 2, self._y1 // 2 + 1):
             t = Text()
@@ -783,8 +821,9 @@ def render_cockpit_header(
         n_rows = max(len(crest_rows), len(text_rows))
         if n_rows == 0:
             return ""
-        # Vertically centre the text block beside the crest.
-        pad_top = max(0, (len(crest_rows) - len(text_rows)) // 2)
+        # Top-align the text beside the crest (the CC layout) with a
+        # 1-row optical inset.
+        pad_top = 1 if len(crest_rows) > len(text_rows) else 0
         crest_w = mini.cols if (mini is not None and crest_rows) else 0
         out = Text()
         for i in range(n_rows):

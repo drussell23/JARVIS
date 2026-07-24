@@ -216,7 +216,7 @@ def test_mini_is_the_real_emblem():
     mini = MiniCrest(frame_count=4, ss=1)
     assert mini.available
     assert isinstance(mini._big, CrestAnimator)          # literally the big one
-    assert 5 <= mini.rows <= 14 and 16 <= mini.cols <= 46
+    assert 5 <= mini.rows <= 14 and 8 <= mini.cols <= 46   # quad-packed width
     asyncio.run(mini.ensure_frames())
     a = "".join(getattr(r, "plain", "") for r in mini.row_texts(now=0.0))
     b_txt = mini.row_texts(now=5.0)
