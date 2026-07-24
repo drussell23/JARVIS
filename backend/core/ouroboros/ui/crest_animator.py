@@ -615,6 +615,36 @@ def build_animator(console: Any, *, plus_lead_deg: Optional[float] = None) -> Op
 # ---------------------------------------------------------------------------
 
 
+
+
+def _quant_palette() -> List[Tuple[int, int, int]]:
+    """The definitive quantization palette — the crest's OWN pure colors (DRY:
+    gradient stops + head + eye + V), never a hardcoded copy."""
+    from .crest import _EYE_RGB, _HEAD_RGB, _STOPS, _V_BOT_RGB, _V_TOP_RGB
+    pal = [tuple(c) for (_deg, c) in _STOPS]
+    pal += [tuple(_HEAD_RGB), tuple(_EYE_RGB), tuple(_V_TOP_RGB), tuple(_V_BOT_RGB)]
+    out: List[Tuple[int, int, int]] = []
+    for c in pal:
+        if c not in out:
+            out.append(c)
+    return out
+
+
+def _v_family() -> set:
+    from .crest import _V_BOT_RGB, _V_TOP_RGB
+    return {tuple(_V_TOP_RGB), tuple(_V_BOT_RGB)}
+
+
+def _snap(rgb: Tuple[float, float, float], pal: List[Tuple[int, int, int]]) -> Tuple[int, int, int]:
+    r, g, b = rgb
+    best, bd = pal[0], 1e18
+    for p in pal:
+        d = (p[0] - r) ** 2 + (p[1] - g) ** 2 + (p[2] - b) ** 2
+        if d < bd:
+            bd, best = d, p
+    return best
+
+
 class MiniCrest:
     """The header logo — the BIG crest's artwork, downsampled (root cause of the
     old blob: re-sampling the vector geometry at ~20 columns is below the
@@ -688,9 +718,19 @@ class MiniCrest:
     # -- the downscaler (box filter, lit-only average → full intensity) --
 
     def _downsample(self, src: dict) -> dict:
+        """The Hard-Edge Vector Quantizer (operator mandate): terminals have no
+        true opacity, so averaging/premultiplied blending renders transition
+        colors as LITERAL mud. Instead: (1) binary alpha threshold — box
+        coverage ≥ 0.4 → 100% visible, else dropped, ZERO feathering; (2) strict
+        palette clamping — every visible cell SNAPS to the nearest pure color of
+        the crest's own palette (no blends, no dimming); (3) feature-preserving
+        bias — V-family cells threshold at 0.15 and dilate 1 cell so the V never
+        collapses between grid coordinates at micro scale. Pure; never raises."""
         try:
             if not src:
                 return {}
+            pal = _quant_palette()
+            vfam = _v_family()
             xs = [x for (x, _py) in src]
             pys = [py for (_x, py) in src]
             x0, x1 = min(xs), max(xs)
@@ -699,34 +739,44 @@ class MiniCrest:
             dst_w = max(4, self._target)
             dst_h = max(4, round(dst_w * h / max(1, w)))
             sx, sy = w / dst_w, h / dst_h
-            out: dict = {}
+            cover: dict = {}
+            vcover: dict = {}
+            color: dict = {}
             for my in range(dst_h):
                 for mx in range(dst_w):
-                    bx0 = x0 + mx * sx
-                    by0 = y0 + my * sy
-                    bx1 = x0 + (mx + 1) * sx
-                    by1 = y0 + (my + 1) * sy
+                    bx0, by0 = x0 + mx * sx, y0 + my * sy
+                    bx1, by1 = x0 + (mx + 1) * sx, y0 + (my + 1) * sy
                     lit = []
                     for px in range(int(bx0), max(int(bx0) + 1, int(math.ceil(bx1)))):
                         for py in range(int(by0), max(int(by0) + 1, int(math.ceil(by1)))):
                             c = src.get((px, py))
-                            if c is not None:
+                            if c is not None and max(c) > 40:   # ignore AA fringe
                                 lit.append(c)
-                    area = max(1.0, (math.ceil(bx1) - int(bx0)) * (math.ceil(by1) - int(by0)))
                     if not lit:
                         continue
-                    # TRUE premultiplied compositing (the crisp fix): the big
-                    # frames carry coverage-alpha BAKED into their colors, so
-                    # the correct thumbnail is sum/AREA — interiors stay full-
-                    # bright, edges taper exactly like the big emblem's own AA.
-                    # (Lit-only averaging un-premultiplied the edges → bloat.)
-                    boost = 1.18                      # counter box-filter loss
-                    r = min(255, round(sum(c[0] for c in lit) / area * boost))
-                    g = min(255, round(sum(c[1] for c in lit) / area * boost))
-                    b = min(255, round(sum(c[2] for c in lit) / area * boost))
-                    if max(r, g, b) < 16:             # crumb cutoff — no fuzz halo
-                        continue
-                    out[(mx, my)] = (r, g, b)
+                    area = max(1.0, (math.ceil(bx1) - int(bx0)) * (math.ceil(by1) - int(by0)))
+                    n = len(lit)
+                    avg = (sum(c[0] for c in lit) / n, sum(c[1] for c in lit) / n,
+                           sum(c[2] for c in lit) / n)
+                    snapped = _snap(avg, pal)
+                    cover[(mx, my)] = n / area
+                    color[(mx, my)] = snapped
+                    if snapped in vfam:
+                        vcover[(mx, my)] = n / area
+            out: dict = {}
+            for k, cv in cover.items():
+                thresh = 0.15 if k in vcover else 0.4   # V bias — never collapses
+                if cv >= thresh:
+                    out[k] = color[k]
+            # 1-cell V dilation: a V cell pulls in 4-neighbours that carry ANY
+            # V coverage — guaranteed feature continuity at micro scale.
+            for (mx, my), cv in list(vcover.items()):
+                if (mx, my) not in out:
+                    continue
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nk = (mx + dx, my + dy)
+                    if nk not in out and vcover.get(nk, 0.0) > 0.05:
+                        out[nk] = color[nk]
             return out
         except Exception:  # noqa: BLE001
             return {}

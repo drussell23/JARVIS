@@ -282,3 +282,30 @@ def test_app_constructs_with_header():
         header_height=3,
     )
     assert app is not None and app.full_screen is True
+
+
+def test_quantizer_zero_out_of_palette_pixels():
+    """Hard-Edge Vector Quantizer mandate: every rendered mini pixel is a PURE
+    member of the crest's own palette — zero blends, zero dimmed transitions."""
+    from backend.core.ouroboros.ui.crest_animator import MiniCrest, _quant_palette
+    mini = MiniCrest(cols=16, frame_count=4, ss=1, source_cols=60, source_rows=24)
+    asyncio.run(mini.ensure_frames())
+    pal = set(_quant_palette())
+    for f in mini._frames:
+        if not f:
+            continue
+        offenders = [rgb for rgb in f.values() if tuple(rgb) not in pal]
+        assert offenders == [], f"blended colors leaked: {offenders[:4]}"
+
+
+def test_quantizer_v_survives_micro_scale():
+    """Feature-preserving dilation: the V-family purple is present in EVERY
+    frame at 16 cols — the V never collapses between grid coordinates."""
+    from backend.core.ouroboros.ui.crest_animator import MiniCrest, _v_family
+    mini = MiniCrest(cols=16, frame_count=4, ss=1, source_cols=60, source_rows=24)
+    asyncio.run(mini.ensure_frames())
+    vfam = _v_family()
+    for f in mini._frames:
+        if not f:
+            continue
+        assert any(tuple(rgb) in vfam for rgb in f.values()), "V vanished"
