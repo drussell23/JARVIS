@@ -133,9 +133,25 @@ def _generic_formatter(payload: dict) -> str:
     return " ".join(parts)
 
 
-_GLYPH_BY_SEV = {SEV_CRITICAL: "✖", SEV_IMPORTANT: "▲", SEV_INFO: "·", SEV_VERBOSE: "·"}
-_COLOR_BY_SEV = {SEV_CRITICAL: "red", SEV_IMPORTANT: "yellow",
-                 SEV_INFO: "cyan", SEV_VERBOSE: "bright_black"}
+# DRY (Style Guide §05): the severity → glyph/color mapping is defined exactly
+# ONCE, in the Reactive Theme Singleton. This registry imports it — zero
+# duplicate color/glyph literals. The theme resolves the color per terminal
+# tier (truecolor → 256 → 16 → stripped); we ask for the active tier here.
+try:
+    from backend.core.ouroboros.ui.theme import (
+        SEVERITY_GLYPH as _GLYPH_BY_SEV,
+        severity_style as _theme_severity_style,
+    )
+
+    def _color_for_sev(sev: int) -> str:
+        return _theme_severity_style(sev)
+except Exception:  # noqa: BLE001 — theme is a soft dep; degrade to a local echo
+    _GLYPH_BY_SEV = {SEV_CRITICAL: "✖", SEV_IMPORTANT: "▲", SEV_INFO: "·", SEV_VERBOSE: "·"}
+    _FALLBACK_COLOR = {SEV_CRITICAL: "red", SEV_IMPORTANT: "yellow",
+                       SEV_INFO: "cyan", SEV_VERBOSE: "bright_black"}
+
+    def _color_for_sev(sev: int) -> str:
+        return _FALLBACK_COLOR.get(sev, "cyan")
 
 
 class EventBreadcrumbRegistry:
@@ -165,7 +181,7 @@ class EventBreadcrumbRegistry:
         sev = _heuristic_severity(event_type)
         return BreadcrumbDescriptor(
             event_type=event_type, glyph=_GLYPH_BY_SEV[sev],
-            color=_COLOR_BY_SEV[sev], severity=sev,
+            color=_color_for_sev(sev), severity=sev,
             formatter=_generic_formatter, category=_heuristic_category(event_type),
         )
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 import enum
 import logging
 import os
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
 
 from rich.console import Console
 from rich.theme import Theme
@@ -250,6 +250,14 @@ _GLYPHS: Mapping[str, tuple] = {
     "human": ("🗣", "you:"),  # the operator's words echoed
     "warn": ("⚠", "!"),     # operator-notable degradation
     "audio": ("🎙", "mic"),  # live audio-plane state
+    # Style Guide §04 glyph grammar — the proactive-cockpit vocabulary. Each maps
+    # to ONE meaning across the whole organism; ASCII degradation keeps geometry.
+    "ignite": ("⚡", "!"),   # a high-energy autonomous fire (AWE launch)
+    "tick": ("◈", "+"),     # one unit of map-reduce progress (chunk commit)
+    "cycle": ("↻", "~"),    # resume / restart / self-heal
+    "poison": ("☠", "X"),   # quarantined / dead-lettered (DLQ)
+    "state_on": ("◆", "#"),  # a lifecycle transition took hold (armed)
+    "state_off": ("◇", "o"),  # a lifecycle stood down (disarmed)
 }
 
 
@@ -395,20 +403,260 @@ def render_rule(console: Console, label: Optional[str] = None) -> None:
             pass
 
 
+# ===========================================================================
+# Style Guide palette + severity ladder (OV_STYLE_GUIDE.md §02, §05)
+#
+# The DEFINITIVE palette lives here as truecolor hex — the single source of
+# truth the /breadcrumbs registry imports (DRY mandate: zero duplicate color or
+# glyph literals anywhere else). Every value degrades across the same four tiers
+# as the semantic tokens above.
+# ===========================================================================
+
+
+#: Named brand + semantic hexes (truecolor). Retune the whole CLI from here.
+PALETTE: Mapping[str, str] = {
+    "ground": "#0A0E0D", "surface": "#111917", "hairline": "#1E2B28",
+    "ink": "#DBE6E1", "muted": "#6C7D77", "faint": "#47554F",
+    "venom_green": "#5EE06A", "venom_purple": "#A371F7", "cyan": "#43D6D0",
+    "crit": "#F85149", "warn": "#E3B341", "info": "#58B0F8", "ok": "#3FB950",
+}
+
+
+# Severity rank → (glyph name, semantic style) — the "derive, don't pick" table.
+# Ranks mirror event_breadcrumb_registry SEV_* (0 verbose … 3 critical). The
+# registry imports SEVERITY_GLYPH / severity_style from here so the mapping is
+# defined exactly ONCE.
+SEVERITY_GLYPH: Mapping[int, str] = {3: "✖", 2: "▲", 1: "·", 0: "·"}
+
+_SEVERITY_STYLE_TRUE: Mapping[int, str] = {
+    3: "bold #F85149", 2: "#E3B341", 1: "#58B0F8", 0: "#6C7D77",
+}
+_SEVERITY_STYLE_C256: Mapping[int, str] = {
+    3: "bold red", 2: "yellow", 1: "color(75)", 0: "grey50",
+}
+_SEVERITY_STYLE_STD: Mapping[int, str] = {
+    3: "bold red", 2: "yellow", 1: "cyan", 0: "bright_black",
+}
+
+
+def severity_style(rank: int, tier: Optional[ColorTier] = None) -> str:
+    """Resolve a severity rank (0–3) to a concrete Rich style for the active (or
+    given) tier — truecolor hex → 256 → 16-color → stripped. NEVER raises."""
+    t = tier if tier is not None else active_tier()
+    try:
+        r = int(rank)
+    except (TypeError, ValueError):
+        r = 1
+    if t >= ColorTier.TRUECOLOR:
+        return _SEVERITY_STYLE_TRUE.get(r, _SEVERITY_STYLE_TRUE[1])
+    if t == ColorTier.C256:
+        return _SEVERITY_STYLE_C256.get(r, _SEVERITY_STYLE_C256[1])
+    if t == ColorTier.STANDARD:
+        return _SEVERITY_STYLE_STD.get(r, _SEVERITY_STYLE_STD[1])
+    return ""  # NONE tier — no color
+
+
+# Named semantic colors the registry references for its tailored per-event
+# overrides (e.g. a CRITICAL-urgent AWE launch styled venom-green, not red).
+# Values are tier-resolved so a descriptor never carries a raw literal.
+_SEMANTIC_TRUE: Mapping[str, str] = {
+    "crit": "#F85149", "crit_bold": "bold #F85149", "warn": "#E3B341",
+    "info": "#58B0F8", "verbose": "#6C7D77", "muted": "#6C7D77",
+    "ok": "#3FB950", "ok_bold": "bold #5EE06A", "venom_green": "#5EE06A",
+    "venom_purple": "#A371F7", "cyan": "#43D6D0", "cyan_bold": "bold #43D6D0",
+}
+_SEMANTIC_STD: Mapping[str, str] = {
+    "crit": "red", "crit_bold": "bold red", "warn": "yellow",
+    "info": "cyan", "verbose": "bright_black", "muted": "dim",
+    "ok": "green", "ok_bold": "bold green", "venom_green": "green",
+    "venom_purple": "magenta", "cyan": "cyan", "cyan_bold": "bold cyan",
+}
+
+
+def semantic(name: str, tier: Optional[ColorTier] = None) -> str:
+    """Resolve a named semantic color to a concrete Rich style for the tier.
+    Truecolor → hex; standard/256 → the 8/16-color ANSI equivalent; NONE → "".
+    An unknown name degrades to muted. NEVER raises."""
+    t = tier if tier is not None else active_tier()
+    if t <= ColorTier.NONE:
+        return ""
+    table = _SEMANTIC_TRUE if t >= ColorTier.C256 else _SEMANTIC_STD
+    return table.get(name, table.get("muted", ""))
+
+
+# ===========================================================================
+# The Reactive Theme Singleton (OV_STYLE_GUIDE.md §06 — State-Reactive border)
+#
+# A state-aware, in-memory-mutable palette. The organism is PROACTIVE; this glass
+# is REACTIVE — a broker state-transition mutates the active accent + fires the
+# registered invalidate hooks (a lightweight in-place redraw), NEVER a teardown /
+# rebuild of the prompt_toolkit Application. Decoupled from any Application: the
+# app REGISTERS its invalidate; the theme calls it. Fully headless-testable.
+# ===========================================================================
+
+
+class UIState(str, enum.Enum):
+    """The organism's meta-state, as reflected by the cockpit's accent."""
+    DORMANT = "DORMANT"     # idle / disarmed
+    ARMED = "ARMED"         # Supervisor armed, watching
+    SOAKING = "SOAKING"     # a checkpointed swarm soak is running
+    DEGRADED = "DEGRADED"   # a provider's inference lane is down
+    HEALTHY = "HEALTHY"     # a provider recovered / live
+
+
+# UIState → semantic color name (resolved per-tier via semantic()).
+_STATE_ACCENT: Mapping[UIState, str] = {
+    UIState.DORMANT: "muted",
+    UIState.ARMED: "warn",          # amber
+    UIState.SOAKING: "venom_green",
+    UIState.DEGRADED: "crit",       # red
+    UIState.HEALTHY: "cyan",
+}
+
+
+# event_type (+ payload) → UIState. The reactive mapping; feeding ANY of these
+# events to on_event mutates the active accent.
+def _state_for_event(event_type: str, payload: dict) -> Optional[UIState]:
+    et = (event_type or "").strip()
+    if et == "provider_state_changed":
+        st = str((payload or {}).get("state", "")).upper()
+        if st == "DEGRADED":
+            return UIState.DEGRADED
+        if st == "HEALTHY":
+            return UIState.HEALTHY
+        return None
+    if et in ("supervisor_armed",):
+        return UIState.ARMED
+    if et in ("supervisor_disarmed",):
+        return UIState.DORMANT
+    if et in ("awe_soak_launched", "soak_resumed", "soak_chunk_committed",
+              "soak_manifest_enqueued"):
+        return UIState.SOAKING
+    if et in ("awe_soak_complete", "soak_run_complete"):
+        return UIState.HEALTHY
+    return None
+
+
+class ReactiveTheme:
+    """The mutable, state-aware accent + a set of invalidate hooks. Thread-safe
+    for the register/notify path. NEVER raises into a render or event path."""
+
+    def __init__(self, *, initial: UIState = UIState.DORMANT) -> None:
+        import threading
+        self._state: UIState = initial
+        self._lock = threading.Lock()
+        self._invalidators: list = []
+        self._transitions: int = 0
+
+    # -- state -----------------------------------------------------------
+
+    @property
+    def state(self) -> UIState:
+        return self._state
+
+    @property
+    def transitions(self) -> int:
+        return self._transitions
+
+    def active_border_style(self, tier: Optional[ColorTier] = None) -> str:
+        """The current border/accent as a concrete Rich style for the tier —
+        the property the canvas reads each render. NEVER raises."""
+        try:
+            name = _STATE_ACCENT.get(self._state, "cyan")
+            return semantic(name, tier)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def set_state(self, state: UIState) -> bool:
+        """Set the meta-state. On a genuine transition, mutate in place and fire
+        the invalidate hooks (a lightweight redraw — NO Application rebuild).
+        Returns True iff the state actually changed. NEVER raises."""
+        with self._lock:
+            if state == self._state:
+                return False
+            self._state = state
+            self._transitions += 1
+            hooks = list(self._invalidators)
+        for fn in hooks:
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 — a bad hook never blocks a transition
+                logger.debug("[theme] invalidate hook raised", exc_info=True)
+        return True
+
+    def on_event(self, event_type: str, payload: Optional[dict] = None) -> bool:
+        """Consume a broker event; if it maps to a meta-state, transition (which
+        invalidates). Returns whether the accent changed. NEVER raises."""
+        try:
+            st = _state_for_event(event_type, payload or {})
+        except Exception:  # noqa: BLE001
+            st = None
+        if st is None:
+            return False
+        return self.set_state(st)
+
+    # -- invalidate hooks (decoupled from the Application) --------------
+
+    def register_invalidate(self, fn) -> "Callable[[], None]":
+        """Register a zero-arg redraw callback (e.g. ``app.invalidate``). Returns
+        an unregister thunk. The theme holds NO reference to the Application
+        itself — only this callable — so it is fully decoupled. NEVER raises."""
+        with self._lock:
+            self._invalidators.append(fn)
+
+        def _unregister() -> None:
+            with self._lock:
+                try:
+                    self._invalidators.remove(fn)
+                except ValueError:
+                    pass
+        return _unregister
+
+    def clear_invalidators(self) -> None:
+        with self._lock:
+            self._invalidators.clear()
+
+
+_reactive_theme: Optional[ReactiveTheme] = None
+
+
+def get_reactive_theme() -> ReactiveTheme:
+    """Process-local singleton — the ONE reactive accent shared by the broker
+    listeners (writers) and the canvas / Application (reader + invalidate)."""
+    global _reactive_theme
+    if _reactive_theme is None:
+        _reactive_theme = ReactiveTheme()
+    return _reactive_theme
+
+
+def reset_reactive_theme() -> None:
+    """Test isolation — drop the singleton so a fresh one is built."""
+    global _reactive_theme
+    _reactive_theme = None
+
+
 __all__ = [
     "ACCENT_HEX",
     "FORCE_TIER_ENV_VAR",
+    "PALETTE",
+    "SEVERITY_GLYPH",
     "ColorTier",
+    "ReactiveTheme",
     "Token",
+    "UIState",
     "active_tier",
     "box_for",
     "build_console",
     "detect_tier",
     "ensure_theme",
+    "get_reactive_theme",
     "mark",
     "render_panel",
     "render_rule",
     "reset_active_tier_cache",
+    "reset_reactive_theme",
+    "semantic",
+    "severity_style",
     "style_for",
     "styles",
     "supports_unicode",

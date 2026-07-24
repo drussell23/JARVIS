@@ -109,6 +109,13 @@ class BipartiteLayout:
             self._buffer.push(f"[{color}]{glyph} {text}[/{color}]")
         except Exception:  # noqa: BLE001 — a bad event never breaks the canvas
             logger.debug("[Bipartite] emit failed", exc_info=True)
+        # Feed the Reactive Theme Singleton — a state-mapped event mutates the
+        # canvas border accent in place (DORMANT/ARMED/SOAKING/DEGRADED/HEALTHY).
+        try:
+            from backend.core.ouroboros.ui.theme import get_reactive_theme
+            get_reactive_theme().on_event(event_type, dict(payload or {}))
+        except Exception:  # noqa: BLE001
+            pass
         self._invalidate_now()
 
     async def aemit(self, event_type: str, payload: dict) -> None:
@@ -152,10 +159,18 @@ class BipartiteLayout:
                 "  idle — waiting for the organism to act", style="bright_black"
             )
             n = self._buffer.line_count if hasattr(self._buffer, "line_count") else len(lines)
+            # State-reactive border (Style Guide §06): the accent reflects the
+            # organism's meta-state, mutated in place by the Reactive Theme.
+            border = "cyan"
+            try:
+                from backend.core.ouroboros.ui.theme import get_reactive_theme
+                border = get_reactive_theme().active_border_style() or "cyan"
+            except Exception:  # noqa: BLE001
+                border = "cyan"
             return Panel(
                 body, title=self._title, title_align="left",
                 subtitle=f"[bright_black]{n} events[/bright_black]", subtitle_align="right",
-                box=ROUNDED, border_style="cyan", padding=(0, 1),
+                box=ROUNDED, border_style=border, padding=(0, 1),
                 height=max(3, self._height - 3),
             )
         except Exception:  # noqa: BLE001
@@ -387,6 +402,14 @@ def build_bipartite_application(
     )
     _APP_REF["app"] = app
     mux.set_invalidate(app.invalidate)
+    # Register the app's invalidate with the Reactive Theme so a state transition
+    # (DORMANT→ARMED→SOAKING→DEGRADED→HEALTHY) repaints the border IN PLACE — no
+    # Application teardown/rebuild (zero-flicker mandate).
+    try:
+        from backend.core.ouroboros.ui.theme import get_reactive_theme
+        get_reactive_theme().register_invalidate(app.invalidate)
+    except Exception:  # noqa: BLE001
+        pass
     return app
 
 
