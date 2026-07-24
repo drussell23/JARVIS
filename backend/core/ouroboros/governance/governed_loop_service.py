@@ -5603,6 +5603,27 @@ class GovernedLoopService:
                 "[GovernedLoop] ExecutionGraphProgressTracker wired (enabled=%s)",
                 self._execution_graph_tracker.stats().get("enabled"),
             )
+            # Cockpit visibility (2026-07-24): start the tracker→broker
+            # forwarder that was built "for the orchestrator's eventual
+            # integration" and never called — the wired-but-inert trap.
+            # With it running, L3 execution-graph lifecycle surfaces on
+            # the canonical broker → mirrored breadcrumb router → every
+            # attached ov cockpit. Fail-soft; master
+            # JARVIS_EXEC_GRAPH_BRIDGE_ENABLED (default true).
+            try:
+                from backend.core.ouroboros.governance.execution_graph_progress_bridge import (  # noqa: E501
+                    start_default_bridge,
+                )
+                _egb_task = start_default_bridge()
+                logger.info(
+                    "[GovernedLoop] ExecutionGraphProgressBridge %s",
+                    "started" if _egb_task is not None else "not started (gated/no-loop)",
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[GovernedLoop] ExecutionGraphProgressBridge start failed",
+                    exc_info=True,
+                )
 
             self._subagent_scheduler = SubagentScheduler(
                 store=ExecutionGraphStore(self._config.execution_graph_state_dir),

@@ -295,6 +295,23 @@ def build_default_registry() -> EventBreadcrumbRegistry:
                                        f"backoff {p.get('backoff_s','?')}s): {p.get('reason','')}", "supervisor"),
         BreadcrumbDescriptor("sentinel_telemetry", "·", "bright_black", SEV_VERBOSE,
                              lambda p: str(p.get("line", "")).strip(), "supervisor"),
+        BreadcrumbDescriptor("swarm_scatter", "⚡", "magenta bold", SEV_IMPORTANT,
+                             lambda p: f"swarm scatter — {p.get('agents','?')} super agents on "
+                                       f"{str(p.get('file','?')).rsplit('/',1)[-1]} "
+                                       f"(≤{p.get('max_concurrency','?')} in flight)", "swarm"),
+        BreadcrumbDescriptor("swarm_stitched", "◈", "magenta", SEV_IMPORTANT,
+                             lambda p: f"swarm stitched {str(p.get('file','?')).rsplit('/',1)[-1]} — "
+                                       f"{p.get('succeeded','?')} ok / {p.get('failed','?')} failed "
+                                       f"(peak {p.get('max_in_flight','?')} agents)", "swarm"),
+        BreadcrumbDescriptor("worker_op_claimed", "⏺", "cyan", SEV_INFO,
+                             lambda p: f"worker {p.get('worker_id','?')} claimed op "
+                                       f"(queue {p.get('queue_depth','?')}) — "
+                                       f"{str(p.get('goal',''))[:48]}", "pool"),
+        BreadcrumbDescriptor("execution_graph_progress", "🕸", "cyan", SEV_IMPORTANT,
+                             lambda p: f"L3 graph {str(p.get('graph_id',''))[:10]} — "
+                                       f"{p.get('kind', p.get('event',''))} "
+                                       f"{str(p.get('unit_id',''))[:12]} "
+                                       f"({p.get('done','?')}/{p.get('total','?')})", "l3"),
         BreadcrumbDescriptor("soak_manifest_enqueued", "⚑", "cyan bold", SEV_IMPORTANT,
                              lambda p: f"soak queued {str(p.get('intent_id',''))[:12]} — "
                                        f"{p.get('chunk_count','?')} chunks", "soak"),

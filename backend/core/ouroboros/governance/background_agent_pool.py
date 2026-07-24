@@ -1151,6 +1151,26 @@ class BackgroundAgentPool:
                 op.started_at = time.monotonic()
                 op.task = asyncio.current_task()
 
+                # Cockpit visibility (2026-07-24): worker pickup on the
+                # canonical broker — the mirrored breadcrumb router shows
+                # "worker N claimed op X (queue depth D)" in attached ov
+                # terminals. Same seam as checkpoint_manifest._emit_event.
+                try:
+                    from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                        publish_task_event,
+                    )
+                    publish_task_event(
+                        "worker_op_claimed",
+                        str(getattr(op, "op_id", "") or ""),
+                        {
+                            "worker_id": worker_id,
+                            "queue_depth": self._queue.qsize(),
+                            "goal": str(getattr(op, "goal", ""))[:80],
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
                 logger.info(
                     "Worker %d picked up operation %s (goal=%r)",
                     worker_id,

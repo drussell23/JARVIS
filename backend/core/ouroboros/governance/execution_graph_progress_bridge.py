@@ -154,14 +154,17 @@ DEFAULT_EMIT_KINDS: FrozenSet[str] = frozenset({
 
 def master_enabled() -> bool:
     """``JARVIS_EXEC_GRAPH_BRIDGE_ENABLED`` master switch.
-    Default-FALSE per §33.1: when OFF, :func:`record_graph_event`
-    is a no-op + :func:`start_default_bridge` returns None
-    immediately. NEVER raises."""
+    Default-TRUE (graduated 2026-07-24 with the cockpit agentic-
+    visibility slice — observability-only, zero authority; the bridge
+    was built default-FALSE per §33.1 but never wired; it now starts
+    at GLS boot so L3 worktree-subagent graphs surface in attached
+    cockpits). OFF → :func:`record_graph_event` is a no-op +
+    :func:`start_default_bridge` returns None. NEVER raises."""
     raw = os.environ.get(
         "JARVIS_EXEC_GRAPH_BRIDGE_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True
     return raw in _TRUTHY
 
 
