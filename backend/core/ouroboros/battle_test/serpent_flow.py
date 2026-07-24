@@ -5419,6 +5419,45 @@ class SerpentREPL:
         no bottom_toolbar, no refresh_interval, no fixed terminal
         regions. Matches Claude Code's flowing terminal UX.
         """
+        # Bipartite Async Layout — the framed cockpit is the DEFAULT entry point.
+        # On a real TTY the full-screen Zone 1/Zone 2 app replaces this flowing
+        # loop, with the Ouroboros chase as the DORMANT hero. on_accept reuses
+        # self._dispatch_repl_command (DRY). ANY failure falls through to the
+        # legacy loop below — the cockpit can NEVER brick the REPL. Kill-switch:
+        # JARVIS_BIPARTITE_LAYOUT_DISABLED=1.
+        try:
+            from backend.core.ouroboros.battle_test.bipartite_layout import (
+                get_active_canvas,
+                run_bipartite_repl,
+                should_run_bipartite,
+            )
+            if should_run_bipartite():
+                import asyncio as _aio
+
+                def _on_accept(text: str) -> None:
+                    _aio.ensure_future(
+                        self._dispatch_repl_command((text or "").strip())
+                    )
+
+                async def _attach_sprite_when_ready() -> None:
+                    from backend.core.ouroboros.battle_test.sprite_engine import (
+                        OuroborosSprite,
+                    )
+                    sprite = OuroborosSprite()
+                    for _ in range(50):
+                        canvas = get_active_canvas()
+                        if canvas is not None:
+                            canvas.attach_sprite(sprite)
+                            sprite.start()
+                            return
+                        await _aio.sleep(0.02)
+
+                _aio.ensure_future(_attach_sprite_when_ready())
+                await run_bipartite_repl(on_accept=_on_accept)
+                return
+        except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL
+            pass  # fall through to the legacy flowing loop below
+
         try:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.formatted_text import HTML

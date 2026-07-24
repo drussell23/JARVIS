@@ -40,10 +40,17 @@ _DEFAULT_MAX_LINES = 500
 
 
 def bipartite_enabled() -> bool:
-    """Master gate ``JARVIS_BIPARTITE_LAYOUT_ENABLED`` (default OFF — the framed
-    full-screen mode is opt-in; enabling it also requires a real TTY)."""
+    """The framed cockpit is now the DEFAULT entry point (opt-in flag removed).
+    A dedicated KILL-SWITCH remains for safety — ``JARVIS_BIPARTITE_LAYOUT_DISABLED``
+    (or ``JARVIS_BIPARTITE_LAYOUT_ENABLED=0``) instantly reverts to the legacy
+    flowing loop, since the full-screen app can't be compile-tested headless.
+    Enabling still requires a real TTY (see :func:`should_run_bipartite`)."""
+    if os.environ.get("JARVIS_BIPARTITE_LAYOUT_DISABLED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        return False
     return os.environ.get(
-        "JARVIS_BIPARTITE_LAYOUT_ENABLED", "false",
+        "JARVIS_BIPARTITE_LAYOUT_ENABLED", "true",   # default ON — the cockpit
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -80,6 +87,34 @@ class BipartiteLayout:
         self._invalidate = invalidate
         self._title = title
         self._resize_count = 0
+        self._sprite: Any = None            # the DORMANT/WAKING hero animation
+
+    # -- the Ouroboros hero animation -----------------------------------
+
+    def attach_sprite(self, sprite: Any) -> None:
+        """Attach the Async Sprite Engine and hang its frame advance on THIS
+        canvas's invalidate (DRY — the same hook the ReactiveTheme uses; one
+        rendering pipeline). The animated logo is shown while the feed is idle."""
+        self._sprite = sprite
+        try:
+            if sprite is not None and self._invalidate is not None:
+                sprite.set_invalidate(self._invalidate)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _hero_active(self) -> bool:
+        """Show the animated logo when nothing has happened yet — the DORMANT /
+        WAKING centrepiece — and hand the canvas to the feed the instant real
+        telemetry arrives."""
+        if self._sprite is None:
+            return False
+        try:
+            if self.line_count() > 0:
+                return False
+            from backend.core.ouroboros.ui.theme import get_reactive_theme, UIState
+            return get_reactive_theme().state in (UIState.DORMANT, UIState.HEALTHY)
+        except Exception:  # noqa: BLE001
+            return self.line_count() == 0
 
     # -- registry (lazy, DRY) -------------------------------------------
 
@@ -155,9 +190,19 @@ class BipartiteLayout:
             from rich.box import ROUNDED
 
             lines = self._visible_lines()
-            body = Group(*[Text.from_markup(ln) for ln in lines]) if lines else Text(
-                "  idle — waiting for the organism to act", style="bright_black"
-            )
+            # DORMANT/WAKING hero: the animated Ouroboros chase is the centrepiece
+            # until real telemetry arrives, then the feed takes over.
+            if self._hero_active():
+                try:
+                    frame = self._sprite.current_frame()
+                    body = Group(frame, Text("\n  the organism rests — awaiting intent",
+                                             style="bright_black", justify="center"))
+                except Exception:  # noqa: BLE001
+                    body = Text("  O + V", style="bold #5EE06A", justify="center")
+            elif lines:
+                body = Group(*[Text.from_markup(ln) for ln in lines])
+            else:
+                body = Text("  idle — waiting for the organism to act", style="bright_black")
             n = self._buffer.line_count if hasattr(self._buffer, "line_count") else len(lines)
             # State-reactive border (Style Guide §06): the accent reflects the
             # organism's meta-state, mutated in place by the Reactive Theme.
