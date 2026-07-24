@@ -1484,6 +1484,8 @@ but NEVER the offending content. Authority-free anti-jailbreak telemetry."""
 _VALID_EVENT_TYPES = frozenset({
     # Agentic-visibility events (2026-07-24): big-file chunk swarm
     # scatter/stitch + worker-pool pickup — the cockpit sees agents spawn.
+    # Moltbook (the agora): one post = one molt_post event.
+    "molt_post",
     "swarm_scatter",
     "swarm_stitched",
     "worker_op_claimed",

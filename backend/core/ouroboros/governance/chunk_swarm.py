@@ -125,6 +125,13 @@ async def swarm_repair(
     # asyncio.gather = structured concurrent fan-out (Python 3.9-safe; the
     # TaskGroup equivalent without the 3.11 floor the codebase forbids). Each
     # coroutine is a lightweight task — no threads, no processes.
+    try:
+        from backend.core.ouroboros.governance.moltbook import post_molt_nowait
+        post_molt_nowait("swarm", "status", facts={
+            "agents": len(targets), "file": file_path.rsplit("/", 1)[-1],
+        })
+    except Exception:  # noqa: BLE001
+        pass
     _emit_swarm_event("swarm_scatter", file_path, {
         "file": file_path,
         "agents": len(targets),
@@ -168,6 +175,15 @@ async def swarm_repair(
         "(atomic, descending-line, no race)",
         len(targets), in_flight["max"], len(succeeded), len(failed),
     )
+    try:
+        from backend.core.ouroboros.governance.moltbook import post_molt_nowait
+        post_molt_nowait("swarm", "celebration", facts={
+            "file": file_path.rsplit("/", 1)[-1],
+            "succeeded": len(succeeded), "failed": len(failed),
+            "agents": len(targets),
+        })
+    except Exception:  # noqa: BLE001
+        pass
     _emit_swarm_event("swarm_stitched", file_path, {
         "file": file_path,
         "agents": len(targets),

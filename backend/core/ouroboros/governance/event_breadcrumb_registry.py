@@ -295,6 +295,11 @@ def build_default_registry() -> EventBreadcrumbRegistry:
                                        f"backoff {p.get('backoff_s','?')}s): {p.get('reason','')}", "supervisor"),
         BreadcrumbDescriptor("sentinel_telemetry", "·", "bright_black", SEV_VERBOSE,
                              lambda p: str(p.get("line", "")).strip(), "supervisor"),
+        BreadcrumbDescriptor("molt_post", "🐍", "magenta", SEV_IMPORTANT,
+                             lambda p: f"{p.get('glyph','')} {p.get('handle','@?')}: "
+                                       f"{str(p.get('body',''))[:72]}"
+                                       f"{' · ' + str(p.get('ref','')) if p.get('ref') else ''}",
+                             "moltbook"),
         BreadcrumbDescriptor("swarm_scatter", "⚡", "magenta bold", SEV_IMPORTANT,
                              lambda p: f"swarm scatter — {p.get('agents','?')} super agents on "
                                        f"{str(p.get('file','?')).rsplit('/',1)[-1]} "
