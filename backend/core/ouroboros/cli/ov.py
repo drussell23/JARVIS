@@ -346,6 +346,44 @@ class AttachUI:
             pass
 
 
+def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
+    """THE one operator-line router — shared by the legacy split-plane loop AND
+    the Bipartite cockpit (DRY: verbs behave identically on both surfaces).
+
+    Returns ``"detach"`` (leave the loop), ``"handled"`` (audio verb routed on
+    the audio lane), or ``"sent"``/``"empty"``. Audio Control Plane verbs never
+    travel as chat text — the daemon synapse owns the duplex. A new operator
+    command while Karen is composing flushes her outbound buffer FIRST (the
+    human always owns the floor). Never raises."""
+    try:
+        text = (line or "").strip()
+        low = text.lower()
+        if low in ("detach", "exit", "quit"):
+            return "detach"
+        audio_verbs = {
+            "wake": "wake", "voice": "wake", "listen": "wake",
+            "wake!": "force_wake", "force-wake": "force_wake",
+            "force wake": "force_wake",
+            "ptt": "ptt",
+            "ptt stop": "ptt_stop", "ptt-stop": "ptt_stop", "ptt off": "ptt_stop",
+            "flush": "flush", "shh": "flush", "hush": "flush",
+            "mute": "sleep", "sleep": "sleep",
+            "barge": "barge",
+        }
+        cmd = audio_verbs.get(low)
+        if cmd is not None:
+            client.send_audio(cmd)
+            return "handled"
+        if text:
+            if ui is not None and ui.should_flush_on_input():
+                client.send_audio("flush")
+            client.send_input(text)
+            return "sent"
+        return "empty"
+    except Exception:  # noqa: BLE001 — routing must never crash an input loop
+        return "empty"
+
+
 async def _split_plane_loop(
     client: Any, console: Any, ui: Optional["AttachUI"] = None,
 ) -> None:
@@ -422,41 +460,59 @@ async def _split_plane_loop(
             except (EOFError, KeyboardInterrupt):
                 await _reap_task(prompt_task)
                 break
-            text = (line or "").strip()
-            low = text.lower()
-            if low in ("detach", "exit", "quit"):
+            outcome = _route_operator_line(client, ui, line)
+            if outcome == "detach":
                 break
-            # Audio Control Plane verbs — routed on the audio lane,
-            # never as chat text (the daemon synapse owns the duplex).
-            if low in ("wake", "voice", "listen"):
-                client.send_audio("wake")
-                continue
-            if low in ("wake!", "force-wake", "force wake"):
-                client.send_audio("force_wake")
-                continue
-            if low == "ptt":
-                client.send_audio("ptt")
-                continue
-            if low in ("ptt stop", "ptt-stop", "ptt off"):
-                client.send_audio("ptt_stop")
-                continue
-            if low in ("flush", "shh", "hush"):
-                client.send_audio("flush")
-                continue
-            if low in ("mute", "sleep"):
-                client.send_audio("sleep")
-                continue
-            if low == "barge":
-                client.send_audio("barge")
-                continue
-            if text:
-                # TTS interruption (ducking): a new operator command
-                # while Karen is composing/speaking flushes her
-                # outbound buffer FIRST — the human always owns the
-                # floor.
-                if ui.should_flush_on_input():
-                    client.send_audio("flush")
-                client.send_input(text)
+
+
+async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
+    """The Style-Guide §06 cockpit ON THE CLIENT: Zone 1 (the Proactive Canvas,
+    state-reactive border) auto-scrolls the daemon's bridge stream; Zone 2 the
+    anchored ``› `` prompt reusing THE SAME verb router as the legacy loop; the
+    morphing AttachUI footer rides below. The connection watcher exits the app
+    the instant the daemon dies (never hangs mid-typing). Never raises out."""
+    from backend.core.ouroboros.battle_test.bipartite_layout import (
+        run_bipartite_repl,
+    )
+    from backend.core.ouroboros.ui.theme import UIState, get_reactive_theme
+
+    # Client-side reactive accent: attached = HEALTHY (cyan). The daemon-death
+    # path flips DEGRADED (red) just before the app exits — an honest mapping of
+    # the CLIENT's own connection state onto the Style-Guide state ladder.
+    try:
+        get_reactive_theme().set_state(UIState.HEALTHY)
+    except Exception:  # noqa: BLE001
+        pass
+
+    def _on_accept(text: str) -> None:
+        outcome = _route_operator_line(client, ui, text)
+        if outcome == "detach":
+            try:
+                from prompt_toolkit.application import get_app
+                get_app().exit()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _alive() -> bool:
+        ok = bool(client.connected)
+        if not ok:
+            try:
+                get_reactive_theme().set_state(UIState.DEGRADED)
+            except Exception:  # noqa: BLE001
+                pass
+        return ok
+
+    await run_bipartite_repl(
+        on_accept=_on_accept,
+        title="◇ O+V · proactive canvas",
+        toolbar=(lambda: ui.toolbar()) if ui is not None else None,
+        watch_alive=_alive,
+        seed=[
+            "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or plain "
+            "words both work · [cyan]wake[/cyan] arms my voice · "
+            "[cyan]detach[/cyan] leaves the organism running",
+        ],
+    )
 
 
 async def _legacy_pump_loop(client: Any) -> None:
@@ -501,10 +557,24 @@ def run_attach(console: Any) -> int:
         )
 
         def _print_line(text: str) -> None:
-            # Builtin print() resolves sys.stdout DYNAMICALLY — under the
-            # split-plane's patch_stdout this routes daemon telemetry
-            # above the pinned prompt; the pre-bound Rich console would
-            # bypass the patch and corrupt the input line.
+            # Cockpit mounted → the daemon's bridge stream auto-scrolls into
+            # Zone 1 (the Proactive Canvas). Rich markup is escaped so a daemon
+            # line can never inject styling into the canvas (inert DATA).
+            try:
+                from backend.core.ouroboros.battle_test.bipartite_layout import (
+                    get_active_canvas,
+                )
+                canvas = get_active_canvas()
+                if canvas is not None:
+                    from rich.markup import escape
+                    canvas.push_raw(escape(str(text)))
+                    return
+            except Exception:
+                pass
+            # Legacy split-plane: builtin print() resolves sys.stdout
+            # DYNAMICALLY — under patch_stdout this routes daemon telemetry
+            # above the pinned prompt; a pre-bound Rich console would bypass
+            # the patch and corrupt the input line.
             try:
                 print(text)
             except Exception:
@@ -532,8 +602,23 @@ def run_attach(console: Any) -> int:
             return 1
 
         try:
+            _ran_cockpit = False
             if _can_run_split_plane():
-                await _split_plane_loop(client, console, ui)
+                # Style-Guide cockpit is the default interactive surface; ANY
+                # failure falls through to the proven split-plane loop (the
+                # cockpit can never brick the attach). Kill-switch:
+                # JARVIS_BIPARTITE_LAYOUT_DISABLED=1.
+                try:
+                    from backend.core.ouroboros.battle_test.bipartite_layout import (
+                        should_run_bipartite,
+                    )
+                    if should_run_bipartite():
+                        await _bipartite_attach_loop(client, console, ui)
+                        _ran_cockpit = True
+                except Exception:
+                    _ran_cockpit = False
+                if not _ran_cockpit:
+                    await _split_plane_loop(client, console, ui)
             else:
                 await _legacy_pump_loop(client)
             if not client.connected:
