@@ -597,4 +597,179 @@ def build_animator(console: Any, *, plus_lead_deg: Optional[float] = None) -> Op
         return None
 
 
-__all__ = ["CrestAnimator", "animator_enabled", "build_animator", "build_rotated_frame"]
+
+
+# ---------------------------------------------------------------------------
+# MiniCrest — the CC-style header logo (small, ambient, stateless-animated)
+# ---------------------------------------------------------------------------
+
+
+class MiniCrest:
+    """A small ambient crest for the cockpit header — the same physically-
+    rotating snake, sized down (``build_rotated_frame`` has no minimum-width
+    clamp, so the mini raster composes the SAME pipeline). Animation phase is
+    derived from the CLOCK (``time.monotonic``), so rendering is stateless —
+    no tick task; prompt_toolkit's refresh interval animates it for free.
+    Headless-testable. Never raises."""
+
+    def __init__(
+        self,
+        *,
+        cols: Optional[int] = None,
+        frame_count: Optional[int] = None,
+        ss: int = 2,
+        speed_laps_per_s: Optional[float] = None,
+    ) -> None:
+        self._cols = cols if cols is not None else _env_int(
+            "JARVIS_CREST_MINI_COLS", 20, 12, 40,
+        )
+        self._rows = _Geometry.rows_needed(self._cols)
+        self._n = frame_count if frame_count is not None else _env_int(
+            "JARVIS_CREST_MINI_FRAMES", 16, 4, 48,
+        )
+        self._ss = ss
+        self._speed = speed_laps_per_s if speed_laps_per_s is not None else _env_float(
+            "JARVIS_CREST_MINI_SPEED", 0.12, 0.01, 2.0,
+        )
+        self._frames: List[Optional[dict]] = [None] * max(1, self._n)
+        self._built = 0
+        self._builder_started = False
+        # Frame 0 built synchronously — small raster (~10-20ms), instant logo.
+        f0 = build_rotated_frame(self._cols, self._rows, 0.0, self._ss)
+        if f0:
+            self._frames[0] = f0
+            self._built = 1
+
+    @property
+    def available(self) -> bool:
+        return self._built > 0
+
+    @property
+    def rows(self) -> int:
+        return self._rows
+
+    @property
+    def cols(self) -> int:
+        return self._cols
+
+    async def ensure_frames(self) -> None:
+        """Fill the small ring off the event loop (progressive, idempotent)."""
+        import asyncio
+        if self._builder_started:
+            return
+        self._builder_started = True
+        try:
+            for k in range(self._n):
+                if self._frames[k] is not None:
+                    continue
+                rot = 2.0 * math.pi * k / self._n
+                v_rot = _v_spin_mult() * rot
+                frame = await asyncio.to_thread(
+                    build_rotated_frame, self._cols, self._rows, rot, self._ss, v_rot,
+                )
+                if frame:
+                    self._frames[k] = frame
+                    self._built = sum(1 for f in self._frames if f is not None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _frame_now(self, now: Optional[float] = None) -> Optional[dict]:
+        import time as _time
+        if not self._frames:
+            return None
+        t = _time.monotonic() if now is None else float(now)
+        phase = (t * self._speed) % 1.0
+        n = len(self._frames)
+        want = int(phase * n) % n
+        for off in range(n):
+            for idx in ((want - off) % n, (want + off) % n):
+                f = self._frames[idx]
+                if f is not None:
+                    return f
+        return None
+
+    def row_texts(self, now: Optional[float] = None) -> List[Any]:
+        """The mini crest as one Rich ``Text`` per cell row (for side-by-side
+        header composition). Empty list when unavailable. Never raises."""
+        try:
+            from rich.text import Text
+        except Exception:  # noqa: BLE001
+            return []
+        frame = self._frame_now(now)
+        if not frame:
+            return []
+        occ = [py // 2 for (_x, py) in frame]
+        lo, hi = (min(occ), max(occ)) if occ else (0, self._rows - 1)
+        rows: List[Any] = []
+        for cy in range(lo, hi + 1):
+            t = Text()
+            for x in range(self._cols):
+                top = frame.get((x, cy * 2))
+                bot = frame.get((x, cy * 2 + 1))
+                if top is None and bot is None:
+                    t.append(" ")
+                elif top is not None and bot is not None:
+                    tr, tg, tb = top
+                    br, bg, bb = bot
+                    t.append("▀", style=f"rgb({tr},{tg},{tb}) on rgb({br},{bg},{bb})")
+                elif top is not None:
+                    tr, tg, tb = top
+                    t.append("▀", style=f"rgb({tr},{tg},{tb})")
+                else:
+                    br, bg, bb = bot
+                    t.append("▄", style=f"rgb({br},{bg},{bb})")
+            rows.append(t)
+        return rows
+
+
+def render_cockpit_header(
+    mini: Optional["MiniCrest"],
+    lines: List[Any],
+    width: int,
+    *,
+    now: Optional[float] = None,
+) -> str:
+    """Compose the CC-style header — mini crest left, identity/context/path
+    lines beside it — to an ANSI string bounded to ``width``. ``lines`` are
+    Rich renderable Texts (or plain strings). Degrades to text-only when the
+    mini crest is unavailable (tiny terminal / NONE tier). Never raises."""
+    try:
+        from io import StringIO
+        from rich.console import Console
+        from rich.text import Text
+
+        crest_rows = mini.row_texts(now) if mini is not None else []
+        text_rows: List[Any] = [
+            ln if not isinstance(ln, str) else Text(ln) for ln in lines
+        ]
+        n_rows = max(len(crest_rows), len(text_rows))
+        if n_rows == 0:
+            return ""
+        # Vertically centre the text block beside the crest.
+        pad_top = max(0, (len(crest_rows) - len(text_rows)) // 2)
+        crest_w = mini.cols if (mini is not None and crest_rows) else 0
+        out = Text()
+        for i in range(n_rows):
+            if i < len(crest_rows):
+                out.append_text(crest_rows[i])
+            else:
+                out.append(" " * crest_w)
+            ti = i - pad_top
+            if 0 <= ti < len(text_rows):
+                out.append("  ")
+                out.append_text(text_rows[ti] if not isinstance(text_rows[ti], str) else Text(text_rows[ti]))
+            if i < n_rows - 1:
+                out.append("\n")
+        buf = StringIO()
+        Console(
+            file=buf, force_terminal=True, color_system="truecolor",
+            width=max(20, width), highlight=False,
+        ).print(out)
+        return buf.getvalue()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+__all__ = ["CrestAnimator", "MiniCrest", "animator_enabled", "build_animator", "build_rotated_frame", "render_cockpit_header"]

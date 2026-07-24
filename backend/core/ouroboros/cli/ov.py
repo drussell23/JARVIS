@@ -502,11 +502,85 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
                 pass
         return ok
 
+    # The CC-style identity header: the mini ANIMATED crest at top-left with
+    # version · state · path beside it (the reactive accent lives in the status
+    # dot now that the canvas is borderless). Stateless clock-driven animation;
+    # the mini ring builds progressively off-loop. Degrades to text-only on
+    # tiny/incapable terminals.
+    mini = None
+    header_height = 0
+    header_render = None
+    try:
+        import asyncio as _aio
+        import os as _os
+        import time as _time
+        from backend.core.ouroboros.ui.crest_animator import (
+            MiniCrest,
+            render_cockpit_header,
+        )
+        from rich.text import Text as _Text
+
+        mini = MiniCrest()
+        if mini.available:
+            _aio.ensure_future(mini.ensure_frames())
+            header_height = max(3, mini.rows)
+        else:
+            mini = None
+            header_height = 3
+
+        def _home_path() -> str:
+            try:
+                cwd = _os.getcwd()
+                home = _os.path.expanduser("~")
+                return cwd.replace(home, "~", 1) if cwd.startswith(home) else cwd
+            except Exception:
+                return ""
+
+        _STATE_DOT = {
+            "HEALTHY": "rgb(67,214,208)", "DEGRADED": "rgb(248,81,73)",
+            "ARMED": "rgb(227,179,65)", "SOAKING": "rgb(94,224,106)",
+            "DORMANT": "rgb(108,125,119)",
+        }
+
+        def _header_lines():
+            t1 = _Text()
+            t1.append("O+V ", style="bold rgb(94,224,106)")
+            t1.append(version_line(), style="rgb(219,230,225)")
+            t2 = _Text()
+            state = "HEALTHY"
+            try:
+                from backend.core.ouroboros.ui.theme import get_reactive_theme
+                state = get_reactive_theme().state.value
+            except Exception:
+                pass
+            t2.append("● ", style=_STATE_DOT.get(state, "rgb(67,214,208)"))
+            t2.append(state.lower(), style="rgb(174,188,182)")
+            t2.append(" · ouroboros + venom · the organism drives", style="rgb(108,125,119)")
+            t3 = _Text(_home_path(), style="rgb(108,125,119)")
+            return [t1, t2, t3]
+
+        _hdr_width = {"w": 0}
+
+        def header_render() -> str:
+            try:
+                import shutil as _shutil
+                w = _shutil.get_terminal_size(fallback=(100, 30)).columns
+                _hdr_width["w"] = w
+                return render_cockpit_header(
+                    mini, _header_lines(), w, now=_time.monotonic(),
+                )
+            except Exception:
+                return ""
+    except Exception:
+        mini, header_render, header_height = None, None, 0
+
     await run_bipartite_repl(
         on_accept=_on_accept,
         title="◇ O+V · proactive canvas",
         toolbar=(lambda: ui.toolbar()) if ui is not None else None,
         watch_alive=_alive,
+        header=header_render,
+        header_height=header_height,
         seed=[
             "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or plain "
             "words both work · [cyan]wake[/cyan] arms my voice · "

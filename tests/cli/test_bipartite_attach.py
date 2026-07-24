@@ -193,3 +193,72 @@ def test_cockpit_app_constructs_with_toolbar():
         toolbar=lambda: (_ for _ in ()).throw(RuntimeError("x")),
     )
     assert app2 is not None
+
+
+# ---------------------------------------------------------------------------
+# (5) CC-style header + borderless canvas (operator mandate 2026-07-23)
+# ---------------------------------------------------------------------------
+
+
+def test_mini_crest_builds_below_static_min_and_animates():
+    """The mini logo works BELOW the static crest's 46-col minimum (it composes
+    build_rotated_frame directly, which has no clamp) and its clock-driven
+    render rotates with time."""
+    from backend.core.ouroboros.ui.crest_animator import MiniCrest
+    mini = MiniCrest(cols=18, frame_count=4, ss=1)
+    assert mini.available and mini.rows >= 4
+    asyncio.run(mini.ensure_frames())
+    rows_a = mini.row_texts(now=0.0)
+    rows_b = mini.row_texts(now=4.0)          # later clock → different frame
+    assert rows_a and rows_b
+    a = "".join(getattr(r, "plain", "") for r in rows_a)
+    b = "".join(getattr(r, "plain", "") for r in rows_b)
+    # Physical rotation → the lit silhouette differs across clock times.
+    assert a != b or rows_a != rows_b
+
+
+def test_cockpit_header_contains_identity_and_path():
+    from backend.core.ouroboros.ui.crest_animator import (
+        MiniCrest,
+        render_cockpit_header,
+    )
+    from rich.text import Text
+    mini = MiniCrest(cols=18, frame_count=4, ss=1)
+    lines = [Text("O+V ov 0.1.0"), Text("● healthy"), Text("~/repos/jarvis")]
+    ansi = render_cockpit_header(mini, lines, 100, now=0.0)
+    import re
+    plain = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", ansi)
+    assert "ov 0.1.0" in plain and "~/repos/jarvis" in plain and "healthy" in plain
+    assert "▀" in plain or "▄" in plain      # the mini crest is beside the text
+    # Text-only degradation (no crest) still renders the identity.
+    ansi2 = render_cockpit_header(None, lines, 100)
+    plain2 = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", ansi2)
+    assert "ov 0.1.0" in plain2
+
+
+def test_canvas_is_borderless_by_default(monkeypatch):
+    from backend.core.ouroboros.battle_test.bipartite_layout import BipartiteLayout
+    monkeypatch.delenv("JARVIS_BIPARTITE_BORDER", raising=False)
+    mux = BipartiteLayout(width=80, height=20)
+    mux.push_raw("hello organism")
+    ansi = mux.render_canvas_ansi()
+    assert "╭" not in ansi and "╰" not in ansi     # no ring
+    assert "hello organism" in ansi
+    # The frame is restorable chrome, not deleted capability.
+    monkeypatch.setenv("JARVIS_BIPARTITE_BORDER", "1")
+    ansi2 = mux.render_canvas_ansi()
+    assert "╭" in ansi2
+
+
+def test_app_constructs_with_header():
+    from backend.core.ouroboros.battle_test.bipartite_layout import (
+        BipartiteLayout,
+        build_bipartite_application,
+    )
+    app = build_bipartite_application(
+        BipartiteLayout(width=80, height=20),
+        on_accept=lambda t: None,
+        header=lambda: "O+V header",
+        header_height=3,
+    )
+    assert app is not None and app.full_screen is True
