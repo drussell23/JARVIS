@@ -672,6 +672,16 @@ def build_scaled_frame(
         if pf is None:
             return {}
         geo = _rotated_geometry(pf.cols, pf.rows, rot, v_rot)
+        # Icon-legibility exaggeration (the pixel-artist rule: at icon scale,
+        # identity features must be OVERSIZED to read). Applied ONLY here — the
+        # big emblem keeps true proportions. Env-tunable, derived not drawn.
+        fb = _env_float("JARVIS_CREST_MINI_FEATURE_BOOST", 1.6, 1.0, 2.5)
+        geo.gap_half = geo.gap_half * fb                 # the bite gap READS
+        geo.head_len = geo.head_len * 1.35
+        geo.head_w = geo.head_w * 1.3
+        geo.eye_r = geo.eye_r * 1.9                      # the eye survives
+        geo.tail_tip = _ang_norm(geo.gap_center + geo.gap_half)
+        geo.head_theta = _ang_norm(geo.gap_center - geo.gap_half)
         xs = [x for (x, _py) in pf.pixels]
         pys = [py for (_x, py) in pf.pixels]
         if not xs:
@@ -721,11 +731,13 @@ def build_scaled_frame(
         out = _prune_sparse_geometry(out)
         # The + prey — the gap centre, same window transform, pure palette.
         theta = _ang_norm(geo.gap_center)
-        px_p = geo.cx + geo.r_mid * math.cos(theta)
-        py_p = geo.cy - geo.r_mid * math.sin(theta)
+        prey_r = geo.r_mid + geo.thick * 1.15            # OUTSIDE the coil → on black
+        px_p = geo.cx + prey_r * math.cos(theta)
+        py_p = geo.cy - prey_r * math.sin(theta)
         qx0 = int((px_p - (cx_p - span / 2.0)) / px_pitch)
         qy0 = int((py_p - (cy_p - span / 2.0)) / py_pitch)
-        arm = max(1, cells_w // 12)
+        qx0 -= qx0 % 2                                    # cell-align → clean pack
+        arm = max(2, cells_w // 8)
         for dx in range(-2 * arm, 2 * arm + 1):
             for dy in range(-arm, arm + 1):
                 if not ((dy == 0 and abs(dx) <= 2 * arm) or (abs(dx) <= 1 and abs(dy) <= arm)):
@@ -851,10 +863,9 @@ class MiniCrest:
                 if not bits:
                     t.append(" ")
                     continue
-                n = len(lit)
-                r = sum(c[0] for c in lit) // n
-                g = sum(c[1] for c in lit) // n
-                b = sum(c[2] for c in lit) // n
+                # Brightest lit sub wins the cell — averaging 4 subs dulled
+                # edges into mush; max-luminance keeps the punch of the big one.
+                r, g, b = max(lit, key=lambda c: c[0] + c[1] + c[2])
                 t.append(_QUAD.get(bits, "█"), style=f"rgb({r},{g},{b})")
             rows.append(t)
         return rows
