@@ -487,10 +487,27 @@ def build_bipartite_application(
             height=1, wrap_lines=False,
         ))
     root = HSplit(rows)
+    # Adaptive color depth (root cause of the quantized/muddy logo): pt 3.0.x's
+    # default depth reads TERM only — COLORTERM is ignored, so a truecolor
+    # terminal gets its 24-bit palette QUANTIZED to the 256 cube. Detect
+    # truecolor honestly; JARVIS_BIPARTITE_COLOR_DEPTH={1,4,8,24} overrides.
+    _depth = None
+    try:
+        from prompt_toolkit.output.color_depth import ColorDepth
+        _env = os.environ.get("JARVIS_BIPARTITE_COLOR_DEPTH", "").strip()
+        _map = {"1": ColorDepth.DEPTH_1_BIT, "4": ColorDepth.DEPTH_4_BIT,
+                "8": ColorDepth.DEPTH_8_BIT, "24": ColorDepth.DEPTH_24_BIT}
+        if _env in _map:
+            _depth = _map[_env]
+        elif os.environ.get("COLORTERM", "").strip().lower() in ("truecolor", "24bit"):
+            _depth = ColorDepth.DEPTH_24_BIT
+    except Exception:  # noqa: BLE001
+        _depth = None
     app = Application(
         layout=PTLayout(root, focused_element=prompt),
         key_bindings=kb, full_screen=True, mouse_support=False,
         refresh_interval=0.1,
+        **({"color_depth": _depth} if _depth is not None else {}),
     )
     _APP_REF["app"] = app
     mux.set_invalidate(app.invalidate)
