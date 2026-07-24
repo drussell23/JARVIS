@@ -71,6 +71,21 @@ class SwarmResult:
 AgentGenerateFn = Callable[[ChunkTarget], Awaitable[str]]
 
 
+def _emit_swarm_event(event_type: str, op_id: str, payload: dict) -> None:
+    """Surface swarm lifecycle on the canonical broker — the mirrored
+    breadcrumb router makes every scatter/stitch visible in attached ov
+    cockpits (the Swarm's parallelism made VISIBLE, not just fast).
+    Same seam as checkpoint_manifest._emit_event. Best-effort; never
+    raises."""
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            publish_task_event,
+        )
+        publish_task_event(event_type, op_id or "swarm", dict(payload))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def swarm_repair(
     full_source: str,
     file_path: str,
@@ -110,6 +125,12 @@ async def swarm_repair(
     # asyncio.gather = structured concurrent fan-out (Python 3.9-safe; the
     # TaskGroup equivalent without the 3.11 floor the codebase forbids). Each
     # coroutine is a lightweight task — no threads, no processes.
+    _emit_swarm_event("swarm_scatter", file_path, {
+        "file": file_path,
+        "agents": len(targets),
+        "max_concurrency": limit,
+        "symbols": [t.symbol for t in targets[:8]],
+    })
     gathered = await asyncio.gather(
         *[_super_agent(t) for t in targets], return_exceptions=False,
     )
@@ -147,6 +168,13 @@ async def swarm_repair(
         "(atomic, descending-line, no race)",
         len(targets), in_flight["max"], len(succeeded), len(failed),
     )
+    _emit_swarm_event("swarm_stitched", file_path, {
+        "file": file_path,
+        "agents": len(targets),
+        "max_in_flight": in_flight["max"],
+        "succeeded": len(succeeded),
+        "failed": len(failed),
+    })
     return SwarmResult(
         stitched=stitched, succeeded=succeeded, failed=failed,
         agents_spawned=len(targets), max_in_flight=in_flight["max"],
