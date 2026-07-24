@@ -117,6 +117,23 @@ class DreamProviderExhaustedError(RuntimeError):
 """Hard cap on dream prompt text length (TC23)."""
 
 _DREAM_LOOP_INTERVAL_S: float = 30.0
+
+
+def _exhaustion_backoff_base_s() -> float:
+    """First cooldown after a full-cascade exhaustion (doubles per streak)."""
+    try:
+        return max(5.0, float(os.environ.get(
+            "JARVIS_DREAM_EXHAUSTION_BACKOFF_BASE_S", "60")))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def _exhaustion_backoff_max_s() -> float:
+    try:
+        return max(60.0, float(os.environ.get(
+            "JARVIS_DREAM_EXHAUSTION_BACKOFF_MAX_S", "1800")))
+    except (TypeError, ValueError):
+        return 1800.0
 """Seconds between dream-loop ticks when not actively computing."""
 
 _JPRIME_GENERATE_ENDPOINT: str = "/v1/generate"
@@ -263,6 +280,12 @@ class DreamEngine:
 
         # Preemption (TC17)
         self._preempted: asyncio.Event = asyncio.Event()
+        # Exhaustion backoff (2026-07-23): when the WHOLE RT cascade is
+        # down, retrying every loop tick is a per-30s warning storm that
+        # rides the log pipeline while providers are provably dead.
+        # Escalating cooldown; any successful inference resets it.
+        self._exhaustion_streak: int = 0
+        self._exhaustion_until: float = 0.0
 
         # Flap damping (TC18) — monotonic time of last user return
         self._last_user_return: float = 0.0
@@ -643,6 +666,20 @@ class DreamEngine:
                 # Reset preemption at start of each cycle
                 self._preempted.clear()
 
+                # Exhaustion cooldown gate: while the whole cascade was
+                # down moments ago, do NOT re-hammer it every tick —
+                # sleep out the escalating cooldown quietly (debug, not
+                # warning — the storm class this kills).
+                remaining = self._exhaustion_until - time.monotonic()
+                if remaining > 0:
+                    logger.debug(
+                        "[DreamEngine] exhaustion cooldown — %.0fs until "
+                        "next cascade attempt (streak=%d)",
+                        remaining, self._exhaustion_streak,
+                    )
+                    await asyncio.sleep(min(remaining, _DREAM_LOOP_INTERVAL_S))
+                    continue
+
                 can, reason = await self._can_dream()
                 if not can:
                     logger.debug("[DreamEngine] Cannot dream: %s", reason)
@@ -733,8 +770,24 @@ class DreamEngine:
         # Exhaustion is a TYPED routing exception, not an ambiguous None.
         try:
             result = await self._call_inference(prompt)
+            self._exhaustion_streak = 0
+            self._exhaustion_until = 0.0
         except DreamProviderExhaustedError as exc:
-            logger.warning("[DreamEngine] inference cascade exhausted: %s", exc)
+            self._exhaustion_streak += 1
+            cooldown = min(
+                _exhaustion_backoff_max_s(),
+                _exhaustion_backoff_base_s()
+                * (2 ** min(self._exhaustion_streak - 1, 16)),
+            )
+            self._exhaustion_until = time.monotonic() + cooldown
+            # ONE line per escalation (WARNING the first, INFO after):
+            # a dead cascade is one fact, not a per-tick warning storm.
+            log = logger.warning if self._exhaustion_streak == 1 else logger.info
+            log(
+                "[DreamEngine] inference cascade exhausted: %s — "
+                "backing off %.0fs (streak=%d)",
+                exc, cooldown, self._exhaustion_streak,
+            )
             await self._emit_dormant("provider_cascade_exhausted")
             return None
 

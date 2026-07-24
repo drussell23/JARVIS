@@ -111,6 +111,31 @@ def merkle_consult_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _fs_debounce_window_s() -> float:
+    """FS-event debounce window (Run #14 autopsy: this sensor produced
+    1049/1065 pool submissions by reacting to the session's OWN writes —
+    one full rglob+AST rescan PER event). Window-absorb semantics, the
+    Slice 5 T2 pattern from test_failure_sensor: the first .py event
+    opens the window, every event during it is ABSORBED, ONE scan runs
+    at close. 0 = legacy per-event scans. Re-read at call time."""
+    try:
+        return max(0.0, min(600.0, float(os.environ.get(
+            "JARVIS_DOCSTALE_FS_DEBOUNCE_S", "45"))))
+    except (TypeError, ValueError):
+        return 45.0
+
+
+def _min_rescan_interval_s() -> float:
+    """Cooldown between event-driven full scans — docs are the LOWEST
+    priority signal; a scan fresher than this answers any burst. The
+    24h poll (6h webhook-fallback) still guarantees eventual coverage."""
+    try:
+        return max(0.0, float(os.environ.get(
+            "JARVIS_DOCSTALE_MIN_RESCAN_S", "300")))
+    except (TypeError, ValueError):
+        return 300.0
+
+
 @dataclass
 class DocFinding:
     """One documentation gap detected."""
@@ -155,6 +180,10 @@ class DocStalenessSensor:
         # and ``ingest_webhook`` becomes the reactive hot path for
         # merges. FS subscription is unchanged.
         self._webhook_mode: bool = webhook_enabled()
+        # FS-event debounce (window-absorb) + scan cooldown state.
+        self._fs_debounce_task: Optional[asyncio.Task] = None
+        self._fs_events_absorbed: int = 0
+        self._last_scan_done_mono: float = 0.0
         # Telemetry counters — exposed via health snapshots during the
         # graduation arc so operators can read the signal:noise ratio.
         self._webhooks_handled: int = 0
@@ -212,13 +241,10 @@ class DocStalenessSensor:
             await self._on_git_event(event)
             return
 
-        # Direct .py file change → rescan that file
+        # Direct .py file change → debounced full rescan (window-absorb)
         if event.payload.get("extension") == ".py":
             if event.topic != "fs.changed.deleted":
-                try:
-                    await self.scan_once()  # Full rescan (simple, correct)
-                except Exception:
-                    logger.debug("[DocSensor] Event-driven scan error", exc_info=True)
+                self._schedule_debounced_scan()
 
     async def _on_git_event(self, event: Any) -> None:
         """React to git commit — rescan if Python files changed."""
@@ -228,11 +254,70 @@ class DocStalenessSensor:
             py_files = data.get("py_files_changed", [])
             if py_files:
                 logger.debug("[DocSensor] Git commit changed %d .py files, rescanning", len(py_files))
-                await self.scan_once()
+                self._schedule_debounced_scan()
         except Exception:
             logger.debug("[DocSensor] Failed to read git event", exc_info=True)
         if self._task and not self._task.done():
             self._task.cancel()
+
+    def _schedule_debounced_scan(self) -> None:
+        """Window-absorb debounce + cooldown for event-driven rescans.
+
+        The first event opens a ``_fs_debounce_window_s()`` window; every
+        event during it increments the absorbed counter and does NOTHING
+        else (no cancel-and-restart — fixed-window semantics, Slice 5 T2).
+        At close, ONE ``scan_once`` runs — unless a scan completed within
+        ``_min_rescan_interval_s()``, in which case the burst is already
+        answered and the run is skipped (the 24h poll still covers).
+        Kills the Run #14 pool-saturation class (one executor submission
+        per event). NEVER raises."""
+        try:
+            window = _fs_debounce_window_s()
+            if window <= 0:                    # legacy per-event behavior
+                task = asyncio.get_running_loop().create_task(
+                    self._scan_swallow_errors(),
+                )
+                self._fs_debounce_task = task
+                return
+            if (self._fs_debounce_task is not None
+                    and not self._fs_debounce_task.done()):
+                self._fs_events_absorbed += 1
+                return
+            self._fs_events_absorbed = 0
+            self._fs_debounce_task = asyncio.get_running_loop().create_task(
+                self._debounced_scan(window),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[DocSensor] debounce scheduling error", exc_info=True)
+
+    async def _debounced_scan(self, window: float) -> None:
+        try:
+            await asyncio.sleep(window)
+            import time as _time
+            since_last = _time.monotonic() - self._last_scan_done_mono
+            if (self._last_scan_done_mono > 0
+                    and since_last < _min_rescan_interval_s()):
+                logger.debug(
+                    "[DocSensor] burst absorbed (%d events) — scan %.0fs "
+                    "ago answers it; skipping",
+                    self._fs_events_absorbed + 1, since_last,
+                )
+                return
+            logger.debug(
+                "[DocSensor] debounce window closed (%d events absorbed) "
+                "— one rescan", self._fs_events_absorbed + 1,
+            )
+            await self._scan_swallow_errors()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.debug("[DocSensor] debounced scan error", exc_info=True)
+
+    async def _scan_swallow_errors(self) -> None:
+        try:
+            await self.scan_once()
+        except Exception:  # noqa: BLE001
+            logger.debug("[DocSensor] Event-driven scan error", exc_info=True)
 
     async def _poll_loop(self) -> None:
         # Delay scan — docs are lowest priority
@@ -370,6 +455,10 @@ class DocStalenessSensor:
         # cartographer's current state so the next cycle can detect
         # post-scan changes.
         self._merkle_last_seen_root_hash = current_hash
+        # Cooldown stamp: a completed FULL scan answers any event burst
+        # for the next _min_rescan_interval_s() (debounce consult).
+        import time as _time
+        self._last_scan_done_mono = _time.monotonic()
 
         # Emit envelopes
         emitted = 0

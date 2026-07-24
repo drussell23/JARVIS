@@ -1388,3 +1388,93 @@ async def test_recovery_tracer_fires_only_when_bypassed(tmp_path, monkeypatch):
     _surface(monkeypatch, tmp_path, _SV.UPSTREAM_DEGRADED, times=3)
     await eng._trace_dw_recovery_if_bypassed()
     assert len(calls) == 1                          # degraded -> probe for recovery
+
+
+# ============================================================================
+# Exhaustion backoff (2026-07-23): a dead cascade is one fact, not a
+# per-30s warning storm
+# ============================================================================
+
+
+def _exhaustion_job_engine(tmp_path, monkeypatch, streaks_raise=True):
+    """A lean engine whose _run_dream_job reaches _call_inference
+    directly (candidate/dedup/preemption seams pinned)."""
+    from backend.core.ouroboros.consciousness.dream_engine import (
+        DreamProviderExhaustedError,
+    )
+    eng = _rt_engine(tmp_path)
+    monkeypatch.setattr(eng, "_hydrate_repo_state", lambda: None)
+    monkeypatch.setattr(
+        eng, "_trace_dw_recovery_if_bypassed", AsyncMock(),
+    )
+    monkeypatch.setattr(eng, "_pick_candidate", lambda: {
+        "repo_sha": "a" * 40, "policy_hash": "b" * 8,
+        "prompt_family": "f", "model_class": "m",
+        "target": "backend/x.py", "reason": "test",
+    })
+    monkeypatch.setattr(
+        eng, "_is_job_completed", lambda *a, **k: False,
+    )
+    monkeypatch.setattr(eng, "_check_preempted", lambda: False)
+    monkeypatch.setattr(eng, "_build_dream_prompt", lambda c: "p", raising=False)
+    if streaks_raise:
+        monkeypatch.setattr(
+            eng, "_call_inference",
+            AsyncMock(side_effect=DreamProviderExhaustedError("all down")),
+        )
+    return eng
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_backoff_escalates_and_quiets(
+    tmp_path, monkeypatch, caplog,
+):
+    """Consecutive full-cascade exhaustions double the cooldown; only the
+    FIRST is a WARNING (the rest are INFO — the log-storm kill)."""
+    import logging
+    monkeypatch.setenv("JARVIS_DREAM_EXHAUSTION_BACKOFF_BASE_S", "60")
+    monkeypatch.setenv("JARVIS_DREAM_EXHAUSTION_BACKOFF_MAX_S", "1800")
+    eng = _exhaustion_job_engine(tmp_path, monkeypatch)
+    with caplog.at_level(logging.INFO):
+        t0 = time.monotonic()
+        assert await eng._run_dream_job() is None
+        assert eng._exhaustion_streak == 1
+        assert 55 <= eng._exhaustion_until - t0 <= 65      # ~60s
+        assert await eng._run_dream_job() is None
+        assert eng._exhaustion_streak == 2
+        assert 115 <= eng._exhaustion_until - time.monotonic() <= 125  # ~120s
+    warns = [r for r in caplog.records
+             if "cascade exhausted" in r.message and r.levelname == "WARNING"]
+    infos = [r for r in caplog.records
+             if "cascade exhausted" in r.message and r.levelname == "INFO"]
+    assert len(warns) == 1 and len(infos) == 1
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_backoff_caps_and_resets_on_success(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("JARVIS_DREAM_EXHAUSTION_BACKOFF_BASE_S", "60")
+    monkeypatch.setenv("JARVIS_DREAM_EXHAUSTION_BACKOFF_MAX_S", "300")
+    eng = _exhaustion_job_engine(tmp_path, monkeypatch)
+    for _ in range(6):
+        await eng._run_dream_job()
+    assert eng._exhaustion_until - time.monotonic() <= 305  # capped, not 1920s
+    # A recovered cascade resets the streak instantly.
+    dw = MagicMock()
+    dw.complete_sync = AsyncMock(return_value=_SyncResult(_BP_JSON))
+    eng2 = _rt_engine(tmp_path, dw=dw, claude=MagicMock())
+    eng2._exhaustion_streak = 5
+    eng2._exhaustion_until = time.monotonic() + 999
+    monkeypatch.setattr(eng2, "_hydrate_repo_state", lambda: None)
+    monkeypatch.setattr(eng2, "_trace_dw_recovery_if_bypassed", AsyncMock())
+    monkeypatch.setattr(eng2, "_pick_candidate", lambda: {
+        "repo_sha": "a" * 40, "policy_hash": "b" * 8,
+        "prompt_family": "f", "model_class": "m",
+        "target": "backend/x.py", "reason": "test",
+    })
+    monkeypatch.setattr(eng2, "_is_job_completed", lambda *a, **k: False)
+    monkeypatch.setattr(eng2, "_check_preempted", lambda: False)
+    await eng2._run_dream_job()
+    assert eng2._exhaustion_streak == 0
+    assert eng2._exhaustion_until == 0.0
