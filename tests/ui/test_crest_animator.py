@@ -27,6 +27,15 @@ from backend.core.ouroboros.ui.crest_animator import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cache(tmp_path, monkeypatch):
+    """EVERY test gets its own cache dir — tests must never read or pollute the
+    user's real ~/.jarvis/crest_anim (the exact leak that made frames_built==n
+    at construction and flipped two tests)."""
+    monkeypatch.setenv("JARVIS_CREST_ANIM_CACHE_DIR", str(tmp_path / "crest_cache"))
+    yield
+
+
 def _anim(**kw):
     kw.setdefault("cols", 60)
     kw.setdefault("rows", 24)
@@ -173,11 +182,15 @@ async def test_progressive_build_never_blocks_and_falls_back():
     assert anim.frames_built == 6
 
 
-async def test_cache_round_trip(tmp_path, monkeypatch):
-    monkeypatch.setenv("JARVIS_CREST_ANIM_CACHE_DIR", str(tmp_path))
+async def test_cache_round_trip():
     a1 = _anim(frame_count=4)
     await a1.ensure_frames()
-    assert a1.frames_built == 4                            # built + cached
+    assert a1.frames_built == 4                            # built
+    # The save is a daemon thread (survives the boot's asyncio.run teardown —
+    # the loop CANCELS pending tasks on close, which killed the old save).
+    assert a1._save_thread is not None
+    a1._save_thread.join(timeout=5.0)
+    assert not a1._save_thread.is_alive(), "cache save did not complete"
     # A NEW animator at the same size loads the finished ring instantly.
     a2 = _anim(frame_count=4)
     assert a2.frames_built == 4, "cache was not loaded"

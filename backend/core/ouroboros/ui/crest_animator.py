@@ -266,6 +266,7 @@ class CrestAnimator:
         self._frames: List[Optional[dict]] = [None] * max(1, self._n)
         self._built = 0
         self._builder_started = False
+        self._save_thread: Optional[threading.Thread] = None
         self._cy_lo = 0
         self._cy_hi = 0
         if self._pf:
@@ -311,10 +312,18 @@ class CrestAnimator:
                     with self._lock:
                         self._built = sum(1 for f in self._frames if f is not None)
             if all(f is not None for f in self._frames):
-                await asyncio.to_thread(
-                    _save_cached_ring, self._cols, self._rows, self._n, self._ss,
-                    [f for f in self._frames if f is not None],
+                # Persist via a daemon THREAD, not the loop: the boot's short
+                # asyncio.run() closes (cancelling loop tasks) right after the
+                # play — a thread survives it, and the ov process lives on
+                # through attach, so the write always completes. The handle is
+                # kept so tests (and shutdown paths) can join it.
+                self._save_thread = threading.Thread(
+                    target=_save_cached_ring,
+                    args=(self._cols, self._rows, self._n, self._ss,
+                          [f for f in self._frames if f is not None]),
+                    daemon=True,
                 )
+                self._save_thread.start()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
