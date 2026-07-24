@@ -275,6 +275,55 @@ def mark(name: str, *, unicode: Optional[bool] = None) -> str:
 
 
 # ===========================================================================
+# Ouroboros spinner — THE organism's identity animation
+# ===========================================================================
+#
+# The snake closing on its own tail (5→0 dots), the bite (🐍◯), reopen.
+# CANONICAL here (design-as-code, Style Guide §04): serpent_flow's REPL
+# spinner and the attach-heartbeat cockpit pulse both consume this ONE
+# definition — the organism animates identically on every surface.
+# Clock-stateless: the frame is a pure function of monotonic time, so any
+# number of readers agree with zero coordination and zero tick tasks.
+
+OUROBOROS_SPINNER_INTERVAL_S: float = 0.10
+OUROBOROS_SPINNER_FRAMES: tuple = (
+    "🐍·····○",
+    "🐍····○",
+    "🐍···○",
+    "🐍··○",
+    "🐍·○",
+    "🐍◯",       # bite — eating own tail
+    "🐍·○",       # cycle resumes
+    "🐍··○",
+    "🐍···○",
+    "🐍····○",
+    "🐍·····○",
+)
+#: ASCII degradation (same geometry, same story) for non-unicode terminals.
+_OUROBOROS_ASCII_FRAMES: tuple = (
+    "s.....o", "s....o", "s...o", "s..o", "s.o", "sO",
+    "s.o", "s..o", "s...o", "s....o", "s.....o",
+)
+
+
+def ouroboros_frame(
+    now: Optional[float] = None, *, unicode: Optional[bool] = None,
+) -> str:
+    """The current Ouroboros spinner frame, derived from the clock.
+
+    ``now`` overrides monotonic time (tests / synchronized surfaces);
+    ``unicode=None`` consults :func:`supports_unicode`. NEVER raises."""
+    try:
+        import time as _time
+        t = _time.monotonic() if now is None else float(now)
+        use = supports_unicode() if unicode is None else bool(unicode)
+        frames = OUROBOROS_SPINNER_FRAMES if use else _OUROBOROS_ASCII_FRAMES
+        return frames[int(t / OUROBOROS_SPINNER_INTERVAL_S) % len(frames)]
+    except Exception:  # noqa: BLE001
+        return "🐍"
+
+
+# ===========================================================================
 # Console factory + primitives
 # ===========================================================================
 

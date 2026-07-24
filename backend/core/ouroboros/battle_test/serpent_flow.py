@@ -67,20 +67,14 @@ from rich.syntax import Syntax
 # multi-line frames — single-line ephemeral inline spinner only.
 _OUROBOROS_SPINNER_NAME = "ouroboros"
 
-_OUROBOROS_FRAMES = (
-    "🐍·····○",
-    "🐍····○",
-    "🐍···○",
-    "🐍··○",
-    "🐍·○",
-    "🐍◯",       # bite — eating own tail
-    "🐍·○",       # cycle resumes
-    "🐍··○",
-    "🐍···○",
-    "🐍····○",
-    "🐍·····○",
+# CANONICAL definition promoted to ui/theme.py (2026-07-23, design-as-code
+# Style Guide §04) so the attach-heartbeat cockpit pulse animates with the
+# SAME identity spinner. These aliases keep every internal reference intact.
+from backend.core.ouroboros.ui.theme import (  # noqa: E402
+    OUROBOROS_SPINNER_FRAMES as _OUROBOROS_FRAMES,
+    OUROBOROS_SPINNER_INTERVAL_S as _OUROBOROS_FRAME_INTERVAL_S,
+    ouroboros_frame as _theme_ouroboros_frame,
 )
-_OUROBOROS_FRAME_INTERVAL_S = 0.10  # 100ms per frame, named (not hardcoded)
 
 
 def _resolve_repl_refresh_interval_s() -> float:
@@ -171,11 +165,10 @@ def _frame_for_now() -> str:
     """Pick the current Ouroboros frame from monotonic time.
 
     Animation is a pure function of time — no internal counter, no
-    per-frame state. Lets multiple readers (REPL bottom_toolbar +
-    any future consumer) see the same frame without coordination.
-    """
-    idx = int(time.monotonic() / _OUROBOROS_FRAME_INTERVAL_S) % len(_OUROBOROS_FRAMES)
-    return _OUROBOROS_FRAMES[idx]
+    per-frame state. Lets multiple readers (REPL bottom_toolbar, the
+    attach-heartbeat pulse, any future consumer) see the same frame
+    without coordination. Delegates to the CANONICAL theme definition."""
+    return _theme_ouroboros_frame(unicode=True)
 
 
 def _active_spinner_name() -> str:

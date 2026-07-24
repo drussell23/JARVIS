@@ -1,6 +1,10 @@
-"""Attach Heartbeat — the CC-style live pulse for `ov` cockpits.
+"""Attach Heartbeat — the live pulse for `ov` cockpits, in O+V's own voice.
 
-``✽ Synthesizing… (4m 9s · ↓ 15.9k tokens · DW-397B)``
+``🐍··○ Synthesizing… (4m 9s · ↓ 15.9k tokens · DW-397B)``
+
+The pulse glyph is the Ouroboros identity spinner (canonical in
+ui/theme.py — the same animation the daemon's REPL toolbar breathes),
+not a borrowed aesthetic.
 
 Two pure halves, one schema (``heartbeat.v1``):
 
@@ -32,11 +36,18 @@ from typing import Any, Dict, Optional
 
 HEARTBEAT_SCHEMA_VERSION = "heartbeat.v1"
 
-#: Time-driven pulse frames (CC's breathing star). ASCII degradation is
-#: the terminal's problem to have — these are BMP codepoints like the
-#: rest of the cockpit glyph grammar.
-_PULSE_FRAMES = ("✽", "✻", "✽", "·")
-_PULSE_INTERVAL_S = 0.28
+
+def _pulse_glyph(now: float) -> str:
+    """The pulse is O+V's OWN identity animation — the Ouroboros spinner
+    (snake closing on its tail, bite, reopen), consumed from its ONE
+    canonical definition in ui/theme.py (the same frames the daemon's
+    REPL spinner renders — every surface animates identically, derived
+    purely from the clock). NEVER raises."""
+    try:
+        from backend.core.ouroboros.ui.theme import ouroboros_frame
+        return ouroboros_frame(now)
+    except Exception:  # noqa: BLE001
+        return "🐍"
 
 #: Phase → gerund fallback when the narrative channel has no verb for
 #: the active op (post-GENERATE phases have no thinking stream). These
@@ -188,9 +199,7 @@ def format_heartbeat_line(
         age = max(0.0, now - arrived)
         if age > _stale_after_s():
             return ""
-        glyph = _PULSE_FRAMES[
-            int(now / _PULSE_INTERVAL_S) % len(_PULSE_FRAMES)
-        ]
+        glyph = _pulse_glyph(now)
         verb = str(payload.get("verb") or "Working")
         elapsed = float(payload.get("elapsed_s") or 0.0) + age
         parts = [_fmt_elapsed(elapsed)]
