@@ -640,7 +640,7 @@ class MiniCrest:
     ) -> None:
         import shutil
         self._target = cols if cols is not None else _env_int(
-            "JARVIS_CREST_MINI_COLS", 13, 8, 32,
+            "JARVIS_CREST_MINI_COLS", 16, 8, 32,
         )
         self._n = frame_count if frame_count is not None else _frame_count_env()
         self._ss = ss if ss is not None else _anim_ss()
@@ -713,13 +713,20 @@ class MiniCrest:
                             if c is not None:
                                 lit.append(c)
                     area = max(1.0, (math.ceil(bx1) - int(bx0)) * (math.ceil(by1) - int(by0)))
-                    if lit and (len(lit) / area) >= 0.28:
-                        n = len(lit)
-                        out[(mx, my)] = (
-                            min(255, round(sum(c[0] for c in lit) / n)),
-                            min(255, round(sum(c[1] for c in lit) / n)),
-                            min(255, round(sum(c[2] for c in lit) / n)),
-                        )
+                    if not lit:
+                        continue
+                    # TRUE premultiplied compositing (the crisp fix): the big
+                    # frames carry coverage-alpha BAKED into their colors, so
+                    # the correct thumbnail is sum/AREA — interiors stay full-
+                    # bright, edges taper exactly like the big emblem's own AA.
+                    # (Lit-only averaging un-premultiplied the edges → bloat.)
+                    boost = 1.18                      # counter box-filter loss
+                    r = min(255, round(sum(c[0] for c in lit) / area * boost))
+                    g = min(255, round(sum(c[1] for c in lit) / area * boost))
+                    b = min(255, round(sum(c[2] for c in lit) / area * boost))
+                    if max(r, g, b) < 16:             # crumb cutoff — no fuzz halo
+                        continue
+                    out[(mx, my)] = (r, g, b)
             return out
         except Exception:  # noqa: BLE001
             return {}
