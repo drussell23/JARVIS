@@ -45,10 +45,31 @@ def test_formatter_renders_cc_shape():
     assert "4m 9s" in line and "↓ 15.9k tokens" in line and "DW-397B" in line
 
 
-def test_formatter_pulse_animates_from_clock():
+def test_formatter_pulse_is_the_ouroboros_identity_spinner():
+    """The pulse is O+V's OWN animation — the theme's canonical Ouroboros
+    frames (snake → bite → reopen), not a borrowed star. Clock-driven:
+    different instants render different frames; the same instant renders
+    the SAME frame the daemon's REPL spinner would show."""
+    from backend.core.ouroboros.ui.theme import ouroboros_frame
     a = format_heartbeat_line(_hb(), now_mono=100.00, arrival_mono=100.0)
     b = format_heartbeat_line(_hb(), now_mono=100.30, arrival_mono=100.0)
-    assert a[:3] != b[:3]                      # the glyph breathes
+    ga = a.split(" Synthesizing")[0]
+    gb = b.split(" Synthesizing")[0]
+    assert ga != gb                            # the snake advances
+    assert "🐍" in ga                          # it IS the ouroboros
+    assert ga.strip() == ouroboros_frame(100.00, unicode=True)  # ONE authority
+
+
+def test_spinner_single_authority_theme_serves_serpent_too():
+    """DRY invariant: serpent_flow's REPL spinner aliases the theme's
+    canonical frames — one definition animates every surface."""
+    from backend.core.ouroboros.ui import theme
+    from backend.core.ouroboros.battle_test import serpent_flow as sf
+    assert sf._OUROBOROS_FRAMES is theme.OUROBOROS_SPINNER_FRAMES
+    assert sf._OUROBOROS_FRAME_INTERVAL_S == theme.OUROBOROS_SPINNER_INTERVAL_S
+    assert sf._frame_for_now() in theme.OUROBOROS_SPINNER_FRAMES
+    # ASCII degradation keeps the same story on dumb terminals.
+    assert theme.ouroboros_frame(0.0, unicode=False) == "s.....o"
 
 
 def test_formatter_elapsed_advances_client_side():
