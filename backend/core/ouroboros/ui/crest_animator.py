@@ -645,129 +645,93 @@ def _snap(rgb: Tuple[float, float, float], pal: List[Tuple[int, int, int]]) -> T
     return best
 
 
-# ---------------------------------------------------------------------------
-# The hand-authored mini sprite — the CC method: designed AT its size, frozen.
-# Shape is pixel art (never derived at runtime); colors are painted from the
-# crest's OWN palette (DRY) and animation is GRADIENT ROTATION on the fixed
-# shape — colors move, pixels never do. Crisp forever.
-#   R ring (angle-painted from the pure gradient stops)   h head   e eye
-#   v V-upper   d V-lower
-# ---------------------------------------------------------------------------
-
-_MINI_SPRITE: List[str] = [
-    "......RRhh.....",
-    "....RRRRheh....",
-    "...RRRR..hh....",
-    "..RRR..........",
-    ".RRR.vv..vv....",
-    ".RR..vv..vv.RR.",
-    ".RR...vddv..RR.",
-    ".RR....dd...RR.",
-    ".RR....dd...RR.",
-    ".RRR.......RRR.",
-    "..RRR.....RRR..",
-    "...RRRRRRRRR...",
-    "....RRRRRRR....",
-    "......RRR......",
-]
-
-
 class MiniCrest:
-    """The header logo — hand-authored pixel art at exact display resolution
-    (the CC method; every derived-downscale approach reads as mush because
-    small logos are DESIGNED, not derived). The frozen ``_MINI_SPRITE`` shape
-    never changes at runtime; the ring's gradient (pure palette stops, snapped
-    — zero blends) ROTATES around it for motion. All frames precompute at
-    construction in microseconds — no async build, no cache, no dependencies.
-    API-compatible with the previous MiniCrest. Never raises."""
+    """The header logo — EXACTLY the big emblem (operator mandate: "the small
+    logo must look exactly the same as the big logo"). Every prior approach
+    (geometry re-sample, downscale, quantize, hand sprite) produced a DIFFERENT
+    logo. The only thing that looks exactly like the big crest is the big
+    crest — so the mini IS the real CrestAnimator at the crest's own minimum
+    legible size (the 46-col quality floor the crest itself defines): same
+    sampler, same anti-aliasing, same physical head-chasing-the-prey rotation,
+    same disk-cached ring, merely smaller. Zero parallel pipelines. Animation
+    phase derives from the clock (stateless). Never raises."""
 
     def __init__(
         self,
         *,
-        cols: Optional[int] = None,            # accepted for API compat (fixed art)
+        cols: Optional[int] = None,
         frame_count: Optional[int] = None,
-        ss: Optional[int] = None,              # ignored — nothing is sampled
+        ss: Optional[int] = None,
         speed_laps_per_s: Optional[float] = None,
-        source_cols: Optional[int] = None,     # ignored — nothing is derived
-        source_rows: Optional[int] = None,
+        source_cols: Optional[int] = None,     # API compat
+        source_rows: Optional[int] = None,     # API compat
     ) -> None:
-        from .crest import _EYE_RGB, _HEAD_RGB, _V_BOT_RGB, _V_TOP_RGB, _grad
-        self._n = frame_count if frame_count is not None else _env_int(
-            "JARVIS_CREST_MINI_FRAMES", 24, 4, 48,
-        )
+        # The crest's own minimum width is the floor of faithfulness; +1 for
+        # the clamp's right-margin. Env-tunable upward for a larger header.
+        base = _env_int("JARVIS_CREST_MINI_COLS", 47, 47, 88)
+        want = max(base, (cols or 0) + 0)
         self._speed = speed_laps_per_s if speed_laps_per_s is not None else _env_float(
-            "JARVIS_CREST_MINI_SPEED", 0.12, 0.01, 2.0,
+            "JARVIS_CREST_MINI_SPEED", 0.10, 0.01, 2.0,
         )
-        art = _MINI_SPRITE
-        self._h = len(art)
-        self._w = max(len(r) for r in art) if art else 0
-        pal = _quant_palette()
-        # Static (non-ring) paint + the ring path ordered by angle.
-        static: dict = {}
-        ring: List[Tuple[float, int, int]] = []
-        cx, cy = (self._w - 1) / 2.0, (self._h - 1) / 2.0
-        for y, row in enumerate(art):
-            for x, ch in enumerate(row):
-                if ch == "h":
-                    static[(x, y)] = tuple(_HEAD_RGB)
-                elif ch == "e":
-                    static[(x, y)] = tuple(_EYE_RGB)
-                elif ch == "v":
-                    static[(x, y)] = tuple(_V_TOP_RGB)
-                elif ch == "d":
-                    static[(x, y)] = tuple(_V_BOT_RGB)
-                elif ch == "R":
-                    theta = math.atan2(-(y - cy), x - cx)
-                    ring.append((_ang_norm(theta) / (2.0 * math.pi), x, y))
-        # Precompute EVERY frame: ring colors = pure gradient stops, rotated.
-        self._frames: List[dict] = []
-        for k in range(max(1, self._n)):
-            phase = k / max(1, self._n)
-            f = dict(static)
-            for (frac, x, y) in ring:
-                f[(x, y)] = _snap(_grad((frac + phase) % 1.0), pal)
-            self._frames.append(f)
-        self._built = len(self._frames)
-        self._builder_started = True
+        rows_need = _Geometry.rows_needed(max(46, want - 1)) + 3
+        self._big = CrestAnimator(
+            cols=want, rows=rows_need,
+            frame_count=frame_count, ss=ss,
+            plus_lead_deg=None,
+        )
+        # Trim bounds from the RESTING raster (stable across the spin).
+        self._x0 = self._x1 = self._y0 = self._y1 = 0
+        if self._big.available:
+            base_px = self._big._base
+            xs = [x for (x, _py) in base_px]
+            pys = [py for (_x, py) in base_px]
+            pad = 1
+            self._x0, self._x1 = max(0, min(xs) - pad), max(xs) + pad
+            self._y0, self._y1 = max(0, min(pys) - pad), max(pys) + pad
 
     @property
     def available(self) -> bool:
-        return bool(self._frames)
+        return self._big.available
 
     @property
     def rows(self) -> int:
-        return (self._h + 1) // 2
+        return max(1, (self._y1 - self._y0 + 2) // 2)
 
     @property
     def cols(self) -> int:
-        return self._w
+        return max(1, self._x1 - self._x0 + 1)
 
     async def ensure_frames(self) -> None:
-        """No-op — every frame precomputes at construction (API compat)."""
-        return
+        """Complete the ring via the big animator's OWN builder + shared disk
+        cache (per-size key — the second boot animates instantly)."""
+        await self._big.ensure_frames()
 
-    def _frame_now(self, now: Optional[float] = None) -> Optional[dict]:
+    def _phase(self, now: Optional[float]) -> float:
         import time as _time
-        if not self._frames:
-            return None
         t = _time.monotonic() if now is None else float(now)
-        return self._frames[int(((t * self._speed) % 1.0) * len(self._frames)) % len(self._frames)]
+        return (t * self._speed) % 1.0
 
     def row_texts(self, now: Optional[float] = None) -> List[Any]:
-        """One Rich ``Text`` per cell row — the fixed sprite, current paint."""
+        """The real emblem frame + the real prey overlay, trimmed to the
+        artwork box — one Rich Text per cell row. Never raises."""
         try:
             from rich.text import Text
         except Exception:  # noqa: BLE001
             return []
-        frame = self._frame_now(now)
-        if not frame:
+        if not self.available:
             return []
+        phase = self._phase(now)
+        pixels = dict(self._big._frame_for(phase))
+        try:
+            pixels.update(self._big.prey_pixels(phase))   # the + rides along
+        except Exception:  # noqa: BLE001
+            pass
         rows: List[Any] = []
-        for cy in range((self._h + 1) // 2):
+        for cy in range(self._y0 // 2, self._y1 // 2 + 1):
             t = Text()
-            for x in range(self._w):
-                top = frame.get((x, cy * 2))
-                bot = frame.get((x, cy * 2 + 1))
+            for x in range(self._x0, self._x1 + 1):
+                top = pixels.get((x, cy * 2))
+                bot = pixels.get((x, cy * 2 + 1))
                 if top is None and bot is None:
                     t.append(" ")
                 elif top is not None and bot is not None:

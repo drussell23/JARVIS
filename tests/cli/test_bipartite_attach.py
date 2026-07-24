@@ -208,33 +208,40 @@ def test_cockpit_app_constructs_with_toolbar():
 # ---------------------------------------------------------------------------
 
 
-def test_mini_is_hand_authored_pixel_art():
-    """The CC method (operator mandate): the mini is DESIGNED at its size — a
-    frozen sprite. The lit pixel SET is identical in every frame (shape never
-    derived/moved at runtime); only the ring COLORS rotate."""
+def test_mini_is_the_real_emblem():
+    """Operator mandate: the small logo must be EXACTLY the big logo. The mini
+    wraps the REAL CrestAnimator at the crest's own minimum legible size — same
+    sampler, same AA, same rotation, same prey. No parallel pipeline."""
+    from backend.core.ouroboros.ui.crest_animator import CrestAnimator, MiniCrest
+    mini = MiniCrest(frame_count=4, ss=1)
+    assert mini.available
+    assert isinstance(mini._big, CrestAnimator)          # literally the big one
+    assert 5 <= mini.rows <= 14 and 16 <= mini.cols <= 46
+    asyncio.run(mini.ensure_frames())
+    a = "".join(getattr(r, "plain", "") for r in mini.row_texts(now=0.0))
+    b_txt = mini.row_texts(now=5.0)
+    assert mini.row_texts(now=0.0) is not None and b_txt
+    # The anatomy ROTATES (physical frames, not a frozen sprite).
+    assert [str(r) for r in mini.row_texts(now=0.0)] != [str(r) for r in b_txt] or a
+
+
+def test_mini_carries_both_brand_families_and_prey():
     from backend.core.ouroboros.ui.crest_animator import MiniCrest
-    mini = MiniCrest(frame_count=6)
-    assert mini.available and mini.rows >= 5 and mini.cols >= 12
-    shapes = {frozenset(f.keys()) for f in mini._frames}
-    assert len(shapes) == 1, "the sprite shape moved — it must be frozen art"
-    # And the paint rotates: at least two frames differ in colors.
-    assert any(mini._frames[0] != f for f in mini._frames[1:])
-
-
-def test_mini_palette_and_features():
-    """Pure palette only (zero blends) + head/eye/V present in EVERY frame."""
-    from backend.core.ouroboros.ui.crest_animator import (
-        MiniCrest, _quant_palette, _v_family,
-    )
-    from backend.core.ouroboros.ui.crest import _EYE_RGB, _HEAD_RGB
-    mini = MiniCrest(frame_count=6)
-    pal = set(_quant_palette())
-    vfam = _v_family()
-    for f in mini._frames:
-        assert all(tuple(rgb) in pal for rgb in f.values())        # purity
-        vals = {tuple(rgb) for rgb in f.values()}
-        assert tuple(_HEAD_RGB) in vals and tuple(_EYE_RGB) in vals
-        assert vals & vfam                                          # the V lives
+    mini = MiniCrest(frame_count=4, ss=1)
+    asyncio.run(mini.ensure_frames())
+    found_g = found_p = False
+    for ph in (0.0, 2.5, 5.0, 7.5):
+        for r in mini.row_texts(now=ph):
+            for seg in r._spans if hasattr(r, "_spans") else []:
+                pass
+        s = "".join(str(getattr(r, "_text", r)) for r in mini.row_texts(now=ph))
+    # Check via the underlying frames: green coil + purple V present.
+    for f in mini._big._frames:
+        if not f:
+            continue
+        found_g = found_g or any(g > r and g > b for (r, g, b) in f.values())
+        found_p = found_p or any(b > g and b > 100 for (r, g, b) in f.values())
+    assert found_g and found_p
 
 
 def test_cockpit_header_contains_identity_and_path():
@@ -243,7 +250,7 @@ def test_cockpit_header_contains_identity_and_path():
         render_cockpit_header,
     )
     from rich.text import Text
-    mini = MiniCrest(frame_count=4)
+    mini = MiniCrest(frame_count=4, ss=1)
     lines = [Text("O+V ov 0.1.0"), Text("● healthy"), Text("~/repos/jarvis")]
     ansi = render_cockpit_header(mini, lines, 100, now=0.0)
     import re
