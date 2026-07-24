@@ -286,6 +286,17 @@ def _seg_dist(px, py, ax, ay, bx, by) -> float:
 
 
 def _sample_v(px: float, py: float, geo: _Geometry) -> bool:
+    # Optional spin (boot animator): ``geo.v_rot`` (radians, default absent/0)
+    # inverse-rotates the sample point around the V's centroid, so the SAME
+    # segment tests draw a rotated V. Zero cost + zero behavior change when
+    # unset — the static crest is untouched.
+    v_rot = getattr(geo, "v_rot", 0.0)
+    if v_rot:
+        vcy = geo.cy + (geo.v_bot - geo.v_top) / 2.0   # the V's spin centre
+        dx, dy = px - geo.cx, py - vcy
+        ca, sa = math.cos(-v_rot), math.sin(-v_rot)
+        px = geo.cx + dx * ca - dy * sa
+        py = vcy + dx * sa + dy * ca
     if py < geo.cy - geo.v_top:                # flat, machined top edge
         return False
     top_inset = 0.8 * geo.scale
