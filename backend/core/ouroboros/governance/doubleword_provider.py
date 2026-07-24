@@ -5900,6 +5900,24 @@ class DoublewordProvider:
             _token_usage["input"], _token_usage["output"],
         )
 
+        # A successful generation is PROOF the Aegis->DW auth + billing path is
+        # currently valid. Publish it so a DWHeartbeat that froze itself on a
+        # stale/transient auth verdict can auto-defrost instead of requiring a
+        # daemon restart (which would strand AWE edge detection for the whole
+        # session). Best-effort telemetry — NEVER affects generation.
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                EVENT_TYPE_PROVIDER_GENERATION_SUCCEEDED,
+                publish_task_event,
+            )
+            publish_task_event(
+                EVENT_TYPE_PROVIDER_GENERATION_SUCCEEDED, "doubleword",
+                {"provider": "doubleword", "candidates": len(result.candidates),
+                 "elapsed_s": round(float(elapsed), 2)},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
         # Slice 84 — attach the Venom tool-loop execution records so the Iron
         # Gate exploration gate can count this op's read_file/search_code calls
         # (mirrors ClaudeProvider, providers.py ~5048). Without this the records

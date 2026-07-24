@@ -149,10 +149,35 @@ class AegisConfigurationError(RuntimeError):
     DW outage. Freezes the heartbeat + routes to the DLQ; never awakens."""
 
 
+class ProbeAuthUnavailable(RuntimeError):
+    """The probe could not ASSEMBLE complete credentials, so it never dispatched.
+
+    The third state the original binary taxonomy lacked. Previously a transient
+    ``TimeoutError`` acquiring the per-call lease was swallowed, the probe sent
+    an under-authenticated request anyway, the Aegis daemon answered 401, and
+    that 401 was classified ``auth`` -> PERMANENT FREEZE. A momentary lease
+    hiccup thereby disabled outage detection for the life of the process (and
+    with it the AWE recovery edge).
+
+    This is neither: not an outage (the data plane was never contacted) and not
+    a config error (the credentials may be perfectly valid -- we just could not
+    fetch them in time). It is transient and local, so the correct verdict is
+    "no information": do not freeze, do not degrade, retry next tick.
+
+    Mirrors the REAL provider's policy, which already fails closed rather than
+    dispatching without a lease ("NO silent fallback to direct upstream
+    credentials -- operator correction #5", aegis_provider_bridge.acquire_call_lease).
+    """
+
+
 def _classify_probe_exception(exc: BaseException) -> str:
-    """Classify a probe failure as ``"auth"`` (401/403 -- config error, never an
-    outage) or ``"outage"`` (timeout / 5xx / connection drop -- a real data-plane
-    failure). NEVER raises -- an unknown error is conservatively an outage."""
+    """Classify a probe failure as ``"transient"`` (credentials unavailable --
+    never dispatched, no information either way), ``"auth"`` (401/403 -- config
+    error, never an outage) or ``"outage"`` (timeout / 5xx / connection drop --
+    a real data-plane failure). NEVER raises -- an unknown error is
+    conservatively an outage."""
+    if isinstance(exc, ProbeAuthUnavailable):
+        return "transient"
     try:
         import urllib.error  # noqa: PLC0415
         if isinstance(exc, urllib.error.HTTPError):
@@ -163,6 +188,19 @@ def _classify_probe_exception(exc: BaseException) -> str:
     except Exception:  # noqa: BLE001
         pass
     return "outage"
+
+
+def _aegis_lease_required() -> bool:
+    """True iff Aegis is enabled, i.e. a per-call lease is MANDATORY for the
+    probe to be properly authenticated. Reuses the same enablement predicate the
+    bridge itself consults (DRY) — no second notion of "is Aegis on". Conservative
+    on error: assume required, because dispatching without a mandatory lease is
+    the failure mode this gate exists to prevent."""
+    try:
+        from backend.core.ouroboros.aegis import client as _aegis_client_mod  # noqa: PLC0415
+        return bool(_aegis_client_mod.is_enabled())
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _default_dlq_emit(payload: Any) -> None:
@@ -266,6 +304,16 @@ async def _resolve_dw_probe_transport():
         auth = await _apb.dw_session_auth_header()
         if not isinstance(auth, dict):
             auth = {}
+        # ── PRE-FLIGHT AUTH GATE ──────────────────────────────────────────
+        # Aegis ENABLED means a lease is mandatory. If we cannot obtain one we
+        # must NOT dispatch: an under-authenticated request earns a guaranteed
+        # 401, and that 401 is indistinguishable (to the classifier) from a real
+        # misconfiguration -> permanent freeze. Fail closed BEFORE the socket,
+        # exactly as the real provider does.
+        #
+        # `acquire_call_lease` returns None *legitimately* when Aegis is
+        # disabled — that is not a failure and must still dispatch (direct-DW
+        # mode carries no lease header at all).
         lease = None
         try:
             lease = await _apb.acquire_call_lease(
@@ -273,11 +321,25 @@ async def _resolve_dw_probe_transport():
                 route="heartbeat",
                 estimated_cost_usd=_env_float("JARVIS_DW_DEEP_PROBE_COST_USD", 0.0001),
             )
-        except Exception as exc:  # noqa: BLE001 -- no lease -> daemon 401 -> classified
-            logger.debug("[DWHeartbeat] probe lease acquire fail-soft err=%r", exc)
+        except Exception as exc:  # noqa: BLE001
+            if _aegis_lease_required():
+                logger.debug(
+                    "[DWHeartbeat] probe lease unavailable (%r) — SKIPPING dispatch "
+                    "(pre-flight gate); transient, no freeze, no degrade", exc,
+                )
+                raise ProbeAuthUnavailable(
+                    "lease acquisition failed pre-dispatch: %r" % (exc,)
+                ) from exc
+            logger.debug("[DWHeartbeat] probe lease absent (aegis off) err=%r", exc)
+        if lease is None and _aegis_lease_required():
+            raise ProbeAuthUnavailable(
+                "aegis enabled but lease resolved to None pre-dispatch"
+            )
         merged = _apb.merge_lease_into_session_headers(auth, lease)
         if isinstance(merged, dict):
             headers.update(merged)
+    except ProbeAuthUnavailable:
+        raise  # the gate's verdict must reach the classifier intact
     except Exception as exc:  # noqa: BLE001 -- best-effort bearer/lease
         logger.debug("[DWHeartbeat] aegis auth/lease fail-soft err=%r", exc)
     return (url, headers)
@@ -383,6 +445,12 @@ class DWHeartbeat:
         # intake DLQ. Injectable for tests. A 401/403 FREEZES the loop here.
         self._dlq_emit_fn = dlq_emit_fn or _default_dlq_emit
         self._frozen = False  # set True on an auth/config error -> never awakens
+        # Observability for the pre-flight gate: how many ticks were skipped
+        # because credentials could not be assembled (transient, no verdict).
+        self._transient_skips = 0
+        # Auto-defrost accounting (bounded — see note_provider_success).
+        self._defrost_count = 0
+        self._success_subscribed: asyncio.Event = asyncio.Event()
         # Recovery signal (Handback Protocol): consecutive HEALTHY probes. A
         # streak of fast-healthy beats means DW recovered -> drives SERVING->HANDBACK.
         self._healthy_streak = 0
@@ -412,6 +480,77 @@ class DWHeartbeat:
     # ------------------------------------------------------------------
     # Public read surface (consumed by the failover lifecycle pre-warm gate)
     # ------------------------------------------------------------------
+
+    def note_provider_success(self) -> bool:
+        """AUTO-DEFROST. A successful DW generation proves the Aegis->DW auth +
+        billing path is currently valid, so a frozen heartbeat's config verdict
+        is stale. Thaw and resume probing. Returns True iff it actually thawed.
+
+        BOUNDED on purpose (``JARVIS_DW_HEARTBEAT_MAX_DEFROSTS``, default 3).
+        Unbounded defrost is a flap machine: if the probe's auth is *genuinely*
+        broken while the provider's works — precisely today's divergence — the
+        loop becomes freeze -> success -> defrost -> 401 -> freeze forever,
+        emitting a CRITICAL and a DLQ record every cycle. A bound means
+        self-healing for the transient case (the common one) while a persistent
+        misconfiguration still ends in a durable freeze a human can see.
+        NEVER raises."""
+        try:
+            if not self._frozen:
+                return False
+            cap = _env_int("JARVIS_DW_HEARTBEAT_MAX_DEFROSTS", 3)
+            if self._defrost_count >= cap:
+                logger.debug(
+                    "[DWHeartbeat] defrost suppressed — cap %d reached; the probe "
+                    "auth failure is persistent, not transient", cap,
+                )
+                return False
+            self._frozen = False
+            self._defrost_count += 1
+            self._healthy_streak = 0
+            logger.warning(
+                "[DWHeartbeat] AUTO-DEFROST (%d/%d) — observed a successful DW "
+                "generation, so the frozen config verdict is stale. Resuming probe "
+                "+ AWE edge detection.", self._defrost_count, cap,
+            )
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def watch_provider_success(self, *, max_events: Optional[int] = None) -> None:
+        """Drain ``provider_generation_succeeded`` off the SAME StreamEventBroker
+        the SSE surface uses and auto-defrost on each. Adds a consumer, not a
+        second poll loop (DRY — mirrors AWETrigger.watch). Never raises."""
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            EVENT_TYPE_PROVIDER_GENERATION_SUCCEEDED,
+            get_default_broker,
+        )
+        broker = None
+        sub = None
+        seen = 0
+        try:
+            broker = get_default_broker()
+            sub = broker.subscribe(op_id_filter="doubleword")
+            if sub is None:
+                return
+            self._success_subscribed.set()
+            async for event in broker.stream_iter(sub, heartbeat_s=0):
+                if getattr(event, "event_type", "") != EVENT_TYPE_PROVIDER_GENERATION_SUCCEEDED:
+                    continue
+                self.note_provider_success()
+                seen += 1
+                if max_events is not None and seen >= max_events:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            return
+        finally:
+            self._success_subscribed.set()
+            try:
+                if broker is not None and sub is not None:
+                    broker.unsubscribe(sub)
+            except Exception:  # noqa: BLE001
+                pass
 
     def is_frozen(self) -> bool:
         """True once an AUTH/config error froze the loop. A frozen heartbeat is
@@ -529,8 +668,13 @@ class DWHeartbeat:
             return False
         except AegisConfigurationError:
             raise  # already classified -- propagate to beat() (the Safety Law)
+        except ProbeAuthUnavailable:
+            raise  # pre-flight gate: propagate so beat() records NO verdict
         except Exception as exc:  # noqa: BLE001 -- classify before treating as degrade
-            if _classify_probe_exception(exc) == "auth":
+            _cls = _classify_probe_exception(exc)
+            if _cls == "transient":
+                raise ProbeAuthUnavailable(str(exc)) from exc
+            if _cls == "auth":
                 # A 401/403 is a PROBE misconfiguration, NOT a DW outage. Raise a
                 # typed error so beat() freezes the loop instead of degrading
                 # (which would conflate a config bug with an outage -> false awaken).
@@ -578,6 +722,17 @@ class DWHeartbeat:
             if asyncio.iscoroutine(result):
                 result = await result
             ok = bool(result)
+        except ProbeAuthUnavailable as exc:
+            # PRE-FLIGHT GATE: credentials could not be assembled, so nothing was
+            # ever sent. That is NO INFORMATION about DW — record no verdict at
+            # all. Not a freeze (the config may be fine), not a degrade (the data
+            # plane was never contacted). Retry next tick.
+            self._transient_skips += 1
+            logger.debug(
+                "[DWHeartbeat] probe skipped pre-dispatch (transient, skips=%d) "
+                "— no freeze, no degrade: %r", self._transient_skips, exc,
+            )
+            return
         except AegisConfigurationError as exc:
             # THE SAFETY LAW: an auth/config error is NOT a DW outage. FREEZE the
             # loop (no proxy spam), route to the DLQ, and record NOTHING into the
