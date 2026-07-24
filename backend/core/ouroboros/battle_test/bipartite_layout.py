@@ -425,8 +425,8 @@ def build_bipartite_application(
         wrap_lines=False, height=Dimension(weight=1),
     )
     prompt = TextArea(
-        height=1, prompt="› ", multiline=False, wrap_lines=False,
-        style="class:command-deck",
+        height=1, prompt=[("fg:#5ee06a bold", "❯ ")], multiline=False,
+        wrap_lines=False, style="class:command-deck",
     )
 
     def _accept(buff) -> bool:
@@ -467,7 +467,11 @@ def build_bipartite_application(
             content=FormattedTextControl(_header_fragments, focusable=False),
             height=header_height, wrap_lines=False,
         ))
-    rows += [canvas, prompt]
+    # The CC input framing: a dim hairline above AND below the ❯ row.
+    def _rule() -> Any:
+        return Window(height=1, char="─", style="fg:#1e2b28")
+
+    rows += [canvas, _rule(), prompt, _rule()]
     if toolbar is not None:
         # A one-row morphing footer (e.g. the attach client's AttachUI.toolbar —
         # audio state, detach hint). Re-evaluated each repaint; a failing
@@ -583,7 +587,7 @@ async def run_bipartite_repl(
     size = shutil.get_terminal_size(fallback=(100, 30))
     mux = BipartiteLayout(
         width=size.columns,
-        height=max(6, size.lines - max(0, header_height)),
+        height=max(6, size.lines - max(0, header_height) - 2),
         title=title,
     )
     set_active_canvas(mux)
