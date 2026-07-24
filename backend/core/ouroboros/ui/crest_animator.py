@@ -665,7 +665,7 @@ def _snap(rgb: Tuple[float, float, float], pal: List[Tuple[int, int, int]]) -> T
 
 def build_scaled_frame(
     cells_w: int, rot: float, ss: int, v_rot: float = 0.0, alpha: str = "sharp",
-    src_cols: int = 47,
+    src_cols: int = 47, pack: str = "quad",
 ) -> Dict[Tuple[int, int], Tuple[int, int, int]]:
     """Aspect-TRUE mini frame for the quadrant medium. A terminal cell is 1:2,
     so quadrant subpixels are 0.5w x 1h — a symmetric 2x2 pack of half-block
@@ -703,7 +703,13 @@ def build_scaled_frame(
         y_lo, y_hi = min(pys) * _REF_ASPECT - pad, (max(pys) + 1) * _REF_ASPECT + pad
         span = max(x_hi - x_lo, y_hi - y_lo)        # square physical window
         cx_p, cy_p = (x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0
-        sub_w, sub_h = 2 * cells_w, cells_w          # 0.5w x 1h subs -> round
+        if pack == "half":
+            # THE BIG LOGO'S OWN FINISH, smaller: halfblock pixels are square
+            # on screen (1 cell wide x half a cell tall), so the grid is
+            # ISOTROPIC — same aa feathering, same per-pixel color fidelity.
+            sub_w, sub_h = cells_w, cells_w
+        else:
+            sub_w, sub_h = 2 * cells_w, cells_w      # 0.5w x 1h subs -> round
         px_pitch, py_pitch = span / sub_w, span / sub_h
         v_span = max(1e-6, geo.v_top + geo.v_bot)
         out: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
@@ -784,16 +790,25 @@ class MiniCrest:
             "JARVIS_CREST_MINI_SPEED", 0.10, 0.01, 2.0,
         )
         self._cells_w = cols if cols is not None else _env_int(
-            "JARVIS_CREST_MINI_CELLS", 16, 10, 28,
+            "JARVIS_CREST_MINI_CELLS", 24, 10, 32,
         )
-        self._ss_mini = ss if ss is not None else _env_int("JARVIS_CREST_MINI_SS", 4, 2, 6)
-        edge = os.environ.get("JARVIS_CREST_MINI_EDGE", "sharp").strip().lower()
+        self._ss_mini = ss if ss is not None else _env_int("JARVIS_CREST_MINI_SS", 5, 2, 6)
+        # THE BIG LOGO'S AESTHETIC by default: halfblock + aa (soft gradient,
+        # feathered edges, per-pixel color — the emblem's own finish, smaller).
+        # JARVIS_CREST_MINI_PACK=quad restores the packed pixel-art mode.
+        self._pack = os.environ.get("JARVIS_CREST_MINI_PACK", "half").strip().lower()
+        if self._pack not in ("half", "quad"):
+            self._pack = "half"
+        edge = os.environ.get(
+            "JARVIS_CREST_MINI_EDGE", "aa" if self._pack == "half" else "sharp",
+        ).strip().lower()
         self._edge = edge if edge in ("aa", "sharp", "crisp") else "sharp"
         self._n = frame_count if frame_count is not None else _env_int(
             "JARVIS_CREST_MINI_FRAMES", 24, 4, 48,
         )
         self._frames: List[Optional[dict]] = [None] * max(1, self._n)
-        f0 = build_scaled_frame(self._cells_w, 0.0, self._ss_mini, 0.0, self._edge)
+        f0 = build_scaled_frame(self._cells_w, 0.0, self._ss_mini, 0.0, self._edge,
+                                pack=self._pack)
         if f0:
             self._frames[0] = f0
         self._built = 1 if f0 else 0
@@ -823,7 +838,7 @@ class MiniCrest:
             rot = 2.0 * math.pi * k / self._n
             f = await asyncio.to_thread(
                 build_scaled_frame, self._cells_w, rot, self._ss_mini,
-                _v_spin_mult() * rot, self._edge,
+                _v_spin_mult() * rot, self._edge, 47, self._pack,
             )
             if f:
                 self._frames[k] = f
@@ -854,6 +869,30 @@ class MiniCrest:
         pixels = self._frame_now(now)
         if not pixels:
             return []
+        if self._pack == "half":
+            # The big logo's own renderer: halfblock ▀ with independent fg/bg —
+            # per-pixel color fidelity, feathered aa edges. Identical finish.
+            rows: List[Any] = []
+            W = self._cells_w
+            for cy in range(W // 2):
+                t = Text()
+                for x in range(W):
+                    top = pixels.get((x, cy * 2))
+                    bot = pixels.get((x, cy * 2 + 1))
+                    if top is None and bot is None:
+                        t.append(" ")
+                    elif top is not None and bot is not None:
+                        tr, tg, tb = top
+                        br, bg, bb = bot
+                        t.append("▀", style=f"rgb({tr},{tg},{tb}) on rgb({br},{bg},{bb})")
+                    elif top is not None:
+                        tr, tg, tb = top
+                        t.append("▀", style=f"rgb({tr},{tg},{tb})")
+                    else:
+                        br, bg, bb = bot
+                        t.append("▄", style=f"rgb({br},{bg},{bb})")
+                rows.append(t)
+            return rows
         sub_w, sub_h = 2 * self._cells_w, self._cells_w
         rows: List[Any] = []
         for cy in range(sub_h // 2):
