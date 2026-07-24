@@ -154,6 +154,7 @@ def _rotated_geometry(
 
 def build_rotated_frame(
     cols: int, rows: int, rot: float, ss: int, v_rot: float = 0.0,
+    alpha: str = "aa",
 ) -> Dict[Tuple[int, int], Tuple[int, int, int]]:
     """Sample ONE fully-rotated frame through the crest's own pipeline
     (`_sample_pixel` → `_pixel_color_and_delay` → coverage-alpha →
@@ -172,10 +173,20 @@ def build_rotated_frame(
                     continue
                 py_frac = (py * _REF_ASPECT - (geo.cy - geo.v_top)) / v_span
                 base, _d = _pixel_color_and_delay(kind, theta, py_frac, geo)
-                alpha = coverage ** 0.75
-                pixels[(x, py)] = tuple(
-                    max(0, min(255, round(c * alpha))) for c in base
-                )
+                if alpha == "crisp":
+                    # Hard pixel art (the CC-logo look): at tiny scales the
+                    # coverage-alpha AA dims nearly EVERY pixel (all edges) into
+                    # mud. Binary threshold + full-intensity color = crystal.
+                    if coverage < 0.34:
+                        continue
+                    pixels[(x, py)] = tuple(
+                        max(0, min(255, round(c))) for c in base
+                    )
+                else:
+                    a = coverage ** 0.75
+                    pixels[(x, py)] = tuple(
+                        max(0, min(255, round(c * a))) for c in base
+                    )
         return _prune_sparse_geometry(pixels)
     except Exception:  # noqa: BLE001
         return {}
@@ -635,7 +646,8 @@ class MiniCrest:
         self._built = 0
         self._builder_started = False
         # Frame 0 built synchronously — small raster (~10-20ms), instant logo.
-        f0 = build_rotated_frame(self._cols, self._rows, 0.0, self._ss)
+        # CRISP mode: hard pixels, no AA mud (the CC-logo look).
+        f0 = build_rotated_frame(self._cols, self._rows, 0.0, self._ss, alpha="crisp")
         if f0:
             self._frames[0] = f0
             self._built = 1
@@ -666,6 +678,7 @@ class MiniCrest:
                 v_rot = _v_spin_mult() * rot
                 frame = await asyncio.to_thread(
                     build_rotated_frame, self._cols, self._rows, rot, self._ss, v_rot,
+                    "crisp",
                 )
                 if frame:
                     self._frames[k] = frame
@@ -702,10 +715,21 @@ class MiniCrest:
             return []
         occ = [py // 2 for (_x, py) in frame]
         lo, hi = (min(occ), max(occ)) if occ else (0, self._rows - 1)
+        # Trim the raster's centering margins: the logo sits flush-left and the
+        # header text rides close beside it (the CC layout). Bounds are computed
+        # from a FIXED reference pose so the trim never jitters as it spins —
+        # use the whole ring's union when built, else this frame.
+        union = {x for f in self._frames if f for (x, _py) in f}
+        xs = sorted(union or {x for (x, _py) in frame})
+        x_lo, x_hi = (xs[0], xs[-1]) if xs else (0, self._cols - 1)
+        # Row bounds from the union too — the logo box is rock-stable as it spins.
+        occ_union = sorted({py // 2 for f in self._frames if f for (_x, py) in f})
+        if occ_union:
+            lo, hi = occ_union[0], occ_union[-1]
         rows: List[Any] = []
         for cy in range(lo, hi + 1):
             t = Text()
-            for x in range(self._cols):
+            for x in range(x_lo, x_hi + 1):
                 top = frame.get((x, cy * 2))
                 bot = frame.get((x, cy * 2 + 1))
                 if top is None and bot is None:

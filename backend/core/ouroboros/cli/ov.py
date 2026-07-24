@@ -544,8 +544,10 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
 
         def _header_lines():
             t1 = _Text()
-            t1.append("O+V ", style="bold rgb(94,224,106)")
-            t1.append(version_line(), style="rgb(219,230,225)")
+            # The CC title grammar: "O+V v0.1.0" (bold brand + bare version),
+            # exactly like "Claude Code v2.1.218". DRY: resolve_version().
+            t1.append("O+V", style="bold rgb(94,224,106)")
+            t1.append(f" v{resolve_version()}", style="rgb(219,230,225)")
             t2 = _Text()
             state = "HEALTHY"
             try:
