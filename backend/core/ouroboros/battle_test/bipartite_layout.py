@@ -380,6 +380,7 @@ def build_bipartite_application(
     *,
     on_accept: Callable[[str], Any],
     extra_key_bindings: Any = None,
+    toolbar: Optional[Callable[[], str]] = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
     window fed from ``mux.render_canvas_ansi()`` (re-rendered each frame, so
@@ -439,7 +440,22 @@ def build_bipartite_application(
         except Exception:  # noqa: BLE001
             pass
 
-    root = HSplit([canvas, prompt])
+    rows = [canvas, prompt]
+    if toolbar is not None:
+        # A one-row morphing footer (e.g. the attach client's AttachUI.toolbar —
+        # audio state, detach hint). Re-evaluated each repaint; a failing
+        # callable renders empty rather than crashing the frame.
+        def _toolbar_fragments():
+            try:
+                return [("class:bottom-toolbar", str(toolbar() or ""))]
+            except Exception:  # noqa: BLE001
+                return [("", "")]
+
+        rows.append(Window(
+            content=FormattedTextControl(_toolbar_fragments, focusable=False),
+            height=1, wrap_lines=False,
+        ))
+    root = HSplit(rows)
     app = Application(
         layout=PTLayout(root, focused_element=prompt),
         key_bindings=kb, full_screen=True, mouse_support=False,
@@ -482,31 +498,84 @@ def should_run_bipartite() -> bool:
         return False
 
 
+async def _alive_watcher(
+    app_exit: Callable[[], Any],
+    watch_alive: Callable[[], bool],
+    *,
+    interval_s: float = 0.25,
+    sleep_fn=None,
+) -> None:
+    """Poll ``watch_alive`` and call ``app_exit`` the moment it goes False — the
+    daemon-died-mid-typing guard, generic + injectable (headless-testable).
+    Never raises out."""
+    import asyncio
+    sleep = sleep_fn or asyncio.sleep
+    try:
+        while True:
+            try:
+                if not watch_alive():
+                    try:
+                        app_exit()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return
+            except Exception:  # noqa: BLE001 — a probe error reads as "gone"
+                try:
+                    app_exit()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            await sleep(interval_s)
+    except asyncio.CancelledError:
+        raise
+
+
 async def run_bipartite_repl(
     *,
     on_accept: Callable[[str], Any],
     title: str = "◇ O+V · proactive canvas",
     extra_key_bindings: Any = None,
+    toolbar: Optional[Callable[[], str]] = None,
+    watch_alive: Optional[Callable[[], bool]] = None,
+    seed: Optional[List[str]] = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
-    the live Zone-1 sink (so the event router redirects into it), run the
-    Application to completion, and clear the sink on exit. The atomic render loop
-    is the ``patch_stdout``-equivalent — background telemetry into Zone 1 never
-    corrupts Zone 2 keystrokes. Caller gates on :func:`should_run_bipartite`.
-    Never raises out."""
+    the live Zone-1 sink (so any producer — the daemon's event router OR the
+    attach client's bridge stream — redirects into it), run the Application to
+    completion, and clear the sink on exit. ``toolbar`` adds a one-row morphing
+    footer; ``watch_alive`` exits the app the moment it returns False (daemon
+    death never hangs the prompt). The atomic render loop is the
+    ``patch_stdout``-equivalent — background telemetry into Zone 1 never corrupts
+    Zone 2 keystrokes. Caller gates on :func:`should_run_bipartite`. Never
+    raises out."""
+    import asyncio
     import shutil
 
     size = shutil.get_terminal_size(fallback=(100, 30))
     mux = BipartiteLayout(width=size.columns, height=size.lines, title=title)
     set_active_canvas(mux)
+    for ln in (seed or []):
+        mux.push_raw(ln)
+    watcher = None
     try:
         app = build_bipartite_application(
             mux, on_accept=on_accept, extra_key_bindings=extra_key_bindings,
+            toolbar=toolbar,
         )
+        if watch_alive is not None:
+            watcher = asyncio.ensure_future(
+                _alive_watcher(app.exit, watch_alive)
+            )
         await app.run_async()
     except Exception:  # noqa: BLE001 — a TUI failure must not crash the organism
         logger.debug("[Bipartite] run_bipartite_repl exited on error", exc_info=True)
     finally:
+        if watcher is not None:
+            watcher.cancel()
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         set_active_canvas(None)
 
 
