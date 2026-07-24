@@ -65,7 +65,7 @@ from .crest import (
 # styling guard exactly as crest.py's per-pixel gradient styles do.
 _LOG_RGB = "rgb(94,224,106)"            # venom-green boot logs
 
-_CACHE_VERSION = 4                      # v4: V-spin baked into frames                      # bump to invalidate stale frame caches
+_CACHE_VERSION = 6                      # v6: resolved-knob keys (stale spun-V purge)                      # bump to invalidate stale frame caches
 
 
 # ---- env knobs (no hardcoding) --------------------------------------------
@@ -253,13 +253,21 @@ def build_prey_sprite(
 
 
 def _cache_key(cols: int, rows: int, n: int, ss: int) -> str:
-    knobs = (
-        _CACHE_VERSION, cols, rows, n, ss,
-        os.environ.get("JARVIS_OV_CREST_BAND_AMP", ""),
-        os.environ.get("JARVIS_OV_CREST_COVERAGE", ""),
-        os.environ.get("JARVIS_OV_CREST_MIN_COMPONENT_PX", ""),
-        os.environ.get("JARVIS_CREST_ANIM_V_SPIN", ""),
-    )
+    """Fingerprint the RESOLVED knob values, never raw env strings — a default
+    change (e.g. V-spin -1.0 → 0.0) left the env string identical ("") so the
+    STALE spun-V ring kept loading forever (the arrow-V the operator saw on the
+    boot emblem). Resolved values make cache identity == rendered identity."""
+    try:
+        from .crest import _band_strength, _coverage_threshold, _min_component_px
+        knobs = (
+            _CACHE_VERSION, cols, rows, n, ss,
+            round(_band_strength(), 4),
+            round(_coverage_threshold(), 4),
+            _min_component_px(),
+            round(_v_spin_mult(), 4),          # RESOLVED — defaults included
+        )
+    except Exception:  # noqa: BLE001
+        knobs = (_CACHE_VERSION, cols, rows, n, ss, "fallback")
     return hashlib.sha256(repr(knobs).encode()).hexdigest()[:16]
 
 
@@ -675,13 +683,17 @@ def build_scaled_frame(
         # Icon-legibility exaggeration (the pixel-artist rule: at icon scale,
         # identity features must be OVERSIZED to read). Applied ONLY here — the
         # big emblem keeps true proportions. Env-tunable, derived not drawn.
-        fb = _env_float("JARVIS_CREST_MINI_FEATURE_BOOST", 1.6, 1.0, 2.5)
-        geo.gap_half = geo.gap_half * fb                 # the bite gap READS
-        geo.head_len = geo.head_len * 1.35
-        geo.head_w = geo.head_w * 1.3
-        geo.eye_r = geo.eye_r * 1.9                      # the eye survives
-        geo.tail_tip = _ang_norm(geo.gap_center + geo.gap_half)
-        geo.head_theta = _ang_norm(geo.gap_center - geo.gap_half)
+        # Default 1.0 = EXACT big-logo proportions (operator mandate). Raising
+        # the boost trades exactness for icon legibility; every factor scales
+        # from (fb-1) so fb=1.0 is mathematically identity.
+        fb = _env_float("JARVIS_CREST_MINI_FEATURE_BOOST", 1.0, 1.0, 2.5)
+        if fb > 1.0:
+            geo.gap_half = geo.gap_half * fb
+            geo.head_len = geo.head_len * (1.0 + (fb - 1.0) * 0.6)
+            geo.head_w = geo.head_w * (1.0 + (fb - 1.0) * 0.5)
+            geo.eye_r = geo.eye_r * (1.0 + (fb - 1.0) * 1.5)
+            geo.tail_tip = _ang_norm(geo.gap_center + geo.gap_half)
+            geo.head_theta = _ang_norm(geo.gap_center - geo.gap_half)
         xs = [x for (x, _py) in pf.pixels]
         pys = [py for (_x, py) in pf.pixels]
         if not xs:
@@ -731,7 +743,7 @@ def build_scaled_frame(
         out = _prune_sparse_geometry(out)
         # The + prey — the gap centre, same window transform, pure palette.
         theta = _ang_norm(geo.gap_center)
-        prey_r = geo.r_mid + geo.thick * 1.15            # OUTSIDE the coil → on black
+        prey_r = geo.r_mid                                # SAME radius as the big logo's prey
         px_p = geo.cx + prey_r * math.cos(theta)
         py_p = geo.cy - prey_r * math.sin(theta)
         qx0 = int((px_p - (cx_p - span / 2.0)) / px_pitch)
