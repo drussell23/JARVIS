@@ -165,3 +165,172 @@ async def test_awe_lock_is_atomic_single_winner(db_path):
     assert len(winners) == 1
     lock = read_soak_lock(sqlite3.connect(db_path))
     assert lock is not None and lock["claimed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Gap #2 — the substrate-aware dispatcher.
+#
+# Before this, AWE's ONLY strategy was a hardcoded battle-test spawn, so a
+# queued checkpoint manifest survived the recovery edge untouched: the intent
+# stayed `pending` forever while a generic soak ran in its place. These pin the
+# routing decision against REAL SQLite + the REAL next_pending_intent query —
+# only the terminal launchers are faked, so a regression in the queue schema or
+# the ordering surfaces here rather than at 3 AM.
+# ---------------------------------------------------------------------------
+
+
+def _seed_intent(db_path, *, intent_id, manifest_json, target, priority=1):
+    """Enqueue via the REAL production writer (not hand-rolled INSERT), so the
+    test binds to the shipping schema."""
+    from backend.core.ouroboros.governance.soak_intent import enqueue_soak_intent
+
+    conn = sqlite3.connect(db_path)
+    try:
+        enqueue_soak_intent(
+            conn, kind="canary_soak", target=target, priority=priority,
+            intent_id=intent_id, manifest_json=manifest_json,
+        )
+    finally:
+        conn.close()
+
+
+def _dispatcher(db_path, *, fallback, client=object(), crumbs=None):
+    from backend.core.ouroboros.governance.awe_trigger import (
+        build_manifest_aware_launch_fn,
+    )
+    return build_manifest_aware_launch_fn(
+        db_factory=lambda: sqlite3.connect(db_path),
+        client_factory=lambda: client,
+        fallback_fn=fallback,
+        breadcrumb_fn=(lambda et, p: crumbs.append((et, dict(p)))) if crumbs is not None else None,
+    )
+
+
+async def test_pending_manifest_routes_to_run_pending_soak(db_path, monkeypatch):
+    """(1) A pending row carrying a manifest routes DIRECTLY to run_pending_soak
+    — and carries the intent's `target` as repo_root, because manifest chunk
+    file_paths are stored relative to it."""
+    import json
+
+    from backend.core.ouroboros.governance import checkpoint_manifest
+
+    manifest = json.dumps({
+        "schema_version": 2, "target": "/tmp/canary",
+        "pending_chunks": [{"chunk_id": "c1", "file_path": "mathy.py",
+                            "symbol": "factorial", "start_line": 4, "end_line": 8}],
+        "completed_chunks": [], "quarantined_chunks": [], "chunk_retry_counts": {},
+    })
+    _seed_intent(db_path, intent_id="canary01", manifest_json=manifest,
+                 target="/tmp/canary")
+
+    seen = {}
+
+    async def fake_run_pending_soak(conn, intent_id, *, client, repo_root="."):
+        seen["intent_id"] = intent_id
+        seen["repo_root"] = repo_root
+        seen["client"] = client
+        return "manifest-ran"
+
+    monkeypatch.setattr(checkpoint_manifest, "run_pending_soak", fake_run_pending_soak)
+
+    fallback_calls = []
+
+    async def fallback(run_id):
+        fallback_calls.append(run_id)
+        return "fallback-ran"
+
+    sentinel_client = object()
+    crumbs: list = []
+    launch = _dispatcher(db_path, fallback=fallback, client=sentinel_client, crumbs=crumbs)
+
+    result = await launch("run-1")
+
+    assert result == "manifest-ran"
+    assert fallback_calls == [], "generic soak must NOT run when a manifest is pending"
+    assert seen["intent_id"] == "canary01"
+    # The load-bearing detail: repo_root is the intent target, NOT the repo root.
+    assert seen["repo_root"] == "/tmp/canary"
+    assert seen["client"] is sentinel_client
+    strategies = [p.get("strategy") for et, p in crumbs if et == "awe_launch_strategy"]
+    assert strategies == ["manifest"], "the routing decision must be observable"
+
+
+async def test_empty_queue_routes_to_subprocess_fallback(db_path):
+    """(2) An empty intent queue cleanly routes to the generic battle-test soak."""
+    fallback_calls = []
+
+    async def fallback(run_id):
+        fallback_calls.append(run_id)
+        return "fallback-ran"
+
+    crumbs: list = []
+    launch = _dispatcher(db_path, fallback=fallback, crumbs=crumbs)
+
+    result = await launch("run-2")
+
+    assert result == "fallback-ran"
+    assert fallback_calls == ["run-2"]
+    strategies = [p.get("strategy") for et, p in crumbs if et == "awe_launch_strategy"]
+    assert strategies == ["subprocess_fallback"]
+
+
+async def test_pending_intent_without_manifest_falls_back(db_path):
+    """A pending intent with no manifest is real work but not CHECKPOINTED work
+    — route it to the generic soak rather than resuming an empty run."""
+    _seed_intent(db_path, intent_id="nomanifest", manifest_json=None, target="/tmp/x")
+
+    fallback_calls = []
+
+    async def fallback(run_id):
+        fallback_calls.append(run_id)
+        return "fallback-ran"
+
+    crumbs: list = []
+    launch = _dispatcher(db_path, fallback=fallback, crumbs=crumbs)
+    assert await launch("run-3") == "fallback-ran"
+    assert fallback_calls == ["run-3"]
+    reasons = [p.get("reason") for et, p in crumbs if et == "awe_launch_strategy"]
+    assert reasons == ["intent carries no manifest"]
+
+
+async def test_unresolvable_client_degrades_to_fallback_not_silence(db_path):
+    """A manifest we cannot drive in-process must run the generic soak, NOT drop
+    the recovery edge on the floor."""
+    import json
+
+    _seed_intent(db_path, intent_id="canary02",
+                 manifest_json=json.dumps({"schema_version": 2, "pending_chunks": []}),
+                 target="/tmp/canary")
+
+    fallback_calls = []
+
+    async def fallback(run_id):
+        fallback_calls.append(run_id)
+        return "fallback-ran"
+
+    crumbs: list = []
+    launch = _dispatcher(db_path, fallback=fallback, client=None, crumbs=crumbs)
+    assert await launch("run-4") == "fallback-ran"
+    assert fallback_calls == ["run-4"]
+
+
+async def test_priority_ordering_picks_the_urgent_intent(db_path):
+    """next_pending_intent must hand AWE the same intent the supervisor's arm
+    gate counted — highest priority (lowest number) first."""
+    import json
+
+    from backend.core.ouroboros.governance.soak_intent import next_pending_intent
+
+    m = json.dumps({"schema_version": 2, "pending_chunks": []})
+    _seed_intent(db_path, intent_id="low", manifest_json=m, target="/a", priority=9)
+    _seed_intent(db_path, intent_id="urgent", manifest_json=m, target="/b", priority=1)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        got = next_pending_intent(conn)
+    finally:
+        conn.close()
+    assert got is not None
+    assert got.intent_id == "urgent"
+    assert got.target == "/b"
+    assert got.has_manifest is True

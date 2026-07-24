@@ -351,6 +351,129 @@ def build_soak_subprocess_launch_fn(
     return _launch
 
 
+def _default_client_factory() -> Any:
+    """Lazily construct the DW-primary client the checkpointed swarm drives.
+
+    Same lazy-handle pattern ``moltbook_garnish`` uses for its DW call (DRY —
+    one construction idiom for "I need a provider handle right now"). Returns
+    ``None`` on any failure, which the dispatcher treats as "cannot run the
+    manifest in-process" and routes to the subprocess fallback rather than
+    fabricating a client."""
+    try:
+        from backend.core.ouroboros.governance.doubleword_provider import (
+            DoublewordProvider,
+        )
+        return DoublewordProvider()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def build_manifest_aware_launch_fn(
+    *,
+    db_factory: Optional[DbFactory] = None,
+    client_factory: Optional[Callable[[], Any]] = None,
+    fallback_fn: Optional[LaunchFn] = None,
+    breadcrumb_fn: Optional[BreadcrumbFn] = None,
+    max_priority: Optional[int] = None,
+) -> LaunchFn:
+    """The substrate-aware dispatcher: inspect state, THEN choose the strategy.
+
+    Closes the orphan-``run_pending_soak`` gap. Before this, AWE's only launch
+    strategy was a hardcoded ``scripts/ouroboros_battle_test.py`` spawn, so a
+    queued checkpoint manifest (e.g. the canary's 7 chunks) survived the
+    recovery edge untouched — the intent stayed ``pending`` forever while a
+    generic, un-manifested soak ran in its place.
+
+    On each recovery edge:
+
+      * **pending intent WITH a manifest** → :func:`run_pending_soak`, resuming
+        that intent's chunks against the real swarm. Crash-resumable: every
+        chunk commits atomically, so a second edge picks up where this left off.
+      * **empty queue, no manifest, or no resolvable client** → the existing
+        subprocess soak, unchanged.
+
+    ``repo_root`` for the manifest path is the intent's ``target``, not the
+    repository root — see :class:`PendingIntent`. Both strategies breadcrumb
+    which way they went, so the choice is visible in ``/breadcrumbs`` rather
+    than inferred. Never raises: any failure degrades to the fallback."""
+    _db = db_factory or _default_db_factory
+    _client = client_factory or _default_client_factory
+    _fallback = fallback_fn or build_soak_subprocess_launch_fn()
+    _crumb = breadcrumb_fn or _default_breadcrumb_fn
+
+    def _emit(strategy: str, detail: dict) -> None:
+        try:
+            _crumb("awe_launch_strategy", {"strategy": strategy, **detail})
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _launch(run_id: str) -> Any:
+        from backend.core.ouroboros.governance.soak_intent import next_pending_intent
+
+        conn = None
+        try:
+            conn = _db()
+        except Exception:  # noqa: BLE001
+            conn = None
+
+        intent = None
+        try:
+            intent = next_pending_intent(conn, max_priority=max_priority)
+        except Exception:  # noqa: BLE001
+            intent = None
+
+        if intent is None or not intent.has_manifest:
+            _emit("subprocess_fallback", {
+                "run_id": run_id,
+                "reason": "no pending intent" if intent is None else "intent carries no manifest",
+                "intent_id": getattr(intent, "intent_id", ""),
+            })
+            logger.info(
+                "[AWE] dispatch → generic soak (run_id=%s, %s)",
+                run_id, "queue empty" if intent is None else "no manifest",
+            )
+            return await _fallback(run_id)
+
+        client = None
+        try:
+            client = _client()
+        except Exception:  # noqa: BLE001
+            client = None
+        if client is None:
+            # Honest degradation: we know there IS a manifest but cannot drive
+            # it in-process. Run the generic soak rather than silently dropping
+            # the recovery edge — and say so.
+            _emit("subprocess_fallback", {
+                "run_id": run_id, "intent_id": intent.intent_id,
+                "reason": "no resolvable client for in-process manifest run",
+            })
+            logger.warning(
+                "[AWE] manifest intent %s pending but no client resolvable — "
+                "falling back to generic soak; intent stays pending",
+                intent.intent_id,
+            )
+            return await _fallback(run_id)
+
+        from backend.core.ouroboros.governance.checkpoint_manifest import (
+            run_pending_soak,
+        )
+        _emit("manifest", {
+            "run_id": run_id, "intent_id": intent.intent_id,
+            "kind": intent.kind, "target": intent.target,
+        })
+        logger.info(
+            "[AWE] dispatch → checkpointed manifest soak intent=%s kind=%s target=%s",
+            intent.intent_id, intent.kind, intent.target,
+        )
+        return await run_pending_soak(
+            conn, intent.intent_id, client=client,
+            # The manifest's chunk file_paths are relative to `target`.
+            repo_root=intent.target or ".",
+        )
+
+    return _launch
+
+
 def start_awe_trigger(
     *,
     launch_fn: Optional[LaunchFn] = None,
@@ -360,12 +483,16 @@ def start_awe_trigger(
     """Construct + start the AWE trigger IFF ``JARVIS_AWE_TRIGGER_ENABLED``.
     Returns the live :class:`AWETrigger` (whose ``.stop()`` the caller tears down)
     or ``None`` when disabled / on any error. Defaults ``launch_fn`` to the
-    self-contained subprocess soak. Never raises."""
+    substrate-aware dispatcher, which resumes a queued checkpoint manifest when
+    one exists and otherwise runs the self-contained subprocess soak. Never
+    raises."""
     if not awe_enabled():
         return None
     try:
         trigger = AWETrigger(
-            launch_fn=launch_fn or build_soak_subprocess_launch_fn(),
+            launch_fn=launch_fn or build_manifest_aware_launch_fn(
+                db_factory=kwargs.get("db_factory"),
+            ),
             provider=provider,
             **kwargs,
         )
@@ -380,6 +507,7 @@ def start_awe_trigger(
 __all__ = [
     "AWETrigger",
     "awe_enabled",
+    "build_manifest_aware_launch_fn",
     "build_soak_subprocess_launch_fn",
     "build_swarm_coroutine_launch_fn",
     "start_awe_trigger",

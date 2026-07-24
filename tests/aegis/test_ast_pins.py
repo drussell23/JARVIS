@@ -312,5 +312,10 @@ def test_preflight_outcome_taxonomy_exact_match():
         "failed_spawn",
         "failed_bootstrap_timeout",
         "failed_credential_scrub",
+        # Boot-time dependency validation. Reached only under
+        # JARVIS_AEGIS_DEP_STRICT, when declared-but-absent packages could not
+        # be reconciled — the loud alternative to silently degrading (the
+        # sentence-transformers LITE-tier incident, 2026-07-24).
+        "failed_dependency_drift",
     }
     assert actual == expected

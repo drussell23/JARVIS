@@ -21,7 +21,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from typing import Optional
+from typing import NamedTuple, Optional
 
 logger = logging.getLogger("Ouroboros.SoakIntent")
 
@@ -108,6 +108,64 @@ def get_manifest_json(
         return None
 
 
+class PendingIntent(NamedTuple):
+    """The single highest-priority pending intent, as the AWE dispatcher needs it.
+
+    ``target`` is load-bearing and easy to get wrong: a manifest's per-chunk
+    ``file_path`` entries are stored RELATIVE to this target (the canary's chunks
+    are ``mathy.py`` / ``strings_util.py`` / ``widgets.py``, not repo-relative
+    paths). ``build_checkpointed_swarm_fn`` opens ``os.path.join(repo_root,
+    file_path)``, so the dispatcher must pass ``target`` as ``repo_root`` — NOT
+    the repository root, which would resolve every chunk to a nonexistent file.
+    """
+
+    intent_id: str
+    kind: str
+    target: str
+    manifest_json: Optional[str]
+
+    @property
+    def has_manifest(self) -> bool:
+        """True iff this intent carries a manifest worth resuming. An intent with
+        no manifest is real work, but not *checkpointed* work — the dispatcher
+        routes it to the generic soak rather than fabricating an empty run."""
+        return bool(self.manifest_json)
+
+
+def next_pending_intent(
+    conn: Optional[sqlite3.Connection], *, max_priority: Optional[int] = None,
+) -> Optional[PendingIntent]:
+    """The highest-priority pending intent (ties broken oldest-first), or ``None``.
+
+    Companion to :func:`pending_soak_count` — that answers "is there work?", this
+    answers "which work, and where does it live?". Same ordering the supervisor's
+    arm gate implies, so the intent the supervisor armed FOR is the intent the AWE
+    dispatcher runs. Never raises."""
+    if conn is None:
+        return None
+    try:
+        ensure_intent_table(conn)
+        sql = (
+            f"SELECT intent_id, kind, COALESCE(target, ''), manifest_json "
+            f"FROM {_INTENT_TABLE} WHERE status=?"
+        )
+        params: tuple = (STATUS_PENDING,)
+        if max_priority is not None:
+            sql += " AND priority<=?"
+            params = (STATUS_PENDING, int(max_priority))
+        sql += " ORDER BY priority ASC, enqueued_ts ASC LIMIT 1"
+        row = conn.execute(sql, params).fetchone()
+        if not row:
+            return None
+        return PendingIntent(
+            intent_id=str(row[0]), kind=str(row[1]),
+            target=str(row[2] or ""), manifest_json=row[3],
+        )
+    except sqlite3.Error:
+        logger.debug("[SoakIntent] next_pending_intent failed", exc_info=True)
+        return None
+
+
 def pending_soak_count(
     conn: Optional[sqlite3.Connection], *, max_priority: Optional[int] = None,
 ) -> int:
@@ -174,9 +232,11 @@ def clear_soak_intent(
 __all__ = [
     "STATUS_CLEARED",
     "STATUS_PENDING",
+    "PendingIntent",
     "clear_soak_intent",
     "enqueue_soak_intent",
     "ensure_intent_table",
     "get_manifest_json",
+    "next_pending_intent",
     "pending_soak_count",
 ]
