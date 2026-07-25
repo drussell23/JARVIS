@@ -766,34 +766,47 @@ def test_well_behaved_input_is_untouched():
     assert np.array_equal(b._fit_to_range(frame), frame)
 
 
-def test_scaling_preserves_waveform_shape_rather_than_clipping():
+def test_compression_preserves_waveform_shape_rather_than_clipping():
     """Clipping flattens peaks and destroys the formant structure speech
-    recognition reads. Scaling keeps the shape."""
+    recognition reads. Soft-knee compression curves them instead.
+
+    The bar is 0.95, not 0.999: compression IS a nonlinearity, and perfect
+    correlation would mean it did nothing. What matters is that the result is
+    recognisably the same waveform rather than a flat-topped square."""
     b = _bus()
     frame = (np.sin(np.linspace(0, 12, 320)) * 3.0).astype(np.float32)
     out = b._fit_to_range(frame)
     corr = float(np.corrcoef(frame, out)[0, 1])
-    assert corr > 0.999, f"waveform distorted (corr={corr:.4f})"
+    assert corr > 0.95, f"waveform distorted beyond recognition (corr={corr:.4f})"
     assert float(np.max(np.abs(out))) <= 1.0 + 1e-6
 
 
-def test_relative_level_is_preserved_across_frames():
-    """Per-frame normalization would make a whisper as loud as a shout and
-    erase the dynamics the endpointer depends on."""
+def test_a_loud_frame_does_not_change_how_quiet_ones_are_treated():
+    """The compressor superseded a linear peak-scaler, and this is the
+    improvement: a shout no longer attenuates everything that follows it.
+    Below the knee the signal is untouched no matter what came before, so
+    the dynamics the endpointer reads survive intact."""
     b = _bus()
-    b._fit_to_range(np.full(320, 4.0, dtype=np.float32))       # set the scale
-    quiet = b._fit_to_range(np.full(320, 1.0, dtype=np.float32))
-    assert float(np.max(np.abs(quiet))) < 0.5, "quiet frame was pumped up"
+    b._fit_to_range(np.full(320, 4.0, dtype=np.float32))       # a shout
+    quiet = np.full(320, 0.3, dtype=np.float32)
+    assert np.array_equal(b._fit_to_range(quiet), quiet), (
+        "a previous loud frame is still attenuating quiet ones"
+    )
 
 
-def test_the_scale_decays_back_toward_unity():
-    """One loud moment must not pin the scale for the whole session."""
+def test_the_compressor_is_stateless():
+    """The linear scaler needed a decaying peak so one loud moment could not
+    pin the scale for a session. A compressor has no such failure mode to
+    manage: each frame is curved on its own, so there is no state to go
+    stale, no decay constant to tune, and no memory of a shout."""
     b = _bus()
-    b._fit_to_range(np.full(320, 4.0, dtype=np.float32))
-    assert b._range_peak > 1.0
-    for _ in range(20000):
+    hot = np.full(320, 4.0, dtype=np.float32)
+    first = b._fit_to_range(hot)
+    for _ in range(500):
         b._fit_to_range(np.full(320, 0.1, dtype=np.float32))
-    assert b._range_peak == pytest.approx(1.0, abs=1e-6)
+    assert np.array_equal(b._fit_to_range(hot), first), (
+        "identical input produced different output — the compressor grew state"
+    )
 
 
 def test_the_over_range_condition_is_reported_but_rate_limited():

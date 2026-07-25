@@ -317,10 +317,16 @@ class MacOSVoice:
             # AudioBus.play_audio() routes through PortAudio callback
             # (GIL-dependent → static during GIL-heavy ops). afplay is
             # native macOS — no GIL, no callback, clean audio.
-            _play_proc = subprocess.Popen(
-                ["afplay", _temp_path],
-                start_new_session=True,
-            )
+            # JIT GATE: the microphone closes HERE — the exact instant sound
+            # starts leaving the speakers — and opens when afplay exits. Not
+            # around synthesis, which can take seconds and during which the
+            # operator must still be able to interrupt.
+            from backend.audio.playback_gate import playback_gate_sync
+            with playback_gate_sync(processed_text):
+                _play_proc = subprocess.Popen(
+                    ["afplay", _temp_path],
+                    start_new_session=True,
+                )
             # ── Phantom tap: Karen's waveform, anchored to THIS instant ──────
             # afplay is a separate OS process (v283.0, deliberately GIL-free), so
             # there is no in-process playback callback to observe. Instead the

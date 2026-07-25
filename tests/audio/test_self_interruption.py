@@ -1,4 +1,4 @@
-"""Karen must not interrupt herself.
+"""Karen must not interrupt herself — without going deaf to interrupt her.
 
 Observed live, mid-reply:
 
@@ -7,17 +7,15 @@ Observed live, mid-reply:
     ... and the reply stopped
 
 Nobody interrupted her. Her own voice left the speakers, the microphone heard
-it, and the barge-in detector read that as the operator cutting in.
+it, and the barge-in detector read that as the operator cutting in. AEC cannot
+cover it: playback leaves through afplay in a separate process precisely so it
+is GIL-free, so the bus holds no reference to subtract.
 
-The machinery to prevent it already existed — UnifiedSpeechStateManager
-.start_speaking() gates AudioBus and stop_speaking() ungates it — but only the
-UNGATE was ever called from the conversation pipeline. A gate whose release is
-wired and whose engage is not is worse than no gate at all: it can only ever
-be opened.
-
-AEC cannot cover this alone. Playback leaves through afplay in a separate
-process precisely so it is GIL-free, so the bus holds no reference signal to
-subtract.
+The FIRST fix gated the microphone around the whole speak call and traded one
+bug for a worse one: with synthesis measured at 5142ms, the operator could not
+interrupt while Karen was merely THINKING. The gate now binds to PLAYBACK
+only. These tests pin both halves of that — she cannot hear herself, and the
+human can always cut in before she starts talking.
 """
 
 from __future__ import annotations
@@ -26,124 +24,126 @@ import asyncio
 
 import pytest
 
-
-class _Mgr:
-    def __init__(self, boom_on_start=False):
-        self.started, self.stopped = [], 0
-        self._boom = boom_on_start
-
-    async def start_speaking(self, text="", source=None, estimated_duration_ms=None):
-        if self._boom:
-            raise RuntimeError("speech state unavailable")
-        self.started.append(text)
-
-    async def stop_speaking(self, *a, **k):
-        self.stopped += 1
+from backend.audio import playback_gate as pg
 
 
-class _Engine:
-    """speak_stream only — the shape UnifiedTTSEngine actually exposes."""
-
-    def __init__(self, boom=False):
-        self.spoke = []
-        self._boom = boom
-
-    async def speak_stream(self, text, play_audio=True, cancel_event=None, source=None):
-        if self._boom:
-            raise RuntimeError("synthesis exploded")
-        self.spoke.append(text)
+@pytest.fixture(autouse=True)
+def _reset():
+    pg.force_open()
+    yield
+    pg.force_open()
 
 
-def _pipeline(engine, mgr, monkeypatch):
-    from backend.audio import conversation_pipeline as cp
+@pytest.fixture
+def bus(monkeypatch):
+    state = {"gated": False, "log": []}
 
-    monkeypatch.setattr(cp, "_tts_can_synthesize", lambda _e: False)  # legacy path
+    def _set(active):
+        state["gated"] = bool(active)
+        state["log"].append(bool(active))
+        return True
 
-    async def _get_mgr():
-        return mgr
-
-    import backend.core.unified_speech_state as uss
-    monkeypatch.setattr(uss, "get_speech_state_manager", _get_mgr)
-
-    p = cp.ConversationPipeline.__new__(cp.ConversationPipeline)
-    p._tts_engine = engine
-    p._audio_bus = None
-    return p
+    monkeypatch.setattr(pg, "_set_bus_gate", _set)
+    return state
 
 
 # ---------------------------------------------------------------------------
-# The regression
+# She cannot hear herself
 # ---------------------------------------------------------------------------
 
 
-async def test_the_mic_is_gated_while_she_speaks(monkeypatch):
-    """THE REGRESSION. Without the gate her voice reaches the mic and
-    barge-in cancels her mid-sentence."""
-    mgr, eng = _Mgr(), _Engine()
-    p = _pipeline(eng, mgr, monkeypatch)
-
-    await p._speak_sentence("Right, I'm here.", asyncio.Event())
-
-    assert mgr.started == ["Right, I'm here."], "the mic was never gated"
-    assert eng.spoke == ["Right, I'm here."]
+async def test_the_mic_is_closed_while_sound_plays(bus):
+    """THE REGRESSION. Without this her own voice triggers barge-in."""
+    async with pg.playback_gate("Right, I'm here."):
+        assert bus["gated"] is True
+    assert bus["gated"] is False
 
 
-async def test_the_gate_is_always_released(monkeypatch):
-    mgr, eng = _Mgr(), _Engine()
-    p = _pipeline(eng, mgr, monkeypatch)
-    await p._speak_sentence("hello", asyncio.Event())
-    assert mgr.stopped == 1
+def test_the_afplay_launch_site_is_gated():
+    """The legacy path synthesizes AND plays inside the engine, so the gate
+    has to live at the subprocess launch — the only place that knows when
+    sound actually starts."""
+    from pathlib import Path
+
+    src = Path("backend/voice/macos_voice.py").read_text(encoding="utf-8")
+    assert "playback_gate_sync" in src
+    assert src.index("playback_gate_sync") < src.index('["afplay"')
 
 
-async def test_a_synthesis_fault_still_releases_the_gate(monkeypatch):
-    """A gate left closed by a crash is a permanently deaf microphone —
-    strictly worse than the bug it prevents."""
-    mgr, eng = _Mgr(), _Engine(boom=True)
-    p = _pipeline(eng, mgr, monkeypatch)
-
-    await p._speak_sentence("hello", asyncio.Event())   # must not raise
-    assert mgr.stopped == 1, "the microphone was left gated after a fault"
-
-
-async def test_the_gate_engages_before_synthesis_not_after(monkeypatch):
-    """Gating after synthesis begins leaves a window in which her first
-    syllables reach the mic — and one frame is all barge-in needs."""
+def test_the_bus_playback_site_is_gated():
+    """The AEC path streams through AudioBus; it needs the same protection."""
     import inspect
 
     from backend.audio.conversation_pipeline import ConversationPipeline
 
     src = inspect.getsource(ConversationPipeline._speak_sentence)
-    assert src.index("start_speaking") < src.index("speak_stream")
+    assert "playback_gate" in src
+    assert src.index("playback_gate") < src.index("play_stream")
 
 
-async def test_an_unavailable_speech_manager_does_not_silence_her(monkeypatch):
-    """An ungated reply beats no reply: the gate is protection, not a
-    precondition for speaking."""
-    mgr, eng = _Mgr(boom_on_start=True), _Engine()
-    p = _pipeline(eng, mgr, monkeypatch)
-
-    await p._speak_sentence("hello", asyncio.Event())
-    assert eng.spoke == ["hello"]
+# ---------------------------------------------------------------------------
+# The human can always interrupt her BEFORE she speaks
+# ---------------------------------------------------------------------------
 
 
-async def test_a_cancelled_turn_never_reaches_the_gate(monkeypatch):
-    """Genuine barge-in must still work — a pre-cancelled sentence is not
-    spoken and does not gate."""
-    mgr, eng = _Mgr(), _Engine()
-    p = _pipeline(eng, mgr, monkeypatch)
+async def test_generation_never_closes_the_mic(bus):
+    """The blindspot the first fix created: 5142ms of synthesis with the
+    microphone deaf. Generation must leave it untouched."""
+    async def _generate():
+        await asyncio.sleep(0.2)          # stands in for LLM + synthesis
+        return "some text"
 
-    ev = asyncio.Event()
-    ev.set()
-    await p._speak_sentence("hello", ev)
-    assert eng.spoke == [] and mgr.started == []
+    await _generate()
+    assert bus["log"] == [], "the gate moved during generation"
+    assert bus["gated"] is False
 
 
-def test_the_gate_and_its_release_are_symmetric():
-    """The bug WAS the asymmetry: release wired, engage absent."""
+def test_the_pipeline_does_not_gate_around_the_whole_call():
+    """Structural pin against reverting to synthesis-wide gating."""
+    import ast
     import inspect
 
     from backend.audio.conversation_pipeline import ConversationPipeline
 
     src = inspect.getsource(ConversationPipeline._speak_sentence)
-    assert src.count("start_speaking") >= 1
-    assert "finally:" in src and "stop_speaking" in src
+    tree = ast.parse(src.lstrip())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            node.value = ""
+    assert "start_speaking" not in ast.unparse(tree)
+
+
+# ---------------------------------------------------------------------------
+# The gate can never be left closed
+# ---------------------------------------------------------------------------
+
+
+async def test_a_playback_crash_reopens_the_mic(bus):
+    """A gate left closed is a permanently DEAF microphone — strictly worse
+    than the bug it prevents."""
+    with pytest.raises(RuntimeError):
+        async with pg.playback_gate("x"):
+            raise RuntimeError("afplay died")
+    assert bus["gated"] is False
+
+
+async def test_cancellation_reopens_the_mic(bus):
+    """Barge-in cancels the task mid-playback; the mic must come back."""
+    async def _play():
+        async with pg.playback_gate("x"):
+            await asyncio.sleep(10)
+
+    task = asyncio.get_running_loop().create_task(_play())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert bus["gated"] is False
+
+
+def test_force_open_always_wins(bus):
+    """The emergency release used by teardown paths."""
+    pg._enter("x")
+    assert bus["gated"] is True
+    pg.force_open()
+    assert bus["gated"] is False and pg.gate_depth() == 0

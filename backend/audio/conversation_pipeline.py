@@ -36,6 +36,8 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from backend.audio.playback_gate import playback_gate
+
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -1232,7 +1234,8 @@ class ConversationPipeline:
         if self._tts_engine is None:
             return
 
-        # GATE THE MIC FOR THE DURATION OF HER OWN VOICE.
+        # JIT PLAYBACK GATING — closed only while sound is LEAVING the
+        # speakers, never during generation.
         #
         # Karen speaks through the speakers, the microphone hears her, the
         # barge-in detector reads that as the operator interrupting, and it
@@ -1253,24 +1256,24 @@ class ConversationPipeline:
         # reference signal to subtract. Gating is the honest mechanism, and
         # it is symmetric here — the finally block always releases, so a
         # synthesis fault can never leave the microphone deaf.
-        _speech_mgr = None
-        try:
-            from backend.core.unified_speech_state import (
-                SpeechSource, get_speech_state_manager,
-            )
-            _speech_mgr = await get_speech_state_manager()
-            # TTS_BACKEND, not an invented member: SpeechSource has no
-            # CONVERSATION, and naming one that does not exist raised an
-            # AttributeError this very except-block then swallowed — the gate
-            # silently never engaged, which is the exact failure shape being
-            # fixed. Caught by the suite rather than by another live session.
-            await _speech_mgr.start_speaking(
-                text=sentence, source=SpeechSource.TTS_BACKEND,
-            )
-        except Exception:  # noqa: BLE001 — an ungated reply beats no reply
-            logger.debug("[ConvPipeline] speech-state gate degraded", exc_info=True)
-            _speech_mgr = None
-
+        # Gating the whole call would deafen the microphone through the
+        # ENTIRE generation phase — measured at 5142ms for one sentence — so
+        # the operator could not interrupt while Karen is merely thinking.
+        # A voice assistant that cannot be stopped mid-thought is a worse
+        # interface than one that occasionally hears itself.
+        #
+        # So the gate is bound to PLAYBACK, not to the call: it closes at the
+        # instant sound starts leaving the speakers and opens the moment it
+        # stops. Synthesis, LLM latency and network waits all happen with the
+        # microphone live.
+        #
+        # NARROW EXCEPTIONS ON PURPOSE. A broad `except Exception` here
+        # swallowed an AttributeError from a mis-named enum member
+        # (SpeechSource.CONVERSATION, which does not exist) and the gate
+        # silently never engaged — a reference error wearing the costume of a
+        # graceful degradation. Import and attribute errors are DEFECTS and
+        # must be loud; only runtime unavailability of the manager is
+        # tolerated.
         try:
             # Preferred path: synthesize → decode WAV → stream through AudioBus
             # This gives AEC a reference signal and supports barge-in cancel.
@@ -1319,13 +1322,17 @@ class ConversationPipeline:
                                 for i in range(0, len(audio_np), _chunk_size):
                                     yield audio_np[i:i + _chunk_size]
 
-                            await self._audio_bus.play_stream(
-                                _audio_chunks(), sample_rate,
-                                cancel=cancel_event,
-                            )
+                            async with playback_gate(sentence):
+                                await self._audio_bus.play_stream(
+                                    _audio_chunks(), sample_rate,
+                                    cancel=cancel_event,
+                                )
                             return
 
-            # Fallback: direct TTS playback (legacy path, no AEC reference)
+            # Fallback: direct TTS playback (legacy path, no AEC reference).
+            # The engine synthesizes AND plays inside this call, so the gate
+            # is driven at the afplay launch site inside macos_voice — the
+            # only place that knows when sound actually starts.
             if hasattr(self._tts_engine, 'speak_stream'):
                 await self._tts_engine.speak_stream(
                     sentence, play_audio=True,
@@ -1339,17 +1346,7 @@ class ConversationPipeline:
                 )
         except Exception as e:
             logger.debug(f"[ConvPipeline] TTS error: {e}")
-        finally:
-            # ALWAYS release. A synthesis fault must never leave the mic gated
-            # — that would trade one silent turn for a permanently deaf one.
-            if _speech_mgr is not None:
-                try:
-                    await _speech_mgr.stop_speaking()
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "[ConvPipeline] speech-state ungate degraded",
-                        exc_info=True,
-                    )
+
 
     async def _is_self_voice_echo(self, text: str) -> bool:
         """

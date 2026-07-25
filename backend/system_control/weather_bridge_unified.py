@@ -4,6 +4,7 @@ Single entry point for ALL weather queries using vision
 Replaces all previous weather providers with one intelligent system
 """
 
+import re
 import logging
 from typing import Dict, Optional
 from datetime import datetime
@@ -11,6 +12,47 @@ from datetime import datetime
 from .unified_vision_weather import get_unified_weather_system
 
 logger = logging.getLogger(__name__)
+
+
+#: Words that mean weather and essentially nothing else — a whole-word match
+#: on one of these is enough on its own.
+_WEATHER_STRONG = re.compile(
+    r"\b(?:weather|forecast|temperature|humidity|celsius|fahrenheit)\b",
+    re.IGNORECASE,
+)
+
+#: Words that OFTEN mean weather but are ordinary English besides. These may
+#: never trigger alone. "wind" and "warm" are the reason this list exists:
+#: they matched "window" and "warming" as substrings.
+_WEATHER_WEAK = re.compile(
+    r"\b(?:rain|raining|snow|snowing|sunny|cloudy|humid|wind|windy|cold|hot|"
+    r"warm|storm|storms|stormy|degrees)\b",
+    re.IGNORECASE,
+)
+
+#: Interrogative shape. A weak word inside a QUESTION is a weather query; the
+#: same word inside a statement is just a word.
+_WEATHER_QUESTION = re.compile(
+    r"\b(?:what|what's|whats|how|is|are|will|going|gonna|should|outside|"
+    r"today|tomorrow|tonight)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_weather_query(text: str) -> bool:
+    """Whole-word weather detection. The canonical implementation.
+
+    Lives here because this module is the one three others already route
+    through (``weather_system_config``, ``migrate_to_unified_weather``, and
+    ``jarvis_agent_voice`` via the bridge) — putting the precise version
+    anywhere else would leave the loose one reachable. NEVER raises."""
+    try:
+        t = str(text or "")
+        if _WEATHER_STRONG.search(t):
+            return True
+        return bool(_WEATHER_WEAK.search(t) and _WEATHER_QUESTION.search(t))
+    except (TypeError, AttributeError):
+        return False
 
 
 class UnifiedWeatherBridge:
@@ -69,12 +111,27 @@ class UnifiedWeatherBridge:
         return await self.get_weather("Will it rain or snow today?")
     
     def is_weather_query(self, text: str) -> bool:
-        """Check if text is a weather-related query"""
-        weather_keywords = [
-            'weather', 'temperature', 'forecast', 'rain', 'snow',
-            'sunny', 'cloudy', 'humid', 'wind', 'cold', 'hot',
-            'warm', 'storm', 'degrees', 'celsius', 'fahrenheit'
-        ]
-        
-        text_lower = text.lower()
-        return any(keyword in text_lower for keyword in weather_keywords)
+        """Is this actually asking about the weather?
+
+        THE BUG THIS REPLACES was a bare substring scan over short common
+        words. ``in`` matches ANYWHERE in a string, so on ordinary phrases
+        from this very system:
+
+            "close the window"        -> 'wind'  -> opened the Weather app
+            "open a new window"       -> 'wind'  -> opened the Weather app
+            "the model is warming up" -> 'warm'  -> opened the Weather app
+            "training the brain"      -> 'rain'  -> opened the Weather app
+            "hotfix deployed"         -> 'hot'   -> opened the Weather app
+            "scold the agent"         -> 'cold'  -> opened the Weather app
+
+        This predicate sits upstream of ``subprocess.run(['open', '-a',
+        'Weather'])`` and downstream of speech recognition, so a MISHEARD
+        FRAGMENT could launch an application unbidden. That is the part that
+        matters: silence is a bug, but taking an action on someone's machine
+        because a substring appeared is a different category.
+
+        Two rules. Whole words only, because the failure was entirely about
+        boundaries. And ambiguous words need interrogative context: "is it
+        cold outside" asks about weather, "the cold start took 12 seconds"
+        does not, and both contain "cold". NEVER raises."""
+        return _is_weather_query(text)

@@ -138,6 +138,13 @@ class Resampler:
 #: to recover when the operator stops shouting.
 _RANGE_PEAK_DECAY = float(os.getenv("JARVIS_AUDIO_RANGE_DECAY", "0.9995"))
 
+#: Soft-knee threshold. Below this the signal is bit-identical; above it the
+#: curve begins. 0.75 leaves normal speech completely untouched (measured
+#: speech peaks here run 0.2-0.6) while catching the excursions that saturate.
+_AGC_THRESHOLD = max(0.05, min(0.99, float(
+    os.getenv("JARVIS_AUDIO_AGC_THRESHOLD", "0.75"),
+)))
+
 
 class AcousticEchoCanceller:
     """
@@ -750,31 +757,63 @@ class AudioBus:
     # ---- Internal: Mic frame processing ----
 
     def _fit_to_range(self, frame: np.ndarray) -> np.ndarray:
-        """Bring an over-range frame back inside [-1, 1]. NEVER raises.
+        """Soft-knee compressor: curve hot peaks below 1.0 without clipping.
 
-        A no-op for well-behaved input — the common case costs one max()."""
+        THE FAULT THIS REMOVES. The capture device delivers samples above full
+        scale (measured: 1.04 through 3.9998). Anything that reaches a tensor
+        saturated flat is not speech any more — faster-whisper reads formant
+        structure, and clipping is precisely the operation that destroys it.
+        The observable symptom was whisper HALLUCINATING: "I'm sorry, I'm
+        sorry, I'm sorry" in place of "Hello Karen".
+
+        Linear scaling by the peak (the previous approach) fixes the range but
+        squashes an entire utterance because one syllable was loud. A
+        compressor leaves everything below the knee UNTOUCHED and curves only
+        the excursions:
+
+            |x| <= T          ->  x                        (bit-identical)
+            |x| >  T          ->  sign(x)*(T + (1-T)*tanh((|x|-T)/(1-T)))
+
+        The curve is continuous in VALUE at the knee (tanh(0) = 0) and in
+        SLOPE (tanh'(0) = 1), which is what makes the knee "soft" — a hard
+        knee would put a corner in the waveform and manufacture the very
+        high-frequency artifacts the compressor exists to avoid. It is
+        asymptotic to 1.0, so saturation becomes mathematically unreachable
+        rather than merely unlikely.
+
+        Sample-wise and stateless: zero latency, no lookahead, no pumping.
+        NEVER raises."""
         try:
-            peak = float(np.max(np.abs(frame)))
-            if peak > self._range_peak:
-                self._range_peak = peak
-                if peak > 1.0 and self._range_reports < 3:
-                    self._range_reports += 1
-                    logger.warning(
-                        "[AudioBus] input exceeds full scale (peak=%.2f) — "
-                        "the capture device is applying gain; scaling to the "
-                        "normalized range downstream consumers require",
-                        peak,
-                    )
-            else:
-                # Decay so the scale follows the source back down instead of
-                # staying pinned by one loud moment for the whole session.
-                self._range_peak = max(
-                    1.0, self._range_peak * _RANGE_PEAK_DECAY,
+            # DRY: the canonical RMS is audio_scope's, the same one the
+            # telemetry bridge and the oscilloscope use. "Hot" is decided on
+            # energy; the curve is applied per sample.
+            from backend.core.ouroboros.ui.audio_scope import rms as _rms
+
+            peak = float(np.max(np.abs(frame))) if frame.size else 0.0
+            if peak <= _AGC_THRESHOLD:
+                return frame                    # the common case, untouched
+
+            if peak > 1.0 and self._range_reports < 3:
+                self._range_reports += 1
+                logger.warning(
+                    "[AudioBus] input peak %.2f exceeds full scale "
+                    "(rms=%.4f) — compressing rather than clipping; the "
+                    "capture device is applying gain",
+                    peak, _rms(frame[:512]),
                 )
-            if self._range_peak > 1.0:
-                return (frame / self._range_peak).astype(np.float32)
-            return frame
-        except Exception:  # noqa: BLE001
+            self._range_peak = max(self._range_peak, peak)
+
+            t = _AGC_THRESHOLD
+            span = 1.0 - t
+            mag = np.abs(frame)
+            over = mag > t
+            out = frame.astype(np.float32, copy=True)
+            out[over] = (
+                np.sign(frame[over])
+                * (t + span * np.tanh((mag[over] - t) / span))
+            ).astype(np.float32)
+            return out
+        except Exception:  # noqa: BLE001 — audio thread: never propagate
             return frame
 
     def _on_mic_frame(self, raw_frame: np.ndarray) -> None:

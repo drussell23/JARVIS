@@ -117,3 +117,82 @@ def test_the_handler_uses_the_predicate_not_a_substring_scan():
     ).read_text(encoding="utf-8")
     assert "_is_weather_query(text)" in src
     assert "for word in ['weather'" not in src, "the substring scan is back"
+
+
+# ---------------------------------------------------------------------------
+# The SECOND matcher — the one three modules actually route through
+# ---------------------------------------------------------------------------
+#
+# `weather_bridge_unified.is_weather_query` had the same substring bug with a
+# worse keyword list, and it sits directly upstream of
+# subprocess.run(['open', '-a', 'Weather']). Fixing only the command handler
+# left this one reachable, and the Weather app kept opening.
+#
+#     "close the window"        -> 'wind'
+#     "open a new window"       -> 'wind'
+#     "the model is warming up" -> 'warm'
+
+
+def _canonical():
+    """Load the predicate without the package's import side-effects."""
+    import ast as _ast
+    import re as _re
+
+    src = open("backend/system_control/weather_bridge_unified.py").read()
+    tree = _ast.parse(src)
+    ns = {"re": _re}
+    for node in tree.body:
+        keep = (
+            isinstance(node, _ast.Assign)
+            and any(getattr(t, "id", "").startswith("_WEATHER") for t in node.targets)
+        ) or (
+            isinstance(node, _ast.FunctionDef) and node.name == "_is_weather_query"
+        )
+        if keep:
+            exec(compile(_ast.Module([node], []), "<x>", "exec"), ns)
+    return ns["_is_weather_query"]
+
+
+@pytest.mark.parametrize("phrase", [
+    "close the window",                 # 'wind' — the one that kept firing
+    "open a new window",
+    "the model is warming up",          # 'warm'
+    "training the brain",               # 'rain'
+    "brainstorm the approach",
+    "hotfix deployed",                  # 'hot'
+    "scold the agent",                  # 'cold'
+    "the cold start took 12 seconds",
+])
+def test_the_canonical_matcher_does_not_launch_the_app(phrase):
+    assert _canonical()(phrase) is False, f"{phrase!r} would open the Weather app"
+
+
+@pytest.mark.parametrize("phrase", [
+    "what's the weather", "is it cold outside", "will it rain today",
+    "check the temperature", "how hot is it outside", "what is the forecast",
+])
+def test_genuine_questions_still_route_through_the_bridge(phrase):
+    assert _canonical()(phrase) is True
+
+
+def test_the_bridge_no_longer_scans_substrings():
+    """Structural pin. This predicate sits directly upstream of an
+    `open -a Weather` subprocess call."""
+    from pathlib import Path
+
+    src = Path(
+        "backend/system_control/weather_bridge_unified.py",
+    ).read_text(encoding="utf-8")
+    assert "for keyword in weather_keywords" not in src
+    assert "_is_weather_query(text)" in src
+
+
+def test_both_matchers_agree():
+    """Two implementations that disagree are a bug waiting for whichever path
+    the operator happens to take."""
+    from backend.voice.intelligent_command_handler import _is_weather_query as a
+
+    b = _canonical()
+    for phrase in ("close the window", "training the brain", "hotfix deployed",
+                   "what's the weather", "is it cold outside"):
+        assert a(phrase) == b(phrase), f"matchers disagree on {phrase!r}"
