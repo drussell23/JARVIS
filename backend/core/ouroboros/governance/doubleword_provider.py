@@ -5602,6 +5602,16 @@ class DoublewordProvider:
                                     if _usage:
                                         input_tokens = _usage.get("prompt_tokens", 0)
                                         output_tokens = _usage.get("completion_tokens", 0)
+                                        # STREAMING is the hot path in practice
+                                        # (the RT default). Instrumenting only
+                                        # the non-streaming branch left this
+                                        # telemetry wired-but-inert: 2 live
+                                        # generations produced 0 lines.
+                                        emit_cache_telemetry(
+                                            _usage,
+                                            op_id=str(getattr(context, "op_id", "") or ""),
+                                            model=str(getattr(self, "_model", "") or ""),
+                                        )
                                 except json.JSONDecodeError:
                                     continue
                             # CD-2 — clear stream-active latch now that the SSE loop
