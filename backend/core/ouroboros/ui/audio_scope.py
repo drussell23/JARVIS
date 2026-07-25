@@ -145,13 +145,105 @@ class AdaptiveNormalizer:
     def __init__(
         self, *, decay: float = 0.995, floor: float = 1e-3,
         hold_frames: int = 40,
+        squelch: bool = True,
+        squelch_window_frames: int = 80,
+        squelch_margin: float = 3.0,   # k in floor + k*spread
+        squelch_epsilon: float = 1e-4,
+        squelch_warmup_frames: int = 20,
     ) -> None:
         self._decay = min(max(float(decay), 0.0), 0.999999)
         self._floor = max(float(floor), 1e-9)
         self._peak = self._floor
         self._hold_frames = max(0, int(hold_frames))
         self._held = 0
+        # --- dynamic noise-floor squelch -------------------------------
+        # A real microphone never reaches digital zero: fans, HVAC and room
+        # tone keep RMS hovering just above it, which renders as a permanently
+        # twitching baseline. A fixed gate cannot solve this — the right
+        # threshold in a quiet study is wrong in a coffee shop — so the floor
+        # is LEARNED from the signal itself.
+        self._squelch = bool(squelch)
+        self._noise_floor = 0.0
+        # Ambient SPREAD, not just its trough. A quiet room's tone ranges
+        # ~0.002-0.006 — a 3x spread — so a gate pinned to the minimum is
+        # sailed over by the noise's own peaks. Gating at floor + k*spread
+        # covers the distribution instead of its lower edge, and adapts to
+        # both a still study and a churning cafe without a constant.
+        self._noise_spread = 0.0
+        self._squelch_seen = 0
+        self._squelch_warmup = max(0, int(squelch_warmup_frames))
+        self._squelch_margin = max(0.0, float(squelch_margin))
+        self._squelch_eps = max(0.0, float(squelch_epsilon))
+        # EMA smoothing derived from the window rather than hardcoded, so
+        # "about four seconds at 20 FPS" stays true if the framerate changes.
+        n = max(1, int(squelch_window_frames))
+        self._squelch_alpha = 2.0 / (n + 1.0)
         self._lock = threading.Lock()
+
+    # -- noise-floor profiler -------------------------------------------
+
+    def _update_noise_floor(self, v: float) -> None:
+        """Track the TROUGH of the stream, asymmetrically. Caller holds lock.
+
+        Down-fast / up-slow is the whole trick. A sample below the current
+        floor is new evidence about how quiet the room can be, so it is adopted
+        quickly. A sample above it might be speech, so the floor creeps upward
+        at a fraction of that rate — otherwise a few seconds of talking would
+        drag the floor up and squelch the speaker's own voice.
+
+        Pure float math on two scalars: no allocation, no deque scan, nothing
+        that could stall the caller."""
+        if self._squelch_seen < self._squelch_warmup:
+            # Warmup: adopt the running minimum outright. One sample cannot
+            # characterise a room, and clamping before the profile exists would
+            # squelch the first words spoken.
+            if self._squelch_seen == 0:
+                self._noise_floor = v
+                self._noise_spread = 0.0
+            else:
+                self._noise_floor = min(self._noise_floor, v)
+                self._noise_spread += (
+                    abs(v - self._noise_floor) - self._noise_spread
+                ) * 0.5          # converge fast during the short warmup
+            return
+        if v < self._noise_floor:
+            a = self._squelch_alpha            # fall toward a quieter trough
+        else:
+            a = self._squelch_alpha * 0.05     # rise 20x slower — speech-proof
+        self._noise_floor += (v - self._noise_floor) * a
+        # Spread learns ONLY from samples the gate currently calls ambient.
+        # Letting speech widen it would inflate the gate until the speaker
+        # squelched themselves.
+        if v <= self._gate_locked():
+            self._noise_spread += (
+                abs(v - self._noise_floor) - self._noise_spread
+            ) * self._squelch_alpha
+
+    def _gate_locked(self) -> float:
+        """The ambient ceiling: trough + k*spread + epsilon. Caller holds lock.
+        Single definition so the profiler and the clamp can never disagree
+        about what counts as noise."""
+        return (
+            self._noise_floor
+            + self._squelch_margin * self._noise_spread
+            + self._squelch_eps
+        )
+
+    @property
+    def noise_gate(self) -> float:
+        with self._lock:
+            return self._gate_locked()
+
+    @property
+    def noise_floor(self) -> float:
+        with self._lock:
+            return self._noise_floor
+
+    @property
+    def squelch_ready(self) -> bool:
+        """True once enough frames have been seen to trust the profile."""
+        with self._lock:
+            return self._squelch_seen >= self._squelch_warmup
 
     def normalize(self, value: float) -> float:
         """Normalized 0..1 against the held/decaying peak.
@@ -178,6 +270,21 @@ class AdaptiveNormalizer:
         if v != v or v == float("inf"):     # NaN / inf are not signal
             return 0.0
         with self._lock:
+            # ── Dynamic squelch, BEFORE scaling ────────────────────────────
+            # The profiler learns from every sample (including squelched ones —
+            # that is precisely where the room tone lives). Anything at or
+            # below floor*margin + eps is declared ambient and clamped to a
+            # hard 0.0, so the meter renders a dead-stable baseline instead of
+            # amplifying HVAC into a waveform. Everything downstream then
+            # operates on the squelched value, so a clamped sample is
+            # indistinguishable from true digital silence — including to the
+            # peak tracker, which must not treat room tone as signal.
+            if self._squelch:
+                self._update_noise_floor(v)
+                self._squelch_seen += 1
+                if self._squelch_seen >= self._squelch_warmup:
+                    if v <= self._gate_locked():
+                        v = 0.0
             if v > self._floor:
                 # Real signal: re-arm the gap guard, but KEEP DECAYING. Holding
                 # the peak on any above-floor sample would pin the reference at
