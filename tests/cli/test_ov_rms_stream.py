@@ -253,3 +253,78 @@ def test_transcript_text_is_escaped_before_rendering():
     src = Path("backend/core/ouroboros/cli/ov.py").read_text(encoding="utf-8")
     block = src[src.index('== "transcript"'):][:900]
     assert "escape" in block, "transcript text reaches the markup renderer raw"
+
+
+# ---------------------------------------------------------------------------
+# Live state — the operator is never left in the dark
+# ---------------------------------------------------------------------------
+#
+# Between "Hello Karen" and her reply there are 3-5 seconds of STT, LLM and
+# synthesis during which the screen said NOTHING. Silence is indistinguishable
+# from a hang. The supervisor has published these transitions since the IPC
+# was written; the cockpit rendered none of them.
+
+
+async def test_state_transitions_are_shown(tmp_path, monkeypatch, scope):
+    """THE GAP. Thinking and speaking must be visible while they happen."""
+    import backend.core.ouroboros.cli.ov as ov
+
+    shown = []
+    monkeypatch.setattr(ov, "_render_markup_frame", lambda t, console=None: shown.append(t))
+    server, client = await _live_session(tmp_path, monkeypatch, scope)
+    try:
+        for kind in ("TTS_GENERATING", "AUDIO_PLAYING", "AUDIO_IDLE"):
+            server.publish_event(kind)
+            await asyncio.sleep(0.08)
+        await asyncio.sleep(0.2)
+        joined = " ".join(shown)
+        assert "thinking" in joined, "no indication she is working"
+        assert "speaking" in joined
+    finally:
+        await client.close()
+        await server.stop()
+
+
+async def test_a_steady_state_is_not_reprinted(tmp_path, monkeypatch, scope):
+    """Announced on the EDGE only — re-printing a steady state turns a status
+    line into a scroll."""
+    import backend.core.ouroboros.cli.ov as ov
+
+    shown = []
+    monkeypatch.setattr(ov, "_render_markup_frame", lambda t, console=None: shown.append(t))
+    server, client = await _live_session(tmp_path, monkeypatch, scope)
+    try:
+        for _ in range(5):
+            server.publish_event("TTS_GENERATING")
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.2)
+        assert len([s for s in shown if "thinking" in s]) == 1
+    finally:
+        await client.close()
+        await server.stop()
+
+
+def test_the_labels_match_the_real_event_vocabulary():
+    """Guessing lowercase names produced a mapping that matched nothing and
+    rendered silently — a publisher with no subscriber, which is the exact
+    failure this feature exists to end."""
+    from backend.core.ouroboros.cli.ov import _AUDIO_STATE_LABELS
+    from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (
+        EVENT_KINDS,
+    )
+
+    unknown = set(_AUDIO_STATE_LABELS) - set(EVENT_KINDS)
+    assert not unknown, f"labels keyed to non-existent events: {unknown}"
+    for key in ("TTS_GENERATING", "AUDIO_PLAYING"):
+        assert key in _AUDIO_STATE_LABELS, f"{key} has no operator-visible line"
+
+
+async def test_a_state_frame_does_not_move_the_wave(tmp_path, monkeypatch, scope):
+    server, client = await _live_session(tmp_path, monkeypatch, scope)
+    try:
+        server.publish_event("TTS_GENERATING")
+        await asyncio.sleep(0.2)
+        assert scope.is_silent()
+    finally:
+        await client.close()
+        await server.stop()

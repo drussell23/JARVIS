@@ -632,6 +632,9 @@ async def _attach_rms_stream(scope: Any) -> Any:
             "tts": AudioPlane.SYSTEM,
         }
 
+        # Edge memory for state transitions, scoped to this subscription.
+        _last = {"event": ""}
+
         def _on_frame(msg: dict) -> None:
             try:
                 # TRANSCRIPTS — what the organism actually HEARD.
@@ -656,6 +659,29 @@ async def _attach_rms_stream(scope: Any) -> Any:
                             + __import__("rich.markup", fromlist=["escape"]).escape(_txt)
                         )
                     return
+                # LIVE STATE — so the operator is never left in the dark.
+                #
+                # The supervisor has published these transitions since the IPC
+                # was written; the cockpit rendered none of them. Between
+                # "Hello Karen" and her reply there are 3-5 seconds of STT,
+                # LLM and synthesis during which the screen said nothing at
+                # all, and silence is indistinguishable from a hang.
+                #
+                # Each transition is announced ONCE, on the edge: the state
+                # machine upstream is already edge-coalesced, and re-printing
+                # a steady state would turn a status line into a scroll.
+                if msg.get("type") == "event":
+                    _kind = str(msg.get("kind", ""))
+                    _label = _AUDIO_STATE_LABELS.get(_kind)
+                    # Closure-local, NOT the caller's _audio dict: that name
+                    # belongs to a different function and referencing it here
+                    # raised a NameError the surrounding except swallowed, so
+                    # every state line vanished silently. Exactly the failure
+                    # this indicator exists to make impossible.
+                    if _label and _kind != _last["event"]:
+                        _last["event"] = _kind
+                        _render_markup_frame(_label)
+                    return
                 if msg.get("type") != MSG_RMS_LEVEL:
                     return
                 plane = planes.get(str(msg.get("plane", "user")).lower())
@@ -672,6 +698,26 @@ async def _attach_rms_stream(scope: Any) -> Any:
         return client if await client.connect() else None
     except Exception:  # noqa: BLE001
         return None
+
+
+#: Audio-state transition -> the one line the cockpit shows for it.
+#: Karen's own voice grammar (💭 thinking, 🗣 speaking) rather than raw event
+#: names, so the operator reads a conversation rather than a state machine.
+#: Keys are the EVENT_KINDS values verbatim. Written from the module's own
+#: tuple rather than from memory: guessing lowercase names produced a mapping
+#: that matched nothing and rendered silently — the same shape of failure as
+#: a publisher with no subscriber, which this feature exists to end.
+_AUDIO_STATE_LABELS = {
+    "VAD_ACTIVE": "[cyan]🎙 listening…[/cyan]",
+    "TTS_GENERATING": "[rgb(94,224,106)]💭 Karen is thinking…[/rgb(94,224,106)]",
+    "AUDIO_PLAYING": "[rgb(94,224,106)]🗣 Karen is speaking…[/rgb(94,224,106)]",
+    "AUDIO_IDLE": "[dim]· ready[/dim]",
+    "SYSTEM_WARMING": "[dim]· audio plane warming…[/dim]",
+    "SYSTEM_READY": "[dim]· audio plane ready[/dim]",
+    "HW_FAULT": "[red]⚠ audio hardware fault[/red]",
+    "SYS_TELEMETRY_DEGRADED": "[yellow]⚠ telemetry degraded[/yellow]",
+    "SYS_TELEMETRY_RECOVERED": "[dim]· telemetry recovered[/dim]",
+}
 
 
 async def _keep_rms_stream(scope: Any, state: dict) -> None:
