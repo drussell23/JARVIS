@@ -394,9 +394,26 @@ class AdaptiveVoiceRouter:
                 async for token in self._remote_stream(request, model):
                     emitted = True
                     yield token
-                self._breaker.record_success()
-                self.last_route = "remote"
-                return
+                if not emitted:
+                    # A stream that ENDS having said nothing is a failure that
+                    # returns 200. Recording it as success kept a mute model
+                    # elected and sent every turn to it — the operator waits
+                    # the full budget and hears silence, which is exactly what
+                    # the voice lane's probe exists to prevent and cannot see
+                    # once the model has already been elected.
+                    #
+                    # Treated as a fault so the breaker counts it, the lane is
+                    # told, and this turn still falls through to local below.
+                    self._breaker.record_failure(now=self._clock())
+                    self._demote_remote(model, "empty_stream")
+                    logger.warning(
+                        "[VoiceRouter] remote %s streamed ZERO tokens — "
+                        "demoting and falling back", model,
+                    )
+                else:
+                    self._breaker.record_success()
+                    self.last_route = "remote"
+                    return
             except asyncio.CancelledError:
                 raise
             except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
@@ -432,6 +449,22 @@ class AdaptiveVoiceRouter:
             # down mid-conversation.
             self.last_route = "failed"
             logger.error("[VoiceRouter] local fallback failed: %r", exc)
+
+    def _demote_remote(self, model: str, reason: str) -> None:
+        """Tell the voice lane a model failed IN PRODUCTION. NEVER raises.
+
+        The lane elects on a probe, and a probe is a sample: a model can pass
+        it and then go mute under real prompts, real lengths, real load. Only
+        the turn path sees that, so the turn path has to be able to say so —
+        otherwise the election is a one-time measurement that reality can
+        never correct."""
+        try:
+            from backend.core.ouroboros.governance.karen_voice_lane import (
+                record_runtime_failure,
+            )
+            record_runtime_failure(model, reason)
+        except Exception:  # noqa: BLE001
+            logger.debug("[VoiceRouter] demote degraded", exc_info=True)
 
     # -- observability ---------------------------------------------------
 

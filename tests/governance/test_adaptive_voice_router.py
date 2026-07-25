@@ -413,3 +413,61 @@ def test_the_router_does_not_reimplement_the_election():
         assert owned_elsewhere not in src, (
             f"router re-implements {owned_elsewhere} — that belongs to the lane"
         )
+
+
+# ---------------------------------------------------------------------------
+# A stream that says nothing is a failure that returns 200
+# ---------------------------------------------------------------------------
+#
+# Measured live: the elected model streamed ZERO tokens, the router recorded
+# SUCCESS, and last_route read "remote". So a mute model stayed elected and
+# every turn went to it — the operator waits the full budget and hears
+# silence. The voice lane's probe exists to prevent exactly this and cannot
+# see it once a model has already been elected.
+
+
+async def test_a_zero_token_stream_falls_back_to_local():
+    """THE REGRESSION."""
+    local = _Local(chunks=("local ", "answer"))
+    r = _router(local=local, dispatch=_dw([]))          # connects, says nothing
+
+    assert await _drain(r) == "local answer"
+    assert local.calls == 1
+    assert r.last_route == "local"
+
+
+async def test_a_zero_token_stream_trips_the_breaker():
+    r = _router(local=_Local(), dispatch=_dw([]))
+    await _drain(r)
+    assert r._breaker.failures == 1                     # noqa: SLF001
+
+
+async def test_a_zero_token_stream_demotes_the_model(monkeypatch):
+    """The election rests on a probe, and a probe is a sample. Only the turn
+    path sees a model that passed the probe and then went mute, so the turn
+    path must be able to say so."""
+    from backend.core.ouroboros.governance import karen_voice_lane as kvl
+
+    demoted = []
+    monkeypatch.setattr(
+        kvl, "record_runtime_failure",
+        lambda m, reason="runtime": demoted.append((m, reason)) or True,
+    )
+    r = _router(local=_Local(), dispatch=_dw([]))
+    await _drain(r)
+    assert demoted and demoted[0][0] == "elected/voice-model"
+    assert "empty" in demoted[0][1]
+
+
+async def test_a_speaking_model_is_not_demoted(monkeypatch):
+    """Positive control — demotion must be the exception, not the rule."""
+    from backend.core.ouroboros.governance import karen_voice_lane as kvl
+
+    demoted = []
+    monkeypatch.setattr(
+        kvl, "record_runtime_failure",
+        lambda m, reason="runtime": demoted.append(m) or True,
+    )
+    r = _router(local=_Local(), dispatch=_dw(["hello"]))
+    assert await _drain(r) == "hello"
+    assert demoted == []

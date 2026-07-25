@@ -40,9 +40,42 @@ def _env_flag(name: str, default: str = "false") -> bool:
 
 
 def _canonical_voice_name() -> str:
-    """Resolve canonical voice identity for deterministic TTS."""
-    if _env_flag("JARVIS_FORCE_DANIEL_VOICE", "true"):
-        return "Daniel"
+    """Resolve canonical voice identity for deterministic TTS.
+
+    ``JARVIS_FORCE_DANIEL_VOICE`` used to DEFAULT TO TRUE, so this returned
+    "Daniel" unconditionally and no injected identity could ever win. It is
+    the engine ConversationPipeline actually speaks through, which is why
+    Karen's cockpit answered in JARVIS's voice even after three other voice
+    sites had been made persona-aware — a flag named FORCE was acting as the
+    default rather than as an override.
+
+    A force flag must be something the operator TURNS ON. Unset, the chain
+    now runs: bound persona -> explicit canonical -> JARVIS_VOICE_NAME ->
+    Daniel. A process that declares no persona is unaffected, so JARVIS keeps
+    his voice exactly as before.
+
+    Returns "" when the persona defers to the OS default — the caller omits
+    ``-v`` on an empty voice, which is how "use the system voice" is
+    expressed. NEVER raises."""
+    # An EXPLICIT force still wins; it just no longer wins by default.
+    if os.getenv("JARVIS_FORCE_DANIEL_VOICE", "").strip():
+        if _env_flag("JARVIS_FORCE_DANIEL_VOICE", "false"):
+            return "Daniel"
+
+    try:
+        from backend.voice.agent_persona import (
+            active_persona, resolve_profile,
+        )
+        persona = active_persona()
+        if persona is not None:
+            profile = resolve_profile(persona)
+            if profile is not None:
+                # Empty string == system default: the say builder below skips
+                # -v when config.voice is falsy, which is exactly right.
+                return "" if profile.is_system_default else profile.voice
+    except Exception:  # noqa: BLE001 — identity is best-effort, never fatal
+        pass
+
     canonical = os.getenv("JARVIS_CANONICAL_VOICE_NAME", "").strip()
     if canonical:
         return canonical

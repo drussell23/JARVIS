@@ -635,6 +635,31 @@ def reset_warm_state() -> None:
         _WARMED = False
 
 
+def record_runtime_failure(model: str, reason: str = "runtime") -> bool:
+    """A model that passed the probe but failed on a REAL turn.
+
+    The election rests on a probe, and a probe is a sample: a model can pass
+    it and then go mute under real prompts, real lengths, real load. Only the
+    turn path sees that, so the turn path needs a way to say so — otherwise
+    the election is a one-time measurement that reality can never correct.
+
+    Recorded through the lane's own record type so the router never has to
+    know the ledger's shape; it reports an OUTCOME and the lane decides what
+    that means for ranking. NEVER raises."""
+    try:
+        led = get_default_ledger()
+        led.record(VoiceModelRecord(
+            model=str(model), ttft_s=-1.0, tokens=0, spoke=False,
+            measured_at=time.time(), reason=f"runtime:{reason}",
+        ))
+        led.save()
+        logger.info("[VoiceLane] %s demoted by the turn path (%s)", model, reason)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[VoiceLane] runtime demotion degraded", exc_info=True)
+        return False
+
+
 def voice_lane_status() -> Dict[str, Any]:
     """Operator-facing snapshot for ``/provider`` and friends. Read-only."""
     try:
@@ -668,6 +693,7 @@ __all__ = [
     "ensure_voice_lane_warm",
     "get_default_ledger",
     "probe_voice_model",
+    "record_runtime_failure",
     "refresh_voice_lane",
     "reset_default_ledger",
     "reset_warm_state",
