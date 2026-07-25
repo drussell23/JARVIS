@@ -332,8 +332,43 @@ def _dw_shape_cached_system(
             return system_text
         if not isinstance(system_text, str) or not system_text:
             return system_text
-        if len(system_text) < max(0, int(min_chars)):
+
+        # ── ACEE: frequency-driven, length-independent ────────────────────
+        # The legacy `min_chars` floor priced the wrong variable. Prefix length
+        # cancels out of the profitability inequality (every term scales
+        # linearly with it), so what matters is REUSE COUNT. The floor blocked
+        # a small high-frequency probe (profitable) while admitting a huge
+        # one-off (a guaranteed write-premium loss).
+        #
+        # This is the ONE chokepoint every DW request funnels through — both
+        # the streaming and non-streaming handlers consume its output — so the
+        # decision is intercepted here without touching either handler.
+        from backend.core.ouroboros.governance.dw_cache_economics import (
+            acee_enabled, should_cache_write,
+        )
+        if acee_enabled():
+            ok, _why = should_cache_write(
+                system_text,
+                write_mult=_dw_cache_write_multiplier(),
+                read_mult=_dw_cache_read_multiplier(),
+            )
+            if not ok:
+                logger.debug(
+                    "[ACEE] bypass uses=%s need=%s chars=%s sig=%s",
+                    _why.get("uses_in_window"), _why.get("break_even_uses"),
+                    _why.get("chars"), _why.get("signature"),
+                )
+                return system_text
+            logger.debug(
+                "[ACEE] cache uses=%s need=%s chars=%s sig=%s",
+                _why.get("uses_in_window"), _why.get("break_even_uses"),
+                _why.get("chars"), _why.get("signature"),
+            )
+        elif len(system_text) < max(0, int(min_chars)):
+            # Legacy path, retained byte-identical for rollback via
+            # JARVIS_DW_ACEE_ENABLED=false.
             return system_text
+
         return [
             {
                 "type": "text",

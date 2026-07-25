@@ -95,6 +95,18 @@ def _ctx(
 
 
 class TestShapeCachedSystem:
+    """Marker SHAPE at the raw shaping helper. ACEE pinned off — see the note on
+    TestBuildSystemContent. Additionally: ACEE's tracker is a PROCESS-WIDE
+    singleton, so without this pin an earlier test's prefix warms the signature
+    and a later 'first sighting' assertion silently receives a cached marker.
+    Policy lives in tests/governance/test_dw_cache_economics.py, which resets
+    the singleton per test."""
+
+    @pytest.fixture(autouse=True)
+    def _legacy_gate(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("JARVIS_DW_ACEE_ENABLED", "false")
+        yield
+
     def test_enabled_long_prefix_marks_cache_control(self) -> None:
         text = "S" * 5000
         out = _dw_shape_cached_system(
@@ -284,6 +296,22 @@ class TestForcePrefixSplit:
 
 
 class TestBuildSystemContent:
+    """Marker SHAPE — placement, TTL threading, block membership.
+
+    ACEE is pinned off for this class deliberately. These assert how the
+    cache_control block is CONSTRUCTED, and ACEE decides WHETHER to build one:
+    under its first-sighting policy a single call is correctly uncached, which
+    would make every shape assertion here fail for a reason that has nothing to
+    do with shape. The policy itself is covered by
+    tests/governance/test_dw_cache_economics.py, including an end-to-end
+    integration test through this same chokepoint.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _legacy_gate(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("JARVIS_DW_ACEE_ENABLED", "false")
+        yield
+
     def test_off_returns_plain_string_byte_identical(self) -> None:
         p = _provider()
         base = "SYSTEM PROMPT"
