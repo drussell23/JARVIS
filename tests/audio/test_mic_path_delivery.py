@@ -282,3 +282,123 @@ def test_the_host_hard_exits():
         "backend/audio/audio_plane_host.py",
     ).read_text(encoding="utf-8")
     assert "os._exit(" in src and "flush()" in src
+
+
+# ---------------------------------------------------------------------------
+# BUG 4 — a rendezvous address that depends on the caller's cwd
+# ---------------------------------------------------------------------------
+#
+# `voice: unavailable (no audio plane)` with a host actively serving. The
+# socket default was the RELATIVE string ".jarvis/audio_state.sock", so every
+# process resolved it against its own working directory. Observed live: two
+# hosts, one on ./.jarvis/audio_state.sock and one on
+# ./backend/audio/.jarvis/audio_state.sock (the reflex spawned with
+# cwd=<script dir>), while the cockpit looked at neither.
+#
+# It also defeated single-flight silently: the host probes for an incumbent
+# before binding, and a probe of a DIFFERENT path finds nothing — so the guard
+# passed and a second owner of the microphone started.
+
+
+def test_the_socket_path_is_absolute_regardless_of_cwd(monkeypatch, tmp_path):
+    """THE REGRESSION. Three programs meet at this address; it cannot depend on
+    where each of them happened to be launched from."""
+    from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (
+        socket_path,
+    )
+
+    monkeypatch.delenv("JARVIS_AUDIO_IPC_SOCKET", raising=False)
+    here = socket_path()
+    monkeypatch.chdir(tmp_path)
+    there = socket_path()
+
+    assert here.is_absolute(), f"cwd-relative rendezvous address: {here}"
+    assert here == there, (
+        f"the socket moved with cwd: {here} != {there} — this is how two "
+        f"hosts bound two sockets while the cockpit found neither"
+    )
+
+
+def test_a_relative_override_also_anchors_to_the_repo(monkeypatch, tmp_path):
+    """Closing the way back in: an operator-supplied relative path must not
+    reintroduce the same drift."""
+    from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (
+        socket_path,
+    )
+
+    monkeypatch.setenv("JARVIS_AUDIO_IPC_SOCKET", "sub/dir/a.sock")
+    here = socket_path()
+    monkeypatch.chdir(tmp_path)
+    assert socket_path() == here and here.is_absolute()
+
+
+def test_an_absolute_override_is_honoured_verbatim(monkeypatch):
+    from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (
+        socket_path,
+    )
+    from pathlib import Path
+
+    monkeypatch.setenv("JARVIS_AUDIO_IPC_SOCKET", "/tmp/explicit.sock")
+    assert socket_path() == Path("/tmp/explicit.sock")
+
+
+def test_the_host_is_spawned_into_the_repo_not_its_own_directory():
+    """`cwd=path.parent` put the host in backend/audio/, where every
+    cwd-relative path it touched resolved where nobody was looking."""
+    from pathlib import Path
+
+    src = Path(
+        "backend/core/ouroboros/cli/audio_daemon_reflex.py",
+    ).read_text(encoding="utf-8")
+    assert "cwd=str(path.parent)" not in src, (
+        "the host is being spawned into its own directory again"
+    )
+
+
+# ---------------------------------------------------------------------------
+# BUG 5 — a detached process that dies leaving no trace
+# ---------------------------------------------------------------------------
+
+
+def test_the_spawned_host_logs_somewhere_readable():
+    """stdio went to DEVNULL so a chatty boot could not corrupt the TUI. Right
+    reasoning, wrong destination: "the cockpit says no audio plane" became
+    unanswerable, which is the one question an operator actually asks."""
+    from backend.core.ouroboros.cli import audio_daemon_reflex as reflex
+
+    p = reflex.host_log_path()
+    assert p is not None and p.is_absolute() and p.parent.is_dir()
+
+
+def test_spawn_redirects_stdio_to_the_log_not_devnull(monkeypatch, tmp_path):
+    from backend.core.ouroboros.cli import audio_daemon_reflex as reflex
+
+    seen = {}
+
+    class _P:
+        pid = 4242
+
+    monkeypatch.setattr(
+        reflex.subprocess, "Popen",
+        lambda argv, **kw: (seen.update(kw), _P())[1],
+    )
+    assert reflex.spawn_supervisor() == 4242
+    assert seen["stdout"] is not reflex.subprocess.DEVNULL, (
+        "the host's death is being sent to /dev/null again"
+    )
+    assert seen["stderr"] == reflex.subprocess.STDOUT
+    assert seen["stdin"] == reflex.subprocess.DEVNULL, (
+        "a detached host must never inherit the terminal's stdin"
+    )
+    assert seen["start_new_session"] is True
+
+
+def test_the_host_log_appends_rather_than_truncates():
+    """The interesting case is a host that dies and gets respawned; truncating
+    would erase the death that explains the retry."""
+    from pathlib import Path
+
+    src = Path(
+        "backend/core/ouroboros/cli/audio_daemon_reflex.py",
+    ).read_text(encoding="utf-8")
+    assert 'open(path, "a"' in src

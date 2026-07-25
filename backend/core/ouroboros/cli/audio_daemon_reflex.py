@@ -147,6 +147,40 @@ async def probe_socket(path: Optional[Path] = None, *, timeout: float = 0.5) -> 
                 pass
 
 
+def host_log_path() -> Optional[Path]:
+    """Where a spawned host's output goes. Repo-anchored, never cwd-relative.
+
+    stdio used to go to DEVNULL on the reasoning that a chatty boot must not
+    corrupt the TUI's terminal. That reasoning is right and the destination was
+    wrong: a detached process that dies leaves NO trace, so "the cockpit says
+    no audio plane" became unanswerable — the one question the operator asks is
+    the one the design made unanswerable.
+
+    A file satisfies both: the terminal stays clean and the failure is
+    readable. NEVER raises."""
+    try:
+        root = Path(__file__).resolve().parents[4]
+        log_dir = root / ".jarvis"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return log_dir / "audio_plane.log"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _open_host_log() -> Any:
+    """Append-mode handle for the host's stdio, or DEVNULL if unavailable.
+
+    Append, not truncate: the interesting case is a host that dies and gets
+    respawned, and truncating would erase the death that explains the retry."""
+    path = host_log_path()
+    if path is None:
+        return subprocess.DEVNULL
+    try:
+        return open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return subprocess.DEVNULL
+
+
 def spawn_supervisor(
     *, script: Optional[Path] = None, extra_args: Optional[list] = None,
 ) -> Optional[int]:
@@ -172,15 +206,25 @@ def spawn_supervisor(
     try:
         python = sys.executable or shutil.which("python3") or "python3"
         argv = [python, str(path)] + list(extra_args or [])
+        sink = _open_host_log()
         proc = subprocess.Popen(
             argv,
-            cwd=str(path.parent),
+            # REPO ROOT, not the script's directory. `cwd=path.parent` sent
+            # the host to backend/audio/, where every cwd-relative path it
+            # touched resolved somewhere nobody else was looking — it bound
+            # backend/audio/.jarvis/audio_state.sock while the cockpit waited
+            # on the repo-root one. socket_path() is anchored now, but the
+            # child's cwd should still be the tree it belongs to.
+            cwd=str(path.resolve().parents[2]),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=sink,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        logger.info("[AudioReflex] spawned audio plane host pid=%s", proc.pid)
+        logger.info(
+            "[AudioReflex] spawned audio plane host pid=%s (log: %s)",
+            proc.pid, host_log_path(),
+        )
         return proc.pid
     except Exception as exc:  # noqa: BLE001
         logger.debug("[AudioReflex] spawn failed: %r", exc)
@@ -275,6 +319,7 @@ async def ensure_audio_daemon(
 __all__ = [
     "audio_host_path",
     "await_socket",
+    "host_log_path",
     "ensure_audio_daemon",
     "probe_socket",
     "reflex_enabled",

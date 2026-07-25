@@ -214,9 +214,14 @@ def test_audio_host_path_resolves_from_the_module_not_the_cwd():
     assert reflex.supervisor_path() == p, "the deprecated alias drifted"
 
 
-def test_spawn_is_detached_and_silenced(monkeypatch):
-    """Detached so the audio plane outlives an ephemeral cockpit; stdio
-    silenced so a chatty boot cannot corrupt the TUI's terminal."""
+def test_spawn_is_detached_and_kept_off_the_terminal(monkeypatch):
+    """Detached so the audio plane outlives an ephemeral cockpit; stdio kept
+    off the TUI's terminal so a chatty boot cannot corrupt it.
+
+    The DESTINATION changed (2026-07-25): output goes to a repo-anchored log
+    file rather than DEVNULL. Same guarantee for the terminal, but a host that
+    dies now leaves a trace — "the cockpit says no audio plane" was
+    unanswerable when its only witness was /dev/null."""
     seen = {}
 
     class _P:
@@ -233,8 +238,10 @@ def test_spawn_is_detached_and_silenced(monkeypatch):
     assert pid == 999
     assert seen["argv"][1].endswith("audio_plane_host.py")
     assert seen["kw"]["start_new_session"] is True
-    assert seen["kw"]["stdout"] == reflex.subprocess.DEVNULL
-    assert seen["kw"]["stderr"] == reflex.subprocess.DEVNULL
+    assert seen["kw"]["stdout"] is not reflex.subprocess.DEVNULL, (
+        "the host's death is being discarded again"
+    )
+    assert seen["kw"]["stderr"] == reflex.subprocess.STDOUT
     assert seen["kw"]["stdin"] == reflex.subprocess.DEVNULL
 
 

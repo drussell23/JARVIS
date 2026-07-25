@@ -198,11 +198,46 @@ def audio_ipc_enabled() -> bool:
     ).strip().lower() in _TRUTHY
 
 
+def _repo_root() -> Path:
+    """This repository's root, from THIS module's position on disk.
+
+    Not ``Path.cwd()``: the processes that meet on this socket are launched
+    from wherever the operator happened to be standing."""
+    return Path(__file__).resolve().parents[6]
+
+
 def socket_path() -> Path:
-    """``JARVIS_AUDIO_IPC_SOCKET`` (default ``.jarvis/audio_state.sock``)."""
-    return Path(os.environ.get(
-        "JARVIS_AUDIO_IPC_SOCKET", ".jarvis/audio_state.sock",
-    ))
+    """Absolute path to the audio-state socket. Anchored, never cwd-relative.
+
+    THE BUG THIS FIXES. The default was the relative string
+    ``.jarvis/audio_state.sock``, so every process resolved it against its own
+    working directory. Three programs meet here — the cockpit (`ov`, launched
+    from anywhere), the daemon, and the audio-plane host (spawned with
+    ``cwd=<script dir>``) — and the moment one of them ran from a different
+    directory it bound a DIFFERENT socket of the same name.
+
+    Observed 2026-07-25: two live hosts, one on
+    ``./.jarvis/audio_state.sock`` and one on
+    ``./backend/audio/.jarvis/audio_state.sock``, while the cockpit reported
+    "voice: unavailable (no audio plane)". Both were serving; neither was
+    where anyone was looking.
+
+    It also silently defeated single-flight. The host probes for an incumbent
+    before binding, but a probe of a different path finds nothing — so the
+    guard passed and a SECOND owner of the microphone started. A rendezvous
+    address that depends on the caller's cwd is not an address.
+
+    ``JARVIS_AUDIO_IPC_SOCKET`` still wins, and a RELATIVE override resolves
+    against the repo root rather than cwd — same reasoning, no way back in.
+    NEVER raises."""
+    raw = os.environ.get("JARVIS_AUDIO_IPC_SOCKET", "").strip()
+    try:
+        if raw:
+            p = Path(raw).expanduser()
+            return p if p.is_absolute() else (_repo_root() / p)
+        return _repo_root() / ".jarvis" / "audio_state.sock"
+    except Exception:  # noqa: BLE001
+        return Path(".jarvis/audio_state.sock")
 
 
 def _recent_cap() -> int:
@@ -301,7 +336,13 @@ class AudioStateBroadcaster:
                 os.chmod(self._path, 0o600)
             except OSError:
                 pass
-            logger.info("[AudioIPC] broadcaster bound at %s", self._path)
+            # Absolute in the log, always. When a client says "no audio
+            # plane" while a host says "serving", the two resolved paths are
+            # the first thing anyone needs to compare — and a relative render
+            # is exactly what made that comparison impossible.
+            logger.info(
+                "[AudioIPC] broadcaster bound at %s", self._path.resolve(),
+            )
             return True
         except Exception as exc:  # noqa: BLE001 — export is optional
             logger.warning("[AudioIPC] broadcaster bind failed: %s", exc)
@@ -885,7 +926,8 @@ class AudioStateClient:
             return True
         except Exception:  # noqa: BLE001 — dead daemon = text-only mode
             logger.debug(
-                "[AudioIPC] connect degraded (text-only mode)", exc_info=True,
+                "[AudioIPC] connect degraded at %s (text-only mode)",
+                self._path, exc_info=True,
             )
             await self.close()
             return False
