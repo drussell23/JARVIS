@@ -455,6 +455,33 @@ async def wire_conversation_pipeline(
             logger.warning(f"[Bootstrap] Karen duplex mount skipped: {e}")
 
     # 4. ConversationPipeline
+    #
+    #    The llm_client is wrapped in an AdaptiveVoiceRouter rather than passed
+    #    through. Injecting UnifiedModelServing directly welded the spoken loop
+    #    to local inference: the measured DW voice election reached typed turns
+    #    only, so a typed question answered in ~1s and a spoken one ran on a
+    #    different brain entirely.
+    #
+    #    The router prefers the elected remote voice, which on 16GB of unified
+    #    memory is the RESOURCE-preserving choice as much as the fast one —
+    #    local generation competes for the same pool as STT capture and TTS
+    #    synthesis, and the symptom of losing that contest is stutter in the
+    #    microphone stream. Local becomes the fallback that keeps Karen talking
+    #    when the network does not.
+    #
+    #    build_voice_router() returns the bare engine when the master flag is
+    #    off, so the disabled path is byte-identical to the pre-router wiring.
+    try:
+        from backend.core.ouroboros.governance.adaptive_voice_router import (
+            build_voice_router,
+        )
+        _voice_llm = build_voice_router(llm_client)
+        if _voice_llm is not llm_client:
+            logger.info("[Bootstrap] AdaptiveVoiceRouter wrapping llm_client")
+    except Exception as e:  # noqa: BLE001 — a routing fault never costs voice
+        _voice_llm = llm_client
+        logger.warning(f"[Bootstrap] voice router skipped: {e}")
+
     try:
         from backend.audio.conversation_pipeline import ConversationPipeline
 
@@ -464,7 +491,7 @@ async def wire_conversation_pipeline(
             turn_detector=handle.turn_detector,
             barge_in=handle.barge_in,
             tts_engine=handle.tts_engine,
-            llm_client=llm_client,
+            llm_client=_voice_llm,
         )
         logger.info("[Bootstrap] ConversationPipeline created")
     except Exception as e:
