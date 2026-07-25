@@ -262,6 +262,90 @@ def resolve_profile(persona: object) -> Optional[VoiceProfile]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Synthesis latency — measured, because voices differ by 3x
+# ---------------------------------------------------------------------------
+
+
+def synthesis_budget_ms() -> float:
+    """How long a voice may take to synthesize a short reply before it stops
+    feeling like a conversation.
+
+    Measured on this machine for one sentence: Daniel 1012ms, Karen 1050ms,
+    Samantha 1644ms, Alex 2702ms, and the SYSTEM DEFAULT 3158ms — the slowest
+    installed. A three-second pause before "hello" is not a slow assistant,
+    it is a broken conversational contract, and no amount of LLM speed hides
+    it because synthesis happens after."""
+    try:
+        return max(100.0, float(os.getenv("JARVIS_VOICE_SYNTH_BUDGET_MS", "2500")))
+    except (TypeError, ValueError):
+        return 2500.0
+
+
+def measure_synthesis_ms(voice: str, *, text: str = "Hello. How can I help?") -> float:
+    """Milliseconds for *voice* to synthesize *text* to a file, or -1.
+
+    An empty voice name measures the system default (no ``-v``), which is the
+    only way to time a voice whose name cannot be resolved. NEVER raises."""
+    import tempfile
+    try:
+        fd, path = tempfile.mkstemp(suffix=".aiff")
+        os.close(fd)
+        args = ["say"] + ([] if _is_system_default(voice) else ["-v", voice])
+        t0 = time.monotonic()
+        proc = subprocess.run(
+            args + ["-o", path, text], capture_output=True, timeout=20,
+        )
+        elapsed = (time.monotonic() - t0) * 1000.0
+        size = os.path.getsize(path)
+        os.unlink(path)
+        if proc.returncode != 0 or size < 1024:
+            return -1.0
+        return elapsed
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return -1.0
+
+
+def fastest_acceptable_voice(persona: AgentPersona) -> Optional[VoiceProfile]:
+    """The persona's preferred voice, unless it is too slow to converse with.
+
+    Walks the SAME preference chain as :func:`resolve_profile` and returns the
+    first entry that both exists and synthesizes inside the budget. Falls back
+    to the plain resolution when nothing measures fast enough, because a slow
+    voice still beats no voice — the identical judgement the DW voice lane
+    makes about models.
+
+    Measurement is real, not assumed: voices differ by 3x on this machine and
+    a table of which is fast would rot the moment Apple ships a new one."""
+    budget = synthesis_budget_ms()
+    try:
+        override = _override_for(persona)
+        chain = ([override] if override else []) + list(
+            _PREFERENCES.get(persona, ())
+        )
+        for name in chain:
+            if not _is_system_default(name) and not voice_installed(name):
+                continue
+            ms = measure_synthesis_ms(name)
+            if ms < 0:
+                continue
+            if ms <= budget:
+                return VoiceProfile(
+                    persona,
+                    SYSTEM_DEFAULT if _is_system_default(name) else name,
+                    _rate_for(persona),
+                    f"measured:{ms:.0f}ms",
+                )
+            logger.info(
+                "[Persona] %s synthesizes in %.0fms, over the %.0fms "
+                "conversational budget — trying the next preference",
+                name or "<system default>", ms, budget,
+            )
+        return resolve_profile(persona)
+    except Exception:  # noqa: BLE001 — selection must never block speech
+        return resolve_profile(persona)
+
+
 def active_persona() -> Optional[AgentPersona]:
     """Process-wide persona from the environment.
 
@@ -272,11 +356,25 @@ def active_persona() -> Optional[AgentPersona]:
     return AgentPersona.coerce(os.getenv("JARVIS_AGENT_PERSONA", ""))
 
 
+def latency_selection_enabled() -> bool:
+    """Measure synthesis speed when choosing a voice? Default ON.
+
+    OFF pins whatever the preference chain names regardless of how slow it
+    is, which is the right choice for an operator who cares more about the
+    voice than the pause before it."""
+    return os.getenv(
+        "JARVIS_VOICE_LATENCY_SELECTION", "true",
+    ).strip().lower() in _TRUTHY
+
+
 def bind_persona(persona: AgentPersona) -> None:
     """Declare the persona for this process. Idempotent; NEVER raises."""
     try:
         os.environ["JARVIS_AGENT_PERSONA"] = AgentPersona(persona).value
-        prof = resolve_profile(persona)
+        prof = (
+            fastest_acceptable_voice(persona) if latency_selection_enabled()
+            else resolve_profile(persona)
+        )
         logger.info(
             "[Persona] bound %s -> voice=%s (%s)",
             persona.value,
@@ -289,6 +387,9 @@ def bind_persona(persona: AgentPersona) -> None:
 
 __all__ = [
     "SYSTEM_DEFAULT",
+    "fastest_acceptable_voice",
+    "measure_synthesis_ms",
+    "synthesis_budget_ms",
     "AgentPersona",
     "VoiceProfile",
     "active_persona",

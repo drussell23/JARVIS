@@ -28,7 +28,30 @@ logger = logging.getLogger(__name__)
 
 # Minimum consecutive speech frames before triggering barge-in
 # Prevents single-frame noise from interrupting
-_MIN_SPEECH_FRAMES = int(os.getenv("JARVIS_BARGEIN_MIN_FRAMES", "3"))
+#: Sustained speech required to call it an interruption, in MILLISECONDS
+#: rather than a frame count — a count silently changes meaning if the frame
+#: duration ever does, and it hid how short this really was.
+#:
+#: The old value was 3 frames = SIXTY MILLISECONDS. Karen's own voice leaking
+#: into the microphone for 60ms is not a possibility, it is a certainty, and
+#: it cancelled her reply within 300ms every single time.
+_MIN_SPEECH_MS = int(os.getenv("JARVIS_BARGEIN_MIN_SPEECH_MS", "120"))
+
+#: The same requirement WHILE JARVIS IS AUDIBLE, where every frame is
+#: echo-suspect. A person who genuinely means to interrupt keeps talking; an
+#: echo burst is brief and stops when she does. Asymmetry is the point — it
+#: costs a deliberate interrupter a fraction of a second and costs an echo
+#: everything.
+_MIN_SPEECH_MS_WHILE_SPEAKING = int(
+    os.getenv("JARVIS_BARGEIN_MIN_SPEECH_MS_SPEAKING", "600")
+)
+
+#: Frame duration the VAD consumer delivers, so the thresholds above stay
+#: expressed in time no matter how the audio path is framed.
+_FRAME_MS = max(1, int(os.getenv("JARVIS_AUDIO_FRAME_MS", "20")))
+
+# Legacy name retained: some call sites and tests reference it.
+_MIN_SPEECH_FRAMES = max(1, _MIN_SPEECH_MS // _FRAME_MS)
 
 # Cooldown after barge-in before allowing another (ms)
 _BARGEIN_COOLDOWN_MS = int(os.getenv("JARVIS_BARGEIN_COOLDOWN_MS", "500"))
@@ -90,10 +113,24 @@ class BargeInController:
         if is_speech:
             self._speech_frame_count += 1
 
-            if self._speech_frame_count >= _MIN_SPEECH_FRAMES:
-                # Check if JARVIS is currently speaking
-                if self._is_jarvis_speaking():
-                    self._trigger_barge_in()
+            # ADAPTIVE THRESHOLD. Barge-in only matters while JARVIS is
+            # speaking — which is exactly when the microphone is hearing HIM.
+            # So the bar is raised for precisely the window in which every
+            # frame is echo-suspect, instead of applying one hair-trigger
+            # count to both cases.
+            speaking = self._is_jarvis_speaking()
+            required_ms = (
+                _MIN_SPEECH_MS_WHILE_SPEAKING if speaking else _MIN_SPEECH_MS
+            )
+            required = max(1, required_ms // _FRAME_MS)
+
+            if self._speech_frame_count >= required and speaking:
+                logger.debug(
+                    "[BargeIn] sustained %dms of speech while speaking "
+                    "(threshold %dms) — treating as a real interruption",
+                    self._speech_frame_count * _FRAME_MS, required_ms,
+                )
+                self._trigger_barge_in()
         else:
             self._speech_frame_count = 0
 
