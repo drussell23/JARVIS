@@ -10,6 +10,10 @@ from backend.core.ouroboros.governance.dw_surface_health import (
 def test_surface_kind_closed_taxonomy():
     assert {k.value for k in SurfaceKind} == {
         "batch_storage", "direct_streaming", "auth_sync",
+        # The deep INFERENCE probe's own surface. DW's control plane can answer
+        # 200 while the data plane deadlocks (soak bt-2026-06-29-032526), so
+        # completion health is tracked separately from streaming transport.
+        "direct_completion",
     }
 
 
@@ -17,6 +21,10 @@ def test_surface_verdict_closed_taxonomy():
     assert {v.value for v in SurfaceVerdict} == {
         "healthy", "transport_degraded", "upstream_degraded",
         "auth_failed", "error_other",
+        # Distinct from transport_degraded: the socket was fine, the INFERENCE
+        # queue was wedged. Conflating the two is what let a healthy control
+        # plane mask a dead data plane.
+        "inference_degraded",
     }
 
 

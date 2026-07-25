@@ -150,7 +150,21 @@ class TestShapeCachedSystem:
 
 
 class TestConfig:
-    def test_cache_enabled_default_false(self) -> None:
+    def test_cache_enabled_default_true_after_graduation(self) -> None:
+        """GRADUATED 2026-07-24. Measured on bt-2026-07-24-212505: ~17KB of
+        static prefix (dev-memory 10,459 + strategic/goal 4,019 + user-prefs
+        1,611 + goal-inference 992 chars) was re-billed at full input price on
+        every op. Caching is content-addressed, so a changed prefix simply
+        misses — there is no stale-context risk to gate on."""
+        assert _dw_prompt_cache_enabled() is True
+
+    @pytest.mark.parametrize("val", ["false", "0", "no", "off", "FALSE"])
+    def test_cache_rollback_to_uncached(
+        self, monkeypatch: pytest.MonkeyPatch, val: str
+    ) -> None:
+        """The graduation must stay reversible — one env var restores the
+        byte-identical un-cached request."""
+        monkeypatch.setenv("JARVIS_DW_PROMPT_CACHE_ENABLED", val)
         assert _dw_prompt_cache_enabled() is False
 
     @pytest.mark.parametrize("val", ["true", "1", "yes", "on", "TRUE"])

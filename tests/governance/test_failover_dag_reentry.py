@@ -177,6 +177,37 @@ class _FakeController:
         return self._endpoint if self._serving else None
 
 
+class _DisabledTopology:
+    """Topology explicitly OFF.
+
+    These tests assert ROUTING, not DW dispatch. They used to rely on the
+    ambient `get_topology().enabled` being false — but it reads real repo
+    config and is TRUE here, so `_dispatch_via_sentinel` walked the ranked
+    DW models and made a LIVE network call, hanging the suite in
+    selector.select() until the pytest timeout fired (2026-07-24).
+
+    Pinning it makes the tests hermetic: no ambient config, no sockets.
+    """
+
+    enabled = False
+
+    def dw_models_for_route(self, _route):
+        return ()
+
+    def fallback_tolerance_for_route(self, _route):
+        return "none"
+
+
+def _pin_topology_disabled(monkeypatch):
+    """Patch at the SOURCE module: `_dispatch_via_sentinel` resolves
+    `get_topology` via a function-LOCAL import, so patching the
+    candidate_generator namespace would never reach it."""
+    from backend.core.ouroboros.governance import provider_topology as _pt
+    monkeypatch.setattr(
+        _pt, "get_topology", lambda: _DisabledTopology(), raising=False,
+    )
+
+
 def _make_generator():
     from backend.core.ouroboros.governance.candidate_generator import (
         CandidateGenerator,
@@ -235,6 +266,25 @@ class TestGenerationReroute:
             cg,
             "get_failover_controller",
             lambda: _FakeController(True, "http://jprime-node:11434"),
+        )
+        # ── The hang this fixes (2026-07-24) ──────────────────────────────
+        # `_discover_jprime_endpoint` resolves these via a FUNCTION-LOCAL
+        # `from .failover_lifecycle import ...`, so patching the
+        # candidate_generator namespace above never reached it. The real
+        # `lifecycle_enabled()` then read the env we just set to "true", the
+        # real controller reported not-serving, and discovery fell through to
+        # step (2): a LIVE zone-aware GCP query. The suite hung in
+        # selector.select() until the pytest timeout killed it.
+        #
+        # Patch the SOURCE module the local import actually binds to. Keeping
+        # the `cg` patches above as well: they cover the other call sites that
+        # DO read the module-level names, so both resolution paths are pinned.
+        monkeypatch.setattr(fl, "lifecycle_enabled", lambda: True, raising=False)
+        monkeypatch.setattr(
+            fl,
+            "get_failover_controller",
+            lambda: _FakeController(True, "http://jprime-node:11434"),
+            raising=False,
         )
 
         spy = {"endpoint": None, "called": 0}
@@ -298,6 +348,7 @@ class TestGenerationReroute:
 
         # Replace the topology import so the sentinel body short-circuits to
         # the DW path marker.
+        _pin_topology_disabled(monkeypatch)
         gen = _make_generator()
         ctx = _make_context()
         from datetime import datetime, timezone, timedelta
@@ -334,12 +385,14 @@ class TestGenerationReroute:
             raising=True,
         )
 
+        _pin_topology_disabled(monkeypatch)
         gen = _make_generator()
         ctx = _make_context()
         from datetime import datetime, timezone, timedelta
 
         # Must NOT raise the local error -- it falls through to the normal DW
-        # path (which returns None here with no topology). The op is not lost.
+        # path (which returns None here with topology explicitly pinned OFF).
+        # The op is not lost.
         result = await gen._dispatch_via_sentinel(
             ctx, datetime.now(timezone.utc) + timedelta(seconds=60),
             "standard",

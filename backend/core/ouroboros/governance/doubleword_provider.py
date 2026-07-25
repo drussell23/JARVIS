@@ -163,10 +163,26 @@ _DW_ZDR_HEADER_VALUE = "true"
 
 
 def _dw_prompt_cache_enabled() -> bool:
-    """Master switch for DW prompt caching. Default FALSE (safe opt-in). When
-    off, the request is byte-identical legacy (no cache_control markers)."""
+    """Master switch for DW prompt caching. GRADUATED to default TRUE
+    (2026-07-24). Rollback: ``JARVIS_DW_PROMPT_CACHE_ENABLED=false`` restores the
+    byte-identical un-cached request.
+
+    Why: every op re-sends a large, near-identical prefix — measured on session
+    bt-2026-07-24-212505 as dev-memory 10,459 chars + strategic/goal 4,019 +
+    user-preferences 1,611 + goal-inference 992, i.e. ~17KB of static context
+    re-billed at full input price against ops of ~2,259 input tokens. With the
+    1h TTL, one cache write amortizes across every op in the window.
+
+    Staleness is NOT a risk here, and needs no invalidation machinery: prompt
+    caching is CONTENT-ADDRESSED. The cache key IS the exact prefix, and
+    ``_dw_shape_cached_system`` adds only ``cache_control`` metadata — the text
+    stays byte-identical. If dev-memory or user preferences change mid-soak the
+    prefix bytes change, so the key changes, so it MISSES and re-writes. It is
+    structurally impossible to be served a cached prefix that differs from the
+    prefix you sent. The TTL bounds how long an IDENTICAL prefix stays warm, not
+    how long stale content survives."""
     return os.environ.get(
-        "JARVIS_DW_PROMPT_CACHE_ENABLED", "false"
+        "JARVIS_DW_PROMPT_CACHE_ENABLED", "true"
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
