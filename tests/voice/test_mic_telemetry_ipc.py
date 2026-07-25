@@ -380,3 +380,208 @@ def test_capture_callback_survives_a_broken_tap():
 
     br = MicTelemetryBridge(server=None, tap=_BadTap())
     br.on_mic_frame(np.zeros(64, dtype=np.float32))   # must not raise
+
+
+# ---------------------------------------------------------------------------
+# adaptive watermark — derived from the socket, never a constant
+# ---------------------------------------------------------------------------
+
+
+def test_watermark_derives_from_the_real_socket_buffer():
+    """Root-cause: ask the kernel how much buffer this socket has rather than
+    guessing. AF_UNIX SO_SNDBUF varies by platform and sysctl, so any constant
+    is wrong somewhere."""
+    import socket as _s
+
+    a, b = _s.socketpair(_s.AF_UNIX, _s.SOCK_STREAM)
+    try:
+        sndbuf = a.getsockopt(_s.SOL_SOCKET, _s.SO_SNDBUF)
+
+        class _W:
+            def get_extra_info(self, key):
+                return a if key == "socket" else None
+
+        w = _W()
+        assert ipc.socket_send_buffer_bytes(w) == sndbuf
+        wm = ipc.rms_drop_watermark_bytes(w)
+        assert wm == pytest.approx(sndbuf * ipc.rms_watermark_multiple(), rel=0.01)
+    finally:
+        a.close(); b.close()
+
+
+def test_watermark_scales_with_a_bigger_socket():
+    """A host with larger buffers must tolerate proportionally more queueing —
+    the behaviour a fixed 64KB could never have."""
+    class _W:
+        def __init__(self, n): self._n = n
+        def get_extra_info(self, key):
+            class _S:
+                def getsockopt(_s2, *_a): return self._n
+            return _S()
+
+    small = ipc.rms_drop_watermark_bytes(_W(8192))
+    large = ipc.rms_drop_watermark_bytes(_W(262144))
+    assert large > small * 4, "watermark did not scale with socket capacity"
+
+
+def test_watermark_falls_back_only_when_introspection_fails():
+    class _NoSock:
+        def get_extra_info(self, key):
+            return None
+
+    assert ipc.socket_send_buffer_bytes(_NoSock()) is None
+    assert ipc.rms_drop_watermark_bytes(_NoSock()) >= 1024
+    assert ipc.rms_drop_watermark_bytes(None) >= 1024
+
+
+def test_introspection_never_raises_on_a_hostile_transport():
+    class _Hostile:
+        def get_extra_info(self, key):
+            raise OSError("no transport")
+
+    assert ipc.socket_send_buffer_bytes(_Hostile()) is None
+
+
+# ---------------------------------------------------------------------------
+# QoS signalling — edge-triggered, on the GUARANTEED lane
+# ---------------------------------------------------------------------------
+
+
+def test_shedding_signals_degraded_on_the_edge_not_per_frame():
+    """Per-frame signalling would put 20 events/sec on the guaranteed lane —
+    more traffic than the telemetry being shed, on the lane that must never
+    drop. Hysteresis makes it one edge."""
+    w = _FakeWriter(queued=10_000_000)
+    srv = _server(w)
+    srv._enqueue = lambda msg: None            # no loop in test; count edges
+
+    for _ in range(100):
+        srv.publish_rms(0.5)
+
+    assert srv.rms_stats["dropped"] == 100
+    assert srv.rms_stats["degraded_edges"] == 1, "signalled per-frame, not per-edge"
+    assert srv.telemetry_degraded is True
+
+
+def test_recovery_signals_once_when_the_client_catches_up():
+    w = _FakeWriter(queued=10_000_000)
+    srv = _server(w)
+    srv._enqueue = lambda msg: None
+
+    for _ in range(20):
+        srv.publish_rms(0.5)
+    assert srv.telemetry_degraded is True
+
+    w.transport._queued = 0
+    for _ in range(20):
+        w.transport._queued = 0                # stay drained
+        srv.publish_rms(0.5)
+
+    assert srv.telemetry_degraded is False
+    assert srv.rms_stats["recovered_edges"] == 1
+
+
+def test_hysteresis_prevents_flapping_at_the_watermark():
+    """A client hovering at the threshold must not strobe the indicator."""
+    w = _FakeWriter(queued=0)
+    srv = _server(w)
+    srv._enqueue = lambda msg: None
+    hyst = ipc._qos_hysteresis()
+
+    for i in range(hyst * 4):                  # alternate shed/send every frame
+        w.transport._queued = 10_000_000 if i % 2 else 0
+        srv.publish_rms(0.5)
+
+    assert srv.rms_stats["degraded_edges"] == 0, "flapped despite hysteresis"
+
+
+def test_qos_events_ride_the_guaranteed_lane():
+    """Transport health is a STATE transition — the cockpit must never miss the
+    edge that says the meter went unreliable."""
+    assert ipc.EVENT_TELEMETRY_DEGRADED in ipc.EVENT_KINDS
+    assert ipc.EVENT_TELEMETRY_RECOVERED in ipc.EVENT_KINDS
+    assert ipc.MSG_RMS_LEVEL not in ipc.EVENT_KINDS
+
+
+# ---------------------------------------------------------------------------
+# IoC binding
+# ---------------------------------------------------------------------------
+
+
+def test_ioc_attaches_via_the_audiobus_singleton(monkeypatch):
+    """No injection into the supervisor, no edit to AudioBus — the bridge PULLS
+    its dependency from the published singleton accessor."""
+    from backend.audio import mic_telemetry_bridge as mtb
+
+    class _Bus:
+        def __init__(self): self.consumers = []
+        def register_mic_consumer(self, cb): self.consumers.append(cb)
+        def unregister_mic_consumer(self, cb): self.consumers.remove(cb)
+
+    bus = _Bus()
+    monkeypatch.setattr(
+        "backend.audio.audio_bus.get_audio_bus_safe", lambda: bus, raising=False,
+    )
+    mtb.reset_bridge()
+    try:
+        br = mtb.ensure_attached(server=None)
+        assert br is not None
+        assert len(bus.consumers) == 1
+        # Idempotent: repeat calls must not double-register.
+        for _ in range(5):
+            mtb.ensure_attached(server=None)
+        assert len(bus.consumers) == 1
+    finally:
+        mtb.reset_bridge()
+
+
+def test_ioc_is_inert_until_a_bus_exists(monkeypatch):
+    from backend.audio import mic_telemetry_bridge as mtb
+
+    monkeypatch.setattr(
+        "backend.audio.audio_bus.get_audio_bus_safe", lambda: None, raising=False,
+    )
+    mtb.reset_bridge()
+    assert mtb.ensure_attached() is None
+    assert mtb.pump_once() is None
+
+
+def test_ioc_reattaches_after_a_bus_restart(monkeypatch):
+    """Self-healing: a torn-down and rebuilt bus must regain the consumer."""
+    from backend.audio import mic_telemetry_bridge as mtb
+
+    class _Bus:
+        def __init__(self): self.consumers = []
+        def register_mic_consumer(self, cb): self.consumers.append(cb)
+        def unregister_mic_consumer(self, cb): self.consumers.remove(cb)
+
+    first, second = _Bus(), _Bus()
+    current = {"bus": first}
+    monkeypatch.setattr(
+        "backend.audio.audio_bus.get_audio_bus_safe",
+        lambda: current["bus"], raising=False,
+    )
+    mtb.reset_bridge()
+    try:
+        mtb.ensure_attached()
+        assert len(first.consumers) == 1
+        current["bus"] = second               # bus restarted
+        mtb.ensure_attached()
+        assert len(second.consumers) == 1, "did not re-attach to the new bus"
+        assert first.consumers == [], "leaked the consumer on the dead bus"
+    finally:
+        mtb.reset_bridge()
+
+
+def test_ioc_never_raises_when_audiobus_import_fails(monkeypatch):
+    from backend.audio import mic_telemetry_bridge as mtb
+
+    def _boom():
+        raise RuntimeError("audio stack unavailable")
+
+    monkeypatch.setattr(
+        "backend.audio.audio_bus.get_audio_bus_safe", _boom, raising=False,
+    )
+    mtb.reset_bridge()
+    assert mtb.ensure_attached() is None      # must not raise
+    assert mtb.pump_once() is None

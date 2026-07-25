@@ -99,9 +99,16 @@ EVENT_TTS_GENERATING = "TTS_GENERATING"
 EVENT_AUDIO_PLAYING = "AUDIO_PLAYING"
 EVENT_AUDIO_IDLE = "AUDIO_IDLE"
 EVENT_HW_FAULT = "HW_FAULT"
+#: Transport-health transitions. These ARE state changes (unlike an amplitude
+#: sample), so they ride the GUARANTEED lane and belong in EVENT_KINDS: the
+#: cockpit must never miss the edge that tells it the meter went unreliable.
+EVENT_TELEMETRY_DEGRADED = "SYS_TELEMETRY_DEGRADED"
+EVENT_TELEMETRY_RECOVERED = "SYS_TELEMETRY_RECOVERED"
+
 EVENT_KINDS = (
     EVENT_VAD_ACTIVE, EVENT_VAD_INACTIVE, EVENT_TTS_GENERATING,
     EVENT_AUDIO_PLAYING, EVENT_AUDIO_IDLE, EVENT_HW_FAULT,
+    EVENT_TELEMETRY_DEGRADED, EVENT_TELEMETRY_RECOVERED,
 )
 
 #: Telemetry frame type — an amplitude SAMPLE, not a state transition.
@@ -116,11 +123,58 @@ MSG_RMS_LEVEL = "rms_level"
 #: ``StreamWriter.write`` never blocks — it buffers without bound — so at
 #: 20 FPS a lagging client would grow the daemon's memory indefinitely.
 #: The valve trades stale amplitude (worthless) for bounded memory.
-def rms_drop_watermark_bytes() -> int:
+def rms_watermark_multiple() -> float:
+    """How many socket-buffers' worth of queued bytes is "behind".
+
+    A ratio, not a byte count: the absolute threshold must scale with whatever
+    the OS actually gave this socket. 2.0 tolerates a little normal in-flight
+    queueing while still shedding long before memory growth matters."""
     try:
-        return max(1024, int(os.environ.get("JARVIS_AUDIO_IPC_RMS_WATERMARK", "65536")))
+        return max(0.25, float(os.environ.get("JARVIS_AUDIO_IPC_RMS_WATERMARK_X", "2.0")))
     except (TypeError, ValueError):
-        return 65536
+        return 2.0
+
+
+def socket_send_buffer_bytes(writer: Any) -> Optional[int]:
+    """The OS's ACTUAL send-buffer size for this socket (SO_SNDBUF), or None.
+
+    This is the root-cause answer to "how much queueing is too much": ask the
+    kernel rather than guess. AF_UNIX buffers vary by platform and by sysctl
+    (8KB on this host, 64KB+ elsewhere), so any constant is wrong somewhere."""
+    try:
+        import socket as _socket
+        sock = writer.get_extra_info("socket")
+        if sock is None:
+            return None
+        val = int(sock.getsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF))
+        return val if val > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def rms_drop_watermark_bytes(writer: Any = None) -> int:
+    """Per-socket drop threshold, derived from SO_SNDBUF.
+
+    Falls back to a conservative floor ONLY when introspection fails (a
+    non-socket transport, or a platform that refuses the getsockopt) — never as
+    the primary policy."""
+    try:
+        floor = max(1024, int(os.environ.get("JARVIS_AUDIO_IPC_RMS_WATERMARK_FLOOR", "8192")))
+    except (TypeError, ValueError):
+        floor = 8192
+    if writer is not None:
+        sndbuf = socket_send_buffer_bytes(writer)
+        if sndbuf:
+            return max(floor, int(sndbuf * rms_watermark_multiple()))
+    return floor
+
+
+def _qos_hysteresis() -> int:
+    """Consecutive frames required to flip transport health either way."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_AUDIO_IPC_QOS_HYSTERESIS", "5")))
+    except (TypeError, ValueError):
+        return 5
 
 
 def rms_publish_enabled() -> bool:
@@ -210,7 +264,13 @@ class AudioStateBroadcaster:
         }
         # Telemetry valve accounting — `dropped` climbing means a client is
         # lagging and frames are being shed, which is the design working.
-        self.rms_stats: Dict[str, int] = {"sent": 0, "dropped": 0, "errors": 0}
+        self.rms_stats: Dict[str, int] = {
+            "sent": 0, "dropped": 0, "errors": 0,
+            "degraded_edges": 0, "recovered_edges": 0,
+        }
+        self._qos_degraded = False
+        self._qos_shed_run = 0
+        self._qos_ok_run = 0
 
     # ---- lifecycle ----
 
@@ -401,6 +461,40 @@ class AudioStateBroadcaster:
             "ts": time.time(),
         })
 
+    def _note_telemetry_health(self, *, shed: bool) -> None:
+        """EDGE-triggered transport-health signalling.
+
+        Silent shedding blinds the cockpit: a still waveform looks identical to
+        a silent room. So the client is told — but on the EDGE only.
+
+        Per-frame signalling would be self-defeating: at 20 FPS a congested
+        client would generate 20 guaranteed-lane events per second, i.e. more
+        traffic than the telemetry being shed, on the lane that must never be
+        dropped. Hysteresis (N consecutive sheds to degrade, N consecutive
+        sends to recover) also stops a client hovering at the watermark from
+        flapping the indicator. NEVER raises."""
+        try:
+            if shed:
+                self._qos_shed_run += 1
+                self._qos_ok_run = 0
+                if not self._qos_degraded and self._qos_shed_run >= _qos_hysteresis():
+                    self._qos_degraded = True
+                    self.rms_stats["degraded_edges"] += 1
+                    self.publish_event(EVENT_TELEMETRY_DEGRADED)
+            else:
+                self._qos_ok_run += 1
+                self._qos_shed_run = 0
+                if self._qos_degraded and self._qos_ok_run >= _qos_hysteresis():
+                    self._qos_degraded = False
+                    self.rms_stats["recovered_edges"] += 1
+                    self.publish_event(EVENT_TELEMETRY_RECOVERED)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @property
+    def telemetry_degraded(self) -> bool:
+        return self._qos_degraded
+
     def _broadcast_lossy(self, msg: Dict[str, Any]) -> None:
         """Broadcast that DROPS rather than queues when a client is behind.
 
@@ -419,8 +513,8 @@ class AudioStateBroadcaster:
             data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         except Exception:  # noqa: BLE001
             return
-        watermark = rms_drop_watermark_bytes()
         for w in list(self._clients):
+            watermark = rms_drop_watermark_bytes(w)
             try:
                 if w.is_closing():
                     self._drop_client(w)
@@ -433,9 +527,11 @@ class AudioStateBroadcaster:
                     queued = 0
                 if queued >= watermark:
                     self.rms_stats["dropped"] += 1
+                    self._note_telemetry_health(shed=True)
                     continue          # drop THIS frame; the client keeps its socket
                 w.write(data)
                 self.rms_stats["sent"] += 1
+                self._note_telemetry_health(shed=False)
             except Exception:  # noqa: BLE001
                 # A telemetry write failure must not tear down a client that is
                 # otherwise healthy for state events; only a closing socket does.

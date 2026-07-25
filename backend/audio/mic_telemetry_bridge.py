@@ -159,6 +159,78 @@ class MicTelemetryBridge:
 
 
 # --------------------------------------------------------------------------
+# IoC binding
+# --------------------------------------------------------------------------
+
+_BRIDGE: Optional["MicTelemetryBridge"] = None
+
+
+def ensure_attached(server: Any = None) -> Optional["MicTelemetryBridge"]:
+    """Idempotently bind the bridge to the live AudioBus singleton.
+
+    Inversion of control WITHOUT touching either collaborator: AudioBus already
+    publishes ``get_audio_bus_safe()`` and ``register_mic_consumer``, so the
+    bridge pulls its dependency at the moment one exists rather than having it
+    pushed in. Nothing is injected into the supervisor's init flow and AudioBus
+    is not modified.
+
+    Why lazy rather than a lifecycle subscription: AudioBus exposes NO
+    ready-hook — there is no ``on_audio_bus_ready`` to subscribe to, and adding
+    one would mean editing the hardware owner to serve a visualizer. So this is
+    called from a path that already runs periodically and self-heals: if the
+    bus does not exist yet (or was torn down and rebuilt), the next call
+    attaches. ``register_mic_consumer`` already de-duplicates, so repeated
+    calls are safe.
+
+    Returns the attached bridge, or None when no bus is available yet. NEVER
+    raises — a visualizer must not be able to break audio bring-up."""
+    global _BRIDGE
+    if not bridge_enabled():
+        return None
+    try:
+        from backend.audio.audio_bus import get_audio_bus_safe
+        bus = get_audio_bus_safe()
+        if bus is None:
+            return None
+        if _BRIDGE is None:
+            _BRIDGE = MicTelemetryBridge(server=server)
+        elif server is not None and _BRIDGE._server is None:
+            _BRIDGE._server = server          # server arrived after the bus
+        if _BRIDGE._registered_bus is not bus:
+            # Covers first attach AND re-attach after a bus restart.
+            _BRIDGE.detach()
+            _BRIDGE.attach(bus)
+        return _BRIDGE
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def get_bridge() -> Optional["MicTelemetryBridge"]:
+    return _BRIDGE
+
+
+def reset_bridge() -> None:
+    """Test seam — drop the singleton so suites cannot bleed into each other."""
+    global _BRIDGE
+    if _BRIDGE is not None:
+        _BRIDGE.detach()
+    _BRIDGE = None
+
+
+def pump_once(server: Any = None, *, plane: str = "user") -> Optional[float]:
+    """One attach-and-drain tick. The single call a host loop needs: it binds
+    on first use, re-binds after a bus restart, and publishes at most one
+    rate-capped sample. NEVER raises."""
+    try:
+        bridge = ensure_attached(server)
+        if bridge is None:
+            return None
+        return bridge.drain(plane=plane)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# --------------------------------------------------------------------------
 # hop 3: client side
 # --------------------------------------------------------------------------
 
@@ -248,6 +320,10 @@ def parse_rms_frame(msg: Any) -> Optional[tuple]:
 
 __all__ = [
     "LevelSmoother",
+    "ensure_attached",
+    "get_bridge",
+    "pump_once",
+    "reset_bridge",
     "MicTelemetryBridge",
     "bridge_enabled",
     "parse_rms_frame",
