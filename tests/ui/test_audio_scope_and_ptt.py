@@ -220,11 +220,40 @@ def test_set_plane_reports_only_real_transitions():
     assert sc.set_plane(AudioPlane.USER) is False
 
 
-def test_render_rich_wraps_in_the_plane_accent():
+def test_render_rich_resolves_the_accent_through_the_theme():
+    """This assertion USED to check for the literal "[venom_green]" markup —
+    and that is precisely how the bug survived. Rich does not know that name;
+    an unknown style is dropped SILENTLY, so the scope rendered with no colour
+    at all while this test stayed green. A PTY integration test caught it by
+    reading the terminal bytes.
+
+    The contract is now: whatever markup is emitted must be a style Rich can
+    actually resolve for the active tier — or none at all on a NONE tier,
+    which is the honest answer for a non-colour terminal."""
+    from backend.core.ouroboros.ui.theme import semantic
+
     sc = BrailleScope(width=3)
     sc.set_plane(AudioPlane.SYSTEM)
     out = sc.render_rich()
-    assert out.startswith("[venom_green]") and out.endswith("[/venom_green]")
+
+    style = semantic("venom_green")
+    if style:
+        assert out.startswith(f"[{style}]") and out.endswith(f"[/{style}]")
+        assert "[venom_green]" not in out, "emitted a name Rich cannot resolve"
+    else:
+        # NONE tier: bare glyphs, no markup at all.
+        assert "[" not in out
+
+
+def test_render_rich_never_emits_an_unresolvable_style_name():
+    """Guard the whole class, not just venom_green: no plane may emit a raw
+    semantic name into markup."""
+    for plane in (AudioPlane.IDLE, AudioPlane.USER, AudioPlane.SYSTEM):
+        sc = BrailleScope(width=3)
+        sc.set_plane(plane)
+        out = sc.render_rich()
+        for raw in ("venom_green", "cyan", "muted"):
+            assert f"[{raw}]" not in out, f"{plane.value} emitted raw name {raw}"
 
 
 # ---------------------------------------------------------------------------
