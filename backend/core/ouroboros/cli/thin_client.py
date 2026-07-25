@@ -39,6 +39,7 @@ thin clients. ``--uninstall`` reverses it.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import plistlib
 import random
@@ -139,15 +140,43 @@ async def probe_socket(
             if not deep:
                 return "live"
             # Handshake depth: connection-established is a kernel fact;
-            # readiness is an APPLICATION fact. Demand the first served
-            # byte (the hydration frame's head) within the bound.
+            # readiness is an APPLICATION fact.
+            #
+            # This demanded ONE BYTE, and one byte is a weaker claim than the
+            # contract it vouches for. ``CockpitAttachClient._connect_once``
+            # needs a COMPLETE LINE that PARSES as JSON — anything else lands
+            # in its except-clause as "dead", which fails fast with no retry.
+            # So a daemon mid-write (partial frame, split across the bound)
+            # satisfied the probe and then failed the attach, producing the
+            # contradiction the operator sees:
+            #
+            #     ⏺ organism live — attaching
+            #     no organism awake — nothing to attach to.
+            #
+            # The probe now consumes exactly what attach consumes. The law
+            # ``ov_doctor`` already states — no probe may be weaker than the
+            # contract it vouches for — applied to the probe that ignition
+            # itself depends on.
             try:
-                first = await asyncio.wait_for(r.read(1), timeout=bound)
+                line = await asyncio.wait_for(r.readline(), timeout=bound)
             except asyncio.TimeoutError:
                 return "booting"
             except (ConnectionResetError, OSError):
                 return "stale"
-            return "live" if first else "booting"
+            if not line:
+                return "booting"          # EOF mid-handshake: still coming up
+            try:
+                json.loads(line)
+            except (ValueError, TypeError):
+                # A complete but unparseable frame means the bridge protocol
+                # is broken, not that nobody is home. "booting" (wait, bounded,
+                # then an honest timeout) over "stale" DELIBERATELY: "stale"
+                # authorises unlinking the socket, and the bridge binds ONCE at
+                # boot, so cleaning a live-but-misbehaving organism's socket
+                # makes it permanently unattachable — the 2026-07-23 class.
+                # Waiting merely costs a bounded wait and a truthful message.
+                return "booting"
+            return "live"
         finally:
             try:
                 w.close()
@@ -495,7 +524,12 @@ async def _await_ignition_window(path: Any, *, say: Any) -> bool:
     while time.monotonic() < deadline:
         try:
             # (a) the incumbent came up after all — nothing was ever wrong.
-            if await probe_socket(path):
+            #
+            # `== "live"`, NOT truthiness: probe_socket returns a CLASSIFI-
+            # CATION string, so `if await probe_socket(...)` is true for
+            # "absent" and "stale" too — it would report a corpse as live.
+            # Caught by the existing starved-organism suite.
+            if await probe_socket(path, deep=True) == "live":
                 say("⏺ organism live — attaching")
                 return True
             # (b) it let go: the lock is free, so ignite again.
