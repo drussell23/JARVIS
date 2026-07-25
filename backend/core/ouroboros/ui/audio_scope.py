@@ -348,11 +348,26 @@ class BrailleScope:
             return " " * self._width
 
     def render_rich(self) -> str:
-        """Rich-markup wrapped in the plane's semantic colour. The theme owns
-        the palette; this only names a colour."""
+        """Rich markup in the plane's colour, RESOLVED through the theme.
+
+        Emitting the bare semantic name (``[venom_green]…``) looked correct and
+        was invisible: Rich does not know that name, and an unknown style is
+        dropped SILENTLY — no error, no colour. A PTY integration test caught
+        it by inspecting the terminal bytes; every unit test had only compared
+        the markup string, which was perfectly well-formed and meant nothing.
+
+        ``theme.semantic()`` maps the name to a concrete style for the ACTIVE
+        colour tier (hex on truecolor, the 8/16-colour equivalent on a limited
+        terminal, and "" on a non-colour one). The theme still owns the palette
+        — this asks it rather than guessing, and never hardcodes a hex value.
+        """
         body = self.render()
         try:
-            return f"[{self.accent}]{body}[/{self.accent}]"
+            from backend.core.ouroboros.ui.theme import semantic
+            style = semantic(self.accent)
+            if not style:
+                return body          # NONE tier: no colour is the right answer
+            return f"[{style}]{body}[/{style}]"
         except Exception:  # noqa: BLE001
             return body
 
