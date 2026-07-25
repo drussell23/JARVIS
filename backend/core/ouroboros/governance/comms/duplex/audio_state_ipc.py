@@ -198,6 +198,28 @@ def audio_ipc_enabled() -> bool:
     ).strip().lower() in _TRUTHY
 
 
+async def _socket_is_live(path: Path, *, timeout: float = 0.5) -> bool:
+    """Is something LISTENING on *path* right now? NEVER raises.
+
+    File presence proves nothing — a stale inode outlives a SIGKILL — so this
+    asks the kernel by connecting, which is the only authority on the
+    question."""
+    writer = None
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(path=str(path)), timeout=timeout,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — refused / absent / timed out == not live
+        return False
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _repo_root() -> Path:
     """This repository's root, from THIS module's position on disk.
 
@@ -324,11 +346,23 @@ class AudioStateBroadcaster:
         try:
             self._loop = asyncio.get_running_loop()
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                if self._path.exists():
+            # Unlink STALE inodes only. A socket file left by a SIGKILLed
+            # process must be cleared or nothing can ever bind again — but the
+            # unconditional unlink could not tell a corpse from a live server,
+            # so a second host silently STOLE the address from a serving
+            # incumbent and both stayed up. Connect first: only the kernel
+            # knows whether anyone is listening.
+            if self._path.exists():
+                if await _socket_is_live(self._path):
+                    logger.warning(
+                        "[AudioIPC] refusing to bind %s — another process is "
+                        "already serving it", self._path.resolve(),
+                    )
+                    return False
+                try:
                     self._path.unlink()
-            except OSError:
-                pass
+                except OSError:
+                    pass
             self._server = await asyncio.start_unix_server(
                 self._on_client, path=str(self._path),
             )

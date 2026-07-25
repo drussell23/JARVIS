@@ -402,3 +402,112 @@ def test_the_host_log_appends_rather_than_truncates():
         "backend/core/ouroboros/cli/audio_daemon_reflex.py",
     ).read_text(encoding="utf-8")
     assert 'open(path, "a"' in src
+
+
+# ---------------------------------------------------------------------------
+# BUG 6 — single-flight had a 13-second hole, and the loser stole the address
+# ---------------------------------------------------------------------------
+#
+# Observed live: two hosts, PIDs three minutes apart, both serving. Every
+# utterance transcribed TWICE — two faster-whisper instances on one
+# microphone. Two independent failures produced it:
+#
+#   (a) the guard was a socket probe, but binding happens ~13s into boot
+#       (whisper loads first), so "is anything listening?" answers NO for a
+#       13-second window in which a second host passes the same guard;
+#   (b) AudioStateBroadcaster.start() unlinked any existing socket file before
+#       binding — meant to clear a corpse, unable to tell one from a live
+#       server — so the late host STOLE the address from the incumbent.
+
+
+def test_the_host_locks_before_it_boots_not_after_it_binds():
+    """A probe asks 'has the winner finished?'; a lock asks 'is anyone
+    trying?'. Only the second is answerable at t=0."""
+    import inspect
+
+    from backend.audio import audio_plane_host as host
+
+    src = inspect.getsource(host._amain)
+    assert "_acquire_exclusive" in src
+    assert src.index("_acquire_exclusive") < src.index("_socket_already_served"), (
+        "the probe runs before the lock — the boot window is open again"
+    )
+
+
+def test_the_lock_is_the_shared_helper_not_a_new_one():
+    """DRY: flock semantics, kernel-released on exit (so a SIGKILLed host
+    cannot strand a lock), already solved in singleton_lock."""
+    import inspect
+
+    from backend.audio import audio_plane_host as host
+
+    src = inspect.getsource(host._acquire_exclusive)
+    assert "acquire_singleton" in src
+    assert "audio_plane.lock" in src, (
+        "the audio plane must not contend with the battle-test soak lock"
+    )
+
+
+async def test_binding_refuses_to_steal_a_live_socket(tmp_path):
+    """THE REGRESSION. The second host must lose, not take over."""
+    import tempfile
+    from pathlib import Path
+
+    from backend.core.ouroboros.governance.comms.duplex import (
+        audio_state_ipc as ipc,
+    )
+
+    # mkdtemp, not tmp_path: macOS caps sun_path at ~104 bytes.
+    sock = Path(tempfile.mkdtemp(prefix="ovlive")) / "a.sock"
+
+    first = ipc.AudioStateBroadcaster(path=sock)
+    if not await first.start():
+        pytest.skip("cannot bind a unix socket in this environment")
+    try:
+        second = ipc.AudioStateBroadcaster(path=sock)
+        assert await second.start() is False, (
+            "a second broadcaster took the address from a live incumbent"
+        )
+        # And the incumbent is untouched.
+        assert await ipc._socket_is_live(sock) is True
+    finally:
+        await first.stop()
+
+
+async def test_a_stale_socket_file_is_still_cleared(tmp_path):
+    """The unlink exists for a reason: a corpse left by SIGKILL must not block
+    every future bind. Refusing to steal must not become refusing to start."""
+    import tempfile
+    from pathlib import Path
+
+    from backend.core.ouroboros.governance.comms.duplex import (
+        audio_state_ipc as ipc,
+    )
+
+    sock = Path(tempfile.mkdtemp(prefix="ovstale")) / "a.sock"
+    sock.write_bytes(b"")                      # inode with nobody behind it
+
+    b = ipc.AudioStateBroadcaster(path=sock)
+    if not await b.start():
+        pytest.skip("cannot bind a unix socket in this environment")
+    try:
+        assert await ipc._socket_is_live(sock) is True
+    finally:
+        await b.stop()
+
+
+async def test_liveness_is_answered_by_the_kernel_not_by_stat(tmp_path):
+    from pathlib import Path
+
+    from backend.core.ouroboros.governance.comms.duplex import (
+        audio_state_ipc as ipc,
+    )
+
+    absent = tmp_path / "nope.sock"
+    assert await ipc._socket_is_live(absent) is False
+
+    corpse = tmp_path / "corpse.sock"
+    corpse.write_bytes(b"")
+    assert await ipc._socket_is_live(corpse) is False, (
+        "file presence was treated as proof of a live server"
+    )

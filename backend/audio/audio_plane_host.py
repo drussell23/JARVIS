@@ -73,6 +73,37 @@ def _log_level() -> int:
     return getattr(logging, raw, logging.INFO)
 
 
+def _acquire_exclusive(stack: Any) -> bool:
+    """Take the process-lifetime microphone lock. False = someone else has it.
+
+    THE RACE THE SOCKET PROBE CANNOT SEE. Binding happens ~13s into boot
+    (faster-whisper loads first), so "is anything listening?" answers NO for a
+    13-second window during which a second host can be spawned, pass the same
+    probe, and come up beside the first. Observed live: two hosts, every
+    utterance transcribed twice, two whisper instances on one microphone.
+
+    A probe asks "has the winner finished?"; a lock asks "is anyone trying?" —
+    and only the second question is answerable at t=0. Reuses the canonical
+    ``singleton_lock`` (flock, fail-fast, released by the kernel on exit, so a
+    SIGKILLed host cannot leave a lock nobody can clear), on its OWN path so
+    the audio plane and a battle-test soak never contend.
+
+    Fails OPEN, matching the helper's contract: a substrate breakage must not
+    be able to prevent audio from ever starting."""
+    try:
+        from backend.core.ouroboros.battle_test.singleton_lock import (
+            acquire_singleton,
+        )
+        root = _repo_root()
+        result = stack.enter_context(
+            acquire_singleton(root, lock_path=root / ".jarvis" / "audio_plane.lock"),
+        )
+        return bool(getattr(result, "acquired", True))
+    except Exception:  # noqa: BLE001
+        logger.debug("[AudioPlane] singleton lock unavailable", exc_info=True)
+        return True
+
+
 async def _socket_already_served(timeout: float = 0.5) -> bool:
     """Is a host already listening on the audio-state socket?
 
@@ -229,13 +260,29 @@ async def _amain(argv: Optional[list] = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    if not args.force and await _socket_already_served():
-        logger.info(
-            "[AudioPlane] another host already owns the microphone — exiting",
-        )
-        return EXIT_ALREADY_RUNNING
+    import contextlib
+    stack = contextlib.ExitStack()
+    try:
+        # Lock FIRST, then probe. The lock closes the boot window; the probe
+        # still catches a host that predates this build (or was started
+        # without the lock), so the two guards cover different failures rather
+        # than duplicating one.
+        if not args.force and not _acquire_exclusive(stack):
+            logger.info(
+                "[AudioPlane] another host holds the microphone lock — exiting",
+            )
+            return EXIT_ALREADY_RUNNING
+        if not args.force and await _socket_already_served():
+            logger.info(
+                "[AudioPlane] another host is already serving — exiting",
+            )
+            return EXIT_ALREADY_RUNNING
+        return await _run_host(host=AudioPlaneHost())
+    finally:
+        stack.close()
 
-    host = AudioPlaneHost()
+
+async def _run_host(*, host: "AudioPlaneHost") -> int:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         try:
