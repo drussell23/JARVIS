@@ -77,7 +77,7 @@ def _stash_list(repo):
 
 def test_git_safety_snapshots_non_destructively(tmp_path):
     """NON-DESTRUCTIVE contract: the dirty + untracked delta is snapshotted into
-    a recoverable [preemption-shield] stash entry AND left in place on disk
+    a recoverable private-namespace snapshot AND left in place on disk
     (the working tree is NOT cleared — the pre-2026-07-18 data-loss vector)."""
     repo = _init_repo(str(tmp_path / "r"))
     open(os.path.join(repo, "seed.txt"), "w").write("HALF-WRITTEN APPLY\n")
@@ -91,14 +91,18 @@ def test_git_safety_snapshots_non_destructively(tmp_path):
     assert open(os.path.join(repo, "seed.txt")).read() == "HALF-WRITTEN APPLY\n"
     assert os.path.isfile(os.path.join(repo, "newfile.py"))
 
-    # ...and the snapshot is recoverable via `git stash list`.
-    assert "preemption-shield" in _stash_list(repo)
+    # ...and the snapshot is recoverable — from the PRIVATE ref namespace, not
+    # the shared stash stack (hazard #70033: `stash store` pushed onto refs/stash,
+    # so a concurrent human/agent `git stash pop` took the daemon's entry).
+    refs = gp.list_preemption_refs(repo)
+    assert refs, "snapshot left no recoverable ref"
+    assert _stash_list(repo).strip() == "", "shared stash stack must stay untouched"
 
 
 def test_git_safety_snapshot_recoverable_after_tree_cleaned(tmp_path):
     """Belt-and-suspenders: even if the tree is later cleaned by something else
     (a subsequent reset / worktree teardown), the tracked delta is recoverable
-    from the [preemption-shield] stash entry via apply. (Untracked files don't
+    from the private-namespace snapshot via apply-by-SHA. (Untracked files don't
     need this path — the shield leaves them on disk in the first place.)"""
     repo = _init_repo(str(tmp_path / "r"))
     open(os.path.join(repo, "seed.txt"), "w").write("HALF-WRITTEN APPLY\n")
@@ -108,8 +112,13 @@ def test_git_safety_snapshot_recoverable_after_tree_cleaned(tmp_path):
     subprocess.run(["git", "-C", repo, "checkout", "--", "seed.txt"], check=True)
     assert "HALF-WRITTEN" not in open(os.path.join(repo, "seed.txt")).read()
 
-    # Recover the tracked delta from the shield's stash entry.
-    subprocess.run(["git", "-C", repo, "stash", "apply"], check=True)
+    # Recover the tracked delta by RAW SHA from the private namespace. Note this
+    # is strictly MORE robust than the old bare `git stash apply`, which relied
+    # on the snapshot still being at stash@{0} — the very assumption #70033 broke.
+    refs = gp.list_preemption_refs(repo)
+    assert refs, "snapshot left no recoverable ref"
+    _refname, sha = refs[0]
+    subprocess.run(["git", "-C", repo, "stash", "apply", sha], check=True)
     assert open(os.path.join(repo, "seed.txt")).read() == "HALF-WRITTEN APPLY\n"
 
 
