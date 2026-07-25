@@ -183,7 +183,10 @@ jobs:
 
       - name: Prove the scanner is still lethal (adversarial canary)
         run: |
-          pip install pytest --quiet
+          # pytest.ini declares `asyncio_mode = auto` and `timeout = 120`, so a
+          # bare `pip install pytest` errors on collection for EVERY test. The
+          # plugins those settings require must be present.
+          pip install --quiet pytest pytest-asyncio pytest-timeout
           python3 -m pytest tests/security/test_adversarial_secrets.py -q
 
       - name: Validate Required Environment Variables
