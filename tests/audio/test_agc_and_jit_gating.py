@@ -277,3 +277,58 @@ def test_the_pipeline_no_longer_gates_around_generation():
     code = ast.unparse(tree)
     assert "start_speaking" not in code, "synthesis-wide gating is back"
     assert "playback_gate" in code
+
+
+# ---------------------------------------------------------------------------
+# EVERY afplay launch must be gated — there are three
+# ---------------------------------------------------------------------------
+#
+# The gate first went into macos_voice.py, which this pipeline never reaches:
+# the engine in use is UnifiedTTSEngine and it plays somewhere else entirely.
+# Karen kept triggering her own barge-in 354ms into a reply because the mic
+# stayed open through a subprocess nobody had gated. One un-gated playback
+# site is the whole bug, so the check is exhaustive rather than per-file.
+
+
+def test_every_afplay_launch_sits_inside_a_gate():
+    """Exhaustive: find every afplay invocation in the audio/voice tree and
+    require a gate above it in the same function."""
+    import re
+    from pathlib import Path
+
+    offenders = []
+    for path in list(Path("backend/voice").rglob("*.py")) + \
+            list(Path("backend/audio").rglob("*.py")):
+        src = path.read_text(encoding="utf-8", errors="replace")
+        for m in re.finditer(r'\["afplay"', src):
+            window = src[max(0, m.start() - 1200):m.start()]
+            if "playback_gate" not in window:
+                line = src[:m.start()].count("\n") + 1
+                offenders.append(f"{path}:{line}")
+    assert not offenders, f"un-gated afplay launches: {offenders}"
+
+
+def test_the_engine_playback_site_is_gated():
+    """The specific site that was missed — named, so a refactor that moves it
+    fails here rather than in a live conversation."""
+    from pathlib import Path
+
+    src = Path(
+        "backend/voice/engines/unified_tts_engine.py",
+    ).read_text(encoding="utf-8")
+    assert "playback_gate_sync" in src
+    assert src.index("playback_gate_sync") < src.index('["afplay", temp_path]')
+
+
+def test_the_gate_wraps_the_launch_not_the_whole_method():
+    """The temp-file write is not audible. Gating it would widen the window in
+    which the operator cannot interrupt — the exact blindspot JIT gating
+    exists to close."""
+    from pathlib import Path
+
+    src = Path(
+        "backend/voice/engines/unified_tts_engine.py",
+    ).read_text(encoding="utf-8")
+    gate = src.index("with playback_gate_sync")
+    write = src.index('f.write(audio_data)')
+    assert write < gate, "the gate swallowed the file write"

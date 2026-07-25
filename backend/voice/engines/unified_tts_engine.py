@@ -1081,13 +1081,26 @@ class UnifiedTTSEngine:
         try:
             with open(temp_path, "wb") as f:
                 f.write(audio_data)
-            subprocess.run(
-                ["afplay", temp_path],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            # JIT MIC GATE — THE playback site for this engine.
+            #
+            # The gate was first placed in macos_voice.py's afplay call, which
+            # is a different class that this pipeline never reaches: the
+            # engine in use is UnifiedTTSEngine, and it plays HERE. Karen kept
+            # triggering her own barge-in 354ms into a reply because the mic
+            # stayed open through a subprocess nobody had gated.
+            #
+            # Wrapping the launch rather than the whole method is deliberate:
+            # the temp-file write above is not audible, and gating it would
+            # widen the window in which the operator cannot interrupt.
+            from backend.audio.playback_gate import playback_gate_sync
+            with playback_gate_sync(f"{len(audio_data)}B"):
+                subprocess.run(
+                    ["afplay", temp_path],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
         finally:
             try:
                 os.unlink(temp_path)

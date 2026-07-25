@@ -1910,8 +1910,15 @@ class EnhancedVoiceEngine:
                 # (GIL-dependent → static during GIL-heavy ops). afplay is
                 # a native macOS process — no GIL, no callback, clean audio.
                 # CoreAudio HAL mixer handles coexistence with FullDuplexDevice.
+                # JIT MIC GATE — the third playback site. Karen's voice
+                # reaching her own microphone triggers barge-in and cuts her
+                # off mid-sentence, so every path that makes sound must close
+                # the mic for exactly as long as it is audible.
                 import subprocess as _sp
-                _sp.run(["afplay", _temp_path], check=False)
+
+                from backend.audio.playback_gate import playback_gate_sync
+                with playback_gate_sync(_temp_path):
+                    _sp.run(["afplay", _temp_path], check=False)
             finally:
                 try:
                     os.unlink(_temp_path)
