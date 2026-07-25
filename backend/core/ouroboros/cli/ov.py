@@ -627,6 +627,74 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
 
         _hdr_width = {"w": 0}
 
+        # ── Audio plane: Braille oscilloscope + protocol-adaptive PTT ──────
+        # The scope fills the empty header real estate; the pump owns it and is
+        # driven by the zero-copy tap on the EXISTING mic stream (CoreAudio
+        # refuses a second handle). Wholly fail-soft: any fault here leaves the
+        # cockpit exactly as it was without the visualizer.
+        _audio = {"pump": None, "latch": None, "mode": None, "unsub": None}
+        try:
+            from backend.core.ouroboros.ui.audio_pump import (
+                AudioLevelPump, default_publisher,
+            )
+            from backend.core.ouroboros.ui.audio_scope import (
+                AudioPlane, BrailleScope, scope_enabled,
+            )
+            from backend.core.ouroboros.ui.ptt_router import (
+                PTTLatch, resolve_ptt_mode,
+            )
+            if scope_enabled():
+                _scope = BrailleScope(width=20)
+                _pump = AudioLevelPump(
+                    scope=_scope, publish=default_publisher(),
+                )
+                # Probe the terminal ONCE at boot: hold-to-talk where the kitty
+                # keyboard protocol answers, toggle+VAD everywhere else.
+                _mode, _verdict, _tel = resolve_ptt_mode()
+                _latch = PTTLatch(
+                    mode=_mode,
+                    on_open=lambda: (
+                        _scope.set_plane(AudioPlane.USER),
+                        _pump.publish_mic_state("open"),
+                    ),
+                    on_close=lambda why: (
+                        _scope.set_plane(AudioPlane.IDLE),
+                        _pump.publish_mic_state("closed", reason=why),
+                    ),
+                )
+                # Subscribe the pump to the zero-copy tap. RMS runs HERE, on the
+                # consumer side — never in the capture thread.
+                try:
+                    from backend.voice.audio_broadcast_tap import get_default_tap
+
+                    def _on_chunk(view, sr) -> None:
+                        lvl = _pump.feed_frames(view, plane=_scope.plane)
+                        if lvl is not None:
+                            _latch.note_level(lvl)
+
+                    _audio["unsub"] = get_default_tap().subscribe(_on_chunk)
+                except Exception:  # noqa: BLE001 — no voice stack: scope stays idle
+                    pass
+                _audio.update(pump=_pump, latch=_latch, mode=_mode)
+                logger.debug(
+                    "[ov] audio scope armed mode=%s verdict=%s terminal=%s",
+                    getattr(_mode, "value", "?"),
+                    getattr(_verdict, "value", "?"), (_tel or {}).get("terminal"),
+                )
+        except Exception:  # noqa: BLE001
+            _audio = {"pump": None, "latch": None, "mode": None, "unsub": None}
+
+        def _gutter():
+            """Right-aligned scope for the header. None when unarmed, so the
+            header renders exactly as before."""
+            _p = _audio.get("pump")
+            if _p is None:
+                return None
+            try:
+                return _p.scope.render_rich()
+            except Exception:  # noqa: BLE001
+                return None
+
         def header_render() -> str:
             try:
                 import shutil as _shutil
@@ -634,19 +702,51 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
                 _hdr_width["w"] = w
                 return render_cockpit_header(
                     mini, _header_lines(), w, now=_time.monotonic(),
+                    right_gutter=_gutter,
                 )
             except Exception:
                 return ""
     except Exception:
         mini, header_render, header_height = None, None, 0
 
+    # Spacebar PTT: merged through the layout's EXISTING extra_key_bindings
+    # seam, so no layout surgery. Inert unless the input buffer is empty.
+    _ptt_kb = None
+    try:
+        _latch = _audio.get("latch") if isinstance(_audio, dict) else None
+        if _latch is not None:
+            from backend.core.ouroboros.ui.ptt_router import build_ptt_key_bindings
+            _ptt_kb = build_ptt_key_bindings(_latch)
+    except Exception:  # noqa: BLE001 — no PTT is survivable; a broken app is not
+        _ptt_kb = None
+
+    def _toolbar_with_mode() -> str:
+        """Existing toolbar plus the ACTIVE PTT paradigm. Stating the real mode
+        matters: a cockpit claiming 'hold' on a terminal blind to key-release
+        would leave the mic latched with no obvious way out."""
+        base = ""
+        try:
+            base = str(ui.toolbar()) if ui is not None else ""
+        except Exception:  # noqa: BLE001
+            base = ""
+        try:
+            _m = _audio.get("mode") if isinstance(_audio, dict) else None
+            _l = _audio.get("latch") if isinstance(_audio, dict) else None
+            if _m is not None:
+                live = " ● mic" if (_l is not None and _l.is_open) else ""
+                return f"{base} · {_m.hint}{live}" if base else f"{_m.hint}{live}"
+        except Exception:  # noqa: BLE001
+            pass
+        return base
+
     await run_bipartite_repl(
         on_accept=_on_accept,
         title="◇ O+V · proactive canvas",
-        toolbar=(lambda: ui.toolbar()) if ui is not None else None,
+        toolbar=_toolbar_with_mode if ui is not None else None,
         watch_alive=_alive,
         header=header_render,
         header_height=header_height,
+        extra_key_bindings=_ptt_kb,
         seed=[
             "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or plain "
             "words both work · [cyan]wake[/cyan] arms my voice · "

@@ -123,6 +123,23 @@ class StreamingAudioProcessor:
         Feed audio data to the processor
         Returns False if buffer is full (data dropped)
         """
+        # ── Zero-copy UI broadcast tap ────────────────────────────────────
+        # FIRST statement in the ingest path, BEFORE any dtype conversion or
+        # chunking, so the visualizer sees exactly what the mic delivered and
+        # adds nothing to the STT critical path.
+        #
+        # macOS CoreAudio refuses a second handle on a captured device, so the
+        # UI cannot open its own stream — it must observe this one. Safety is
+        # structural: offer() stores a read-only VIEW (O(1), no copy) into a
+        # single-slot latest-wins mailbox using a NON-BLOCKING lock, performs no
+        # arithmetic, and swallows every exception. RMS happens on the consumer
+        # side. A no-op when nothing is subscribed.
+        try:
+            from backend.voice.audio_broadcast_tap import offer_to_default_tap
+            offer_to_default_tap(audio_data, sample_rate=self.sample_rate)
+        except Exception:  # noqa: BLE001 — the tap can NEVER affect transcription
+            pass
+
         # Convert to float32 if needed
         if audio_data.dtype != np.float32:
             audio_data = audio_data.astype(np.float32)
