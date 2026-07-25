@@ -93,6 +93,29 @@ def _set_bus_gate(active: bool) -> bool:
     return True
 
 
+def _mark_hardware(busy: bool) -> None:
+    """Publish speaker occupancy to the speech scheduler.
+
+    Deliberately INDEPENDENT of whether the mic gate engaged. Those are two
+    different facts: "we managed to close the microphone" and "sound is
+    leaving the speakers". ``_enter`` returns False when no AudioBus is
+    mounted — but ``afplay`` still plays, and a conductor that believed the
+    speakers were free would grant the next agent straight over the top.
+
+    Strictly paired by the context managers, never by ``_enter``/``_exit``,
+    because the busy counter is process-global: an unmatched decrement taken
+    on a failure path would zero out a DIFFERENT thread's live playback.
+    Import-guarded — the gate predates the scheduler and must work without
+    it."""
+    try:
+        from backend.audio.speech_scheduler import (
+            mark_hardware_busy, mark_hardware_idle,
+        )
+    except ImportError:
+        return
+    (mark_hardware_busy if busy else mark_hardware_idle)()
+
+
 def _enter(text: str = "") -> bool:
     global _DEPTH
     if not gate_enabled():
@@ -199,25 +222,36 @@ async def playback_gate(
     subprocess (afplay) is finished when the call returns, while a ring
     buffer is only finished when it empties. Holding the gate on the call
     alone protects the first and nothing at all for the second."""
+    _mark_hardware(True)
     engaged = _enter(text)
     try:
         yield engaged
     finally:
-        if engaged:
-            if await_drain:
-                await _await_playback_drain()
-            _exit()
+        try:
+            if engaged:
+                if await_drain:
+                    await _await_playback_drain()
+                _exit()
+        finally:
+            # Paired unconditionally with the mark above — a leaked busy count
+            # makes every later utterance wait out the conductor's full idle
+            # timeout before it is allowed to speak.
+            _mark_hardware(False)
 
 
 @contextlib.contextmanager
 def playback_gate_sync(text: str = "") -> Iterator[bool]:
     """Close the mic for the body. The ``afplay`` subprocess site."""
+    _mark_hardware(True)
     engaged = _enter(text)
     try:
         yield engaged
     finally:
-        if engaged:
-            _exit()
+        try:
+            if engaged:
+                _exit()
+        finally:
+            _mark_hardware(False)
 
 
 def gate_depth() -> int:
@@ -232,6 +266,11 @@ def force_open() -> None:
     global _DEPTH
     with _DEPTH_LOCK:
         _DEPTH = 0
+    try:
+        from backend.audio.speech_scheduler import reset_hardware_state
+        reset_hardware_state()
+    except ImportError:
+        pass
     try:
         _set_bus_gate(False)
     except BaseException:  # noqa: BLE001 - emergency release, see below
