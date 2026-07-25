@@ -53,6 +53,20 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+#: Sentinel meaning "whatever voice macOS is configured to use" — `say` with
+#: no ``-v`` at all. Not a voice NAME, and deliberately so: it follows the
+#: operator's System Settings instead of pinning a name that goes stale the
+#: moment they change it, and it is the only value that stays correct across
+#: machines with different voices installed.
+SYSTEM_DEFAULT = "system"
+
+_SYSTEM_ALIASES = ("system", "default", "system_default", "os", "")
+
+
+def _is_system_default(name: object) -> bool:
+    return str(name or "").strip().lower() in _SYSTEM_ALIASES
+
+
 class AgentPersona(str, enum.Enum):
     """Who is speaking. The value is the env-knob suffix and log token."""
 
@@ -78,7 +92,12 @@ class AgentPersona(str, enum.Enum):
 #: happened to pick.
 _PREFERENCES: Dict[AgentPersona, Tuple[str, ...]] = {
     # Australian first — her prompt says so.
-    AgentPersona.KAREN: ("Karen", "Tessa", "Serena", "Samantha", "Moira"),
+    # SYSTEM_DEFAULT first, by operator request 2026-07-25: the voice they
+    # actually want for O+V is the one macOS is set to, and asking for "the
+    # system voice" is a stable request while asking for a NAME is not — the
+    # name is right until they change the setting, and wrong silently after.
+    # The named fallbacks stay for machines whose default cannot be resolved.
+    AgentPersona.KAREN: (SYSTEM_DEFAULT, "Karen", "Tessa", "Serena", "Samantha"),
     # British first — the established JARVIS voice.
     AgentPersona.JARVIS: ("Daniel", "Oliver", "Serena", "Alex"),
     AgentPersona.SYSTEM: ("Samantha", "Alex", "Daniel"),
@@ -101,8 +120,19 @@ class VoiceProfile:
     rate: int
     source: str          # how it was chosen — for honest logging
 
+    @property
+    def is_system_default(self) -> bool:
+        """True when this profile defers to the OS-configured voice."""
+        return _is_system_default(self.voice)
+
     def as_say_args(self) -> List[str]:
-        """``say`` arguments for this profile."""
+        """``say`` arguments for this profile.
+
+        The system default is expressed by OMITTING ``-v`` entirely rather
+        than passing a resolved name: `say` then uses whatever the operator
+        has configured, and stays correct when they change it."""
+        if self.is_system_default:
+            return ["-r", str(self.rate)]
         return ["-v", self.voice, "-r", str(self.rate)]
 
 
@@ -203,6 +233,8 @@ def resolve_profile(persona: object) -> Optional[VoiceProfile]:
         rate = _rate_for(p)
 
         override = _override_for(p)
+        if _is_system_default(override) and override:
+            return VoiceProfile(p, SYSTEM_DEFAULT, rate, "operator_override")
         if override:
             # Honour it even if the inventory lookup failed — the operator may
             # know about a voice this parse could not see.
@@ -214,6 +246,8 @@ def resolve_profile(persona: object) -> Optional[VoiceProfile]:
             )
 
         for name in _PREFERENCES.get(p, ()):
+            if _is_system_default(name):
+                return VoiceProfile(p, SYSTEM_DEFAULT, rate, "system_default")
             if voice_installed(name):
                 return VoiceProfile(p, name, rate, "preference")
 
@@ -254,6 +288,7 @@ def bind_persona(persona: AgentPersona) -> None:
 
 
 __all__ = [
+    "SYSTEM_DEFAULT",
     "AgentPersona",
     "VoiceProfile",
     "active_persona",

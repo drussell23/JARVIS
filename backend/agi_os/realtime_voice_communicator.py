@@ -131,6 +131,23 @@ class UserUtterance:
             ).hexdigest()[:12]
 
 
+def _voice_args(voice: object) -> list:
+    """``['-v', name]``, or ``[]`` for the system default.
+
+    Two call sites build the same `say` command; both must express "defer to
+    the OS" by OMITTING -v rather than resolving a name, or the operator's
+    System Settings choice gets pinned at the moment of the first synthesis
+    and silently ignored afterwards."""
+    try:
+        from backend.voice.agent_persona import _is_system_default
+        if _is_system_default(voice):
+            return []
+    except Exception:  # noqa: BLE001
+        if str(voice or "").strip().lower() in ("system", "default", ""):
+            return []
+    return ['-v', str(voice)]
+
+
 def _persona_voice_or(default: str) -> str: 
     """Voice for the persona bound to this process, else *default*.
 
@@ -788,13 +805,11 @@ class RealTimeVoiceCommunicator:
             )
             os.close(_temp_fd)
             try:
-                cmd = [
-                    'say',
-                    '-v', config.voice,
-                    '-r', str(config.rate),
-                    '-o', _temp_path,
-                    message.text
-                ]
+                cmd = (
+                    ['say']
+                    + _voice_args(config.voice)
+                    + ['-r', str(config.rate), '-o', _temp_path, message.text]
+                )
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.DEVNULL,
@@ -1579,13 +1594,11 @@ class RealTimeVoiceCommunicator:
                         )
                         os.close(_temp_fd)
                         try:
-                            cmd = [
-                                'say',
-                                '-v', config.voice,
-                                '-r', str(config.rate),
-                                '-o', _temp_path,
-                                text
-                            ]
+                            cmd = (
+                                ['say']
+                                + _voice_args(config.voice)
+                                + ['-r', str(config.rate), '-o', _temp_path, text]
+                            )
                             process = await asyncio.create_subprocess_exec(
                                 *cmd,
                                 stdout=asyncio.subprocess.DEVNULL,

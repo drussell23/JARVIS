@@ -15,6 +15,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def _is_system_default_voice(name: object) -> bool:
+    """Does this voice value mean 'defer to the OS'? NEVER raises."""
+    try:
+        from backend.voice.agent_persona import _is_system_default
+        return _is_system_default(name)
+    except Exception:  # noqa: BLE001
+        return str(name or "").strip().lower() in ("system", "default", "")
+
+
 class TTSGenerationError(RuntimeError):
     """Synthesis produced no usable audio.
 
@@ -215,12 +224,17 @@ class MacOSVoice:
         """Speak text with specified mode"""
         voice_config = self.voice_modes.get(mode, self.voice_modes['normal'])
         
-        # Prepare say command
-        cmd = [
-            'say',
-            '-v', voice_config['voice'],
-            '-r', str(voice_config['rate'])
-        ]
+        # Prepare say command.
+        #
+        # A voice of SYSTEM_DEFAULT means "whatever macOS is configured to
+        # use", which is expressed by OMITTING -v — not by resolving a name.
+        # Passing a resolved name would pin the operator's current setting
+        # and go silently wrong the moment they change it in System Settings.
+        cmd = ['say']
+        _voice = voice_config.get('voice')
+        if _voice and not _is_system_default_voice(_voice):
+            cmd += ['-v', _voice]
+        cmd += ['-r', str(voice_config['rate'])]
         
         # Add text processing for better speech
         processed_text = self._process_text_for_speech(text)

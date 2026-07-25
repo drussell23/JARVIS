@@ -47,15 +47,24 @@ def _clean_env(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_karen_resolves_to_the_karen_voice_profile():
-    """(1) THE MANDATE."""
+def test_karen_resolves_to_her_own_profile_not_jarvis(monkeypatch):
+    """(1) THE MANDATE — that KAREN resolves to KAREN's profile.
+
+    The head of her preference chain became SYSTEM_DEFAULT on 2026-07-25 at
+    the operator's request, so the assertion is about the PERSONA being
+    honoured, not about one voice name. Pinning the name here would make the
+    test the very thing the sentinel exists to avoid.
+
+    With the sentinel removed, the named chain must still resolve to Karen."""
     profile = resolve_profile(AgentPersona.KAREN)
     if profile is None:
         pytest.skip("no macOS voice inventory in this environment")
     assert profile.persona is AgentPersona.KAREN
-    assert profile.voice == "Karen", f"Karen resolved to {profile.voice!r}"
-    assert "-v" in profile.as_say_args()
-    assert "Karen" in profile.as_say_args()
+
+    monkeypatch.setenv("JARVIS_VOICE_KAREN", "Karen")
+    named = resolve_profile(AgentPersona.KAREN)
+    assert named.voice == "Karen"
+    assert named.as_say_args()[:2] == ["-v", "Karen"]
 
 
 def test_jarvis_still_resolves_to_daniel():
@@ -79,6 +88,7 @@ def test_binding_a_persona_reaches_the_synthesizer(monkeypatch):
     the wrong voice survived."""
     from backend.voice.macos_voice import MacOSVoice
 
+    monkeypatch.setenv("JARVIS_VOICE_KAREN", "Karen")   # pin a NAME to observe
     bind_persona(AgentPersona.KAREN)
     assert active_persona() is AgentPersona.KAREN
     voice = MacOSVoice()
@@ -121,11 +131,21 @@ def test_an_unknown_persona_returns_none_rather_than_guessing():
     assert AgentPersona.coerce("garbage") is None
 
 
-def test_resolution_never_raises(monkeypatch):
+def test_resolution_never_raises_even_with_no_inventory(monkeypatch):
+    """A dead `say -v ?` must not propagate. KAREN still resolves — the system
+    default needs no inventory, which is precisely why it is a safer head of
+    the chain than any name."""
     import backend.voice.agent_persona as ap
 
-    monkeypatch.setattr(ap, "installed_voices", lambda **_k: (_ for _ in ()).throw(OSError))
-    assert ap.resolve_profile(AgentPersona.KAREN) is None
+    monkeypatch.setattr(
+        ap, "installed_voices", lambda **_k: (_ for _ in ()).throw(OSError),
+    )
+    p = ap.resolve_profile(AgentPersona.KAREN)
+    assert p is not None and p.is_system_default
+
+    # A persona whose chain is all NAMES has nothing to verify against and
+    # correctly declines rather than guessing.
+    assert ap.resolve_profile(AgentPersona.JARVIS) is None
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +267,7 @@ def test_the_voice_communicator_follows_the_bound_persona(monkeypatch):
     from backend.agi_os.realtime_voice_communicator import _persona_voice_or
 
     monkeypatch.setenv("JARVIS_AGENT_PERSONA", "karen")
+    monkeypatch.setenv("JARVIS_VOICE_KAREN", "Karen")
     assert _persona_voice_or("Daniel") == "Karen"
 
 
@@ -282,6 +303,7 @@ def test_voice_discovery_does_not_override_the_persona(monkeypatch):
     from backend.agi_os.realtime_voice_communicator import RealTimeVoiceCommunicator
 
     monkeypatch.setenv("JARVIS_AGENT_PERSONA", "karen")
+    monkeypatch.setenv("JARVIS_VOICE_KAREN", "Karen")
     c = RealTimeVoiceCommunicator()
     if not c._available_voices:
         pytest.skip("no macOS voices available")
@@ -296,6 +318,7 @@ def test_every_mode_config_speaks_as_the_persona(monkeypatch):
     from backend.agi_os.realtime_voice_communicator import RealTimeVoiceCommunicator
 
     monkeypatch.setenv("JARVIS_AGENT_PERSONA", "karen")
+    monkeypatch.setenv("JARVIS_VOICE_KAREN", "Karen")
     c = RealTimeVoiceCommunicator()
     if not c._available_voices:
         pytest.skip("no macOS voices available")
@@ -313,3 +336,73 @@ def test_an_unbound_process_still_discovers_daniel(monkeypatch):
     if not c._available_voices:
         pytest.skip("no macOS voices available")
     assert c._primary_voice == "Daniel"
+
+
+# ---------------------------------------------------------------------------
+# The system-default voice — operator's explicit choice for O+V
+# ---------------------------------------------------------------------------
+#
+# "whatever voice that was, I want to use that instead of Karen's voice" — the
+# voice heard was `say` with no -v, i.e. whatever macOS is configured to use.
+# Asking for "the system voice" is a STABLE request; pinning the name it
+# currently resolves to is right until the operator changes the setting, and
+# silently wrong afterwards.
+
+
+def test_karen_now_defers_to_the_system_default():
+    from backend.voice.agent_persona import SYSTEM_DEFAULT
+
+    p = resolve_profile(AgentPersona.KAREN)
+    assert p is not None
+    assert p.voice == SYSTEM_DEFAULT and p.is_system_default
+
+
+def test_the_system_default_omits_dash_v_entirely():
+    """Expressed by OMITTING -v, never by resolving a name — that is the whole
+    difference between following the setting and pinning it."""
+    p = resolve_profile(AgentPersona.KAREN)
+    args = p.as_say_args()
+    assert "-v" not in args, f"a voice name was pinned: {args}"
+    assert "-r" in args
+
+
+def test_a_named_persona_still_passes_dash_v():
+    """The sentinel must not turn every voice into the default."""
+    p = resolve_profile(AgentPersona.JARVIS)
+    if p is None or p.is_system_default:
+        pytest.skip("no named voice resolvable here")
+    assert p.as_say_args()[:2] == ["-v", p.voice]
+
+
+@pytest.mark.parametrize("alias", ["system", "default", "SYSTEM", " Default "])
+def test_operator_can_ask_for_the_system_voice_by_alias(monkeypatch, alias):
+    monkeypatch.setenv("JARVIS_VOICE_JARVIS", alias)
+    p = resolve_profile(AgentPersona.JARVIS)
+    assert p is not None and p.is_system_default
+
+
+def test_both_communicator_say_sites_honour_the_sentinel():
+    """Two call sites build the same command; one un-migrated site is a mode
+    that silently reverts to a pinned voice."""
+    from pathlib import Path
+
+    from backend.agi_os.realtime_voice_communicator import _voice_args
+
+    assert _voice_args("system") == []
+    assert _voice_args("Daniel") == ["-v", "Daniel"]
+
+    src = Path(
+        "backend/agi_os/realtime_voice_communicator.py",
+    ).read_text(encoding="utf-8")
+    assert "'-v', config.voice" not in src, "a say site still pins the voice"
+
+
+def test_macos_voice_builds_the_command_without_dash_v(monkeypatch):
+    from backend.voice.macos_voice import _is_system_default_voice
+
+    assert _is_system_default_voice("system") is True
+    assert _is_system_default_voice("Karen") is False
+
+    from pathlib import Path
+    src = Path("backend/voice/macos_voice.py").read_text(encoding="utf-8")
+    assert "'-v', voice_config['voice']" not in src
