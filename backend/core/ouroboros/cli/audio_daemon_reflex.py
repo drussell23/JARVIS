@@ -91,15 +91,30 @@ def _backoff_cap_s() -> float:
         return 3.0
 
 
-def supervisor_path() -> Optional[Path]:
-    """Locate ``unified_supervisor.py`` from THIS module's position rather than
-    a cwd-relative guess: `ov` is launched from arbitrary directories."""
+def audio_host_path() -> Optional[Path]:
+    """Locate the audio-plane host from THIS module's position rather than a
+    cwd-relative guess: `ov` is launched from arbitrary directories.
+
+    ``backend/audio/audio_plane_host.py``, NOT ``unified_supervisor.py``. The
+    supervisor does own a microphone, but it reaches one by booting the
+    websocket router, the legacy web app and the local model stack — a web UI
+    nobody asked for, and a local model loaded into the same unified memory the
+    audio path is competing for. The host is the same
+    ``wire_conversation_pipeline`` call with a process around it."""
     try:
         root = Path(__file__).resolve().parents[4]
-        candidate = root / "unified_supervisor.py"
+        candidate = root / "backend" / "audio" / "audio_plane_host.py"
         return candidate if candidate.is_file() else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def supervisor_path() -> Optional[Path]:
+    """Deprecated alias for :func:`audio_host_path`.
+
+    Kept because the name is load-bearing in existing callers and tests; the
+    TARGET moved, the seam did not."""
+    return audio_host_path()
 
 
 async def probe_socket(path: Optional[Path] = None, *, timeout: float = 0.5) -> bool:
@@ -135,16 +150,18 @@ async def probe_socket(path: Optional[Path] = None, *, timeout: float = 0.5) -> 
 def spawn_supervisor(
     *, script: Optional[Path] = None, extra_args: Optional[list] = None,
 ) -> Optional[int]:
-    """Start ``unified_supervisor.py`` DETACHED. Returns its pid, or None.
+    """Start the audio-plane host DETACHED. Returns its pid, or None.
 
     ``start_new_session=True`` puts it in its own process group so it survives
     the cockpit exiting — the audio plane is meant to outlive an ephemeral
     client, and this mirrors how the codebase already detaches `say`/`afplay`.
     stdio goes to DEVNULL so a chatty boot cannot corrupt the TUI's terminal.
 
-    No duplicate-guard here by design: the supervisor's own
-    ``_fast_kernel_check()`` exits early when one is already healthy."""
-    path = Path(script) if script is not None else supervisor_path()
+    No duplicate-guard here by design: the host probes the audio-state socket
+    before binding and exits 75 when another already serves it, so a duplicate
+    spawn costs a short-lived process rather than a second microphone owner —
+    which CoreAudio would refuse anyway."""
+    path = Path(script) if script is not None else audio_host_path()
     # Validate REGARDLESS of where the path came from. Popen succeeds on a
     # missing script — python3 starts, then dies — so without this check the
     # reflex would report a pid, believe it spawned an audio plane, and then
@@ -163,7 +180,7 @@ def spawn_supervisor(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        logger.info("[AudioReflex] spawned unified_supervisor pid=%s", proc.pid)
+        logger.info("[AudioReflex] spawned audio plane host pid=%s", proc.pid)
         return proc.pid
     except Exception as exc:  # noqa: BLE001
         logger.debug("[AudioReflex] spawn failed: %r", exc)
@@ -256,6 +273,7 @@ async def ensure_audio_daemon(
 
 
 __all__ = [
+    "audio_host_path",
     "await_socket",
     "ensure_audio_daemon",
     "probe_socket",

@@ -34,6 +34,12 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+class _STTDeferred(Exception):
+    """ASR admission is closed. Routed through step 2's existing ``except`` so
+    the deferral takes exactly the same path a genuine STT fault takes — one
+    exit from the step, nine components still wired below it."""
+
+
 def _can_start_streaming_stt_now() -> tuple[bool, str]:
     """Check startup ASR admission before loading faster-whisper."""
     if os.getenv("JARVIS_ASR_ADMISSION_FORCE_OPEN", "").lower() in ("1", "true", "yes", "on"):
@@ -137,11 +143,33 @@ async def wire_conversation_pipeline(
     try:
         stt_allowed, stt_reason = _can_start_streaming_stt_now()
         if not stt_allowed:
-            logger.info(
-                "[Bootstrap] StreamingSTT deferred by admission gate: %s",
+            # DEFER STT — not the entire pipeline.
+            #
+            # This branch used to `return handle`, abandoning every step below
+            # it: turn detection, barge-in, the Karen duplex, the audio-state
+            # IPC broadcaster, ConversationPipeline and ModeDispatcher. The
+            # admission gate exists to keep faster-whisper from loading during
+            # a heavy boot; it says nothing about the other nine components,
+            # and silently dropping them turned "ASR is not ready yet" into
+            # "there is no audio plane at all".
+            #
+            # The failure was invisible from outside: the log line says
+            # "StreamingSTT deferred", the function returns a PipelineHandle,
+            # and the caller sees a successful wire. What the operator sees is
+            # a cockpit whose wave never moves and whose `wake` verb reaches
+            # nothing — because the socket it would reach was never bound.
+            #
+            # Every other step here is try/except-and-continue, and the
+            # docstring already promises "partial wiring is OK (degraded
+            # mode)". This branch is now the same shape as its neighbours.
+            logger.warning(
+                "[Bootstrap] StreamingSTT deferred by admission gate: %s "
+                "— continuing to wire the rest of the plane (no transcription "
+                "until ASR is admitted)",
                 stt_reason,
             )
-            return handle
+            handle.streaming_stt = None
+            raise _STTDeferred(stt_reason)
         from backend.voice.streaming_stt import StreamingSTTEngine
         handle.streaming_stt = StreamingSTTEngine()
         await asyncio.wait_for(handle.streaming_stt.start(), timeout=stt_timeout)
@@ -151,6 +179,8 @@ async def wire_conversation_pipeline(
             logger.info("[Bootstrap] StreamingSTT registered on AudioBus")
         else:
             logger.info("[Bootstrap] StreamingSTT started (no AudioBus)")
+    except _STTDeferred:
+        pass                      # already reported above; keep wiring
     except Exception as e:
         logger.warning(f"[Bootstrap] StreamingSTT init skipped: {e}")
         handle.streaming_stt = None

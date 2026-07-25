@@ -199,12 +199,19 @@ async def test_final_probe_after_the_last_sleep():
 # ---------------------------------------------------------------------------
 
 
-def test_supervisor_path_resolves_from_the_module_not_the_cwd():
+def test_audio_host_path_resolves_from_the_module_not_the_cwd():
     """`ov` is launched from arbitrary directories, so a cwd-relative guess
-    would break for every operator not sitting in the repo root."""
-    p = reflex.supervisor_path()
-    assert p is not None, "unified_supervisor.py not located"
-    assert p.name == "unified_supervisor.py" and p.is_file()
+    would break for every operator not sitting in the repo root.
+
+    The TARGET moved (2026-07-25): the reflex spawns the dedicated audio-plane
+    host, not ``unified_supervisor.py``. The supervisor does own a microphone,
+    but it reaches one by booting the websocket router, the legacy web app and
+    the local model stack — a web UI nobody asked for, and a local model in the
+    same unified memory the audio path is competing for."""
+    p = reflex.audio_host_path()
+    assert p is not None, "audio_plane_host.py not located"
+    assert p.name == "audio_plane_host.py" and p.is_file()
+    assert reflex.supervisor_path() == p, "the deprecated alias drifted"
 
 
 def test_spawn_is_detached_and_silenced(monkeypatch):
@@ -224,7 +231,7 @@ def test_spawn_is_detached_and_silenced(monkeypatch):
     pid = reflex.spawn_supervisor()
 
     assert pid == 999
-    assert seen["argv"][1].endswith("unified_supervisor.py")
+    assert seen["argv"][1].endswith("audio_plane_host.py")
     assert seen["kw"]["start_new_session"] is True
     assert seen["kw"]["stdout"] == reflex.subprocess.DEVNULL
     assert seen["kw"]["stderr"] == reflex.subprocess.DEVNULL

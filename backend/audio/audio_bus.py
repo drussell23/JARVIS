@@ -47,6 +47,9 @@ class Resampler:
         self._ratio = to_rate / from_rate
         self._use_libsamplerate = False
         self._resampler = None
+        #: Whether the backend accepts the third (end-of-input) argument.
+        #: Probed once — never per frame.
+        self._eoi_supported = False
 
         if from_rate == to_rate:
             return  # No-op
@@ -55,6 +58,7 @@ class Resampler:
             import samplerate
             self._resampler = samplerate.Resampler("sinc_fastest", channels=channels)
             self._use_libsamplerate = True
+            self._eoi_supported = self._probe_end_of_input()
             logger.debug(
                 f"[Resampler] Using libsamplerate: {from_rate} -> {to_rate}"
             )
@@ -63,6 +67,25 @@ class Resampler:
                 f"[Resampler] libsamplerate not available, using linear "
                 f"interpolation: {from_rate} -> {to_rate}"
             )
+
+    def _probe_end_of_input(self) -> bool:
+        """Does this libsamplerate build accept the end-of-input flag?
+
+        Answered ONCE, against a throwaway resampler so the real one's filter
+        state is never perturbed by the probe. Bindings differ across versions;
+        discovering that per-frame inside a try/except is what turned a
+        signature drift into silent total frame loss."""
+        try:
+            import samplerate
+            probe = samplerate.Resampler("sinc_fastest", channels=self.channels)
+            probe.process(np.zeros(8, dtype=np.float32), 1.0, False)
+            return True
+        except Exception:  # noqa: BLE001
+            logger.info(
+                "[Resampler] backend does not accept an end-of-input flag; "
+                "using the 2-argument form",
+            )
+            return False
 
     def process(
         self, data: np.ndarray, end_of_data: bool = False
@@ -82,9 +105,21 @@ class Resampler:
             return data
 
         if self._use_libsamplerate and self._resampler is not None:
-            return self._resampler.process(
-                data, self._ratio, end_of_data=end_of_data
-            )
+            # POSITIONAL, not keyword. This call was ``end_of_data=...`` while
+            # libsamplerate's pybind11 binding declares ``end_of_input`` —
+            # so every invocation raised TypeError, AudioBus._on_mic_frame
+            # swallowed it at DEBUG level, and 100% of microphone frames were
+            # discarded while every status surface reported healthy. One
+            # keyword silenced the entire microphone.
+            #
+            # Positional is the durable form: an argument RENAME breaks
+            # keywords silently, whereas a reorder would break every caller of
+            # the library loudly. ``_eoi_supported`` is resolved ONCE at init,
+            # because per-frame try/except in the audio path is precisely the
+            # pattern that hid this for so long.
+            if self._eoi_supported:
+                return self._resampler.process(data, self._ratio, end_of_data)
+            return self._resampler.process(data, self._ratio)
 
         # Fallback: linear interpolation (end_of_data N/A)
         n_out = int(len(data) * self._ratio)
@@ -395,6 +430,10 @@ class AudioBus:
         # v265.0: Mic gate — when active, no mic frames are dispatched.
         # Used by speech state manager to suppress self-voice during TTS.
         self._mic_gate_active: bool = False
+        #: Consecutive mic-frame processing failures. Non-zero means the
+        #: microphone is not reaching its consumers, whatever else says.
+        self._mic_error_count: int = 0
+        self._mic_frames_delivered: int = 0
 
     @classmethod
     def get_instance(cls) -> "AudioBus":
@@ -742,9 +781,29 @@ class AudioBus:
                         consumer(cleaned)
                     except Exception:
                         pass  # Never crash the audio thread
+            self._mic_frames_delivered += 1
+            self._mic_error_count = 0
 
         except Exception as e:
-            logger.debug(f"[AudioBus] Mic frame processing error: {e}")
+            # LOUD, not DEBUG. A resampler keyword drift discarded 100% of mic
+            # frames here while every status surface still read healthy — the
+            # microphone was dead and nothing said so. Total frame loss is not
+            # a debug detail; it is the audio path being down.
+            #
+            # Rate-limited by COUNT rather than time: this runs on the audio
+            # thread at 50Hz, so a per-frame log would itself become the fault.
+            # The first failure speaks immediately; the rest report as a
+            # growing tally on a geometric cadence.
+            self._mic_error_count += 1
+            n = self._mic_error_count
+            if n == 1 or (n & (n - 1)) == 0:      # 1, 2, 4, 8, 16, …
+                logger.warning(
+                    "[AudioBus] mic frame processing FAILED (%d frame%s "
+                    "dropped, 0 delivered to %d consumer%s): %s",
+                    n, "" if n == 1 else "s",
+                    len(self._mic_consumers),
+                    "" if len(self._mic_consumers) == 1 else "s", e,
+                )
 
     # ---- Properties ----
 
@@ -766,6 +825,10 @@ class AudioBus:
             "running": self._running,
             "device_running": self._device.is_running if self._device else False,
             "mic_consumers": len(self._mic_consumers),
+            # Delivery is the only honest health signal for the mic path:
+            # "running" was True throughout a total outage.
+            "mic_frames_delivered": self._mic_frames_delivered,
+            "mic_frame_errors": self._mic_error_count,
             "input_enabled": self._device.input_enabled if self._device else False,
             "sinks": list(self._sinks.keys()),
             "playback_buffered": (
