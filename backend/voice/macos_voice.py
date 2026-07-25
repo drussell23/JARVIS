@@ -216,6 +216,32 @@ class MacOSVoice:
                 ["afplay", _temp_path],
                 start_new_session=True,
             )
+            # ── Phantom tap: Karen's waveform, anchored to THIS instant ──────
+            # afplay is a separate OS process (v283.0, deliberately GIL-free), so
+            # there is no in-process playback callback to observe. Instead the
+            # UI envelope is synthesized from the very file afplay is playing and
+            # advanced on a clock anchored to the Popen above. Fire-and-forget:
+            # speech is never delayed, and any failure here leaves TTS
+            # byte-identical.
+            try:
+                from backend.voice.tts_phantom_tap import (
+                    default_system_emitter, phantom_tap_enabled, run_phantom_tap,
+                )
+                if phantom_tap_enabled():
+                    import asyncio as _aio
+                    import time as _t
+                    _anchor = _t.monotonic()
+                    try:
+                        _loop = _aio.get_running_loop()
+                    except RuntimeError:
+                        _loop = None
+                    if _loop is not None:
+                        _loop.create_task(run_phantom_tap(
+                            _temp_path, proc=_play_proc,
+                            emit=default_system_emitter(), anchor=_anchor,
+                        ))
+            except Exception:  # noqa: BLE001 — visualization NEVER affects speech
+                pass
             _play_proc.wait()
         finally:
             try:

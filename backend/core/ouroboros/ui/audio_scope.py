@@ -144,21 +144,56 @@ class AdaptiveNormalizer:
 
     def __init__(
         self, *, decay: float = 0.995, floor: float = 1e-3,
+        hold_frames: int = 40,
     ) -> None:
         self._decay = min(max(float(decay), 0.0), 0.999999)
         self._floor = max(float(floor), 1e-9)
         self._peak = self._floor
+        self._hold_frames = max(0, int(hold_frames))
+        self._held = 0
         self._lock = threading.Lock()
 
     def normalize(self, value: float) -> float:
+        """Normalized 0..1 against the held/decaying peak.
+
+        DIGITAL SILENCE (the TTS case). A microphone always has a noise floor;
+        synthesized speech hits *absolute* 0.0 between words and between
+        utterances. Two consequences are handled explicitly:
+
+        1. **No division by zero, ever.** ``_floor`` clamps the peak from below
+           and a defensive ``peak <= 0`` guard follows, so an all-zero buffer
+           returns 0.0 instead of raising.
+        2. **The scale must not collapse in the gaps.** A silent sample is the
+           ABSENCE of signal, not evidence of a quieter source, so it never
+           lowers the peak (``max`` already ignores it) — and for
+           ``hold_frames`` after real signal the peak does not decay at all.
+           Without that hold, an inter-syllable gap would shrink the reference
+           and the next syllable would slam to full scale, making Karen's voice
+           pulse like a strobe instead of breathing.
+        """
         try:
             v = abs(float(value))
         except (TypeError, ValueError):
             return 0.0
+        if v != v or v == float("inf"):     # NaN / inf are not signal
+            return 0.0
         with self._lock:
-            self._peak = max(v, self._peak * self._decay, self._floor)
+            if v > self._floor:
+                # Real signal: re-arm the gap guard, but KEEP DECAYING. Holding
+                # the peak on any above-floor sample would pin the reference at
+                # an old loud value forever, so a source that drops from 1.0 to
+                # 0.01 would flatline at 1% — the very failure the decay exists
+                # to prevent. Decay here, hold only in the gaps below.
+                self._held = self._hold_frames
+                self._peak = max(v, self._peak * self._decay, self._floor)
+            elif self._held > 0:
+                # Inside a gap — hold the reference steady.
+                self._held -= 1
+            else:
+                # Sustained silence: only now let the reference relax.
+                self._peak = max(self._peak * self._decay, self._floor)
             peak = self._peak
-        if peak <= 0.0:
+        if peak <= 0.0:                     # unreachable via floor; belt-and-braces
             return 0.0
         return min(1.0, max(0.0, v / peak))
 
