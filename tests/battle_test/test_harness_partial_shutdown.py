@@ -343,3 +343,99 @@ def test_signal_handler_tolerates_missing_shutdown_event(tmp_harness):
     # Must not raise.
     tmp_harness._handle_shutdown_signal()
     assert (tmp_harness._session_dir / "summary.json").is_file()
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM contract — asserted against what the harness ACTUALLY does.
+#
+# Deliberately NOT asserting "exits 0": this harness exits via os._exit(75)
+# (the Py_FinalizeEx zombie class) and os._exit(137) (the resource-zero
+# backstop) on its watchdog paths, so a test demanding 0 would either fail or
+# pin a contract the code does not have. What IS guaranteed on a signal-driven
+# stop is the ledger: a parseable summary, a signal-derived stop_reason, and a
+# `complete` outcome when the reason is a clean terminal.
+# ---------------------------------------------------------------------------
+
+
+def test_sigterm_stop_reason_classifies_complete(tmp_harness):
+    """`shutdown_signal` is in the `_clean` set, so the pre-exit flush stamps
+    session_outcome=complete — a SIGTERM'd session is a finished session, not a
+    corrupted one."""
+    tmp_harness._stop_reason = "shutdown_signal"
+
+    tmp_harness._watchdog_pre_exit_flush()
+
+    summary_path = tmp_harness._session_dir / "summary.json"
+    assert summary_path.exists(), "pre-exit flush wrote no summary"
+    data = json.loads(summary_path.read_text())
+    assert data["session_outcome"] == "complete"
+    assert data["stop_reason"].startswith("shutdown_signal")
+    assert data["schema_version"] == 2
+
+
+def test_non_clean_stop_reason_classifies_incomplete_kill(tmp_harness):
+    """The negative half of the same gate — an unrecognised terminal must NOT
+    be laundered into `complete`."""
+    tmp_harness._stop_reason = "some_unexpected_wedge"
+
+    tmp_harness._watchdog_pre_exit_flush()
+
+    data = json.loads((tmp_harness._session_dir / "summary.json").read_text())
+    assert data["session_outcome"] == "incomplete_kill"
+
+
+def test_pre_exit_flush_is_idempotent(tmp_harness):
+    """A watchdog fire racing the normal writer must not double-write or raise
+    — the flush no-ops once a summary exists."""
+    tmp_harness._stop_reason = "shutdown_signal"
+    tmp_harness._watchdog_pre_exit_flush()
+    first = (tmp_harness._session_dir / "summary.json").read_text()
+
+    tmp_harness._watchdog_pre_exit_flush()  # must not raise, must not clobber
+    assert (tmp_harness._session_dir / "summary.json").read_text() == first
+
+
+def test_sigterm_flush_never_raises_on_broken_recorder(tmp_harness):
+    """The flush runs on the watchdog thread during teardown; it must swallow
+    everything rather than take the exit path down with it."""
+    class _Exploding:
+        def __getattr__(self, _name):
+            raise RuntimeError("recorder is gone")
+
+    tmp_harness._stop_reason = "shutdown_signal"
+    tmp_harness._session_recorder = _Exploding()
+
+    tmp_harness._watchdog_pre_exit_flush()  # must not raise
+
+
+def test_sqlite_locks_released_after_close(tmp_path):
+    """SQLite half of the shutdown contract: once the owning connection closes,
+    a fresh writer can take BEGIN IMMEDIATE and integrity_check is clean.
+
+    Pins the real behaviour observed on the live rotation — the intent DB runs
+    journal_mode=delete, so there is no WAL sidecar to flush; proof of release
+    is that a second writer can acquire, not that a -wal file vanished."""
+    import sqlite3
+
+    from backend.core.ouroboros.governance.soak_intent import (
+        enqueue_soak_intent,
+        pending_soak_count,
+    )
+
+    db = tmp_path / "chunk_strategy.db"
+    conn = sqlite3.connect(db)
+    enqueue_soak_intent(conn, kind="canary_soak", target="/tmp/c", intent_id="i1")
+    assert pending_soak_count(conn) == 1
+    conn.close()
+
+    assert not (tmp_path / "chunk_strategy.db-wal").exists()
+    assert not (tmp_path / "chunk_strategy.db-shm").exists()
+
+    after = sqlite3.connect(db, timeout=5)
+    try:
+        assert after.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        after.execute("BEGIN IMMEDIATE")   # would raise "database is locked"
+        after.rollback()
+        assert pending_soak_count(after) == 1, "the row survived the close"
+    finally:
+        after.close()

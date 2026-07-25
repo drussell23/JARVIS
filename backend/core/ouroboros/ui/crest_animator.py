@@ -989,11 +989,23 @@ def render_cockpit_header(
     width: int,
     *,
     now: Optional[float] = None,
+    right_gutter: Optional[Any] = None,
+    gutter_row: int = 0,
 ) -> str:
     """Compose the CC-style header — mini crest left, identity/context/path
     lines beside it — to an ANSI string bounded to ``width``. ``lines`` are
     Rich renderable Texts (or plain strings). Degrades to text-only when the
-    mini crest is unavailable (tiny terminal / NONE tier). Never raises."""
+    mini crest is unavailable (tiny terminal / NONE tier). Never raises.
+
+    ``right_gutter`` fills the empty real estate to the RIGHT of the identity
+    lines — the Braille audio oscilloscope lives there. It may be a Rich
+    renderable, a plain/markup string, or a zero-arg callable returning either;
+    a callable is re-evaluated per frame so the clock-driven repaint animates it
+    with no extra task. It is RIGHT-ALIGNED against ``width``, which is why the
+    alignment lives here rather than in the caller: this function is the only
+    place that knows the terminal width. Rendered on ``gutter_row`` of the text
+    block. Silently omitted if it does not fit, so a narrow terminal degrades to
+    the plain header instead of wrapping into a broken layout."""
     try:
         from io import StringIO
         from rich.console import Console
@@ -1019,7 +1031,23 @@ def render_cockpit_header(
             ti = i - pad_top
             if 0 <= ti < len(text_rows):
                 out.append("  ")
-                out.append_text(text_rows[ti] if not isinstance(text_rows[ti], str) else Text(text_rows[ti]))
+                _row = text_rows[ti] if not isinstance(text_rows[ti], str) else Text(text_rows[ti])
+                out.append_text(_row)
+                if ti == gutter_row and right_gutter is not None:
+                    try:
+                        _g = right_gutter() if callable(right_gutter) else right_gutter
+                        _gt = _g if not isinstance(_g, str) else Text.from_markup(_g)
+                        if _gt is not None and len(_gt) > 0:
+                            # Right-align: pad from where this row currently ends
+                            # to (width - gutter_len). Omit rather than wrap when
+                            # the terminal is too narrow.
+                            _used = crest_w + 2 + len(_row)
+                            _pad = max(0, int(width) - _used - len(_gt) - 1)
+                            if _used + _pad + len(_gt) <= int(width):
+                                out.append(" " * _pad)
+                                out.append_text(_gt)
+                    except Exception:  # noqa: BLE001 — a gutter fault never breaks the header
+                        pass
             if i < n_rows - 1:
                 out.append("\n")
         buf = StringIO()

@@ -159,6 +159,57 @@ def _detect_repo_root() -> Optional[str]:
         return None
 
 
+#: Private ref namespace for preemption snapshots. Deliberately NOT ``refs/stash``
+#: — see the note in :func:`git_safety_stash`. Listable via
+#: ``git for-each-ref refs/jarvis/preemption``; each ref points at a
+#: ``git stash create`` commit that ``git stash apply <sha>`` restores.
+_PREEMPTION_REF_NS = "refs/jarvis/preemption"
+
+
+def list_preemption_refs(repo_root: str) -> list:
+    """``[(refname, sha), ...]`` newest-first for the private namespace. The
+    replacement for ``git stash list`` as the operator's recovery surface.
+    Fail-soft: returns ``[]`` on any error."""
+    try:
+        res = _run_git(
+            repo_root, "for-each-ref", "--sort=-refname",
+            "--format=%(refname) %(objectname)", _PREEMPTION_REF_NS,
+        )
+        if res.returncode != 0:
+            return []
+        out = []
+        for line in (res.stdout or "").splitlines():
+            parts = line.strip().split()
+            if len(parts) == 2:
+                out.append((parts[0], parts[1]))
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _prune_preemption_refs(repo_root: str) -> int:
+    """Retain the newest ``JARVIS_PREEMPTION_SNAPSHOT_RETAIN`` (default 20)
+    snapshots; delete older refs so the namespace cannot grow without bound
+    across a long-lived daemon. Deleting the ref only unpins the commit (GC
+    reclaims it later) — it never touches the working tree. Returns the count
+    pruned. Fail-soft; NEVER raises."""
+    try:
+        keep = int(os.environ.get("JARVIS_PREEMPTION_SNAPSHOT_RETAIN", "20"))
+    except (TypeError, ValueError):
+        keep = 20
+    keep = max(1, keep)
+    pruned = 0
+    try:
+        refs = list_preemption_refs(repo_root)
+        for refname, _sha in refs[keep:]:
+            res = _run_git(repo_root, "update-ref", "-d", refname)
+            if res.returncode == 0:
+                pruned += 1
+    except Exception:  # noqa: BLE001
+        pass
+    return pruned
+
+
 def git_safety_stash(repo_root: Optional[str] = None) -> str:
     """NON-DESTRUCTIVELY snapshot in-flight working-tree changes so a partial
     APPLY is recoverable WITHOUT clearing the operator's uncommitted work off
@@ -206,15 +257,25 @@ def git_safety_stash(repo_root: Optional[str] = None) -> str:
             # Tree raced clean, or git could not snapshot — never clear the tree.
             return "snapshot_none"
         ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        # Register the snapshot as a listable, apply-able stash entry WITHOUT
-        # modifying the working tree (unlike `stash push`).
-        store = _run_git(
-            root, "stash", "store", "-m", f"[preemption-shield] in-flight {ts}", sha,
-        )
+        # ── Hazard #70033: NEVER touch the shared stash stack ──────────────
+        # `git stash store` pushes onto refs/stash — a SHARED, ORDER-SENSITIVE
+        # stack. A human or agent running `git stash pop` gets stash@{0}, so a
+        # daemon snapshot landing between their push and their pop silently
+        # hands them the DAEMON's tree. Observed 2026-07-24: an agent's pop
+        # returned a preemption snapshot and conflicted.
+        #
+        # The tree was never the problem (create+store are both non-destructive);
+        # the shared NAMESPACE was. Anchor snapshots under a private ref
+        # namespace instead: the dangling commit is preserved from GC exactly as
+        # before, recovery still works (apply_stash_ref takes a RAW SHA and never
+        # consults the stack), and refs/stash is left entirely to humans.
+        ref = f"{_PREEMPTION_REF_NS}/{ts}-{sha[:8]}"
+        store = _run_git(root, "update-ref", ref, sha)
         if store.returncode == 0:
+            _prune_preemption_refs(root)
             return f"snapshot:{sha[:8]}"
-        # store failed, but the dangling `create` commit still exists + the tree
-        # is intact — recovery is still possible by SHA; report it.
+        # update-ref failed, but the dangling `create` commit still exists + the
+        # tree is intact — recovery is still possible by SHA; report it.
         return f"snapshot_unstored:{sha[:8]}"
     except subprocess.TimeoutExpired:
         return "git_timeout"

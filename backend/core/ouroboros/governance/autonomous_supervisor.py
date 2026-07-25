@@ -211,10 +211,14 @@ class AutonomousSupervisor:
         soak on the recovery edge the Sentinel produces."""
         from backend.core.ouroboros.governance.awe_trigger import (
             AWETrigger,
-            build_soak_subprocess_launch_fn,
+            build_manifest_aware_launch_fn,
         )
+        # Substrate-aware dispatch: the supervisor armed BECAUSE an intent is
+        # pending, so the recovery edge must run THAT intent's manifest — not a
+        # generic soak that leaves it pending forever. Same db_factory, so the
+        # dispatcher reads the very queue the arm gate counted.
         return AWETrigger(
-            launch_fn=build_soak_subprocess_launch_fn(),
+            launch_fn=build_manifest_aware_launch_fn(db_factory=self._db_factory),
             db_factory=self._db_factory,
             provider=self._provider,
         )

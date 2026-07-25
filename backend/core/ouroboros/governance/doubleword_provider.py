@@ -163,10 +163,26 @@ _DW_ZDR_HEADER_VALUE = "true"
 
 
 def _dw_prompt_cache_enabled() -> bool:
-    """Master switch for DW prompt caching. Default FALSE (safe opt-in). When
-    off, the request is byte-identical legacy (no cache_control markers)."""
+    """Master switch for DW prompt caching. GRADUATED to default TRUE
+    (2026-07-24). Rollback: ``JARVIS_DW_PROMPT_CACHE_ENABLED=false`` restores the
+    byte-identical un-cached request.
+
+    Why: every op re-sends a large, near-identical prefix — measured on session
+    bt-2026-07-24-212505 as dev-memory 10,459 chars + strategic/goal 4,019 +
+    user-preferences 1,611 + goal-inference 992, i.e. ~17KB of static context
+    re-billed at full input price against ops of ~2,259 input tokens. With the
+    1h TTL, one cache write amortizes across every op in the window.
+
+    Staleness is NOT a risk here, and needs no invalidation machinery: prompt
+    caching is CONTENT-ADDRESSED. The cache key IS the exact prefix, and
+    ``_dw_shape_cached_system`` adds only ``cache_control`` metadata — the text
+    stays byte-identical. If dev-memory or user preferences change mid-soak the
+    prefix bytes change, so the key changes, so it MISSES and re-writes. It is
+    structurally impossible to be served a cached prefix that differs from the
+    prefix you sent. The TTL bounds how long an IDENTICAL prefix stays warm, not
+    how long stale content survives."""
     return os.environ.get(
-        "JARVIS_DW_PROMPT_CACHE_ENABLED", "false"
+        "JARVIS_DW_PROMPT_CACHE_ENABLED", "true"
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -194,6 +210,111 @@ def _dw_prompt_cache_min_chars() -> int:
         return _DW_PROMPT_CACHE_MIN_CHARS_DEFAULT
 
 
+def _dw_cache_read_multiplier() -> float:
+    """Billing multiplier for a cache READ vs fresh input. Env-tunable — no
+    hardcoded provider economics. Default 0.1 (the standard ephemeral-cache
+    read rate)."""
+    try:
+        return max(0.0, float(os.environ.get("JARVIS_DW_CACHE_READ_MULT", "0.1")))
+    except (TypeError, ValueError):
+        return 0.1
+
+
+def _dw_cache_write_multiplier() -> float:
+    """Billing multiplier for a cache WRITE vs fresh input. A write costs MORE
+    than plain input (it provisions the entry); the savings only materialize on
+    subsequent reads. Default 1.25."""
+    try:
+        return max(0.0, float(os.environ.get("JARVIS_DW_CACHE_WRITE_MULT", "1.25")))
+    except (TypeError, ValueError):
+        return 1.25
+
+
+def extract_cache_usage(usage: Any) -> Optional[dict]:
+    """Pull cache accounting out of a DW usage payload.
+
+    Returns ``None`` when the payload carries NO cache fields at all — the
+    graceful-degradation path for a provider/response that predates or omits
+    caching, so the caller falls back to plain token counting rather than
+    reporting fabricated zeros as if they were measured.
+
+    Returns a dict when at least one cache field is present, even if zero: a
+    genuine measured zero (cache armed, first call, nothing warm yet) is
+    meaningful and must be distinguishable from "not reported".
+
+    Pure + total: never raises, never does I/O."""
+    try:
+        if not isinstance(usage, dict):
+            return None
+        has_read = "cache_read_input_tokens" in usage
+        has_write = "cache_creation_input_tokens" in usage
+        if not (has_read or has_write):
+            return None
+
+        def _i(key: str) -> int:
+            try:
+                return max(0, int(usage.get(key, 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        read = _i("cache_read_input_tokens")
+        write = _i("cache_creation_input_tokens")
+        prompt = _i("prompt_tokens")
+        # Fresh input is whatever was neither read from nor written to cache.
+        # Clamp at 0: providers occasionally report prompt_tokens exclusive of
+        # cached reads, which would otherwise yield a negative.
+        fresh = max(0, prompt - read - write)
+
+        read_mult = _dw_cache_read_multiplier()
+        write_mult = _dw_cache_write_multiplier()
+        # Billed-equivalent input units vs. what the same prefix would have cost
+        # with no cache at all (every token at full rate).
+        billed_units = fresh + (read * read_mult) + (write * write_mult)
+        uncached_units = float(fresh + read + write)
+        saved_units = uncached_units - billed_units
+
+        return {
+            "cache_read_tokens": read,
+            "cache_write_tokens": write,
+            "fresh_input_tokens": fresh,
+            "prompt_tokens": prompt,
+            "billed_input_units": round(billed_units, 2),
+            "uncached_input_units": round(uncached_units, 2),
+            "saved_input_units": round(saved_units, 2),
+            "hit_ratio": round(read / prompt, 4) if prompt > 0 else 0.0,
+        }
+    except Exception:  # noqa: BLE001 — telemetry NEVER breaks generation
+        return None
+
+
+def emit_cache_telemetry(
+    usage: Any, *, op_id: str = "", model: str = "",
+) -> Optional[dict]:
+    """Structured, non-blocking cache-amortization telemetry.
+
+    Proves the prompt-cache graduation empirically instead of by assertion: a
+    ``cache_read_tokens`` that climbs across a soak while ``saved_input_units``
+    accumulates IS the amortization. Emits nothing (and returns None) when the
+    provider omits cache fields, so a silent absence never masquerades as a
+    measured zero. Logging only — no I/O, never raises."""
+    stats = extract_cache_usage(usage)
+    if stats is None:
+        return None
+    try:
+        logger.info(
+            "[DW_CACHE_TELEMETRY] op=%s model=%s read=%d write=%d fresh=%d "
+            "billed_units=%.2f uncached_units=%.2f saved_units=%.2f hit_ratio=%.4f",
+            op_id or "-", model or "-",
+            stats["cache_read_tokens"], stats["cache_write_tokens"],
+            stats["fresh_input_tokens"], stats["billed_input_units"],
+            stats["uncached_input_units"], stats["saved_input_units"],
+            stats["hit_ratio"],
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return stats
+
+
 def _dw_shape_cached_system(
     system_text: Any, *, enabled: bool, min_chars: int, ttl: str
 ) -> Any:
@@ -211,8 +332,43 @@ def _dw_shape_cached_system(
             return system_text
         if not isinstance(system_text, str) or not system_text:
             return system_text
-        if len(system_text) < max(0, int(min_chars)):
+
+        # ── ACEE: frequency-driven, length-independent ────────────────────
+        # The legacy `min_chars` floor priced the wrong variable. Prefix length
+        # cancels out of the profitability inequality (every term scales
+        # linearly with it), so what matters is REUSE COUNT. The floor blocked
+        # a small high-frequency probe (profitable) while admitting a huge
+        # one-off (a guaranteed write-premium loss).
+        #
+        # This is the ONE chokepoint every DW request funnels through — both
+        # the streaming and non-streaming handlers consume its output — so the
+        # decision is intercepted here without touching either handler.
+        from backend.core.ouroboros.governance.dw_cache_economics import (
+            acee_enabled, should_cache_write,
+        )
+        if acee_enabled():
+            ok, _why = should_cache_write(
+                system_text,
+                write_mult=_dw_cache_write_multiplier(),
+                read_mult=_dw_cache_read_multiplier(),
+            )
+            if not ok:
+                logger.debug(
+                    "[ACEE] bypass uses=%s need=%s chars=%s sig=%s",
+                    _why.get("uses_in_window"), _why.get("break_even_uses"),
+                    _why.get("chars"), _why.get("signature"),
+                )
+                return system_text
+            logger.debug(
+                "[ACEE] cache uses=%s need=%s chars=%s sig=%s",
+                _why.get("uses_in_window"), _why.get("break_even_uses"),
+                _why.get("chars"), _why.get("signature"),
+            )
+        elif len(system_text) < max(0, int(min_chars)):
+            # Legacy path, retained byte-identical for rollback via
+            # JARVIS_DW_ACEE_ENABLED=false.
             return system_text
+
         return [
             {
                 "type": "text",
@@ -5481,6 +5637,16 @@ class DoublewordProvider:
                                     if _usage:
                                         input_tokens = _usage.get("prompt_tokens", 0)
                                         output_tokens = _usage.get("completion_tokens", 0)
+                                        # STREAMING is the hot path in practice
+                                        # (the RT default). Instrumenting only
+                                        # the non-streaming branch left this
+                                        # telemetry wired-but-inert: 2 live
+                                        # generations produced 0 lines.
+                                        emit_cache_telemetry(
+                                            _usage,
+                                            op_id=str(getattr(context, "op_id", "") or ""),
+                                            model=str(getattr(self, "_model", "") or ""),
+                                        )
                                 except json.JSONDecodeError:
                                     continue
                             # CD-2 — clear stream-active latch now that the SSE loop
@@ -5570,6 +5736,15 @@ class DoublewordProvider:
                             content = choices[0].get("message", {}).get("content", "")
                             input_tokens = usage.get("prompt_tokens", 0)
                             output_tokens = usage.get("completion_tokens", 0)
+                            # Cache amortization telemetry — fail-soft, no I/O.
+                            # Both operands resolved defensively: this sits on
+                            # the hot generation path, so a telemetry NameError
+                            # would kill real ops.
+                            emit_cache_telemetry(
+                                usage,
+                                op_id=str(getattr(context, "op_id", "") or ""),
+                                model=str(getattr(self, "_model", "") or ""),
+                            )
 
                 except _DWToolForcingRejectedError:
                     if _attempt == 0:
@@ -5899,6 +6074,24 @@ class DoublewordProvider:
             len(result.candidates), elapsed, total_cost, len(tool_records),
             _token_usage["input"], _token_usage["output"],
         )
+
+        # A successful generation is PROOF the Aegis->DW auth + billing path is
+        # currently valid. Publish it so a DWHeartbeat that froze itself on a
+        # stale/transient auth verdict can auto-defrost instead of requiring a
+        # daemon restart (which would strand AWE edge detection for the whole
+        # session). Best-effort telemetry — NEVER affects generation.
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                EVENT_TYPE_PROVIDER_GENERATION_SUCCEEDED,
+                publish_task_event,
+            )
+            publish_task_event(
+                EVENT_TYPE_PROVIDER_GENERATION_SUCCEEDED, "doubleword",
+                {"provider": "doubleword", "candidates": len(result.candidates),
+                 "elapsed_s": round(float(elapsed), 2)},
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         # Slice 84 — attach the Venom tool-loop execution records so the Iron
         # Gate exploration gate can count this op's read_file/search_code calls

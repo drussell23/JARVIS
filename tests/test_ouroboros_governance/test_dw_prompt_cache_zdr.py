@@ -95,6 +95,18 @@ def _ctx(
 
 
 class TestShapeCachedSystem:
+    """Marker SHAPE at the raw shaping helper. ACEE pinned off — see the note on
+    TestBuildSystemContent. Additionally: ACEE's tracker is a PROCESS-WIDE
+    singleton, so without this pin an earlier test's prefix warms the signature
+    and a later 'first sighting' assertion silently receives a cached marker.
+    Policy lives in tests/governance/test_dw_cache_economics.py, which resets
+    the singleton per test."""
+
+    @pytest.fixture(autouse=True)
+    def _legacy_gate(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("JARVIS_DW_ACEE_ENABLED", "false")
+        yield
+
     def test_enabled_long_prefix_marks_cache_control(self) -> None:
         text = "S" * 5000
         out = _dw_shape_cached_system(
@@ -150,7 +162,21 @@ class TestShapeCachedSystem:
 
 
 class TestConfig:
-    def test_cache_enabled_default_false(self) -> None:
+    def test_cache_enabled_default_true_after_graduation(self) -> None:
+        """GRADUATED 2026-07-24. Measured on bt-2026-07-24-212505: ~17KB of
+        static prefix (dev-memory 10,459 + strategic/goal 4,019 + user-prefs
+        1,611 + goal-inference 992 chars) was re-billed at full input price on
+        every op. Caching is content-addressed, so a changed prefix simply
+        misses — there is no stale-context risk to gate on."""
+        assert _dw_prompt_cache_enabled() is True
+
+    @pytest.mark.parametrize("val", ["false", "0", "no", "off", "FALSE"])
+    def test_cache_rollback_to_uncached(
+        self, monkeypatch: pytest.MonkeyPatch, val: str
+    ) -> None:
+        """The graduation must stay reversible — one env var restores the
+        byte-identical un-cached request."""
+        monkeypatch.setenv("JARVIS_DW_PROMPT_CACHE_ENABLED", val)
         assert _dw_prompt_cache_enabled() is False
 
     @pytest.mark.parametrize("val", ["true", "1", "yes", "on", "TRUE"])
@@ -270,6 +296,22 @@ class TestForcePrefixSplit:
 
 
 class TestBuildSystemContent:
+    """Marker SHAPE — placement, TTL threading, block membership.
+
+    ACEE is pinned off for this class deliberately. These assert how the
+    cache_control block is CONSTRUCTED, and ACEE decides WHETHER to build one:
+    under its first-sighting policy a single call is correctly uncached, which
+    would make every shape assertion here fail for a reason that has nothing to
+    do with shape. The policy itself is covered by
+    tests/governance/test_dw_cache_economics.py, including an end-to-end
+    integration test through this same chokepoint.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _legacy_gate(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("JARVIS_DW_ACEE_ENABLED", "false")
+        yield
+
     def test_off_returns_plain_string_byte_identical(self) -> None:
         p = _provider()
         base = "SYSTEM PROMPT"
