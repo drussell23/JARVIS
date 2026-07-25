@@ -37,6 +37,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import numpy as np
 
 from backend.audio.playback_gate import playback_gate
+from backend.audio.streaming_synthesis import streaming_enabled as _streaming_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -639,15 +640,26 @@ class ConversationPipeline:
                     intent_decision=intent_decision,
                 )
 
-                async for sentence in self._sentence_splitter.split(token_stream):
-                    if cancel_event.is_set():
-                        logger.info("[ConvPipeline] Barge-in — stopping response")
-                        break
+                if _streaming_enabled() and self._audio_bus is not None:
+                    # STREAMED PATH. Sentence-level buffering is itself a
+                    # latency floor: nothing can be heard until a full
+                    # sentence has been synthesized, and synthesis measures
+                    # 1.0-3.2s here. Piping `say`'s output as it is written
+                    # drops first-audio to ~1.7s on a short reply and 1.9s on
+                    # a long one where the serialized path took 6.2s.
+                    full_response = await self._speak_streamed(
+                        token_stream, cancel_event,
+                    )
+                else:
+                    async for sentence in self._sentence_splitter.split(token_stream):
+                        if cancel_event.is_set():
+                            logger.info("[ConvPipeline] Barge-in — stopping response")
+                            break
 
-                    full_response += sentence + " "
+                        full_response += sentence + " "
 
-                    # Speak sentence through TTS
-                    await self._speak_sentence(sentence, cancel_event)
+                        # Speak sentence through TTS
+                        await self._speak_sentence(sentence, cancel_event)
 
             else:
                 # No LLM client — echo mode for testing
@@ -1223,6 +1235,106 @@ class ConversationPipeline:
         if hint.startswith("math_") or hint.startswith("reason_"):
             return task_type_enum.REASONING
         return task_type_enum.CHAT
+
+    async def _speak_streamed(
+        self, token_stream: "AsyncIterator[str]", cancel_event: asyncio.Event,
+    ) -> str:
+        """Speak the reply as it is generated. Returns the spoken text.
+
+        AEC ROUTING, NOT BINARY GATING. The audio goes out through AudioBus,
+        so the device's output frame becomes the AEC reference and the
+        canceller can subtract Karen from the microphone. The mic therefore
+        stays OPEN for the whole reply and VAD keeps working — which is the
+        point: gating deafened the operator for the entire utterance, and an
+        assistant that cannot be interrupted while speaking is the blindspot
+        we set out to remove, not a smaller version of it.
+
+        Self-interruption is prevented by the sustained-speech requirement in
+        the barge-in detector (600ms while audible), which distinguishes a
+        person from an echo without silencing the microphone at all.
+        NEVER raises."""
+        from backend.audio.streaming_synthesis import (
+            AdaptiveJitterBuffer, piped_say, stitch_zero_crossing,
+        )
+
+        spoken: List[str] = []
+        rate = int(os.getenv("JARVIS_TTS_STREAM_RATE", "22050"))
+        buf = AdaptiveJitterBuffer(sample_rate=rate)
+        voice_args = self._persona_say_args()
+
+        async def _tokens_to_text() -> str:
+            parts = []
+            async for tok in token_stream:
+                if cancel_event.is_set():
+                    break
+                parts.append(tok)
+            return "".join(parts)
+
+        text = (await _tokens_to_text()).strip()
+        if not text:
+            return ""
+        spoken.append(text)
+
+        async def _chunks():
+            pending: List[np.ndarray] = []
+            async for piece in piped_say(
+                text, voice_args=voice_args, sample_rate=rate,
+                cancel=cancel_event,
+            ):
+                if cancel_event.is_set():
+                    return
+                buf.offer(piece)
+                if buf.ready():
+                    got = buf.drain()
+                    if got:
+                        # Seams between reads are sample-continuous within one
+                        # synthesis, but the stitcher is cheap and covers the
+                        # case where a read straddles a `say` flush boundary.
+                        pending.append(stitch_zero_crossing(got, sample_rate=rate))
+                        out, pending = pending, []
+                        for blob in out:
+                            if cancel_event.is_set():
+                                return
+                            yield blob
+            buf.mark_producer_done()
+            tail = buf.drain()
+            if tail and not cancel_event.is_set():
+                yield stitch_zero_crossing(tail, sample_rate=rate)
+
+        try:
+            await self._audio_bus.play_stream(
+                _chunks(), rate, cancel=cancel_event,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (RuntimeError, OSError, ValueError) as exc:
+            logger.warning("[ConvPipeline] streamed playback failed: %r", exc)
+            return ""
+        finally:
+            if cancel_event.is_set():
+                # Queued audio is already committed and would keep playing
+                # past the interrupt.
+                try:
+                    self._audio_bus.flush_playback()
+                except (RuntimeError, OSError):
+                    pass
+        return " ".join(spoken)
+
+    def _persona_say_args(self) -> List[str]:
+        """`say` voice/rate flags for the bound persona, or none.
+
+        DRY: the persona resolver owns identity and already knows to omit
+        ``-v`` for the system default."""
+        try:
+            from backend.voice.agent_persona import active_persona, resolve_profile
+
+            persona = active_persona()
+            if persona is None:
+                return []
+            profile = resolve_profile(persona)
+            return list(profile.as_say_args()) if profile else []
+        except (ImportError, AttributeError):
+            return []
 
     async def _speak_sentence(
         self, sentence: str, cancel_event: asyncio.Event
