@@ -410,6 +410,52 @@ class AttachUI:
             pass
 
 
+def _maybe_summon_audio_plane(client: Any, cmd: str) -> None:
+    """Ensure an audio plane exists, without blocking the input loop.
+
+    Schedules the reflex on the running loop and re-sends the arming verb once
+    the supervisor is listening — the first send raced the boot and was
+    answered by nobody. A no-op when a supervisor is already up (the reflex
+    probes before it spawns), and entirely inert with no running loop.
+    NEVER raises: a cockpit that cannot summon audio is still a cockpit."""
+    try:
+        # Local imports: this module imports asyncio per-function (see the
+        # existing pattern) and has no module-level logger.
+        import asyncio as _aio
+        import logging as _logging
+
+        from backend.core.ouroboros.cli.audio_daemon_reflex import (
+            ensure_audio_daemon, reflex_enabled,
+        )
+        _log = _logging.getLogger(__name__)
+        if not reflex_enabled():
+            return
+        try:
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _summon() -> None:
+            try:
+                available, reason = await ensure_audio_daemon()
+                if available and reason == "spawned":
+                    # Re-arm: the original verb was sent before anything was
+                    # listening for it.
+                    try:
+                        client.send_audio(cmd)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _log.info("[ov] audio plane summoned (%s)", reason)
+                elif not available:
+                    _log.info("[ov] audio plane unavailable (%s)", reason)
+            except Exception:  # noqa: BLE001
+                pass
+
+        loop.create_task(_summon())
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
     """THE one operator-line router — shared by the legacy split-plane loop AND
     the Bipartite cockpit (DRY: verbs behave identically on both surfaces).
@@ -436,6 +482,19 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
         }
         cmd = audio_verbs.get(low)
         if cmd is not None:
+            # AUTO-SPAWN REFLEX. `ov` boots ouroboros_battle_test.py, which has
+            # no audio pipeline; the mic lives in unified_supervisor.py. Arming
+            # verbs therefore had nothing to arm unless a supervisor happened
+            # to be running.
+            #
+            # `ov` stays a thin IPC relayer — it does NOT import the audio
+            # pipeline and never touches CoreAudio. It just starts the process
+            # that OWNS the hardware, then relays the verb over the existing
+            # UDS. Fire-and-forget so the input loop never stalls behind a
+            # 98K-line kernel boot; the verb is relayed either way, so a
+            # supervisor that is already live behaves exactly as before.
+            if cmd in ("wake", "force_wake"):
+                _maybe_summon_audio_plane(client, cmd)
             client.send_audio(cmd)
             return "handled"
         if text:
