@@ -80,11 +80,11 @@ def master_on(monkeypatch):
 # are SYNTHETIC strings matching the regex shape; they are NOT
 # real credentials.
 _FAKE_OPENAI = "sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-_FAKE_SLACK = "xoxb-aaaaaaaaaa"
-_FAKE_AWS = "AKIAIOSFODNN7EXAMPLE"  # 16 chars after AKIA
+_FAKE_SLACK = "xoxb-aaaaaaaaaa"  # pragma: allowlist secret
+_FAKE_AWS = "AKIAIOSFODNN7EXAMPLE"  # 16 chars after AKIA  # pragma: allowlist secret
 _FAKE_GITHUB = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _FAKE_PRIVATE_KEY = (
-    "-----BEGIN RSA PRIVATE KEY-----\nABCDEFGH\n"
+    "-----BEGIN RSA PRIVATE KEY-----\nABCDEFGH\n"  # pragma: allowlist secret
     "-----END RSA PRIVATE KEY-----"
 )
 

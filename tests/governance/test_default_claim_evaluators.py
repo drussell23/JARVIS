@@ -265,7 +265,7 @@ def test_no_new_credentials_secret_value_never_echoed() -> None:
     # Defensive: the actual secret must NEVER appear in the verdict
     # reason — only the pattern + offset. Otherwise the verdict log
     # leaks the secret operators just tried to keep out.
-    secret = "sk-VerySecretValueDoNotLeakIt-1234567890"
+    secret = "sk-VerySecretValueDoNotLeakIt-1234567890"  # pragma: allowlist secret
     v = _eval_no_new_credential_shapes(
         _prop("no_new_credential_shapes"), {"diff_text": f"key = '{secret}'"},
     )

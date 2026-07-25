@@ -155,7 +155,7 @@ async def test_reject_credential_shape_introduced(tmp_path: Path) -> None:
         "    return {}\n"
     )
     new = (
-        "def load_config():\n"
+        "def load_config():\n"  # pragma: allowlist secret
         "    return {\n"
         "        'api_key': 'sk-1234567890abcdefghijklmnopqrstuvwxyz',\n"
         "    }\n"

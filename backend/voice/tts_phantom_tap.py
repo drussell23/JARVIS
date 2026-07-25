@@ -47,6 +47,8 @@ import os
 import time
 from typing import Any, AsyncIterator, Callable, List, Optional, Sequence
 
+from backend.voice.audio_decoders import decode_file_blocking, rms_envelope
+
 logger = logging.getLogger(__name__)
 
 #: Envelope framerate. Matches the UI pump's publish cap so the visual cadence
@@ -73,59 +75,18 @@ def _fps() -> float:
 
 
 def _decode_samples(path: str) -> tuple:
-    """``(samples, sample_rate)`` as a mono float list in -1..1, or ``([], 0)``.
+    """``(samples, sample_rate)`` via the adaptive decoder, or ``([], 0)``.
 
-    Tries progressively more available backends. ``say -o`` emits AIFF by
-    default; the invocation is NOT altered to suit this reader, because changing
-    a working TTS command line to make a visualizer easier is the wrong
-    direction of dependency."""
-    # 1) soundfile — handles AIFF/WAV/CAF uniformly when present.
-    try:
-        import soundfile as sf  # type: ignore
-        data, sr = sf.read(path, dtype="float32", always_2d=True)
-        return ([float(f[0]) for f in data], int(sr))
-    except Exception:  # noqa: BLE001
-        pass
-    # 2) stdlib aifc (deprecated in 3.11, gone in 3.13 — hence the guard).
-    try:
-        import aifc  # type: ignore
-        import audioop  # type: ignore
-        with aifc.open(path, "rb") as fh:  # type: ignore[attr-defined]
-            sr = int(fh.getframerate())
-            width = int(fh.getsampwidth())
-            ch = int(fh.getnchannels())
-            raw = fh.readframes(fh.getnframes())
-        if ch > 1:
-            raw = audioop.tomono(raw, width, 0.5, 0.5)
-        scale = float(1 << (8 * width - 1))
-        import array as _array
-        code = {1: "b", 2: "h", 4: "i"}.get(width)
-        if code is None:
-            return ([], 0)
-        arr = _array.array(code)
-        arr.frombytes(raw[: len(raw) - (len(raw) % arr.itemsize)])
-        return ([s / scale for s in arr], sr)
-    except Exception:  # noqa: BLE001
-        pass
-    # 3) stdlib wave, for a WAV-shaped file.
-    try:
-        import array as _array
-        import wave
-        with wave.open(path, "rb") as fh:
-            sr = int(fh.getframerate())
-            width = int(fh.getsampwidth())
-            ch = int(fh.getnchannels())
-            raw = fh.readframes(fh.getnframes())
-        code = {1: "b", 2: "h", 4: "i"}.get(width)
-        if code is None:
-            return ([], 0)
-        arr = _array.array(code)
-        arr.frombytes(raw[: len(raw) - (len(raw) % arr.itemsize)])
-        vals = list(arr)[::ch] if ch > 1 else list(arr)
-        scale = float(1 << (8 * width - 1))
-        return ([v / scale for v in vals], sr)
-    except Exception:  # noqa: BLE001
+    Delegates to :mod:`backend.voice.audio_decoders`, which routes on the
+    file's MAGIC NUMBER (not its extension) to whichever backend the host
+    actually has. The previous implementation reached for stdlib ``aifc`` +
+    ``audioop``; both are DELETED in Python 3.13 (PEP 594), so the visualizer
+    carried an expiry date. The native PCM strategy has no dependency and no
+    removal horizon."""
+    out = decode_file_blocking(path)
+    if not out:
         return ([], 0)
+    return out
 
 
 def extract_envelope_blocking(
@@ -139,17 +100,7 @@ def extract_envelope_blocking(
         samples, sr = _decode_samples(path)
         if not samples or sr <= 0:
             return []
-        step = max(1, int(sr / rate))
-        out: List[float] = []
-        for i in range(0, len(samples), step):
-            window = samples[i:i + step]
-            if not window:
-                break
-            total = 0.0
-            for s in window:
-                total += s * s
-            out.append(math.sqrt(total / len(window)))
-        return out
+        return rms_envelope(samples, sr, rate)
     except Exception:  # noqa: BLE001
         return []
 

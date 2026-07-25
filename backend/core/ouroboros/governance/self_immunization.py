@@ -531,7 +531,7 @@ def master_enabled() -> bool:
 # reference them continue to import without breaking.  They contain the
 # same combined source — both alias _CANARY_COMBINED_SOURCE.
 _CANARY_COMBINED_SOURCE: str = (
-    "from backend.core.ouroboros.governance.phase_runner"
+    "from backend.core.ouroboros.governance.phase_runner"  # pragma: allowlist secret
     " import PhaseRunner, PhaseResult\n"
     "from backend.core.ouroboros.governance.op_context"
     " import OperationContext\n"

@@ -265,7 +265,7 @@ def test_credential_shape_api_key_assignment(guard):
 
 def test_credential_shape_silent_when_preexisting(guard):
     """Don't flag credentials that already existed in the old content."""
-    cred = "ghp_abcdefghijklmnop0123456789ABCDEFGHIJ"
+    cred = "ghp_abcdefghijklmnop0123456789ABCDEFGHIJ"  # pragma: allowlist secret
     old = f"TOKEN = '{cred}'\n"
     new = f"TOKEN = '{cred}'\nX = 1\n"
     findings = guard.inspect(
@@ -278,7 +278,7 @@ def test_credential_shape_silent_when_preexisting(guard):
 
 def test_credential_shape_private_key_header(guard):
     new = (
-        "KEY = '''-----BEGIN RSA PRIVATE KEY-----\n"
+        "KEY = '''-----BEGIN RSA PRIVATE KEY-----\n"  # pragma: allowlist secret
         "MIIEpAIBAAKCAQEA...\n"
         "-----END RSA PRIVATE KEY-----'''\n"
     )

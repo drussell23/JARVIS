@@ -19,7 +19,7 @@ def test_scanner_flags_and_redactor_removes_credential(monkeypatch):
     from backend.core.ouroboros.governance.conversation_bridge import redact_secrets
 
     monkeypatch.setenv("JARVIS_MCP_OUTPUT_SCANNER_ENABLED", "1")
-    leaky = "here is the key AKIAIOSFODNN7EXAMPLE you asked for"
+    leaky = "here is the key AKIAIOSFODNN7EXAMPLE you asked for"  # pragma: allowlist secret
     report = scan_mcp_output(leaky, source_label="mcp_github_search")
     assert report.verdict == McpScanVerdict.CREDENTIAL_FOUND
     assert len(report.findings) >= 1

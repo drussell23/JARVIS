@@ -169,7 +169,7 @@ def test_redaction_private_key_block(monkeypatch):
     # the regex matches without anchoring to line starts.
     key_body = "A" * 80
     raw = (
-        f"-----BEGIN RSA PRIVATE KEY-----{key_body}-----END RSA PRIVATE KEY-----"
+        f"-----BEGIN RSA PRIVATE KEY-----{key_body}-----END RSA PRIVATE KEY-----"  # pragma: allowlist secret
     )
     bridge.record_turn("user", raw)
     snap = bridge.snapshot()

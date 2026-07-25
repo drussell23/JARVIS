@@ -169,87 +169,22 @@ jobs:
 
       - name: Check for Sensitive Data Exposure
         run: |
-          python3 << 'EOF'
-          import re
-          import sys
-          from pathlib import Path
+          # AST + Shannon-entropy scanner. Replaces the previous raw-text grep,
+          # which produced 8 permanent false positives on main (docstrings,
+          # enum members, env-var NAME constants, a log placeholder, and code
+          # that correctly reads a key from .env) and zero true positives.
+          # A permanently-red check is worse than no check: it trains everyone
+          # to ignore it, so a real leak lands camouflaged.
+          #
+          # Detector strength is pinned adversarially by
+          # tests/security/test_adversarial_secrets.py — 13 structurally valid
+          # fake secrets that must ALL still be flagged.
+          python3 .github/scripts/scan_secrets.py --root .
 
-          print("\n🔐 Checking for sensitive data exposure...")
-
-          sensitive_patterns = {
-              'API Keys': r'api[_-]?key\s*=\s*["\'][^"\']{20,}["\']',
-              'Passwords': r'password\s*=\s*["\'][^"\']+["\']',
-              'Tokens': r'token\s*=\s*["\'][^"\']{20,}["\']',
-              'Secrets': r'secret\s*=\s*["\'][^"\']{20,}["\']',
-              'Private Keys': r'-----BEGIN (RSA |)PRIVATE KEY-----',
-              'AWS Keys': r'AKIA[0-9A-Z]{16}',
-              'GCP Keys': r'AIza[0-9A-Za-z-_]{35}',
-          }
-
-          issues = []
-          files_to_check = []
-
-          # Check Python files
-          files_to_check.extend(Path(".").glob("**/*.py"))
-          files_to_check.extend(Path(".").glob("**/*.js"))
-          files_to_check.extend(Path(".").glob("**/*.ts"))
-          files_to_check.extend(Path(".").glob("**/*.env*"))
-
-          # Filter out venv, node_modules, and safe files
-          files_to_check = [
-              f for f in files_to_check
-              if "venv" not in str(f)
-              and "node_modules" not in str(f)
-              and "site-packages" not in str(f)
-              and str(f) != ".env.example"  # .env.example is allowed
-              and "test" not in str(f).lower()  # Exclude test files
-              and "diagnose" not in str(f).lower()  # Exclude diagnostic scripts
-              and "verify" not in str(f).lower()  # Exclude verification scripts
-              and ".github/workflows/scripts/" not in str(f)  # Exclude workflow scripts
-          ]
-
-          for file_path in files_to_check:
-              try:
-                  content = file_path.read_text()
-
-                  for issue_type, pattern in sensitive_patterns.items():
-                      matches = re.finditer(pattern, content, re.IGNORECASE)
-                      for match in matches:
-                          # Skip if it's using environment variables or in safe contexts
-                          line = content[max(0, match.start() - 100):match.end() + 100]
-
-                          # Skip if using env vars
-                          if "os.getenv" in line or "process.env" in line or "ENV[" in line:
-                              continue
-
-                          # Skip if it's a test variable
-                          if "test_password" in line.lower() or "test_api_key" in line.lower():
-                              continue
-
-                          # Skip if checking for env var presence (not actual value)
-                          if 'in content' in line or 'ANTHROPIC_API_KEY=' in line or 'echo' in line:
-                              continue
-
-                          issues.append({
-                              'file': str(file_path),
-                              'type': issue_type,
-                              'line': content[:match.start()].count('\n') + 1
-                          })
-
-              except Exception:
-                  pass
-
-          if issues:
-              print(f"\n⚠️  POTENTIAL SENSITIVE DATA EXPOSURE DETECTED!\n")
-              for issue in issues:
-                  print(f"   ❌ {issue['type']} in {issue['file']}:{issue['line']}")
-
-              print(f"\n❌ Found {len(issues)} potential issue(s)")
-              print("   Please ensure these are using environment variables!")
-              sys.exit(1)
-          else:
-              print("✅ No hardcoded sensitive data detected!")
-          EOF
+      - name: Prove the scanner is still lethal (adversarial canary)
+        run: |
+          pip install pytest --quiet
+          python3 -m pytest tests/security/test_adversarial_secrets.py -q
 
       - name: Validate Required Environment Variables
         run: |

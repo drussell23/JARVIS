@@ -247,7 +247,7 @@ async def test_review_credential_pattern_forces_reject(
 ) -> None:
     """Credential shape introduced → forced REJECT regardless of score."""
     pre = "def config():\n    return {}\n"
-    new = 'def config():\n    return {"api_key": "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJK_uvwxyz0123456789"}\n'
+    new = 'def config():\n    return {"api_key": "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJK_uvwxyz0123456789"}\n'  # pragma: allowlist secret
     reviewer = AgenticReviewSubagent(project_root=tmp_path)
     ctx = _make_ctx_with_candidate(pre=pre, new=new, tmp_path=tmp_path)
     result = await reviewer.review(ctx)
