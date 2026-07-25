@@ -171,6 +171,20 @@ class AudioPlaneHost:
         #
         # setdefault, not assignment: an operator who has explicitly closed
         # admission keeps it closed.
+        # WHOSE ears and whose mouth this process is. Bound BEFORE the
+        # pipeline is wired, because TTS engines resolve their voice at
+        # construction: bind it afterwards and the singleton is already
+        # holding JARVIS's voice.
+        #
+        # This host is the `ov` cockpit's audio plane, and `ov` is O+V —
+        # Karen. Without the declaration, MacOSVoice's British-first selector
+        # answered for every agent alike and this cockpit spoke as Daniel.
+        try:
+            from backend.voice.agent_persona import AgentPersona, bind_persona
+            bind_persona(AgentPersona.KAREN)
+        except Exception:  # noqa: BLE001 — a nameless voice still speaks
+            logger.debug("[AudioPlane] persona bind degraded", exc_info=True)
+
         os.environ.setdefault("JARVIS_ASR_ADMISSION_OPEN", "1")
 
         # Warm the voice lane NOW, not at the first turn. This host is

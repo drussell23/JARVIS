@@ -11,6 +11,58 @@ import queue
 import time
 from typing import Optional, List, Dict
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+class TTSGenerationError(RuntimeError):
+    """Synthesis produced no usable audio.
+
+    Raised INSTEAD of playing, because silence and success are
+    indistinguishable to a caller once a 0-byte file reaches the player."""
+
+
+def _min_synthesis_bytes() -> int:
+    """Floor below which a synthesized AIFF cannot contain speech.
+
+    An AIFF header alone is ~50 bytes and the shortest real utterance is
+    thousands, so 1KB separates "a header and nothing else" from "someone
+    said something" without being anywhere near a real utterance."""
+    try:
+        return max(1, int(os.getenv("JARVIS_TTS_MIN_BYTES", "1024")))
+    except (TypeError, ValueError):
+        return 1024
+
+
+def _validate_synthesized_audio(path: str, text: str, returncode: object = None) -> None:
+    """Raise :class:`TTSGenerationError` unless *path* holds real audio.
+
+    Checked in order of how much they explain: a missing file (say never
+    wrote), an empty file (say opened and died), a runt file (header only).
+    The message names the size and the voice, because "TTS failed" sends the
+    next person back to the same subprocess this check was added to see into.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise TTSGenerationError(
+            f"synthesis produced no file at {path} (say rc={returncode}): {exc}"
+        ) from exc
+
+    if size == 0:
+        raise TTSGenerationError(
+            f"synthesis produced a 0-byte file (say rc={returncode}) for "
+            f"{len(text)} chars — afplay would have played this as silence "
+            f"and exited successfully"
+        )
+    floor = _min_synthesis_bytes()
+    if size < floor:
+        raise TTSGenerationError(
+            f"synthesis produced {size}B, below the {floor}B floor "
+            f"(say rc={returncode}) — a header with no audio behind it"
+        )
+
+
 class MacOSVoice:
     """Enhanced TTS using macOS 'say' command with professional features"""
     
@@ -21,8 +73,14 @@ class MacOSVoice:
         # Find British voices (prioritized)
         self.british_voices = self._find_british_voices()
 
-        # Select primary voice
-        self.primary_voice = self._select_best_voice()
+        # Select primary voice — PERSONA FIRST.
+        #
+        # The generic selector below prefers British voices, which is JARVIS's
+        # identity, and it had no idea which agent it was speaking for. Every
+        # process that mounted TTS therefore spoke as Daniel, including the
+        # `ov` cockpit, which is Karen's. A persona bound for this process now
+        # decides; the legacy selector remains the answer when nobody said.
+        self.primary_voice = self._persona_voice() or self._select_best_voice()
 
         # Speech settings
         self.rate = 175  # Words per minute (slightly faster for JARVIS)
@@ -89,6 +147,24 @@ class MacOSVoice:
         
         return british_voices
     
+    def _persona_voice(self) -> Optional[str]:
+        """Voice for the persona bound to this process, or None. NEVER raises."""
+        try:
+            from backend.voice.agent_persona import active_persona, resolve_profile
+            persona = active_persona()
+            if persona is None:
+                return None
+            profile = resolve_profile(persona)
+            if profile is None:
+                return None
+            logger.info(
+                "[MacOSVoice] persona=%s voice=%s (%s)",
+                persona.value, profile.voice, profile.source,
+            )
+            return profile.voice
+        except Exception:  # noqa: BLE001
+            return None
+
     def _select_best_voice(self) -> str:
         """Select the best available voice for JARVIS"""
         # Try British voices first
@@ -207,6 +283,21 @@ class MacOSVoice:
             finally:
                 if self._current_say_process is proc:
                     self._current_say_process = None
+
+            # ── ZERO-BYTE GUARD: prove synthesis happened ────────────────
+            # `say -o` can fail and still leave the temp file behind — an
+            # unknown voice name, a memory spike on unified memory, a killed
+            # subprocess. afplay then plays a 0-byte AIFF perfectly happily
+            # and exits 0. The result is SILENCE THAT REPORTS SUCCESS: no
+            # exception, no error log, no fallback, and an operator who hears
+            # nothing with nothing to read.
+            #
+            # A file is the only evidence that synthesis produced audio, so
+            # it is checked before anything is asked to play it. Below the
+            # floor this raises instead of playing, because a caller that
+            # knows synthesis failed can retry or fall back, while a caller
+            # handed silence cannot tell it apart from success.
+            _validate_synthesized_audio(_temp_path, processed_text, proc.returncode)
 
             # v283.0: Always use afplay (native, no GIL dependency).
             # AudioBus.play_audio() routes through PortAudio callback

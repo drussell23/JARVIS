@@ -435,13 +435,30 @@ class AdaptiveVoiceRouter:
 
     # -- observability ---------------------------------------------------
 
+    @property
+    def persona(self) -> Any:
+        """Which agent this router speaks for, if the process declared one.
+
+        Read rather than stored: the router is built during pipeline wiring
+        and the persona is bound at host boot, so capturing it at __init__
+        would freeze whichever order happened to win. Advisory — the router
+        multiplexes GENERATION; the persona decides RENDERING, and neither
+        needs to own the other."""
+        try:
+            from backend.voice.agent_persona import active_persona
+            return active_persona()
+        except Exception:  # noqa: BLE001
+            return None
+
     def status(self) -> Dict[str, Any]:
         model = None
         try:
             model = self._elected_model()
         except Exception:  # noqa: BLE001
             pass
+        _persona = self.persona
         return {
+            "persona": getattr(_persona, "value", None),
             "enabled": router_enabled(),
             "remote_first": remote_first(),
             "elected_model": model,
