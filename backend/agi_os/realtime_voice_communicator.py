@@ -274,8 +274,25 @@ class RealTimeVoiceCommunicator:
                         elif voice_name in ['Daniel', 'Oliver', 'Kate', 'Serena']:
                             self._british_voices.append(voice_name)
 
-            # Prioritize Daniel
-            if 'Daniel' in self._available_voices:
+            # DISCOVERY MAY NOT OVERRIDE AN IDENTITY.
+            #
+            # This block re-ran a Daniel-first selection during __init__ and
+            # clobbered the persona voice assigned moments earlier — which is
+            # why binding KAREN produced a resolved profile of "Karen" and an
+            # instance still holding "Daniel". Two selectors, one attribute,
+            # last writer wins, and the last writer knew nothing about agents.
+            #
+            # Discovery answers "what is available and which is a sensible
+            # default"; the persona answers "who is speaking". The second
+            # question outranks the first, so an explicit persona is left
+            # alone and this stays the fallback for processes that declared
+            # none.
+            if _persona_voice_or("") :
+                logger.debug(
+                    "Voice discovery found %d voices; keeping persona voice %s",
+                    len(self._available_voices), self._primary_voice,
+                )
+            elif 'Daniel' in self._available_voices:
                 self._primary_voice = 'Daniel'
             elif self._british_voices:
                 self._primary_voice = self._british_voices[0]
@@ -285,7 +302,8 @@ class RealTimeVoiceCommunicator:
 
         except Exception as e:
             logger.warning("Failed to discover voices: %s", e)
-            self._primary_voice = 'Daniel'  # Fallback
+            # Even the error path must not steal an identity.
+            self._primary_voice = _persona_voice_or('Daniel')
 
     def register_transcript_hook(self, hook: Callable) -> None:
         """Register a hook called with each user utterance text before processing.

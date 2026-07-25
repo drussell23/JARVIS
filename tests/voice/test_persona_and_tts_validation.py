@@ -269,3 +269,47 @@ def test_no_mode_config_pins_a_voice_name():
     ).read_text(encoding="utf-8")
     assert 'VoiceModeConfig(rate=175, voice="Daniel"' not in src
     assert "voice=self._primary_voice" in src
+
+
+def test_voice_discovery_does_not_override_the_persona(monkeypatch):
+    """THE THIRD SITE. `_discover_voices()` re-ran a Daniel-first selection
+    during __init__ and clobbered the persona voice assigned moments earlier —
+    two selectors writing one attribute, last writer wins, and the last writer
+    knew nothing about agents.
+
+    Discovery answers "what is available"; the persona answers "who is
+    speaking". The second outranks the first."""
+    from backend.agi_os.realtime_voice_communicator import RealTimeVoiceCommunicator
+
+    monkeypatch.setenv("JARVIS_AGENT_PERSONA", "karen")
+    c = RealTimeVoiceCommunicator()
+    if not c._available_voices:
+        pytest.skip("no macOS voices available")
+    assert c._primary_voice == "Karen", (
+        f"discovery overrode the persona: got {c._primary_voice!r}"
+    )
+
+
+def test_every_mode_config_speaks_as_the_persona(monkeypatch):
+    """Seven configs each pinned a voice; one surviving pin is a mode that
+    silently reverts to the wrong agent mid-conversation."""
+    from backend.agi_os.realtime_voice_communicator import RealTimeVoiceCommunicator
+
+    monkeypatch.setenv("JARVIS_AGENT_PERSONA", "karen")
+    c = RealTimeVoiceCommunicator()
+    if not c._available_voices:
+        pytest.skip("no macOS voices available")
+    voices = {cfg.voice for cfg in c._mode_configs.values()}
+    assert voices == {"Karen"}, f"modes disagree on who is speaking: {voices}"
+
+
+def test_an_unbound_process_still_discovers_daniel(monkeypatch):
+    """The fallback must survive: a process with no persona keeps the
+    behaviour it had before any of this existed."""
+    from backend.agi_os.realtime_voice_communicator import RealTimeVoiceCommunicator
+
+    monkeypatch.delenv("JARVIS_AGENT_PERSONA", raising=False)
+    c = RealTimeVoiceCommunicator()
+    if not c._available_voices:
+        pytest.skip("no macOS voices available")
+    assert c._primary_voice == "Daniel"
