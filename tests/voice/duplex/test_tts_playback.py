@@ -48,7 +48,10 @@ async def test_play_calls_speak_stream_with_cancel_event_and_tracks_active():
     await asyncio.sleep(0)
     assert pb.is_active is True
     assert eng.calls[0]["text"] == "Fix applied."
-    assert eng.calls[0]["source"] == "karen"
+    # The source tag carries the persona now ("karen:persona=<agent>") so a
+    # log line says WHICH agent spoke, not merely that the karen path did.
+    src = eng.calls[0]["source"]
+    assert src.split(":")[0] == "karen"
     assert eng.calls[0]["cancel_event"] is not None
     eng.finish()
     await task

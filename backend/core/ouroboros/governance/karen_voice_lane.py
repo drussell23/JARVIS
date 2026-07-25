@@ -50,6 +50,7 @@ path returns ``None`` (meaning "caller, keep your default").
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -62,6 +63,28 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 _TRUTHY = ("1", "true", "yes", "on")
+
+#: The knob namespace this module shipped with. Every reader below now takes a
+#: *prefix* so a second agent can have its own lane, and this stays the
+#: default — an operator's existing JARVIS_KAREN_VOICE_* settings keep working
+#: unchanged, and a new agent INHERITS them until it overrides one.
+#:
+#: Generalising by parameter rather than by copy is the whole point: a forked
+#: "jarvis_voice_lane.py" would duplicate the ledger, the probe, the election
+#: and the demotion path, and the copy would drift from the original the first
+#: time either was fixed.
+_LEGACY_PREFIX = "JARVIS_KAREN_VOICE"
+
+
+def _env_raw(suffix: str, prefix: str = _LEGACY_PREFIX) -> str:
+    """Prefixed knob, else the legacy one. Two-level lookup so per-agent
+    settings are optional rather than mandatory duplication."""
+    val = os.environ.get(f"{prefix}_{suffix}", "").strip()
+    if val:
+        return val
+    if prefix != _LEGACY_PREFIX:
+        return os.environ.get(f"{_LEGACY_PREFIX}_{suffix}", "").strip()
+    return ""
 SCHEMA_VERSION = "karen_voice_lane.1"
 
 
@@ -84,30 +107,36 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-def voice_lane_enabled() -> bool:
+def voice_lane_enabled(*, prefix: str = _LEGACY_PREFIX) -> bool:
     """Master gate. Default ON, but inert without a ledger — an unprobed
     system resolves to ``None`` and keeps the caller's existing default."""
-    return os.environ.get(
-        "JARVIS_KAREN_VOICE_LANE_ENABLED", "true",
-    ).strip().lower() in _TRUTHY
+    return (_env_raw("LANE_ENABLED", prefix) or "true").lower() in _TRUTHY
 
 
-def spoken_ttft_budget_s() -> float:
+def spoken_ttft_budget_s(*, prefix: str = _LEGACY_PREFIX) -> float:
     """The conversational floor: how long a human tolerates before a reply
     starts. ~1.5s is a beat of natural silence; past that the operator starts
     wondering whether the mic heard them. Not a performance target — an
     ADMISSION threshold: a model over it is disqualified from speech, however
     good its prose."""
-    return max(0.1, _env_float("JARVIS_KAREN_VOICE_TTFT_BUDGET_S", 1.5))
+    raw = _env_raw("TTFT_BUDGET_S", prefix)
+    try:
+        return max(0.1, float(raw)) if raw else 1.5
+    except (TypeError, ValueError):
+        return 1.5
 
 
-def ledger_ttl_s() -> float:
+def ledger_ttl_s(*, prefix: str = _LEGACY_PREFIX) -> float:
     """How long a measurement is trusted. Long enough not to re-probe every
     boot, short enough to notice a cluster that has been rebalanced."""
-    return max(60.0, _env_float("JARVIS_KAREN_VOICE_LEDGER_TTL_S", 21600.0))
+    raw = _env_raw("LEDGER_TTL_S", prefix)
+    try:
+        return max(60.0, float(raw)) if raw else 21600.0
+    except (TypeError, ValueError):
+        return 21600.0
 
 
-def spoken_ttft_hard_cap_s() -> float:
+def spoken_ttft_hard_cap_s(*, prefix: str = _LEGACY_PREFIX) -> float:
     """The line past which a voice is unusable, full stop.
 
     Distinct from the BUDGET, which is a preference: prefer a model that
@@ -116,10 +145,14 @@ def spoken_ttft_hard_cap_s() -> float:
     earlier — electing nobody means a remote-only host answers a heard
     utterance with silence. A voice that starts in 2.5s is degraded; no voice
     is broken. Above THIS cap, silence really is better."""
-    return max(1.0, _env_float("JARVIS_KAREN_VOICE_TTFT_HARD_CAP_S", 6.0))
+    raw = _env_raw("TTFT_HARD_CAP_S", prefix)
+    try:
+        return max(1.0, float(raw)) if raw else 6.0
+    except (TypeError, ValueError):
+        return 6.0
 
 
-def transport_failure_ttl_s() -> float:
+def transport_failure_ttl_s(*, prefix: str = _LEGACY_PREFIX) -> float:
     """How long a TRANSPORT failure is trusted — much shorter, on purpose.
 
     A probe that ends in a DNS error, a refused connection or a reset says
@@ -129,10 +162,14 @@ def transport_failure_ttl_s() -> float:
     "freshly measured as silent" for six hours, so the lane resolved None,
     the remote-only host had no engine, and Karen answered a heard utterance
     with nothing at all."""
-    return max(5.0, _env_float("JARVIS_KAREN_VOICE_FAILURE_TTL_S", 120.0))
+    raw = _env_raw("FAILURE_TTL_S", prefix)
+    try:
+        return max(5.0, float(raw)) if raw else 120.0
+    except (TypeError, ValueError):
+        return 120.0
 
 
-def max_probe_candidates() -> int:
+def max_probe_candidates(*, prefix: str = _LEGACY_PREFIX) -> int:
     """Ceiling on how many models ONE refresh may probe. Each probe is a real
     (tiny) generation, so this bounds spend explicitly rather than trusting the
     catalog to stay small.
@@ -141,27 +178,38 @@ def max_probe_candidates() -> int:
     the outcome, so the next refresh skips it and walks further down the
     ranking. A cold 26-model catalog therefore converges over a handful of
     refreshes instead of demanding one expensive sweep."""
-    return max(1, _env_int("JARVIS_KAREN_VOICE_MAX_CANDIDATES", 8))
+    raw = _env_raw("MAX_CANDIDATES", prefix)
+    try:
+        return max(1, int(raw)) if raw else 8
+    except (TypeError, ValueError):
+        return 8
 
 
-def probe_max_tokens() -> int:
+def probe_max_tokens(*, prefix: str = _LEGACY_PREFIX) -> int:
     """Deliberately voice-sized. A generous budget would let a reasoning model
     finish thinking and then speak, hiding precisely the failure mode that
     makes it unusable for conversation."""
-    return max(8, _env_int("JARVIS_KAREN_VOICE_PROBE_MAX_TOKENS", 48))
+    raw = _env_raw("PROBE_MAX_TOKENS", prefix)
+    try:
+        return max(8, int(raw)) if raw else 48
+    except (TypeError, ValueError):
+        return 48
 
 
-def ledger_path() -> Path:
-    raw = os.environ.get("JARVIS_KAREN_VOICE_LEDGER_PATH", "").strip()
+def ledger_path(*, prefix: str = _LEGACY_PREFIX, slug: str = "karen") -> Path:
+    """Per-agent ledger file. OV keeps the original filename so measurements
+    already on disk are not orphaned by the generalisation."""
+    raw = _env_raw("LEDGER_PATH", prefix)
     if raw:
         return Path(raw).expanduser()
-    return Path.cwd() / ".jarvis" / "karen_voice_lane.json"
+    name = "karen_voice_lane.json" if slug == "karen" else f"voice_lane_{slug}.json"
+    return Path.cwd() / ".jarvis" / name
 
 
-def model_override() -> str:
+def model_override(*, prefix: str = _LEGACY_PREFIX) -> str:
     """Operator's explicit choice. Always wins — measurement informs, it does
     not overrule."""
-    return os.environ.get("JARVIS_KAREN_VOICE_MODEL", "").strip()
+    return _env_raw("MODEL", prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +224,13 @@ VOICE_PROBE_SYSTEM = (
 VOICE_PROBE_USER = "Hey Karen, are you there?"
 
 
-def build_voice_probe_payload(model: str, *, max_tokens: int = 0) -> dict:
+def build_voice_probe_payload(
+    model: str,
+    *,
+    max_tokens: int = 0,
+    system: str = "",
+    user: str = "",
+) -> dict:
     """Probe body shaped like the workload it is grading.
 
     ``dw_deep_probe``'s own builders ask for a bare ``ok`` or a 150-token code
@@ -187,8 +241,8 @@ def build_voice_probe_payload(model: str, *, max_tokens: int = 0) -> dict:
     return {
         "model": model,
         "messages": [
-            {"role": "system", "content": VOICE_PROBE_SYSTEM},
-            {"role": "user", "content": VOICE_PROBE_USER},
+            {"role": "system", "content": system or VOICE_PROBE_SYSTEM},
+            {"role": "user", "content": user or VOICE_PROBE_USER},
         ],
         "max_tokens": int(max_tokens or probe_max_tokens()),
         "temperature": 0.6,
@@ -212,16 +266,30 @@ class VoiceModelRecord:
     measured_at: float
     reason: str = ""
 
+    def fits(self, prefix: str = _LEGACY_PREFIX) -> bool:
+        """Fit to hold a conversation FOR THIS LANE: it spoke, and it started
+        inside that lane's budget. Per-lane because the threshold is a
+        property of the agent's interaction style, not of the model — a
+        background agent may tolerate what a conversational one cannot."""
+        return bool(self.spoke) and 0.0 <= self.ttft_s <= spoken_ttft_budget_s(
+            prefix=prefix,
+        )
+
+    def is_usable(self, prefix: str = _LEGACY_PREFIX) -> bool:
+        """Spoke, inside the HARD cap. The degraded tier: eligible only when
+        nothing conversational exists, because a slow voice beats no voice."""
+        return bool(self.spoke) and 0.0 <= self.ttft_s <= spoken_ttft_hard_cap_s(
+            prefix=prefix,
+        )
+
     @property
     def conversational(self) -> bool:
-        """Fit to hold a conversation: it spoke, and it started in time."""
-        return bool(self.spoke) and 0.0 <= self.ttft_s <= spoken_ttft_budget_s()
+        """Default-lane convenience for existing callers."""
+        return self.fits()
 
     @property
     def usable(self) -> bool:
-        """Spoke, inside the HARD cap. The degraded tier: eligible only when
-        nothing conversational exists, because a slow voice beats no voice."""
-        return bool(self.spoke) and 0.0 <= self.ttft_s <= spoken_ttft_hard_cap_s()
+        return self.is_usable()
 
     @property
     def transport_failure(self) -> bool:
@@ -231,15 +299,21 @@ class VoiceModelRecord:
         r = self.reason or ""
         return r.startswith("probe_error:") or r.startswith("dispatch_error:")
 
-    def fresh(self, *, now: Optional[float] = None, ttl_s: Optional[float] = None) -> bool:
+    def fresh(
+        self,
+        *,
+        now: Optional[float] = None,
+        ttl_s: Optional[float] = None,
+        prefix: str = _LEGACY_PREFIX,
+    ) -> bool:
         t = time.time() if now is None else float(now)
         if ttl_s is None:
             # Transport faults expire fast: they describe the network at one
             # instant, and treating them as model verdicts poisons the lane
             # for the full TTL (the 2026-07-25 silent-Karen class).
             ttl = (
-                transport_failure_ttl_s() if self.transport_failure
-                else ledger_ttl_s()
+                transport_failure_ttl_s(prefix=prefix) if self.transport_failure
+                else ledger_ttl_s(prefix=prefix)
             )
         else:
             ttl = float(ttl_s)
@@ -254,8 +328,11 @@ class VoiceLatencyLedger:
     measurement of a model always supersedes an older one, and cross-process
     interleaving costs at most one re-probe."""
 
-    def __init__(self, path: Optional[Path] = None) -> None:
-        self._path = Path(path) if path is not None else ledger_path()
+    def __init__(
+        self, path: Optional[Path] = None, *, prefix: str = _LEGACY_PREFIX,
+    ) -> None:
+        self._prefix = prefix
+        self._path = Path(path) if path is not None else ledger_path(prefix=prefix)
         self._records: Dict[str, VoiceModelRecord] = {}
         self._loaded = False
 
@@ -335,19 +412,22 @@ class VoiceLatencyLedger:
         Ties break on model id so two cockpits booted together converge on the
         same voice instead of drifting apart on dict ordering."""
         self._ensure()
-        fresh = [r for r in self._records.values() if r.fresh(now=now)]
+        fresh = [
+            r for r in self._records.values()
+            if r.fresh(now=now, prefix=self._prefix)
+        ]
         # Tier 1: within the conversational budget — the preference.
-        fit = [r for r in fresh if r.conversational]
+        fit = [r for r in fresh if r.fits(self._prefix)]
         # Tier 2: spoke, within the hard cap — degraded, but a voice. Only
         # consulted when tier 1 is empty, so a fast model always wins outright
         # and the degraded tier cannot drag the election down.
         if not fit:
-            fit = [r for r in fresh if r.usable]
+            fit = [r for r in fresh if r.is_usable(self._prefix)]
             if fit:
                 logger.info(
                     "[VoiceLane] no candidate inside the %.1fs budget — "
                     "electing the fastest usable voice instead (degraded "
-                    "beats silent)", spoken_ttft_budget_s(),
+                    "beats silent)", spoken_ttft_budget_s(prefix=self._prefix),
                 )
         if not fit:
             return None
@@ -361,7 +441,7 @@ class VoiceLatencyLedger:
         out = []
         for m in models:
             rec = self._records.get(m)
-            if rec is None or not rec.fresh(now=now):
+            if rec is None or not rec.fresh(now=now, prefix=self._prefix):
                 out.append(m)
         return out
 
@@ -463,6 +543,9 @@ async def probe_voice_model(
     *,
     dispatch_fn: Optional[Callable[[dict], Any]] = None,
     budget_s: Optional[float] = None,
+    prefix: str = _LEGACY_PREFIX,
+    system: str = "",
+    user: str = "",
 ) -> VoiceModelRecord:
     """Measure one model's fitness to speak. NEVER raises.
 
@@ -470,7 +553,9 @@ async def probe_voice_model(
     ``deep_probe`` and supplies only what is voice-specific: the spoken payload
     and the interpretation. ``tokens == 0`` is the reasoning-model verdict —
     the model answered, but said nothing aloud."""
-    budget = spoken_ttft_budget_s() if budget_s is None else float(budget_s)
+    budget = (
+        spoken_ttft_budget_s(prefix=prefix) if budget_s is None else float(budget_s)
+    )
     try:
         from backend.core.ouroboros.governance.dw_deep_probe import (
             _default_dw_stream_dispatch, deep_probe,
@@ -483,8 +568,14 @@ async def probe_voice_model(
         result = await deep_probe(
             dispatch_fn=dispatch,
             model=model,
-            max_tokens=probe_max_tokens(),
-            payload_builder=build_voice_probe_payload,
+            max_tokens=probe_max_tokens(prefix=prefix),
+            # Bound to THIS agent's identity: a probe that always asks "Hey
+            # Karen, are you there?" would grade every agent's model against
+            # one persona's prompt, and prompt length is part of what TTFT
+            # measures.
+            payload_builder=functools.partial(
+                build_voice_probe_payload, system=system, user=user,
+            ),
         )
         spoke = int(getattr(result, "tokens", 0) or 0) > 0
         ttft = float(getattr(result, "ttft_s", -1.0))
@@ -499,7 +590,7 @@ async def probe_voice_model(
                 if not spoke
                 else (
                     "ok" if ttft <= budget
-                    else "slow" if ttft <= spoken_ttft_hard_cap_s()
+                    else "slow" if ttft <= spoken_ttft_hard_cap_s(prefix=prefix)
                     else "too_slow_for_speech"
                 )
             ),
@@ -517,6 +608,9 @@ async def refresh_voice_lane(
     dispatch_fn: Optional[Callable[[dict], Any]] = None,
     ledger: Optional[VoiceLatencyLedger] = None,
     force: bool = False,
+    prefix: str = _LEGACY_PREFIX,
+    probe_system: str = "",
+    probe_user: str = "",
 ) -> Optional[str]:
     """Probe the stale candidates concurrently and return the elected model.
 
@@ -524,7 +618,7 @@ async def refresh_voice_lane(
     would take as long as the sum of the slowest — including the 20s+ models
     it exists to disqualify. NEVER raises; returns ``None`` when nothing
     qualifies, which leaves the caller's default in place."""
-    if not voice_lane_enabled():
+    if not voice_lane_enabled(prefix=prefix):
         return None
     led = ledger if ledger is not None else get_default_ledger()
     try:
@@ -532,11 +626,17 @@ async def refresh_voice_lane(
         if not cands:
             return led.best()
         todo = (cands if force else led.stale_or_unknown(cands))[
-            : max_probe_candidates()
+            : max_probe_candidates(prefix=prefix)
         ]
         if todo:
             results = await asyncio.gather(
-                *(probe_voice_model(m, dispatch_fn=dispatch_fn) for m in todo),
+                *(
+                    probe_voice_model(
+                        m, dispatch_fn=dispatch_fn, prefix=prefix,
+                        system=probe_system, user=probe_user,
+                    )
+                    for m in todo
+                ),
                 return_exceptions=True,
             )
             for rec in results:
@@ -561,7 +661,11 @@ async def refresh_voice_lane(
 # ---------------------------------------------------------------------------
 
 
-def resolve_voice_model(*, ledger: Optional[VoiceLatencyLedger] = None) -> Optional[str]:
+def resolve_voice_model(
+    *,
+    ledger: Optional[VoiceLatencyLedger] = None,
+    prefix: str = _LEGACY_PREFIX,
+) -> Optional[str]:
     """The DW model Karen should SPEAK through, or ``None``.
 
     Synchronous and allocation-cheap by contract: this sits on the turn path,
@@ -572,10 +676,10 @@ def resolve_voice_model(*, ledger: Optional[VoiceLatencyLedger] = None) -> Optio
     default". Returning a guess instead would trade a known-slow voice for an
     unknown one. NEVER raises."""
     try:
-        override = model_override()
+        override = model_override(prefix=prefix)
         if override:
             return override
-        if not voice_lane_enabled():
+        if not voice_lane_enabled(prefix=prefix):
             return None
         return (ledger if ledger is not None else get_default_ledger()).best()
     except Exception:  # noqa: BLE001
@@ -583,10 +687,17 @@ def resolve_voice_model(*, ledger: Optional[VoiceLatencyLedger] = None) -> Optio
 
 
 _WARM_LOCK = threading.Lock()
-_WARMED = False
+#: Keyed by lane, not a single flag: with two agents a global "already warmed"
+#: would let whichever lane ran first suppress the other's election forever.
+_WARMED: Dict[str, bool] = {}
 
 
-def ensure_voice_lane_warm(*, force: bool = False) -> bool:
+def ensure_voice_lane_warm(
+    *,
+    force: bool = False,
+    prefix: str = _LEGACY_PREFIX,
+    ledger: Optional["VoiceLatencyLedger"] = None,
+) -> bool:
     """Kick ONE background refresh if the lane has no elected model yet.
 
     True when a refresh was started. Returns IMMEDIATELY — the caller is on a
@@ -602,21 +713,21 @@ def ensure_voice_lane_warm(*, force: bool = False) -> bool:
 
     Once per process (the guard is the point: several turns arriving together
     must not each start a sweep). NEVER raises."""
-    global _WARMED
     try:
-        if not voice_lane_enabled() or model_override():
+        if not voice_lane_enabled(prefix=prefix) or model_override(prefix=prefix):
             return False
+        led = ledger if ledger is not None else get_default_ledger()
         with _WARM_LOCK:
-            if _WARMED and not force:
+            if _WARMED.get(prefix) and not force:
                 return False
-            if not force and get_default_ledger().best() is not None:
-                _WARMED = True          # already elected — nothing to learn
+            if not force and led.best() is not None:
+                _WARMED[prefix] = True   # already elected — nothing to learn
                 return False
-            _WARMED = True
+            _WARMED[prefix] = True
 
         def _run() -> None:
             try:
-                asyncio.run(refresh_voice_lane(force=force))
+                asyncio.run(refresh_voice_lane(force=force, ledger=ledger))
             except Exception:  # noqa: BLE001
                 logger.debug("[VoiceLane] warm refresh degraded", exc_info=True)
 
@@ -630,12 +741,16 @@ def ensure_voice_lane_warm(*, force: bool = False) -> bool:
 
 def reset_warm_state() -> None:
     """Test seam — re-arms the once-per-process guard."""
-    global _WARMED
     with _WARM_LOCK:
-        _WARMED = False
+        _WARMED.clear()
 
 
-def record_runtime_failure(model: str, reason: str = "runtime") -> bool:
+def record_runtime_failure(
+    model: str,
+    reason: str = "runtime",
+    *,
+    ledger: Optional["VoiceLatencyLedger"] = None,
+) -> bool:
     """A model that passed the probe but failed on a REAL turn.
 
     The election rests on a probe, and a probe is a sample: a model can pass
@@ -647,7 +762,7 @@ def record_runtime_failure(model: str, reason: str = "runtime") -> bool:
     know the ledger's shape; it reports an OUTCOME and the lane decides what
     that means for ranking. NEVER raises."""
     try:
-        led = get_default_ledger()
+        led = ledger if ledger is not None else get_default_ledger()
         led.record(VoiceModelRecord(
             model=str(model), ttft_s=-1.0, tokens=0, spoke=False,
             measured_at=time.time(), reason=f"runtime:{reason}",
@@ -660,16 +775,20 @@ def record_runtime_failure(model: str, reason: str = "runtime") -> bool:
         return False
 
 
-def voice_lane_status() -> Dict[str, Any]:
+def voice_lane_status(
+    *,
+    prefix: str = _LEGACY_PREFIX,
+    ledger: Optional["VoiceLatencyLedger"] = None,
+) -> Dict[str, Any]:
     """Operator-facing snapshot for ``/provider`` and friends. Read-only."""
     try:
-        led = get_default_ledger()
+        led = ledger if ledger is not None else get_default_ledger()
         recs = sorted(led.all(), key=lambda r: (not r.conversational, r.ttft_s))
         return {
-            "enabled": voice_lane_enabled(),
-            "override": model_override() or None,
-            "elected": resolve_voice_model(),
-            "budget_s": spoken_ttft_budget_s(),
+            "enabled": voice_lane_enabled(prefix=prefix),
+            "override": model_override(prefix=prefix) or None,
+            "elected": resolve_voice_model(ledger=led, prefix=prefix),
+            "budget_s": spoken_ttft_budget_s(prefix=prefix),
             "measured": [
                 {
                     "model": r.model, "ttft_s": round(r.ttft_s, 3),

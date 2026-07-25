@@ -233,15 +233,18 @@ class AdaptiveVoiceRouter:
             except Exception:  # noqa: BLE001
                 return None
         try:
-            from backend.core.ouroboros.governance.karen_voice_lane import (
-                ensure_voice_lane_warm, resolve_voice_model,
-            )
-            model = resolve_voice_model()
+            # Per-AGENT lane: the election is measured against this persona's
+            # own prompt and budget, so JARVIS and O+V can sit on different
+            # models without either one's runtime demotion muting the other.
+            from backend.core.ouroboros.governance.agent_voice_lane import lane_for
+
+            lane = lane_for(self.persona)
+            model = lane.resolve_model()
             if model is None:
                 # Cold lane: learn in the background, serve this turn locally.
                 # Speaking through an UNMEASURED remote model is how a spoken
                 # turn ends up on the 22-second code brain.
-                ensure_voice_lane_warm()
+                lane.ensure_warm()
             return model
         except Exception:  # noqa: BLE001
             return None
@@ -459,10 +462,9 @@ class AdaptiveVoiceRouter:
         otherwise the election is a one-time measurement that reality can
         never correct."""
         try:
-            from backend.core.ouroboros.governance.karen_voice_lane import (
-                record_runtime_failure,
-            )
-            record_runtime_failure(model, reason)
+            from backend.core.ouroboros.governance.agent_voice_lane import lane_for
+
+            lane_for(self.persona).record_failure(model, reason)
         except Exception:  # noqa: BLE001
             logger.debug("[VoiceRouter] demote degraded", exc_info=True)
 
