@@ -98006,7 +98006,45 @@ def main() -> int:
 # =============================================================================
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # ── Py_FinalizeEx bypass (2026-07-25) ───────────────────────────────────
+    # `sys.exit()` raises SystemExit, which reaches handle_system_exit ->
+    # Py_Exit -> Py_FinalizeEx -> finalize_modules -> _PyModule_ClearDict ->
+    # type_dealloc, where a C extension null-derefs during teardown. Verified
+    # from the macOS crash report: EXC_BAD_ACCESS, KERN_INVALID_ADDRESS at 0x0,
+    # on that exact frame chain. It fired on EVERY invocation — even `--help`,
+    # which segfaulted (rc=-11) after ~9.8s having done nothing but print usage.
+    #
+    # The work is already complete by the time we get here; interpreter
+    # finalization exists only to tidy memory the OS is about to reclaim
+    # wholesale. So skip it: os._exit() terminates without unwinding module
+    # state, which makes the fault UNREACHABLE rather than merely unlikely.
+    #
+    # DRY: this is the same remedy battle_test/harness.py already applies for
+    # the same documented failure class ("Closes the 14-incident
+    # Py_FinalizeEx zombie class", harness.py:742).
+    #
+    # SystemExit is caught rather than allowed to propagate because argparse
+    # raises it directly for --help/--version, BEFORE main() ever returns —
+    # that was the crashing path. stdio is flushed explicitly since os._exit
+    # skips the flush that normal shutdown would perform.
+    _exit_rc = 0
+    try:
+        _exit_rc = main()
+    except SystemExit as _se:
+        _code = getattr(_se, "code", 0)
+        _exit_rc = _code if isinstance(_code, int) else (0 if _code is None else 1)
+    except KeyboardInterrupt:
+        _exit_rc = 130
+    finally:
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+    os._exit(int(_exit_rc or 0))
 
 
 # ── Quarantine symbol net (Migration Slice 1, 2026-07-19) ──

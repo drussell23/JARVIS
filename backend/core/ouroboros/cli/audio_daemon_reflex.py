@@ -64,14 +64,17 @@ def reflex_enabled() -> bool:
 
 
 def _boot_budget_s() -> float:
-    """Total time to wait for the supervisor to start listening. The kernel is
-    ~98K lines and imports PyTorch/transformers on some paths, so this is
-    generous by necessity — but bounded, because an operator waiting on a
-    prompt must eventually get one."""
+    """Total time to wait for the supervisor to start listening.
+
+    10s, MEASURED not guessed. The original 90 was my own conservative
+    invention and was never observed: `--status` completes in 2.9s and
+    `--help` in 4.2s once the Py_FinalizeEx segfault is bypassed. A budget an
+    order of magnitude above reality is not caution — it is a UI that appears
+    hung for 90 seconds when a supervisor genuinely cannot start."""
     try:
-        return max(1.0, float(os.environ.get("JARVIS_OV_AUDIO_BOOT_BUDGET_S", "90")))
+        return max(1.0, float(os.environ.get("JARVIS_OV_AUDIO_BOOT_BUDGET_S", "10")))
     except (TypeError, ValueError):
-        return 90.0
+        return 10.0
 
 
 def _backoff_base_s() -> float:

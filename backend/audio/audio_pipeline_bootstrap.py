@@ -349,6 +349,19 @@ async def wire_conversation_pipeline(
     # Reuses the SAME mailbox the broadcast tap already provides (DRY: no
     # second ring buffer) and the SAME UDS the VAD edges use (no second
     # socket). Fully fail-soft: any fault here leaves capture untouched.
+    # Boot-progress edge: the UDS is already bound and a cockpit may already be
+    # connected, but the mic is not yet acquired. Without this the client sees a
+    # live-but-silent bridge and cannot distinguish "warming" from "armed and
+    # quiet". Emitted from the EXISTING bind location — the socket does not move.
+    try:
+        if handle.audio_ipc is not None:
+            from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (
+                EVENT_SYSTEM_WARMING,
+            )
+            handle.audio_ipc.publish_event(EVENT_SYSTEM_WARMING)
+    except Exception:  # noqa: BLE001
+        pass
+
     try:
         from backend.audio.mic_telemetry_bridge import (
             bridge_enabled, ensure_attached, pump_once,
@@ -383,6 +396,16 @@ async def wire_conversation_pipeline(
                     "[Bootstrap] Mic telemetry bridged to ov cockpit "
                     "(%.0f FPS, lossy valve)", 1.0 / _tel_interval,
                 )
+                # Mic acquired + drain running: the bridge can now carry a real
+                # waveform, so the cockpit may drop its warming state.
+                try:
+                    if handle.audio_ipc is not None:
+                        from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (  # noqa: E501
+                            EVENT_SYSTEM_READY,
+                        )
+                        handle.audio_ipc.publish_event(EVENT_SYSTEM_READY)
+                except Exception:  # noqa: BLE001
+                    pass
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[Bootstrap] Mic telemetry skipped: {e}")
 

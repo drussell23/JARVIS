@@ -105,10 +105,18 @@ EVENT_HW_FAULT = "HW_FAULT"
 EVENT_TELEMETRY_DEGRADED = "SYS_TELEMETRY_DEGRADED"
 EVENT_TELEMETRY_RECOVERED = "SYS_TELEMETRY_RECOVERED"
 
+#: Boot-progress edges. The socket binds before the mic is acquired, so a
+#: connected cockpit would otherwise sit on a live-but-silent bridge with no
+#: way to tell "still warming" from "armed and quiet". Emitted from the
+#: EXISTING bind location — the socket does not move.
+EVENT_SYSTEM_WARMING = "SYSTEM_WARMING"
+EVENT_SYSTEM_READY = "SYSTEM_READY"
+
 EVENT_KINDS = (
     EVENT_VAD_ACTIVE, EVENT_VAD_INACTIVE, EVENT_TTS_GENERATING,
     EVENT_AUDIO_PLAYING, EVENT_AUDIO_IDLE, EVENT_HW_FAULT,
     EVENT_TELEMETRY_DEGRADED, EVENT_TELEMETRY_RECOVERED,
+    EVENT_SYSTEM_WARMING, EVENT_SYSTEM_READY,
 )
 
 #: Telemetry frame type — an amplitude SAMPLE, not a state transition.
