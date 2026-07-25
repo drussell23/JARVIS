@@ -162,11 +162,29 @@ class KarenQueryProvider:
             from backend.core.ouroboros.governance.rt_gate import (
                 gate_completion,
             )
+            # Karen SPEAKS her answers, so her DW tier is a conversation lane,
+            # not a code lane. Left unset it inherits DOUBLEWORD_MODEL — the
+            # 397B code brain, measured at 22.8s to first token for a one-
+            # sentence reply. The elected model comes from measurement
+            # (karen_voice_lane), and ``None`` means "no evidence yet, keep the
+            # default" — the lane never guesses.
+            from backend.core.ouroboros.governance.karen_voice_lane import (
+                ensure_voice_lane_warm, resolve_voice_model,
+            )
+            _voice_model = resolve_voice_model()
+            if _voice_model is None:
+                # Cold lane: learn in the background so the NEXT turn is fast.
+                # Blocking here to elect a faster voice would make the first
+                # reply slower to make later ones quicker — self-defeating.
+                ensure_voice_lane_warm()
+            if _voice_model:
+                self._emit(f"⎿ voice lane · {_voice_model}")
             answer = asyncio.run(gate_completion(
                 grounded,
                 caller_id="karen_chat_answer",
                 system_prompt=_SYSTEM_PROMPT,
                 max_tokens=max_tokens or _answer_max_tokens(),
+                dw_model=_voice_model,
             ))
             if isinstance(answer, str) and answer.strip():
                 return answer.strip()

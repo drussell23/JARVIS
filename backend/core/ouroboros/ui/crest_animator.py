@@ -991,6 +991,7 @@ def render_cockpit_header(
     now: Optional[float] = None,
     right_gutter: Optional[Any] = None,
     gutter_row: int = 0,
+    gutter_align: str = "right",
 ) -> str:
     """Compose the CC-style header — mini crest left, identity/context/path
     lines beside it — to an ANSI string bounded to ``width``. ``lines`` are
@@ -1005,7 +1006,20 @@ def render_cockpit_header(
     alignment lives here rather than in the caller: this function is the only
     place that knows the terminal width. Rendered on ``gutter_row`` of the text
     block. Silently omitted if it does not fit, so a narrow terminal degrades to
-    the plain header instead of wrapping into a broken layout."""
+    the plain header instead of wrapping into a broken layout.
+
+    ``gutter_align`` chooses WHERE, because the same live surface reads very
+    differently in the two spots:
+
+      ``"right"``  — right-aligned on ``gutter_row``, hugging the terminal
+                     edge. Out of the way; also easy to miss.
+      ``"below"``  — its own row in the text column, directly beneath the
+                     identity lines, so it reads as part of the organism's
+                     nameplate rather than as chrome pinned to the margin.
+
+    Placement is a parameter rather than a fork because everything else about
+    the gutter — the per-frame callable, the markup handling, the fit check —
+    is identical between the two."""
     try:
         from io import StringIO
         from rich.console import Console
@@ -1015,13 +1029,33 @@ def render_cockpit_header(
         text_rows: List[Any] = [
             ln if not isinstance(ln, str) else Text(ln) for ln in lines
         ]
-        n_rows = max(len(crest_rows), len(text_rows))
-        if n_rows == 0:
-            return ""
         # Top-align the text beside the crest (the CC layout) with a
-        # 1-row optical inset.
+        # 1-row optical inset. Computed from the ORIGINAL text rows, BEFORE a
+        # "below" gutter is appended: otherwise arming the audio plane would
+        # add a row, flip this inset, and shift every identity line up by one —
+        # the header would visibly jump the moment the mic came alive.
         pad_top = 1 if len(crest_rows) > len(text_rows) else 0
         crest_w = mini.cols if (mini is not None and crest_rows) else 0
+
+        if right_gutter is not None and str(gutter_align).lower() == "below":
+            # The gutter becomes an ordinary text row. Nothing about the row
+            # loop needs to know it is special, which is why this is an append
+            # rather than a second rendering path.
+            try:
+                _g = right_gutter() if callable(right_gutter) else right_gutter
+                _gt = _g if not isinstance(_g, str) else Text.from_markup(_g)
+                # An empty gutter contributes NO row — an unarmed audio plane
+                # must not leave a blank line under the path.
+                if _gt is not None and len(_gt) > 0:
+                    _avail = int(width) - crest_w - 2 - 1
+                    if len(_gt) <= _avail:
+                        text_rows.append(_gt)
+            except Exception:  # noqa: BLE001 — a gutter fault never breaks the header
+                pass
+
+        n_rows = max(len(crest_rows), len(text_rows) + pad_top)
+        if n_rows == 0:
+            return ""
         out = Text()
         for i in range(n_rows):
             if i < len(crest_rows):
@@ -1033,7 +1067,11 @@ def render_cockpit_header(
                 out.append("  ")
                 _row = text_rows[ti] if not isinstance(text_rows[ti], str) else Text(text_rows[ti])
                 out.append_text(_row)
-                if ti == gutter_row and right_gutter is not None:
+                if (
+                    ti == gutter_row
+                    and right_gutter is not None
+                    and str(gutter_align).lower() != "below"
+                ):
                     try:
                         _g = right_gutter() if callable(right_gutter) else right_gutter
                         _gt = _g if not isinstance(_g, str) else Text.from_markup(_g)

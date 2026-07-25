@@ -691,19 +691,36 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
         # driven by the zero-copy tap on the EXISTING mic stream (CoreAudio
         # refuses a second handle). Wholly fail-soft: any fault here leaves the
         # cockpit exactly as it was without the visualizer.
+        # Columns the crest already owns, plus the 2-space gap the header puts
+        # between crest and text. Read from the crest itself rather than
+        # guessed, so a different crest tier cannot silently overlap the wave.
+        try:
+            _CREST_RESERVE = int(getattr(mini, "cols", 0) or 0) + 2
+        except Exception:  # noqa: BLE001
+            _CREST_RESERVE = 2
+        _scope_align = "right"
         _audio = {"pump": None, "latch": None, "mode": None, "unsub": None}
         try:
             from backend.core.ouroboros.ui.audio_pump import (
                 AudioLevelPump, default_publisher,
             )
             from backend.core.ouroboros.ui.audio_scope import (
-                AudioPlane, BrailleScope, scope_enabled,
+                AudioPlane, BrailleScope, scope_enabled, scope_placement,
+                scope_width_for,
             )
+            import shutil as _shutil_boot
             from backend.core.ouroboros.ui.ptt_router import (
                 PTTLatch, resolve_ptt_mode,
             )
-            if scope_enabled():
-                _scope = BrailleScope(width=20)
+            _scope_align = scope_placement()
+            if scope_enabled() and _scope_align != "off":
+                # Boot width from the terminal, not a constant. The crest
+                # column plus its 2-space gap is reserved so the scope never
+                # collides with the identity text it sits beneath.
+                _cols0 = _shutil_boot.get_terminal_size(fallback=(100, 30)).columns
+                _scope = BrailleScope(
+                    width=scope_width_for(_cols0, reserved=_CREST_RESERVE),
+                )
                 _pump = AudioLevelPump(
                     scope=_scope, publish=default_publisher(),
                 )
@@ -749,12 +766,20 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             _audio = {"pump": None, "latch": None, "mode": None, "unsub": None}
 
         def _gutter():
-            """Right-aligned scope for the header. None when unarmed, so the
-            header renders exactly as before."""
+            """The live scope for the header — placed by ``gutter_align``.
+            None when unarmed, so the header renders exactly as before."""
             _p = _audio.get("pump")
             if _p is None:
                 return None
             try:
+                # Follow the terminal. header_render() has already stamped the
+                # live column count for this frame, so the scope re-widths on
+                # a resize instead of staying pinned at its boot width.
+                _w = _hdr_width.get("w") or 0
+                if _w:
+                    _p.scope.set_width(
+                        scope_width_for(_w, reserved=_CREST_RESERVE)
+                    )
                 # Gravity BEFORE paint, on the render clock rather than the
                 # audio clock. When heavy STT inference starves the telemetry
                 # stream the wave must keep falling; a repaint that only ever
@@ -772,7 +797,7 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
                 _hdr_width["w"] = w
                 return render_cockpit_header(
                     mini, _header_lines(), w, now=_time.monotonic(),
-                    right_gutter=_gutter,
+                    right_gutter=_gutter, gutter_align=_scope_align,
                 )
             except Exception:
                 return ""

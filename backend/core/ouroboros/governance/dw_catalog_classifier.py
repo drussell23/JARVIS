@@ -150,6 +150,27 @@ def gate_for_route(route: str) -> EligibilityGate:
                 "JARVIS_DW_CLASSIFIER_SPECULATIVE_MAX_OUT_PRICE", 0.1,
             ),
         )
+    if r == "voice":
+        # A CEILING, not a floor — the inverse of every other route. Speech is
+        # bounded by time-to-first-token, and active parameter count is the
+        # only latency proxy available from metadata alone, so the gate excludes
+        # the large models the other routes are built to prefer. Streaming is
+        # required outright: a voice lane that cannot stream cannot start
+        # speaking before the whole reply is generated.
+        #
+        # The ceiling only NARROWS the field; it does not certify anyone. The
+        # actual verdict comes from a measured probe in ``karen_voice_lane``,
+        # because metadata cannot tell you that a model will spend its entire
+        # budget on reasoning tokens and never say a word.
+        return EligibilityGate(
+            max_params_b=_env_float(
+                "JARVIS_DW_CLASSIFIER_VOICE_MAX_PARAMS_B", 120.0,
+            ),
+            max_out_price_per_m=_env_float(
+                "JARVIS_DW_CLASSIFIER_VOICE_MAX_OUT_PRICE", 3.0,
+            ),
+            require_streaming=True,
+        )
     # IMMEDIATE has empty dw_models by Manifesto §5 — sentinel falls
     # through to legacy Claude-direct dispatch. Return a max-restrictive
     # gate (admits nothing) so we never accidentally populate it.
@@ -289,6 +310,19 @@ _GENERATIVE_ROUTES: Tuple[str, ...] = (
     "complex", "standard", "background", "speculative",
 )
 
+#: Routes that are RANKED here but are not op lanes. ``voice`` selects the
+#: model Karen speaks through, where the binding constraint is time-to-first-
+#: token rather than capability or price — a spoken reply that starts in 20
+#: seconds has already failed regardless of how good the sentence is.
+#:
+#: Kept OUT of ``_GENERATIVE_ROUTES`` deliberately: the quarantine / promotion
+#: accounting in ``classify()`` is defined over the op lanes, and adding a
+#: fifth member there would silently change SPECULATIVE bookkeeping. Auxiliary
+#: routes are ranked and returned; they register nothing.
+_AUXILIARY_ROUTES: Tuple[str, ...] = ("voice",)
+
+_ALL_ROUTES: Tuple[str, ...] = _GENERATIVE_ROUTES + _AUXILIARY_ROUTES
+
 
 class DwCatalogClassifier:
     """Pure-function classifier. Construction is cheap (no I/O).
@@ -361,7 +395,7 @@ class DwCatalogClassifier:
         weights = _ranking_weights()
         family_bonus = _family_preference()
         gates: Dict[str, EligibilityGate] = {
-            r: gate_for_route(r) for r in _GENERATIVE_ROUTES
+            r: gate_for_route(r) for r in _ALL_ROUTES
         }
 
         # Identify quarantine-pinned + newly-ambiguous models
@@ -399,7 +433,7 @@ class DwCatalogClassifier:
 
         # Build per-route candidate sets
         assignments: Dict[str, RouteAssignment] = {}
-        for route in _GENERATIVE_ROUTES:
+        for route in _ALL_ROUTES:
             ranked_ids = self._rank_for_route(
                 route=route,
                 snapshot=snapshot,
@@ -437,7 +471,10 @@ class DwCatalogClassifier:
         modality_ledger: Optional[Any] = None,
         cold_storage_ids: Optional[set] = None,
     ) -> Tuple[str, ...]:
-        prefer_cheap = route in ("background", "speculative")
+        # ``voice`` joins the cheap routes so the param axis inverts: on this
+        # lane a smaller ACTIVE parameter count is a POSITIVE signal, because
+        # it is the closest metadata proxy for first-token latency.
+        prefer_cheap = route in ("background", "speculative", "voice")
         eligible: List[Tuple[float, str]] = []
         cold_ids = cold_storage_ids if cold_storage_ids is not None else set()
 
@@ -542,7 +579,7 @@ class DwCatalogClassifier:
     def _empty_assignments() -> Dict[str, RouteAssignment]:
         return {
             r: RouteAssignment(route=r, ranked_model_ids=())
-            for r in _GENERATIVE_ROUTES
+            for r in _ALL_ROUTES
         }
 
 

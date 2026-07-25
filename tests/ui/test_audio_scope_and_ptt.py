@@ -846,8 +846,164 @@ def test_the_render_loop_ticks_before_it_paints():
     src = Path(
         "backend/core/ouroboros/cli/ov.py",
     ).read_text(encoding="utf-8", errors="replace")
-    gut = src[src.index("def _gutter():"):][:900]
+    gut = src[src.index("def _gutter():"):][:1800]
     assert ".tick()" in gut, "the header no longer applies gravity"
     assert gut.index(".tick()") < gut.index("render_rich()"), (
         "gravity applied AFTER the paint — one frame stale, every frame"
     )
+
+
+# ===========================================================================
+# Placement — the wave lives under the nameplate, not pinned to the margin
+# ===========================================================================
+
+
+class _FakeMini:
+    """A crest of known geometry, so the text column is arithmetic."""
+
+    cols = 24
+
+    def row_texts(self, now=None):
+        from rich.text import Text
+        return [Text("#" * self.cols) for _ in range(11)]
+
+
+def _header(gutter, align, width=100, lines=None):
+    from rich.text import Text
+    from backend.core.ouroboros.ui.crest_animator import render_cockpit_header
+
+    rows = lines or [
+        Text("O+V v0.1.0"),
+        Text("● healthy · ouroboros + venom · the organism drives"),
+        Text("~/Documents/repos/JARVIS-AI-Agent.nosync"),
+    ]
+    out = render_cockpit_header(
+        _FakeMini(), rows, width, now=0.0,
+        right_gutter=gutter, gutter_align=align,
+    )
+    import re
+    plain = [re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in out.splitlines()]
+    return plain
+
+
+WAVE = "⢠⣾⣿⣿⣦⣠⣾⣿⣿⣦"
+
+
+def test_below_puts_the_wave_under_the_path_in_the_text_column():
+    rows = _header(lambda: WAVE, "below")
+    path_i = next(i for i, r in enumerate(rows) if "~/Documents" in r)
+    wave_i = next(i for i, r in enumerate(rows) if WAVE in r)
+    assert wave_i == path_i + 1, "the wave is not directly under the path"
+    # Same left edge as the identity text: it reads as part of the nameplate.
+    assert rows[wave_i].index(WAVE) == rows[path_i].index("~/Documents")
+
+
+def test_right_still_hugs_the_terminal_edge():
+    """The old placement is a supported choice, not dead code."""
+    rows = _header(lambda: WAVE, "right", width=100)
+    title_i = next(i for i, r in enumerate(rows) if "O+V" in r)
+    assert WAVE in rows[title_i]
+    assert rows[title_i].rstrip().endswith(WAVE)
+
+
+def test_below_does_not_also_paint_the_right_gutter():
+    rows = _header(lambda: WAVE, "below")
+    assert sum(r.count(WAVE) for r in rows) == 1, "the wave was drawn twice"
+
+
+def test_an_unarmed_scope_leaves_no_blank_row():
+    """A cockpit without audio must render exactly as it did before — an empty
+    gutter contributes no row, not an empty one."""
+    with_g = _header(lambda: "", "below")
+    without = _header(None, "below")
+    assert [r.rstrip() for r in with_g] == [r.rstrip() for r in without]
+
+
+def test_arming_the_scope_does_not_shift_the_identity_lines():
+    """THE JITTER BUG this guards: the crest/text optical inset is computed
+    from the row count. If it were computed after appending the wave, the
+    header would jump by one row the moment the mic came alive."""
+    off = _header(None, "below")
+    on = _header(lambda: WAVE, "below")
+    for probe in ("O+V", "healthy", "~/Documents"):
+        assert (
+            next(i for i, r in enumerate(off) if probe in r)
+            == next(i for i, r in enumerate(on) if probe in r)
+        ), f"{probe!r} moved when the scope armed"
+
+
+def test_a_wave_too_wide_for_the_terminal_is_omitted_not_wrapped():
+    rows = _header(lambda: "⣿" * 200, "below", width=60)
+    assert all("⣿" * 200 not in r for r in rows)
+    assert any("~/Documents" in r for r in rows), "the header itself survived"
+
+
+def test_a_raising_gutter_never_breaks_the_header():
+    def _boom():
+        raise RuntimeError("scope on fire")
+
+    rows = _header(_boom, "below")
+    assert any("~/Documents" in r for r in rows)
+
+
+def test_placement_is_operator_selectable(monkeypatch):
+    from backend.core.ouroboros.ui.audio_scope import scope_placement
+
+    assert scope_placement() == "below"
+    monkeypatch.setenv("JARVIS_AUDIO_SCOPE_PLACEMENT", "right")
+    assert scope_placement() == "right"
+    monkeypatch.setenv("JARVIS_AUDIO_SCOPE_PLACEMENT", "off")
+    assert scope_placement() == "off"
+    monkeypatch.setenv("JARVIS_AUDIO_SCOPE_PLACEMENT", "sideways")
+    assert scope_placement() == "below", "garbage falls back, never crashes"
+
+
+# ---------------------------------------------------------------------------
+# Width follows the terminal
+# ---------------------------------------------------------------------------
+
+
+def test_width_scales_with_the_terminal_and_is_clamped():
+    from backend.core.ouroboros.ui.audio_scope import scope_width_for
+
+    narrow, wide = scope_width_for(60, reserved=26), scope_width_for(300, reserved=26)
+    assert narrow < wide, "a 20-cell constant would be identical at both"
+    assert 8 <= narrow and wide <= 64
+
+
+def test_width_survives_an_absurd_terminal():
+    from backend.core.ouroboros.ui.audio_scope import scope_width_for
+
+    assert scope_width_for(0, reserved=26) >= 1
+    assert scope_width_for(-5, reserved=999) >= 1
+
+
+def test_resize_keeps_the_newest_samples():
+    """The right-hand edge is 'now'. Shrinking must crop the past, so a resize
+    reads as a crop rather than a glitch."""
+    sc = BrailleScope(width=8)
+    sc.extend([i / 20.0 for i in range(16)])
+    tail = sc.samples()[-6:]
+    assert sc.set_width(3) is True
+    assert sc.samples() == tail
+
+
+def test_resize_to_the_same_width_is_a_no_op():
+    sc = BrailleScope(width=8)
+    assert sc.set_width(8) is False
+
+
+def test_resize_grows_without_losing_history():
+    sc = BrailleScope(width=4)
+    sc.extend([0.5] * 8)
+    before = sc.samples()
+    assert sc.set_width(10) is True
+    assert sc.samples() == before
+    assert sc.render() and len(sc.render()) == 10
+
+
+def test_resize_never_raises_on_garbage():
+    sc = BrailleScope(width=8)
+    assert sc.set_width(0) is not None
+    assert sc.set_width(-3) is not None
+    assert len(sc.render()) >= 1

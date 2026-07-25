@@ -125,6 +125,34 @@ def _gravity_floor() -> float:
     return max(0.0, _env_float("JARVIS_AUDIO_SCOPE_GRAVITY_FLOOR", 0.02))
 
 
+def scope_placement() -> str:
+    """Where the scope sits in the cockpit header.
+
+    ``below`` — its own row under the identity lines, beside the crest. The
+    default: there the wave reads as part of the organism's nameplate, next to
+    who it is and where it is, rather than as chrome pinned to the margin.
+    ``right`` — the original right-aligned gutter. ``off`` — no scope."""
+    v = os.environ.get("JARVIS_AUDIO_SCOPE_PLACEMENT", "below").strip().lower()
+    return v if v in ("below", "right", "off") else "below"
+
+
+def scope_width_for(term_cols: int, *, reserved: int = 0) -> int:
+    """Scope width in CELLS, derived from the terminal — never a constant.
+
+    A 20-cell scope invented for one laptop is a stripe on an ultrawide and an
+    overflow on a split pane. The scope claims a FRACTION of the usable row and
+    is clamped at both ends, so it stays legible at 60 columns and stays a wave
+    rather than a wall at 300."""
+    try:
+        usable = max(0, int(term_cols) - max(0, int(reserved)))
+        frac = _env_float("JARVIS_AUDIO_SCOPE_WIDTH_FRACTION", 0.42)
+        lo = int(_env_float("JARVIS_AUDIO_SCOPE_MIN_CELLS", 8))
+        hi = int(_env_float("JARVIS_AUDIO_SCOPE_MAX_CELLS", 64))
+        return max(1, min(max(lo, hi), max(lo, min(hi, int(usable * frac)))))
+    except Exception:  # noqa: BLE001
+        return 20
+
+
 def braille_available() -> bool:
     """Whether the terminal encoding can carry Braille. Falls back to ASCII on
     a legacy/POSIX locale rather than emitting replacement glyphs."""
@@ -616,6 +644,27 @@ class BrailleScope:
             return f"[{style}]{body}[/{style}]"
         except Exception:  # noqa: BLE001
             return body
+
+    def set_width(self, width: int) -> bool:
+        """Re-cap the ring to *width* cells. True when it actually changed.
+
+        A terminal resize must not orphan the scope at its boot width. The
+        newest samples are KEPT and the oldest dropped when shrinking — the
+        right-hand edge is 'now', so preserving the tail is what makes a resize
+        look like a crop rather than a glitch. NEVER raises."""
+        try:
+            w = max(1, int(width))
+            with self._lock:
+                if w == self._width:
+                    return False
+                cap = w * SAMPLES_PER_CELL
+                # deque(maxlen=) truncates from the LEFT on construction, which
+                # is exactly the tail-preserving behaviour wanted here.
+                self._samples = deque(self._samples, maxlen=cap)
+                self._width, self._cap = w, cap
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def samples(self) -> list:
         """Locked snapshot of the ring, oldest → newest.
