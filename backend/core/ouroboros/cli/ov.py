@@ -588,6 +588,70 @@ async def _split_plane_loop(
                 break
 
 
+
+async def _attach_rms_stream(scope: Any) -> Any:
+    """Feed the header scope from the SUPERVISOR's amplitude stream.
+
+    The gap this closes. `ov` and `unified_supervisor` are separate processes
+    — CoreAudio hands the microphone to exactly one of them, and that one is
+    the supervisor. The scope was wired only to ``audio_broadcast_tap``, an
+    IN-PROCESS zero-copy broadcast, so in the cockpit process nothing ever
+    captured audio, the tap never fired, and the wave sat at its flat baseline
+    however loudly anyone spoke.
+
+    The supervisor has been publishing ``rms_level`` frames on the audio-state
+    socket the whole time (``MicTelemetryBridge`` → ``publish_rms``). There was
+    simply no consumer: a producer with no reader is indistinguishable from a
+    silent room, which is exactly why it went unnoticed.
+
+    Subscribed DIRECTLY rather than relayed through the daemon bridge. The
+    frames are lossy-by-contract 20 FPS telemetry; hopping them through a
+    second socket would add a queue that must then be given its own drop
+    policy, to carry samples whose whole design is that dropping them is free.
+
+    The in-process tap subscription stays alongside this — it is still correct
+    when the cockpit itself owns audio. Whichever source produces data drives
+    the wave; neither knows about the other.
+
+    Returns the connected client (so the caller can close it), or None.
+    NEVER raises: no amplitude stream is survivable, a broken cockpit is not.
+    """
+    try:
+        from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (
+            MSG_RMS_LEVEL, AudioStateClient,
+        )
+        from backend.core.ouroboros.ui.audio_scope import AudioPlane
+
+        # plane wire-value → the scope's colour lane. Karen speaking is venom
+        # green, the operator cyan, so a glance answers "is that me or her?"
+        planes = {
+            "user": AudioPlane.USER,
+            "mic": AudioPlane.USER,
+            "system": AudioPlane.SYSTEM,
+            "karen": AudioPlane.SYSTEM,
+            "tts": AudioPlane.SYSTEM,
+        }
+
+        def _on_frame(msg: dict) -> None:
+            try:
+                if msg.get("type") != MSG_RMS_LEVEL:
+                    return
+                plane = planes.get(str(msg.get("plane", "user")).lower())
+                if plane is not None and plane != scope.plane:
+                    scope.set_plane(plane)
+                # Already normalized upstream: the RMS + adaptive scaling ran
+                # on the producer side, next to the frames. Re-normalizing a
+                # normalized value here would square the curve.
+                scope.push(float(msg.get("level", 0.0)), normalized=True)
+            except Exception:  # noqa: BLE001 — one bad frame is not an outage
+                pass
+
+        client = AudioStateClient(on_message=_on_frame)
+        return client if await client.connect() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
     """The Style-Guide §06 cockpit ON THE CLIENT: Zone 1 (the Proactive Canvas,
     state-reactive border) auto-scrolls the daemon's bridge stream; Zone 2 the
@@ -751,6 +815,10 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
                     _audio["unsub"] = get_default_tap().subscribe(_on_chunk)
                 except Exception:  # noqa: BLE001 — no voice stack: scope stays idle
                     pass
+                # ...and to the supervisor's stream, which is where the mic
+                # actually lives. This is the one that moves the wave when a
+                # human speaks into a cockpit that does not own CoreAudio.
+                _audio["rms_client"] = await _attach_rms_stream(_scope)
                 _audio.update(pump=_pump, latch=_latch, mode=_mode)
                 # `ov` has no module-level logger — this scope is the only
                 # record of which PTT paradigm the terminal probe chose, and a
@@ -834,20 +902,38 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             pass
         return base
 
-    await run_bipartite_repl(
-        on_accept=_on_accept,
-        title="◇ O+V · proactive canvas",
-        toolbar=_toolbar_with_mode if ui is not None else None,
-        watch_alive=_alive,
-        header=header_render,
-        header_height=header_height,
-        extra_key_bindings=_ptt_kb,
-        seed=[
-            "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or plain "
-            "words both work · [cyan]wake[/cyan] arms my voice · "
-            "[cyan]detach[/cyan] leaves the organism running",
-        ],
-    )
+    try:
+        await run_bipartite_repl(
+            on_accept=_on_accept,
+            title="◇ O+V · proactive canvas",
+            toolbar=_toolbar_with_mode if ui is not None else None,
+            watch_alive=_alive,
+            header=header_render,
+            header_height=header_height,
+            extra_key_bindings=_ptt_kb,
+            seed=[
+                "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "
+                "plain words both work · [cyan]wake[/cyan] arms my voice · "
+                "[cyan]detach[/cyan] leaves the organism running",
+            ],
+        )
+    finally:
+        # Release the amplitude subscriptions. The tap unsubscribe was already
+        # unreleased before the RMS client joined it; that one leaked only
+        # until process death, but a live socket plus its read task deserves
+        # an explicit close on the way out.
+        try:
+            _u = _audio.get("unsub") if isinstance(_audio, dict) else None
+            if callable(_u):
+                _u()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _c = _audio.get("rms_client") if isinstance(_audio, dict) else None
+            if _c is not None:
+                await _c.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _legacy_pump_loop(client: Any) -> None:
