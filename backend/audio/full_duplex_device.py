@@ -67,8 +67,62 @@ _REMOTE_MIC_PATTERNS: tuple = (
     "earpods",       # Lightning/USB EarPods can still trigger Handoff mic activity
 )
 
+def _device_label(index: Any) -> str:
+    """Human name for a PortAudio device index. Never raises — a logging
+    helper must not be able to break audio bring-up."""
+    try:
+        if index is None:
+            return "default"
+        import sounddevice as sd
+        return str(sd.query_devices()[int(index)].get("name", "?"))
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+#: Substrings that positively identify Apple's BUILT-IN input. Apple's naming
+#: for it is stable ("MacBook Pro Microphone", "Built-in Microphone",
+#: "Internal Microphone") in a way that the blocklist below can never be.
+_LOCAL_MIC_PATTERNS: tuple = (
+    "macbook",
+    "built-in",
+    "builtin",
+    "internal microphone",
+    "imac",
+    "mac mini",
+    "mac studio",
+)
+
+
+def preferred_input_name() -> str:
+    """Operator's explicit input device — a NAME SUBSTRING or an index.
+
+    The escape hatch that always wins. Device selection is a judgement about
+    hardware the code cannot fully see, so the operator must be able to end
+    the argument."""
+    return os.getenv("JARVIS_AUDIO_INPUT_DEVICE", "").strip()
+
+
+def _is_local_mic_name(name_lower: str) -> bool:
+    """Does this name positively identify a built-in Mac microphone?"""
+    return any(pat in name_lower for pat in _LOCAL_MIC_PATTERNS)
+
+
 def _is_remote_mic_name(name_lower: str) -> bool:
-    """Return True if the device name looks like a remote / Continuity microphone."""
+    """Return True if the device name looks like a remote / Continuity microphone.
+
+    A BLOCKLIST, and blocklists fail open — which is exactly how the iPhone
+    got the microphone. macOS names a Continuity mic after its OWNER, not its
+    hardware: this machine enumerates ``"Derek J. Russell Microphone"`` as
+    device 0 and makes it the system default. It matches none of iphone /
+    ipad / continuity / airpods, so it sailed through the filter and took the
+    mic — the operator watched the recording indicator light up on their
+    PHONE while the Mac's own microphone sat unused.
+
+    No amount of adding names fixes a blocklist; the next device will be
+    called something else again. The positive test in
+    :func:`_filter_local_input_devices` is what actually closes this — an
+    UNRECOGNISED device is no longer silently trusted. This stays as a
+    cheap first pass for the names it does know."""
     for pat in _REMOTE_MIC_PATTERNS:
         if pat in name_lower:
             return True
@@ -82,12 +136,45 @@ def _filter_local_input_devices(devices: list) -> list:
     returned list still match the original PortAudio indices — the caller
     relies on index correspondence when passing device numbers to PortAudio.
     """
+    # An explicit operator choice ends the argument — keep ONLY what matches.
+    want = preferred_input_name().lower()
+    if want:
+        kept = []
+        for i, dev in enumerate(devices):
+            name_lower = str(dev.get("name", "")).lower()
+            match = (want in name_lower) or (want.isdigit() and int(want) == i)
+            if dev.get("max_input_channels", 0) > 0 and not match:
+                dev = dict(dev, max_input_channels=0)
+            kept.append(dev)
+        if any(int(d.get("max_input_channels", 0)) > 0 for d in kept):
+            return kept
+        logger.warning(
+            "[FullDuplexDevice] JARVIS_AUDIO_INPUT_DEVICE=%r matched no input "
+            "device — falling back to automatic selection", preferred_input_name(),
+        )
+
+    # POSITIVE selection when a built-in is present. The blocklist below fails
+    # OPEN — an unknown device is trusted — and macOS names Continuity mics
+    # after their owner ("Derek J. Russell Microphone"), so the unknown case is
+    # the common case, not the edge. When a device positively identifiable as
+    # the built-in mic exists, every OTHER input is masked: unrecognised
+    # hardware then loses by default instead of winning by default.
+    has_local = any(
+        int(dev.get("max_input_channels", 0)) > 0
+        and _is_local_mic_name(str(dev.get("name", "")).lower())
+        for dev in devices
+    )
     filtered = []
     for dev in devices:
         name_lower = str(dev.get("name", "")).lower()
-        if dev.get("max_input_channels", 0) > 0 and _is_remote_mic_name(name_lower):
-            # Mask the input capability so _resolve_device() skips this entry
-            dev = dict(dev, max_input_channels=0)
+        if dev.get("max_input_channels", 0) > 0:
+            if has_local:
+                if not _is_local_mic_name(name_lower):
+                    dev = dict(dev, max_input_channels=0)
+            elif _is_remote_mic_name(name_lower):
+                # No built-in to prefer — fall back to the blocklist so a
+                # Mac mini with only a USB mic still finds it.
+                dev = dict(dev, max_input_channels=0)
         filtered.append(dev)
     return filtered
 
@@ -373,12 +460,20 @@ class FullDuplexDevice:
                 fallback_note = ""
                 if idx > 1:
                     fallback_note = f", fallback_profile={idx}/{len(startup_profiles)}"
+                # NAME the devices, not just their indices. "in=0" is opaque:
+                # an operator watching the microphone light up on their iPHONE
+                # cannot tell from an index whether JARVIS chose the built-in
+                # mic or a Continuity device, and neither could I. The remote-
+                # mic filter may be working perfectly and the log still cannot
+                # say so. One resolved name turns a speculative hunt into a
+                # glance.
                 logger.info(
                     f"[FullDuplexDevice] Started: sr={self.config.sample_rate}, "
                     f"frame={self.config.frame_size} samples "
                     f"({self.config.frame_duration_ms}ms), "
                     f"mode={self._mode}, "
-                    f"in={in_device_label}, out={out_device_label}, "
+                    f"in={in_device_label} {_device_label(in_device_label)!r}, "
+                    f"out={out_device_label} {_device_label(out_device_label)!r}, "
                     f"startup_silence={self.config.startup_silence_ms}ms{fallback_note}"
                 )
                 self._persist_successful_profile(

@@ -216,9 +216,27 @@ async def run_phantom_tap(
 
 
 def default_system_emitter() -> Optional[Callable[[float], Any]]:
-    """Feed the SAME pump/broker plumbing the microphone uses, tagged
-    ``AudioPlane.SYSTEM`` so the scope swaps cyan → venom green. DRY: no second
-    RMS pipeline, no second event path, no second normalizer."""
+    """Publish Karen's speaking envelope on BOTH planes she can be watched on.
+
+    In-process, the ``AudioLevelPump`` event bus — correct when the cockpit and
+    the audio plane share a process.
+
+    Cross-process, the audio-state socket, tagged ``system`` so the cockpit
+    scope swaps cyan → venom green while she talks. THIS is the one that was
+    missing. The emitter fed only the in-process bus, but Karen speaks inside
+    the audio-plane HOST and the cockpit is a different process, so her
+    envelope was published where nobody listens: the operator saw a flat wave
+    for the whole time she was speaking, and the venom-green plane — built,
+    tested, and reachable — had never once been rendered.
+
+    Exactly the failure that hid the microphone for weeks (a producer with no
+    reader across a process boundary), on the other half of the duplex.
+
+    DRY: the socket leg reuses the mic bridge's OWN broadcaster handle and its
+    ``publish_rms`` valve — same lossy contract, same 20 FPS budget, same
+    frame schema. No second transport, no second normalizer. Missing either
+    leg is survivable; a raising emitter would stall TTS, so nothing here
+    propagates."""
     try:
         from backend.core.ouroboros.ui.audio_pump import (
             AudioLevelPump, default_publisher,
@@ -228,7 +246,21 @@ def default_system_emitter() -> Optional[Callable[[float], Any]]:
         pump = AudioLevelPump(publish=default_publisher())
 
         def _emit(level: float) -> None:
-            pump.feed_level(level, plane=AudioPlane.SYSTEM)
+            try:
+                pump.feed_level(level, plane=AudioPlane.SYSTEM)
+            except Exception:  # noqa: BLE001
+                pass
+            # Cross-process leg. Resolved per-call rather than captured: the
+            # broadcaster binds AFTER this emitter is built during boot, and
+            # re-binds if the host ever loses its address.
+            try:
+                from backend.audio.mic_telemetry_bridge import get_bridge
+                bridge = get_bridge()
+                server = getattr(bridge, "_server", None) if bridge else None
+                if server is not None:
+                    server.publish_rms(level, "system")
+            except Exception:  # noqa: BLE001
+                pass
 
         return _emit
     except Exception:  # noqa: BLE001

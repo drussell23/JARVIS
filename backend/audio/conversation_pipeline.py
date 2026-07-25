@@ -233,6 +233,41 @@ class SentenceSplitter:
 # Conversation Pipeline
 # ============================================================================
 
+def _tts_can_synthesize(engine: Any) -> bool:
+    """Can this engine hand back audio BYTES instead of playing them?
+
+    The check was ``hasattr(engine, 'synthesize')``, and the shipped
+    ``UnifiedTTSEngine`` has no such method — it exposes ``speak`` and
+    ``speak_stream``. So the probe was permanently False and the entire
+    preferred branch below it was unreachable: every sentence Karen ever spoke
+    took the legacy fallback, which plays straight out of the engine and hands
+    AudioBus nothing.
+
+    That cost more than tidiness. The bus never saw her voice, so AEC had no
+    reference to cancel her out of the microphone, and the playback the
+    system-plane visualiser watches never happened on the bus at all.
+
+    ``speak(text, play_audio=False)`` IS the synthesis capability — it returns
+    a ``TTSResult`` carrying ``audio_data`` (measured: 54KB @ 22050Hz). A
+    capability probe must ask what the object can DO, not whether one
+    particular spelling of the method name exists."""
+    return bool(
+        getattr(engine, "synthesize", None)
+        or getattr(engine, "speak", None)
+    )
+
+
+async def _tts_synthesize(engine: Any, sentence: str) -> Any:
+    """Audio bytes for *sentence*, via whichever API the engine offers.
+
+    Prefers a genuine ``synthesize`` when an engine grows one, so this adapter
+    never becomes the thing that blocks a better API from being used."""
+    synth = getattr(engine, "synthesize", None)
+    if synth is not None:
+        return await synth(sentence)
+    return await engine.speak(sentence, play_audio=False)
+
+
 class ConversationPipeline:
     """
     Full conversation orchestrator.
@@ -1201,10 +1236,10 @@ class ConversationPipeline:
             # Preferred path: synthesize → decode WAV → stream through AudioBus
             # This gives AEC a reference signal and supports barge-in cancel.
             if (
-                hasattr(self._tts_engine, 'synthesize')
+                _tts_can_synthesize(self._tts_engine)
                 and self._audio_bus is not None
             ):
-                tts_result = await self._tts_engine.synthesize(sentence)
+                tts_result = await _tts_synthesize(self._tts_engine, sentence)
                 if tts_result is not None:
                     audio_bytes = getattr(tts_result, 'audio_data', None)
                     sample_rate = getattr(tts_result, 'sample_rate', 22050)
