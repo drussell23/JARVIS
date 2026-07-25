@@ -139,14 +139,73 @@ def _exit() -> None:
         logger.warning("[PlaybackGate] failed to reopen the mic: %r", exc)
 
 
+async def _await_playback_drain(timeout_s: float = 30.0) -> None:
+    """Wait until the speaker ring buffer is actually empty. NEVER raises.
+
+    ``AudioBus.play_stream`` is NOT blocking — it writes into the device's
+    PlaybackRingBuffer and returns, and the output callback drains it over
+    the following seconds. Gating around that CALL therefore gated nothing:
+
+        13:18:17,324  mic CLOSED for playback (16 chars)
+        13:18:17,331  mic OPEN                          <- 7ms later
+        13:18:17,631  [BargeIn] User interrupted JARVIS
+
+    Seven milliseconds of protection for several seconds of speech. The mic
+    reopened while Karen was still talking, heard her, and cut her off.
+
+    So the gate is held until the audio has actually been CONSUMED. Bounded,
+    because a wedged device must not deafen the operator forever."""
+    import asyncio as _aio
+
+    try:
+        from backend.audio.audio_bus import AudioBus
+    except ImportError:
+        return
+    bus = AudioBus.get_instance_safe()
+    device = getattr(bus, "_device", None) if bus is not None else None
+    buf = getattr(device, "playback_buffer", None)
+    if buf is None:
+        return
+    deadline = _aio.get_running_loop().time() + max(0.5, timeout_s)
+    # Two consecutive empty reads before releasing: the buffer momentarily
+    # reads empty between a write and the callback picking it up, and
+    # releasing in that gap reopens the mic mid-utterance.
+    empty_streak = 0
+    while _aio.get_running_loop().time() < deadline:
+        try:
+            pending = int(getattr(buf, "available", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if pending <= 0:
+            empty_streak += 1
+            if empty_streak >= 2:
+                return
+        else:
+            empty_streak = 0
+        await _aio.sleep(0.02)
+    logger.warning(
+        "[PlaybackGate] playback did not drain within %.1fs — reopening the "
+        "mic rather than leaving the operator unheard", timeout_s,
+    )
+
+
 @contextlib.asynccontextmanager
-async def playback_gate(text: str = "") -> AsyncIterator[bool]:
-    """Close the mic for the body. Async playback sites."""
+async def playback_gate(
+    text: str = "", *, await_drain: bool = True,
+) -> AsyncIterator[bool]:
+    """Close the mic for the body — and, for buffered sinks, until it drains.
+
+    ``await_drain`` exists because the two playback shapes differ: a
+    subprocess (afplay) is finished when the call returns, while a ring
+    buffer is only finished when it empties. Holding the gate on the call
+    alone protects the first and nothing at all for the second."""
     engaged = _enter(text)
     try:
         yield engaged
     finally:
         if engaged:
+            if await_drain:
+                await _await_playback_drain()
             _exit()
 
 

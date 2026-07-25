@@ -332,3 +332,99 @@ def test_the_gate_wraps_the_launch_not_the_whole_method():
     gate = src.index("with playback_gate_sync")
     write = src.index('f.write(audio_data)')
     assert write < gate, "the gate swallowed the file write"
+
+
+# ---------------------------------------------------------------------------
+# A buffered sink is not finished when the call returns
+# ---------------------------------------------------------------------------
+#
+# AudioBus.play_stream writes into the device's PlaybackRingBuffer and
+# RETURNS; the output callback drains it over the following seconds. Gating
+# around that call gated nothing:
+#
+#     13:18:17,324  mic CLOSED for playback (16 chars)
+#     13:18:17,331  mic OPEN                            <- 7ms later
+#     13:18:17,631  [BargeIn] User interrupted JARVIS
+#
+# Seven milliseconds of protection for several seconds of speech.
+
+
+class _Buf:
+    def __init__(self, frames):
+        self._left = list(frames)
+
+    @property
+    def available(self):
+        return self._left.pop(0) if self._left else 0
+
+
+def _fake_device(monkeypatch, frames):
+    """Point the drain-waiter at a ring buffer that empties on a schedule."""
+    class _Dev:
+        playback_buffer = _Buf(frames)
+
+    class _Bus:
+        _device = _Dev()
+
+        @staticmethod
+        def get_instance_safe():
+            return _Bus
+
+    import backend.audio.audio_bus as ab
+    monkeypatch.setattr(ab.AudioBus, "get_instance_safe", staticmethod(lambda: _Bus))
+
+
+async def test_the_gate_is_held_until_the_buffer_drains(fake_bus, monkeypatch):
+    """THE REGRESSION. The mic must stay closed while queued audio is still
+    being consumed, not merely while the enqueue call runs."""
+    _fake_device(monkeypatch, [4096, 4096, 2048, 0, 0])
+
+    async with pg.playback_gate("hello"):
+        pass                                   # enqueue returns immediately
+    # By the time the context manager has exited, the buffer must have drained.
+    assert fake_bus.gated is False
+    assert fake_bus.transitions == [True, False]
+
+
+async def test_the_gate_survives_a_momentary_empty_read(fake_bus, monkeypatch):
+    """The buffer reads empty for an instant between a write and the callback
+    picking it up. Releasing in that gap reopens the mic mid-utterance, so two
+    consecutive empty reads are required."""
+    _fake_device(monkeypatch, [4096, 0, 4096, 0, 0])
+    async with pg.playback_gate("x"):
+        pass
+    assert fake_bus.gated is False
+
+
+async def test_a_wedged_device_still_reopens_the_mic(monkeypatch, fake_bus):
+    """Bounded: a buffer that never drains must not deafen the operator
+    forever. Reopening late beats never."""
+    _fake_device(monkeypatch, [4096] * 10_000)
+    original = pg._await_playback_drain        # capture BEFORE patching
+
+    async def _short(timeout_s=0.2):
+        await original(0.2)
+
+    monkeypatch.setattr(pg, "_await_playback_drain", _short)
+
+    async with pg.playback_gate("x"):
+        pass
+    assert fake_bus.gated is False, "a wedged buffer left the mic closed"
+
+
+async def test_subprocess_sites_do_not_wait_for_a_drain(fake_bus):
+    """afplay is finished when the call returns — there is no buffer to wait
+    on, and waiting would hold the mic closed past the end of her voice."""
+    with pg.playback_gate_sync("x"):
+        pass
+    assert fake_bus.transitions == [True, False]
+
+
+def test_both_gate_shapes_exist_for_a_reason():
+    """Structural pin: the two playback shapes differ, and collapsing them
+    would either under-protect the buffer or over-hold the subprocess."""
+    import inspect
+
+    src = inspect.getsource(pg)
+    assert "await_drain" in src
+    assert "_await_playback_drain" in src
