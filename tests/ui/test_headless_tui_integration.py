@@ -343,3 +343,56 @@ def test_repeated_sessions_do_not_exhaust_the_pty_pool():
             [sys.executable, "-c", "print('ok',flush=True)"], env=_env(),
         ) as s:
             assert s.wait_for("ok", timeout=30)
+
+
+# ---------------------------------------------------------------------------
+# the invisible-idle regression
+# ---------------------------------------------------------------------------
+
+
+def test_idle_scope_is_visible_in_a_real_terminal():
+    """A live cockpit showed NOTHING in the gutter. The wiring was correct all
+    along — the scope was rendering 20 x U+2800, the BLANK braille pattern, so
+    a silent meter was literally whitespace and looked identical to an
+    uninstalled feature.
+
+    Asserted through the production header renderer into a real terminal,
+    because that is the only place the bug was observable: every unit test
+    compared strings and a string of blanks compares fine."""
+    probe = (
+        "from backend.core.ouroboros.ui.audio_scope import BrailleScope;"
+        "from backend.core.ouroboros.ui.crest_animator import render_cockpit_header;"
+        "sc=BrailleScope(width=20);"          # never fed — the idle case
+        "out=render_cockpit_header(None,['O+V v0.1.0','healthy','~/repo'],100,"
+        "right_gutter=lambda: sc.render_rich());"
+        "print('HDR',flush=True); print(out,flush=True); print('END',flush=True)"
+    )
+    with PtySession([sys.executable, "-c", probe], env=_env()) as s:
+        assert s.wait_for("END", timeout=60), s.output()
+        out = s.output()
+        blanks = [c for c in out if ord(c) == 0x2800]
+        marks = [c for c in out if 0x2801 <= ord(c) <= 0x28FF]
+        assert not blanks, "idle scope emitted BLANK braille — invisible again"
+        assert len(marks) >= 10, (
+            f"idle scope drew no visible baseline (got {len(marks)} glyphs)"
+        )
+
+
+def test_idle_and_active_scopes_are_visually_distinct():
+    """The baseline must not be so prominent that a silent meter reads as a
+    live one — quiet and loud have to look different at a glance."""
+    probe = (
+        "from backend.core.ouroboros.ui.audio_scope import BrailleScope;"
+        "a=BrailleScope(width=10);"
+        "b=BrailleScope(width=10); b.extend([1.0]*20);"
+        "print('IDLE:'+a.render(),flush=True);"
+        "print('LOUD:'+b.render(),flush=True);"
+        "print('END',flush=True)"
+    )
+    with PtySession([sys.executable, "-c", probe], env=_env()) as s:
+        assert s.wait_for("END", timeout=60), s.output()
+        out = s.output()
+        idle = [l for l in out.splitlines() if l.startswith("IDLE:")][0][5:]
+        loud = [l for l in out.splitlines() if l.startswith("LOUD:")][0][5:]
+        assert idle != loud, "idle and full-scale render identically"
+        assert "⣿" in loud, "full scale missing"

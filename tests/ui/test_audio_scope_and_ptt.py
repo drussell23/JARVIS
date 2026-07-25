@@ -35,6 +35,10 @@ from backend.core.ouroboros.ui.ptt_router import (
 )
 
 _BASE = 0x2800
+#: A silent sub-column still draws its bottom dot, so quiet renders as a
+#: visible flat line. U+2800 is BLANK — a scope made of it is invisible,
+#: which is indistinguishable from the feature not being installed.
+_BASELINE = chr(_BASE + 0x40 + 0x80)   # dots 7+8, both bottom dots
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +51,7 @@ def test_silence_renders_empty_braille_cells():
     sc.extend([0.0] * 16)
     out = sc.render()
     assert len(out) == 8
-    assert out == chr(_BASE) * 8, "silence must be blank cells, not a floating bar"
+    assert out == _BASELINE * 8, "silence must be a visible flat line"
     assert sc.is_silent() is True
 
 
@@ -60,19 +64,21 @@ def test_full_scale_renders_all_eight_dots():
 def test_cell_encodes_two_samples_at_four_levels():
     """The resolution claim, asserted bit-exactly: one cell = 2 columns x 4 rows,
     bars filling from the BOTTOM."""
-    assert cell_for(0.0, 0.0) == chr(_BASE)
+    assert cell_for(0.0, 0.0, baseline=False) == chr(_BASE)
+    assert cell_for(0.0, 0.0) == _BASELINE          # baseline on by default
     # Left column only, one dot from the bottom -> dot 7 (0x40).
-    assert cell_for(0.2, 0.0) == chr(_BASE + 0x40)
+    assert cell_for(0.2, 0.0, baseline=False) == chr(_BASE + 0x40)
     # Right column only, one dot from the bottom -> dot 8 (0x80).
-    assert cell_for(0.0, 0.2) == chr(_BASE + 0x80)
+    assert cell_for(0.0, 0.2, baseline=False) == chr(_BASE + 0x80)
     # Both columns full -> all eight dots.
-    assert cell_for(1.0, 1.0) == chr(_BASE + 0xFF)
+    assert cell_for(1.0, 1.0) == chr(_BASE + 0xFF)   # unchanged: full scale
 
 
 def test_bars_fill_upward_from_the_baseline():
     """A louder sample must be a TALLER bar anchored at the bottom, so a rising
     ramp is monotonically denser."""
-    masks = [ord(cell_for(v, v)) - _BASE for v in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    masks = [ord(cell_for(v, v, baseline=False)) - _BASE
+             for v in (0.0, 0.25, 0.5, 0.75, 1.0)]
     assert masks == sorted(masks), f"not monotonic: {masks}"
     assert masks[0] == 0 and masks[-1] == 0xFF
 
@@ -94,9 +100,9 @@ def test_newest_sample_lands_at_the_right_edge():
     """Right-to-left scroll: the freshest data is always rightmost."""
     sc = BrailleScope(width=3)
     sc.extend([0.0] * 6)
-    assert sc.render()[-1] == chr(_BASE)
+    assert sc.render()[-1] == _BASELINE
     sc.push(1.0)
-    assert sc.render()[-1] != chr(_BASE), "new sample did not reach the right edge"
+    assert sc.render()[-1] != _BASELINE, "new sample did not reach the right edge"
 
 
 def test_partial_buffer_is_left_padded_to_stable_width():
@@ -105,7 +111,7 @@ def test_partial_buffer_is_left_padded_to_stable_width():
     sc.push(1.0)
     out = sc.render()
     assert len(out) == 10
-    assert out.startswith(chr(_BASE)), "partial buffer must left-pad"
+    assert out.startswith(_BASELINE), "partial buffer must left-pad with baseline"
     assert out[-1] != chr(_BASE)
 
 
@@ -142,7 +148,7 @@ def test_clear_resets_to_silence():
     sc = BrailleScope(width=6)
     sc.extend([1.0] * 12)
     sc.clear()
-    assert sc.render() == chr(_BASE) * 6
+    assert sc.render() == _BASELINE * 6
     assert sc.is_silent() is True
 
 
@@ -185,7 +191,11 @@ def test_normalizer_uses_full_range_for_quiet_and_loud_sources():
 
 
 def test_normalizer_peak_decays_so_a_quieter_source_recovers():
-    n = AdaptiveNormalizer(decay=0.5)
+    """Squelch OFF on purpose: this isolates the PEAK-DECAY mechanism. With the
+    squelch armed a sustained 0.01 is correctly identified as room tone and
+    clamped to zero, so the peak would never see it — a true behaviour, but a
+    different one, covered by the squelch tests below."""
+    n = AdaptiveNormalizer(decay=0.5, squelch=False)
     n.normalize(1.0)
     for _ in range(40):
         n.normalize(0.01)
@@ -438,3 +448,157 @@ def test_broker_event_types_are_registered():
     )
     assert "audio_level_changed" in _VALID_EVENT_TYPES
     assert "mic_state_changed" in _VALID_EVENT_TYPES
+
+
+def test_idle_scope_is_visible_not_blank():
+    """THE BUG A LIVE COCKPIT EXPOSED: U+2800 is the BLANK braille pattern, so
+    a silent scope rendered as pure whitespace — the operator saw nothing and
+    could not tell it from an uninstalled feature. A real oscilloscope shows a
+    flat line at rest."""
+    sc = BrailleScope(width=20)
+    out = sc.render()
+    assert all(ord(c) != _BASE for c in out), "idle scope is invisible"
+    assert out == _BASELINE * 20
+    assert sc.is_silent() is True, "baseline must not be mistaken for signal"
+
+
+def test_baseline_is_below_every_signal_level():
+    """The flat line must sit UNDER the trace, never overlap it — otherwise a
+    quiet passage would look louder than it is."""
+    quiet = ord(cell_for(0.0, 0.0)) - _BASE
+    loud = ord(cell_for(1.0, 1.0)) - _BASE
+    assert quiet & loud == quiet, "baseline dots are not a subset of full scale"
+
+
+def test_ascii_fallback_also_shows_a_baseline(monkeypatch):
+    monkeypatch.setenv("JARVIS_AUDIO_SCOPE_ASCII", "true")
+    sc = BrailleScope(width=6)
+    out = sc.render()
+    assert out.strip(), "ASCII fallback rendered invisible whitespace"
+    assert out == "_" * 6
+
+
+# ---------------------------------------------------------------------------
+# dynamic noise-floor squelch
+# ---------------------------------------------------------------------------
+
+
+def _noise(n, lo, hi, seed=11):
+    import random
+    r = random.Random(seed)
+    return [r.uniform(lo, hi) for _ in range(n)]
+
+
+def test_ambient_noise_clamps_to_absolute_zero_after_the_window_adapts():
+    """(1) A live mic never reaches digital zero — fans and HVAC keep RMS
+    hovering, which renders as a permanently twitching baseline. Once the
+    profile is learned, ambient must clamp to a HARD 0.0."""
+    n = AdaptiveNormalizer()
+    out = [n.normalize(v) for v in _noise(200, 0.002, 0.006)]
+
+    assert all(v == 0.0 for v in out[-100:]), (
+        f"ambient leaked through: max={max(out[-100:]):.4f}"
+    )
+    assert n.squelch_ready is True
+
+
+def test_speech_bypasses_the_clamp_and_registers_high():
+    """(2) The gate must open instantly for real signal — a meter that swallows
+    the first word is worse than no meter."""
+    n = AdaptiveNormalizer()
+    for v in _noise(120, 0.002, 0.006):
+        n.normalize(v)
+
+    loud = n.normalize(0.7)
+    assert loud > 0.5, f"speech was squelched (got {loud})"
+
+
+def test_squelch_adapts_across_wildly_different_rooms():
+    """The reason a constant cannot work: the correct gate in a quiet study is
+    20x too low for a cafe. Both must end up silent."""
+    for lo, hi in ((0.002, 0.006), (0.02, 0.05), (0.06, 0.10)):
+        n = AdaptiveNormalizer()
+        out = [n.normalize(v) for v in _noise(200, lo, hi)]
+        assert all(v == 0.0 for v in out[-80:]), (
+            f"room {lo}-{hi} still jittering: max={max(out[-80:]):.4f}"
+        )
+        assert n.normalize(0.7) > 0.5, f"speech blocked in room {lo}-{hi}"
+
+
+def test_gate_spans_the_ambient_distribution_not_just_its_trough():
+    """A gate pinned to the MINIMUM is sailed over by the noise's own peaks —
+    the first implementation failed exactly here in a quiet room."""
+    n = AdaptiveNormalizer()
+    for v in _noise(200, 0.002, 0.006):
+        n.normalize(v)
+    assert n.noise_gate > 0.006, (
+        f"gate {n.noise_gate:.4f} sits below the ambient ceiling 0.006"
+    )
+    assert n.noise_floor < 0.006, "floor should track the trough, not the peak"
+
+
+def test_speech_does_not_drag_the_gate_up():
+    """Speech must not widen the profile, or a talker would progressively
+    squelch themselves."""
+    n = AdaptiveNormalizer()
+    for v in _noise(150, 0.02, 0.05):
+        n.normalize(v)
+    before = n.noise_gate
+    for _ in range(30):
+        n.normalize(0.8)
+    after = n.noise_gate
+    assert after < before * 1.5, f"gate inflated under speech: {before:.4f}->{after:.4f}"
+    assert n.normalize(0.8) > 0.5, "speaker squelched themselves"
+
+
+def test_no_clamping_before_the_profile_exists():
+    """One sample cannot characterise a room. Clamping during warmup would
+    swallow the first words after launch."""
+    n = AdaptiveNormalizer(squelch_warmup_frames=20)
+    assert n.squelch_ready is False
+    assert n.normalize(0.5) > 0.0, "clamped before learning the room"
+
+
+def test_squelch_can_be_disabled():
+    n = AdaptiveNormalizer(squelch=False)
+    out = [n.normalize(v) for v in _noise(200, 0.002, 0.006)]
+    assert any(v > 0.0 for v in out[-50:]), "squelch ran while disabled"
+
+
+def test_a_quieter_room_is_adopted_quickly():
+    """Down-fast: moving somewhere quieter must not leave a stale high gate
+    that swallows speech."""
+    n = AdaptiveNormalizer()
+    for v in _noise(150, 0.06, 0.10):
+        n.normalize(v)
+    loud_gate = n.noise_gate
+    for v in _noise(300, 0.001, 0.003, seed=5):
+        n.normalize(v)
+    assert n.noise_gate < loud_gate, "gate never fell after the room quietened"
+
+
+def test_squelch_is_allocation_free_scalar_math():
+    """Structural: the profiler must stay two float updates. A deque scan per
+    frame would put real work on the path that feeds the STT thread."""
+    import inspect
+
+    src = inspect.getsource(AdaptiveNormalizer._update_noise_floor)
+    # Strip the docstring first: it *describes* the costs being avoided, and a
+    # naive substring scan matched its own prose rather than the code.
+    body = src.split('"""')[-1]
+    for banned in ("deque", "sorted", "np.", "numpy", "for ", "while "):
+        assert banned not in body, f"profiler is doing {banned!r} work per frame"
+
+
+def test_squelched_output_renders_a_stable_baseline():
+    """End-to-end into the visual: a noisy room must draw the flat line, not a
+    twitching trace."""
+    sc = BrailleScope(width=20)
+    n = AdaptiveNormalizer()
+    for v in _noise(40, 0.002, 0.006):
+        n.normalize(v)
+    for v in _noise(40, 0.002, 0.006, seed=3):
+        sc.push(n.normalize(v))
+    out = sc.render()
+    assert len(set(out)) == 1, f"baseline is jittering: {out}"
+    assert sc.is_silent() is True
