@@ -124,6 +124,9 @@ class AudioPlaneHost:
         self._bus: Any = None
         self._handle: Any = None
         self._stop = asyncio.Event()
+        #: Inode of the socket file this host bound. Identity, not liveness —
+        #: the only thing that can detect losing an address.
+        self._inode: Optional[int] = None
 
     # -- lifecycle -------------------------------------------------------
 
@@ -203,10 +206,104 @@ class AudioPlaneHost:
                 pass
         return True
 
+    # -- address watchdog ------------------------------------------------
+
+    def _bound_inode(self) -> Optional[int]:
+        """Inode of the socket path right now, or None if it is gone."""
+        try:
+            from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (  # noqa: E501
+                socket_path,
+            )
+            return socket_path().stat().st_ino
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _address_watchdog(self) -> None:
+        """Notice when the host loses its own address, and take it back.
+
+        A unix-domain server can be unbound WITHOUT KNOWING IT. Another
+        process unlinks or replaces the path — a stale-socket cleanup, an
+        ``rm``, a second host — and the listener goes on serving an orphaned
+        inode that no path points to. Every client then gets ECONNREFUSED
+        while the server reports perfect health.
+
+        Observed live 2026-07-25: the host was transcribing speech at the same
+        moment the cockpit read "no audio plane". Both were telling the truth
+        about different inodes.
+
+        Liveness cannot answer this — the process is fine, the pipeline is
+        fine, the socket object is fine. Only IDENTITY answers it: is the file
+        at my address still the one I bound? So the watchdog compares inodes
+        and re-binds when they diverge, which also recovers the case where the
+        path was deleted outright.
+
+        Bounded, cheap (one stat per tick), and fail-soft: a watchdog fault
+        costs the self-healing, never the audio."""
+        try:
+            interval = max(1.0, float(
+                os.environ.get("JARVIS_AUDIO_PLANE_ADDRESS_CHECK_S", "5"),
+            ))
+        except (TypeError, ValueError):
+            interval = 5.0
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                return                      # stop signalled
+            except asyncio.TimeoutError:
+                pass
+            try:
+                now = self._bound_inode()
+                if now == self._inode:
+                    continue
+                logger.warning(
+                    "[AudioPlane] lost my address (inode %s -> %s) — "
+                    "another process replaced or removed the socket; "
+                    "re-binding", self._inode, now,
+                )
+                if await self._rebind():
+                    logger.info("[AudioPlane] address recovered")
+                else:
+                    # Cannot serve, and holding the singleton lock while
+                    # serving nothing would block every replacement. Exit and
+                    # let the cockpit's reflex spawn a healthy one.
+                    logger.error(
+                        "[AudioPlane] could not re-bind — exiting so a "
+                        "replacement can take the lock",
+                    )
+                    self.request_stop("address_lost")
+                    return
+            except Exception:  # noqa: BLE001
+                logger.debug("[AudioPlane] address watchdog degraded", exc_info=True)
+
+    async def _rebind(self) -> bool:
+        """Stop and restart just the IPC broadcaster. NEVER raises."""
+        try:
+            ipc = getattr(self._handle, "audio_ipc", None)
+            if ipc is None:
+                return False
+            try:
+                await asyncio.wait_for(ipc.stop(), timeout=5.0)
+            except Exception:  # noqa: BLE001
+                pass
+            if not await ipc.start():
+                return False
+            self._inode = self._bound_inode()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     async def run(self) -> None:
-        """Idle until signalled. The pipeline drives itself from here — this
-        coroutine exists only to keep the loop alive and own the shutdown."""
-        await self._stop.wait()
+        """Idle until signalled, watching that the address stays ours."""
+        self._inode = self._bound_inode()
+        watchdog = asyncio.get_running_loop().create_task(self._address_watchdog())
+        try:
+            await self._stop.wait()
+        finally:
+            watchdog.cancel()
+            try:
+                await watchdog
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
     def request_stop(self, reason: str = "") -> None:
         """Signal-handler safe: sets an Event, does no I/O, takes no lock.

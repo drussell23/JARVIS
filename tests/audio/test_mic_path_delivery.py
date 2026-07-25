@@ -511,3 +511,86 @@ async def test_liveness_is_answered_by_the_kernel_not_by_stat(tmp_path):
     assert await ipc._socket_is_live(corpse) is False, (
         "file presence was treated as proof of a live server"
     )
+
+
+# ---------------------------------------------------------------------------
+# BUG 7 — a server can lose its own address and never notice
+# ---------------------------------------------------------------------------
+#
+# Observed live: the host was transcribing speech at the same moment the
+# cockpit read "no audio plane". Both were telling the truth about DIFFERENT
+# INODES — something had replaced the socket file, so the host went on serving
+# an orphaned inode no path pointed at, and every client got ECONNREFUSED.
+#
+# Liveness cannot detect this. The process is fine, the pipeline is fine, the
+# socket object is fine. Only IDENTITY can: is the file at my address still
+# the one I bound?
+
+
+async def test_the_host_notices_when_its_address_is_taken_away(tmp_path, monkeypatch):
+    """THE REGRESSION. Deleting the socket path must be noticed and repaired,
+    not served straight past."""
+    import tempfile
+    from pathlib import Path
+
+    from backend.audio.audio_plane_host import AudioPlaneHost
+    from backend.core.ouroboros.governance.comms.duplex import (
+        audio_state_ipc as ipc,
+    )
+
+    sock = Path(tempfile.mkdtemp(prefix="ovwd")) / "a.sock"
+    monkeypatch.setenv("JARVIS_AUDIO_IPC_SOCKET", str(sock))
+    monkeypatch.setenv("JARVIS_AUDIO_PLANE_ADDRESS_CHECK_S", "1")
+
+    broadcaster = ipc.AudioStateBroadcaster(path=sock)
+    if not await broadcaster.start():
+        pytest.skip("cannot bind a unix socket in this environment")
+
+    host = AudioPlaneHost()
+    host._handle = type("H", (), {"audio_ipc": broadcaster})()   # noqa: SLF001
+    try:
+        runner = asyncio.get_running_loop().create_task(host.run())
+        await asyncio.sleep(0.2)
+        first = host._inode                                       # noqa: SLF001
+        assert first is not None
+
+        sock.unlink()                       # the address is taken away
+        await asyncio.sleep(2.5)            # one watchdog tick + rebind
+
+        assert await ipc._socket_is_live(sock) is True, (
+            "the host kept serving an orphaned inode"
+        )
+        assert host._inode != first, "re-bound to the same inode?"  # noqa: SLF001
+    finally:
+        host.request_stop("test")
+        await asyncio.sleep(0.1)
+        await broadcaster.stop()
+
+
+async def test_identity_not_liveness_is_what_gets_compared():
+    """A health check that asks 'am I running?' answers yes throughout this
+    failure. The watchdog must compare the inode it bound."""
+    import inspect
+
+    from backend.audio.audio_plane_host import AudioPlaneHost
+
+    src = inspect.getsource(AudioPlaneHost._address_watchdog)
+    assert "_bound_inode" in src and "_rebind" in src
+
+
+async def test_a_host_that_cannot_rebind_exits_rather_than_squatting(monkeypatch):
+    """It holds the singleton lock. Staying alive while serving nothing would
+    block every replacement from ever taking the microphone."""
+    from backend.audio.audio_plane_host import AudioPlaneHost
+
+    monkeypatch.setenv("JARVIS_AUDIO_PLANE_ADDRESS_CHECK_S", "1")
+    host = AudioPlaneHost()
+    host._inode = 12345                                   # noqa: SLF001
+    host._handle = type("H", (), {"audio_ipc": None})()   # rebind impossible
+
+    task = asyncio.get_running_loop().create_task(host._address_watchdog())
+    await asyncio.sleep(2.5)
+    assert host._stop.is_set(), (                          # noqa: SLF001
+        "the host squatted on the lock while unable to serve"
+    )
+    task.cancel()
