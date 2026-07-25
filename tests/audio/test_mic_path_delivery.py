@@ -729,3 +729,95 @@ async def test_the_keeper_reconnects_after_a_host_restart(monkeypatch):
     except (asyncio.CancelledError, Exception):
         pass
     assert len(made) >= 2, "a dead subscription was never replaced"
+
+
+# ---------------------------------------------------------------------------
+# BUG 10 — input arriving above full scale
+# ---------------------------------------------------------------------------
+#
+# Measured live across sessions: frames at peak 1.04, 2.36, 2.76, 3.26, 3.99 —
+# up to FOUR TIMES full scale. Nothing in this codebase multiplies the signal,
+# so the capture device is applying gain. Every downstream consumer assumes
+# normalized audio (faster-whisper contracts on [-1, 1]), so 4.0 is distortion
+# by the time it arrives — which is exactly the "speech-level amplitude,
+# empty transcript" signature that made this fault so hard to place.
+
+
+def _bus():
+    from backend.audio.audio_bus import AudioBus
+
+    b = AudioBus.__new__(AudioBus)
+    b._range_peak = 1.0
+    b._range_reports = 0
+    return b
+
+
+def test_over_range_input_is_brought_back_inside_the_contract():
+    """THE REGRESSION."""
+    b = _bus()
+    out = b._fit_to_range(np.full(320, 4.0, dtype=np.float32))
+    assert float(np.max(np.abs(out))) <= 1.0 + 1e-6
+
+
+def test_well_behaved_input_is_untouched():
+    """The common case must cost nothing and change nothing."""
+    b = _bus()
+    frame = (np.sin(np.linspace(0, 6, 320)) * 0.4).astype(np.float32)
+    assert np.array_equal(b._fit_to_range(frame), frame)
+
+
+def test_scaling_preserves_waveform_shape_rather_than_clipping():
+    """Clipping flattens peaks and destroys the formant structure speech
+    recognition reads. Scaling keeps the shape."""
+    b = _bus()
+    frame = (np.sin(np.linspace(0, 12, 320)) * 3.0).astype(np.float32)
+    out = b._fit_to_range(frame)
+    corr = float(np.corrcoef(frame, out)[0, 1])
+    assert corr > 0.999, f"waveform distorted (corr={corr:.4f})"
+    assert float(np.max(np.abs(out))) <= 1.0 + 1e-6
+
+
+def test_relative_level_is_preserved_across_frames():
+    """Per-frame normalization would make a whisper as loud as a shout and
+    erase the dynamics the endpointer depends on."""
+    b = _bus()
+    b._fit_to_range(np.full(320, 4.0, dtype=np.float32))       # set the scale
+    quiet = b._fit_to_range(np.full(320, 1.0, dtype=np.float32))
+    assert float(np.max(np.abs(quiet))) < 0.5, "quiet frame was pumped up"
+
+
+def test_the_scale_decays_back_toward_unity():
+    """One loud moment must not pin the scale for the whole session."""
+    b = _bus()
+    b._fit_to_range(np.full(320, 4.0, dtype=np.float32))
+    assert b._range_peak > 1.0
+    for _ in range(20000):
+        b._fit_to_range(np.full(320, 0.1, dtype=np.float32))
+    assert b._range_peak == pytest.approx(1.0, abs=1e-6)
+
+
+def test_the_over_range_condition_is_reported_but_rate_limited():
+    """Worth saying — it means the operator's input gain is too hot — but it
+    runs on the audio thread, so it cannot say it 50 times a second."""
+    b = _bus()
+    for _ in range(50):
+        b._fit_to_range(np.full(320, 4.0 + _ * 0.1, dtype=np.float32))
+    assert b._range_reports <= 3
+
+
+def test_fitting_never_raises_on_garbage():
+    b = _bus()
+    for junk in (np.zeros(0, dtype=np.float32), np.array([np.nan], dtype=np.float32)):
+        b._fit_to_range(junk)
+
+
+def test_the_fit_runs_before_consumers_see_the_frame():
+    """Structural pin: fitting after dispatch would hand whisper the
+    out-of-range audio and normalize only what nobody reads."""
+    import inspect
+
+    from backend.audio.audio_bus import AudioBus
+
+    src = inspect.getsource(AudioBus._on_mic_frame)
+    assert "_fit_to_range" in src
+    assert src.index("_fit_to_range") < src.index("for consumer in")

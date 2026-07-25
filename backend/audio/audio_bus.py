@@ -133,6 +133,12 @@ class Resampler:
 # Acoustic Echo Canceller
 # ============================================================================
 
+#: How fast the observed-peak scale relaxes. ~0.9995 per 20ms frame is a few
+#: seconds to halve — slow enough not to pump inside an utterance, fast enough
+#: to recover when the operator stops shouting.
+_RANGE_PEAK_DECAY = float(os.getenv("JARVIS_AUDIO_RANGE_DECAY", "0.9995"))
+
+
 class AcousticEchoCanceller:
     """
     Wraps speexdsp for acoustic echo cancellation. Falls back to spectral
@@ -434,6 +440,10 @@ class AudioBus:
         #: microphone is not reaching its consumers, whatever else says.
         self._mic_error_count: int = 0
         self._mic_frames_delivered: int = 0
+        #: Decaying observed peak, used to fit over-range input back into the
+        #: normalized range every downstream consumer contracts on.
+        self._range_peak: float = 1.0
+        self._range_reports: int = 0
 
     @classmethod
     def get_instance(cls) -> "AudioBus":
@@ -739,6 +749,34 @@ class AudioBus:
 
     # ---- Internal: Mic frame processing ----
 
+    def _fit_to_range(self, frame: np.ndarray) -> np.ndarray:
+        """Bring an over-range frame back inside [-1, 1]. NEVER raises.
+
+        A no-op for well-behaved input — the common case costs one max()."""
+        try:
+            peak = float(np.max(np.abs(frame)))
+            if peak > self._range_peak:
+                self._range_peak = peak
+                if peak > 1.0 and self._range_reports < 3:
+                    self._range_reports += 1
+                    logger.warning(
+                        "[AudioBus] input exceeds full scale (peak=%.2f) — "
+                        "the capture device is applying gain; scaling to the "
+                        "normalized range downstream consumers require",
+                        peak,
+                    )
+            else:
+                # Decay so the scale follows the source back down instead of
+                # staying pinned by one loud moment for the whole session.
+                self._range_peak = max(
+                    1.0, self._range_peak * _RANGE_PEAK_DECAY,
+                )
+            if self._range_peak > 1.0:
+                return (frame / self._range_peak).astype(np.float32)
+            return frame
+        except Exception:  # noqa: BLE001
+            return frame
+
     def _on_mic_frame(self, raw_frame: np.ndarray) -> None:
         """
         Called from the audio thread with raw mic data at device rate.
@@ -774,7 +812,27 @@ class AudioBus:
             else:
                 cleaned = internal_frame
 
-            # 4. Dispatch to all consumers
+            # 4. HONOUR THE RANGE CONTRACT before dispatching.
+            #
+            # Measured live: frames arriving at peak 1.04, 2.36, 3.26, 3.99 —
+            # up to FOUR TIMES full scale. Nothing in this codebase multiplies
+            # the signal, so macOS is delivering input above +/-1.0 (device
+            # input boost). Every downstream consumer assumes normalized
+            # audio: faster-whisper contracts on [-1, 1], and handing it 4.0
+            # is distortion by the time it arrives — which is precisely the
+            # "speech-level amplitude, empty transcript" signature that made
+            # this fault so hard to place.
+            #
+            # Scaled by a DECAYING PEAK rather than clipped or per-frame
+            # normalized. Clipping flattens the waveform and destroys exactly
+            # the formant structure speech recognition reads; per-frame
+            # normalization pumps, making quiet frames as loud as shouted
+            # ones and erasing the dynamics an endpointer needs. A decaying
+            # peak preserves relative level across an utterance and recovers
+            # when the source gets quieter.
+            cleaned = self._fit_to_range(cleaned)
+
+            # 5. Dispatch to all consumers
             with self._consumer_lock:
                 for consumer in self._mic_consumers:
                     try:
