@@ -1232,6 +1232,45 @@ class ConversationPipeline:
         if self._tts_engine is None:
             return
 
+        # GATE THE MIC FOR THE DURATION OF HER OWN VOICE.
+        #
+        # Karen speaks through the speakers, the microphone hears her, the
+        # barge-in detector reads that as the operator interrupting, and it
+        # cancels her mid-sentence. Observed live:
+        #
+        #     [TTS] Synthesized 29 chars
+        #     [BargeIn] User interrupted JARVIS (total: 1)
+        #     ... and the reply stopped
+        #
+        # She interrupted herself. The machinery to prevent it already exists
+        # — UnifiedSpeechStateManager.start_speaking() gates AudioBus, and
+        # stop_speaking() ungates it — but only the UNGATE was ever called
+        # from this pipeline. A gate whose open half is wired and whose close
+        # half is not is worse than no gate: it can only ever be released.
+        #
+        # AEC cannot cover this on its own: playback leaves through afplay in
+        # a separate process precisely so it is GIL-free, so the bus has no
+        # reference signal to subtract. Gating is the honest mechanism, and
+        # it is symmetric here — the finally block always releases, so a
+        # synthesis fault can never leave the microphone deaf.
+        _speech_mgr = None
+        try:
+            from backend.core.unified_speech_state import (
+                SpeechSource, get_speech_state_manager,
+            )
+            _speech_mgr = await get_speech_state_manager()
+            # TTS_BACKEND, not an invented member: SpeechSource has no
+            # CONVERSATION, and naming one that does not exist raised an
+            # AttributeError this very except-block then swallowed — the gate
+            # silently never engaged, which is the exact failure shape being
+            # fixed. Caught by the suite rather than by another live session.
+            await _speech_mgr.start_speaking(
+                text=sentence, source=SpeechSource.TTS_BACKEND,
+            )
+        except Exception:  # noqa: BLE001 — an ungated reply beats no reply
+            logger.debug("[ConvPipeline] speech-state gate degraded", exc_info=True)
+            _speech_mgr = None
+
         try:
             # Preferred path: synthesize → decode WAV → stream through AudioBus
             # This gives AEC a reference signal and supports barge-in cancel.
@@ -1300,6 +1339,17 @@ class ConversationPipeline:
                 )
         except Exception as e:
             logger.debug(f"[ConvPipeline] TTS error: {e}")
+        finally:
+            # ALWAYS release. A synthesis fault must never leave the mic gated
+            # — that would trade one silent turn for a permanently deaf one.
+            if _speech_mgr is not None:
+                try:
+                    await _speech_mgr.stop_speaking()
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[ConvPipeline] speech-state ungate degraded",
+                        exc_info=True,
+                    )
 
     async def _is_self_voice_echo(self, text: str) -> bool:
         """
