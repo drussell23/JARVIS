@@ -185,3 +185,71 @@ def test_the_subscription_is_released_on_exit():
     ).read_text(encoding="utf-8")
     tail = src[src.index("await run_bipartite_repl("):][:2000]
     assert "finally:" in tail and "rms_client" in tail
+
+
+# ---------------------------------------------------------------------------
+# Transcripts — what the organism actually HEARD
+# ---------------------------------------------------------------------------
+#
+# The supervisor has published `transcript` frames on this socket since
+# 2026-07-18 and the cockpit never read one. An operator who spoke and got no
+# answer could not tell "it never heard me" from "it heard me and could not
+# reply" — two completely different faults, and this session spent days
+# guessing between them.
+
+
+async def test_a_user_transcript_reaches_the_cockpit(tmp_path, monkeypatch, scope):
+    """THE GAP. Your own words must land on screen."""
+    import backend.core.ouroboros.cli.ov as ov
+
+    shown = []
+    monkeypatch.setattr(ov, "_render_markup_frame", lambda t, console=None: shown.append(t))
+    server, client = await _live_session(tmp_path, monkeypatch, scope)
+    try:
+        server.publish_transcript("user", "Hello Karen", final=True)
+        await asyncio.sleep(0.4)
+        assert any("Hello Karen" in s for s in shown), (
+            "the cockpit still cannot show what it heard"
+        )
+        assert any("you" in s for s in shown)
+    finally:
+        await client.close()
+        await server.stop()
+
+
+async def test_karen_transcripts_are_attributed_to_her(tmp_path, monkeypatch, scope):
+    import backend.core.ouroboros.cli.ov as ov
+
+    shown = []
+    monkeypatch.setattr(ov, "_render_markup_frame", lambda t, console=None: shown.append(t))
+    server, client = await _live_session(tmp_path, monkeypatch, scope)
+    try:
+        server.publish_transcript("karen", "Right, I'm here.", final=True)
+        await asyncio.sleep(0.4)
+        assert any("Karen" in s and "Right" in s for s in shown)
+    finally:
+        await client.close()
+        await server.stop()
+
+
+async def test_a_transcript_frame_does_not_move_the_wave(tmp_path, monkeypatch, scope):
+    """Different frame types, different surfaces — text must not be mistaken
+    for amplitude."""
+    server, client = await _live_session(tmp_path, monkeypatch, scope)
+    try:
+        server.publish_transcript("user", "Hello Karen", final=True)
+        await asyncio.sleep(0.3)
+        assert scope.is_silent(), "a transcript frame drove the oscilloscope"
+    finally:
+        await client.close()
+        await server.stop()
+
+
+def test_transcript_text_is_escaped_before_rendering():
+    """Transcribed speech is untrusted text on a markup surface: a spoken
+    '[bold]' must render as characters, never as styling."""
+    from pathlib import Path
+
+    src = Path("backend/core/ouroboros/cli/ov.py").read_text(encoding="utf-8")
+    block = src[src.index('== "transcript"'):][:900]
+    assert "escape" in block, "transcript text reaches the markup renderer raw"

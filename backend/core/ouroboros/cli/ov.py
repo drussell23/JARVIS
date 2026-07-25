@@ -634,6 +634,28 @@ async def _attach_rms_stream(scope: Any) -> Any:
 
         def _on_frame(msg: dict) -> None:
             try:
+                # TRANSCRIPTS — what the organism actually HEARD.
+                #
+                # The supervisor has published these on this very socket since
+                # 2026-07-18 and the cockpit never read one. So an operator who
+                # spoke and got no answer had no way to tell "it never heard
+                # me" from "it heard me and could not reply" — two completely
+                # different faults, and days were spent guessing between them.
+                #
+                # Showing the transcript makes the loop legible: you see your
+                # own words land, or you see nothing and know the ears are the
+                # problem, not the mouth.
+                if msg.get("type") == "transcript":
+                    _txt = str(msg.get("chunk") or msg.get("text") or "").strip()
+                    if _txt and msg.get("final", True):
+                        _role = str(msg.get("role", "user")).lower()
+                        _who = "you" if _role == "user" else "Karen"
+                        _style = "cyan" if _role == "user" else "rgb(94,224,106)"
+                        _render_markup_frame(
+                            f"[{_style}]🎙 {_who}:[/{_style}] "
+                            + __import__("rich.markup", fromlist=["escape"]).escape(_txt)
+                        )
+                    return
                 if msg.get("type") != MSG_RMS_LEVEL:
                     return
                 plane = planes.get(str(msg.get("plane", "user")).lower())
