@@ -467,6 +467,56 @@ def _mk_tick(say: Callable[[str], None]) -> Callable[[float], None]:
     return _tick
 
 
+def _ignition_retry_budget_s() -> float:
+    """How long to wait out a transient single-flight refusal.
+
+    Sized to a SHUTDOWN, not a boot: the window being waited out is an
+    organism draining after SIGTERM. Bounded so a genuinely wedged incumbent
+    still returns the operator to a prompt."""
+    try:
+        raw = os.environ.get("JARVIS_OV_IGNITION_RETRY_S", "").strip()
+        return max(0.0, float(raw)) if raw else 20.0
+    except (TypeError, ValueError):
+        return 20.0
+
+
+async def _await_ignition_window(path: Any, *, say: Any) -> bool:
+    """Wait out a transient lock refusal. True iff an organism is now serving.
+
+    Races the two ways the window closes — the incumbent starts serving, or it
+    releases the lock and a fresh ignition succeeds — because waiting on only
+    one of them would hang on the other. NEVER raises."""
+    budget = _ignition_retry_budget_s()
+    if budget <= 0.0:
+        return False
+    say("⎿ another organism is still shutting down — waiting for the lock")
+    deadline = time.monotonic() + budget
+    attempt = 0
+    while time.monotonic() < deadline:
+        try:
+            # (a) the incumbent came up after all — nothing was ever wrong.
+            if await probe_socket(path):
+                say("⏺ organism live — attaching")
+                return True
+            # (b) it let go: the lock is free, so ignite again.
+            if _live_incumbent() is None:
+                proc = spawn_daemon()
+                if proc is not None and await await_socket(
+                    path, on_tick=_mk_tick(say),
+                    child_poll=getattr(proc, "poll", None),
+                ):
+                    say("⏺ organism live — attaching")
+                    return True
+        except Exception:  # noqa: BLE001 — a failed probe is just another tick
+            pass
+        attempt += 1
+        # Full jitter, same discipline as the audio reflex: several cockpits
+        # started together must not all re-ignite on the same instant.
+        delay = min(2.0, 0.25 * (2 ** min(attempt, 4)))
+        await asyncio.sleep(random.uniform(0.0, delay))
+    return False
+
+
 async def ensure_daemon(
     *,
     on_status: Optional[Callable[[str], None]] = None,
@@ -544,13 +594,29 @@ async def ensure_daemon(
         except Exception:  # noqa: BLE001
             pass
         if rc == 75:                      # EX_TEMPFAIL — single-flight
+            # A REFUSAL IS USUALLY TRANSIENT, so retrying is the cockpit's job
+            # rather than the operator's.
+            #
+            # The message used to end at "retry shortly", which reads as an
+            # instruction and is in fact a description of a race the cockpit
+            # can wait out itself. `pkill` sends SIGTERM and the organism
+            # drains for several seconds; throughout that drain the kernel
+            # still holds its flock, so an ignition fired in that window is
+            # refused for a condition that resolves on its own. The operator
+            # then sees a hard failure for something nobody needed to fix.
+            #
+            # Two outcomes are watched together, because either ends the wait
+            # legitimately: the incumbent finishes booting and starts SERVING
+            # (attach to it — there was never anything wrong), or it finishes
+            # DYING and releases the lock (ignite again).
+            if await _await_ignition_window(path, say=_say):
+                return True
             incumbent = _live_incumbent()
             who = f"PID {incumbent}" if incumbent else "another process"
             _say(
-                f"⚠ ignition refused — {who} already holds the "
-                "single-flight organism lock, but its attach socket "
-                "is not serving. It may be starved or mid-boot; retry "
-                "shortly, or tail " + str(daemon_log_path()),
+                f"⚠ ignition refused — {who} holds the single-flight "
+                "organism lock and never served. Its loop may be starved; "
+                "tail " + str(daemon_log_path()),
             )
             return False
         if rc is not None:
