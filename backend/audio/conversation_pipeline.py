@@ -271,6 +271,22 @@ async def _tts_synthesize(engine: Any, sentence: str) -> Any:
     return await engine.speak(sentence, play_audio=False)
 
 
+def _persona_system_prompt() -> Optional[str]:
+    """Identity prompt for the persona bound to this process, or None.
+
+    None means "no persona declared" — the caller keeps its existing prompt,
+    so a process that never bound one behaves exactly as before."""
+    try:
+        from backend.voice.agent_persona import active_persona, system_prompt_for
+
+        persona = active_persona()
+        if persona is None:
+            return None
+        return system_prompt_for(persona)
+    except (ImportError, AttributeError):
+        return None
+
+
 class ConversationPipeline:
     """
     Full conversation orchestrator.
@@ -320,13 +336,27 @@ class ConversationPipeline:
         self._resume_event.set()  # Start unpaused
         self._run_task: Optional[asyncio.Task] = None
 
-        # System prompt for conversation mode
-        self._system_prompt = os.getenv(
-            "JARVIS_CONV_SYSTEM_PROMPT",
-            "You are JARVIS, a helpful AI assistant engaged in a voice "
-            "conversation. Keep responses concise and natural for speech. "
-            "Use short sentences. Avoid markdown, code blocks, or lists "
-            "unless specifically asked."
+        # System prompt — PERSONA FIRST.
+        #
+        # This was hardcoded to "You are JARVIS", so in Karen's cockpit the
+        # model believed it was a different agent. Hearing "Hello Karen" it
+        # reasoned that the operator was addressing SOMEONE ELSE and replied
+        # "Karen, or whoever you are, what would you like to do today?" —
+        # an assistant asking the operator to identify a third party who was
+        # in fact itself.
+        #
+        # A persona is an identity. Four voice sites were taught that and the
+        # prompt was not, so the two drifted: she SOUNDED like Karen and
+        # THOUGHT she was JARVIS. Identity now comes from one place.
+        self._system_prompt = (
+            _persona_system_prompt()
+            or os.getenv(
+                "JARVIS_CONV_SYSTEM_PROMPT",
+                "You are JARVIS, a helpful AI assistant engaged in a voice "
+                "conversation. Keep responses concise and natural for speech. "
+                "Use short sentences. Avoid markdown, code blocks, or lists "
+                "unless specifically asked."
+            )
         )
 
     def set_mode_dispatcher(self, dispatcher) -> None:

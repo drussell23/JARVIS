@@ -356,6 +356,103 @@ def active_persona() -> Optional[AgentPersona]:
     return AgentPersona.coerce(os.getenv("JARVIS_AGENT_PERSONA", ""))
 
 
+# ---------------------------------------------------------------------------
+# Identity — who she IS, not merely how she sounds
+# ---------------------------------------------------------------------------
+
+#: Per-persona self-description. A persona is an IDENTITY; the voice is one
+#: platform's rendering of it and the prompt is the model's. Both must come
+#: from the same place or they drift — which is exactly what happened: four
+#: voice sites were made persona-aware while the conversation prompt still
+#: said "You are JARVIS", so the model heard "Hello Karen" as the operator
+#: addressing SOMEONE ELSE and replied "Karen, or whoever you are, what would
+#: you like to do today?".
+_IDENTITY: Dict[AgentPersona, Dict[str, str]] = {
+    AgentPersona.KAREN: {
+        "name": "Karen",
+        "character": (
+            "the voice of O+V (Ouroboros + Venom), an autonomous "
+            "self-developing engineering organism. You are a terse, senior "
+            "Australian engineer: plain words, no filler, no bullet spam"
+        ),
+    },
+    AgentPersona.JARVIS: {
+        "name": "JARVIS",
+        "character": (
+            "a precise, understated British AI assistant to the operator"
+        ),
+    },
+    AgentPersona.SYSTEM: {
+        "name": "the system",
+        "character": "a neutral system voice",
+    },
+}
+
+
+def operator_name() -> str:
+    """Who the assistant is TALKING TO. Resolved, never hardcoded.
+
+    ``JARVIS_OPERATOR_NAME`` first, then git's configured user name, then
+    empty — an assistant that invents a name for the person in front of it is
+    worse than one that simply does not use it."""
+    name = os.getenv("JARVIS_OPERATOR_NAME", "").strip()
+    if name:
+        return name
+    try:
+        out = subprocess.run(
+            ["git", "config", "user.name"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        # Full names appear in git config; the first token is what a person
+        # is actually called out loud.
+        return out.split()[0] if out else ""
+    except (OSError, subprocess.SubprocessError, IndexError):
+        return ""
+
+
+def system_prompt_for(persona: object, *, spoken: bool = True) -> Optional[str]:
+    """The system prompt establishing this persona's identity, or None.
+
+    ``None`` means "no opinion — keep the caller's prompt", the same contract
+    :func:`resolve_profile` uses for voices, so an unknown persona degrades to
+    existing behaviour instead of an invented identity.
+
+    An explicit ``JARVIS_CONV_SYSTEM_PROMPT`` always wins: an operator who has
+    written their own prompt has said something more specific than any default
+    this function can compose."""
+    p = AgentPersona.coerce(persona)
+    if p is None:
+        return None
+    override = os.getenv("JARVIS_CONV_SYSTEM_PROMPT", "").strip()
+    if override:
+        return override
+    ident = _IDENTITY.get(p)
+    if ident is None:
+        return None
+
+    who = operator_name()
+    parts = [f"You are {ident['name']}, {ident['character']}."]
+    if who:
+        # Naming BOTH sides is the fix: the model must know that hearing its
+        # own name is being ADDRESSED, not being asked about a third party.
+        parts.append(
+            f"You are speaking with {who}. When {who} says "
+            f"\"{ident['name']}\", they are addressing YOU — never treat "
+            f"your own name as someone else in the room."
+        )
+    else:
+        parts.append(
+            f"When the operator says \"{ident['name']}\", they are "
+            f"addressing YOU — never treat your own name as a third party."
+        )
+    if spoken:
+        parts.append(
+            "This is a spoken conversation. Reply in one or two short "
+            "sentences. No markdown, no lists, no code blocks."
+        )
+    return " ".join(parts)
+
+
 def latency_selection_enabled() -> bool:
     """Measure synthesis speed when choosing a voice? Default ON.
 
@@ -388,6 +485,8 @@ def bind_persona(persona: AgentPersona) -> None:
 __all__ = [
     "SYSTEM_DEFAULT",
     "fastest_acceptable_voice",
+    "operator_name",
+    "system_prompt_for",
     "measure_synthesis_ms",
     "synthesis_budget_ms",
     "AgentPersona",

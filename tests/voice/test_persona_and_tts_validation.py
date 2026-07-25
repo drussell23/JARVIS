@@ -406,3 +406,97 @@ def test_macos_voice_builds_the_command_without_dash_v(monkeypatch):
     from pathlib import Path
     src = Path("backend/voice/macos_voice.py").read_text(encoding="utf-8")
     assert "'-v', voice_config['voice']" not in src
+
+
+# ---------------------------------------------------------------------------
+# Identity — she must know that her own name means HER
+# ---------------------------------------------------------------------------
+#
+# The conversation prompt was hardcoded "You are JARVIS", so in Karen's
+# cockpit the model believed it was a different agent. Hearing "Hello Karen"
+# it reasoned the operator was addressing SOMEONE ELSE:
+#
+#   "if you're expecting a real Karen to respond, that's not me …
+#    So, Karen, or whoever you are, what would you like to do today?"
+#
+# An assistant asking the operator to identify a third party who was in fact
+# itself. Four voice sites had been made persona-aware; the prompt had not.
+# She SOUNDED like Karen and THOUGHT she was JARVIS.
+
+
+def test_the_prompt_establishes_her_own_name():
+    from backend.voice.agent_persona import system_prompt_for
+
+    prompt = system_prompt_for(AgentPersona.KAREN)
+    assert prompt and prompt.startswith("You are Karen"), prompt
+
+
+def test_the_prompt_says_her_name_means_her():
+    """THE REGRESSION. Without this the model treats its own name as a third
+    party in the room."""
+    from backend.voice.agent_persona import system_prompt_for
+
+    prompt = system_prompt_for(AgentPersona.KAREN).lower()
+    assert "addressing you" in prompt
+    assert "third party" in prompt or "someone else" in prompt
+
+
+def test_the_prompt_names_the_operator_when_known(monkeypatch):
+    monkeypatch.setenv("JARVIS_OPERATOR_NAME", "Derek")
+    from backend.voice.agent_persona import system_prompt_for
+
+    assert "Derek" in system_prompt_for(AgentPersona.KAREN)
+
+
+def test_the_operator_name_is_resolved_not_invented(monkeypatch):
+    """An assistant that invents a name for the person in front of it is
+    worse than one that simply does not use it."""
+    import backend.voice.agent_persona as ap
+
+    monkeypatch.delenv("JARVIS_OPERATOR_NAME", raising=False)
+    monkeypatch.setattr(ap.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError))
+    assert ap.operator_name() == ""
+    prompt = ap.system_prompt_for(AgentPersona.KAREN)
+    assert prompt and "addressing YOU" in prompt   # still unambiguous
+
+
+def test_jarvis_keeps_his_own_identity():
+    from backend.voice.agent_persona import system_prompt_for
+
+    prompt = system_prompt_for(AgentPersona.JARVIS)
+    assert prompt.startswith("You are JARVIS")
+    assert "Karen" not in prompt
+
+
+def test_an_explicit_operator_prompt_still_wins(monkeypatch):
+    """Someone who wrote their own prompt has said something more specific
+    than any default this can compose."""
+    monkeypatch.setenv("JARVIS_CONV_SYSTEM_PROMPT", "You are a pirate.")
+    from backend.voice.agent_persona import system_prompt_for
+
+    assert system_prompt_for(AgentPersona.KAREN) == "You are a pirate."
+
+
+def test_an_unknown_persona_yields_no_prompt():
+    """None means 'keep the caller's prompt' — the same contract voices use,
+    so an unknown persona degrades to existing behaviour rather than an
+    invented identity."""
+    from backend.voice.agent_persona import system_prompt_for
+
+    assert system_prompt_for("nobody") is None
+    assert system_prompt_for(None) is None
+
+
+def test_the_pipeline_takes_its_identity_from_the_persona(monkeypatch):
+    """Wiring pin: voice and prompt must come from ONE place or they drift —
+    which is precisely how she came to sound like Karen and think she was
+    JARVIS."""
+    import backend.audio.conversation_pipeline as cp
+
+    monkeypatch.delenv("JARVIS_CONV_SYSTEM_PROMPT", raising=False)
+    monkeypatch.setenv("JARVIS_AGENT_PERSONA", "karen")
+    assert (cp._persona_system_prompt() or "").startswith("You are Karen")
+
+    monkeypatch.delenv("JARVIS_AGENT_PERSONA", raising=False)
+    assert cp._persona_system_prompt() is None
