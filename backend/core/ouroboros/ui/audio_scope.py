@@ -41,8 +41,9 @@ import enum
 import math
 import os
 import threading
+import time
 from collections import deque
-from typing import Deque, Iterable, Optional, Sequence, Tuple
+from typing import Callable, Deque, Iterable, Optional, Sequence, Tuple
 
 _BRAILLE_BASE = 0x2800
 
@@ -85,6 +86,43 @@ def scope_enabled() -> bool:
     return os.environ.get(
         "JARVIS_AUDIO_SCOPE_ENABLED", "true",
     ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a tunable from the environment, falling back on garbage.
+
+    Every timing constant here is a *taste* parameter — how fast a starved
+    wave should fall reads differently on a 60Hz repaint than on a laggy SSH
+    session — so none of them are baked into a signature."""
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _starve_after_s() -> float:
+    """Silence longer than this means the STREAM stalled, not that the room
+    went quiet. Derived from the pump's 20 FPS cap: ~50ms between frames, so
+    60ms is one missed frame plus jitter — late enough not to fire on normal
+    scheduling noise, early enough that a stall never looks like signal."""
+    return max(0.0, _env_float("JARVIS_AUDIO_SCOPE_STARVE_S", 0.06))
+
+
+def _gravity_tau_s() -> float:
+    """Exponential time constant of the fall. ~50ms puts the trace on the
+    baseline in about a quarter second — fast enough that a frozen spike is
+    never mistaken for live sound, slow enough to read as motion rather than a
+    cut."""
+    return max(1e-3, _env_float("JARVIS_AUDIO_SCOPE_GRAVITY_TAU_S", 0.05))
+
+
+def _gravity_floor() -> float:
+    """Fraction of full scale below which the fall SNAPS to exactly 0.0.
+
+    Exponential decay never reaches zero. Without a snap the ring would hold
+    denormal-ish residue forever and ``is_silent`` would answer False for a
+    scope that has been visually flat for minutes."""
+    return max(0.0, _env_float("JARVIS_AUDIO_SCOPE_GRAVITY_FLOOR", 0.02))
 
 
 def braille_available() -> bool:
@@ -383,12 +421,39 @@ class BrailleScope:
         width: int = 20,
         plane: AudioPlane = AudioPlane.IDLE,
         normalizer: Optional[AdaptiveNormalizer] = None,
+        starve_after_s: Optional[float] = None,
+        gravity_tau_s: Optional[float] = None,
+        gravity_floor: Optional[float] = None,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self._width = max(1, int(width))
         self._cap = self._width * SAMPLES_PER_CELL
         self._samples: Deque[float] = deque(maxlen=self._cap)
         self._plane = plane
         self._norm = normalizer if normalizer is not None else AdaptiveNormalizer()
+        # --- kinetic decay (client-side visual gravity) -----------------
+        # When heavy STT inference starves the event loop, telemetry frames stop
+        # arriving. Holding the last amplitude freezes the trace mid-spike,
+        # which reads as "loud right now" — the exact lie a monitor must never
+        # tell. Instead the wave FALLS under gravity toward the baseline, so a
+        # starved stream looks like silence settling rather than a still frame.
+        #
+        # Purely visual and purely client-side: the daemon's AdaptiveNormalizer
+        # is untouched, so nothing about measurement changes.
+        self._starve_after = (
+            max(0.0, float(starve_after_s)) if starve_after_s is not None
+            else _starve_after_s()
+        )
+        self._gravity_tau = (
+            max(1e-3, float(gravity_tau_s)) if gravity_tau_s is not None
+            else _gravity_tau_s()
+        )
+        self._gravity_floor = (
+            max(0.0, float(gravity_floor)) if gravity_floor is not None
+            else _gravity_floor()
+        )
+        self._clock = clock or time.monotonic
+        self._last_rx = self._clock()
         self._lock = threading.Lock()
 
     # -- ingest ---------------------------------------------------------
@@ -405,6 +470,7 @@ class BrailleScope:
         v = min(1.0, max(0.0, v))
         with self._lock:
             self._samples.append(v)
+            self._last_rx = self._clock()
 
     def push_rms(self, samples: Sequence[float]) -> float:
         """Compute RMS over a raw audio buffer, normalize, append. Returns the
@@ -416,6 +482,57 @@ class BrailleScope:
     def extend(self, values: Iterable[float], *, normalized: bool = True) -> None:
         for v in values or ():
             self.push(v, normalized=normalized)
+
+    def tick(self, now: Optional[float] = None) -> bool:
+        """Apply visual gravity when telemetry has starved. Returns True iff it
+        decayed this call.
+
+        Called by the UI on every repaint — which is why the decay is
+        TIME-BASED rather than per-frame: the repaint rate is set by terminal
+        redraws, not by the audio stream, and a per-frame constant would fall
+        at a different speed on a busy machine than an idle one. Elapsed time
+        is the only frame-rate-independent basis.
+
+        Decays the WHOLE ring, not just new samples. A spike that merely
+        scrolled away would still show its peak for the width of the buffer;
+        the operator would see a loud trace long after the sound stopped. The
+        entire wave descends together, so a starved stream reads as settling.
+
+        Snaps to exactly 0.0 below ``gravity_floor`` so the trace reaches the
+        true squelched baseline instead of hovering asymptotically just above
+        it, which would keep the meter looking faintly alive forever.
+
+        NEVER raises."""
+        try:
+            t = self._clock() if now is None else float(now)
+            with self._lock:
+                idle = t - self._last_rx
+                if idle < self._starve_after or not self._samples:
+                    return False
+                # Decay measured from the START of starvation, so one late
+                # repaint after a long stall lands at the same place a steady
+                # stream of repaints would have — no dependence on how often
+                # the UI happened to tick.
+                factor = math.exp(-(idle - self._starve_after) / self._gravity_tau)
+                changed = False
+                for i, v in enumerate(self._samples):
+                    if v <= 0.0:
+                        continue
+                    nv = v * factor
+                    if nv < self._gravity_floor:
+                        nv = 0.0
+                    if nv != v:
+                        self._samples[i] = nv
+                        changed = True
+                return changed
+        except Exception:  # noqa: BLE001 — gravity NEVER breaks a frame
+            return False
+
+    @property
+    def starved(self) -> bool:
+        """True when no telemetry has arrived within the starvation window."""
+        with self._lock:
+            return (self._clock() - self._last_rx) >= self._starve_after
 
     # -- state ----------------------------------------------------------
 
@@ -445,6 +562,7 @@ class BrailleScope:
     def clear(self) -> None:
         with self._lock:
             self._samples.clear()
+            self._last_rx = self._clock()
         self._norm.reset()
 
     # -- render ---------------------------------------------------------
@@ -498,6 +616,16 @@ class BrailleScope:
             return f"[{style}]{body}[/{style}]"
         except Exception:  # noqa: BLE001
             return body
+
+    def samples(self) -> list:
+        """Locked snapshot of the ring, oldest → newest.
+
+        A COPY, not a view: the audio thread appends to this deque while the
+        render thread reads it, and handing out the live object would let a
+        caller iterate a mutating deque (``RuntimeError`` on CPython, and a
+        torn frame everywhere else)."""
+        with self._lock:
+            return list(self._samples)
 
     def is_silent(self) -> bool:
         with self._lock:

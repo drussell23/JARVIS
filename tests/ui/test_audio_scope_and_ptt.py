@@ -15,6 +15,7 @@ prove nothing about how prompt_toolkit actually routes a key through a filter.
 from __future__ import annotations
 
 import math
+import time
 
 import pytest
 
@@ -602,3 +603,251 @@ def test_squelched_output_renders_a_stable_baseline():
     out = sc.render()
     assert len(set(out)) == 1, f"baseline is jittering: {out}"
     assert sc.is_silent() is True
+
+
+# ===========================================================================
+# Kinetic Decay Interpolator — the wave must FALL when telemetry starves
+# ===========================================================================
+#
+# The failure this defends against: heavy STT inference spikes the CPU, the
+# telemetry stream stalls mid-utterance, and the scope keeps painting the last
+# frame it received. The operator sees a full-height trace and reads it as
+# "loud right now". A monitor that freezes on its last reading is worse than a
+# blank one, because it is confidently wrong.
+#
+# Every test drives an INJECTED clock. Using wall time would make these both
+# slow and flaky, and would test the machine's scheduler rather than the decay.
+
+
+class _Clock:
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = float(t)
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> float:
+        self.t += float(dt)
+        return self.t
+
+
+def _loud_scope(width: int = 3, **kw):
+    """A scope pinned at full deflection, with an injected clock."""
+    clk = _Clock()
+    sc = BrailleScope(width=width, clock=clk, **kw)
+    sc.extend([0.9] * (width * SAMPLES_PER_CELL))
+    return sc, clk
+
+
+# --- (1) the mandated pair --------------------------------------------------
+
+
+def test_high_amplitude_frame_renders_at_full_deflection():
+    """(1) A 0.9 frame must render loud. Without this control, a decay test
+    passes trivially on a scope that never drew anything."""
+    sc, _clk = _loud_scope(width=3)
+    assert sc.render() == "⣿⣿⣿"
+
+
+async def test_starved_stream_decays_to_the_squelched_baseline():
+    """(2) THE REGRESSION. Advance the clock 200ms with no new frames — the
+    trace must have fallen to the flat baseline, not held its spike."""
+    sc, clk = _loud_scope(width=3)
+    assert sc.render() == "⣿⣿⣿"
+
+    clk.advance(0.200)
+    sc.tick()
+
+    assert sc.render() == "⣀⣀⣀", "the wave froze instead of falling"
+
+
+# --- gravity mechanics ------------------------------------------------------
+
+
+def test_no_decay_inside_the_starvation_window():
+    """A frame arriving on schedule must not be dragged down. Decaying between
+    normal 50ms frames would flatten live audio into a permanent murmur."""
+    sc, clk = _loud_scope(width=3)
+    clk.advance(0.03)                     # < starve_after
+    assert sc.tick() is False
+    assert sc.render() == "⣿⣿⣿"
+
+
+def test_decay_is_monotonic_and_never_rebounds():
+    """Gravity only ever pulls down. A rebound would render as phantom sound."""
+    sc, clk = _loud_scope(width=4)
+    seen = []
+    for _ in range(12):
+        clk.advance(0.02)
+        sc.tick()
+        seen.append(max(sc.samples()) if sc.samples() else 0.0)
+    assert all(b <= a + 1e-12 for a, b in zip(seen, seen[1:])), seen
+
+
+def test_decay_reaches_exact_zero_not_an_asymptote():
+    """Exponential decay never mathematically reaches 0. Without the snap the
+    ring would hold residue forever and is_silent would answer False for a
+    scope that has been visually flat for minutes."""
+    sc, clk = _loud_scope(width=4)
+    clk.advance(2.0)
+    sc.tick()
+    assert sc.samples() == [0.0] * len(sc.samples())
+    assert sc.is_silent() is True
+
+
+def test_decay_is_frame_rate_independent():
+    """The same elapsed time must produce the same amplitude whether the UI
+    repainted once or fifty times. A per-tick constant would fall faster on an
+    idle machine than a busy one — i.e. fastest exactly when it is least
+    needed."""
+    coarse, c1 = _loud_scope(width=3)
+    c1.advance(0.30)
+    coarse.tick()
+
+    fine, c2 = _loud_scope(width=3)
+    for _ in range(30):
+        c2.advance(0.01)
+        fine.tick()
+
+    assert max(coarse.samples()) == pytest.approx(max(fine.samples()), abs=1e-9)
+
+
+def test_the_whole_ring_falls_together_not_just_new_samples():
+    """A spike that merely scrolled off would still be painted at full height
+    for the width of the buffer. Every column descends."""
+    sc, clk = _loud_scope(width=6)
+    clk.advance(0.12)
+    sc.tick()
+    vals = sc.samples()
+    assert all(v < 0.9 for v in vals), vals
+    assert len(set(round(v, 9) for v in vals)) == 1, "columns fell unevenly"
+
+
+def test_a_new_frame_rearms_the_stream_and_stops_gravity():
+    """Recovery: when telemetry resumes, the trace must snap back to what is
+    actually being heard rather than continuing to sink."""
+    sc, clk = _loud_scope(width=3)
+    clk.advance(0.15)
+    sc.tick()
+    assert sc.render() != "⣿⣿⣿"
+
+    sc.extend([1.0] * 6)                  # stream recovers
+    assert sc.tick() is False, "kept decaying through live telemetry"
+    assert sc.render() == "⣿⣿⣿"
+
+
+def test_starved_predicate_tracks_the_stream_not_the_samples():
+    sc, clk = _loud_scope(width=3)
+    assert sc.starved is False
+    clk.advance(0.5)
+    assert sc.starved is True
+    sc.push(0.4)
+    assert sc.starved is False
+
+
+# --- isolation --------------------------------------------------------------
+
+
+def test_gravity_never_touches_the_daemon_side_normalizer():
+    """Kinetic decay is a CLIENT-side visual affordance. If it moved the
+    adaptive peak, a starved stream would silently rescale the meter and the
+    next real frame would render at the wrong height — corrupting measurement
+    to fix a repaint."""
+    norm = AdaptiveNormalizer()
+    sc, clk = _loud_scope(width=3, normalizer=norm)
+    before = norm.peak
+    clk.advance(1.0)
+    sc.tick()
+    assert norm.peak == before
+
+
+def test_tick_on_an_empty_scope_is_a_no_op():
+    sc = BrailleScope(width=3, clock=_Clock())
+    assert sc.tick() is False
+    assert sc.render() == "⣀⣀⣀"
+
+
+def test_tick_never_raises_on_a_hostile_clock():
+    """A clock that explodes must cost a frame of animation, never the cockpit."""
+    def _boom() -> float:
+        raise RuntimeError("monotonic went backwards")
+
+    sc = BrailleScope(width=3)
+    sc.extend([0.8] * 6)
+    sc._clock = _boom                     # noqa: SLF001 — fault injection
+    assert sc.tick() is False
+
+
+def test_clear_rearms_the_starvation_clock():
+    """A cleared scope has no stale amplitude to fall from; it must not report
+    itself starved from the moment of the clear."""
+    sc, clk = _loud_scope(width=3)
+    clk.advance(5.0)
+    assert sc.starved is True
+    sc.clear()
+    assert sc.starved is False
+
+
+def test_concurrent_ticks_and_pushes_do_not_corrupt_the_ring():
+    """The render thread ticks while the audio thread pushes. Both mutate the
+    deque, so both must hold the lock."""
+    import threading as _t
+
+    sc = BrailleScope(width=8)
+    stop = _t.Event()
+
+    def _push():
+        while not stop.is_set():
+            sc.push(0.5)
+
+    def _tick():
+        while not stop.is_set():
+            sc.tick()
+
+    threads = [_t.Thread(target=_push), _t.Thread(target=_tick)]
+    for th in threads:
+        th.daemon = True
+        th.start()
+    time.sleep(0.15)
+    stop.set()
+    for th in threads:
+        th.join(timeout=2.0)
+
+    vals = sc.samples()
+    assert len(vals) <= 16
+    assert all(0.0 <= v <= 1.0 for v in vals)
+
+
+# --- tunability -------------------------------------------------------------
+
+
+def test_gravity_timings_are_environment_tunable(monkeypatch):
+    """None of these constants are taste-free: a laggy SSH session wants a
+    slower fall than a local 60Hz repaint."""
+    monkeypatch.setenv("JARVIS_AUDIO_SCOPE_STARVE_S", "0.5")
+    monkeypatch.setenv("JARVIS_AUDIO_SCOPE_GRAVITY_TAU_S", "1.5")
+    sc = BrailleScope(width=3, clock=_Clock())
+    assert sc._starve_after == pytest.approx(0.5)    # noqa: SLF001
+    assert sc._gravity_tau == pytest.approx(1.5)     # noqa: SLF001
+
+
+def test_garbage_env_falls_back_to_defaults(monkeypatch):
+    monkeypatch.setenv("JARVIS_AUDIO_SCOPE_GRAVITY_TAU_S", "molasses")
+    sc = BrailleScope(width=3, clock=_Clock())
+    assert sc._gravity_tau > 0.0                      # noqa: SLF001
+
+
+def test_the_render_loop_ticks_before_it_paints():
+    """Structural pin. tick() is only reachable from the UI repaint seam; if a
+    refactor drops that call the decay becomes dead code that every unit test
+    here still passes."""
+    from pathlib import Path
+
+    src = Path(
+        "backend/core/ouroboros/cli/ov.py",
+    ).read_text(encoding="utf-8", errors="replace")
+    gut = src[src.index("def _gutter():"):][:900]
+    assert ".tick()" in gut, "the header no longer applies gravity"
+    assert gut.index(".tick()") < gut.index("render_rich()"), (
+        "gravity applied AFTER the paint — one frame stale, every frame"
+    )

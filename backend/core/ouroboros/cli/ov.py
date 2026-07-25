@@ -735,7 +735,12 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
                 except Exception:  # noqa: BLE001 — no voice stack: scope stays idle
                     pass
                 _audio.update(pump=_pump, latch=_latch, mode=_mode)
-                logger.debug(
+                # `ov` has no module-level logger — this scope is the only
+                # record of which PTT paradigm the terminal probe chose, and a
+                # bare `logger` here resolved to nothing but a swallowed
+                # NameError, so the line never emitted.
+                import logging as _lg
+                _lg.getLogger(__name__).debug(
                     "[ov] audio scope armed mode=%s verdict=%s terminal=%s",
                     getattr(_mode, "value", "?"),
                     getattr(_verdict, "value", "?"), (_tel or {}).get("terminal"),
@@ -750,6 +755,12 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             if _p is None:
                 return None
             try:
+                # Gravity BEFORE paint, on the render clock rather than the
+                # audio clock. When heavy STT inference starves the telemetry
+                # stream the wave must keep falling; a repaint that only ever
+                # drew the last received frame would freeze the trace mid-spike
+                # and report "loud right now" long after the sound stopped.
+                _p.scope.tick()
                 return _p.scope.render_rich()
             except Exception:  # noqa: BLE001
                 return None
