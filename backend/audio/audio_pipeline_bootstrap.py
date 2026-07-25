@@ -59,6 +59,7 @@ class PipelineHandle:
     mode_dispatcher: object = None
     health_task: Optional[asyncio.Task] = None
     _bargein_vad_consumer: object = None  # stored for unregister on shutdown
+    _mic_telemetry_task: Optional["asyncio.Task"] = None
     karen: object = None  # Sprint 3: full-duplex control layer (env-gated mount)
     voice_build: object = None  # Sprint 4: voice->build bridge (env-gated mount)
     audio_ipc: object = None  # 2026-07-18: audio-state UDS broadcaster (ov CLI subscribes)
@@ -332,6 +333,82 @@ async def wire_conversation_pipeline(
         handle.audio_ipc = None
         logger.warning(f"[Bootstrap] audio-state IPC skipped: {e}")
 
+    # 3a-tel. Mic amplitude telemetry → ov cockpit (the data plane).
+    #
+    # The control plane (VAD edges) already crosses this UDS; this adds the
+    # AMPLITUDE so the cockpit's Braille oscilloscope can draw a live waveform
+    # instead of a binary talking/not-talking light.
+    #
+    # Thread-safety is the whole design constraint. AudioBus invokes mic
+    # consumers on the PortAudio C thread, which must never block and cannot
+    # touch the asyncio loop. So the callback does one O(1) thing — hand a
+    # zero-copy view to a latest-wins mailbox — and this task, running on the
+    # orchestrator's own loop, does the RMS and the socket write. The two
+    # sides never share a lock the audio thread could wait on.
+    #
+    # Reuses the SAME mailbox the broadcast tap already provides (DRY: no
+    # second ring buffer) and the SAME UDS the VAD edges use (no second
+    # socket). Fully fail-soft: any fault here leaves capture untouched.
+    # Boot-progress edge: the UDS is already bound and a cockpit may already be
+    # connected, but the mic is not yet acquired. Without this the client sees a
+    # live-but-silent bridge and cannot distinguish "warming" from "armed and
+    # quiet". Emitted from the EXISTING bind location — the socket does not move.
+    try:
+        if handle.audio_ipc is not None:
+            from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (
+                EVENT_SYSTEM_WARMING,
+            )
+            handle.audio_ipc.publish_event(EVENT_SYSTEM_WARMING)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        from backend.audio.mic_telemetry_bridge import (
+            bridge_enabled, ensure_attached, pump_once,
+        )
+        if bridge_enabled() and audio_bus is not None:
+            _tel_bridge = ensure_attached(server=handle.audio_ipc)
+            if _tel_bridge is not None:
+                _tel_interval = 1.0 / max(1.0, float(
+                    os.environ.get("JARVIS_MIC_TELEMETRY_FPS", "20"),
+                ))
+
+                async def _mic_telemetry_loop() -> None:
+                    """Drain the mailbox onto the UDS at the telemetry rate.
+
+                    Sleeps a fixed tick rather than awaiting a signal: the
+                    mailbox is latest-wins, so there is nothing to wake for —
+                    an empty drain is a no-op and a full one is one RMS. Never
+                    raises out; a telemetry fault must not end the pipeline."""
+                    while True:
+                        try:
+                            pump_once(handle.audio_ipc, plane="user")
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:  # noqa: BLE001
+                            pass
+                        await asyncio.sleep(_tel_interval)
+
+                handle._mic_telemetry_task = loop.create_task(
+                    _mic_telemetry_loop(),
+                )
+                logger.info(
+                    "[Bootstrap] Mic telemetry bridged to ov cockpit "
+                    "(%.0f FPS, lossy valve)", 1.0 / _tel_interval,
+                )
+                # Mic acquired + drain running: the bridge can now carry a real
+                # waveform, so the cockpit may drop its warming state.
+                try:
+                    if handle.audio_ipc is not None:
+                        from backend.core.ouroboros.governance.comms.duplex.audio_state_ipc import (  # noqa: E501
+                            EVENT_SYSTEM_READY,
+                        )
+                        handle.audio_ipc.publish_event(EVENT_SYSTEM_READY)
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[Bootstrap] Mic telemetry skipped: {e}")
+
     # 3b. Karen full-duplex control layer (Sprint 3) — env-gated adaptive mount.
     #     Default OFF: the pipeline pays zero voice-allocation overhead and its
     #     lifecycle is byte-identical to before (mandate #2). When enabled, the
@@ -583,6 +660,20 @@ async def shutdown(handle: PipelineHandle) -> None:
             handle.barge_in.set_loop(None)
         except Exception:
             pass
+
+    # 2a-tel. Stop mic telemetry first — it reads the bus and the IPC server,
+    # both of which are torn down below.
+    if handle._mic_telemetry_task is not None:
+        try:
+            handle._mic_telemetry_task.cancel()
+        except Exception:
+            pass
+        handle._mic_telemetry_task = None
+    try:
+        from backend.audio.mic_telemetry_bridge import reset_bridge
+        reset_bridge()          # unregisters the mic consumer
+    except Exception:
+        pass
 
     # 2b. Unregister barge-in VAD consumer from AudioBus
     if handle._bargein_vad_consumer is not None and handle.audio_bus is not None:
