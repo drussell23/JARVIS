@@ -166,6 +166,9 @@ class StreamingSTTEngine:
         self._preroll: Deque[np.ndarray] = deque(
             maxlen=max(1, int(_PREROLL_MS / 20)),
         )
+        #: One transcription at a time. See _run_transcription for why.
+        self._transcribe_lock: asyncio.Lock = asyncio.Lock()
+        self._partials_skipped: int = 0
         self._buffer_lock = threading.Lock()
         self._total_frames = 0
         self._max_buffer_frames = int(_MAX_BUFFER_SECONDS * sample_rate)
@@ -436,7 +439,36 @@ class StreamingSTTEngine:
                     text_parts.append(segment.text.strip())
                 return " ".join(text_parts), getattr(info, "language_probability", 0.9)
 
-            text, confidence = await loop.run_in_executor(None, _transcribe)
+            # SERIALIZE. faster-whisper's WhisperModel is NOT safe to call
+            # concurrently: one CTranslate2 instance, shared decoder state.
+            #
+            # This engine fires a partial every 500ms and a final on every
+            # endpoint, each dispatched to run_in_executor — so on any real
+            # utterance several transcriptions ran AT ONCE on one model, and
+            # they corrupted each other into empty results. It presented as
+            # "the model rejected speech-level audio", and the proof is stark:
+            # the engine's own accumulated buffer, handed to the SAME model in
+            # a single call, transcribes perfectly:
+            #
+            #     engine events: NONE
+            #     buffer 5.88s -> 'Hello, Karen, testing with the full pipeline'
+            #
+            # It got worse the more the pipeline did, because more components
+            # meant more scheduling jitter and more overlap — which is why
+            # bus+STT alone sometimes worked and the full host never did.
+            #
+            # Partials are ADVISORY: when the model is busy, skipping one
+            # costs an intermediate render nobody has read yet. Finals are
+            # the turn, so they always wait their turn.
+            if is_partial:
+                if self._transcribe_lock.locked():
+                    self._partials_skipped += 1
+                    return
+                async with self._transcribe_lock:
+                    text, confidence = await loop.run_in_executor(None, _transcribe)
+            else:
+                async with self._transcribe_lock:
+                    text, confidence = await loop.run_in_executor(None, _transcribe)
 
             # EMPTY-RESULT FORENSICS. `if text:` silently discards every
             # transcription that comes back blank, which is correct behaviour

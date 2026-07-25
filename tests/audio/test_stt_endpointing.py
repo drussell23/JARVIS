@@ -198,3 +198,112 @@ def test_vad_no_longer_gates_which_samples_survive():
         "a per-frame VAD test gates accumulation again — that is the gate "
         "behaviour that shredded every utterance"
     )
+
+
+# ---------------------------------------------------------------------------
+# BUG: concurrent transcription on one WhisperModel
+# ---------------------------------------------------------------------------
+#
+# faster-whisper's WhisperModel is not safe to call concurrently — one
+# CTranslate2 instance, shared decoder state. This engine fires a partial
+# every 500ms and a final on every endpoint, each into run_in_executor, so on
+# any real utterance several transcriptions ran AT ONCE and corrupted each
+# other into empty results.
+#
+# It presented as "the model rejected speech-level audio". The proof was
+# stark: the engine's own accumulated buffer, handed to the SAME model in a
+# single call, transcribed perfectly while the engine emitted nothing:
+#
+#     engine events: NONE
+#     buffer 5.88s -> 'Hello, Karen, testing with the full pipeline mounted'
+
+
+async def test_transcriptions_never_overlap():
+    """THE REGRESSION. Two concurrent calls into one model is the bug."""
+    import asyncio as aio
+
+    eng = _Engine([])
+    eng._model = object()
+    eng._transcript_queue = aio.Queue()
+    eng._loop = aio.get_running_loop()
+
+    concurrent = {"now": 0, "max": 0}
+
+    async def _fake_exec(_none, fn):
+        concurrent["now"] += 1
+        concurrent["max"] = max(concurrent["max"], concurrent["now"])
+        await aio.sleep(0.05)
+        concurrent["now"] -= 1
+        return ("hi", 0.9)
+
+    loop = aio.get_running_loop()
+    orig = loop.run_in_executor
+    loop.run_in_executor = _fake_exec          # type: ignore[method-assign]
+    try:
+        audio = np.zeros(16000, dtype=np.float32)
+        await aio.gather(*[
+            eng._run_transcription(audio, False) for _ in range(4)
+        ])
+    finally:
+        loop.run_in_executor = orig            # type: ignore[method-assign]
+
+    assert concurrent["max"] == 1, (
+        f"{concurrent['max']} transcriptions ran at once on one WhisperModel"
+    )
+
+
+async def test_a_partial_is_skipped_rather_than_queued_behind_the_model():
+    """Partials are ADVISORY: skipping one costs an intermediate render
+    nobody has read. Queueing them stacks work behind a busy model and the
+    backlog is what produced the overlap."""
+    import asyncio as aio
+
+    eng = _Engine([])
+    eng._model = object()
+    eng._transcript_queue = aio.Queue()
+    eng._loop = aio.get_running_loop()
+    await eng._transcribe_lock.acquire()       # model is "busy"
+    try:
+        await eng._run_transcription(np.zeros(8000, dtype=np.float32), True)
+    finally:
+        eng._transcribe_lock.release()
+    assert eng._partials_skipped == 1
+
+
+async def test_a_final_always_waits_its_turn():
+    """A final IS the turn. Dropping one loses what the operator said."""
+    import asyncio as aio
+
+    eng = _Engine([])
+    eng._model = object()
+    eng._transcript_queue = aio.Queue()
+    eng._loop = aio.get_running_loop()
+
+    async def _exec(_none, fn):
+        return ("final text", 0.9)
+
+    loop = aio.get_running_loop()
+    orig = loop.run_in_executor
+    loop.run_in_executor = _exec               # type: ignore[method-assign]
+    try:
+        await eng._run_transcription(np.zeros(16000, dtype=np.float32), False)
+    finally:
+        loop.run_in_executor = orig            # type: ignore[method-assign]
+
+    ev = eng._transcript_queue.get_nowait()
+    assert ev.text == "final text" and ev.is_partial is False
+    assert eng._partials_skipped == 0
+
+
+def test_the_serialization_is_structural():
+    """A lock removed here reintroduces silent, intermittent corruption that
+    no other test would see — it fails as EMPTY output, not an exception."""
+    import inspect
+
+    from backend.voice.streaming_stt import StreamingSTTEngine
+
+    src = inspect.getsource(StreamingSTTEngine._run_transcription)
+    assert "_transcribe_lock" in src, "transcription is unserialized again"
+    assert src.count("async with self._transcribe_lock") >= 2, (
+        "a path reaches the model without holding the lock"
+    )
