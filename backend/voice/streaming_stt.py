@@ -98,20 +98,48 @@ def _rejected_capture_cap() -> int:
         return 6
 
 
-def _dump_rejected_audio(audio, sample_rate: int) -> None:
-    """Write one rejected buffer to ``.jarvis/stt_rejected/``. NEVER raises."""
+def _rejected_capture_min_rms() -> float:
+    """Only keep rejections with real speech energy. Ambient sits at
+    0.002-0.004 on this class of machine and speech at 0.05-0.11, so the
+    default sits above the noise and below the quietest real utterance."""
+    try:
+        return max(0.0, float(os.getenv("JARVIS_STT_CAPTURE_MIN_RMS", "0.03")))
+    except (TypeError, ValueError):
+        return 0.03
+
+
+def _dump_rejected_audio(audio, sample_rate: int, rms: float = 0.0) -> None:
+    """Write one rejected buffer to ``.jarvis/stt_rejected/``. NEVER raises.
+
+    When the cap is reached, the QUIETEST kept sample is evicted if this one
+    is louder — so the slots converge on the loudest rejections rather than
+    the earliest. The filename carries the RMS, which is both the sort key
+    and the first thing worth knowing about the file."""
     try:
         from pathlib import Path
         root = Path(__file__).resolve().parents[2]
         out = root / ".jarvis" / "stt_rejected"
         out.mkdir(parents=True, exist_ok=True)
-        existing = sorted(out.glob("*.wav"))
+        existing = sorted(out.glob("rej_*.wav"))
         if len(existing) >= _rejected_capture_cap():
-            return
+            def _rms_of(p):
+                try:
+                    return float(p.name.split("_")[1])
+                except (IndexError, ValueError):
+                    return 0.0
+            weakest = min(existing, key=_rms_of)
+            if _rms_of(weakest) >= rms:
+                return                      # nothing here beats what we have
+            try:
+                weakest.unlink()
+            except OSError:
+                return
         import soundfile as sf
-        path = out / f"rejected_{len(existing):02d}_{int(time.time())}.wav"
+        path = out / f"rej_{rms:.4f}_{int(time.time())}.wav"
         sf.write(str(path), audio, int(sample_rate))
-        logger.warning("[StreamingSTT] rejected audio saved: %s", path)
+        logger.warning(
+            "[StreamingSTT] rejected audio saved (rms=%.4f): %s", rms, path,
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -445,8 +473,15 @@ class StreamingSTTEngine:
                     # off with one env var. This writes a recording of
                     # someone's voice to disk, so it stays proportionate and
                     # obvious rather than quietly permanent.
-                    if _pk >= 0.01 and _rejected_capture_enabled():
-                        _dump_rejected_audio(audio, self._sample_rate)
+                    # Capture the LOUD rejections, not the first ones. The
+                    # first version filled its six slots with quiet VAD
+                    # false-positives (peak 0.12-0.26) while the buffers that
+                    # actually mattered — the operator's voice at peak 0.97,
+                    # rms 0.065 — arrived after the cap and were dropped. An
+                    # instrument that samples the wrong events is worse than
+                    # none: it produces confident analysis of the wrong data.
+                    if _rms >= _rejected_capture_min_rms() and _rejected_capture_enabled():
+                        _dump_rejected_audio(audio, self._sample_rate, _rms)
                 except Exception:  # noqa: BLE001
                     pass
 
