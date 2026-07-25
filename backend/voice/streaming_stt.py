@@ -39,6 +39,10 @@ _LANGUAGE = os.getenv("JARVIS_STT_LANGUAGE", "en")
 # Prevents wasting CPU on ambient noise fragments (20ms-120ms) that webrtcvad
 # mode 3 misclassifies as speech.
 _MIN_SPEECH_DURATION_MS = int(os.getenv("JARVIS_STT_MIN_SPEECH_DURATION_MS", "300"))
+#: Audio retained BEFORE the VAD fires, so an utterance keeps its onset. VAD
+#: needs energy to trigger, which means the first phoneme is always already
+#: past by the time it says "speech".
+_PREROLL_MS = int(os.getenv("JARVIS_STT_PREROLL_MS", "320"))
 
 
 def _startup_asr_admission() -> tuple[bool, str]:
@@ -129,6 +133,11 @@ class StreamingSTTEngine:
 
         # Audio accumulation
         self._audio_buffer: Deque[np.ndarray] = deque()
+        # Rolling pre-speech ring, sized in FRAMES from the configured window
+        # so it holds the same wall-clock regardless of frame duration.
+        self._preroll: Deque[np.ndarray] = deque(
+            maxlen=max(1, int(_PREROLL_MS / 20)),
+        )
         self._buffer_lock = threading.Lock()
         self._total_frames = 0
         self._max_buffer_frames = int(_MAX_BUFFER_SECONDS * sample_rate)
@@ -256,36 +265,66 @@ class StreamingSTTEngine:
         now_ms = time.time() * 1000
         is_speech = self._detect_speech(frame)
 
-        if is_speech:
-            if not self._speech_active:
-                # Speech just started
-                self._speech_active = True
-                self._speech_start_ms = now_ms
-                self._silence_start_ms = None
+        # VAD IS AN ENDPOINTER, NOT A GATE.
+        #
+        # This used to append a frame ONLY when the VAD called it speech, and
+        # drop it otherwise. webrtcvad in mode 3 — the most aggressive setting,
+        # which this engine selects — rejects the gaps between words, unvoiced
+        # consonants (s, f, th, p, t, k) and the low-energy tails of vowels. So
+        # the buffer accumulated speech SHRAPNEL: surviving fragments spliced
+        # directly together with every transition between them deleted.
+        #
+        # It presented perfectly: speech-level amplitude, speech-shaped
+        # spectrum, plausible duration — and faster-whisper returned "" every
+        # single time, because the audio was no longer language. Measured on
+        # this machine, same microphone, same session: a tap that kept EVERY
+        # frame transcribed "Hello, Karen, testing the microphone path."
+        # while this buffer produced nothing at all.
+        #
+        # The VAD's job is to decide WHEN an utterance starts and ends. It has
+        # no business deciding WHICH SAMPLES INSIDE IT survive — speech is
+        # continuous, and the quiet parts carry the consonants.
+        if is_speech and not self._speech_active:
+            self._speech_active = True
+            self._speech_start_ms = now_ms
+            self._silence_start_ms = None
+            # Pre-roll: VAD needs energy before it fires, so by the time it
+            # says "speech" the onset is already past. Without this, every
+            # utterance loses its first consonant — "hello" arrives as "ello".
+            with self._buffer_lock:
+                for held in self._preroll:
+                    self._audio_buffer.append(held)
+                    self._total_frames += len(held)
+                self._preroll.clear()
 
-            # Accumulate frame
+        if self._speech_active:
+            # Accumulate EVERYTHING until the endpoint — including the silence
+            # inside the utterance, which is where the consonants live.
             with self._buffer_lock:
                 self._audio_buffer.append(frame.copy())
                 self._total_frames += len(frame)
-
-                # Prevent unbounded growth
                 while self._total_frames > self._max_buffer_frames:
                     oldest = self._audio_buffer.popleft()
                     self._total_frames -= len(oldest)
 
-            # Emit partial transcript periodically
-            if now_ms - self._last_partial_time > _PARTIAL_INTERVAL_MS:
-                self._last_partial_time = now_ms
-                self._schedule_transcription(is_partial=True)
-
-        else:
-            if self._speech_active:
+            if is_speech:
+                self._silence_start_ms = None
+            else:
                 if self._silence_start_ms is None:
                     self._silence_start_ms = now_ms
                 elif now_ms - self._silence_start_ms > _VAD_SILENCE_THRESHOLD_MS:
-                    # End of speech detected
+                    # Sustained silence — the utterance is over.
                     self._speech_active = False
+                    self._silence_start_ms = None
                     self._schedule_transcription(is_partial=False)
+                    return
+
+            if now_ms - self._last_partial_time > _PARTIAL_INTERVAL_MS:
+                self._last_partial_time = now_ms
+                self._schedule_transcription(is_partial=True)
+        else:
+            # Idle: keep a short rolling pre-roll so an onset is never clipped.
+            self._preroll.append(frame.copy())
 
     def _detect_speech(self, frame: np.ndarray) -> bool:
         """Detect speech in a frame using webrtcvad or energy threshold."""
