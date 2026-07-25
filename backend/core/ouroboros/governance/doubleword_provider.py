@@ -210,6 +210,111 @@ def _dw_prompt_cache_min_chars() -> int:
         return _DW_PROMPT_CACHE_MIN_CHARS_DEFAULT
 
 
+def _dw_cache_read_multiplier() -> float:
+    """Billing multiplier for a cache READ vs fresh input. Env-tunable — no
+    hardcoded provider economics. Default 0.1 (the standard ephemeral-cache
+    read rate)."""
+    try:
+        return max(0.0, float(os.environ.get("JARVIS_DW_CACHE_READ_MULT", "0.1")))
+    except (TypeError, ValueError):
+        return 0.1
+
+
+def _dw_cache_write_multiplier() -> float:
+    """Billing multiplier for a cache WRITE vs fresh input. A write costs MORE
+    than plain input (it provisions the entry); the savings only materialize on
+    subsequent reads. Default 1.25."""
+    try:
+        return max(0.0, float(os.environ.get("JARVIS_DW_CACHE_WRITE_MULT", "1.25")))
+    except (TypeError, ValueError):
+        return 1.25
+
+
+def extract_cache_usage(usage: Any) -> Optional[dict]:
+    """Pull cache accounting out of a DW usage payload.
+
+    Returns ``None`` when the payload carries NO cache fields at all — the
+    graceful-degradation path for a provider/response that predates or omits
+    caching, so the caller falls back to plain token counting rather than
+    reporting fabricated zeros as if they were measured.
+
+    Returns a dict when at least one cache field is present, even if zero: a
+    genuine measured zero (cache armed, first call, nothing warm yet) is
+    meaningful and must be distinguishable from "not reported".
+
+    Pure + total: never raises, never does I/O."""
+    try:
+        if not isinstance(usage, dict):
+            return None
+        has_read = "cache_read_input_tokens" in usage
+        has_write = "cache_creation_input_tokens" in usage
+        if not (has_read or has_write):
+            return None
+
+        def _i(key: str) -> int:
+            try:
+                return max(0, int(usage.get(key, 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        read = _i("cache_read_input_tokens")
+        write = _i("cache_creation_input_tokens")
+        prompt = _i("prompt_tokens")
+        # Fresh input is whatever was neither read from nor written to cache.
+        # Clamp at 0: providers occasionally report prompt_tokens exclusive of
+        # cached reads, which would otherwise yield a negative.
+        fresh = max(0, prompt - read - write)
+
+        read_mult = _dw_cache_read_multiplier()
+        write_mult = _dw_cache_write_multiplier()
+        # Billed-equivalent input units vs. what the same prefix would have cost
+        # with no cache at all (every token at full rate).
+        billed_units = fresh + (read * read_mult) + (write * write_mult)
+        uncached_units = float(fresh + read + write)
+        saved_units = uncached_units - billed_units
+
+        return {
+            "cache_read_tokens": read,
+            "cache_write_tokens": write,
+            "fresh_input_tokens": fresh,
+            "prompt_tokens": prompt,
+            "billed_input_units": round(billed_units, 2),
+            "uncached_input_units": round(uncached_units, 2),
+            "saved_input_units": round(saved_units, 2),
+            "hit_ratio": round(read / prompt, 4) if prompt > 0 else 0.0,
+        }
+    except Exception:  # noqa: BLE001 — telemetry NEVER breaks generation
+        return None
+
+
+def emit_cache_telemetry(
+    usage: Any, *, op_id: str = "", model: str = "",
+) -> Optional[dict]:
+    """Structured, non-blocking cache-amortization telemetry.
+
+    Proves the prompt-cache graduation empirically instead of by assertion: a
+    ``cache_read_tokens`` that climbs across a soak while ``saved_input_units``
+    accumulates IS the amortization. Emits nothing (and returns None) when the
+    provider omits cache fields, so a silent absence never masquerades as a
+    measured zero. Logging only — no I/O, never raises."""
+    stats = extract_cache_usage(usage)
+    if stats is None:
+        return None
+    try:
+        logger.info(
+            "[DW_CACHE_TELEMETRY] op=%s model=%s read=%d write=%d fresh=%d "
+            "billed_units=%.2f uncached_units=%.2f saved_units=%.2f hit_ratio=%.4f",
+            op_id or "-", model or "-",
+            stats["cache_read_tokens"], stats["cache_write_tokens"],
+            stats["fresh_input_tokens"], stats["billed_input_units"],
+            stats["uncached_input_units"], stats["saved_input_units"],
+            stats["hit_ratio"],
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return stats
+
+
 def _dw_shape_cached_system(
     system_text: Any, *, enabled: bool, min_chars: int, ttl: str
 ) -> Any:
@@ -5586,6 +5691,15 @@ class DoublewordProvider:
                             content = choices[0].get("message", {}).get("content", "")
                             input_tokens = usage.get("prompt_tokens", 0)
                             output_tokens = usage.get("completion_tokens", 0)
+                            # Cache amortization telemetry — fail-soft, no I/O.
+                            # Both operands resolved defensively: this sits on
+                            # the hot generation path, so a telemetry NameError
+                            # would kill real ops.
+                            emit_cache_telemetry(
+                                usage,
+                                op_id=str(getattr(context, "op_id", "") or ""),
+                                model=str(getattr(self, "_model", "") or ""),
+                            )
 
                 except _DWToolForcingRejectedError:
                     if _attempt == 0:
