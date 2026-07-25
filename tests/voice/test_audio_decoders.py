@@ -315,7 +315,16 @@ def test_decodes_a_real_say_aiff_with_the_native_strategy(tmp_path):
     # mkstemp targets the real system temp — but a test pointed at tmp_path
     # would skip forever and quietly prove nothing.
     import tempfile
-    with tempfile.TemporaryDirectory(dir=str(Path.home())) as td:
+
+    # `say -o` writes a 0-second file inside a sandboxed TMPDIR, so this must
+    # run somewhere else — but a sandbox may equally forbid writing to $HOME.
+    # Skip rather than fail: an environment restriction is not a code defect,
+    # and a red test here would train everyone to ignore this suite.
+    try:
+        _probe = tempfile.TemporaryDirectory(dir=str(Path.home()))
+    except (OSError, PermissionError) as exc:
+        pytest.skip(f"cannot write outside TMPDIR in this environment: {exc}")
+    with _probe as td:
         out_path = Path(td) / "karen.aiff"
         try:
             subprocess.run(

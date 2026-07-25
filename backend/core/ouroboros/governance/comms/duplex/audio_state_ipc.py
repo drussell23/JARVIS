@@ -104,6 +104,30 @@ EVENT_KINDS = (
     EVENT_AUDIO_PLAYING, EVENT_AUDIO_IDLE, EVENT_HW_FAULT,
 )
 
+#: Telemetry frame type — an amplitude SAMPLE, not a state transition.
+#: Deliberately NOT in EVENT_KINDS: that tuple is the closed vocabulary the
+#: state machine keys off, and every one of those events must be delivered
+#: (a dropped VAD_ACTIVE corrupts state). RMS frames are lossy by design, so
+#: they ride a separate type and a separate, droppable broadcast path.
+MSG_RMS_LEVEL = "rms_level"
+
+#: Write-buffer watermark. Above this many bytes queued on a client's
+#: transport, telemetry frames are DROPPED rather than queued. asyncio's
+#: ``StreamWriter.write`` never blocks — it buffers without bound — so at
+#: 20 FPS a lagging client would grow the daemon's memory indefinitely.
+#: The valve trades stale amplitude (worthless) for bounded memory.
+def rms_drop_watermark_bytes() -> int:
+    try:
+        return max(1024, int(os.environ.get("JARVIS_AUDIO_IPC_RMS_WATERMARK", "65536")))
+    except (TypeError, ValueError):
+        return 65536
+
+
+def rms_publish_enabled() -> bool:
+    return os.environ.get(
+        "JARVIS_AUDIO_IPC_RMS_ENABLED", "true",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
 
 def audio_ipc_enabled() -> bool:
     """Master gate — default ON (read-only state export). NEVER raises."""
@@ -184,6 +208,9 @@ class AudioStateBroadcaster:
             "preempts": 0, "ptt_sessions": 0, "flushes": 0,
             "hw_faults": 0,
         }
+        # Telemetry valve accounting — `dropped` climbing means a client is
+        # lagging and frames are being shed, which is the design working.
+        self.rms_stats: Dict[str, int] = {"sent": 0, "dropped": 0, "errors": 0}
 
     # ---- lifecycle ----
 
@@ -355,6 +382,64 @@ class AudioStateBroadcaster:
             self._broadcast(msg)
         else:
             loop.call_soon_threadsafe(self._broadcast, msg)
+
+    def publish_rms(self, level: float, plane: str = "user") -> None:
+        """Publish one amplitude sample. LOSSY BY CONTRACT — see _broadcast_lossy.
+
+        Called from the audio consumer side at ~20 FPS. Never raises, never
+        blocks, and never queues behind a lagging client."""
+        if not rms_publish_enabled():
+            return
+        try:
+            lvl = min(1.0, max(0.0, float(level)))
+        except (TypeError, ValueError):
+            return
+        self._broadcast_lossy({
+            "type": MSG_RMS_LEVEL,
+            "level": round(lvl, 4),
+            "plane": str(plane or "user"),
+            "ts": time.time(),
+        })
+
+    def _broadcast_lossy(self, msg: Dict[str, Any]) -> None:
+        """Broadcast that DROPS rather than queues when a client is behind.
+
+        The difference from :meth:`_broadcast` is deliberate and load-bearing.
+        `_broadcast` must deliver: its messages are state transitions and
+        transcript chunks, where a drop corrupts the client's model. This path
+        carries amplitude samples, where the newest value is the only useful
+        one and a stale frame is worse than no frame.
+
+        Backpressure is read from the transport's own write-buffer size, so the
+        valve reacts to the ACTUAL socket condition rather than guessing from
+        elapsed time. NEVER raises."""
+        if not self._clients:
+            return
+        try:
+            data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+        except Exception:  # noqa: BLE001
+            return
+        watermark = rms_drop_watermark_bytes()
+        for w in list(self._clients):
+            try:
+                if w.is_closing():
+                    self._drop_client(w)
+                    continue
+                # THE VALVE: consult the real queue depth before writing.
+                try:
+                    transport = w.transport
+                    queued = transport.get_write_buffer_size() if transport else 0
+                except Exception:  # noqa: BLE001
+                    queued = 0
+                if queued >= watermark:
+                    self.rms_stats["dropped"] += 1
+                    continue          # drop THIS frame; the client keeps its socket
+                w.write(data)
+                self.rms_stats["sent"] += 1
+            except Exception:  # noqa: BLE001
+                # A telemetry write failure must not tear down a client that is
+                # otherwise healthy for state events; only a closing socket does.
+                self.rms_stats["errors"] += 1
 
     def _broadcast(self, msg: Dict[str, Any]) -> None:
         if not self._clients:
