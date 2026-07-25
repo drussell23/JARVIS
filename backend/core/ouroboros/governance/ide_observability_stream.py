@@ -115,6 +115,11 @@ EVENT_TYPE_HEARTBEAT = "heartbeat"
 # Aegis->DW auth+billing path is currently valid, which is what lets a frozen
 # DWHeartbeat auto-defrost instead of needing a daemon restart.
 EVENT_TYPE_PROVIDER_GENERATION_SUCCEEDED = "provider_generation_succeeded"
+# Audio plane: normalized RMS level + which plane is speaking. Drives the
+# cockpit Braille oscilloscope. High-frequency by nature, so producers
+# coalesce before publishing (see ui/audio_scope).
+EVENT_TYPE_AUDIO_LEVEL_CHANGED = "audio_level_changed"
+EVENT_TYPE_MIC_STATE_CHANGED = "mic_state_changed"
 EVENT_TYPE_STREAM_LAG = "stream_lag"
 EVENT_TYPE_REPLAY_START = "replay_start"
 EVENT_TYPE_REPLAY_END = "replay_end"
@@ -1487,6 +1492,8 @@ but NEVER the offending content. Authority-free anti-jailbreak telemetry."""
 
 _VALID_EVENT_TYPES = frozenset({
     "provider_generation_succeeded",
+    "audio_level_changed",
+    "mic_state_changed",
     # Agentic-visibility events (2026-07-24): big-file chunk swarm
     # scatter/stitch + worker-pool pickup — the cockpit sees agents spawn.
     # Moltbook (the agora): one post = one molt_post event.
