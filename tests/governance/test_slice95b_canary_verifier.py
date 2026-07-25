@@ -439,7 +439,7 @@ class TestSlice95bTrueDualLayerPath:
         )
 
         cred_source = (
-            "# credential shape canary\n"
+            "# credential shape canary\n"  # pragma: allowlist secret
             '_K = "sk-ant-api03-canary000000000000000000000000"\n'
         )
         saved = os.environ.get("JARVIS_SEMANTIC_GUARD_ENABLED")

@@ -304,7 +304,7 @@ def test_tar_transport_back_compat_unchanged(hyper, monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_secret_contents_never_logged(hyper, monkeypatch, capsys):
     monkeypatch.setenv("JARVIS_IAC_SECRET_FILES", ".env")
-    secret_value = "SUPER_SECRET_API_KEY=sk-deadbeefcafe123456"
+    secret_value = "SUPER_SECRET_API_KEY=sk-deadbeefcafe123456"  # pragma: allowlist secret
 
     def fake_run(cmd, *, timeout_s=120.0):
         # The scp command carries PATHS only -- never the file contents.

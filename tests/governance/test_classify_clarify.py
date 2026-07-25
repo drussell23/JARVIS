@@ -113,21 +113,21 @@ def test_sanitize_length_cap():
 
 
 def test_sanitize_redacts_openai_key():
-    raw = "My key is sk-abcdefghijklmnopqrstuvwxyz0123456789 please use it"
+    raw = "My key is sk-abcdefghijklmnopqrstuvwxyz0123456789 please use it"  # pragma: allowlist secret
     out = sanitize_answer(raw)
     assert "sk-abcdefghijklmnopqrstuvwxyz" not in out
     assert "[REDACTED_SECRET]" in out
 
 
 def test_sanitize_redacts_aws_key():
-    raw = "AWS key: AKIAIOSFODNN7EXAMPLE and stuff"
+    raw = "AWS key: AKIAIOSFODNN7EXAMPLE and stuff"  # pragma: allowlist secret
     out = sanitize_answer(raw)
     assert "AKIAIOSFODNN7EXAMPLE" not in out
     assert "[REDACTED_SECRET]" in out
 
 
 def test_sanitize_redacts_github_token():
-    raw = "Token is ghp_abcdefghijklmnopqrstuvwxyz0123456789AB"
+    raw = "Token is ghp_abcdefghijklmnopqrstuvwxyz0123456789AB"  # pragma: allowlist secret
     out = sanitize_answer(raw)
     assert "ghp_abcdefghijklm" not in out
     assert "[REDACTED_SECRET]" in out

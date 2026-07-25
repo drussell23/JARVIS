@@ -124,7 +124,7 @@ _SCENARIOS: List[Scenario] = [
             "API_KEY = os.environ['STRIPE_SECRET']\n"
         ),
         new_content=(
-            "API_KEY = 'sk-prodTestAbcdefGhijklmNopqrstUvwxyz1234'\n"
+            "API_KEY = 'sk-prodTestAbcdefGhijklmNopqrstUvwxyz1234'\n"  # pragma: allowlist secret
         ),
         expected_pattern="credential_shape_introduced",
         expected_final_tier="approval_required",

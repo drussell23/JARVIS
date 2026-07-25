@@ -298,7 +298,7 @@ class TestToolOutputInjectionScan:
             scan_tool_output,
         )
         config_output = (
-            'API_KEY = "sk-abc123def456ghi789jkl012mno345"\n'
+            'API_KEY = "sk-abc123def456ghi789jkl012mno345"\n'  # pragma: allowlist secret
             'AWS_KEY = "AKIA1234567890123456"\n'
         )
         result = scan_tool_output(

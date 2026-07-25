@@ -321,7 +321,7 @@ def test_firewall_rejects_credential_shape(store: RememberedAllowStore):
     with pytest.raises(GrantRejected) as exc:
         store.grant(
             tool="bash",
-            pattern="export API_KEY=sk-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH12345678",
+            pattern="export API_KEY=sk-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH12345678",  # pragma: allowlist secret
         )
     # Firewall flags the credential shape as an injection pattern hit.
     assert exc.value.reasons
