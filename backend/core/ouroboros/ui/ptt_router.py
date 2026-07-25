@@ -72,15 +72,54 @@ def _silence_level() -> float:
         return 0.06
 
 
+class PTTMode(str, enum.Enum):
+    """How the latch closes — chosen by capability probe, never hardcoded."""
+
+    HOLD = "hold"        # KEY_DOWN opens, KEY_UP flushes (kitty protocol)
+    TOGGLE = "toggle"    # tap opens, tap closes, silence auto-flushes
+
+    @property
+    def hint(self) -> str:
+        """Operator-facing hint. The UI must state the ACTIVE paradigm — a
+        cockpit that says 'hold' on a terminal that cannot see release would
+        leave the mic latched with no obvious way out."""
+        return "Hold Space to Talk" if self is PTTMode.HOLD else "Space ⇄ Mic"
+
+
+def resolve_ptt_mode(*, probe: Optional[Any] = None) -> "tuple":
+    """``(PTTMode, verdict, telemetry)`` from a live terminal probe.
+
+    ``probe`` is injectable so tests exercise both paradigms with zero terminal
+    I/O. Fails CLOSED to TOGGLE on every non-supporting verdict, including
+    TIMEOUT and ERROR: degrading is harmless, whereas wrongly assuming release
+    support strands the mic open."""
+    try:
+        if probe is None:
+            from backend.core.ouroboros.terminal_capability import (
+                probe_key_release_support,
+            )
+            probe = probe_key_release_support
+        verdict, telemetry = probe()
+        mode = PTTMode.HOLD if verdict.has_release else PTTMode.TOGGLE
+        return (mode, verdict, dict(telemetry or {}))
+    except Exception as exc:  # noqa: BLE001 — probe faults degrade, never raise
+        return (PTTMode.TOGGLE, None, {"reason": type(exc).__name__})
+
+
 def on_release_supported() -> bool:
     """Whether the input stack can deliver a true key-RELEASE edge.
 
-    False on the default prompt_toolkit stack. Kept as an explicit predicate so
-    the limitation is discoverable in code rather than buried in a comment, and
-    so a release-capable layer can flip it without touching the latch."""
-    return os.environ.get(
-        "JARVIS_PTT_KEY_RELEASE_SUPPORTED", "false",
-    ).strip().lower() in ("1", "true", "yes", "on")
+    Now answered by a live handshake with the terminal (kitty keyboard protocol
+    ``CSI ? u``) rather than assumed. Fail-closed: anything short of a
+    conforming reply is False."""
+    try:
+        from backend.core.ouroboros.terminal_capability import (
+            probe_key_release_support,
+        )
+        verdict, _ = probe_key_release_support()
+        return bool(verdict.has_release)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class PTTLatch:
@@ -96,6 +135,7 @@ class PTTLatch:
         on_open: Optional[Callable[[], None]] = None,
         on_close: Optional[Callable[[str], None]] = None,
         clock: Optional[Callable[[], float]] = None,
+        mode: Optional["PTTMode"] = None,
     ) -> None:
         self._state = MicState.CLOSED
         self._on_open = on_open
@@ -103,6 +143,7 @@ class PTTLatch:
         self._clock = clock or time.monotonic
         self._opened_at = 0.0
         self._last_voice_at = 0.0
+        self._mode = mode if mode is not None else PTTMode.TOGGLE
         self._open_count = 0
         self._close_reasons: list = []
 
@@ -174,6 +215,12 @@ class PTTLatch:
         silence closes the latch on its own. Only meaningful while open, so a
         quiet idle cockpit never emits spurious flushes."""
         if self._state is not MicState.OPEN:
+            return False
+        # HOLD mode has a REAL closing edge (key release), so silence must not
+        # flush: the operator may pause mid-thought while still holding the key,
+        # and cutting them off there would be worse than no PTT at all. VAD is
+        # strictly the substitute for an unobservable release.
+        if self._mode is PTTMode.HOLD:
             return False
         try:
             lvl = float(level)
