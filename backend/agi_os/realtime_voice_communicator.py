@@ -131,6 +131,22 @@ class UserUtterance:
             ).hexdigest()[:12]
 
 
+def _persona_voice_or(default: str) -> str: 
+    """Voice for the persona bound to this process, else *default*.
+
+    Falls back to the caller's constant rather than guessing, so a process
+    that never declared an identity keeps exactly the behaviour it had."""
+    try:
+        from backend.voice.agent_persona import active_persona, resolve_profile
+        persona = active_persona()
+        if persona is None:
+            return default
+        profile = resolve_profile(persona)
+        return profile.voice if profile is not None else default
+    except Exception:  # noqa: BLE001
+        return default
+
+
 class RealTimeVoiceCommunicator:
     """
     Advanced async voice communicator for AGI OS.
@@ -145,8 +161,15 @@ class RealTimeVoiceCommunicator:
 
     def __init__(self):
         """Initialize the voice communicator."""
-        # Voice configuration
-        self._primary_voice = "Daniel"
+        # Voice configuration — PERSONA FIRST.
+        #
+        # "Daniel" was hardcoded here and in every mode config below, so this
+        # component announced JARVIS's voice even inside Karen's cockpit:
+        #   RealTimeVoiceCommunicator initialized with voice: Daniel
+        # Binding the persona fixed MacOSVoice but not this second, entirely
+        # independent site. A multi-agent system cannot have each component
+        # deciding identity for itself.
+        self._primary_voice = _persona_voice_or("Daniel")
         self._available_voices: Dict[str, str] = {}
         self._british_voices: List[str] = []
 
@@ -180,13 +203,16 @@ class RealTimeVoiceCommunicator:
 
         # Voice mode configurations (dynamically adjustable)
         self._mode_configs: Dict[VoiceMode, VoiceModeConfig] = {
-            VoiceMode.NORMAL: VoiceModeConfig(rate=175, voice="Daniel", pause_multiplier=1.0),
-            VoiceMode.URGENT: VoiceModeConfig(rate=200, voice="Daniel", pause_multiplier=0.7),
-            VoiceMode.THOUGHTFUL: VoiceModeConfig(rate=155, voice="Daniel", pause_multiplier=1.3),
-            VoiceMode.QUIET: VoiceModeConfig(rate=145, voice="Daniel", pause_multiplier=1.2),
-            VoiceMode.CONVERSATIONAL: VoiceModeConfig(rate=170, voice="Daniel", pause_multiplier=1.0),
-            VoiceMode.NOTIFICATION: VoiceModeConfig(rate=185, voice="Daniel", pause_multiplier=0.8),
-            VoiceMode.APPROVAL: VoiceModeConfig(rate=165, voice="Daniel", pause_multiplier=1.1),
+            # Rates and pauses are per-MODE character; the voice is per-AGENT
+            # identity. They were conflated, so seven mode configs each pinned
+            # JARVIS's voice and no persona could ever override them.
+            VoiceMode.NORMAL: VoiceModeConfig(rate=175, voice=self._primary_voice, pause_multiplier=1.0),
+            VoiceMode.URGENT: VoiceModeConfig(rate=200, voice=self._primary_voice, pause_multiplier=0.7),
+            VoiceMode.THOUGHTFUL: VoiceModeConfig(rate=155, voice=self._primary_voice, pause_multiplier=1.3),
+            VoiceMode.QUIET: VoiceModeConfig(rate=145, voice=self._primary_voice, pause_multiplier=1.2),
+            VoiceMode.CONVERSATIONAL: VoiceModeConfig(rate=170, voice=self._primary_voice, pause_multiplier=1.0),
+            VoiceMode.NOTIFICATION: VoiceModeConfig(rate=185, voice=self._primary_voice, pause_multiplier=0.8),
+            VoiceMode.APPROVAL: VoiceModeConfig(rate=165, voice=self._primary_voice, pause_multiplier=1.1),
         }
 
         # Callbacks for events

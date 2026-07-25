@@ -231,3 +231,41 @@ def test_the_host_binds_karen():
         "persona bound after the pipeline — TTS resolves its voice at "
         "construction, so the singleton would already hold JARVIS's"
     )
+
+
+# ---------------------------------------------------------------------------
+# The SECOND hardcoding site
+# ---------------------------------------------------------------------------
+#
+# Binding the persona fixed MacOSVoice and not RealTimeVoiceCommunicator,
+# which pinned "Daniel" in _primary_voice AND in all seven VoiceModeConfigs.
+# It kept announcing JARVIS's voice inside Karen's cockpit:
+#   RealTimeVoiceCommunicator initialized with voice: Daniel
+
+
+def test_the_voice_communicator_follows_the_bound_persona(monkeypatch):
+    from backend.agi_os.realtime_voice_communicator import _persona_voice_or
+
+    monkeypatch.setenv("JARVIS_AGENT_PERSONA", "karen")
+    assert _persona_voice_or("Daniel") == "Karen"
+
+
+def test_an_unbound_process_keeps_its_existing_default(monkeypatch):
+    """A process that never declared an identity must behave exactly as before
+    — the fix may not change JARVIS."""
+    from backend.agi_os.realtime_voice_communicator import _persona_voice_or
+
+    monkeypatch.delenv("JARVIS_AGENT_PERSONA", raising=False)
+    assert _persona_voice_or("Daniel") == "Daniel"
+
+
+def test_no_mode_config_pins_a_voice_name():
+    """Rate and pause are per-MODE character; the voice is per-AGENT identity.
+    Conflating them meant seven configs each overrode the persona."""
+    from pathlib import Path
+
+    src = Path(
+        "backend/agi_os/realtime_voice_communicator.py",
+    ).read_text(encoding="utf-8")
+    assert 'VoiceModeConfig(rate=175, voice="Daniel"' not in src
+    assert "voice=self._primary_voice" in src

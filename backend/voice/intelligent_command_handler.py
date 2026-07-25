@@ -204,6 +204,68 @@ class ResponseStyle(Enum):
     RELAXED = "relaxed"           # Evening (calm, conversational)
     ENCOURAGING = "encouraging"   # Error recovery (supportive, helpful)
 
+#: Words that mean weather and essentially nothing else. A match on one of
+#: these, as a WHOLE WORD, is strong enough to pre-empt classification.
+_WEATHER_STRONG = re.compile(
+    r"\b(?:weather|forecast|temperature|humidity)\b", re.IGNORECASE,
+)
+
+#: Words that OFTEN mean weather but are ordinary English besides. These may
+#: never pre-empt on their own — see _is_weather_query.
+_WEATHER_WEAK = re.compile(
+    r"\b(?:rain|snow|sunny|cloudy|hot|cold|humid|windy|storm|storms)\b",
+    re.IGNORECASE,
+)
+
+#: Interrogative shape. A weak word inside an actual QUESTION is a weather
+#: query; the same word inside a statement is just a word.
+_WEATHER_QUESTION = re.compile(
+    r"\b(?:what|what's|whats|how|is|are|will|going to|gonna|should)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_weather_query(text: str) -> bool:
+    """Is this actually asking about the weather?
+
+    THE BUG THIS REPLACES was a bare substring scan:
+
+        any(word in text.lower() for word in
+            ['weather', ..., 'rain', 'snow', 'hot', 'cold', 'storm'])
+
+    ``in`` on a string matches anywhere, so short common words matched INSIDE
+    other words, at PRIORITY 1, ahead of every real classifier — and the
+    handler opened the Weather app. Measured on ordinary phrases from this
+    very system:
+
+        "the brain is thinking"  -> 'rain'  -> Weather app
+        "training the model"     -> 'rain'  -> Weather app
+        "I took a shot"          -> 'hot'   -> Weather app
+        "scold the agent"        -> 'cold'  -> Weather app
+        "hotfix deployed"        -> 'hot'   -> Weather app
+
+    An AI that discusses its own BRAIN and its own TRAINING could hardly have
+    picked worse substrings, and a misheard transcript reaches this line too —
+    so a speech-recognition artifact could launch an application unbidden.
+
+    Two rules replace it:
+
+      * whole words only — the failure was entirely about word boundaries;
+      * ambiguous words need interrogative context. "Is it cold outside" asks
+        about weather; "the cold start took 12 seconds" does not, and both
+        contain "cold".
+
+    Anything that fails these still reaches the real classifier below; this
+    only decides whether to SKIP it. NEVER raises."""
+    try:
+        t = str(text or "")
+        if _WEATHER_STRONG.search(t):
+            return True
+        return bool(_WEATHER_WEAK.search(t) and _WEATHER_QUESTION.search(t))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class IntelligentCommandHandler:
     """
     Handles commands using Swift-based intelligent classification
@@ -3126,7 +3188,7 @@ class IntelligentCommandHandler:
             # ===================================================================
             # PRIORITY 1: Weather queries - route to system for Weather app
             # ===================================================================
-            if any(word in text.lower() for word in ['weather', 'temperature', 'forecast', 'rain', 'snow', 'sunny', 'cloudy', 'hot', 'cold', 'humid', 'windy', 'storm']):
+            if _is_weather_query(text):
                 logger.info(f"Detected weather query, routing to system handler for Weather app workflow")
                 # Create classification for weather
                 classification = {'type': 'system', 'confidence': 0.9, 'intent': 'weather'}
