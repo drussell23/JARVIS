@@ -652,6 +652,53 @@ async def _attach_rms_stream(scope: Any) -> Any:
         return None
 
 
+async def _keep_rms_stream(scope: Any, state: dict) -> None:
+    """Maintain the amplitude subscription for the cockpit's whole lifetime.
+
+    The one-shot connect this replaces encoded a boot-order assumption that
+    the operator's own workflow violates: `ov` first, `wake` second. The
+    cockpit subscribed ONCE at boot; if the audio host wasn't serving at that
+    exact instant — it usually isn't, since `wake` is what spawns it — the
+    client was None forever and the wave could never move, no matter what
+    came up afterwards.
+
+    A subscription is not an event, it is a RELATIONSHIP: the host may start
+    late, restart, re-bind after losing its address, or die and be respawned
+    by the reflex. So the keeper loops for the cockpit's lifetime — connect
+    when absent, notice disconnection, back off with full jitter (several
+    cockpits must not stampede a booting host), and reconnect. Cheap when
+    idle: one failed connect per backoff tick. NEVER raises."""
+    # Local imports — this module imports asyncio per-function by convention,
+    # and a bare module-level name here would be a NameError swallowed by the
+    # task wrapper: the keeper would die instantly and silently, recreating
+    # the exact one-shot behaviour it exists to replace.
+    import asyncio
+    import random as _random
+
+    delay = 0.5
+    while not state.get("closing"):
+        client = state.get("rms_client")
+        if client is not None and getattr(client, "connected", False):
+            delay = 0.5                       # healthy — re-arm the backoff
+            await asyncio.sleep(1.0)
+            continue
+        if client is not None:                # died — release before retrying
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            state["rms_client"] = None
+        try:
+            state["rms_client"] = await _attach_rms_stream(scope)
+        except Exception:  # noqa: BLE001
+            state["rms_client"] = None
+        if state.get("rms_client") is None:
+            await asyncio.sleep(_random.uniform(0.2, delay))
+            delay = min(5.0, delay * 2)       # capped: a host can appear any time
+        else:
+            delay = 0.5
+
+
 async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
     """The Style-Guide §06 cockpit ON THE CLIENT: Zone 1 (the Proactive Canvas,
     state-reactive border) auto-scrolls the daemon's bridge stream; Zone 2 the
@@ -816,9 +863,12 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
                 except Exception:  # noqa: BLE001 — no voice stack: scope stays idle
                     pass
                 # ...and to the supervisor's stream, which is where the mic
-                # actually lives. This is the one that moves the wave when a
-                # human speaks into a cockpit that does not own CoreAudio.
-                _audio["rms_client"] = await _attach_rms_stream(_scope)
+                # actually lives. A KEEPER task, not a one-shot connect: the
+                # host usually starts AFTER the cockpit (wake spawns it), and
+                # may restart at any point in the session.
+                _audio["rms_task"] = asyncio.get_running_loop().create_task(
+                    _keep_rms_stream(_scope, _audio),
+                )
                 _audio.update(pump=_pump, latch=_latch, mode=_mode)
                 # `ov` has no module-level logger — this scope is the only
                 # record of which PTT paradigm the terminal probe chose, and a
@@ -929,9 +979,18 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
         except Exception:  # noqa: BLE001
             pass
         try:
-            _c = _audio.get("rms_client") if isinstance(_audio, dict) else None
-            if _c is not None:
-                await _c.close()
+            if isinstance(_audio, dict):
+                _audio["closing"] = True
+                _t = _audio.get("rms_task")
+                if _t is not None:
+                    _t.cancel()
+                    try:
+                        await _t
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+                _c = _audio.get("rms_client")
+                if _c is not None:
+                    await _c.close()
         except Exception:  # noqa: BLE001
             pass
 

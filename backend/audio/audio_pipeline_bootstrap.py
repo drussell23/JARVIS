@@ -288,12 +288,56 @@ async def wire_conversation_pipeline(
                             _wire_interruption_reporter()
                             await handle.karen.start()
                             logger.info("[Bootstrap] audio lease ARMED")
+                        # The lease IS the operator's intent to converse.
+                        #
+                        # Without this, arming was circular: whisper's
+                        # transcripts are drained only by the Conversation-
+                        # Pipeline loop; the loop starts only when the
+                        # ModeDispatcher enters CONVERSATION; and that mode
+                        # was entered only by a wake PHRASE heard through the
+                        # realtime voice communicator — a different STT path
+                        # with no audio in this process. The mode that would
+                        # drain the transcripts was gated on a listener that
+                        # never hears. `wake` already says what the operator
+                        # wants; route it through the dispatcher's own
+                        # switch_mode so session start, loop launch and
+                        # speaker verification all ride the existing path.
+                        try:
+                            if handle.mode_dispatcher is not None:
+                                from backend.audio.mode_dispatcher import (
+                                    VoiceMode,
+                                )
+                                await handle.mode_dispatcher.switch_mode(
+                                    VoiceMode.CONVERSATION,
+                                )
+                                logger.info(
+                                    "[Bootstrap] lease ARM → CONVERSATION "
+                                    "mode (pipeline loop running)",
+                                )
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "[Bootstrap] conversation-mode entry "
+                                "degraded", exc_info=True,
+                            )
                     else:
                         if handle.karen is not None:
                             await handle.karen.stop()
                             logger.info(
                                 "[Bootstrap] audio lease DISARMED (fail-safe)",
                             )
+                        # Symmetric: losing the lease ends the conversation
+                        # loop, so a disarmed mic cannot leave a loop pulling
+                        # from a silenced STT forever.
+                        try:
+                            if handle.mode_dispatcher is not None:
+                                from backend.audio.mode_dispatcher import (
+                                    VoiceMode,
+                                )
+                                await handle.mode_dispatcher.switch_mode(
+                                    VoiceMode.COMMAND,
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
                 except Exception:
                     logger.warning(
                         "[Bootstrap] lease arm/disarm degraded", exc_info=True,

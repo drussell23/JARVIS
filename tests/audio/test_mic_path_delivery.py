@@ -594,3 +594,138 @@ async def test_a_host_that_cannot_rebind_exits_rather_than_squatting(monkeypatch
         "the host squatted on the lock while unable to serve"
     )
     task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# BUG 8 — the conversation loop was gated on a listener that never hears
+# ---------------------------------------------------------------------------
+#
+# Whisper's transcripts are drained only by ConversationPipeline.run(); run()
+# starts only when the ModeDispatcher enters CONVERSATION; and that mode was
+# entered only by a wake PHRASE heard through the realtime voice communicator
+# — a different STT path with no audio in this host. Circular: the mode that
+# would drain the transcripts was gated on a listener that never hears.
+# Result: "Processing audio" forever, zero turns, Karen silent.
+
+
+def test_lease_arm_enters_conversation_mode():
+    """THE REGRESSION. `wake` already states the operator's intent to
+    converse; it must reach the dispatcher's own switch_mode so session
+    start, loop launch and speaker verification all ride the existing path."""
+    import inspect
+
+    from backend.audio import audio_pipeline_bootstrap as bootstrap
+
+    src = inspect.getsource(bootstrap.wire_conversation_pipeline)
+    i = src.index("audio lease ARMED")
+    arm_block = src[i:i + 2000]
+    assert "switch_mode" in arm_block and "CONVERSATION" in arm_block, (
+        "arming the mic no longer starts the conversation loop — transcripts "
+        "will pile up with no consumer again"
+    )
+
+
+def test_lease_disarm_leaves_conversation_mode():
+    """Symmetric: a disarmed mic must not leave a loop pulling from a
+    silenced STT forever."""
+    import inspect
+
+    from backend.audio import audio_pipeline_bootstrap as bootstrap
+
+    src = inspect.getsource(bootstrap.wire_conversation_pipeline)
+    i = src.index("DISARMED (fail-safe)")
+    disarm_block = src[i:i + 1200]
+    assert "switch_mode" in disarm_block and "COMMAND" in disarm_block
+
+
+# ---------------------------------------------------------------------------
+# BUG 9 — the cockpit's amplitude subscription was a one-shot
+# ---------------------------------------------------------------------------
+#
+# The cockpit subscribed to the RMS stream ONCE at boot. The operator's own
+# workflow violates that assumption every time: `ov` first, `wake` second —
+# and wake is what SPAWNS the host. So the client was None before the host
+# existed, and stayed None forever. The wave could not move.
+
+
+def test_the_cockpit_keeps_the_rms_subscription_alive():
+    from pathlib import Path
+
+    src = Path("backend/core/ouroboros/cli/ov.py").read_text(encoding="utf-8")
+    assert "_keep_rms_stream" in src
+    assert "create_task(\n                    _keep_rms_stream" in src or \
+           "_keep_rms_stream(_scope" in src, "keeper never scheduled"
+
+
+async def test_the_keeper_connects_when_the_host_appears_late(monkeypatch):
+    """THE REGRESSION, at the seam: no host at boot → host appears → the
+    subscription must follow."""
+    import backend.core.ouroboros.cli.ov as ov_mod
+
+    calls = {"n": 0}
+    state: dict = {}
+
+    async def _fake_attach(_scope):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return None                      # host not up yet
+        return type("C", (), {"connected": True, "close": staticmethod(lambda: None)})()
+
+    monkeypatch.setattr(ov_mod, "_attach_rms_stream", _fake_attach)
+    task = asyncio.get_running_loop().create_task(
+        ov_mod._keep_rms_stream(object(), state),
+    )
+    for _ in range(200):
+        await asyncio.sleep(0.05)
+        if state.get("rms_client") is not None:
+            break
+    state["closing"] = True
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+    assert state.get("rms_client") is not None, (
+        "the subscription never followed the late host"
+    )
+    assert calls["n"] >= 3
+
+
+async def test_the_keeper_reconnects_after_a_host_restart(monkeypatch):
+    import backend.core.ouroboros.cli.ov as ov_mod
+
+    class _C:
+        def __init__(self):
+            self.connected = True
+
+        async def close(self):
+            self.connected = False
+
+    made = []
+
+    async def _fake_attach(_scope):
+        c = _C()
+        made.append(c)
+        return c
+
+    monkeypatch.setattr(ov_mod, "_attach_rms_stream", _fake_attach)
+    state: dict = {}
+    task = asyncio.get_running_loop().create_task(
+        ov_mod._keep_rms_stream(object(), state),
+    )
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        if made:
+            break
+    made[0].connected = False               # the host dies
+    for _ in range(200):
+        await asyncio.sleep(0.05)
+        if len(made) >= 2:
+            break
+    state["closing"] = True
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+    assert len(made) >= 2, "a dead subscription was never replaced"

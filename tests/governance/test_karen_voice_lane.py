@@ -353,11 +353,20 @@ def test_names_are_never_used_to_infer_modality():
             f"model-id pattern matching on {smell!r} — forbidden by the "
             "modality-ledger mandate; the probe is the only authority"
         )
-    # And the shapes such matching would take, whatever strings it used.
-    assert ".startswith(" not in body and ".endswith(" not in body, (
-        "prefix/suffix matching on a model id is the same forbidden inference "
-        "wearing a different method name"
-    )
+    # And the shapes such matching would take — but only when applied to a
+    # MODEL identifier. Classifying the lane's own reason strings
+    # (``r.reason.startswith("probe_error:")``) is bookkeeping, not modality
+    # inference; a blanket ban on the method name would outlaw that too and
+    # the pin would get deleted the first time it blocked legitimate code.
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Attribute)
+                and node.attr in ("startswith", "endswith")):
+            continue
+        recv = ast.unparse(node.value)
+        assert "model" not in recv.lower(), (
+            f"prefix/suffix matching on {recv!r} — model-id inference is the "
+            "same forbidden shortcut wearing a different method name"
+        )
 
 
 def test_karen_answers_request_the_elected_voice_model():
@@ -460,4 +469,85 @@ def test_the_answer_path_warms_the_lane():
     src = Path(
         "backend/core/ouroboros/governance/karen_answer_engine.py",
     ).read_text(encoding="utf-8")
+    assert "ensure_voice_lane_warm" in src
+
+
+# ---------------------------------------------------------------------------
+# Ledger poisoning — a network fault is not a model verdict
+# ---------------------------------------------------------------------------
+#
+# Observed live: a sandboxed run's probes all failed with DNS errors, and the
+# lane cached those as fresh "never spoke" verdicts for six hours. The
+# remote-only host then resolved None, had no engine to fall back to, and
+# answered a heard utterance with silence.
+
+
+def test_a_transport_failure_expires_fast(monkeypatch):
+    """THE REGRESSION. A DNS error describes the network at one instant, not
+    the model — it must not poison the lane for the full TTL."""
+    monkeypatch.setenv("JARVIS_KAREN_VOICE_FAILURE_TTL_S", "60")
+    dead = _rec("victim", -1.0, tokens=0, age_s=300,
+                reason="dispatch_error:ClientConnectorDNSError")
+    spoke = _rec("witness", 0.9, age_s=300, reason="ok")
+    assert dead.fresh() is False, "a 5-minute-old network fault is still trusted"
+    assert spoke.fresh() is True, "a genuine measurement expired with it"
+
+
+def test_a_stale_transport_failure_is_reprobed(monkeypatch):
+    """stale_or_unknown must offer the victim up for measurement again."""
+    monkeypatch.setenv("JARVIS_KAREN_VOICE_FAILURE_TTL_S", "60")
+    led = VoiceLatencyLedger().load()
+    led.record(_rec("victim", -1.0, tokens=0, age_s=300,
+                    reason="probe_error:OSError"))
+    assert "victim" in led.stale_or_unknown(["victim"])
+
+
+def test_behavioural_verdicts_keep_the_full_ttl():
+    """no_tokens IS knowledge about the model — a reasoner that never speaks
+    stays disqualified for the normal window."""
+    rec = _rec("thinker", -1.0, tokens=0, age_s=3600, reason="no_tokens")
+    assert rec.transport_failure is False
+    assert rec.fresh() is True
+
+
+# ---------------------------------------------------------------------------
+# Degraded election — a slow voice beats no voice
+# ---------------------------------------------------------------------------
+#
+# Observed live an hour after the first benchmark: the SAME models measured
+# 2.1-2.7s that had measured 0.9-1.1s. Every candidate missed the 1.5s budget
+# and the lane elected nobody — which for a remote-only host means silence.
+
+
+def test_the_budget_is_a_preference_not_a_cliff():
+    """THE REGRESSION. All candidates over budget but under the hard cap →
+    elect the fastest of them, not nobody."""
+    led = VoiceLatencyLedger().load()
+    led.record(_rec("slow-a", 2.13))
+    led.record(_rec("slow-b", 2.69))
+    assert led.best() == "slow-a"
+
+
+def test_a_fast_model_always_beats_the_degraded_tier():
+    led = VoiceLatencyLedger().load()
+    led.record(_rec("degraded", 2.2))
+    led.record(_rec("snappy", 0.9))
+    assert led.best() == "snappy"
+
+
+def test_the_hard_cap_is_still_a_cliff(monkeypatch):
+    """Somewhere silence genuinely is better; 22.8s is past it."""
+    led = VoiceLatencyLedger().load()
+    led.record(_rec("Qwen/Qwen3.5-397B-A17B-FP8", 22.84))
+    assert led.best() is None
+    monkeypatch.setenv("JARVIS_KAREN_VOICE_TTFT_HARD_CAP_S", "30")
+    assert led.best() == "Qwen/Qwen3.5-397B-A17B-FP8", "cap is a knob"
+
+
+def test_the_host_warms_the_lane_at_boot():
+    """Remote-only + cold lane = guaranteed first-turn silence; boot is the
+    one moment probing costs the operator nothing."""
+    from pathlib import Path
+
+    src = Path("backend/audio/audio_plane_host.py").read_text(encoding="utf-8")
     assert "ensure_voice_lane_warm" in src

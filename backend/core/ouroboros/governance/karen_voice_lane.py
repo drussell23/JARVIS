@@ -107,6 +107,31 @@ def ledger_ttl_s() -> float:
     return max(60.0, _env_float("JARVIS_KAREN_VOICE_LEDGER_TTL_S", 21600.0))
 
 
+def spoken_ttft_hard_cap_s() -> float:
+    """The line past which a voice is unusable, full stop.
+
+    Distinct from the BUDGET, which is a preference: prefer a model that
+    starts inside ~1.5s, but when the whole cluster is having a slow hour —
+    measured live: every candidate 2.1-2.7s at one moment, 0.9-1.1s an hour
+    earlier — electing nobody means a remote-only host answers a heard
+    utterance with silence. A voice that starts in 2.5s is degraded; no voice
+    is broken. Above THIS cap, silence really is better."""
+    return max(1.0, _env_float("JARVIS_KAREN_VOICE_TTFT_HARD_CAP_S", 6.0))
+
+
+def transport_failure_ttl_s() -> float:
+    """How long a TRANSPORT failure is trusted — much shorter, on purpose.
+
+    A probe that ends in a DNS error, a refused connection or a reset says
+    nothing about the model; it is evidence about the NETWORK at that moment.
+    Caching it under the full TTL poisons the lane: observed live, a
+    sandboxed run's ClientConnectorDNSError records left every candidate
+    "freshly measured as silent" for six hours, so the lane resolved None,
+    the remote-only host had no engine, and Karen answered a heard utterance
+    with nothing at all."""
+    return max(5.0, _env_float("JARVIS_KAREN_VOICE_FAILURE_TTL_S", 120.0))
+
+
 def max_probe_candidates() -> int:
     """Ceiling on how many models ONE refresh may probe. Each probe is a real
     (tiny) generation, so this bounds spend explicitly rather than trusting the
@@ -192,11 +217,33 @@ class VoiceModelRecord:
         """Fit to hold a conversation: it spoke, and it started in time."""
         return bool(self.spoke) and 0.0 <= self.ttft_s <= spoken_ttft_budget_s()
 
+    @property
+    def usable(self) -> bool:
+        """Spoke, inside the HARD cap. The degraded tier: eligible only when
+        nothing conversational exists, because a slow voice beats no voice."""
+        return bool(self.spoke) and 0.0 <= self.ttft_s <= spoken_ttft_hard_cap_s()
+
+    @property
+    def transport_failure(self) -> bool:
+        """Did the probe fail before it could learn anything about the model?
+        ``probe_error:``/``dispatch_error:`` name exception CLASSES raised in
+        dispatch — network knowledge, not model knowledge."""
+        r = self.reason or ""
+        return r.startswith("probe_error:") or r.startswith("dispatch_error:")
+
     def fresh(self, *, now: Optional[float] = None, ttl_s: Optional[float] = None) -> bool:
         t = time.time() if now is None else float(now)
-        return (t - float(self.measured_at)) <= (
-            ledger_ttl_s() if ttl_s is None else float(ttl_s)
-        )
+        if ttl_s is None:
+            # Transport faults expire fast: they describe the network at one
+            # instant, and treating them as model verdicts poisons the lane
+            # for the full TTL (the 2026-07-25 silent-Karen class).
+            ttl = (
+                transport_failure_ttl_s() if self.transport_failure
+                else ledger_ttl_s()
+            )
+        else:
+            ttl = float(ttl_s)
+        return (t - float(self.measured_at)) <= ttl
 
 
 class VoiceLatencyLedger:
@@ -288,10 +335,20 @@ class VoiceLatencyLedger:
         Ties break on model id so two cockpits booted together converge on the
         same voice instead of drifting apart on dict ordering."""
         self._ensure()
-        fit = [
-            r for r in self._records.values()
-            if r.fresh(now=now) and r.conversational
-        ]
+        fresh = [r for r in self._records.values() if r.fresh(now=now)]
+        # Tier 1: within the conversational budget — the preference.
+        fit = [r for r in fresh if r.conversational]
+        # Tier 2: spoke, within the hard cap — degraded, but a voice. Only
+        # consulted when tier 1 is empty, so a fast model always wins outright
+        # and the degraded tier cannot drag the election down.
+        if not fit:
+            fit = [r for r in fresh if r.usable]
+            if fit:
+                logger.info(
+                    "[VoiceLane] no candidate inside the %.1fs budget — "
+                    "electing the fastest usable voice instead (degraded "
+                    "beats silent)", spoken_ttft_budget_s(),
+                )
         if not fit:
             return None
         fit.sort(key=lambda r: (round(r.ttft_s, 3), r.model))
@@ -440,7 +497,11 @@ async def probe_voice_model(
             reason=(
                 str(getattr(result, "reason", "") or "")
                 if not spoke
-                else ("ok" if ttft <= budget else "too_slow_for_speech")
+                else (
+                    "ok" if ttft <= budget
+                    else "slow" if ttft <= spoken_ttft_hard_cap_s()
+                    else "too_slow_for_speech"
+                )
             ),
         )
     except Exception as exc:  # noqa: BLE001

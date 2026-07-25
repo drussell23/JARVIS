@@ -167,10 +167,13 @@ def test_the_cockpit_actually_subscribes():
     src = Path(
         "backend/core/ouroboros/cli/ov.py",
     ).read_text(encoding="utf-8")
-    assert "_attach_rms_stream(_scope)" in src, (
-        "the cockpit no longer subscribes to the supervisor's amplitude stream"
+    # The subscription became a KEEPER (2026-07-25): a one-shot connect
+    # encoded a boot-order assumption the operator violates every time
+    # (`ov` first, `wake` — which spawns the host — second).
+    assert "_keep_rms_stream(_scope" in src, (
+        "the cockpit no longer maintains the supervisor amplitude subscription"
     )
-    assert 'rms_client' in src
+    assert 'rms_client' in src and 'rms_task' in src
 
 
 def test_the_subscription_is_released_on_exit():

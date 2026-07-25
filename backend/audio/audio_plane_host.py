@@ -173,6 +173,20 @@ class AudioPlaneHost:
         # admission keeps it closed.
         os.environ.setdefault("JARVIS_ASR_ADMISSION_OPEN", "1")
 
+        # Warm the voice lane NOW, not at the first turn. This host is
+        # remote-only by design, so an unelected lane is not a degraded mode —
+        # it is guaranteed silence on the first exchange while the election
+        # runs behind it. Boot is the one moment where spending a few probe
+        # seconds costs the operator nothing.
+        try:
+            from backend.core.ouroboros.governance.karen_voice_lane import (
+                ensure_voice_lane_warm,
+            )
+            if ensure_voice_lane_warm():
+                logger.info("[AudioPlane] voice lane warming in background")
+        except Exception:  # noqa: BLE001
+            logger.debug("[AudioPlane] voice-lane warm degraded", exc_info=True)
+
         try:
             from backend.audio.audio_pipeline_bootstrap import (
                 wire_conversation_pipeline,
