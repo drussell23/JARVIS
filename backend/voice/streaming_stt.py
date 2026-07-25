@@ -78,6 +78,40 @@ class StreamingTranscriptEvent:
     metadata: dict = field(default_factory=dict)
 
 
+def _rejected_capture_enabled() -> bool:
+    """Keep audio that whisper rejected? Default ON while this fault is open,
+    OFF with ``JARVIS_STT_CAPTURE_REJECTED=0``. Writes a voice recording to
+    disk, so it is capped and named for what it is."""
+    return os.getenv("JARVIS_STT_CAPTURE_REJECTED", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _rejected_capture_cap() -> int:
+    try:
+        return max(1, int(os.getenv("JARVIS_STT_CAPTURE_REJECTED_MAX", "6")))
+    except (TypeError, ValueError):
+        return 6
+
+
+def _dump_rejected_audio(audio, sample_rate: int) -> None:
+    """Write one rejected buffer to ``.jarvis/stt_rejected/``. NEVER raises."""
+    try:
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[2]
+        out = root / ".jarvis" / "stt_rejected"
+        out.mkdir(parents=True, exist_ok=True)
+        existing = sorted(out.glob("*.wav"))
+        if len(existing) >= _rejected_capture_cap():
+            return
+        import soundfile as sf
+        path = out / f"rejected_{len(existing):02d}_{int(time.time())}.wav"
+        sf.write(str(path), audio, int(sample_rate))
+        logger.warning("[StreamingSTT] rejected audio saved: %s", path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class StreamingSTTEngine:
     """
     Streaming speech-to-text using faster-whisper.
@@ -361,6 +395,19 @@ class StreamingSTTEngine:
                         if _pk < 0.01 else
                         "signal has SPEECH-level amplitude: the model rejected it",
                     )
+                    # And when the signal LOOKS like speech but transcribes
+                    # to nothing, keep the audio itself. Statistics say the
+                    # amplitude is right; only the samples can say whether the
+                    # CONTENT is — corrupted resampling, interleaving, or
+                    # reversed frames all present as speech-level noise.
+                    #
+                    # Strictly bounded: only this exact anomaly, only while
+                    # under the cap, into a clearly-named directory, and
+                    # off with one env var. This writes a recording of
+                    # someone's voice to disk, so it stays proportionate and
+                    # obvious rather than quietly permanent.
+                    if _pk >= 0.01 and _rejected_capture_enabled():
+                        _dump_rejected_audio(audio, self._sample_rate)
                 except Exception:  # noqa: BLE001
                     pass
 
