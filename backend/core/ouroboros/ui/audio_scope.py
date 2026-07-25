@@ -223,21 +223,42 @@ def _level_for(value: float) -> int:
     return max(1, min(LEVELS, int(math.ceil(v * LEVELS))))
 
 
-def cell_for(left: float, right: float) -> str:
-    """Two normalized samples → one Braille cell. Pure; never raises."""
+def cell_for(left: float, right: float, *, baseline: bool = True) -> str:
+    """Two normalized samples → one Braille cell. Pure; never raises.
+
+    ``baseline`` draws the bottom dot row for a silent sample. This is not
+    decoration — it is the difference between a working meter and an invisible
+    one. U+2800 is the BLANK braille pattern, so a silent scope without a
+    baseline renders as pure whitespace, which an operator cannot distinguish
+    from "the feature isn't installed". A real oscilloscope shows a flat line
+    at rest; so does this one now.
+
+    (This module's docstring claimed a flat baseline from the start; the code
+    never did it. Caught by looking at a live cockpit and seeing nothing.)"""
     try:
         mask = 0
-        for i in range(_level_for(left)):
+        left_n, right_n = _level_for(left), _level_for(right)
+        for i in range(left_n):
             mask |= _COL0_BOTTOM_UP[i]
-        for i in range(_level_for(right)):
+        for i in range(right_n):
             mask |= _COL1_BOTTOM_UP[i]
+        if baseline:
+            # Silent sub-columns still get their bottom dot, so the trace is
+            # continuous across quiet passages instead of breaking into
+            # floating islands.
+            if left_n == 0:
+                mask |= _COL0_BOTTOM_UP[0]
+            if right_n == 0:
+                mask |= _COL1_BOTTOM_UP[0]
         return chr(_BRAILLE_BASE + mask)
     except Exception:  # noqa: BLE001
         return chr(_BRAILLE_BASE)
 
 
-def _ascii_cell(left: float, right: float) -> str:
+def _ascii_cell(left: float, right: float, *, baseline: bool = True) -> str:
     lvl = max(_level_for(left), _level_for(right))
+    if lvl == 0 and baseline:
+        return "_"          # visible flat line, same reason as the Braille path
     return _ASCII_RAMP[min(lvl, len(_ASCII_RAMP) - 1)]
 
 

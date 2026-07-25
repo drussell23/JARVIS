@@ -35,6 +35,10 @@ from backend.core.ouroboros.ui.ptt_router import (
 )
 
 _BASE = 0x2800
+#: A silent sub-column still draws its bottom dot, so quiet renders as a
+#: visible flat line. U+2800 is BLANK — a scope made of it is invisible,
+#: which is indistinguishable from the feature not being installed.
+_BASELINE = chr(_BASE + 0x40 + 0x80)   # dots 7+8, both bottom dots
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +51,7 @@ def test_silence_renders_empty_braille_cells():
     sc.extend([0.0] * 16)
     out = sc.render()
     assert len(out) == 8
-    assert out == chr(_BASE) * 8, "silence must be blank cells, not a floating bar"
+    assert out == _BASELINE * 8, "silence must be a visible flat line"
     assert sc.is_silent() is True
 
 
@@ -60,19 +64,21 @@ def test_full_scale_renders_all_eight_dots():
 def test_cell_encodes_two_samples_at_four_levels():
     """The resolution claim, asserted bit-exactly: one cell = 2 columns x 4 rows,
     bars filling from the BOTTOM."""
-    assert cell_for(0.0, 0.0) == chr(_BASE)
+    assert cell_for(0.0, 0.0, baseline=False) == chr(_BASE)
+    assert cell_for(0.0, 0.0) == _BASELINE          # baseline on by default
     # Left column only, one dot from the bottom -> dot 7 (0x40).
-    assert cell_for(0.2, 0.0) == chr(_BASE + 0x40)
+    assert cell_for(0.2, 0.0, baseline=False) == chr(_BASE + 0x40)
     # Right column only, one dot from the bottom -> dot 8 (0x80).
-    assert cell_for(0.0, 0.2) == chr(_BASE + 0x80)
+    assert cell_for(0.0, 0.2, baseline=False) == chr(_BASE + 0x80)
     # Both columns full -> all eight dots.
-    assert cell_for(1.0, 1.0) == chr(_BASE + 0xFF)
+    assert cell_for(1.0, 1.0) == chr(_BASE + 0xFF)   # unchanged: full scale
 
 
 def test_bars_fill_upward_from_the_baseline():
     """A louder sample must be a TALLER bar anchored at the bottom, so a rising
     ramp is monotonically denser."""
-    masks = [ord(cell_for(v, v)) - _BASE for v in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    masks = [ord(cell_for(v, v, baseline=False)) - _BASE
+             for v in (0.0, 0.25, 0.5, 0.75, 1.0)]
     assert masks == sorted(masks), f"not monotonic: {masks}"
     assert masks[0] == 0 and masks[-1] == 0xFF
 
@@ -94,9 +100,9 @@ def test_newest_sample_lands_at_the_right_edge():
     """Right-to-left scroll: the freshest data is always rightmost."""
     sc = BrailleScope(width=3)
     sc.extend([0.0] * 6)
-    assert sc.render()[-1] == chr(_BASE)
+    assert sc.render()[-1] == _BASELINE
     sc.push(1.0)
-    assert sc.render()[-1] != chr(_BASE), "new sample did not reach the right edge"
+    assert sc.render()[-1] != _BASELINE, "new sample did not reach the right edge"
 
 
 def test_partial_buffer_is_left_padded_to_stable_width():
@@ -105,7 +111,7 @@ def test_partial_buffer_is_left_padded_to_stable_width():
     sc.push(1.0)
     out = sc.render()
     assert len(out) == 10
-    assert out.startswith(chr(_BASE)), "partial buffer must left-pad"
+    assert out.startswith(_BASELINE), "partial buffer must left-pad with baseline"
     assert out[-1] != chr(_BASE)
 
 
@@ -142,7 +148,7 @@ def test_clear_resets_to_silence():
     sc = BrailleScope(width=6)
     sc.extend([1.0] * 12)
     sc.clear()
-    assert sc.render() == chr(_BASE) * 6
+    assert sc.render() == _BASELINE * 6
     assert sc.is_silent() is True
 
 
@@ -438,3 +444,31 @@ def test_broker_event_types_are_registered():
     )
     assert "audio_level_changed" in _VALID_EVENT_TYPES
     assert "mic_state_changed" in _VALID_EVENT_TYPES
+
+
+def test_idle_scope_is_visible_not_blank():
+    """THE BUG A LIVE COCKPIT EXPOSED: U+2800 is the BLANK braille pattern, so
+    a silent scope rendered as pure whitespace — the operator saw nothing and
+    could not tell it from an uninstalled feature. A real oscilloscope shows a
+    flat line at rest."""
+    sc = BrailleScope(width=20)
+    out = sc.render()
+    assert all(ord(c) != _BASE for c in out), "idle scope is invisible"
+    assert out == _BASELINE * 20
+    assert sc.is_silent() is True, "baseline must not be mistaken for signal"
+
+
+def test_baseline_is_below_every_signal_level():
+    """The flat line must sit UNDER the trace, never overlap it — otherwise a
+    quiet passage would look louder than it is."""
+    quiet = ord(cell_for(0.0, 0.0)) - _BASE
+    loud = ord(cell_for(1.0, 1.0)) - _BASE
+    assert quiet & loud == quiet, "baseline dots are not a subset of full scale"
+
+
+def test_ascii_fallback_also_shows_a_baseline(monkeypatch):
+    monkeypatch.setenv("JARVIS_AUDIO_SCOPE_ASCII", "true")
+    sc = BrailleScope(width=6)
+    out = sc.render()
+    assert out.strip(), "ASCII fallback rendered invisible whitespace"
+    assert out == "_" * 6
