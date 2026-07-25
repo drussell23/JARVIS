@@ -337,6 +337,33 @@ class StreamingSTTEngine:
 
             text, confidence = await loop.run_in_executor(None, _transcribe)
 
+            # EMPTY-RESULT FORENSICS. `if text:` silently discards every
+            # transcription that comes back blank, which is correct behaviour
+            # and terrible observability: the log shows faster-whisper's
+            # "Processing audio with duration 00:01.400" and then nothing, so
+            # a session ends "(0 turns)" with no way to tell whether the model
+            # heard silence or heard speech and failed on it. Those are
+            # completely different faults — one is a microphone problem, the
+            # other a model problem — and this line is the difference between
+            # naming which, and another round of guessing.
+            #
+            # Describes the SIGNAL, never its content: peak/RMS/duration only,
+            # so nothing anyone said can leak into a log file.
+            if not text:
+                try:
+                    _pk = float(np.max(np.abs(audio))) if len(audio) else 0.0
+                    _rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
+                    logger.warning(
+                        "[StreamingSTT] EMPTY transcript from %.2fs of audio "
+                        "(peak=%.4f rms=%.4f partial=%s) — %s",
+                        len(audio) / self._sample_rate, _pk, _rms, is_partial,
+                        "signal is at NOISE level: the mic is not hearing you"
+                        if _pk < 0.01 else
+                        "signal has SPEECH-level amplitude: the model rejected it",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
             if text:
                 event = StreamingTranscriptEvent(
                     text=text,
