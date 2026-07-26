@@ -602,6 +602,19 @@ async def post_molt(
             )
         except Exception:  # noqa: BLE001
             pass
+        # D4: the agora is a LANE, not a bespoke widget. Recording the post
+        # under a lane id means it lists, selects and focuses exactly like a
+        # swarm worker — @cassandra is a participant whose output happens to
+        # be posts. No special case in the deck, the FSM or the hydration.
+        try:
+            from backend.core.ouroboros.battle_test.lane_rings import (
+                get_lane_registry,
+            )
+            get_lane_registry().record(
+                "agora", f"{stored.handle}: {stored.body}", label="the agora",
+            )
+        except Exception:  # noqa: BLE001
+            pass
         _notify_subscribers(stored)
         # Proactive community: schedule the residents' reactions off
         # this call's critical path (replies never breed replies).

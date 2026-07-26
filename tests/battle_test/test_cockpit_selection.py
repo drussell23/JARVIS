@@ -293,18 +293,18 @@ async def test_a_vanished_lane_answers_found_false_not_silence() -> None:
 # 4. the client renders each mode into the one toolbar region
 # --------------------------------------------------------------------------
 
-def test_toolbar_shows_the_lane_list_in_select() -> None:
+def test_lane_list_renders_above_the_caret_in_select() -> None:
     from backend.core.ouroboros.cli import ov
 
     ui = ov.AttachUI()
     ui._lanes = _rows("swarm/a", "unit/b")
     assert ui.fsm.enter_select() is True
-    out = ui.toolbar()
+    out = ui.prompt()   # the live region sits ABOVE the caret
     assert "swarm/a" in out and "unit/b" in out
     assert "↑↓" in out, "no affordance shown for the new mode"
 
 
-def test_toolbar_shows_hydrated_output_in_focus() -> None:
+def test_hydrated_output_renders_above_the_caret_in_focus() -> None:
     from backend.core.ouroboros.cli import ov
 
     ui = ov.AttachUI()
@@ -315,7 +315,7 @@ def test_toolbar_shows_hydrated_output_in_focus() -> None:
         "lane": "unit/b", "found": True, "tombstoned": True,
         "dropped": 0, "lines": ["patched saga.py"],
     })
-    out = ui.toolbar()
+    out = ui.prompt()
     assert "patched saga.py" in out
     assert "finished" in out
 
@@ -333,7 +333,7 @@ def test_stale_hydration_for_an_abandoned_lane_is_ignored() -> None:
     ui.on_lane_history({
         "lane": "unit/b", "found": True, "lines": ["late answer"],
     })
-    assert "late answer" not in ui.toolbar()
+    assert "late answer" not in ui.prompt()
 
 
 def test_escape_restores_the_ambient_deck_view() -> None:
@@ -344,6 +344,6 @@ def test_escape_restores_the_ambient_deck_view() -> None:
     ui.on_ambient("DW provider failover")
     ui._lanes = _rows("unit/b")
     ui.fsm.enter_select()
-    assert "failover" not in ui.toolbar(), "ambient deck leaked into SELECT"
+    assert "failover" not in ui.prompt(), "ambient deck leaked into SELECT"
     ui.fsm.escape()
-    assert "failover" in ui.toolbar(), "ambient view was not restored"
+    assert "failover" in ui.prompt(), "ambient view was not restored"

@@ -177,6 +177,46 @@ class LaneRegistry:
         self._lanes: Dict[str, LaneState] = {}
         self._lock = threading.Lock()
         self.evicted_lanes = 0
+        #: Called with a lane id when it stops existing — TTL expiry or
+        #: eviction. The client FSM cannot infer this: a lane simply missing
+        #: from the next heartbeat is indistinguishable from a slow frame, so
+        #: an operator focused on it would sit in a pane that never updates
+        #: and never explains itself. The daemon knows the moment it happens
+        #: and says so.
+        self._reap_sinks: List[Callable[[str], None]] = []
+        #: Reaps collected under the lock, announced after it is released.
+        self._pending_reaps: List[str] = []
+
+    def on_reap(self, sink: Callable[[str], None]) -> Callable[[], None]:
+        """Subscribe to lane disappearance. Returns an unsubscribe callable."""
+        self._reap_sinks.append(sink)
+
+        def _off() -> None:
+            try:
+                self._reap_sinks.remove(sink)
+            except ValueError:
+                pass
+        return _off
+
+    def _drain_reaps(self) -> None:
+        """Announce reaps collected under the lock. Call AFTER releasing it.
+
+        The two-phase shape is deliberate: eviction and TTL expiry both run
+        inside the critical section, and a subscriber that queries the
+        registry from its callback would deadlock if notified there."""
+        with self._lock:
+            pending, self._pending_reaps = self._pending_reaps, []
+        for lane in pending:
+            self._announce_reap(lane)
+
+    def _announce_reap(self, lane: str) -> None:
+        """Fan out one reap. Called WITHOUT the lock held — a sink that
+        reaches back into the registry must not deadlock. NEVER raises."""
+        for sink in list(self._reap_sinks):
+            try:
+                sink(lane)
+            except Exception:  # noqa: BLE001
+                logger.debug("[LaneRings] reap sink degraded", exc_info=True)
 
     def record(
         self, lane: str, text: str, *, severity: str = "INFO",
@@ -205,6 +245,7 @@ class LaneRegistry:
                 st.lines.append(LaneLine(text=text, ts=now, severity=severity))
                 st.last_seen = now
                 st.total += 1
+            self._drain_reaps()
         except Exception:  # noqa: BLE001
             pass
 
@@ -230,15 +271,21 @@ class LaneRegistry:
             st = self._lanes.get(str(lane))
             return bool(st and st.tombstoned)
 
-    def _expire_tombstones(self, now: float) -> None:
+    def _expire_tombstones(self, now: float) -> List[str]:
         """Drop tombstones past their TTL. Called with the lock held.
+
+        Returns the reaped ids rather than announcing them, because the
+        caller holds the lock and a sink that reaches back in would deadlock.
 
         Only tombstones expire on time. A live lane that has simply been quiet
         for a while is still a worker the operator may want to look at, so
         silence is not death."""
+        reaped: List[str] = []
         for k, st in list(self._lanes.items()):
             if st.died_at is not None and now - st.died_at > tombstone_ttl_s():
                 del self._lanes[k]
+                reaped.append(k)
+        return reaped
 
     def _reap_if_needed(self, now: float) -> None:
         """Evict the least-recently-active lane when at the ceiling.
@@ -246,17 +293,18 @@ class LaneRegistry:
         Called with the lock held. Recency rather than size: a finished
         worker's history stops being interesting long before a busy one's,
         and the operator focuses what is happening now."""
-        self._expire_tombstones(now)
+        reaped = self._expire_tombstones(now)
         limit = max_lanes()
-        if len(self._lanes) < limit:
-            return
-        # Prefer a tombstone as the victim: a finished lane's history is worth
-        # less than a running worker's, whatever the timestamps say.
-        pool = [s for s in self._lanes.values() if s.tombstoned] or \
-               list(self._lanes.values())
-        victim = min(pool, key=lambda s: s.last_seen)
-        self._lanes.pop(victim.lane, None)
-        self.evicted_lanes += 1
+        if len(self._lanes) >= limit:
+            # Prefer a tombstone as the victim: a finished lane's history is
+            # worth less than a running worker's, whatever the timestamps say.
+            pool = [s for s in self._lanes.values() if s.tombstoned] or \
+                   list(self._lanes.values())
+            victim = min(pool, key=lambda s: s.last_seen)
+            self._lanes.pop(victim.lane, None)
+            self.evicted_lanes += 1
+            reaped.append(victim.lane)
+        self._pending_reaps.extend(reaped)
 
     # -- read side --------------------------------------------------------
 
@@ -283,12 +331,12 @@ class LaneRegistry:
         re-agreed at both ends every time a field is added."""
         with self._lock:
             now = self._clock()
-            self._expire_tombstones(now)
+            self._pending_reaps.extend(self._expire_tombstones(now))
             rows = sorted(
                 self._lanes.values(),
                 key=lambda s: (s.tombstoned, -s.last_seen),
             )
-            return [
+            out = [
                 {
                     "lane": s.lane,
                     "lines": len(s.lines),
@@ -299,6 +347,11 @@ class LaneRegistry:
                 }
                 for s in rows
             ]
+        # Announced here, outside the lock: summary() is polled ~1Hz by the
+        # heartbeat, which makes it the reliable place a TTL expiry becomes
+        # observable even if nothing else touches the registry.
+        self._drain_reaps()
+        return out
 
     def dropped(self, lane: str) -> int:
         """Lines this lane emitted that the ring no longer holds. Reported

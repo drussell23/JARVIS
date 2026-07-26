@@ -222,15 +222,20 @@ def test_addressed_goes_to_scrollback_ambient_goes_to_the_deck(
     )
 
 
-def test_toolbar_grows_to_show_deck_rows() -> None:
+def test_live_region_grows_above_the_caret() -> None:
+    """The pulse and deck render ABOVE the input line (operator layout), so
+    the block is part of the prompt, not the bottom toolbar."""
     from backend.core.ouroboros.cli import ov
 
     ui = ov.AttachUI()
-    assert "\n" not in ui.toolbar(), "empty deck should stay one line"
+    base_lines = len(ui.prompt().splitlines())
     ui.on_ambient("DW provider failover")
-    out = ui.toolbar()
-    assert "\n" in out and "failover" in out
-    assert out.splitlines()[0].strip() != "", "the pulse line was lost"
+    out = ui.prompt()
+    assert "failover" in out
+    assert len(out.splitlines()) > base_lines, "the deck row did not appear"
+    assert out.splitlines()[-1].strip().endswith("›"), (
+        "the caret must be the LAST line — the live region sits above it"
+    )
 
 
 def test_deck_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -239,4 +244,4 @@ def test_deck_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JARVIS_AMBIENT_DECK", "0")
     ui = ov.AttachUI()
     ui.on_ambient("DW provider failover")
-    assert "\n" not in ui.toolbar(), "OFF must restore the single-line toolbar"
+    assert "failover" not in ui.prompt(), "OFF must hide the deck rows"
