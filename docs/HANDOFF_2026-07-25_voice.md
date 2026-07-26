@@ -87,9 +87,61 @@ NEW: speech rhythm survives the chain (raw 0.25 -> processed 0.262) — look dow
 **This is a new lead and it points somewhere nobody has looked.** Syllabic modulation
 *survives* the bus (raw ≈ 0.25 → processed ≈ 0.26) and the recogniser still returns
 empty. That is not distance and not the chain — it is downstream of the bus: the
-buffer assembled for the model, or the model stage itself. Worth noting the
-model-input peak in incident `232221` is 0.0157 against a processed-bus peak of
-0.3992. Different windows, so not yet a finding — but it is the first thing to measure.
+buffer assembled for the model, or the model stage itself.
+
+### 1c. The model-input attenuation was not real — the handoff is bit-exact
+The `0.0157` vs `0.3992` figure was a window-mismatch artifact (12 s ring containing
+one loud transient, vs a 1.72 s utterance tail) and should never have been promoted to
+a lead. Settled by full-window normalised cross-correlation of each `model_input.wav`
+against its own `processed_bus.wav`:
+
+```
+lag_s  corr  bus_seg_pk  mdl_pk   ratio    dB
+ 7.72  1.000     0.2900  0.2900  1.0000  0.00
+ 1.00  1.000     0.0195  0.0195  1.0000  0.00
+ 8.04  1.000     0.5806  0.5806  1.0000  0.00
+ 2.78  1.000     0.0508  0.0508  1.0000  0.00
+```
+
+**Ratio exactly 1.0000 at correlation 1.000 — 0 dB. No attenuation, no dtype fault, no
+double normalisation.** Structurally it could not be otherwise: `audio_bus.py:1097`
+calls `note_processed(cleaned, ...)` and `audio_bus.py:1103` dispatches *the same
+`cleaned` array* to `streaming_stt.on_audio_frame` (registered at
+`audio_pipeline_bootstrap.py:178`). There is no transformation between the tap and the
+consumer — it is one object.
+
+Two traps worth carrying forward:
+
+- **Alignment must search the whole ring.** Incidents are written 1–8 s after the
+  buffer is assembled (measured: 0.94 s–8.04 s), so a short search window finds
+  garbage and reports it as divergence. My first pass searched 0.5 s and produced
+  correlations of 0.05–0.33, which read convincingly as "the buffer isn't the bus
+  audio". It was a search bug.
+- **Low correlation produces large fake gains.** Incident `234722` aligns at corr 0.13
+  and reports +20.7 dB. Believe no gain figure without its correlation.
+
+### 1d. Handoff integrity is now measured per-incident, not assumed
+The module header always described the processed ring as "exactly what the model was
+handed" — an assumption the recorder never checked, which is why this cost a hunt.
+`CaptureForensics._handoff` now proves or disproves it on every incident, reusing the
+rings already held (no new taps): FFT normalised cross-correlation → `lossless` /
+`scaled` / `unverifiable`.
+
+`scaled` is the int16→float32 and double-normalisation class the hunt was looking for.
+It did not turn out to be present, but it is now named automatically on the first
+incident instead of costing a session. The epistemic floor matters as much as the
+detector: below `JARVIS_FORENSICS_HANDOFF_CORR_FLOOR` (0.99) the report is
+`unverifiable` and says nothing further — an unproven match is not evidence of a fault.
+Knobs: `JARVIS_FORENSICS_HANDOFF_CHECK`, `..._CORR_FLOOR`, `..._GAIN_TOL_DB`.
+
+Replayed over the 8 stored incidents: 4 `lossless` (corr 1.0, 0.0 dB), 4
+`unverifiable` — including the +20.7 dB phantom, correctly suppressed.
+
+**Where the fault actually is:** the audio reaching Whisper *is* the bus audio, and it
+carries speech rhythm. So the remaining candidates are the recogniser itself, or what
+`_schedule_transcription` buffered for it. `streaming_stt.py:391-440` already documents
+two solved faults of exactly that shape (VAD shrapnel; trailing room tone). That is the
+next place to look — not the DSP chain.
 
 Metrics schema 1.0 → 1.1: lifetime totals moved under a `session` key, window-scoped
 `over_full_scale_samples` added. Spine: `tests/audio/test_capture_forensics_verdict.py`
