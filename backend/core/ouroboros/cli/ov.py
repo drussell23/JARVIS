@@ -383,9 +383,51 @@ class AttachUI:
         # time-driven glyph (the pt refresh_interval animates it free).
         self._heartbeat: Any = None
         self._heartbeat_arrived: float = 0.0
+        # The ambient deck: severity-ordered rows below the pulse. Ambient
+        # frames land here instead of the scrollback, so a chatty agora
+        # cannot bury the session it is commenting on.
+        try:
+            from backend.core.ouroboros.battle_test.ambient_deck import (
+                DeckManager,
+            )
+            self.deck: Any = DeckManager()
+        except Exception:  # noqa: BLE001 — a deckless cockpit still works
+            self.deck = None
 
     def bind_app(self, app: Any) -> None:
         self._app_ref = app
+
+    def on_ambient(self, text: str, *, kind: str = "") -> None:
+        """One ambient frame → the deck, then repaint. NEVER raises."""
+        try:
+            if self.deck is None:
+                return
+            from backend.core.ouroboros.battle_test.ambient_deck import (
+                classify,
+            )
+            severity, key = classify(text, kind=kind)
+            author = ""
+            if "@" in text:
+                for tok in text.split():
+                    if tok.startswith("@"):
+                        author = tok.strip("[]")
+                        break
+            self.deck.push(
+                text, severity=severity, key=key or None, author=author,
+            )
+            self._invalidate()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _invalidate(self) -> None:
+        """Ask prompt_toolkit to repaint. Its own scheduler decides when, so
+        this never touches the operator's keystroke buffer."""
+        try:
+            app = self._app_ref
+            if app is not None:
+                app.invalidate()
+        except Exception:  # noqa: BLE001
+            pass
 
     def prompt(self) -> str:
         return self._PROMPTS.get(self.audio_state, "ov › ")
@@ -408,10 +450,35 @@ class AttachUI:
                 self._heartbeat, arrival_mono=self._heartbeat_arrived,
             )
             if pulse:
-                return f"{pulse}{audio} · 'detach' to leave"
+                return self._with_deck(f"{pulse}{audio} · 'detach' to leave")
         except Exception:
             pass
-        return f" ov attach — organism live{audio} · 'detach' to leave"
+        return self._with_deck(
+            f" ov attach — organism live{audio} · 'detach' to leave"
+        )
+
+    def _with_deck(self, pulse_line: str) -> str:
+        """Pulse on top, ambient rows beneath.
+
+        Rendered into the SAME bottom_toolbar prompt_toolkit already repaints
+        — no second render loop, no Live region competing for the terminal.
+        The toolbar simply grows to the number of lines returned."""
+        try:
+            from backend.core.ouroboros.battle_test.ambient_deck import (
+                GLYPHS,
+                deck_enabled,
+            )
+            if self.deck is None or not deck_enabled():
+                return pulse_line
+            rows = self.deck.rows()
+            if not rows:
+                return pulse_line
+            lines = [pulse_line]
+            for severity, text in rows:
+                lines.append(f"  {GLYPHS.get(severity, '·')} {text}")
+            return "\n".join(lines)
+        except Exception:  # noqa: BLE001
+            return pulse_line
 
     def on_telemetry(self, frame: Any) -> None:
         """Telemetry lane landing point — retain heartbeat frames for
@@ -1176,9 +1243,27 @@ def run_attach(console: Any) -> int:
                 pass
             hydrated.set()
 
+        def _markup_sink(text: str, addressed: bool = False) -> None:
+            """THE ambient/addressed split, at the one place both arrive.
+
+            Addressed — the daemon answering a command this cockpit sent —
+            goes to the scrollback: the operator asked for it and expects to
+            scroll back to it. Ambient — a worker spawning, a provider
+            failing over, the agora talking — goes to the deck, which is
+            severity-ordered and ages out.
+
+            Routed on the daemon's marker rather than inferred from the text,
+            because "was this answering my command?" is not a property of the
+            characters. The daemon knows; it decided when it addressed the
+            frame."""
+            if addressed:
+                _render_markup_frame(text, console)
+                return
+            ui.on_ambient(text)
+
         client = CockpitAttachClient(
             on_hydration=_on_hydration, on_line=_print_line,
-            on_markup=lambda t: _render_markup_frame(t, console),
+            on_markup=_markup_sink,
             on_telemetry=ui.on_telemetry,
             on_audio_state=ui.on_audio_state,
         )
