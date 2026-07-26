@@ -196,6 +196,35 @@ async def run_track(
     return events
 
 
+#: What faster-whisper emits when handed audio that is NOT speech. These are
+#: not transcripts, they are the model's prior leaking through — and treating
+#: them as success is worse than reporting nothing, because it converts "the
+#: mic heard noise" into "the pipeline works". `capture_forensics` documents
+#: the canonical one: thresholds disabled, non-speech renders as
+#: "I'm sorry, I'm sorry, I'm sorry".
+_HALLUCINATIONS = {
+    "i'm sorry", "im sorry", "sorry", "thank you", "thanks", "you",
+    "thanks for watching", "thank you for watching", "bye", "okay", "ok",
+    "please subscribe", "subscribe", "the", "yeah", "mm", "hmm", "uh",
+}
+
+
+def _is_hallucination(text: str) -> bool:
+    """True when the text is only the model's non-speech prior.
+
+    Compared on the whole utterance, not per word: a real sentence containing
+    "thank you" is speech, whereas an utterance that IS "Thank you." from a
+    0.9s buffer of room tone is the prior."""
+    t = " ".join(text.lower().replace(",", " ").split()).strip(" .!?")
+    if not t:
+        return True
+    if t in _HALLUCINATIONS:
+        return True
+    # "I'm sorry. I'm sorry. I'm sorry." — the same fragment repeated.
+    parts = [p.strip() for p in t.replace("!", ".").split(".") if p.strip()]
+    return bool(parts) and all(p in _HALLUCINATIONS for p in parts)
+
+
 def verdict(label: str, events: List[Tuple[bool, str]], expected: Optional[str]) -> bool:
     finals = [t for p, t in events if not p and t.strip()]
     partials = [t for p, t in events if p and t.strip()]
@@ -205,6 +234,10 @@ def verdict(label: str, events: List[Tuple[bool, str]], expected: Optional[str])
         return False
     heard = " ".join(finals) if finals else " ".join(partials)
     print(f"[{label}] heard: {heard!r}")
+    if _is_hallucination(heard):
+        print(f"[{label}] RESULT: FAIL — {heard!r} is whisper's non-speech "
+              f"prior, not a transcript. The audio is not intelligible speech.")
+        return False
     if expected:
         want = {w.strip(".,!?").lower() for w in expected.split() if len(w) > 3}
         got = {w.strip(".,!?").lower() for w in heard.split()}
