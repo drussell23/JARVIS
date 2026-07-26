@@ -128,9 +128,75 @@ class _Ambient(contextlib.AbstractContextManager):
             _CURRENT_SESSION.set(None)
 
 
+# ---------------------------------------------------------------------------
+# Lanes — WHICH worker produced this, orthogonal to which cockpit sees it
+# ---------------------------------------------------------------------------
+
+#: The default lane. Output with no worker above it on the stack is the
+#: organism speaking as itself, which is exactly the "ambient" the deck
+#: already renders — the two vocabularies line up on purpose.
+AMBIENT_LANE = "ambient"
+
+#: Which worker's execution this output belongs to.
+#:
+#: The session ContextVar answers "who asked?". This one answers "who is
+#: doing it?". They are independent: one cockpit can watch four lanes, and
+#: one lane's output can be addressed to a cockpit that asked about it.
+#:
+#: Tagging at emission is the only approach that survives contact with the
+#: codebase. Parsing output for a worker id fails the moment a worker prints
+#: something unformatted; keying on logger name fails because workers share
+#: modules; passing an id down the call chain would touch every renderer and
+#: every future one. The execution context already knows, and carries itself
+#: across every ``await`` for free.
+_CURRENT_LANE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "ov_lane", default=AMBIENT_LANE,
+)
+
+
+def lane_tagging_enabled() -> bool:
+    """``JARVIS_LANE_TAGGING`` (default ON). OFF makes every emission
+    ambient, which is the pre-lane behaviour."""
+    return os.environ.get(
+        "JARVIS_LANE_TAGGING", "1",
+    ).strip().lower() in _TRUTHY
+
+
+def current_lane() -> str:
+    """The worker whose execution is producing this output."""
+    try:
+        return _CURRENT_LANE.get() or AMBIENT_LANE
+    except LookupError:      # pragma: no cover
+        return AMBIENT_LANE
+
+
+@contextlib.contextmanager
+def lane_scope(lane: Optional[str]) -> Iterator[None]:
+    """Attribute everything emitted inside this block to *lane*.
+
+    Nests correctly: a swarm worker that spawns a sub-worker gets the inner
+    lane for the inner work and the outer lane restored afterwards, because
+    the token is per-``set`` rather than global. NEVER raises."""
+    token = None
+    try:
+        if lane and lane_tagging_enabled():
+            token = _CURRENT_LANE.set(str(lane))
+        yield
+    finally:
+        if token is not None:
+            try:
+                _CURRENT_LANE.reset(token)
+            except (ValueError, LookupError):
+                _CURRENT_LANE.set(AMBIENT_LANE)
+
+
 __all__ = [
+    "AMBIENT_LANE",
     "as_ambient",
+    "current_lane",
     "current_session",
+    "lane_scope",
+    "lane_tagging_enabled",
     "new_session_id",
     "session_routing_enabled",
     "session_scope",

@@ -542,6 +542,34 @@ class CockpitAttachBridge:
         msg = dict(msg)
         msg["addressed"] = target is not None
 
+        # LANE TAGGING — the same interceptor, one more ContextVar.
+        #
+        # Deliberately not a second interception layer: session and lane are
+        # read from the same execution context at the same seam, because both
+        # answer questions only the emitter's context can answer ("who asked?"
+        # and "who is doing it?"). Splitting them would mean two places to
+        # keep in step.
+        #
+        # The ring is written HERE rather than at the producer, so every
+        # producer is covered without any producer knowing lanes exist —
+        # including ones written later.
+        try:
+            from backend.core.ouroboros.battle_test.attach_session import (
+                AMBIENT_LANE,
+                current_lane,
+            )
+            lane = current_lane()
+            if lane and lane != AMBIENT_LANE:
+                msg["lane"] = lane
+                body = msg.get("text")
+                if isinstance(body, str) and body:
+                    from backend.core.ouroboros.battle_test.lane_rings import (
+                        get_lane_registry,
+                    )
+                    get_lane_registry().record(lane, body)
+        except Exception:  # noqa: BLE001 — tagging must never eat output
+            pass
+
         data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         for w in writers:
             try:

@@ -162,6 +162,42 @@ class GenerationSubagentExecutor:
         _dw_cost_usd: Optional[float] = None
         _branch_label: str = ""
         _result: Optional[WorkUnitResult] = None
+        # LANE. One scope around the unit's entire execution, so every line
+        # this worker emits — generation, validation, tool calls, and anything
+        # it hands to an executor via ContextAwareThreadPool — is attributable
+        # to it. Tagged at the emission CONTEXT rather than by parsing output
+        # or by logger name: workers share modules and print unformatted text,
+        # so both of those lose the association exactly when parallelism makes
+        # it matter.
+        try:
+            from backend.core.ouroboros.battle_test.attach_session import (
+                lane_scope,
+            )
+            _lane_ctx: Any = lane_scope(f"unit/{unit.unit_id}")
+        except Exception:  # noqa: BLE001 — untagged beats not running
+            import contextlib as _ctxlib
+            _lane_ctx = _ctxlib.nullcontext()
+        with _lane_ctx:
+            return await self._execute_tagged(
+                graph, unit, started_at_ns, causal_parent_id,
+                _worktree_path, _sandbox, _worktree_create_mono,
+                _worktree_lifespan_s, _dw_cost_usd, _branch_label, _result,
+            )
+
+    async def _execute_tagged(
+        self, graph: ExecutionGraph, unit: WorkUnitSpec,
+        started_at_ns: int, causal_parent_id: Any,
+        _worktree_path: Optional[Path], _sandbox: Optional[Any],
+        _worktree_create_mono: Optional[float],
+        _worktree_lifespan_s: Optional[float],
+        _dw_cost_usd: Optional[float], _branch_label: str,
+        _result: Optional[WorkUnitResult],
+    ) -> WorkUnitResult:
+        """The original ``execute`` body, now running inside a lane scope.
+
+        Split out rather than indented in place so the diff stays readable
+        and the lane wrapper is one obvious frame rather than a re-indent of
+        two hundred lines."""
         try:
             if len(unit.target_files) != 1:
                 raise RuntimeError(
