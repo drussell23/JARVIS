@@ -38,6 +38,7 @@ import numpy as np
 
 from backend.audio.playback_gate import playback_gate
 from backend.audio.streaming_synthesis import streaming_enabled as _streaming_enabled
+from backend.voice.phatic_fastpath import fastpath_enabled as _phatic_intercept_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -495,6 +496,15 @@ class ConversationPipeline:
                     )
                     continue
 
+                # 2b. Whoever was ADDRESSED answers.
+                #
+                # The active agent follows what the operator said, not what
+                # the process was launched with: "Hey JARVIS" in Karen's
+                # cockpit should get JARVIS's voice and JARVIS's prompt. A
+                # turn naming nobody leaves the current agent in place — it
+                # is a continuation, not a request to switch.
+                self._route_persona(user_text)
+
                 # 3. Add user turn to session
                 self._session.add_turn("user", user_text)
                 logger.info(
@@ -643,6 +653,28 @@ class ConversationPipeline:
         """Generate LLM response and stream it through TTS."""
         if self._session is None:
             return
+
+        # ── PHATIC FAST PATH — zero network, zero tokens ──────────────
+        #
+        # "Hey Karen" carries no question. Sending it to a 30B model costs
+        # tokens, ~0.9s of TTFT and the operator's patience for an utterance
+        # whose entire content is "I am addressing you". Intercepted BEFORE
+        # the router so no request is built at all.
+        #
+        # The turn is still written to session history: a bypassed greeting
+        # that vanished would leave the next complex turn reasoning about a
+        # conversation whose opening it never saw.
+        if _phatic_intercept_enabled() and user_text:
+            ack = self._phatic_reply(user_text)
+            if ack is not None:
+                self._session.add_turn("assistant", ack)
+                logger.info("[ConvPipeline] JARVIS (phatic, no LLM): %s", ack)
+                cancel_event = (
+                    self._barge_in.get_cancel_event()
+                    if self._barge_in is not None else asyncio.Event()
+                )
+                await self._speak_sentence(ack, cancel_event)
+                return
 
         # Build messages for LLM
         messages = [
@@ -1349,6 +1381,64 @@ class ConversationPipeline:
                 except (RuntimeError, OSError):
                     pass
         return " ".join(spoken)
+
+    def _route_persona(self, user_text: str) -> bool:
+        """Bind the process persona to the agent named in *user_text*.
+
+        Returns True when the active agent CHANGED. Writes the same env seam
+        ``active_persona`` reads, because that is what every synthesis site in
+        the process already consults — threading a persona argument through
+        each of them is how voice and identity drifted apart in the first
+        place. NEVER raises."""
+        try:
+            from backend.voice.agent_persona import active_persona
+            from backend.voice.agent_registry import route_by_wake_word
+
+            spec = route_by_wake_word(user_text)
+            if spec is None:
+                return False
+            current = active_persona()
+            if current is not None and current.canonical is spec.persona:
+                return False
+            os.environ["JARVIS_AGENT_PERSONA"] = spec.persona.value
+            # The prompt is part of the identity, so it moves with it —
+            # otherwise the model keeps the previous agent's self-description
+            # while speaking in the new agent's voice.
+            prompt = _persona_system_prompt()
+            if prompt:
+                self._system_prompt = prompt
+            logger.info(
+                "[ConvPipeline] agent -> %s (voice %s)",
+                spec.display_name, spec.preferred_voice,
+            )
+            return True
+        except (ImportError, AttributeError, OSError):
+            return False
+
+    def _phatic_reply(self, user_text: str) -> Optional[str]:
+        """An acknowledgement if this turn is pure contact, else None.
+
+        None means "this is a real turn" — the caller proceeds to the model
+        unchanged, so the fast path can only ever REMOVE an unnecessary call,
+        never intercept a question. NEVER raises."""
+        try:
+            from backend.voice.agent_registry import all_agents, spec_for
+            from backend.voice.agent_persona import active_persona, operator_name
+            from backend.voice.phatic_fastpath import acknowledge, classify
+
+            names = []
+            for spec in all_agents():
+                names.append(spec.display_name)
+                names.extend(spec.wake_words)
+            verdict = classify(user_text, agent_names=names)
+            if not verdict:
+                return None
+
+            active = spec_for(active_persona())
+            salt = active.display_name if active else ""
+            return acknowledge(user_text, operator=operator_name(), salt=salt)
+        except (ImportError, AttributeError):
+            return None
 
     def _persona_say_args(self) -> List[str]:
         """`say` voice/rate flags for the bound persona, or none.

@@ -408,7 +408,9 @@ def test_the_router_does_not_reimplement_the_election():
     src = Path(
         "backend/core/ouroboros/governance/adaptive_voice_router.py",
     ).read_text(encoding="utf-8")
-    assert "resolve_voice_model" in src
+    # Delegation, through the per-agent lane façade — which itself calls
+    # resolve_voice_model with this agent's prefix and ledger.
+    assert "lane_for" in src and "resolve_model()" in src
     for owned_elsewhere in ("ttft_s", "VoiceLatencyLedger", "deep_probe("):
         assert owned_elsewhere not in src, (
             f"router re-implements {owned_elsewhere} — that belongs to the lane"
@@ -451,7 +453,10 @@ async def test_a_zero_token_stream_demotes_the_model(monkeypatch):
     demoted = []
     monkeypatch.setattr(
         kvl, "record_runtime_failure",
-        lambda m, reason="runtime": demoted.append((m, reason)) or True,
+        # **kw: the lane now passes the per-agent ledger, and a fake that
+        # mirrored the OLD signature would raise TypeError into the router's
+        # handler and report "no demotion" for a demotion that happened.
+        lambda m, reason="runtime", **kw: demoted.append((m, reason)) or True,
     )
     r = _router(local=_Local(), dispatch=_dw([]))
     await _drain(r)
@@ -466,7 +471,7 @@ async def test_a_speaking_model_is_not_demoted(monkeypatch):
     demoted = []
     monkeypatch.setattr(
         kvl, "record_runtime_failure",
-        lambda m, reason="runtime": demoted.append(m) or True,
+        lambda m, reason="runtime", **kw: demoted.append(m) or True,
     )
     r = _router(local=_Local(), dispatch=_dw(["hello"]))
     assert await _drain(r) == "hello"

@@ -70,9 +70,19 @@ def _is_system_default(name: object) -> bool:
 class AgentPersona(str, enum.Enum):
     """Who is speaking. The value is the env-knob suffix and log token."""
 
-    KAREN = "karen"        # O+V's voice — the ov cockpit
+    #: O+V — Ouroboros + Venom, the self-developing organism. THE AGENT.
+    #: Its macOS rendering is the `Karen` voice, which is why the two got
+    #: conflated; the agent and the voice are now named separately.
+    OV = "ov"
+    #: Deprecated alias for OV, kept so existing bindings do not break.
+    KAREN = "karen"
     JARVIS = "jarvis"      # the supervisor / Body
     SYSTEM = "system"      # unattributed system speech
+
+    @property
+    def canonical(self) -> "AgentPersona":
+        """KAREN resolves to OV — one identity, two spellings."""
+        return AgentPersona.OV if self is AgentPersona.KAREN else self
 
     @classmethod
     def coerce(cls, value: object) -> Optional["AgentPersona"]:
@@ -97,6 +107,7 @@ _PREFERENCES: Dict[AgentPersona, Tuple[str, ...]] = {
     # system voice" is a stable request while asking for a NAME is not — the
     # name is right until they change the setting, and wrong silently after.
     # The named fallbacks stay for machines whose default cannot be resolved.
+    AgentPersona.OV: (SYSTEM_DEFAULT, "Karen", "Tessa", "Serena", "Samantha"),
     AgentPersona.KAREN: (SYSTEM_DEFAULT, "Karen", "Tessa", "Serena", "Samantha"),
     # British first — the established JARVIS voice.
     AgentPersona.JARVIS: ("Daniel", "Oliver", "Serena", "Alex"),
@@ -105,6 +116,7 @@ _PREFERENCES: Dict[AgentPersona, Tuple[str, ...]] = {
 
 #: Locale to fall back to when no preferred voice is installed.
 _LOCALES: Dict[AgentPersona, str] = {
+    AgentPersona.OV: "en_AU",
     AgentPersona.KAREN: "en_AU",
     AgentPersona.JARVIS: "en_GB",
     AgentPersona.SYSTEM: "en_US",
@@ -220,12 +232,22 @@ def _rate_for(persona: AgentPersona) -> int:
         return 175
 
 
-def resolve_profile(persona: object) -> Optional[VoiceProfile]:
+def resolve_profile(
+    persona: object, *, prefer: str = "",
+) -> Optional[VoiceProfile]:
     """The voice *persona* should speak in on THIS machine, or None.
 
     ``None`` means "no opinion — keep your default": an unknown persona or a
     machine with no usable voice must not silence a reply, and guessing a
-    voice would be worse than the caller's existing behaviour. NEVER raises."""
+    voice would be worse than the caller's existing behaviour.
+
+    *prefer* is the agent registry's stated voice for this persona. It is
+    inserted at the HEAD of the preference chain rather than replacing it, so
+    the registry states the intent, the operator override still outranks it,
+    and an uninstalled registry voice still degrades through the same locale
+    fallback as everything else. The registry is where an agent's voice is
+    declared; this function remains the only thing that decides what the
+    machine can actually deliver. NEVER raises."""
     p = AgentPersona.coerce(persona)
     if p is None:
         return None
@@ -245,11 +267,18 @@ def resolve_profile(persona: object) -> Optional[VoiceProfile]:
                 p.value, override,
             )
 
-        for name in _PREFERENCES.get(p, ()):
+        chain = _PREFERENCES.get(p, ())
+        if prefer and prefer not in chain:
+            chain = (prefer,) + tuple(chain)
+        elif prefer:
+            # Registry voice already listed: promote it rather than duplicate.
+            chain = (prefer,) + tuple(n for n in chain if n != prefer)
+        for name in chain:
             if _is_system_default(name):
                 return VoiceProfile(p, SYSTEM_DEFAULT, rate, "system_default")
             if voice_installed(name):
-                return VoiceProfile(p, name, rate, "preference")
+                reason = "registry" if name == prefer else "preference"
+                return VoiceProfile(p, name, rate, reason)
 
         locale = _LOCALES.get(p, "")
         for name, loc in installed_voices():
@@ -368,6 +397,14 @@ def active_persona() -> Optional[AgentPersona]:
 #: addressing SOMEONE ELSE and replied "Karen, or whoever you are, what would
 #: you like to do today?".
 _IDENTITY: Dict[AgentPersona, Dict[str, str]] = {
+    AgentPersona.OV: {
+        "name": "Karen",
+        "character": (
+            "the voice of O+V (Ouroboros + Venom), an autonomous "
+            "self-developing engineering organism. You are a terse, senior "
+            "Australian engineer: plain words, no filler, no bullet spam"
+        ),
+    },
     AgentPersona.KAREN: {
         "name": "Karen",
         "character": (
