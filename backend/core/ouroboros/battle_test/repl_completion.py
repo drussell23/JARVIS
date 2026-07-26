@@ -1164,7 +1164,9 @@ def discover_verbs(repl_instance: object) -> VerbRegistry:
 # ===========================================================================
 
 
-def build_completer(registry: VerbRegistry) -> Optional[object]:
+def build_completer(
+    registry: VerbRegistry, *, max_results: int = 8,
+) -> Optional[object]:
     """Build a ``prompt_toolkit.completion.Completer`` that fires only
     when the input starts with ``/``. Returns ``None`` when
     prompt_toolkit isn't available (headless / sandbox).
@@ -1251,7 +1253,9 @@ def build_completer(registry: VerbRegistry) -> Optional[object]:
             # fuzzy meaningful. Byte-identical to legacy prefix-match
             # for the common case (operator typing a known verb).
             try:
-                matches = fuzzy_match(text, registry)
+                matches = fuzzy_match(
+                    text, registry, max_results=max_results,
+                )
             except Exception:  # noqa: BLE001 — defensive
                 matches = ()
             for verb in matches:
@@ -1440,6 +1444,48 @@ __all__ = [
 ]
 
 
+def _describe(fn: object) -> str:
+    """One line of operator-facing help for a dispatcher. NEVER raises.
+
+    Cascade, because 13 of the 60 dispatchers carry no docstring and a menu
+    entry with no meta is a name the operator has to guess at:
+
+      1. the function's own docstring — nearest the behaviour, so it is the
+         one most likely to be corrected when the behaviour changes;
+      2. its MODULE's docstring — these verbs live in single-purpose
+         ``*_repl.py`` files whose header describes exactly the thing the
+         verb does;
+      3. an honest placeholder. Never a blank.
+
+    The leading ``/verb —`` echo is trimmed: repeating the verb beside itself
+    wastes the dropdown's width, which is the scarcest thing in a palette."""
+    def _first_line(doc: object) -> str:
+        text = (doc or "")
+        if not isinstance(text, str):
+            return ""
+        text = text.strip()
+        if not text:
+            return ""
+        line = text.splitlines()[0].strip()
+        if line.startswith("`") or line.startswith("/"):
+            parts = line.split("—", 1)
+            line = parts[1].strip() if len(parts) == 2 else line
+        return line.strip(" `")
+
+    try:
+        own = _first_line(getattr(fn, "__doc__", ""))
+        if own:
+            return own[:80]
+        import sys as _sys
+        mod = _sys.modules.get(getattr(fn, "__module__", "") or "")
+        from_module = _first_line(getattr(mod, "__doc__", ""))
+        if from_module:
+            return from_module[:80]
+    except Exception:  # noqa: BLE001
+        pass
+    return "no description — add a docstring to its dispatcher"
+
+
 def registry_from_dispatch() -> VerbRegistry:
     """Build a :class:`VerbRegistry` from the AUTO-DISCOVERED dispatch table.
 
@@ -1467,22 +1513,37 @@ def registry_from_dispatch() -> VerbRegistry:
         except Exception:  # noqa: BLE001 — a partial table still completes
             pass
         for verb, fn in sorted(_VERB_TO_DISPATCHER.items()):
-            doc = (getattr(fn, "__doc__", "") or "").strip()
-            first = doc.splitlines()[0].strip() if doc else ""
-            # Trim the leading ``/verb ...`` echo many docstrings open with —
-            # repeating the verb beside itself wastes the dropdown's width.
-            if first.startswith("`") or first.startswith("/"):
-                parts = first.split("—", 1)
-                first = parts[1].strip() if len(parts) == 2 else first
             descriptors.append(
                 VerbDescriptor(
                     slash_form=f"/{verb}",
                     handler_method="",
-                    description=first[:80],
+                    description=_describe(fn),
                 )
             )
     except Exception:  # noqa: BLE001
         logger.debug("[Completion] dispatch registry unavailable", exc_info=True)
+
+    # Client-handled verbs belong in the SAME palette. `/deck`, `wake` and
+    # `detach` never reach the daemon, so a dispatch-only registry both omits
+    # them AND — because no verb starts with "/deck" — sends the operator into
+    # the fuzzy fallback, which answered "/deck" with "/bus, /cost". A palette
+    # that invents plausible wrong answers is worse than one that says nothing.
+    try:
+        from backend.core.ouroboros.cli.ov import client_verbs
+        known = {d.slash_form for d in descriptors}
+        for verb, help_text in sorted(client_verbs().items()):
+            slash = f"/{verb}"
+            if slash in known:
+                continue
+            descriptors.append(
+                VerbDescriptor(
+                    slash_form=slash, handler_method="",
+                    description=help_text or "handled by this cockpit",
+                )
+            )
+    except Exception:  # noqa: BLE001 — daemon verbs alone still complete
+        logger.debug("[Completion] client verbs unavailable", exc_info=True)
+
     return VerbRegistry(verbs=tuple(descriptors))
 
 
@@ -1497,7 +1558,15 @@ def build_attach_completer() -> Optional[object]:
 
     NEVER raises."""
     try:
-        completer = build_completer(registry_from_dispatch())
+        # A browsable palette, not a "did you mean" hint. The default cap of
+        # 8 exists for typo suggestion, and it silently truncated a 60-verb
+        # menu to its first eight alphabetically — the operator saw
+        # /anticipate..../bus and reasonably concluded the palette was broken.
+        # prompt_toolkit's CompletionsMenu scrolls, so the ceiling only needs
+        # to exceed the table.
+        completer = build_completer(
+            registry_from_dispatch(), max_results=512,
+        )
         if completer is None:
             return None
         try:
