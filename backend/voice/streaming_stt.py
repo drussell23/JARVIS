@@ -172,6 +172,11 @@ class StreamingSTTEngine:
         self._buffer_lock = threading.Lock()
         self._total_frames = 0
         self._max_buffer_frames = int(_MAX_BUFFER_SECONDS * sample_rate)
+        #: Samples of PRE-ROLL currently sitting at the head of the buffer.
+        #: Pre-roll is context carried FOR the recogniser; it is not evidence
+        #: that an utterance is long enough to be worth transcribing, so the
+        #: minimum-duration gate measures the buffer MINUS this.
+        self._preroll_samples = 0
 
         # VAD state
         self._speech_active = False
@@ -282,6 +287,7 @@ class StreamingSTTEngine:
         with self._buffer_lock:
             self._audio_buffer.clear()
             self._total_frames = 0
+            self._preroll_samples = 0
 
         if self._transcript_queue is not None:
             # Signal end
@@ -328,10 +334,33 @@ class StreamingSTTEngine:
             # says "speech" the onset is already past. Without this, every
             # utterance loses its first consonant — "hello" arrives as "ello".
             with self._buffer_lock:
+                self._preroll_samples = 0
                 for held in self._preroll:
                     self._audio_buffer.append(held)
                     self._total_frames += len(held)
+                    self._preroll_samples += len(held)
                 self._preroll.clear()
+
+            # ANCHOR THE PARTIAL CADENCE TO THE ONSET.
+            #
+            # The interval test below is `now - _last_partial_time > 500ms`,
+            # and _last_partial_time was left wherever the PREVIOUS utterance
+            # abandoned it — seconds or minutes in the past. So the test was
+            # always already true when speech began, and the first partial of
+            # every utterance fired on its FIRST FRAME: 320ms of pre-roll room
+            # tone plus 20ms of speech.
+            #
+            # Whisper returned nothing, correctly — it was handed 94% silence.
+            # The pipeline then logged "signal has SPEECH-level amplitude: the
+            # model rejected it", wrote a forensic incident, and held the
+            # transcription lock long enough that the FIRST USEFUL partial,
+            # 500ms later, was skipped as busy. Measured in one live session:
+            # 334 transcriptions of exactly 00:00.340 — the single most common
+            # duration in the log, more than double the next.
+            #
+            # Restarting the clock here costs nothing and makes the first
+            # partial land one full interval after speech actually started.
+            self._last_partial_time = now_ms
 
         if self._speech_active:
             # Accumulate EVERYTHING until the endpoint — including the silence
@@ -342,6 +371,13 @@ class StreamingSTTEngine:
                 while self._total_frames > self._max_buffer_frames:
                     oldest = self._audio_buffer.popleft()
                     self._total_frames -= len(oldest)
+                    # The cap evicts from the HEAD, which is where pre-roll
+                    # sits — so the pre-roll accounting has to shrink with it,
+                    # or a long utterance would keep discounting samples that
+                    # were dropped minutes ago.
+                    self._preroll_samples = max(
+                        0, self._preroll_samples - len(oldest),
+                    )
 
             if is_speech:
                 self._silence_start_ms = None
@@ -402,12 +438,24 @@ class StreamingSTTEngine:
             # WebRTC VAD mode 3 misclassifies ambient noise as speech for
             # single 20ms frames — without this gate, Whisper wastes CPU
             # processing 20-120ms noise fragments.
+            #
+            # Measured against the SPEECH, not the buffer. Pre-roll is 320ms
+            # by default and the gate is 300ms, so the buffer cleared this
+            # test on pre-roll alone: the one guard whose entire purpose is to
+            # keep sub-speech fragments away from the recogniser was being
+            # satisfied by audio that is, by construction, not speech. A
+            # single 20ms frame of real voice was enough to pass it.
             duration_ms = (len(audio) / self._sample_rate) * 1000
-            if duration_ms < _MIN_SPEECH_DURATION_MS:
+            speech_ms = (
+                max(0, len(audio) - self._preroll_samples)
+                / self._sample_rate
+            ) * 1000
+            if speech_ms < _MIN_SPEECH_DURATION_MS:
                 if not is_partial:
                     # Still clear buffer on final to prevent stale accumulation
                     self._audio_buffer.clear()
                     self._total_frames = 0
+                    self._preroll_samples = 0
                 return
 
             if not is_partial:
@@ -432,6 +480,7 @@ class StreamingSTTEngine:
                 self._audio_buffer.clear()
                 self._total_frames = 0
                 self._voiced_frames = 0
+                self._preroll_samples = 0
                 if voiced == 0:
                     logger.debug(
                         "[StreamingSTT] final suppressed: %.2fs buffered with "

@@ -144,11 +144,11 @@ def _align(haystack: np.ndarray, needle: np.ndarray) -> Optional[Dict[str, Any]]
 
     Returns ``None`` when no honest comparison is possible. NEVER raises."""
     try:
-        n = int(needle.size)
-        if n < 64 or haystack.size < n:
+        n = int(needle.size) # length of the needle, in samples
+        if n < 64 or haystack.size < n: # needle is too short or haystack is too short to match
             return None
         nd = needle - needle.mean() # zero-mean the needle
-        nd_energy = float(np.sqrt((nd ** 2).sum()))
+        nd_energy = float(np.sqrt((nd ** 2).sum())) # energy of the needle
         if nd_energy < 1e-12: # needle is silent — nothing to match
             return None                      # digital silence — nothing to match
 
@@ -167,19 +167,21 @@ def _align(haystack: np.ndarray, needle: np.ndarray) -> Optional[Dict[str, Any]]
         var[var < 1e-20] = np.inf            # silent windows can never win
         r = corr / (np.sqrt(var) * nd_energy) # normalised correlation
 
-        lag = int(np.argmax(r))
-        segment = haystack[lag:lag + n]
-        seg_peak = float(np.max(np.abs(segment)))
-        needle_peak = float(np.max(np.abs(needle)))
-        gain = needle_peak / seg_peak if seg_peak > 1e-12 else float("nan")
+        lag = int(np.argmax(r)) # lag of the best match
+        segment = haystack[lag:lag + n] # segment of haystack that best matches the needle
+        seg_peak = float(np.max(np.abs(segment))) # peak of the best-matching segment
+        needle_peak = float(np.max(np.abs(needle))) # peak of the needle
+        gain = needle_peak / seg_peak if seg_peak > 1e-12 else float("nan") # gain ratio between needle and segment
+        # The gain is the ratio of the peak amplitudes of the needle and the best-matching 
+        # segment of the haystack. If the segment is silent, the gain is undefined (NaN).
         return {
-            "lag_samples": lag,
-            "correlation": round(float(r[lag]), 4),
-            "bus_segment_peak": round(seg_peak, 6),
-            "model_peak": round(needle_peak, 6),
-            "gain_ratio": round(gain, 4) if gain == gain else None,
-            "gain_db": (round(20.0 * float(np.log10(gain)), 2)
-                        if gain == gain and gain > 0 else None),
+            "lag_samples": lag, # lag of the best match in samples
+            "correlation": round(float(r[lag]), 4), # correlation coefficient at the best match
+            "bus_segment_peak": round(seg_peak, 6), # peak of the best-matching segment of the haystack
+            "model_peak": round(needle_peak, 6), # peak of the needle
+            "gain_ratio": round(gain, 4) if gain == gain else None, # gain ratio (None if undefined)
+            "gain_db": (round(20.0 * float(np.log10(gain)), 2) # gain in decibels,
+                        if gain == gain and gain > 0 else None), # gain in dB (None if undefined or negative)
         }
     except (ValueError, TypeError, MemoryError, FloatingPointError):
         return None
