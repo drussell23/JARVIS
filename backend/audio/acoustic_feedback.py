@@ -46,6 +46,19 @@ def _controller() -> Any:
     return _CONTROLLER
 
 
+def _note_ticket_outcome(task: Any) -> None:
+    """Retrieve a speech ticket's result so a failure is LOGGED, not lost.
+
+    An un-retrieved task exception surfaces only as an interpreter warning on
+    stderr, which in a daemon means nowhere. NEVER raises."""
+    try:
+        exc = task.exception()
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        return
+    if exc is not None:
+        logger.warning("[Acoustic] speech ticket failed: %r", exc)
+
+
 def speak_immediate(line: str) -> bool:
     """Say *line* now, ahead of anything queued. Returns True if it was spoken.
 
@@ -77,8 +90,21 @@ def speak_immediate(line: str) -> bool:
         # macos_voice owns synthesis AND the playback gate. Calling its
         # existing entry point is the whole implementation; anything more
         # would be a second audio stack.
+        #
+        # `say_and_wait`, not `say`: this runs inside the speech scheduler's
+        # ticket, and the scheduler holds the floor for exactly as long as
+        # this call takes. `say` only enqueues, so it would return instantly,
+        # release the floor, and let the next speaker talk over this one.
+        #
+        # It was `.speak()`, which MacOSVoice has never defined — the class
+        # exposes `say` / `say_and_wait`. So the delivery half STILL never
+        # ran: the AttributeError was raised inside an executor called from a
+        # fire-and-forget `create_task`, which lands as "Task exception was
+        # never retrieved" rather than reaching the guard below. The same
+        # wired-but-inert trap this function's docstring was written to
+        # close, one layer further down, hidden by the async boundary.
         from backend.voice.macos_voice import MacOSVoice
-        MacOSVoice().speak(text)
+        MacOSVoice().say_and_wait(text)
 
     async def _ticket() -> None:
         from backend.audio.speech_scheduler import SpeechRole, get_scheduler
@@ -97,7 +123,15 @@ def speak_immediate(line: str) -> bool:
             # Scheduled, never awaited inline: this is called from the STT
             # rejection path, and blocking it would stall recognition to
             # announce that recognition is failing.
-            loop.create_task(_ticket())
+            task = loop.create_task(_ticket())
+            # ...but fire-and-forget must not mean fail-and-never-know. The
+            # guard below cannot see inside a task, which is exactly how a
+            # call to a non-existent method survived two releases: the
+            # delivery half raised on every single invocation and the only
+            # trace was an interpreter-level "Task exception was never
+            # retrieved" on stderr. Retrieving it is the difference between a
+            # silent dead feature and a log line naming it.
+            task.add_done_callback(_note_ticket_outcome)
         else:
             _render()
         logger.info("[Acoustic] speaking: %s", text)

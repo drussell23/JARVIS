@@ -42,13 +42,66 @@ def test_it_reuses_macos_voice_and_the_turnstile() -> None:
     assert "Popen" not in src and "subprocess" not in src
 
 
+def test_the_method_it_calls_exists_on_the_real_voice() -> None:
+    """The fake mirrored the bug, so the suite stayed green while production
+    raised on EVERY invocation.
+
+    ``speak_immediate`` called ``MacOSVoice().speak(...)``. MacOSVoice has
+    never defined ``speak`` — it exposes ``say`` and ``say_and_wait``. The
+    AttributeError was raised inside an executor called from a
+    fire-and-forget task, so it never reached the guard and surfaced only as
+    "Task exception was never retrieved" on stderr. Every test below injects
+    a stand-in, and a stand-in that mirrors the caller can only ever confirm
+    the caller agrees with itself.
+
+    This asserts against the REAL class instead: whatever attribute the
+    source names, MacOSVoice must actually have it."""
+    import inspect
+    import re
+
+    from backend.voice.macos_voice import MacOSVoice
+
+    src = inspect.getsource(af.speak_immediate)
+    called = set(re.findall(r"MacOSVoice\(\)\.(\w+)", src))
+    assert called, "speak_immediate no longer calls MacOSVoice directly"
+    for name in called:
+        assert hasattr(MacOSVoice, name), (
+            f"speak_immediate calls MacOSVoice().{name}(), which does not "
+            f"exist. Available: {sorted(m for m in dir(MacOSVoice) if not m.startswith('_'))}"
+        )
+
+
+def test_a_failed_speech_ticket_is_logged_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fire-and-forget must not mean fail-and-never-know — the invisibility
+    is what let a non-existent method survive two releases."""
+    import asyncio as _aio
+
+    async def _go() -> None:
+        class _Broken:
+            def say_and_wait(self, text: str, mode: str = "normal") -> None:
+                raise AttributeError("simulated engine breakage")
+
+        monkeypatch.setattr("backend.voice.macos_voice.MacOSVoice", _Broken)
+        with caplog.at_level("WARNING"):
+            af.speak_immediate("this will fail")
+            for _ in range(40):
+                await _aio.sleep(0.01)
+                if any("speech ticket failed" in r.message for r in caplog.records):
+                    return
+        raise AssertionError("a failing speech ticket produced no log line")
+
+    _aio.run(_go())
+
+
 def test_it_speaks_with_no_running_loop(monkeypatch: pytest.MonkeyPatch) -> None:
     """Callable from any context — the STT rejection path is not guaranteed
     to be on a loop."""
     spoken: List[str] = []
 
     class _Voice:
-        def speak(self, text: str) -> None:
+        def say_and_wait(self, text: str, mode: str = "normal") -> None:
             spoken.append(text)
 
     monkeypatch.setattr("backend.voice.macos_voice.MacOSVoice", _Voice)
@@ -67,7 +120,7 @@ async def test_it_takes_a_primary_ticket_on_the_turnstile(
     order: List[str] = []
 
     class _Voice:
-        def speak(self, text: str) -> None:
+        def say_and_wait(self, text: str, mode: str = "normal") -> None:
             order.append("interrupt")
 
     monkeypatch.setattr("backend.voice.macos_voice.MacOSVoice", _Voice)
@@ -106,7 +159,7 @@ async def test_it_does_not_block_the_rejection_path(
     import time
 
     class _SlowVoice:
-        def speak(self, text: str) -> None:
+        def say_and_wait(self, text: str, mode: str = "normal") -> None:
             time.sleep(0.6)
 
     monkeypatch.setattr("backend.voice.macos_voice.MacOSVoice", _SlowVoice)
@@ -117,7 +170,7 @@ async def test_it_does_not_block_the_rejection_path(
 
 def test_a_broken_voice_engine_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Broken:
-        def speak(self, text: str) -> None:
+        def say_and_wait(self, text: str, mode: str = "normal") -> None:
             raise OSError("no audio device")
 
     monkeypatch.setattr("backend.voice.macos_voice.MacOSVoice", _Broken)
