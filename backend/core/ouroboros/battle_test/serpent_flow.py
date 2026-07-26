@@ -5309,6 +5309,24 @@ class SerpentREPL:
         if _outcome is not None and _outcome.matched:
             self._flow.console.print()
             if _outcome.text:
+                # THE gap that made 59 verbs invisible from `ov attach`.
+                #
+                # Every auto-discovered verb executed correctly and rendered
+                # to the DAEMON's console. An attached cockpit sent the
+                # command, the daemon ran it, and the operator saw nothing.
+                #
+                # Mirrored as MARKUP, not as plain text: `_outcome.text` is
+                # already Rich markup ("[bold]🐍 Moltbook[/bold] [dim]…"),
+                # and the markup channel is width-agnostic by contract — the
+                # raw markup travels and each client fits it to its own
+                # canvas. Rendering to ANSI here would bake this daemon's
+                # width and colour depth into the wire and produce a worse
+                # picture on every terminal that differs from it.
+                #
+                # Addressing is handled at the bridge from the ContextVar the
+                # dispatch is running inside, so a verb typed in cockpit A
+                # returns to cockpit A alone.
+                self._flow._mirror_markup(_outcome.text)
                 self._flow.console.print(
                     _outcome.text, highlight=False,
                 )

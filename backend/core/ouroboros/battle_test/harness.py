@@ -4129,6 +4129,57 @@ class BattleTestHarness:
     # REPL command handler
     # ------------------------------------------------------------------
 
+    def _render_molt_line(self, post: Any) -> str:
+        """One live post as a CC-style block, in the agora's own voice.
+
+        Rendered here rather than shipping the raw payload because the markup
+        channel's contract is that all MODEL-controlled content is escaped by
+        the composition layer before it is wrapped in styling. A resident's
+        body text is model-authored, so it is escaped into inert data and the
+        chrome around it is ours. NEVER raises."""
+        try:
+            handle = str(getattr(post, "handle", "") or "?")
+            glyph = str(getattr(post, "glyph", "") or "🐍")
+            kind = str(getattr(post, "kind", "") or "")
+            body = str(getattr(post, "body", "") or "").strip()
+            if not body:
+                return ""
+            try:
+                from rich.markup import escape as _escape
+                body = _escape(body)
+                handle = _escape(handle)
+            except Exception:  # noqa: BLE001
+                body = body.replace("[", "\\[")
+                handle = handle.replace("[", "\\[")
+            kind_seg = f" [dim]· {kind}[/dim]" if kind else ""
+            return (
+                f"  [bold]⏺ {glyph} {handle}[/bold]{kind_seg}\n"
+                f"  [dim]⎿[/dim]  {body}"
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def _handle_repl_command_for(
+        self, command: str, session: Optional[str],
+    ) -> None:
+        """Run one attached cockpit's command attributed to THAT cockpit.
+
+        The ContextVar set here rides the whole dispatch — through every
+        ``await``, into the render helpers fifteen frames down — so the
+        bridge can address the answer back without any renderer knowing an
+        IPC session exists. Ambient output emitted concurrently by other
+        tasks is unaffected: a ContextVar is per-task, not global.
+
+        NEVER raises."""
+        try:
+            from backend.core.ouroboros.battle_test.attach_session import (
+                session_scope,
+            )
+            with session_scope(session):
+                await self._handle_repl_command(command)
+        except Exception:  # noqa: BLE001
+            logger.debug("[Attach] scoped command degraded", exc_info=True)
+
     async def _handle_repl_command(self, command: str) -> None:
         """Process a user command from the SerpentREPL.
 
@@ -4447,7 +4498,7 @@ class BattleTestHarness:
                 except Exception:  # noqa: BLE001
                     return {}
 
-            def _on_input(text: str) -> None:
+            def _on_input(text: str, session: Optional[str] = None) -> None:
                 # Operator Prompt Bridge FIRST (2026-07-23): while an
                 # interactive gate ([Y/n] Iron Gate, endorse) is pending,
                 # the next attached-terminal line IS the answer — HITL
@@ -4467,7 +4518,7 @@ class BattleTestHarness:
                     loop = asyncio.get_running_loop()
                 except RuntimeError:
                     return
-                loop.create_task(self._handle_repl_command(text))
+                loop.create_task(self._handle_repl_command_for(text, session))
 
             # Audio-Visual Synapse (v2): attached terminals arm/disarm
             # the karen_duplex plane and receive the audio FSM. Pure
@@ -4515,6 +4566,37 @@ class BattleTestHarness:
                         sf.markup_mirror = bridge.publish_markup
                 except Exception:  # noqa: BLE001
                     pass
+                # Moltbook live feed: the agora is PROACTIVE — residents post
+                # unprompted — so a cockpit that only sees posts when the
+                # operator types /moltbook is watching an archive. Subscribe
+                # the bridge and posts arrive as they happen.
+                #
+                # Published AMBIENT (no session scope): a post is the
+                # organism speaking on its own initiative, and every attached
+                # cockpit should see it. Only operator-requested output is
+                # addressed.
+                try:
+                    from backend.core.ouroboros.governance.moltbook import (
+                        subscribe_molts,
+                    )
+
+                    def _molt_to_cockpit(post: Any) -> None:
+                        try:
+                            from backend.core.ouroboros.battle_test.attach_session import (  # noqa: E501
+                                session_scope,
+                            )
+                            line = self._render_molt_line(post)
+                            if not line:
+                                return
+                            with session_scope(None):
+                                bridge.publish_markup(line)
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    self._molt_unsub = subscribe_molts(_molt_to_cockpit)
+                except Exception:  # noqa: BLE001
+                    logger.debug("[Moltbook] live feed wiring degraded",
+                                 exc_info=True)
                 # Attach heartbeat (2026-07-23): ~1s CC-style pulse
                 # (verb · elapsed · ↓ tokens · provider) published on
                 # the telemetry lane; publish_telemetry no-ops with

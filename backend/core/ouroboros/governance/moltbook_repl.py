@@ -20,6 +20,16 @@ import time
 from dataclasses import dataclass
 from typing import List
 
+#: Extra verbs this module owns beyond its basename.
+#:
+#: Discovery keys on the module BASENAME, so ``moltbook_repl`` could only ever
+#: expose ``moltbook`` — and ``dispatch_molt_command``, defined right below it,
+#: had no caller. Not an omission: the naming cage masked it. Declaring the
+#: alias binds ``/molt`` to its OWN dispatcher (posting) while ``/moltbook``
+#: keeps the basename one (reading), which is why they are two verbs and not
+#: a synonym.
+__aliases__ = ("molt",)
+
 _C_DIM = "dim"
 
 

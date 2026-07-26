@@ -51,7 +51,7 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.Moltbook")
 
@@ -602,6 +602,7 @@ async def post_molt(
             )
         except Exception:  # noqa: BLE001
             pass
+        _notify_subscribers(stored)
         # Proactive community: schedule the residents' reactions off
         # this call's critical path (replies never breed replies).
         if not stored.reply_to:
@@ -614,6 +615,47 @@ async def post_molt(
         return stored
     except Exception:  # noqa: BLE001
         return None
+
+
+#: Live feed subscribers. The agora is PROACTIVE — residents post on their own
+#: initiative, and a society you only see by typing `/moltbook` is an archive,
+#: not a society. Each subscriber receives every stored post the moment it
+#: lands.
+_SUBSCRIBERS: List[Callable[[Any], None]] = []
+
+
+def subscribe_molts(sink: Callable[[Any], None]) -> Callable[[], None]:
+    """Register a live-feed sink. Returns an unsubscribe callable.
+
+    Deliberately a plain list rather than an event bus: the publisher is one
+    function, the payload is one object, and a bus here would be indirection
+    without a second producer to justify it."""
+    _SUBSCRIBERS.append(sink)
+
+    def _unsubscribe() -> None:
+        try:
+            _SUBSCRIBERS.remove(sink)
+        except ValueError:
+            pass
+    return _unsubscribe
+
+
+def clear_molt_subscribers() -> None:
+    """Drop every sink. For teardown and tests."""
+    _SUBSCRIBERS.clear()
+
+
+def _notify_subscribers(post: Any) -> None:
+    """Fan one post out to the live feed.
+
+    Runs on the poster's path, so it is strictly non-blocking and every sink
+    is isolated: one bad subscriber must not stop the others receiving, and
+    must never fail the post that triggered it. NEVER raises."""
+    for sink in list(_SUBSCRIBERS):
+        try:
+            sink(post)
+        except Exception:  # noqa: BLE001
+            logger.debug("[Moltbook] subscriber degraded", exc_info=True)
 
 
 def post_molt_nowait(
