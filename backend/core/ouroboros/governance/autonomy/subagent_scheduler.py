@@ -177,12 +177,25 @@ class GenerationSubagentExecutor:
         except Exception:  # noqa: BLE001 — untagged beats not running
             import contextlib as _ctxlib
             _lane_ctx = _ctxlib.nullcontext()
-        with _lane_ctx:
-            return await self._execute_tagged(
-                graph, unit, started_at_ns, causal_parent_id,
-                _worktree_path, _sandbox, _worktree_create_mono,
-                _worktree_lifespan_s, _dw_cost_usd, _branch_label, _result,
-            )
+        try:
+            with _lane_ctx:
+                return await self._execute_tagged(
+                    graph, unit, started_at_ns, causal_parent_id,
+                    _worktree_path, _sandbox, _worktree_create_mono,
+                    _worktree_lifespan_s, _dw_cost_usd, _branch_label, _result,
+                )
+        finally:
+            # TOMBSTONE, not delete — the deck may be showing this unit and
+            # the operator's selection takes a human moment. Retained
+            # read-only so focusing a just-finished worker hydrates its final
+            # output instead of racing its destruction.
+            try:
+                from backend.core.ouroboros.battle_test.lane_rings import (
+                    get_lane_registry,
+                )
+                get_lane_registry().mark_dead(f"unit/{unit.unit_id}")
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _execute_tagged(
         self, graph: ExecutionGraph, unit: WorkUnitSpec,

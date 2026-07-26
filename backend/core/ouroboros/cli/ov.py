@@ -393,6 +393,47 @@ class AttachUI:
             self.deck: Any = DeckManager()
         except Exception:  # noqa: BLE001 — a deckless cockpit still works
             self.deck = None
+        # D3: selectable lanes. The list is whatever the last heartbeat
+        # carried — never a client-side cache, so the cursor always resolves
+        # against what the daemon currently holds.
+        self._lanes: List[dict] = []
+        self._focus_lines: List[str] = []
+        self._focus_note: str = ""
+        try:
+            from backend.core.ouroboros.battle_test.cockpit_fsm import (
+                CockpitFSM,
+            )
+            self.fsm: Any = CockpitFSM(lanes_provider=lambda: self._lanes)
+        except Exception:  # noqa: BLE001
+            self.fsm = None
+
+    def refresh(self) -> None:
+        """Repaint after a mode change. Alias of the invalidate seam so key
+        handlers read as intent rather than mechanism."""
+        self._invalidate()
+
+    def on_lane_history(self, payload: dict) -> None:
+        """Hydrate the focused pane from the daemon's ring. NEVER raises.
+
+        ``found: false`` is rendered as an explicit notice rather than as an
+        empty pane: "this worker's output has aged out" and "this worker
+        produced nothing" are different facts and must not look alike."""
+        try:
+            lane = str(payload.get("lane", ""))
+            if self.fsm is not None and self.fsm.focused_lane != lane:
+                return                      # a stale answer for a lane we left
+            self._focus_lines = [str(x) for x in (payload.get("lines") or [])]
+            if not payload.get("found"):
+                self._focus_note = "no retained output — this lane has aged out"
+            elif payload.get("tombstoned"):
+                dropped = int(payload.get("dropped") or 0)
+                more = f", {dropped} earlier line(s) dropped" if dropped else ""
+                self._focus_note = f"finished — final output{more}"
+            else:
+                self._focus_note = "live"
+            self._invalidate()
+        except Exception:  # noqa: BLE001
+            pass
 
     def bind_app(self, app: Any) -> None:
         self._app_ref = app
@@ -457,6 +498,44 @@ class AttachUI:
             f" ov attach — organism live{audio} · 'detach' to leave"
         )
 
+    def _mode_lines(self) -> Optional[List[str]]:
+        """SELECT / FOCUS rendering, or None to fall through to the deck.
+
+        Both modes draw into the SAME bottom toolbar the ambient deck uses —
+        one region, three states — so nothing competes for the terminal and
+        the operator's input line is never disturbed."""
+        try:
+            from backend.core.ouroboros.battle_test.cockpit_fsm import (
+                MODE_SELECT,
+            )
+            fsm = self.fsm
+            if fsm is None:
+                return None
+            if fsm.mode == MODE_SELECT:
+                rows = fsm.rows()
+                if not rows:
+                    return ["  (no lanes) · esc"]
+                out = ["  [bold]lanes[/bold] [dim]↑↓ move · ⏎ focus · esc[/dim]"]
+                for i, r in enumerate(rows[:8]):
+                    cur = "▸" if i == fsm.cursor else " "
+                    dead = " [dim](finished)[/dim]" if r.get("tombstoned") else ""
+                    out.append(
+                        f"  {cur} {r.get('lane','?')}{dead} "
+                        f"[dim]{r.get('lines',0)} lines · {r.get('age_s',0)}s[/dim]"
+                    )
+                return out
+            lane = fsm.focused_lane
+            if lane:
+                head = (
+                    f"  [bold]{lane}[/bold] "
+                    f"[dim]{self._focus_note} · esc to return[/dim]"
+                )
+                body = [f"  [dim]│[/dim] {ln}" for ln in self._focus_lines[-6:]]
+                return [head] + (body or ["  [dim]│ (hydrating…)[/dim]"])
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+
     def _with_deck(self, pulse_line: str) -> str:
         """Pulse on top, ambient rows beneath.
 
@@ -468,6 +547,10 @@ class AttachUI:
                 GLYPHS,
                 deck_enabled,
             )
+            # SELECT / FOCUS take the region when active; FLOW shows ambient.
+            mode_lines = self._mode_lines()
+            if mode_lines is not None:
+                return "\n".join([pulse_line] + mode_lines)
             if self.deck is None or not deck_enabled():
                 return pulse_line
             rows = self.deck.rows()
@@ -489,6 +572,13 @@ class AttachUI:
                 import time as _time
                 self._heartbeat = frame
                 self._heartbeat_arrived = _time.monotonic()
+                # Selectable lanes ride the heartbeat. Replaced wholesale
+                # rather than merged: the daemon's summary IS the truth, and
+                # a client-side merge would resurrect lanes the daemon has
+                # already reaped.
+                lanes = frame.get("lanes")
+                if isinstance(lanes, list):
+                    self._lanes = [x for x in lanes if isinstance(x, dict)]
         except Exception:
             pass
 
@@ -648,6 +738,7 @@ async def _split_plane_loop(
     session: Any = PromptSession(
         message=lambda: ui.prompt(),
         bottom_toolbar=lambda: ui.toolbar(),
+        key_bindings=_build_selection_bindings(ui, client),
     )
     ui.bind_app(session.app)
 
@@ -689,6 +780,88 @@ async def _split_plane_loop(
             if outcome == "detach":
                 break
 
+
+
+def _build_selection_bindings(ui: Any, client: Any) -> Any:
+    """Arrow/Enter/Esc for the selectable deck. NEVER raises.
+
+    Every binding is gated by a ``@Condition`` on the FSM mode rather than by
+    an ``if`` inside the handler. The difference matters: a filtered binding
+    is not registered for that keypress at all, so ``Up`` still edits history
+    and ``Enter`` still submits the line while the cockpit is in FLOW. A
+    handler that swallowed the key and then decided not to act would have
+    stolen normal editing from the operator.
+
+    Returns None when selection is disabled, which leaves the session exactly
+    as it was before D3."""
+    try:
+        from prompt_toolkit.filters import Condition
+        from prompt_toolkit.key_binding import KeyBindings
+
+        from backend.core.ouroboros.battle_test.cockpit_fsm import (
+            MODE_FLOW,
+            MODE_SELECT,
+            selection_enabled,
+        )
+        if not selection_enabled():
+            return None
+
+        kb = KeyBindings()
+        fsm = ui.fsm
+
+        in_select = Condition(lambda: fsm.mode == MODE_SELECT)
+        not_flow = Condition(lambda: fsm.mode != MODE_FLOW)
+        # Entering SELECT is only offered when the buffer is EMPTY. Ctrl-O on
+        # a half-typed command would otherwise discard the operator's context
+        # to open a picker they can only leave by escaping.
+        can_open = Condition(
+            lambda: fsm.mode == MODE_FLOW and not _buffer_text(),
+        )
+
+        @kb.add("c-o", filter=can_open)
+        def _open(event: Any) -> None:
+            fsm.enter_select()
+            ui.refresh()
+
+        @kb.add("up", filter=in_select)
+        def _up(event: Any) -> None:
+            fsm.move(-1)
+            ui.refresh()
+
+        @kb.add("down", filter=in_select)
+        def _down(event: Any) -> None:
+            fsm.move(1)
+            ui.refresh()
+
+        @kb.add("enter", filter=in_select)
+        def _enter(event: Any) -> None:
+            lane = fsm.selected_lane()
+            if fsm.focus_selected() and lane:
+                # Hydration is REQUESTED, never assumed present. The daemon
+                # answers from the lane's ring — including a tombstoned one.
+                try:
+                    client.send_lane(lane)
+                except Exception:  # noqa: BLE001
+                    pass
+            ui.refresh()
+
+        @kb.add("escape", filter=not_flow, eager=True)
+        def _esc(event: Any) -> None:
+            fsm.escape()
+            ui.refresh()
+
+        return kb
+    except Exception:  # noqa: BLE001 — a cockpit without selection still works
+        return None
+
+
+def _buffer_text() -> str:
+    """Current input buffer, or "" when there is no live application."""
+    try:
+        from prompt_toolkit.application.current import get_app
+        return get_app().current_buffer.text or ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 async def _attach_rms_stream(scope: Any) -> Any:
@@ -1266,6 +1439,7 @@ def run_attach(console: Any) -> int:
             on_markup=_markup_sink,
             on_telemetry=ui.on_telemetry,
             on_audio_state=ui.on_audio_state,
+            on_lane_history=ui.on_lane_history,
         )
         if not await client.connect():
             console.print(_NO_ORGANISM_MESSAGE, markup=False, highlight=False)
