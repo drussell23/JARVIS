@@ -66,6 +66,51 @@ def version_line() -> str:
     except Exception:
         return "ov — ouroboros + venom"
 
+#: Operator words the CLIENT handles itself, mapped to the audio command they
+#: fire. Module scope on purpose: ``_route_operator_line`` dispatches from this
+#: table and the slash palette ENUMERATES it, so a verb cannot exist in one and
+#: be missing from the other. A second list for the menu is exactly how a
+#: palette starts lying about what the CLI accepts.
+AUDIO_VERBS = {
+    "wake": "wake", "voice": "wake", "listen": "wake",
+    "wake!": "force_wake", "force-wake": "force_wake",
+    "force wake": "force_wake",
+    "ptt": "ptt",
+    "ptt stop": "ptt_stop", "ptt-stop": "ptt_stop", "ptt off": "ptt_stop",
+    "flush": "flush", "shh": "flush", "hush": "flush",
+    "mute": "sleep", "sleep": "sleep",
+    "barge": "barge",
+}
+
+#: One line per client verb for the palette's ``display_meta``. Keys that are
+#: absent fall back to a generated description, so adding to AUDIO_VERBS can
+#: never break the menu — it just reads less well until documented here.
+CLIENT_VERB_HELP = {
+    "wake": "arm Karen's microphone",
+    "sleep": "disarm the microphone",
+    "barge": "interrupt Karen mid-sentence",
+    "flush": "halt outbound audio now (ducking)",
+    "ptt": "hold push-to-talk open",
+    "ptt stop": "close the push-to-talk hold",
+    "force-wake": "seize the mic from another terminal",
+    "deck": "deck height — off | compact | full",
+    "detach": "leave; the organism keeps running",
+}
+
+
+def client_verbs() -> "dict":
+    """Verbs this cockpit answers WITHOUT the daemon. NEVER raises.
+
+    Derived from the live dispatch tables rather than transcribed beside
+    them: the audio words come from AUDIO_VERBS (the same object the router
+    switches on) and the local-only verbs are listed once here."""
+    out = {v: CLIENT_VERB_HELP.get(v, f"audio: {AUDIO_VERBS[v]}")
+           for v in AUDIO_VERBS}
+    for v in ("deck", "detach"):
+        out[v] = CLIENT_VERB_HELP.get(v, "")
+    return out
+
+
 def _render_markup_frame(text: str, console: Any = None) -> None:
     """Render ONE daemon-composed styled line (the typed ``markup`` frame:
     CC-style ⏺/⎿ tool blocks + numbered diffs). Unlike the untyped ``line``
@@ -786,16 +831,7 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
         low = text.lower()
         if low in ("detach", "exit", "quit"):
             return "detach"
-        audio_verbs = {
-            "wake": "wake", "voice": "wake", "listen": "wake",
-            "wake!": "force_wake", "force-wake": "force_wake",
-            "force wake": "force_wake",
-            "ptt": "ptt",
-            "ptt stop": "ptt_stop", "ptt-stop": "ptt_stop", "ptt off": "ptt_stop",
-            "flush": "flush", "shh": "flush", "hush": "flush",
-            "mute": "sleep", "sleep": "sleep",
-            "barge": "barge",
-        }
+        audio_verbs = AUDIO_VERBS
         # /deck sizing is a CLIENT concern — two cockpits on different
         # terminals want different amounts of screen, and the daemon has no
         # business knowing how tall anyone's window is. Handled here rather
