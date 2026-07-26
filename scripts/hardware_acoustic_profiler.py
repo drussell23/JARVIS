@@ -477,6 +477,25 @@ def main() -> int:
             print("   → speech rhythm is present. If whisper still returns")
             print("     nothing, the fault is downstream of capture.")
 
+    # ALWAYS persist. A diagnostic whose only output is stdout forces the
+    # operator to copy-paste it back, and that has now failed repeatedly in
+    # this investigation — three separate runs whose numbers were lost between
+    # the terminal and the analysis. The report is written where it can simply
+    # be read.
+    try:
+        out_dir = os.path.join(REPO_ROOT, ".jarvis", "acoustic_profile")
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        report["captured_at"] = stamp
+        for name in (f"profile-{stamp}.json", "latest.json"):
+            with open(os.path.join(out_dir, name), "w", encoding="utf-8") as fh:
+                json.dump(report, fh, indent=2)
+        if not args.json:
+            print(f"\n   report written: .jarvis/acoustic_profile/latest.json")
+    except (OSError, TypeError, ValueError) as exc:
+        if not args.json:
+            print(f"\n   (could not persist report: {type(exc).__name__})")
+
     if args.json:
         print(json.dumps(report, indent=2))
     return 0
