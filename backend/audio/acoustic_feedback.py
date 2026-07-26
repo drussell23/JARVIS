@@ -7,6 +7,7 @@ recogniser and the speaker, which is how a system ends up transcribing itself.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -39,14 +40,71 @@ def _controller() -> Any:
         # Routed through the SAME zero-cost path the phatic acknowledgements
         # use: this is Karen reporting her own limitation, not a model turn,
         # and it must never cost a token or wait on a provider.
-        try:
-            from backend.audio.conversation_pipeline import speak_immediate
-            speak_immediate(line)
-        except (ImportError, AttributeError):
-            logger.info("[Acoustic] (unspoken) %s", line)
+        speak_immediate(line)
 
     _CONTROLLER = AcousticFeedbackController(emit=_emit, speak=_speak)
     return _CONTROLLER
+
+
+def speak_immediate(line: str) -> bool:
+    """Say *line* now, ahead of anything queued. Returns True if it was spoken.
+
+    This is Karen admitting she cannot hear — it is worth interrupting for, and
+    it must never cost a token or wait on a provider. So it takes a
+    ``SpeechRole.PRIMARY`` ticket on the EXISTING turnstile rather than opening
+    its own playback path: a second player would race the first, and two voices
+    over one speaker is the collision the scheduler was built to prevent.
+
+    THE OMISSION THIS FIXES. ``acoustic_feedback`` referenced this function
+    before it existed, so every degradation logged ``(unspoken)`` — the
+    measurement half of the loop worked perfectly and the delivery half had
+    never once executed. A dependency referenced but not defined is the
+    wired-but-inert trap, and it deserves to be named rather than quietly
+    patched.
+
+    Callable from ANY context. With a running loop the ticket is scheduled on
+    it; without one the utterance runs inline on this thread. The synthesis
+    itself is ``macos_voice``'s — reused, not reimplemented — and it already
+    takes ``playback_gate_sync`` around its own ``afplay``, so the microphone
+    is closed for exactly as long as sound is leaving the speakers.
+
+    NEVER raises: this sits on the STT rejection path."""
+    text = str(line or "").strip()
+    if not text:
+        return False
+
+    def _render() -> None:
+        # macos_voice owns synthesis AND the playback gate. Calling its
+        # existing entry point is the whole implementation; anything more
+        # would be a second audio stack.
+        from backend.voice.macos_voice import MacOSVoice
+        MacOSVoice().speak(text)
+
+    async def _ticket() -> None:
+        from backend.audio.speech_scheduler import SpeechRole, get_scheduler
+        loop = asyncio.get_running_loop()
+        await get_scheduler().speak(
+            lambda: loop.run_in_executor(None, _render),
+            agent="acoustic", role=SpeechRole.PRIMARY, text=text,
+        )
+
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and loop.is_running():
+            # Scheduled, never awaited inline: this is called from the STT
+            # rejection path, and blocking it would stall recognition to
+            # announce that recognition is failing.
+            loop.create_task(_ticket())
+        else:
+            _render()
+        logger.info("[Acoustic] speaking: %s", text)
+        return True
+    except (ImportError, AttributeError, RuntimeError, OSError) as exc:
+        logger.warning("[Acoustic] could not speak %r: %r", text, exc)
+        return False
 
 
 def report_rejection(audio: Any, sample_rate: int, peak: float, rms: float,
@@ -82,4 +140,4 @@ def reset() -> None:
     _CONTROLLER = None
 
 
-__all__ = ["report_rejection", "reset"]
+__all__ = ["report_rejection", "reset", "speak_immediate"]
