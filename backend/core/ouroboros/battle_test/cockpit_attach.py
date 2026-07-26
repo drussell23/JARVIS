@@ -531,6 +531,17 @@ class CockpitAttachBridge:
         else:
             writers = list(self._clients)
 
+        # Tell the client WHICH kind of output this is. It already knows here
+        # — the ContextVar decided it one line up — and the client cannot
+        # re-derive it, because "was this answering my command?" is not a
+        # property of the text. Addressed output belongs in the scrollback the
+        # operator asked for; ambient output belongs in the live deck that
+        # ages out. Without the marker the client would have to guess, and
+        # guessing puts provider failovers in the transcript and command
+        # answers in a region that erases them.
+        msg = dict(msg)
+        msg["addressed"] = target is not None
+
         data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         for w in writers:
             try:
@@ -811,7 +822,18 @@ class CockpitAttachClient:
                     # Daemon-composed styled line. No on_markup handler →
                     # degrade to on_line (conservative clients escape it).
                     cb = self._on_markup or self._on_line
-                    self._safe_cb_text(cb, str(frame.get("text", "")))
+                    # Forward the addressed/ambient marker to sinks that want
+                    # it, using the same arity inspection the input path uses
+                    # rather than a second convention. A one-argument sink —
+                    # every pre-deck client — is called exactly as before.
+                    if _accepts_two_positional(cb):
+                        try:
+                            cb(str(frame.get("text", "")),
+                               bool(frame.get("addressed", False)))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    else:
+                        self._safe_cb_text(cb, str(frame.get("text", "")))
                 elif ftype == "telemetry":
                     try:
                         self._on_telemetry(dict(frame))
