@@ -37,6 +37,33 @@ def _serpent_flow_src() -> str:
     ).read_text()
 
 
+def _code_only(block: str) -> str:
+    """Strip docstrings and comments — leave executable source.
+
+    A source-inspection pin must distinguish a USE from a MENTION. The
+    docstring of ``show_streaming_start`` explains that Slice 7 "retired the
+    Rich ``Live(Syntax)`` persistent region", so a naive substring check for
+    ``Live(`` fails on the very sentence documenting its removal."""
+    out, in_doc, delim = [], False, ""
+    for line in block.splitlines():
+        stripped = line.strip()
+        if in_doc:
+            if delim in stripped:
+                in_doc = False
+            continue
+        for d in ('"""', "'''"):
+            if stripped.startswith(d):
+                # A one-line docstring opens and closes on the same line.
+                if stripped.count(d) == 1:
+                    in_doc, delim = True, d
+                stripped = ""
+                break
+        if not stripped or stripped.startswith("#"):
+            continue
+        out.append(stripped.split("  #")[0])
+    return "\n".join(out)
+
+
 def _streaming_block() -> str:
     """Return source of show_streaming_start/token/end as one block."""
     src = _serpent_flow_src()
@@ -70,13 +97,30 @@ def test_streaming_block_no_live_syntax_construction():
     )
 
 
-def test_streaming_block_uses_console_status():
-    """The new ephemeral path uses ``self.console.status(...)`` (Rich
-    ephemeral spinner primitive) and stores the handle on
-    ``self._active_status``."""
-    block = _streaming_block()
-    assert "self.console.status(" in block
-    assert "self._active_status" in block
+def test_streaming_block_leaves_no_persistent_region():
+    """Streaming progress is EPHEMERAL — no fixed Rich region.
+
+    This pin used to assert ``self.console.status(`` and
+    ``self._active_status`` appeared in the block. Both were retired on
+    purpose: the D3 emit-tier work moved the streaming indicator to the
+    ``bottom_toolbar`` spinner, and ``_active_status`` is now declared once
+    with the comment "no longer driven by spinner code". The pin was
+    freezing a MECHANISM the codebase had deliberately superseded, and it
+    documented its own obsolescence in the source it was reading.
+
+    What Slice 7 actually guaranteed, and what still matters, is the
+    absence of the persistent ``Live(Syntax)`` region it replaced —
+    operators see WHAT was generated as a clean diff block, not as a
+    fixed-region token stream.
+    """
+    code = _code_only(_streaming_block())
+    assert "Live(" not in code, (
+        "a persistent Live region is back in the streaming path — Slice 7 "
+        "retired it in favour of ephemeral progress plus a diff block"
+    )
+    assert "Syntax(" not in code, (
+        "fixed-region syntax rendering is back in the streaming path"
+    )
 
 
 def test_streaming_block_emits_receipt_on_end():
