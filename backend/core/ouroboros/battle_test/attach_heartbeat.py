@@ -142,9 +142,22 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
             except Exception:  # noqa: BLE001
                 provider_label = provider
 
+        # Selectable lanes ride the heartbeat rather than opening a second
+        # stream: it already flows at ~1Hz, which is the cadence a deck list
+        # needs, and a dedicated lane channel would be a parallel lifecycle
+        # to keep in sync for no additional freshness.
+        try:
+            from backend.core.ouroboros.battle_test.lane_rings import (
+                get_lane_registry,
+            )
+            lanes = get_lane_registry().summary()[:12]
+        except Exception:  # noqa: BLE001 — a laneless heartbeat still beats
+            lanes = []
+
         return {
             "kind": "heartbeat",
             "schema_version": HEARTBEAT_SCHEMA_VERSION,
+            "lanes": lanes,
             "active": active,
             "verb": verb,
             "phase": phase,

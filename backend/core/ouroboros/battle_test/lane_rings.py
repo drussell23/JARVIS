@@ -124,6 +124,28 @@ class LaneLine:
     severity: str = "INFO"
 
 
+def tombstone_ttl_s() -> float:
+    """How long a finished lane's history outlives the worker that wrote it.
+
+    THE GHOST-PANE DEFENSE. The deck is painted from a snapshot; the operator
+    reads it, reaches for an arrow key, and presses Enter — and in that human
+    interval the worker can finish. Destroying the lane on completion makes
+    that a race the operator loses at random, and no amount of `except
+    KeyError` around the lookup fixes it: catching the miss just turns a crash
+    into an empty pane, which is the same lie told politely.
+
+    The answer is retention. A finished lane becomes read-only rather than
+    absent, so the selection that was valid when the operator saw it is still
+    valid when they act on it — and its final output, which is usually the
+    interesting part, is exactly what they get."""
+    try:
+        return max(1.0, min(3600.0, float(
+            os.environ.get("JARVIS_LANE_TOMBSTONE_TTL_S", "60") or 60,
+        )))
+    except (TypeError, ValueError):
+        return 60.0
+
+
 @dataclass
 class LaneState:
     lane: str
@@ -132,6 +154,12 @@ class LaneState:
     last_seen: float
     total: int = 0          # lifetime count, including lines the ring dropped
     label: str = ""
+    #: When the worker finished. None while it is still running.
+    died_at: Optional[float] = None
+
+    @property
+    def tombstoned(self) -> bool:
+        return self.died_at is not None
 
 
 class LaneRegistry:
@@ -180,16 +208,53 @@ class LaneRegistry:
         except Exception:  # noqa: BLE001
             pass
 
+    def mark_dead(self, lane: str) -> bool:
+        """The worker finished. Retain its history as a tombstone.
+
+        Idempotent, and deliberately NOT a delete: see :func:`tombstone_ttl_s`.
+        A lane that was never seen is not resurrected — marking the death of
+        something that never lived would put an empty pane in the deck."""
+        try:
+            with self._lock:
+                st = self._lanes.get(str(lane))
+                if st is None:
+                    return False
+                if st.died_at is None:
+                    st.died_at = self._clock()
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def is_tombstoned(self, lane: str) -> bool:
+        with self._lock:
+            st = self._lanes.get(str(lane))
+            return bool(st and st.tombstoned)
+
+    def _expire_tombstones(self, now: float) -> None:
+        """Drop tombstones past their TTL. Called with the lock held.
+
+        Only tombstones expire on time. A live lane that has simply been quiet
+        for a while is still a worker the operator may want to look at, so
+        silence is not death."""
+        for k, st in list(self._lanes.items()):
+            if st.died_at is not None and now - st.died_at > tombstone_ttl_s():
+                del self._lanes[k]
+
     def _reap_if_needed(self, now: float) -> None:
         """Evict the least-recently-active lane when at the ceiling.
 
         Called with the lock held. Recency rather than size: a finished
         worker's history stops being interesting long before a busy one's,
         and the operator focuses what is happening now."""
+        self._expire_tombstones(now)
         limit = max_lanes()
         if len(self._lanes) < limit:
             return
-        victim = min(self._lanes.values(), key=lambda s: s.last_seen)
+        # Prefer a tombstone as the victim: a finished lane's history is worth
+        # less than a running worker's, whatever the timestamps say.
+        pool = [s for s in self._lanes.values() if s.tombstoned] or \
+               list(self._lanes.values())
+        victim = min(pool, key=lambda s: s.last_seen)
         self._lanes.pop(victim.lane, None)
         self.evicted_lanes += 1
 
@@ -210,14 +275,29 @@ class LaneRegistry:
             lines = list(st.lines)
         return lines[-limit:] if limit else lines
 
-    def summary(self) -> List[Tuple[str, int, float, str]]:
-        """``(lane, retained, last_seen, label)`` — what the deck lists."""
+    def summary(self) -> List[Dict[str, Any]]:
+        """What the selectable deck lists — live lanes first, then tombstones.
+
+        A dict rather than a tuple because this crosses the IPC bridge into
+        the client's selection list, and a positional payload would have to be
+        re-agreed at both ends every time a field is added."""
         with self._lock:
+            now = self._clock()
+            self._expire_tombstones(now)
+            rows = sorted(
+                self._lanes.values(),
+                key=lambda s: (s.tombstoned, -s.last_seen),
+            )
             return [
-                (s.lane, len(s.lines), s.last_seen, s.label)
-                for s in sorted(
-                    self._lanes.values(), key=lambda s: -s.last_seen,
-                )
+                {
+                    "lane": s.lane,
+                    "lines": len(s.lines),
+                    "last_seen": s.last_seen,
+                    "label": s.label,
+                    "tombstoned": s.tombstoned,
+                    "age_s": round(now - s.last_seen, 1),
+                }
+                for s in rows
             ]
 
     def dropped(self, lane: str) -> int:

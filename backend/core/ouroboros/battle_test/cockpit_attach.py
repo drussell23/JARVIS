@@ -582,6 +582,62 @@ class CockpitAttachBridge:
             except Exception:  # noqa: BLE001 — ANY writer fault = drop
                 self._drop(w)
 
+    def _serve_lane_history(
+        self, lane: str, session: Optional[str], *, limit: Any = None,
+    ) -> None:
+        """Answer one lane-history request. NEVER raises.
+
+        A lane that no longer exists gets an EMPTY history with
+        ``found: false`` rather than silence. The client can then say "that
+        worker's output has aged out" instead of rendering a blank pane the
+        operator reads as "it produced nothing" — the two are very different
+        facts and the pane must not conflate them."""
+        try:
+            lane = str(lane or "").strip()
+            if not lane:
+                return
+            from backend.core.ouroboros.battle_test.lane_rings import (
+                get_lane_registry,
+            )
+            reg = get_lane_registry()
+            try:
+                n = int(limit) if limit is not None else None
+            except (TypeError, ValueError):
+                n = None
+            lines = reg.history(lane, limit=n)
+            payload = {
+                "type": "lane_history",
+                "lane": lane,
+                "found": bool(lines) or reg.is_tombstoned(lane),
+                "tombstoned": reg.is_tombstoned(lane),
+                "dropped": reg.dropped(lane),
+                "lines": [ln.text for ln in lines],
+                "ts": time.time(),
+            }
+            # Addressed to the requester alone, reusing the session scope the
+            # bridge already routes on — no second addressing mechanism.
+            from backend.core.ouroboros.battle_test.attach_session import (
+                session_scope,
+            )
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+
+            def _emit() -> None:
+                with session_scope(session):
+                    self._broadcast(payload)
+
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                _emit()
+            else:
+                loop.call_soon_threadsafe(_emit)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] lane history degraded", exc_info=True)
+
     def bind_session(self, session_id: str, w: asyncio.StreamWriter) -> None:
         """Associate a cockpit's declared identity with its socket.
 
@@ -666,6 +722,15 @@ class CockpitAttachBridge:
                                 "[CockpitAttach] input sink degraded",
                                 exc_info=True,
                             )
+                elif ftype == "lane":
+                    # Hydration request: the client focused a lane and wants
+                    # its history. Answered ONLY to the asking cockpit —
+                    # another terminal's focus is not this one's business —
+                    # by addressing the reply to the session on the frame.
+                    self._serve_lane_history(
+                        str(frame.get("lane", "")), _sid or None,
+                        limit=frame.get("limit"),
+                    )
                 elif ftype == "audio":
                     cmd = str(frame.get("cmd", "")).strip().lower()
                     if cmd in AUDIO_CMDS:
@@ -710,6 +775,7 @@ class CockpitAttachClient:
         on_telemetry: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_audio_state: Optional[Callable[[str], None]] = None,
         on_thermal: Optional[Callable[[str], None]] = None,
+        on_lane_history: Optional[Callable[[Dict[str, Any]], None]] = None,
         path: Optional[Path] = None,
     ) -> None:
         self._path = Path(path) if path is not None else attach_socket_path()
@@ -722,6 +788,9 @@ class CockpitAttachClient:
         self._on_telemetry = on_telemetry or (lambda _m: None)
         self._on_audio_state = on_audio_state or (lambda _s: None)
         self._on_thermal = on_thermal or (lambda _s: None)
+        #: Focused-lane hydration payloads (D3). Absent handler = the client
+        #: does not use selection; the frame is simply not dispatched.
+        self._on_lane_history = on_lane_history or (lambda _p: None)
         #: This cockpit's identity for the life of the attachment. Declared
         #: on every outbound frame so the daemon can address answers back to
         #: the terminal that asked, instead of to all of them.
@@ -811,6 +880,23 @@ class CockpitAttachClient:
         except Exception:  # noqa: BLE001
             return False
 
+    def send_lane(self, lane: str, limit: Optional[int] = None) -> bool:
+        """Ask the daemon for one lane's history. NEVER raises."""
+        try:
+            w = self._writer
+            if not self.connected or w is None or w.is_closing():
+                return False
+            frame: Dict[str, Any] = {
+                "type": "lane", "lane": str(lane),
+                "session": self.session_id,
+            }
+            if limit is not None:
+                frame["limit"] = int(limit)
+            w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def send_input(self, text: str) -> bool:
         """Pipe one operator line upstream. Non-blocking; False when
         detached. NEVER raises."""
@@ -875,6 +961,11 @@ class CockpitAttachClient:
                     self._safe_cb_text(
                         self._on_thermal, str(frame.get("state", "")),
                     )
+                elif ftype == "lane_history":
+                    try:
+                        self._on_lane_history(dict(frame))
+                    except Exception:  # noqa: BLE001
+                        pass
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

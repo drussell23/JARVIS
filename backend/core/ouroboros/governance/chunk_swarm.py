@@ -135,6 +135,18 @@ async def swarm_repair(
                 return (target, None, exc)
             finally:
                 in_flight["cur"] -= 1
+                # TOMBSTONE, not delete. The deck may already be showing this
+                # lane, and the operator's arrow-and-Enter takes a human
+                # moment — destroying the ring here would make that selection
+                # race the worker's completion. Its final output is usually
+                # the interesting part, so it is retained read-only.
+                try:
+                    from backend.core.ouroboros.battle_test.lane_rings import (
+                        get_lane_registry,
+                    )
+                    get_lane_registry().mark_dead(_lane)
+                except Exception:  # noqa: BLE001
+                    pass
 
     # asyncio.gather = structured concurrent fan-out (Python 3.9-safe; the
     # TaskGroup equivalent without the 3.11 floor the codebase forbids). Each
