@@ -1445,8 +1445,19 @@ class ConversationPipeline:
             spec = summons.secondary
             workload = Workload(agent=spec.persona.value, task=summons.delegated_task)
 
+            # INTER-AGENT CONTEXT BUS. Composed once, at the handoff, rather
+            # than by the secondary on arrival: the secondary would have to
+            # re-read the whole transcript to recover facts the primary
+            # already has in hand, which is the amnesia this closes.
+            from backend.voice.agent_context_bus import build_context
+
+            ctx = build_context(summons, self._session)
+            self._delegation_ctx = ctx
+
             async def _fallback() -> str:
-                return await self._generate_text_as(spec, summons.delegated_task)
+                return await self._generate_text_as(
+                    spec, summons.delegated_task, ctx=ctx,
+                )
 
             return get_dispatcher().spawn(workload, _fallback)
         except (ImportError, AttributeError, RuntimeError):
@@ -1480,8 +1491,13 @@ class ConversationPipeline:
             previous = os.environ.get("JARVIS_AGENT_PERSONA", "")
             self._bind_persona(spec)
             self._speech_role = SpeechRole.SECONDARY
-            if self._session is not None:
-                self._session.add_turn("assistant", reply)
+            # RESPONSE BRIDGING — the delegated answer joins the shared
+            # history, attributed, so the primary's next turn knows the work
+            # happened and the operator can ask about it.
+            from backend.voice.agent_context_bus import bridge_response
+            bridge_response(
+                self._session, getattr(self, "_delegation_ctx", None), reply,
+            )
             await self._speak_sentence(reply, asyncio.Event())
         except asyncio.CancelledError:
             raise
@@ -1495,7 +1511,9 @@ class ConversationPipeline:
                 if prompt:
                     self._system_prompt = prompt
 
-    async def _generate_text_as(self, spec: Any, task: str) -> str:
+    async def _generate_text_as(
+        self, spec: Any, task: str, ctx: Any = None,
+    ) -> str:
         """Generate one reply AS *spec*, without speaking it.
 
         The caller-side fallback the dispatcher uses when no remote tier is
@@ -1512,6 +1530,14 @@ class ConversationPipeline:
             {"role": "system", "content": system},
             {"role": "user", "content": task},
         ]
+        # The delegation payload rides as ordinary system framing — the same
+        # shape every other prompt in this stack uses, so no provider in the
+        # chain needs to learn a new role.
+        try:
+            from backend.voice.agent_context_bus import inject
+            messages = inject(messages, ctx)
+        except (ImportError, AttributeError):
+            pass
         chunks = []
         async for chunk in self._get_llm_stream(messages, user_text=task):
             chunks.append(chunk)
