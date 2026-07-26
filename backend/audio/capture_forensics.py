@@ -120,7 +120,11 @@ class _Ring:
         self._held = 0
         self._lock = threading.Lock()
         #: Running observations — cheaper than re-deriving them from the ring,
-        #: and they survive even if the ring is later trimmed.
+        #: and they survive even if the ring is later trimmed. Because they
+        #: survive, they describe the PROCESS, not the incident.
+        #: LIFETIME totals, not window measurements. They are reported under
+        #: a separate ``session`` key and are never evidence about an
+        #: individual incident — see :meth:`stats`.
         self.frames_seen = 0
         self.peak_max = 0.0
         self.over_full_scale = 0
@@ -147,11 +151,25 @@ class _Ring:
                 return np.zeros(0, dtype=np.float32)
             return np.concatenate(list(self._frames))
 
+    def _session(self) -> Dict[str, Any]:
+        """Lifetime totals, quarantined behind their own key.
+
+        Kept because "this device has overdriven at some point" is genuinely
+        useful context, and deliberately separated because it is NOT a
+        measurement of the incident being written. Flattened alongside the
+        window numbers it reads as one, which is how a single early transient
+        came to be reported as the cause of every later rejection."""
+        return {
+            "frames_seen": self.frames_seen,
+            "peak_ever": round(self.peak_max, 4),
+            "over_full_scale_frames": self.over_full_scale,
+        }
+
     def stats(self) -> Dict[str, Any]:
         a = self.snapshot()
         if not a.size:
             return {"samples": 0, "sample_rate": self.sample_rate,
-                    "frames_seen": self.frames_seen}
+                    "session": self._session()}
         peak = float(np.max(np.abs(a)))
         rms = float(np.sqrt(np.mean(a.astype(np.float64) ** 2)))
         crest_db = 20.0 * float(np.log10(peak / rms)) if rms > 1e-9 else 0.0
@@ -179,10 +197,11 @@ class _Ring:
             "rms": round(rms, 5),
             "crest_db": round(crest_db, 1),
             "clipped_samples": int(np.sum(np.abs(a) >= 0.999)),
-            "over_full_scale_frames": self.over_full_scale,
-            "peak_ever": round(self.peak_max, 4),
-            "frames_seen": self.frames_seen,
+            # Window-scoped overdrive, re-derived from the retained audio so
+            # it describes THIS incident and nothing earlier.
+            "over_full_scale_samples": int(np.sum(np.abs(a) > 1.0)),
             "syllabic_modulation_2_8hz": round(mod, 3),
+            "session": self._session(),
         }
 
 
@@ -250,7 +269,11 @@ class CaptureForensics:
             out.mkdir(parents=True, exist_ok=True)
 
             metrics: Dict[str, Any] = {
-                "schema_version": "1.0",
+                # 1.1: lifetime ring totals moved out of the per-window blocks
+                # into their own ``session`` key (they were being read as
+                # incident evidence); adds window-scoped
+                # ``over_full_scale_samples``.
+                "schema_version": "1.1",
                 "reason": reason,
                 "wall_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "detail": dict(detail or {}),
@@ -297,7 +320,17 @@ class CaptureForensics:
         opposite fixes: if the raw device signal already lacks the 2-8 Hz
         rhythm of speech, no amount of processing repair will help; if the raw
         end has it and the processed end does not, the chain is destroying
-        it."""
+        it.
+
+        Every number it reads is scoped to the incident window. It previously
+        opened on the ring's LIFETIME over-full-scale counter, so the first
+        overdriven frame of a process latched "input gain, not the chain" onto
+        every rejection that followed and the modulation comparison this hint
+        exists for never ran again. Overdrive is also not, by itself, a fault:
+        ``AudioBus._fit_to_range`` exists precisely because macOS delivers
+        this device above +/-1.0 routinely. It is reported below as a possible
+        MECHANISM when the chain is measurably losing speech, never as a
+        standalone cause."""
         raw = metrics.get("raw_device") or {}
         proc = metrics.get("processed_bus") or {}
         r_mod = raw.get("syllabic_modulation_2_8hz")
@@ -306,15 +339,18 @@ class CaptureForensics:
             return "no raw frames tapped — cannot attribute"
         if r_mod is None or p_mod is None:
             return "incomplete measurements"
-        if raw.get("over_full_scale_frames", 0) > 0:
-            return (f"device delivered {raw['over_full_scale_frames']} frames "
-                    f"above full scale (peak {raw.get('peak_ever')}) — input "
-                    f"gain, not the chain")
         if r_mod < 0.15:
             return (f"raw device audio already lacks speech rhythm "
                     f"(modulation {r_mod}) — the microphone did not hear a "
                     f"voice; the chain is not at fault")
         if p_mod < r_mod * 0.6:
+            over = int(raw.get("over_full_scale_samples", 0) or 0)
+            if over > 0:
+                return (f"speech rhythm present at the device ({r_mod}) and "
+                        f"lost by the bus ({p_mod}) — the chain is destroying "
+                        f"it; {over} samples arrived above full scale (peak "
+                        f"{raw.get('peak')}) in this window, so suspect input "
+                        f"gain ahead of range-fitting")
             return (f"speech rhythm present at the device ({r_mod}) and lost "
                     f"by the bus ({p_mod}) — the chain is destroying it")
         return (f"speech rhythm survives the chain (raw {r_mod} -> "
