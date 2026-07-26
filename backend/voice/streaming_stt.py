@@ -559,6 +559,17 @@ class StreamingSTTEngine:
                     # level is already explained by its own log line, and
                     # recording it would evict the incidents that matter.
                     if _pk >= 0.01:
+                        # CLOSE THE LOOP. The forensics already measures why
+                        # this failed; until now nothing consumed it and the
+                        # operator got silence 34 times in a row while the
+                        # system knew it could not hear them.
+                        try:
+                            from backend.audio.acoustic_feedback import (
+                                report_rejection,
+                            )
+                            report_rejection(audio, self._sample_rate, _pk, _rms)
+                        except (ImportError, AttributeError):
+                            pass
                         try:
                             from backend.audio.capture_forensics import (
                                 get_forensics,
