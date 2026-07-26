@@ -122,8 +122,15 @@ _PROBE_RATE = 16000
 
 @dataclass
 class _Incumbent:
-    """What we know about the device currently bound."""
+    """What we know about the device currently bound.
+
+    Carries the NAME as well as the index because a CoreAudio index is a
+    position in a list that changes under you. Observed live: a Continuity
+    microphone left the enumeration when the phone slept, and
+    ``MacBook Pro Microphone`` moved from index 1 to index 0. Anything
+    remembered as an integer then pointed at a different device."""
     index: Optional[int] = None
+    name: str = ""
     samples: List[QualitySample] = field(default_factory=list)
 
     def sqi(self) -> float:
@@ -166,14 +173,18 @@ class AdaptiveInputManager:
         self._clock = clock
 
         self._incumbent = _Incumbent()
-        self._builtin_index: Optional[int] = None
+        #: The fallback target, remembered by NAME. Resolved to an index only
+        #: at the moment of binding — see _resolve_index.
+        self._builtin_name: str = ""
         self._degraded_run = 0
         self._armed = False
         self._last_rebind_at = -1e9
         self._busy = False
 
-        #: Devices that starved us. Never offered again this session.
-        self._benched: Dict[int, int] = {}
+        #: Devices that starved us, keyed by NAME. Never offered again this
+        #: session. Keyed by name for the same reason as the fallback: an
+        #: index benched now can be a different device ten seconds later.
+        self._benched: Dict[str, int] = {}
         self._probation_until = 0.0
         self._last_frame_at = 0.0
         self._starve_events = 0
@@ -184,10 +195,53 @@ class AdaptiveInputManager:
     # -- telemetry in ----------------------------------------------------
 
     def note_builtin(self, index: Optional[int]) -> None:
-        """Record the device to fall back TO. Set once, at boot."""
-        self._builtin_index = index
+        """Record the device to fall back TO. Set once, at boot.
+
+        Stores the NAME. An index captured at boot is a promise about list
+        positions that CoreAudio does not keep."""
+        self._builtin_name = self._name_of(index)
         if self._incumbent.index is None:
             self._incumbent.index = index
+            self._incumbent.name = self._builtin_name
+
+    def _name_of(self, index: Optional[int]) -> str:
+        """Current name at *index*, or "" for the system default. NEVER raises."""
+        if index is None:
+            return ""
+        try:
+            sd = self._sd
+            if sd is None:
+                import sounddevice as sd  # type: ignore[no-redef]
+            devices = sd.query_devices()
+            if 0 <= int(index) < len(devices):
+                return str(devices[int(index)].get("name", ""))
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+    def _resolve_index(self, name: str) -> Optional[int]:
+        """Where *name* lives RIGHT NOW, or None for the system default.
+
+        None is the honest answer for a device that has left the enumeration:
+        binding the system default is what the pre-adaptive pipeline did, and
+        it is always better than binding whatever inherited the old index."""
+        if not name:
+            return None
+        try:
+            sd = self._sd
+            if sd is None:
+                import sounddevice as sd  # type: ignore[no-redef]
+            for idx, dev in enumerate(sd.query_devices()):
+                if str(dev.get("name", "")) == name:
+                    if int(dev.get("max_input_channels", 0) or 0) > 0:
+                        return idx
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning(
+            "[AdaptiveInput] %r is no longer enumerated — using the system "
+            "default rather than whatever took its index", name,
+        )
+        return None
 
     def observe(self, sample: QualitySample) -> None:
         """One rejection's measurements from the live pipeline. NEVER raises."""
@@ -251,7 +305,7 @@ class AdaptiveInputManager:
                 if incumbent_sample is None:
                     raise RuntimeError("no measurements for the incumbent yet")
                 return incumbent_sample
-            if index in self._benched:
+            if self._name_of(index) in self._benched:
                 raise RuntimeError("benched this session")
             audio = self._capture(index, PROBE_S)
             return QualitySample.from_audio(audio, _PROBE_RATE)
@@ -260,18 +314,36 @@ class AdaptiveInputManager:
             lambda: rank_devices(probe=_probe, sd=self._sd),
         )
         for s in scores:
+            # The COMPONENTS, not just the index. sqi blends modulation,
+            # crest, level and belief, so a high score can hide a worse crest
+            # than the incumbent — and crest is the whole reason this manager
+            # exists. A composite number with no breakdown behind it is the
+            # gap this investigation kept falling into.
+            m = s.sample
+            detail = (
+                f" crest={m.crest_db:.1f}dB mod={m.modulation:.3f} "
+                f"rms={m.rms:.5f}" if m is not None else ""
+            )
             logger.info(
-                "[AdaptiveInput] candidate %d %r sqi=%.3f%s%s",
-                s.index, s.name, s.sqi,
+                "[AdaptiveInput] candidate %d %r sqi=%.3f%s%s%s",
+                s.index, s.name, s.sqi, detail,
                 " continuity" if s.is_continuity else "",
                 f" error={s.error}" if s.error else "",
             )
 
         winner = best_device(scores)
         if winner is None or winner.index == incumbent_idx:
+            top = scores[0] if scores else None
+            gap = (
+                top.sqi - scores[1].sqi
+                if top is not None and len(scores) > 1 else 0.0
+            )
             logger.info(
-                "[AdaptiveInput] staying on %s — nothing cleared the margin",
+                "[AdaptiveInput] staying on %s — best was %s at sqi %.3f, "
+                "%.3f ahead of the next (margin needed 0.150)",
                 incumbent_idx,
+                f"{top.index} {top.name!r}" if top is not None else "nothing",
+                top.sqi if top is not None else 0.0, gap,
             )
             self._armed = False
             self._degraded_run = 0
@@ -286,11 +358,11 @@ class AdaptiveInputManager:
         )
         ok = await self._call_rebind(winner.index)
         if not ok:
-            self._bench(winner.index, "rebind failed")
+            self._bench(winner.name, "rebind failed")
             self._armed = False
             return False
 
-        self._incumbent = _Incumbent(index=winner.index)
+        self._incumbent = _Incumbent(index=winner.index, name=winner.name)
         self._last_rebind_at = self._clock()
         self._probation_until = self._last_rebind_at + PROBATION_S
         self._last_frame_at = self._clock()
@@ -310,8 +382,8 @@ class AdaptiveInputManager:
         try:
             if not adaptive_input_enabled():
                 return False
-            if self._incumbent.index == self._builtin_index:
-                return False
+            if self._incumbent.name == self._builtin_name:
+                return False        # already home; nothing to retreat to
             now = self._clock()
             if now > self._probation_until:
                 return False
@@ -338,21 +410,28 @@ class AdaptiveInputManager:
 
         Benches the offending device so the manager cannot immediately choose
         it again and oscillate. NEVER raises."""
-        failed = self._incumbent.index
-        if failed is not None and failed != self._builtin_index:
-            self._bench(failed, reason)
+        failed_name = self._incumbent.name
+        if failed_name and failed_name != self._builtin_name:
+            self._bench(failed_name, reason)
+        # Resolve the fallback NOW, not from an index captured at boot: the
+        # enumeration may have shifted since, and binding a stale index is
+        # how a fallback lands on the very device it is retreating from.
+        builtin_index = self._resolve_index(self._builtin_name)
         logger.warning(
-            "[AdaptiveInput] falling back %s → %s (%s)",
-            failed, self._builtin_index, reason,
+            "[AdaptiveInput] falling back %r → %r (index %s) (%s)",
+            failed_name or self._incumbent.index,
+            self._builtin_name or "system default", builtin_index, reason,
         )
         try:
-            await self._call_rebind(self._builtin_index)
+            await self._call_rebind(builtin_index)
         except Exception as exc:  # noqa: BLE001
             logger.error("[AdaptiveInput] fallback rebind raised: %r", exc)
         # Incumbent is updated regardless. If even the built-in refused to
         # start, the bus has stopped itself and the truthful record is that we
         # are no longer on the remote device.
-        self._incumbent = _Incumbent(index=self._builtin_index)
+        self._incumbent = _Incumbent(
+            index=builtin_index, name=self._builtin_name,
+        )
         self._starve_events = 0
         self._probation_until = 0.0
         self._armed = False
@@ -361,9 +440,11 @@ class AdaptiveInputManager:
 
     # -- plumbing --------------------------------------------------------
 
-    def _bench(self, index: int, reason: str) -> None:
-        self._benched[index] = self._benched.get(index, 0) + 1
-        logger.info("[AdaptiveInput] benched device %d (%s)", index, reason)
+    def _bench(self, name: str, reason: str) -> None:
+        if not name:
+            return
+        self._benched[name] = self._benched.get(name, 0) + 1
+        logger.info("[AdaptiveInput] benched %r (%s)", name, reason)
 
     async def _call_rebind(self, index: Optional[int]) -> bool:
         result = self._rebind(index)

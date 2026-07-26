@@ -308,6 +308,102 @@ async def test_observe_never_raises_on_garbage() -> None:
 
 
 # --------------------------------------------------------------------------
+# 3b. device identity — indices move under you (found in live testing)
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fallback_follows_the_device_not_the_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bug the first live run exposed.
+
+    Observed: a Continuity microphone left the enumeration when the phone
+    slept, and 'MacBook Pro Microphone' moved from index 1 to index 0. A
+    fallback target remembered as the integer 0 would, once the phone
+    reconnects and retakes index 0, bind the PHONE while believing it was
+    retreating to the built-in array — the one path that must always be
+    correct, pointed at the device it is fleeing."""
+    sd = _SD()
+    # Boot order: built-in is at index 1, behind the Continuity device.
+    bus, clock = _Bus(), _Clock()
+    m = ai.AdaptiveInputManager(
+        rebind=bus.rebind,
+        probe_factory=lambda _i, s: np.zeros(int(16000 * s), np.float32),
+        sd=sd, clock=clock,
+    )
+    m.note_builtin(1)                       # 'MacBook Pro Microphone'
+
+    monkeypatch.setattr(
+        ai.QualitySample, "from_audio", staticmethod(lambda *a, **k: _near()),
+    )
+    for _ in range(ai.DEGRADED_RUN):
+        m.observe(_far())
+    assert await m.on_speech() is True
+    assert bus.bound == 0, "expected a swap to the Continuity device"
+
+    # The enumeration now REORDERS: something is inserted ahead of both, so
+    # the built-in is at 2 and index 1 belongs to a different device.
+    sd.devices.insert(0, {"name": "USB Interface", "max_input_channels": 2})
+
+    await m.fall_back("phone slept")
+    assert bus.bound == 2, (
+        f"fell back to index {bus.bound} — followed the stale index instead "
+        f"of the device named 'MacBook Pro Microphone'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_vanished_fallback_device_binds_the_system_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the built-in is not enumerated at all, None (system default) is the
+    honest answer — never whatever inherited its old index."""
+    sd = _SD()
+    bus, clock = _Bus(), _Clock()
+    m = ai.AdaptiveInputManager(
+        rebind=bus.rebind,
+        probe_factory=lambda _i, s: np.zeros(int(16000 * s), np.float32),
+        sd=sd, clock=clock,
+    )
+    m.note_builtin(0)                       # 'MacBook Pro Microphone'
+    sd.devices = [{"name": "Some Other Mic", "max_input_channels": 1}]
+
+    await m.fall_back("device gone")
+    assert bus.bound is None, "bound a stranger that inherited the index"
+
+
+@pytest.mark.asyncio
+async def test_bench_survives_reindexing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A device benched for starving us must stay benched under its own name,
+    not release a different device from the bench when indices shift."""
+    sd = _SD()
+    bus, clock = _Bus(refuse={1}), _Clock()
+    m = ai.AdaptiveInputManager(
+        rebind=bus.rebind,
+        probe_factory=lambda _i, s: np.zeros(int(16000 * s), np.float32),
+        sd=sd, clock=clock,
+    )
+    m.note_builtin(0)
+    monkeypatch.setattr(
+        ai.QualitySample, "from_audio", staticmethod(lambda *a, **k: _near()),
+    )
+    for _ in range(ai.DEGRADED_RUN):
+        m.observe(_far())
+    await m.on_speech()                     # fails -> benches by NAME
+
+    sd.devices.insert(0, {"name": "USB Interface", "max_input_channels": 2})
+    clock.t += ai.COOLDOWN_S * 2
+    for _ in range(ai.DEGRADED_RUN):
+        m.observe(_far())
+    await m.on_speech()
+    assert 2 not in bus.calls, (
+        "the benched device came back under its new index"
+    )
+
+
+# --------------------------------------------------------------------------
 # 4. DRY — scoring is acoustic_quality's, not a second copy
 # --------------------------------------------------------------------------
 
