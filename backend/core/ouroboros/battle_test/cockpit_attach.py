@@ -638,6 +638,37 @@ class CockpitAttachBridge:
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] lane history degraded", exc_info=True)
 
+    def announce_lane_reaped(self, lane: str) -> None:
+        """Tell every cockpit a lane no longer exists. NEVER raises.
+
+        Broadcast, not addressed: any terminal could be focused on it. This
+        is the one lane message that is genuinely everyone's business."""
+        try:
+            if not self._clients:
+                return
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+            msg = {"type": "lane_reaped", "lane": str(lane), "ts": time.time()}
+
+            def _emit() -> None:
+                from backend.core.ouroboros.battle_test.attach_session import (
+                    session_scope,
+                )
+                with session_scope(None):     # ambient — reaches all cockpits
+                    self._broadcast(msg)
+
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                _emit()
+            else:
+                loop.call_soon_threadsafe(_emit)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] reap announce degraded", exc_info=True)
+
     def bind_session(self, session_id: str, w: asyncio.StreamWriter) -> None:
         """Associate a cockpit's declared identity with its socket.
 
@@ -776,6 +807,7 @@ class CockpitAttachClient:
         on_audio_state: Optional[Callable[[str], None]] = None,
         on_thermal: Optional[Callable[[str], None]] = None,
         on_lane_history: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_lane_reaped: Optional[Callable[[str], None]] = None,
         path: Optional[Path] = None,
     ) -> None:
         self._path = Path(path) if path is not None else attach_socket_path()
@@ -791,6 +823,9 @@ class CockpitAttachClient:
         #: Focused-lane hydration payloads (D3). Absent handler = the client
         #: does not use selection; the frame is simply not dispatched.
         self._on_lane_history = on_lane_history or (lambda _p: None)
+        #: A lane stopped existing. The FSM cannot infer this from an absent
+        #: heartbeat row — that is indistinguishable from a slow frame.
+        self._on_lane_reaped = on_lane_reaped or (lambda _l: None)
         #: This cockpit's identity for the life of the attachment. Declared
         #: on every outbound frame so the daemon can address answers back to
         #: the terminal that asked, instead of to all of them.
@@ -960,6 +995,10 @@ class CockpitAttachClient:
                 elif ftype == "thermal":
                     self._safe_cb_text(
                         self._on_thermal, str(frame.get("state", "")),
+                    )
+                elif ftype == "lane_reaped":
+                    self._safe_cb_text(
+                        self._on_lane_reaped, str(frame.get("lane", "")),
                     )
                 elif ftype == "lane_history":
                     try:

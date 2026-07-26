@@ -4597,6 +4597,17 @@ class BattleTestHarness:
                 except Exception:  # noqa: BLE001
                     logger.debug("[Moltbook] live feed wiring degraded",
                                  exc_info=True)
+                # D4: a reaped lane must eject any cockpit focused on it.
+                try:
+                    from backend.core.ouroboros.battle_test.lane_rings import (
+                        get_lane_registry,
+                    )
+                    self._lane_unsub = get_lane_registry().on_reap(
+                        bridge.announce_lane_reaped,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("[Moltbook] live feed wiring degraded",
+                                 exc_info=True)
                 # Attach heartbeat (2026-07-23): ~1s CC-style pulse
                 # (verb · elapsed · ↓ tokens · provider) published on
                 # the telemetry lane; publish_telemetry no-ops with

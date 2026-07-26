@@ -95,15 +95,22 @@ def _ctx(
 
 
 class TestTaxonomy:
-    def test_termination_cause_eight_values(self):
-        assert len(list(TerminationCause)) == 8
+    def test_termination_cause_nine_values(self):
+        assert len(list(TerminationCause)) == 9
 
     def test_termination_cause_vocabulary_frozen(self):
         # Pin the literal vocabulary against silent additions.
+        #
+        # UPDATED, not loosened. This pin's whole job is to make an addition
+        # impossible to land silently, so the correct response to it failing
+        # is to acknowledge the new member here — which is also the moment
+        # the contributor is forced to classify it in
+        # _CAUSE_TO_SESSION_OUTCOME. `process_memory_cap` reached the enum
+        # without either step; both are done now.
         expected = {
             "wall_clock_cap", "sigterm", "sigint", "sighup",
             "idle_timeout", "budget_exceeded", "normal_exit",
-            "unknown",
+            "process_memory_cap", "unknown",
         }
         assert {c.value for c in TerminationCause} == expected
 

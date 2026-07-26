@@ -64,7 +64,10 @@ class TestDualClientMultiplex:
             # BOTH clients update from the ONE broadcast:
             assert await _wait(lambda: ov_ui.audio_state == "SPEAKING")
             assert await _wait(lambda: topo.state["audio"] == "SPEAKING")
-            assert ov_ui.prompt() == "🗣 Karen (speaking) › "   # ov morph
+            # The caret is the LAST line: the live region (pulse + deck)
+            # renders above it, so prompt() is a block rather than one string.
+            # What this pins is unchanged — the audio state morphs the caret.
+            assert ov_ui.prompt().splitlines()[-1] == "🗣 Karen (speaking) › "
             assert "🗣 speaking" in topo.render()               # jarvis map
             assert "lease: HELD" in topo.render()
         finally:

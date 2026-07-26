@@ -399,6 +399,9 @@ class AttachUI:
         self._lanes: List[dict] = []
         self._focus_lines: List[str] = []
         self._focus_note: str = ""
+        self._flash_text: str = ""
+        self._flash_until: float = 0.0
+        self._deck_size: str = "full"
         try:
             from backend.core.ouroboros.battle_test.cockpit_fsm import (
                 CockpitFSM,
@@ -406,6 +409,65 @@ class AttachUI:
             self.fsm: Any = CockpitFSM(lanes_provider=lambda: self._lanes)
         except Exception:  # noqa: BLE001
             self.fsm = None
+
+    def on_lane_reaped(self, lane: str) -> None:
+        """The daemon garbage-collected a lane. Eject if we are in it.
+
+        DRY: an auto-eject is the daemon pressing Esc for the operator, so it
+        calls the SAME ``fsm.escape()`` the key binding calls — one transition
+        path, one set of invariants. A parallel "force_flow" would be a second
+        way to reach FLOW that could drift from the first.
+
+        The flash matters as much as the transition. Silently yanking someone
+        out of a pane looks like the UI glitched; naming it turns a mystery
+        into an explanation. NEVER raises."""
+        try:
+            fsm = self.fsm
+            if fsm is None or not lane:
+                return
+            if fsm.focused_lane != lane:
+                return          # not our pane — nothing to eject from
+            fsm.escape()
+            self.flash(f"lane {lane} expired — returned to ambient view")
+            self._focus_lines = []
+            self._focus_note = ""
+            self._invalidate()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def flash(self, message: str, seconds: float = 4.0) -> None:
+        """Show a transient notice above the caret. NEVER raises."""
+        try:
+            import time as _t
+            self._flash_text = str(message)
+            self._flash_until = _t.monotonic() + max(0.5, float(seconds))
+            self._invalidate()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _flash_line(self) -> Optional[str]:
+        try:
+            import time as _t
+            if self._flash_text and _t.monotonic() < self._flash_until:
+                return f"  [yellow]![/yellow] {self._flash_text}"
+            self._flash_text = ""
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def set_deck_size(self, mode: str) -> str:
+        """``/deck off|compact|full`` — the operator's screen budget.
+
+        Height is a CLIENT concern: two cockpits on different terminals want
+        different amounts of screen, and the daemon has no business knowing
+        how tall anyone's window is."""
+        mode = str(mode or "").strip().lower()
+        sizes = {"off": 0, "compact": 2, "full": 8}
+        if mode not in sizes:
+            return f"deck: {self._deck_size} (off | compact | full)"
+        self._deck_size = mode
+        self._invalidate()
+        return f"deck: {mode}"
 
     def refresh(self) -> None:
         """Repaint after a mode change. Alias of the invalidate seam so key
@@ -471,18 +533,59 @@ class AttachUI:
             pass
 
     def prompt(self) -> str:
-        return self._PROMPTS.get(self.audio_state, "ov › ")
+        """The live region sits ABOVE the input line, then the caret.
 
-    def toolbar(self) -> str:
-        note = self._TOOLBAR_NOTES.get(self.audio_state)
-        if note is not None:
-            audio = f" · {note}"
-        elif self.audio_state == "OFFLINE":
-            audio = " · voice: off ('wake')"
-        else:
-            audio = f" · voice: {self.audio_state.lower()}"
-        # CC-style live pulse while the organism works — falls back to
-        # the idle line when inactive/stale. NEVER raises.
+        Operator correction, and it is the right shape: the pulse, the deck
+        and a focused pane are all things the organism is DOING, and reading
+        order runs downward — status, then the line you are typing. A live
+        region below the caret makes the eye travel back up to read what just
+        happened, and the caret drifts down the screen as the region grows.
+
+        prompt_toolkit renders a multi-line ``message`` above the cursor and
+        repaints the whole block on invalidate, so this is the same seam and
+        the same redraw machinery — no second region, no manual cursor math.
+        The bottom toolbar keeps only the static key hints, which genuinely
+        do belong under the input."""
+        caret = self._PROMPTS.get(self.audio_state, "ov › ")
+        try:
+            block = self._live_region()
+            return f"{block}\n{caret}" if block else caret
+        except Exception:  # noqa: BLE001 — a caret always renders
+            return caret
+
+    def _live_region(self) -> str:
+        """Pulse + (deck | lanes | focused pane) — the block above the caret.
+
+        One region, three states, exactly as before; only its position moved.
+        Composed from the same pieces the toolbar used, so nothing about the
+        deck, the FSM or the heartbeat formatter had to change."""
+        try:
+            pulse = self._pulse_line()
+            flash = self._flash_line()
+            mode_lines = self._mode_lines()
+            if mode_lines is not None:
+                return "\n".join([pulse] + ([flash] if flash else []) + mode_lines)
+            from backend.core.ouroboros.battle_test.ambient_deck import (
+                GLYPHS,
+                deck_enabled,
+            )
+            head = [pulse] + ([flash] if flash else [])
+            cap = {"off": 0, "compact": 2, "full": 99}.get(self._deck_size, 99)
+            if self.deck is None or not deck_enabled() or cap == 0:
+                return "\n".join(head)
+            rows = self.deck.rows()[:cap]
+            if not rows:
+                return "\n".join(head)
+            return "\n".join(
+                head + [
+                    f"  {GLYPHS.get(sev, '·')} {text}" for sev, text in rows
+                ]
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _pulse_line(self) -> str:
+        """The CC-style working pulse, or the idle breadcrumb."""
         try:
             from backend.core.ouroboros.battle_test.attach_heartbeat import (
                 format_heartbeat_line,
@@ -491,12 +594,33 @@ class AttachUI:
                 self._heartbeat, arrival_mono=self._heartbeat_arrived,
             )
             if pulse:
-                return self._with_deck(f"{pulse}{audio} · 'detach' to leave")
-        except Exception:
+                return pulse
+        except Exception:  # noqa: BLE001
             pass
-        return self._with_deck(
-            f" ov attach — organism live{audio} · 'detach' to leave"
-        )
+        return "  ov attach — organism live"
+
+    def toolbar(self) -> str:
+        """Static key hints only. The live region moved above the caret; what
+        remains under the input is the affordance list, which genuinely
+        belongs there because it describes the line you are typing on."""
+        note = self._TOOLBAR_NOTES.get(self.audio_state)
+        if note is not None:
+            audio = f" · {note}"
+        elif self.audio_state == "OFFLINE":
+            audio = " · voice: off ('wake')"
+        else:
+            audio = f" · voice: {self.audio_state.lower()}"
+        try:
+            from backend.core.ouroboros.battle_test.cockpit_fsm import (
+                MODE_FLOW, selection_enabled,
+            )
+            keys = ""
+            if selection_enabled() and self.fsm is not None:
+                keys = (" · ^O lanes" if self.fsm.mode == MODE_FLOW
+                        else " · esc back")
+        except Exception:  # noqa: BLE001
+            keys = ""
+        return f"{audio.lstrip(' ·')}{keys} · 'detach' to leave"
 
     def _mode_lines(self) -> Optional[List[str]]:
         """SELECT / FOCUS rendering, or None to fall through to the deck.
@@ -672,6 +796,16 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
             "mute": "sleep", "sleep": "sleep",
             "barge": "barge",
         }
+        # /deck sizing is a CLIENT concern — two cockpits on different
+        # terminals want different amounts of screen, and the daemon has no
+        # business knowing how tall anyone's window is. Handled here rather
+        # than relayed.
+        if low.startswith("/deck") or low == "deck" or low.startswith("deck "):
+            arg = text.split(None, 1)[1].strip() if " " in text else ""
+            if ui is not None and hasattr(ui, "set_deck_size"):
+                ui.flash(ui.set_deck_size(arg))
+            return "handled"
+
         cmd = audio_verbs.get(low)
         if cmd is not None:
             # AUTO-SPAWN REFLEX. `ov` boots ouroboros_battle_test.py, which has
@@ -1440,6 +1574,7 @@ def run_attach(console: Any) -> int:
             on_telemetry=ui.on_telemetry,
             on_audio_state=ui.on_audio_state,
             on_lane_history=ui.on_lane_history,
+            on_lane_reaped=ui.on_lane_reaped,
         )
         if not await client.connect():
             console.print(_NO_ORGANISM_MESSAGE, markup=False, highlight=False)

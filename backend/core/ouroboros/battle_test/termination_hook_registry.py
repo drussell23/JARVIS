@@ -966,6 +966,11 @@ def register_shipped_invariants() -> list:
                 "WALL_CLOCK_CAP", "SIGTERM", "SIGINT", "SIGHUP",
                 "IDLE_TIMEOUT", "BUDGET_EXCEEDED",
                 "NORMAL_EXIT", "UNKNOWN",
+                # Widened deliberately. The pin demands "update the AST pin
+                # AND the test suite when widening the vocabulary" — both
+                # done, along with the _CAUSE_TO_SESSION_OUTCOME mapping the
+                # addition had silently skipped.
+                "PROCESS_MEMORY_CAP",
             },
         )
 
