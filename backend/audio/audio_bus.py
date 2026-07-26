@@ -166,6 +166,41 @@ _AGC_RELEASE_S = _agc_env("JARVIS_AUDIO_AGC_RELEASE_S", 2.0, 0.05, 60.0)
 #: whole session toward silence with no way back inside the release constant.
 _AGC_MIN_GAIN = _agc_env("JARVIS_AUDIO_AGC_MIN_GAIN", 0.02, 1e-4, 1.0)
 
+# --- upward normalization -------------------------------------------------
+#
+# Measured on this machine: the operator's speech arrives at peak 0.070,
+# rms 0.0029 — 27x quieter than a played probe on the SAME microphone, and
+# whisper cannot read it from the raw device tap. Scaling DOWN was never
+# going to help that; the signal needs to come UP.
+
+#: Below this peak the frame is a candidate for boosting.
+_AGC_QUIET_PEAK = _agc_env("JARVIS_AUDIO_AGC_QUIET_PEAK", 0.10, 0.01, 0.90)
+
+#: Where a boosted frame is placed. Comfortably below the ceiling so a
+#: boosted transient cannot punch through it, and in the range whisper's
+#: feature extractor is happiest with.
+_AGC_NOMINAL = _agc_env("JARVIS_AUDIO_AGC_NOMINAL", 0.50, 0.05, 0.90)
+
+#: Ceiling on boost. Without it, a silent room would be multiplied until its
+#: noise floor filled the range — deafening static, and a VAD that fires on
+#: everything.
+_AGC_MAX_BOOST = _agc_env("JARVIS_AUDIO_AGC_MAX_BOOST", 24.0, 1.0, 200.0)
+
+#: How far above the tracked noise floor a peak must sit before it is treated
+#: as signal. Measured separation on this machine: speech peaks 0.070 against
+#: an ambient floor of 0.0068 — 20dB. RMS separation was only 3.7dB, which is
+#: why the gate keys on PEAK.
+_AGC_SQUELCH_RATIO = _agc_env("JARVIS_AUDIO_AGC_SQUELCH_RATIO", 4.0, 1.1, 100.0)
+
+#: Absolute floor. Below this a frame is silence in any room.
+_AGC_SQUELCH_ABS = _agc_env("JARVIS_AUDIO_AGC_SQUELCH_ABS", 0.005, 1e-5, 0.5)
+
+#: Noise-floor tracker time constants. Rises slowly (a room that gets louder
+#: is learned over seconds) and falls quickly (a room that goes quiet must be
+#: believed at once, or the gate stays shut through the next utterance).
+_AGC_FLOOR_RISE_S = _agc_env("JARVIS_AUDIO_AGC_FLOOR_RISE_S", 8.0, 0.1, 120.0)
+_AGC_FLOOR_FALL_S = _agc_env("JARVIS_AUDIO_AGC_FLOOR_FALL_S", 1.0, 0.05, 60.0)
+
 _AGC_THRESHOLD = max(0.05, min(0.99, float(
     os.getenv("JARVIS_AUDIO_AGC_THRESHOLD", "0.75"),
 )))
@@ -451,6 +486,7 @@ class AudioBus:
         self._agc_gain: float = 1.0          # current linear gain, 1.0 = off
         self._range_peak: float = 0.0        # loudest input peak ever seen
         self._range_reports: int = 0         # log budget for over-scale input
+        self._noise_floor: float = 0.0       # adaptive room-quiet estimate
         self._aec: Optional[AcousticEchoCanceller] = None
         self._resampler_down: Optional[Resampler] = None      # 48k -> 16k (mic)
         self._resampler_aec_ref: Optional[Resampler] = None  # 48k -> 16k (AEC ref)
@@ -883,7 +919,32 @@ class AudioBus:
                 dt = out.size / max(rate, 1.0)
                 coeff = float(np.exp(-dt / _AGC_RELEASE_S))
                 target_gain = min(1.0, prev * coeff + 1.0 * (1.0 - coeff))
+            elif peak < _AGC_QUIET_PEAK:
+                # UPWARD NORMALIZATION.
+                #
+                # The operator's speech measured peak 0.070 / rms 0.0029 here
+                # — 27x quieter than a played probe on the same microphone,
+                # and unreadable by whisper from the raw device tap. A
+                # governor that only ever attenuates cannot help that; a
+                # signal this far down needs to come up.
+                #
+                # Gated on an ADAPTIVE noise floor rather than a fixed
+                # threshold, because "quiet" is a property of the room, not a
+                # constant. Boosting the floor would turn a silent room into
+                # static and give the endpointer a signal that never stops.
+                floor = self._track_noise_floor(peak, out.size)
+                gate = max(_AGC_SQUELCH_ABS, floor * _AGC_SQUELCH_RATIO)
+                if peak <= gate or peak <= 0.0:
+                    # Noise floor, or silence. Left ALONE — not scaled, not
+                    # muted: the caller's frame is the honest answer.
+                    self._agc_gain = 1.0
+                    self._range_peak = max(getattr(self, "_range_peak", 0.0), peak)
+                    return out if sanitized else frame
+                boost = min(_AGC_MAX_BOOST, _AGC_NOMINAL / peak)
+                target_gain = max(1.0, boost)
+                frame_gain = target_gain
             else:
+                self._track_noise_floor(peak, out.size)
                 self._agc_gain = 1.0
                 self._range_peak = max(getattr(self, "_range_peak", 0.0), peak)
                 # Return the SANITISED array when sanitising happened. The
@@ -919,6 +980,33 @@ class AudioBus:
         except Exception:  # noqa: BLE001 — audio thread: never propagate
             return frame
 
+    def _track_noise_floor(self, peak: float, n_samples: int) -> float:
+        """Follow the room's quiet level. Returns the current floor estimate.
+
+        Asymmetric on purpose, and in the opposite direction to the gain
+        release: the floor RISES slowly (a room that gets noisier is learned
+        over seconds, so one cough does not raise the gate) and FALLS quickly
+        (a room that goes quiet must be believed immediately, or the gate
+        stays shut through the operator's next sentence).
+
+        Fed every frame including loud ones — a floor that only sampled quiet
+        frames would never learn that the room got louder, and would gate
+        speech as though it were still silent. The slow rise is what keeps
+        speech from dragging the floor up to meet it."""
+        try:
+            rate = float(getattr(self._config, "internal_rate", 16000) or 16000)
+            dt = max(n_samples, 1) / max(rate, 1.0)
+            prev = getattr(self, "_noise_floor", None)
+            if prev is None or not np.isfinite(prev) or prev <= 0.0:
+                self._noise_floor = max(peak, 1e-6)
+                return self._noise_floor
+            tau = _AGC_FLOOR_RISE_S if peak > prev else _AGC_FLOOR_FALL_S
+            coeff = float(np.exp(-dt / max(tau, 1e-6)))
+            self._noise_floor = float(prev * coeff + peak * (1.0 - coeff))
+            return self._noise_floor
+        except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+            return getattr(self, "_noise_floor", 1e-6)
+
     def agc_state(self) -> dict:
         """Observability seam — what the governor is currently doing."""
         return {
@@ -927,6 +1015,10 @@ class AudioBus:
             "target": _AGC_TARGET,
             "release_s": _AGC_RELEASE_S,
             "peak_seen": round(float(getattr(self, "_range_peak", 0.0)), 4),
+            "noise_floor": round(float(getattr(self, "_noise_floor", 0.0) or 0.0), 6),
+            "quiet_peak": _AGC_QUIET_PEAK,
+            "nominal": _AGC_NOMINAL,
+            "max_boost": _AGC_MAX_BOOST,
         }
 
     def _on_mic_frame(self, raw_frame: np.ndarray) -> None:
