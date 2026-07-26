@@ -36,7 +36,29 @@ SCOPE=("docs/" "scripts/")
 EXEMPT=(
     "scripts/check_no_stdin_guard.sh"
     "docs/operations/battle_test_runbook.md"
+    # Archival memory: postmortems and topic records describe what HAPPENED,
+    # including the incidents this pattern caused. Rewriting history to
+    # satisfy a lint would destroy the evidence that motivated the ban.
+    "docs/memory_topics/"
+    # Generated HTML renders of docs already scanned in Markdown form. The
+    # source is checked; the artifact is a duplicate whose line breaks fall
+    # in different places, which is how a correctly-marked deprecation notice
+    # in the .md failed as an unmarked hit in the .html.
+    "*.html"
 )
+
+# The rule is USE vs MENTION, and a path allowlist cannot express that.
+#
+# Every document that correctly tells a reader "the old idiom is dead, use
+# --headless" contains the string it is warning about, so a path-based
+# exemption has to be edited on every such doc — which guarantees drift and
+# is exactly how this guard came to fail on OV_RESEARCH_PAPER_2026-04-16.md,
+# a file whose only offence was documenting the deprecation.
+#
+# A line that MARKS the pattern as retired is prose about the ban, not a
+# copy-pasteable command. Matching that intent keeps the guard honest without
+# a list to maintain.
+MENTION_MARKER='deprecated|replaces|replaced|instead of|no longer|banned|do not use|don'"'"'t use|superseded'
 
 # Build a `git grep` exclude list from the EXEMPT array.
 EXCLUDE_ARGS=()
@@ -45,25 +67,28 @@ for f in "${EXEMPT[@]}"; do
 done
 
 if command -v git > /dev/null 2>&1 && git rev-parse --git-dir > /dev/null 2>&1; then
-    if git grep -E "${PATTERN}" -- "${SCOPE[@]}" "${EXCLUDE_ARGS[@]}" 2>/dev/null; then
-        echo "" >&2
-        echo "ERROR: banned 'tail -f /dev/null | python' stdin-guard pattern" \
-             "found in docs/ or scripts/." >&2
-        echo "       Use --headless instead. See docs/operations/battle_test_runbook.md." >&2
-        exit 1
-    fi
+    HITS=$(git grep -nE "${PATTERN}" -- "${SCOPE[@]}" "${EXCLUDE_ARGS[@]}" 2>/dev/null || true)
 else
     # grep -r fallback: build --exclude= args from EXEMPT basenames
     EXCLUDE_GREP=()
     for f in "${EXEMPT[@]}"; do
         EXCLUDE_GREP+=("--exclude=$(basename "${f}")")
     done
-    if grep -rE "${PATTERN}" "${EXCLUDE_GREP[@]}" "${SCOPE[@]}" 2>/dev/null; then
-        echo "" >&2
-        echo "ERROR: banned 'tail -f /dev/null | python' stdin-guard pattern" \
-             "found in docs/ or scripts/." >&2
-        exit 1
-    fi
+    HITS=$(grep -rnE "${PATTERN}" "${EXCLUDE_GREP[@]}" "${SCOPE[@]}" 2>/dev/null || true)
+fi
+
+# Drop lines that document the ban rather than commit it.
+VIOLATIONS=$(printf '%s\n' "${HITS}" | grep -vEi "${MENTION_MARKER}" | sed '/^$/d' || true)
+
+if [ -n "${VIOLATIONS}" ]; then
+    printf '%s\n' "${VIOLATIONS}" >&2
+    echo "" >&2
+    echo "ERROR: banned 'tail -f /dev/null | python' stdin-guard pattern" \
+         "found in docs/ or scripts/." >&2
+    echo "       Use --headless instead. See docs/operations/battle_test_runbook.md." >&2
+    echo "       (Prose documenting the deprecation is allowed — mark it with" \
+         "'deprecated', 'replaces', 'instead of', etc.)" >&2
+    exit 1
 fi
 
 echo "OK: no banned stdin-guard patterns in docs/ or scripts/."

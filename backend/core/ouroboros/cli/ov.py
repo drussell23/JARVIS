@@ -89,10 +89,45 @@ def _render_markup_frame(text: str, console: Any = None) -> None:
         if canvas is not None:
             canvas.push_raw(safe)
             return
-        if console is not None:
-            console.print(safe, highlight=False)
-        else:
-            print(raw)
+        # NON-DESTRUCTIVE INJECTION.
+        #
+        # A Rich Console binds sys.stdout at CONSTRUCTION. `patch_stdout`
+        # swaps sys.stdout afterwards, so a console built before the prompt
+        # started writes straight past the proxy and paints over the line the
+        # operator is typing. `_print_line` already documents this — "a
+        # pre-bound Rich console would bypass the patch and corrupt the input
+        # line" — and then this branch did precisely that.
+        #
+        # It mattered little while markup carried only occasional op chrome.
+        # It matters now: every Moltbook post and all 60 REPL verb results
+        # arrive on this channel, unprompted, while the operator types.
+        #
+        # The fix is to bind LATE, not to build a redraw engine. A console
+        # constructed against the CURRENT sys.stdout is the patched proxy, so
+        # prompt_toolkit renders the line above the prompt and redraws the
+        # input buffer intact — its own machinery, reused rather than
+        # reimplemented. Width is inherited from the original console so the
+        # proxy (not a tty) does not collapse to 80 columns.
+        _emitted = False
+        try:
+            import sys as _sys
+
+            from rich.console import Console as _Console
+            _kw = {"file": _sys.stdout, "highlight": False}
+            _width = getattr(console, "width", None)
+            if isinstance(_width, int) and _width > 0:
+                _kw["width"] = _width
+            _late = _Console(**{k: v for k, v in _kw.items()
+                                if k != "highlight"})
+            _late.print(safe, highlight=False)
+            _emitted = True
+        except Exception:  # noqa: BLE001 — never lose the frame
+            _emitted = False
+        if not _emitted:
+            if console is not None:
+                console.print(safe, highlight=False)
+            else:
+                print(raw)
     except Exception:  # noqa: BLE001
         try:
             print(str(text))

@@ -73,14 +73,26 @@ def test_shutdown_deadline_default_30s(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_intake_lock_stale_ttl_default_7200s_in_source():
-    """Source-grep: stale-TTL default is 7200 (2h) in the lock cleanup."""
+    """Stale-TTL default is 7200 (2h) in the lock cleanup.
+
+    Matched with whitespace tolerance rather than as a contiguous literal.
+    The previous form asserted ``'JARVIS_INTAKE_LOCK_STALE_TTL_S", "7200"'``
+    appeared verbatim, so reflowing the ``os.environ.get(...)`` call across
+    three lines broke the pin while the flag, the default and the behaviour
+    were all completely unchanged. A pin that fails on line breaks is
+    measuring the formatter, not the invariant.
+    """
+    import re
+
     src = Path(
         "backend/core/ouroboros/governance/intake/unified_intake_router.py"
     ).read_text()
-    # Used in the staleness check default fallback
-    assert 'JARVIS_INTAKE_LOCK_STALE_TTL_S", "7200"' in src
-    # Default 7200s
-    assert "_stale_ttl = 7200.0" in src
+    assert re.search(
+        r'"JARVIS_INTAKE_LOCK_STALE_TTL_S"\s*,\s*"7200"', src,
+    ), "the stale-TTL env default is no longer 7200"
+    assert re.search(r"_stale_ttl\s*=\s*7200\.0", src), (
+        "the stale-TTL parse fallback is no longer 7200.0"
+    )
 
 
 def test_exit_code_harness_wedged_constant():
@@ -292,26 +304,45 @@ def test_slice_3_pin_canonical_pgrep_consistent_runbook_vs_launcher():
 
 
 def test_slice_3_pin_codebase_clean_of_banned_pattern():
-    """Slice 3 — no banned 'tail -f /dev/null | python' pattern outside
-    the documented exemptions (guard script + runbook)."""
-    EXEMPT_PATHS = {
-        "scripts/check_no_stdin_guard.sh",
-        "docs/operations/battle_test_runbook.md",
-    }
-    for scope in (Path("docs"), Path("scripts")):
-        for f in scope.rglob("*"):
-            if not f.is_file():
-                continue
-            relpath = str(f.as_posix())
-            if relpath in EXEMPT_PATHS:
-                continue
-            try:
-                content = f.read_text(errors="ignore")
-            except (OSError, UnicodeDecodeError):
-                continue
-            assert "tail -f /dev/null | python" not in content, (
-                f"banned pattern found in {f} — use --headless instead"
-            )
+    """Slice 3 — no banned 'tail -f /dev/null | python' pattern in the
+    prescriptive surfaces an operator copy-pastes from.
+
+    DELEGATES to the guard script rather than re-implementing the scan.
+    This test used to carry its own copy of the rule with its own hardcoded
+    exemption list, and the two drifted: the script and the test disagreed
+    about whether a research paper documenting the deprecation was a
+    violation. One invariant, one implementation — the script is the
+    authority because CI runs it.
+    """
+    result = subprocess.run(
+        ["bash", "scripts/check_no_stdin_guard.sh"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"banned stdin-guard pattern present — use --headless instead.\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    )
+
+
+def test_slice_3_guard_still_detects_a_real_use(tmp_path):
+    """The guard must not have been softened into uselessness.
+
+    A rule that exempts its way to green is worse than no rule, so this
+    proves the mention-marker still lets an actual runnable command through
+    to a failure."""
+    marked = "The deprecated `tail -f /dev/null | python3 ...` idiom is gone."
+    unmarked = "    tail -f /dev/null | python3 scripts/ouroboros_battle_test.py"
+
+    import re
+    src = Path("scripts/check_no_stdin_guard.sh").read_text()
+    m = re.search(r"MENTION_MARKER='([^']*(?:'\"'\"'[^']*)*)'", src)
+    assert m, "guard no longer declares a MENTION_MARKER"
+    marker = m.group(1).replace("'\"'\"'", "'")
+
+    assert re.search(marker, marked, re.I), "a documented mention would fail"
+    assert not re.search(marker, unmarked, re.I), (
+        "a bare runnable command is being treated as documentation"
+    )
 
 
 # ---------------------------------------------------------------------------

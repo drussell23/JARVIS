@@ -31,12 +31,32 @@ def tmp_harness(tmp_path: Path) -> Iterator[BattleTestHarness]:
     """Build a harness rooted in tmp_path. Clean up its atexit handler
     after the test so pytest's own shutdown doesn't fire 100 fallbacks
     across a suite run."""
+    # Make tmp_path a PLAUSIBLE repo root before building the config.
+    #
+    # HarnessConfig.__post_init__ re-anchors repo_path to the real .git root
+    # unless the path "carries the canonical source tree"
+    # (_repo_root_plausible). A bare tmp_path does not, so the config silently
+    # redirected to the developer's actual repo: this fixture wrote its
+    # summary into tmp_path and LastSessionSummary then read the REAL
+    # .ouroboros/sessions/, returning whichever live session sorted highest
+    # (observed: bt-iso-1783997989). The isolation was theatre, and the test
+    # only started failing once that directory accumulated real sessions.
+    #
+    # The re-anchor already documents the escape hatch — "an explicit,
+    # already-plausible repo root (e.g. a worktree or a hermetic fixture) is
+    # honored verbatim". This makes the fixture hermetic enough to qualify.
+    (tmp_path / "backend" / "core" / "ouroboros").mkdir(parents=True, exist_ok=True)
+
     session_dir = tmp_path / ".ouroboros" / "sessions" / "bt-unit-test"
     config = HarnessConfig(
         repo_path=tmp_path,
         cost_cap_usd=0.05,
         idle_timeout_s=30.0,
         session_dir=session_dir,
+    )
+    assert config.repo_path == tmp_path.resolve(), (
+        "the harness re-anchored away from the fixture root — this test is "
+        "not isolated and will read the developer's live sessions"
     )
     harness = BattleTestHarness(config)
     yield harness

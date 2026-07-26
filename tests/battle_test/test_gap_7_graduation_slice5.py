@@ -81,12 +81,21 @@ class _StubRegistry:
 
 
 def test_register_flags_seeds_six_specs():
-    """Three master flags + three sub-knobs = six FlagSpecs."""
+    """The Gap #7 flags are all registered.
+
+    Asserted as a SUBSET, not an exact set/count. The original pinned
+    ``count == 6`` and an exact name set, so every legitimately-added flag
+    broke it — the borderless op-block and TUI-pulse knobs from the later
+    cockpit arcs took it to 8 while nothing this test cares about changed.
+
+    A removal is still caught: the required names below must all be present.
+    An addition is the normal case and should not fail a graduation pin.
+    """
     reg = _StubRegistry()
     count = register_flags(reg)
-    assert count == 6
     names = {s.name for s in reg.registered}
-    assert names == {
+    assert count == len(reg.registered), "count disagrees with what was registered"
+    assert names >= {
         "JARVIS_PRESENTATION_RESTRAINT_ENABLED",
         "JARVIS_REPL_COMPLETION_ENABLED",
         "JARVIS_REPL_HISTORY_ENABLED",
