@@ -148,7 +148,7 @@ class TestAdapterSchema:
             == "partial_summary_writer"
         )
 
-    def test_cause_map_covers_all_8_causes(self):
+    def test_cause_map_covers_all_causes(self):
         # Every TerminationCause must have an explicit mapping —
         # silent additions to TerminationCause MUST be classified
         # against this map by the next contributor.

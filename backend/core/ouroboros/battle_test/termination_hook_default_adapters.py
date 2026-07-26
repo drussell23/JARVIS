@@ -185,6 +185,18 @@ _CAUSE_TO_SESSION_OUTCOME: dict = {
     TerminationCause.WALL_CLOCK_CAP: "complete",
     TerminationCause.IDLE_TIMEOUT: "complete",
     TerminationCause.BUDGET_EXCEEDED: "complete",
+    # A memory-cap kill is a RESOURCE GUARD firing, not a finished session.
+    # Grouped with the signal causes rather than the intended ones: the
+    # harness was stopped mid-work by a watchdog, so the run is interrupted
+    # and its summary is partial. Stamping "complete" would let the soak
+    # classifier score an OOM abort as a clean bar — the precise mistake the
+    # Layer 8 mapping exists to prevent, in the opposite direction.
+    #
+    # This mapping was MISSING: PROCESS_MEMORY_CAP was added to the enum
+    # without being classified here, which is exactly the omission
+    # test_cause_map_covers_all_causes was written to catch. The pin worked;
+    # nobody read it, because the suite it lives in could not complete.
+    TerminationCause.PROCESS_MEMORY_CAP: "incomplete_kill",
     TerminationCause.NORMAL_EXIT: None,  # clean path writes
                                           # "complete" itself
     TerminationCause.UNKNOWN: "incomplete_kill",  # safe default
