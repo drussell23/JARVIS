@@ -246,12 +246,48 @@ class ExecutorRegistry:
                     f"force_timeout={self._config.force_timeout}s")
 
     def _register_signal_handlers(self):
-        """Register signal handlers for graceful shutdown."""
+        """Register an ASYNC-SIGNAL-SAFE shutdown flag.
+
+        The handler sets an integer and an event. Nothing else. That is not
+        minimalism for its own sake — it is the difference between a clean
+        shutdown and a segfault.
+
+        THE CRASH THIS REMOVES. The previous handler built
+        ``signal.Signals(signum).name`` and called ``logger.info`` from inside
+        the signal context. Both ALLOCATE and both touch module dictionaries;
+        logging additionally takes locks. CPython runs signal handlers between
+        bytecodes, so when one lands during interpreter finalization those
+        module dicts are already being torn down, and the handler dereferences
+        freed memory. Observed live::
+
+            _PyErr_CheckSignalsTstate -> handle_signals -> _Py_HandlePending
+            _PyErr_CheckSignalsTstate -> handle_signals -> _Py_HandlePending
+            _PyErr_CheckSignalsTstate -> handle_signals -> _Py_HandlePending
+              -> _PyFrame_ClearExceptCode -> module_dealloc -> dict_dealloc
+              -> dictkeys_decref -> SIGSEGV at 0x0
+
+        The repetition is the second half of the fault: the handler executed
+        enough Python to trigger further signal checks, which re-entered it.
+        A handler that only stores an int cannot re-enter, because it runs no
+        bytecode that could yield to another check.
+
+        This also explains why SIGTERM never took during shutdown and the
+        process had to be SIGKILLed: the handler was crashing rather than
+        completing, so the shutdown it was supposed to start never began.
+
+        The signal NAME and the log line are recovered later, on the main
+        thread, by :meth:`drain_pending_signal` — deferred reporting rather
+        than no reporting."""
+        # Pre-resolve the slot so the handler never allocates an attribute.
+        self._pending_signal = 0
+
         def signal_handler(signum, frame):
-            sig_name = signal.Signals(signum).name
-            logger.info(f"📡 Received {sig_name}, initiating graceful shutdown...")
+            # ASYNC-SIGNAL-SAFE REGION. No logging, no formatting, no enum
+            # construction, no imports, no allocation beyond a small int.
+            if self._pending_signal:
+                return          # re-entrancy guard: already flagged, do nothing
+            self._pending_signal = signum
             self._global_shutdown_event.set()
-            # Don't call shutdown directly - let the main thread handle it
 
         # Only register if we're in the main thread
         if threading.current_thread() is threading.main_thread():
@@ -260,6 +296,23 @@ class ExecutorRegistry:
                 # SIGINT is typically handled by the application
             except (ValueError, OSError) as e:
                 logger.debug(f"Could not register signal handlers: {e}")
+
+    def drain_pending_signal(self) -> int:
+        """Report and clear a signal the handler flagged. Main thread only.
+
+        Returns the signal number (0 when none). This is where the logging
+        that used to sit inside the handler now happens — on a thread that is
+        allowed to allocate, take locks and touch module state."""
+        signum = getattr(self, "_pending_signal", 0)
+        if not signum:
+            return 0
+        self._pending_signal = 0
+        try:
+            name = signal.Signals(signum).name
+        except (ValueError, AttributeError):
+            name = str(signum)
+        logger.info("📡 Received %s, initiating graceful shutdown...", name)
+        return signum
 
     def _start_health_monitoring(self):
         """Start background health monitoring thread."""
