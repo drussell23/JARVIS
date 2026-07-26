@@ -20,6 +20,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from abc import ABC, abstractmethod
 from typing import AsyncIterator, Callable, ClassVar, Dict, List, Optional
 
@@ -629,6 +630,110 @@ class AudioBus:
             f"(mode={'duplex' if self._device.input_enabled else 'output-only'}, "
             f"settle={_settle_ms}ms)"
         )
+
+    async def rebind_input(self, input_device: Optional[int]) -> bool:
+        """Swap the capture device UNDER the consumer registry.
+
+        Why this is not ``stop()`` then ``start()``: ``stop()`` clears
+        ``_mic_consumers``. Every consumer — StreamingSTT, the barge-in VAD,
+        the forensics taps — is registered by whoever owns it, and none of them
+        watch for the bus restarting. A stop/start cycle therefore returns a
+        RUNNING bus with nothing listening, which is indistinguishable from a
+        working system until the first utterance is silently dropped.
+
+        So this replaces exactly one layer: the ``FullDuplexDevice`` and the
+        state that belongs to it (AEC, capture-side resamplers, speaker sink).
+        The consumer list, the IPC broadcaster above it, and the forensics
+        rings are never touched.
+
+        Honest about what "seamless" can mean here. Input and output share ONE
+        ``sd.Stream`` — AEC needs the speaker reference in the same callback —
+        and PortAudio has no API to re-point half of a duplex stream. The
+        stream must be torn down and rebuilt, so capture DOES gap for the
+        duration. Bounded, measured and logged rather than pretended away.
+
+        Fails CLOSED to the incumbent: if the new device will not start, the
+        previous one is restored. If the restore also fails the bus stops
+        cleanly rather than wedging, because a host holding a half-dead
+        CoreAudio stream is the failure mode that cost three restarts.
+
+        Returns True only when the new device is live. NEVER raises."""
+        if not self._running:
+            logger.warning("[AudioBus] rebind_input on a stopped bus — ignored")
+            return False
+
+        previous = self._config.input_device
+        if previous == input_device:
+            return True
+
+        old_device = self._device
+        t0 = time.monotonic()
+
+        async def _bring_up(index: Optional[int]) -> bool:
+            self._config.input_device = index
+            device = FullDuplexDevice(self._config)
+            try:
+                await device.start()
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                try:
+                    device.request_cancel()
+                    device._safe_close_stream()
+                except BaseException:  # noqa: BLE001
+                    pass
+                return False
+            self._device = device
+            if device.input_enabled:
+                self._resampler_down = Resampler(
+                    self._config.sample_rate, self._config.internal_rate,
+                )
+                self._resampler_aec_ref = Resampler(
+                    self._config.sample_rate, self._config.internal_rate,
+                )
+                self._aec = AcousticEchoCanceller(
+                    frame_size=self._config.internal_frame_size,
+                    sample_rate=self._config.internal_rate,
+                )
+                device.add_capture_callback(self._on_mic_frame)
+            self._local_sink = LocalSpeakerSink(device, self._resampler_up)
+            self._sinks["local"] = self._local_sink
+            return True
+
+        # Tear the incumbent down first: two open duplex streams on one machine
+        # contend for CoreAudio, and the contention is what hangs.
+        if old_device is not None:
+            old_device.request_cancel()
+            try:
+                if old_device.input_enabled:
+                    old_device.remove_capture_callback(self._on_mic_frame)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await old_device.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._device = None
+
+        if await _bring_up(input_device):
+            logger.info(
+                "[AudioBus] input rebound %s → %s (gap %.0fms, %d consumer(s) "
+                "preserved)", previous, input_device,
+                (time.monotonic() - t0) * 1000.0, len(self._mic_consumers),
+            )
+            return True
+
+        logger.warning(
+            "[AudioBus] input rebind to %s failed — restoring %s",
+            input_device, previous,
+        )
+        if await _bring_up(previous):
+            return False
+
+        logger.error(
+            "[AudioBus] could not restore input %s after a failed rebind — "
+            "stopping cleanly rather than holding a dead stream", previous,
+        )
+        self._running = False
+        return False
 
     async def stop(self) -> None:
         """Stop the audio bus and release all resources.

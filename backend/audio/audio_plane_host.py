@@ -127,6 +127,9 @@ class AudioPlaneHost:
         #: Inode of the socket file this host bound. Identity, not liveness —
         #: the only thing that can detect losing an address.
         self._inode: Optional[int] = None
+        #: Proximity re-binder. Absent unless the operator armed it.
+        self._adaptive: Any = None
+        self._adaptive_task: Optional[asyncio.Task] = None
 
     # -- lifecycle -------------------------------------------------------
 
@@ -232,7 +235,86 @@ class AudioPlaneHost:
                 logger.info("[AudioPlane] serving %s", socket_path())
             except Exception:  # noqa: BLE001
                 pass
+
+        self._wire_adaptive_input()
         return True
+
+    # -- adaptive input --------------------------------------------------
+
+    def _wire_adaptive_input(self) -> None:
+        """Arm the proximity re-binder, if the operator asked for it.
+
+        Wired here rather than inside AudioBus because the bus must not decide
+        which microphone it is: ranking devices means capturing from them, and
+        a bus that probes its own alternatives while running is a bus that can
+        contend with itself. The host owns the policy; the bus owns one verb
+        (``rebind_input``) and performs it.
+
+        Default OFF. This can open a Continuity handshake and it tears down a
+        live CoreAudio stream to do its job — three wedged processes in this
+        investigation came from exactly that. NEVER raises."""
+        try:
+            from backend.audio.acoustic_feedback import set_adaptive_input_sink
+            from backend.audio.adaptive_input import (
+                CREST_TRIGGER_DB,
+                AdaptiveInputManager,
+                adaptive_input_enabled,
+            )
+            if not adaptive_input_enabled():
+                return
+
+            manager = AdaptiveInputManager(rebind=self._bus.rebind_input)
+            try:
+                manager.note_builtin(self._bus._config.input_device)
+            except Exception:  # noqa: BLE001
+                manager.note_builtin(None)
+
+            # The rejection path already measures every failed capture. That
+            # telemetry IS the incumbent's score — reusing it means the manager
+            # never opens a second stream on the device in use.
+            set_adaptive_input_sink(manager.observe)
+            self._adaptive = manager
+            self._adaptive_task = asyncio.create_task(self._adaptive_loop())
+            logger.info(
+                "[AudioPlane] adaptive input armed (crest trigger %.0fdB)",
+                CREST_TRIGGER_DB,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[AudioPlane] adaptive input wiring degraded",
+                         exc_info=True)
+
+    async def _adaptive_loop(self) -> None:
+        """Drive the manager off the audio thread.
+
+        Two jobs, both cheap: ask for a re-evaluation while speech is actually
+        happening (the only moment a comparison between microphones is fair),
+        and poll the starvation breaker on a freshly bound device."""
+        manager = getattr(self, "_adaptive", None)
+        if manager is None:
+            return
+        try:
+            while not self._stop.is_set():
+                await asyncio.sleep(0.25)
+                try:
+                    await manager.check_liveness()
+                    if manager.armed and self._speech_active():
+                        await manager.on_speech()
+                except Exception:  # noqa: BLE001
+                    logger.debug("[AudioPlane] adaptive tick degraded",
+                                 exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.debug("[AudioPlane] adaptive loop ended", exc_info=True)
+
+    def _speech_active(self) -> bool:
+        """Is the operator talking right now? Read from the STT engine that
+        already answers this — no second VAD."""
+        try:
+            stt = getattr(self._handle, "streaming_stt", None)
+            return bool(stt is not None and stt.is_speech_active)
+        except Exception:  # noqa: BLE001
+            return False
 
     # -- address watchdog ------------------------------------------------
 
@@ -345,6 +427,23 @@ class AudioPlaneHost:
     async def stop(self) -> None:
         """Reverse-order teardown. NEVER raises — every failure here is one a
         hard exit resolves a moment later anyway."""
+        # Detach the telemetry sink FIRST: the manager must not receive a
+        # measurement, decide to rebind, and reach for a bus that teardown is
+        # already halfway through disposing of.
+        task, self._adaptive_task = self._adaptive_task, None
+        self._adaptive = None
+        try:
+            from backend.audio.acoustic_feedback import set_adaptive_input_sink
+            set_adaptive_input_sink(None)
+        except Exception:  # noqa: BLE001
+            pass
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
         handle, self._handle = self._handle, None
         if handle is not None:
             for attr in ("stop", "shutdown", "close"):

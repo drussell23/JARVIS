@@ -106,6 +106,42 @@ class QualitySample:
     no_speech_prob: float = 0.0
     device: str = ""
 
+    @classmethod
+    def from_audio(
+        cls, audio: Any, sample_rate: int, *,
+        no_speech_prob: float = 0.0, device: str = "",
+    ) -> "QualitySample":
+        """Measure a buffer. The ONE way audio becomes a QualitySample.
+
+        Routed through the forensics ring so modulation and crest are computed
+        by the recorder's own code. Two implementations of these formulas would
+        drift, and then an incident file and a device score could disagree
+        about the same audio — with no way to tell which was lying.
+
+        NEVER raises: an unmeasurable buffer scores zero, which ranks last."""
+        try:
+            import numpy as _np
+
+            from backend.audio.capture_forensics import _Ring
+
+            x = _np.asarray(audio, dtype=_np.float32).reshape(-1)
+            if not x.size:
+                return cls(device=str(device))
+            ring = _Ring(sample_rate, max(1.0, x.size / max(sample_rate, 1)))
+            ring.push(x)
+            st = ring.stats()
+            return cls(
+                modulation=float(st.get("syllabic_modulation_2_8hz", 0.0)),
+                crest_db=float(st.get("crest_db", 0.0)),
+                rms=float(st.get("rms", 0.0)),
+                peak=float(st.get("peak", 0.0)),
+                no_speech_prob=float(no_speech_prob),
+                device=str(device),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Acoustic] could not measure buffer: %r", exc)
+            return cls(device=str(device))
+
     @property
     def sqi(self) -> float:
         """Speech Quality Index in [0, 1]. Higher is more transcribable.
