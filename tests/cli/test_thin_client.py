@@ -605,9 +605,18 @@ class TestStarvedOrganismHonesty:
     async def test_child_exit_75_stops_wait_and_names_incumbent(
         self, sock_dir, monkeypatch,
     ):
-        """A single-flight-rejected ignition (exit 75) must stop the wait
-        within seconds and attribute the lock holder — never a blind
-        full-deadline vigil over a corpse."""
+        """A single-flight-rejected ignition (exit 75) must stop BOUNDED and
+        attribute the lock holder — never a blind full-deadline vigil over a
+        corpse.
+
+        The contract widened (2026-07-25): a refusal is usually TRANSIENT (an
+        organism draining after SIGTERM still holds its flock), so the cockpit
+        now waits it out rather than telling the operator to retry. The
+        anti-vigil guarantee is unchanged — the wait is its own bounded budget,
+        strictly shorter than the boot deadline, and the incumbent is still
+        named when it expires. The retry budget is pinned small here so the
+        test measures the CONTRACT, not the clock."""
+        monkeypatch.setenv("JARVIS_OV_IGNITION_RETRY_S", "1")
         path = sock_dir / "attach.sock"        # absent → cold boot branch
         import backend.core.ouroboros.battle_test.cockpit_attach as ca
         monkeypatch.setattr(ca, "attach_socket_path", lambda: path)
