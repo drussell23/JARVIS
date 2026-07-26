@@ -231,6 +231,7 @@ def test_the_gate_uses_targeted_exceptions_not_a_broad_catch():
     enum member and the gate silently never engaged — a reference error
     wearing the costume of graceful degradation."""
     import ast
+    import textwrap
     from pathlib import Path
 
     src = Path("backend/audio/playback_gate.py").read_text(encoding="utf-8")
@@ -263,14 +264,19 @@ def test_a_contract_error_is_not_swallowed(monkeypatch):
 def test_the_pipeline_no_longer_gates_around_generation():
     """Structural pin: start_speaking() around the whole call is the very
     blindspot this replaces."""
+    import ast
     import inspect
+    import textwrap
 
     from backend.audio.conversation_pipeline import ConversationPipeline
 
-    import ast
-
-    src = inspect.getsource(ConversationPipeline._speak_sentence)
-    tree = ast.parse(src.lstrip())
+    # _render_sentence is where playback now lives; _speak_sentence in front
+    # of it only takes a turnstile ticket so two agents cannot overlap.
+    src = (
+        inspect.getsource(ConversationPipeline._speak_sentence)
+        + inspect.getsource(ConversationPipeline._render_sentence)
+    )
+    tree = ast.parse(textwrap.dedent(src))
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             node.value = ""

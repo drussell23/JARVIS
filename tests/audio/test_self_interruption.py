@@ -71,12 +71,17 @@ def test_the_afplay_launch_site_is_gated():
 
 
 def test_the_bus_playback_site_is_gated():
-    """The AEC path streams through AudioBus; it needs the same protection."""
+    """The AEC path streams through AudioBus; it needs the same protection.
+
+    Pinned on ``_render_sentence``: the speech scheduler split the ORDERING
+    decision (``_speak_sentence``, which now only acquires the turnstile)
+    from the PLAYBACK itself. The gate belongs with whatever puts sound on
+    the speakers, so the pin follows the body rather than the name."""
     import inspect
 
     from backend.audio.conversation_pipeline import ConversationPipeline
 
-    src = inspect.getsource(ConversationPipeline._speak_sentence)
+    src = inspect.getsource(ConversationPipeline._render_sentence)
     assert "playback_gate" in src
     assert src.index("playback_gate") < src.index("play_stream")
 

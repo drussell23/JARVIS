@@ -476,6 +476,7 @@ class ConversationPipeline:
                 logger.info("[ConvPipeline] Session expired")
                 break
 
+            delegated = None
             try:
                 # 1. Wait for user to finish speaking (get transcript)
                 user_text = await self._listen_for_turn()
@@ -496,14 +497,10 @@ class ConversationPipeline:
                     )
                     continue
 
-                # 2b. Whoever was ADDRESSED answers.
-                #
-                # The active agent follows what the operator said, not what
-                # the process was launched with: "Hey JARVIS" in Karen's
-                # cockpit should get JARVIS's voice and JARVIS's prompt. A
-                # turn naming nobody leaves the current agent in place — it
-                # is a continuation, not a request to switch.
-                self._route_persona(user_text)
+                # 2b. Whoever was ADDRESSED answers — and if they were asked
+                # to delegate, the second agent is arbitrated into a SECONDARY
+                # role rather than racing the first.
+                summons = self._arbitrate_turn(user_text)
 
                 # 3. Add user turn to session
                 self._session.add_turn("user", user_text)
@@ -511,6 +508,12 @@ class ConversationPipeline:
                     f"[ConvPipeline] User: {user_text[:80]}"
                     f"{'...' if len(user_text) > 80 else ''}"
                 )
+
+                # 3b. A dual summon starts the delegated turn NOW, on a lane
+                # the primary is not using, so the secondary's work overlaps
+                # the primary's reply instead of following it. Nothing is
+                # awaited here: the primary speaks first, always.
+                delegated = self._begin_delegation(summons)
 
                 # 4. Classify turn intent and route deterministically
                 intent_decision = await self._classify_turn_intent(user_text)
@@ -571,9 +574,24 @@ class ConversationPipeline:
                     intent_decision=intent_decision,
                 )
 
+                # 6. The delegated agent reports — never before the primary
+                # has finished, and never over the top of it: the turnstile
+                # holds the SECONDARY ticket until the speakers are idle and
+                # the acoustic tail has cleared.
+                await self._finish_delegation(summons, delegated)
+
             except asyncio.CancelledError:
+                if delegated is not None and not delegated.done():
+                    delegated.cancel()
                 raise
             except Exception as e:
+                # A delegated turn outlives the turn that started it unless it
+                # is cancelled here: the primary failing does not stop work
+                # already running on another lane, and an orphan would report
+                # into a conversation that has moved on — or, at shutdown,
+                # keep the loop alive waiting for it.
+                if delegated is not None and not delegated.done():
+                    delegated.cancel()
                 logger.error(f"[ConvPipeline] Turn error: {e}")
                 await asyncio.sleep(0.5)
 
@@ -1382,34 +1400,158 @@ class ConversationPipeline:
                     pass
         return " ".join(spoken)
 
-    def _route_persona(self, user_text: str) -> bool:
-        """Bind the process persona to the agent named in *user_text*.
+    def _arbitrate_turn(self, user_text: str) -> Optional[Any]:
+        """Assign roles for this turn and bind the process to the PRIMARY.
 
-        Returns True when the active agent CHANGED. Writes the same env seam
-        ``active_persona`` reads, because that is what every synthesis site in
-        the process already consults — threading a persona argument through
-        each of them is how voice and identity drifted apart in the first
-        place. NEVER raises."""
+        The primary claims the audio plane by becoming the active persona
+        before anything synthesizes — every voice site in the process reads
+        that seam, so the claim is a single write rather than an argument
+        threaded through each one. NEVER raises."""
         try:
-            from backend.voice.agent_persona import active_persona
-            from backend.voice.agent_registry import route_by_wake_word
+            from backend.voice.agent_registry import arbitrate
 
-            spec = route_by_wake_word(user_text)
-            if spec is None:
-                return False
-            current = active_persona()
-            if current is not None and current.canonical is spec.persona:
-                return False
+            summons = arbitrate(user_text)
+            if summons is None:
+                return None
+            self._bind_persona(summons.primary)
+            if summons.is_dual:
+                logger.info(
+                    "[ConvPipeline] dual summon — primary=%s secondary=%s task=%r (%s)",
+                    summons.primary.display_name,
+                    summons.secondary.display_name,
+                    summons.delegated_task, summons.reason,
+                )
+            return summons
+        except (ImportError, AttributeError):
+            return None
+
+    def _begin_delegation(self, summons: Optional[Any]) -> Optional[Any]:
+        """Start the secondary's turn on a lane the primary is not using.
+
+        Returns the task, or None when this turn has no delegation. Nothing
+        is awaited: the point is that the secondary's generation overlaps the
+        primary's reply rather than queueing behind it. NEVER raises."""
+        if summons is None or not getattr(summons, "is_dual", False):
+            return None
+        if not summons.delegated_task.strip():
+            # Named but handed nothing to do. Spending a lane on an empty
+            # task would answer a sentence the operator never finished.
+            return None
+        try:
+            from backend.core.ouroboros.governance.remote_compute_dispatcher import (
+                Workload, get_dispatcher,
+            )
+
+            spec = summons.secondary
+            workload = Workload(agent=spec.persona.value, task=summons.delegated_task)
+
+            async def _fallback() -> str:
+                return await self._generate_text_as(spec, summons.delegated_task)
+
+            return get_dispatcher().spawn(workload, _fallback)
+        except (ImportError, AttributeError, RuntimeError):
+            return None
+
+    async def _finish_delegation(
+        self, summons: Optional[Any], task: Optional[Any],
+    ) -> None:
+        """Speak the secondary's answer, in the secondary's voice, after the
+        primary. NEVER raises — a delegated turn that failed must not unwind
+        the conversation loop."""
+        if summons is None or task is None:
+            return
+        from backend.audio.speech_scheduler import SpeechRole
+
+        spec = summons.secondary
+        previous = None
+        try:
+            result = await task
+            reply = str(getattr(result, "value", "") or "").strip()
+            if not reply:
+                logger.info(
+                    "[ConvPipeline] %s had nothing to report (%s)",
+                    spec.display_name, getattr(result, "error", "") or "empty",
+                )
+                return
+            logger.info(
+                "[ConvPipeline] %s reports via %s: %s",
+                spec.display_name, getattr(result, "tier", "?"), reply[:80],
+            )
+            previous = os.environ.get("JARVIS_AGENT_PERSONA", "")
+            self._bind_persona(spec)
+            self._speech_role = SpeechRole.SECONDARY
+            if self._session is not None:
+                self._session.add_turn("assistant", reply)
+            await self._speak_sentence(reply, asyncio.Event())
+        except asyncio.CancelledError:
+            raise
+        except (AttributeError, TypeError, ValueError, OSError, RuntimeError) as exc:
+            logger.warning("[ConvPipeline] delegated turn failed: %r", exc)
+        finally:
+            self._speech_role = SpeechRole.PRIMARY
+            if previous:
+                os.environ["JARVIS_AGENT_PERSONA"] = previous
+                prompt = _persona_system_prompt()
+                if prompt:
+                    self._system_prompt = prompt
+
+    async def _generate_text_as(self, spec: Any, task: str) -> str:
+        """Generate one reply AS *spec*, without speaking it.
+
+        The caller-side fallback the dispatcher uses when no remote tier is
+        wired — deliberately the same generation path the primary uses, so
+        the delegated answer is never lower quality than an undelegated one."""
+        if self._llm_client is None:
+            return ""
+        try:
+            from backend.voice.agent_registry import prompt_for
+            system = prompt_for(spec.persona) or self._system_prompt
+        except (ImportError, AttributeError):
+            system = self._system_prompt
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": task},
+        ]
+        chunks = []
+        async for chunk in self._get_llm_stream(messages, user_text=task):
+            chunks.append(chunk)
+        return "".join(chunks).strip()
+
+    def _bind_persona(self, spec: Any) -> None:
+        """Make *spec* the active agent for this process — voice and prompt
+        together, because they are one identity."""
+        try:
             os.environ["JARVIS_AGENT_PERSONA"] = spec.persona.value
-            # The prompt is part of the identity, so it moves with it —
-            # otherwise the model keeps the previous agent's self-description
-            # while speaking in the new agent's voice.
             prompt = _persona_system_prompt()
             if prompt:
                 self._system_prompt = prompt
+        except (AttributeError, OSError, TypeError):
+            pass
+
+    def _route_persona(self, user_text: str) -> bool:
+        """Bind the process persona to the agent named in *user_text*.
+
+        Returns True when the active agent CHANGED. Thin by design: role
+        assignment lives in the registry's ``arbitrate`` and binding lives in
+        ``_bind_persona``, so this is the boolean answer to "did the operator
+        hand the turn to someone else" and nothing more. Duplicating either
+        here is how the voice and the prompt drifted apart the first time.
+
+        NEVER raises."""
+        try:
+            from backend.voice.agent_persona import active_persona
+            from backend.voice.agent_registry import arbitrate
+
+            summons = arbitrate(user_text)
+            if summons is None:
+                return False               # nobody named — a continuation
+            current = active_persona()
+            if current is not None and current.canonical is summons.primary.persona:
+                return False
+            self._bind_persona(summons.primary)
             logger.info(
                 "[ConvPipeline] agent -> %s (voice %s)",
-                spec.display_name, spec.preferred_voice,
+                summons.primary.display_name, summons.primary.preferred_voice,
             )
             return True
         except (ImportError, AttributeError, OSError):
@@ -1459,11 +1601,41 @@ class ConversationPipeline:
     async def _speak_sentence(
         self, sentence: str, cancel_event: asyncio.Event
     ) -> None:
-        """Speak a single sentence through TTS, routing through AudioBus for AEC."""
+        """Speak a single sentence through TTS, routing through AudioBus for AEC.
+
+        Serialised at the speakers. Two agents in one turn ("ask Karen to…")
+        each synthesize independently and each hand a file to afplay, which is
+        a separate OS process with no idea another is playing — so without a
+        turnstile the operator hears both at once. The role comes from
+        arbitration, not from which synthesis happened to finish first."""
         if cancel_event.is_set():
             return
 
         if self._tts_engine is None:
+            return
+
+        from backend.audio.speech_scheduler import SpeechRole, get_scheduler
+
+        role = getattr(self, "_speech_role", SpeechRole.PRIMARY)
+        agent = ""
+        try:
+            from backend.voice.agent_persona import active_persona
+            persona = active_persona()
+            agent = getattr(persona, "value", "") if persona else ""
+        except (ImportError, AttributeError):
+            agent = ""
+
+        await get_scheduler().speak(
+            lambda: self._render_sentence(sentence, cancel_event),
+            agent=agent, role=role, text=sentence,
+        )
+
+    async def _render_sentence(
+        self, sentence: str, cancel_event: asyncio.Event
+    ) -> None:
+        """Actually put the sentence through TTS. Called ONLY by the scheduler,
+        which guarantees the speakers are ours for the duration."""
+        if cancel_event.is_set() or self._tts_engine is None:
             return
 
         # JIT PLAYBACK GATING — closed only while sound is LEAVING the
