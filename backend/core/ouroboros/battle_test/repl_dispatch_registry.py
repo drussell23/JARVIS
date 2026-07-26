@@ -374,6 +374,19 @@ def prime_registry(
     # naming convention; the handler resolves
     # ``dispatch_<verb>_command`` per module.
 
+    def _declared_aliases(mod: Any) -> tuple:
+        """Extra verb names a module opts into. NEVER raises.
+
+        Read defensively: a module that sets ``__aliases__`` to a string
+        would otherwise register one verb per character."""
+        try:
+            raw = getattr(mod, "__aliases__", ())
+            if isinstance(raw, str) or not isinstance(raw, (tuple, list, set)):
+                return ()
+            return tuple(str(a).strip() for a in raw if str(a).strip())
+        except Exception:  # noqa: BLE001
+            return ()
+
     def module_handler(full_name: str, mod: Any) -> int:
         if full_name in excluded_modules_t:
             return 0
@@ -402,7 +415,42 @@ def prime_registry(
                 )
                 return 0
             _VERB_TO_DISPATCHER[verb] = fn
-        return 1
+        registered = 1
+
+        # ALIAS UNMASKING.
+        #
+        # Discovery keys on the module BASENAME, so a module may expose only
+        # one verb no matter how many dispatchers it defines. `moltbook_repl`
+        # defined both `dispatch_moltbook_command` and `dispatch_molt_command`;
+        # only the first was ever reachable, and `/molt` sat in the tree with
+        # no caller — the wired-but-inert trap, produced by the naming cage
+        # rather than by an omission.
+        #
+        # A module now declares extra verbs with a module-level tuple:
+        #
+        #     __aliases__ = ("molt",)
+        #
+        # Each alias binds to its OWN `dispatch_<alias>_command` when the
+        # module defines one (distinct behaviour, e.g. posting vs reading),
+        # and otherwise to the basename dispatcher (a true synonym). The
+        # basename convention is untouched: aliases are additive and opt-in.
+        for alias in _declared_aliases(mod):
+            if alias in exclusions or not alias.isidentifier():
+                continue
+            alias_fn = getattr(mod, f"dispatch_{alias}_command", None)
+            if not callable(alias_fn):
+                alias_fn = fn                       # synonym for the basename
+            if _validate_dispatch_signature(alias_fn) is not None:
+                continue
+            with _REGISTRY_LOCK:
+                if alias in _VERB_TO_DISPATCHER:
+                    continue
+                _VERB_TO_DISPATCHER[alias] = alias_fn
+            registered += 1
+            logger.debug(
+                "[ReplRegistry] alias %r -> %s", alias, full_name,
+            )
+        return registered
 
     discover_module_provided_callable(
         packages=pkg_list,

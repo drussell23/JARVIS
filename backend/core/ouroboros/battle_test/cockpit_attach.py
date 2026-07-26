@@ -82,6 +82,32 @@ AUDIO_CMDS = (
 _TRUTHY = ("1", "true", "yes", "on")
 
 
+def _accepts_two_positional(fn: Any) -> bool:
+    """Can *fn* be called with (text, session)?
+
+    Sinks predating session routing take one argument, and both shapes must
+    keep working — this bridge is the only path an attached cockpit has to
+    the REPL, so guessing wrong drops the operator's command. Determined by
+    signature rather than by trial call: see the note at the assignment site
+    for why a retry-on-TypeError is unsafe here.
+
+    Defaults to False (the older, narrower shape) when the signature cannot
+    be read at all — a C builtin or an exotic callable still gets called."""
+    try:
+        import inspect
+        sig = inspect.signature(fn)
+        positional = 0
+        for p in sig.parameters.values():
+            if p.kind is inspect.Parameter.VAR_POSITIONAL:
+                return True
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                          inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                positional += 1
+        return positional >= 2
+    except (TypeError, ValueError):
+        return False
+
+
 def attach_enabled() -> bool:
     """Master gate — default ON. NEVER raises."""
     return os.environ.get(
@@ -178,10 +204,23 @@ class CockpitAttachBridge:
         self._replay = replay_provider or (lambda: [])
         self._on_input = on_input or (lambda _t: None)
         self._on_audio = on_audio or (lambda _c: None)
+        #: Does the input sink accept the originating session?
+        #:
+        #: Decided ONCE, by inspection. The obvious alternative — call with
+        #: two arguments and retry on TypeError — cannot distinguish "wrong
+        #: arity" from "the sink raised TypeError while doing its job", and
+        #: in the second case the retry executes the operator's command a
+        #: SECOND time. A dispatch surface must never guess by re-running the
+        #: thing it is dispatching.
+        self._input_takes_session = _accepts_two_positional(self._on_input)
         self._path = Path(path) if path is not None else attach_socket_path()
         self._server: Optional[asyncio.AbstractServer] = None
         self._sentinel_task: Optional[asyncio.Task] = None
         self._clients: Set[asyncio.StreamWriter] = set()
+        #: session_id → that cockpit's writer. Populated from the session
+        #: field on inbound frames; entries are removed by _drop so a
+        #: detached cockpit can never be addressed.
+        self._sessions: Dict[str, asyncio.StreamWriter] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._audio_state: str = "OFFLINE"
         self.stats: Dict[str, int] = {
@@ -459,8 +498,41 @@ class CockpitAttachBridge:
             pass
 
     def _broadcast(self, msg: Dict[str, Any]) -> None:
+        """Deliver *msg* to the cockpit that asked, or to all of them.
+
+        The addressing decision is made HERE rather than at each call site,
+        because the ~15 render frames between a verb dispatch and this method
+        have no business knowing about IPC sessions. They set a ContextVar on
+        the way in; this reads it on the way out.
+
+        An addressed message whose cockpit has since detached is DROPPED, not
+        broadcast. Falling back to broadcast would mean a reconnecting
+        operator's private verb output appears in someone else's scrollback
+        precisely when the intended reader is gone — the failure mode this
+        routing exists to prevent, arriving through its own error path."""
+        target = None
+        try:
+            from backend.core.ouroboros.battle_test.attach_session import (
+                current_session,
+            )
+            target = current_session()
+        except Exception:  # noqa: BLE001 — routing must never eat output
+            target = None
+
+        if target is not None:
+            w = self._sessions.get(target)
+            if w is None:
+                self.stats["addressed_undeliverable"] = (
+                    self.stats.get("addressed_undeliverable", 0) + 1
+                )
+                return
+            writers = [w]
+            self.stats["addressed"] = self.stats.get("addressed", 0) + 1
+        else:
+            writers = list(self._clients)
+
         data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
-        for w in list(self._clients):
+        for w in writers:
             try:
                 if w.is_closing():
                     self._drop(w)
@@ -471,10 +543,23 @@ class CockpitAttachBridge:
             except Exception:  # noqa: BLE001 — ANY writer fault = drop
                 self._drop(w)
 
+    def bind_session(self, session_id: str, w: asyncio.StreamWriter) -> None:
+        """Associate a cockpit's declared identity with its socket.
+
+        Called on the first frame that carries one. Idempotent, and a
+        reconnecting client that reuses an id simply re-points it."""
+        if not session_id:
+            return
+        self._sessions[session_id] = w
+        self.stats["sessions_bound"] = self.stats.get("sessions_bound", 0) + 1
+
     def _drop(self, w: asyncio.StreamWriter) -> None:
         if w in self._clients:
             self.stats["dropped"] += 1
         self._clients.discard(w)
+        for sid, sw in list(self._sessions.items()):
+            if sw is w:
+                del self._sessions[sid]
         try:
             w.close()
         except Exception:  # noqa: BLE001
@@ -522,12 +607,21 @@ class CockpitAttachBridge:
                 except (ValueError, TypeError):
                     continue
                 ftype = frame.get("type")
+                # Any frame may declare who is speaking. Bound before the
+                # frame is acted on, so the very first command a cockpit
+                # sends is already addressable when its output returns.
+                _sid = str(frame.get("session", "")).strip()
+                if _sid:
+                    self.bind_session(_sid, writer)
                 if ftype == "input":
                     text = str(frame.get("text", "")).strip()
                     if text:
                         self.stats["inputs_received"] += 1
                         try:
-                            self._on_input(text)
+                            if self._input_takes_session:
+                                self._on_input(text, _sid or None)
+                            else:
+                                self._on_input(text)
                         except Exception:  # noqa: BLE001
                             logger.debug(
                                 "[CockpitAttach] input sink degraded",
@@ -589,6 +683,16 @@ class CockpitAttachClient:
         self._on_telemetry = on_telemetry or (lambda _m: None)
         self._on_audio_state = on_audio_state or (lambda _s: None)
         self._on_thermal = on_thermal or (lambda _s: None)
+        #: This cockpit's identity for the life of the attachment. Declared
+        #: on every outbound frame so the daemon can address answers back to
+        #: the terminal that asked, instead of to all of them.
+        try:
+            from backend.core.ouroboros.battle_test.attach_session import (
+                new_session_id,
+            )
+            self.session_id: str = new_session_id()
+        except Exception:  # noqa: BLE001 — an unidentified client still works
+            self.session_id = ""
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._read_task: Optional[asyncio.Task] = None
@@ -678,7 +782,10 @@ class CockpitAttachClient:
             # dead peer — a detached pipe must refuse input immediately.
             if not self.connected or w is None or w.is_closing():
                 return False
-            frame = {"type": "input", "text": str(text)}
+            # Declare who is asking, so the daemon can address the answer
+            # back rather than broadcasting it to every attached cockpit.
+            frame = {"type": "input", "text": str(text),
+                     "session": self.session_id}
             w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
             return True
         except Exception:  # noqa: BLE001
