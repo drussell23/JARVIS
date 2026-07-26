@@ -873,6 +873,12 @@ async def _split_plane_loop(
         message=lambda: ui.prompt(),
         bottom_toolbar=lambda: ui.toolbar(),
         key_bindings=_build_selection_bindings(ui, client),
+        # Native `/` palette over the SAME 60-verb dispatch table the daemon
+        # routes to — not a hand-kept list that can drift from it. Threaded:
+        # priming the registry walks packages, and on the event loop that
+        # would freeze the very keystroke that opened the menu.
+        completer=_build_slash_completer(),
+        complete_while_typing=True,
     )
     ui.bind_app(session.app)
 
@@ -914,6 +920,17 @@ async def _split_plane_loop(
             if outcome == "detach":
                 break
 
+
+
+def _build_slash_completer() -> Any:
+    """The cockpit's slash palette. None when unavailable. NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.repl_completion import (
+            build_attach_completer,
+        )
+        return build_attach_completer()
+    except Exception:  # noqa: BLE001 — a cockpit without a palette still works
+        return None
 
 
 def _build_selection_bindings(ui: Any, client: Any) -> Any:

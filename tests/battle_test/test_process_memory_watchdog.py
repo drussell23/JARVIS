@@ -212,11 +212,38 @@ def test_ast_pin_watchdog_armed_beside_wall_clock():
     assert "self._monitor_process_memory(" in src
     assert "self._process_memory_monitor_task = asyncio.ensure_future(" in src
     assert "self._start_process_memory_hard_deadline_thread(" in src
-    # Armed in the same region as the wall-clock watchdog.
-    wall_idx = src.index("[WallClockWatchdog] armed:")
-    pm_idx = src.index("[ProcessMemoryWatchdog] armed:")
-    assert 0 < pm_idx - wall_idx < 2000, (
-        "ProcessMemoryWatchdog must be armed alongside WallClockWatchdog"
+    # Armed in the same region as the wall-clock watchdog — asserted
+    # STRUCTURALLY, by shared enclosing function, not by character distance.
+    #
+    # This previously read `0 < pm_idx - wall_idx < 2000` over string offsets.
+    # Both watchdogs are armed 36 lines apart and always have been; the region
+    # simply grew to 2117 characters and the pin failed on a comment. A
+    # proximity assertion in bytes measures the length of the prose between
+    # two things, which is not the invariant anyone cares about.
+    #
+    # What matters is that arming them is ONE decision in ONE place: a future
+    # change that moves the memory watchdog into a different function — where
+    # it could be skipped while the wall-clock one still arms — is the actual
+    # regression, and that is what this now catches.
+    tree = ast.parse(src)
+    owners = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = ast.get_source_segment(src, node) or ""
+        for marker in ("[WallClockWatchdog] armed:",
+                       "[ProcessMemoryWatchdog] armed:"):
+            if marker in body:
+                # Innermost wins: nested defs are walked after their parent.
+                owners[marker] = node.name
+    wall_owner = owners.get("[WallClockWatchdog] armed:")
+    pm_owner = owners.get("[ProcessMemoryWatchdog] armed:")
+    assert wall_owner is not None, "wall-clock watchdog is no longer armed"
+    assert pm_owner is not None, "ProcessMemoryWatchdog is no longer armed"
+    assert pm_owner == wall_owner, (
+        f"ProcessMemoryWatchdog must be armed alongside WallClockWatchdog — "
+        f"wall-clock arms in {wall_owner!r} but memory arms in {pm_owner!r}, "
+        f"so one can now be skipped without the other"
     )
 
 
