@@ -385,6 +385,28 @@ def get_active_canvas() -> Optional[BipartiteLayout]:
 # ---------------------------------------------------------------------------
 
 
+def _palette_height() -> int:
+    """Rows the `/` menu may occupy. Bounded so a 76-verb palette cannot
+    swallow the canvas — it scrolls instead."""
+    try:
+        return max(3, min(24, int(
+            os.environ.get("JARVIS_PALETTE_HEIGHT", "12") or 12,
+        )))
+    except (TypeError, ValueError):
+        return 12
+
+
+def _palette_multicolumn() -> bool:
+    """Multi-column menu (``JARVIS_PALETTE_MULTICOLUMN``, default off).
+
+    Single-column is the default deliberately: it is the layout that shows
+    ``display_meta`` beside each verb, and a 60-verb table whose names are
+    mostly self-explanatory is worth far less than one that says what each
+    verb DOES. Multi-column fits more names and drops the descriptions."""
+    return (os.environ.get("JARVIS_PALETTE_MULTICOLUMN", "0")
+            .strip().lower() in ("1", "true", "yes", "on"))
+
+
 def build_bipartite_application(
     mux: BipartiteLayout,
     *,
@@ -393,6 +415,7 @@ def build_bipartite_application(
     toolbar: Optional[Callable[[], str]] = None,
     header: Optional[Callable[[], str]] = None,
     header_height: int = 0,
+    completer: Any = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
     window fed from ``mux.render_canvas_ansi()`` (re-rendered each frame, so
@@ -424,9 +447,16 @@ def build_bipartite_application(
         content=FormattedTextControl(_canvas_fragments, focusable=False),
         wrap_lines=False, height=Dimension(weight=1),
     )
+    # The `/` palette. Passing a completer here is only HALF the wiring —
+    # prompt_toolkit computes completions into the buffer, but draws the menu
+    # as a Float, and this layout had no FloatContainer to draw it on. That is
+    # why the completer built in D5 yielded 76 correct verbs and the operator
+    # saw nothing: the menu had nowhere to exist.
     prompt = TextArea(
         height=1, prompt=[("fg:#5ee06a bold", "❯ ")], multiline=False,
         wrap_lines=False, style="class:command-deck",
+        completer=completer,
+        complete_while_typing=bool(completer is not None),
     )
 
     def _accept(buff) -> bool:
@@ -487,7 +517,32 @@ def build_bipartite_application(
             content=FormattedTextControl(_toolbar_fragments, focusable=False),
             height=1, wrap_lines=False,
         ))
-    root = HSplit(rows)
+    root: Any = HSplit(rows)
+    if completer is not None:
+        # THE missing half. A CompletionsMenu is a Float; without a
+        # FloatContainer it is never rendered no matter how many completions
+        # the buffer holds.
+        #
+        # Anchored to the cursor, so it opens ABOVE the ❯ row when the prompt
+        # sits at the bottom of the frame — which it always does here. That is
+        # the placement the operator is used to, and it falls out of
+        # prompt_toolkit's own float positioning rather than being computed.
+        try:
+            from prompt_toolkit.layout import FloatContainer, Float
+            from prompt_toolkit.layout.menus import (
+                CompletionsMenu, MultiColumnCompletionsMenu,
+            )
+            _menu = (
+                MultiColumnCompletionsMenu(show_meta=True)
+                if _palette_multicolumn() else
+                CompletionsMenu(max_height=_palette_height(), scroll_offset=1)
+            )
+            root = FloatContainer(
+                content=root,
+                floats=[Float(xcursor=True, ycursor=True, content=_menu)],
+            )
+        except Exception:  # noqa: BLE001 — a cockpit without a menu still types
+            logger.debug("[Bipartite] completion menu unavailable", exc_info=True)
     # Adaptive color depth (root cause of the quantized/muddy logo): pt 3.0.x's
     # default depth reads TERM only — COLORTERM is ignored, so a truecolor
     # terminal gets its 24-bit palette QUANTIZED to the 256 cube. Detect
@@ -589,6 +644,7 @@ async def run_bipartite_repl(
     seed: Optional[List[str]] = None,
     header: Optional[Callable[[], str]] = None,
     header_height: int = 0,
+    completer: Any = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
     the live Zone-1 sink (so any producer — the daemon's event router OR the
@@ -616,6 +672,7 @@ async def run_bipartite_repl(
         app = build_bipartite_application(
             mux, on_accept=on_accept, extra_key_bindings=extra_key_bindings,
             toolbar=toolbar, header=header, header_height=header_height,
+            completer=completer,
         )
         if watch_alive is not None:
             watcher = asyncio.ensure_future(

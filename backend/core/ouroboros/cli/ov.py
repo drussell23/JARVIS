@@ -1491,6 +1491,10 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             header=header_render,
             header_height=header_height,
             extra_key_bindings=_ptt_kb,
+            # The `/` palette. THIS is the surface the operator actually
+            # types into — the bipartite Application, not the split-plane
+            # PromptSession the completer was first wired to.
+            completer=_build_slash_completer(),
             seed=[
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "
                 "plain words both work · [cyan]wake[/cyan] arms my voice · "
