@@ -851,6 +851,20 @@ class AudioBus:
             else:
                 cleaned = internal_frame
 
+            # FORENSIC TAP (raw end of the chain). Recorded before any
+            # processing so an incident can distinguish "the microphone did
+            # not hear a voice" from "we destroyed the voice it heard" —
+            # two faults with opposite fixes, indistinguishable from the
+            # post-processing audio that diagnosis has had to rely on.
+            try:
+                from backend.audio.capture_forensics import get_forensics
+                get_forensics().note_raw(
+                    raw_frame,
+                    getattr(self._device, "sample_rate", self._config.sample_rate),
+                )
+            except (ImportError, AttributeError):
+                pass
+
             # 4. HONOUR THE RANGE CONTRACT before dispatching.
             #
             # Measured live: frames arriving at peak 1.04, 2.36, 3.26, 3.99 —
@@ -870,6 +884,14 @@ class AudioBus:
             # peak preserves relative level across an utterance and recovers
             # when the source gets quieter.
             cleaned = self._fit_to_range(cleaned)
+
+            # FORENSIC TAP (model end of the chain) — byte-for-byte what the
+            # recogniser is about to be handed.
+            try:
+                from backend.audio.capture_forensics import get_forensics
+                get_forensics().note_processed(cleaned, self._config.internal_rate)
+            except (ImportError, AttributeError):
+                pass
 
             # 5. Dispatch to all consumers
             with self._consumer_lock:

@@ -175,6 +175,10 @@ class StreamingSTTEngine:
 
         # VAD state
         self._speech_active = False
+        #: VAD-positive frames accumulated since the buffer was last cleared.
+        #: A final whose buffer contains NONE of them is not an utterance —
+        #: see _schedule_transcription.
+        self._voiced_frames = 0
         self._silence_start_ms: Optional[float] = None
         self._speech_start_ms: Optional[float] = None
 
@@ -317,6 +321,7 @@ class StreamingSTTEngine:
         # continuous, and the quiet parts carry the consonants.
         if is_speech and not self._speech_active:
             self._speech_active = True
+            self._voiced_frames = 0
             self._speech_start_ms = now_ms
             self._silence_start_ms = None
             # Pre-roll: VAD needs energy before it fires, so by the time it
@@ -340,6 +345,7 @@ class StreamingSTTEngine:
 
             if is_speech:
                 self._silence_start_ms = None
+                self._voiced_frames += 1
             else:
                 if self._silence_start_ms is None:
                     self._silence_start_ms = now_ms
@@ -405,9 +411,34 @@ class StreamingSTTEngine:
                 return
 
             if not is_partial:
-                # Clear buffer for final transcript
+                # A FINAL whose buffer holds no voiced frame is not an
+                # utterance — it is the room tone that accumulated AFTER the
+                # real final already fired and cleared the buffer.
+                #
+                # This is the "EMPTY transcript from speech-level amplitude"
+                # class, caught with the flight recorder: on one such final
+                # the model was handed 1.04s at peak 0.025 while the device
+                # in that same window peaked at 0.9665 and transcribes the
+                # whole sentence. Whisper was right to return nothing; it was
+                # asked to read silence, scored it no_speech_prob=0.81, and
+                # the warning that followed accused the model of rejecting
+                # speech that had never been in the buffer.
+                #
+                # Gated on the VAD's own decisions rather than on amplitude:
+                # a level threshold here would re-introduce the judgement the
+                # endpointer already makes, and disagree with it at exactly
+                # the margins where it matters.
+                voiced = self._voiced_frames
                 self._audio_buffer.clear()
                 self._total_frames = 0
+                self._voiced_frames = 0
+                if voiced == 0:
+                    logger.debug(
+                        "[StreamingSTT] final suppressed: %.2fs buffered with "
+                        "no voiced frame (trailing room tone)",
+                        duration_ms / 1000.0,
+                    )
+                    return
 
         # Run transcription in thread pool
         self._loop.call_soon_threadsafe(
@@ -514,6 +545,39 @@ class StreamingSTTEngine:
                     # none: it produces confident analysis of the wrong data.
                     if _rms >= _rejected_capture_min_rms() and _rejected_capture_enabled():
                         _dump_rejected_audio(audio, self._sample_rate, _rms)
+
+                    # FLIGHT RECORDER. The dump above holds only the buffer
+                    # the MODEL saw, which cannot separate "the microphone
+                    # never heard a voice" from "the chain destroyed one" —
+                    # two faults with opposite fixes, and the reason this
+                    # capture fault has survived three rounds of diagnosis.
+                    # The forensics tap holds both ends of the chain and
+                    # compares their syllabic rhythm, which is the one
+                    # measurement that tells them apart.
+                    #
+                    # Only on the speech-amplitude case: a rejection at NOISE
+                    # level is already explained by its own log line, and
+                    # recording it would evict the incidents that matter.
+                    if _pk >= 0.01:
+                        try:
+                            from backend.audio.capture_forensics import (
+                                get_forensics,
+                            )
+                            get_forensics().record_rejection(
+                                "empty_transcript_at_speech_amplitude",
+                                model_audio=audio,
+                                model_sample_rate=self._sample_rate,
+                                detail={
+                                    "peak": round(_pk, 4),
+                                    "rms": round(_rms, 5),
+                                    "is_partial": bool(is_partial),
+                                    "duration_s": round(
+                                        len(audio) / self._sample_rate, 3,
+                                    ),
+                                },
+                            )
+                        except (ImportError, AttributeError):
+                            pass
                 except Exception:  # noqa: BLE001
                     pass
 
