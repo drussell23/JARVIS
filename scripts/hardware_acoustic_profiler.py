@@ -197,7 +197,8 @@ def detect_contention() -> List[str]:
 
 
 def capture(sd: Any, seconds: float, channels: int,
-            sr: int = 48000) -> Tuple[Optional[np.ndarray], str]:
+            sr: int = 48000, device: Optional[int] = None,
+            ) -> Tuple[Optional[np.ndarray], str]:
     """Record *channels* channels. Returns (array, error).
 
     The stream is closed in a ``finally`` under every outcome. A profiler that
@@ -207,7 +208,9 @@ def capture(sd: Any, seconds: float, channels: int,
     stream = None
     try:
         frames = int(sr * seconds)
-        stream = sd.InputStream(samplerate=sr, channels=channels, dtype="float32")
+        stream = sd.InputStream(
+            samplerate=sr, channels=channels, dtype="float32", device=device,
+        )
         stream.start()
         buf = np.zeros((frames, channels), dtype=np.float32)
         filled = 0
@@ -328,6 +331,12 @@ def main() -> int:
     ap.add_argument("--no-whisper", action="store_true")
     ap.add_argument("--force", action="store_true",
                     help="measure even while another audio owner is live")
+    ap.add_argument("--device", type=int, default=None,
+                    help="input device index. DEFAULTS TO THE SYSTEM DEFAULT, "
+                         "which on macOS may be a Continuity microphone — an "
+                         "iPhone named after its owner, sitting in a pocket. "
+                         "Run --list-devices first.")
+    ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -350,6 +359,32 @@ def main() -> int:
         return 3
 
     report["devices"] = enumerate_inputs(sd)
+    try:
+        default_in = sd.query_devices(kind="input")
+        report["default_input"] = default_in.get("name", "?")
+    except Exception:                                  # noqa: BLE001
+        report["default_input"] = "?"
+    chosen = args.device
+    report["device_used"] = chosen if chosen is not None else f"default ({report['default_input']!r})"
+    # A Continuity microphone — an iPhone or iPad — is named after its owner
+    # and can silently become the system default when the phone comes into
+    # range. Measuring it instead of the built-in array produces exactly the
+    # "27x too quiet, no speech rhythm" signature this script hunts, so the
+    # ambiguity is called out rather than left for the reader to notice.
+    if chosen is None:
+        for d in report["devices"]:
+            if d.get("name") == report["default_input"] and "macbook" not in str(d.get("name", "")).lower():
+                print(f"⚠  The system default input is {d.get('name')!r} "
+                      f"(index {d.get('index')}).")
+                print("   That is not the built-in array. On macOS a device named")
+                print("   after a person is a Continuity microphone — a phone or")
+                print("   tablet, wherever it happens to be. Re-run with")
+                print(f"   --device <index> to measure a specific microphone.")
+                break
+    if args.list_devices:
+        for d in report["devices"]:
+            print(f"   [{d.get('index')}] {d.get('name')!r} accepted={d.get('accepted_channel_counts')}")
+        return 0
     if not args.json:
         print("── input devices ──")
         for d in report["devices"]:
@@ -361,7 +396,7 @@ def main() -> int:
     # record which happened — "the hardware refused" is the finding.
     granted, data, err = 0, None, ""
     for want in (2, 1):
-        data, err = capture(sd, args.seconds, want, args.samplerate)
+        data, err = capture(sd, args.seconds, want, args.samplerate, args.device)
         if data is not None and data.size:
             granted = want
             break
@@ -441,6 +476,25 @@ def main() -> int:
         else:
             print("   → speech rhythm is present. If whisper still returns")
             print("     nothing, the fault is downstream of capture.")
+
+    # ALWAYS persist. A diagnostic whose only output is stdout forces the
+    # operator to copy-paste it back, and that has now failed repeatedly in
+    # this investigation — three separate runs whose numbers were lost between
+    # the terminal and the analysis. The report is written where it can simply
+    # be read.
+    try:
+        out_dir = os.path.join(REPO_ROOT, ".jarvis", "acoustic_profile")
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        report["captured_at"] = stamp
+        for name in (f"profile-{stamp}.json", "latest.json"):
+            with open(os.path.join(out_dir, name), "w", encoding="utf-8") as fh:
+                json.dump(report, fh, indent=2)
+        if not args.json:
+            print(f"\n   report written: .jarvis/acoustic_profile/latest.json")
+    except (OSError, TypeError, ValueError) as exc:
+        if not args.json:
+            print(f"\n   (could not persist report: {type(exc).__name__})")
 
     if args.json:
         print(json.dumps(report, indent=2))
