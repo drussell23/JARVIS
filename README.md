@@ -529,6 +529,55 @@ The primary interface is voice. Derek talks to JARVIS and JARVIS talks back — 
 
 **ProactiveSpeechEngine** allows JARVIS to speak first — predictions, emergency alerts, operation completions, milestones — with configurable debounce (30s default).
 
+### 🎙️ Voice I/O — the `ov` Conversational Loop (status 2026-07-26)
+
+The operator speaks to Karen in the `ov` cockpit and gets a spoken answer. This is the Body's primary afferent nerve — and the one major subsystem in this repository that has **never completed a full cycle in production**. Full analysis, root-cause ranking and phased roadmap: **`docs/architecture/OUROBOROS_VENOM_PRD.md` §24**.
+
+**The path** (every stage exists; none is stubbed):
+
+```
+speech → CoreAudio → AudioBus (AEC · 48→16k · range-fit) → StreamingSTT (VAD endpoint ·
+pre/post-roll · faster-whisper) → ConversationPipeline → AdaptiveVoiceRouter → DoubleWord
+→ UnifiedTTSEngine → AudioBus → speaker
+```
+
+**Proven, individually and on hardware:**
+
+| Claim | Evidence |
+|---|---|
+| Control plane arms the mic | `ov` frame → `LISTENING` at +50 ms → `[Bootstrap] audio lease ARMED` |
+| The STT pipeline transcribes speech | Golden Master through the **live** engine — **100 %**, twice |
+| Bus → model handoff is lossless | cross-correlation **1.000**, gain **0.00 dB**, live in production |
+| DoubleWord is primary | `route_for() == "remote"` with no env set; local is emergency-only |
+| Karen can speak | `[Acoustic] speaking:` + `[SPEECH START]` — heard by the operator |
+| **Operator speech transcribes** | ❌ **never** |
+
+**The blocker is acoustic, not software.** Measured at the operator's desk vs known-good speech:
+
+| | operator, seated | known-good |
+|---|---|---|
+| crest factor | 18.5 – 37.2 dB | **15.8 dB** |
+| syllabic modulation | 0.14 – 0.24 | **0.472** |
+| Whisper | `""` / `"I'm sorry."` | 100 % |
+
+`"I'm sorry."` is faster-whisper's **non-speech prior** — what it emits when handed something that is not language. High crest with low modulation is the *distance signature*: sustained vowels decay into the room floor while consonant transients survive.
+
+**Crest factor cannot be fixed in software.** It is `peak/rms`, a ratio — a scalar gain scales both terms identically. Proven: raising macOS input volume 40 → 85 lifted rms **6.4× (+16 dB)** and moved crest **not at all**. Every amplitude-based fix in this arc failed for that reason.
+
+**Shipped in this arc** — #70106 window-scoped forensics verdict + per-incident handoff integrity · #70107 partial cadence anchored to speech onset · #70108 Golden Master injector + the fix that finally gave Karen a working voice · #70109 `AdaptiveInputManager` proximity re-binder · #70110 device identity by name, not CoreAudio index. Spines: 43 new tests; `tests/audio` + `tests/voice` **548 passed, 5 skipped**.
+
+**Next** — V1: get one capture under 20 dB crest with modulation > 0.4 (Continuity mic awake and beside the operator, or a headset; the re-binder detects and binds either automatically). V2: prove one complete turn. V3: p50 < 1.5 s to first syllable. V4: robustness. V5: voice as an intake channel into the 11-phase pipeline.
+
+```bash
+# Is the PIPELINE working? (synthetic speech, known transcript, real engine)
+python3 scripts/stt_golden_master.py --golden "Karen can you hear me clearly"
+
+# Run the plane with the proximity re-binder armed
+JARVIS_ADAPTIVE_INPUT=1 python3 backend/audio/audio_plane_host.py
+```
+
+> **Methodology note.** Four defects in this arc were *instruments lying*, not components breaking — a lifetime counter presented as a per-incident measurement, a false `PASS` on the model's non-speech prior, a composite score logged without its components, a truncated correlation search reported as divergence. An unreliable instrument costs more than a broken component, because it sends the next several sessions in a confidently wrong direction. Every diagnostic here now carries an epistemic floor that reports `unverifiable` rather than guessing.
+
 ### JARVIS-Level Intelligence (7 Tiers)
 
 **`backend/core/ouroboros/governance/` — 7 tiers of autonomous intelligence**
