@@ -193,6 +193,9 @@
 - [Appendix D — Document History](#appendix-d--document-history)
 
 ---
+24. [Voice I/O — the `ov` Conversational Loop](#24-voice-io--the-ov-conversational-loop-new-2026-07-26)
+    - [24.4 Root problems, ranked](#244-root-problems-ranked)
+    - [24.6 Roadmap](#246-roadmap)
 
 ## 1. Executive Summary
 
@@ -2445,3 +2448,291 @@ The Pass A reconciliation surfaced three open operator decisions. All three were
 
 ---
 
+## 24. Voice I/O — the `ov` Conversational Loop *(NEW 2026-07-26)*
+
+### 24.1 Why this section exists
+
+Everything else in this PRD is about O+V reading and rewriting code. This section is
+about the operator **talking to it** — speaking to Karen in the `ov` cockpit and getting
+a spoken answer back, in the time a human expects an answer.
+
+That is not a peripheral. §22 frames JARVIS as the Body of a tri-partite organism, and a
+body whose only input channel is a keyboard has no more sensory surface than a REPL. The
+voice loop is the Body's primary afferent nerve. It is also the single most-used surface
+the operator has, and it is currently the only major subsystem in this repository that
+has **never completed one end-to-end cycle in production**.
+
+This section records what was built, what is now proven, what the actual blocker is, and
+the ordered work remaining. It is written to be handed to someone who was not present.
+
+### 24.2 The complete path
+
+```
+  operator speaks
+        │
+        ▼
+  CoreAudio ── sd.Stream (duplex: mic + speaker in ONE callback, for AEC)
+        │        full_duplex_device.py:1017  in_flat = indata[:,0].copy()
+        ▼
+  AudioBus._on_mic_frame                             audio_bus.py:1024
+        ├── note_raw(raw_frame)          ─────────────▶ CaptureForensics (RAW ring)
+        ├── resample 48k → 16k
+        ├── AEC (speaker reference from the same callback)
+        ├── _fit_to_range (decaying-peak normalisation)
+        ├── note_processed(cleaned)      ─────────────▶ CaptureForensics (PROCESSED ring)
+        └── dispatch `cleaned` ──▶ _mic_consumers
+                                      │
+                                      ▼
+  StreamingSTTEngine.on_audio_frame                   streaming_stt.py:292
+        ├── webrtcvad (ENDPOINTER, not a gate)
+        ├── pre-roll ring (320 ms) drained at onset
+        ├── accumulate EVERYTHING until 600 ms sustained silence
+        ├── partial every 500 ms (anchored to onset since #70107)
+        └── _schedule_transcription ──▶ faster-whisper (serialised, one at a time)
+                                      │
+                                      ▼
+  transcript ──▶ ModeDispatcher ──▶ ConversationPipeline._conversation_loop
+                                      │              conversation_pipeline.py:466
+        ┌─────────────────────────────┤
+        │  phatic fast path ("Hey Karen") — zero network, zero tokens
+        │                             │
+        ▼                             ▼
+  _speak_sentence          _generate_and_speak_response
+        │                             │
+        │                    AdaptiveVoiceRouter.route_for()
+        │                             ├── "remote" ──▶ DoubleWord  (DEFAULT)
+        │                             └── "local"  ──▶ emergency fallback only
+        │                             │
+        ▼                             ▼
+  UnifiedTTSEngine ──▶ AudioBus playback ──▶ speaker
+```
+
+Control plane, separately:
+
+```
+  ov  ──▶ .jarvis/cockpit_attach.sock ──▶ harness _dispatch_audio_cmd
+      ──▶ AudioVisualSynapse.handle_cmd("wake")
+      ──▶ RemoteAudioLease.acquire() ──▶ .jarvis/audio_state.sock
+      ──▶ audio_plane_host: "[Bootstrap] audio lease ARMED" ──▶ CONVERSATION mode
+```
+
+**Every box in both diagrams exists and has been individually verified.** No stage is
+stubbed, missing, or inert.
+
+### 24.3 What is proven (with evidence)
+
+| Claim | Method | Result |
+|---|---|---|
+| The control plane arms the mic | live frame to `cockpit_attach.sock`, identical to what `ov` sends | `LISTENING` at +50 ms, `[Bootstrap] audio lease ARMED` |
+| The STT pipeline transcribes speech | `stt_golden_master.py --golden` through the **live** engine | `"Hello, Karen. This is the Golden Master Test…"` **100 %**, twice, two phrases |
+| The bus→model handoff is lossless | FFT normalised cross-correlation, per incident, in production | correlation **1.000**, gain **0.00 dB**, `status: lossless` |
+| DoubleWord is primary | route audit + tests with no env set | `route_for() == "remote"`; local reached only on DW failure |
+| Karen can speak | live | `[Acoustic] speaking:` + `[SPEECH START]`, operator heard it |
+| The response path exists | source trace | phatic fast path + `_generate_and_speak_response` + `_speak_sentence`, all wired |
+| **Captured operator speech transcribes** | live | ❌ **never** |
+
+That last row is the whole problem, and it is one row.
+
+### 24.4 Root problems, ranked
+
+#### RP-1 — Acoustic capture quality (the blocker)
+
+The microphone receives a signal that is not intelligible speech. Measured at the
+operator's desk, against a known-good reference:
+
+| | operator, seated | known-good speech |
+|---|---|---|
+| crest factor | **18.5 – 37.2 dB** | **15.8 dB** |
+| syllabic modulation (2–8 Hz) | **0.14 – 0.24** | **0.472** |
+| Whisper output | `""` or `"I'm sorry."` | 100 % match |
+
+`"I'm sorry."` is not a transcription failure — it is faster-whisper's **non-speech
+prior**, the token sequence it emits when handed something that is not language.
+
+**Crest factor cannot be fixed in software.** It is `peak/rms`, a ratio; a scalar gain
+multiplies numerator and denominator identically. Proven empirically: raising macOS input
+volume 40 → 85 lifted rms **6.4× (+16 dB)** and moved crest **not at all**. Every
+amplitude-based fix attempted across this arc failed for that reason, and any future one
+will too.
+
+High crest with low modulation is the **distance signature**: sustained vowels decay into
+the room floor while consonant transients survive. The fix is physical proximity to a
+transducer, not processing.
+
+**Corroborating evidence that this is environmental, not electrical:** the same handoff
+that fails for the operator succeeds byte-for-byte for synthetic audio injected at the
+same point in the same process.
+
+#### RP-2 — No microphone within range is currently better
+
+`AdaptiveInputManager` (#70109) measures this automatically and has run live:
+
+```
+candidate 0 'Derek J. Russell Microphone' sqi=0.801  (continuity)
+candidate 1 'MacBook Pro Microphone'      sqi=0.732
+staying on 1 — nothing cleared the margin (needed 0.150)
+```
+
+The Continuity mic is consistently better — and a *silent* probe scores 0.275, so it is
+genuinely hearing speech — but never by the margin that justifies dropping an utterance
+to swap. It then left the enumeration entirely when the phone slept.
+
+#### RP-3 — The incumbent is scored only on its failures (methodological)
+
+`report_rejection` fires **only on empty transcripts**, so the incumbent's score is drawn
+exclusively from captures that already failed, while a challenger gets a fresh window.
+The bias runs *against* the incumbent, meaning the margin's refusal to swap was
+conservative-correct — but it also means the measured 0.07–0.10 gap is not trustworthy
+enough to justify lowering the margin.
+
+#### RP-4 — Long buffers that never endpoint (uninvestigated)
+
+Buffers of **12.70 s and 13.14 s** observed, peak pinned at 0.9500 throughout. Either the
+room was continuously noisy or the VAD never finds a silence gap long enough to close the
+utterance. If the latter, it is independent of RP-1 and would explain empty long finals
+on its own — Whisper handed 13 s of mostly-room with speech scattered through it.
+
+#### RP-5 — Diagnostic honesty is a recurring failure mode
+
+Four separate defects in this arc were **instruments lying**, not the pipeline breaking:
+a latched lifetime counter presented as a per-incident measurement; a false `PASS` on the
+model's non-speech prior; a composite score logged without its components; a truncated
+correlation search reported as divergence. Three were in code, one was in the analysis of
+that code. **An unreliable instrument costs more than a broken component**, because it
+sends the next several sessions in a confidently wrong direction. Every diagnostic added
+here now carries an epistemic floor that reports `unverifiable` rather than guessing.
+
+### 24.5 What was built
+
+| PR | Change | Why it mattered |
+|---|---|---|
+| #70106 | Window-scoped forensics verdict; per-incident handoff integrity (`lossless`/`scaled`/`unverifiable`) | Every incident had been reciting one six-hour-old transient as its diagnosis |
+| #70107 | Partial cadence anchored to speech onset; speech-only duration gate | Every utterance opened by handing Whisper 320 ms of room tone (`334 × 00:00.340` in one session), which also held the transcription lock so the first *useful* partial was skipped |
+| #70108 | `stt_golden_master.py`; `MacOSVoice.say_and_wait` fix; hallucination guard | Proved the pipeline; gave Karen a voice that had never once executed |
+| #70109 | `AdaptiveInputManager` + `AudioBus.rebind_input` | Consumed `rank_devices()`/`best_device()`, which had tests and zero callers |
+| #70110 | Device identity by name, not CoreAudio index | A fallback keyed on an integer could bind the device it was fleeing |
+| #70111 | Handoff documentation | — |
+
+Test spines added: `test_capture_forensics_verdict.py` (17), `test_stt_partial_cadence.py`
+(7), `test_adaptive_input.py` (19). `tests/audio` + `tests/voice`: **548 passed, 5 skipped**.
+
+### 24.6 Roadmap
+
+Sequenced so each phase is falsifiable and none depends on a hypothesis the previous one
+did not establish.
+
+#### V1 — Close the acoustic gap (blocking, physical)
+
+**Exit criterion: one capture at crest < 20 dB and modulation > 0.4 that transcribes.**
+
+| Step | Action |
+|---|---|
+| V1.1 | Probe with the Continuity mic **awake and beside the operator** — the one condition under which `AdaptiveInputManager` has a real choice |
+| V1.2 | If it swaps, measure post-swap crest. Target < 20 dB |
+| V1.3 | If no device clears the margin, test a headset / AirPods — a boom mic is 3–5 cm from the mouth and structurally wins on crest |
+| V1.4 | Fix RP-3 first if the margin looks like the obstacle: score the incumbent from the forensics `processed_bus` ring (all recent audio) rather than rejection-only telemetry |
+
+Do **not** attempt dereverberation, spectral subtraction, or a larger Whisper model at
+this stage. §24.4/RP-1 explains why each is structurally incapable of moving crest, and
+V1 exists to remove the variable, not to work around it.
+
+#### V2 — Prove one complete turn
+
+**Exit criterion: `ov` → `wake` → operator speaks a question → Karen answers it aloud.**
+
+Everything required is built and individually verified (§24.3); this phase is a
+verification, not a build. Expect it to surface integration defects that only appear once
+a real transcript flows — the lease, conversation mode, DW routing and TTS have never run
+against operator speech, only against each other.
+
+Instrument the turn end-to-end: capture → transcript → route → TTFT → first audio out.
+
+#### V3 — Latency to conversational
+
+**Exit criterion: p50 < 1.5 s from end-of-speech to first spoken syllable.**
+
+| Item | Note |
+|---|---|
+| V3.1 | Measure the real budget: endpoint (600 ms hangover) + STT + DW TTFT + TTS first-sentence |
+| V3.2 | The 600 ms endpoint hangover is a floor on perceived latency — evaluate an adaptive endpoint that closes faster on a falling energy envelope |
+| V3.3 | Verify DW RT tier is actually in use (`service_tier:"priority"`; see CLAUDE.md — without it DW serves the ~66 s async tier) |
+| V3.4 | Phatic fast path already bypasses the LLM for greetings — confirm it fires in production |
+| V3.5 | Stream TTS by sentence rather than by full response (`_speak_sentence` already supports this) |
+
+#### V4 — Robustness under real conditions
+
+| Item | Note |
+|---|---|
+| V4.1 | RP-4: investigate the 13 s non-endpointing buffers |
+| V4.2 | Barge-in verified live (interrupting Karen mid-sentence) |
+| V4.3 | Continuity/Bluetooth dropout mid-turn → circuit breaker verified on hardware, not just in tests |
+| V4.4 | Karen's acoustic complaints need a rate limit tied to *conversation state* — during the live test she interrupted nearly every utterance |
+
+#### V5 — Voice as a first-class O+V surface
+
+Once a turn is reliable, voice becomes an intake channel rather than a demo:
+`VoiceCommandSensor` → `UnifiedIntakeRouter` → the 11-phase pipeline, with IMMEDIATE
+routing (already specified in CLAUDE.md §5) so a spoken instruction becomes an operation.
+This is the point at which the Body's afferent nerve connects to the Mind.
+
+### 24.7 Diagnostics
+
+```bash
+# Does the PIPELINE work? Synthetic speech, known transcript, the REAL engine.
+python3 scripts/stt_golden_master.py --golden "Karen can you hear me clearly"
+
+# Does a CAPTURED buffer transcribe in isolation?
+python3 scripts/stt_golden_master.py --incident .jarvis/capture_forensics/incident-XXXX
+
+# Measure the microphone directly (stop the audio plane first — contention guard)
+python3 scripts/hardware_acoustic_profiler.py --device 1 --seconds 5
+
+# Every STT rejection writes an incident automatically. Ring of 8; archive
+# anything worth keeping, it evicts fast under load.
+ls .jarvis/capture_forensics/     # raw/processed/model_input wav + metrics.json
+
+# Run the plane with the re-binder armed and Karen's complaints muted
+JARVIS_ACOUSTIC_FEEDBACK=false JARVIS_ADAPTIVE_INPUT=1 \
+  python3 backend/audio/audio_plane_host.py
+```
+
+### 24.8 Surface map
+
+| File | Owns |
+|---|---|
+| `backend/audio/full_duplex_device.py` | The single `sd.Stream` (mic + speaker, one callback for AEC) |
+| `backend/audio/audio_bus.py` | AEC, resampling, `_fit_to_range`, consumer registry, `rebind_input` |
+| `backend/voice/streaming_stt.py` | VAD endpointing, pre/post-roll, partial cadence, faster-whisper |
+| `backend/audio/conversation_pipeline.py` | listen → understand → respond → speak |
+| `backend/core/ouroboros/governance/adaptive_voice_router.py` | DW-primary routing, TTFT budget, breaker |
+| `backend/audio/capture_forensics.py` | Flight recorder, verdict, handoff integrity |
+| `backend/audio/acoustic_quality.py` | `QualitySample`/`sqi`, `rank_devices`, `best_device` |
+| `backend/audio/adaptive_input.py` | Proximity re-binder, circuit breaker, bench list |
+| `backend/audio/acoustic_feedback.py` | Karen's spoken degradation reports |
+| `backend/audio/audio_plane_host.py` | Process that owns the mic + the audio-state socket |
+| `backend/core/ouroboros/battle_test/audio_synapse.py` | `ov` audio verbs → lease → plane |
+| `scripts/stt_golden_master.py` | Pipeline oracle (synthetic + replay) |
+
+### 24.9 Binding lessons
+
+These are cheap to state and were expensive to learn. They generalise past voice.
+
+1. **Crest factor is scale-invariant.** Never propose a gain change as a fix for it.
+2. **A cumulative counter is not a measurement.** Two separate defects here came from
+   reading lifetime state as per-incident evidence — one in code, one in the analysis.
+3. **A composite score must be logged with its components.** `sqi` hid the very quantity
+   the subsystem existed to optimise.
+4. **`"I'm sorry."` / `"Thank you."` from an ASR are the model's prior, not a transcript.**
+   Scoring them as success converts "the mic heard noise" into "the pipeline works".
+5. **Fakes must mirror the real contract, not the caller.** A test double defining
+   `speak()` kept a dead code path green across two releases.
+6. **Fire-and-forget tasks swallow exceptions.** `create_task` without a done-callback
+   turns a hard failure into an interpreter warning on stderr — nowhere, in a daemon.
+7. **A CoreAudio index is not a device identity.** Enumeration reorders under you.
+8. **Restart the process to pick up merges.** A six-hour-old plane emitted every fixed
+   defect while the fixes sat on `main`.
+9. **Prove the instrument before trusting the reading.** The Golden Master exists so that
+   "the pipeline is broken" is a testable claim rather than an assumption — and the first
+   thing it proved was that the pipeline was fine.
+
+---
