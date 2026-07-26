@@ -1438,3 +1438,72 @@ __all__ = [
     "suggest_for_typo",
     "unregister_arg_provider",
 ]
+
+
+def registry_from_dispatch() -> VerbRegistry:
+    """Build a :class:`VerbRegistry` from the AUTO-DISCOVERED dispatch table.
+
+    ``discover_verbs`` walks a live ``SerpentREPL`` for ``_handle_*`` methods,
+    which the attach cockpit does not have — it is a thin client with no REPL
+    instance. Its verbs come from ``repl_dispatch_registry``, the same 60
+    ``dispatch_<verb>_command`` callables the daemon actually routes to.
+
+    The DOCSTRING is the single source of truth for the dropdown text: it sits
+    beside the implementation, so a verb whose behaviour changes and whose
+    docstring does not is a review problem rather than a silently stale menu
+    entry in some parallel table.
+
+    NEVER raises — an empty registry yields a completer that simply offers
+    nothing, which is what a cockpit attached to an unreachable daemon should
+    do anyway."""
+    descriptors: list = []
+    try:
+        from backend.core.ouroboros.battle_test.repl_dispatch_registry import (
+            _VERB_TO_DISPATCHER,
+            prime_registry,
+        )
+        try:
+            prime_registry()
+        except Exception:  # noqa: BLE001 — a partial table still completes
+            pass
+        for verb, fn in sorted(_VERB_TO_DISPATCHER.items()):
+            doc = (getattr(fn, "__doc__", "") or "").strip()
+            first = doc.splitlines()[0].strip() if doc else ""
+            # Trim the leading ``/verb ...`` echo many docstrings open with —
+            # repeating the verb beside itself wastes the dropdown's width.
+            if first.startswith("`") or first.startswith("/"):
+                parts = first.split("—", 1)
+                first = parts[1].strip() if len(parts) == 2 else first
+            descriptors.append(
+                VerbDescriptor(
+                    slash_form=f"/{verb}",
+                    handler_method="",
+                    description=first[:80],
+                )
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Completion] dispatch registry unavailable", exc_info=True)
+    return VerbRegistry(verbs=tuple(descriptors))
+
+
+def build_attach_completer() -> Optional[object]:
+    """The cockpit's ``/`` palette, threaded so typing never blocks.
+
+    ``ThreadedCompleter`` matters here specifically: priming the dispatch
+    registry walks packages and the first call is not instant. On the event
+    loop that would stall the keystroke that triggered it — the operator types
+    ``/`` and the terminal freezes. Off-thread, prompt_toolkit renders the
+    menu when results arrive and the buffer stays live throughout.
+
+    NEVER raises."""
+    try:
+        completer = build_completer(registry_from_dispatch())
+        if completer is None:
+            return None
+        try:
+            from prompt_toolkit.completion import ThreadedCompleter
+            return ThreadedCompleter(completer)
+        except ImportError:
+            return completer
+    except Exception:  # noqa: BLE001
+        return None
