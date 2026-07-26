@@ -141,6 +141,31 @@ _RANGE_PEAK_DECAY = float(os.getenv("JARVIS_AUDIO_RANGE_DECAY", "0.9995"))
 #: Soft-knee threshold. Below this the signal is bit-identical; above it the
 #: curve begins. 0.75 leaves normal speech completely untouched (measured
 #: speech peaks here run 0.2-0.6) while catching the excursions that saturate.
+def _agc_env(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        return max(lo, min(hi, float(os.getenv(name, "").strip() or default)))
+    except (TypeError, ValueError):
+        return default
+
+
+#: Above this the frame is scaled. Below it the signal passes BIT-IDENTICAL —
+#: the common case must cost nothing and change nothing.
+_AGC_CEILING = _agc_env("JARVIS_AUDIO_AGC_CEILING", 0.90, 0.10, 0.99)
+
+#: Where a scaled frame is placed. Under the ceiling, so the scaler is not
+#: re-triggered by its own output on the next frame.
+_AGC_TARGET = _agc_env("JARVIS_AUDIO_AGC_TARGET", 0.95, 0.10, 0.99)
+
+#: Seconds for the gain to climb back toward unity once the loud passage
+#: ends. Long, deliberately: speech has pauses, and a governor that recovered
+#: inside one would raise the noise floor between every word — audible as
+#: "pumping" and, worse, a moving noise floor for the endpointer to chase.
+_AGC_RELEASE_S = _agc_env("JARVIS_AUDIO_AGC_RELEASE_S", 2.0, 0.05, 60.0)
+
+#: Floor on the gain. Without it a single freak transient could attenuate the
+#: whole session toward silence with no way back inside the release constant.
+_AGC_MIN_GAIN = _agc_env("JARVIS_AUDIO_AGC_MIN_GAIN", 0.02, 1e-4, 1.0)
+
 _AGC_THRESHOLD = max(0.05, min(0.99, float(
     os.getenv("JARVIS_AUDIO_AGC_THRESHOLD", "0.75"),
 )))
@@ -421,6 +446,11 @@ class AudioBus:
 
         # These are set during start()
         self._device: Optional[FullDuplexDevice] = None
+        #: Governor state. Declared here rather than discovered by getattr so
+        #: the object's shape is honest and a reader can see the AGC exists.
+        self._agc_gain: float = 1.0          # current linear gain, 1.0 = off
+        self._range_peak: float = 0.0        # loudest input peak ever seen
+        self._range_reports: int = 0         # log budget for over-scale input
         self._aec: Optional[AcousticEchoCanceller] = None
         self._resampler_down: Optional[Resampler] = None      # 48k -> 16k (mic)
         self._resampler_aec_ref: Optional[Resampler] = None  # 48k -> 16k (AEC ref)
@@ -757,64 +787,147 @@ class AudioBus:
     # ---- Internal: Mic frame processing ----
 
     def _fit_to_range(self, frame: np.ndarray) -> np.ndarray:
-        """Soft-knee compressor: curve hot peaks below 1.0 without clipping.
+        """Scale hot frames into range PROPORTIONALLY. Fast attack, slow release.
 
-        THE FAULT THIS REMOVES. The capture device delivers samples above full
-        scale (measured: 1.04 through 3.9998). Anything that reaches a tensor
-        saturated flat is not speech any more — faster-whisper reads formant
-        structure, and clipping is precisely the operation that destroys it.
-        The observable symptom was whisper HALLUCINATING: "I'm sorry, I'm
-        sorry, I'm sorry" in place of "Hello Karen".
+        THE FAULT THIS REMOVES. The capture device delivers float PCM above
+        full scale — measured on this machine at peak 4.19 while the operator
+        spoke. CoreAudio is right to do so: 32-bit float PCM has no ceiling,
+        and nothing is lost in memory. The loss happens at every consumer that
+        quantises, and this pipeline has several — webrtcvad takes int16, the
+        WebSocket tap takes int16, speexdsp takes int16 — each of which HARD
+        CLIPS what it is given.
 
-        Linear scaling by the peak (the previous approach) fixes the range but
-        squashes an entire utterance because one syllable was loud. A
-        compressor leaves everything below the knee UNTOUCHED and curves only
-        the excursions:
+        Why proportional and not a soft knee
+        ------------------------------------
+        The previous version curved excursions through
+        ``tanh``, which keeps the peak under 1.0 but is a NONLINEARITY: it
+        compresses the loud parts of the waveform against the quiet parts and
+        manufactures harmonics that were never spoken. Speech recognition
+        reads formant structure, so distorting the relationship between
+        harmonics is precisely the wrong tool — it was chosen to avoid hard
+        clipping, and it does, but it trades one waveform corruption for a
+        subtler one.
 
-            |x| <= T          ->  x                        (bit-identical)
-            |x| >  T          ->  sign(x)*(T + (1-T)*tanh((|x|-T)/(1-T)))
+        Multiplying the whole frame by a single scalar has no such cost. The
+        waveform is IDENTICAL in shape; only its amplitude moves. Every
+        harmonic ratio, every formant, every zero crossing survives exactly.
+        That is the operation a recogniser wants and the tanh curve is not.
 
-        The curve is continuous in VALUE at the knee (tanh(0) = 0) and in
-        SLOPE (tanh'(0) = 1), which is what makes the knee "soft" — a hard
-        knee would put a corner in the waveform and manufacture the very
-        high-frequency artifacts the compressor exists to avoid. It is
-        asymptotic to 1.0, so saturation becomes mathematically unreachable
-        rather than merely unlikely.
+        Attack and release
+        ------------------
+        Attack is immediate: the gain needed to bring THIS frame under the
+        target is applied to THIS frame, so nothing is ever handed downstream
+        above the ceiling. There is no lookahead and none is needed — the
+        frame is already in hand when its peak is known.
 
-        Sample-wise and stateless: zero latency, no lookahead, no pumping.
+        Release is slow (seconds). Restoring gain quickly would raise the
+        noise floor in every pause between words, which is audible as pumping
+        and gives the endpointer a moving floor to chase. Asymmetry is the
+        whole design: react instantly to loudness, forget it gradually.
+
+        Ramped across the frame
+        -----------------------
+        Applying a step change in gain at a frame boundary puts a
+        discontinuity in the waveform — a click, and a broadband one, which is
+        exactly the artefact this exists to avoid. The gain is therefore
+        interpolated linearly from the previous frame's value to this one's
+        across the frame, so the signal stays continuous.
+
+        Below the ceiling the frame is returned UNTOUCHED and bit-identical.
         NEVER raises."""
         try:
-            # DRY: the canonical RMS is audio_scope's, the same one the
-            # telemetry bridge and the oscilloscope use. "Hot" is decided on
-            # energy; the curve is applied per sample.
-            from backend.core.ouroboros.ui.audio_scope import rms as _rms
+            if frame is None or not frame.size:
+                return frame
+            out = np.asarray(frame, dtype=np.float32)
 
-            peak = float(np.max(np.abs(frame))) if frame.size else 0.0
-            if peak <= _AGC_THRESHOLD:
-                return frame                    # the common case, untouched
+            # Non-finite samples would poison the gain state for every frame
+            # that follows, so they are neutralised rather than propagated.
+            sanitized = False
+            if not np.all(np.isfinite(out)):
+                out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+                sanitized = True
 
-            if peak > 1.0 and self._range_reports < 3:
-                self._range_reports += 1
-                logger.warning(
-                    "[AudioBus] input peak %.2f exceeds full scale "
-                    "(rms=%.4f) — compressing rather than clipping; the "
-                    "capture device is applying gain",
-                    peak, _rms(frame[:512]),
-                )
-            self._range_peak = max(self._range_peak, peak)
+            peak = float(np.max(np.abs(out)))
+            prev = getattr(self, "_agc_gain", 1.0)
+            if not np.isfinite(prev) or prev <= 0.0:
+                prev = 1.0
 
-            t = _AGC_THRESHOLD
-            span = 1.0 - t
-            mag = np.abs(frame)
-            over = mag > t
-            out = frame.astype(np.float32, copy=True)
-            out[over] = (
-                np.sign(frame[over])
-                * (t + span * np.tanh((mag[over] - t) / span))
-            ).astype(np.float32)
-            return out
+            if peak * prev > _AGC_CEILING and peak > 0.0:
+                # ATTACK — immediate, sized to this frame.
+                #
+                # The floor bounds the REMEMBERED gain, not the correction
+                # applied here. Flooring the correction let an absurd frame
+                # (1e30, a device glitch) leave at 2e28 — the ceiling
+                # defeated by the very guard meant to protect recovery. The
+                # frame is always scaled by exactly what it needs; the floor
+                # only stops one freak transient from parking the session at
+                # a gain it cannot climb back from inside the release
+                # constant.
+                frame_gain = _AGC_TARGET / peak
+                target_gain = max(_AGC_MIN_GAIN, frame_gain)
+                if peak > 1.0 and getattr(self, "_range_reports", 0) < 3:
+                    self._range_reports = getattr(self, "_range_reports", 0) + 1
+                    logger.warning(
+                        "[AudioBus] input peak %.2f exceeds full scale — "
+                        "scaling by %.3f (proportional, waveform preserved); "
+                        "the capture device is applying gain",
+                        peak, target_gain,
+                    )
+            elif prev < 1.0:
+                # RELEASE — exponential climb back toward unity, per-frame
+                # coefficient derived from the frame's own duration so the
+                # time constant is in SECONDS and independent of frame size
+                # and sample rate.
+                frame_gain = target_gain = 1.0    # release path: no attack
+                rate = float(getattr(self._config, "internal_rate", 16000) or 16000)
+                dt = out.size / max(rate, 1.0)
+                coeff = float(np.exp(-dt / _AGC_RELEASE_S))
+                target_gain = min(1.0, prev * coeff + 1.0 * (1.0 - coeff))
+            else:
+                self._agc_gain = 1.0
+                self._range_peak = max(getattr(self, "_range_peak", 0.0), peak)
+                # Return the SANITISED array when sanitising happened. The
+                # passthrough branch previously returned the caller's frame,
+                # which handed NaN/inf straight back out — the one path where
+                # "untouched" was the wrong promise.
+                return out if sanitized else frame
+
+            self._agc_gain = target_gain
+            self._range_peak = max(getattr(self, "_range_peak", 0.0), peak)
+
+            # ASYMMETRY, applied here rather than merely described above.
+            #
+            # ATTACK is a STEP, not a ramp. Ramping into an attack defeats it:
+            # the frame would start at the OLD gain, so its loudest samples —
+            # which are why the attack fired — leave the stage still above the
+            # ceiling. Caught by the smoke test: a 4.19 frame emerged at 4.14
+            # and hard-clipped downstream, i.e. the governor did nothing at
+            # exactly the moment it existed for. A step down at the onset of a
+            # loud passage is inaudible against the loud passage itself;
+            # clipping is not.
+            #
+            # RELEASE is ramped, because that is where smoothness is worth
+            # something and there is no ceiling to breach — gain is rising
+            # into headroom the signal is not using.
+            if target_gain < prev:
+                applied = min(target_gain, frame_gain)
+                return (out * np.float32(applied)).astype(np.float32)
+            ramp = np.linspace(
+                prev, target_gain, out.size, dtype=np.float32, endpoint=True,
+            )
+            return (out * ramp).astype(np.float32)
         except Exception:  # noqa: BLE001 — audio thread: never propagate
             return frame
+
+    def agc_state(self) -> dict:
+        """Observability seam — what the governor is currently doing."""
+        return {
+            "gain": round(float(getattr(self, "_agc_gain", 1.0)), 5),
+            "ceiling": _AGC_CEILING,
+            "target": _AGC_TARGET,
+            "release_s": _AGC_RELEASE_S,
+            "peak_seen": round(float(getattr(self, "_range_peak", 0.0)), 4),
+        }
 
     def _on_mic_frame(self, raw_frame: np.ndarray) -> None:
         """
