@@ -114,8 +114,22 @@ async def swarm_repair(
         async with sem:
             in_flight["cur"] += 1
             in_flight["max"] = max(in_flight["max"], in_flight["cur"])
+            # LANE. Set once, here, around the whole of this agent's work.
+            # Everything it emits below — through every await, in every task
+            # it spawns, and (via ContextAwareThreadPool) in every executor
+            # call it makes — inherits the tag with no producer touching it.
+            _lane = f"swarm/{getattr(target, 'name', None) or getattr(target, 'chunk_id', '?')}"
             try:
-                node = await generate_fn(target)
+                from backend.core.ouroboros.battle_test.attach_session import (
+                    lane_scope,
+                )
+                _scope = lane_scope(_lane)
+            except Exception:  # noqa: BLE001 — untagged beats not running
+                import contextlib as _ctxlib
+                _scope = _ctxlib.nullcontext()
+            try:
+                with _scope:
+                    node = await generate_fn(target)
                 return (target, node, None)
             except Exception as exc:  # noqa: BLE001 — an agent failure is isolated
                 return (target, None, exc)
