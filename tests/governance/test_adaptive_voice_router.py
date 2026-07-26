@@ -305,6 +305,43 @@ async def test_the_master_flag_makes_the_router_a_pass_through(monkeypatch):
     )
 
 
+async def test_doubleword_is_primary_by_default(monkeypatch):
+    """DW-primary is the DEFAULT, not a configuration an operator must find.
+
+    The inverse of ``test_remote_first_can_be_inverted``, and the one that
+    actually protects the invariant: that test proves the override works, but
+    would still pass if the default silently flipped to local. With no env set
+    at all, a healthy lane and a resolved model must route to DoubleWord, and
+    the local engine is reachable only as a fallback.
+
+    Pinned here rather than in the audio suite: which microphone is bound and
+    which LLM answers are unrelated concerns, and coupling them would make a
+    device test fail on a provider change."""
+    for var in ("JARVIS_ADAPTIVE_VOICE_ROUTER_ENABLED",
+                "JARVIS_VOICE_ROUTER_REMOTE_FIRST"):
+        monkeypatch.delenv(var, raising=False)
+
+    local = _Local()
+    r = _router(local=local, dispatch=_dw(["remote answer"]))
+    assert r.route_for(model="m") == "remote", "default route is not DoubleWord"
+    assert await _drain(r) == "remote answer"
+    assert r.last_route == "remote"
+
+
+async def test_local_is_reached_only_when_doubleword_cannot_serve(monkeypatch):
+    """The fallback is emergency-only: it engages on a DW failure, never as a
+    peer the router picks between."""
+    for var in ("JARVIS_ADAPTIVE_VOICE_ROUTER_ENABLED",
+                "JARVIS_VOICE_ROUTER_REMOTE_FIRST"):
+        monkeypatch.delenv(var, raising=False)
+
+    local = _Local()
+    r = _router(local=local, dispatch=_dw([], fail_after=0,
+                                          exc=ConnectionError("dw down")))
+    assert await _drain(r) == "local answer"
+    assert r.last_route == "local"
+
+
 async def test_remote_first_can_be_inverted(monkeypatch):
     monkeypatch.setenv("JARVIS_VOICE_ROUTER_REMOTE_FIRST", "false")
     local = _Local()

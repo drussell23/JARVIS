@@ -9,13 +9,38 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Optional
+from dataclasses import replace
+from typing import Any, Callable, Optional
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 _CONTROLLER: Optional[Any] = None
+
+#: Set by whoever owns the AdaptiveInputManager (the audio plane host). Left
+#: as a plain seam rather than an import so this module keeps knowing nothing
+#: about CoreAudio, and so the manager stays absent — not merely disabled —
+#: in every process that has not deliberately armed it.
+_ADAPTIVE_SINK: Optional[Callable[[Any], None]] = None
+
+
+def set_adaptive_input_sink(sink: Optional[Callable[[Any], None]]) -> None:
+    """Register (or clear) the observer that receives every QualitySample."""
+    global _ADAPTIVE_SINK
+    _ADAPTIVE_SINK = sink
+
+
+def _notify_adaptive_input(sample: Any) -> None:
+    """Hand one measurement to the device manager. NEVER raises: this sits on
+    the STT rejection path and must not be able to break recognition."""
+    sink = _ADAPTIVE_SINK
+    if sink is None:
+        return
+    try:
+        sink(sample)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Acoustic] adaptive sink degraded: %r", exc)
 
 
 def _controller() -> Any:
@@ -146,23 +171,21 @@ def report_rejection(audio: Any, sample_rate: int, peak: float, rms: float,
     """Turn one empty transcript into a measurement. NEVER raises."""
     try:
         from backend.audio.acoustic_quality import QualitySample
-        from backend.audio.capture_forensics import _Ring
 
         x = np.asarray(audio, dtype=np.float32).reshape(-1)
         if not x.size:
             return None
-        # DRY: the ring's stats are the forensics' own formulas, so the numbers
-        # here and in an incident file cannot disagree.
-        ring = _Ring(sample_rate, max(1.0, x.size / max(sample_rate, 1)))
-        ring.push(x)
-        st = ring.stats()
-        sample = QualitySample(
-            modulation=float(st.get("syllabic_modulation_2_8hz", 0.0)),
-            crest_db=float(st.get("crest_db", 0.0)),
-            rms=float(rms), peak=float(peak),
-            no_speech_prob=float(no_speech_prob), device=str(device),
+        # DRY: QualitySample.from_audio routes through the forensics ring, so
+        # the numbers here and in an incident file cannot disagree. The caller
+        # already has peak/rms measured on the same buffer — keep those rather
+        # than the ring's, since they are what the rejection log reported.
+        sample = QualitySample.from_audio(
+            x, sample_rate, no_speech_prob=no_speech_prob, device=device,
         )
-        return _controller().observe(sample)
+        sample = replace(sample, rms=float(rms), peak=float(peak))
+        result = _controller().observe(sample)
+        _notify_adaptive_input(sample)
+        return result
     except (ImportError, AttributeError, TypeError, ValueError):
         logger.debug("[Acoustic] report degraded", exc_info=True)
         return None
