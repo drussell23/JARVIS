@@ -777,8 +777,14 @@ class ShutdownHandler:
                 signal.signal(sig, lambda s, f: asyncio.create_task(self._handle_signal(s)))
 
         # Also register atexit for non-signal exits
-        atexit.register(self._sync_cleanup)
-
+        # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so an
+        # `except Exception` inside the handler never catches them and a
+        # Ctrl+C landing here prints a traceback over the goodbye. Local
+        # import so this can never introduce a cycle.
+        from backend.core.ouroboros.governance.exit_guard import (
+            guarded_atexit_register,
+        )
+        guarded_atexit_register(self._sync_cleanup)
         logger.info("[ShutdownHandler] Started signal handling")
 
     async def _handle_signal(self, sig: signal.Signals) -> None:

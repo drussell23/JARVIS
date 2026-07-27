@@ -1388,7 +1388,14 @@ def get_ml_loader() -> ProcessIsolatedMLLoader:
 
         # v93.0: Register atexit handler for proper cleanup
         if not _atexit_registered:
-            atexit.register(_sync_cleanup_processes)
+            # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so an
+            # `except Exception` inside the handler never catches them and a
+            # Ctrl+C landing here prints a traceback over the goodbye. Local
+            # import so this can never introduce a cycle.
+            from backend.core.ouroboros.governance.exit_guard import (
+                guarded_atexit_register,
+            )
+            guarded_atexit_register(_sync_cleanup_processes)
             _atexit_registered = True
             logger.debug("ML loader atexit cleanup handler registered")
 

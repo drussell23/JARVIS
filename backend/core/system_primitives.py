@@ -297,8 +297,14 @@ class ResourceGuard:
             self._active_guards.add(self._id)
 
         # Register with atexit as additional safety
-        atexit.register(self._atexit_cleanup)
-
+        # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so an
+        # `except Exception` inside the handler never catches them and a
+        # Ctrl+C landing here prints a traceback over the goodbye. Local
+        # import so this can never introduce a cycle.
+        from backend.core.ouroboros.governance.exit_guard import (
+            guarded_atexit_register,
+        )
+        guarded_atexit_register(self._atexit_cleanup)
     def cleanup(self) -> None:
         """Explicit cleanup - preferred method."""
         if not self._cleaned_up:
@@ -902,8 +908,14 @@ class SafeProcess:
         """Register global cleanup handler for emergency shutdown."""
         with cls._lock:
             if not cls._cleanup_registered:
-                atexit.register(cls._global_cleanup)
-
+                # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so an
+                # `except Exception` inside the handler never catches them and a
+                # Ctrl+C landing here prints a traceback over the goodbye. Local
+                # import so this can never introduce a cycle.
+                from backend.core.ouroboros.governance.exit_guard import (
+                    guarded_atexit_register,
+                )
+                guarded_atexit_register(cls._global_cleanup)
                 # Also register signal handlers
                 for sig in (signal.SIGTERM, signal.SIGINT):
                     try:

@@ -239,8 +239,14 @@ class ExecutorRegistry:
         self._register_signal_handlers()
 
         # Register atexit handler
-        atexit.register(self._atexit_handler)
-
+        # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so the
+        # `except Exception` inside these handlers never caught them and a
+        # Ctrl+C landing here printed a traceback over the goodbye. Imported
+        # locally so this can never introduce an import cycle.
+        from backend.core.ouroboros.governance.exit_guard import (
+            guarded_atexit_register,
+        )
+        guarded_atexit_register(self._atexit_handler)
         logger.info("🔧 ExecutorRegistry initialized")
         logger.debug(f"   Config: shutdown_timeout={self._config.shutdown_timeout}s, "
                     f"force_timeout={self._config.force_timeout}s")
@@ -1236,8 +1242,14 @@ class AdvancedThreadManager:
         self.categories: Dict[str, Set[int]] = defaultdict(set)
 
         self._start_monitoring()
-        atexit.register(self._emergency_cleanup)
-
+        # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so the
+        # `except Exception` inside these handlers never caught them and a
+        # Ctrl+C landing here printed a traceback over the goodbye. Imported
+        # locally so this can never introduce an import cycle.
+        from backend.core.ouroboros.governance.exit_guard import (
+            guarded_atexit_register,
+        )
+        guarded_atexit_register(self._emergency_cleanup)
         logger.info("🧵 AdvancedThreadManager initialized")
 
     def _start_monitoring(self):
@@ -2762,7 +2774,14 @@ class NativeLibrarySafetyGuard:
                 self.request_shutdown()
                 self.wait_for_operations(timeout=5.0)
 
-            atexit.register(on_shutdown)
+            # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so the
+            # `except Exception` inside these handlers never caught them and a
+            # Ctrl+C landing here printed a traceback over the goodbye. Imported
+            # locally so this can never introduce an import cycle.
+            from backend.core.ouroboros.governance.exit_guard import (
+                guarded_atexit_register,
+            )
+            guarded_atexit_register(on_shutdown)
         except Exception as e:
             logger.warning(f"Could not register shutdown handler: {e}")
 

@@ -1071,7 +1071,14 @@ class VisionSensor:
         ``ValueError``. We silently skip that branch; atexit alone is
         already enough for the common cooperative-shutdown case.
         """
-        atexit.register(self._purge_session_dir_safe)
+        # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so an
+        # `except Exception` inside the handler never catches them and a
+        # Ctrl+C landing here prints a traceback over the goodbye. Local
+        # import so this can never introduce a cycle.
+        from backend.core.ouroboros.governance.exit_guard import (
+            guarded_atexit_register,
+        )
+        guarded_atexit_register(self._purge_session_dir_safe)
         try:
             self._prev_sigterm_handler = _signal.signal(
                 _signal.SIGTERM, self._on_sigterm,

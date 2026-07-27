@@ -401,8 +401,14 @@ class CrossRepoCleanupCoordinator:
         self._cleaned_up = False
         
         # Register atexit handler
-        atexit.register(self._sync_emergency_cleanup)
-        
+        # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so the
+        # `except Exception` inside these handlers never caught them and a
+        # Ctrl+C landing here printed a traceback over the goodbye. Imported
+        # locally so this can never introduce an import cycle.
+        from backend.core.ouroboros.governance.exit_guard import (
+            guarded_atexit_register,
+        )
+        guarded_atexit_register(self._sync_emergency_cleanup)
         # Register signal handlers for graceful cleanup
         self._register_signal_handlers()
         
