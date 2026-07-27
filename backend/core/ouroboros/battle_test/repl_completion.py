@@ -1532,6 +1532,31 @@ def _humanise(line: str) -> str:
     return text[0].upper() + text[1:]
 
 
+def _help_bound(text: str) -> str:
+    """A SANITY bound on resolved help — not a layout decision.
+
+    `[:88]` used to sit at every return of `_describe`, which put line-breaking
+    in the resolver: descriptions arrived pre-cut, so the palette's wrapping
+    could never fire and every entry was one truncated line regardless of how
+    much room the terminal had.
+
+    Where a description breaks depends on the terminal width and the name
+    column, neither of which this layer knows. So it stops deciding, and
+    `layout_palette` — which does know — wraps with a hanging indent.
+
+    A bound is still needed: a docstring line can be kilobytes, and the
+    palette would render it as a wall. This one is generous enough that real
+    prose survives to be wrapped, and tight enough that pathological input
+    cannot take the screen. Env: ``JARVIS_VERB_HELP_MAX_CHARS``.
+    """
+    try:
+        limit = max(40, int(os.environ.get("JARVIS_VERB_HELP_MAX_CHARS", "220")))
+    except (TypeError, ValueError):
+        limit = 220
+    text = " ".join(str(text).split())      # collapse newlines: the layout owns them
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _describe(fn: object) -> str:
     """One line of operator-facing help for a dispatcher. NEVER raises.
 
@@ -1580,7 +1605,7 @@ def _describe(fn: object) -> str:
         if isinstance(authored, dict):
             text = authored.get(verb) or authored.get(f"/{verb}")
             if isinstance(text, str) and text.strip():
-                return text.strip()[:88]
+                return _help_bound(text)
 
         # 1b. An ``Operator:`` section in the function's OWN docstring.
         #
@@ -1592,7 +1617,7 @@ def _describe(fn: object) -> str:
         #     other, and 45 verbs were never going to get dict entries.
         operator_line = extract_operator_section(getattr(fn, "__doc__", None))
         if operator_line:
-            return operator_line[:88]
+            return _help_bound(operator_line)
 
         # 2. The FUNCTION docstring, humanised — accepted only if it survives
         #    as prose.
@@ -1606,7 +1631,7 @@ def _describe(fn: object) -> str:
         #    yet"; plausible noise is not.
         own = _first_line(getattr(fn, "__doc__", ""))
         if own:
-            return own[:88]
+            return _help_bound(own)
 
         # 3. No prose anywhere — mine the verb's own SUBCOMMAND VOCABULARY.
         #
@@ -1618,7 +1643,7 @@ def _describe(fn: object) -> str:
         #    not used, and it was sitting unread in the source.
         mined = mine_subcommands(fn)
         if mined:
-            return " | ".join(mined)[:88]
+            return _help_bound(" | ".join(mined))
 
         # 4. No prose anywhere. The SIGNATURE still knows what the verb
         #    takes, and "what arguments does this want" is most of what an
@@ -1627,7 +1652,7 @@ def _describe(fn: object) -> str:
         #    signature would be worse than the blank it replaces.
         derived = derive_usage(fn, verb)
         if derived:
-            return derived[:88]
+            return _help_bound(derived)
     except Exception:  # noqa: BLE001
         pass
     # 5. Nothing authored, nothing extractable, nothing to derive. Say so
