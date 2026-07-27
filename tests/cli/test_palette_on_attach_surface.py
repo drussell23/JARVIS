@@ -228,12 +228,33 @@ def child():
         style=_cockpit_style(), reserve_space_for_menu=0,
     )
     n = _strip_native_menu(session.app)
+    import json as _json
+    try:
+        _sz = session.app.output.get_size()
+        _geo = "%dx%d" % (_sz.columns, _sz.rows)
+    except Exception as _e:
+        _geo = "unknown:%r" % (_e,)
+    _ncomp = "?"
+    try:
+        from prompt_toolkit.document import Document as _D
+        _inner = getattr(session.completer, "completer", session.completer)
+        _ncomp = len(list(_inner.get_completions(_D("/"), None)))
+    except Exception as _e:
+        _ncomp = "err:%r" % (_e,)
+    # Reported in the failure message so a red run says WHICH half broke:
+    # geometry culling and a dead completer look identical on a blank screen.
+    sys.stderr.write("DIAG=" + _json.dumps(
+        {"geo": _geo, "ncomp": _ncomp}) + "\n")
+    sys.stderr.flush()
     # Signal on the FIRST ACTUAL FRAME rather than letting the parent sleep
     # and hope. Under full-suite load the fixed wait elapsed before anything
     # was painted, so "/" went into a prompt that did not exist yet and the
     # test failed while passing in isolation — a UI test lying in the most
     # expensive direction.
+    _painted_once = []
     def _painted(_app=None):
+        if _painted_once: return
+        _painted_once.append(1)
         sys.stderr.write("PAINTED\n"); sys.stderr.flush()
     try: session.app.after_render += _painted
     except Exception: pass
@@ -261,11 +282,22 @@ while time.time() - t0 < 90:
         if b"\x1b[6n" in c: os.write(fd, b"\x1b[22;1R")
     if not sent and b"PAINTED" in out:
         time.sleep(0.4); mark = len(out); os.write(fd, b"/"); sent = True; ts = time.time()
-    if sent and (b"|" in out[mark:] or b"Usage:" in out[mark:]
-                 or time.time() - ts > 20): break
+    if sent:
+        # Stop when the PALETTE is on screen, decided on the stripped text.
+        # This used to break on a bare b"|" in the RAW stream — a byte that
+        # occurs freely inside ANSI sequences, so the loop exited before
+        # anything rendered and the test reported an empty screen. It passed
+        # in isolation purely because the timing differed, which is the most
+        # expensive way for a UI test to be wrong.
+        _seen = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "",
+                       out[mark:].decode("utf8", "replace"))
+        _v = set(re.findall(r"^\s*(/\S+)\s{2,}\S", _seen, re.M))
+        if len(_v) >= 6 or time.time() - ts > 25:
+            break
 raw = out.decode("utf8", "replace")
 plain = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw[mark:])
 print("RESULT_STRIPPED=" + (raw.split("STRIPPED=")[1][:1] if "STRIPPED=" in raw else "0"))
+print("RESULT_DIAG=" + (raw.split("DIAG=")[1].split(chr(10))[0] if "DIAG=" in raw else "{}"))
 print("RESULT_PAINTED=" + ("1" if b"PAINTED" in out else "0"))
 print("RESULT_BODY_START")
 print(plain)
@@ -314,10 +346,15 @@ def test_pressing_slash_actually_draws_the_palette(tmp_path: Path) -> None:
 
     assert stripped != "0", "the native completions float was never removed"
 
+    verbs = set(re.findall(r"^\s*(/\S+)\s{2,}\S", body, re.M))
     rows = [ln for ln in body.splitlines() if ln.strip().startswith("/")]
-    assert len(rows) >= 5, (
+    diag = ""
+    if "RESULT_DIAG=" in proc.stdout:
+        diag = proc.stdout.split("RESULT_DIAG=")[1].split("\n")[0]
+    assert len(verbs) >= 5, (
         f"pressing '/' painted {len(rows)} palette rows; the menu is not "
-        f"reaching the screen"
+        f"reaching the screen. geo/ncomp: {diag[:60]} | "
+        f"PAINTED_BODY={body[-500:]!r}"
     )
     # Page-style, not widget-style: name column, gutter, then a description
     # on the SAME line. The native float puts descriptions in a second column
