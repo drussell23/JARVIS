@@ -583,7 +583,14 @@ def _get_fs_process_pool():
                     _reg_pool(_FS_PROCESS_POOL)
                 except Exception:  # noqa: BLE001
                     pass
-                atexit.register(shutdown_fs_process_pool)
+                # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so an
+                # `except Exception` inside the handler never catches them and a
+                # Ctrl+C landing here prints a traceback over the goodbye. Local
+                # import so this can never introduce a cycle.
+                from backend.core.ouroboros.governance.exit_guard import (
+                    guarded_atexit_register,
+                )
+                guarded_atexit_register(shutdown_fs_process_pool)
                 # Slice 23 — fold this pool's hard-reap into the child_reaper
                 # cascade so a shutdown/OOM-triggered teardown (graceful,
                 # LoopDeadman pre-exit, or atexit) leaves ZERO ghost workers

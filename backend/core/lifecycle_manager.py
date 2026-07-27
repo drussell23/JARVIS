@@ -156,8 +156,14 @@ class LifecycleManager:
         logger.info("🛡️  Registering shutdown handlers...")
 
         # Register atexit handler
-        atexit.register(self._sync_shutdown)
-
+        # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so the
+        # `except Exception` inside these handlers never caught them and a
+        # Ctrl+C landing here printed a traceback over the goodbye. Imported
+        # locally so this can never introduce an import cycle.
+        from backend.core.ouroboros.governance.exit_guard import (
+            guarded_atexit_register,
+        )
+        guarded_atexit_register(self._sync_shutdown)
         # Register signal handlers
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, self._signal_handler)

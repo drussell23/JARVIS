@@ -144,8 +144,14 @@ class AsyncResourceManager:
         }
 
         # Register atexit handler for synchronous cleanup
-        atexit.register(self._sync_cleanup_atexit)
-
+        # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so an
+        # `except Exception` inside the handler never catches them and a
+        # Ctrl+C landing here prints a traceback over the goodbye. Local
+        # import so this can never introduce a cycle.
+        from backend.core.ouroboros.governance.exit_guard import (
+            guarded_atexit_register,
+        )
+        guarded_atexit_register(self._sync_cleanup_atexit)
         self._initialized = True
         logger.info("[AsyncResourceManager] Initialized")
 

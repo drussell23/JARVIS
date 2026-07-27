@@ -268,7 +268,14 @@ class EmbeddingService:
         self._tier_transitions: int = 0  # observability: total demote/promote events
 
         # Register cleanup
-        atexit.register(self._sync_cleanup)
+        # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so the
+        # `except Exception` inside these handlers never caught them and a
+        # Ctrl+C landing here printed a traceback over the goodbye. Imported
+        # locally so this can never introduce an import cycle.
+        from backend.core.ouroboros.governance.exit_guard import (
+            guarded_atexit_register,
+        )
+        guarded_atexit_register(self._sync_cleanup)
         self._register_with_shutdown_manager()
         self._register_with_cross_repo_cleanup()
 
@@ -1126,8 +1133,13 @@ def _register_cleanup_handlers() -> None:
         if _service_instance:
             _service_instance._sync_cleanup()
 
-    atexit.register(cleanup_on_exit)
-
-
+    # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so the
+    # `except Exception` inside these handlers never caught them and a
+    # Ctrl+C landing here printed a traceback over the goodbye. Imported
+    # locally so this can never introduce an import cycle.
+    from backend.core.ouroboros.governance.exit_guard import (
+        guarded_atexit_register,
+    )
+    guarded_atexit_register(cleanup_on_exit)
 # Auto-register cleanup handlers when module is imported
 _register_cleanup_handlers()

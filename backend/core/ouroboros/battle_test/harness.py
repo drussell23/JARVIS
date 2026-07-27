@@ -871,8 +871,14 @@ class BattleTestHarness:
         The fallback is a no-op when ``_summary_written`` is True (the
         clean path already wrote a full summary).
         """
-        atexit.register(self._atexit_fallback_write)
-
+        # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so an
+        # `except Exception` inside the handler never catches them and a
+        # Ctrl+C landing here prints a traceback over the goodbye. Local
+        # import so this can never introduce a cycle.
+        from backend.core.ouroboros.governance.exit_guard import (
+            guarded_atexit_register,
+        )
+        guarded_atexit_register(self._atexit_fallback_write)
     def _atexit_fallback_write(self, session_outcome: Optional[str] = None) -> None:
         """Best-effort synchronous summary.json writer for partial shutdown.
 

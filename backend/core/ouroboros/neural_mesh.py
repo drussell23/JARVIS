@@ -1070,4 +1070,11 @@ def _neural_mesh_atexit_cleanup() -> None:
 
 # Register atexit handler
 import atexit
-atexit.register(_neural_mesh_atexit_cleanup)
+# Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so an
+# `except Exception` inside the handler never catches them and a
+# Ctrl+C landing here prints a traceback over the goodbye. Local
+# import so this can never introduce a cycle.
+from backend.core.ouroboros.governance.exit_guard import (
+    guarded_atexit_register,
+)
+guarded_atexit_register(_neural_mesh_atexit_cleanup)

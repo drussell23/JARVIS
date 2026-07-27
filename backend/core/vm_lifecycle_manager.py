@@ -291,7 +291,14 @@ class LifecycleLease:
 
         self._session_id = session_id
         import atexit
-        atexit.register(self.release)
+        # Guarded: KeyboardInterrupt/SystemExit are BaseExceptions, so the
+        # `except Exception` inside these handlers never caught them and a
+        # Ctrl+C landing here printed a traceback over the goodbye. Imported
+        # locally so this can never introduce an import cycle.
+        from backend.core.ouroboros.governance.exit_guard import (
+            guarded_atexit_register,
+        )
+        guarded_atexit_register(self.release)
         _log.info("LifecycleLease acquired: session=%s pid=%d", session_id, os.getpid())
         return session_id
 
