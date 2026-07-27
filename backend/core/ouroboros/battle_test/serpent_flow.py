@@ -600,34 +600,136 @@ def _parse_unified_diff(diff_text: str) -> tuple:
 # ══════════════════════════════════════════════════════════════
 
 
-def _tool_chrome_line(tool_name: str, args_summary: str = "") -> str:
-    """``⏺ Read(backend/core/…/thin_client.py)`` — one tool call, CC-style.
+#: Built-in tools whose natural derivation would read WRONG. Everything else
+#: is derived, so this is an override list rather than a registry — a new
+#: tool needs an entry only when `read_file → Read File` is not what an
+#: operator should see.
+_VERB_OVERRIDE = {
+    "read_file": "Read", "search_code": "Search", "edit_file": "Update",
+    "write_file": "Write", "run_tests": "Test", "bash": "Bash",
+    "get_callers": "Callers", "list_symbols": "Symbols",
+    "glob_files": "Glob", "list_dir": "List", "web_search": "WebSearch",
+    "web_fetch": "Fetch", "ask_human": "Ask",
+}
 
-    The tool token is a routing identifier (`read_file`); this is the verb an
-    operator reads. Keyed off the existing token so a new tool means one entry
-    here rather than a renderer that must learn a new concept, and an unknown
-    tool still renders under its own name rather than vanishing.
+#: Path-shaped arguments are identified by their TAIL (the filename);
+#: commands and patterns by their HEAD (the verb and its first operands).
+#: One clip rule cannot serve both, and picking either alone silently
+#: destroys half the cases.
+_ARG_MAX = 56
 
-    The ARGUMENT is the point. `⏺ Read()` says an op is busy; `⏺ Read(path)`
-    says what it is busy with, and that difference is the whole request.
-    Paths are shown from the RIGHT — the filename is what identifies a file,
-    and a left-clip of a deep repo path yields identical `backend/core/…`
-    prefixes for every entry.
+
+def derive_verb(tool_name: str, mcp_servers: Any = None) -> str:
+    """The word an operator reads for a tool. Derived, not enumerated.
+
+    MCP tools arrive at RUNTIME — an operator can connect a server this
+    afternoon — so a fixed table cannot cover them and a lookup miss must not
+    render a raw routing token. `mcp_{server}_{tool}` (the canonical form from
+    `mcp_tool_client`) becomes `server·tool`.
+
+    Server names may themselves contain underscores, so the split is
+    ambiguous without the connection list. When one is supplied the longest
+    matching server wins — the same rule the client's own dispatcher uses.
+    Without it, the first segment is assumed and the tool still renders
+    honestly rather than not at all: a slightly mis-split label beats a raw
+    `mcp_github_search_issues`.
     """
-    verbs = {
-        "read_file": "Read", "search_code": "Search", "run_tests": "Test",
-        "bash": "Bash", "web_search": "WebSearch", "web_fetch": "Fetch",
-        "get_callers": "Callers", "list_symbols": "Symbols",
-        "glob_files": "Glob", "list_dir": "List", "git_log": "GitLog",
-        "git_diff": "GitDiff", "git_blame": "GitBlame",
-        "edit_file": "Update", "write_file": "Write", "ask_human": "Ask",
-    }
-    verb = verbs.get(str(tool_name or ""), str(tool_name or "Tool"))
-    arg = " ".join(str(args_summary or "").split())
-    if len(arg) > 56:
-        # Keep the tail: the filename identifies the file.
-        arg = "…" + arg[-55:]
-    return f"⏺ {verb}({arg})" if arg else f"⏺ {verb}"
+    token = str(tool_name or "").strip()
+    if not token:
+        return "Tool"
+    if token in _VERB_OVERRIDE:
+        return _VERB_OVERRIDE[token]
+    if token.startswith("mcp_"):
+        remainder = token[4:]
+        server = ""
+        try:
+            for name in sorted(mcp_servers or (), key=len, reverse=True):
+                if remainder.startswith(f"{name}_"):
+                    server = str(name)
+                    break
+        except Exception:  # noqa: BLE001
+            server = ""
+        if not server:
+            server = remainder.split("_", 1)[0]
+        tail = remainder[len(server) + 1:] if remainder.startswith(
+            f"{server}_") else remainder
+        return f"{server}·{tail}" if tail else server or token
+    # A plain snake_case tool: title-case it rather than showing the token.
+    return "".join(part.capitalize() for part in token.split("_")) or token
+
+
+def _looks_like_path(text: str) -> bool:
+    """Is this argument identified by its tail?
+
+    A path has separators and no spaces before the first one. A shell command
+    ("pytest tests/cli -q") also contains a slash, so the presence of one is
+    not enough — the discriminator is whether the FIRST token is itself the
+    path.
+    """
+    head = text.split(" ", 1)[0]
+    return "/" in head and not head.startswith("-")
+
+
+def elide_path(text: str, limit: int = _ARG_MAX) -> str:
+    """Shorten a path while keeping BOTH ends that identify it.
+
+    `…ouroboros/governance/thin_client.py` loses the repo it is in;
+    `backend/core/…` loses the file entirely. Whole SEGMENTS are elided from
+    the middle, so the result is still a readable path rather than a string
+    cut mid-word — the same rule that made op ids legible, applied to the
+    other axis.
+    """
+    if len(text) <= limit:
+        return text
+    parts = [p for p in text.split("/") if p]
+    if len(parts) <= 2:
+        # Nothing to elide between: keep the tail, which names the file.
+        return "…" + text[-(limit - 1):]
+    head, tail = parts[0], parts[-1]
+    minimal = f"{head}/…/{tail}"
+    if len(minimal) > limit:
+        # Even head/…/file is too long — the filename is the last thing to go.
+        return "…/" + tail[-(limit - 2):]
+
+    # Grow back toward the FILE: the segments nearest the filename carry the
+    # most meaning (`governance/chat_repl_dispatcher.py` locates it; `core/`
+    # barely narrows anything). Free context should buy the useful end.
+    best = minimal
+    for keep in range(1, len(parts) - 1):
+        candidate = f"{head}/…/" + "/".join(parts[-(keep + 1):])
+        if len(candidate) > limit:
+            break
+        best = candidate
+    # If every segment fits, there was nothing to elide after all.
+    whole = "/".join(parts)
+    return whole if len(whole) <= limit else best
+
+
+def _clip_arg(text: str, limit: int = _ARG_MAX) -> str:
+    """Clip an argument on the axis that preserves its meaning."""
+    flat = " ".join(str(text or "").split())
+    if len(flat) <= limit:
+        return flat
+    if _looks_like_path(flat):
+        return elide_path(flat, limit)
+    # A command or pattern: the HEAD identifies it, so the tail goes.
+    return flat[: limit - 1].rstrip() + "…"
+
+
+def _tool_chrome_line(
+    tool_name: str, args_summary: str = "", mcp_servers: Any = None,
+) -> str:
+    """``⏺ Read(backend/…/thin_client.py)`` — one tool call, CC-style.
+
+    The ARGUMENT is the point: `⏺ Read()` says an op is busy; `⏺ Read(path)`
+    says what it is busy with.
+    """
+    try:
+        verb = derive_verb(tool_name, mcp_servers)
+        arg = _clip_arg(args_summary)
+        return f"⏺ {verb}({arg})" if arg else f"⏺ {verb}"
+    except Exception:  # noqa: BLE001 — chrome must never break a tool round
+        return f"⏺ {tool_name or 'Tool'}"
 
 
 class SerpentFlow:
