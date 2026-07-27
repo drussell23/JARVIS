@@ -1024,6 +1024,20 @@ async def _split_plane_loop(
     )
 
     ui = ui or AttachUI()
+    # Arm the out-of-band stack dump BEFORE the UI mounts. If the cockpit
+    # wedges, `kill -USR1 <pid>` is the only way to ask it what it is doing —
+    # Ctrl+C does nothing to a deadlocked thread and `kill -9` destroys the
+    # frames. Armed here so it covers the mount itself, not just steady state.
+    try:
+        from backend.core.ouroboros.battle_test.oob_diagnostics import (
+            install_oob_stack_dump, oob_hint,
+        )
+        if install_oob_stack_dump():
+            hint = oob_hint()
+            if hint and os.environ.get("JARVIS_OOB_HINT", "1") != "0":
+                console.print(f"⎿ {hint}", markup=False, highlight=False)
+    except Exception:  # noqa: BLE001 — a missing debugger must not stop a boot
+        pass
     # This surface has no container to float the palette into, so it draws it
     # in the toolbar. The cockpit floats it and must NOT opt in, or it renders
     # twice.
