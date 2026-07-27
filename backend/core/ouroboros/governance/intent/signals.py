@@ -94,6 +94,18 @@ class SignalSource(str, Enum):
     SWE_BENCH_PRO = "swe_bench_pro"
     TEST_COVERAGE = "test_coverage"
     VOICE_HUMAN = "voice_human"
+    # A goal TYPED by the operator into the cockpit. Distinct from
+    # voice_human (spoken) and from backlog (a task list mined by a sensor):
+    # all three are different ORIGINS, and the origin is what routing reads.
+    #
+    # Before this existed, a typed goal was written to backlog.json and
+    # therefore carried source="backlog" — which sits in _BACKGROUND_SOURCES
+    # ("DW only, no Claude fallback... cost-optimization-first") and is
+    # collected on a later sensor sweep. Correct for the Backlog SENSOR
+    # mining a list; wrong for a human who just pressed Enter and is watching
+    # the screen. The token described where the goal was STORED rather than
+    # who ASKED for it.
+    OPERATOR_CHAT = "operator_chat"
     CLI_EMERGENCY = "cli_emergency"
     HUMAN_OVERRIDE = "human_override"
     # Proactive desktop-topology origin (2026-07-19): an operator-

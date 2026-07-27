@@ -71,6 +71,13 @@ __all__ = [
 #: flag: True when the work will be collected later rather than started now,
 #: which is the difference between "on it" and "queued".
 ACTION_VOICE = {
+    # backlog_dispatch is now TWO outcomes wearing one action name: the goal
+    # either entered intake and is running, or it was filed for a sensor
+    # sweep. The receipt shape tells them apart (`op-…` vs `chat:…`), and
+    # saying "queued" about live work — or "on it" about filed work — is
+    # exactly the dishonesty the queue note exists to prevent. Resolved at
+    # render time by `_dispatched_now`, not by a second action token, so the
+    # classifier is not asked to predict what the executor will manage.
     "backlog_dispatch": ("adding that to the backlog", True),
     "subagent_explore": ("sending a subagent to explore that", False),
     "claude_query": ("thinking about that", False),
@@ -78,6 +85,12 @@ ACTION_VOICE = {
     "social_ack": ("", False),          # the reply IS the response
     "noop": ("nothing to do here", False),
 }
+
+
+def _short_ref(ref: str) -> str:
+    """The distinguishing TAIL of an op id — UUIDv7 shares its prefix."""
+    parts = [p for p in str(ref).split("-") if p]
+    return "-".join(parts[-2:]) if len(parts) >= 3 else str(ref)
 
 
 def _voice(action: str) -> tuple:
@@ -97,6 +110,18 @@ def acknowledge(action: str, message: str = "") -> str:
     return f"⏺ {phrase}"
 
 
+def _dispatched_now(receipt: str) -> bool:
+    """Did this goal actually START, or was it filed?
+
+    An op-id means intake accepted it and a worker has it. A `chat:` task-id
+    means it landed in backlog.json for the Backlog sensor to collect. Read
+    off the receipt the executor returns, because the executor is the only
+    layer that knows which path it took.
+    """
+    ref = str(receipt or "").strip()
+    return bool(ref) and (ref.startswith("op-") or ref.startswith("op_"))
+
+
 def _queue_note(action: str, receipt: str = "") -> Optional[str]:
     """Say plainly when work is queued rather than started.
 
@@ -105,7 +130,7 @@ def _queue_note(action: str, receipt: str = "") -> Optional[str]:
     needs to know whether to wait or to worry.
     """
     _phrase, deferred = _voice(action)
-    if not deferred:
+    if not deferred or _dispatched_now(receipt):
         return None
     ref = f" ({receipt})" if receipt else ""
     return (f"⎿ queued{ref} — the Backlog sensor will pick it up on its "
@@ -180,9 +205,17 @@ def compose_reply(
         if action == "social_ack" and social_reply:
             lines.append(f"⏺ {social_reply}")
         else:
-            head = acknowledge(action, message)
-            if head:
-                lines.append(head)
+            if _dispatched_now(receipt):
+                # It is RUNNING. Say so, and hand the operator the ref the op
+                # chrome will narrate under — so the ⏺/⎿ lines that follow
+                # are recognisably the answer to what they just typed.
+                lines.append("⏺ on it")
+                lines.append(f"  ⎿ dispatched {_short_ref(receipt)} · "
+                             f"immediate · watching")
+            else:
+                head = acknowledge(action, message)
+                if head:
+                    lines.append(head)
 
             for step in steps:
                 text = str(step).strip()
@@ -190,9 +223,14 @@ def compose_reply(
                     lines.append(f"  ⎿ {text}")
 
             note = _queue_note(action, receipt)
+            if _dispatched_now(receipt):
+                note = None                      # already said above
             if note:
                 lines.append(f"  {note.lstrip()}")
-            elif receipt and action != "noop":
+            elif receipt and action != "noop" and not _dispatched_now(receipt):
+                # Not repeated when dispatched: the ref is already on the
+                # "dispatched …" line, and printing the full id underneath it
+                # is the UUID-noise the digest work removed everywhere else.
                 lines.append(f"  ⎿ {receipt}")
 
         if verbose:

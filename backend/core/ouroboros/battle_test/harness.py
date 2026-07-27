@@ -4619,6 +4619,15 @@ class BattleTestHarness:
                                 write_provenance,
                             )
                             write_provenance()
+                            # Arm immediate dispatch for typed goals. Until
+                            # this runs the chat executor files them for the
+                            # Backlog sensor and the reply honestly says
+                            # "queued" — the degradation is visible, never
+                            # silent.
+                            from backend.core.ouroboros.governance.chat_repl_backlog_executor import (  # noqa: E501
+                                set_operator_dispatcher,
+                            )
+                            set_operator_dispatcher(self._submit_operator_goal)
                         except Exception:  # noqa: BLE001
                             pass
                         spooler.start()
@@ -4713,6 +4722,73 @@ class BattleTestHarness:
                 submit(envelope)
         except Exception:  # noqa: BLE001
             logger.debug("[QoS] emit routing degraded", exc_info=True)
+
+    def _submit_operator_goal(self, message: str, turn: Any) -> Optional[str]:
+        """A typed goal → intake, NOW. Returns the op id, or None to defer.
+
+        Routes through the SAME router every sensor uses — no private lane for
+        operator input, so one set of governance, dedup and WAL rules applies
+        to autonomous and human-originated work alike.
+
+        The envelope carries `operator_chat`: human-origin, SOVEREIGN,
+        IMMEDIATE-eligible. Previously a typed goal was written to
+        backlog.json and therefore claimed `source="backlog"` — a BACKGROUND,
+        cost-optimized, sensor-polled route. The token described where the
+        goal was stored rather than who asked for it.
+
+        Returns None rather than raising when intake is unreachable: the
+        caller then FILES the goal and says so. A queued goal is a
+        degradation; a dropped one is a betrayal.
+        """
+        try:
+            gls = getattr(self, "_governed_loop_service", None)
+            router = None
+            for _attr in ("_intake_router", "intake_router", "_router"):
+                router = getattr(gls, _attr, None)
+                if router is not None:
+                    break
+            if router is None:
+                return None
+            submit = (
+                getattr(router, "submit_envelope", None)
+                or getattr(router, "ingest", None)
+                or getattr(router, "emit", None)
+            )
+            if submit is None:
+                return None
+
+            from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: E501
+                IntentEnvelope,
+            )
+            envelope = IntentEnvelope(
+                source="operator_chat",
+                description=str(message),
+                # HIGH, not critical: the operator is waiting, but a typed
+                # goal is not an emergency and must not outrank a genuine
+                # runtime alarm. IMMEDIATE eligibility comes from the SOURCE
+                # being human-origin; urgency does not need inflating to buy
+                # it, and inflating it would distort every priority queue the
+                # envelope passes through.
+                urgency="high",
+                evidence={
+                    "turn_id": str(getattr(turn, "turn_id", "") or ""),
+                    "session_id": str(getattr(turn, "session_id", "") or ""),
+                    "origin": "cockpit_chat",
+                },
+            )
+            result = submit(envelope)
+            if asyncio.iscoroutine(result):
+                # The caller is synchronous (the chat executor). Schedule and
+                # report the id we already hold, rather than blocking the loop
+                # waiting for intake to accept.
+                asyncio.ensure_future(result)
+                return str(getattr(envelope, "op_id", "") or
+                           getattr(envelope, "envelope_id", "") or "") or None
+            return str(result) if result else None
+        except Exception:  # noqa: BLE001
+            logger.debug("[OperatorGoal] immediate dispatch degraded",
+                         exc_info=True)
+            return None
 
     def _qos_note_override(self, kind: str = "sigint") -> None:
         """Operational-override hook (SIGINT / lease seizure) → QoS.

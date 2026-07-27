@@ -123,6 +123,17 @@ class ProviderRoute(str, Enum):
 _IMMEDIATE_SOURCES = frozenset({
     "test_failure",
     "voice_human",
+    # A goal TYPED by the operator, who is watching the screen right now.
+    # This is the same class as voice_human — a human asked — and it belongs
+    # here for the same reason: §5 routes human-originated signals IMMEDIATE
+    # because a person is waiting on the answer.
+    #
+    # It does NOT widen the cost surface the way the bt-2026-04-13 regression
+    # did. That was seven autonomous sensors mislabelling themselves as
+    # `runtime_health` and firing unattended. This source can only be
+    # produced by someone pressing Enter, so its rate is bounded by human
+    # typing speed, and IMMEDIATE still requires an urgent signal on top.
+    "operator_chat",
     "runtime_health",
 })
 
