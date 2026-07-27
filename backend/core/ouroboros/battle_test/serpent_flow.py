@@ -6913,6 +6913,29 @@ class SerpentREPL:
                 highlight=False,
             )
             return
+        # BARE cancel (Esc, or `/cancel` with no argument) targets the
+        # operator's OWN work, most recent first.
+        #
+        # Not "everything running": Esc means "stop what I asked for", not
+        # "stop the organism". One keystroke that reached autonomous work
+        # could kill a soak, and an operator who discovers that stops
+        # trusting the key — so the scope is narrow by construction rather
+        # than by warning.
+        if not str(op_id or "").strip():
+            mine = []
+            if hasattr(self._gls, "operator_ops_active"):
+                try:
+                    mine = self._gls.operator_ops_active() or []
+                except Exception:  # noqa: BLE001
+                    mine = []
+            if not mine:
+                self._flow.console.print(
+                    f"  [{_C['dim']}]nothing of yours is running — "
+                    f"autonomous work keeps going[/{_C['dim']}]",
+                    highlight=False,
+                )
+                return
+            op_id = mine[0]
         if hasattr(self._gls, "request_cancel"):
             found = self._gls.request_cancel(op_id)
             if found:

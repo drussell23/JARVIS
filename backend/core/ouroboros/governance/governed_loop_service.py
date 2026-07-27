@@ -3386,6 +3386,49 @@ class GovernedLoopService:
             return self._bg_pool.get_result(op_id)
         return None
 
+    def note_operator_op(self, op_id: str) -> None:
+        """Remember an op the OPERATOR asked for. NEVER raises.
+
+        Esc means "stop what I asked for", not "stop the organism". The
+        distinction is load-bearing: a bare cancel that reached autonomous
+        work would let one keystroke kill a soak, and an operator who learns
+        that stops trusting the key.
+
+        Bounded: this is a recency hint for interrupt targeting, not a
+        ledger. The authoritative record of what ran lives in the op ledger.
+        """
+        try:
+            if not op_id:
+                return
+            ring = getattr(self, "_operator_ops", None)
+            if ring is None:
+                from collections import deque
+                ring = deque(maxlen=16)
+                self._operator_ops = ring
+            ring.append(str(op_id))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def operator_ops_active(self) -> list:
+        """Operator-initiated ops still running, most recent FIRST.
+
+        Intersected with `_active_ops` so a finished op is never offered as an
+        interrupt target — cancelling something already done would report
+        success and change nothing, which is worse than reporting nothing to
+        cancel.
+        """
+        try:
+            ring = getattr(self, "_operator_ops", None) or ()
+            active = self._active_ops
+            seen, out = set(), []
+            for op_id in reversed(list(ring)):
+                if op_id in active and op_id not in seen:
+                    seen.add(op_id)
+                    out.append(op_id)
+            return out
+        except Exception:  # noqa: BLE001
+            return []
+
     def request_cancel(self, op_id: str) -> bool:
         """Request cooperative cancellation of an in-flight operation.
 

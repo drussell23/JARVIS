@@ -4776,6 +4776,16 @@ class BattleTestHarness:
                     "origin": "cockpit_chat",
                 },
             )
+            # Record it BEFORE dispatch resolves: Esc must be able to target
+            # an op the moment the operator sees "dispatched", not after
+            # intake finishes accepting it.
+            try:
+                _oid = str(getattr(envelope, "op_id", "") or
+                           getattr(envelope, "envelope_id", "") or "")
+                if _oid and hasattr(gls, "note_operator_op"):
+                    gls.note_operator_op(_oid)
+            except Exception:  # noqa: BLE001
+                pass
             result = submit(envelope)
             if asyncio.iscoroutine(result):
                 # The caller is synchronous (the chat executor). Schedule and
