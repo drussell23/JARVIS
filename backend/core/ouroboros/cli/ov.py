@@ -1348,6 +1348,21 @@ async def _split_plane_loop(
     except Exception:  # noqa: BLE001 — a styled fallback still works
         pass
     ui.bind_app(session.app)
+    # A dropped file becomes something the organism understands.
+    #
+    # Terminals inject an ABSOLUTE PATH on drag-and-drop. Wrapping
+    # `Buffer.insert_text` rather than binding a paste key is deliberate: a
+    # drop arrives as bracketed-paste text through the same insertion path as
+    # typing, so there is no keystroke to bind, and wrapping the one method
+    # every insertion goes through catches it however the terminal delivers
+    # it.
+    try:
+        from backend.core.ouroboros.battle_test.drop_translate import (
+            install_drop_translation,
+        )
+        install_drop_translation(session.app.current_buffer)
+    except Exception:  # noqa: BLE001 — a paste must still paste
+        pass
 
     async def _watch_disconnect() -> None:
         while client.connected:
