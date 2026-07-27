@@ -505,7 +505,21 @@ def build_bipartite_application(
     # why the completer built in D5 yielded 76 correct verbs and the operator
     # saw nothing: the menu had nowhere to exist.
     prompt = TextArea(
-        height=1, prompt=[("fg:#5ee06a bold", "❯ ")], multiline=False,
+        # Multi-line, with the CONDITION applied to the buffer just below.
+        #
+        # The old `multiline=False` did not only stop the operator typing a
+        # second line — it made a PASTED block lose its newlines, silently
+        # collapsing a stack trace into one line. That is data loss.
+        #
+        # Passing the condition HERE does not work, despite the parameter
+        # being annotated `FilterOrBool`: TextArea branches on the raw
+        # truthiness (`if multiline:`) before any `to_filter`, and a Filter
+        # raises ValueError on `__bool__`. So the literal True selects the
+        # growable branch — the falsy one hard-clamps `height = D.exact(1)`,
+        # which would put the caret below the fold on line two — and the
+        # buffer gets the real rule afterwards.
+        height=Dimension(min=1, max=8), multiline=True,
+        prompt=[("fg:#5ee06a bold", "❯ ")],
         wrap_lines=False, style="class:command-deck",
         completer=completer,
         complete_while_typing=bool(completer is not None),
@@ -520,8 +534,27 @@ def build_bipartite_application(
         return False  # clear the buffer after accept
 
     prompt.buffer.accept_handler = _accept
+    # Enter submits unless the text is visibly unfinished. `Buffer.multiline`
+    # is the library's OWN seam — it stores a Filter and `is_multiline` calls
+    # it per keystroke — so this needs no custom Enter binding to fight with.
+    try:
+        from backend.core.ouroboros.battle_test.input_continuation import (
+            continuation_filter,
+        )
+        prompt.buffer.multiline = continuation_filter(lambda: prompt.buffer.text)
+    except Exception:  # noqa: BLE001 — plain multiline still beats one line
+        logger.debug("[Bipartite] continuation rule degraded", exc_info=True)
 
     kb = KeyBindings()
+    # Alt+Enter, from the same module that decides when Enter continues — so
+    # the rule and its escape hatch can never be wired on different surfaces.
+    try:
+        from backend.core.ouroboros.battle_test.input_continuation import (
+            install_newline_binding,
+        )
+        install_newline_binding(kb)
+    except Exception:  # noqa: BLE001
+        pass
 
     @kb.add("c-c")
     @kb.add("c-d")
