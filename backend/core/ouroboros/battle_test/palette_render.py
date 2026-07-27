@@ -79,6 +79,21 @@ def _wrap(text: str, width: int) -> List[str]:
     return out or [""]
 
 
+def _rendered_height(desc: Any, desc_col: int, wrap: bool) -> int:
+    """How many LINES an entry will occupy once drawn.
+
+    Deliberately calls the same ``_wrap`` the renderer uses rather than
+    estimating from ``len(desc) / desc_col``: an estimate and a renderer that
+    disagree by one line produce a palette that overflows its own budget,
+    which is the failure this budget exists to prevent."""
+    if not wrap:
+        return 1
+    try:
+        return max(1, len(_wrap(str(desc), desc_col)))
+    except Exception:  # noqa: BLE001
+        return 1
+
+
 def layout_palette(
     entries: List[Tuple[str, str]],
     *,
@@ -107,13 +122,39 @@ def layout_palette(
     )
     desc_col = max(8, width - name_col - _GUTTER - 2)
 
-    # Window the ENTRY list around the selection before rendering, so wrapping
-    # cost is paid only for what is shown.
+    # The budget is RENDERED LINES, not entries.
+    #
+    # Counting entries makes the block's height depend on how long the
+    # descriptions happen to be: four entries that each wrap to three lines
+    # is a twelve-line slab, and the same four with terse descriptions is
+    # four. The visible size of a UI element should not be a side effect of
+    # its content — so entries are admitted until the LINE budget is spent,
+    # which adapts by itself. Terse verbs show more of them; a verb whose
+    # description needs three lines gets them, and displaces its neighbours
+    # rather than overflowing.
+    #
+    # This is also what makes wrapping safe to enable at all. On a narrow
+    # terminal every description wraps, and an entry-counted budget would
+    # silently triple the palette's height exactly when there is least room.
     total = len(entries)
+    line_budget = max(1, limit)
     start = 0
-    if selected >= 0 and total > limit:
-        start = max(0, min(selected - limit // 2, total - limit))
-    visible = entries[start: start + limit]
+    if selected >= 0 and total > 1:
+        # Centre the window on the selection, measured in ENTRIES, then let
+        # the line budget decide how many actually fit from there.
+        start = max(0, min(selected - line_budget // 2, total - 1))
+
+    visible: List[Tuple[str, str]] = []
+    spent = 0
+    for entry in entries[start:]:
+        cost = _rendered_height(entry[1], desc_col, wrap_descriptions)
+        # Always admit the first entry, even if it alone exceeds the budget:
+        # showing nothing is worse than showing one tall thing, and the
+        # selected row must never be the one that gets dropped.
+        if visible and spent + cost > line_budget:
+            break
+        visible.append(entry)
+        spent += cost
 
     lines: List[List[Tuple[str, str]]] = []
     for offset, (name, desc) in enumerate(visible):

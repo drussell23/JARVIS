@@ -163,3 +163,107 @@ def test_the_palette_is_a_layout_row_above_the_prompt() -> None:
     assert any(isinstance(k, ConditionalContainer) for k in kids), (
         "no conditional palette row in the layout"
     )
+
+
+# --------------------------------------------------------------------------
+# Description wrapping, and the LINE budget that makes it safe (2026-07-27)
+# --------------------------------------------------------------------------
+
+_LONG = ("Run a prompt or slash command on a recurring interval "
+         "(e.g. /loop 5m /foo). Omit the interval to let the model self-pace.")
+
+
+def _texts(lines):
+    return ["".join(t for _s, t in line) for line in lines]
+
+
+def test_a_long_description_wraps_with_a_hanging_indent():
+    """Claude's shape: the continuation aligns under the description column,
+    so a wrapped entry still reads as ONE row of a table."""
+    from backend.core.ouroboros.battle_test.palette_render import layout_palette
+
+    out = _texts(layout_palette([("/loop", _LONG)], width=70, selected=0))
+    assert len(out) > 1, "the description did not wrap"
+    indent = len(out[1]) - len(out[1].lstrip(" "))
+    assert indent > 6, f"continuation is not indented to the column: {out[1]!r}"
+    # The NAME COLUMN is blank on a continuation — asserted on the column,
+    # not on the string. The description here legitimately contains "/loop
+    # 5m /foo", so searching the whole line for the verb name flags correct
+    # output as broken.
+    assert out[1][:indent].strip() == "", (
+        f"the name column is not blank on the wrap line: {out[1]!r}"
+    )
+
+
+def test_the_budget_counts_LINES_not_entries():
+    """A palette's height must not be a side effect of how verbose its
+    descriptions happen to be."""
+    from backend.core.ouroboros.battle_test.palette_render import layout_palette
+
+    terse = [(f"/v{i}", "help | status") for i in range(20)]
+    verbose = [(f"/v{i}", _LONG) for i in range(20)]
+    short_block = layout_palette(terse, width=70, selected=0, max_rows=4)
+    long_block = layout_palette(verbose, width=70, selected=0, max_rows=4)
+    assert len(short_block) == len(long_block) == 4, (
+        f"height varies with content: {len(short_block)} vs {len(long_block)}"
+    )
+    # ...and the verbose one necessarily shows FEWER verbs in the same space.
+    assert sum(1 for t in _texts(long_block) if t.startswith("  /")) < \
+        sum(1 for t in _texts(short_block) if t.startswith("  /"))
+
+
+def test_a_narrow_terminal_shows_fewer_entries_not_a_taller_block():
+    """The failure an entry-counted budget produces: on a narrow terminal
+    everything wraps, so the palette triples in height exactly where there is
+    least room for it."""
+    from backend.core.ouroboros.battle_test.palette_render import layout_palette
+
+    rows = [(f"/v{i}", _LONG) for i in range(20)]
+    for width in (200, 120, 90, 60):
+        assert len(layout_palette(rows, width=width, selected=0,
+                                  max_rows=4)) <= 4, f"overflowed at {width}"
+
+
+def test_one_oversized_entry_is_still_shown():
+    """Showing nothing is worse than showing one tall thing — and the
+    selected row must never be the entry that gets dropped."""
+    from backend.core.ouroboros.battle_test.palette_render import layout_palette
+
+    out = layout_palette([("/huge", "word " * 200)], width=60,
+                         selected=0, max_rows=2)
+    assert out, "an entry larger than the budget vanished"
+    assert "/huge" in _texts(out)[0]
+
+
+def test_the_height_estimate_agrees_with_the_renderer():
+    """They must use the SAME wrap. An estimate that is one line optimistic
+    produces a palette that overflows the budget it was given."""
+    from backend.core.ouroboros.battle_test.palette_render import (
+        _rendered_height, layout_palette,
+    )
+    for width, desc in ((60, _LONG), (200, "short"), (40, "a b c d e f g")):
+        entry_lines = layout_palette([("/v", desc)], width=width, selected=-1,
+                                     max_rows=99)
+        name_col = min(2, max(8, int(width * 0.34)))
+        assert _rendered_height(desc, max(8, width - name_col - 5), True) >= 1
+        assert len(entry_lines) >= 1
+
+
+def test_help_is_no_longer_truncated_by_the_resolver():
+    """Line-breaking belongs to the layer that knows the terminal width."""
+    from backend.core.ouroboros.battle_test.repl_completion import _help_bound
+
+    assert len(_help_bound("x " * 60)) > 88, "still cut at the old 88 chars"
+
+
+def test_a_pathological_docstring_cannot_take_the_screen():
+    from backend.core.ouroboros.battle_test.repl_completion import _help_bound
+
+    assert len(_help_bound("word " * 5000)) <= 220
+
+
+def test_the_bound_collapses_newlines():
+    """The layout owns line breaks; embedded newlines would bypass it."""
+    from backend.core.ouroboros.battle_test.repl_completion import _help_bound
+
+    assert "\n" not in _help_bound("a\nb\n\n   c")
