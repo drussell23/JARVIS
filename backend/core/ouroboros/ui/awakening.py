@@ -337,7 +337,8 @@ class AwakeningConductor:
         # never a raw-ANSI overwrite hack.
         try:
             if self._last_size is not None:
-                _rows_needed = frame.rows + 6      # crest + header lines
+                from .crest import CREST_HEADER_ROWS
+                _rows_needed = frame.rows + CREST_HEADER_ROWS
                 if self._last_size[1] < _rows_needed:
                     from .crest import render_crest_auto as _rca
                     self._console.print(_rca(frame, tier))

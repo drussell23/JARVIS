@@ -13,6 +13,9 @@ from backend.core.ouroboros.ui.theme import ColorTier
 T = ColorTier.TRUECOLOR
 
 
+from backend.core.ouroboros.ui import crest as crest_mod
+
+
 def gen(cols=60, rows=24, tier=T, unicode_ok=True) -> CrestFrame:
     return generate_crest(cols, rows, tier=tier, unicode_ok=unicode_ok)
 
@@ -87,11 +90,30 @@ def test_geometry_scales_with_width():
 
 
 def test_hard_clamp_at_default_max():
-    # 2026-07-18 sharpening pass: default max raised 72 -> 88 (still
-    # terminal-clamped; env-overridable via JARVIS_OV_CREST_MAX_COLS).
+    # 2026-07-18 sharpening pass: default max raised 72 -> 88.
+    # 2026-07-25 SUPERSEDED: sizing is no longer width-only. ``gen`` supplies
+    # rows=24, and on a 24-row terminal the binding constraint is HEIGHT, not
+    # the column cap — an 88-column crest plus the ceremony's 6-line header
+    # does not fit. Asserting 88 here was asserting that the crest ignores the
+    # rows it was handed, which is the bug that made a wide-but-short window
+    # either overflow or vanish.
+    #
+    # The invariants that survive: the cap still bounds the crest, the crest
+    # still fits with its header, and no cell escapes the frame.
+    from backend.core.ouroboros.ui.crest import CREST_HEADER_ROWS, _Geometry
     f = gen(cols=200)
-    assert f.cols == 88
-    assert max(c.x for c in f.cells) < 88
+    _lo, hi, _c = crest_mod._clamp_cols(200)
+    assert f.cols <= hi
+    assert _Geometry.rows_needed(f.cols) + CREST_HEADER_ROWS <= 24
+    assert max(c.x for c in f.cells) < f.cols
+
+
+def test_a_tall_terminal_lifts_the_height_constraint():
+    """The same 200 columns, with rows to spend, reaches the cap — proof the
+    shrink above is height doing its job and not a smaller ceiling."""
+    _lo, hi, _c = crest_mod._clamp_cols(200)
+    assert gen(cols=200, rows=60).cols == hi
+    assert gen(cols=200, rows=60).cols > gen(cols=200, rows=24).cols
 
 
 def test_env_min_clamp(monkeypatch):

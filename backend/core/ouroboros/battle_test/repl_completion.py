@@ -53,6 +53,7 @@ What this module does NOT do
 """
 from __future__ import annotations
 
+import contextlib
 import enum
 import inspect
 import re
@@ -1595,6 +1596,40 @@ def _describe(fn: object) -> str:
     return ""
 
 
+@contextlib.contextmanager
+def _root_logging_preserved():
+    """Hold the root logger harmless across an arbitrary-module import walk.
+
+    Priming the verb registry imports every module in the dispatch packages
+    purely to read function names off them. Import is not inert: a module that
+    calls ``logging.basicConfig`` at import time installs a handler on the ROOT
+    logger, and from then on every unrelated log record in the cockpit carries
+    that module's format. ``isolated_agent_worker`` did exactly this, and the
+    operator's terminal filled with ``[worker]``-stamped lines emitted by
+    subsystems containing no worker.
+
+    That module is fixed at the source, but the exposure is structural: any
+    future module acquires the same power simply by being importable. Since
+    introspection has no business mutating the host's logging, the walk is
+    made non-destructive by construction — handlers and level are snapshotted
+    and restored, so a stray ``basicConfig`` affects nothing.
+
+    Deliberately narrow: only root handlers and level are restored. Named
+    loggers a module configures for ITSELF are its own business."""
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    try:
+        yield
+    finally:
+        try:
+            if root.handlers != saved_handlers:
+                root.handlers[:] = saved_handlers
+            root.setLevel(saved_level)
+        except Exception:  # noqa: BLE001 — never break completion over logging
+            pass
+
+
 def registry_from_dispatch() -> VerbRegistry:
     """Build a :class:`VerbRegistry` from the AUTO-DISCOVERED dispatch table.
 
@@ -1618,7 +1653,8 @@ def registry_from_dispatch() -> VerbRegistry:
             prime_registry,
         )
         try:
-            prime_registry()
+            with _root_logging_preserved():
+                prime_registry()
         except Exception:  # noqa: BLE001 — a partial table still completes
             pass
         for verb, fn in sorted(_VERB_TO_DISPATCHER.items()):

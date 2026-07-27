@@ -79,12 +79,30 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-logging.basicConfig(
-    level=logging.DEBUG if os.environ.get("JARVIS_WORKER_DEBUG") else logging.WARNING,
-    format="%(asctime)s [worker] %(message)s",
-    stream=sys.stderr,  # logs to stderr, protocol on stdout
-)
 logger = logging.getLogger(__name__)
+
+
+def _configure_worker_logging() -> None:
+    """Install the worker's root log format — ONLY when run as a subprocess.
+
+    This used to execute at import. That is fine for the ``python3 -m`` entry
+    point and wrong everywhere else: ``basicConfig`` configures the ROOT
+    logger, so any process that merely IMPORTS this module inherits a root
+    handler stamping every unrelated record with ``[worker]``. The cockpit's
+    slash-palette primes its verb registry by walking the governance package
+    and importing each module to read its dispatch functions — so opening
+    ``ov`` pulled this module in, and the operator's terminal filled with
+    ``[worker]`` lines emitted by subsystems that have no worker in them.
+
+    A library import must not configure logging for its host. Configuration
+    is an application decision, so it moves to the application entry point.
+    """
+    logging.basicConfig(
+        level=(logging.DEBUG if os.environ.get("JARVIS_WORKER_DEBUG")
+               else logging.WARNING),
+        format="%(asctime)s [worker] %(message)s",
+        stream=sys.stderr,  # logs to stderr, protocol on stdout
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -815,4 +833,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    _configure_worker_logging()
     sys.exit(main())

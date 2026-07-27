@@ -223,8 +223,13 @@ def arm_atexit_cascade() -> None:
             if _atexit_armed:
                 return
             _atexit_armed = True
-        import atexit
-        atexit.register(lambda: cascade_terminate())
+        # Guarded: cascade_terminate() WAITS on children, which holds the
+        # shutdown window open long enough for an impatient second Ctrl+C to
+        # land inside it. KeyboardInterrupt is a BaseException, so it escapes
+        # every ordinary guard and atexit prints a traceback over the
+        # operator's prompt at the exact moment they asked to leave.
+        from .exit_guard import guarded_atexit_register
+        guarded_atexit_register(cascade_terminate)
     except Exception:  # noqa: BLE001
         pass
 

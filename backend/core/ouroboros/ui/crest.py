@@ -122,6 +122,57 @@ class CrestFrame:
     unavailable_reason: Optional[str] = None
 
 
+#: Rows the awakening ceremony prints beneath the crest (header + spacing).
+#: Both the fit and the ceremony's own "will the animated path fit" check read
+#: this, so the crest is never sized into space the header is about to claim.
+CREST_HEADER_ROWS = 6
+
+
+def _fit_cols(measured_cols: int, measured_rows: int) -> Tuple[int, int, int]:
+    """Largest crest that fits BOTH dimensions: (lo, hi, fitted).
+
+    Sizing used to be width-only — ``min(measured - 1, 88)`` — with height as
+    a veto: if the resulting crest was taller than the terminal, the whole
+    thing was suppressed. Two consequences, both visible:
+
+      * on a wide terminal the crest capped at 88 columns and sat in under
+        half the available width, because 88 was chosen when the reference
+        geometry was drawn rather than measured against anything;
+      * simply raising that cap makes the crest VANISH on a short-but-wide
+        window, since a wider crest needs proportionally more rows.
+
+    So width and height are solved together: take the widest crest whose
+    ``rows_needed`` still fits the rows we actually have. The ceiling becomes
+    a true bound on the terminal rather than an arbitrary number, and the
+    crest degrades by shrinking instead of disappearing.
+
+    Search is a descending scan, not a formula: ``rows_needed`` involves a
+    ceil, so inverting it algebraically lands off-by-one at the boundaries —
+    exactly where a crest either overflows or vanishes. The range is at most
+    a few hundred integers and this runs once per resize."""
+    # The cap is now a SAFETY rail, not the working limit: a crest wider than
+    # it stops reading as an emblem and starts reading as wallpaper. The
+    # bounds and the one-column margin come from _clamp_cols so there is a
+    # single definition of each (DRY).
+    lo, hi, width_budget = _clamp_cols(measured_cols)
+    # Reserve rows for the header the ceremony prints beneath the crest.
+    # CREST_HEADER_ROWS is the single definition of that number — awakening
+    # independently reserved 6 rows before deciding whether the animated path
+    # would fit, so a reserve chosen separately here would be a second copy
+    # free to drift out of step with it.
+    try:
+        reserve = max(0, int(os.environ.get(
+            "JARVIS_OV_CREST_ROW_RESERVE", str(CREST_HEADER_ROWS))))
+    except (TypeError, ValueError):
+        reserve = CREST_HEADER_ROWS
+    row_budget = max(0, int(measured_rows) - reserve)
+
+    fitted = width_budget
+    while fitted > lo and _Geometry.rows_needed(fitted) > row_budget:
+        fitted -= 1
+    return lo, hi, fitted
+
+
 def _clamp_cols(measured: int) -> Tuple[int, int, int]:
     """Return (lo, hi, clamped) column bounds for a measured width.
 
@@ -129,15 +180,20 @@ def _clamp_cols(measured: int) -> Tuple[int, int, int]:
     check the low bound against ``measured`` directly (not ``clamped``,
     which is floored at ``lo`` by construction and so can never itself
     read as "below minimum").
+
+    Width-only. Since 2026-07-25 this is the WIDTH HALF of
+    :func:`_fit_cols`, which additionally solves for height — callers that
+    know their row count must use that instead, or a wide-but-short window
+    gets a crest too tall to draw and the emblem vanishes entirely.
+
+    Strict bounding-box margin (operator finding 2026-07-18): a crest exactly
+    as wide as the terminal auto-wraps its last cell onto the next line, and
+    every row sheds one detached artifact block. One column of right margin
+    kills the whole off-by-one wrap class.
     """
     lo = int(os.environ.get("JARVIS_OV_CREST_MIN_COLS", "46"))
-    hi = int(os.environ.get("JARVIS_OV_CREST_MAX_COLS", "88"))
-    # Strict bounding-box margin (operator finding 2026-07-18): a crest
-    # exactly as wide as the terminal auto-wraps its last cell onto the
-    # next line — every row sheds one detached artifact block. One
-    # column of right margin kills the whole off-by-one wrap class.
-    clamped = max(lo, min(measured - 1, hi))
-    return lo, hi, clamped
+    hi = int(os.environ.get("JARVIS_OV_CREST_MAX_COLS", "140"))
+    return lo, hi, max(lo, min(measured - 1, hi))
 
 
 # ===========================================================================
@@ -456,11 +512,13 @@ def generate_crest(
             return CrestFrame(0, 0, (), 0.0, "unicode required")
         if tier is ColorTier.NONE:
             return CrestFrame(0, 0, (), 0.0, "color tier NONE")
-        lo, _hi, clamped = _clamp_cols(measured_cols)
+        lo, _hi, clamped = _fit_cols(measured_cols, measured_rows)
         if measured_cols < lo:
             return CrestFrame(0, 0, (), 0.0, f"width {measured_cols} < min {lo}")
         needed_rows = _Geometry.rows_needed(clamped)
         if measured_rows < needed_rows:
+            # Only reachable when even the MINIMUM crest is too tall — the
+            # fit already shrank as far as it is allowed to go.
             return CrestFrame(0, 0, (), 0.0,
                                f"rows {measured_rows} < needed {needed_rows}")
         return _generate_cached(clamped, needed_rows, int(tier))
@@ -702,7 +760,7 @@ def generate_crest_pixels(
     """Half-block raster sized like :func:`generate_crest` (same clamps
     + row fit). None when the terminal can't fit it. NEVER raises."""
     try:
-        lo, _hi, clamped = _clamp_cols(measured_cols)
+        lo, _hi, clamped = _fit_cols(measured_cols, measured_rows)
         if measured_cols < lo:
             return None
         rows = _Geometry.rows_needed(clamped)
@@ -765,19 +823,64 @@ def pixels_to_text(
             return ""
 
 
+def center_pad(crest_cols: int, term_cols: Optional[int] = None) -> int:
+    """Left padding that centres a ``crest_cols``-wide emblem. Never negative,
+    never wide enough to push the crest off the right edge.
+
+    Measured here rather than passed down because the crest is centred on the
+    TERMINAL, not on whatever container a caller happens to be inside — every
+    consumer that has tried to own this ended up left-aligned."""
+    try:
+        if os.environ.get("JARVIS_OV_CREST_CENTER", "1").strip().lower() in (
+                "0", "false", "no", "off"):
+            return 0
+        if term_cols is None:
+            import shutil
+            term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+        return max(0, (int(term_cols) - int(crest_cols)) // 2)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _indent(text: "Any", pad: int) -> "Any":
+    """Prefix every rendered row with ``pad`` spaces, styles intact.
+
+    Done on the composed Text instead of inside the two pixel/quadrant loops:
+    padding is a placement concern, and threading an offset through both
+    renderers would put the same arithmetic in two places that must agree."""
+    if pad <= 0:
+        return text
+    try:
+        from rich.text import Text
+        out = Text()
+        for i, line in enumerate(text.split("\n")):
+            if i:
+                out.append("\n")
+            out.append(" " * pad)
+            out.append_text(line)
+        return out
+    except Exception:  # noqa: BLE001
+        return text
+
+
 def render_crest_auto(
     frame: "CrestFrame", tier: ColorTier, *, elapsed: Optional[float] = None,
+    term_cols: Optional[int] = None,
 ) -> "Any":
     """THE renderer dispatch: half-block pixels on capable terminals
     (C256+ and renderer=halfblock), quadrant glyphs otherwise. Both
-    paths honor the reveal clock. NEVER raises."""
+    paths honor the reveal clock, and both come out centred on the
+    terminal. NEVER raises."""
+    body = None
     try:
         if crest_renderer() == "halfblock" and tier >= ColorTier.C256:
             pf = _generate_pixels_cached(frame.cols, frame.rows)
-            return pixels_to_text(pf, elapsed=elapsed)
+            body = pixels_to_text(pf, elapsed=elapsed)
     except Exception:  # noqa: BLE001
-        pass
-    return frame_to_text(frame, tier, elapsed=elapsed)
+        body = None
+    if body is None:
+        body = frame_to_text(frame, tier, elapsed=elapsed)
+    return _indent(body, center_pad(frame.cols, term_cols))
 
 
 def frame_to_text(
