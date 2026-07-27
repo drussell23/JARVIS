@@ -559,10 +559,24 @@ def build_bipartite_application(
             _depth = ColorDepth.DEPTH_24_BIT
     except Exception:  # noqa: BLE001
         _depth = None
+    # Brand styling for the completion menu + footer. Sourced from the ONE
+    # palette in ui.theme, so a brand change moves the cockpit with it, and
+    # tier-aware so a 16-colour terminal is not handed truecolor hexes to
+    # quantize into mud. Without it prompt_toolkit paints its default: a
+    # filled light-grey listbox and a reverse-video toolbar bar — the two
+    # loudest things on an otherwise dark screen.
+    _style = None
+    try:
+        from backend.core.ouroboros.ui.theme import cockpit_prompt_style
+        _style = cockpit_prompt_style()
+    except Exception:  # noqa: BLE001 — an unstyled cockpit still works
+        _style = None
+
     app = Application(
         layout=PTLayout(root, focused_element=prompt),
         key_bindings=kb, full_screen=True, mouse_support=False,
         refresh_interval=0.1,
+        **({"style": _style} if _style is not None else {}),
         **({"color_depth": _depth} if _depth is not None else {}),
     )
     _APP_REF["app"] = app
