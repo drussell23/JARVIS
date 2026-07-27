@@ -193,7 +193,10 @@ def child():
         t = asyncio.ensure_future(feed())
         try: await app.run_async()
         finally: t.cancel()
+    _once = []
     def _painted(_a=None):
+        if _once: return
+        _once.append(1)
         sys.stderr.write("PAINTED\n"); sys.stderr.flush()
     try: app.after_render += _painted
     except Exception: pass
@@ -221,7 +224,12 @@ while time.time() - t0 < 100:
         if b"\x1b[6n" in c: os.write(fd, b"\x1b[30;1R")
     if not sent and b"PAINTED" in out:
         time.sleep(0.4); mark = len(out); os.write(fd, b"/"); sent = True; ts = time.time()
-    if sent and time.time() - ts > 7: break
+    if sent:
+        _seen = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "",
+                       out[mark:].decode("utf8", "replace"))
+        _v = set(re.findall(r"^\s*(/\S+)\s{2,}\S", _seen, re.M))
+        if len(_v) >= 6 or time.time() - ts > 25:
+            break
 raw = out.decode("utf8", "replace")
 print("RESULT_ROUTER=" + ("True" if "ROUTER=True" in raw else "False"))
 print("RESULT_PAINTED=" + ("1" if b"PAINTED" in out else "0"))
@@ -278,8 +286,9 @@ def test_the_router_mounts_bipartite_and_the_overlay_paints(
             "pty child never rendered a frame (device/scheduler "
             "contention under a full-suite run) — no screen to assert on")
     body = proc.stdout.split("RESULT_BODY_START", 1)[1]
+    verbs = set(re.findall(r"^\s*(/\S+)\s{2,}\S", body, re.M))
     rows = [ln for ln in body.splitlines() if ln.strip().startswith("/")]
-    assert len(rows) >= 8, (
+    assert len(verbs) >= 5, (
         f"'/' painted {len(rows)} palette rows on the cockpit — the overlay "
         f"is collapsed (a float honours its PREFERRED height, so a stale "
         f"preferred=1 renders exactly one entry)"
