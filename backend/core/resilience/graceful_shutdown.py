@@ -1120,7 +1120,10 @@ def should_reject_operation(category: str = "default") -> bool:
 # v95.12: Multiprocessing Resource Cleanup
 # =============================================================================
 
-import atexit
+import atexit  # noqa: F401 — kept for callers that unregister
+from backend.core.ouroboros.governance.exit_guard import (
+    guarded_atexit_register,
+)
 import weakref
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
@@ -1164,7 +1167,7 @@ class MultiprocessingResourceTracker:
         }
 
         # Register atexit handler for emergency cleanup
-        atexit.register(self._emergency_cleanup)
+        guarded_atexit_register(self._emergency_cleanup)
         logger.debug("[v95.12] MultiprocessingResourceTracker initialized")
 
     def register_executor(
@@ -2402,10 +2405,24 @@ def cleanup_all_semaphores_sync() -> Dict[str, Any]:
         results["errors"].append(f"MP children: {e}")
 
     # Step 3: Terminate torch multiprocessing children
+    #
+    # LOOK UP, never IMPORT. This ran at interpreter shutdown and imported
+    # torch — seconds of C-extension loading, executed while the interpreter
+    # is already tearing itself down. Two consequences, both observed:
+    #
+    #   * it stretches the shutdown window from microseconds to seconds, which
+    #     is what let a Ctrl+C land INSIDE the handler and print a traceback
+    #     over the goodbye (the operator report this fixes);
+    #   * import machinery at shutdown is running on partially collected
+    #     module state, so the failure modes are exotic and unreproducible.
+    #
+    # It is also unnecessary by construction: torch can only have
+    # multiprocessing children if torch was already imported. If it is absent
+    # from sys.modules there is nothing to clean, so importing it to look
+    # CREATES the very subsystem it then tears down.
     try:
-        import torch.multiprocessing as torch_mp
-
-        if hasattr(torch_mp, 'active_children'):
+        torch_mp = sys.modules.get("torch.multiprocessing")
+        if torch_mp is not None and hasattr(torch_mp, 'active_children'):
             for child in torch_mp.active_children():
                 with suppress(Exception):
                     if child.is_alive():
@@ -2582,7 +2599,7 @@ def _register_semaphore_cleanup_atexit():
             pass  # Best effort at exit
 
     # Register our cleanup - it will run FIRST due to LIFO ordering
-    atexit.register(_final_semaphore_cleanup)
+    guarded_atexit_register(_final_semaphore_cleanup)
 
 
 # Auto-register on import - this happens after multiprocessing is imported
@@ -2660,7 +2677,7 @@ def _register_thread_cleanup_atexit():
             logger.debug(f"[v117.0] atexit thread cleanup error: {e}")
 
     # Register our cleanup (LIFO ordering means it runs before Python's thread check)
-    atexit.register(_final_thread_cleanup)
+    guarded_atexit_register(_final_thread_cleanup)
     logger.debug("[v117.0] Thread cleanup atexit handler registered")
 
 
