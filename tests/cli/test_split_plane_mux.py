@@ -138,9 +138,24 @@ def test_non_tty_degrades_to_legacy_pump():
 def test_line_renderer_resolves_stdout_dynamically():
     """The pre-bound Rich console would bypass patch_stdout and corrupt
     the prompt — daemon lines must go through builtin print()."""
+    import ast
+
+    # Asserted on the FUNCTION, not on a 700-character window after its name.
+    # The window measured how much prose sat between the def and the call, so
+    # it failed the moment a comment was added — the same defect as a
+    # proximity pin. The invariant never changed.
     src = _src()
-    body = src[src.index("def _print_line"):][:700]
-    assert "print(text)" in body
+    body = None
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and \
+                node.name == "_print_line":
+            body = "\n".join(ast.unparse(stmt) for stmt in node.body)
+            break
+    assert body is not None, "_print_line is gone"
+    assert "print(" in body, (
+        "daemon lines no longer go through builtin print() — a pre-bound Rich "
+        "console bypasses patch_stdout and corrupts the prompt"
+    )
     assert "console.print" not in body
 
 

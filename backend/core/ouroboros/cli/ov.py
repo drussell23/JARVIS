@@ -1733,6 +1733,7 @@ def run_attach(console: Any) -> int:
                 # cockpit can never brick the attach). Kill-switch:
                 # JARVIS_BIPARTITE_LAYOUT_DISABLED=1.
                 _why = ""
+                _crash: Optional[BaseException] = None
                 try:
                     from backend.core.ouroboros.battle_test.bipartite_layout import (
                         bipartite_enabled,
@@ -1746,16 +1747,39 @@ def run_attach(console: Any) -> int:
                     else:
                         _why = "stdout is not a real TTY"
                 except Exception as _exc:
+                    # A software crash, NOT a hardware downgrade. Keep the
+                    # exception itself: the old code truncated it to 80
+                    # characters, discarded the traceback, and printed the
+                    # same routine line a missing TTY produces — which is how
+                    # a cockpit bug reaches an operator disguised as normal
+                    # behaviour and never gets reported.
                     _ran_cockpit = False
+                    _crash = _exc
                     _why = f"{type(_exc).__name__}: {str(_exc)[:80]}"
                 if not _ran_cockpit:
-                    # Observability over silent reroute (operator law): say WHY
-                    # the cockpit did not mount before falling back.
+                    # ONE seam for both causes (DRY): quiet for hardware, a
+                    # banner plus a full traceback on disk for software. Both
+                    # then land in the same degraded session below.
                     try:
-                        console.print(
-                            f"⎿ cockpit fallback → legacy view ({_why or 'unknown'})",
-                            markup=False, highlight=False,
+                        from backend.core.ouroboros.battle_test.mount_breaker import (
+                            announce,
                         )
+                        _kind, _ = announce(
+                            _crash, _why,
+                            emit=lambda text: console.print(
+                                text, markup=False, highlight=False,
+                            ),
+                        )
+                        if _kind == "software":
+                            # A crash mid-render leaves the terminal in an
+                            # UNKNOWN state — possibly alt-screen, possibly
+                            # raw mode, cursor anywhere. The parachute must
+                            # therefore assume nothing about the screen and
+                            # emit strictly linear plain text, exactly as it
+                            # does for a terminal that cannot be addressed.
+                            # Hardware downgrades that still have a good TTY
+                            # keep their colour; nothing is broken there.
+                            ui.degrade_to_append_only()
                     except Exception:
                         pass
                     await _split_plane_loop(client, console, ui)
