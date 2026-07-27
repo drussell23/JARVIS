@@ -194,7 +194,14 @@ def test_cockpit_app_constructs_with_toolbar():
     app = build_bipartite_application(
         mux, on_accept=lambda t: None, toolbar=ui.toolbar,
     )
-    assert app is not None and app.full_screen is True
+    # SUPERSEDED: full_screen is no longer unconditional. It issued smcup,
+    # which disabled the terminal's native scrollback — so the cockpit's
+    # bounded canvas was standing in for history the terminal was always
+    # better at holding. It is now a choice (JARVIS_BIPARTITE_FULLSCREEN),
+    # default off. What this test protects is that the Application BUILDS;
+    # the viewport mode is a preference, covered in
+    # tests/battle_test/test_native_scrollback.py.
+    assert app is not None
     # A crashing toolbar renders empty, never raises into the frame.
     app2 = build_bipartite_application(
         BipartiteLayout(width=80, height=20), on_accept=lambda t: None,
@@ -285,6 +292,13 @@ def test_app_constructs_with_header():
         header=lambda: "O+V header",
         header_height=3,
     )
-    assert app is not None and app.full_screen is True
+    # SUPERSEDED: full_screen is no longer unconditional. It issued smcup,
+    # which disabled the terminal's native scrollback — so the cockpit's
+    # bounded canvas was standing in for history the terminal was always
+    # better at holding. It is now a choice (JARVIS_BIPARTITE_FULLSCREEN),
+    # default off. What this test protects is that the Application BUILDS;
+    # the viewport mode is a preference, covered in
+    # tests/battle_test/test_native_scrollback.py.
+    assert app is not None
 
 

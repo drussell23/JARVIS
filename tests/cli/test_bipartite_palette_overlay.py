@@ -288,7 +288,12 @@ def test_the_router_mounts_bipartite_and_the_overlay_paints(
     body = proc.stdout.split("RESULT_BODY_START", 1)[1]
     verbs = set(re.findall(r"^\s*(/\S+)\s{2,}\S", body, re.M))
     rows = [ln for ln in body.splitlines() if ln.strip().startswith("/")]
-    assert len(verbs) >= 3, (
+    # Lowered when the cockpit left full-screen: outside the alternate screen
+    # the app owns a bounded region rather than the whole terminal, so the
+    # overlay legitimately shows fewer rows. What matters is that a BROWSABLE
+    # list paints — the row count is a consequence of viewport size, not an
+    # invariant.
+    assert len(verbs) >= 2, (
         f"'/' painted {len(rows)} palette rows on the cockpit — the overlay "
         f"is collapsed (a float honours its PREFERRED height, so a stale "
         f"preferred=1 renders exactly one entry)"
