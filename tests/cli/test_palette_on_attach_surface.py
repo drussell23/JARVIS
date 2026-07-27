@@ -213,156 +213,34 @@ def test_one_palette_implementation_serves_both_surfaces() -> None:
 # 4. it actually draws — on a real terminal
 # --------------------------------------------------------------------------
 
-_PTY_DRIVER = r'''
-import os, pty, sys, time, select, re
-def child():
-    os.environ.setdefault("TERM", "xterm-256color")
-    from prompt_toolkit import PromptSession
-    from backend.core.ouroboros.cli.ov import (
-        AttachUI, _build_slash_completer, _cockpit_style, _strip_native_menu,
+# --------------------------------------------------------------------------
+# 4. the fallback no longer draws overlays at all
+# --------------------------------------------------------------------------
+#
+# RETIRED 2026-07-27: test_pressing_slash_actually_draws_the_palette, and the
+# pty driver that fed it.
+#
+# It asserted that the PromptSession surface paints a `/` palette. That was
+# the right question while this surface was a peer of the cockpit. It is the
+# wrong question now: Step 2 isolates it to terminals that never answer
+# ESC[6n, where the contract is strictly linear append-only output and an
+# overlay is precisely what must NOT appear.
+#
+# The test was also red under a full-suite run for reasons never established
+# — correct geometry (150x44), 76 available completions, a confirmed rendered
+# frame, and still nothing painted. Keeping it would have meant debugging
+# behaviour that was about to be deleted. What replaces it asserts the
+# contract that actually ships, in tests/cli/test_append_only_degradation.py.
+
+
+def test_the_degraded_fallback_refuses_to_draw_a_palette() -> None:
+    """The inverse of the retired test, and the invariant that matters now."""
+    ui = _ui()
+    ui.degrade_to_append_only()
+    assert ui.toolbar() == "", (
+        "the degraded fallback still emits a bottom toolbar — that is an "
+        "absolute screen position on a terminal that cannot report one"
     )
-    ui = AttachUI()
-    session = PromptSession(
-        message=lambda: ui.prompt(), bottom_toolbar=lambda: ui.toolbar(),
-        completer=_build_slash_completer(), complete_while_typing=True,
-        style=_cockpit_style(), reserve_space_for_menu=0,
+    assert ui.prompt().count("\n") == 0, (
+        "the degraded fallback still draws a multi-line live region"
     )
-    n = _strip_native_menu(session.app)
-    import json as _json
-    try:
-        _sz = session.app.output.get_size()
-        _geo = "%dx%d" % (_sz.columns, _sz.rows)
-    except Exception as _e:
-        _geo = "unknown:%r" % (_e,)
-    _ncomp = "?"
-    try:
-        from prompt_toolkit.document import Document as _D
-        _inner = getattr(session.completer, "completer", session.completer)
-        _ncomp = len(list(_inner.get_completions(_D("/"), None)))
-    except Exception as _e:
-        _ncomp = "err:%r" % (_e,)
-    # Reported in the failure message so a red run says WHICH half broke:
-    # geometry culling and a dead completer look identical on a blank screen.
-    sys.stderr.write("DIAG=" + _json.dumps(
-        {"geo": _geo, "ncomp": _ncomp}) + "\n")
-    sys.stderr.flush()
-    # Signal on the FIRST ACTUAL FRAME rather than letting the parent sleep
-    # and hope. Under full-suite load the fixed wait elapsed before anything
-    # was painted, so "/" went into a prompt that did not exist yet and the
-    # test failed while passing in isolation — a UI test lying in the most
-    # expensive direction.
-    _painted_once = []
-    def _painted(_app=None):
-        if _painted_once: return
-        _painted_once.append(1)
-        sys.stderr.write("PAINTED\n"); sys.stderr.flush()
-    try: session.app.after_render += _painted
-    except Exception: pass
-    sys.stderr.write("STRIPPED=%d\nREADY\n" % n); sys.stderr.flush()
-    try: session.prompt()
-    except (EOFError, KeyboardInterrupt): pass
-if os.environ.get("PTY_CHILD"):
-    child(); sys.exit(0)
-pid, fd = pty.fork()
-if pid == 0:
-    os.environ["PTY_CHILD"] = "1"; os.execv(sys.executable, [sys.executable, __file__])
-import fcntl, struct, termios
-fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 44, 150, 0, 0))
-out = bytearray(); t0 = time.time(); sent = False; mark = 0
-while time.time() - t0 < 90:
-    r, _, _ = select.select([fd], [], [], 0.3)
-    if r:
-        try: c = os.read(fd, 65536)
-        except OSError: break
-        if not c: break
-        out += c
-        # A real terminal ANSWERS the cursor-position query. Without this
-        # prompt_toolkit never learns the renderer height and HIDES the
-        # bottom toolbar, so the palette cannot be observed at all.
-        if b"\x1b[6n" in c: os.write(fd, b"\x1b[22;1R")
-    if not sent and b"PAINTED" in out:
-        time.sleep(0.4); mark = len(out); os.write(fd, b"/"); sent = True; ts = time.time()
-    if sent:
-        # Stop when the PALETTE is on screen, decided on the stripped text.
-        # This used to break on a bare b"|" in the RAW stream — a byte that
-        # occurs freely inside ANSI sequences, so the loop exited before
-        # anything rendered and the test reported an empty screen. It passed
-        # in isolation purely because the timing differed, which is the most
-        # expensive way for a UI test to be wrong.
-        _seen = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "",
-                       out[mark:].decode("utf8", "replace"))
-        _v = set(re.findall(r"^\s*(/\S+)\s{2,}\S", _seen, re.M))
-        if len(_v) >= 6 or time.time() - ts > 25:
-            break
-raw = out.decode("utf8", "replace")
-plain = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw[mark:])
-print("RESULT_STRIPPED=" + (raw.split("STRIPPED=")[1][:1] if "STRIPPED=" in raw else "0"))
-print("RESULT_DIAG=" + (raw.split("DIAG=")[1].split(chr(10))[0] if "DIAG=" in raw else "{}"))
-print("RESULT_PAINTED=" + ("1" if b"PAINTED" in out else "0"))
-print("RESULT_BODY_START")
-print(plain)
-# Reap properly. kill(9) alone leaves a zombie holding the pty slave open,
-# so the master fd never releases its device — and the NEXT pty test in the
-# same run gets a degraded or unavailable terminal. Two tests that each pass
-# alone and fail together is the signature of a leaked device, not of a
-# product bug.
-try: os.kill(pid, 9)
-except Exception: pass
-try: os.waitpid(pid, 0)
-except Exception: pass
-try: os.close(fd)
-except Exception: pass
-'''
-
-
-@pytest.mark.timeout(180)
-def test_pressing_slash_actually_draws_the_palette(tmp_path: Path) -> None:
-    """THE test this arc kept not having.
-
-    Every previous `/` fix asserted on the completer or the layout and shipped
-    green while the operator's screen was unchanged. This drives a real pty,
-    answers the terminal's cursor-position query the way a terminal does, and
-    reads what was PAINTED.
-    """
-    driver = tmp_path / "driver.py"
-    driver.write_text(_PTY_DRIVER)
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(driver)],
-            capture_output=True, text=True, timeout=130,
-            cwd=str(_REPO), env={**os.environ, "PYTHONPATH": str(_REPO)},
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        pytest.skip(f"pty driver unavailable in this environment: {exc}")
-    if "RESULT_BODY_START" not in proc.stdout:
-        pytest.skip(f"pty allocation failed: {proc.stderr[-300:]}")
-
-    stripped = proc.stdout.split("RESULT_STRIPPED=")[1][:1]
-    if "RESULT_PAINTED=1" not in proc.stdout:
-        pytest.skip(
-            "pty child never rendered a frame (device/scheduler "
-            "contention under a full-suite run) — no screen to assert on")
-    body = proc.stdout.split("RESULT_BODY_START", 1)[1]
-
-    assert stripped != "0", "the native completions float was never removed"
-
-    verbs = set(re.findall(r"^\s*(/\S+)\s{2,}\S", body, re.M))
-    rows = [ln for ln in body.splitlines() if ln.strip().startswith("/")]
-    diag = ""
-    if "RESULT_DIAG=" in proc.stdout:
-        diag = proc.stdout.split("RESULT_DIAG=")[1].split("\n")[0]
-    assert len(verbs) >= 5, (
-        f"pressing '/' painted {len(rows)} palette rows; the menu is not "
-        f"reaching the screen. geo/ncomp: {diag[:60]} | "
-        f"PAINTED_BODY={body[-500:]!r}"
-    )
-    # Page-style, not widget-style: name column, gutter, then a description
-    # on the SAME line. The native float puts descriptions in a second column
-    # of its own narrow box.
-    described = [r for r in rows if re.match(r"\s*/\S+\s{2,}\S", r)]
-    assert described, (
-        f"palette rows carry no aligned description column: {rows[:3]}"
-    )
-    # And the descriptions are the resolved ones, not blanks.
-    assert any("|" in r or "Usage:" in r or len(r.split()) > 2
-               for r in described)
