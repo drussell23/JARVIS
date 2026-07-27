@@ -299,16 +299,24 @@ def test_authored_help_is_preferred_over_any_docstring() -> None:
     )
 
 
-def test_an_undescribed_verb_shows_a_blank_not_a_fabrication() -> None:
-    """A blank reads as 'nobody has written this yet'. Plausible noise reads
-    as a description that happens to be wrong — which is worse, because the
-    operator acts on it."""
+def test_an_undescribed_verb_is_marked_not_fabricated() -> None:
+    """SUPERSEDED 2026-07-26: was ``== ""``.
+
+    The honesty requirement is unchanged and still the point — nothing may
+    invent a description. What changed is how the absence is SPOKEN. A blank
+    column is indistinguishable from a rendering fault and cannot be counted;
+    ``[undocumented]`` is visible and greppable, so the remaining gaps can be
+    listed instead of silently tolerated.
+
+    Full coverage of the cascade that now sits in front of this lives in
+    tests/cli/test_verb_usage_resolver.py."""
     from backend.core.ouroboros.battle_test.repl_completion import _describe
+    from backend.core.ouroboros.battle_test.verb_usage import UNDOCUMENTED
 
     def dispatch_nothing_command(line: str):
         """Parse ``/nothing`` line and dispatch. NEVER raises."""
 
-    assert _describe(dispatch_nothing_command) == ""
+    assert _describe(dispatch_nothing_command) == UNDOCUMENTED
 
 
 def test_modules_declare_palette_help_beside_their_aliases() -> None:
