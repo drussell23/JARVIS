@@ -60,6 +60,12 @@ import re
 import logging
 import os
 import re
+from backend.core.ouroboros.battle_test.verb_usage import (
+    UNDOCUMENTED,
+    derive_usage,
+    extract_operator_section,
+    mine_subcommands,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, FrozenSet, List, Optional, Tuple
@@ -1565,15 +1571,28 @@ def _describe(fn: object) -> str:
         # declares palette metadata. This exists because the humanisation
         # below cannot invent what nobody wrote: these docstrings are
         # contracts for maintainers, and stripping them yields "<verb> REPL".
+        name = str(getattr(fn, "__name__", ""))
+        verb = name[len("dispatch_"):-len("_command")] if (
+            name.startswith("dispatch_") and name.endswith("_command")
+        ) else name
+
         authored = getattr(mod, "__verb_help__", None)
         if isinstance(authored, dict):
-            name = str(getattr(fn, "__name__", ""))
-            verb = name[len("dispatch_"):-len("_command")] if (
-                name.startswith("dispatch_") and name.endswith("_command")
-            ) else name
             text = authored.get(verb) or authored.get(f"/{verb}")
             if isinstance(text, str) and text.strip():
                 return text.strip()[:88]
+
+        # 1b. An ``Operator:`` section in the function's OWN docstring.
+        #
+        #     Ranked with authored help rather than with the humanised
+        #     docstring below, because it is the same KIND of thing: a
+        #     sentence someone wrote for the person typing the verb. It sits
+        #     beside the implementation instead of in a dict at the top of
+        #     the module, which is the only reason to prefer one over the
+        #     other, and 45 verbs were never going to get dict entries.
+        operator_line = extract_operator_section(getattr(fn, "__doc__", None))
+        if operator_line:
+            return operator_line[:88]
 
         # 2. The FUNCTION docstring, humanised — accepted only if it survives
         #    as prose.
@@ -1588,12 +1607,37 @@ def _describe(fn: object) -> str:
         own = _first_line(getattr(fn, "__doc__", ""))
         if own:
             return own[:88]
+
+        # 3. No prose anywhere — mine the verb's own SUBCOMMAND VOCABULARY.
+        #
+        #    Ranked above signature derivation because it is strictly more
+        #    informative here: every dispatcher takes the whole line as one
+        #    string, so the signature says "(line)" while the body knows the
+        #    verb accepts status | history | explain. That is the single most
+        #    useful thing a palette can tell someone about a verb they have
+        #    not used, and it was sitting unread in the source.
+        mined = mine_subcommands(fn)
+        if mined:
+            return " | ".join(mined)[:88]
+
+        # 4. No prose anywhere. The SIGNATURE still knows what the verb
+        #    takes, and "what arguments does this want" is most of what an
+        #    operator wants from a palette entry anyway. Translated to POSIX
+        #    brackets and stripped of injected plumbing — a raw Python
+        #    signature would be worse than the blank it replaces.
+        derived = derive_usage(fn, verb)
+        if derived:
+            return derived[:88]
     except Exception:  # noqa: BLE001
         pass
-    # 3. Nothing authored, nothing extractable. Say so plainly rather than
-    #    printing residue: an honest blank reads as "no description yet",
-    #    fabricated prose reads as a description that happens to be wrong.
-    return ""
+    # 5. Nothing authored, nothing extractable, nothing to derive. Say so
+    #    plainly rather than printing residue: fabricated prose reads as a
+    #    description that happens to be wrong, and the operator acts on it.
+    #
+    #    UNDOCUMENTED rather than "" so the gap is VISIBLE and countable —
+    #    ``/help --undocumented`` can list exactly what still needs writing,
+    #    which a blank column cannot.
+    return UNDOCUMENTED
 
 
 @contextlib.contextmanager

@@ -915,6 +915,12 @@ async def _split_plane_loop(
         # would freeze the very keystroke that opened the menu.
         completer=_build_slash_completer(),
         complete_while_typing=True,
+        # The SAME Style the bipartite cockpit uses. Without it
+        # prompt_toolkit paints its default filled light-grey listbox — the
+        # loudest thing on a dark screen, and the exact look #70121 removed
+        # from the other surface. Two surfaces, one palette (DRY): the brand
+        # owns its colours in ui.theme, not per widget.
+        style=_cockpit_style(),
     )
     ui.bind_app(session.app)
 
@@ -956,6 +962,15 @@ async def _split_plane_loop(
             if outcome == "detach":
                 break
 
+
+
+def _cockpit_style() -> Any:
+    """The brand Style, or None if unavailable. NEVER raises."""
+    try:
+        from backend.core.ouroboros.ui.theme import cockpit_prompt_style
+        return cockpit_prompt_style()
+    except Exception:  # noqa: BLE001 — default styling still types fine
+        return None
 
 
 def _build_slash_completer() -> Any:
