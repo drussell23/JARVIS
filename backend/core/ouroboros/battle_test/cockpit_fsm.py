@@ -29,6 +29,11 @@ from typing import Callable, List, Optional, Sequence
 
 COCKPIT_FSM_SCHEMA_VERSION = "cockpit_fsm.1"
 
+#: Before the first byte of upstream telemetry. A cockpit attached to a
+#: cold-booting daemon renders faster than the daemon hydrates, and the
+#: honest state during that gap is "waiting", not "nothing is happening" —
+#: which is what a blank deck says.
+MODE_IGNITION = "ignition"
 MODE_FLOW = "flow"
 MODE_SELECT = "select"
 MODE_FOCUS_PREFIX = "focus:"
