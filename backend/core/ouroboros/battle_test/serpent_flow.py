@@ -894,9 +894,39 @@ class SerpentFlow:
                 register_stream_renderer,
             )
             self._stream_renderer: Optional[Any] = StreamRenderer(console=self.console)
+            # Model output reaches an ATTACHED cockpit too.
+            #
+            # `StreamRenderer` draws with Rich `Live`, an animated in-place
+            # widget: it needs a real TTY, and it cannot be mirrored — `Live`
+            # repaints by moving the cursor, and replaying those escapes on a
+            # remote surface corrupts it rather than animating it.
+            #
+            # So the local widget is untouched and a SECOND consumer of the
+            # same token feed emits committed text frames. Two renderings of
+            # one stream; neither a degraded copy of the other.
+            #
+            # The mirror is resolved per frame, not captured here: SerpentFlow
+            # is constructed before the bridge attaches, so a handle taken now
+            # would be None forever — the wired-but-inert shape.
+            try:
+                from backend.core.ouroboros.battle_test.stream_mirror import (
+                    StreamMirror, fan_out_tokens, stream_mirror_enabled,
+                )
+                if stream_mirror_enabled():
+                    self._stream_mirror = StreamMirror(
+                        lambda text: self._mirror_markup(text),
+                    )
+                    self._stream_renderer = fan_out_tokens(
+                        self._stream_renderer, self._stream_mirror,
+                    )
+                else:
+                    self._stream_mirror = None
+            except Exception:  # noqa: BLE001 — local streaming still works
+                self._stream_mirror = None
             register_stream_renderer(self._stream_renderer)
         except Exception:
             self._stream_renderer = None
+            self._stream_mirror = None
 
         # InlinePromptGate Slice 5b (2026-05-02) — phase-boundary
         # renderer boot wire-up. Subscribes a listener to the
