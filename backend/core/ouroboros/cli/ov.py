@@ -1407,6 +1407,24 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
             lambda: fsm.mode == MODE_FLOW and not _buffer_text(),
         )
 
+        @Condition
+        def in_flow_working() -> bool:
+            """FLOW mode with work in flight.
+
+            Gated on work EXISTING so an idle Esc does nothing rather than
+            emitting a verb that reports "nothing to cancel" — a key that
+            answers when it was not asked trains the operator to ignore it.
+            """
+            try:
+                from backend.core.ouroboros.battle_test.cockpit_fsm import (
+                    MODE_FLOW,
+                )
+                if ui.fsm is None or ui.fsm.mode != MODE_FLOW:
+                    return False
+                return bool(getattr(ui, "_active_ops", None))
+            except Exception:  # noqa: BLE001
+                return False
+
         @kb.add("c-o", filter=can_open)
         def _open(event: Any) -> None:
             fsm.enter_select()
@@ -1433,6 +1451,27 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
                 except Exception:  # noqa: BLE001
                     pass
             ui.refresh()
+
+        @kb.add("escape", filter=in_flow_working, eager=True)
+        def _interrupt(event: Any) -> None:
+            """Esc in FLOW interrupts the operator's own work.
+
+            Layered under the existing Esc, which leaves SELECT/FOCUS — that
+            binding is filtered to `not_flow`, so FLOW was free and no
+            conflict had to be resolved. One key, two meanings, disambiguated
+            by what is on screen rather than by a modifier the operator must
+            remember.
+
+            Sends the EXISTING `/cancel` verb rather than a new frame type:
+            bare cancel already means "my work" on the daemon, so the
+            keystroke and the typed verb resolve through one path and cannot
+            drift apart.
+            """
+            try:
+                client.send_input("/cancel")
+                ui.flash("interrupting…", seconds=2.0)
+            except Exception:  # noqa: BLE001
+                pass
 
         @kb.add("escape", filter=not_flow, eager=True)
         def _esc(event: Any) -> None:
