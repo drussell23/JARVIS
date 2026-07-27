@@ -518,8 +518,10 @@ def build_bipartite_application(
             logger.debug("[Bipartite] palette row unavailable", exc_info=True)
 
     rows += [canvas]
-    if _palette is not None:
-        rows.append(_palette)
+    # The palette is NOT a row. See the FloatContainer below: as an HSplit row
+    # it shares the ambient grid with the canvas, so every asynchronous Deck or
+    # Lane frame arriving underneath forces the palette's geometry to be
+    # recomputed along with everything else.
     rows += [_rule(), prompt, _rule()]
     if toolbar is not None:
         # A one-row morphing footer (e.g. the attach client's AttachUI.toolbar —
@@ -536,17 +538,51 @@ def build_bipartite_application(
             height=1, wrap_lines=False,
         ))
     root: Any = HSplit(rows)
-    if completer is not None and _palette is None:
-        # THE missing half. A CompletionsMenu is a Float; without a
-        # FloatContainer it is never rendered no matter how many completions
-        # the buffer holds.
+    if _palette is not None:
+        # Z-INDEX OVERLAY, not a row.
         #
-        # Anchored to the cursor, so it opens ABOVE the ❯ row when the prompt
-        # sits at the bottom of the frame — which it always does here. That is
-        # the placement the operator is used to, and it falls out of
-        # prompt_toolkit's own float positioning rather than being computed.
+        # This cockpit takes asynchronous IPC continuously — Deck entries, Lane
+        # frames, the heartbeat. A palette that participates in the HSplit
+        # shares the ambient grid with all of it, so each of those frames
+        # recomputes the palette's geometry too, and the reflow lands on the
+        # keystroke that opened the menu.
+        #
+        # A Float is measured independently of the grid: the canvas beneath can
+        # repaint at whatever rate the daemon pushes without the overlay taking
+        # part. Background updates stop being able to disturb the menu.
+        #
+        # The float carries OUR page-style palette, not prompt_toolkit's
+        # CompletionsMenu widget. That widget is a bounded dropdown sized to
+        # its longest entry — the narrow grey control #70123 replaced and
+        # #70140 stripped — and reintroducing it as a float would trade the
+        # layout back for the tearing fix. There is no need to choose:
+        #
+        #   left=0, right=0  -> spans the terminal, so descriptions wrap into
+        #                       a real column instead of the widget's width;
+        #   ycursor=True     -> tracks the caret. The prompt here is a
+        #                       multi-line block (pulse + deck + caret) whose
+        #                       height changes as those regions fill, so any
+        #                       fixed `bottom=` offset would drift the moment
+        #                       the live region grew a line.
         try:
-            from prompt_toolkit.layout import FloatContainer, Float
+            from prompt_toolkit.layout import Float, FloatContainer
+            root = FloatContainer(
+                content=root,
+                floats=[Float(
+                    content=_palette,
+                    left=0, right=0,          # full terminal width
+                    ycursor=True,             # follow the caret, not a constant
+                )],
+            )
+        except Exception:  # noqa: BLE001 — a cockpit without a menu still types
+            logger.debug("[Bipartite] palette overlay unavailable",
+                         exc_info=True)
+    elif completer is not None:
+        # No page palette available (import failure). Fall back to
+        # prompt_toolkit's own widget rather than leaving completions
+        # invisible: a bounded dropdown beats no menu at all.
+        try:
+            from prompt_toolkit.layout import Float, FloatContainer
             from prompt_toolkit.layout.menus import (
                 CompletionsMenu, MultiColumnCompletionsMenu,
             )
@@ -559,7 +595,7 @@ def build_bipartite_application(
                 content=root,
                 floats=[Float(xcursor=True, ycursor=True, content=_menu)],
             )
-        except Exception:  # noqa: BLE001 — a cockpit without a menu still types
+        except Exception:  # noqa: BLE001
             logger.debug("[Bipartite] completion menu unavailable", exc_info=True)
     # Adaptive color depth (root cause of the quantized/muddy logo): pt 3.0.x's
     # default depth reads TERM only — COLORTERM is ignored, so a truecolor
