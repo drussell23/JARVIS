@@ -168,6 +168,21 @@ class ChatActionExecutor(Protocol):
 # ---------------------------------------------------------------------------
 
 
+def _chat_trace_enabled() -> bool:
+    """Is the classifier's reasoning shown inline?
+
+    Reads the environment at CALL time rather than at import, so a live
+    `/breadcrumbs verbose` takes effect on the next reply instead of the next
+    restart. Default off: an operator asking a question is the common case;
+    one debugging the router is the rare one, and the old output had that
+    backwards.
+    """
+    import os as _os
+    return _os.environ.get(
+        "JARVIS_CHAT_TRACE", "",
+    ).strip().lower() in ("1", "true", "yes", "on", "verbose")
+
+
 def render_decision(
     turn: ChatTurn,
     decision: ChatRoutingDecision,
@@ -448,6 +463,40 @@ class ChatReplDispatcher:
             return HISTORY_DEFAULT_N
         return min(n, HISTORY_MAX_N)
 
+    def _compose_operator_reply(
+        self,
+        turn: Any,
+        decision: Any,
+        *,
+        receipt: str = "",
+    ) -> str:
+        """The reply an operator reads. NEVER raises.
+
+        Falls back to `render_decision` on any failure: a formatting fault
+        must degrade to the older, uglier output rather than swallow a real
+        response.
+        """
+        try:
+            from backend.core.ouroboros.governance.chat_response_style import (
+                compose_reply,
+            )
+            return compose_reply(
+                str(decision.action),
+                message=str(decision.payload.get("message", "") or ""),
+                receipt=receipt,
+                social_reply=str(decision.payload.get("reply", "") or ""),
+                turn_id=str(getattr(turn, "turn_id", "") or ""),
+                session_id=str(getattr(turn, "session_id", "") or ""),
+                intent=getattr(getattr(decision, "intent", None), "name", ""),
+                confidence=getattr(decision, "confidence", None),
+                reasons=tuple(getattr(decision, "reasons", ()) or ()),
+                reason=str(getattr(decision, "reason", "") or ""),
+                verbose=_chat_trace_enabled(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[ChatReplDispatcher] style degraded", exc_info=True)
+            return render_decision(turn, decision)
+
     # ---- message dispatch ----
 
     def _dispatch_message(
@@ -463,7 +512,15 @@ class ChatReplDispatcher:
             verdict_override=verdict_override,
         )
 
-        rendered = render_decision(turn, decision)
+        # OPERATOR-facing composition, not the classifier's state dump.
+        #
+        # `render_decision` still exists and is still correct — for
+        # `/chat why <turn>`, where the routing internals ARE the answer the
+        # operator asked for. On the reply path they are not: intent,
+        # confidence and the matched heuristic describe how the decision was
+        # made, and presenting them as the response is the same defect the
+        # palette had when docstrings leaked into it as help.
+        rendered = self._compose_operator_reply(turn, decision)
 
         # No executor wired — Slice 3 returns just the decision.
         if self.executor is None or decision.action == "noop":
@@ -502,8 +559,8 @@ class ChatReplDispatcher:
                 )
         return ChatReplResult(
             status=ChatReplStatus.EXECUTOR_OK,
-            rendered_text=(
-                f"{rendered}\n[chat] => {response}"
+            rendered_text=self._compose_operator_reply(
+                turn, decision, receipt=str(response or ""),
             ),
             decision=decision,
             turn=turn,
