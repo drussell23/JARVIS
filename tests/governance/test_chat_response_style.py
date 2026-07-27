@@ -221,3 +221,58 @@ def test_the_trace_floor_is_read_at_call_time(
     assert d._chat_trace_enabled() is False
     monkeypatch.setenv("JARVIS_CHAT_TRACE", "verbose")
     assert d._chat_trace_enabled() is True
+
+
+# --------------------------------------------------------------------------
+# 7. immediate dispatch — "on it", not "queued"  (2026-07-27)
+# --------------------------------------------------------------------------
+
+def test_a_running_op_says_on_it_not_queued() -> None:
+    """An op-id receipt means intake accepted the goal and a worker has it.
+    Calling that "queued" is the same dishonesty in the opposite direction."""
+    out = compose_reply("backlog_dispatch", receipt="op-019fa4d2-246e-7759-86")
+    assert "on it" in out
+    assert "queued" not in out
+    assert "Backlog sensor" not in out
+
+
+def test_a_filed_goal_still_says_queued() -> None:
+    """The fallback path is unchanged — and must stay honest about waiting."""
+    out = compose_reply("backlog_dispatch", receipt="chat:chat-1dc")
+    assert "queued" in out and "Backlog sensor" in out
+    # Asserted on the ACKNOWLEDGEMENT LINE, not the whole reply: "on it" is a
+    # substring of "…pick it up on its next sweep", so a naive `not in`
+    # flags correct output as broken.
+    assert out.splitlines()[0] == "⏺ adding that to the backlog"
+
+
+def test_the_two_paths_are_told_apart_by_the_RECEIPT() -> None:
+    """Not by a second action token: the classifier cannot predict which path
+    the executor will manage, and asking it to would put routing knowledge in
+    the wrong layer."""
+    from backend.core.ouroboros.governance.chat_response_style import (
+        _dispatched_now,
+    )
+    assert _dispatched_now("op-019fa4d2-246e") is True
+    assert _dispatched_now("chat:chat-1dc") is False
+    assert _dispatched_now("") is False
+    assert _dispatched_now("error-append-failed-x") is False
+
+
+def test_the_operator_gets_the_ref_the_chrome_will_narrate_under() -> None:
+    """So the ⏺/⎿ op lines that follow are recognisably the answer to what
+    they just typed, rather than unrelated autonomous traffic."""
+    out = compose_reply("backlog_dispatch", receipt="op-019fa4d2-246e-7759-86")
+    assert "7759-86" in out
+
+
+def test_the_full_uuid_is_not_repeated_underneath() -> None:
+    """The digest work removed UUID noise everywhere else; this must not
+    reintroduce it."""
+    out = compose_reply("backlog_dispatch", receipt="op-019fa4d2-246e-7759-86")
+    assert out.count("019fa4d2") == 0
+
+
+def test_immediate_replies_stay_two_lines() -> None:
+    out = compose_reply("backlog_dispatch", receipt="op-019fa4d2-246e-7759-86")
+    assert len(out.splitlines()) == 2

@@ -97,6 +97,10 @@ _VALID_SOURCES = frozenset({
     # Resurrected > Normal) and trigger preemption of a running resurrected op.
     "cli_emergency",
     "human_override",
+    # A goal typed into the cockpit. Human-origin like voice_human, and
+    # attributable separately so observability can tell a spoken goal from a
+    # typed one — the same reason cli_emergency is distinct from both.
+    "operator_chat",
     # Added 2026-07-01 for the Autonomous FSM Checkpoint/Resume hydrator. A
     # suspended op (checkpointed on the wall-clock cap / Spot preemption) is
     # re-injected at the NEXT ignition's intake boot with its preserved
@@ -111,7 +115,9 @@ _VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
 # a resurrected hibernation survivor (which itself outranks all normal work). The
 # host always keeps ultimate control. Lives here (a leaf module) so both the
 # IntakeRouter and the BackgroundAgentPool import it without a cycle.
-SOVEREIGN_SOURCES = frozenset({"voice_human", "cli_emergency", "human_override"})
+SOVEREIGN_SOURCES = frozenset({
+    "voice_human", "cli_emergency", "human_override", "operator_chat",
+})
 
 # F2 Slice 2 — allowed values for the optional ``routing_override``
 # envelope field. Empty string is the "no override" sentinel (default).

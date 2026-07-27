@@ -54,7 +54,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Callable, Any, Dict, List, Optional
 
 from backend.core.ouroboros.governance.backlog_auto_proposed_repl import (
     _append_to_backlog_json,
@@ -123,6 +123,39 @@ def _backlog_path(project_root: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# The operator-dispatch seam
+# ---------------------------------------------------------------------------
+#
+# ONE registry rather than a `submit_now=` parameter threaded through three
+# nested factories (chat_text_bridge → with_claude → with_backlog). Threading
+# it would mean every intermediate factory grows a parameter it does not use
+# and must remember to forward — and a factory that forgets produces an
+# executor that silently files goals instead of running them, which is
+# exactly the wired-but-inert failure this codebase keeps paying for.
+#
+# Same shape as `set_active_canvas` in bipartite_layout: the daemon installs
+# its capability once at boot; every consumer asks rather than being handed.
+
+_OPERATOR_DISPATCH: Optional[Callable[[str, Any], Optional[str]]] = None
+
+
+def set_operator_dispatcher(
+    fn: Optional[Callable[[str, Any], Optional[str]]],
+) -> None:
+    """Install the daemon's immediate-dispatch capability. None disarms it.
+
+    Called once at harness boot. Absent it, every goal is filed and the reply
+    honestly says so — the degradation is visible rather than silent.
+    """
+    global _OPERATOR_DISPATCH
+    _OPERATOR_DISPATCH = fn
+
+
+def get_operator_dispatcher() -> Optional[Callable[[str, Any], Optional[str]]]:
+    return _OPERATOR_DISPATCH
+
+
 class BacklogChatActionExecutor:
     """Concrete ChatActionExecutor that wires `dispatch_backlog`
     against the real `.jarvis/backlog.json` writer.
@@ -145,11 +178,17 @@ class BacklogChatActionExecutor:
         self,
         project_root: Path,
         fallback: Optional[ChatActionExecutor] = None,
+        submit_now: Optional[Callable[[str, ChatTurn], Optional[str]]] = None,
     ) -> None:
         self._project_root = Path(project_root)
         self._fallback: ChatActionExecutor = (
             fallback or LoggingChatActionExecutor()
         )
+        # INJECTED, not imported: this module writes JSON and must stay
+        # testable without an intake router, an event loop or a daemon. The
+        # harness supplies the real submitter; absent one, the backlog write
+        # below remains the behaviour — degraded, but never lost.
+        self._submit_now = submit_now
         # Audit list — tests + operator inspection. Each entry is the
         # task_id returned (or the failure token).
         self.calls: List[str] = []
@@ -164,6 +203,41 @@ class BacklogChatActionExecutor:
         deduplicates on task_id so the FSM only fires once.
         """
         msg_clipped = (message or "")[:MAX_BACKLOG_DESCRIPTION_CHARS]
+
+        # IMMEDIATE PATH — a human is watching the screen.
+        #
+        # Writing to backlog.json makes the goal carry source="backlog",
+        # which routes BACKGROUND (DW only, cost-optimized) and waits for a
+        # sensor sweep. That is right for the Backlog SENSOR mining a task
+        # list and wrong for someone who just pressed Enter: the token
+        # described where the goal was STORED, not who ASKED for it.
+        #
+        # When a submitter is wired, the goal enters intake as
+        # `operator_chat` — human-origin, SOVEREIGN, IMMEDIATE-eligible —
+        # and the op runs now, narrating itself through the same chrome
+        # every autonomous op uses.
+        # Explicit injection wins (tests, callers that know better); the
+        # registry is the daemon's standing answer.
+        submitter = self._submit_now or get_operator_dispatcher()
+        if submitter is not None and msg_clipped.strip():
+            try:
+                op_id = submitter(msg_clipped, turn)
+                if op_id:
+                    self.calls.append(str(op_id))
+                    logger.info(
+                        "[BacklogChatExecutor] turn=%s dispatched IMMEDIATE "
+                        "op=%s (source=operator_chat)", turn.turn_id, op_id,
+                    )
+                    return str(op_id)
+            except Exception as exc:  # noqa: BLE001
+                # Fall through to the durable write. An intake fault must
+                # never LOSE an operator's goal — a queued goal is a
+                # degradation; a dropped one is a betrayal.
+                logger.warning(
+                    "[BacklogChatExecutor] turn=%s immediate dispatch failed "
+                    "(%s) — falling back to backlog", turn.turn_id, exc,
+                )
+
         if not msg_clipped.strip():
             logger.warning(
                 "[BacklogChatExecutor] turn=%s empty message — refusing "
@@ -238,6 +312,7 @@ class BacklogChatActionExecutor:
 
 def build_chat_repl_dispatcher_with_backlog(
     *,
+    submit_now: Optional[Callable[[str, "ChatTurn"], Optional[str]]] = None,
     project_root: Optional[Path] = None,
     orchestrator: Optional[ConversationOrchestrator] = None,
     fallback_executor: Optional[ChatActionExecutor] = None,
@@ -270,6 +345,11 @@ def build_chat_repl_dispatcher_with_backlog(
     wired_executor: ChatActionExecutor = BacklogChatActionExecutor(
         project_root=root,
         fallback=fallback_executor or LoggingChatActionExecutor(),
+        # None here is the honest default: with no submitter the goal is
+        # filed, and the reply SAYS it was filed. The harness supplies the
+        # real one, so the immediate path turns on where intake exists rather
+        # than being assumed everywhere.
+        submit_now=submit_now,
     )
     return build_chat_repl_dispatcher(
         orchestrator=orchestrator,
@@ -280,6 +360,8 @@ def build_chat_repl_dispatcher_with_backlog(
 
 __all__ = [
     "BacklogChatActionExecutor",
+    "set_operator_dispatcher",
+    "get_operator_dispatcher",
     "MAX_BACKLOG_DESCRIPTION_CHARS",
     "build_chat_repl_dispatcher_with_backlog",
     "is_enabled",
