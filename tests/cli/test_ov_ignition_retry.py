@@ -13,6 +13,8 @@ import asyncio
 
 import pytest
 
+from tests.contract_fakes import contract_fake
+
 from backend.core.ouroboros.cli import thin_client as tc
 
 
@@ -64,8 +66,13 @@ async def test_attaches_when_the_incumbent_simply_finishes_booting(monkeypatch):
         state["n"] += 1
         return "live" if state["n"] > 2 else "stale"
 
-    monkeypatch.setattr(tc, "probe_socket", _probe)
-    monkeypatch.setattr(tc, "_live_incumbent", lambda: 999)   # never releases
+    # Wrapped, so the bool-for-str drift that cost 24 seconds and a wrong
+    # diagnosis raises at the boundary instead of surfacing as a timeout.
+    monkeypatch.setattr(tc, "probe_socket", contract_fake(tc.probe_socket, _probe))
+    monkeypatch.setattr(
+        tc, "_live_incumbent",
+        contract_fake(tc._live_incumbent, lambda: 999),       # never releases
+    )
     monkeypatch.setattr(
         tc, "spawn_daemon",
         lambda **_k: pytest.fail("raced a live incumbent"),
