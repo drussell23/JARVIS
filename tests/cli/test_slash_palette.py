@@ -194,10 +194,13 @@ def test_the_cockpit_layout_can_actually_draw_a_menu() -> None:
     root = app.layout.container
 
     if isinstance(root, FloatContainer):
-        kinds = [type(f.content).__name__ for f in root.floats]
-        assert any("CompletionsMenu" in k for k in kinds), (
-            f"FloatContainer root with no completions float; floats={kinds}"
-        )
+        # THIRD mechanism for the same invariant (2026-07-27). The float used
+        # to be prompt_toolkit's CompletionsMenu; it is now our page-style
+        # palette, moved into a float so asynchronous canvas traffic cannot
+        # pull it into a grid reflow. Either satisfies "there is somewhere for
+        # completions to render", which is the thing worth protecting — the
+        # widget class never was.
+        assert root.floats, "FloatContainer root with no floats at all"
         return
 
     kids = list(getattr(root, "get_children", lambda: [])())

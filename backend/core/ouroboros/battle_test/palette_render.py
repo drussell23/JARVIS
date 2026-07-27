@@ -288,8 +288,16 @@ def build_palette_window(condition_style: str = "") -> Any:
     return ConditionalContainer(
         content=Window(
             content=FormattedTextControl(_fragments, focusable=False),
-            height=Dimension(min=0, max=palette_rows() * 3,
-                             preferred=1, weight=0),
+            # Height must be the CONTENT's height, computed per render.
+            #
+            # This was `preferred=1`, which was invisible while the palette was
+            # an HSplit row: `dont_extend_height` let the row take what its
+            # content needed. Inside a Float there is no such negotiation — the
+            # preferred height IS the height, so the overlay painted exactly
+            # one entry and looked like a broken menu.
+            height=lambda: Dimension(
+                min=0, preferred=_height(), max=palette_rows() * 3, weight=0,
+            ),
             dont_extend_height=True,
             wrap_lines=False,
             style=condition_style or "class:completion-menu",
