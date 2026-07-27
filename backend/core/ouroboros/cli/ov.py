@@ -332,26 +332,137 @@ def _render_hydration(console: Any, payload: dict) -> None:
             markup=False, highlight=False,
         )
         if ops:
-            console.print(
-                f"⎿ active ops: {', '.join(str(o) for o in ops[:4])}",
-                markup=False, highlight=False,
-            )
-        providers = liq.get("providers") or {}
-        for name, row in list(providers.items())[:3]:
-            tokens = row.get("tokens_remaining")
-            tok_txt = f"{tokens:,} tokens" if tokens is not None else "undeclared"
-            console.print(
-                f"⎿ liquidity {name}: {tok_txt}",
-                markup=False, highlight=False,
-            )
-        if liq.get("any_exhausted"):
-            console.print("⚠ a provider runway is dry", markup=False)
+            console.print(_active_ops_line(ops), markup=False, highlight=False)
+        for line in _liquidity_lines(liq.get("providers") or {},
+                                     any_exhausted=liq.get("any_exhausted")):
+            console.print(line, markup=False, highlight=False)
         console.print(
             "⎿ type verbs or plain text · Ctrl+C detaches (the organism "
             "keeps running)", markup=False, highlight=False,
         )
     except Exception:
         pass
+
+
+def _active_ops_line(ops: Any) -> str:
+    """What the organism is working on, in a form a human can hold.
+
+    This printed full UUIDv7s — ``op-019fa4d2-246e-7759-86,
+    op-019fa4d2-2468-794f-bc, ...`` — three of which fill a line and none of
+    which an operator can distinguish, because UUIDv7 is time-ordered and
+    same-millisecond ops share their entire prefix. The identifying bytes are
+    at the END, which is exactly where the truncation cut.
+
+    So the SUFFIX is shown: it is the part that actually differs. The count
+    leads, because "how many" is the question a glance is asking, and the
+    total is stated when more are running than are listed — a silent
+    truncation reads as "that is all of them".
+    """
+    try:
+        items = [str(o) for o in (ops or []) if str(o).strip()]
+    except Exception:  # noqa: BLE001
+        return "⎿ active ops: (unreadable)"
+    if not items:
+        return "⎿ active ops: none"
+
+    def _short(op_id: str) -> str:
+        # Whole trailing SEGMENTS, never a raw character slice: cutting
+        # mid-segment yields "-7759-86" with a leading dash that reads as a
+        # typo. Two segments is enough to distinguish same-millisecond ops,
+        # which share every earlier byte.
+        parts = [p for p in op_id.split("-") if p]
+        if len(parts) >= 3:
+            return "-".join(parts[-2:])
+        return parts[-1] if parts else op_id
+
+    shown = items[:4]
+    body = ", ".join(_short(o) for o in shown)
+    more = len(items) - len(shown)
+    suffix = f" (+{more} more)" if more > 0 else ""
+    return f"⎿ {len(items)} active op{'s' if len(items) != 1 else ''}: {body}{suffix}"
+
+
+def _liquidity_lines(providers: Any, *, any_exhausted: Any = None) -> list:
+    """Provider runways, ordered by what an operator needs to act on.
+
+    Three defects this replaces, and they compounded:
+
+      * ``⚠ a provider runway is dry`` named NOTHING. The per-provider rows
+        that answer "which one" were already in hand, so the warning withheld
+        an answer it was holding.
+      * the rows were sliced ``[:3]`` in DICT ORDER — arbitrary, so an
+        exhausted provider sitting fourth was never displayed, and the warning
+        then referred to something invisible.
+      * ``5,000,000 tokens`` beside "a runway is dry" reads as a contradiction
+        until you know they describe different providers.
+
+    So the list is ordered by URGENCY rather than by whatever order the dict
+    happened to have: exhausted first, then the thinnest runway. Truncation
+    now drops what matters least instead of whatever sorted last, and an
+    exhausted provider can never be the row that gets cut.
+    """
+    lines: list = []
+    try:
+        rows = list((providers or {}).items())
+    except Exception:  # noqa: BLE001
+        return lines
+
+    def _remaining(row: Any) -> Any:
+        try:
+            return row.get("tokens_remaining")
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _dry(row: Any) -> bool:
+        try:
+            if row.get("exhausted"):
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+        left = _remaining(row)
+        return isinstance(left, (int, float)) and left <= 0
+
+    # Sort key: dry first, then thinnest. `None` (undeclared) sorts last —
+    # an unknown runway is not evidence of a problem, and promoting it would
+    # push a real one off the list.
+    def _key(item: Any) -> Any:
+        _name, row = item
+        left = _remaining(row)
+        known = isinstance(left, (int, float))
+        return (0 if _dry(row) else 1, 0 if known else 1,
+                left if known else 0)
+
+    try:
+        rows.sort(key=_key)
+    except Exception:  # noqa: BLE001
+        pass
+
+    dry_names = [n for n, r in rows if _dry(r)]
+    # Always show every dry provider, plus enough healthy ones for context.
+    shown = max(3, len(dry_names))
+    for name, row in rows[:shown]:
+        left = _remaining(row)
+        if isinstance(left, (int, float)):
+            amount = f"{int(left):,} tokens"
+        else:
+            amount = "undeclared"
+        mark = " ← dry" if _dry(row) else ""
+        lines.append(f"⎿ liquidity {name}: {amount}{mark}")
+
+    if dry_names:
+        # NAME them. "a provider" is the one thing the operator cannot look up.
+        lines.append(
+            f"⚠ runway exhausted: {', '.join(dry_names)} — "
+            f"routing will fall through to the remaining providers"
+        )
+    elif any_exhausted:
+        # The aggregate flag disagrees with every row we can see. Say that,
+        # rather than repeating a claim nothing supports.
+        lines.append(
+            "⚠ a runway is reported dry but no provider row shows it — "
+            "run /provider for the authoritative view"
+        )
+    return lines
 
 
 def _can_run_split_plane() -> bool:
