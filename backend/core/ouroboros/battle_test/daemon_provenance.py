@@ -105,15 +105,20 @@ def staleness_line(
             # Not a git checkout, or git is unavailable. Age alone is still
             # worth saying once it is large — "unknown" beats a confident
             # wrong answer about what code is loaded.
-            return (f"⚠ daemon booted {_age(age_s)} ago · commit unknown"
+            return (f"⚠ daemon booted {_age(age_s)} ago · commit unknown · "
+                    f"`ov restart` if it looks stale"
                     if age_s >= _age_threshold_s() else "")
         if head == commit:
             return ""                       # current; say nothing
 
         behind = _git("rev-list", "--count", f"{commit}..{head}", root=root)
         detail = f"{behind} commits behind" if behind.isdigit() else "behind HEAD"
+        # Name the COMMAND, not the intent. "restart to load current code"
+        # told an operator what to want; `ov restart` tells them what to
+        # type — and the gap between those two was four steps of `ps`, a
+        # transcribed pid, and a `kill`.
         return (f"⚠ daemon booted {_age(age_s)} ago on {commit[:7]} · "
-                f"{detail} · restart to load current code")
+                f"{detail} · run `ov restart` to load current code")
     except Exception:  # noqa: BLE001
         return ""
 

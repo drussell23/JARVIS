@@ -29,7 +29,7 @@ from typing import Any, Callable, List, Optional, Sequence
 from backend.core.ouroboros.ui.theme import build_console
 
 _VERBS = {"cockpit", "run", "daemon", "status", "attach", "system", "hive",
-          "doctor", "version"}
+          "doctor", "restart", "version"}
 _HELP_TOKENS = {"help", "--help", "-h"}
 _VERSION_TOKENS = {"version", "--version", "-V"}
 
@@ -258,6 +258,8 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
         return Invocation("hive")
     if verb == "doctor":
         return Invocation("doctor", list(rest))
+    if verb == "restart":
+        return Invocation("restart", list(rest))
     # cockpit (explicit or defaulted)
     return Invocation("cockpit", rest)
 
@@ -338,10 +340,102 @@ def _render_hydration(console: Any, payload: dict) -> None:
             console.print(line, markup=False, highlight=False)
         console.print(
             "⎿ type verbs or plain text · Ctrl+C detaches (the organism "
-            "keeps running)", markup=False, highlight=False,
+            "keeps running) · `ov restart` reloads it",
+            markup=False, highlight=False,
         )
     except Exception:
         pass
+
+
+def _live_incumbent() -> Any:
+    """PID of the live single-flight holder, or None.
+
+    Delegates to `thin_client`, which owns the ONE reader the reaper,
+    preflight and ghost-socket check all share — so `ov restart` cannot form
+    a different opinion about whether a daemon exists than the code that
+    decides whether to ignite one.
+    """
+    try:
+        from backend.core.ouroboros.cli.thin_client import (
+            _live_incumbent as _probe,
+        )
+        return _probe()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _restart_daemon(say: Any) -> int:
+    """Stop the running organism and ignite a fresh one. Returns an exit code.
+
+    This exists because the alternative was `ps`, reading a pid, `kill`, then
+    `ov` — four steps and a number the operator had to transcribe correctly,
+    performed most often when a daemon is stale and least often when they have
+    patience for it.
+
+    NOT bound to Ctrl+C, deliberately. The organism is PROACTIVE: it runs
+    sensors and autonomous operations, and detaching is meant to leave it
+    working. Killing on Ctrl+C would end a long soak every time someone
+    glanced at it — the persistence is the feature, and this is the escape
+    hatch, not a reversal of it.
+
+    Graceful first: SIGTERM lets the harness write its summary, flush
+    telemetry and release its lock, which is what makes the NEXT boot clean.
+    SIGKILL only if it will not leave — and a killed daemon leaves the ghost
+    socket this codebase now detects rather than wedges on.
+    """
+    import signal
+    import time as _t
+
+    pid = _live_incumbent()
+    if pid is None:
+        say("⎿ no organism running — igniting a fresh one")
+    else:
+        say(f"⏺ stopping organism (pid {pid}) — SIGTERM, letting it finish")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pid = None
+        except PermissionError:
+            say(f"⚠ not permitted to stop pid {pid} — is it yours?")
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            say(f"⚠ could not signal pid {pid}: {type(exc).__name__}")
+            return 1
+
+    if pid is not None:
+        # Wait for it to ACTUALLY go. Igniting while the old one still holds
+        # the single-flight lock is how two organisms briefly race for one
+        # socket — the class this codebase already paid for.
+        deadline = _t.monotonic() + _restart_grace_s()
+        while _t.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except (ProcessLookupError, PermissionError):
+                break
+            _t.sleep(0.2)
+        else:
+            say("⎿ it did not stop in time — escalating to SIGKILL")
+            try:
+                os.kill(pid, signal.SIGKILL)
+                _t.sleep(0.5)
+            except Exception:  # noqa: BLE001
+                pass
+        say("⎿ organism stopped")
+    return 0
+
+
+def _restart_grace_s() -> float:
+    """How long a daemon gets to shut down cleanly before SIGKILL.
+
+    Generous by default: the harness writes a summary and flushes telemetry
+    on the way out, and cutting that short is what leaves the next boot
+    dirty. Env ``JARVIS_OV_RESTART_GRACE_S``.
+    """
+    try:
+        return max(1.0, float(
+            os.environ.get("JARVIS_OV_RESTART_GRACE_S", "15") or 15))
+    except (TypeError, ValueError):
+        return 15.0
 
 
 def _active_ops_line(ops: Any) -> str:
@@ -2212,6 +2306,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_system(console)
     if inv.action == "hive":
         return run_hive(console)
+    if inv.action == "restart":
+        # Stop, then fall through to the normal cockpit path — which already
+        # knows how to ignite, wait for the socket and attach. Reusing it
+        # means `ov restart` and `ov` cannot drift apart in how they boot.
+        def _say(text: str) -> None:
+            try:
+                print(text, flush=True)
+            except Exception:  # noqa: BLE001
+                pass
+        rc = _restart_daemon(_say)
+        if rc != 0:
+            return rc
+        inv = Invocation("cockpit", [])
+
     if inv.action == "doctor":
         try:
             from backend.core.ouroboros.cli.ov_doctor import run_doctor
