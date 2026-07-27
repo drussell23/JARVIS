@@ -1699,6 +1699,89 @@ def _root_logging_preserved():
             pass
 
 
+class MentionPathCompleter:
+    """Completes `@path` mentions against the repo.
+
+    A mention the operator cannot TYPE is a feature only someone who already
+    knows the tree can use. This makes `@bac<tab>` reach
+    `@backend/core/...`, which is the difference between a parser and a
+    surface.
+
+    Deliberately NOT prompt_toolkit's `PathCompleter`: that completes from
+    the process CWD and would happily offer `/etc/passwd`. Mentions name
+    files in the REPO the organism works on, so the walk is rooted there and
+    cannot climb out — a completer that offers what the daemon will then
+    refuse to read teaches the operator nothing.
+    """
+
+    def __init__(self, root: Optional[str] = None, max_results: int = 12) -> None:
+        self._root = root
+        self._max = max(1, int(max_results))
+
+    def _repo_root(self):
+        import pathlib as _p
+        if self._root:
+            return _p.Path(self._root)
+        return _p.Path(os.environ.get("JARVIS_REPO_PATH", ".")).resolve()
+
+    def get_completions(self, document: Any, _event: Any = None):
+        from prompt_toolkit.completion import Completion
+        try:
+            text = document.text_before_cursor or ""
+            at = text.rfind("@")
+            if at < 0:
+                return
+            # Only the token being typed — an `@` earlier in a finished
+            # sentence must not re-open the menu on every later keystroke.
+            fragment = text[at + 1:]
+            if " " in fragment or "\n" in fragment:
+                return
+            root = self._repo_root()
+            if not root.is_dir():
+                return
+            for path in self._walk(root, fragment):
+                yield Completion(path, start_position=-len(fragment))
+        except Exception:  # noqa: BLE001 — completion must never break typing
+            return
+
+    def _walk(self, root: Any, fragment: str) -> List[str]:
+        """Repo-relative paths matching *fragment*. Bounded and prefix-first.
+
+        Bounded because a mention completer that walks a large repo on every
+        keystroke stalls the very keystroke that opened it — the failure the
+        threaded completer exists to avoid, reintroduced one layer down.
+        """
+        import itertools
+        frag = fragment.lower()
+        hits: List[str] = []
+        skip = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                ".mypy_cache", ".pytest_cache", "dist", "build"}
+        try:
+            walker = os.walk(str(root))
+            for dirpath, dirnames, filenames in itertools.islice(walker, 4000):
+                dirnames[:] = [d for d in dirnames
+                               if d not in skip and not d.startswith(".")]
+                rel_dir = os.path.relpath(dirpath, str(root))
+                for name in filenames:
+                    if name.startswith("."):
+                        continue
+                    rel = name if rel_dir == "." else os.path.join(rel_dir, name)
+                    low = rel.lower()
+                    if not frag or low.startswith(frag) or frag in low:
+                        hits.append(rel)
+                        if len(hits) >= self._max * 4:
+                            break
+                if len(hits) >= self._max * 4:
+                    break
+        except Exception:  # noqa: BLE001
+            return hits[: self._max]
+        # Prefix matches first — what the operator is typing beats what merely
+        # contains it — then shortest, since a shallower path is likelier the
+        # one meant.
+        hits.sort(key=lambda r: (0 if r.lower().startswith(frag) else 1, len(r)))
+        return hits[: self._max]
+
+
 def registry_from_dispatch() -> VerbRegistry:
     """Build a :class:`VerbRegistry` from the AUTO-DISCOVERED dispatch table.
 
@@ -1783,6 +1866,16 @@ def build_attach_completer() -> Optional[object]:
         )
         if completer is None:
             return None
+        # `/` opens verbs, `@` opens files. One surface, two vocabularies —
+        # dispatched on the sigil the operator typed rather than on a mode
+        # they have to enter.
+        try:
+            from prompt_toolkit.completion import merge_completers
+            completer = merge_completers(
+                [completer, MentionPathCompleter()],
+            )
+        except Exception:  # noqa: BLE001 — verbs alone still complete
+            pass
         try:
             from prompt_toolkit.completion import ThreadedCompleter
             return ThreadedCompleter(completer)
