@@ -62,23 +62,35 @@ def test_each_tool_is_SPOKEN_not_tokenised(token: str, verb: str) -> None:
 
 
 def test_an_unknown_tool_renders_under_its_own_name() -> None:
-    """A new tool must appear, not vanish — MCP tools arrive at runtime and
+    """SUPERSEDED same-day: this asserted the RAW token survived, which was
+    the weaker behaviour it was describing. An MCP tool now renders as
+    `server·tool`, so the invariant that matters — a new tool APPEARS rather
+    than vanishing — is expressed against identity instead of against the
+    routing string.
+
+    A new tool must appear, not vanish: MCP tools arrive at runtime and
     cannot be enumerated ahead of time."""
-    assert "mcp_github_search" in _tool_chrome_line("mcp_github_search", "q=x")
+    out = _tool_chrome_line("mcp_github_search", "q=x")
+    assert "github" in out and "search" in out
+    assert "mcp_" not in out, "the raw routing prefix leaked to the operator"
 
 
 # --------------------------------------------------------------------------
 # 2. long paths keep the part that identifies them
 # --------------------------------------------------------------------------
 
-def test_a_deep_path_is_clipped_from_the_LEFT() -> None:
-    """The filename identifies the file. Clipping the tail would give every
-    entry an identical `backend/core/…` prefix — the same defect as truncating
-    a UUIDv7 from the right."""
+def test_a_deep_path_keeps_BOTH_ends() -> None:
+    """SUPERSEDED same-day: this required the line to START with `…`, which
+    pinned a clip that threw the repo away. Keeping only the tail loses which
+    project the file is in; keeping only the head loses the file. Whole
+    segments are elided from the MIDDLE now, so both ends survive.
+
+    The filename still identifies the file — that part was right."""
     deep = "backend/core/ouroboros/governance/" + ("x" * 60) + "/thin_client.py"
     out = _tool_chrome_line("read_file", deep)
     assert "thin_client.py" in out
-    assert out.startswith("⏺ Read(…")
+    assert "backend" in out, "the repo root was thrown away"
+    assert "…" in out
 
 
 def test_a_line_stays_a_line() -> None:
@@ -138,3 +150,108 @@ def test_op_line_is_the_mirroring_chokepoint() -> None:
             assert "_mirror_markup" in ast.unparse(node)
             return
     pytest.fail("_op_line is gone")
+
+
+# --------------------------------------------------------------------------
+# 4. verbs are DERIVED, not enumerated  (2026-07-27)
+# --------------------------------------------------------------------------
+
+from backend.core.ouroboros.battle_test.serpent_flow import (  # noqa: E402
+    derive_verb,
+    elide_path,
+)
+
+
+def test_an_mcp_tool_renders_as_server_and_tool() -> None:
+    """MCP tools arrive at RUNTIME — an operator can connect a server this
+    afternoon — so a fixed table cannot cover them, and a lookup miss must
+    not render a raw routing token."""
+    assert derive_verb("mcp_github_search_issues") == "github·search_issues"
+
+
+def test_a_known_server_list_resolves_an_ambiguous_split() -> None:
+    """Server names may contain underscores, so `mcp_my_server_run_query` is
+    ambiguous without the connection list. Longest match wins — the same rule
+    the client's own dispatcher uses."""
+    assert derive_verb("mcp_my_server_run_query", ["my_server"]) == \
+        "my_server·run_query"
+
+
+def test_an_unknown_server_still_renders_honestly() -> None:
+    """A slightly mis-split label beats a raw `mcp_github_search_issues`."""
+    out = derive_verb("mcp_unknown_thing")
+    assert "·" in out and "mcp_" not in out
+
+
+def test_a_brand_new_builtin_is_title_cased_not_tokenised() -> None:
+    """No entry needed: derivation covers it."""
+    assert derive_verb("some_brand_new_tool") == "SomeBrandNewTool"
+
+
+def test_the_override_table_is_only_for_wrong_derivations() -> None:
+    """`edit_file` would derive to "EditFile"; operators read "Update". The
+    table is an override list, not a registry."""
+    assert derive_verb("edit_file") == "Update"
+    assert derive_verb("read_file") == "Read"
+
+
+@pytest.mark.parametrize("junk", ["", None, 42])
+def test_verb_derivation_never_returns_empty(junk: Any) -> None:
+    assert derive_verb(junk)
+
+
+# --------------------------------------------------------------------------
+# 5. paths keep BOTH ends; commands keep their head
+# --------------------------------------------------------------------------
+
+def test_a_long_path_elides_WHOLE_SEGMENTS() -> None:
+    """A mid-word cut yields `…xxxxx/deep_module.py` — the same defect as
+    truncating a UUIDv7 from the wrong end, on the other axis."""
+    out = elide_path("backend/core/ouroboros/governance/chat_repl_dispatcher.py")
+    assert out.startswith("backend/")
+    assert out.endswith("chat_repl_dispatcher.py")
+    assert "…" in out
+    for segment in out.split("/"):
+        assert segment == "…" or "…" not in segment, "a segment was cut in half"
+
+
+def test_elision_grows_back_toward_the_FILENAME() -> None:
+    """The segments nearest the file carry the most meaning: `governance/`
+    locates it, `core/` barely narrows anything. Free context should buy the
+    useful end."""
+    out = elide_path("backend/core/ouroboros/governance/chat_repl_dispatcher.py")
+    assert "governance" in out
+
+
+def test_a_path_that_fits_is_left_alone() -> None:
+    short = "backend/core/ouroboros/battle_test/serpent_flow.py"
+    assert elide_path(short) == short
+
+
+def test_a_single_enormous_filename_keeps_its_tail() -> None:
+    """Nothing to elide between — the extension and suffix still identify
+    it."""
+    out = elide_path("one_enormous_single_segment_filename_with_no_dirs.py" * 2)
+    assert out.endswith(".py") and out.startswith("…")
+
+
+def test_a_command_is_clipped_from_the_RIGHT() -> None:
+    """A shell command is identified by its head. Eliding `pytest` to keep
+    `--no-header` would be exactly backwards."""
+    out = _tool_chrome_line(
+        "bash", "pytest tests/cli/test_thin_client.py -q --tb=short -x --no-header",
+    )
+    assert "pytest" in out
+    assert out.rstrip(")").endswith("…")
+
+
+def test_a_command_containing_a_slash_is_not_mistaken_for_a_path() -> None:
+    """`pytest tests/cli -q` has a slash but is not a path — the
+    discriminator is whether the FIRST token is itself the path."""
+    out = _tool_chrome_line("bash", "pytest " + "tests/cli/x " * 20)
+    assert out.startswith("⏺ Bash(pytest")
+
+
+def test_a_bare_long_path_IS_treated_as_one() -> None:
+    out = _tool_chrome_line("read_file", "backend/core/ouroboros/" + "d/" * 20 + "f.py")
+    assert out.endswith("f.py)")
