@@ -176,24 +176,34 @@ def _cockpit_app():
 
 
 def test_the_cockpit_layout_can_actually_draw_a_menu() -> None:
-    """THE bug the operator reported.
+    """THE bug the operator reported: completions computed, nothing drawn.
 
-    D5 built a correct completer yielding 76 verbs and wired it to
-    `_split_plane_loop`'s PromptSession — a surface the bipartite cockpit
-    never runs. Even once reached, the layout was a bare HSplit: prompt_toolkit
-    draws the completions menu as a Float, so with no FloatContainer it had
-    nowhere to exist. Completions were computed and silently discarded."""
-    from prompt_toolkit.layout import FloatContainer
+    Asserted as an INVARIANT — the layout contains somewhere for the palette
+    to render — rather than as a mechanism. This test originally required the
+    root to be a FloatContainer, which was true while the menu was
+    prompt_toolkit's Float widget and became false the moment the palette
+    moved to a full-width row above the prompt. The mechanism changed; the
+    thing worth protecting did not.
+
+    Either shape satisfies it:
+      * a FloatContainer carrying a CompletionsMenu float, or
+      * a ConditionalContainer palette row participating in the layout."""
+    from prompt_toolkit.layout import ConditionalContainer, FloatContainer
 
     app = _cockpit_app()
     root = app.layout.container
-    assert isinstance(root, FloatContainer), (
-        "the cockpit root is not a FloatContainer — a completions menu has "
-        "nowhere to render, however many completions the buffer holds"
-    )
-    kinds = [type(f.content).__name__ for f in root.floats]
-    assert any("CompletionsMenu" in k for k in kinds), (
-        f"no completions menu float is mounted; floats={kinds}"
+
+    if isinstance(root, FloatContainer):
+        kinds = [type(f.content).__name__ for f in root.floats]
+        assert any("CompletionsMenu" in k for k in kinds), (
+            f"FloatContainer root with no completions float; floats={kinds}"
+        )
+        return
+
+    kids = list(getattr(root, "get_children", lambda: [])())
+    assert any(isinstance(k, ConditionalContainer) for k in kids), (
+        "the cockpit layout has neither a completions float nor a palette "
+        "row — completions are computed and silently discarded"
     )
 
 

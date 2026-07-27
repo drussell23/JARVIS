@@ -502,7 +502,25 @@ def build_bipartite_application(
         # Bright venom-purple hairlines (Style Guide brand) — visible framing.
         return Window(height=1, char="─", style="fg:#a371f7")
 
-    rows += [canvas, _rule(), prompt, _rule()]
+    # The palette sits ABOVE the input, full width, and pushes the prompt down
+    # as it opens — the same relationship Claude Code has. A Float would
+    # overlay the canvas at the widget's own width; a row participates in the
+    # layout, so it wraps to the terminal and the prompt stays anchored under
+    # it. `dont_extend_height` keeps it at zero rows when nothing is matching.
+    _palette = None
+    if completer is not None:
+        try:
+            from backend.core.ouroboros.battle_test.palette_render import (
+                build_palette_window,
+            )
+            _palette = build_palette_window()
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] palette row unavailable", exc_info=True)
+
+    rows += [canvas]
+    if _palette is not None:
+        rows.append(_palette)
+    rows += [_rule(), prompt, _rule()]
     if toolbar is not None:
         # A one-row morphing footer (e.g. the attach client's AttachUI.toolbar —
         # audio state, detach hint). Re-evaluated each repaint; a failing
@@ -518,7 +536,7 @@ def build_bipartite_application(
             height=1, wrap_lines=False,
         ))
     root: Any = HSplit(rows)
-    if completer is not None:
+    if completer is not None and _palette is None:
         # THE missing half. A CompletionsMenu is a Float; without a
         # FloatContainer it is never rendered no matter how many completions
         # the buffer holds.
