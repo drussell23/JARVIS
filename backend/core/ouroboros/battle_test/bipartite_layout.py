@@ -54,6 +54,58 @@ def bipartite_enabled() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+def fullscreen_enabled() -> bool:
+    """Does the cockpit claim the terminal's ALTERNATE SCREEN?
+
+    `full_screen=True` issues smcup, which gives a fixed viewport and — as a
+    direct consequence — **disables the terminal's native scrollback**. An
+    operator scrolling up to re-read what the organism did an hour ago finds
+    nothing there, because the alternate buffer has no history and the primary
+    buffer stopped receiving output the moment the cockpit mounted.
+
+    That made the cockpit's own canvas load-bearing: Zone 1 existed to replace
+    the scrollback the alt-screen had taken away, and it is a bounded ring, so
+    history beyond it was simply gone.
+
+    Default FALSE. Outside the alternate screen the terminal keeps every line
+    the organism ever printed, scrollback works the way it does in every other
+    tool, and the canvas becomes a small live region rather than a substitute
+    for history the terminal was always better at holding.
+
+    ``JARVIS_BIPARTITE_FULLSCREEN=1`` restores the old behaviour — a fixed
+    viewport is genuinely better on a wall display or a dedicated monitor,
+    where nobody scrolls and a stable frame reads as an instrument panel.
+    """
+    return os.environ.get(
+        "JARVIS_BIPARTITE_FULLSCREEN", "",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _canvas_dimension() -> Any:
+    """How much room the live canvas takes.
+
+    In the alternate screen it takes what is left — there is nowhere else for
+    history to live, so it should be as large as possible.
+
+    Outside it, a greedy canvas would push the prompt to the bottom of a
+    screen the app does not own, and prompt_toolkit would reserve that height
+    on every repaint — turning the scrollback we just restored into a wall of
+    blank rows. It becomes a bounded live region instead: recent activity
+    stays visible, and everything older scrolls into the terminal's own
+    history where it belongs.
+    """
+    from prompt_toolkit.layout.dimension import Dimension
+    if fullscreen_enabled():
+        return Dimension(weight=1)
+    try:
+        rows = max(0, int(os.environ.get("JARVIS_BIPARTITE_LIVE_ROWS", "8")))
+    except (TypeError, ValueError):
+        rows = 8
+    # min=0 so an idle organism shows no empty frame at all — the cockpit
+    # should occupy exactly the prompt when there is nothing happening.
+    return Dimension(min=0, max=rows, preferred=rows)
+
+
 def _canvas_max_lines() -> int:
     try:
         return max(16, int(os.environ.get("JARVIS_BIPARTITE_CANVAS_MAX_LINES", _DEFAULT_MAX_LINES)))
@@ -445,7 +497,7 @@ def build_bipartite_application(
 
     canvas = Window(
         content=FormattedTextControl(_canvas_fragments, focusable=False),
-        wrap_lines=False, height=Dimension(weight=1),
+        wrap_lines=False, height=_canvas_dimension(),
     )
     # The `/` palette. Passing a completer here is only HALF the wiring —
     # prompt_toolkit computes completions into the buffer, but draws the menu
@@ -641,7 +693,11 @@ def build_bipartite_application(
 
     app = Application(
         layout=PTLayout(root, focused_element=prompt),
-        key_bindings=kb, full_screen=True, mouse_support=False,
+        # NOT unconditionally full-screen. The alternate screen buffer
+        # disables the terminal's native scrollback, which is the surface
+        # best placed to hold history — see `fullscreen_enabled`.
+        key_bindings=kb, full_screen=fullscreen_enabled(),
+        mouse_support=False,
         refresh_interval=0.1,
         **({"style": _style} if _style is not None else {}),
         **({"color_depth": _depth} if _depth is not None else {}),
