@@ -1145,6 +1145,32 @@ def _maybe_summon_audio_plane(client: Any, cmd: str) -> None:
         pass
 
 
+def _extract_mentions(text: str) -> list:
+    """The `@path` mentions in a line, via the ONE parser that defines them.
+
+    Delegates to `repl_input_polish.extract_attachments` rather than matching
+    `@\\S+` here: that module already decides what counts — `@here` is prose,
+    a real path is a mention — and a second rule would eventually disagree
+    with the daemon about which is which.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.repl_input_polish import (
+            extract_attachments, is_polish_enabled,
+        )
+        if not is_polish_enabled():
+            return []
+        return list(extract_attachments(text).paths or ())
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _short_path(path: str) -> str:
+    """Filename plus its parent — enough to disambiguate, short enough to
+    sit in a flash message."""
+    parts = [p for p in str(path or "").split("/") if p]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else "")
+
+
 def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
     """THE one operator-line router — shared by the legacy split-plane loop AND
     the Bipartite cockpit (DRY: verbs behave identically on both surfaces).
@@ -1190,6 +1216,29 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
         if text:
             if ui is not None and ui.should_flush_on_input():
                 client.send_audio("flush")
+            # @path mentions, acknowledged HERE rather than silently relayed.
+            #
+            # `repl_input_polish` has parsed these since it shipped — but it
+            # was wired into SerpentFlow's own REPL, which lives on a headless
+            # daemon nobody types into. The operator's actual input surface
+            # never called it, so `@backend/auth.py` travelled upstream as
+            # ordinary prose.
+            #
+            # The line is relayed UNCHANGED. Stripping the mention here would
+            # make the cockpit and the daemon disagree about what was said,
+            # and the daemon is where attachment resolution belongs. This
+            # confirms the operator was understood; it does not decide.
+            _mentions = _extract_mentions(text)
+            if _mentions and ui is not None:
+                try:
+                    ui.flash(
+                        f"attached {len(_mentions)} file"
+                        f"{'s' if len(_mentions) != 1 else ''}: "
+                        + ", ".join(_short_path(m) for m in _mentions[:3]),
+                        seconds=3.0,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             client.send_input(text)
             return "sent"
         return "empty"
