@@ -142,6 +142,113 @@ def layout_palette(
     return lines
 
 
+def live_completion_entries() -> Tuple[List[Tuple[str, str]], int]:
+    """The live completion state as ``(entries, selected_index)``.
+
+    Reads ``buffer.complete_state`` — the ONE place prompt_toolkit keeps this
+    — so every surface renders the same state rather than each keeping its own
+    idea of what is being completed. ``([], -1)`` whenever nothing is active
+    or no application is running. NEVER raises."""
+    try:
+        from prompt_toolkit.application.current import get_app
+        state = get_app().current_buffer.complete_state
+        if state is None or not state.completions:
+            return [], -1
+        rows = [
+            (c.display_text or c.text, c.display_meta_text or "")
+            for c in state.completions
+        ]
+        index = state.complete_index if state.complete_index is not None else -1
+        return rows, index
+    except Exception:  # noqa: BLE001
+        return [], -1
+
+
+def palette_fragments(max_rows: Optional[int] = None) -> List[Tuple[str, str]]:
+    """The palette as ONE formatted-text fragment list, newlines included.
+
+    This is the form prompt_toolkit accepts anywhere formatted text is taken —
+    ``bottom_toolbar``, ``message``, a ``FormattedTextControl``. Having it
+    means a surface does not need a container to show the palette, which is
+    what kept the page layout confined to the full ``Application`` while the
+    ``PromptSession`` cockpit fell back to the native widget.
+
+    Empty list when nothing is being completed. NEVER raises."""
+    try:
+        rows, index = live_completion_entries()
+        if not rows:
+            return []
+        try:
+            from prompt_toolkit.application.current import get_app
+            width = get_app().output.get_size().columns
+        except Exception:  # noqa: BLE001
+            width = 80
+        lines = layout_palette(rows, width=width, selected=index,
+                               max_rows=max_rows)
+        out: List[Tuple[str, str]] = []
+        for i, line in enumerate(lines):
+            out.extend(line)
+            if i < len(lines) - 1:
+                out.append(("", "\n"))
+        return out
+    except Exception:  # noqa: BLE001 — a palette fault must not blank the UI
+        logger.debug("[Palette] fragment render degraded", exc_info=True)
+        return []
+
+
+def _is_native_completion_menu(container: Any) -> bool:
+    """True if *container* is (or wraps) prompt_toolkit's own menu widget.
+
+    Checked at EVERY level rather than after unwrapping to the innermost
+    child: ``CompletionsMenu`` is itself a ``ConditionalContainer`` subclass,
+    so unwrapping first walks straight past the thing being looked for. That
+    exact mistake left both menus on screen at once during development.
+    """
+    names = ("CompletionsMenu", "MultiColumnCompletionsMenu")
+    seen = 0
+    while container is not None and seen < 8:
+        if type(container).__name__ in names:
+            return True
+        for base in type(container).__mro__:
+            if base.__name__ in names:
+                return True
+        inner = getattr(container, "content", None)
+        if inner is None or inner is container:
+            break
+        container = inner
+        seen += 1
+    return False
+
+
+def strip_native_completion_menu(app: Any) -> int:
+    """Remove prompt_toolkit's completions float from *app*. Returns the count.
+
+    The palette REPLACES the native presentation rather than restyling it —
+    they are different layouts, not different colour schemes — so leaving the
+    widget in place renders both at once: a narrow floating column on top of
+    the full-width page.
+
+    ``FloatContainer.floats`` is a plain list and mutating it is how floats are
+    managed, so this is not reaching past an API. It is done after
+    construction because ``PromptSession`` builds its layout internally and
+    exposes no seam to opt out of the menu.
+
+    NEVER raises; returns 0 when there is nothing to remove."""
+    removed = 0
+    try:
+        from prompt_toolkit.layout import FloatContainer
+        for node in app.layout.walk():
+            if not isinstance(node, FloatContainer):
+                continue
+            keep = [f for f in node.floats
+                    if not _is_native_completion_menu(f.content)]
+            removed += len(node.floats) - len(keep)
+            node.floats[:] = keep
+    except Exception:  # noqa: BLE001
+        logger.debug("[Palette] native menu strip degraded", exc_info=True)
+    return removed
+
+
 def build_palette_window(condition_style: str = "") -> Any:
     """A full-width container that draws the palette above the prompt.
 
@@ -164,32 +271,9 @@ def build_palette_window(condition_style: str = "") -> Any:
             return None
 
     def _entries_and_index():
-        st = _state()
-        if st is None or not st.completions:
-            return [], -1
-        rows = [
-            (c.display_text or c.text, c.display_meta_text or "")
-            for c in st.completions
-        ]
-        idx = st.complete_index if st.complete_index is not None else -1
-        return rows, idx
+        return live_completion_entries()
 
-    def _fragments():
-        try:
-            rows, idx = _entries_and_index()
-            if not rows:
-                return []
-            width = get_app().output.get_size().columns
-            lines = layout_palette(rows, width=width, selected=idx)
-            out: List[Tuple[str, str]] = []
-            for i, line in enumerate(lines):
-                out.extend(line)
-                if i < len(lines) - 1:
-                    out.append(("", "\n"))
-            return out
-        except Exception:  # noqa: BLE001 — a palette fault must not blank the UI
-            logger.debug("[Palette] render degraded", exc_info=True)
-            return []
+    _fragments = palette_fragments
 
     def _height() -> int:
         try:
@@ -217,5 +301,8 @@ def build_palette_window(condition_style: str = "") -> Any:
 __all__ = [
     "build_palette_window",
     "layout_palette",
+    "live_completion_entries",
+    "palette_fragments",
     "palette_rows",
+    "strip_native_completion_menu",
 ]

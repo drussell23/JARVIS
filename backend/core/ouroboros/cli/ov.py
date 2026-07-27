@@ -644,10 +644,32 @@ class AttachUI:
             pass
         return "  ov attach — organism live"
 
-    def toolbar(self) -> str:
-        """Static key hints only. The live region moved above the caret; what
-        remains under the input is the affordance list, which genuinely
-        belongs there because it describes the line you are typing on."""
+    def toolbar(self) -> Any:
+        """The slash palette while completing; static key hints otherwise.
+
+        The region directly beneath the caret is where a command palette
+        belongs — it describes the line being typed — and on this surface it
+        is the only full-width region available. ``PromptSession`` builds its
+        own layout and takes no extra containers, which is why the page-style
+        palette shipped in #70123 reached the bipartite cockpit and never
+        reached the surface ``ov`` actually attaches with: it was written as a
+        container, and this surface has nowhere to put one.
+
+        Rendering it as formatted text instead removes that constraint. Same
+        ``layout_palette`` maths, same live ``complete_state`` — one palette,
+        both surfaces, no second implementation to drift.
+
+        Returns a fragment list while completing and a plain string otherwise;
+        prompt_toolkit accepts either."""
+        try:
+            from backend.core.ouroboros.battle_test.palette_render import (
+                palette_fragments,
+            )
+            fragments = palette_fragments()
+            if fragments:
+                return fragments
+        except Exception:  # noqa: BLE001 — hints are the safe fallback
+            pass
         note = self._TOOLBAR_NOTES.get(self.audio_state)
         if note is not None:
             audio = f" · {note}"
@@ -921,7 +943,14 @@ async def _split_plane_loop(
         # from the other surface. Two surfaces, one palette (DRY): the brand
         # owns its colours in ui.theme, not per widget.
         style=_cockpit_style(),
+        # The palette draws in the toolbar, so the native menu's reserved
+        # strip would only open a gap between the caret and the entries.
+        reserve_space_for_menu=0,
     )
+    # Replace prompt_toolkit's floating menu rather than restyling it: they
+    # are different LAYOUTS, and leaving the widget in place renders both at
+    # once — a narrow floating column on top of the full-width page.
+    _strip_native_menu(session.app)
     ui.bind_app(session.app)
 
     async def _watch_disconnect() -> None:
@@ -962,6 +991,17 @@ async def _split_plane_loop(
             if outcome == "detach":
                 break
 
+
+
+def _strip_native_menu(app: Any) -> int:
+    """Drop prompt_toolkit's completions float. NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.palette_render import (
+            strip_native_completion_menu,
+        )
+        return strip_native_completion_menu(app)
+    except Exception:  # noqa: BLE001 — the native menu is a survivable fallback
+        return 0
 
 
 def _cockpit_style() -> Any:
