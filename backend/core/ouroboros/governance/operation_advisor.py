@@ -500,7 +500,8 @@ def _get_advisor_blast_executor() -> "_futures.ThreadPoolExecutor":
                     max_workers=_ADVISOR_BLAST_EXECUTOR_MAX_WORKERS,
                     thread_name_prefix="advisor-blast",
                 )
-                _atexit.register(_shutdown_advisor_blast_executor)
+                from .exit_guard import guarded_atexit_register
+                guarded_atexit_register(_shutdown_advisor_blast_executor)
                 logger.info(
                     "[Advisor] dedicated executor initialized "
                     "(max_workers=%d, thread_prefix=advisor-blast)",

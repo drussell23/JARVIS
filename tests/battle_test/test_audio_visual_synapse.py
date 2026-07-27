@@ -337,8 +337,16 @@ class TestCrestBoundingAndBlit:
         # the off-by-one detached-artifact class. One column of margin.
         _lo, _hi, clamped = crest._clamp_cols(80)
         assert clamped == 79
-        _lo, _hi, clamped = crest._clamp_cols(200)
-        assert clamped == 88                    # cap still wins when roomy
+        # SUPERSEDED 2026-07-25: the cap was 88 — a number chosen when the
+        # reference geometry was drawn, not measured against anything — so on
+        # a 200-column terminal the crest sat in under half the width. The
+        # safety rail is now 140 and sizing is solved in BOTH dimensions by
+        # _fit_cols. What this test protects is the one-column wrap margin,
+        # which is unchanged; the specific ceiling is a tunable, not an
+        # invariant, so it is read rather than restated.
+        _lo, hi, clamped = crest._clamp_cols(200)
+        assert clamped == hi                    # cap still wins when roomy
+        assert hi > 88, "the crest is still capped at the old hardcoded width"
 
     def test_blit_writes_one_atomic_frame(self):
         from backend.core.ouroboros.ui import crest
