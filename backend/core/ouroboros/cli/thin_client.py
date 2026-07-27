@@ -576,17 +576,40 @@ async def ensure_daemon(
         if state == "live":
             return True
         if state == "booting":
-            # A daemon is home but boot-starved — its socket must NOT be
-            # cleaned and no second ignition raced. Wait for it to serve.
-            _say("⏺ organism already waking — waiting for it to serve")
-            if await await_socket(path, on_tick=_mk_tick(_say)):
-                _say("⏺ organism live — attaching")
-                return True
-            _say(
-                "⚠ the waking organism never served — "
-                "tail " + str(daemon_log_path()),
-            )
-            return False
+            # "booting" is INFERRED from a socket that exists and does not
+            # answer — which is exactly what a daemon killed mid-life leaves
+            # behind. The two are indistinguishable from the socket alone, so
+            # the claim is corroborated against a LIVE process before it is
+            # believed.
+            #
+            # Without this, an ungraceful death wedges `ov` permanently: the
+            # client waits for a corpse, and the stale-socket reaper lives
+            # inside the harness the client is refusing to start. The cleanup
+            # is trapped inside the thing that cannot boot, and only a human
+            # deleting a file breaks the cycle — which no operator would know
+            # to do. Observed 2026-07-27 after a routine `kill`.
+            #
+            # `_live_incumbent` is the SAME reader the reaper and preflight
+            # use, so there is one authority on "is anyone home" and no way
+            # for two components to disagree about it.
+            if _live_incumbent() is None:
+                _say(
+                    "⎿ a socket is present but nobody owns it — "
+                    "treating as a ghost and igniting",
+                )
+                state = "stale"          # fall through to the reap+spawn path
+            else:
+                # A daemon is home but boot-starved — its socket must NOT be
+                # cleaned and no second ignition raced. Wait for it to serve.
+                _say("⏺ organism already waking — waiting for it to serve")
+                if await await_socket(path, on_tick=_mk_tick(_say)):
+                    _say("⏺ organism live — attaching")
+                    return True
+                _say(
+                    "⚠ the waking organism never served — "
+                    "tail " + str(daemon_log_path()),
+                )
+                return False
         if state == "stale":
             # NEVER unlink while a live single-flight incumbent exists:
             # the bridge binds ONCE at boot, so cleaning a live-but-

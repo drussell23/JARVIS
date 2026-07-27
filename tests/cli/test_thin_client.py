@@ -527,6 +527,17 @@ class TestHandshakeDepthProbe:
             served["on"] = True
 
         try:
+            # A booting daemon HAS an owner. Since 2026-07-27 the client
+            # corroborates a "booting" socket against a live incumbent before
+            # waiting on it, because a socket left by a killed daemon is
+            # indistinguishable from a booting one — and waiting on a corpse
+            # wedged `ov` until a human deleted the file by hand.
+            #
+            # This fake previously left the owner unset, which now correctly
+            # reads as a ghost. Stating it makes the test say WHICH of the two
+            # cases it is about; the ghost case is covered in
+            # tests/cli/test_ghost_socket_and_staleness.py.
+            monkeypatch.setattr(thin_client, "_live_incumbent", lambda: 4242)
             flip = asyncio.ensure_future(_flip())
             ok = await thin_client.ensure_daemon(
                 spawner=lambda *a, **k: spawns.append(a),
