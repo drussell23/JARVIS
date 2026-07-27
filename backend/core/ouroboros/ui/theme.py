@@ -739,9 +739,14 @@ def cockpit_prompt_style(tier: Optional[ColorTier] = None) -> Any:
             ink, muted, faint = p["ink"], p["muted"], p["faint"]
             green, purple = p["venom_green"], p["venom_purple"]
             rules = [
-                # No fill. The menu floats on the terminal, CC-style.
-                ("completion-menu", f"bg:{ground} {muted}"),
-                ("completion-menu.completion", f"bg:{ground} {ink}"),
+                # No fill — and this time actually. Every rule below used to
+                # set `bg:{ground}`, which paints a solid block behind the
+                # whole palette; the comment claimed otherwise. Omitting bg
+                # lets the terminal's own background show through, so the
+                # palette reads as part of the page rather than a control
+                # dropped on top of it. Only the SELECTED row takes a fill.
+                ("completion-menu", f"{muted}"),
+                ("completion-menu.completion", f"{ink}"),
                 # Selection is a TINT, not reverse video — the eye tracks a
                 # highlight far better than an inverted block, and inverted
                 # text loses the accent colour that carries meaning.
@@ -749,7 +754,7 @@ def cockpit_prompt_style(tier: Optional[ColorTier] = None) -> Any:
                  f"bg:{surface} {green} bold"),
                 # Descriptions in venom purple: subordinate to the verb name
                 # but legible, which is exactly CC's blue-on-black relationship.
-                ("completion-menu.meta.completion", f"bg:{ground} {purple}"),
+                ("completion-menu.meta.completion", f"{purple}"),
                 ("completion-menu.meta.completion.current",
                  f"bg:{surface} {purple}"),
                 ("completion-menu.multi-column-meta", f"bg:{surface} {purple}"),

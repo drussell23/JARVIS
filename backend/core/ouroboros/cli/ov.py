@@ -577,6 +577,10 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             pass
 
+    #: Set by the surface that has nowhere else to draw the palette. Default
+    #: False so the cockpit, which floats it, never double-renders.
+    palette_in_toolbar: bool = False
+
     def degrade_to_append_only(self) -> None:
         """Strip this UI to a single caret and nothing else.
 
@@ -684,6 +688,11 @@ class AttachUI:
             # No toolbar: prompt_toolkit anchors it to the bottom of the
             # screen, which is an absolute position by definition.
             return ""
+        if not self.palette_in_toolbar:
+            # The cockpit floats the palette as a Z-index overlay, so drawing
+            # it here too would render it twice. Only the PromptSession
+            # surface — which has nowhere to put a container — opts in.
+            return self._key_hints()
         try:
             from backend.core.ouroboros.battle_test.palette_render import (
                 palette_fragments,
@@ -693,6 +702,10 @@ class AttachUI:
                 return fragments
         except Exception:  # noqa: BLE001 — hints are the safe fallback
             pass
+        return self._key_hints()
+
+    def _key_hints(self) -> str:
+        """The affordance list — what the line you are typing on can do."""
         note = self._TOOLBAR_NOTES.get(self.audio_state)
         if note is not None:
             audio = f" · {note}"
@@ -946,6 +959,10 @@ async def _split_plane_loop(
     )
 
     ui = ui or AttachUI()
+    # This surface has no container to float the palette into, so it draws it
+    # in the toolbar. The cockpit floats it and must NOT opt in, or it renders
+    # twice.
+    ui.palette_in_toolbar = True
     # ONE persistent session, dynamic prompt + rigid footer toolbar:
     # both are callables re-evaluated on every repaint, so an
     # audio_state frame morphs the footer via app.invalidate() while
