@@ -398,19 +398,28 @@ class CockpitAttachBridge:
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] publish degraded", exc_info=True)
 
-    def publish_markup(self, text: str) -> None:
-        """Broadcast one DAEMON-COMPOSED styled line (Rich markup) to every
+    def publish_markup(self, text: str, *,
+                       session: Optional[str] = None) -> None:
+        """Publish one DAEMON-COMPOSED styled line (Rich markup) to every
         attached terminal — the CC-style tool-activity channel (⏺ Bash /
         ⏺ Update diffs / ⎿ results). TYPED separately from ``line`` so the
         client can render it unescaped: the composition layer
         (tool_render_view / serpent_flow) escapes all MODEL-controlled
         content before wrapping it in markup, so the frame is styled chrome
         around inert data. Untrusted/raw text must NEVER travel here — use
-        publish_line. Strictly non-blocking; thread-safe; NEVER raises."""
+        publish_line. Strictly non-blocking; thread-safe; NEVER raises.
+
+        ``session`` addresses the frame to ONE cockpit — the one that ran the
+        command. Verb output belongs to whoever asked for it: `/posture
+        status` typed in one terminal must not paint in another. ``None``
+        broadcasts, which is right for AMBIENT output, since an autonomous
+        operation belongs to no one and is everyone's business."""
         try:
             if not self._clients or not tool_activity_enabled():
                 return
             msg = {"type": "markup", "text": str(text), "ts": time.time()}
+            if session:
+                msg["session"] = session
             self.stats["markup_published"] = (
                 self.stats.get("markup_published", 0) + 1
             )
