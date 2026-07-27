@@ -1044,6 +1044,32 @@ class GovernedLoopConfig:
 # ---------------------------------------------------------------------------
 
 
+def _wrap_subagent_narration(gls: Any, inner: Any) -> Any:
+    """Add cockpit narration to a CommSink. Returns `inner` unchanged on any
+    failure — a missing narrator must never cost observability.
+    """
+    try:
+        from backend.core.ouroboros.governance.subagent_narrator import (
+            SubagentNarrationSink, narration_enabled,
+        )
+        if not narration_enabled():
+            return inner
+
+        def _emit(line: str) -> None:
+            # Resolved PER EVENT: SerpentFlow attaches to the service after
+            # this stack is constructed, so a handle captured at build time
+            # is None forever. The same late-binding the alert emitter above
+            # already uses.
+            flow = getattr(gls, "_serpent_flow", None)
+            mirror = getattr(flow, "_mirror_markup", None) if flow else None
+            if mirror is not None:
+                mirror(line)
+
+        return SubagentNarrationSink(inner, _emit)
+    except Exception:  # noqa: BLE001
+        return inner
+
+
 class GovernedLoopService:
     """Lifecycle manager for the governed self-programming pipeline.
 
@@ -5975,7 +6001,18 @@ class GovernedLoopService:
                         self._config.project_root,
                         provider_registry=self._resolve_provider_for_subagent,
                     ),
-                    comm=_sub_comm,
+                    # Narration WRAPS the CommProtocol sink rather than
+                    # replacing it: the orchestrator takes one `comm`, and
+                    # swapping it would cost the spine that carries these
+                    # events to the ledger, the observability API and the SSE
+                    # stream. Wrapped, the inner sink sees every event
+                    # unchanged and the cockpit gains ⏺/⎿ chrome beside it.
+                    #
+                    # Emits through the SAME markup mirror every op-chrome
+                    # line uses — resolved late, per event, because
+                    # SerpentFlow attaches after this stack is built and a
+                    # handle captured here would be permanently None.
+                    comm=_wrap_subagent_narration(self, _sub_comm),
                     ledger=_sub_ledger,
                 )
                 self._subagent_orchestrator_ref = _sub_orch
