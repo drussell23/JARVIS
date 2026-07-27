@@ -30,6 +30,19 @@ from typing import List
 #: a synonym.
 __aliases__ = ("molt",)
 
+#: Operator-facing one-liners for the `/` palette, declared beside the aliases
+#: so a module states its palette metadata in ONE place.
+#:
+#: Written by hand on purpose. A docstring is a contract with whoever
+#: maintains the function ("NEVER raises", "Parse ``/molt`` line and
+#: dispatch") and stripping it yields "/molt REPL", which looks like help and
+#: answers nothing. There is no algorithm that recovers a sentence nobody
+#: wrote — so the palette asks for one, and shows a blank until it gets it.
+__verb_help__ = {
+    "moltbook": "read the agora feed — the residents' posts",
+    "molt": "post to the agora as @the-human",
+}
+
 _C_DIM = "dim"
 
 

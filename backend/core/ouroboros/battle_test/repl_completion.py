@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import enum
 import inspect
+import re
 import logging
 import os
 import re
@@ -1444,46 +1445,154 @@ __all__ = [
 ]
 
 
+#: Sentences a docstring's first line uses to address MAINTAINERS, not
+#: operators. Dropped whole — "NEVER raises" is a contract with the caller and
+#: means nothing in a menu; "Parse ``/x`` line and dispatch" describes the
+#: plumbing rather than the effect. Patterns, not a per-verb list, so a verb
+#: added tomorrow is cleaned by the same rules.
+_MAINTAINER_NOISE = (
+    r"NEVER\s+raises?\.?",
+    r"Never\s+raises?\.?",
+    r"Parse\s+(a\s+)?``?/?[\w.\- ]+``?\s+line(\s*\+?\s*and\s+dispatch)?\.?",
+    r"Parse\s+(a\s+)?``?/?[\w.\- ]+``?\s+line\s*\+\s*dispatch\.?",
+    r"``?matched=(True|False)``?\.?",
+    r"auto-discovered\.?",
+    r"canonical\s+entry\s+point\.?",
+    r"operator\s+surface\.?",
+)
+
+#: Internal provenance markers — section numbers, slice ids, path codes. They
+#: are load-bearing in the source and pure noise in a palette: an operator
+#: cannot act on "§38.11-F".
+_PROVENANCE = (
+    r"§\s*[\d.]+[A-Za-z\-]*",
+    r"\bSlice\s+\d+\w*\b",
+    r"\bPath\s+[A-Z]\.\d+\b",
+    r"\bPhase\s+\d+\w*\b",
+    r"\bU\d+\s+empirical\s+wiring\b",
+    r"\bGap\s+#\d+\b",
+    r"\(\s*\d{4}-\d{2}-\d{2}\s*\)",
+)
+
+
+def _humanise(line: str) -> str:
+    """One docstring line -> operator prose, or "" if nothing survives.
+
+    Docstrings are written for whoever maintains the function. Their first
+    line is usually a contract ("NEVER raises") or a restatement of the
+    plumbing ("Parse ``/canvas`` line and dispatch") — both true, both useless
+    in a menu that is supposed to answer "what does this do for me?".
+
+    Rules, not exceptions: strip RST markup, drop maintainer boilerplate and
+    provenance markers, then judge what remains. Returning "" is a real answer
+    and lets the caller fall through to the module docstring, which for these
+    single-purpose ``*_repl.py`` files is usually the sentence we wanted."""
+    text = str(line or "").strip()
+    if not text:
+        return ""
+    for pattern in _MAINTAINER_NOISE + _PROVENANCE:
+        text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
+    text = text.replace("``", "").replace("`", "")
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip(" .,;:—-\u2014")
+    # A fragment that is only punctuation, a bare verb echo, or two words of
+    # residue is worse than falling through — it looks like a description and
+    # carries none.
+    if len(text) < 12:
+        return ""
+    low = text.lower().lstrip("/")
+    # Reject a line that only ECHOES the verb. "/anticipate REPL" and
+    # "/causal REPL dispatcher" are what survives stripping a docstring that
+    # never described anything, and a menu entry reading "<verb> REPL" beside
+    # the verb is worse than a blank: it looks like help and answers nothing.
+    if re.fullmatch(r"[\w\-]+(\s+(repl|verb|dispatcher|surface|command))+", low):
+        return ""
+    # Reject sentence fragments — residue from a stripped clause, not prose.
+    if low.split()[0] in ("and", "or", "but", "with", "then", "returns",
+                          "short-circuit", "lets"):
+        return ""
+    if not re.search(r"[a-z]{3,}\s+[a-z]{3,}", low):
+        return ""
+    words = low.split()
+    # A clause that was cut mid-thought. "Canonical entry point — by" is what a
+    # stripped provenance marker leaves behind, and it reads as a description
+    # right up until you try to use it.
+    if len(words) < 4 or words[-1] in (
+        "by", "for", "with", "and", "or", "the", "a", "an", "to", "of", "in",
+        "on", "from", "when", "that", "is", "are",
+    ):
+        return ""
+    return text[0].upper() + text[1:]
+
+
 def _describe(fn: object) -> str:
     """One line of operator-facing help for a dispatcher. NEVER raises.
 
-    Cascade, because 13 of the 60 dispatchers carry no docstring and a menu
-    entry with no meta is a name the operator has to guess at:
+    Cascade, because no single source is reliably operator-facing:
 
-      1. the function's own docstring — nearest the behaviour, so it is the
-         one most likely to be corrected when the behaviour changes;
-      2. its MODULE's docstring — these verbs live in single-purpose
-         ``*_repl.py`` files whose header describes exactly the thing the
-         verb does;
-      3. an honest placeholder. Never a blank.
-
-    The leading ``/verb —`` echo is trimmed: repeating the verb beside itself
-    wastes the dropdown's width, which is the scarcest thing in a palette."""
+      1. the function's docstring, HUMANISED — nearest the behaviour, so it is
+         the line most likely to be corrected when behaviour changes;
+      2. its MODULE's docstring, humanised — these verbs live in
+         single-purpose ``*_repl.py`` files whose header describes the feature
+         rather than the function;
+      3. an honest placeholder. Never a blank, and never maintainer jargon
+         dressed up as help."""
     def _first_line(doc: object) -> str:
-        text = (doc or "")
-        if not isinstance(text, str):
-            return ""
+        text = doc if isinstance(doc, str) else ""
         text = text.strip()
         if not text:
             return ""
-        line = text.splitlines()[0].strip()
-        if line.startswith("`") or line.startswith("/"):
-            parts = line.split("—", 1)
-            line = parts[1].strip() if len(parts) == 2 else line
-        return line.strip(" `")
+        # Prefer the first line, but a docstring that opens with a bare
+        # ``/verb`` heading keeps its meaning on the NEXT line.
+        for raw in text.splitlines()[:3]:
+            human = _humanise(raw)
+            if human:
+                return human
+        return ""
 
     try:
-        own = _first_line(getattr(fn, "__doc__", ""))
-        if own:
-            return own[:80]
         import sys as _sys
         mod = _sys.modules.get(getattr(fn, "__module__", "") or "")
-        from_module = _first_line(getattr(mod, "__doc__", ""))
-        if from_module:
-            return from_module[:80]
+
+        # 1. AUTHORED help. The only source written FOR an operator.
+        #
+        # A module opts in with a dict beside its ``__aliases__``:
+        #
+        #     __verb_help__ = {"moltbook": "read the agora feed"}
+        #
+        # Same convention as __aliases__, so there is one place a module
+        # declares palette metadata. This exists because the humanisation
+        # below cannot invent what nobody wrote: these docstrings are
+        # contracts for maintainers, and stripping them yields "<verb> REPL".
+        authored = getattr(mod, "__verb_help__", None)
+        if isinstance(authored, dict):
+            name = str(getattr(fn, "__name__", ""))
+            verb = name[len("dispatch_"):-len("_command")] if (
+                name.startswith("dispatch_") and name.endswith("_command")
+            ) else name
+            text = authored.get(verb) or authored.get(f"/{verb}")
+            if isinstance(text, str) and text.strip():
+                return text.strip()[:88]
+
+        # 2. The FUNCTION docstring, humanised — accepted only if it survives
+        #    as prose.
+        #
+        #    The module docstring is deliberately NOT a fallback. It is a file
+        #    header: it narrates the feature's history and provenance ("Wave 1
+        #    #8", "§38.11-F operator surface"), which is the wrong GENRE, not
+        #    merely the wrong wording. Mining it produced entries like
+        #    "/autobiography REPL — Wave 1 #8" — confident, well-formed, and
+        #    useless. A blank is the honest state for "nobody has written this
+        #    yet"; plausible noise is not.
+        own = _first_line(getattr(fn, "__doc__", ""))
+        if own:
+            return own[:88]
     except Exception:  # noqa: BLE001
         pass
-    return "no description — add a docstring to its dispatcher"
+    # 3. Nothing authored, nothing extractable. Say so plainly rather than
+    #    printing residue: an honest blank reads as "no description yet",
+    #    fabricated prose reads as a description that happens to be wrong.
+    return ""
 
 
 def registry_from_dispatch() -> VerbRegistry:

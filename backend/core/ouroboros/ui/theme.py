@@ -710,3 +710,73 @@ __all__ = [
     "styles",
     "supports_unicode",
 ]
+
+
+def cockpit_prompt_style(tier: Optional[ColorTier] = None) -> Any:
+    """The cockpit's prompt_toolkit ``Style`` — O+V palette, CC restraint.
+
+    prompt_toolkit ships a completion menu that looks like a Windows listbox:
+    a filled light-grey block with reverse-video selection. Claude Code's
+    reads as part of the terminal because it has NO fill — the names sit on
+    the ground colour and only the selected row is tinted. That is the whole
+    difference, and it is styling, not layout.
+
+    Derived from :data:`PALETTE` rather than restating hexes: the brand owns
+    those six colours in exactly one place, so a palette change moves the menu
+    with it. Degrades by tier — a 16-colour terminal gets named colours rather
+    than truecolor hexes that would quantize to mud.
+
+    NEVER raises: an unstyled menu is ugly, a crashed cockpit is unusable."""
+    try:
+        from prompt_toolkit.styles import Style
+    except ImportError:
+        return None
+    t = tier if tier is not None else active_tier()
+    try:
+        if t >= ColorTier.TRUECOLOR:
+            p = PALETTE
+            ground, surface = p["ground"], p["surface"]
+            ink, muted, faint = p["ink"], p["muted"], p["faint"]
+            green, purple = p["venom_green"], p["venom_purple"]
+            rules = [
+                # No fill. The menu floats on the terminal, CC-style.
+                ("completion-menu", f"bg:{ground} {muted}"),
+                ("completion-menu.completion", f"bg:{ground} {ink}"),
+                # Selection is a TINT, not reverse video — the eye tracks a
+                # highlight far better than an inverted block, and inverted
+                # text loses the accent colour that carries meaning.
+                ("completion-menu.completion.current",
+                 f"bg:{surface} {green} bold"),
+                # Descriptions in venom purple: subordinate to the verb name
+                # but legible, which is exactly CC's blue-on-black relationship.
+                ("completion-menu.meta.completion", f"bg:{ground} {purple}"),
+                ("completion-menu.meta.completion.current",
+                 f"bg:{surface} {purple}"),
+                ("completion-menu.multi-column-meta", f"bg:{surface} {purple}"),
+                ("scrollbar.background", f"bg:{surface}"),
+                ("scrollbar.button", f"bg:{purple}"),
+                # The default bottom-toolbar is reverse-video — a solid bar of
+                # colour across the width, which is the single loudest thing
+                # on the screen and says nothing.
+                ("bottom-toolbar", f"bg:{ground} {faint} noreverse"),
+                ("bottom-toolbar.text", f"bg:{ground} {faint}"),
+                ("command-deck", f"bg:{ground} {ink}"),
+            ]
+        else:
+            rules = [
+                ("completion-menu", "bg:default fg:gray"),
+                ("completion-menu.completion", "bg:default"),
+                ("completion-menu.completion.current",
+                 "bg:default fg:ansibrightgreen bold"),
+                ("completion-menu.meta.completion", "bg:default fg:ansimagenta"),
+                ("completion-menu.meta.completion.current",
+                 "bg:default fg:ansimagenta"),
+                ("scrollbar.background", "bg:default"),
+                ("scrollbar.button", "bg:ansimagenta"),
+                ("bottom-toolbar", "bg:default fg:gray noreverse"),
+                ("bottom-toolbar.text", "bg:default fg:gray"),
+                ("command-deck", "bg:default"),
+            ]
+        return Style(rules)
+    except Exception:  # noqa: BLE001
+        return None

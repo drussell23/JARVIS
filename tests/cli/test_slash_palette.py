@@ -50,10 +50,34 @@ def test_a_bare_slash_offers_the_whole_palette() -> None:
     )
 
 
-def test_every_offered_verb_carries_a_description() -> None:
-    """An entry with no meta is a name the operator has to guess at."""
-    blank = [t for t, m in _completions("/") if not m.strip()]
-    assert blank == [], f"verbs with no display_meta: {blank[:5]}"
+def test_no_entry_shows_maintainer_prose_as_help() -> None:
+    """SUPERSEDES an earlier assertion that every verb must carry meta.
+
+    That test was written while descriptions were mined from module
+    docstrings, and it passed by accepting things like "/autobiography REPL —
+    Wave 1 #8". Filling the column was the wrong goal: a blank reads as
+    "nobody has written this yet", whereas confident noise reads as a
+    description that happens to be wrong, and the operator acts on it.
+
+    The invariant that actually matters is that nothing SHOWN is junk."""
+    bad = []
+    for verb, meta in _completions("/"):
+        m = meta.strip()
+        if not m:
+            continue                      # honest blank — awaiting authored help
+        low = m.lower()
+        if "never raises" in low or m.startswith("§") or "slice " in low:
+            bad.append((verb, m))
+        if low.rstrip(".").endswith((" repl", " dispatcher", " by", " for")):
+            bad.append((verb, m))
+    assert bad == [], f"maintainer prose shown as help: {bad[:4]}"
+
+
+def test_authored_verbs_do_carry_help() -> None:
+    """The verbs that HAVE been written for an operator must show it."""
+    described = {t: m for t, m in _completions("/") if m.strip()}
+    for verb in ("/molt", "/moltbook", "/deck", "/wake"):
+        assert described.get(verb), f"{verb} has authored help but shows none"
 
 
 def test_prefix_narrows_the_palette() -> None:
@@ -201,3 +225,86 @@ def test_a_cockpit_without_a_completer_still_builds() -> None:
         mux = BipartiteLayout(width=100, height=20, title="t")
         app = build_bipartite_application(mux, on_accept=lambda _t: None)
     assert app is not None
+
+
+# --------------------------------------------------------------------------
+# 5. aesthetics — brand styling, and honest descriptions
+# --------------------------------------------------------------------------
+
+def test_the_cockpit_carries_the_brand_style() -> None:
+    """Without a Style, prompt_toolkit paints a filled light-grey listbox and
+    a reverse-video toolbar — the two loudest things on a dark screen."""
+    app = _cockpit_app()
+    assert app.style is not None, "cockpit has no Style; menu renders default"
+    rules = dict(app.style.style_rules)
+    for cls in ("completion-menu.completion",
+                "completion-menu.completion.current",
+                "completion-menu.meta.completion",
+                "bottom-toolbar"):
+        assert cls in rules, f"{cls} unstyled — falls back to pt defaults"
+    assert "noreverse" in rules["bottom-toolbar"], (
+        "the footer is still reverse-video: a solid bar of colour that says "
+        "nothing"
+    )
+
+
+def test_the_style_comes_from_the_one_palette() -> None:
+    """DRY: the brand owns its colours in ui.theme, not restated per widget."""
+    from backend.core.ouroboros.ui.theme import PALETTE, cockpit_prompt_style
+
+    rules = dict(cockpit_prompt_style().style_rules)
+    blob = " ".join(rules.values())
+    assert PALETTE["venom_green"] in blob or "ansibrightgreen" in blob
+    assert PALETTE["venom_purple"] in blob or "ansimagenta" in blob
+
+
+@pytest.mark.parametrize("junk", [
+    "NEVER raises.",
+    "Parse ``/anticipate`` line. NEVER raises.",
+    "Parse a ``/canvas`` line and dispatch. NEVER raises.",
+    "§32.11 Slice 4 canonical entry point — auto-discovered.",
+    "Canonical entry point — by",
+    "/causal REPL",
+    "/continuity REPL dispatcher",
+    "+ dispatch",
+])
+def test_maintainer_prose_is_not_shown_as_help(junk: str) -> None:
+    """These are contracts with whoever maintains the function. Shown in a
+    menu they look like descriptions and answer nothing."""
+    from backend.core.ouroboros.battle_test.repl_completion import _humanise
+
+    assert _humanise(junk) == "", f"{junk!r} leaked into the palette"
+
+
+def test_authored_help_is_preferred_over_any_docstring() -> None:
+    """The only source written FOR an operator wins."""
+    from backend.core.ouroboros.battle_test.repl_completion import _describe
+
+    import backend.core.ouroboros.governance.moltbook_repl as mr
+    assert _describe(mr.dispatch_moltbook_command) == (
+        "read the agora feed — the residents' posts"
+    )
+    assert _describe(mr.dispatch_molt_command) == (
+        "post to the agora as @the-human"
+    )
+
+
+def test_an_undescribed_verb_shows_a_blank_not_a_fabrication() -> None:
+    """A blank reads as 'nobody has written this yet'. Plausible noise reads
+    as a description that happens to be wrong — which is worse, because the
+    operator acts on it."""
+    from backend.core.ouroboros.battle_test.repl_completion import _describe
+
+    def dispatch_nothing_command(line: str):
+        """Parse ``/nothing`` line and dispatch. NEVER raises."""
+
+    assert _describe(dispatch_nothing_command) == ""
+
+
+def test_modules_declare_palette_help_beside_their_aliases() -> None:
+    """One place per module for palette metadata — the __aliases__ convention
+    extended, not a second registry."""
+    import backend.core.ouroboros.governance.moltbook_repl as mr
+
+    assert isinstance(getattr(mr, "__verb_help__", None), dict)
+    assert set(mr.__verb_help__) >= {"moltbook", "molt"}
