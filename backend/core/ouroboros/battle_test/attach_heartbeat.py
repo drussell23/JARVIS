@@ -37,6 +37,22 @@ from typing import Any, Dict, Optional
 HEARTBEAT_SCHEMA_VERSION = "heartbeat.v1"
 
 
+def _context_pct(op_id: str) -> float:
+    """Fraction of the prompt budget in use for *op_id*, 0.0 if unknown.
+
+    Zero means "no reading", not "empty" — the renderer treats it as absent
+    rather than as 0%, because a confident 0% on an op that is actually full
+    is worse than saying nothing.
+    """
+    try:
+        from backend.core.ouroboros.governance.tool_executor import (
+            context_utilisation,
+        )
+        return float(context_utilisation(op_id))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def _pulse_glyph(now: float) -> str:
     """The pulse is O+V's OWN identity animation — the Ouroboros spinner
     (snake closing on its tail, bite, reopen), consumed from its ONE
@@ -163,6 +179,12 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
             "phase": phase,
             "elapsed_s": round(elapsed_s, 1),
             "tokens_total": tokens_total,
+            # How full the op's context is. Read from the tool loop's OWN
+            # gauge — the same number it compares against the compaction
+            # threshold — so the status line and the compactor cannot
+            # disagree about whether earlier rounds are about to be
+            # summarised away.
+            "context_pct": _context_pct(op_id),
             "effort": effort,
             "provider": provider,
             "provider_label": provider_label,
@@ -219,6 +241,26 @@ def format_heartbeat_line(
         tokens = int(payload.get("tokens_total") or 0)
         if tokens > 0:
             parts.append(f"↓ {_fmt_tokens(tokens)} tokens")
+        # Context headroom, shown only once it MATTERS.
+        #
+        # Below the compaction threshold this is noise — every op starts near
+        # empty and the number would sit there teaching the operator to
+        # ignore it. Past the threshold it explains something they would
+        # otherwise experience as the model forgetting: earlier rounds are
+        # being summarised away to make room.
+        ctx = float(payload.get("context_pct") or 0.0)
+        if ctx > 0.0:
+            try:
+                from backend.core.ouroboros.governance.tool_executor import (
+                    compaction_threshold_fraction,
+                )
+                floor = compaction_threshold_fraction()
+            except Exception:  # noqa: BLE001
+                floor = 0.75
+            if ctx >= floor:
+                parts.append(f"ctx {int(ctx * 100)}% · compacting")
+            elif ctx >= floor * 0.8:
+                parts.append(f"ctx {int(ctx * 100)}%")
         label = str(
             payload.get("provider_label") or payload.get("provider") or ""
         )

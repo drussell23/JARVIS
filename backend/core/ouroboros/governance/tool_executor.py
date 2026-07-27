@@ -26,6 +26,7 @@ import enum
 import hashlib
 import json
 import logging
+from collections import OrderedDict
 import os
 import re
 import subprocess
@@ -4950,6 +4951,55 @@ _COMPACT_THRESHOLD_CHARS = int(
     )
 )  # Trigger compaction at 75% of max to avoid hard crash
 
+# ---------------------------------------------------------------------------
+# Context-utilisation gauge
+# ---------------------------------------------------------------------------
+#
+# The loop ALREADY measures this every round — `len(current_prompt)` against
+# `_COMPACT_THRESHOLD_CHARS` — and has only ever logged it. Publishing the
+# same number rather than computing a second one keeps ONE definition of "how
+# full is the context", so the status line and the compactor can never
+# disagree about whether an op is about to lose its earlier rounds.
+#
+# A gauge, not a ledger: last-writer-wins per op, bounded, and read
+# opportunistically. Nothing depends on it — a missed sample costs one frame
+# of a status line, never a decision.
+
+_CONTEXT_GAUGE: "OrderedDict[str, float]" = OrderedDict()
+_CONTEXT_GAUGE_MAX = 32
+
+
+def note_context_utilisation(op_id: str, used_chars: int) -> None:
+    """Record how full an op's prompt is, as a fraction. NEVER raises."""
+    try:
+        if not op_id:
+            return
+        pct = float(used_chars) / max(1, _MAX_PROMPT_CHARS)
+        key = str(op_id)
+        _CONTEXT_GAUGE.pop(key, None)
+        _CONTEXT_GAUGE[key] = max(0.0, min(1.0, pct))
+        while len(_CONTEXT_GAUGE) > _CONTEXT_GAUGE_MAX:
+            _CONTEXT_GAUGE.popitem(last=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def context_utilisation(op_id: str) -> float:
+    """Fraction of the prompt budget in use, or 0.0 if unknown."""
+    try:
+        return float(_CONTEXT_GAUGE.get(str(op_id or ""), 0.0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def compaction_threshold_fraction() -> float:
+    """The point at which context starts being compacted away."""
+    try:
+        return float(_COMPACT_THRESHOLD_CHARS) / max(1, _MAX_PROMPT_CHARS)
+    except Exception:  # noqa: BLE001
+        return 0.75
+
+
 
 # ── Slice 85 Phase 3 — cumulative convergence axis ──
 # The existing convergence nudges miss a model that EXPLORES forever by varying
@@ -7045,6 +7095,10 @@ class ToolLoopCoordinator:
             # When the accumulated prompt crosses the soft threshold but is
             # still below the compaction ceiling, emit a single-line
             # telemetry warning and stash a structured hint on the next
+            # Publish utilisation every round — the watermark below fires
+            # once, but an operator watching a long op needs the number
+            # continuously, and it is already in hand.
+            note_context_utilisation(op_id, len(current_prompt))
             # round's instruction footer so the model knows to stop
             # fetching new context and write the patch. Lossless signal
             # that rides one round ahead of the lossy compactor.
