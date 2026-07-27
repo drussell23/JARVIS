@@ -528,8 +528,21 @@ def build_bipartite_application(
         # audio state, detach hint). Re-evaluated each repaint; a failing
         # callable renders empty rather than crashing the frame.
         def _toolbar_fragments():
+            # ``toolbar()`` returns EITHER a plain string (key hints) or a
+            # formatted-text fragment list (#70140, the palette on the
+            # PromptSession surface). This wrapped it in str() unconditionally,
+            # so a fragment list rendered as its Python repr —
+            # `[('class:completion-menu.completion', '  /anticipate ...` —
+            # printed across the bottom of the cockpit.
+            #
+            # Producer/consumer contract drift, the same shape as the mock
+            # drift that cost a day: one side widened its return type and the
+            # other kept assuming the old one.
             try:
-                return [("class:bottom-toolbar", str(toolbar() or ""))]
+                value = toolbar()
+                if isinstance(value, list):
+                    return value          # already fragments; pass through
+                return [("class:bottom-toolbar", str(value or ""))]
             except Exception:  # noqa: BLE001
                 return [("", "")]
 

@@ -37,10 +37,10 @@ def palette_rows() -> int:
     """Maximum entries drawn at once (``JARVIS_PALETTE_HEIGHT``)."""
     try:
         return max(3, min(30, int(
-            os.environ.get("JARVIS_PALETTE_HEIGHT", "12") or 12,
+            os.environ.get("JARVIS_PALETTE_HEIGHT", "6") or 6,
         )))
     except (TypeError, ValueError):
-        return 12
+        return 6
 
 
 def _ellipsis(text: str, width: int) -> str:

@@ -169,7 +169,13 @@ def test_the_toolbar_renders_the_palette_while_completing(
         pr, "palette_fragments",
         lambda max_rows=None: [("class:completion-menu.completion", "  /molt")],
     )
-    toolbar = _ui().toolbar()
+    ui = _ui()
+    # The opt-in now belongs to the SURFACE: only PromptSession, which has no
+    # container to float a palette into, draws it in the toolbar. The cockpit
+    # floats it and must not, or it renders twice — which is exactly what
+    # shipped, as a Python repr across the bottom of the screen.
+    ui.palette_in_toolbar = True
+    toolbar = ui.toolbar()
     assert not isinstance(toolbar, str), (
         "the toolbar ignored an active completion and drew hints"
     )
