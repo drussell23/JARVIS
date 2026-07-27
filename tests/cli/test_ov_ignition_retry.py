@@ -53,8 +53,16 @@ async def test_attaches_when_the_incumbent_simply_finishes_booting(monkeypatch):
     state = {"n": 0}
 
     async def _probe(_p, **_k):
+        # The REAL probe_socket returns a CLASSIFICATION STRING, and
+        # _await_ignition_window compares `== "live"`. This fake returned a
+        # bool, so the comparison could never be true and the test burned the
+        # entire retry budget before failing — which read exactly like a
+        # 24-second IPC timeout bleeding in from a host daemon.
+        #
+        # It was never the host. A fake that does not mirror the real
+        # contract cannot fail in a way that points at itself.
         state["n"] += 1
-        return state["n"] > 2
+        return "live" if state["n"] > 2 else "stale"
 
     monkeypatch.setattr(tc, "probe_socket", _probe)
     monkeypatch.setattr(tc, "_live_incumbent", lambda: 999)   # never releases
