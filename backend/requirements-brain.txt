@@ -35,7 +35,7 @@ httpx==0.28.1            # DW provider / HTTP clients
 PyYAML==6.0.3            # brain_selection_policy.yaml -- zero hardcoded models
 python-dotenv==1.2.1
 cryptography>=42.0.0     # mTLS chain (Stage 1) + Ed25519 roadmap authority
-prompt_toolkit>=3.0.43   # REPL (headless-safe)
+prompt_toolkit>=3.0.53   # REPL (headless-safe)
 watchdog==6.0.0          # FileWatchGuard / fs sensors (Slice 12K budget runs on it)
 numpy>=1.26.4,<2.5       # semantic index / oracle math
 fastembed>=0.3.0         # Oracle LITE embeddings (graduated default-ON); pulls onnxruntime (CPU)
