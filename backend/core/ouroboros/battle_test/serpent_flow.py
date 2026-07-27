@@ -2575,6 +2575,18 @@ class SerpentFlow:
             # exactly.
             path = _extract_path_arg(args_summary)
             self.show_diff(path or "file", op_id=op_id)
+            # Tick the plan. Completion is DERIVED from the file landing
+            # rather than reported by the orchestrator: a second source of
+            # truth about what happened would eventually disagree with this
+            # one about an op that partially applied.
+            try:
+                from backend.core.ouroboros.battle_test.plan_checklist import (
+                    note_file_touched,
+                )
+                for line in note_file_touched(op_id, path):
+                    self._op_line(op_id, line)
+            except Exception:  # noqa: BLE001
+                pass
             return
 
         if tool_name == "write_file" and status == "success" and False:

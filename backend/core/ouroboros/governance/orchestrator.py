@@ -4892,6 +4892,20 @@ class GovernedOrchestrator:
                         )
                     except Exception:
                         pass
+                    # The plan is a CHECKLIST — register it so the cockpit
+                    # can tick items as files land, instead of the operator
+                    # having to run /show_plan mid-flight to see the shape of
+                    # work already decided.
+                    try:
+                        from backend.core.ouroboros.battle_test.plan_checklist import (  # noqa: E501
+                            register_plan,
+                        )
+                        register_plan(
+                            ctx.op_id,
+                            getattr(_plan_result, "ordered_changes", []) or [],
+                        )
+                    except Exception:  # noqa: BLE001 — a checklist is additive
+                        pass
                     logger.info(
                         "[Orchestrator] PLAN complete for op=%s: complexity=%s, "
                         "%d ordered changes, %.1fs",
