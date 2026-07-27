@@ -599,6 +599,21 @@ def build_awakening_for_cockpit(
     return conductor
 
 
+def _accepts_session(fn) -> bool:
+    """Does this publisher take a ``session=`` target?
+
+    Probed rather than assumed: the bridge's addressing arrived in #70113 and
+    an older build may not carry it. Asking is cheap and degrades to a
+    broadcast, which is wrong only in the multi-terminal case — silently
+    passing an unsupported kwarg would break output entirely.
+    """
+    try:
+        import inspect
+        return "session" in inspect.signature(fn).parameters
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class BattleTestHarness:
     """Orchestrates the full Ouroboros boot, event-driven session loop, and shutdown.
 
@@ -4570,6 +4585,33 @@ class BattleTestHarness:
                     sf = getattr(self, "_serpent_flow", None)
                     if sf is not None:
                         sf.markup_mirror = bridge.publish_markup
+                        # THE verb-output gap. `markup_mirror` above carries op
+                        # lines and banners; the ~76 dispatch handlers print
+                        # straight to `sf.console`, which renders on the
+                        # DAEMON's terminal — detached, unwatched. An operator
+                        # typing /posture status saw the verb succeed and
+                        # produce nothing.
+                        #
+                        # Swapping the console mirrors all of them at once,
+                        # without touching a single handler. Output is
+                        # addressed to the session that ran the verb and
+                        # spooled through a bounded queue, so no attached
+                        # cockpit can stall the daemon's loop.
+                        from backend.core.ouroboros.battle_test.spooled_console import (
+                            make_spooled_console,
+                        )
+
+                        def _mirror_sink(session_id, text):
+                            bridge.publish_markup(text, session=session_id) \
+                                if _accepts_session(bridge.publish_markup) \
+                                else bridge.publish_markup(text)
+
+                        spooled, spooler = make_spooled_console(
+                            _mirror_sink, base=sf.console,
+                        )
+                        sf.console = spooled
+                        spooler.start()
+                        self._console_spooler = spooler
                 except Exception:  # noqa: BLE001
                     pass
                 # Moltbook live feed: the agora is PROACTIVE — residents post
