@@ -716,6 +716,26 @@ def _clip_arg(text: str, limit: int = _ARG_MAX) -> str:
     return flat[: limit - 1].rstrip() + "…"
 
 
+def _extract_path_arg(args_summary: str) -> str:
+    """Pull the file path out of a tool's argument summary.
+
+    `args_summary` is free text — sometimes a bare path, sometimes
+    `path=... old=... new=...`. The path is the first token that looks like
+    one, which is more robust than assuming a position and cheaper than
+    parsing a format the tool layer does not promise.
+    """
+    text = " ".join(str(args_summary or "").split())
+    if not text:
+        return ""
+    for token in text.split(" "):
+        candidate = token.split("=", 1)[-1].strip("\"'`,")
+        if "/" in candidate or candidate.endswith(
+            (".py", ".md", ".json", ".yaml", ".yml", ".toml", ".txt", ".sh"),
+        ):
+            return candidate
+    return text.split(" ", 1)[0].split("=", 1)[-1]
+
+
 def _tool_chrome_line(
     tool_name: str, args_summary: str = "", mcp_servers: Any = None,
 ) -> str:
@@ -2510,25 +2530,27 @@ class SerpentFlow:
         status_mark = "" if status == "success" else f"  [{_C['death']}]✗[/{_C['death']}]"
 
         # ── CC-style blocks for write/edit tools ──
-        if tool_name == "edit_file" and status == "success":
-            # Render as ⏺ Update(path) with result preview as inline diff
-            path = args_summary[:60] if args_summary else "file"
-            self._op_line(
-                op_id,
-                f"[{_C['neural']}]⏺ Update[/{_C['neural']}]"
-                f"([{_C['file']}]{path}[/{_C['file']}]){dur}",
-            )
-            if result_preview:
-                # Count added/removed lines from result
-                lines = result_preview.split("\n")
-                n_changed = sum(1 for l in lines if l.strip())
-                self._op_line(
-                    op_id,
-                    f"[{_C['dim']}]⎿  edit applied ({n_changed} line{'s' if n_changed != 1 else ''} affected)[/{_C['dim']}]",
-                )
+        if tool_name in ("edit_file", "write_file") and status == "success":
+            # THE REAL DIFF, not a count.
+            #
+            # This printed "⎿ edit applied (12 lines affected)" — a number
+            # where the change belongs. `show_diff` has rendered numbered
+            # green/red hunks through `_op_line` (the mirrored path) all
+            # along; the tool loop simply never called it.
+            #
+            # It needs no diff text: after a successful edit the file ON DISK
+            # is the change, so `show_diff` falls back to `_get_git_diff`
+            # and reads it. Passing the tool's `result_preview` instead would
+            # be a second, weaker source for something git already knows
+            # exactly.
+            path = _extract_path_arg(args_summary)
+            self.show_diff(path or "file", op_id=op_id)
             return
 
-        if tool_name == "write_file" and status == "success":
+        if tool_name == "write_file" and status == "success" and False:
+            # Superseded above: write_file now renders its real diff. Left
+            # unreachable rather than deleted so the fallback shape stays
+            # visible to whoever revisits this branch.
             path = args_summary[:60] if args_summary else "file"
             self._op_line(
                 op_id,
@@ -4035,21 +4057,60 @@ class SerpentFlow:
             highlight=False,
         )
 
+    def _is_untracked(self, file_path: str) -> bool:
+        """Is this path outside git's index? NEVER raises.
+
+        Answered with `ls-files --error-unmatch`, which is a pure index
+        lookup — no working-tree scan, so it stays cheap inside a tool loop.
+        A non-zero exit means git has never heard of the file.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "--", file_path],
+                cwd=self._repo_path, capture_output=True, text=True,
+                timeout=2,
+            )
+            return result.returncode != 0
+        except Exception:  # noqa: BLE001
+            return False
+
     def _get_git_diff(self, file_path: str) -> str:
-        """Get git diff for a file."""
-        for args in (
-            ["git", "diff", "--cached", "--", file_path],
+        """The diff for a file, including one git does not track yet.
+
+        Two gaps this closes, both of which produced a silently empty diff:
+
+          * a NEW file is untracked, so every `git diff` form returns nothing
+            — exactly the case a `write_file` produces. `--no-index` against
+            /dev/null renders it as all-additions, which is what it is;
+          * three invocations at 5s each is up to 15 seconds inside a tool
+            loop that may edit repeatedly. The timeout is per-call and tight,
+            and the ladder stops at the first answer.
+
+        Returns "" on anything unreadable — `show_diff` then falls back to its
+        compact one-liner, so a missing diff costs a detail, never the line.
+        """
+        candidates = [
             ["git", "diff", "--", file_path],
-            ["git", "diff", "HEAD~1", "--", file_path],
-        ):
+            ["git", "diff", "--cached", "--", file_path],
+        ]
+        # `--no-index` against /dev/null renders ANY existing file as
+        # all-additions — including an UNCHANGED one. Gating it on the file
+        # actually being untracked is what keeps "nothing changed" meaning
+        # nothing changed; without the gate, every unmodified file an op
+        # touched would render as if it had just been written.
+        if self._is_untracked(file_path):
+            candidates.append(
+                ["git", "diff", "--no-index", "--", os.devnull, file_path],
+            )
+        for args in candidates:
             try:
                 result = subprocess.run(
                     args, cwd=self._repo_path,
-                    capture_output=True, text=True, timeout=5,
+                    capture_output=True, text=True, timeout=2,
                 )
                 if result.stdout.strip():
                     return result.stdout.strip()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 continue
         return ""
 
