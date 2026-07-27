@@ -739,27 +739,34 @@ def cockpit_prompt_style(tier: Optional[ColorTier] = None) -> Any:
             ink, muted, faint = p["ink"], p["muted"], p["faint"]
             green, purple = p["venom_green"], p["venom_purple"]
             rules = [
-                # No fill — and this time actually. Every rule below used to
-                # set `bg:{ground}`, which paints a solid block behind the
-                # whole palette; the comment claimed otherwise. Omitting bg
-                # lets the terminal's own background show through, so the
-                # palette reads as part of the page rather than a control
-                # dropped on top of it. Only the SELECTED row takes a fill.
-                ("completion-menu", f"{muted}"),
-                ("completion-menu.completion", f"{ink}"),
-                # Selection is a TINT, not reverse video — the eye tracks a
-                # highlight far better than an inverted block, and inverted
-                # text loses the accent colour that carries meaning.
+                # `bg:default` — the TERMINAL's background, stated EXPLICITLY.
+                #
+                # Two wrong answers preceded this one. `bg:{ground}` paints a
+                # slab of our own dark grey. Then OMITTING bg entirely, which
+                # looks like it should mean transparent and does not: an
+                # unspecified background INHERITS, and prompt_toolkit's own
+                # default for `completion-menu` is a light grey fill — so
+                # removing our colour handed the palette to pt's, which is
+                # louder than what it replaced.
+                #
+                # Only `bg:default` resolves to the terminal's real
+                # background, which is what makes the palette read as part of
+                # the page rather than a control sitting on top of it.
+                ("completion-menu", f"bg:default {muted}"),
+                ("completion-menu.completion", f"bg:default {ink}"),
+                # Selection is carried by the TEXT, not by a filled block.
+                # A green slab behind one row is the loudest thing on the
+                # screen and reads as a widget; Claude marks the current entry
+                # by brightening it, so the eye tracks colour and the row
+                # stays part of the same page.
                 ("completion-menu.completion.current",
-                 f"bg:{surface} {green} bold"),
-                # Descriptions in venom purple: subordinate to the verb name
-                # but legible, which is exactly CC's blue-on-black relationship.
-                ("completion-menu.meta.completion", f"{purple}"),
+                 f"bg:default {green} bold"),
+                ("completion-menu.meta.completion", f"bg:default {purple}"),
                 ("completion-menu.meta.completion.current",
-                 f"bg:{surface} {purple}"),
-                ("completion-menu.multi-column-meta", f"bg:{surface} {purple}"),
-                ("scrollbar.background", f"bg:{surface}"),
-                ("scrollbar.button", f"bg:{purple}"),
+                 f"bg:default {green}"),
+                ("completion-menu.multi-column-meta", f"bg:default {purple}"),
+                ("scrollbar.background", "bg:default"),
+                ("scrollbar.button", f"bg:default {purple}"),
                 # The default bottom-toolbar is reverse-video — a solid bar of
                 # colour across the width, which is the single loudest thing
                 # on the screen and says nothing.
