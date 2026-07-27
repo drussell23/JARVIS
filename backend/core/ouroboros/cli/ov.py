@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence
 
@@ -525,6 +526,7 @@ class AttachUI:
         ``found: false`` is rendered as an explicit notice rather than as an
         empty pane: "this worker's output has aged out" and "this worker
         produced nothing" are different facts and must not look alike."""
+        self.note_upstream_activity()
         try:
             lane = str(payload.get("lane", ""))
             if self.fsm is not None and self.fsm.focused_lane != lane:
@@ -547,6 +549,7 @@ class AttachUI:
 
     def on_ambient(self, text: str, *, kind: str = "") -> None:
         """One ambient frame → the deck, then repaint. NEVER raises."""
+        self.note_upstream_activity()
         try:
             if self.deck is None:
                 return
@@ -577,9 +580,65 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             pass
 
+    def _ignition_deadline(self) -> float:
+        """Seconds to wait for first telemetry before flagging unreachable."""
+        try:
+            return max(1.0, float(
+                os.environ.get("JARVIS_IGNITION_TIMEOUT_S", "10") or 10))
+        except (TypeError, ValueError):
+            return 10.0
+
+    def note_upstream_activity(self) -> bool:
+        """First byte from the daemon ends ignition. Returns True on the edge.
+
+        Called from every inbound callback rather than from a poller: the
+        bridge already delivers these, and a timer asking "has anything
+        arrived yet" would be a second source of truth for a question the
+        stream itself answers.
+
+        Idempotent — the transition happens once, on the first payload of any
+        kind. Which kind does not matter: a heartbeat, a lane registration and
+        an ambient line all prove the same thing, that the far end is alive.
+        """
+        if not self._igniting:
+            return False
+        self._igniting = False
+        return True
+
+    @property
+    def ignition_state(self) -> str:
+        """``ignition`` until the first payload, then the FSM's own mode."""
+        from backend.core.ouroboros.battle_test.cockpit_fsm import MODE_IGNITION
+        return MODE_IGNITION if self._igniting else self.fsm.mode
+
+    def _ignition_line(self) -> Optional[str]:
+        """The skeleton row, or None once telemetry has arrived.
+
+        A blank deck during a cold boot is indistinguishable from a healthy
+        idle organism with nothing to say — and from a dead socket. Saying
+        which one it is costs one line and removes the entire question.
+        """
+        if not self._igniting:
+            return None
+        if not self._ignition_started:
+            # Lazily anchored to the FIRST RENDER, not to construction: the
+            # clock that matters is how long the OPERATOR has been looking at
+            # an empty deck. A zero default would read as an instant timeout.
+            self._ignition_started = time.monotonic()
+        waited = time.monotonic() - self._ignition_started
+        if waited > self._ignition_deadline():
+            # Still nothing. Do not keep implying progress that is not
+            # happening; name the suspicion and let the operator act.
+            return ("  ⚠ daemon unreachable — no telemetry in "
+                    f"{int(waited)}s · 'detach' to leave")
+        return "  ⏺ awaiting daemon telemetry…"
+
     #: Set by the surface that has nowhere else to draw the palette. Default
     #: False so the cockpit, which floats it, never double-renders.
     palette_in_toolbar: bool = False
+    #: True until the first upstream payload of any kind arrives.
+    _igniting: bool = True
+    _ignition_started: float = 0.0
 
     def degrade_to_append_only(self) -> None:
         """Strip this UI to a single caret and nothing else.
@@ -643,7 +702,12 @@ class AttachUI:
                 return "\n".join(head)
             rows = self.deck.rows()[:cap]
             if not rows:
-                return "\n".join(head)
+                # The cold-boot gap: the cockpit paints before the daemon has
+                # hydrated. A skeleton row here is the difference between
+                # "waiting" and an empty screen that could equally mean idle,
+                # wedged, or disconnected.
+                skeleton = self._ignition_line()
+                return "\n".join(head + ([skeleton] if skeleton else []))
             return "\n".join(
                 head + [
                     f"  {GLYPHS.get(sev, '·')} {text}" for sev, text in rows
@@ -794,6 +858,7 @@ class AttachUI:
         """Telemetry lane landing point — retain heartbeat frames for
         the toolbar pulse; other telemetry kinds pass untouched.
         NEVER raises."""
+        self.note_upstream_activity()
         try:
             if isinstance(frame, dict) and frame.get("kind") == "heartbeat":
                 import time as _time
