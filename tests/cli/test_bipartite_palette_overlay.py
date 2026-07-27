@@ -228,7 +228,7 @@ while time.time() - t0 < 100:
         _seen = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "",
                        out[mark:].decode("utf8", "replace"))
         _v = set(re.findall(r"^\s*(/\S+)\s{2,}\S", _seen, re.M))
-        if len(_v) >= 6 or time.time() - ts > 25:
+        if len(_v) >= 3 or time.time() - ts > 25:
             break
 raw = out.decode("utf8", "replace")
 print("RESULT_ROUTER=" + ("True" if "ROUTER=True" in raw else "False"))
@@ -288,7 +288,7 @@ def test_the_router_mounts_bipartite_and_the_overlay_paints(
     body = proc.stdout.split("RESULT_BODY_START", 1)[1]
     verbs = set(re.findall(r"^\s*(/\S+)\s{2,}\S", body, re.M))
     rows = [ln for ln in body.splitlines() if ln.strip().startswith("/")]
-    assert len(verbs) >= 5, (
+    assert len(verbs) >= 3, (
         f"'/' painted {len(rows)} palette rows on the cockpit — the overlay "
         f"is collapsed (a float honours its PREFERRED height, so a stale "
         f"preferred=1 renders exactly one entry)"

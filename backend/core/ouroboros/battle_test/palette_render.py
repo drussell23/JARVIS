@@ -37,10 +37,10 @@ def palette_rows() -> int:
     """Maximum entries drawn at once (``JARVIS_PALETTE_HEIGHT``)."""
     try:
         return max(3, min(30, int(
-            os.environ.get("JARVIS_PALETTE_HEIGHT", "6") or 6,
+            os.environ.get("JARVIS_PALETTE_HEIGHT", "4") or 4,
         )))
     except (TypeError, ValueError):
-        return 6
+        return 4
 
 
 def _ellipsis(text: str, width: int) -> str:
@@ -300,7 +300,7 @@ def build_palette_window(condition_style: str = "") -> Any:
             ),
             dont_extend_height=True,
             wrap_lines=False,
-            style=condition_style or "class:completion-menu",
+            style=condition_style or "bg:default",
         ),
         filter=Condition(lambda: _height() > 0),
     )
