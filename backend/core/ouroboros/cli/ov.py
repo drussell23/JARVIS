@@ -1024,6 +1024,19 @@ async def _split_plane_loop(
     )
 
     ui = ui or AttachUI()
+    # Say what the organism is made of, BEFORE anything else is trusted. A
+    # daemon outlives its terminal, so "attached" alone does not tell an
+    # operator whether today's work is loaded — and a stale one answers every
+    # verb with old behaviour while looking perfectly healthy.
+    try:
+        from backend.core.ouroboros.battle_test.daemon_provenance import (
+            staleness_line,
+        )
+        _stale = staleness_line()
+        if _stale:
+            console.print(_stale, markup=False, highlight=False)
+    except Exception:  # noqa: BLE001 — provenance must never block an attach
+        pass
     # Arm the out-of-band stack dump BEFORE the UI mounts. If the cockpit
     # wedges, `kill -USR1 <pid>` is the only way to ask it what it is doing —
     # Ctrl+C does nothing to a deadlocked thread and `kill -9` destroys the

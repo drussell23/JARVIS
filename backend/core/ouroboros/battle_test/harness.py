@@ -4610,6 +4610,17 @@ class BattleTestHarness:
                             _mirror_sink, base=sf.console,
                         )
                         sf.console = spooled
+                        # Stamp what this daemon is MADE of. It outlives the
+                        # terminal that started it, so an operator cannot
+                        # otherwise tell a minute-old process from a two-day
+                        # one carrying none of today's fixes.
+                        try:
+                            from backend.core.ouroboros.battle_test.daemon_provenance import (  # noqa: E501
+                                write_provenance,
+                            )
+                            write_provenance()
+                        except Exception:  # noqa: BLE001
+                            pass
                         spooler.start()
                         self._console_spooler = spooler
                 except Exception:  # noqa: BLE001
