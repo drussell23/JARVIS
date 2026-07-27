@@ -577,6 +577,21 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             pass
 
+    def degrade_to_append_only(self) -> None:
+        """Strip this UI to a single caret and nothing else.
+
+        Entered when the terminal never reports its cursor position. Every
+        region above the caret — pulse, deck, focused pane — is drawn by
+        repainting a block whose position is only knowable from the cursor,
+        so on a stream that cannot answer that question they do not degrade
+        into something ugly, they degrade into corrupted output.
+        """
+        self._append_only = True
+
+    @property
+    def append_only(self) -> bool:
+        return bool(getattr(self, "_append_only", False))
+
     def prompt(self) -> str:
         """The live region sits ABOVE the input line, then the caret.
 
@@ -591,6 +606,10 @@ class AttachUI:
         the same redraw machinery — no second region, no manual cursor math.
         The bottom toolbar keeps only the static key hints, which genuinely
         do belong under the input."""
+        if self.append_only:
+            # A bare caret. No live region, because there is no way to
+            # repaint one without knowing where it is.
+            return "ov > "
         caret = self._PROMPTS.get(self.audio_state, "ov › ")
         try:
             block = self._live_region()
@@ -661,6 +680,10 @@ class AttachUI:
 
         Returns a fragment list while completing and a plain string otherwise;
         prompt_toolkit accepts either."""
+        if self.append_only:
+            # No toolbar: prompt_toolkit anchors it to the bottom of the
+            # screen, which is an absolute position by definition.
+            return ""
         try:
             from backend.core.ouroboros.battle_test.palette_render import (
                 palette_fragments,
@@ -951,6 +974,16 @@ async def _split_plane_loop(
     # are different LAYOUTS, and leaving the widget in place renders both at
     # once — a narrow floating column on top of the full-width page.
     _strip_native_menu(session.app)
+    # Consume prompt_toolkit's OWN cursor-position timeout rather than probing
+    # the terminal again — a second probe races the first for the same reply
+    # bytes and misclassifies healthy terminals. See append_only.py.
+    try:
+        from backend.core.ouroboros.battle_test.append_only import (
+            install_cpr_degradation,
+        )
+        install_cpr_degradation(session.app, ui.degrade_to_append_only)
+    except Exception:  # noqa: BLE001 — a styled fallback still works
+        pass
     ui.bind_app(session.app)
 
     async def _watch_disconnect() -> None:
