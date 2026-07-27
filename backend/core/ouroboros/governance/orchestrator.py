@@ -1674,6 +1674,40 @@ class _LiveWorkGateResult(NamedTuple):
 # ---------------------------------------------------------------------------
 
 
+def _await_approval_with_operator(orch: Any, request_id: str, ctx: Any) -> Any:
+    """Await the gate decision, letting an attached cockpit answer it.
+
+    Degrades to the plain provider wait on ANY failure: the gate's behaviour
+    with nobody attached must stay byte-identical, so this can only ADD a way
+    to answer.
+    """
+    timeout_s = orch._config.approval_timeout_s
+    try:
+        from backend.core.ouroboros.governance.approval_narrator import (
+            await_decision_with_operator,
+        )
+
+        def _emit(line: str) -> None:
+            # Same late-bound mirror the subagent narrator uses: SerpentFlow
+            # attaches after the stack is built, so a handle captured at
+            # construction time would be None forever.
+            flow = getattr(orch, "_serpent_flow", None) or getattr(
+                getattr(orch, "_gls", None), "_serpent_flow", None,
+            )
+            mirror = getattr(flow, "_mirror_markup", None) if flow else None
+            if mirror is not None:
+                mirror(line)
+
+        return await_decision_with_operator(
+            orch._approval_provider, request_id, timeout_s,
+            emit=_emit,
+            risk=str(getattr(getattr(ctx, "risk_tier", None), "name", "") or ""),
+            reason=str(getattr(ctx, "approval_reason", "") or ""),
+        )
+    except Exception:  # noqa: BLE001
+        return orch._approval_provider.await_decision(request_id, timeout_s)
+
+
 class GovernedOrchestrator:
     """Central coordinator for the governed self-programming pipeline.
 
@@ -10279,8 +10313,18 @@ class GovernedOrchestrator:
                     )
 
                 request_id = await self._approval_provider.request(ctx)
-                decision: ApprovalResult = await self._approval_provider.await_decision(
-                    request_id, self._config.approval_timeout_s
+                # The gate ASKS now. `await_decision` remains the authority on
+                # the outcome — it owns the timeout, the EXPIRED stamp and the
+                # ledger semantics — and the operator path is raced alongside
+                # it as a faster route to the SAME decision: answering `y`
+                # calls the provider's own approve(), which sets the event
+                # await_decision is already waiting on.
+                #
+                # Before this, the gate emitted a comm heartbeat nothing
+                # rendered and then sat silently until it expired. Nothing
+                # hung; nobody was ever asked.
+                decision: ApprovalResult = await _await_approval_with_operator(
+                    self, request_id, ctx,
                 )
 
                 if decision.status is ApprovalStatus.EXPIRED:
