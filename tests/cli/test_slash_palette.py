@@ -130,3 +130,74 @@ def test_completer_is_threaded() -> None:
         from backend.core.ouroboros.cli.ov import _build_slash_completer
         c = _build_slash_completer()
     assert type(c).__name__ == "ThreadedCompleter"
+
+
+# --------------------------------------------------------------------------
+# 4. the palette must be wired to the surface the operator ACTUALLY types into
+# --------------------------------------------------------------------------
+
+def _cockpit_app():
+    from backend.core.ouroboros.battle_test.bipartite_layout import (
+        BipartiteLayout,
+        build_bipartite_application,
+    )
+    from backend.core.ouroboros.cli.ov import _build_slash_completer
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        mux = BipartiteLayout(width=100, height=20, title="t")
+        return build_bipartite_application(
+            mux, on_accept=lambda _t: None,
+            completer=_build_slash_completer(),
+        )
+
+
+def test_the_cockpit_layout_can_actually_draw_a_menu() -> None:
+    """THE bug the operator reported.
+
+    D5 built a correct completer yielding 76 verbs and wired it to
+    `_split_plane_loop`'s PromptSession — a surface the bipartite cockpit
+    never runs. Even once reached, the layout was a bare HSplit: prompt_toolkit
+    draws the completions menu as a Float, so with no FloatContainer it had
+    nowhere to exist. Completions were computed and silently discarded."""
+    from prompt_toolkit.layout import FloatContainer
+
+    app = _cockpit_app()
+    root = app.layout.container
+    assert isinstance(root, FloatContainer), (
+        "the cockpit root is not a FloatContainer — a completions menu has "
+        "nowhere to render, however many completions the buffer holds"
+    )
+    kinds = [type(f.content).__name__ for f in root.floats]
+    assert any("CompletionsMenu" in k for k in kinds), (
+        f"no completions menu float is mounted; floats={kinds}"
+    )
+
+
+def test_the_cockpit_prompt_buffer_has_the_completer() -> None:
+    from prompt_toolkit.layout.controls import BufferControl
+
+    app = _cockpit_app()
+    wired = []
+    for window in app.layout.walk():
+        control = getattr(window, "content", None)
+        if isinstance(control, BufferControl):
+            b = control.buffer
+            wired.append((b.completer is not None, bool(b.complete_while_typing())))
+    assert wired, "no input buffer found in the cockpit layout"
+    assert any(has and typing for has, typing in wired), (
+        f"prompt buffer lacks a completer or complete_while_typing: {wired}"
+    )
+
+
+def test_a_cockpit_without_a_completer_still_builds() -> None:
+    """The palette is additive — a completer-less cockpit must not become a
+    FloatContainer it does not need, and must still type."""
+    from backend.core.ouroboros.battle_test.bipartite_layout import (
+        BipartiteLayout,
+        build_bipartite_application,
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        mux = BipartiteLayout(width=100, height=20, title="t")
+        app = build_bipartite_application(mux, on_accept=lambda _t: None)
+    assert app is not None
