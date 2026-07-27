@@ -600,6 +600,36 @@ def _parse_unified_diff(diff_text: str) -> tuple:
 # ══════════════════════════════════════════════════════════════
 
 
+def _tool_chrome_line(tool_name: str, args_summary: str = "") -> str:
+    """``⏺ Read(backend/core/…/thin_client.py)`` — one tool call, CC-style.
+
+    The tool token is a routing identifier (`read_file`); this is the verb an
+    operator reads. Keyed off the existing token so a new tool means one entry
+    here rather than a renderer that must learn a new concept, and an unknown
+    tool still renders under its own name rather than vanishing.
+
+    The ARGUMENT is the point. `⏺ Read()` says an op is busy; `⏺ Read(path)`
+    says what it is busy with, and that difference is the whole request.
+    Paths are shown from the RIGHT — the filename is what identifies a file,
+    and a left-clip of a deep repo path yields identical `backend/core/…`
+    prefixes for every entry.
+    """
+    verbs = {
+        "read_file": "Read", "search_code": "Search", "run_tests": "Test",
+        "bash": "Bash", "web_search": "WebSearch", "web_fetch": "Fetch",
+        "get_callers": "Callers", "list_symbols": "Symbols",
+        "glob_files": "Glob", "list_dir": "List", "git_log": "GitLog",
+        "git_diff": "GitDiff", "git_blame": "GitBlame",
+        "edit_file": "Update", "write_file": "Write", "ask_human": "Ask",
+    }
+    verb = verbs.get(str(tool_name or ""), str(tool_name or "Tool"))
+    arg = " ".join(str(args_summary or "").split())
+    if len(arg) > 56:
+        # Keep the tail: the filename identifies the file.
+        arg = "…" + arg[-55:]
+    return f"⏺ {verb}({arg})" if arg else f"⏺ {verb}"
+
+
 class SerpentFlow:
     """Ouroboros flowing CLI with 4-zone layout architecture.
 
@@ -2291,6 +2321,20 @@ class SerpentFlow:
                     f"[{_C['dim']} italic]🗣 {preamble}[/{_C['dim']} italic]",
                 )
 
+        # The MIRRORED half of the start event.
+        #
+        # `_start_status` renders a Rich spinner, which is local-only: it
+        # never passes through `_op_line`, the chokepoint that reaches an
+        # attached cockpit. So the tool NAME and its ARGUMENTS — which file
+        # is being read, which pattern is being searched — rendered on the
+        # daemon's own terminal and nowhere else. An operator saw an op
+        # working with no idea what it was touching.
+        #
+        # The spinner stays: it is the right affordance locally, where a
+        # transient in-place animation costs nothing. The cockpit gets a
+        # PERSISTENT line instead, because a remote surface has no spinner to
+        # erase and a vanishing status is worse than none.
+        self._op_line(op_id, _tool_chrome_line(tool_name, args_summary))
         self._start_status(
             f"{prefix}{icon} T{round_index + 1} {tool_name}{summary}",
             spinner=_active_spinner_name(),
