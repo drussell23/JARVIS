@@ -85,6 +85,20 @@ def _say(console: Any, text: str = "") -> None:
         pass
 
 
+def _markup(console: Any, text: str = "") -> None:
+    """Print a line the deck grammar composed — tags INTERPRETED.
+
+    Separate from :func:`_say` on purpose. `_say` suppresses markup because
+    board rows and error text are literal operator strings that must survive a
+    stray bracket; deck lines are the opposite, and printing them through
+    `_say` would show the operator `[grey50]847 lines[/grey50]`.
+    """
+    try:
+        console.print(text, highlight=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Scene: the progress board
 # ---------------------------------------------------------------------------
@@ -156,21 +170,52 @@ def _limit(argv: Sequence[str]) -> int:
 # Scene: the transcript
 # ---------------------------------------------------------------------------
 
-#: A synthetic op. Deliberately a FAILING one: the deck's whole grammar —
-#: `⎿` results, an agora thread reacting to a failure — only shows itself when
-#: something goes wrong, and a demo of the happy path shows the least
-#: interesting third of the surface.
+#: A synthetic op, as BEATS rather than as finished lines: `(kind, args)`
+#: pairs the deck grammar composes. Writing the lines out here is what let the
+#: `⎿` results and the diff beneath them disagree about which column a
+#: continuation body starts in — two literals, one column, nobody to notice.
+#:
+#: Deliberately a FAILING op: the deck's whole grammar — `⎿` results, an agora
+#: thread reacting to a failure — only shows itself when something goes wrong,
+#: and a demo of the happy path shows the least interesting third of it.
 _SCRIPT: List[Any] = [
-    ("op", "⏺ Read(backend/core/ouroboros/governance/risk_tier_floor.py)"),
-    ("res", "⎿ 847 lines"),
-    ("op", "⏺ Update(risk_tier_floor.py)"),
-    ("res", "⎿ +18 -3"),
-    ("diff", "+    except RiskFloorConfigError:"),
-    ("diff", "+        raise"),
-    ("diff", "-    except Exception:  # noqa: BLE001"),
-    ("op", "⏺ Validate(7759-86)"),
-    ("res", "⎿ ✗ 3 failed · test_scoped_paths, test_sandbox_dir"),
+    ("act", ("Read", "backend/core/ouroboros/governance/risk_tier_floor.py")),
+    ("det", ("Read 847 lines",)),
+    ("act", ("Update", "risk_tier_floor.py")),
+    ("det", ("Updated risk_tier_floor.py with 18 additions and 3 removals",)),
+    ("diff", (412, "+", "    except RiskFloorConfigError:")),
+    ("diff", (413, "+", "        raise")),
+    ("diff", (414, "-", "    except Exception:  # noqa: BLE001")),
+    ("act", ("Validate", "7759-86")),
+    ("det", ("✗ 3 failed · test_scoped_paths, test_sandbox_dir", "crit")),
 ]
+
+
+def _compose(kind: str, args: Sequence[Any]) -> str:
+    """One beat -> one deck line, through the SHARED grammar.
+
+    Every scene routes through here, so the transcript and the live cockpit
+    cannot drift into two column disciplines — which is exactly what they had
+    done: `  ⎿ ` (body at column 4) above `     + ` (body at column 5).
+    """
+    from backend.core.ouroboros.ui import deck_grammar as deck
+    try:
+        if kind == "act":
+            # `(verb, arg, tone)` — tone is keyword-only on the grammar so a
+            # call site cannot pass a colour where an argument belongs.
+            return deck.action(args[0], args[1] if len(args) > 1 else "",
+                               tone=(args[2] if len(args) > 2 else "ok"))
+        if kind == "det":
+            return deck.detail(args[0], tone=(args[1] if len(args) > 1
+                                              else "muted"))
+        if kind == "diff":
+            return deck.diff(*args)
+        if kind == "voice":
+            return deck.voice(*args)
+        return deck.blank()
+    except Exception:  # noqa: BLE001 — a demo must never be what breaks
+        logger.debug("[OvDemo] beat degraded: %s", kind, exc_info=True)
+        return ""
 
 #: The agora reacting to that failure, in the schema `moltbook_inline` expects.
 _THREAD: List[dict] = [
@@ -178,28 +223,35 @@ _THREAD: List[dict] = [
      "body": "three tests. you fixed the assert and broke the file."},
     {"handle": "@the-builder", "op_id": "op-7759-86",
      "body": "the containment check is right, the fixture is stale"},
+    # No `⚔` in the body: `render_post` derives the glyph from `kind`, and
+    # carrying it in the text too rendered `▸ ⚔ @cassandra  ⚔ REVIEW …`.
+    # A glyph that means "contested" means it once per line or it is noise.
     {"handle": "@cassandra", "op_id": "op-7759-86", "kind": "conflict",
-     "body": "⚔ REVIEW disagrees: that except clause still swallows I2"},
+     "body": "REVIEW disagrees: that except clause still swallows I2"},
 ]
 
 
 def scene_transcript(console: Any, argv: Sequence[str] = ()) -> int:
     """The CC-style deck, rendered by the cockpit's OWN renderers."""
     _rule(console, "transcript")
-    for kind, text in _SCRIPT:
-        if kind == "op":
-            _say(console, text)
-        elif kind == "res":
-            _say(console, f"  {text}")
-        else:
-            _say(console, f"     {text}")
+    # A blank line before each new action is the deck's only grouping cue.
+    # Without it nine correct lines read as one paragraph, which is what
+    # "it doesn't look like Claude Code" actually means most of the time.
+    for i, (kind, args) in enumerate(_SCRIPT):
+        if kind in ("act", "voice") and i:
+            _markup(console, "")
+        _markup(console, _compose(kind, args))
 
     try:
         from backend.core.ouroboros.battle_test.moltbook_inline import (
             render_thread,
         )
+        # `_markup`, not `_say`: the thread renderer tints its glyph and
+        # handle now, and printing that through a markup=False path shows the
+        # operator `[#58B0F8]💬[/#58B0F8]` — and then wraps the line, because
+        # the tags are counted as visible width.
         for line in render_thread(_THREAD, width=76):
-            _say(console, line)
+            _markup(console, line)
     except Exception as exc:  # noqa: BLE001
         _say(console, f"  (agora unavailable: {exc})")
 
@@ -255,36 +307,92 @@ def _dispatcher_for(verb: str) -> Any:
 # Scene: live
 # ---------------------------------------------------------------------------
 
-#: A scripted operation, as SECONDS-since-start paired with a deck line.
-#: Timings are the point — the deck's rhythm is most of what the cockpit feels
-#: like, and a burst of lines arriving at once looks nothing like an organism
+#: The scripted operation, as SECONDS-since-start paired with a BEAT. Timings
+#: are the point — the deck's rhythm is most of what the cockpit feels like,
+#: and a burst of lines arriving at once looks nothing like an organism
 #: working. Kept as data so the shape can be tuned without touching the driver.
-_LIVE_SCRIPT = [
-    (0.4, "⏺ Signal(test_failure) · risk_tier_floor.py"),
-    (1.0, "  ⎿ 2 source loci · 1 test locus"),
-    (2.0, "⏺ Read(governance/risk_tier_floor.py)"),
-    (2.8, "  ⎿ 847 lines"),
-    (3.4, "⏺ Search(\"except Exception\")"),
-    (4.2, "  ⎿ 19 matches in 1 file"),
-    (5.0, "🗣 the vision floor raises, and the caller swallows it"),
-    (6.2, "⏺ Update(risk_tier_floor.py)"),
-    (7.0, "  ⎿ +18 -3"),
-    (7.4, "     + except RiskFloorConfigError:"),
-    (7.7, "     +     raise"),
-    (8.0, "     - except Exception:  # noqa: BLE001"),
-    (9.2, "⏺ Validate(7759-86)"),
-    (10.8, "  ⎿ ✗ 3 failed · test_scoped_paths, test_sandbox_dir"),
-    (11.6, "  💬 @the-pit  three tests. you fixed the assert and broke the file."),
-    (12.6, "     ▸ @the-builder  the containment check is right, the fixture is stale"),
-    (13.8, "     ▸ ⚔ @cassandra  REVIEW disagrees: that clause still swallows I2"),
-    (15.2, "⏺ Repair(L2) · iteration 1/5"),
-    (16.8, "  ⎿ fixture rebuilt from the live seam"),
-    (18.0, "⏺ Validate(7759-86)"),
-    (19.4, "  ⎿ ✓ 47 passed"),
-    (20.4, "⏺ Gate(7759-86) · NOTIFY_APPLY"),
-    (21.2, "  ⎿ applied · verified · committed 90706b8"),
-    (22.4, "⏺ Complete(7759-86) · 22.4s · $0.011"),
+#:
+#: Beats, not lines, for the same reason the transcript uses them: the column
+#: discipline belongs to the grammar. The blank line that closes each block is
+#: DERIVED here rather than written, so a new block cannot be added without
+#: one.
+_LIVE_BEATS: List[Any] = [
+    (0.4, "act", ("Signal", "test_failure · risk_tier_floor.py")),
+    (1.0, "det", ("2 source loci · 1 test locus",)),
+    (2.0, "act", ("Read", "governance/risk_tier_floor.py")),
+    (2.8, "det", ("Read 847 lines",)),
+    (3.4, "act", ("Search", '"except Exception"')),
+    (4.2, "det", ("Found 19 matches in 1 file",)),
+    (5.0, "voice", ("the vision floor raises, and the caller swallows it",)),
+    (6.2, "act", ("Update", "risk_tier_floor.py")),
+    (7.0, "det", ("Updated risk_tier_floor.py with 18 additions and"
+                  " 3 removals",)),
+    (7.4, "diff", (412, "+", "    except RiskFloorConfigError:")),
+    (7.7, "diff", (413, "+", "        raise")),
+    (8.0, "diff", (414, "-", "    except Exception:  # noqa: BLE001")),
+    (9.2, "act", ("Validate", "7759-86", "crit")),
+    (10.8, "det", ("✗ 3 failed · test_scoped_paths, test_sandbox_dir",
+                   "crit")),
+    # The agora reacting, rendered by the REAL renderer — see `_agora_beats`.
+    (11.6, "agora", ()),
+    (15.2, "act", ("Repair", "L2 · iteration 1/5", "warn")),
+    (16.8, "det", ("fixture rebuilt from the live seam",)),
+    (18.0, "act", ("Validate", "7759-86")),
+    (19.4, "det", ("✓ 47 passed", "ok")),
+    (20.4, "act", ("Gate", "7759-86 · NOTIFY_APPLY")),
+    (21.2, "det", ("applied · verified · committed 90706b8", "ok")),
+    (22.4, "act", ("Complete", "7759-86 · 22.4s · $0.011")),
 ]
+
+#: When each agora line lands, once the thread renderer has produced them.
+#: A reply arriving a beat after the post is what makes the room read as
+#: people talking rather than as a block of text that appeared.
+_AGORA_AT = (11.6, 12.6, 13.8)
+
+
+def _agora_beats() -> List[Any]:
+    """The room's reaction, from `moltbook_inline` — never reimplemented here.
+
+    The live scene used to carry these three lines as literals, which meant
+    the one scene an operator actually WATCHES was the one scene that would
+    keep looking right after the real renderer regressed. Calling it is the
+    entire premise of this module.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.moltbook_inline import (
+            render_thread,
+        )
+        lines = list(render_thread(_THREAD, width=76))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[OvDemo] agora degraded", exc_info=True)
+        lines = [f"  (agora unavailable: {exc})"]
+    return [(_AGORA_AT[min(i, len(_AGORA_AT) - 1)], line)
+            for i, line in enumerate(lines)]
+
+
+def compose_live_script() -> List[Any]:
+    """`[(seconds, line), ...]` — the beats, composed and block-separated.
+
+    Called fresh by :func:`scene_live` rather than baked at import, so a
+    renderer swapped underneath (a test, a regression) is the one that shows.
+    """
+    out: List[Any] = []
+    for i, (at, kind, args) in enumerate(_LIVE_BEATS):
+        if kind == "agora":
+            out.extend(_agora_beats())
+            continue
+        # The separator rides the SAME timestamp as the line it precedes, so
+        # the block opens as one visual event instead of a gap that appears a
+        # beat early and reads as the deck stalling.
+        if kind in ("act", "voice") and i:
+            out.append((at, ""))
+        out.append((at, _compose(kind, args)))
+    return out
+
+
+#: Composed once at import for introspection (`--speed` docs, tests). The live
+#: scene recomposes; this is a snapshot, never the thing that renders.
+_LIVE_SCRIPT = compose_live_script()
 
 #: Windows during which the toolbar shows a token counter climbing, because in
 #: the real cockpit that is the ONLY sign the organism is thinking. A static
@@ -331,7 +439,8 @@ def _live_toolbar(started: Callable[[], float], clock: Callable[[], float]):
 
 async def _drive(mux: Any, app: Any, speed: float,
                  started: Callable[[], float],
-                 clock: Callable[[], float]) -> None:
+                 clock: Callable[[], float],
+                 script: Optional[Sequence[Any]] = None) -> None:
     """Feed the script in real time, then idle until the operator quits.
 
     Sleeps against the SCHEDULE rather than accumulating per-step delays: a
@@ -339,7 +448,7 @@ async def _drive(mux: Any, app: Any, speed: float,
     rhythm — the thing being demonstrated — would decay over the run.
     """
     import asyncio
-    for at, line in _LIVE_SCRIPT:
+    for at, line in (script if script is not None else _LIVE_SCRIPT):
         target = started() + (at / speed)
         while True:
             gap = target - clock()
@@ -443,10 +552,12 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
     except Exception:  # noqa: BLE001
         pass
 
+    script = compose_live_script()
+
     async def _main() -> None:
         start[0] = clock()
         driver = asyncio.ensure_future(
-            _drive(mux, app, speed, lambda: start[0], clock))
+            _drive(mux, app, speed, lambda: start[0], clock, script))
         try:
             await app.run_async()
         finally:
