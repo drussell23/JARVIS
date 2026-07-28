@@ -1285,6 +1285,20 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
                 ui.flash(ui.set_deck_size(arg))
             return "handled"
 
+        # /keys is likewise a CLIENT concern when attached: the bindings
+        # that govern THIS terminal (deck selection, Esc-interrupt,
+        # Ctrl+R) are mounted in THIS process's keymap — the daemon's
+        # catalog describes a different surface. `/keys daemon [...]`
+        # forwards to the daemon REPL's own table for that view.
+        if low == "/keys" or low == "keys" or low.startswith(("/keys ", "keys ")):
+            parts = text.split(None, 2)
+            if len(parts) > 1 and parts[1].lower() == "daemon":
+                forward = "/keys" + (f" {parts[2]}" if len(parts) > 2 else "")
+                client.send_input(forward)
+                return "sent"
+            _render_client_keys(ui, text)
+            return "handled"
+
         cmd = audio_verbs.get(low)
         if cmd is not None:
             # AUTO-SPAWN REFLEX. `ov` boots ouroboros_battle_test.py, which has
@@ -1439,6 +1453,28 @@ async def _split_plane_loop(
     # in the toolbar. The cockpit floats it and must NOT opt in, or it renders
     # twice.
     ui.palette_in_toolbar = True
+    # Ctrl+R history search — the SAME gated-completer mechanism the
+    # bipartite cockpit uses (history_search.py), merged ahead of the
+    # slash palette so the two attach surfaces cannot diverge.
+    _history = _build_prompt_history()
+    _completer = _build_slash_completer()
+    _hist_controller = None
+    _kb = _build_selection_bindings(ui, client)
+    try:
+        from backend.core.ouroboros.battle_test.history_search import (
+            build_history_search,
+            install_history_search,
+            merge_history_completer,
+        )
+        _hist_controller, _hc = build_history_search(_history)
+        _completer = merge_history_completer(_completer, _hc)
+        if _hist_controller is not None:
+            if _kb is None:
+                from prompt_toolkit.key_binding import KeyBindings
+                _kb = KeyBindings()
+            install_history_search(_kb, _hist_controller)
+    except Exception:  # noqa: BLE001 — search is a bonus, typing is not
+        _hist_controller = None
     # ONE persistent session, dynamic prompt + rigid footer toolbar:
     # both are callables re-evaluated on every repaint, so an
     # audio_state frame morphs the footer via app.invalidate() while
@@ -1446,17 +1482,17 @@ async def _split_plane_loop(
     session: Any = PromptSession(
         message=lambda: ui.prompt(),
         bottom_toolbar=lambda: ui.toolbar(),
-        key_bindings=_build_selection_bindings(ui, client),
+        key_bindings=_kb,
         # Native `/` palette over the SAME 60-verb dispatch table the daemon
         # routes to — not a hand-kept list that can drift from it. Threaded:
         # priming the registry walks packages, and on the event loop that
         # would freeze the very keystroke that opened the menu.
-        completer=_build_slash_completer(),
+        completer=_completer,
         complete_while_typing=True,
         # Persistent recall + history ghost-text — the same
         # .jarvis/repl_history every other surface reads, so a verb
         # typed at the daemon REPL suggests here and vice versa.
-        history=_build_prompt_history(),
+        history=_history,
         auto_suggest=_build_prompt_auto_suggest(),
         # Multi-line, with the CONDITION applied to the buffer below — the
         # same two-step the cockpit uses, from the same module, so the two
@@ -1489,6 +1525,14 @@ async def _split_plane_loop(
         _buf.multiline = continuation_filter(lambda: _buf.text)
     except Exception:  # noqa: BLE001 — plain multiline still beats one line
         pass
+    # The history-search auto-disarm rides the buffer's OWN
+    # completions-changed event — subscribable only now that the
+    # session (and its default buffer) exists.
+    if _hist_controller is not None:
+        try:
+            _hist_controller.watch(session.default_buffer)
+        except Exception:  # noqa: BLE001
+            pass
     # Consume prompt_toolkit's OWN cursor-position timeout rather than probing
     # the terminal again — a second probe races the first for the same reply
     # bytes and misclassifies healthy terminals. See append_only.py.
@@ -1611,6 +1655,34 @@ def _build_prompt_auto_suggest() -> Any:
         return build_auto_suggest()
     except Exception:  # noqa: BLE001
         return None
+
+
+def _render_client_keys(ui: Any, line: str) -> None:
+    """Render THIS process's keymap table into the operator's scrollback.
+
+    Reuses keys_repl's renderer verbatim (one table format everywhere);
+    only the delivery differs — the addressed markup sink every ⏺/⎿ line
+    already takes, with rich-markup escaping because context headers
+    like ``[Chat]`` are content here, not tags. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.keys_repl import (
+            dispatch_keys_command,
+        )
+        result = dispatch_keys_command(line)
+        sink = getattr(ui, "markup_sink", None) if ui is not None else None
+        if callable(sink):
+            try:
+                from rich.markup import escape as _escape
+            except Exception:  # noqa: BLE001
+                def _escape(s: str) -> str:
+                    return s
+            for ln in str(result.text or "").splitlines():
+                sink(_escape(ln), True)
+        elif ui is not None and hasattr(ui, "flash"):
+            first = str(result.text or "").splitlines() or [""]
+            ui.flash(f"{first[0]} — `/keys daemon` for the daemon view")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _register_client_op_provider(ui: Any) -> None:

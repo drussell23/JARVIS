@@ -5944,6 +5944,83 @@ class SerpentREPL:
                 )
         return False
 
+    def _register_completion_providers(self) -> None:
+        """Register the dynamic arg-completion providers. Idempotent —
+        re-registration overwrites with an equivalent callable, so both
+        REPL entry paths may call it safely.
+
+        * ``op_id`` — §41.3 Slice 3 #14. Snapshots ``GLS._active_ops``
+          (a Set[str]) at completion time, so newly-spawned ops surface
+          on the next keystroke. Matches the ``<op_id>`` arg-name
+          convention of the ``_handle_cancel``-style verbs.
+        * ``ref`` — the cross-substrate artifact refs ``/expand``
+          accepts (``t-N``/``d-N``/``o-N``/``p-N``), harvested from each
+          substrate's default store at completion time. A substrate that
+          is not up yet simply contributes nothing — the candidates are
+          exactly the refs the verb would honor RIGHT NOW, never a
+          stale parallel list.
+
+        NEVER raises into prompt_toolkit.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
+                register_arg_provider as _ac_register,
+            )
+        except Exception:  # noqa: BLE001
+            return  # arg completion unavailable — verb-name path still works
+
+        def _op_id_provider(prefix: str) -> Tuple[str, ...]:
+            _gls = self._gls
+            if _gls is None:
+                return ()
+            try:
+                active = getattr(_gls, "_active_ops", None)
+                if active is None:
+                    return ()
+                # Snapshot to a tuple — guards against mutation during
+                # iteration. Sorted for stable dropdown ordering.
+                return tuple(sorted(
+                    op for op in active
+                    if isinstance(op, str)
+                ))
+            except Exception:  # noqa: BLE001
+                return ()
+
+        # The substrates /expand routes to, in the order its summary
+        # lists them. One table, next to nothing hardcoded downstream:
+        # each entry is (module, default-store getter) and the refs come
+        # from the store's OWN all_refs().
+        _ref_substrates = (
+            ("backend.core.ouroboros.battle_test.tool_render_store",
+             "get_default_store"),
+            ("backend.core.ouroboros.battle_test.diff_archive",
+             "get_default_archive"),
+            ("backend.core.ouroboros.battle_test.op_block_buffer",
+             "get_default_buffer"),
+            ("backend.core.ouroboros.governance.permission_decision_archive",
+             "get_default_archive"),
+        )
+
+        def _ref_provider(prefix: str) -> Tuple[str, ...]:
+            import importlib
+            refs: list = []
+            for mod_name, getter_name in _ref_substrates:
+                try:
+                    mod = importlib.import_module(mod_name)
+                    store = getattr(mod, getter_name)()
+                    # Most recent last in the ring → most useful; keep
+                    # the tail so the dropdown stays browsable.
+                    refs.extend(store.all_refs()[-24:])
+                except Exception:  # noqa: BLE001
+                    continue
+            return tuple(r for r in refs if isinstance(r, str))
+
+        try:
+            _ac_register("op_id", _op_id_provider)
+            _ac_register("ref", _ref_provider)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _loop(self) -> None:
         """Async REPL loop — flowing CLI, no fixed UI panels.
 
@@ -5955,6 +6032,12 @@ class SerpentREPL:
         no bottom_toolbar, no refresh_interval, no fixed terminal
         regions. Matches Claude Code's flowing terminal UX.
         """
+        # Dynamic arg-completion providers, BEFORE either surface mounts.
+        # They used to live inside the legacy wiring block below — which
+        # the bipartite fast-path returns without ever reaching, so the
+        # DEFAULT cockpit had verb completion but no live op-id/ref
+        # candidates. Same split-surface class as the palette PRs.
+        self._register_completion_providers()
         # Bipartite Async Layout — the framed cockpit is the DEFAULT entry point.
         # On a real TTY the full-screen Zone 1/Zone 2 app replaces this flowing
         # loop, with the Ouroboros chase as the DORMANT hero. on_accept reuses
@@ -6046,38 +6129,11 @@ class SerpentREPL:
         # input handling and output coordination land in this commit.
         _repl_bindings = KeyBindings()
 
-        # §41.3 Slice 3 #14 — register a dynamic arg-completion
-        # provider for ``<op_id>``. Snapshots GLS._active_ops (a
-        # Set[str]) at completion time, so newly-spawned ops surface
-        # in the next tab press. The provider key matches the arg
-        # name convention used by all `_handle_cancel`-style verbs
-        # (``<op_id>``). NEVER raises into prompt_toolkit.
-        try:
-            from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
-                register_arg_provider as _ac_register,
-            )
-
-            def _op_id_provider(prefix: str) -> Tuple[str, ...]:
-                _gls = self._gls
-                if _gls is None:
-                    return ()
-                try:
-                    active = getattr(_gls, "_active_ops", None)
-                    if active is None:
-                        return ()
-                    # Snapshot to a tuple — guards against
-                    # mutation during iteration. Sorted for
-                    # stable dropdown ordering.
-                    return tuple(sorted(
-                        op for op in active
-                        if isinstance(op, str)
-                    ))
-                except Exception:  # noqa: BLE001
-                    return ()
-
-            _ac_register("op_id", _op_id_provider)
-        except Exception:  # noqa: BLE001
-            pass  # arg completion unavailable — verb-name path still works
+        # §41.3 Slice 3 #14 — dynamic arg-completion providers. Hoisted
+        # to _register_completion_providers(), called at the TOP of
+        # _loop so the bipartite fast-path gets them too; kept here as
+        # an idempotent re-register for direct legacy-path entry.
+        self._register_completion_providers()
 
         @_repl_bindings.add("enter")
         def _on_enter(event: Any) -> None:
@@ -7567,6 +7623,10 @@ class SerpentREPL:
 
         Empty arg → list recent refs across all substrates.
         NEVER raises — every lookup degrades to a friendly error line.
+
+        @arg_spec: [ref]
+        @example: /expand t-3
+        @example: /expand o-1
         """
         parts = line.replace("/expand", "expand", 1).split(None, 1)
         if len(parts) < 2 or not parts[1].strip():

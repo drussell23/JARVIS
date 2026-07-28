@@ -297,6 +297,95 @@ def test_bipartite_prompt_defaults_stay_none_safe() -> None:
     assert _prompt_buffer(app) is not None
 
 
+# --------------------------------------------------------------------------
+# 8. dynamic providers reach the DEFAULT surface + /expand completes refs
+# --------------------------------------------------------------------------
+
+def test_providers_register_before_the_fast_path() -> None:
+    """The op_id/ref providers used to live in the legacy wiring block,
+    which the bipartite fast-path returns without reaching — the
+    default cockpit had no dynamic candidates. Pinned: registration is
+    hoisted above the fast-path."""
+    import inspect
+    from backend.core.ouroboros.battle_test import serpent_flow
+    src = inspect.getsource(serpent_flow.SerpentREPL._loop)
+    assert (
+        src.index("_register_completion_providers")
+        < src.index("run_bipartite_repl")
+    )
+
+
+def test_register_completion_providers_lands_both_keys() -> None:
+    import types
+    from backend.core.ouroboros.battle_test import serpent_flow
+    stub = types.SimpleNamespace(_gls=None)
+    serpent_flow.SerpentREPL._register_completion_providers(stub)
+    assert {"op_id", "ref"} <= set(rc.list_arg_providers())
+    # both degrade to tuples, never raise, with no GLS / empty stores
+    op = rc._ARG_PROVIDERS["op_id"]
+    ref = rc._ARG_PROVIDERS["ref"]
+    assert op("") == ()
+    assert isinstance(ref(""), tuple)
+
+
+def test_expand_declares_a_dynamic_ref_position() -> None:
+    from backend.core.ouroboros.battle_test import serpent_flow
+    tags = rc._parse_doc_tags(serpent_flow.SerpentREPL._handle_expand)
+    assert tags["arg_spec"] == "[ref]"
+    # with the provider registered (test above), [ref] classifies DYNAMIC
+    (pos,) = rc.parse_arg_spec("[ref]")
+    assert pos.kind is rc.ArgKind.DYNAMIC and pos.provider_key == "ref"
+
+
+# --------------------------------------------------------------------------
+# 9. /keys is answered by the process whose bindings it describes
+# --------------------------------------------------------------------------
+
+class _FakeClient:
+    def __init__(self):
+        self.sent = []
+        self.audio = []
+
+    def send_input(self, text):
+        self.sent.append(text)
+
+    def send_audio(self, cmd):
+        self.audio.append(cmd)
+
+
+class _FakeUI:
+    def __init__(self):
+        self.lines = []
+        self.flashes = []
+
+    def markup_sink(self, line, addressed=False):
+        self.lines.append(line)
+
+    def flash(self, msg, seconds=None):
+        self.flashes.append(msg)
+
+    def should_flush_on_input(self):
+        return False
+
+
+def test_keys_verb_is_intercepted_client_side() -> None:
+    from backend.core.ouroboros.cli.ov import _route_operator_line
+    client, ui = _FakeClient(), _FakeUI()
+    outcome = _route_operator_line(client, ui, "/keys")
+    assert outcome == "handled"
+    assert client.sent == []                    # never crossed the bridge
+    assert any("keymap" in ln for ln in ui.lines)
+
+
+def test_keys_daemon_subcommand_forwards() -> None:
+    from backend.core.ouroboros.cli.ov import _route_operator_line
+    client, ui = _FakeClient(), _FakeUI()
+    outcome = _route_operator_line(client, ui, "/keys daemon warnings")
+    assert outcome == "sent"
+    assert client.sent == ["/keys warnings"]
+    assert ui.lines == []
+
+
 def test_daemon_cockpit_fast_path_passes_the_wiring() -> None:
     """serpent_flow's bipartite fast-path must hand the SAME wiring the
     legacy PromptSession gets to run_bipartite_repl — pinned at source
