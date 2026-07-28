@@ -60,6 +60,84 @@ _IMPL_OPENERS = (
 _DANGLING = re.compile(r"^(?:and\s+|then\s+|to\s+|the\s+|a\s+|an\s+)+", re.I)
 
 
+#: A leading provenance citation — "§37 Slice 1 — ", "Upgrade 3 Slice 5 — ",
+#: "M11 Slice 5 — ", "Treefinement Phase 4 — ". These modules DO describe
+#: themselves; the description just sits behind a reference to the spec that
+#: commissioned it. Thirty verbs read as undocumented for that reason alone,
+#: and writing thirty fresh docstrings would have duplicated prose that was
+#: already there and already accurate.
+#:
+#: Only stripped when what PRECEDES the dash looks like a citation — short, and
+#: carrying a §/slice/phase/move/wave/upgrade marker or a bare identifier. A
+#: blind "cut at the first dash" would decapitate "Posture — the organism's
+#: current stance", which is a real sentence that happens to use one.
+_CITATION = re.compile(
+    r"^(?P<head>[^—-]{0,64}?)\s*[—–]\s*(?P<rest>.+)$", re.S,
+)
+_CITATION_MARKER = re.compile(
+    r"§|\bslice\b|\bphase\s*\d|\bmove\s*\d|\bwave\s*\d|\bupgrade\s*\d"
+    r"|\btier\s*\d|\bprd\b|\bstep\s*\d|^[A-Z]\d+\b|\bv\d+\b",
+    re.I,
+)
+
+#: Openers describing the FILE's role rather than the verb's job.
+_SURFACE_OPENERS = (
+    "repl dispatcher for", "repl dispatcher", "repl surface composing",
+    "repl surface for", "repl surface", "repl verb for", "repl verb",
+    "operator-facing cli surface for", "operator-facing cli surface",
+    "operator-facing surface for", "operator-facing surface",
+    "operator surface for", "operator surface", "read-only inspection of",
+    "dashboard for", "cli surface for", "cli surface",
+)
+
+
+#: Sphinx cross-reference roles — ``:mod:`pkg.mod.Class```. Unwrapping to the
+#: raw target produced "Mod:component_health.ComponentHealthTracker", which is
+#: not a description, it is a symbol path with a capital letter.
+_RST_ROLE = re.compile(r":(?:mod|class|func|meth|attr|data|obj|ref):`([^`]+)`")
+
+#: A TRAILING provenance parenthetical — "(PRD §38 Slice 3, 2026-05-07)".
+#: The leading-citation stripper only looks at the head; these sit at the tail
+#: and ate the description's budget with a reference the operator cannot use.
+_TRAILING_CITATION = re.compile(
+    r"\s*\((?=[^)]*(?:§|PRD|Slice|Phase|Wave|Tier|Pattern|\d{4}-\d{2}-\d{2}))"
+    r"[^)]*\)\s*$", re.I,
+)
+
+
+def _humanise_symbol(match: "re.Match") -> str:
+    """`:mod:`a.b.ComponentHealthTracker`` -> "component health tracker".
+
+    The LAST segment is the meaningful one; the package path is address, not
+    meaning. CamelCase and snake_case both become words so the result reads as
+    prose rather than as an identifier that happens to be in a sentence.
+    """
+    target = str(match.group(1) or "").strip("~`")
+    leaf = target.rsplit(".", 1)[-1]
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", leaf).replace("_", " ")
+    return spaced.strip().lower()
+
+
+def _strip_citation(text: str) -> str:
+    """Drop a leading spec reference, keeping the sentence it introduces."""
+    match = _CITATION.match(text.strip())
+    if not match:
+        return text
+    head, rest = match.group("head"), match.group("rest")
+    if head and not _CITATION_MARKER.search(head):
+        return text            # a real sentence that merely contains a dash
+    return rest.strip() or text
+
+
+def _strip_surface_opener(text: str) -> str:
+    """Drop 'REPL dispatcher' / 'operator-facing surface' scaffolding."""
+    lowered = text.lower()
+    for opener in _SURFACE_OPENERS:
+        if lowered.startswith(opener):
+            return text[len(opener):].strip(" .:,—-")
+    return text
+
+
 def prose_first_enabled() -> bool:
     """Default ON. Off restores subcommands-before-prose ranking."""
     return os.environ.get(
@@ -213,9 +291,14 @@ def to_operator_voice(text: Optional[str], verb: str = "",
         # the verb-name check silently failed on it, leaving "``/anticipate``
         # line" as the description. Docstrings in this codebase mark up verb
         # names by convention, so this is the common case, not an edge one.
+        raw = _RST_ROLE.sub(_humanise_symbol, raw)
         raw = re.sub(r"``([^`]*)``", r"\1", raw)
         raw = re.sub(r"`([^`]*)`", r"\1", raw)
         raw = " ".join(raw.split())
+        # Citation first, THEN the verb name, THEN surface scaffolding. Order
+        # matters: the verb name usually sits inside the clause the citation
+        # introduces, so stripping the citation last leaves nothing to match.
+        raw = _strip_citation(raw)
         original = raw
 
         # First sentence only. A palette row is one line, and everything
@@ -235,12 +318,28 @@ def to_operator_voice(text: Optional[str], verb: str = "",
         head = _DANGLING.sub("", head.strip())
         head = _strip_verb_name(head.strip(), verb)
         head = _DANGLING.sub("", head.strip())
+        head = _strip_surface_opener(head.strip())
+        head = _strip_verb_name(head.strip(), verb)
+        head = _DANGLING.sub("", head.strip())
+        head = _TRAILING_CITATION.sub("", head).strip()
         head = head.strip(" .:;,—-")
+        # A result that is ENTIRELY a parenthetical is a citation wearing
+        # brackets — "(PRD §32.7 Pattern B)" told an operator nothing.
+        if head.startswith("(") and head.endswith(")"):
+            inner = head[1:-1].strip()
+            head = inner if _has_domain_content(inner) and len(inner) >= 12 else ""
 
         if len(head) < 3:
-            # Subtraction ate the sentence. Fall back to the author's words
-            # rather than emit a fragment.
-            head = original.strip(" .")
+            # Subtraction emptied it. That is a RESULT, not a failure: what
+            # was removed was scaffolding, so there was no description here.
+            #
+            # This used to resurrect the whole docstring, which put
+            # "/m10 REPL dispatcher. Operator-facing CLI surface" back on the
+            # palette — the exact scaffolding the stripping had just correctly
+            # identified. Returning empty lets the cascade fall through to the
+            # module docstring and then to mined subcommands, both of which
+            # say more than a restated function signature.
+            return ""
 
         # Sentence case: uppercase the first letter ONLY. Title-casing would
         # mangle identifiers, and lowering the rest would mangle `DW`, `L2`,
