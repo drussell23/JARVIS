@@ -37,6 +37,36 @@ The operator can be pointing at row 3 when an agent two rows above them
 finishes. Selection is therefore held by AGENT ID, not by index: an index
 would silently move the cursor onto a different agent at the exact moment
 they press Enter.
+
+The roster lives in one process and is READ in another
+------------------------------------------------------
+This is the constraint that shapes everything below. The producer is the
+daemon — `SerpentFlow` calls :meth:`AgentRoster.spawn` as each subagent is
+dispatched. The consumer is a cockpit, which under ``ov attach`` is a
+DIFFERENT PROCESS with its own empty module singleton. Mounting a render call
+in the client would draw an empty roster forever, and it would look exactly
+like a system that never dispatches agents.
+
+So the module is split the way ``attach_heartbeat`` is split — two pure
+halves over one schema:
+
+* :meth:`AgentRoster.snapshot` — the daemon serialises its live state.
+* :func:`render_roster` — a PURE function over that snapshot, which the
+  in-process cockpit and the remote client both call.
+
+:meth:`AgentRoster.render` is a thin delegation to the same function, so
+there is exactly one place that decides what a roster looks like.
+
+Elapsed, never a timestamp
+--------------------------
+A snapshot carries ``elapsed_s`` per agent, never ``started``.
+``time.monotonic()`` is an arbitrary per-process origin: shipping one across
+the bridge and subtracting it from the reader's clock yields a duration that
+is wrong by however long the two processes have been alive, and wrong in a
+way that looks plausible. Durations are computed where the clock lives.
+
+Between frames the reader advances running agents by the snapshot's own age,
+so seconds tick smoothly at 1 Hz instead of stepping.
 """
 from __future__ import annotations
 
@@ -47,7 +77,15 @@ from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("Ouroboros.AgentRoster")
 
-__all__ = ["AgentEntry", "AgentRoster", "agent_view_enabled", "format_duration"]
+__all__ = [
+    "ROSTER_SCHEMA_VERSION", "AgentEntry", "AgentRoster", "agent_view_enabled",
+    "format_duration", "render_roster", "roster_hint",
+]
+
+#: Additive schema. A reader that does not know a field ignores it; a reader
+#: that expects one it does not get renders without it. Bumped only if a
+#: field's MEANING changes, never for an addition.
+ROSTER_SCHEMA_VERSION = "roster.v1"
 
 #: Rows drawn before the roster collapses to a count. A cockpit footer is a
 #: glance, not a process table.
@@ -55,6 +93,16 @@ _MAX_ROWS = 8
 
 #: Longest a running agent may go unheard from before it is presumed lost.
 _STALE_S = 900.0
+
+#: Narrowest goal column worth printing. Below this a label is all ellipsis
+#: and the row costs a line to say nothing.
+_MIN_LABEL = 18
+
+#: The roster's own keys, declared to the ONE registry that knows what this
+#: cockpit binds. Registered rather than printed so `/keys` can list them and
+#: the rendered hint has a single source — the defect the registry exists to
+#: prevent is a footer that advertises a key nothing binds.
+_ROSTER_ACTIONS = (("↑/↓", "select"), ("Enter", "view"))
 
 
 def agent_view_enabled() -> bool:
@@ -70,6 +118,96 @@ def _stale_after_s() -> float:
                                or _STALE_S))
     except (TypeError, ValueError):
         return _STALE_S
+
+
+def _max_rows() -> int:
+    """Rows drawn before collapsing to a count. Re-read at call time, so a
+    resized cockpit or a changed preference takes effect without a restart."""
+    try:
+        return max(1, min(64, int(os.environ.get(
+            "JARVIS_AGENT_VIEW_ROWS", "") or _MAX_ROWS)))
+    except (TypeError, ValueError):
+        return _MAX_ROWS
+
+
+def roster_wire_rows() -> int:
+    """Rows a SNAPSHOT carries, as distinct from rows a cockpit DRAWS.
+
+    These are different questions and conflating them caps the wrong one. The
+    producer cannot know how tall its readers are — a 60-row terminal and a
+    24-row one attach to the same daemon — so if it serialises only what the
+    smallest could draw, the roomy client is silently truncated by a peer's
+    screen. It therefore ships a generous window and lets each reader fold to
+    its own budget.
+
+    Generous, not unbounded: this rides a 1 Hz frame, so the window is what
+    stops a 400-worker swarm from putting 400 rows on the wire every second
+    for a reader that can draw twenty.
+    """
+    try:
+        return max(1, min(128, int(os.environ.get(
+            "JARVIS_AGENT_VIEW_WIRE_ROWS", "") or 24)))
+    except (TypeError, ValueError):
+        return 24
+
+
+def _screen_share() -> float:
+    """Fraction of the terminal the roster may take before it folds.
+
+    A share, not a row count, because the constraint is proportional: eleven
+    rows is a footer on a 60-row terminal and half the cockpit on a 24-row
+    one, and the operator opened the cockpit to watch the DECK. Tunable, but
+    clamped — a roster permitted the whole screen is a process table, and this
+    is a glance.
+    """
+    try:
+        return max(0.05, min(0.75, float(os.environ.get(
+            "JARVIS_AGENT_VIEW_SCREEN_SHARE", "") or 0.35)))
+    except (TypeError, ValueError):
+        return 0.35
+
+
+def roster_line_budget(term_rows: Optional[int]) -> Optional[int]:
+    """Terminal rows the roster may occupy, or None when height is unknown.
+
+    None rather than a guess: :func:`render_roster` folds only when it is
+    given a budget, so an unknown height degrades to "show the snapshot's own
+    window" — the behaviour before there was a budget at all — instead of
+    folding against a number nobody measured.
+    """
+    try:
+        if not term_rows or int(term_rows) <= 0:
+            return None
+        return max(_CHROME_ROWS + 2, int(int(term_rows) * _screen_share()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _register_keys() -> None:
+    """Publish the roster's keys to the canonical registry. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.keybinding_registry import (
+            register_keybinding,
+        )
+        for key, action in _ROSTER_ACTIONS:
+            register_keybinding(
+                key=key, action=action,
+                source_file="battle_test/agent_roster.py",
+            )
+    except Exception:  # noqa: BLE001 — an unregistered key still works
+        logger.debug("[AgentRoster] key registration degraded", exc_info=True)
+
+
+def roster_hint() -> str:
+    """``↑/↓ to select · Enter to view`` — composed from the registered keys.
+
+    Read back from the declaration rather than written twice, so a rebind
+    cannot leave the cockpit advertising a key that no longer does anything.
+    """
+    try:
+        return " · ".join(f"{k} to {a}" for k, a in _ROSTER_ACTIONS)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def format_duration(seconds: float) -> str:
@@ -128,6 +266,21 @@ class AgentEntry:
             goal = goal[: width - 1].rstrip() + "…"
         return goal
 
+    def as_row(self, now: float) -> Dict[str, Any]:
+        """This agent as a transport-safe dict.
+
+        ``elapsed_s``, never ``started`` — see the module docstring. The goal
+        is carried UNCLIPPED: how much of it fits is the reader's question,
+        because the reader is the one who knows how wide its terminal is.
+        """
+        return {
+            "id": self.agent_id,
+            "kind": self.kind,
+            "goal": self.goal,
+            "state": self.state,
+            "elapsed_s": round(self.elapsed(now), 1),
+        }
+
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<AgentEntry {self.agent_id!r} {self.kind} {self.state}>"
 
@@ -138,15 +291,26 @@ class AgentRoster:
     def __init__(
         self,
         clock: Optional[Callable[[], float]] = None,
-        max_rows: int = _MAX_ROWS,
+        max_rows: Optional[int] = None,
     ) -> None:
         self._clock = clock or time.monotonic
         self._entries: Dict[str, AgentEntry] = {}
         self._order: List[str] = []
-        self._max = max(1, int(max_rows))
+        #: ``None`` = follow the env at call time, so an operator who widens
+        #: the window mid-session gets it. An explicit int PINS the window,
+        #: which is what a test wants and what an embedding surface with a
+        #: fixed budget of rows wants.
+        self._max: Optional[int] = (
+            max(1, int(max_rows)) if max_rows else None
+        )
         #: Held by ID, never by index — see the module docstring.
         self._selected: Optional[str] = None
         self.reaped = 0
+        _register_keys()
+
+    @property
+    def _window(self) -> int:
+        return self._max if self._max is not None else _max_rows()
 
     # -- the feed ----------------------------------------------------------
 
@@ -259,40 +423,52 @@ class AgentRoster:
 
     # -- render ------------------------------------------------------------
 
-    def render(self) -> List[str]:
-        """Footer rows, or [] when nothing has been dispatched.
+    def snapshot(self, *, max_rows: Optional[int] = None) -> Dict[str, Any]:
+        """The roster as a transport-safe dict — the daemon's half.
 
-        An empty roster renders NOTHING — not "0 agents". A cockpit that
-        always shows a section for work that is not happening spends a row
-        saying nothing, every session, forever.
+        REAPS first, because the process holding the entries is the only one
+        that can honestly decide an agent has gone quiet. A reader that reaped
+        on its own would be guessing from a frame that is already a second
+        old, and would eventually mark an agent lost that the daemon can see
+        is running.
+
+        Bounded to the visible window plus a ``hidden`` count. The whole point
+        of the cap is that a 200-worker swarm must not turn a 1 Hz frame into
+        a 200-row payload — the operator cannot read 200 rows either way, so
+        the truthful summary is cheaper AND better.
         """
         try:
             if not agent_view_enabled():
-                return []
+                return {"schema_version": ROSTER_SCHEMA_VERSION, "rows": [],
+                        "total": 0, "running": 0, "hidden": 0}
             self.reap()
+            now = self._clock()
             rows = self.entries
-            if not rows:
-                return []
-            lines = ["  ↑/↓ to select · Enter to view", ""]
-            cursor = "❯" if self._selected is None else " "
-            lines.append(f"{cursor} ⏺ main")
-            shown = rows[-self._max:]
-            for entry in shown:
-                mark = "❯" if self._selected == entry.agent_id else " "
-                label = entry.label()
-                took = ""
-                if not entry.running:
-                    took = f"  {format_duration(entry.elapsed(self._clock()))}"
-                lines.append(
-                    f"{mark} {entry.glyph} {entry.kind}  {label}{took}".rstrip()
-                )
-            hidden = len(rows) - len(shown)
-            if hidden > 0:
-                lines.append(f"    … {hidden} more")
-            return lines
+            window = int(max_rows) if max_rows else self._window
+            shown = rows[-window:] if window > 0 else []
+            return {
+                "schema_version": ROSTER_SCHEMA_VERSION,
+                "rows": [e.as_row(now) for e in shown],
+                "total": len(rows),
+                "running": sum(1 for e in rows if e.running),
+                "hidden": max(0, len(rows) - len(shown)),
+            }
         except Exception:  # noqa: BLE001
-            logger.debug("[AgentRoster] render degraded", exc_info=True)
-            return []
+            logger.debug("[AgentRoster] snapshot degraded", exc_info=True)
+            return {"schema_version": ROSTER_SCHEMA_VERSION, "rows": [],
+                    "total": 0, "running": 0, "hidden": 0}
+
+    def render(self, *, width: Optional[int] = None) -> List[str]:
+        """Footer rows for the IN-PROCESS cockpit.
+
+        A thin delegation to :func:`render_roster` over this roster's own
+        snapshot. Local and remote readers therefore cannot drift into two
+        opinions about what a roster looks like — which they would, because
+        the two would be edited months apart.
+        """
+        return render_roster(
+            self.snapshot(), selected=self._selected, width=width,
+        )
 
     # -- internals ---------------------------------------------------------
 
@@ -300,7 +476,7 @@ class AgentRoster:
         # Drop the oldest FINISHED entry first. A running agent is never
         # evicted for age: it is the one thing on this list that is still
         # true.
-        limit = self._max * 3
+        limit = self._window * 3
         while len(self._order) > limit:
             for key in list(self._order):
                 entry = self._entries.get(key)
@@ -310,6 +486,114 @@ class AgentRoster:
                     break
             else:
                 return
+
+
+# ---------------------------------------------------------------------------
+# The reader's half — pure, stdlib-only, shared by both processes
+# ---------------------------------------------------------------------------
+
+
+#: state → mark. Failure and loss are NOT the same: one reported back, the
+#: other never did. Defined once here because the reader may be holding a
+#: snapshot from a process whose AgentEntry class it never imported.
+_GLYPHS = {"running": "◯", "finished": "⏺", "failed": "✗", "unknown": "?"}
+
+
+def _clip(text: Any, width: int) -> str:
+    goal = " ".join(str(text or "").split())
+    if width > 0 and len(goal) > width:
+        return goal[: width - 1].rstrip() + "…"
+    return goal
+
+
+#: Rows the roster spends on itself: the hint, its blank, and `main`.
+_CHROME_ROWS = 3
+
+
+def render_roster(
+    snapshot: Optional[Dict[str, Any]],
+    *,
+    selected: Optional[str] = None,
+    age_s: float = 0.0,
+    width: Optional[int] = None,
+    max_lines: Optional[int] = None,
+) -> List[str]:
+    """Footer rows for a roster snapshot, from any process. NEVER raises.
+
+    An empty roster renders NOTHING — not "0 agents". A cockpit that always
+    shows a section for work that is not happening spends a row saying
+    nothing, every session, forever.
+
+    ``age_s`` is how long ago the snapshot was taken. Running agents advance
+    by it, so a 1 Hz frame still shows seconds ticking; finished ones do not,
+    because their duration is settled and inventing motion in it would be a
+    lie the reader has no way to check.
+
+    ``width`` is the reader's terminal, so the goal column is sized where the
+    terminal is known rather than guessed at the producer. A snapshot rendered
+    into an 80-column client and a 200-column one differ in what they clip,
+    and neither producer could have known which.
+
+    ``max_lines`` is how many TERMINAL ROWS the roster may occupy — a
+    different question from how many agents the snapshot holds, and the one a
+    30-row cockpit running a 40-worker swarm actually needs answered. Rows
+    beyond the budget are folded into the "… N more" count rather than
+    silently dropped, because a roster that quietly shows six of forty is
+    worse than one that says so.
+    """
+    try:
+        if not agent_view_enabled() or not isinstance(snapshot, dict):
+            return []
+        rows = [r for r in (snapshot.get("rows") or ()) if isinstance(r, dict)]
+        if not rows:
+            return []
+        age = max(0.0, float(age_s or 0.0))
+        # Fold to fit BEFORE anything is formatted: the count line has to
+        # include what the height budget dropped, and it cannot if the drop
+        # happens after the total was written.
+        folded = 0
+        if max_lines is not None:
+            # Budget the "… N more" row up front. Reserving it only when
+            # something overflows costs a row exactly when the overflow is
+            # one — and then the reservation causes a second overflow.
+            budget = int(max_lines) - _CHROME_ROWS - 1
+            if budget < 1:
+                return []
+            if len(rows) > budget:
+                folded = len(rows) - budget
+                rows = rows[-budget:]
+        # Chrome is `❯ ◯ Kind  ` plus a duration column. Whatever is left is
+        # the goal's, floored so a narrow terminal drops the goal entirely
+        # rather than printing three characters and an ellipsis.
+        cols = int(width) if width and int(width) > 0 else 80
+        kind_w = max((len(str(r.get("kind") or "")) for r in rows), default=8)
+        room = cols - (kind_w + 16)
+        label_w = room if room >= _MIN_LABEL else 0
+
+        lines = [f"  {roster_hint()}", ""]
+        lines.append(f"{'❯' if selected is None else ' '} ⏺ main")
+        for row in rows:
+            state = str(row.get("state") or "running")
+            mark = "❯" if selected and selected == row.get("id") else " "
+            glyph = _GLYPHS.get(state, "◯")
+            elapsed = float(row.get("elapsed_s") or 0.0)
+            if state == "running":
+                elapsed += age
+            took = f"  {format_duration(elapsed)}"
+            label = _clip(row.get("goal"), label_w) if label_w else ""
+            body = f"{row.get('kind') or 'agent'}  {label}".rstrip()
+            lines.append(f"{mark} {glyph} {body}{took}".rstrip())
+        # What the PRODUCER withheld plus what the height budget folded. Two
+        # separate elisions, one honest number — reporting either alone would
+        # undercount, and the operator reads this to decide whether they are
+        # looking at all of it.
+        hidden = int(snapshot.get("hidden") or 0) + folded
+        if hidden > 0:
+            lines.append(f"    … {hidden} more")
+        return lines
+    except Exception:  # noqa: BLE001
+        logger.debug("[AgentRoster] render degraded", exc_info=True)
+        return []
 
 
 _ROSTER: Optional[AgentRoster] = None

@@ -643,6 +643,64 @@ def _mount_region_layout(rows: "list") -> Any:
         logger.debug("[Bipartite] region layout mount degraded", exc_info=True)
         return HSplit(rows)
 
+def build_agent_row(rows: Callable[[], Any]) -> Any:
+    """The agent view — a container that is EXACTLY as tall as the roster.
+
+    ``Dimension.exact``, computed per repaint, for the reason the prompt
+    learned the hard way: ``HSplit`` hands each child its preferred size and
+    distributes the leftover by weight, so a child whose ``max`` exceeds its
+    ``preferred`` absorbs the slack. A range here would nail an eight-row
+    black slab open above the prompt on an idle cockpit.
+
+    Paired with a ``ConditionalContainer`` so zero agents costs zero rows —
+    an idle cockpit must be exactly as tall as it was before the agent view
+    existed, and a Window rendering an empty string still occupies a line.
+
+    ``rows`` is a callable returning the CURRENT roster lines, so the source
+    (a local singleton in-process, a heartbeat snapshot remotely) is the
+    caller's concern and this container never learns which one it is drawing.
+    NEVER raises — returns None, and the layout omits the row.
+    """
+    try:
+        from prompt_toolkit.filters import Condition
+        from prompt_toolkit.layout import ConditionalContainer, Window
+        from prompt_toolkit.layout.controls import FormattedTextControl
+        from prompt_toolkit.layout.dimension import Dimension
+
+        def _current() -> list:
+            try:
+                return [str(x) for x in (rows() or ())]
+            except Exception:  # noqa: BLE001
+                return []
+
+        def _fragments() -> Any:
+            try:
+                lines = _current()
+                if not lines:
+                    return []
+                from prompt_toolkit.formatted_text import ANSI
+                return ANSI("\n".join(lines))
+            except Exception:  # noqa: BLE001
+                return []
+
+        def _height() -> Any:
+            try:
+                return Dimension.exact(max(1, len(_current())))
+            except Exception:  # noqa: BLE001
+                return Dimension.exact(1)
+
+        return ConditionalContainer(
+            content=Window(
+                content=FormattedTextControl(_fragments, focusable=False),
+                height=_height, wrap_lines=False,
+            ),
+            filter=Condition(lambda: bool(_current())),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Bipartite] agent row unavailable", exc_info=True)
+        return None
+
+
 def build_bipartite_application(
     mux: BipartiteLayout,
     *,
@@ -655,6 +713,7 @@ def build_bipartite_application(
     history: Any = None,
     auto_suggest: Any = None,
     turn_spinner: Any = None,
+    agent_rows: Optional[Callable[[], Any]] = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
     window fed from ``mux.render_canvas_ansi()`` (re-rendered each frame, so
@@ -933,6 +992,16 @@ def build_bipartite_application(
                 rows += [_turn_row]
         except Exception:  # noqa: BLE001
             logger.debug("[Bipartite] turn row unavailable", exc_info=True)
+    # WHO is working, directly above WHAT is happening to my turn. Both sit
+    # under the deck and above the prompt because they answer questions about
+    # the present, and the deck is the past.
+    if agent_rows is not None:
+        try:
+            _agent_row = build_agent_row(agent_rows)
+            if _agent_row is not None:
+                rows += [_agent_row]
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] agent row unavailable", exc_info=True)
     # The palette is NOT a row. See the FloatContainer below: as an HSplit row
     # it shares the ambient grid with the canvas, so every asynchronous Deck or
     # Lane frame arriving underneath forces the palette's geometry to be
@@ -1193,6 +1262,7 @@ async def run_bipartite_repl(
     history: Any = None,
     auto_suggest: Any = None,
     turn_spinner: Any = None,
+    agent_rows: Optional[Callable[[], Any]] = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
     the live Zone-1 sink (so any producer — the daemon's event router OR the
@@ -1221,7 +1291,7 @@ async def run_bipartite_repl(
             mux, on_accept=on_accept, extra_key_bindings=extra_key_bindings,
             toolbar=toolbar, header=header, header_height=header_height,
             completer=completer, history=history, auto_suggest=auto_suggest,
-            turn_spinner=turn_spinner,
+            turn_spinner=turn_spinner, agent_rows=agent_rows,
         )
         if watch_alive is not None:
             watcher = asyncio.ensure_future(

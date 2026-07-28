@@ -672,6 +672,10 @@ class AttachUI:
         # carried — never a client-side cache, so the cursor always resolves
         # against what the daemon currently holds.
         self._lanes: List[dict] = []
+        #: The daemon's agent roster, as of the last heartbeat. A SNAPSHOT,
+        #: not a local roster: this process dispatches nothing, so it has no
+        #: business holding agent state of its own.
+        self._agents: dict = {}
         self._focus_lines: List[str] = []
         self._focus_note: str = ""
         self._flash_text: str = ""
@@ -925,7 +929,7 @@ class AttachUI:
                 GLYPHS,
                 deck_enabled,
             )
-            head = [pulse] + ([flash] if flash else [])
+            head = [pulse] + ([flash] if flash else []) + self._agent_lines()
             cap = {"off": 0, "compact": 2, "full": 99}.get(self._deck_size, 99)
             if self.deck is None or not deck_enabled() or cap == 0:
                 return "\n".join(head)
@@ -944,6 +948,62 @@ class AttachUI:
             )
         except Exception:  # noqa: BLE001
             return ""
+
+    def _agent_lines(self) -> List[str]:
+        """Who is working right now, from the daemon's last snapshot.
+
+        Three properties this has to get right, and each of them is a way the
+        surface could lie:
+
+        **Staleness retires the roster, silence does not.** If the daemon dies
+        mid-dispatch the last frame we hold says three agents are running, and
+        it will say that forever. So the roster expires on the SAME window the
+        pulse uses — one clock, one definition of "we have lost contact",
+        rather than a second timeout to keep in sync.
+
+        **Elapsed advances between frames.** Frames arrive at ~1 Hz. Without
+        the age correction, every running agent's duration would freeze for a
+        second and jump, which reads as a stalled system.
+
+        **Width comes from here.** The client knows its terminal; the daemon
+        that composed the snapshot does not. Passing it means the goal column
+        is clipped to the screen the operator is actually looking at.
+
+        NEVER raises — an unrenderable roster costs its rows, not the cockpit.
+        """
+        try:
+            import time as _time
+            from backend.core.ouroboros.battle_test.agent_roster import (
+                render_roster, roster_line_budget,
+            )
+            from backend.core.ouroboros.battle_test.attach_heartbeat import (
+                heartbeat_stale_after_s,
+            )
+            age = max(0.0, _time.monotonic() - float(self._heartbeat_arrived))
+            if not self._heartbeat_arrived or age > heartbeat_stale_after_s():
+                return []
+            size = self._terminal_size()
+            return render_roster(
+                self._agents, age_s=age, width=size[0],
+                max_lines=roster_line_budget(size[1]),
+            )
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _terminal_size(self) -> tuple:
+        """``(columns, rows)``, or ``(None, None)`` when it cannot be known.
+
+        None rather than a guess: both consumers treat an unknown dimension as
+        "do not constrain on it", and two different fallbacks for the same
+        unknown is how a client and its renderer end up disagreeing about how
+        much room there is.
+        """
+        try:
+            import shutil
+            size = shutil.get_terminal_size()
+            return max(20, int(size.columns)), max(4, int(size.lines))
+        except Exception:  # noqa: BLE001
+            return None, None
 
     def _pulse_line(self) -> str:
         """The CC-style working pulse, or the idle breadcrumb.
@@ -1197,6 +1257,19 @@ class AttachUI:
                 lanes = frame.get("lanes")
                 if isinstance(lanes, list):
                     self._lanes = [x for x in lanes if isinstance(x, dict)]
+                # The agent roster, same wholesale-replacement rule: the
+                # daemon's snapshot IS the truth. Merging would resurrect
+                # agents it has already reaped, and a resurrected agent
+                # claims work is still happening.
+                #
+                # A frame WITHOUT the key leaves the last roster standing —
+                # that is an older daemon, not an emptied roster, and the
+                # staleness window below is what retires it. A frame with an
+                # explicit empty snapshot clears it, because that daemon is
+                # saying "nothing is running".
+                agents = frame.get("agents")
+                if isinstance(agents, dict):
+                    self._agents = agents
         except Exception:
             pass
 
@@ -2958,6 +3031,14 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             history=_build_prompt_history(),
             auto_suggest=_build_prompt_auto_suggest(),
             turn_spinner=getattr(ui, "turn_spinner", None),
+            # WHO is working. Bound to the AttachUI rather than to the roster
+            # singleton: this process dispatches nothing, so its own roster is
+            # permanently empty, and rendering it would show an organism that
+            # never delegates. The UI holds the daemon's snapshot instead.
+            agent_rows=(
+                ui._agent_lines if ui is not None
+                and hasattr(ui, "_agent_lines") else None
+            ),
             seed=[
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "
                 "plain words both work · [cyan]wake[/cyan] arms my voice · "

@@ -736,6 +736,32 @@ def _extract_path_arg(args_summary: str) -> str:
     return text.split(" ", 1)[0].split("=", 1)[-1]
 
 
+def _local_agent_rows() -> list:
+    """Roster rows from THIS process's singleton, sized to this terminal.
+
+    The daemon's own cockpit reads the roster directly — no bridge, no
+    snapshot age — because the entries are right here. `render_roster` still
+    takes the snapshot, so the local and remote surfaces run identical code
+    over identical data and cannot diverge in appearance.
+
+    NEVER raises: the agent view is chrome, and chrome does not get to take
+    down the REPL.
+    """
+    try:
+        import shutil
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            get_agent_roster, render_roster, roster_line_budget,
+        )
+        size = shutil.get_terminal_size(fallback=(100, 30))
+        return render_roster(
+            get_agent_roster().snapshot(),
+            width=max(20, int(size.columns)),
+            max_lines=roster_line_budget(max(4, int(size.lines))),
+        )
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _tool_chrome_line(
     tool_name: str, args_summary: str = "", mcp_servers: Any = None,
 ) -> str:
@@ -6229,6 +6255,12 @@ class SerpentREPL:
                     history=getattr(_bp_wiring, "history", None),
                     auto_suggest=getattr(_bp_wiring, "auto_suggest", None),
                     turn_spinner=getattr(self, "_turn_spinner", None),
+                    # In-process, so the LOCAL roster is the live one — this
+                    # is the process that dispatches. Same renderer as the
+                    # remote cockpit, different source, which is the entire
+                    # reason `render_roster` takes a snapshot rather than a
+                    # roster: neither surface can drift into its own look.
+                    agent_rows=_local_agent_rows,
                 )
                 return
         except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL
