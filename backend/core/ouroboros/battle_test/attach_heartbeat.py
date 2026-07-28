@@ -92,12 +92,23 @@ def heartbeat_interval_s() -> float:
         return 1.0
 
 
-def _stale_after_s() -> float:
+def heartbeat_stale_after_s() -> float:
+    """How long a frame stays believable — THE definition of "lost contact".
+
+    Public because more than the pulse depends on it. Anything rendered from
+    a heartbeat frame — the pulse, the agent roster — must retire on the same
+    window, or the cockpit ends up showing a dead daemon's agents as running
+    underneath an idle pulse, and each surface would be individually correct.
+    """
     try:
         return max(2.0, float(os.environ.get(
             "JARVIS_ATTACH_HEARTBEAT_STALE_S", "10")))
     except (TypeError, ValueError):
         return 10.0
+
+
+def _stale_after_s() -> float:
+    return heartbeat_stale_after_s()
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +181,33 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
         except Exception:  # noqa: BLE001 — a laneless heartbeat still beats
             lanes = []
 
+        # The agent roster rides here for the same reason lanes do, and for
+        # one more: the roster is a module SINGLETON in the daemon, and the
+        # cockpit that must draw it is a different process under `ov attach`.
+        # A client rendering its own `get_agent_roster()` would draw an empty
+        # roster forever — indistinguishable from a system that never
+        # dispatches agents. Serialising it here is what makes the agent view
+        # true remotely rather than only in-process.
+        try:
+            from backend.core.ouroboros.battle_test.agent_roster import (
+                get_agent_roster, roster_wire_rows,
+            )
+            # The WIRE window, not the display window. This daemon cannot see
+            # its readers' terminals, and two of them may differ by forty
+            # rows — serialising only what the smallest could draw would
+            # truncate the roomy one by a peer's screen size.
+            agents = get_agent_roster().snapshot(max_rows=roster_wire_rows())
+        except Exception:  # noqa: BLE001 — a rosterless heartbeat still beats
+            agents = None
+
         return {
             "kind": "heartbeat",
             "schema_version": HEARTBEAT_SCHEMA_VERSION,
             "lanes": lanes,
+            # Additive under heartbeat.v1: an older client that has never
+            # heard of `agents` ignores the key, and a newer client that does
+            # not receive one renders no roster. Neither is a version error.
+            "agents": agents,
             "active": active,
             "verb": verb,
             "phase": phase,
