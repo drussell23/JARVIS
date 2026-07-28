@@ -1947,7 +1947,22 @@ def _root_logging_preserved():
             pass
 
 
-class MentionPathCompleter:
+def _pt_completer_base() -> Any:
+    """prompt_toolkit's `Completer`, or `object` when it is unavailable.
+
+    Inheriting is load-bearing, not tidy: prompt_toolkit consumes a completer
+    through `get_completions_async`, which the base class supplies by wrapping
+    the sync method. A duck-typed completer satisfies every static reading of
+    the protocol and raises `AttributeError` on the first keystroke.
+    """
+    try:
+        from prompt_toolkit.completion import Completer
+        return Completer
+    except Exception:  # noqa: BLE001
+        return object
+
+
+class MentionPathCompleter(_pt_completer_base()):  # type: ignore[misc]
     """Completes `@path` mentions against the repo.
 
     A mention the operator cannot TYPE is a feature only someone who already

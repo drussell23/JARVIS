@@ -109,8 +109,36 @@ def _history_strings(history: Any) -> List[str]:
         return []
 
 
-class HistoryCompleter:
+def _completer_base() -> Any:
+    """prompt_toolkit's `Completer`, or `object` if it cannot be imported.
+
+    Resolved at class-creation time rather than imported at module scope so
+    this file stays importable without prompt_toolkit — the history ranking
+    below is pure logic and is tested without a terminal.
+    """
+    try:
+        from prompt_toolkit.completion import Completer
+        return Completer
+    except Exception:  # noqa: BLE001
+        return object
+
+
+class HistoryCompleter(_completer_base()):  # type: ignore[misc]
     """Feeds history entries into the completion menu while armed.
+
+    INHERITS `Completer`, and that is load-bearing rather than tidy. A
+    completer is not consumed through `get_completions`: prompt_toolkit's
+    async completion path calls `get_completions_async`, which the base class
+    supplies by wrapping the sync method. A duck-typed class implementing
+    only `get_completions` therefore satisfies every static reading of the
+    protocol and raises `AttributeError` on the first keystroke —
+
+        Exception 'HistoryCompleter' object has no attribute
+        'get_completions_async'
+
+    repeated per keypress, because the failure is inside a coroutine the
+    event loop restarts. Tests that call `get_completions` directly cannot
+    see it; only prompt_toolkit calling it the way prompt_toolkit does.
 
     Ranking: substring hits, most recent first; entries whose START
     matches the typed text rank above mere containment. Duplicates
