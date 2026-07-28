@@ -1074,8 +1074,21 @@ class AttachUI:
                 health = self.advisor.render()
         except Exception:  # noqa: BLE001
             health = ""
+        # The risk floor, when it is NOT the configured one. Silent while
+        # following config: a permanent badge saying "normal" is chrome. The
+        # moment it says anything, the operator changed something — which is
+        # exactly when they need to see it.
+        floor = ""
+        try:
+            from backend.core.ouroboros.governance.session_risk_floor import (
+                session_floor_label,
+            )
+            floor = session_floor_label()
+        except Exception:  # noqa: BLE001
+            floor = ""
         mic = self.acoustic_badge()
         badge = f"{mic} · {badge}" if mic and badge else (mic or badge)
+        badge = f"{floor} · {badge}" if floor and badge else (floor or badge)
         # Health LAST in the composed line, so it survives truncation least —
         # it is the least time-critical of the three and the only one with a
         # dedicated verb (`ov doctor`) that recovers the full detail.
@@ -2152,6 +2165,18 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
                 install_newline_binding,
             )
             install_newline_binding(kb)
+        except Exception:  # noqa: BLE001
+            pass
+        # Shift+Tab raises the risk floor for this session. It composes
+        # into risk_tier_floor's strictest-wins resolution rather than
+        # overriding it, so the keystroke can only ever ADD friction —
+        # it cannot make the organism more permissive than the config
+        # already allows, in any cycle position.
+        try:
+            from backend.core.ouroboros.governance.session_risk_floor import (
+                cycle_session_floor,
+            )
+            kb.add("s-tab")(lambda event: cycle_session_floor())
         except Exception:  # noqa: BLE001
             pass
         # Ctrl+V pastes a SCREENSHOT. The most common way an operator has

@@ -685,6 +685,18 @@ def build_bipartite_application(
             install_history_search(kb, _hist_controller)
         except Exception:  # noqa: BLE001
             pass
+    # Shift+Tab raises the risk floor for this session. It composes
+    # into risk_tier_floor's strictest-wins resolution rather than
+    # overriding it, so the keystroke can only ever ADD friction —
+    # it cannot make the organism more permissive than the config
+    # already allows, in any cycle position.
+    try:
+        from backend.core.ouroboros.governance.session_risk_floor import (
+            cycle_session_floor,
+        )
+        kb.add("s-tab")(lambda event: cycle_session_floor())
+    except Exception:  # noqa: BLE001
+        pass
     # Ctrl+V pastes a SCREENSHOT. The most common way an operator has
     # an image is Cmd+Shift+Ctrl+4 — on the clipboard, never written
     # to disk — and a terminal pastes text, so it produced nothing.
