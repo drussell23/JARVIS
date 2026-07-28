@@ -635,6 +635,8 @@ class AttachUI:
         # it needs so the FSM never reaches for a live app: `_shield_show`
         # renders, `refresh` repaints the badge.
         self.shield = _build_shield(self)
+        #: Owns the provisional span while speech is being recognised.
+        self.composer = _build_composer()
         #: Set once the attach client exists. LATE-BOUND for the same reason
         #: the approval narrator's emit is: the markup sink is built after the
         #: UI, so a handle captured here would be None forever.
@@ -1681,6 +1683,17 @@ def _not_composing() -> Any:
         return True
 
 
+def _build_composer() -> Any:
+    """The dictation span manager, or None if unavailable."""
+    try:
+        from backend.core.ouroboros.battle_test.transcript_composer import (
+            TranscriptComposer,
+        )
+        return TranscriptComposer()
+    except Exception:  # noqa: BLE001 — voice still works without dictation
+        return None
+
+
 def _build_shield(ui: Any) -> Any:
     """The client's deferral FSM, wired to this cockpit's surfaces."""
     try:
@@ -1722,6 +1735,42 @@ def _shield_show(ui: Any, prompt: Any) -> None:
         ui.refresh()
     except Exception:  # noqa: BLE001
         pass
+
+
+def _on_transcript_frame(ui: Any, frame: Any) -> None:
+    """Fold one recognised chunk into the prompt buffer. NEVER raises.
+
+    The buffer is SHARED with the operator's typing, so the composer decides
+    what may be replaced and this only carries it out. When it releases a
+    span — because the utterance finished, or because they edited inside it —
+    the words simply stay where they are and become ordinary typed text.
+    """
+    try:
+        composer = getattr(ui, "composer", None)
+        buf = _prompt_buffer()
+        if composer is None or buf is None:
+            return
+        result = composer.on_chunk(frame, buf.text, buf.cursor_position)
+        if not result.edits:
+            return
+        # Splice rather than insert: replacing our own previous partial is
+        # what keeps the prompt showing ONE evolving sentence instead of
+        # every revision the recogniser passed through.
+        before, after = buf.text[:result.start], buf.text[result.end:]
+        buf.text = before + result.text + after
+        buf.cursor_position = result.start + len(result.text)
+        ui.refresh()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _prompt_buffer() -> Any:
+    """The live input buffer, or None when no application is running."""
+    try:
+        from prompt_toolkit.application.current import get_app
+        return get_app().current_buffer
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _on_prompt_frame(ui: Any, frame: Any) -> None:
@@ -2346,6 +2395,9 @@ def run_attach(console: Any) -> int:
             # Gates as DATA — the id + deadline the shield needs to defer one
             # safely and still answer the right op.
             on_prompt=lambda frame: _on_prompt_frame(ui, frame),
+            # Speech, into the prompt where it can be corrected before it is
+            # sent — rather than an utterance leaving unseen.
+            on_transcript=lambda frame: _on_transcript_frame(ui, frame),
             on_prompt_resolved=lambda pid: (
                 ui.shield.dismiss(pid) if ui.shield is not None else None
             ),

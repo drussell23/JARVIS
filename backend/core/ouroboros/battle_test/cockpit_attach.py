@@ -506,6 +506,37 @@ class CockpitAttachBridge:
             logger.debug("[CockpitAttach] prompt publish degraded",
                          exc_info=True)
 
+    def publish_transcript(
+        self, utterance_id: str, text: str, *,
+        final: bool = False, role: str = "user", seq: int = 0,
+    ) -> None:
+        """Stream one recognised chunk to attached cockpits.
+
+        Carries the SAME shape `audio_state_ipc` already uses — utterance id,
+        accumulated text, final flag — rather than a second transcript
+        vocabulary that would have to be kept in step with it.
+
+        The id and seq are what let a cockpit fold chunks safely: a socket
+        does not promise ordering, and a partial applied after its own final
+        would rewind the sentence in the operator's prompt.
+        """
+        try:
+            utterance_id = str(utterance_id or "").strip()
+            if not utterance_id or not self._clients:
+                return
+            self.stats["transcripts_published"] = (
+                self.stats.get("transcripts_published", 0) + 1
+            )
+            self._dispatch({
+                "type": "transcript", "utterance_id": utterance_id,
+                "text": str(text or ""), "final": bool(final),
+                "role": str(role or "user"), "seq": int(seq or 0),
+                "ts": time.time(),
+            })
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] transcript publish degraded",
+                         exc_info=True)
+
     def publish_prompt_resolved(self, prompt_id: str) -> None:
         """The gate is closed — answered here, elsewhere, or expired.
 
@@ -925,6 +956,7 @@ class CockpitAttachClient:
         on_markup: Optional[Callable[[str], None]] = None,
         on_telemetry: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_prompt: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_transcript: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_prompt_resolved: Optional[Callable[[str], None]] = None,
         on_audio_state: Optional[Callable[[str], None]] = None,
         on_thermal: Optional[Callable[[str], None]] = None,
@@ -941,6 +973,7 @@ class CockpitAttachClient:
         self._on_markup = on_markup
         self._on_telemetry = on_telemetry or (lambda _m: None)
         self._on_prompt = on_prompt
+        self._on_transcript = on_transcript
         self._on_prompt_resolved = on_prompt_resolved
         self._on_audio_state = on_audio_state or (lambda _s: None)
         self._on_thermal = on_thermal or (lambda _s: None)
@@ -1121,6 +1154,14 @@ class CockpitAttachClient:
                     if self._on_prompt is not None:
                         try:
                             self._on_prompt(dict(frame))
+                        except Exception:  # noqa: BLE001
+                            pass
+                elif ftype == "transcript":
+                    # A cockpit with no handler is pre-dictation: it already
+                    # gets the finished utterance the way it always did.
+                    if self._on_transcript is not None:
+                        try:
+                            self._on_transcript(dict(frame))
                         except Exception:  # noqa: BLE001
                             pass
                 elif ftype == "prompt_resolved":
