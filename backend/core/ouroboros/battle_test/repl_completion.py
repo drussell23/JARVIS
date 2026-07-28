@@ -1879,7 +1879,7 @@ def _describe(fn: object) -> str:
         #     other, and 45 verbs were never going to get dict entries.
         operator_line = extract_operator_section(getattr(fn, "__doc__", None))
         if operator_line:
-            return _help_bound(operator_line)
+            return _help_bound(_operator_voice(operator_line, verb))
 
         # 2. The FUNCTION docstring, humanised — accepted only if it survives
         #    as prose.
@@ -1893,7 +1893,14 @@ def _describe(fn: object) -> str:
         #    yet"; plausible noise is not.
         own = _first_line(getattr(fn, "__doc__", ""))
         if own:
-            return _help_bound(own)
+            # Normalised to the OPERATOR's voice. A docstring is written for
+            # an implementer and it shows — "Parse /breadcrumbs and set/show
+            # the feed verbosity" opens with the verb the FUNCTION performs
+            # and then repeats the verb name, which is already the left-hand
+            # column. Subtractive only: no word appears that the author did
+            # not write, because a palette that paraphrases can be
+            # confidently wrong and the operator acts on it.
+            return _help_bound(_operator_voice(own, verb))
 
         # 3. No prose anywhere — mine the verb's own SUBCOMMAND VOCABULARY.
         #
@@ -1905,7 +1912,11 @@ def _describe(fn: object) -> str:
         #    not used, and it was sitting unread in the source.
         mined = mine_subcommands(fn)
         if mined:
-            return _help_bound(" | ".join(mined))
+            # A middot reads as a LIST of options; a pipe reads as grammar
+            # borrowed from a usage string. This row is not a usage string —
+            # it is the honest answer to "nobody wrote a description, but the
+            # verb does accept these".
+            return _help_bound(" · ".join(mined))
 
         # 4. No prose anywhere. The SIGNATURE still knows what the verb
         #    takes, and "what arguments does this want" is most of what an
@@ -1928,6 +1939,17 @@ def _describe(fn: object) -> str:
 
 
 @contextlib.contextmanager
+def _operator_voice(text: str, verb: str) -> str:
+    """Normalise a description to the operator's voice. Degrades to *text*."""
+    try:
+        from backend.core.ouroboros.battle_test.verb_description import (
+            to_operator_voice,
+        )
+        return to_operator_voice(text, verb) or text
+    except Exception:  # noqa: BLE001
+        return text
+
+
 def _root_logging_preserved():
     """Hold the root logger harmless across an arbitrary-module import walk.
 
