@@ -293,6 +293,24 @@ def test_rewind_completer_offers_undo_verbs_only_while_armed() -> None:
     assert [c.text for c in completions] == ["/undo 1", "/undo 2"]
 
 
+def test_outer_merged_completers_speak_the_async_protocol() -> None:
+    """prompt_toolkit consumes OUTER-merged completers through
+    ``get_completions_async`` — only the ``Completer`` base supplies it.
+    A duck-typed completer passes every direct test and raises
+    AttributeError on the first REAL keystroke (history_search learned
+    this live). Pin every completer we merge at the outer level."""
+    pytest.importorskip("prompt_toolkit")
+    from backend.core.ouroboros.battle_test.history_search import (
+        HistoryCompleter,
+        HistorySearchController,
+    )
+    for completer in (
+        rm.RewindCompleter(rm.RewindController(_FakeClient())),
+        HistoryCompleter(HistorySearchController(), None),
+    ):
+        assert hasattr(completer, "get_completions_async"), type(completer)
+
+
 def test_master_flag_off_takes_no_hold(monkeypatch) -> None:
     monkeypatch.setenv(rm.MASTER_FLAG_ENV_VAR, "false")
     client = _FakeClient()
