@@ -188,6 +188,7 @@ def _render_stats() -> str:
 def dispatch_bus_command(
     line: str,
 ) -> BusReplDispatchResult:
+    """L1 command bus throughput and counters."""
     if not _matches(line):
         return BusReplDispatchResult(
             ok=False, text="", matched=False,

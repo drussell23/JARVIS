@@ -327,6 +327,7 @@ def _render_stats() -> str:
 def dispatch_graph_command(
     line: str,
 ) -> GraphReplDispatchResult:
+    """L3 execution graph — units, edges and stats."""
     if not _matches(line):
         return GraphReplDispatchResult(
             ok=False, text="", matched=False,
