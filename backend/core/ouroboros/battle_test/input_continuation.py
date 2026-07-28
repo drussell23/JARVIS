@@ -180,8 +180,11 @@ def install_newline_binding(kb: Any) -> bool:
             from backend.core.ouroboros.battle_test.keymap import (
                 bind_action,
             )
+            # Ctrl+J rides along (CC parity): it works in EVERY terminal
+            # with zero setup, where Alt+Enter needs Option-as-Meta on
+            # macOS. Two spellings, one action, both remappable.
             if not bind_action(
-                kb, "chat:newline", ("alt+enter",), _newline,
+                kb, "chat:newline", ("alt+enter", "ctrl+j"), _newline,
                 context="Chat",
                 description="insert a newline without submitting",
             ):

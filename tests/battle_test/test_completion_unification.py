@@ -183,8 +183,13 @@ def test_wiring_uses_the_unified_registry() -> None:
 # 5. one mention completer per surface (gap #4)
 # --------------------------------------------------------------------------
 
-def test_include_mentions_false_returns_bare_slash_completer() -> None:
+def test_include_mentions_false_returns_bare_slash_completer(
+    monkeypatch,
+) -> None:
     pytest.importorskip("prompt_toolkit")
+    # Emoji is its own (always-merged, self-gating) source — silence it
+    # so this pins exactly the MENTION dedupe contract.
+    monkeypatch.setenv("JARVIS_EMOJI_SHORTCODES_ENABLED", "false")
     reg = rc.VerbRegistry(verbs=(
         rc.VerbDescriptor(slash_form="/x", handler_method="", description=""),
     ))

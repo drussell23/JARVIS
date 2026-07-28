@@ -1383,22 +1383,36 @@ def build_completer(
     # repo-rooted MentionPathCompleter) — without it the attach
     # surface ran BOTH mention completers and every `@` prefix
     # yielded duplicate candidates.
-    if not include_mentions:
-        return slash_completer
+    # `:emoji:` shortcodes ride every surface's chain — self-gating on
+    # the `:name` fragment, so verbs, mentions and emoji never collide.
+    extra_completers = []
     try:
-        from backend.core.ouroboros.battle_test.repl_input_polish import (
-            build_mention_completer,
+        from backend.core.ouroboros.battle_test.emoji_shortcodes import (
+            EmojiShortcodeCompleter,
+            is_emoji_shortcodes_enabled,
         )
-        mention_completer = build_mention_completer()
-    except Exception:  # noqa: BLE001 — defensive
-        mention_completer = None
-    if mention_completer is None:
+        if is_emoji_shortcodes_enabled():
+            extra_completers.append(EmojiShortcodeCompleter())
+    except Exception:  # noqa: BLE001 — emoji are decoration, typing is not
+        pass
+
+    if include_mentions:
+        try:
+            from backend.core.ouroboros.battle_test.repl_input_polish import (
+                build_mention_completer,
+            )
+            mention_completer = build_mention_completer()
+            if mention_completer is not None:
+                extra_completers.append(mention_completer)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+    if not extra_completers:
         return slash_completer
     try:
         from prompt_toolkit.completion import merge_completers
     except ImportError:
         return slash_completer
-    return merge_completers([slash_completer, mention_completer])
+    return merge_completers([slash_completer, *extra_completers])
 
 
 # ===========================================================================

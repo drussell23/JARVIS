@@ -260,8 +260,11 @@ def test_describe_flags_unknown_config_actions(config_file) -> None:
     ]})
     info = km.describe_keymap()
     assert any("unknown action" in w for w in info["warnings"])
+    # The catalog is process-global and first-registration-wins; other
+    # suites may have registered chat:newline with its full default set
+    # (alt+enter + ctrl+j). Pin membership, not an exact tuple.
     row = next(r for r in info["actions"] if r["action"] == "chat:newline")
-    assert row["keys"] == ("escape enter",)
+    assert "escape enter" in row["keys"]
     assert row["customized"] is False
 
 
