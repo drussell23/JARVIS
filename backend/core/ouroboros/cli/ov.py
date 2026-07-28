@@ -1494,6 +1494,15 @@ async def _split_plane_loop(
         # typed at the daemon REPL suggests here and vice versa.
         history=_history,
         auto_suggest=_build_prompt_auto_suggest(),
+        # Up PREFIX-FILTERS on what has already been typed instead of walking
+        # the whole file. Without it a 2000-entry history is technically
+        # recallable and practically unusable — the operator presses Up
+        # eleven times looking for a goal they typed this morning.
+        enable_history_search=True,
+        # Ctrl+X Ctrl+E — readline's "finish this in $EDITOR". It matters
+        # most for exactly the long multi-line goals the prompt now accepts,
+        # where the terminal's one-line editing model runs out.
+        enable_open_in_editor=True,
         # Multi-line, with the CONDITION applied to the buffer below — the
         # same two-step the cockpit uses, from the same module, so the two
         # surfaces cannot disagree about when Enter means "go".
@@ -1892,6 +1901,16 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
                 install_newline_binding,
             )
             install_newline_binding(kb)
+        except Exception:  # noqa: BLE001
+            pass
+        # Ctrl+S parks a draft. Bound on BOTH surfaces from one definition,
+        # because a feature wired to one while the operator types into the
+        # other is the defect this codebase keeps finding.
+        try:
+            from backend.core.ouroboros.battle_test.draft_stash import (
+                install_stash_binding,
+            )
+            install_stash_binding(kb, _prompt_buffer)
         except Exception:  # noqa: BLE001
             pass
         return kb
