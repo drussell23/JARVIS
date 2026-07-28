@@ -685,6 +685,16 @@ def build_bipartite_application(
             install_history_search(kb, _hist_controller)
         except Exception:  # noqa: BLE001
             pass
+    # Ctrl+S parks a half-written goal so the operator can check something
+    # and come back to it — the prompt accepts paragraphs now, which makes it
+    # worth interrupting.
+    try:
+        from backend.core.ouroboros.battle_test.draft_stash import (
+            install_stash_binding,
+        )
+        install_stash_binding(kb, lambda: prompt.buffer)
+    except Exception:  # noqa: BLE001
+        pass
     # Scrollback keys. In the alternate screen the terminal no longer offers
     # its own, so these ARE the scrollback — not a convenience layered on it.
     try:
