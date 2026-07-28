@@ -2158,7 +2158,22 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
         _latch = _audio.get("latch") if isinstance(_audio, dict) else None
         if _latch is not None:
             from backend.core.ouroboros.ui.ptt_router import build_ptt_key_bindings
-            _ptt_kb = build_ptt_key_bindings(_latch)
+            # HOLD-TO-TALK. A TTY sends no key-release, but the OS repeats a
+            # held key — so a hold is a RATE and a release is that rate
+            # stopping. The detector is created here and owned by the binding
+            # for the life of the cockpit, because its whole state is the
+            # arrival times of previous keystrokes; a fresh one per press
+            # would have nothing to compare against.
+            _hold = None
+            try:
+                from backend.core.ouroboros.ui.hold_to_talk import (
+                    HoldDetector, hold_to_talk_enabled,
+                )
+                if hold_to_talk_enabled():
+                    _hold = HoldDetector()
+            except Exception:  # noqa: BLE001 — toggle still works without it
+                _hold = None
+            _ptt_kb = build_ptt_key_bindings(_latch, detector=_hold)
     except Exception:  # noqa: BLE001 — no PTT is survivable; a broken app is not
         _ptt_kb = None
 
