@@ -210,6 +210,83 @@ def test_cockpit_app_constructs_with_toolbar():
     assert app2 is not None
 
 
+def _row_order(app) -> list:
+    """The root HSplit's children, flattened to a list of ids.
+
+    Walks containers rather than asserting on a fixed index: the palette
+    overlay, the header and the turn row all come and go, and a test pinned to
+    `rows[3]` would break on a change that moved nothing the operator sees.
+    """
+    seen = []
+
+    def _walk(node):
+        seen.append(node)
+        for attr in ("children", "content", "container"):
+            child = getattr(node, attr, None)
+            if isinstance(child, (list, tuple)):
+                for c in child:
+                    _walk(c)
+            elif child is not None and child is not node:
+                _walk(child)
+
+    _walk(app.layout.container)
+    return seen
+
+
+def test_the_pulse_sits_above_the_prompt():
+    """Operator mandate 2026-07-28: the snake goes ABOVE the `❯`.
+
+    prompt_toolkit's `bottom_toolbar` idiom puts the liveness row under the
+    input, which is where a SHELL puts its chrome. Claude Code puts the pulse
+    immediately above the box, continuing the transcript line it belongs to.
+    """
+    from backend.core.ouroboros.battle_test.bipartite_layout import (
+        BipartiteLayout, build_bipartite_application,
+    )
+    app = build_bipartite_application(
+        BipartiteLayout(width=80, height=20),
+        on_accept=lambda t: None, toolbar=lambda: "PULSE-SENTINEL",
+    )
+    nodes = _row_order(app)
+    # The prompt is located by IDENTITY, not by its `❯`: the caret lives on a
+    # BufferControl's prompt margin, so a text scan finds the toolbar and
+    # silently reports the input row missing.
+    prompt_window = app.layout.current_window
+    assert prompt_window in nodes, "the focused prompt is not in the layout"
+    caret = nodes.index(prompt_window)
+
+    pulse = None
+    for i, node in enumerate(nodes):
+        text = getattr(getattr(node, "content", None), "text", None)
+        if not callable(text):
+            continue
+        try:
+            if "PULSE-SENTINEL" in str(text()):
+                pulse = i
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    assert pulse is not None, "the toolbar row never rendered"
+    assert pulse < caret, (
+        "the pulse rendered BELOW the prompt — it is the organism breathing, "
+        "not terminal furniture"
+    )
+
+
+def test_the_footer_position_is_still_reachable(monkeypatch):
+    """A surface whose toolbar is genuinely a footer (persistent key hints,
+    not a pulse) keeps the old geometry behind one env flag."""
+    from backend.core.ouroboros.battle_test import bipartite_layout as bl
+
+    monkeypatch.setenv("JARVIS_BIPARTITE_TOOLBAR_BELOW", "1")
+    assert bl.toolbar_above_prompt() is False
+    app = bl.build_bipartite_application(
+        bl.BipartiteLayout(width=80, height=20),
+        on_accept=lambda t: None, toolbar=lambda: "PULSE-SENTINEL",
+    )
+    assert app is not None
+
+
 # ---------------------------------------------------------------------------
 # (5) CC-style header + borderless canvas (operator mandate 2026-07-23)
 # ---------------------------------------------------------------------------

@@ -180,6 +180,24 @@ def bottom_anchor_enabled() -> bool:
     return fullscreen_enabled()
 
 
+def toolbar_above_prompt() -> bool:
+    """Does the pulse row sit above the ``❯`` input, or beneath it?
+
+    Above, by default. The toolbar carries the organism's liveness — spinner,
+    elapsed, tokens — and Claude Code puts that immediately above the input
+    box, adjacent to the transcript line it continues. prompt_toolkit's
+    ``bottom_toolbar`` idiom put it underneath, which is where a shell puts
+    ITS chrome, and the difference is whether the operator reads the pulse as
+    the organism working or as furniture.
+
+    ``JARVIS_BIPARTITE_TOOLBAR_BELOW=1`` restores the footer position for a
+    surface that genuinely wants a footer (persistent key hints rather than a
+    pulse). NEVER raises.
+    """
+    raw = os.environ.get("JARVIS_BIPARTITE_TOOLBAR_BELOW", "").strip().lower()
+    return raw not in ("1", "true", "yes", "on")
+
+
 def _canvas_max_lines() -> int:
     try:
         return canvas_history_lines()
@@ -919,7 +937,7 @@ def build_bipartite_application(
     # it shares the ambient grid with the canvas, so every asynchronous Deck or
     # Lane frame arriving underneath forces the palette's geometry to be
     # recomputed along with everything else.
-    rows += [_rule(), prompt, _rule()]
+    _toolbar_row = None
     if toolbar is not None:
         # A one-row morphing footer (e.g. the attach client's AttachUI.toolbar —
         # audio state, detach hint). Re-evaluated each repaint; a failing
@@ -943,10 +961,27 @@ def build_bipartite_application(
             except Exception:  # noqa: BLE001
                 return [("", "")]
 
-        rows.append(Window(
+        _toolbar_row = Window(
             content=FormattedTextControl(_toolbar_fragments, focusable=False),
             height=1, wrap_lines=False,
-        ))
+        )
+
+    # The pulse belongs ABOVE the input, which is where Claude Code puts it and
+    # where the eye already is: the operator is reading the newest deck line,
+    # and "still working, 42s, 33k tokens" is the continuation of that line,
+    # not a footer. Below the prompt it is separated from what it describes by
+    # the whole input frame, and it reads as terminal chrome — something the
+    # shell put there — rather than as the organism still breathing.
+    #
+    # It also keeps the geometry honest: the canvas bottom-anchors so the
+    # newest event lands against the prompt, and a row wedged underneath meant
+    # the LAST thing before the input was a status bar the deck did not own.
+    if _toolbar_row is not None and toolbar_above_prompt():
+        rows += [_toolbar_row, _rule(), prompt, _rule()]
+    else:
+        rows += [_rule(), prompt, _rule()]
+        if _toolbar_row is not None:
+            rows.append(_toolbar_row)
     # ── Region layout mount (PR #70213's seam, finally consumed) ──────
     #
     # `viewport_arbiter` has decided placements since #70187 and
