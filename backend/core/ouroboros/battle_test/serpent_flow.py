@@ -6085,9 +6085,19 @@ class SerpentREPL:
                                 )
                     except Exception:  # noqa: BLE001
                         pass
-                    _aio.ensure_future(
+                    # The turn row, daemon-side. This surface AWAITS its
+                    # own dispatch, so the close signal is exact — no
+                    # reply-frame heuristic, no timeout guessing.
+                    _spinner = getattr(self, "_turn_spinner", None)
+                    if _spinner is not None and cleaned:
+                        _spinner.open(cleaned)
+                    _fut = _aio.ensure_future(
                         self._dispatch_repl_command(cleaned)
                     )
+                    if _spinner is not None and cleaned:
+                        _fut.add_done_callback(
+                            lambda _f: _spinner.note_reply()
+                        )
 
                 async def _attach_sprite_when_ready() -> None:
                     from backend.core.ouroboros.battle_test.sprite_engine import (
@@ -6109,6 +6119,28 @@ class SerpentREPL:
                 # had all three wired at ov.py — the two-surfaces split,
                 # again. Same wiring seam the legacy PromptSession below
                 # uses (DRY), so the vocabularies cannot diverge.
+                # Daemon-cockpit turn row: the same module the attach
+                # client mounts, fed by the same heartbeat payload builder
+                # (pure pull) and writing its tombstone into the canvas.
+                try:
+                    from backend.core.ouroboros.battle_test.turn_spinner import (  # noqa: E501
+                        TurnSpinner,
+                    )
+                    from backend.core.ouroboros.battle_test.attach_heartbeat import (  # noqa: E501
+                        build_heartbeat_payload,
+                    )
+
+                    def _emit_tombstone(line: str) -> None:
+                        canvas = get_active_canvas()
+                        if canvas is not None:
+                            canvas.push_raw(line)
+
+                    self._turn_spinner = TurnSpinner(
+                        heartbeat_fn=build_heartbeat_payload,
+                        emit_fn=_emit_tombstone,
+                    )
+                except Exception:  # noqa: BLE001
+                    self._turn_spinner = None
                 _bp_wiring = None
                 try:
                     from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
@@ -6122,6 +6154,7 @@ class SerpentREPL:
                     completer=getattr(_bp_wiring, "completer", None),
                     history=getattr(_bp_wiring, "history", None),
                     auto_suggest=getattr(_bp_wiring, "auto_suggest", None),
+                    turn_spinner=getattr(self, "_turn_spinner", None),
                 )
                 return
         except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL

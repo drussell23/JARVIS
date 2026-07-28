@@ -444,7 +444,12 @@ def test_keys_daemon_subcommand_forwards() -> None:
     outcome = _route_operator_line(client, ui, "/keys daemon warnings")
     assert outcome == "sent"
     assert client.sent == ["/keys warnings"]
-    assert ui.lines == []
+    # The line DOES travel, so it earns a ❯ anchor like any other
+    # submitted message — what it must NOT do is render the CLIENT's
+    # keymap table locally, which is the thing `daemon` opted out of.
+    assert any("❯" in ln and "/keys daemon warnings" in ln
+               for ln in ui.lines)
+    assert not any("keymap —" in ln for ln in ui.lines)
 
 
 def test_daemon_cockpit_fast_path_passes_the_wiring() -> None:

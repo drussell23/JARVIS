@@ -943,7 +943,23 @@ class AttachUI:
             return ""
 
     def _pulse_line(self) -> str:
-        """The CC-style working pulse, or the idle breadcrumb."""
+        """The CC-style working pulse, or the idle breadcrumb.
+
+        A live TURN outranks the ambient pulse here. The fallback surface
+        has no container to host a turn row, so its one region answers the
+        more specific question first: what is happening to MY question,
+        then what is happening to the organism."""
+        try:
+            spinner = getattr(self, "turn_spinner", None)
+            if spinner is not None and spinner.active:
+                from backend.core.ouroboros.battle_test.turn_spinner import (
+                    _markup_to_ansi,
+                )
+                row = spinner.render()
+                if row:
+                    return "  " + _markup_to_ansi(row)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             from backend.core.ouroboros.battle_test.attach_heartbeat import (
                 format_heartbeat_line,
@@ -1357,6 +1373,16 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
                     expand_paste_chips,
                 )
                 text = expand_paste_chips(text)
+            except Exception:  # noqa: BLE001
+                pass
+            # The turn opens HERE — the one place a line is proven to be
+            # leaving for the daemon. Opening at keypress would spin for
+            # client-local verbs (/deck, /keys) that no reply is coming
+            # for; opening after send would miss a reply that beat us.
+            try:
+                spinner = getattr(ui, "turn_spinner", None)
+                if spinner is not None:
+                    spinner.open(text)
             except Exception:  # noqa: BLE001
                 pass
             if ui is not None and ui.should_flush_on_input():
@@ -2172,6 +2198,9 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
             """
             try:
                 client.send_input("/cancel")
+                spinner = getattr(ui, "turn_spinner", None)
+                if spinner is not None:
+                    spinner.close(reason="interrupted")
                 ui.flash("interrupting…", seconds=2.0)
             except Exception:  # noqa: BLE001
                 pass
@@ -2925,6 +2954,7 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             # file every surface shares, so Up-arrow survives a detach.
             history=_build_prompt_history(),
             auto_suggest=_build_prompt_auto_suggest(),
+            turn_spinner=getattr(ui, "turn_spinner", None),
             seed=[
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "
                 "plain words both work · [cyan]wake[/cyan] arms my voice · "
@@ -3066,6 +3096,15 @@ def run_attach(console: Any) -> int:
             characters. The daemon knows; it decided when it addressed the
             frame."""
             if addressed:
+                # An addressed frame IS the answer to something this
+                # cockpit asked — the honest close signal. Ambient frames
+                # (autonomous work) deliberately do NOT close a turn.
+                try:
+                    spinner = getattr(ui, "turn_spinner", None)
+                    if spinner is not None:
+                        spinner.note_reply()
+                except Exception:  # noqa: BLE001
+                    pass
                 _render_markup_frame(text, console)
                 return
             ui.on_ambient(text)
@@ -3101,6 +3140,20 @@ def run_attach(console: Any) -> int:
                 and ui.rewind.deliver(f)
             ),
         )
+        # The turn spinner — the live row bound to the operator's own
+        # question. Reads the heartbeat this UI already retains (pure
+        # pull, zero new state) and writes its tombstone through the
+        # SAME addressed markup sink every ⏺/⎿ line takes.
+        try:
+            from backend.core.ouroboros.battle_test.turn_spinner import (
+                TurnSpinner,
+            )
+            ui.turn_spinner = TurnSpinner(
+                heartbeat_fn=lambda: getattr(ui, "_heartbeat", None),
+                emit_fn=lambda line: _markup_sink(line, True),
+            )
+        except Exception:  # noqa: BLE001
+            ui.turn_spinner = None
         # The Transactional Viewport Lock's client half. Lives on the ui
         # so both attach surfaces reach it without new plumbing.
         try:
