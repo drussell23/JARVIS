@@ -642,6 +642,9 @@ class AttachUI:
         #: "recovered" event, so a badge with no decay would accuse a
         #: perfectly good headset for the rest of the session.
         self.acoustic: Any = None
+        #: Health, derived from the doctor's OWN verdicts on the hydration
+        #: frame this cockpit already receives — not a second opinion.
+        self.advisor = _build_advisor()
         #: Set once the attach client exists. LATE-BOUND for the same reason
         #: the approval narrator's emit is: the markup sink is built after the
         #: UI, so a handle captured here would be None forever.
@@ -1065,8 +1068,18 @@ class AttachUI:
         # on this line is still working. A degraded mic means the operator's
         # words are not arriving at all, and everything they try next will
         # fail for a reason they cannot see.
+        health = ""
+        try:
+            if self.advisor is not None:
+                health = self.advisor.render()
+        except Exception:  # noqa: BLE001
+            health = ""
         mic = self.acoustic_badge()
         badge = f"{mic} · {badge}" if mic and badge else (mic or badge)
+        # Health LAST in the composed line, so it survives truncation least —
+        # it is the least time-critical of the three and the only one with a
+        # dedicated verb (`ov doctor`) that recovers the full detail.
+        badge = f"{badge} · {health}" if badge and health else (badge or health)
         head = f"{badge} · " if badge else ""
         return f"{head}{audio.lstrip(' ·')}{keys} · 'detach' to leave"
 
@@ -1735,6 +1748,15 @@ def _not_composing() -> Any:
         return _cond
     except Exception:  # noqa: BLE001
         return True
+
+
+def _build_advisor() -> Any:
+    """The health advisory line, or None if unavailable."""
+    try:
+        from backend.core.ouroboros.cli.health_advisory import HealthAdvisor
+        return HealthAdvisor()
+    except Exception:  # noqa: BLE001 — a cockpit without it still attaches
+        return None
 
 
 def _build_composer() -> Any:
@@ -2416,6 +2438,16 @@ def run_attach(console: Any) -> int:
 
         def _on_hydration(payload: dict) -> None:
             _render_hydration(console, payload)
+            # Health, from the SAME frame — the doctor's own verdicts on the
+            # bytes already in hand. No second probe, no second thresholds,
+            # so the line and `ov doctor` cannot disagree.
+            try:
+                if ui.advisor is not None and ui.advisor.observe_hydration(
+                    payload,
+                ):
+                    ui.refresh()
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 state = (payload.get("audio") or {}).get("state", "")
                 if state:
