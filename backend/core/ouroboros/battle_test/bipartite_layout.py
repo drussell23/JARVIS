@@ -590,6 +590,22 @@ def build_bipartite_application(
         content=FormattedTextControl(_canvas_fragments, focusable=False),
         wrap_lines=False, height=_canvas_dimension(),
     )
+    # Ctrl+R history search rides the SAME completion menu the palette
+    # renders — a gated completer that yields nothing until the
+    # (remappable) history:search action arms it. Merged BEFORE the
+    # TextArea exists because the buffer's completer is fixed at
+    # construction.
+    _hist_controller = None
+    try:
+        from backend.core.ouroboros.battle_test.history_search import (
+            build_history_search,
+            merge_history_completer,
+        )
+        _hist_controller, _hist_completer = build_history_search(history)
+        completer = merge_history_completer(completer, _hist_completer)
+    except Exception:  # noqa: BLE001 — search is a bonus, typing is not
+        _hist_controller = None
+
     # The `/` palette. Passing a completer here is only HALF the wiring —
     # prompt_toolkit computes completions into the buffer, but draws the menu
     # as a Float, and this layout had no FloatContainer to draw it on. That is
@@ -659,6 +675,16 @@ def build_bipartite_application(
         logger.debug("[Bipartite] continuation rule degraded", exc_info=True)
 
     kb = KeyBindings()
+    # Arm/cycle history search (default Ctrl+R) + the auto-disarm watch.
+    if _hist_controller is not None:
+        try:
+            from backend.core.ouroboros.battle_test.history_search import (
+                install_history_search,
+            )
+            _hist_controller.watch(prompt.buffer)
+            install_history_search(kb, _hist_controller)
+        except Exception:  # noqa: BLE001
+            pass
     # Scrollback keys. In the alternate screen the terminal no longer offers
     # its own, so these ARE the scrollback — not a convenience layered on it.
     try:
