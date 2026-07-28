@@ -245,6 +245,27 @@ def decide_placement(
         return Placement(MUTED, reason="degraded", post=post)
 
 
+def _tint(text: str, tone: str) -> str:
+    """Colour the CHROME of a post — its glyph and its handle — and nothing else.
+
+    Deliberately narrow. The leading pad stays literal because placement math
+    upstream measures indentation with ``lstrip()``, and the body and ref stay
+    literal because a post's text is operator-supplied content that must not
+    be re-parsed as markup. Styling only the two tokens the eye scans for is
+    what lets a thread carry hierarchy without the deck growing a second
+    layout vocabulary.
+
+    Degrades to the plain token on any failure — a post rendering uncoloured
+    is a cosmetic loss; a post not rendering is a lost disagreement.
+    """
+    try:
+        from backend.core.ouroboros.ui.theme import semantic
+        style = semantic(tone)
+        return f"[{style}]{text}[/{style}]" if style else text
+    except Exception:  # noqa: BLE001
+        return text
+
+
 def render_post(post: Any, *, depth: int = 0, width: int = 78) -> List[str]:
     """The `💬` block for one post, in the nested `⎿` grammar.
 
@@ -268,10 +289,14 @@ def render_post(post: Any, *, depth: int = 0, width: int = 78) -> List[str]:
                 glyph = f"▸ {glyph}"
         pad = "  " + ("   " * max(0, int(depth)))
         lead = f"{pad}{glyph} {handle}"
+        # Room is measured on the PLAIN lead, before any styling — a clip
+        # computed against markup would count `[#3FB950]` as visible text and
+        # truncate every post by the length of its own colour tags.
         room = max(24, width - len(lead) - len(ref) - 4)
         if len(body) > room:
             body = body[: room - 1].rstrip() + "…"
-        line = f"{lead}  {body}"
+        line = f"{pad}{_tint(glyph, 'crit' if conflict else 'info')} " \
+               f"{_tint(handle, 'ink')}  {body}"
         if ref:
             line = f"{line}  {ref}"
         return [line]

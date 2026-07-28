@@ -513,12 +513,23 @@ _SEMANTIC_TRUE: Mapping[str, str] = {
     "info": "#58B0F8", "verbose": "#6C7D77", "muted": "#6C7D77",
     "ok": "#3FB950", "ok_bold": "bold #5EE06A", "venom_green": "#5EE06A",
     "venom_purple": "#A371F7", "cyan": "#43D6D0", "cyan_bold": "bold #43D6D0",
+    # The §09 ground/ink ladder, which the palette defined but nothing could
+    # ASK for. Without a resolvable name, "primary text" had to be spelled as
+    # no style at all -- and an unstyled line takes the terminal profile's
+    # foreground, so a green-on-black terminal rendered the whole deck in the
+    # one colour §08 reserves for outcomes. Naming it is what makes the
+    # dim -> ink -> accent hierarchy expressible.
+    "ink": PALETTE["ink"], "faint": PALETTE["faint"],
 }
 _SEMANTIC_STD: Mapping[str, str] = {
     "crit": "red", "crit_bold": "bold red", "warn": "yellow",
     "info": "cyan", "verbose": "bright_black", "muted": "dim",
     "ok": "green", "ok_bold": "bold green", "venom_green": "green",
     "venom_purple": "magenta", "cyan": "cyan", "cyan_bold": "bold cyan",
+    # 16 colours cannot say #DBE6E1. "default" is the honest degradation --
+    # the terminal's own foreground -- rather than picking white and fighting
+    # a palette we cannot see.
+    "ink": "default", "faint": "bright_black",
 }
 
 
