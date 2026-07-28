@@ -44,7 +44,7 @@ logger = logging.getLogger("Ouroboros.InputContinuation")
 
 __all__ = ["multiline_enabled", "wants_continuation",
            "strip_continuations", "install_newline_binding",
-           "continuation_filter"]
+           "continuation_filter", "prompt_rows", "prompt_height"]
 
 _OPENERS = {"(": ")", "[": "]", "{": "}"}
 _CLOSERS = {v: k for k, v in _OPENERS.items()}
@@ -205,3 +205,57 @@ def continuation_filter(get_text: Any) -> Any:
             return False
 
     return _cond
+
+
+def max_prompt_rows() -> int:
+    """Tallest the composing area may grow before it starts scrolling.
+
+    Env-tunable rather than fixed: how much of the screen a half-written
+    thought deserves is a matter of screen size and taste, and the deck below
+    it is what pays for the rows.
+    """
+    try:
+        return max(1, int(os.environ.get("JARVIS_INPUT_MAX_ROWS", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def prompt_rows(text: Any, cap: Optional[int] = None) -> int:
+    """How many rows this text actually needs. Always at least 1."""
+    try:
+        limit = max_prompt_rows() if cap is None else max(1, int(cap))
+        raw = str(text or "")
+        if not raw:
+            return 1
+        return max(1, min(limit, raw.count("\n") + 1))
+    except Exception:  # noqa: BLE001
+        return 1
+
+
+def prompt_height(get_text: Any, cap: Optional[int] = None) -> Any:
+    """A height callable that is EXACTLY the content's size.
+
+    Returns `Dimension.exact`, and the exactness is the whole point rather
+    than a detail. A range like ``Dimension(min=1, max=8)`` looks like "one
+    row, grow to eight if needed" and is not: `HSplit` hands each child its
+    preferred size and then distributes the LEFTOVER by weight, so any child
+    whose max exceeds its preferred absorbs slack. An empty prompt sat eight
+    rows tall as a black slab under the deck, because the layout had spare
+    rows and the prompt was willing to take them.
+
+    Pinning min == max == preferred leaves nothing to distribute into. The
+    prompt is one row while a goal is one line, grows as the operator writes,
+    and gives every other row back to the deck.
+
+    Re-evaluated per repaint — prompt_toolkit accepts a callable here — so
+    growth follows typing with no resize plumbing.
+    """
+    from prompt_toolkit.layout.dimension import Dimension
+
+    def _height() -> Any:
+        try:
+            return Dimension.exact(prompt_rows(get_text(), cap))
+        except Exception:  # noqa: BLE001 — a prompt must always have a size
+            return Dimension.exact(1)
+
+    return _height

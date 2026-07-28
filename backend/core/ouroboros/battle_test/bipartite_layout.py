@@ -36,6 +36,9 @@ from typing import Any, Callable, List, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.BipartiteLayout")
 
+from backend.core.ouroboros.battle_test.input_continuation import (
+    prompt_height,
+)
 from backend.core.ouroboros.battle_test.canvas_viewport import (
     CanvasViewport, canvas_history_lines, install_scroll_bindings,
     scrollback_enabled,
@@ -589,7 +592,13 @@ def build_bipartite_application(
         # growable branch — the falsy one hard-clamps `height = D.exact(1)`,
         # which would put the caret below the fold on line two — and the
         # buffer gets the real rule afterwards.
-        height=Dimension(min=1, max=8), multiline=True,
+        # Height is set to the CONTENT's size just below, once the buffer
+        # this reads from exists. A range here (`min=1, max=8`) reads as
+        # "one row, grow if needed" and does the opposite: HSplit hands out
+        # preferred sizes and then distributes leftover rows by weight, so a
+        # child whose max exceeds its preferred absorbs the slack — an empty
+        # prompt rendered as an eight-row black slab under the deck.
+        multiline=True,
         prompt=[("fg:#5ee06a bold", "❯ ")],
         wrap_lines=False, style="class:command-deck",
         completer=completer,
@@ -613,6 +622,10 @@ def build_bipartite_application(
             continuation_filter,
         )
         prompt.buffer.multiline = continuation_filter(lambda: prompt.buffer.text)
+        # Exactly as tall as what is typed — nothing left for HSplit to
+        # inflate. Same module as the continuation rule: how the prompt
+        # behaves while composing lives in one place.
+        prompt.window.height = prompt_height(lambda: prompt.buffer.text)
     except Exception:  # noqa: BLE001 — plain multiline still beats one line
         logger.debug("[Bipartite] continuation rule degraded", exc_info=True)
 
