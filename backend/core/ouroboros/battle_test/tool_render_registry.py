@@ -764,7 +764,7 @@ def render(
     )
     if body_eligible:
         body_lines, elided = _extract_body(
-            result_safe, max_body_lines,
+            result_safe, max_body_lines, descriptor.body_shape,
         )
 
     return RenderedToolResult(
@@ -776,34 +776,132 @@ def render(
     )
 
 
-def _extract_body(
-    result: str, max_lines: int,
-) -> Tuple[Tuple[str, ...], int]:
-    """Head + tail elision (CC pattern).
+#: Per-shape body profile: (is_noise, head_ratio).
+#:
+#: WHY A PROFILE AND NOT A SMALLER NUMBER
+#: --------------------------------------
+#: Head+tail elision is content-BLIND, so two thirds of a bash body was the
+#: first two thirds of a pytest run: `===== test session starts =====`,
+#: `collected 47 items`, a line of progress dots, a bar of `=`. Shrinking the
+#: budget keeps proportionally MORE of that, because the preamble is at the
+#: front and the budget is spent front-first.
+#:
+#: The fix is to spend the budget on lines that carry information. Noise is
+#: dropped before the budget is applied, and the split is weighted per shape:
+#: a log's answer is at the END (`3 failed, 44 passed`), a list of matches is
+#: uniform, a diff's answer is in the middle.
+#:
+#: Nothing is LOST — `BoundedBodyStore` parks the full body and the elided
+#: count includes what was denoised, so `/expand t-N` still returns every
+#: byte. This decides what is worth a row, not what is worth keeping.
+_BODY_PROFILES: Mapping[BodyShape, Tuple[Callable[[str], bool], float]] = {}
 
-    Returns ``(body_lines, elided_count)``. When the source fits in
-    the budget no truncation marker is inserted. When the source
-    exceeds budget, head + tail are kept and a single ``…`` marker
-    line replaces the elided middle. The marker counts toward the
-    budget so total line count never exceeds ``max_lines``.
+
+def _is_log_noise(line: str) -> bool:
+    """Lines a pytest / build log spends on itself.
+
+    Separator bars, the collection banner, and the progress-dot line are
+    scaffolding around the result — none of them survives being read. The
+    dots line is deliberately matched by SHAPE rather than by pytest's name
+    for it, so a build tool with the same habit is covered too.
+    """
+    try:
+        text = line.strip()
+        if not text:
+            return True
+        # A RULED line — mostly separator characters, whether or not it has a
+        # title embedded in it.
+        #
+        # Matching only bare bars missed `===== test session starts =====`
+        # and `_____ test_scoped_paths _____`, which are the ones a log
+        # actually spends its rows on. The rule is information DENSITY, not a
+        # vocabulary: a line that is three-quarters punctuation is a divider
+        # whatever it says, and what it labels is on the next line anyway.
+        if len(text) >= 8:
+            content = text.strip("=-_~ \t")
+            if len(content) <= len(text) * 0.4:
+                return True
+        # `tests/foo.py ..F..F......F...` — a path then only progress marks.
+        tail = text.rsplit(" ", 1)[-1]
+        if len(tail) >= 8 and set(tail) <= set(".FEsxX"):
+            return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_diff_noise(line: str) -> bool:
+    """`--- a/path` and `+++ b/path`.
+
+    The header already says which file this is — `⏺ Update(risk_tier_floor
+    .py)` — so the unified-diff preamble restates it twice at two rows a
+    block. The `@@` hunk header stays: it says WHERE, which the header does
+    not.
+    """
+    try:
+        text = line.lstrip()
+        return text.startswith("--- ") or text.startswith("+++ ")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _no_noise(_line: str) -> bool:
+    return False
+
+
+def _body_profile(shape: object) -> Tuple[Callable[[str], bool], float]:
+    """``(is_noise, head_ratio)`` for a body shape. NEVER raises."""
+    try:
+        if shape is BodyShape.LOG:
+            # Tail-weighted: a run's verdict is its last line.
+            return _is_log_noise, 0.35
+        if shape is BodyShape.DIFF:
+            return _is_diff_noise, 0.55
+        # Matches and code are uniform — no line is more the answer.
+        return _no_noise, 0.66
+    except Exception:  # noqa: BLE001
+        return _no_noise, 0.66
+
+
+def _extract_body(
+    result: str, max_lines: int, shape: object = None,
+) -> Tuple[Tuple[str, ...], int]:
+    """Denoise, then head + tail elision (CC pattern).
+
+    Returns ``(body_lines, elided_count)``. The count is what the operator
+    is NOT seeing — denoised plus elided — so the marker stays true and
+    ``/expand`` remains the honest escape hatch.
     """
     lines = result.splitlines()
+    total = len(lines)
+
+    is_noise, head_ratio = _body_profile(shape)
+    if is_noise is not _no_noise:
+        kept = [ln for ln in lines if not is_noise(ln)]
+        # A filter that empties the body has told us the predicate is wrong
+        # for this content, not that the content was worthless.
+        if kept:
+            lines = kept
+
     if len(lines) <= max_lines:
-        return tuple(lines), 0
+        # Denoising alone may have brought it under budget — the operator is
+        # still not seeing everything, and the count says so.
+        return tuple(lines), max(0, total - len(lines))
 
     # Reserve 1 slot for the truncation marker.
     payload = max_lines - 1
     if payload < 2:
         # Degenerate budget — just return head, no marker.
-        return tuple(lines[:max_lines]), len(lines) - max_lines
+        return tuple(lines[:max_lines]), total - max_lines
 
-    head_count = max(1, (payload * 2) // 3)
+    head_count = max(1, int(payload * head_ratio))
     tail_count = payload - head_count
     if tail_count < 1:
         tail_count = 1
         head_count = payload - 1
 
-    elided = len(lines) - head_count - tail_count
+    shown = head_count + tail_count
+    elided = total - shown
     marker = f"… +{elided} more line{'s' if elided != 1 else ''} elided …"
     return (
         (*lines[:head_count], marker, *lines[-tail_count:]),
