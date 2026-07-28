@@ -162,6 +162,22 @@ def _env_floor() -> Optional[str]:
     ``"blocked"`` (case-insensitive).
     """
     raw = _norm_tier(os.environ.get(_ENV_MIN_TIER, ""))
+    # The SESSION floor (Shift+Tab) composes here, as one more candidate for
+    # the strictest-wins resolution below — never as an override of it. That
+    # is what makes a keystroke structurally incapable of loosening anything:
+    # if the env demands a stricter tier, the env still wins, exactly as it
+    # does against paranoia mode and quiet hours.
+    try:
+        from backend.core.ouroboros.governance.session_risk_floor import (
+            session_floor,
+        )
+        session = _norm_tier(session_floor() or "")
+        if session and session in get_active_tier_order():
+            order = get_active_tier_order()
+            if not raw or order.get(session, -1) > order.get(raw, -1):
+                raw = session
+    except Exception:  # noqa: BLE001 — a floor must never fail open
+        pass
     if not raw:
         return None
     if raw not in get_active_tier_order():
