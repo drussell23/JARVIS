@@ -463,6 +463,32 @@ def _escape(text: str) -> str:
 # ===========================================================================
 
 
+def _arg_colour(
+    arg_kind: str, palette: Optional[Mapping[str, str]],
+) -> str:
+    """Style for a tool's ARGUMENT, chosen by what the argument IS.
+
+    Every argument used to take the file style, because the only descriptors
+    reaching this branch were file tools. Once every tool routed through it,
+    `Bash(python3 -m pytest …)` and `Search("except Exception")` came out
+    blue-underlined — the convention this deck uses for a path you can open.
+    A command is not a location, and underlining one invites a click that
+    goes nowhere.
+
+    Falls back to the file style for an unknown kind, matching the behaviour
+    of every descriptor written before `arg_kind` existed.
+    """
+    try:
+        return {
+            "path": _palette_value(palette, "file"),
+            "command": _palette_value(palette, "dim"),
+            "text": _palette_value(palette, "dim"),
+            "url": _palette_value(palette, "file"),
+        }.get(str(arg_kind or ""), _palette_value(palette, "file"))
+    except Exception:  # noqa: BLE001
+        return _palette_value(palette, "file")
+
+
 def _compose_header(
     rendered_header: str,
     descriptor_cc_verb: Optional[str],
@@ -470,6 +496,7 @@ def _compose_header(
     status_enum: ToolStatus,
     palette: Optional[Mapping[str, str]],
     tool_name: str = "",
+    arg_kind: str = "text",
 ) -> str:
     """Build the Rich-markup header line.
 
@@ -500,7 +527,7 @@ def _compose_header(
         # rendered_header looks like "Read(foo.py)" — split into verb
         # + path-in-parens so we can colour each piece independently.
         verb_color = _palette_value(palette, "neural")
-        file_color = _palette_value(palette, "file")
+        arg_color = _arg_colour(arg_kind, palette)
         # Find the parens; if not present (defensive), fall back to dim.
         lparen = rendered_header.find("(")
         rparen = rendered_header.rfind(")")
@@ -509,7 +536,7 @@ def _compose_header(
             inner = rendered_header[lparen + 1 : rparen]
             return (
                 f"[{verb_color}]⏺ {verb}[/{verb_color}]"
-                f"([{file_color}]{_escape(inner)}[/{file_color}])"
+                f"([{arg_color}]{_escape(inner)}[/{arg_color}])"
                 f"{duration_part}{status_part}"
             )
         # Fall-through: emit as a plain neural-coloured header
@@ -523,7 +550,7 @@ def _compose_header(
     # and a distinct layout for it tells the operator about our descriptor
     # table rather than about their work.
     verb_color = _palette_value(palette, "neural")
-    file_color = _palette_value(palette, "file")
+    file_color = _arg_colour(arg_kind, palette)
     lparen = rendered_header.find("(")
     rparen = rendered_header.rfind(")")
     inner = rendered_header[lparen + 1 : rparen] if 0 < lparen < rparen else ""
@@ -753,6 +780,7 @@ def compose(
         # MCP-forwarded call rendered as `Default(#eng)`. This layer has
         # the real name and is the only one that does.
         tool_name=str(tool_name or ""),
+        arg_kind=getattr(descriptor, "arg_kind", "text"),
     )
 
     body_present = bool(rendered.body_lines)

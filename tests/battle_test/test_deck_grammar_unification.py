@@ -123,3 +123,45 @@ class TestTheGlyphIsCanonical:
     def test_status_failure_is_marked(self):
         out = compose("bash", "cmd", "boom", status=ToolStatus.ERROR)
         assert "✗" in _plain(out.header_markup)
+
+
+class TestArgumentsAreStyledByWhatTheyARE:
+    """A regression introduced by the unification itself.
+
+    Routing every tool through the CC-verb branch also routed every argument
+    through the FILE style, because the only descriptors that had ever
+    reached that branch were file tools. `Bash(python3 -m pytest …)` and
+    `Search("except Exception")` came out blue-underlined — this deck's
+    convention for a path you can open — inviting a click that goes nowhere.
+    """
+
+    def test_a_path_still_looks_like_a_path(self):
+        out = compose("read_file", "governance/risk_tier_floor.py", "x")
+        assert "underline" in out.header_markup
+
+    @pytest.mark.parametrize("kind,arg", [
+        ("bash", "python3 -m pytest -q"),
+        ("search_code", "except Exception"),
+        ("type_check", "mypy backend/"),
+    ])
+    def test_a_command_or_pattern_does_NOT(self, kind, arg):
+        out = compose(kind, arg, "x")
+        assert "underline" not in out.header_markup, (
+            f"{kind} argument styled as a clickable path"
+        )
+
+    def test_every_descriptor_declares_what_its_argument_is(self):
+        """Data, not a code path — the same shape as the verbs."""
+        for kind, desc in _DESCRIPTORS.items():
+            assert desc.arg_kind in ("path", "command", "text", "url"), (
+                f"{kind} has arg_kind={desc.arg_kind!r}"
+            )
+
+    def test_an_unknown_kind_degrades_to_the_old_behaviour(self):
+        """Every descriptor written before `arg_kind` existed behaved as a
+        file tool; an unrecognised value must keep doing that rather than
+        rendering unstyled."""
+        from backend.core.ouroboros.battle_test.tool_render_view import (
+            _arg_colour,
+        )
+        assert _arg_colour("nonsense", None) == _arg_colour("path", None)
