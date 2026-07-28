@@ -202,3 +202,41 @@ def test_the_terminal_renders_one_row_for_an_empty_prompt(
     assert "EMPTY=1" in proc.stdout, "the empty prompt is a slab again"
     assert "ONE=1" in proc.stdout
     assert "THREE=3" in proc.stdout
+
+
+# --------------------------------------------------------------------------
+# mouse capture — the trade it makes
+# --------------------------------------------------------------------------
+
+def test_the_cockpit_captures_the_mouse_when_it_owns_the_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.core.ouroboros.battle_test.bipartite_layout import (
+        mouse_enabled,
+    )
+
+    monkeypatch.delenv("JARVIS_DISABLE_MOUSE", raising=False)
+    monkeypatch.setenv("JARVIS_BIPARTITE_FULLSCREEN", "1")
+    assert mouse_enabled() is True
+    monkeypatch.setenv("JARVIS_BIPARTITE_FULLSCREEN", "0")
+    assert mouse_enabled() is False, (
+        "capturing the mouse without a scrollable deck takes the terminal's "
+        "own selection away and gives nothing back"
+    )
+
+
+def test_the_mouse_can_be_declined_on_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capturing the mouse stops the terminal's native click-and-drag
+    selection — the most common friction point of a full-screen TUI. An
+    operator who selects more than they scroll keeps the rendering and drops
+    the capture."""
+    from backend.core.ouroboros.battle_test.bipartite_layout import (
+        fullscreen_enabled, mouse_enabled,
+    )
+
+    monkeypatch.setenv("JARVIS_BIPARTITE_FULLSCREEN", "1")
+    monkeypatch.setenv("JARVIS_DISABLE_MOUSE", "1")
+    assert mouse_enabled() is False
+    assert fullscreen_enabled() is True, "rendering is kept either way"

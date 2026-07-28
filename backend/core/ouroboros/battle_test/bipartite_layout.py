@@ -62,6 +62,21 @@ def bipartite_enabled() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+def mouse_enabled() -> bool:
+    """Should the cockpit capture mouse events?
+
+    Follows the alt-screen decision — without it the deck is not a scrollable
+    viewport and there is nothing for the wheel to move.
+    ``JARVIS_DISABLE_MOUSE=1`` opts out on its own, for anyone who relies on
+    native click-and-drag selection.
+    """
+    if os.environ.get("JARVIS_DISABLE_MOUSE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        return False
+    return fullscreen_enabled()
+
+
 def _real_tty() -> bool:
     """A real interactive terminal, via the canonical helper.
 
@@ -818,11 +833,17 @@ def build_bipartite_application(
 
     app = Application(
         layout=PTLayout(root, focused_element=prompt),
-        # NOT unconditionally full-screen. The alternate screen buffer
-        # disables the terminal's native scrollback, which is the surface
-        # best placed to hold history — see `fullscreen_enabled`.
+        # Full-screen on a real terminal — the canvas holds the history the
+        # alternate screen takes away (see `fullscreen_enabled`).
         key_bindings=kb, full_screen=fullscreen_enabled(),
-        mouse_support=False,
+        # The wheel scrolls the deck. Capturing the mouse is a real trade:
+        # the terminal's own click-and-drag selection stops working while an
+        # application owns mouse events, which is the single most common
+        # friction point of a full-screen TUI. So it follows the alt-screen
+        # decision (there is nothing to scroll without it) and can be turned
+        # off on its own by an operator who selects text more than they
+        # scroll — keeping the flicker-free rendering either way.
+        mouse_support=mouse_enabled(),
         refresh_interval=0.1,
         **({"style": _style} if _style is not None else {}),
         **({"color_depth": _depth} if _depth is not None else {}),
