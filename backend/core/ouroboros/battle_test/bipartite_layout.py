@@ -77,6 +77,23 @@ def mouse_enabled() -> bool:
     return fullscreen_enabled()
 
 
+def _shared_history() -> Any:
+    """The history BOTH surfaces read and write, or None.
+
+    A TextArea otherwise gets the bare `InMemoryHistory` prompt_toolkit hands
+    every widget: empty at start, gone at exit. Up recalled nothing, and
+    `Ctrl+R` — which prompt_toolkit has been providing all along — searched an
+    empty list.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.input_history import (
+            shared_history,
+        )
+        return shared_history()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _real_tty() -> bool:
     """A real interactive terminal, via the canonical helper.
 
@@ -594,6 +611,12 @@ def build_bipartite_application(
     # why the completer built in D5 yielded 76 correct verbs and the operator
     # saw nothing: the menu had nowhere to exist.
     prompt = TextArea(
+        # History at CONSTRUCTION, not assigned afterwards. A Buffer builds
+        # its `_working_lines` from whatever history it was given when it
+        # was created, so a later assignment swaps the object without
+        # repopulating what Up walks — the history is then present,
+        # correct, and unreachable.
+        history=_shared_history(),
         # Multi-line, with the CONDITION applied to the buffer just below.
         #
         # The old `multiline=False` did not only stop the operator typing a
@@ -641,10 +664,20 @@ def build_bipartite_application(
         # inflate. Same module as the continuation rule: how the prompt
         # behaves while composing lives in one place.
         prompt.window.height = prompt_height(lambda: prompt.buffer.text)
+        prompt.buffer.load_history_if_not_yet_loaded()
     except Exception:  # noqa: BLE001 — plain multiline still beats one line
         logger.debug("[Bipartite] continuation rule degraded", exc_info=True)
 
     kb = KeyBindings()
+    # Up/Down: history from the first line, cursor movement inside a
+    # paragraph. `auto_up`/`auto_down` encode exactly that rule.
+    try:
+        from backend.core.ouroboros.battle_test.input_history import (
+            install_history_bindings,
+        )
+        install_history_bindings(kb, lambda: prompt.buffer)
+    except Exception:  # noqa: BLE001
+        pass
     # Scrollback keys. In the alternate screen the terminal no longer offers
     # its own, so these ARE the scrollback — not a convenience layered on it.
     try:

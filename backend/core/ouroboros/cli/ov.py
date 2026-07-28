@@ -1457,6 +1457,18 @@ async def _split_plane_loop(
         # same two-step the cockpit uses, from the same module, so the two
         # surfaces cannot disagree about when Enter means "go".
         multiline=True,
+        # THE SAME history object the cockpit uses — one file, both surfaces,
+        # so a goal typed on either is recallable from the other. Without
+        # this the session had no history at all: Up recalled nothing and
+        # Ctrl+R (a prompt_toolkit built-in, always live) searched an empty
+        # list. `enable_history_search` makes Up prefix-filter on what has
+        # already been typed, which is what makes a long history usable.
+        history=_shared_history(),
+        enable_history_search=True,
+        # Ctrl+X Ctrl+E — the readline-native "finish this in $EDITOR",
+        # which matters most for exactly the long multi-line goals the
+        # prompt now accepts.
+        enable_open_in_editor=True,
         # The SAME Style the bipartite cockpit uses. Without it
         # prompt_toolkit paints its default filled light-grey listbox — the
         # loudest thing on a dark screen, and the exact look #70121 removed
@@ -1748,6 +1760,17 @@ def _not_composing() -> Any:
         return _cond
     except Exception:  # noqa: BLE001
         return True
+
+
+def _shared_history() -> Any:
+    """The history both surfaces share. None degrades to no history."""
+    try:
+        from backend.core.ouroboros.battle_test.input_history import (
+            shared_history,
+        )
+        return shared_history()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _build_advisor() -> Any:
