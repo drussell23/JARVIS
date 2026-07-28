@@ -232,7 +232,22 @@ class StatusLineBuilder:
             return ""
         try:
             snap = self.snapshot()
-            return _format_plain(snap, compact=compact_mode_enabled())
+            rendered = _format_plain(snap, compact=compact_mode_enabled())
+            # The trust dial's chip — appended at THIS seam because every
+            # surface (daemon toolbar, attach heartbeat, both cockpits)
+            # mirrors this one line, so a Shift+Tab in any pane shows in
+            # all of them within a heartbeat. Empty at the safe_auto
+            # resting state so the line stays calm.
+            try:
+                from backend.core.ouroboros.governance.trust_repl import (
+                    floor_chip,
+                )
+                chip = floor_chip()
+                if chip:
+                    rendered = f"{rendered} · {chip}" if rendered else chip
+            except Exception:  # noqa: BLE001
+                pass
+            return rendered
         except Exception:  # noqa: BLE001
             logger.debug(
                 "[StatusLine] plain render failed", exc_info=True,

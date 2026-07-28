@@ -216,6 +216,8 @@ class CockpitAttachBridge:
         replay_provider: Optional[Callable[[], Any]] = None,
         on_input: Optional[Callable[[str], None]] = None,
         on_audio: Optional[Callable[[str], None]] = None,
+        on_autonomy: Optional[Callable[[str], None]] = None,
+        rewind_provider: Optional[Callable[[int], Any]] = None,
         path: Optional[Path] = None,
     ) -> None:
         self._status = status_provider or (lambda: {})
@@ -231,6 +233,21 @@ class CockpitAttachBridge:
         self._replay = replay_provider or (lambda: [])
         self._on_input = on_input or (lambda _t: None)
         self._on_audio = on_audio or (lambda _c: None)
+        #: The Transactional Viewport Lock's execution seam: called with
+        #: "pause" on the FIRST hold and "resume" when the LAST hold
+        #: releases. The harness wires this to the same intake pause the
+        #: pause/resume verbs use — one implementation, two entrances.
+        self._on_autonomy = on_autonomy or (lambda _a: None)
+        #: rewind_provider(limit) → serializable candidate list for the
+        #: Esc-Esc menu. Supplied by the harness from the EXISTING /undo
+        #: planner — this bridge never touches git.
+        self._rewind = rewind_provider or (lambda _n: [])
+        #: session → monotonic deadline. A REFCOUNT, not a flag: two panes
+        #: may hold rewind menus at once, and autonomy resumes only when
+        #: the last hold releases. The TTL is the dead-client failsafe —
+        #: an operator's crashed terminal must never freeze the organism
+        #: forever; _drop() also releases synchronously on disconnect.
+        self._autonomy_holds: Dict[str, float] = {}
         #: Does the input sink accept the originating session?
         #:
         #: Decided ONCE, by inspection. The obvious alternative — call with
@@ -465,6 +482,151 @@ class CockpitAttachBridge:
                 loop.call_soon_threadsafe(self._broadcast, msg)
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] markup publish degraded", exc_info=True)
+
+    # ---- the Transactional Viewport Lock (autonomy pause refcount) ----
+
+    @staticmethod
+    def _autonomy_ttl_s() -> float:
+        """Dead-holder failsafe. A crashed terminal releases via _drop;
+        this covers the one it can't — a client alive on the socket but
+        wedged with its menu open. Env: JARVIS_AUTONOMY_LOCK_TTL_S."""
+        try:
+            return max(5.0, float(
+                os.environ.get("JARVIS_AUTONOMY_LOCK_TTL_S", "120"),
+            ))
+        except (TypeError, ValueError):
+            return 120.0
+
+    def _sweep_autonomy_holds(self) -> None:
+        now = time.monotonic()
+        for sid, deadline in list(self._autonomy_holds.items()):
+            if deadline <= now:
+                del self._autonomy_holds[sid]
+
+    def _autonomy_ctl(self, action: str, session: Optional[str]) -> None:
+        """One pause/resume request from one cockpit. Refcounted: the
+        daemon's execution intake pauses on the FIRST hold and resumes on
+        the LAST release — pane B's open rewind menu keeps the world
+        frozen even after pane A closes hers. Every transition (and every
+        no-op re-assert) re-broadcasts autonomy_state so all panes agree.
+        NEVER raises."""
+        try:
+            sid = str(session or "").strip() or "?anonymous"
+            was_held = bool(self._autonomy_holds)
+            self._sweep_autonomy_holds()
+            if action == "pause":
+                self._autonomy_holds[sid] = (
+                    time.monotonic() + self._autonomy_ttl_s()
+                )
+            elif action == "resume":
+                self._autonomy_holds.pop(sid, None)
+            else:
+                return
+            now_held = bool(self._autonomy_holds)
+            if now_held and not was_held:
+                self.stats["autonomy_pauses"] = (
+                    self.stats.get("autonomy_pauses", 0) + 1
+                )
+                try:
+                    self._on_autonomy("pause")
+                except Exception:  # noqa: BLE001
+                    logger.debug("[CockpitAttach] pause sink degraded",
+                                 exc_info=True)
+            elif was_held and not now_held:
+                try:
+                    self._on_autonomy("resume")
+                except Exception:  # noqa: BLE001
+                    logger.debug("[CockpitAttach] resume sink degraded",
+                                 exc_info=True)
+            self.publish_autonomy_state()
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] autonomy ctl degraded",
+                         exc_info=True)
+
+    def publish_autonomy_state(self) -> None:
+        """Broadcast the lock's truth to every cockpit — held or free, and
+        by how many holders — so a pane that never touched Esc-Esc still
+        shows the ⏸ freeze another pane caused. NEVER raises."""
+        try:
+            self._sweep_autonomy_holds()
+            msg = {
+                "type": "autonomy_state",
+                "paused": bool(self._autonomy_holds),
+                "holders": len(self._autonomy_holds),
+                "ts": time.time(),
+            }
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+
+            def _emit() -> None:
+                from backend.core.ouroboros.battle_test.attach_session import (
+                    session_scope,
+                )
+                with session_scope(None):
+                    self._broadcast(msg)
+
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                _emit()
+            else:
+                loop.call_soon_threadsafe(_emit)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] autonomy state degraded",
+                         exc_info=True)
+
+    def _serve_rewind_list(
+        self, session: Optional[str], *, limit: Any = None,
+    ) -> None:
+        """Answer one Esc-Esc menu request with the LOCKED restore points.
+
+        Called after the requester's pause hold landed, so the list is a
+        static snapshot — nothing is mutating underneath it. The provider
+        is the harness's adapter over the EXISTING /undo planner; this
+        bridge never reads git. Addressed to the requester alone, like
+        lane history. NEVER raises."""
+        try:
+            try:
+                n = max(1, min(int(limit), 50)) if limit is not None else 10
+            except (TypeError, ValueError):
+                n = 10
+            try:
+                candidates = list(self._rewind(n) or [])
+            except Exception:  # noqa: BLE001
+                logger.debug("[CockpitAttach] rewind provider degraded",
+                             exc_info=True)
+                candidates = []
+            payload = {
+                "type": "rewind_list",
+                "candidates": candidates,
+                "locked": bool(self._autonomy_holds),
+                "ts": time.time(),
+            }
+            from backend.core.ouroboros.battle_test.attach_session import (
+                session_scope,
+            )
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+
+            def _emit() -> None:
+                with session_scope(session):
+                    self._broadcast(payload)
+
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                _emit()
+            else:
+                loop.call_soon_threadsafe(_emit)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] rewind list degraded",
+                         exc_info=True)
 
     def publish_history_append(
         self, text: str, *, origin_session: Optional[str] = None,
@@ -933,6 +1095,11 @@ class CockpitAttachBridge:
         for sid, sw in list(self._sessions.items()):
             if sw is w:
                 del self._sessions[sid]
+                # Safe resumption: a cockpit that dies with its rewind
+                # menu open must release its autonomy hold NOW, not at
+                # TTL expiry — a SIGKILL'd terminal cannot send resume.
+                if sid in self._autonomy_holds:
+                    self._autonomy_ctl("resume", sid)
         try:
             w.close()
         except Exception:  # noqa: BLE001
@@ -1018,6 +1185,20 @@ class CockpitAttachBridge:
                     text = str(frame.get("text", "")).strip()
                     if text:
                         self._sync_history(text, _sid or None)
+                elif ftype == "autonomy":
+                    # The Transactional Viewport Lock: pause on menu
+                    # open, resume on close/rollback — refcounted across
+                    # panes, TTL'd against wedged holders.
+                    self._autonomy_ctl(
+                        str(frame.get("action", "")).strip().lower(),
+                        _sid or None,
+                    )
+                elif ftype == "rewind_list":
+                    # Esc-Esc menu hydration — answered only to the
+                    # asking cockpit, from the locked snapshot.
+                    self._serve_rewind_list(
+                        _sid or None, limit=frame.get("limit"),
+                    )
                 elif ftype == "lane":
                     # Hydration request: the client focused a lane and wants
                     # its history. Answered ONLY to the asking cockpit —
@@ -1078,6 +1259,8 @@ class CockpitAttachClient:
         on_lane_history: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_lane_reaped: Optional[Callable[[str], None]] = None,
         on_history_append: Optional[Callable[[str], None]] = None,
+        on_autonomy_state: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_rewind_list: Optional[Callable[[Dict[str, Any]], None]] = None,
         path: Optional[Path] = None,
     ) -> None:
         self._path = Path(path) if path is not None else attach_socket_path()
@@ -1103,6 +1286,11 @@ class CockpitAttachClient:
         #: Another terminal's line, for Up-arrow parity. Absent handler =
         #: a pre-sync cockpit; the frame is simply not dispatched.
         self._on_history_append = on_history_append
+        #: The viewport lock's truth (paused/holders) — every pane shows
+        #: the freeze, whoever caused it.
+        self._on_autonomy_state = on_autonomy_state
+        #: The Esc-Esc menu's hydration payload (locked restore points).
+        self._on_rewind_list = on_rewind_list
         #: This cockpit's identity for the life of the attachment. Declared
         #: on every outbound frame so the daemon can address answers back to
         #: the terminal that asked, instead of to all of them.
@@ -1209,6 +1397,38 @@ class CockpitAttachClient:
         except Exception:  # noqa: BLE001
             return False
 
+    def send_autonomy(self, action: str) -> bool:
+        """Acquire ("pause") or release ("resume") this cockpit's hold on
+        the Transactional Viewport Lock. Non-blocking; False when
+        detached or the action is outside the taxonomy. NEVER raises."""
+        try:
+            action = str(action or "").strip().lower()
+            if action not in ("pause", "resume"):
+                return False
+            w = self._writer
+            if not self.connected or w is None or w.is_closing():
+                return False
+            frame = {"type": "autonomy", "action": action,
+                     "session": self.session_id}
+            w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def send_rewind_request(self, limit: int = 10) -> bool:
+        """Ask the daemon for the locked restore-point list. NEVER
+        raises."""
+        try:
+            w = self._writer
+            if not self.connected or w is None or w.is_closing():
+                return False
+            frame = {"type": "rewind_list", "limit": int(limit),
+                     "session": self.session_id}
+            w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def send_history(self, text: str) -> bool:
         """Report one CLIENT-HANDLED line upstream for history fan-out.
 
@@ -1287,6 +1507,18 @@ class CockpitAttachClient:
                             pass
                     else:
                         self._safe_cb_text(cb, str(frame.get("text", "")))
+                elif ftype == "autonomy_state":
+                    if self._on_autonomy_state is not None:
+                        try:
+                            self._on_autonomy_state(dict(frame))
+                        except Exception:  # noqa: BLE001
+                            pass
+                elif ftype == "rewind_list":
+                    if self._on_rewind_list is not None:
+                        try:
+                            self._on_rewind_list(dict(frame))
+                        except Exception:  # noqa: BLE001
+                            pass
                 elif ftype == "history_append":
                     # Another terminal's line. Drop our own echo — the
                     # daemon excludes the originator by session binding,

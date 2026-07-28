@@ -183,7 +183,11 @@ def test_the_subscription_is_released_on_exit():
     src = Path(
         "backend/core/ouroboros/cli/ov.py",
     ).read_text(encoding="utf-8")
-    tail = src[src.index("await run_bipartite_repl("):][:2000]
+    # Window bounded by the NEXT function def rather than a byte count —
+    # a byte budget silently un-pins the contract every time the call
+    # gains a kwarg (it did, twice, in the completion arc).
+    tail = src[src.index("await run_bipartite_repl("):]
+    tail = tail[: tail.index("\ndef ")] if "\ndef " in tail else tail
     assert "finally:" in tail and "rms_client" in tail
 
 
