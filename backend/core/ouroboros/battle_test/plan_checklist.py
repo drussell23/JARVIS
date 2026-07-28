@@ -63,6 +63,32 @@ def checklist_enabled() -> bool:
     ).strip().lower() not in ("0", "false", "no", "off")
 
 
+#: Session-scoped visibility, toggled by Ctrl+T. SEPARATE from the env master
+#: on purpose: the env switch says "this cockpit never shows checklists", the
+#: toggle says "not while I am reading something else". Collapsing them would
+#: mean a keystroke silently rewrites configuration, and the operator's next
+#: session would inherit a decision they made about one screenful.
+_VISIBLE = True
+
+
+def checklist_visible() -> bool:
+    """False while the operator has collapsed it for this session."""
+    return _VISIBLE and checklist_enabled()
+
+
+def toggle_checklist(on: Optional[bool] = None) -> bool:
+    """Ctrl+T. Returns the new visibility.
+
+    Collapsing does not stop TRACKING — `mark_touched` keeps folding results
+    in, so re-opening shows the plan's real state rather than the state it
+    had when it was hidden. A checklist that resumed stale would be worse
+    than one that was never shown.
+    """
+    global _VISIBLE
+    _VISIBLE = (not _VISIBLE) if on is None else bool(on)
+    return _VISIBLE
+
+
 def paths_match(plan_path: str, touched_path: str) -> bool:
     """Do these two path spellings name the same file?
 
@@ -147,7 +173,7 @@ class PlanChecklist:
         checklist that never had a decision in it, and it would push the real
         work off screen for no information.
         """
-        if not checklist_enabled() or len(self._items) < 2:
+        if not checklist_visible() or len(self._items) < 2:
             return []
         lines = [f"⏺ Plan({self.done}/{self.total} changes)"]
         # UNFINISHED work first among the hidden: if a plan is longer than the
