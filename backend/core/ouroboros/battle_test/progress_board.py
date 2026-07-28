@@ -152,6 +152,31 @@ class FeatureRow:
     value: Any = None
 
     @property
+    def kind(self) -> str:
+        """``switch`` or ``knob`` — a real distinction, not a formatting one.
+
+        A boolean-defaulted flag TURNS SOMETHING ON. A value-defaulted flag
+        (``"30"``, ``"notify_apply"``) TUNES something that is already on. An
+        unwired switch is a feature nobody connected; an unwired knob is a
+        dial on a module nobody imports — which is the SAME finding as its
+        module, repeated once per dial.
+
+        Sorting them together let twelve ``ADAPTATION_*`` thresholds crowd out
+        every interesting row, and gave a threshold the same glyph as a dead
+        feature.
+        """
+        # Name first for the AMBIGUOUS defaults only. A literal `True`, or a
+        # word like "true"/"on", is decisive on its own; "1" is not, and
+        # trusting it made every threshold-defaulting-to-1 look like a feature.
+        from_name = _kind_from_name(self.flag)
+        if from_name is not None and isinstance(self.value, str) \
+                and self.value.strip() in ("0", "1"):
+            return from_name
+        if self.enabled is not None:
+            return "switch"
+        return from_name or "knob"
+
+    @property
     def is_actionable(self) -> bool:
         """Worth an operator's attention right now."""
         return self.state in (MISSING, DARK)
@@ -194,7 +219,31 @@ class BoardReading:
         """MISSING then DARK — the rows that mean something is wrong."""
         return sorted(
             [r for r in self.rows if r.is_actionable],
-            key=lambda r: (_STATE_ORDER.index(r.state), r.flag),
+            # MISSING before DARK, switches before knobs, then grouped by
+            # module. Alphabetical-by-flag put `JARVIS_A*` first and nothing
+            # else was ever seen — the sort was hiding the signal it existed
+            # to surface.
+            key=lambda r: (_STATE_ORDER.index(r.state),
+                           0 if r.kind == "switch" else 1,
+                           r.module, r.flag),
+        )
+
+    @property
+    def actionable_modules(self) -> "List[Tuple[str, List[FeatureRow]]]":
+        """Actionable rows COLLAPSED BY MODULE, worst-first.
+
+        One unimported module holding twelve thresholds is ONE thing to fix,
+        and listing it twelve times is how a real finding gets buried under
+        its own repetitions.
+        """
+        grouped: Dict[str, List[FeatureRow]] = {}
+        for row in self.actionable:
+            grouped.setdefault(row.module or row.flag, []).append(row)
+        return sorted(
+            grouped.items(),
+            key=lambda kv: (_STATE_ORDER.index(kv[1][0].state),
+                            0 if any(r.kind == "switch" for r in kv[1]) else 1,
+                            -len(kv[1]), kv[0]),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -649,6 +698,47 @@ def _has_main_guard(tree: ast.AST) -> bool:
                     return True
     return False
 
+
+def switch_suffixes() -> Tuple[str, ...]:
+    """Name endings that mean a flag TURNS SOMETHING ON."""
+    raw = os.environ.get("JARVIS_PROGRESS_BOARD_SWITCH_SUFFIXES", "").strip()
+    if raw:
+        return tuple(x.strip().upper() for x in raw.split(",") if x.strip())
+    return ("_ENABLED", "_DISABLED", "_ON", "_OFF", "_ALLOW", "_ALLOWED",
+            "_REQUIRE", "_REQUIRED", "_FORCE", "_STRICT", "_DRY_RUN")
+
+
+def knob_suffixes() -> Tuple[str, ...]:
+    """Name endings that mean a flag TUNES something already on."""
+    raw = os.environ.get("JARVIS_PROGRESS_BOARD_KNOB_SUFFIXES", "").strip()
+    if raw:
+        return tuple(x.strip().upper() for x in raw.split(",") if x.strip())
+    return ("_S", "_MS", "_SEC", "_SECONDS", "_TIMEOUT", "_TTL", "_INTERVAL",
+            "_SIZE", "_MAX", "_MIN", "_LIMIT", "_THRESHOLD", "_PCT", "_RATIO",
+            "_COUNT", "_DEPTH", "_BUDGET", "_WIDTH", "_HEIGHT", "_PORT",
+            "_PATH", "_DIR", "_URL", "_HOST", "_MODE", "_LEVEL", "_TIER")
+
+
+def _kind_from_name(flag: str) -> Optional[str]:
+    """`switch` / `knob` from the flag's NAME, or None when it says nothing.
+
+    Needed because the default literal is not always decisive. `"1"` means
+    both "on" and "the number one", so a threshold defaulting to 1 was
+    classified as a switch — a real misreading, surfaced when a test fixture
+    happened to name one `JARVIS_DIAL_1`.
+
+    The name is the stronger signal precisely where the value is weakest, so
+    it is consulted FIRST and only for the ambiguous numeric cases.
+    """
+    name = str(flag or "").upper()
+    for suffix in switch_suffixes():
+        if name.endswith(suffix):
+            return "switch"
+    for suffix in knob_suffixes():
+        if name.endswith(suffix):
+            return "knob"
+    return None
+
 def _coerce_bool(value: Any) -> Optional[bool]:
     """A default literal's boolean meaning, or None if it has none.
 
@@ -735,38 +825,91 @@ def _resolve_enabled(flag: str, default: Any) -> Tuple[Optional[bool], Any]:
     return (None, raw)
 
 
-def render_board(reading: BoardReading, *, width: int = 78,
-                 limit: int = 0) -> List[str]:
-    """Operator-facing lines. Worst news first.
+def terminal_width(default: int = 78) -> int:
+    """Real width, asked at render time.
 
-    Deliberately not a full dump by default: 481 rows is not a status view, it
-    is a log. What an operator needs on sight is the count line and the rows
-    that mean something is wrong.
+    The previous default of 78 was a GUESS baked into a signature. Rows padded
+    to 44 columns plus an unclipped reason wrapped and broke the layout the
+    moment it met an actual terminal — invisible in every unit test, obvious in
+    one second of `ov demo board`.
     """
     try:
+        import shutil
+        return max(40, int(shutil.get_terminal_size((default, 24)).columns))
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def render_board(reading: BoardReading, *, width: Optional[int] = None,
+                 limit: int = 0) -> List[str]:
+    """Operator-facing lines. Worst news first, one line per finding.
+
+    Not a full dump: 3,900 rows is a log, not a status view. What an operator
+    needs on sight is the count line and the things that are wrong — grouped by
+    module, because one unimported module holding twelve dials is one problem.
+    """
+    try:
+        cols = terminal_width() if width is None else max(40, int(width))
         counts = reading.counts
-        out: List[str] = [
-            f"  live {counts.get(LIVE, 0)}   dark {counts.get(DARK, 0)}   "
-            f"off {counts.get(OFF, 0)}   missing {counts.get(MISSING, 0)}   "
-            f"unknown {counts.get(UNKNOWN, 0)}"
-            f"    ({reading.scanned_files} files, "
-            f"{reading.duration_s:.1f}s)",
-        ]
+        head = (f"  live {counts.get(LIVE, 0)}   dark {counts.get(DARK, 0)}   "
+                f"dynamic {counts.get(DYNAMIC_LIVE, 0)}   "
+                f"entry {counts.get(ENTRY, 0)}   off {counts.get(OFF, 0)}")
+        out: List[str] = [head[:cols]]
+        out.append(f"  ({reading.scanned_files} files, "
+                   f"{reading.duration_s:.1f}s)"[:cols])
         if reading.degraded:
-            out.append(f"  ⚠ degraded: {reading.degraded}")
-        rows = reading.actionable
-        if not rows:
+            out.append(f"  ⚠ degraded: {reading.degraded}"[:cols])
+
+        groups = reading.actionable_modules
+        if not groups:
             out.append("  ✓ nothing enabled-but-inert")
             return out
-        shown = rows if limit <= 0 else rows[:limit]
+
+        shown = groups if limit <= 0 else groups[:limit]
         out.append("")
-        for row in shown:
-            glyph = "✗" if row.state == MISSING else "◌"
-            name = row.flag[:44]
-            out.append(f"  {glyph} {name:<44} {row.state:<8} {row.reason}"[:width])
-        hidden = len(rows) - len(shown)
+        # Widest name we will actually print, so the reason column starts in
+        # the same place without being padded to a constant nobody measured.
+        # Bounded by the TERMINAL, not just by a constant. With long module
+        # paths the name column claimed the whole line, leaving the tail
+        # negative room — so the flag was chopped by the final `[:cols]` with
+        # no ellipsis, which reads as a different flag. At least 20 columns
+        # stay reserved for what the finding actually IS.
+        namew = min(48, max(12, cols - 26),
+                    max((len(_short(m)) for m, _ in shown), default=20))
+        for module, rows in shown:
+            first = rows[0]
+            glyph = "✗" if first.state == MISSING else "◌"
+            switches = [r for r in rows if r.kind == "switch"]
+            if switches:
+                tail = switches[0].flag
+                if len(rows) > 1:
+                    tail += f"  +{len(rows) - 1} more"
+            else:
+                tail = f"{len(rows)} knob{'s' if len(rows) != 1 else ''}"
+            # Budget the tail rather than truncating the finished line: a
+            # blind `line[:cols]` cut flag names mid-word (`JARVIS_MULTI_FACTOR_BOOS`),
+            # which reads as a DIFFERENT flag and is worse than an ellipsis.
+            room = cols - (namew + 6)
+            if room > 4 and len(tail) > room:
+                tail = tail[: room - 1] + "…"
+            name = _short(module, namew)
+            out.append(f"  {glyph} {name:<{namew}}  {tail}"[:cols])
+        hidden = len(groups) - len(shown)
         if hidden > 0:
-            out.append(f"    … {hidden} more")
+            out.append(f"    … {hidden} more module(s)"[:cols])
         return out
     except Exception:  # noqa: BLE001
         return ["  ⚠ board render degraded"]
+
+
+def _short(module: str, width: int = 48) -> str:
+    """Trim a module path from the LEFT — the tail identifies it.
+
+    Takes the budget as an argument because `f"{name:<{w}}"` PADS to a minimum
+    and never clips: a 48-character path stayed 48 characters inside a
+    14-column field, and the final `[:cols]` then ate the tail instead. The
+    name column has to enforce its own width.
+    """
+    text = str(module or "")
+    limit = max(4, int(width))
+    return text if len(text) <= limit else "…" + text[-(limit - 1):]
