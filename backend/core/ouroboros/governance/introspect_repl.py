@@ -81,6 +81,7 @@ def _master_enabled() -> bool:
 def dispatch_introspect_command(
     line: str,
 ) -> IntrospectReplDispatchResult:
+    """Introspection frames and the dream panel."""
     if not _matches(line):
         return IntrospectReplDispatchResult(
             ok=False, text="", matched=False,

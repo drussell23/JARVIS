@@ -1028,6 +1028,7 @@ def dispatch_format_command(
     contract_registry: Optional[OutputContractRegistry] = None,
     validator: Optional[OutputValidator] = None,
 ) -> FormatDispatchResult:
+    """Output format rules and validation results."""
     if not _matches(line):
         return FormatDispatchResult(ok=False, text="", matched=False)
     # For `/format validate`, preserve the raw tail VERBATIM (shlex

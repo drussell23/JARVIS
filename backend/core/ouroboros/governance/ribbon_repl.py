@@ -84,6 +84,7 @@ def _master_enabled() -> bool:
 def dispatch_ribbon_command(
     line: str,
 ) -> RibbonReplDispatchResult:
+    """Forward-flow ribbon with per-phase density."""
     if not _matches(line):
         return RibbonReplDispatchResult(
             ok=False, text="", matched=False,

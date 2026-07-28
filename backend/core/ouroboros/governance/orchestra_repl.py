@@ -85,6 +85,7 @@ def _master_enabled() -> bool:
 def dispatch_orchestra_command(
     line: str,
 ) -> OrchestraReplDispatchResult:
+    """Audio cue events per phase."""
     if not _matches(line):
         return OrchestraReplDispatchResult(
             ok=False, text="", matched=False,
