@@ -931,8 +931,20 @@ def build_bipartite_application(
     except Exception:  # noqa: BLE001 — an unstyled cockpit still works
         _style = None
 
+    # Vim editing mode, from the ONE reader every surface consults
+    # (JARVIS_EDITOR_MODE=vim). None = prompt_toolkit's emacs default,
+    # byte-identical to every cockpit that ever shipped.
+    _editing_mode = None
+    try:
+        from backend.core.ouroboros.battle_test.keymap import editing_mode
+        _editing_mode = editing_mode()
+    except Exception:  # noqa: BLE001
+        _editing_mode = None
+
     app = Application(
         layout=PTLayout(root, focused_element=prompt),
+        **({"editing_mode": _editing_mode}
+           if _editing_mode is not None else {}),
         # Full-screen on a real terminal — the canvas holds the history the
         # alternate screen takes away (see `fullscreen_enabled`).
         key_bindings=kb, full_screen=fullscreen_enabled(),

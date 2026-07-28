@@ -1332,6 +1332,15 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
             _report_local_history(client, text)
             return "handled"
         if text:
+            # Splice collapsed pastes back in — the daemon receives what
+            # was pasted; the operator's screen showed the chip.
+            try:
+                from backend.core.ouroboros.battle_test.paste_chips import (
+                    expand_paste_chips,
+                )
+                text = expand_paste_chips(text)
+            except Exception:  # noqa: BLE001
+                pass
             if ui is not None and ui.should_flush_on_input():
                 client.send_audio("flush")
             # The daemon receives the GOAL, not the typing mechanics. A
@@ -1513,10 +1522,16 @@ async def _split_plane_loop(
     # both are callables re-evaluated on every repaint, so an
     # audio_state frame morphs the footer via app.invalidate() while
     # the active keystroke buffer stays untouched (mandate 4).
+    try:
+        from backend.core.ouroboros.battle_test.keymap import editing_mode
+        _em = editing_mode()
+    except Exception:  # noqa: BLE001
+        _em = None
     session: Any = PromptSession(
         message=lambda: ui.prompt(),
         bottom_toolbar=lambda: ui.toolbar(),
         key_bindings=_kb,
+        **({"editing_mode": _em} if _em is not None else {}),
         # Native `/` palette over the SAME 60-verb dispatch table the daemon
         # routes to — not a hand-kept list that can drift from it. Threaded:
         # priming the registry walks packages, and on the event loop that
@@ -1879,6 +1894,15 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
                 install_transcript_hatches,
             )
             install_transcript_hatches(kb, ui, client)
+        except Exception:  # noqa: BLE001
+            pass
+        # Large pastes collapse to a chip; the full text splices back in
+        # at submit (expand_paste_chips in _route_operator_line).
+        try:
+            from backend.core.ouroboros.battle_test.paste_chips import (
+                install_paste_collapse,
+            )
+            install_paste_collapse(kb)
         except Exception:  # noqa: BLE001
             pass
         return kb

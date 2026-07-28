@@ -93,6 +93,26 @@ TERMINAL_CONFLICTS: Dict[str, str] = {
 }
 
 
+EDITOR_MODE_ENV_VAR: str = "JARVIS_EDITOR_MODE"
+
+
+def editing_mode() -> Any:
+    """The prompt_toolkit ``EditingMode`` for every input surface, from
+    ``JARVIS_EDITOR_MODE={emacs|vim}`` (default emacs — the behavior every
+    surface has always had). One reader, so the cockpit, the fallback and
+    the daemon REPL cannot disagree about what kind of editor they are.
+    Returns None when prompt_toolkit is unavailable or the value is the
+    default. NEVER raises."""
+    try:
+        raw = os.environ.get(EDITOR_MODE_ENV_VAR, "").strip().lower()
+        if raw in ("vi", "vim"):
+            from prompt_toolkit.enums import EditingMode
+            return EditingMode.VI
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def is_keymap_enabled() -> bool:
     """Master flag — default TRUE. Off means defaults only (the config file
     is neither read nor watched); the action seam itself stays live so no

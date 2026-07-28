@@ -6425,9 +6425,18 @@ class SerpentREPL:
         except Exception:
             _refresh_interval_kwarg = _REPL_REFRESH_INTERVAL_S
 
+        try:
+            from backend.core.ouroboros.battle_test.keymap import (
+                editing_mode as _keymap_editing_mode,
+            )
+            _editing_mode = _keymap_editing_mode()
+        except Exception:  # noqa: BLE001
+            _editing_mode = None
         self._session = PromptSession(
             multiline=True,
             key_bindings=_repl_bindings,
+            **({"editing_mode": _editing_mode}
+               if _editing_mode is not None else {}),
             wrap_lines=True,
             # History ghost-text from the wiring (None when disabled via
             # JARVIS_REPL_AUTOSUGGEST_ENABLED — the legacy explicit-None).

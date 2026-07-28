@@ -131,6 +131,42 @@ class StatusSnapshot:
 # ---------------------------------------------------------------------------
 
 
+_CUSTOM_SEGMENT_CACHE = {"at": 0.0, "text": ""}
+
+
+def _custom_segment() -> str:
+    """An operator-supplied status segment (CC's custom statusline):
+    ``JARVIS_STATUSLINE_CMD`` names a command whose first stdout line is
+    appended to the status line. Bounded (1s timeout, 80-char cap) and
+    cached (``JARVIS_STATUSLINE_TTL_S``, default 10) — a slow script may
+    lag the segment, never the repaint. NEVER raises."""
+    try:
+        cmd = os.environ.get("JARVIS_STATUSLINE_CMD", "").strip()
+        if not cmd:
+            return ""
+        try:
+            ttl = max(2.0, float(os.environ.get("JARVIS_STATUSLINE_TTL_S",
+                                                "10")))
+        except (TypeError, ValueError):
+            ttl = 10.0
+        now = time.monotonic()
+        if now - _CUSTOM_SEGMENT_CACHE["at"] < ttl:
+            return _CUSTOM_SEGMENT_CACHE["text"]
+        # Stamp FIRST so a hanging script is retried at TTL cadence, not
+        # on every repaint.
+        _CUSTOM_SEGMENT_CACHE["at"] = now
+        import subprocess
+        proc = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=1.0,
+        )
+        line = (proc.stdout or "").strip().splitlines()
+        text = line[0][:80] if line else ""
+        _CUSTOM_SEGMENT_CACHE["text"] = text
+        return text
+    except Exception:  # noqa: BLE001
+        return _CUSTOM_SEGMENT_CACHE.get("text", "")
+
+
 class StatusLineBuilder:
     """Pull-model aggregator for the glanceable status line.
 
@@ -247,6 +283,9 @@ class StatusLineBuilder:
                     rendered = f"{rendered} · {chip}" if rendered else chip
             except Exception:  # noqa: BLE001
                 pass
+            custom = _custom_segment()
+            if custom:
+                rendered = f"{rendered} · {custom}" if rendered else custom
             return rendered
         except Exception:  # noqa: BLE001
             logger.debug(
