@@ -36,6 +36,11 @@ from typing import Any, Callable, List, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.BipartiteLayout")
 
+from backend.core.ouroboros.battle_test.canvas_viewport import (
+    CanvasViewport, canvas_history_lines, install_scroll_bindings,
+    scrollback_enabled,
+)
+
 _DEFAULT_MAX_LINES = 500
 
 
@@ -54,6 +59,23 @@ def bipartite_enabled() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _real_tty() -> bool:
+    """A real interactive terminal, via the canonical helper.
+
+    ``sys.stdout.isatty()`` is False under the active ``patch_stdout`` proxy,
+    which is why `real_stdout_isatty` (reading ``sys.__stdout__``) exists. One
+    definition, used by both the launch gate and the alt-screen decision, so
+    they cannot disagree about what a terminal is.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.presentation_restraint import (
+            real_stdout_isatty,
+        )
+        return real_stdout_isatty()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def fullscreen_enabled() -> bool:
     """Does the cockpit claim the terminal's ALTERNATE SCREEN?
 
@@ -63,22 +85,35 @@ def fullscreen_enabled() -> bool:
     nothing there, because the alternate buffer has no history and the primary
     buffer stopped receiving output the moment the cockpit mounted.
 
-    That made the cockpit's own canvas load-bearing: Zone 1 existed to replace
-    the scrollback the alt-screen had taken away, and it is a bounded ring, so
-    history beyond it was simply gone.
+    That made the cockpit's own canvas load-bearing, and it was not up to the
+    job: Zone 1 existed to replace the scrollback the alt-screen had taken
+    away, but it rendered only ``snap[-budget:]`` — the last screenful, with
+    no way to reach anything above it. Claiming the screen meant deleting the
+    session's history, so #70171 defaulted this OFF and let the terminal keep
+    what it was better at keeping.
 
-    Default FALSE. Outside the alternate screen the terminal keeps every line
-    the organism ever printed, scrollback works the way it does in every other
-    tool, and the canvas becomes a small live region rather than a substitute
-    for history the terminal was always better at holding.
+    **Default TRUE as of the scrollback viewport.** `canvas_viewport` turned
+    Zone 1 from a tail into a window over ~20k retained lines, with PgUp/PgDn,
+    Home/End and a view that holds still while the organism appends. The
+    canvas can now hold a session, so the objection that kept the cockpit out
+    of the alternate screen no longer applies — and full-screen is what makes
+    `ov` an instrument you are inside of rather than a command that scrolled
+    past. Exiting issues rmcup, so the shell comes back untouched, with the
+    scrollback that was there before the cockpit mounted.
 
-    ``JARVIS_BIPARTITE_FULLSCREEN=1`` restores the old behaviour — a fixed
-    viewport is genuinely better on a wall display or a dedicated monitor,
-    where nobody scrolls and a stable frame reads as an instrument panel.
+    ``JARVIS_BIPARTITE_FULLSCREEN=0`` returns to the inline cockpit for anyone
+    who would rather keep native scrollback (or is debugging with the shell's
+    output interleaved).
     """
-    return os.environ.get(
-        "JARVIS_BIPARTITE_FULLSCREEN", "",
-    ).strip().lower() in ("1", "true", "yes", "on")
+    raw = os.environ.get("JARVIS_BIPARTITE_FULLSCREEN", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    # Unset → on, but only where an alternate screen exists at all. A pipe or
+    # a dumb terminal has no smcup to issue, and claiming one there produces
+    # escape soup in a log file rather than a cockpit.
+    return _real_tty()
 
 
 def _canvas_dimension() -> Any:
@@ -108,7 +143,7 @@ def _canvas_dimension() -> Any:
 
 def _canvas_max_lines() -> int:
     try:
-        return max(16, int(os.environ.get("JARVIS_BIPARTITE_CANVAS_MAX_LINES", _DEFAULT_MAX_LINES)))
+        return canvas_history_lines()
     except (TypeError, ValueError):
         return _DEFAULT_MAX_LINES
 
@@ -132,7 +167,13 @@ class BipartiteLayout:
         # Reuse the bounded buffer primitive (DRY) — never the Live renderer.
         from backend.core.ouroboros.battle_test.split_layout import RegionBuffer
 
-        self._buffer = RegionBuffer(name="canvas", maxlen=max_lines or _canvas_max_lines())
+        # In the alternate screen this ring is the ONLY history that exists,
+        # so it is sized for a session rather than for a tail sitting beneath
+        # a terminal that still had its own scrollback.
+        self._buffer = RegionBuffer(
+            name="canvas", maxlen=max_lines or _canvas_max_lines(),
+        )
+        self._viewport = CanvasViewport()
         self._registry = registry
         self._width = max(10, int(width))
         self._height = max(3, int(height))
@@ -223,15 +264,45 @@ class BipartiteLayout:
 
     # -- rendering ------------------------------------------------------
 
-    def _visible_lines(self) -> List[str]:
-        # Auto-scroll: keep only the last (height - frame chrome) lines.
+    def _line_budget(self) -> int:
+        """Rows the canvas may draw into, frame chrome deducted."""
+        chrome = 4 if os.environ.get(
+            "JARVIS_BIPARTITE_BORDER", "",
+        ).strip().lower() in ("1", "true", "yes", "on") else 1
+        return max(1, self._height - chrome)
+
+    def scroll_metrics(self) -> tuple:
+        """``(total, budget)`` — what the scroll keys clamp against."""
         try:
-            chrome = 4 if os.environ.get("JARVIS_BIPARTITE_BORDER", "").strip().lower() in (
-                "1", "true", "yes", "on",
-            ) else 1
-            budget = max(1, self._height - chrome)   # frame chrome only when bordered
+            return len(self._buffer.snapshot()), self._line_budget()
+        except Exception:  # noqa: BLE001
+            return 0, 1
+
+    def _visible_lines(self) -> List[str]:
+        """The screenful the operator is LOOKING AT — the live tail while
+        following, an older window once they scroll back.
+
+        The status row replaces the topmost visible line rather than being
+        overlaid: losing one row of telemetry is a fair price for always
+        knowing whether you are watching "now", and it costs nothing while
+        following, when there is no status to show.
+        """
+        try:
+            budget = self._line_budget()
             snap = self._buffer.snapshot()
-            return list(snap[-budget:])
+            if not scrollback_enabled():
+                return list(snap[-budget:])
+            visible, above, below = self._viewport.window(
+                # push_count, not len(): once the ring saturates its length
+                # stops changing while the content keeps moving.
+                snap, budget, appended=self._buffer.push_count,
+            )
+            status = self._viewport.status(above, below)
+            if status:
+                return list(visible[1:]) + [
+                    f"[reverse dim] {status} [/reverse dim]",
+                ]
+            return list(visible)
         except Exception:  # noqa: BLE001
             return []
 
@@ -546,6 +617,14 @@ def build_bipartite_application(
         logger.debug("[Bipartite] continuation rule degraded", exc_info=True)
 
     kb = KeyBindings()
+    # Scrollback keys. In the alternate screen the terminal no longer offers
+    # its own, so these ARE the scrollback — not a convenience layered on it.
+    try:
+        install_scroll_bindings(
+            kb, mux._viewport, mux.scroll_metrics, mux._invalidate_now,
+        )
+    except Exception:  # noqa: BLE001
+        pass
     # Alt+Enter, from the same module that decides when Enter continues — so
     # the rule and its escape hatch can never be wired on different surfaces.
     try:
@@ -761,15 +840,7 @@ def should_run_bipartite() -> bool:
     canonical ``real_stdout_isatty`` — a plain ``sys.stdout.isatty`` is False under
     the active ``patch_stdout`` proxy). Headless / piped / CI never enters the
     full-screen mode. Never raises."""
-    if not bipartite_enabled():
-        return False
-    try:
-        from backend.core.ouroboros.battle_test.presentation_restraint import (
-            real_stdout_isatty,
-        )
-        return real_stdout_isatty()
-    except Exception:  # noqa: BLE001
-        return False
+    return bipartite_enabled() and _real_tty()
 
 
 async def _alive_watcher(

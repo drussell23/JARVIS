@@ -17,6 +17,7 @@ Application would pass any test that only read the config.
 from __future__ import annotations
 
 import os
+from typing import Optional
 import subprocess
 import sys
 from pathlib import Path
@@ -158,14 +159,16 @@ except Exception: pass
 '''
 
 
-def _run_pty(tmp_path: Path, fullscreen: bool) -> str:
-    driver = tmp_path / f"drv_{int(fullscreen)}.py"
+def _run_pty(tmp_path: Path, fullscreen: Optional[bool]) -> str:
+    """Drive the cockpit under a real PTY. *fullscreen* None = unset (the
+    DEFAULT path), True/False = the explicit opt-in / opt-out."""
+    driver = tmp_path / f"drv_{fullscreen}.py"
     driver.write_text(_PTY_DRIVER)
     env = {**os.environ, "PYTHONPATH": str(_REPO)}
-    if fullscreen:
-        env["JARVIS_BIPARTITE_FULLSCREEN"] = "1"
-    else:
+    if fullscreen is None:
         env.pop("JARVIS_BIPARTITE_FULLSCREEN", None)
+    else:
+        env["JARVIS_BIPARTITE_FULLSCREEN"] = "1" if fullscreen else "0"
     try:
         proc = subprocess.run(
             [sys.executable, str(driver)], capture_output=True, text=True,
@@ -181,13 +184,32 @@ def _run_pty(tmp_path: Path, fullscreen: bool) -> str:
 
 
 @pytest.mark.timeout(150)
-def test_the_terminal_is_NOT_switched_by_default(tmp_path: Path) -> None:
-    """`ESC[?1049h` is what a terminal acts on. A config value that failed to
-    reach the Application would pass any test that only read the config."""
+def test_the_terminal_IS_switched_by_default(tmp_path: Path) -> None:
+    """The cockpit claims the alternate screen on a real terminal.
+
+    This assertion is the REVERSE of what it was. #70171 defaulted
+    full-screen off because the alternate screen disables native scrollback
+    and Zone 1 was a tail — `snap[-budget:]`, with nothing reachable above
+    it — so claiming the screen deleted the session's history.
+
+    `canvas_viewport` removed that objection: Zone 1 is now a window over
+    ~20k retained lines with PgUp/PgDn/Home/End. With history safe inside the
+    cockpit, taking the screen is what makes `ov` an instrument you are in
+    rather than a command that scrolled past.
+
+    `ESC[?1049h` is what a terminal actually acts on — a config value that
+    never reached the Application would pass any test that only read config.
+    """
+    assert "RESULT_ALT=1" in _run_pty(tmp_path, fullscreen=None)
+
+
+@pytest.mark.timeout(150)
+def test_opting_out_keeps_the_primary_screen(tmp_path: Path) -> None:
+    """The escape hatch for anyone who wants native scrollback back, and the
+    inverse that proves the assertion above measures something."""
     assert "RESULT_ALT=0" in _run_pty(tmp_path, fullscreen=False)
 
 
 @pytest.mark.timeout(150)
-def test_opting_in_DOES_switch_the_terminal(tmp_path: Path) -> None:
-    """The inverse proves the assertion above is measuring something."""
+def test_opting_in_explicitly_still_switches(tmp_path: Path) -> None:
     assert "RESULT_ALT=1" in _run_pty(tmp_path, fullscreen=True)
