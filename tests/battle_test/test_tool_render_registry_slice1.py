@@ -151,7 +151,17 @@ def test_cc_verb_assignments(kind: str, expected_verb: str):
     "delete_file", "type_check", "web_fetch", "web_search", "ask_human",
 ])
 def test_non_cc_tools_use_icon_path(kind: str):
-    assert get_descriptor(kind).cc_verb is None
+    """INVERTED: every built-in now carries a CC verb.
+
+    Fifteen of eighteen descriptors had `cc_verb=None`, so they fell to the
+    icon path and one deck showed `⏺ Read(foo.py)` beside `🔍 search_code
+    "x"` and `💻 bash $ pytest` — three shapes and three naming conventions
+    on one screen. The icon path is now reached only by a tool this registry
+    has never heard of.
+    """
+    assert get_descriptor(kind).cc_verb, (
+        f"{kind} has no CC verb and would fall back to the unknown-tool path"
+    )
 
 
 # ===========================================================================
@@ -193,13 +203,16 @@ def test_path_args_truncate_to_80_chars():
 
 
 def test_bash_args_show_dollar_prefix():
+    """The `$` was a shell cue for `💻 bash $ pytest -x`. Inside `Bash(…)`
+    the verb already says which interpreter this is, and the sigil reads as
+    part of the command — which it is not."""
     desc = get_descriptor("bash")
-    assert desc.summarize_args("pytest -x") == "$ pytest -x"
+    assert desc.summarize_args("pytest -x") == "pytest -x"
 
 
 def test_bash_args_collapse_whitespace():
     desc = get_descriptor("bash")
-    assert desc.summarize_args("  pytest   -x  ") == "$ pytest -x"
+    assert desc.summarize_args("  pytest   -x  ") == "pytest -x"
 
 
 def test_search_args_quoted():
@@ -340,9 +353,10 @@ def test_render_cc_verb_header_format():
 
 
 def test_render_icon_header_format():
+    """One header shape for every tool: `Verb(args)`."""
     desc = get_descriptor("bash")
     out = render(desc, "ls", "x", ToolStatus.SUCCESS)
-    assert out.header_line.startswith("💻 bash $ ls")
+    assert out.header_line == "Bash(ls)"
 
 
 def test_render_default_descriptor_for_unknown():
@@ -350,8 +364,11 @@ def test_render_default_descriptor_for_unknown():
         get_descriptor("mcp_unknown_tool"), "args", "result",
         ToolStatus.SUCCESS,
     )
-    # Default descriptor uses icon path; header begins with the wrench icon.
-    assert out.header_line.startswith("🔧 _default")
+    # An unknown tool is still a tool call. Giving it its own layout would
+    # tell the operator about our descriptor table rather than their work.
+    # (The registry layer cannot name it — `_default` is the descriptor's own
+    # kind; `tool_render_view` substitutes the real name, covered there.)
+    assert out.header_line.startswith("Default(")
 
 
 def test_render_zero_budget_yields_no_body():
@@ -429,7 +446,7 @@ def test_render_invalid_descriptor_falls_back_to_default():
         "not-a-descriptor",  # type: ignore[arg-type]
         "args", "result", ToolStatus.SUCCESS,
     )
-    assert out.header_line.startswith("🔧 _default")
+    assert out.header_line.startswith("Default(")
 
 
 def test_render_handles_none_inputs():
