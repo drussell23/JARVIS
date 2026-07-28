@@ -246,6 +246,8 @@ def build_ptt_key_bindings(
     *,
     buffer_getter: Optional[Callable[[], str]] = None,
     invalidate: Optional[Callable[[], None]] = None,
+    detector: Optional[Any] = None,
+    watchdog_factory: Optional[Callable[..., Any]] = None,
 ) -> Any:
     """A ``KeyBindings`` carrying ONLY the space intercept.
 
@@ -287,6 +289,51 @@ def build_ptt_key_bindings(
                     return
         except Exception:  # noqa: BLE001
             pass
+        # HOLD-TO-TALK, layered under the toggle rather than replacing it.
+        #
+        # A TTY sends no key-release, but a HELD key is not silent: the OS
+        # repeats it. So a hold is observable as a rate and a release as that
+        # rate stopping — see `hold_to_talk`.
+        #
+        # The first press opens the microphone IMMEDIATELY, exactly as the
+        # toggle always did. Only what CLOSES it is decided later: repeats
+        # arriving mean this was a hold, so releasing closes it; silence means
+        # it was a tap, so it stays open until the next tap. Deciding the
+        # close rather than the open is what keeps tap latency at zero and
+        # removes any need to type a space and retroactively delete it — the
+        # binding is already gated to an empty buffer, where space is a
+        # control key rather than text, so there is nothing to take back.
+        if detector is not None:
+            try:
+                from backend.core.ouroboros.ui.hold_to_talk import HoldAction
+
+                action = detector.on_key()
+                if action is HoldAction.WARMUP:
+                    # A repeat that has not yet proved a hold. The mic is
+                    # already open from the first press; toggling again here
+                    # would shut it the instant the operator held the key.
+                    _arm_hold_watchdog(latch, detector, watchdog_factory,
+                                       invalidate)
+                    return
+                if action is HoldAction.SWALLOW:
+                    # A repeat of a key already known to be held. Dropping it
+                    # is the whole point: without this the buffer fills with
+                    # spaces for as long as the operator speaks.
+                    return
+                if action is HoldAction.CONFIRM:
+                    # Already open from the first press; nothing to do but
+                    # let the watchdog close it on release.
+                    if invalidate is not None:
+                        try:
+                            invalidate()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return
+                _arm_hold_watchdog(latch, detector, watchdog_factory,
+                                   invalidate)
+            except Exception:  # noqa: BLE001
+                logger.debug("[PTT] hold detect degraded", exc_info=True)
+
         try:
             latch.toggle()
         except Exception:  # noqa: BLE001
@@ -298,6 +345,42 @@ def build_ptt_key_bindings(
                 pass
 
     return kb
+
+
+def _arm_hold_watchdog(
+    latch: "PTTLatch",
+    detector: Any,
+    watchdog_factory: Optional[Callable[..., Any]],
+    invalidate: Optional[Callable[[], None]],
+) -> None:
+    """Start (or reuse) the watcher that decides when the key was let go.
+
+    The RELEASE event closes the latch; TAP deliberately does nothing — the
+    microphone stays open, which is the toggle behaviour that shipped before
+    hold detection existed and must survive it unchanged.
+    """
+    from backend.core.ouroboros.ui.hold_to_talk import HoldEvent, HoldWatchdog
+
+    existing = getattr(detector, "_ov_watchdog", None)
+    if existing is not None and getattr(existing, "running", False):
+        return
+
+    def _on_event(event: Any) -> None:
+        try:
+            if event is HoldEvent.RELEASE:
+                latch.close("release")
+                if invalidate is not None:
+                    invalidate()
+        except Exception:  # noqa: BLE001
+            logger.debug("[PTT] release close degraded", exc_info=True)
+
+    factory = watchdog_factory or HoldWatchdog
+    watchdog = factory(detector, _on_event)
+    try:
+        detector._ov_watchdog = watchdog  # noqa: SLF001 — one owner, one task
+    except Exception:  # noqa: BLE001
+        pass
+    watchdog.kick()
 
 
 __all__ = [
