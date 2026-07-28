@@ -29,7 +29,7 @@ from typing import Any, Callable, List, Optional, Sequence
 from backend.core.ouroboros.ui.theme import build_console
 
 _VERBS = {"cockpit", "run", "daemon", "status", "attach", "system", "hive",
-          "doctor", "restart", "version"}
+          "doctor", "demo", "restart", "version"}
 _HELP_TOKENS = {"help", "--help", "-h"}
 _VERSION_TOKENS = {"version", "--version", "-V"}
 
@@ -201,6 +201,7 @@ _HELP_TEXT = """ov -- Ouroboros + Venom, autonomous engineering organism
   ov status           last-session digest (no boot)
   ov doctor [--live]  8-edge connectivity matrix; --live fires the
                       trace-isolated synthetic tool probe end-to-end
+  ov demo [scene]     watch the cockpit with synthetic events
   ov attach           attach this terminal to the running organism
   ov version          version + milestone
   ov help             this message
@@ -261,6 +262,8 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
         return Invocation("hive")
     if verb == "doctor":
         return Invocation("doctor", list(rest))
+    if verb == "demo":
+        return Invocation("demo", list(rest))
     if verb == "restart":
         return Invocation("restart", list(rest))
     # cockpit (explicit or defaulted)
@@ -3504,6 +3507,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return rc
         inv = Invocation("cockpit", [])
 
+    if inv.action == "demo":
+        # Lazy, like `doctor`: a demo that cannot import must not be able to
+        # cost the cockpit its boot path.
+        try:
+            from backend.core.ouroboros.cli.ov_demo import run_demo
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"ov demo unavailable: {exc}", markup=False)
+            return 1
+        return run_demo(console, inv.delegate_argv)
     if inv.action == "doctor":
         try:
             from backend.core.ouroboros.cli.ov_doctor import run_doctor
