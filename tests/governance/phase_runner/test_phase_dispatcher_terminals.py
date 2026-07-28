@@ -30,6 +30,10 @@ from backend.core.ouroboros.governance.approval_provider import (
     ApprovalResult,
     ApprovalStatus,
 )
+# `spec=` is load-bearing, not decoration: it is what makes the NEXT surface
+# added to CancelToken fail loudly in this fake instead of auto-vivifying into
+# a truthy Mock the way `is_cancelled` did.
+from backend.core.ouroboros.governance.cancel_token import CancelToken
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
@@ -79,6 +83,28 @@ def _build_stack(
             success=change_success, rolled_back=False, op_id="op-test",
         ))
     stack.governed_loop_service.is_cancel_requested.return_value = cancel_requested
+    # W3(7) Slice 2 added a SECOND cancel surface — the per-op CancelToken
+    # registry — and this shared fake was never taught about it. The
+    # dispatcher reads `getattr(token, "is_cancelled", False)`, and on an
+    # auto-vivified MagicMock that attribute is a truthy Mock, so EVERY op
+    # in this file looked cancelled and routed to POSTMORTEM before reaching
+    # the terminal each test actually asserts on.
+    #
+    # The dispatcher's own comment states the contract it expects from unit
+    # tests: "they construct an orchestrator without a stack / GLS and the
+    # registry property returns None". A MagicMock can never return None, so
+    # the fake silently violated the assumption the production code documents.
+    #
+    # Driven by the SAME `cancel_requested` knob as the legacy surface, so
+    # the two can never disagree about whether this op was cancelled — a fake
+    # that models one surface and auto-vivifies the other is how this class
+    # of bug arrives in the first place.
+    _token = MagicMock(spec=CancelToken)
+    _token.is_cancelled = cancel_requested
+    _token.get_record.return_value = None
+    stack.governed_loop_service._cancel_token_registry.get_or_create.return_value = (
+        _token
+    )
     stack.learning_bridge = MagicMock()
     stack.learning_bridge.publish = AsyncMock(return_value=None)
     stack.security_reviewer = MagicMock()
