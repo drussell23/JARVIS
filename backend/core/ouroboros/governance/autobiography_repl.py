@@ -98,7 +98,9 @@ def _master_enabled() -> bool:
 def dispatch_autobiography_command(
     line: str,
 ) -> AutobiographyReplDispatchResult:
-    """§32.11 Slice 4 canonical entry point — auto-discovered."""
+    """Retrospective audit of O+V-signed commits.
+
+    §32.11 Slice 4 canonical entry point — auto-discovered."""
     if not _matches(line):
         return AutobiographyReplDispatchResult(
             ok=False, text="", matched=False,

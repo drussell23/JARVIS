@@ -494,7 +494,9 @@ def dispatch_backlog_auto_proposed_command(
     *,
     project_root: Optional[Path] = None,
 ) -> BacklogAutoProposedResult:
-    """Parse a ``/backlog auto-proposed ...`` line and dispatch.
+    """Review auto-proposed backlog items.
+
+    Parse a ``/backlog auto-proposed ...`` line and dispatch.
 
     Returns a result with ``matched=False`` when the line doesn't begin
     ``/backlog auto-proposed`` so the SerpentREPL fallthrough can try

@@ -77,7 +77,9 @@ def _matches(line: str) -> bool:
 async def dispatch_story_command(
     line: str,
 ) -> StoryReplDispatchResult:
-    """Parse and dispatch a ``/story`` line. ``async`` because
+    """Memory crystallisation timeline.
+
+    Parse and dispatch a ``/story`` line. ``async`` because
     ``/story session`` awaits :func:`session_story.aggregate_session_story`
     directly (fs-hot-tier Batch 3 made the underlying
     ``LastSessionSummary.load`` async) — the registry

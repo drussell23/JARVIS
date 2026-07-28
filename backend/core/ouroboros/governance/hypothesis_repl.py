@@ -171,7 +171,9 @@ def dispatch_hypothesis_command(
     project_root: Optional[Path] = None,
     ledger: Optional[HypothesisLedger] = None,
 ) -> HypothesisDispatchResult:
-    """Parse `/hypothesis ledger ...` and dispatch.
+    """Hypothesis ledger — open and invalidated.
+
+    Parse `/hypothesis ledger ...` and dispatch.
 
     Tests inject ``ledger`` directly; production resolves a singleton
     via ``hypothesis_ledger.get_default_ledger`` if ``ledger=None``."""
