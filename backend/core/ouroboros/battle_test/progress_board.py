@@ -52,6 +52,7 @@ logger = logging.getLogger("Ouroboros.ProgressBoard")
 
 __all__ = [
     "FeatureState", "FeatureRow", "BoardReading", "ProgressBoard", "ENTRY",
+    "DYNAMIC_LIVE",
     "board_enabled", "scan_roots",
 ]
 
@@ -64,8 +65,9 @@ LIVE = "live"            # ON, present, and something in production imports it
 OFF = "off"              # flag resolves off — deliberately dormant
 UNKNOWN = "unknown"      # cannot be measured; never a guess
 ENTRY = "entry"          # runs via `python -m` / console script, not imports
+DYNAMIC_LIVE = "dynamic" # discovered at runtime by a registry, not imported
 
-_STATE_ORDER = (MISSING, DARK, LIVE, ENTRY, OFF, UNKNOWN)
+_STATE_ORDER = (MISSING, DARK, LIVE, DYNAMIC_LIVE, ENTRY, OFF, UNKNOWN)
 
 
 class FeatureState:
@@ -77,6 +79,7 @@ class FeatureState:
     OFF = OFF
     UNKNOWN = UNKNOWN
     ENTRY = ENTRY
+    DYNAMIC_LIVE = DYNAMIC_LIVE
     ORDER = _STATE_ORDER
 
 
@@ -220,6 +223,8 @@ class ProgressBoard:
         #: modules with a `__main__` guard — reachable by execution,
         #: never by import.
         self._entry_modules: Set[str] = set()
+        #: module -> why a runtime registry would discover it.
+        self._shadow_edges: Dict[str, str] = {}
         self._scanned = 0
 
     # -- import graph ------------------------------------------------------
@@ -239,6 +244,7 @@ class ProgressBoard:
         flags: Dict[str, str] = {}
         defaults: Dict[str, Any] = {}
         entries: Set[str] = set()
+        shadows: Dict[str, str] = {}
         prefix = flag_prefix()
         scanned = 0
         for root in scan_roots():
@@ -274,6 +280,9 @@ class ProgressBoard:
                     # forgetting to register.
                     if _has_main_guard(tree):
                         entries.add(_module_name(rel))
+                    marker = _semantic_marker(tree, rel)
+                    if marker:
+                        shadows[_module_name(rel)] = marker
                     for flag, dflt in _flag_literals(tree, prefix):
                         if flag not in flags:
                             flags[flag] = rel
@@ -282,6 +291,7 @@ class ProgressBoard:
         self._flag_sites = flags
         self._flag_defaults = defaults
         self._entry_modules = entries
+        self._shadow_edges = shadows
         self._scanned = scanned
         return scanned
 
@@ -393,6 +403,13 @@ class ProgressBoard:
             # default, so it exited through this path and was reported dark
             # even after entry-point detection shipped. A state check that
             # only one of two exits consults is not a state check.
+            if importers == 0 and module in self._shadow_edges:
+                # A runtime registry finds this by convention. NOT live:
+                # 'discovered by a registry' and 'imported by a caller'
+                # are different facts, and collapsing them would hide the
+                # day the registry stops being primed.
+                return FeatureRow(flag, DYNAMIC_LIVE, module_rel, category,
+                                  None, 0, self._shadow_edges[module], value)
             if importers == 0 and module in self._entry_modules:
                 return FeatureRow(flag, ENTRY, module_rel, category, None, 0,
                                   "module entry point (__main__ guard)", value)
@@ -400,6 +417,13 @@ class ProgressBoard:
             return FeatureRow(flag, state, module_rel, category, None,
                               importers, "non-boolean flag; state from graph",
                               value)
+        if importers == 0 and module in self._shadow_edges:
+            # A runtime registry finds this by convention. NOT live:
+            # 'discovered by a registry' and 'imported by a caller'
+            # are different facts, and collapsing them would hide the
+            # day the registry stops being primed.
+            return FeatureRow(flag, DYNAMIC_LIVE, module_rel, category,
+                              enabled, 0, self._shadow_edges[module], value)
         if importers == 0 and module in self._entry_modules:
             # Runs via `python -m` or a console script. Nothing imports
             # `commit_authority_cli`, and it is emphatically not dead —
@@ -477,6 +501,118 @@ def _imported_modules(tree: ast.AST) -> Set[str]:
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# The semantic shadow graph
+# ---------------------------------------------------------------------------
+#
+# Static AST cannot evaluate `inspect.getmembers`. But it does not have to:
+# a runtime registry only finds what it can RECOGNISE, and what it recognises
+# is a convention written into the source. Detect the convention and you have
+# the edge the import graph is missing — without importing or executing
+# anything.
+#
+# The markers below were MEASURED, not assumed. `repl_dispatch_registry`
+# has no `@verb` decorator; it walks curated packages for modules named
+# `*_repl` (or `repl` inside a sub-package) and picks up module-level
+# callables named `dispatch_<verb>_command`. Guessing a plausible-looking
+# decorator would have produced a detector that matched nothing and reported
+# a confident zero.
+
+
+def marker_functions() -> Tuple[str, ...]:
+    """Function-name prefixes/suffixes a registry discovers by convention.
+
+    ``prefix*suffix`` form. Env-overridable because a second registry with a
+    different convention should be a config change, not a code change.
+    """
+    raw = os.environ.get("JARVIS_PROGRESS_BOARD_FN_MARKERS", "").strip()
+    if raw:
+        return tuple(x.strip() for x in raw.split(",") if x.strip())
+    return ("dispatch_*_command",)
+
+
+def marker_modules() -> Tuple[str, ...]:
+    """Module basenames that a discovery walk treats as registrable."""
+    raw = os.environ.get("JARVIS_PROGRESS_BOARD_MODULE_MARKERS", "").strip()
+    if raw:
+        return tuple(x.strip() for x in raw.split(",") if x.strip())
+    return ("*_repl", "repl")
+
+
+def marker_decorators() -> frozenset:
+    """Decorator names that register their target at import time.
+
+    Empty by default HERE — this codebase's REPL registry uses naming, not
+    decorators. Populated by env for subsystems that do, rather than shipping
+    a speculative list that quietly matches nothing.
+    """
+    raw = os.environ.get("JARVIS_PROGRESS_BOARD_DECORATORS", "").strip()
+    return frozenset(x.strip() for x in raw.split(",") if x.strip())
+
+
+def marker_base_classes() -> frozenset:
+    """Base classes whose subclasses a registry collects."""
+    raw = os.environ.get("JARVIS_PROGRESS_BOARD_BASES", "").strip()
+    return frozenset(x.strip() for x in raw.split(",") if x.strip())
+
+
+def _glob_match(name: str, pattern: str) -> bool:
+    """`a*b` without importing fnmatch's full machinery per node."""
+    if "*" not in pattern:
+        return name == pattern
+    head, _, tail = pattern.partition("*")
+    return (name.startswith(head) and name.endswith(tail)
+            and len(name) >= len(head) + len(tail))
+
+
+def _semantic_marker(tree: ast.AST, rel: str) -> str:
+    """Why a runtime registry would find this module, or ''.
+
+    Returns a REASON, not a boolean: an operator told a module is
+    dynamically live deserves to know which convention made it so, or the
+    state is just a different flavour of guess.
+    """
+    stem = Path(rel).stem
+    module_hit = any(_glob_match(stem, pat) for pat in marker_modules())
+
+    decorators = marker_decorators()
+    bases = marker_base_classes()
+    fn_pats = marker_functions()
+
+    for node in getattr(tree, "body", ()):  # MODULE level only
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for pat in fn_pats:
+                if _glob_match(node.name, pat):
+                    return f"registry convention: {node.name}()"
+            for dec in node.decorator_list:
+                nm = _decorator_name(dec)
+                if nm and nm in decorators:
+                    return f"decorator @{nm}"
+        elif isinstance(node, ast.ClassDef):
+            for dec in node.decorator_list:
+                nm = _decorator_name(dec)
+                if nm and nm in decorators:
+                    return f"decorator @{nm}"
+            for base in node.bases:
+                nm = _decorator_name(base)
+                if nm and nm in bases:
+                    return f"subclass of {nm}"
+    if module_hit:
+        return f"module naming convention: {stem}"
+    return ""
+
+
+def _decorator_name(node: ast.AST) -> str:
+    """Last dotted segment of a decorator/base expression."""
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
 
 def _has_main_guard(tree: ast.AST) -> bool:
     """Does this module run itself?

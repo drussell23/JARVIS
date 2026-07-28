@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from backend.core.ouroboros.battle_test.progress_board import (
-    DARK, ENTRY, LIVE, OFF, ProgressBoard, _coerce_bool, _flag_literals,
+    DARK, DYNAMIC_LIVE, ENTRY, LIVE, OFF, ProgressBoard, _coerce_bool, _flag_literals,
     _is_test_path, _module_name, board_enabled, render_board,
 )
 import ast
@@ -240,3 +240,103 @@ class TestEntryPoints:
                'import os\nos.environ.get("JARVIS_PLAIN_ENABLED", "1")\n')
         rows = {r.flag: r for r in _board(tmp_path).read().rows}
         assert rows["JARVIS_PLAIN_ENABLED"].state == DARK
+
+
+class TestSemanticShadowGraph:
+    """Static AST cannot evaluate `inspect.getmembers` — but it does not need to.
+
+    A runtime registry only finds what it can RECOGNISE, and what it recognises
+    is a convention written into the source. Detect the convention and you have
+    the edge the import graph is missing, with no import and no execution.
+
+    The markers here were MEASURED. `repl_dispatch_registry` has no `@verb`
+    decorator: it walks for modules named `*_repl` carrying module-level
+    `dispatch_<verb>_command` callables. A detector built on a plausible-looking
+    decorator would have matched nothing and reported a confident zero.
+    """
+
+    def test_registry_convention_beats_zero_importers(self, tmp_path,
+                                                      monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/thing_repl.py",
+               'import os\n'
+               'X = os.environ.get("JARVIS_THING_ENABLED", "1")\n'
+               'def dispatch_thing_command(line):\n    return None\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        row = rows["JARVIS_THING_ENABLED"]
+        assert row.state == DYNAMIC_LIVE
+        assert "dispatch_thing_command" in row.reason
+
+    def test_module_naming_convention_alone_is_enough(self, tmp_path,
+                                                      monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/lonely_repl.py",
+               'import os\nos.environ.get("JARVIS_LONELY_ENABLED", "1")\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_LONELY_ENABLED"].state == DYNAMIC_LIVE
+
+    def test_decorator_marker_is_configurable_not_hardcoded(self, tmp_path,
+                                                            monkeypatch):
+        # A second registry with a different convention must be a config
+        # change, not a code change.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_DECORATORS", "verb")
+        _write(tmp_path, "backend/plugin.py",
+               'import os\n'
+               'X = os.environ.get("JARVIS_PLUGIN_ENABLED", "1")\n'
+               '@verb\ndef handler():\n    return None\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        row = rows["JARVIS_PLUGIN_ENABLED"]
+        assert row.state == DYNAMIC_LIVE
+        assert "@verb" in row.reason
+
+    def test_base_class_marker(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_BASES", "BaseSensor")
+        _write(tmp_path, "backend/sensor.py",
+               'import os\n'
+               'X = os.environ.get("JARVIS_SENSOR_ENABLED", "1")\n'
+               'class Thing(BaseSensor):\n    pass\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_SENSOR_ENABLED"].state == DYNAMIC_LIVE
+
+    def test_nested_function_does_NOT_count(self, tmp_path, monkeypatch):
+        # A registry walks MODULE-level members. A conventionally-named inner
+        # function is unreachable by `getmembers`, and treating it as a marker
+        # would launder dark modules into live ones — the exact failure the
+        # vendored-venv exclusion already had to fix once.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/inner.py",
+               'import os\n'
+               'X = os.environ.get("JARVIS_INNER_ENABLED", "1")\n'
+               'def outer():\n'
+               '    def dispatch_inner_command(line):\n        return None\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_INNER_ENABLED"].state == DARK
+
+    def test_a_real_importer_still_wins(self, tmp_path, monkeypatch):
+        # DYNAMIC_LIVE is the fallback for "nothing imports it". Direct
+        # evidence must beat an inference.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/thing_repl.py",
+               'import os\n'
+               'X = os.environ.get("JARVIS_THING_ENABLED", "1")\n'
+               'def dispatch_thing_command(line):\n    return None\n')
+        _write(tmp_path, "backend/caller.py", "from backend import thing_repl\n")
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_THING_ENABLED"].state == LIVE
+
+    @pytest.mark.asyncio
+    async def test_async_read_classifies_shadow_modules_identically(
+        self, tmp_path, monkeypatch,
+    ):
+        # The mandated async assertion: a file with NO inbound imports but a
+        # registry-recognisable marker is DYNAMIC_LIVE off the event loop too.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/async_repl.py",
+               'import os\n'
+               'X = os.environ.get("JARVIS_ASYNC_VERB_ENABLED", "1")\n'
+               'def dispatch_async_command(line):\n    return None\n')
+        board = _board(tmp_path)
+        rows = {r.flag: r for r in (await board.read_async()).rows}
+        assert rows["JARVIS_ASYNC_VERB_ENABLED"].state == DYNAMIC_LIVE
