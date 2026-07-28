@@ -154,14 +154,19 @@ def _ov_src() -> str:
 
 
 def test_esc_in_flow_interrupts() -> None:
+    """Esc-in-FLOW now routes through the remappable keymap — the pin
+    follows the seam: the action is declared with the escape default and
+    the SAME in_flow_working gate."""
     src = _ov_src()
-    assert 'kb.add("escape", filter=in_flow_working' in src
+    block = src.split('"chat:interrupt"')[1][:200]
+    assert '("escape",)' in block and "filter=in_flow_working" in block
 
 
 def test_the_existing_escape_still_leaves_select_and_focus() -> None:
     """One key, two meanings — and the older one must not be displaced."""
     src = _ov_src()
-    assert 'kb.add("escape", filter=not_flow' in src
+    block = src.split('"deck:escape"')[1][:200]
+    assert '("escape",)' in block and "filter=not_flow" in block
 
 
 def test_the_two_bindings_do_not_overlap() -> None:

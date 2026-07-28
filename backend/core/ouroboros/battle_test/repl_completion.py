@@ -68,7 +68,7 @@ from backend.core.ouroboros.battle_test.verb_usage import (
 )
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, FrozenSet, List, Optional, Tuple
+from typing import Any, Callable, FrozenSet, List, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.ReplCompletion")
 
@@ -85,6 +85,9 @@ MASTER_FLAG_ENV_VAR: str = "JARVIS_REPL_COMPLETION_ENABLED"
 HISTORY_PATH_ENV_VAR: str = "JARVIS_REPL_HISTORY_FILE"
 HISTORY_ENABLED_ENV_VAR: str = "JARVIS_REPL_HISTORY_ENABLED"
 INLINE_HELP_ENABLED_ENV_VAR: str = "JARVIS_REPL_INLINE_HELP_ENABLED"
+AUTOSUGGEST_ENABLED_ENV_VAR: str = "JARVIS_REPL_AUTOSUGGEST_ENABLED"
+COMPLETE_WHILE_TYPING_ENV_VAR: str = "JARVIS_REPL_COMPLETE_WHILE_TYPING"
+UNIFIED_REGISTRY_ENV_VAR: str = "JARVIS_UNIFIED_VERB_REGISTRY_ENABLED"
 
 
 # Default: project-local. Operators with multiple O+V projects get
@@ -142,6 +145,53 @@ def is_inline_help_enabled() -> bool:
         return False
     raw = os.environ.get(INLINE_HELP_ENABLED_ENV_VAR, "true")
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def is_autosuggest_enabled() -> bool:
+    """``JARVIS_REPL_AUTOSUGGEST_ENABLED``. Default true. Gates the
+    history ghost-text (fish/CC-style grey suggestion completed with →).
+    Implicitly off when history is off — there is nothing to suggest
+    from. NEVER raises."""
+    if not is_history_enabled():
+        return False
+    raw = os.environ.get(AUTOSUGGEST_ENABLED_ENV_VAR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def is_complete_while_typing_enabled() -> bool:
+    """``JARVIS_REPL_COMPLETE_WHILE_TYPING``. Default true — the palette
+    opens as the operator types ``/`` instead of demanding an explicit
+    Tab, matching the attach surfaces (both already pass
+    ``complete_while_typing=True``). Flip ``=false`` to restore
+    Tab-only completion on the daemon REPL. NEVER raises."""
+    raw = os.environ.get(COMPLETE_WHILE_TYPING_ENV_VAR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def is_unified_registry_enabled() -> bool:
+    """``JARVIS_UNIFIED_VERB_REGISTRY_ENABLED``. Default true. Gates the
+    reconciliation of the two historic verb sources — ``discover_verbs``
+    (the daemon's ``_handle_*`` walk) and ``registry_from_dispatch``
+    (the 60-verb dispatch table + client verbs) — into ONE registry, so
+    every surface completes the same vocabulary. NEVER raises."""
+    raw = os.environ.get(UNIFIED_REGISTRY_ENV_VAR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def build_auto_suggest() -> Optional[object]:
+    """History ghost-text, threaded so a large history file never lands
+    on a keystroke. Returns ``None`` when disabled or prompt_toolkit is
+    unavailable. NEVER raises."""
+    if not is_autosuggest_enabled():
+        return None
+    try:
+        from prompt_toolkit.auto_suggest import (
+            AutoSuggestFromHistory,
+            ThreadedAutoSuggest,
+        )
+        return ThreadedAutoSuggest(AutoSuggestFromHistory())
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def resolve_history_path() -> Optional[Path]:
@@ -574,14 +624,23 @@ def list_arg_providers() -> Tuple[str, ...]:
         return ()
 
 
-# Regex covering the four arg_spec atom forms:
+# Regex covering the six arg_spec atom forms:
 #   <name>             — required positional
 #   [name]             — optional positional
 #   [--flag]           — optional flag, no value
 #   [--flag <value>]   — optional flag with value
+#   <a|b|c>            — required choice (STATIC values inline)
+#   [a|b|c]            — optional choice (STATIC values inline)
+# Choice atoms exist so a verb's MINED subcommand vocabulary
+# (verb_usage.mine_subcommands) can ride the same spec grammar the
+# doc-tag convention uses — per-verb static values with no parallel
+# table and no per-verb provider registration. Choice alternatives
+# are listed first so the atom regex prefers them over bare names.
 # Compiled once; pure-function consumers are thread-safe.
 _ARG_SPEC_ATOM_RE = re.compile(
-    r"<(?P<req>[a-zA-Z_][\w-]*)>"
+    r"<(?P<req_choice>[a-zA-Z_][\w-]*(?:\|[a-zA-Z_][\w-]*)+)>"
+    r"|\[(?P<opt_choice>[a-zA-Z_][\w-]*(?:\|[a-zA-Z_][\w-]*)+)\]"
+    r"|<(?P<req>[a-zA-Z_][\w-]*)>"
     r"|\[--(?P<flag>[a-zA-Z][\w-]*)(?:\s+<(?P<flag_val>[a-zA-Z_][\w-]*)>)?\]"
     r"|\[(?P<opt>[a-zA-Z_][\w-]*)\]"
 )
@@ -642,7 +701,18 @@ def parse_arg_spec(raw: object) -> Tuple[ArgPositionSpec, ...]:
     out: List[ArgPositionSpec] = []
     for match in _ARG_SPEC_ATOM_RE.finditer(text):
         gd = match.groupdict()
-        if gd.get("flag"):
+        if gd.get("req_choice") or gd.get("opt_choice"):
+            raw_choice = gd.get("req_choice") or gd.get("opt_choice") or ""
+            values = tuple(
+                v for v in (p.strip() for p in raw_choice.split("|")) if v
+            )
+            out.append(ArgPositionSpec(
+                name="subcommand",
+                required=bool(gd.get("req_choice")),
+                kind=ArgKind.STATIC,
+                static_values=values,
+            ))
+        elif gd.get("flag"):
             flag_name = gd["flag"]
             flag_val = gd.get("flag_val") or ""
             if flag_val:
@@ -772,10 +842,10 @@ def cursor_arg_position(buffer_text: object) -> Tuple[int, str]:
     stripped_left = text.lstrip()
     if not stripped_left.startswith("/"):
         return -1, ""
-    # Number of leading spaces consumed when lstripping — preserved
-    # so that downstream completers can compute start_position
-    # correctly if needed.
-    tokens = stripped_left.split(" ")
+    # Quote-aware split: '/attach "my file<cursor>' is ONE half-typed
+    # argument, not two. A naive split(" ") put the cursor in a
+    # phantom second position the moment a path contained a space.
+    tokens = _split_arg_tokens(stripped_left)
     # tokens[0] is the verb (e.g., "/cancel"); subsequent tokens
     # are arg slots. Trailing empty string means "started a new
     # token" (operator typed a space).
@@ -784,6 +854,31 @@ def cursor_arg_position(buffer_text: object) -> Tuple[int, str]:
     position_index = len(tokens) - 2  # tokens[1] is position 0
     prefix = tokens[-1]
     return position_index, prefix
+
+
+def _split_arg_tokens(text: str) -> List[str]:
+    """Split on spaces OUTSIDE quotes, preserving the naive-split
+    contract the completer depends on: a trailing unquoted space yields
+    a trailing ``""`` token ("operator started a new slot"), and quote
+    characters stay in the token (the prefix the operator actually
+    typed, byte-for-byte, so ``start_position`` math stays honest).
+    Unbalanced quotes — the mid-typing state — simply extend the final
+    token. NEVER raises."""
+    tokens: List[str] = [""]
+    quote = ""
+    for ch in text:
+        if quote:
+            tokens[-1] += ch
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+            tokens[-1] += ch
+        elif ch == " ":
+            tokens.append("")
+        else:
+            tokens[-1] += ch
+    return tokens
 
 
 # ===========================================================================
@@ -1174,6 +1269,7 @@ def discover_verbs(repl_instance: object) -> VerbRegistry:
 
 def build_completer(
     registry: VerbRegistry, *, max_results: int = 8,
+    include_mentions: bool = True,
 ) -> Optional[object]:
     """Build a ``prompt_toolkit.completion.Completer`` that fires only
     when the input starts with ``/``. Returns ``None`` when
@@ -1281,6 +1377,14 @@ def build_completer(
     # mention on `@` word-boundary), so they never collide. When
     # mention completer is unavailable (polish off / prompt_toolkit
     # missing), fall through to slash-only.
+    #
+    # ``include_mentions=False`` exists for callers that bring their
+    # OWN mention completer (build_attach_completer merges the
+    # repo-rooted MentionPathCompleter) — without it the attach
+    # surface ran BOTH mention completers and every `@` prefix
+    # yielded duplicate candidates.
+    if not include_mentions:
+        return slash_completer
     try:
         from backend.core.ouroboros.battle_test.repl_input_polish import (
             build_mention_completer,
@@ -1366,6 +1470,8 @@ class CompletionWiring:
     history: Optional[object]
     enable_history_search: bool
     registry: VerbRegistry
+    auto_suggest: Optional[object] = None
+    complete_while_typing: bool = False
     schema_version: str = REPL_COMPLETION_SCHEMA_VERSION
 
 
@@ -1388,14 +1494,29 @@ def build_completion_wiring(
     NEVER raises. Always returns a wiring (even with ``None`` slots
     when prompt_toolkit / FS access is unavailable).
     """
-    registry = discover_verbs(repl_instance)
+    # ONE registry for every surface (gap #3 reconciliation): the daemon's
+    # discovered ``_handle_*`` verbs merged with the dispatch table it also
+    # routes to. Kill-switch inside unified_registry restores the split.
+    registry = unified_registry(repl_instance)
     completer: Optional[object] = None
     history: Optional[object] = None
+    auto_suggest: Optional[object] = None
     enable_search = False
 
     if is_completion_enabled():
         try:
-            completer = build_completer(registry)
+            # A browsable palette over the unified table — the historic
+            # default of 8 was a typo-suggestion cap, not a menu size.
+            completer = build_completer(registry, max_results=512)
+            if completer is not None:
+                # Off-thread for the same reason as the attach surface:
+                # first-completion work (registry walks, fs walks) must
+                # land between keystrokes, not on one.
+                try:
+                    from prompt_toolkit.completion import ThreadedCompleter
+                    completer = ThreadedCompleter(completer)
+                except ImportError:
+                    pass
         except Exception:  # noqa: BLE001
             logger.debug(
                 "[ReplCompletion] build_completer failed", exc_info=True,
@@ -1410,26 +1531,41 @@ def build_completion_wiring(
                 "[ReplCompletion] build_history failed", exc_info=True,
             )
 
+        try:
+            auto_suggest = build_auto_suggest()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[ReplCompletion] build_auto_suggest failed", exc_info=True,
+            )
+
     return CompletionWiring(
         completer=completer,
         history=history,
         enable_history_search=enable_search,
         registry=registry,
+        auto_suggest=auto_suggest,
+        complete_while_typing=(
+            completer is not None and is_complete_while_typing_enabled()
+        ),
     )
 
 
 __all__ = [
     "ArgKind",
     "ArgPositionSpec",
+    "AUTOSUGGEST_ENABLED_ENV_VAR",
+    "COMPLETE_WHILE_TYPING_ENV_VAR",
     "CompletionWiring",
     "HISTORY_ENABLED_ENV_VAR",
     "HISTORY_PATH_ENV_VAR",
     "INLINE_HELP_ENABLED_ENV_VAR",
     "MASTER_FLAG_ENV_VAR",
     "REPL_COMPLETION_SCHEMA_VERSION",
+    "UNIFIED_REGISTRY_ENV_VAR",
     "VerbCategory",
     "VerbDescriptor",
     "VerbRegistry",
+    "build_auto_suggest",
     "build_completer",
     "build_completion_wiring",
     "build_history",
@@ -1439,11 +1575,15 @@ __all__ = [
     "format_verb_hint",
     "fuzzy_match",
     "get_arg_candidates",
+    "is_autosuggest_enabled",
+    "is_complete_while_typing_enabled",
     "is_completion_enabled",
     "is_history_enabled",
     "is_inline_help_enabled",
+    "is_unified_registry_enabled",
     "list_arg_providers",
     "parse_arg_spec",
+    "unified_registry",
     "register_arg_provider",
     "resolve_help_for_buffer",
     "resolve_history_path",
@@ -1782,6 +1922,88 @@ class MentionPathCompleter:
         return hits[: self._max]
 
 
+def _dispatch_arg_spec(verb: str, fn: object) -> str:
+    """Arg spec for a dispatch verb — the piece that makes the ~330-line
+    arg-completion machinery LIVE on the attach surface, where every
+    dispatcher's Python signature is the uninformative ``(line)``.
+
+    Sources, most-authored first (same ranking philosophy as _describe):
+
+      1. a module-level ``__verb_args__ = {"cancel": "<op_id>"}`` dict —
+         the same one-place-per-module convention as ``__verb_help__`` /
+         ``__aliases__``, for verbs whose arguments aren't literals in
+         the function body;
+      2. the verb's MINED subcommand vocabulary rendered as a choice
+         atom (``[status|history|explain]``) — read from the code, so a
+         dispatcher that grows a subcommand completes it with no other
+         edit.
+
+    NEVER raises; "" means "no arg completion", which is where every
+    dispatch verb was before this seam."""
+    try:
+        import sys as _sys
+        mod = _sys.modules.get(getattr(fn, "__module__", "") or "")
+        authored = getattr(mod, "__verb_args__", None)
+        if isinstance(authored, dict):
+            spec = authored.get(verb) or authored.get(f"/{verb}")
+            if isinstance(spec, str) and spec.strip():
+                return spec.strip()
+        subs = mine_subcommands(fn)
+        if subs:
+            return "[" + "|".join(subs) + "]"
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def unified_registry(repl_instance: object = None) -> VerbRegistry:
+    """THE verb registry — the reconciliation of the two historic sources
+    that drifted for four palette PRs:
+
+      * ``registry_from_dispatch()`` — the 60-verb dispatch table the
+        daemon actually routes to, plus the client-handled verbs;
+      * ``discover_verbs(repl_instance)`` — the daemon's ``_handle_*``
+        walk, which carries the metadata the dispatch table lacks
+        (doc-tag arg specs, aliases, examples, categories).
+
+    Merge policy per colliding slash form: the dispatch descriptor's
+    HUMANISED description wins unless it is UNDOCUMENTED and the
+    discovered one has prose; every other field prefers whichever side
+    actually has data. Kill-switch ``JARVIS_UNIFIED_VERB_REGISTRY_ENABLED=
+    false`` restores the legacy per-surface split. NEVER raises."""
+    if not is_unified_registry_enabled():
+        return discover_verbs(repl_instance)
+    try:
+        merged: dict = {
+            d.slash_form: d for d in registry_from_dispatch().verbs
+        }
+        for d in discover_verbs(repl_instance).verbs:
+            base = merged.get(d.slash_form)
+            if base is None:
+                merged[d.slash_form] = d
+                continue
+            description = base.description
+            if (not description or description == UNDOCUMENTED) and (
+                d.description
+            ):
+                description = d.description
+            merged[d.slash_form] = VerbDescriptor(
+                slash_form=base.slash_form,
+                handler_method=d.handler_method or base.handler_method,
+                description=description,
+                aliases=tuple(dict.fromkeys(base.aliases + d.aliases)),
+                examples=tuple(dict.fromkeys(base.examples + d.examples)),
+                arg_spec=base.arg_spec or d.arg_spec,
+                category=d.category if d.handler_method else base.category,
+            )
+        return VerbRegistry(
+            verbs=tuple(sorted(merged.values(), key=lambda v: v.slash_form))
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Completion] unified registry degraded", exc_info=True)
+        return discover_verbs(repl_instance)
+
+
 def registry_from_dispatch() -> VerbRegistry:
     """Build a :class:`VerbRegistry` from the AUTO-DISCOVERED dispatch table.
 
@@ -1815,6 +2037,7 @@ def registry_from_dispatch() -> VerbRegistry:
                     slash_form=f"/{verb}",
                     handler_method="",
                     description=_describe(fn),
+                    arg_spec=_dispatch_arg_spec(verb, fn),
                 )
             )
     except Exception:  # noqa: BLE001
@@ -1863,6 +2086,11 @@ def build_attach_completer() -> Optional[object]:
         # to exceed the table.
         completer = build_completer(
             registry_from_dispatch(), max_results=512,
+            # The repo-rooted MentionPathCompleter below is this
+            # surface's `@` vocabulary — without this flag the polish
+            # module's cwd-rooted PathCompleter ALSO merged in and every
+            # mention completed twice.
+            include_mentions=False,
         )
         if completer is None:
             return None

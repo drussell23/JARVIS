@@ -557,6 +557,8 @@ def build_bipartite_application(
     header: Optional[Callable[[], str]] = None,
     header_height: int = 0,
     completer: Any = None,
+    history: Any = None,
+    auto_suggest: Any = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
     window fed from ``mux.render_canvas_ansi()`` (re-rendered each frame, so
@@ -618,6 +620,18 @@ def build_bipartite_application(
         wrap_lines=False, style="class:command-deck",
         completer=completer,
         complete_while_typing=bool(completer is not None),
+        # Persistent recall on THE surface the operator actually types
+        # into. Without an explicit history the TextArea's buffer gets a
+        # fresh InMemoryHistory — Up-arrow forgot everything at detach,
+        # while the fallback PromptSession remembered. `auto_up` on the
+        # buffer already walks history when the caret is on the first
+        # line, so a History object is the ONLY missing piece.
+        **({"history": history} if history is not None else {}),
+        # History ghost-text (grey fish/CC-style suggestion). None when
+        # the operator disabled it — TextArea treats None as "no
+        # suggestions" natively.
+        **({"auto_suggest": auto_suggest} if auto_suggest is not None
+           else {}),
     )
 
     def _accept(buff) -> bool:
@@ -663,10 +677,33 @@ def build_bipartite_application(
     except Exception:  # noqa: BLE001
         pass
 
-    @kb.add("c-c")
-    @kb.add("c-d")
+    # Detach/exit through the remappable keymap (defaults unchanged:
+    # Ctrl+C / Ctrl+D). A mount rather than a literal `@kb.add("c-c")`
+    # so keybindings.json can move them and `/keys` can show them; the
+    # except-branch keeps the legacy hardcoded pair when the keymap
+    # module is unavailable — a cockpit the operator cannot LEAVE is
+    # the one regression this seam must never introduce.
     def _exit(event) -> None:
         event.app.exit()
+
+    try:
+        from backend.core.ouroboros.battle_test.keymap import KeymapMount
+        _mount = KeymapMount("cockpit")
+        _mount.action(
+            "app:detach", ("ctrl+c",), context="Global",
+            description="leave the cockpit; the daemon keeps running",
+        )(_exit)
+        _mount.action(
+            "app:exit", ("ctrl+d",), context="Global",
+            description="leave the cockpit",
+        )(_exit)
+        _mount_kb = _mount.key_bindings()
+        if _mount_kb is None:
+            raise RuntimeError("keymap mount unavailable")
+        kb = _merge_key_bindings(kb, _mount_kb)
+    except Exception:  # noqa: BLE001
+        kb.add("c-c")(_exit)
+        kb.add("c-d")(_exit)
 
     if extra_key_bindings is not None:
         try:
@@ -920,6 +957,8 @@ async def run_bipartite_repl(
     header: Optional[Callable[[], str]] = None,
     header_height: int = 0,
     completer: Any = None,
+    history: Any = None,
+    auto_suggest: Any = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
     the live Zone-1 sink (so any producer — the daemon's event router OR the
@@ -947,7 +986,7 @@ async def run_bipartite_repl(
         app = build_bipartite_application(
             mux, on_accept=on_accept, extra_key_bindings=extra_key_bindings,
             toolbar=toolbar, header=header, header_height=header_height,
-            completer=completer,
+            completer=completer, history=history, auto_suggest=auto_suggest,
         )
         if watch_alive is not None:
             watcher = asyncio.ensure_future(

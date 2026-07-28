@@ -5989,7 +5989,26 @@ class SerpentREPL:
                         await _aio.sleep(0.02)
 
                 _aio.ensure_future(_attach_sprite_when_ready())
-                await run_bipartite_repl(on_accept=_on_accept)
+                # The daemon-side cockpit is a surface the operator TYPES
+                # into, and it ran with zero completion, zero persistent
+                # history and zero ghost-text while the attach cockpit
+                # had all three wired at ov.py — the two-surfaces split,
+                # again. Same wiring seam the legacy PromptSession below
+                # uses (DRY), so the vocabularies cannot diverge.
+                _bp_wiring = None
+                try:
+                    from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
+                        build_completion_wiring,
+                    )
+                    _bp_wiring = build_completion_wiring(self)
+                except Exception:  # noqa: BLE001
+                    _bp_wiring = None
+                await run_bipartite_repl(
+                    on_accept=_on_accept,
+                    completer=getattr(_bp_wiring, "completer", None),
+                    history=getattr(_bp_wiring, "history", None),
+                    auto_suggest=getattr(_bp_wiring, "auto_suggest", None),
+                )
                 return
         except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL
             pass  # fall through to the legacy flowing loop below
@@ -6094,7 +6113,16 @@ class SerpentREPL:
                     discover_verbs as _qm_discover,
                     resolve_help_for_buffer as _qm_resolve,
                 )
-                _reg = _qm_discover(self)
+                # The verb set is static per-process — rebuilding the
+                # whole registry (an inspect.getmembers walk) on EVERY
+                # `?` keypress was pure waste on the key dispatch path.
+                _reg = getattr(self, "_qm_registry_cache", None)
+                if _reg is None:
+                    _reg = _qm_discover(self)
+                    try:
+                        self._qm_registry_cache = _reg
+                    except Exception:  # noqa: BLE001
+                        pass
                 _help_text = _qm_resolve(buf.text, _reg)
             except Exception:  # noqa: BLE001 — NEVER raise
                 _help_text = None
@@ -6284,6 +6312,7 @@ class SerpentREPL:
             "complete_while_typing": False,
             "enable_history_search": False,
         }
+        _auto_suggest = None
         try:
             from backend.core.ouroboros.battle_test.repl_completion import (
                 build_completion_wiring,
@@ -6291,11 +6320,19 @@ class SerpentREPL:
             _wiring = build_completion_wiring(self)
             if _wiring.completer is not None:
                 _completion_kwargs["completer"] = _wiring.completer
+                # Palette-as-you-type (default true, env
+                # JARVIS_REPL_COMPLETE_WHILE_TYPING) — the attach
+                # surfaces already behaved this way; Tab-only was a
+                # daemon-side historical accident, not a decision.
+                _completion_kwargs["complete_while_typing"] = (
+                    _wiring.complete_while_typing
+                )
             if _wiring.history is not None:
                 _completion_kwargs["history"] = _wiring.history
                 _completion_kwargs["enable_history_search"] = (
                     _wiring.enable_history_search
                 )
+            _auto_suggest = _wiring.auto_suggest
         except Exception:
             pass  # fail-closed — REPL still works without completion
 
@@ -6325,7 +6362,9 @@ class SerpentREPL:
             multiline=True,
             key_bindings=_repl_bindings,
             wrap_lines=True,
-            auto_suggest=None,
+            # History ghost-text from the wiring (None when disabled via
+            # JARVIS_REPL_AUTOSUGGEST_ENABLED — the legacy explicit-None).
+            auto_suggest=_auto_suggest,
             prompt_continuation=_continuation,
             bottom_toolbar=_live_bottom_toolbar,
             refresh_interval=_refresh_interval_kwarg,

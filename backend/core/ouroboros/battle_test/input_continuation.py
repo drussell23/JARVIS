@@ -165,12 +165,29 @@ def install_newline_binding(kb: Any) -> bool:
         if kb is None or not multiline_enabled():
             return False
 
-        @kb.add("escape", "enter")
         def _newline(event: Any) -> None:
             try:
                 event.current_buffer.insert_text("\n")
             except Exception:  # noqa: BLE001
                 pass
+
+        # Through the remappable keymap (default unchanged: Alt+Enter),
+        # so keybindings.json can move the escape hatch and `/keys` can
+        # show it. The except-branch keeps the hardcoded default — the
+        # continuation rules above are only safe while a deliberate
+        # newline exists, so this binding may degrade but never vanish.
+        try:
+            from backend.core.ouroboros.battle_test.keymap import (
+                bind_action,
+            )
+            if not bind_action(
+                kb, "chat:newline", ("alt+enter",), _newline,
+                context="Chat",
+                description="insert a newline without submitting",
+            ):
+                raise RuntimeError("keymap yielded no newline binding")
+        except Exception:  # noqa: BLE001
+            kb.add("escape", "enter")(_newline)
 
         return True
     except Exception:  # noqa: BLE001

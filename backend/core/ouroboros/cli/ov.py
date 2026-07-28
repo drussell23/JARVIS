@@ -1453,6 +1453,11 @@ async def _split_plane_loop(
         # would freeze the very keystroke that opened the menu.
         completer=_build_slash_completer(),
         complete_while_typing=True,
+        # Persistent recall + history ghost-text — the same
+        # .jarvis/repl_history every other surface reads, so a verb
+        # typed at the daemon REPL suggests here and vice versa.
+        history=_build_prompt_history(),
+        auto_suggest=_build_prompt_auto_suggest(),
         # Multi-line, with the CONDITION applied to the buffer below — the
         # same two-step the cockpit uses, from the same module, so the two
         # surfaces cannot disagree about when Enter means "go".
@@ -1582,6 +1587,57 @@ def _build_slash_completer() -> Any:
         return None
 
 
+def _build_prompt_history() -> Any:
+    """Persistent prompt history for the attach surfaces — the SAME
+    ``.jarvis/repl_history`` file the daemon REPL writes, so what the
+    operator typed at one surface recalls at every other. None when
+    disabled/unavailable. NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.repl_completion import (
+            build_history,
+        )
+        return build_history()
+    except Exception:  # noqa: BLE001 — a cockpit without recall still works
+        return None
+
+
+def _build_prompt_auto_suggest() -> Any:
+    """History ghost-text for the attach surfaces. None when disabled.
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.repl_completion import (
+            build_auto_suggest,
+        )
+        return build_auto_suggest()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _register_client_op_provider(ui: Any) -> None:
+    """Arg-completion candidates for ``<op_id>`` positions, resolved from
+    the op ids the bridge stream has ALREADY delivered to this client
+    (``ui._active_ops``) — the same source the Esc-interrupt gate trusts.
+    Completion never asks the daemon anything on a keystroke. NEVER
+    raises."""
+    try:
+        from backend.core.ouroboros.battle_test.repl_completion import (
+            register_arg_provider,
+        )
+
+        def _candidates(prefix: str) -> tuple:
+            try:
+                ops = getattr(ui, "_active_ops", None) or ()
+                return tuple(
+                    str(op) for op in ops if str(op).startswith(prefix or "")
+                )
+            except Exception:  # noqa: BLE001
+                return ()
+
+        register_arg_provider("op_id", _candidates)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _build_selection_bindings(ui: Any, client: Any) -> Any:
     """Arrow/Enter/Esc for the selectable deck. NEVER raises.
 
@@ -1636,22 +1692,43 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
             except Exception:  # noqa: BLE001
                 return False
 
-        @kb.add("c-o", filter=can_open)
+        # Every selection key routes through the remappable keymap
+        # (defaults unchanged) — `bind_action` resolves the operator's
+        # keybindings.json over the declared default, registers the
+        # action for `/keys`, and NEVER raises; when the config is
+        # absent this is byte-for-byte the old `@kb.add(...)`.
+        from backend.core.ouroboros.battle_test.keymap import bind_action
+
         def _open(event: Any) -> None:
             fsm.enter_select()
             ui.refresh()
 
-        @kb.add("up", filter=in_select)
+        bind_action(
+            kb, "deck:open", ("ctrl+o",), _open,
+            context="Deck", filter=can_open,
+            description="enter deck selection (empty buffer only)",
+        )
+
         def _up(event: Any) -> None:
             fsm.move(-1)
             ui.refresh()
 
-        @kb.add("down", filter=in_select)
+        bind_action(
+            kb, "deck:previous", ("up",), _up,
+            context="Deck", filter=in_select,
+            description="previous deck entry",
+        )
+
         def _down(event: Any) -> None:
             fsm.move(1)
             ui.refresh()
 
-        @kb.add("enter", filter=in_select)
+        bind_action(
+            kb, "deck:next", ("down",), _down,
+            context="Deck", filter=in_select,
+            description="next deck entry",
+        )
+
         def _enter(event: Any) -> None:
             lane = fsm.selected_lane()
             if fsm.focus_selected() and lane:
@@ -1663,6 +1740,12 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
                     pass
             ui.refresh()
 
+        bind_action(
+            kb, "deck:focus", ("enter",), _enter,
+            context="Deck", filter=in_select,
+            description="focus the selected lane",
+        )
+
         # `eager` is a FILTER, not a flag. Eager means "fire now, do not wait
         # to see if this is the start of a longer sequence" — which is exactly
         # what would swallow the escape half of Alt+Enter. So Esc stays
@@ -1670,7 +1753,6 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
         # they want to interrupt: watching, not typing) and yields the
         # sequence while they are composing. Both meanings survive, and which
         # one applies is decided by what the operator is visibly doing.
-        @kb.add("escape", filter=in_flow_working, eager=_not_composing())
         def _interrupt(event: Any) -> None:
             """Esc in FLOW interrupts the operator's own work.
 
@@ -1691,12 +1773,22 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
             except Exception:  # noqa: BLE001
                 pass
 
-        @kb.add("escape", filter=not_flow, eager=_not_composing())
+        bind_action(
+            kb, "chat:interrupt", ("escape",), _interrupt,
+            context="Chat", filter=in_flow_working, eager=_not_composing(),
+            description="interrupt your own in-flight work (/cancel)",
+        )
+
         def _esc(event: Any) -> None:
             fsm.escape()
             ui.refresh()
 
-        @kb.add("c-p")
+        bind_action(
+            kb, "deck:escape", ("escape",), _esc,
+            context="Deck", filter=not_flow, eager=_not_composing(),
+            description="leave SELECT/FOCUS",
+        )
+
         def _release_gate(event: Any) -> None:
             """Surface a deferred approval on demand.
 
@@ -1716,6 +1808,12 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
                     )
             except Exception:  # noqa: BLE001
                 pass
+
+        bind_action(
+            kb, "gate:review", ("ctrl+p",), _release_gate,
+            context="Chat",
+            description="surface a deferred approval on demand",
+        )
 
         try:
             from backend.core.ouroboros.battle_test.input_continuation import (
@@ -2081,6 +2179,11 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             except Exception:  # noqa: BLE001
                 pass
 
+    # Dynamic op-id completion from the ops THIS client has already been
+    # told about — no bridge round-trip on a keystroke. Inert until a
+    # dispatch module declares an ``<op_id>`` position via __verb_args__.
+    _register_client_op_provider(ui)
+
     def _alive() -> bool:
         ok = bool(client.connected)
         if not ok:
@@ -2334,6 +2437,10 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             # types into — the bipartite Application, not the split-plane
             # PromptSession the completer was first wired to.
             completer=_build_slash_completer(),
+            # Persistent recall + history ghost-text — the same history
+            # file every surface shares, so Up-arrow survives a detach.
+            history=_build_prompt_history(),
+            auto_suggest=_build_prompt_auto_suggest(),
             seed=[
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "
                 "plain words both work · [cyan]wake[/cyan] arms my voice · "
