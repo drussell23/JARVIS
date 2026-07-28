@@ -4519,7 +4519,8 @@ class BattleTestHarness:
                 except Exception:  # noqa: BLE001
                     return {}
 
-            def _on_input(text: str, session: Optional[str] = None) -> None:
+            def _on_input(text: str, session: Optional[str] = None,
+                          prompt_id: Optional[str] = None) -> None:
                 # Operator Prompt Bridge FIRST (2026-07-23): while an
                 # interactive gate ([Y/n] Iron Gate, endorse) is pending,
                 # the next attached-terminal line IS the answer — HITL
@@ -4529,7 +4530,9 @@ class BattleTestHarness:
                     from backend.core.ouroboros.battle_test.operator_prompt_bridge import (  # noqa: E501
                         get_operator_prompt_bridge,
                     )
-                    if get_operator_prompt_bridge().resolve(text):
+                    if get_operator_prompt_bridge().resolve(
+                        text, prompt_id=prompt_id,
+                    ):
                         return
                 except Exception:  # noqa: BLE001
                     pass
@@ -4582,6 +4585,21 @@ class BattleTestHarness:
                 # CC-style ⏺/⎿ tool blocks + diffs the local console
                 # renders (composition layer escapes model content).
                 try:
+                    # Interactive gates, as DATA. The question already
+                    # mirrors as a markup line; this adds the id + deadline a
+                    # cockpit needs to defer it safely and still answer the
+                    # right op. Wired at the bridge's arming seam, so every
+                    # gate that can be answered remotely is announced.
+                    try:
+                        from backend.core.ouroboros.battle_test.operator_prompt_bridge import (  # noqa: E501
+                            set_prompt_publisher,
+                        )
+                        set_prompt_publisher(
+                            bridge.publish_prompt,
+                            bridge.publish_prompt_resolved,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                     sf = getattr(self, "_serpent_flow", None)
                     if sf is not None:
                         sf.markup_mirror = bridge.publish_markup

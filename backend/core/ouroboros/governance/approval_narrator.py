@@ -134,7 +134,12 @@ async def await_decision_with_operator(
             get_operator_prompt_bridge,
         )
         bridge = get_operator_prompt_bridge()
-        fut = bridge.begin(str(request_id))
+        fut = bridge.begin(
+            str(request_id),
+            text=render_gate_prompt(request_id, risk, reason, timeout_s),
+            risk=risk,
+            timeout_s=timeout_s,
+        )
     except Exception:  # noqa: BLE001
         bridge, fut = None, None
 

@@ -3908,6 +3908,17 @@ class SerpentFlow:
             )
             bridge_fut = get_operator_prompt_bridge().begin(
                 f"iron-gate:{short}",
+                text=str(description or f"Iron Gate({short}) — apply?"),
+                risk=str(risk_reason or "APPROVAL_REQUIRED"),
+                # No deadline declared, deliberately. This gate has none
+                # while a local [Y/n] prompt is alive (`_race_gate_answer`
+                # passes `timeout=None`), and only `_bridge_only_wait_s()`
+                # once that surface is dead — which is not known yet, here.
+                # Declaring the shorter bound would let a cockpit expire a
+                # gate the organism is still waiting on, so the queue is
+                # purged by the authoritative `prompt_resolved` instead,
+                # which `end()` fires on every exit path.
+                timeout_s=0.0,
             )
         except Exception:  # noqa: BLE001
             bridge_fut = None
