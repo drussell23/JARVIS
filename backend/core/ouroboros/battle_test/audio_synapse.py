@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Dict
 
 logger = logging.getLogger("Ouroboros.AudioSynapse")
 
@@ -86,8 +86,24 @@ class RemoteAudioLease:
     reaps itself; the supervisor's own drop-release disarms the mic.
     """
 
-    def __init__(self, publish: Callable[[str], None]) -> None:
+    def __init__(
+        self,
+        publish: Callable[[str], None],
+        publish_transcript: Optional[Callable[..., None]] = None,
+    ) -> None:
         self._publish = publish
+        #: Optional sink for recognised speech. Absent, transcripts are
+        #: simply not forwarded and voice behaves exactly as before.
+        self._publish_transcript = publish_transcript
+        #: utterance_id → (accumulated_text, seq). The WIRE carries deltas
+        #: (`chunk`); a cockpit needs the accumulated sentence, because it
+        #: replaces a span rather than appending to one. Accumulating here
+        #: keeps that in ONE place instead of in every consumer.
+        #:
+        #: `seq` is added here too: the duplex protocol has no ordering field,
+        #: and without one a partial delivered after its own final would
+        #: rewind the sentence in the operator's prompt.
+        self._utterances: Dict[str, Any] = {}
         self._client: Any = None
         self._hb_task: Optional[asyncio.Task] = None
         self._ttl_s: float = 5.0
@@ -140,9 +156,47 @@ class RemoteAudioLease:
             await self.release()
             return False
 
+    def _on_transcript(self, msg: dict) -> None:
+        """Accumulate a chunk and forward the sentence so far. NEVER raises.
+
+        Karen's own speech is forwarded with its role intact and refused by
+        the composer — she is talking, not dictating, and her words have no
+        business in the operator's prompt.
+        """
+        try:
+            sink = self._publish_transcript
+            if sink is None:
+                return
+            uid = str(msg.get("utterance_id", "") or "").strip()
+            if not uid:
+                return
+            chunk = str(msg.get("chunk", "") or "")
+            final = bool(msg.get("final", False))
+            state = self._utterances.get(uid) or {"text": "", "seq": 0}
+            state["text"] = (state["text"] + chunk)[:4000]
+            state["seq"] += 1
+            self._utterances[uid] = state
+            if final:
+                self._utterances.pop(uid, None)
+            # Bounded on EVERY chunk, not only on a final. A dropped final or
+            # a crashed recogniser produces utterances that never complete,
+            # and evicting only on completion means those accumulate for the
+            # life of the daemon. Oldest first: an utterance still being
+            # spoken is the one worth keeping.
+            while len(self._utterances) > 8:
+                self._utterances.pop(next(iter(self._utterances)), None)
+            sink(uid, state["text"], final=final,
+                 role=str(msg.get("role", "user") or "user"),
+                 seq=state["seq"])
+        except Exception:  # noqa: BLE001 — never break the audio FSM
+            logger.debug("[AudioSynapse] transcript degraded", exc_info=True)
+
     def _on_message(self, msg: dict) -> None:
         try:
             mtype = msg.get("type")
+            if mtype == "transcript":
+                self._on_transcript(msg)
+                return
             if mtype == "lease":
                 if msg.get("granted"):
                     ttl = msg.get("ttl_s")
@@ -268,10 +322,15 @@ class AudioVisualSynapse:
     def __init__(
         self,
         publish: Callable[[str], None],
+        publish_transcript: Optional[Callable[..., None]] = None,
         *,
         handle_resolver: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._publish = publish
+        #: Threaded down to the lease, which is where duplex messages
+        #: actually arrive. Optional throughout: without it, transcripts are
+        #: simply not forwarded and voice behaves exactly as before.
+        self._publish_transcript = publish_transcript
         self._resolve = handle_resolver or self._default_resolver
         self._watch_task: Optional[asyncio.Task] = None
         self._armed = False
@@ -329,7 +388,9 @@ class AudioVisualSynapse:
             # absent/refusing does the TUI see UNAVAILABLE — honesty,
             # never a fake LISTENING.
             if broker_enabled():
-                remote = RemoteAudioLease(self._publish)
+                remote = RemoteAudioLease(
+                    self._publish, self._publish_transcript,
+                )
                 if await remote.acquire(preempt=preempt, ptt=ptt):
                     self._remote = remote
                     self._armed = True

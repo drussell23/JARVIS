@@ -4576,6 +4576,11 @@ class BattleTestHarness:
             )
             self._audio_synapse = AudioVisualSynapse(
                 bridge.publish_audio_state,
+                # Recognised speech, forwarded to attached cockpits so it
+                # lands in the prompt where the operator can correct it
+                # before sending. `audio_state_ipc` has emitted these frames
+                # since it shipped and nothing consumed them.
+                bridge.publish_transcript,
             )
             if await bridge.start():
                 self._cockpit_attach_bridge = bridge
