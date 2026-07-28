@@ -79,6 +79,7 @@ def _matches(line: str) -> bool:
 def dispatch_embodied_command(
     line: str,
 ) -> EmbodiedReplDispatchResult:
+    """Embodied-state views: arch, aura, attention, portrait."""
     if not _matches(line):
         return EmbodiedReplDispatchResult(
             ok=False, text="", matched=False,

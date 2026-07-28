@@ -212,6 +212,7 @@ def _render_show_features(
 def dispatch_causal_command(
     line: str,
 ) -> CausalReplDispatchResult:
+    """Browse an operation's causal lineage."""
     if not _matches(line):
         return CausalReplDispatchResult(
             ok=False, text="", matched=False,

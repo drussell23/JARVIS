@@ -87,6 +87,7 @@ def _master_enabled() -> bool:
 def dispatch_constellation_command(
     line: str,
 ) -> ConstellationReplDispatchResult:
+    """Capability flag star-map."""
     if not _matches(line):
         return ConstellationReplDispatchResult(
             ok=False, text="", matched=False,

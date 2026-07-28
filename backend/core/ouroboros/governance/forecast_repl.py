@@ -83,6 +83,7 @@ def _matches(line: str) -> bool:
 def dispatch_forecast_command(
     line: str,
 ) -> ForecastReplDispatchResult:
+    """Pre-submission risk preview and trajectory."""
     if not _matches(line):
         return ForecastReplDispatchResult(
             ok=False, text="", matched=False,
