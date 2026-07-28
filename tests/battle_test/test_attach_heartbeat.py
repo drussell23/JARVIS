@@ -4,7 +4,15 @@
 Covers: the pure formatter (pulse animation, elapsed advance, staleness,
 token/elapsed formatting, provider chip), the daemon composer's payload
 schema + provider labeling, the bridge telemetry roundtrip into the
-client's on_telemetry callback, and the AttachUI toolbar integration.
+client's on_telemetry callback, and the AttachUI integration — the live
+region above the caret, and that it reaches the callable prompt_toolkit
+renders.
+
+The pulse used to live in the bottom toolbar and moved above the caret in
+#70118; the tests here were left pointing at the old surface and went red for
+two days on a position that was deliberately changed. They now assert per
+surface — pulse in the live region, key hints in the toolbar — so a future
+move fails on the thing that moved rather than on everything at once.
 """
 
 from __future__ import annotations
@@ -186,16 +194,51 @@ async def test_telemetry_roundtrip_lands_in_on_telemetry(sock):
         await b.stop()
 
 
-def test_attach_ui_toolbar_shows_pulse_then_falls_back():
+def test_attach_ui_pulse_shows_then_falls_back():
+    """The pulse lives ABOVE the caret, in the live region — not the toolbar.
+
+    It moved there in #70118 on the same operator mandate that later moved the
+    bipartite cockpit's row (#70228): reading order runs downward, so status
+    belongs above the line you are typing. This test asserted the old position
+    and went red at that commit rather than at the one that broke something —
+    which is the failure mode a position assertion exists to prevent, so it now
+    pins the surface each piece actually owns.
+    """
     from backend.core.ouroboros.cli.ov import AttachUI
     ui = AttachUI()
-    idle = ui.toolbar()
-    assert "organism live" in idle             # idle fallback
+    assert "organism live" in ui._live_region()   # idle fallback
     ui.on_telemetry(_hb())
-    live = ui.toolbar()
+    live = ui._live_region()
     assert "Synthesizing…" in live and "DW-397B" in live
-    assert "'detach' to leave" in live         # chrome retained
-    ui.on_telemetry({"kind": "other", "x": 1})  # non-heartbeat ignored
-    assert "Synthesizing…" in ui.toolbar()
-    ui._heartbeat_arrived -= 60.0              # goes stale
-    assert "organism live" in ui.toolbar()
+    ui.on_telemetry({"kind": "other", "x": 1})    # non-heartbeat ignored
+    assert "Synthesizing…" in ui._live_region()
+    ui._heartbeat_arrived -= 60.0                 # goes stale
+    assert "organism live" in ui._live_region()
+
+
+def test_the_pulse_reaches_the_rendered_prompt():
+    """`_live_region` composing correctly is not the same as it being DRAWN.
+
+    Nothing proved the block reached `prompt()` — the callable wired into
+    `PromptSession(message=...)` at ov.py:1578, which is what prompt_toolkit
+    actually renders. Without this the region could be composed for no one and
+    every other test here would still pass.
+    """
+    from backend.core.ouroboros.cli.ov import AttachUI
+    ui = AttachUI()
+    ui.on_telemetry(_hb())
+    rendered = ui.prompt()
+    assert "Synthesizing…" in rendered
+    # Above the caret, not below it: the whole point of the move.
+    assert rendered.index("Synthesizing…") < rendered.rindex("›")
+
+
+def test_the_toolbar_keeps_the_key_hints():
+    """What genuinely does belong under the input: hints about the line you
+    are on. The pulse left; the chrome stayed."""
+    from backend.core.ouroboros.cli.ov import AttachUI
+    ui = AttachUI()
+    ui.on_telemetry(_hb())
+    toolbar = str(ui.toolbar())
+    assert "'detach' to leave" in toolbar
+    assert "Synthesizing…" not in toolbar
