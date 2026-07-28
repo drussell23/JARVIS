@@ -96,9 +96,21 @@ def test_ast_pin_build_bundle_async_present_with_per_signal_wires() -> None:
             assert "posture.signal." in body, (
                 "build_bundle_async missing per-signal callsite labels"
             )
-            assert "asyncio.to_thread" in body or "to_thread" in body, (
-                "build_bundle_async not dispatching signals to threads"
-            )
+            # The INVARIANT is "every collector runs off the loop", not any
+            # particular way of achieving it. Pinning the literal
+            # `asyncio.to_thread` made this fail when Tier-2b converged the
+            # dispatch onto the unified `cooperative_fs_io.offload` substrate
+            # via `_offload_signal` — a strictly better mechanism, since it
+            # shares the advisor-blast pool instead of spawning a bespoke one.
+            #
+            # A pin that names the mechanism breaks every time the mechanism
+            # improves, which teaches the next engineer to weaken the pin
+            # rather than to check the property. So the property is what is
+            # asserted, and any of the sanctioned off-loop dispatchers satisfy it.
+            assert (
+                "to_thread" in body or "_offload_signal" in body
+                or "offload(" in body
+            ), "build_bundle_async not dispatching signals off the event loop"
             assert "sleep(0)" in body, (
                 "build_bundle_async missing cooperative yields"
             )

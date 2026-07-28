@@ -407,6 +407,19 @@ class TestAuthorityInvariants:
     def test_no_external_imports_of_underscore_order(self):
         # `_ORDER` is module-private; no live caller should import it
         # directly. This pin guards against accidental reach-around.
+        #
+        # Checked by AST, not by substring. The original detector did
+        # `if "_ORDER" in src` across the whole file once any import from
+        # risk_tier_floor was present — so `second_order_doll_metric.py`
+        # failed on its OWN constant, `SECOND_ORDER_DOLL_METRIC_ENABLED`,
+        # while actually importing the public `get_active_tier_order`. The
+        # invariant held; the detector could not tell use from mention, and
+        # reported the module that was obeying it.
+        #
+        # An authority invariant that cries wolf is worse than none: it
+        # trains the reader to dismiss exactly the signal that matters.
+        import ast
+
         violations = []
         backend_dir = _REPO_ROOT / "backend"
         for path in backend_dir.rglob("*.py"):
@@ -416,15 +429,23 @@ class TestAuthorityInvariants:
             if rel == "backend/core/ouroboros/governance/risk_tier_floor.py":
                 continue
             try:
-                src = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, SyntaxError):
                 continue
-            if "from backend.core.ouroboros.governance.risk_tier_floor import" in src:
-                # Only legitimate import is `apply_floor_to_name` (and
-                # other public APIs). _ORDER must not appear.
-                if "_ORDER" in src:
-                    violations.append(rel)
+            for node in ast.walk(tree):
+                # `from ...risk_tier_floor import _ORDER`
+                if isinstance(node, ast.ImportFrom) and "risk_tier_floor" in (
+                    node.module or ""
+                ):
+                    if any(a.name == "_ORDER" for a in node.names):
+                        violations.append(f"{rel} (import)")
+                # `risk_tier_floor._ORDER` — reach-around via the module
+                # object, which an import-name check alone would miss.
+                elif isinstance(node, ast.Attribute) and node.attr == "_ORDER":
+                    base = node.value
+                    if isinstance(base, ast.Name) and "risk_tier_floor" in base.id:
+                        violations.append(f"{rel} (attribute)")
         assert not violations, (
-            f"External callers import private _ORDER directly:\n  "
+            f"External callers reach private _ORDER directly:\n  "
             + "\n  ".join(violations)
         )
