@@ -77,3 +77,57 @@ class TestCascadeIsPublic:
             """Parse a ``/thing`` line and dispatch. NEVER raises."""
 
         assert describe_dispatcher(fn) != ""
+
+
+class TestCitationStripping:
+    """The descriptions already existed — behind a citation.
+
+    Thirty verbs read as undocumented because their module docstrings open with
+    the spec that commissioned them (`§37 Slice 1 — `, `M11 Slice 5 — `).
+    Writing thirty fresh docstrings would have duplicated prose that was
+    already there and already accurate.
+    """
+
+    @pytest.mark.parametrize("doc,expect", [
+        ("§37 Slice 1 — component health tracker surface", "health"),
+        ("M11 Slice 5 — outcome clustering surface", "outcome"),
+        ("Upgrade 3 Slice 5 — failure ledger surface", "failure"),
+        ("Treefinement Phase 4 — repair tree browser", "repair"),
+    ])
+    def test_leading_citations_are_dropped(self, doc, expect):
+        assert expect in to_operator_voice(doc, "x", 60).lower()
+
+    def test_a_real_sentence_with_a_dash_survives(self):
+        # A blind "cut at the first dash" would decapitate this. The head has
+        # to LOOK like a citation before it is removed.
+        out = to_operator_voice(
+            "Posture — the organism's current strategic stance", "posture", 60)
+        assert "stance" in out.lower()
+
+    def test_trailing_provenance_parenthetical_is_dropped(self):
+        out = to_operator_voice(
+            "Activity radar operator surface (PRD §38 Slice 4, 2026-05-07)",
+            "radar", 60)
+        assert "PRD" not in out and "radar" in out.lower()
+
+    def test_a_purely_parenthetical_citation_is_contentless(self):
+        # "(PRD §32.7 Pattern B)" told an operator nothing.
+        assert to_operator_voice("/mode REPL verb (PRD §32.7 Pattern B)",
+                                 "mode", 60) == ""
+
+    def test_rst_role_becomes_words_not_a_symbol_path(self):
+        # Unwrapping to the raw target produced
+        # "Mod:component_health.ComponentHealthTracker" — a symbol path with a
+        # capital letter, not a description.
+        out = to_operator_voice(
+            "§37 Slice 1 — `/health` REPL surface composing "
+            ":mod:`component_health.ComponentHealthTracker`.", "health", 60)
+        assert "component health tracker" in out.lower()
+        assert ":mod:" not in out and "_" not in out
+
+    def test_emptied_subtraction_returns_empty_not_the_original(self):
+        # The old fallback resurrected the whole docstring, putting
+        # "/m10 REPL dispatcher. Operator-facing CLI surface" back on the
+        # palette — the exact scaffolding stripping had just identified.
+        assert to_operator_voice(
+            "M10 Slice 5 — ``/m10`` REPL dispatcher.", "m10", 60) == ""
