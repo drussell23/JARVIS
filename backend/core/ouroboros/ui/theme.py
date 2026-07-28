@@ -286,24 +286,26 @@ def mark(name: str, *, unicode: Optional[bool] = None) -> str:
 # number of readers agree with zero coordination and zero tick tasks.
 
 OUROBOROS_SPINNER_INTERVAL_S: float = 0.10
-OUROBOROS_SPINNER_FRAMES: tuple = (
-    "🐍·····○",
-    "🐍····○",
-    "🐍···○",
-    "🐍··○",
-    "🐍·○",
-    "🐍◯",       # bite — eating own tail
-    "🐍·○",       # cycle resumes
-    "🐍··○",
-    "🐍···○",
-    "🐍····○",
-    "🐍·····○",
-)
+#: The organism's glyph, in Claude Code's SLOT.
+#:
+#: CC's working line is `✽ Synthesizing…` — one cell of glyph, then a verb.
+#: This used to be `🐍·····○` closing to `🐍◯`: the snake eating its own tail,
+#: eight cells wide, animating the tail rather than the word.
+#:
+#: The operator's rule is CC's grammar with O+V's content, and here that
+#: resolves cleanly — the SHAPE is CC's one-glyph slot, the GLYPH is ours.
+#: An emoji cannot morph the way `✻✽✳✶` does, so the motion moved to where CC
+#: also puts it: the elapsed seconds, and a verb that changes as the organism
+#: works. A spinner that animates a decoration while the words stand still is
+#: telling the operator about a timer, not about the work.
+#:
+#: Kept as a tuple with a single entry rather than collapsing to a constant,
+#: so `ouroboros_frame()` keeps its signature and every consumer — the daemon
+#: toolbar, the attach pulse, the demo — inherits this with no edit. A second
+#: glyph could be added here and animate again with no change to a renderer.
+OUROBOROS_SPINNER_FRAMES: tuple = ("🐍",)
 #: ASCII degradation (same geometry, same story) for non-unicode terminals.
-_OUROBOROS_ASCII_FRAMES: tuple = (
-    "s.....o", "s....o", "s...o", "s..o", "s.o", "sO",
-    "s.o", "s..o", "s...o", "s....o", "s.....o",
-)
+_OUROBOROS_ASCII_FRAMES: tuple = ("~",)
 
 
 def ouroboros_frame(

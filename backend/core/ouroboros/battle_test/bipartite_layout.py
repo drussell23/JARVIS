@@ -727,6 +727,7 @@ def build_bipartite_application(
     agent_rows: Optional[Callable[[], Any]] = None,
     search_rows: Optional[Callable[[], Any]] = None,
     status_rows: Optional[Callable[[], Any]] = None,
+    serpent_active: Optional[Callable[[], bool]] = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
     window fed from ``mux.render_canvas_ansi()`` (re-rendered each frame, so
@@ -970,9 +971,53 @@ def build_bipartite_application(
             height=header_height, wrap_lines=False,
         ))
     # The CC input framing: a dim hairline above AND below the ❯ row.
-    def _rule() -> Any:
-        # Bright venom-purple hairlines (Style Guide brand) — visible framing.
-        return Window(height=1, char="─", style="fg:#a371f7")
+    def _rule(row: int = 0) -> Any:
+        """A venom-purple hairline — with the serpent running it while the
+        organism works.
+
+        The boot crest already tells this story: a snake travelling a closed
+        path after a `+`, catching it, going round again. Two hairlines ARE a
+        closed path (left→right along the top, right→left along the bottom),
+        so the same creature lives here on the same laws — `serpent_rule`
+        takes the crest's own prey palette.
+
+        Falls back to the plain `char="─"` Window when no activity source was
+        supplied: a border that moves forever is a distraction that teaches
+        the operator to stop seeing the border, and framing the caret is the
+        one thing this line has to do.
+        """
+        if serpent_active is None:
+            return Window(height=1, char="─", style="fg:#a371f7")
+        try:
+            from prompt_toolkit.layout.controls import FormattedTextControl
+
+            def _fragments(_row: int = row) -> Any:
+                try:
+                    import time as _t
+                    from backend.core.ouroboros.ui.serpent_rule import (
+                        rule_fragments,
+                    )
+                    width = 80
+                    app = _APP_REF.get("app")
+                    if app is not None and app.output is not None:
+                        width = max(1, int(app.output.get_size().columns))
+                    try:
+                        live = bool(serpent_active())
+                    except Exception:  # noqa: BLE001
+                        live = False
+                    return rule_fragments(
+                        _row, width, _t.monotonic(), active=live,
+                    )
+                except Exception:  # noqa: BLE001
+                    return [("fg:#a371f7", "─" * 80)]
+
+            return Window(
+                content=FormattedTextControl(_fragments, focusable=False),
+                height=1, wrap_lines=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] serpent rule unavailable", exc_info=True)
+            return Window(height=1, char="─", style="fg:#a371f7")
 
     # The palette sits ABOVE the input, full width, and pushes the prompt down
     # as it opens — the same relationship Claude Code has. A Float would
@@ -1075,9 +1120,9 @@ def build_bipartite_application(
     # newest event lands against the prompt, and a row wedged underneath meant
     # the LAST thing before the input was a status bar the deck did not own.
     if _toolbar_row is not None and toolbar_above_prompt():
-        rows += [_toolbar_row, _rule(), prompt, _rule()]
+        rows += [_toolbar_row, _rule(0), prompt, _rule(1)]
     else:
-        rows += [_rule(), prompt, _rule()]
+        rows += [_rule(0), prompt, _rule(1)]
         if _toolbar_row is not None:
             rows.append(_toolbar_row)
     # The standing state, under the box the operator types into.
@@ -1296,6 +1341,7 @@ async def run_bipartite_repl(
     agent_rows: Optional[Callable[[], Any]] = None,
     search_rows: Optional[Callable[[], Any]] = None,
     status_rows: Optional[Callable[[], Any]] = None,
+    serpent_active: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
     the live Zone-1 sink (so any producer — the daemon's event router OR the
@@ -1326,6 +1372,7 @@ async def run_bipartite_repl(
             completer=completer, history=history, auto_suggest=auto_suggest,
             turn_spinner=turn_spinner, agent_rows=agent_rows,
             search_rows=search_rows, status_rows=status_rows,
+            serpent_active=serpent_active,
         )
         if watch_alive is not None:
             watcher = asyncio.ensure_future(

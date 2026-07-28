@@ -755,6 +755,14 @@ def _live_toolbar(
     return _render
 
 
+def _demo_generating(elapsed: float) -> bool:
+    """Is the scripted organism thinking right now? NEVER raises."""
+    try:
+        return any(lo <= elapsed <= hi for lo, hi in _GENERATING)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _generating_seconds(elapsed: float) -> float:
     """Seconds spent INSIDE a generating window, up to ``elapsed``.
 
@@ -909,6 +917,13 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         # scene exists to make visible. Reused rather than reimplemented, so
         # the demo and the daemon cockpit render it identically.
         agent_rows=_agent_view_rows(),
+        # The serpent runs the hairlines while the organism is THINKING —
+        # gated on the same `_GENERATING` windows the pulse uses, so the
+        # border and the verb agree about whether work is happening. A
+        # border that moves forever teaches the operator to stop seeing it.
+        serpent_active=lambda: _demo_generating(
+            (clock() - start[0]) * speed
+        ),
     )
     try:
         mux.set_invalidate(app.invalidate)
