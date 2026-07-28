@@ -283,6 +283,17 @@ class StatusLineBuilder:
                     rendered = f"{rendered} · {chip}" if rendered else chip
             except Exception:  # noqa: BLE001
                 pass
+            # Chat spend — silent until money moves, loud once it has.
+            try:
+                from backend.core.ouroboros.governance.chat_cost_breaker import (  # noqa: E501
+                    chat_budget_chip,
+                )
+                chip2 = chat_budget_chip()
+                if chip2:
+                    rendered = (f"{rendered} · {chip2}" if rendered
+                                else chip2)
+            except Exception:  # noqa: BLE001
+                pass
             custom = _custom_segment()
             if custom:
                 rendered = f"{rendered} · {custom}" if rendered else custom

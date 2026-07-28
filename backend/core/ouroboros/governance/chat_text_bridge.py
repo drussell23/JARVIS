@@ -480,6 +480,10 @@ def build_chat_text_multiplexer(
             d = build_chat_repl_dispatcher_with_claude(
                 project_root=project_root,
                 claude_provider=_karen_provider,
+                # The breaker's voice reaches the operator through the SAME
+                # print chokepoint every other chat line takes — router
+                # conformance and the attach-terminal mirror for free.
+                breaker_notify=print_sink,
             )
         if d is None:
             return None
