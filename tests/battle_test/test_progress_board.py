@@ -340,3 +340,82 @@ class TestSemanticShadowGraph:
         board = _board(tmp_path)
         rows = {r.flag: r for r in (await board.read_async()).rows}
         assert rows["JARVIS_ASYNC_VERB_ENABLED"].state == DYNAMIC_LIVE
+
+
+class TestVerbPrimingIsNotACount:
+    """`ov demo board` said `verbs primed 0` while `ov demo transcript` said 62
+    IN THE SAME RUN. Only one of them had asked the registry to prime, and
+    `list_verbs()` returns an empty tuple both when discovery has not run and
+    when it ran and found nothing.
+
+    A count cannot express "nobody asked yet".
+    """
+
+    def test_board_reports_unprimed_distinctly_from_empty(self, tmp_path,
+                                                          monkeypatch):
+        from backend.core.ouroboros.battle_test import (
+            repl_dispatch_registry as reg,
+        )
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "nonexistent")
+        reg.reset_registry_for_tests()
+        reading = _board(tmp_path).read()
+        assert reading.verbs == ()
+        assert reading.verbs_primed is False
+
+    def test_reading_the_board_does_NOT_prime(self, tmp_path, monkeypatch):
+        # The load-bearing property. A read-only status view must not trigger
+        # the import walk priming performs — looking at the board would then
+        # change what the process has loaded, and the board would be reporting
+        # on a system its own observation had altered.
+        from backend.core.ouroboros.battle_test import (
+            repl_dispatch_registry as reg,
+        )
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "nonexistent")
+        reg.reset_registry_for_tests()
+
+        called = {"n": 0}
+        real = reg.prime_registry
+
+        def _spy(*a, **k):  # noqa: ANN002, ANN003
+            called["n"] += 1
+            return real(*a, **k)
+
+        monkeypatch.setattr(reg, "prime_registry", _spy)
+        _board(tmp_path).read()
+        assert called["n"] == 0, "the board primed the registry as a side effect"
+
+    def test_primed_state_is_reported_when_it_is_true(self, tmp_path,
+                                                      monkeypatch):
+        from backend.core.ouroboros.battle_test import (
+            repl_dispatch_registry as reg,
+        )
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "nonexistent")
+        reg.reset_registry_for_tests()
+        reg.prime_registry()
+        assert _board(tmp_path).read().verbs_primed is True
+
+    def test_to_dict_carries_the_distinction(self, tmp_path, monkeypatch):
+        # A JSON consumer must not have to re-derive it from a zero.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "nonexistent")
+        assert "verbs_primed" in _board(tmp_path).read().to_dict()
+
+
+class TestRegistryPrimedAccessor:
+    def test_public_accessor_exists_rather_than_a_reach_around(self):
+        # Callers needed this and the only alternative was reading the private
+        # `_REGISTRY_PRIMED` — the same reach-around the risk-tier ladder has an
+        # authority invariant against.
+        from backend.core.ouroboros.battle_test import (
+            repl_dispatch_registry as reg,
+        )
+        assert "registry_primed" in reg.__all__
+
+    def test_accessor_is_side_effect_free(self, monkeypatch):
+        from backend.core.ouroboros.battle_test import (
+            repl_dispatch_registry as reg,
+        )
+        reg.reset_registry_for_tests()
+        assert reg.registry_primed() is False
+        assert reg.registry_primed() is False   # still false — it did not prime
+        reg.prime_registry()
+        assert reg.registry_primed() is True

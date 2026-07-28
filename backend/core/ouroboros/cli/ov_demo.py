@@ -42,6 +42,30 @@ DEMO_HELP = """ov demo -- watch the cockpit, no model calls
 """
 
 
+
+def _ensure_primed() -> bool:
+    """Prime the verb registry once per process. Returns whether it is primed.
+
+    The demo is a demo of CAPABILITY — "what can this cockpit do" — so it
+    primes, exactly as the cockpit does at boot. The progress board deliberately
+    does not, because a read-only status view must not change what the process
+    has imported.
+
+    Both scenes route through here. When they primed independently, `ov demo
+    board` reported `verbs primed 0` and `ov demo transcript` reported 62 IN
+    THE SAME RUN, because only one of them had asked.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.repl_dispatch_registry import (
+            prime_registry, registry_primed,
+        )
+        if not registry_primed():
+            prime_registry()
+        return bool(registry_primed())
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] verb priming degraded", exc_info=True)
+        return False
+
 def _rule(console: Any, title: str) -> None:
     try:
         console.rule(f"[dim]{title}[/dim]")
@@ -80,6 +104,7 @@ def scene_board(console: Any, argv: Sequence[str] = ()) -> int:
         _say(console, f"  progress board unavailable: {exc}")
         return 1
 
+    _ensure_primed()
     _rule(console, "where ov stands")
     reading = ProgressBoard().read()
     for line in render_board(reading, limit=_limit(argv)):
@@ -94,9 +119,10 @@ def scene_board(console: Any, argv: Sequence[str] = ()) -> int:
         for row in dynamic[:6]:
             _say(console, f"    ◇ {row.flag[:44]:<44} {row.reason[:40]}")
     _say(console)
+    verbs = (f"{len(reading.verbs)} verbs" if reading.verbs_primed
+             else "verbs NOT primed")
     _say(console, f"  entry points {len(reading.by_state(ENTRY))}"
-                  f" · off {len(reading.by_state(OFF))}"
-                  f" · verbs primed {len(reading.verbs)}")
+                  f" · off {len(reading.by_state(OFF))} · {verbs}")
     _say(console, "  dark = enabled, on disk, imported by nothing. A SIGNAL,")
     _say(console, "  not a defect count: plugin discovery and dynamic import")
     _say(console, "  remain invisible to a static graph.")
@@ -179,15 +205,12 @@ def _demo_palette(console: Any) -> None:
     """
     try:
         from backend.core.ouroboros.battle_test.repl_dispatch_registry import (
-            list_verbs, prime_registry,
+            list_verbs,
         )
         from backend.core.ouroboros.battle_test.verb_description import (
             to_operator_voice,
         )
-        try:
-            prime_registry()
-        except Exception:  # noqa: BLE001
-            pass
+        _ensure_primed()
         verbs = list(list_verbs())
         if not verbs:
             _say(console, "  (no verbs primed — registry empty)")
