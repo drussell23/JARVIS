@@ -1871,6 +1871,16 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
                 install_rewind_binding(kb, rewind)
             except Exception:  # noqa: BLE001
                 pass
+        # The transcript escape hatches: [ v { } while scrolled, Ctrl+L
+        # repaint, Ctrl+O narration toggle — the "see what it is doing /
+        # what it did" cluster.
+        try:
+            from backend.core.ouroboros.battle_test.transcript_hatches import (
+                install_transcript_hatches,
+            )
+            install_transcript_hatches(kb, ui, client)
+        except Exception:  # noqa: BLE001
+            pass
         return kb
     except Exception:  # noqa: BLE001
         return None
@@ -3014,6 +3024,17 @@ def run_attach(console: Any) -> int:
             )
         except Exception:  # noqa: BLE001
             ui.rewind = None
+        # A bell that fires into tmux's void is worse than none — the
+        # operator TRUSTS it. Probe once at attach and say so plainly.
+        try:
+            from backend.core.ouroboros.battle_test.transcript_hatches import (
+                tmux_bell_warning,
+            )
+            _bell_warn = tmux_bell_warning()
+            if _bell_warn:
+                console.print(_bell_warn, markup=False, highlight=False)
+        except Exception:  # noqa: BLE001
+            pass
         # The shield renders released gates through the SAME markup path
         # every other ⏺/⎿ line takes — one display, one ordering, and the
         # gate lands in scrollback the operator can page back to.
