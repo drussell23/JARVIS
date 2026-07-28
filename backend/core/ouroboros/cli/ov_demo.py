@@ -37,6 +37,7 @@ DEMO_HELP = """ov demo -- watch the cockpit, no model calls
 
   ov demo             board + transcript
   ov demo board       what is LIVE vs DARK right now (derived from the tree)
+  ov demo surfaces    which of the 3 surfaces can REACH each module
   ov demo transcript  the CC-style deck: ops, diffs, agora threads
   ov demo live        the COCKPIT running, driven by synthetic events
                       (needs a real terminal; --speed=N to fast-forward)
@@ -153,6 +154,27 @@ def scene_board(console: Any, argv: Sequence[str] = ()) -> int:
     _say(console, "  dark = enabled, on disk, imported by nothing. A SIGNAL,")
     _say(console, "  not a defect count: plugin discovery and dynamic import")
     _say(console, "  remain invisible to a static graph.")
+    return 0
+
+
+def scene_surfaces(console: Any, argv: Sequence[str] = ()) -> int:
+    """Which of `ov`'s three surfaces can reach a module.
+
+    The board answers "is this imported by anything"; this answers "by
+    WHICH surface", which is the question five separate shipped-but-invisible
+    modules turned out to hinge on. Same discipline as the board: derived
+    from the tree, never cached, and stated as a signal rather than a verdict.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.surface_reachability import (
+            audit, render,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _say(console, f"  surface audit unavailable: {exc}")
+        return 1
+    _rule(console, "which surface can reach what")
+    for line in render(audit(), limit=_limit(argv)):
+        _say(console, line)
     return 0
 
 
@@ -861,6 +883,7 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
 #: derived from what actually exists and cannot drift from it.
 _SCENES: "dict[str, Callable[[Any, Sequence[str]], int]]" = {
     "board": scene_board,
+    "surfaces": scene_surfaces,
     "transcript": scene_transcript,
     # NOT in the default all-scenes run: it takes over the screen and
     # waits for a keypress, so it must be asked for by name.
