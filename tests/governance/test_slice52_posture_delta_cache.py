@@ -33,15 +33,15 @@ async def test_caches_commit_ratios_when_head_unchanged(tmp_path, monkeypatch):
     sc = _make(tmp_path)
     calls = {"subjects": 0}
 
-    async def fake_subjects(n):  # noqa: ANN001
+    def fake_subjects(n):  # noqa: ANN001
         calls["subjects"] += 1
         return ["feat: a", "fix: b", "feat: c", "refactor: d"]
 
-    async def fake_head():
+    def fake_head():
         return "deadbeef1234"
 
-    monkeypatch.setattr(sc, "_git_subjects_async", fake_subjects)
-    monkeypatch.setattr(sc, "_git_head_async", fake_head)
+    monkeypatch.setattr(sc, "_git_subjects", fake_subjects)
+    monkeypatch.setattr(sc, "_git_head", fake_head)
 
     r1 = await sc.commit_ratios_async()
     r2 = await sc.commit_ratios_async()
@@ -60,15 +60,15 @@ async def test_recomputes_when_head_advances(tmp_path, monkeypatch):
     calls = {"subjects": 0}
     heads = iter(["h1", "h2"])  # HEAD moves between the two calls
 
-    async def fake_subjects(n):  # noqa: ANN001
+    def fake_subjects(n):  # noqa: ANN001
         calls["subjects"] += 1
         return ["feat: a"]
 
-    async def fake_head():
+    def fake_head():
         return next(heads)
 
-    monkeypatch.setattr(sc, "_git_subjects_async", fake_subjects)
-    monkeypatch.setattr(sc, "_git_head_async", fake_head)
+    monkeypatch.setattr(sc, "_git_subjects", fake_subjects)
+    monkeypatch.setattr(sc, "_git_head", fake_head)
 
     await sc.commit_ratios_async()
     await sc.commit_ratios_async()
@@ -81,15 +81,15 @@ async def test_never_caches_when_head_unresolvable(tmp_path, monkeypatch):
     sc = _make(tmp_path)
     calls = {"subjects": 0}
 
-    async def fake_subjects(n):  # noqa: ANN001
+    def fake_subjects(n):  # noqa: ANN001
         calls["subjects"] += 1
         return ["feat: a"]
 
-    async def fake_head():
+    def fake_head():
         return ""  # no git / detached — unresolvable
 
-    monkeypatch.setattr(sc, "_git_subjects_async", fake_subjects)
-    monkeypatch.setattr(sc, "_git_head_async", fake_head)
+    monkeypatch.setattr(sc, "_git_subjects", fake_subjects)
+    monkeypatch.setattr(sc, "_git_head", fake_head)
 
     await sc.commit_ratios_async()
     await sc.commit_ratios_async()
@@ -103,15 +103,15 @@ async def test_empty_history_baseline_is_cached_safely(tmp_path, monkeypatch):
     sc = _make(tmp_path)
     calls = {"subjects": 0}
 
-    async def fake_subjects(n):  # noqa: ANN001
+    def fake_subjects(n):  # noqa: ANN001
         calls["subjects"] += 1
         return []  # empty history
 
-    async def fake_head():
+    def fake_head():
         return "abc"
 
-    monkeypatch.setattr(sc, "_git_subjects_async", fake_subjects)
-    monkeypatch.setattr(sc, "_git_head_async", fake_head)
+    monkeypatch.setattr(sc, "_git_subjects", fake_subjects)
+    monkeypatch.setattr(sc, "_git_head", fake_head)
 
     r1 = await sc.commit_ratios_async()
     r2 = await sc.commit_ratios_async()

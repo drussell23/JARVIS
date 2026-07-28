@@ -79,6 +79,27 @@ _VISION_SENSOR_HARD_FLOOR = "notify_apply"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+
+class RiskFloorConfigError(ValueError):
+    """The operator asked for a floor the lattice forbids.
+
+    Structurally distinct from a subsystem failure, and the distinction is
+    load-bearing. The fail-closed handler in :func:`apply_floor_to_name`
+    exists so that an *erroring* subsystem can never open the floor — but a
+    deliberate refusal is not an error, it IS the floor working. Catching
+    both with one ``except Exception`` inverted the guarantee: setting
+    ``JARVIS_VISION_SENSOR_RISK_FLOOR=safe_auto`` raised I2's ValueError,
+    the handler swallowed it, and with ``MIN_RISK_TIER`` unset the fallback
+    returned ``None`` — so a vision-originated op reached ``safe_auto``,
+    precisely what I2 forbids. The misconfiguration meant to be loud was
+    the quietest path through the module.
+
+    A ValueError raised BY the floor logic is an assertion about
+    configuration and must reach the operator. Everything else still
+    fails closed.
+    """
+
+
 # Canonical ordering — safer-is-higher. Used only for comparison; the
 # orchestrator continues to import RiskTier from risk_engine for its
 # own handling so this module stays dependency-free.
@@ -320,7 +341,7 @@ def _vision_floor_from_env() -> str:
         )
         return _VISION_SENSOR_HARD_FLOOR
     if _order[raw] < _order[_VISION_SENSOR_HARD_FLOOR]:
-        raise ValueError(
+        raise RiskFloorConfigError(
             f"{_ENV_VISION_FLOOR}={raw!r} cannot be lower than "
             f"{_VISION_SENSOR_HARD_FLOOR!r}. Vision-originated ops are "
             "forbidden from reaching safe_auto (Invariant I2 in "
@@ -721,6 +742,14 @@ def apply_floor_to_name(
             target_repo=target_repo,
             crosses_repo=crosses_repo,
         )
+    except RiskFloorConfigError:
+        # NOT a failure — this IS the floor working. The operator asked for
+        # something the lattice forbids, and fail-closed must not convert
+        # that refusal into silence. Swallowing it here let a vision op
+        # reach safe_auto whenever MIN_RISK_TIER was unset, because the
+        # fallback then returned None. The loudest misconfiguration in the
+        # module was travelling its quietest path.
+        raise
     except Exception:  # noqa: BLE001
         # Slice 163 — FAIL-CLOSED. A failure computing the recommendation must NOT
         # silently bypass the operator's deliberate governance posture. Fall back to
@@ -774,6 +803,35 @@ def apply_floor_to_risk_tier(
         }.get(effective)
         if tgt is not None and risk_tier.value < tgt.value:
             return tgt
+        return risk_tier
+    except RiskFloorConfigError:
+        # The enum path cannot raise — gate sites depend on that contract —
+        # but returning the input unchanged would reopen the hole this
+        # module exists to close: the operator's illegal value would simply
+        # be ignored and the op would keep whatever tier it arrived with.
+        #
+        # So the illegal value is discarded and the invariant it tried to
+        # undercut is applied instead. NOT an escalation to the strictest
+        # tier: over-escalating on a config error trains operators to
+        # dismiss the gate, and the hard floor is precisely the guarantee
+        # that was being violated. Loud in the log, correct in the lattice.
+        try:
+            from backend.core.ouroboros.governance.risk_engine import RiskTier
+            logger.error(
+                "[RiskFloor] illegal %s discarded — falling back to the %s "
+                "hard floor it tried to undercut (Invariant I2)",
+                _ENV_VISION_FLOOR, _VISION_SENSOR_HARD_FLOOR,
+            )
+            hard = {
+                "notify_apply": RiskTier.NOTIFY_APPLY,
+                "approval_required": RiskTier.APPROVAL_REQUIRED,
+                "blocked": RiskTier.BLOCKED,
+            }.get(_VISION_SENSOR_HARD_FLOOR)
+            if hard is not None and risk_tier.value < hard.value:
+                return hard
+        except Exception:  # noqa: BLE001
+            logger.debug("[RiskFloor] hard-floor fallback degraded",
+                         exc_info=True)
         return risk_tier
     except Exception:  # noqa: BLE001 — fail-soft; never break the gate
         return risk_tier

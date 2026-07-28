@@ -294,9 +294,21 @@ class SignalCollector:
         self._cost_burn_cache: Optional[Tuple[Tuple[int, int], float]] = None
 
     def _git_subjects(self, n: int) -> List[str]:
-        """Legacy sync entry — retained for backwards compat with the
-        sync ``commit_ratios`` / ``build_bundle`` path. Production
-        chunked-async cycle uses :meth:`_git_subjects_async`."""
+        """The PRODUCTION git-log path, sync by design.
+
+        Slice 257 inverted what this docstring used to claim. The async
+        variant resolved HEAD via ``asyncio.create_subprocess_exec``, which
+        forks on the event-loop thread — from this large multi-threaded
+        process, concurrent with Oracle's pool, that fork blocked the loop
+        33–108s and the heartbeat froze. ``subprocess.run`` releases the GIL
+        while the child runs, so dispatched through ``_offload_signal`` it
+        blocks a worker thread and never the loop.
+
+        So this is not a legacy shim: it is the live path, and
+        :meth:`_git_subjects_async` is retired with no production callers.
+        The old wording survived the fix and pointed the reader at the
+        abandoned implementation — which is exactly how the Slice 52 tests
+        came to patch a seam nothing calls."""
         try:
             result = subprocess.run(
                 ["git", "log", f"-{n}", "--pretty=format:%s"],
