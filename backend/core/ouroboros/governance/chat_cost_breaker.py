@@ -116,16 +116,30 @@ class SessionCostLedger:
         self._lock = threading.Lock()
         self._spent: float = 0.0
         self._trips: int = 0
-        self._loaded = False
+        #: The path these figures were loaded FROM — not a bool.
+        #:
+        #: A bool made the ledger able to load from one file and persist to
+        #: another: the resolved path is read fresh on every write, so an
+        #: env change (a test isolating its own ledger, an operator
+        #: repointing JARVIS_CHAT_SPEND_LEDGER) left stale spend attached to
+        #: a new file. Keying the cache on the RESOLVED path — never on the
+        #: env string, never on "have we loaded" — is the same discipline
+        #: the crest cache learned: a cache key must fingerprint the config
+        #: it actually used.
+        self._loaded_path: Optional[str] = None
 
     # -- persistence -------------------------------------------------------
 
     def _load_once(self) -> None:
-        if self._loaded:
-            return
-        self._loaded = True
         try:
             path = _ledger_path()
+            key = str(path) if path is not None else ""
+            if self._loaded_path == key:
+                return
+            # A different book: start from ITS figures, not the last one's.
+            self._loaded_path = key
+            self._spent = 0.0
+            self._trips = 0
             if path is None or not path.is_file():
                 return
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -198,7 +212,8 @@ class SessionCostLedger:
         """Operator re-arm. NEVER raises."""
         try:
             with self._lock:
-                self._loaded = True
+                path = _ledger_path()
+                self._loaded_path = str(path) if path is not None else ""
                 self._spent = 0.0
                 self._trips = 0
                 self._persist()

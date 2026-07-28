@@ -153,6 +153,25 @@ def test_spend_survives_the_executor_that_spent_it(isolated) -> None:
     assert isolated.spent == pytest.approx(0.12)
 
 
+def test_ledger_rebinds_when_the_path_changes(tmp_path, monkeypatch) -> None:
+    """The bug this pins cost a phantom $1.00 on the developer's real
+    ledger: keyed on a BOOL, the ledger loaded from one file and then
+    persisted to another, carrying stale spend across books."""
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    monkeypatch.setenv(cb.LEDGER_PATH_ENV_VAR, str(a))
+    ledger = cb.SessionCostLedger()
+    ledger.record(0.30)
+    assert ledger.spent == pytest.approx(0.30)
+    # Repoint mid-process — the figures must come from the NEW book.
+    monkeypatch.setenv(cb.LEDGER_PATH_ENV_VAR, str(b))
+    assert ledger.spent == 0.0
+    ledger.record(0.10)
+    assert ledger.spent == pytest.approx(0.10)
+    # ...and the first book is untouched by the second's spend.
+    monkeypatch.setenv(cb.LEDGER_PATH_ENV_VAR, str(a))
+    assert ledger.spent == pytest.approx(0.30)
+
+
 def test_ledger_is_file_backed_across_processes(isolated, tmp_path) -> None:
     """A daemon restart mid-runaway must not hand the next process a
     fresh allowance."""

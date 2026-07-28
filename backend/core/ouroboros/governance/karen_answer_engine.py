@@ -158,7 +158,21 @@ class KarenQueryProvider:
                  f"{pack}\n\n" if pack else "")
                 + prompt
             )
-            self._emit("⎿ thinking · asking claude (doubleword fallback)")
+            # ADAPTIVE LANE. The right provider is a property of the
+            # PAYLOAD, not of policy: a two-word question on DW's async
+            # tier waits ~60s for its first token, and a 40k-token dump
+            # on Claude buys latency nobody asked for at ~10x the price.
+            # Measured on the GROUNDED prompt — what actually goes on the
+            # wire, attachments and evidence included — so the estimate
+            # cannot drift from the request.
+            from backend.core.ouroboros.governance.adaptive_lane_router import (  # noqa: E501
+                route as _route_lane,
+            )
+            _decision = _route_lane(
+                grounded, _SYSTEM_PROMPT, notify=self._emit,
+            )
+            if not _decision.is_heavy:
+                self._emit("⎿ thinking · asking claude (doubleword fallback)")
             from backend.core.ouroboros.governance.rt_gate import (
                 gate_completion,
             )
@@ -185,6 +199,9 @@ class KarenQueryProvider:
                 system_prompt=_SYSTEM_PROMPT,
                 max_tokens=max_tokens or _answer_max_tokens(),
                 dw_model=_voice_model,
+                # Bias only — the other tier stays the fallback, so a
+                # heavy query still gets answered when DW is down.
+                prefer=_decision.prefer,
             ))
             if isinstance(answer, str) and answer.strip():
                 return answer.strip()
