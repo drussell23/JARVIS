@@ -218,8 +218,8 @@ def _demo_palette(console: Any) -> None:
         from backend.core.ouroboros.battle_test.repl_dispatch_registry import (
             list_verbs,
         )
-        from backend.core.ouroboros.battle_test.verb_description import (
-            to_operator_voice,
+        from backend.core.ouroboros.battle_test.repl_completion import (
+            describe_dispatcher,
         )
         _ensure_primed()
         verbs = list(list_verbs())
@@ -229,8 +229,11 @@ def _demo_palette(console: Any) -> None:
         for verb in verbs[:8]:
             desc = ""
             try:
-                fn = _dispatcher_for(verb)
-                desc = to_operator_voice(getattr(fn, "__doc__", ""), verb, 46)
+                # The FULL cascade the real palette uses, not just its first
+                # rung. Calling `to_operator_voice` directly rendered a blank
+                # for every verb whose description lives in its module
+                # docstring — the demo disagreeing with the surface it previews.
+                desc = describe_dispatcher(_dispatcher_for(verb))[:46]
             except Exception:  # noqa: BLE001
                 desc = ""
             _say(console, f"  /{verb:<20} {desc}")

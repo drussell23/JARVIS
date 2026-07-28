@@ -1819,6 +1819,23 @@ def _help_bound(text: str) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def describe_dispatcher(fn: object) -> str:
+    """PUBLIC name for the description cascade. NEVER raises.
+
+    Added because a second consumer appeared — `ov demo`'s palette scene — and
+    the only alternative was importing the private `_describe`. That is the
+    reach-around the risk-tier ladder has an authority invariant against, and
+    it would have made this module's internals part of its contract by accident.
+
+    Worth more than tidiness here: the demo originally called
+    `to_operator_voice` directly, which is only the FIRST rung of this cascade.
+    So it rendered a blank where the real palette falls through to the module
+    docstring — a demo disagreeing with the surface it exists to preview, which
+    is the one thing a demo must never do.
+    """
+    return _describe(fn)
+
+
 def _describe(fn: object) -> str:
     """One line of operator-facing help for a dispatcher. NEVER raises.
 
