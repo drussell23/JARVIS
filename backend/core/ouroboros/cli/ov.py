@@ -1216,6 +1216,17 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
         if text:
             if ui is not None and ui.should_flush_on_input():
                 client.send_audio("flush")
+            # The daemon receives the GOAL, not the typing mechanics. A
+            # trailing `\` told the PROMPT to keep the line open; upstream it
+            # is noise the model would read as content. Fences and brackets
+            # are content and travel untouched.
+            try:
+                from backend.core.ouroboros.battle_test.input_continuation import (  # noqa: E501
+                    strip_continuations,
+                )
+                text = strip_continuations(text)
+            except Exception:  # noqa: BLE001
+                pass
             # @path mentions, acknowledged HERE rather than silently relayed.
             #
             # `repl_input_polish` has parsed these since it shipped — but it
@@ -1224,7 +1235,7 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
             # never called it, so `@backend/auth.py` travelled upstream as
             # ordinary prose.
             #
-            # The line is relayed UNCHANGED. Stripping the mention here would
+            # The mention itself is relayed UNCHANGED. Stripping it here would
             # make the cockpit and the daemon disagree about what was said,
             # and the daemon is where attachment resolution belongs. This
             # confirms the operator was understood; it does not decide.
@@ -1323,6 +1334,10 @@ async def _split_plane_loop(
         # would freeze the very keystroke that opened the menu.
         completer=_build_slash_completer(),
         complete_while_typing=True,
+        # Multi-line, with the CONDITION applied to the buffer below — the
+        # same two-step the cockpit uses, from the same module, so the two
+        # surfaces cannot disagree about when Enter means "go".
+        multiline=True,
         # The SAME Style the bipartite cockpit uses. Without it
         # prompt_toolkit paints its default filled light-grey listbox — the
         # loudest thing on a dark screen, and the exact look #70121 removed
@@ -1337,6 +1352,19 @@ async def _split_plane_loop(
     # are different LAYOUTS, and leaving the widget in place renders both at
     # once — a narrow floating column on top of the full-width page.
     _strip_native_menu(session.app)
+    # Enter submits unless the text is visibly unfinished. `Buffer.multiline`
+    # is prompt_toolkit's own seam — it holds a Filter that `is_multiline`
+    # calls per keystroke — so no custom Enter binding has to fight the
+    # library's. Bound to THIS buffer rather than `get_app().current_buffer`,
+    # which would consult whatever has focus.
+    try:
+        from backend.core.ouroboros.battle_test.input_continuation import (
+            continuation_filter,
+        )
+        _buf = session.default_buffer
+        _buf.multiline = continuation_filter(lambda: _buf.text)
+    except Exception:  # noqa: BLE001 — plain multiline still beats one line
+        pass
     # Consume prompt_toolkit's OWN cursor-position timeout rather than probing
     # the terminal again — a second probe races the first for the same reply
     # bytes and misclassifies healthy terminals. See append_only.py.
@@ -1516,7 +1544,14 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
                     pass
             ui.refresh()
 
-        @kb.add("escape", filter=in_flow_working, eager=True)
+        # `eager` is a FILTER, not a flag. Eager means "fire now, do not wait
+        # to see if this is the start of a longer sequence" — which is exactly
+        # what would swallow the escape half of Alt+Enter. So Esc stays
+        # instant while the buffer is EMPTY (the state an operator is in when
+        # they want to interrupt: watching, not typing) and yields the
+        # sequence while they are composing. Both meanings survive, and which
+        # one applies is decided by what the operator is visibly doing.
+        @kb.add("escape", filter=in_flow_working, eager=_not_composing())
         def _interrupt(event: Any) -> None:
             """Esc in FLOW interrupts the operator's own work.
 
@@ -1537,14 +1572,42 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
             except Exception:  # noqa: BLE001
                 pass
 
-        @kb.add("escape", filter=not_flow, eager=True)
+        @kb.add("escape", filter=not_flow, eager=_not_composing())
         def _esc(event: Any) -> None:
             fsm.escape()
             ui.refresh()
 
+        try:
+            from backend.core.ouroboros.battle_test.input_continuation import (
+                install_newline_binding,
+            )
+            install_newline_binding(kb)
+        except Exception:  # noqa: BLE001
+            pass
         return kb
     except Exception:  # noqa: BLE001 — a cockpit without selection still works
         return None
+
+
+def _not_composing() -> Any:
+    """True while the input buffer is empty. NEVER raises.
+
+    Defaults to True (eager) on any fault, preserving the instant Esc that
+    shipped before multi-line existed.
+    """
+    try:
+        from prompt_toolkit.filters import Condition
+
+        @Condition
+        def _cond() -> bool:
+            try:
+                return not _buffer_text().strip()
+            except Exception:  # noqa: BLE001
+                return True
+
+        return _cond
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _buffer_text() -> str:
