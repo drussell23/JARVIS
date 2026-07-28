@@ -3271,6 +3271,17 @@ class SerpentFlow:
         when the dispatch completes.
         """
         short_sub = subagent_id.rsplit("::", 1)[-1] if "::" in subagent_id else subagent_id
+        # Agent view is DERIVED from this same call, not reported separately.
+        # A second reporting path would eventually disagree with the deck
+        # about what happened, and then the roster is a thing you have to
+        # check against the transcript instead of trust.
+        try:
+            from backend.core.ouroboros.battle_test.agent_roster import (
+                get_agent_roster,
+            )
+            get_agent_roster().spawn(subagent_id, subagent_type, goal)
+        except Exception:  # noqa: BLE001
+            pass
         goal_str = f"  [{_C['dim']}]{goal[:70]}[/{_C['dim']}]" if goal else ""
         self._op_line(
             op_id,
@@ -3303,6 +3314,25 @@ class SerpentFlow:
         """
         short_sub = subagent_id.rsplit("::", 1)[-1] if "::" in subagent_id else subagent_id
         fallback_tag = f" [fallback→{provider_used or 'claude'}]" if fallback_triggered else ""
+
+        # Close the roster entry from the SAME call that renders the result,
+        # and announce it from the entry the roster closed — so the notice's
+        # duration and the footer's cannot drift apart.
+        try:
+            from backend.core.ouroboros.battle_test.agent_roster import (
+                get_agent_roster,
+            )
+            _roster = get_agent_roster()
+            _entry = _roster.finish(
+                subagent_id,
+                "finished" if status == "completed" else "failed",
+                detail=error_class or "",
+            )
+            _notice = _roster.finished_notice(_entry)
+            if _notice:
+                self._op_line(op_id, _notice)
+        except Exception:  # noqa: BLE001
+            pass
 
         # Marker + color by status
         if status == "completed":
