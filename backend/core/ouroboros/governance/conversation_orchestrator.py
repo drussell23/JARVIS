@@ -74,6 +74,41 @@ _SOCIAL_ACKS: Tuple[str, ...] = (
 )
 
 
+#: session_id → monotonic time of the last social greeting issued. A
+#: greeting is a HANDSHAKE, not a loop: four stacked "Hey. I'm listening"
+#: lines read as a bot talking to itself (operator screenshot,
+#: 2026-07-28). Within the cooldown the reply collapses to one quiet
+#: acknowledgment instead of another opener.
+_LAST_GREET: dict = {}
+
+
+def _regreet_cooldown_s() -> float:
+    import os
+    try:
+        return max(0.0, float(
+            os.environ.get("JARVIS_CHAT_REGREET_COOLDOWN_S", "300"),
+        ))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _social_reply_for_session(message: str, session_id: str) -> str:
+    """The rotation on first contact; "Still here." inside the cooldown.
+    NEVER raises."""
+    try:
+        import time as _time
+        now = _time.monotonic()
+        last = _LAST_GREET.get(str(session_id))
+        _LAST_GREET[str(session_id)] = now
+        if len(_LAST_GREET) > 64:
+            _LAST_GREET.pop(next(iter(_LAST_GREET)), None)
+        if last is not None and (now - last) < _regreet_cooldown_s():
+            return "Still here."
+    except Exception:  # noqa: BLE001
+        pass
+    return _social_reply(message)
+
+
 def _social_reply(message: str) -> str:
     """Stable per-message pick from the ack rotation. NEVER raises."""
     try:
@@ -280,6 +315,7 @@ class ConversationOrchestrator:
                 message=message,
                 verdict=verdict,
                 previous=previous,
+                session_id=session_id,
             )
 
             turn = ChatTurn(
@@ -380,6 +416,7 @@ class ConversationOrchestrator:
         message: str,
         verdict: IntentClassification,
         previous: Optional[ChatTurn],
+        session_id: str = "default",
     ) -> ChatRoutingDecision:
         msg = str(message or "")
         clipped = msg[:MAX_PAYLOAD_TEXT_CHARS]
@@ -406,7 +443,8 @@ class ConversationOrchestrator:
                 confidence=verdict.confidence,
                 reasons=verdict.reasons,
                 payload={"message": clipped,
-                         "reply": _social_reply(clipped)},
+                         "reply": _social_reply_for_session(
+                             clipped, session_id)},
                 reason="L0 zero-entropy social gate",
                 truncated=verdict.truncated,
             )

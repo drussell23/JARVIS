@@ -1288,6 +1288,11 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
         if low in ("detach", "exit", "quit"):
             return "detach"
 
+        # The message anchor — every submitted line except shell mode,
+        # which opens its own ⏺ chrome with the command in the header.
+        if text and not text.startswith("!"):
+            _echo_operator_line(ui, text)
+
         # `!` shell mode (CC parity): one command on THIS machine, output
         # into this operator's scrollback. Runs in an executor — a slow
         # command never blocks a keystroke. A bare "!" falls through as
@@ -1752,6 +1757,35 @@ def _render_client_keys(ui: Any, line: str) -> None:
         elif ui is not None and hasattr(ui, "flash"):
             first = str(result.text or "").splitlines() or [""]
             ui.flash(f"{first[0]} — `/keys daemon` for the daemon view")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _echo_operator_line(ui: Any, text: str) -> None:
+    """CC-style message anchor: what you typed lands in YOUR scrollback
+    as a ❯ block the moment you press Enter, so the exchange has a
+    visible head before anything answers it. Without this the only echo
+    of a question was whatever fragment a downstream renderer chose to
+    quote. Multi-line input indents its continuation under the glyph.
+    Env: JARVIS_OPERATOR_ECHO_ENABLED (default true). NEVER raises."""
+    try:
+        if os.environ.get(
+            "JARVIS_OPERATOR_ECHO_ENABLED", "true",
+        ).strip().lower() in ("0", "false", "no", "off"):
+            return
+        sink = getattr(ui, "markup_sink", None) if ui is not None else None
+        if not callable(sink):
+            return
+        try:
+            from rich.markup import escape as _escape
+        except Exception:  # noqa: BLE001
+            def _escape(s: str) -> str:
+                return s
+        lines = str(text or "").splitlines() or [""]
+        sink(f"[bold #5ee06a]❯[/bold #5ee06a] "
+             f"[#dbe6e1]{_escape(lines[0])}[/#dbe6e1]", True)
+        for ln in lines[1:]:
+            sink(f"  [#dbe6e1]{_escape(ln)}[/#dbe6e1]", True)
     except Exception:  # noqa: BLE001
         pass
 
@@ -2895,6 +2929,11 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "
                 "plain words both work · [cyan]wake[/cyan] arms my voice · "
                 "[cyan]detach[/cyan] leaves the organism running",
+                # Boot warnings (stale-binary sentinel, …) must survive
+                # the alt-screen mount — a console print alone dies with
+                # the primary buffer the moment the cockpit takes over.
+                *(f"[bold #e3b341]{w}[/bold #e3b341]"
+                  for w in getattr(ui, "boot_warnings", ()) or ()),
             ],
         )
     finally:
@@ -3082,6 +3121,24 @@ def run_attach(console: Any) -> int:
             _bell_warn = tmux_bell_warning()
             if _bell_warn:
                 console.print(_bell_warn, markup=False, highlight=False)
+        except Exception:  # noqa: BLE001
+            pass
+        # The stale-shim sentinel: a pyenv/pip copy shadowing the editable
+        # install shows a GHOST of an older interface — old renderers, old
+        # bugs, hours lost re-fixing the fixed. Said loudly, at attach, on
+        # every surface (console now; cockpit seed via ui.boot_warnings).
+        try:
+            from backend.core.ouroboros.battle_test.daemon_provenance import (
+                client_binary_warning,
+            )
+            _stale_bin = client_binary_warning()
+            if _stale_bin:
+                console.print(_stale_bin, markup=False, highlight=False)
+                try:
+                    ui.boot_warnings = [*getattr(ui, "boot_warnings", ()),
+                                        _stale_bin]
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception:  # noqa: BLE001
             pass
         # The shield renders released gates through the SAME markup path

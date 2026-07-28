@@ -30,7 +30,8 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("Ouroboros.Provenance")
 
-__all__ = ["read_provenance", "staleness_line", "write_provenance"]
+__all__ = ["client_binary_warning", "read_provenance", "staleness_line",
+           "write_provenance"]
 
 _STAMP = ".jarvis/daemon_provenance.json"
 
@@ -130,3 +131,38 @@ def _age_threshold_s() -> float:
             "JARVIS_DAEMON_STALE_AGE_S", "3600") or 3600))
     except (TypeError, ValueError):
         return 3600.0
+
+
+def client_binary_warning() -> str:
+    """One loud line when the RUNNING ov imported code from somewhere
+    other than the repo it is operating on, or "".
+
+    The stale-shim trap: a pyenv/pip-installed copy of the package
+    shadows the editable install, and the operator watches a GHOST of an
+    older interface — old renderers, old bugs, hours lost to fixing what
+    is already fixed (the 2026-07-28 classifier-dump screenshot was
+    exactly this). Detected by provenance, not by version strings: the
+    imported ``backend`` package's filesystem root either IS the repo
+    (editable install / in-tree run, incl. worktrees whose env points at
+    the main checkout) or it is a copy that can silently rot.
+
+    NEVER raises; unknowable = silent."""
+    try:
+        import backend as _backend
+        code_root = Path(_backend.__file__).resolve().parent.parent
+        repo_raw = os.environ.get("JARVIS_REPO_PATH", "").strip()
+        repo = Path(repo_raw).resolve() if repo_raw else Path.cwd().resolve()
+        code_s, repo_s = str(code_root), str(repo)
+        if (
+            code_s == repo_s
+            or code_s.startswith(repo_s + os.sep)
+            or repo_s.startswith(code_s + os.sep)
+        ):
+            return ""
+        return (
+            f"⚠ stale ov binary — this process imported code from "
+            f"{code_root}, but the repo is {repo}. What you see may be an "
+            f"OLD interface. Fix: pip install -e {repo}"
+        )
+    except Exception:  # noqa: BLE001
+        return ""
