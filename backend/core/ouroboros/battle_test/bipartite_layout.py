@@ -559,6 +559,7 @@ def build_bipartite_application(
     completer: Any = None,
     history: Any = None,
     auto_suggest: Any = None,
+    turn_spinner: Any = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
     window fed from ``mux.render_canvas_ansi()`` (re-rendered each frame, so
@@ -822,6 +823,21 @@ def build_bipartite_application(
             logger.debug("[Bipartite] palette row unavailable", exc_info=True)
 
     rows += [canvas]
+    # The TURN row — the live spinner bound to the question the operator
+    # just asked, between the canvas and the prompt exactly where Claude
+    # Code puts it. A ConditionalContainer, so an idle cockpit is EXACTLY
+    # as tall as it was before this existed (Style Guide §07: one
+    # in-place spinner, never six stacked lines).
+    if turn_spinner is not None:
+        try:
+            from backend.core.ouroboros.battle_test.turn_spinner import (
+                build_turn_row,
+            )
+            _turn_row = build_turn_row(turn_spinner)
+            if _turn_row is not None:
+                rows += [_turn_row]
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] turn row unavailable", exc_info=True)
     # The palette is NOT a row. See the FloatContainer below: as an HSplit row
     # it shares the ambient grid with the canvas, so every asynchronous Deck or
     # Lane frame arriving underneath forces the palette's geometry to be
@@ -1046,6 +1062,7 @@ async def run_bipartite_repl(
     completer: Any = None,
     history: Any = None,
     auto_suggest: Any = None,
+    turn_spinner: Any = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
     the live Zone-1 sink (so any producer — the daemon's event router OR the
@@ -1074,6 +1091,7 @@ async def run_bipartite_repl(
             mux, on_accept=on_accept, extra_key_bindings=extra_key_bindings,
             toolbar=toolbar, header=header, header_height=header_height,
             completer=completer, history=history, auto_suggest=auto_suggest,
+            turn_spinner=turn_spinner,
         )
         if watch_alive is not None:
             watcher = asyncio.ensure_future(
