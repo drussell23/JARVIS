@@ -637,6 +637,11 @@ class AttachUI:
         self.shield = _build_shield(self)
         #: Owns the provisional span while speech is being recognised.
         self.composer = _build_composer()
+        #: Last acoustic verdict: (monotonic_ts, diagnosis, device). The
+        #: TIMESTAMP is the point — a microphone that recovers sends no
+        #: "recovered" event, so a badge with no decay would accuse a
+        #: perfectly good headset for the rest of the session.
+        self.acoustic: Any = None
         #: Set once the attach client exists. LATE-BOUND for the same reason
         #: the approval narrator's emit is: the markup sink is built after the
         #: UI, so a handle captured here would be None forever.
@@ -986,6 +991,49 @@ class AttachUI:
             pass
         return self._key_hints()
 
+    def acoustic_badge(self) -> str:
+        """``🎙 mic: reverb (AirPods)`` while a verdict is fresh, else "".
+
+        Decays on a timer rather than waiting for an all-clear, because the
+        gate only fires on a RUN of bad utterances — silence afterwards is
+        indistinguishable from "fixed" and from "stopped talking". Fading is
+        the honest reading of that ambiguity; a sticky badge would assert
+        something the telemetry never said.
+        """
+        try:
+            snap = self.acoustic
+            if not snap:
+                return ""
+            import time as _t
+            seen, diagnosis, device = snap
+            import os as _o
+            ttl = float(_o.environ.get("JARVIS_ACOUSTIC_BADGE_TTL_S", "90"))
+            if _t.monotonic() - seen > max(5.0, ttl):
+                self.acoustic = None
+                return ""
+            where = f" ({device})" if device else ""
+            return f"🎙 mic: {diagnosis or 'degraded'}{where}"
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def on_acoustic(self, frame: Any) -> None:
+        """A degradation verdict arrived. NEVER raises."""
+        try:
+            import time as _t
+            self.acoustic = (
+                _t.monotonic(),
+                str((frame or {}).get("diagnosis", "") or ""),
+                str((frame or {}).get("device", "") or ""),
+            )
+            spoken = str((frame or {}).get("spoken", "") or "")
+            if spoken:
+                # Karen says this aloud too; showing it means an operator
+                # who missed it — or has her muted — still learns why.
+                self.flash(f"🎙 {spoken}", seconds=8.0)
+            self.refresh()
+        except Exception:  # noqa: BLE001
+            pass
+
     def _key_hints(self) -> str:
         """The affordance list — what the line you are typing on can do."""
         note = self._TOOLBAR_NOTES.get(self.audio_state)
@@ -1013,6 +1061,12 @@ class AttachUI:
             badge = self.shield.badge()
         except Exception:  # noqa: BLE001
             badge = ""
+        # The microphone outranks even a pending approval: every OTHER thing
+        # on this line is still working. A degraded mic means the operator's
+        # words are not arriving at all, and everything they try next will
+        # fail for a reason they cannot see.
+        mic = self.acoustic_badge()
+        badge = f"{mic} · {badge}" if mic and badge else (mic or badge)
         head = f"{badge} · " if badge else ""
         return f"{head}{audio.lstrip(' ·')}{keys} · 'detach' to leave"
 
@@ -2398,6 +2452,7 @@ def run_attach(console: Any) -> int:
             # Speech, into the prompt where it can be corrected before it is
             # sent — rather than an utterance leaving unseen.
             on_transcript=lambda frame: _on_transcript_frame(ui, frame),
+            on_acoustic=ui.on_acoustic,
             on_prompt_resolved=lambda pid: (
                 ui.shield.dismiss(pid) if ui.shield is not None else None
             ),

@@ -4605,6 +4605,21 @@ class BattleTestHarness:
                         )
                     except Exception:  # noqa: BLE001
                         pass
+                    # The acoustic gate's verdict, on the operator's screen.
+                    # It has measured correctly all along and published into
+                    # a module that does not exist (#70180); this is the
+                    # surface that was waiting on the other end.
+                    try:
+                        from backend.audio.acoustic_feedback import (
+                            set_degradation_sink,
+                        )
+                        set_degradation_sink(
+                            lambda _kind, payload: bridge.publish_acoustic(
+                                payload,
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                     sf = getattr(self, "_serpent_flow", None)
                     if sf is not None:
                         sf.markup_mirror = bridge.publish_markup
