@@ -1933,6 +1933,22 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
             install_newline_binding(kb)
         except Exception:  # noqa: BLE001
             pass
+        # Ctrl+V pastes a SCREENSHOT. The most common way an operator has
+        # an image is Cmd+Shift+Ctrl+4 — on the clipboard, never written
+        # to disk — and a terminal pastes text, so it produced nothing.
+        # Spilled to a file and handed to the EXISTING /attach verb, so
+        # validation, the size cap and the multi-modal path are the ones
+        # a dragged file already uses. Text pastes fall through unchanged.
+        try:
+            from backend.core.ouroboros.battle_test.clipboard_image import (
+                install_image_paste_binding,
+            )
+            install_image_paste_binding(
+                kb, lambda text: (_prompt_buffer().insert_text(text)
+                                  if _prompt_buffer() is not None else None),
+            )
+        except Exception:  # noqa: BLE001
+            pass
         # Ctrl+T collapses the plan checklist. A four-item plan is
         # orientation while work runs and clutter while reading a diff,
         # and which of those it is changes minute to minute — so it is a
