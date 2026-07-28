@@ -685,6 +685,17 @@ def build_bipartite_application(
             install_history_search(kb, _hist_controller)
         except Exception:  # noqa: BLE001
             pass
+    # Ctrl+T collapses the plan checklist. A four-item plan is
+    # orientation while work runs and clutter while reading a diff,
+    # and which of those it is changes minute to minute — so it is a
+    # keystroke, not a setting.
+    try:
+        from backend.core.ouroboros.battle_test.plan_checklist import (
+            toggle_checklist,
+        )
+        kb.add("c-t")(lambda event: toggle_checklist())
+    except Exception:  # noqa: BLE001
+        pass
     # Ctrl+S parks a half-written goal so the operator can check something
     # and come back to it — the prompt accepts paragraphs now, which makes it
     # worth interrupting.
