@@ -43,7 +43,7 @@ from typing import Optional
 logger = logging.getLogger("Ouroboros.VerbDescription")
 
 __all__ = ["to_operator_voice", "describe_width", "prose_first_enabled",
-           "is_contentless"]
+           "is_contentless", "implementation_vocabulary"]
 
 #: Openers that describe what the FUNCTION does rather than what the operator
 #: gets. Stripped with their trailing connective so the remainder still reads
@@ -104,12 +104,62 @@ def is_contentless(text: str) -> bool:
     """
     try:
         stripped = str(text or "").strip(" .:;,—-")
-        return not stripped or len(stripped) < 12 or bool(
-            _CONTENTLESS.match(stripped),
-        )
+        if not stripped or len(stripped) < 12:
+            return True
+        if _CONTENTLESS.match(stripped):
+            return True
+        # The length floor is necessary but nowhere near sufficient: "Line and
+        # dispatch" is 17 characters of pure machinery. A description has to
+        # name something in the operator's world, not the function's.
+        return not _has_domain_content(stripped)
     except Exception:  # noqa: BLE001
         return True
 
+
+
+def implementation_vocabulary() -> frozenset:
+    """Words that describe MACHINERY rather than the operator's world.
+
+    Env-overridable, because what counts as machinery is codebase-specific and
+    a fork should be able to say so without editing this file.
+    """
+    raw = os.environ.get("JARVIS_PALETTE_IMPL_WORDS", "").strip()
+    if raw:
+        return frozenset(w.strip().lower() for w in raw.split(",") if w.strip())
+    return frozenset({
+        # implementation verbs + their objects
+        "parse", "parses", "dispatch", "dispatches", "dispatcher", "handle",
+        "handles", "handler", "route", "routes", "router", "process",
+        "processes", "execute", "executes", "run", "runs", "call", "calls",
+        "invoke", "invokes", "return", "returns", "raise", "raises", "never",
+        "line", "lines", "command", "commands", "subcommand", "subcommands",
+        "verb", "verbs", "arg", "args", "argument", "arguments", "input",
+        "result", "results", "entry", "point", "wrapper", "helper", "callback",
+        "hook", "shim", "facade", "impl", "implementation", "function",
+        # grammar
+        "a", "an", "the", "and", "or", "to", "for", "of", "on", "in", "with",
+        "from", "into", "this", "that", "it", "its", "is", "are", "be",
+    })
+
+
+def _has_domain_content(text: str) -> bool:
+    """Does anything survive that is about the OPERATOR'S world?
+
+    The load-bearing test, and it is structural rather than a blocklist.
+    ``"Parse a ``/canvas`` line and dispatch."`` normalises to ``"Line and
+    dispatch"`` — 17 characters, so it cleared the length floor and shipped as
+    a description for months. Every word in it is machinery.
+
+    Enumerating bad PHRASES would be whack-a-mole: the next template produces
+    ``"Handle the command and return"`` and the palette lies again. Asking
+    whether ANY word names something the operator cares about generalises to
+    templates nobody has written yet.
+    """
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9_]*", str(text or "").lower())
+    if not words:
+        return False
+    vocabulary = implementation_vocabulary()
+    return any(w not in vocabulary for w in words)
 
 def _strip_verb_name(text: str, verb: str) -> str:
     """Deal with the verb's own name in the opening.
