@@ -149,21 +149,29 @@ def test_compose_icon_header_for_search():
         "search_code", "pattern", "hit1\nhit2",
         explicit_density=_density(),
     )
-    # Icon-prefixed rendered_header, NOT a CC verb.
-    assert "⏺" not in out.header_markup
-    assert "search_code" in out.header_markup
-    assert "🔍" in out.header_markup
+    # INVERTED: one grammar. `⏺ Search("pattern")`, not `🔍 search_code`.
+    assert "⏺" in out.header_markup
+    assert "Search" in out.header_markup
+    assert "🔍" not in out.header_markup
+    assert "search_code" not in out.header_markup
 
 
 def test_compose_default_descriptor_for_unknown_tool():
-    """MCP-forwarded tools land here; default descriptor renders the
-    icon path with the wrench glyph."""
+    """MCP-forwarded tools land here — and get the SAME shape.
+
+    The registry resolves them to the default descriptor, whose own
+    `tool_kind` is the literal string `_default`, so this layer substitutes
+    the name the caller actually asked for. Without it an MCP call rendered
+    as `Default(#eng)`, naming our fallback instead of their tool.
+    """
     out = compose(
         "mcp_unknown", "args", "result",
         explicit_density=_density(),
     )
-    assert "🔧" in out.header_markup
-    assert "_default" in out.header_markup
+    assert "⏺" in out.header_markup
+    assert "McpUnknown" in out.header_markup
+    assert "🔧" not in out.header_markup
+    assert "_default" not in out.header_markup
 
 
 def test_compose_includes_duration_ms():
@@ -499,8 +507,14 @@ def test_console_renders_full_pipeline():
     if out.expansion_hint:
         console.print(out.expansion_hint)
     text = console.export_text()
-    assert "search_code" in text
+    assert "Search" in text
     assert "matches" in text
+    # The deck's column discipline, end to end: the summary indents under
+    # the action and the body indents under the summary.
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    assert lines[0].startswith("⏺ ")
+    assert lines[1].startswith("  ⎿  ")
+    assert lines[2].startswith("     ")
     assert "elided" in text
     assert "/expand t-" in text
 

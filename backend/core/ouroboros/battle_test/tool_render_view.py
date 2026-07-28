@@ -469,6 +469,7 @@ def _compose_header(
     duration_ms: float,
     status_enum: ToolStatus,
     palette: Optional[Mapping[str, str]],
+    tool_name: str = "",
 ) -> str:
     """Build the Rich-markup header line.
 
@@ -517,12 +518,58 @@ def _compose_header(
             f"{duration_part}{status_part}"
         )
 
-    # Icon path
-    c = _palette_value(palette, "neural")
+    # Unknown tool — MCP-forwarded, typically. SAME shape as everything
+    # else: a tool this registry has never heard of is still a tool call,
+    # and a distinct layout for it tells the operator about our descriptor
+    # table rather than about their work.
+    verb_color = _palette_value(palette, "neural")
+    file_color = _palette_value(palette, "file")
+    lparen = rendered_header.find("(")
+    rparen = rendered_header.rfind(")")
+    inner = rendered_header[lparen + 1 : rparen] if 0 < lparen < rparen else ""
+    try:
+        from backend.core.ouroboros.battle_test.tool_render_registry import (
+            _titlecase_kind,
+        )
+        verb = _titlecase_kind(tool_name) if tool_name else rendered_header
+    except Exception:  # noqa: BLE001
+        verb = rendered_header
     return (
-        f"[{c}]{_escape(rendered_header)}[/{c}]"
+        f"[{verb_color}]⏺ {_escape(verb)}[/{verb_color}]"
+        f"([{file_color}]{_escape(inner)}[/{file_color}])"
         f"{duration_part}{status_part}"
     )
+
+
+def _detail_prefix() -> str:
+    """``  ⎿  `` — the deck's continuation lead, from the ONE definition.
+
+    Composed rather than written so the glyph, the indent and the gap all
+    come from `deck_grammar`; a literal here is how this line drifted to
+    column 0 in the first place. NEVER raises — an unstyled fallback still
+    indents, because the indent is the part that carries meaning.
+    """
+    try:
+        from backend.core.ouroboros.ui.deck_grammar import detail
+        from rich.text import Text
+        # `detail("")` is the prefix and nothing else.
+        return Text.from_markup(detail("")).plain
+    except Exception:  # noqa: BLE001
+        return "  ⎿  "
+
+
+def _body_indent() -> str:
+    """Leading spaces that put a body line under the summary's text.
+
+    Body lines rendered at column 0, so a pytest traceback under a failing
+    `Bash(…)` looked like console output that had escaped the block rather
+    than the result OF it.
+    """
+    try:
+        from backend.core.ouroboros.ui.deck_grammar import DETAIL_COLUMN
+        return " " * int(DETAIL_COLUMN)
+    except Exception:  # noqa: BLE001
+        return "     "
 
 
 def _compose_summary(
@@ -555,13 +602,17 @@ def _compose_summary(
         return ("", "")
 
     c_dim = _palette_value(palette, "dim")
-    try:
-        from backend.core.ouroboros.ui.theme import mark
-        glyph = mark("detail") or "⎿"
-    except Exception:  # noqa: BLE001 — a themeless render still continues
-        glyph = "⎿"
+    # INDENTED under the action, through the module that owns the deck's
+    # column discipline.
+    #
+    # This line sat at column 0 while `deck_grammar` put every other
+    # continuation at column 2 with its body at column 5 — so one deck
+    # showed `⏺ Repair(L2)` / `  ⎿ fixture rebuilt` directly above
+    # `⏺ Update(f.py)` / `⎿ +5 / -2` with the diff flat beneath it. Two
+    # column disciplines, and the block structure is the indentation: remove
+    # it and a transcript is a log.
     summary_markup = (
-        f"[{c_dim}]{glyph}  {_escape(summary_text)}[/{c_dim}]"
+        f"[{c_dim}]{_detail_prefix()}{_escape(summary_text)}[/{c_dim}]"
     )
 
     expansion_hint = ""
@@ -696,6 +747,12 @@ def compose(
         duration_ms,
         status_enum,
         palette,
+        # The tool the CALLER asked for. An unknown tool resolves to the
+        # default descriptor, whose own `tool_kind` is the string
+        # "default" — so the registry layer cannot name it and an
+        # MCP-forwarded call rendered as `Default(#eng)`. This layer has
+        # the real name and is the only one that does.
+        tool_name=str(tool_name or ""),
     )
 
     body_present = bool(rendered.body_lines)
@@ -718,9 +775,19 @@ def compose(
         wrapper = _BODY_WRAPPERS.get(
             descriptor.body_shape, _wrap_text_line,
         )
+    # ONE seam for the indent, not four wrappers each remembering to.
+    #
+    # Every body line lands in the deck's body column, so a pytest traceback
+    # under a failing `Bash(…)` reads as the result OF that call rather than
+    # as console output that escaped the block. The wrappers keep owning
+    # COLOUR; this owns POSITION, and neither has to know the other's rules.
+    _indent = _body_indent()
     body_lines_markup: Tuple[str, ...] = tuple(
-        _wrap_marker_line(ln, palette) if "elided" in ln and ln.lstrip().startswith("…")
-        else wrapper(ln, palette)
+        _indent + (
+            _wrap_marker_line(ln, palette)
+            if "elided" in ln and ln.lstrip().startswith("…")
+            else wrapper(ln, palette)
+        )
         for ln in rendered.body_lines
     )
 

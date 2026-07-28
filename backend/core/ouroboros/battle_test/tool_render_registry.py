@@ -233,13 +233,19 @@ def _summarize_path_arg(args: str) -> str:
 
 
 def _summarize_bash_arg(args: str) -> str:
-    """Bash command — show with leading ``$``."""
+    """The command itself.
+
+    The leading ``$`` was a shell cue for a header that read
+    ``💻 bash $ pytest -q``. Inside ``Bash(…)`` the verb already says which
+    interpreter this is, so the sigil is a second announcement of the same
+    fact — and it reads as part of the command, which it is not.
+    """
     s = _safe_str(args).strip()
     if not s:
-        return "$"
+        return ""
     # Collapse internal whitespace for one-line display
     s = re.sub(r"\s+", " ", s)
-    return _truncate(f"$ {s}", 80)
+    return _truncate(s, 80)
 
 
 def _summarize_search_arg(args: str) -> str:
@@ -470,6 +476,22 @@ def _safe_result_summarizer(fn: ResultSummarizer) -> ResultSummarizer:
 # ===========================================================================
 
 
+def _titlecase_kind(tool_kind: str) -> str:
+    """``mcp_slack_post_message`` → ``McpSlackPostMessage``.
+
+    A last-resort verb for a tool with no descriptor. Derived rather than
+    tabled, because the whole point of the fallback is that nobody wrote an
+    entry for this one — an MCP server names its own tools and no table here
+    can enumerate them in advance.
+    """
+    try:
+        parts = [p for p in str(tool_kind or "tool").replace("-", "_").split("_")
+                 if p]
+        return "".join(p[:1].upper() + p[1:] for p in parts) or "Tool"
+    except Exception:  # noqa: BLE001
+        return "Tool"
+
+
 def _make(
     tool_kind: str,
     icon: str,
@@ -498,27 +520,27 @@ _DESCRIPTORS: Mapping[str, ToolRenderDescriptor] = {
         _summarize_path_arg, _summarize_read,
     ),
     "list_symbols": _make(
-        "list_symbols", "📋", None,
+        "list_symbols", "📋", "Symbols",
         BodyShape.MULTI_LINE, "text",
         _summarize_path_arg, _summarize_list_symbols,
     ),
     "list_dir": _make(
-        "list_dir", "📂", None,
+        "list_dir", "📂", "List",
         BodyShape.MULTI_LINE, "text",
         _summarize_path_arg, _summarize_list_dir,
     ),
     "glob_files": _make(
-        "glob_files", "📁", None,
+        "glob_files", "📁", "Glob",
         BodyShape.MULTI_LINE, "text",
         _summarize_search_arg, _summarize_glob,
     ),
     "search_code": _make(
-        "search_code", "🔍", None,
+        "search_code", "🔍", "Search",
         BodyShape.MULTI_LINE, "text",
         _summarize_search_arg, _summarize_search,
     ),
     "get_callers": _make(
-        "get_callers", "🔗", None,
+        "get_callers", "🔗", "Callers",
         BodyShape.MULTI_LINE, "text",
         _summarize_default_arg, _summarize_callers,
     ),
@@ -534,55 +556,55 @@ _DESCRIPTORS: Mapping[str, ToolRenderDescriptor] = {
         _summarize_path_arg, _summarize_write,
     ),
     "delete_file": _make(
-        "delete_file", "🗑️", None,
+        "delete_file", "🗑️", "Delete",
         BodyShape.SINGLE_LINE, None,
         _summarize_path_arg, _summarize_delete,
     ),
     # ---- Execution-shape (LOG body) -------------------------------------
     "bash": _make(
-        "bash", "💻", None,
+        "bash", "💻", "Bash",
         BodyShape.LOG, "bash",
         _summarize_bash_arg, _summarize_bash,
     ),
     "run_tests": _make(
-        "run_tests", "🧪", None,
+        "run_tests", "🧪", "Test",
         BodyShape.LOG, "text",
         _summarize_default_arg, _summarize_tests,
     ),
     "type_check": _make(
-        "type_check", "🔬", None,
+        "type_check", "🔬", "TypeCheck",
         BodyShape.LOG, "text",
         _summarize_default_arg, _summarize_type_check,
     ),
     # ---- Git-shape ------------------------------------------------------
     "git_log": _make(
-        "git_log", "📜", None,
+        "git_log", "📜", "GitLog",
         BodyShape.MULTI_LINE, "text",
         _summarize_default_arg, _summarize_git_log,
     ),
     "git_diff": _make(
-        "git_diff", "📊", None,
+        "git_diff", "📊", "GitDiff",
         BodyShape.DIFF, "diff",
         _summarize_default_arg, _summarize_git_diff,
     ),
     "git_blame": _make(
-        "git_blame", "🔎", None,
+        "git_blame", "🔎", "GitBlame",
         BodyShape.MULTI_LINE, "text",
         _summarize_path_arg, _summarize_git_blame,
     ),
     # ---- Async-native (ToolManifest-only, not in _dispatch) -------------
     "web_fetch": _make(
-        "web_fetch", "🌐", None,
+        "web_fetch", "🌐", "Fetch",
         BodyShape.MULTI_LINE, "text",
         _summarize_default_arg, _summarize_web_fetch,
     ),
     "web_search": _make(
-        "web_search", "🌐", None,
+        "web_search", "🌐", "WebSearch",
         BodyShape.MULTI_LINE, "text",
         _summarize_search_arg, _summarize_web_search,
     ),
     "ask_human": _make(
-        "ask_human", "🗣️", None,
+        "ask_human", "🗣️", "Ask",
         BodyShape.SINGLE_LINE, None,
         _summarize_default_arg, _summarize_ask_human,
     ),
@@ -689,14 +711,23 @@ def render(
     args_summary = descriptor.summarize_args(args_safe)
     body_summary = descriptor.summarize_result(result_safe, status_enum)
 
-    # Header line: CC verb (Read/Update/Write/...) takes precedence;
-    # otherwise icon-prefixed kind for the legacy-style one-liner path.
+    # Header line: ``Verb(args)``, uniformly.
+    #
+    # Every descriptor now carries a `cc_verb`, so the icon path below is
+    # reached only by an UNKNOWN tool — an MCP-forwarded one, typically.
+    # It used to be reached by fifteen of the eighteen built-ins, which is
+    # why one deck showed `⏺ Read(foo.py)` beside `🔍 search_code "x"` and
+    # `💻 bash $ pytest`: three shapes, three naming conventions, one screen.
+    #
+    # The unknown case gets the same shape rather than a different one. A
+    # tool this registry has never heard of is still a tool call, and giving
+    # it its own layout tells the operator about our descriptor table instead
+    # of about their work. The icon is kept in the DESCRIPTOR — it is useful
+    # in a picker or a legend — it is simply not part of the deck line.
     if descriptor.cc_verb:
         header_line = f"{descriptor.cc_verb}({args_summary})"
     else:
-        header_line = (
-            f"{descriptor.icon} {descriptor.tool_kind} {args_summary}".rstrip()
-        )
+        header_line = f"{_titlecase_kind(descriptor.tool_kind)}({args_summary})"
 
     # Body lines: only when shape allows AND budget > 0 AND result has content.
     body_lines: Tuple[str, ...] = ()
