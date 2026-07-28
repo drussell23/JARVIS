@@ -53,6 +53,22 @@ def _context_pct(op_id: str) -> float:
         return 0.0
 
 
+def _context_reading(op_id: str, provider: str, snap: Any) -> Optional[dict]:
+    """The context meter's payload for this op, or None.
+
+    None when nothing has been measured — a zeroed reading and an unmeasured
+    one look identical to a renderer, and only one of them should draw.
+    """
+    try:
+        from backend.core.ouroboros.governance.context_meter import (
+            as_payload, read,
+        )
+        model = str(getattr(snap, "model", "") or "")
+        return as_payload(read(op_id, provider=provider, model=model))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _pulse_glyph(now: float) -> str:
     """The pulse is O+V's OWN identity animation — the Ouroboros spinner
     (snake closing on its tail, bite, reopen), consumed from its ONE
@@ -219,6 +235,11 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
             # disagree about whether earlier rounds are about to be
             # summarised away.
             "context_pct": _context_pct(op_id),
+            # The richer reading: tokens against the PROVIDER's window as
+            # well as chars against this process's compaction threshold,
+            # with the binding wall named. `context_pct` stays for older
+            # clients — additive, never a replacement.
+            "context": _context_reading(op_id, provider, snap),
             "effort": effort,
             "provider": provider,
             "provider_label": provider_label,
@@ -277,24 +298,37 @@ def format_heartbeat_line(
             parts.append(f"↓ {_fmt_tokens(tokens)} tokens")
         # Context headroom, shown only once it MATTERS.
         #
-        # Below the compaction threshold this is noise — every op starts near
-        # empty and the number would sit there teaching the operator to
-        # ignore it. Past the threshold it explains something they would
-        # otherwise experience as the model forgetting: earlier rounds are
-        # being summarised away to make room.
-        ctx = float(payload.get("context_pct") or 0.0)
-        if ctx > 0.0:
-            try:
-                from backend.core.ouroboros.governance.tool_executor import (
-                    compaction_threshold_fraction,
-                )
-                floor = compaction_threshold_fraction()
-            except Exception:  # noqa: BLE001
-                floor = 0.75
-            if ctx >= floor:
-                parts.append(f"ctx {int(ctx * 100)}% · compacting")
-            elif ctx >= floor * 0.8:
-                parts.append(f"ctx {int(ctx * 100)}%")
+        # Below the threshold this is noise — every op starts near empty and
+        # a permanent 3% teaches the operator to ignore the field, which is
+        # exactly how it fails to register on the day it says 91%.
+        #
+        # The METER's line is preferred when present because it names the
+        # WALL: "left until compact" and "left of window" call for different
+        # actions, and the bare fraction could only ever describe the first.
+        ctx_line = ""
+        try:
+            from backend.core.ouroboros.governance.context_meter import (
+                render_payload,
+            )
+            ctx_line = render_payload(payload.get("context"))
+        except Exception:  # noqa: BLE001
+            ctx_line = ""
+        if ctx_line:
+            parts.append(ctx_line)
+        else:
+            ctx = float(payload.get("context_pct") or 0.0)
+            if ctx > 0.0:
+                try:
+                    from backend.core.ouroboros.governance.tool_executor import (
+                        compaction_threshold_fraction,
+                    )
+                    floor = compaction_threshold_fraction()
+                except Exception:  # noqa: BLE001
+                    floor = 0.75
+                if ctx >= floor:
+                    parts.append(f"ctx {int(ctx * 100)}% · compacting")
+                elif ctx >= floor * 0.8:
+                    parts.append(f"ctx {int(ctx * 100)}%")
         label = str(
             payload.get("provider_label") or payload.get("provider") or ""
         )

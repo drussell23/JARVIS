@@ -627,6 +627,23 @@ def _emit_provider_latency(
     (2) cross-process JSONL via ``flock_append_line`` (durable,
     survives bounded-shutdown, the Slice-1 training set)."""
     try:
+        # The context meter's calibration half, taken BEFORE the latency
+        # flag is consulted — these are two independent observers of the same
+        # boundary, and gating one behind the other's (default-off) switch
+        # would leave the meter estimating tokens forever while the true
+        # count sat one line away.
+        #
+        # `input_tokens` here is the provider's OWN server-side tokenizer
+        # count, which is exactly what the meter needs and cannot get any
+        # other way.
+        try:
+            from backend.core.ouroboros.governance.context_meter import (
+                note_prompt_tokens,
+            )
+            note_prompt_tokens(op_id, provider, input_tokens)
+        except Exception:  # noqa: BLE001 — never perturb a provider call
+            pass
+
         if not _provider_latency_telemetry_enabled():
             return
         import time as _t
