@@ -491,9 +491,47 @@ def _replies_per_min() -> int:
         return 6
 
 
-def _reply_budget_ok(resident: str, now: float) -> bool:
-    """Cooldown + global window admission. Thread-safe. NEVER raises."""
+def _posture_permits_banter(kind: str = "", body: str = "") -> bool:
+    """Should the room speak at all right now?
+
+    Gated on POSTURE, not on a verbosity flag. Under HARDEN — an incident, a
+    soak, a production repair — banter is actively harmful: it competes for
+    attention with the thing going wrong, and an operator fighting a failure
+    should not first have to remember to turn the jokes off.
+
+    A `⚔` conflict always passes. REVIEW contesting GENERATE is not banter;
+    it is the system reporting that its own components disagree, which is
+    exactly the signal an incident needs.
+
+    Unknown posture resolves to SPEAK. A missing signal must not silence the
+    room — the gate exists to quiet noise during trouble, not to demand proof
+    of calm.
+    """
     try:
+        from backend.core.ouroboros.battle_test.moltbook_inline import (
+            posture_allows,
+        )
+        from backend.core.ouroboros.governance.posture_store import (
+            current_posture,
+        )
+        posture = str(getattr(current_posture(), "value", "") or "")
+        return posture_allows({"kind": kind, "body": body}, posture)
+    except Exception:  # noqa: BLE001 — never silence on a lookup failure
+        return True
+
+
+def _reply_budget_ok(resident: str, now: float,
+                     kind: str = "", body: str = "") -> bool:
+    """Posture + cooldown + global window admission. Thread-safe. NEVER raises.
+
+    Posture is checked FIRST and cheapest: refusing here means the reaction is
+    never formulated at all, rather than generated and then dropped at the
+    renderer — the muted post would still have cost a model call and still
+    have consumed the resident's cooldown.
+    """
+    try:
+        if not _posture_permits_banter(kind, body):
+            return False
         with _REPLY_STATE_LOCK:
             if now - _LAST_REPLY_AT.get(resident, 0.0) < _reply_cooldown_s():
                 return False
