@@ -534,7 +534,18 @@ def _compose_summary(
 ) -> Tuple[str, str]:
     """Build (summary_markup, expansion_hint).
 
-    ``summary_markup`` mirrors CC's ``⎿`` continuation glyph.
+    ``summary_markup`` uses the CANONICAL continuation glyph, resolved
+    from ``ui.theme`` rather than written here.
+
+    It used to be a literal — and the literal was ``⏎`` (U+23CE RETURN
+    SYMBOL) while all four docstrings in this module and its registry said
+    ``⎿`` (U+23BF). So every tool result in the cockpit continued with a
+    different mark from every other continuation line in the deck, and the
+    documentation asserted otherwise. A one-character typo is exactly what a
+    duplicated glyph literal is FOR: nothing compares the copies, so nothing
+    notices. Asking the theme also buys the ASCII degradation that the deck's
+    other continuations already have on a non-UTF-8 terminal.
+
     ``expansion_hint`` is a separate dim line emitted only when the
     body was actually elided (``elided > 0``) AND a stable ref was
     issued — without a ref the operator has no recovery path, so
@@ -544,8 +555,13 @@ def _compose_summary(
         return ("", "")
 
     c_dim = _palette_value(palette, "dim")
+    try:
+        from backend.core.ouroboros.ui.theme import mark
+        glyph = mark("detail") or "⎿"
+    except Exception:  # noqa: BLE001 — a themeless render still continues
+        glyph = "⎿"
     summary_markup = (
-        f"[{c_dim}]⏎  {_escape(summary_text)}[/{c_dim}]"
+        f"[{c_dim}]{glyph}  {_escape(summary_text)}[/{c_dim}]"
     )
 
     expansion_hint = ""
