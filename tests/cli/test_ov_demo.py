@@ -227,17 +227,23 @@ class TestLiveScene:
         assert "c-d" in keys
 
     def test_toolbar_uses_the_canonical_pulse(self):
-        # `ui.theme.ouroboros_frame` is what serpent_flow and attach_heartbeat
-        # already render. A second spinner would drift against the real one and
-        # the demo would teach the wrong rhythm.
+        """The demo must not format a second pulse.
+
+        It used to compose the line itself from `ui.theme.ouroboros_frame` —
+        canonical glyph, bespoke sentence. It now hands a payload to
+        `attach_heartbeat.format_heartbeat_line`, the formatter every
+        attached cockpit renders, which owns that frame. Stronger than the
+        old property: there is no second formatter to drift, not merely a
+        shared glyph.
+        """
         import ast
         import pathlib
         src = pathlib.Path(
             "backend/core/ouroboros/cli/ov_demo.py").read_text(encoding="utf-8")
-        assert "ouroboros_frame" in src
+        assert "format_heartbeat_line" in src
         modules = {n.module or "" for n in ast.walk(ast.parse(src))
                    if isinstance(n, ast.ImportFrom)}
-        assert any("ui.theme" in m for m in modules)
+        assert any("attach_heartbeat" in m for m in modules)
 
     def test_toolbar_renders_without_an_app(self):
         from backend.core.ouroboros.cli.ov_demo import _live_toolbar
