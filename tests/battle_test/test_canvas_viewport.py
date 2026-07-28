@@ -207,3 +207,101 @@ def test_the_pre_existing_knob_still_wins(
 def test_the_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JARVIS_CANVAS_SCROLLBACK_ENABLED", "0")
     assert scrollback_enabled() is False
+
+
+# --------------------------------------------------------------------------
+# fullscreen-rendering parity: the wheel, half pages, and what arrived
+# --------------------------------------------------------------------------
+
+def test_paging_moves_HALF_a_screen() -> None:
+    """A full page leaves nothing on screen to anchor against, so the reader
+    loses their place at every press."""
+    v = CanvasViewport()
+    v.window(_lines(500), 20)
+    v.page(1, total=500, budget=20)
+    assert v.offset == 10
+
+
+def test_the_wheel_moves_by_the_configured_speed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminals disagree about wheel events — some send one per notch,
+    others amplify. Nothing can detect which, so it is a knob."""
+    from backend.core.ouroboros.battle_test.canvas_viewport import scroll_speed
+
+    assert scroll_speed() == 3.0, "vim's default"
+    monkeypatch.setenv("JARVIS_SCROLL_SPEED", "0.25")
+    assert scroll_speed() == 0.25
+    monkeypatch.setenv("JARVIS_SCROLL_SPEED", "999")
+    assert scroll_speed() == 20.0, "clamped"
+    monkeypatch.setenv("JARVIS_SCROLL_SPEED", "nonsense")
+    assert scroll_speed() == 3.0
+
+
+def test_it_counts_what_ARRIVED_while_reading() -> None:
+    """"3 new" answers "should I jump back to live". The raw lines-below
+    count includes everything already scrolled past and answers a different
+    question."""
+    v = CanvasViewport()
+    history = _lines(500)
+    v.window(history, 11, appended=500)
+    v.page(1, total=500, budget=11)
+    history += _lines(30, start=500)
+    _vis, above, below = v.window(history, 11, appended=530)
+
+    assert v.new_since_paused == 30
+    assert "30 new" in v.status(above, below)
+
+
+def test_returning_to_live_clears_the_count() -> None:
+    v = CanvasViewport()
+    v.window(_lines(500), 11, appended=500)
+    v.page(1, total=500, budget=11)
+    v.window(_lines(530), 11, appended=530)
+    assert v.new_since_paused > 0
+    v.to_bottom()
+    assert v.new_since_paused == 0
+
+
+def test_following_never_accrues_a_count() -> None:
+    """Nothing is "new" to someone already watching it."""
+    v = CanvasViewport()
+    v.window(_lines(100), 10, appended=100)
+    v.window(_lines(200), 10, appended=200)
+    assert v.new_since_paused == 0
+
+
+def test_the_wheel_and_the_keyboard_share_one_viewport() -> None:
+    """Bound to the same clamped object rather than a second scroll path
+    that could disagree about where the bottom is."""
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.keys import Keys
+
+    from backend.core.ouroboros.battle_test.canvas_viewport import (
+        install_scroll_bindings,
+    )
+
+    v = CanvasViewport()
+    kb = KeyBindings()
+    assert install_scroll_bindings(kb, v, lambda: (500, 11)) is True
+    combos = {tuple(str(k) for k in b.keys) for b in kb.bindings}
+    for key in ("Keys.ScrollUp", "Keys.ScrollDown", "Keys.PageUp",
+                "Keys.PageDown", "Keys.End", "Keys.Home"):
+        assert (key,) in combos, f"{key} unbound"
+
+
+def test_BOTH_end_and_ctrl_end_return_to_live() -> None:
+    """Ctrl+End is conventional, and a MacBook keyboard cannot send it —
+    Ctrl+Fn+→ does not reach the app. Binding only that would leave this
+    machine with no way back to live."""
+    from prompt_toolkit.key_binding import KeyBindings
+
+    from backend.core.ouroboros.battle_test.canvas_viewport import (
+        install_scroll_bindings,
+    )
+
+    kb = KeyBindings()
+    install_scroll_bindings(kb, CanvasViewport(), lambda: (500, 11))
+    combos = {tuple(str(k) for k in b.keys) for b in kb.bindings}
+    assert ("Keys.End",) in combos and ("Keys.ControlEnd",) in combos
+    assert ("Keys.Home",) in combos and ("Keys.ControlHome",) in combos

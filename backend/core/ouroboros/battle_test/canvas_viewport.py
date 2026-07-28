@@ -58,7 +58,8 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.CanvasViewport")
 
-__all__ = ["CanvasViewport", "scrollback_enabled", "canvas_history_lines"]
+__all__ = ["CanvasViewport", "scrollback_enabled", "canvas_history_lines",
+           "scroll_speed", "install_scroll_bindings"]
 
 #: History the canvas keeps once it is the ONLY history there is. The old 500
 #: was sized for a tail beneath a terminal that still had its own scrollback;
@@ -72,6 +73,21 @@ def scrollback_enabled() -> bool:
     return os.environ.get(
         "JARVIS_CANVAS_SCROLLBACK_ENABLED", "1",
     ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def scroll_speed() -> float:
+    """Lines moved per wheel notch.
+
+    Terminals disagree about wheel events: some send one per physical notch,
+    others amplify already. Nothing can detect which, so this is a knob rather
+    than a constant. 3 matches vim's default and is the value that feels right
+    in terminals that do NOT amplify.
+    """
+    try:
+        value = float(os.environ.get("JARVIS_SCROLL_SPEED", "3"))
+        return min(20.0, max(0.25, value))
+    except (TypeError, ValueError):
+        return 3.0
 
 
 def canvas_history_lines() -> int:
@@ -111,6 +127,10 @@ class CanvasViewport:
         #: UI can say "this is everything that is kept" rather than appearing
         #: to freeze. Truncation the operator cannot see reads as a bug.
         self.hit_top = False
+        #: Lines that arrived while the operator was reading history. Shown
+        #: as a count rather than left implicit — "there is newer output" is
+        #: the fact that decides whether they want to jump back to live.
+        self.new_since_paused = 0
 
     # -- state -------------------------------------------------------------
 
@@ -126,6 +146,7 @@ class CanvasViewport:
     def reset(self) -> None:
         self._offset = 0
         self.hit_top = False
+        self.new_since_paused = 0
 
     # -- movement ----------------------------------------------------------
 
@@ -162,7 +183,10 @@ class CanvasViewport:
         as dead. It was only visible because the test asserted on the lines
         rather than on the return value.
         """
-        step = max(1, int(budget) - 1)
+        # HALF a screen, not a full one. A full page leaves nothing on
+        # screen to anchor against, so the reader loses their place at every
+        # press; half keeps the previous context in view.
+        step = max(1, int(budget) // 2)
         return self.scroll(-step if direction >= 0 else step,
                            total=total, budget=budget)
 
@@ -204,7 +228,9 @@ class CanvasViewport:
             marker = total if appended is None else int(appended)
             previous, self._last_appended = self._last_appended, marker
             if self._offset > 0 and previous is not None and marker > previous:
-                self._offset += marker - previous
+                arrived = marker - previous
+                self._offset += arrived
+                self.new_since_paused += arrived
 
             if total <= budget:
                 # Everything fits; there is no history to be inside of.
@@ -235,7 +261,12 @@ class CanvasViewport:
             older = f"↑ {hidden_above} older" if hidden_above > 0 else "↑ top"
             if self.hit_top and hidden_above <= 0:
                 older = "↑ oldest kept"
-            return f"{older} · {hidden_below} newer below · End to follow"
+            # What ARRIVED while they were reading is the fact that decides
+            # whether to jump back; the raw "lines below" count includes
+            # everything they scrolled past and answers a different question.
+            fresh = (f"{self.new_since_paused} new" if self.new_since_paused
+                     else f"{hidden_below} newer")
+            return f"{older} · {fresh} below · End to follow"
         except Exception:  # noqa: BLE001
             return ""
 
@@ -273,15 +304,32 @@ def install_scroll_bindings(
             lambda t, b: viewport.page(1, total=t, budget=b)))
         kb.add("pagedown")(_move(
             lambda t, b: viewport.page(-1, total=t, budget=b)))
-        # Wheel events arrive as scroll-up/scroll-down when mouse support is
-        # on; harmless to bind when it is not.
-        kb.add("s-up")(_move(
-            lambda t, b: viewport.scroll(-3, total=t, budget=b)))
-        kb.add("s-down")(_move(
-            lambda t, b: viewport.scroll(3, total=t, budget=b)))
-        kb.add("end")(_move(lambda _t, _b: viewport.to_bottom()))
-        kb.add("home")(_move(
-            lambda t, b: viewport.to_top(total=t, budget=b)))
+        # The MOUSE WHEEL. prompt_toolkit turns wheel events into these two
+        # keys once `mouse_support` is on, so the wheel and the keyboard move
+        # the same viewport through the same clamping — no second scroll path
+        # that can disagree about where the bottom is.
+        from prompt_toolkit.keys import Keys
+
+        def _notch(direction: int) -> Any:
+            def _fn(t: int, b: int) -> bool:
+                step = max(1, int(round(scroll_speed())))
+                return viewport.scroll(direction * step, total=t, budget=b)
+            return _fn
+
+        kb.add(Keys.ScrollUp)(_move(_notch(-1)))
+        kb.add(Keys.ScrollDown)(_move(_notch(1)))
+        kb.add("s-up")(_move(_notch(-1)))
+        kb.add("s-down")(_move(_notch(1)))
+
+        # Home/End AND their Ctrl variants. Both, deliberately: Ctrl+End is
+        # the conventional jump-to-latest, and a MacBook keyboard cannot send
+        # it at all (Ctrl+Fn+→ does not reach the app), so binding only that
+        # would leave this machine with no way back to live.
+        for key in ("end", "c-end"):
+            kb.add(key)(_move(lambda _t, _b: viewport.to_bottom()))
+        for key in ("home", "c-home"):
+            kb.add(key)(_move(
+                lambda t, b: viewport.to_top(total=t, budget=b)))
         return True
     except Exception:  # noqa: BLE001
         logger.debug("[CanvasViewport] bindings degraded", exc_info=True)
