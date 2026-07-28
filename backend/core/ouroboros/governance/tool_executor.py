@@ -4980,6 +4980,18 @@ def note_context_utilisation(op_id: str, used_chars: int) -> None:
         _CONTEXT_GAUGE[key] = max(0.0, min(1.0, pct))
         while len(_CONTEXT_GAUGE) > _CONTEXT_GAUGE_MAX:
             _CONTEXT_GAUGE.popitem(last=False)
+        # The RAW char count, not the fraction, to the context meter. The
+        # gauge stores a ratio against this process's own char budget, which
+        # cannot be converted back into tokens — and tokens are the unit the
+        # provider's window is denominated in. Same measurement, taken once,
+        # published in both shapes rather than measured twice.
+        try:
+            from backend.core.ouroboros.governance.context_meter import (
+                note_prompt_chars,
+            )
+            note_prompt_chars(key, int(used_chars))
+        except Exception:  # noqa: BLE001 — a meter must not perturb the loop
+            pass
     except Exception:  # noqa: BLE001
         pass
 
