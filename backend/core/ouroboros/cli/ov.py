@@ -60,6 +60,9 @@ def resolve_version() -> str:
     return "0.0.0+unknown"
 
 
+from backend.core.ouroboros.ui.alt_screen import alternate_screen
+
+
 def version_line() -> str:
     """``ov 0.1.0 “unchained” — ouroboros + venom``. NEVER raises."""
     try:
@@ -2444,7 +2447,26 @@ def run_attach(console: Any) -> int:
 def run_cockpit_thin(console: Any) -> int:
     """The presentation-shell cockpit: instant crest, zero-trust
     probe, seamless attach — cold-booting a detached organism when
-    none is home. The operator NEVER sees a traceback here."""
+    none is home. The operator NEVER sees a traceback here.
+
+    Borrows the terminal's ALTERNATE SCREEN before the first byte is drawn.
+    The cockpit already asked for it (prompt_toolkit's ``full_screen=True``)
+    — but it asked at the END, after the crest, the wake logs and the attach
+    summary had been printed to the NORMAL buffer. The logo therefore sat in
+    the scrollback behind the cockpit and could be scrolled back to, which is
+    the one thing a full-screen takeover exists to prevent.
+
+    Entering HERE puts the whole boot inside the borrowed buffer. On exit the
+    normal buffer returns exactly as it was found, with the operator's own
+    scrollback intact and no logo residue — reversible, rather than erasing
+    their history with ED-3.
+    """
+    with alternate_screen() as _alt:
+        return _run_cockpit_thin_inner(console, _alt)
+
+
+def _run_cockpit_thin_inner(console: Any, alt_screen_active: bool) -> int:
+    """The boot itself, running inside whatever screen it was handed."""
     import asyncio
 
     # The emblem law: the mark ALWAYS greets `ov`. With the Client-Side Boot
@@ -2531,7 +2553,9 @@ def run_cockpit_thin(console: Any) -> int:
         return rc
     # Warm path from here — identical surface to `ov attach` (DRY:
     # same hydration card, same split-plane, same PresentationRouter-
-    # conformed stream, same audio verbs).
+    # conformed stream, same audio verbs). Still INSIDE the borrowed screen:
+    # handing the terminal back between the crest and the cockpit would flash
+    # the operator's shell in the middle of a boot.
     return run_attach(console)
 
 
