@@ -6065,8 +6065,28 @@ class SerpentREPL:
                 import asyncio as _aio
 
                 def _on_accept(text: str) -> None:
+                    cleaned = (text or "").strip()
+                    # CC-style message anchor on the DAEMON cockpit too —
+                    # the typed line lands in the canvas before anything
+                    # answers it (same contract as the attach client's
+                    # _echo_operator_line; one genre, every surface).
+                    try:
+                        import os as _os
+                        if cleaned and _os.environ.get(
+                            "JARVIS_OPERATOR_ECHO_ENABLED", "true",
+                        ).strip().lower() not in ("0", "false", "no",
+                                                  "off"):
+                            canvas = get_active_canvas()
+                            if canvas is not None:
+                                from rich.markup import escape as _esc
+                                canvas.push_raw(
+                                    "[bold #5ee06a]❯[/bold #5ee06a] "
+                                    f"[#dbe6e1]{_esc(cleaned)}[/#dbe6e1]"
+                                )
+                    except Exception:  # noqa: BLE001
+                        pass
                     _aio.ensure_future(
-                        self._dispatch_repl_command((text or "").strip())
+                        self._dispatch_repl_command(cleaned)
                     )
 
                 async def _attach_sprite_when_ready() -> None:
