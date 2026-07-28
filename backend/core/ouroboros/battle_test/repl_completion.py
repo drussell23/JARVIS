@@ -1938,7 +1938,6 @@ def _describe(fn: object) -> str:
     return UNDOCUMENTED
 
 
-@contextlib.contextmanager
 def _operator_voice(text: str, verb: str) -> str:
     """Normalise a description to the operator's voice. Degrades to *text*."""
     try:
@@ -1950,6 +1949,7 @@ def _operator_voice(text: str, verb: str) -> str:
         return text
 
 
+@contextlib.contextmanager
 def _root_logging_preserved():
     """Hold the root logger harmless across an arbitrary-module import walk.
 
