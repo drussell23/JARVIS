@@ -199,7 +199,22 @@ class RewindController:
         self._failsafe = None
 
 
-class RewindCompleter:
+def _completer_base() -> Any:
+    """prompt_toolkit's ``Completer``, or ``object`` when unavailable.
+
+    INHERITING is load-bearing, not tidy (same lesson history_search
+    learned live): prompt_toolkit consumes completers through
+    ``get_completions_async``, which only the base class supplies by
+    wrapping the sync method. A duck-typed completer passes every direct
+    test and raises AttributeError on the first real keystroke."""
+    try:
+        from prompt_toolkit.completion import Completer
+        return Completer
+    except Exception:  # noqa: BLE001
+        return object
+
+
+class RewindCompleter(_completer_base()):  # type: ignore[misc]
     """Feeds the locked restore points into the palette while armed.
 
     Selecting one INSERTS ``/undo N`` — the same typed verb the daemon
