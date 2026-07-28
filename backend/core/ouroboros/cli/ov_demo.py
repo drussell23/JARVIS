@@ -38,6 +38,8 @@ DEMO_HELP = """ov demo -- watch the cockpit, no model calls
   ov demo             board + transcript
   ov demo board       what is LIVE vs DARK right now (derived from the tree)
   ov demo transcript  the CC-style deck: ops, diffs, agora threads
+  ov demo live        the COCKPIT running, driven by synthetic events
+                      (needs a real terminal; --speed=N to fast-forward)
   ov demo scenes      list available scenes
 """
 
@@ -248,6 +250,225 @@ def _dispatcher_for(verb: str) -> Any:
     return table.get(verb)
 
 
+
+# ---------------------------------------------------------------------------
+# Scene: live
+# ---------------------------------------------------------------------------
+
+#: A scripted operation, as SECONDS-since-start paired with a deck line.
+#: Timings are the point — the deck's rhythm is most of what the cockpit feels
+#: like, and a burst of lines arriving at once looks nothing like an organism
+#: working. Kept as data so the shape can be tuned without touching the driver.
+_LIVE_SCRIPT = [
+    (0.4, "⏺ Signal(test_failure) · risk_tier_floor.py"),
+    (1.0, "  ⎿ 2 source loci · 1 test locus"),
+    (2.0, "⏺ Read(governance/risk_tier_floor.py)"),
+    (2.8, "  ⎿ 847 lines"),
+    (3.4, "⏺ Search(\"except Exception\")"),
+    (4.2, "  ⎿ 19 matches in 1 file"),
+    (5.0, "🗣 the vision floor raises, and the caller swallows it"),
+    (6.2, "⏺ Update(risk_tier_floor.py)"),
+    (7.0, "  ⎿ +18 -3"),
+    (7.4, "     + except RiskFloorConfigError:"),
+    (7.7, "     +     raise"),
+    (8.0, "     - except Exception:  # noqa: BLE001"),
+    (9.2, "⏺ Validate(7759-86)"),
+    (10.8, "  ⎿ ✗ 3 failed · test_scoped_paths, test_sandbox_dir"),
+    (11.6, "  💬 @the-pit  three tests. you fixed the assert and broke the file."),
+    (12.6, "     ▸ @the-builder  the containment check is right, the fixture is stale"),
+    (13.8, "     ▸ ⚔ @cassandra  REVIEW disagrees: that clause still swallows I2"),
+    (15.2, "⏺ Repair(L2) · iteration 1/5"),
+    (16.8, "  ⎿ fixture rebuilt from the live seam"),
+    (18.0, "⏺ Validate(7759-86)"),
+    (19.4, "  ⎿ ✓ 47 passed"),
+    (20.4, "⏺ Gate(7759-86) · NOTIFY_APPLY"),
+    (21.2, "  ⎿ applied · verified · committed 90706b8"),
+    (22.4, "⏺ Complete(7759-86) · 22.4s · $0.011"),
+]
+
+#: Windows during which the toolbar shows a token counter climbing, because in
+#: the real cockpit that is the ONLY sign the organism is thinking. A static
+#: spinner and a moving number read completely differently at 2am.
+_GENERATING = ((5.0, 9.2), (15.2, 18.0))
+
+
+def live_speed(argv: Sequence[str]) -> float:
+    for arg in argv:
+        if arg.startswith("--speed="):
+            try:
+                return max(0.1, min(20.0, float(arg.split("=", 1)[1])))
+            except (TypeError, ValueError):
+                return 1.0
+    return 1.0
+
+
+def _live_toolbar(started: Callable[[], float], clock: Callable[[], float]):
+    """The pulse line, built from the CANONICAL frame source.
+
+    `ui.theme.ouroboros_frame` is what `serpent_flow` and `attach_heartbeat`
+    already render, so every surface shows the same frame at the same instant.
+    A second spinner here would drift against the real one and the demo would
+    be teaching the wrong rhythm.
+    """
+    def _render() -> str:
+        try:
+            from backend.core.ouroboros.ui.theme import ouroboros_frame
+            now = clock()
+            elapsed = max(0.0, now - started())
+            glyph = ouroboros_frame(now)
+            phase = "Synthesizing" if any(
+                lo <= elapsed <= hi for lo, hi in _GENERATING) else "Watching"
+            # Derived from elapsed rather than accumulated, so a dropped frame
+            # cannot desynchronise the number from the clock beside it.
+            tokens = int(elapsed * 780)
+            mins, secs = divmod(int(elapsed), 60)
+            return (f"{glyph} {phase}… ({mins}m {secs}s · ↓ {tokens/1000:.1f}k "
+                    f"tokens · DEMO) — q to quit")
+        except Exception:  # noqa: BLE001
+            return "ov demo live — q to quit"
+    return _render
+
+
+async def _drive(mux: Any, app: Any, speed: float,
+                 started: Callable[[], float],
+                 clock: Callable[[], float]) -> None:
+    """Feed the script in real time, then idle until the operator quits.
+
+    Sleeps against the SCHEDULE rather than accumulating per-step delays: a
+    slow frame would otherwise push every later line further out, and the
+    rhythm — the thing being demonstrated — would decay over the run.
+    """
+    import asyncio
+    for at, line in _LIVE_SCRIPT:
+        target = started() + (at / speed)
+        while True:
+            gap = target - clock()
+            if gap <= 0:
+                break
+            await asyncio.sleep(min(gap, 0.05))
+        try:
+            mux.push_raw(line)
+            app.invalidate()
+        except Exception:  # noqa: BLE001
+            logger.debug("[OvDemo] live push degraded", exc_info=True)
+    # The toolbar keeps pulsing after the script ends. Exiting on the last
+    # line would deny the operator the chance to look at the finished deck,
+    # which is most of what they came to see.
+    while True:
+        await asyncio.sleep(0.2)
+        try:
+            app.invalidate()
+        except Exception:  # noqa: BLE001
+            return
+
+
+
+def _live_exit_bindings() -> Any:
+    """Keys that end the demo. NEVER raises.
+
+    The toolbar promised "q to quit" and q did NOT quit: the cockpit owns a
+    text input, so the keystroke went into the prompt buffer. A surface that
+    advertises an exit it does not honour is worse than one that advertises
+    nothing — the operator's next move is SIGKILL.
+
+    `q` only fires on an EMPTY buffer, so typing a word containing q still
+    works; Ctrl-C and Ctrl-D always fire, because an escape hatch that can be
+    disabled by the state of a text field is not an escape hatch.
+    """
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.filters import Condition
+
+    kb = KeyBindings()
+
+    @Condition
+    def _buffer_empty() -> bool:
+        try:
+            from prompt_toolkit.application.current import get_app
+            return not get_app().current_buffer.text.strip()
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _quit(event) -> None:  # noqa: ANN001
+        event.app.exit()
+
+    kb.add("q", filter=_buffer_empty)(_quit)
+    kb.add("escape", filter=_buffer_empty, eager=True)(_quit)
+    kb.add("c-c")(_quit)
+    kb.add("c-d")(_quit)
+    return kb
+
+def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
+    """The cockpit, running, driven by synthetic events.
+
+    Boots the REAL `build_bipartite_application` — the same Application `ov`
+    attaches to, with the region container mounted — and pushes timed events
+    through `push_raw`, the same seam the daemon bridge uses. Nothing here
+    renders anything itself.
+    """
+    import asyncio
+    import sys
+
+    # A real interactive TTY is REQUIRED, and saying so beats degrading
+    # silently. prompt_toolkit needs a terminal to take over; without one it
+    # either raises or draws nothing, and a demo that appears to do nothing is
+    # indistinguishable from a broken one.
+    if not (sys.__stdin__ is not None and sys.__stdin__.isatty()
+            and sys.__stdout__ is not None and sys.__stdout__.isatty()):
+        _say(console, "  ov demo live needs an interactive terminal.")
+        _say(console, "  (piped or captured output cannot be taken over —")
+        _say(console, "   run it directly in your terminal, not through a pipe)")
+        return 64
+
+    try:
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout, build_bipartite_application,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _say(console, f"  cockpit unavailable: {exc}")
+        return 1
+
+    clock = __import__("time").monotonic
+    start = [clock()]
+    speed = live_speed(argv)
+
+    mux = BipartiteLayout()
+    app = build_bipartite_application(
+        mux,
+        on_accept=lambda text: None,          # input is inert in a demo
+        toolbar=_live_toolbar(lambda: start[0], clock),
+        extra_key_bindings=_live_exit_bindings(),
+    )
+    try:
+        mux.set_invalidate(app.invalidate)
+    except Exception:  # noqa: BLE001
+        pass
+
+    async def _main() -> None:
+        start[0] = clock()
+        driver = asyncio.ensure_future(
+            _drive(mux, app, speed, lambda: start[0], clock))
+        try:
+            await app.run_async()
+        finally:
+            # The driver holds a reference to the Application; leaving it
+            # running after the app exits keeps invalidating a dead surface
+            # and the process never returns.
+            driver.cancel()
+            try:
+                await driver
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        _say(console, f"  live scene ended: {type(exc).__name__}: {exc}")
+        return 1
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -257,6 +478,9 @@ def _dispatcher_for(verb: str) -> Any:
 _SCENES: "dict[str, Callable[[Any, Sequence[str]], int]]" = {
     "board": scene_board,
     "transcript": scene_transcript,
+    # NOT in the default all-scenes run: it takes over the screen and
+    # waits for a keypress, so it must be asked for by name.
+    "live": scene_live,
 }
 
 
@@ -279,7 +503,7 @@ def run_demo(console: Any, argv: Optional[Sequence[str]] = None) -> int:
 
     if not positional:
         rc = 0
-        for name in demo_scenes():
+        for name in (n for n in demo_scenes() if n != "live"):
             rc |= _SCENES[name](console, args)
             _say(console)
         return rc
