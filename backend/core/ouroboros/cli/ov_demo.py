@@ -307,38 +307,159 @@ def _dispatcher_for(verb: str) -> Any:
 # Scene: live
 # ---------------------------------------------------------------------------
 
-#: The scripted operation, as SECONDS-since-start paired with a BEAT. Timings
-#: are the point — the deck's rhythm is most of what the cockpit feels like,
-#: and a burst of lines arriving at once looks nothing like an organism
-#: working. Kept as data so the shape can be tuned without touching the driver.
+#: Tool RESULTS, as the tools actually return them. Deliberately raw: the
+#: registry's summarizers are what turn 847 lines into "847 lines read" and a
+#: pytest tail into "command failed", and handing them a pre-summarized string
+#: would demo the sentence rather than the summarizer.
+_READ_RESULT = "\n".join(
+    f"    # risk_tier_floor.py line {i}" for i in range(847)
+)
+#: A real search: 14 hits across 4 files, each one different. Under the
+#: density budget on purpose — the elision belongs on the failure below,
+#: where an operator actually wants to expand, not on a grep they skim.
+_SEARCH_RESULT = "\n".join(
+    f"backend/core/ouroboros/governance/{mod}.py:{line}:"
+    f"    except Exception:  {tail}"
+    for mod, line, tail in [
+        ("risk_tier_floor", 412, "# noqa: BLE001"),
+        ("risk_tier_floor", 488, "# floor resolution"),
+        ("risk_tier_floor", 631, "# quiet-hours parse"),
+        ("semantic_guardian", 204, "# pattern scan"),
+        ("semantic_guardian", 377, "# AST walk"),
+        ("semantic_guardian", 512, "# credential shape"),
+        ("iron_gate", 118, "# exploration ledger"),
+        ("iron_gate", 292, "# ascii strictness"),
+        ("iron_gate", 401, "# retry feedback"),
+        ("gate_runner", 87, "# attribution floor"),
+        ("gate_runner", 156, "# test-only notify"),
+        ("gate_runner", 233, "# containment probe"),
+        ("gate_runner", 310, "# risk-tier compose"),
+        ("gate_runner", 448, "# advisory ledger"),
+    ]
+)
+
+
+_EDIT_RESULT = (
+    "--- a/backend/core/ouroboros/governance/risk_tier_floor.py\n"
+    "+++ b/backend/core/ouroboros/governance/risk_tier_floor.py\n"
+    "@@ -410,7 +410,22 @@\n"
+    "     try:\n"
+    "         return _resolve_floor(raw)\n"
+    "-    except Exception:  # noqa: BLE001\n"
+    "-        return SAFE_AUTO\n"
+    "+    except RiskFloorConfigError:\n"
+    "+        # A malformed floor is the ONE case that must not degrade\n"
+    "+        # quietly: silently returning SAFE_AUTO turns a broken config\n"
+    "+        # into permission the operator never granted.\n"
+    "+        raise\n"
+)
+#: The pytest tail as pytest actually prints it — long enough to exceed the
+#: density budget, so the elision AND its `/expand t-N` recovery hint land on
+#: the failure. That is where truncation matters: an operator reading a red
+#: test wants the rest, and a demo that elides without showing the way back
+#: teaches that elision is loss.
+_PYTEST_FAIL = "\n".join([
+    "============================= test session starts =====================",
+    "collected 47 items",
+    "",
+    "tests/governance/test_risk_tier_floor.py ..F..F......F................",
+    "",
+    "================================== FAILURES ===========================",
+    "_____________________________ test_scoped_paths _______________________",
+    "",
+    "    def test_scoped_paths():",
+    "        floor = resolve_floor({'min_tier': 'notify_apply'})",
+    ">       assert floor is NOTIFY_APPLY",
+    "E       AssertionError: assert SAFE_AUTO is NOTIFY_APPLY",
+    "",
+    "tests/governance/test_risk_tier_floor.py:88: AssertionError",
+    "_____________________________ test_sandbox_dir ________________________",
+    "",
+    "    def test_sandbox_dir(tmp_path):",
+    "        with pytest.raises(BlockedPathError):",
+    ">           _normalize(tmp_path / 'outside')",
+    "E       Failed: DID NOT RAISE <class 'BlockedPathError'>",
+    "",
+    "tests/governance/test_risk_tier_floor.py:141: Failed",
+    "___________________________ test_quiet_hours_tz _______________________",
+    "",
+    "    def test_quiet_hours_tz():",
+    "        floor = resolve_floor({'quiet_hours': '22-06'}, tz='America/Denver')",
+    ">       assert floor is NOTIFY_APPLY",
+    "E       AssertionError: assert SAFE_AUTO is NOTIFY_APPLY",
+    "",
+    "tests/governance/test_risk_tier_floor.py:203: AssertionError",
+    "=========================== short test summary info ===================",
+    "FAILED tests/governance/test_risk_tier_floor.py::test_scoped_paths",
+    "FAILED tests/governance/test_risk_tier_floor.py::test_sandbox_dir",
+    "FAILED tests/governance/test_risk_tier_floor.py::test_quiet_hours_tz",
+    "3 failed, 44 passed in 4.12s",
+])
+_PYTEST_PASS = (
+    "tests/governance/test_risk_tier_floor.py::test_scoped_paths PASSED\n"
+    "tests/governance/test_risk_tier_floor.py::test_sandbox_dir PASSED\n"
+    "tests/governance/test_risk_tier_floor.py::test_quiet_hours_tz PASSED\n"
+    "47 passed in 3.98s"
+)
+
+#: The scripted operation, as SECONDS-since-start paired with a BEAT.
 #:
-#: Beats, not lines, for the same reason the transcript uses them: the column
-#: discipline belongs to the grammar. The blank line that closes each block is
-#: DERIVED here rather than written, so a new block cannot be added without
-#: one.
+#: Beats are SEMANTIC EVENTS, not lines — `("tool", ("bash", cmd, output,
+#: "error"))` rather than a pre-composed `⏺ Bash(…)`. That distinction is this
+#: module's entire premise applied to the one scene an operator actually
+#: WATCHES.
+#:
+#: Hand-written lines were a second draw path wearing the deck's clothes. They
+#: agreed with themselves while `tool_render_registry` — the descriptor table
+#: the cockpit renders EVERY tool call through, with its own per-tool icon,
+#: argument summarizer, result summarizer, status glyph, density policy and
+#: `t-N` expansion refs — went entirely unexercised. A demo that cannot show a
+#: regression in the renderer it is demonstrating is decoration.
+#:
+#: So the payloads here are REAL: `read_file` returns 847 lines of text and
+#: the registry's summarizer counts them; `bash` returns pytest output and the
+#: summarizer decides it failed. Nothing in this list states a conclusion the
+#: renderer is supposed to reach.
 _LIVE_BEATS: List[Any] = [
     (0.4, "act", ("Signal", "test_failure · risk_tier_floor.py")),
     (1.0, "det", ("2 source loci · 1 test locus",)),
-    (2.0, "act", ("Read", "governance/risk_tier_floor.py")),
-    (2.8, "det", ("Read 847 lines",)),
-    (3.4, "act", ("Search", '"except Exception"')),
-    (4.2, "det", ("Found 19 matches in 1 file",)),
+
+    (2.0, "tool", ("read_file",
+                   "backend/core/ouroboros/governance/risk_tier_floor.py",
+                   _READ_RESULT, "success", 310)),
+    (3.4, "tool", ("search_code", "except Exception",
+                   _SEARCH_RESULT, "success", 180)),
+
     (5.0, "voice", ("the vision floor raises, and the caller swallows it",)),
-    (6.2, "act", ("Update", "risk_tier_floor.py")),
-    (7.0, "det", ("Updated risk_tier_floor.py with 18 additions and"
-                  " 3 removals",)),
-    (7.4, "diff", (412, "+", "    except RiskFloorConfigError:")),
-    (7.7, "diff", (413, "+", "        raise")),
-    (8.0, "diff", (414, "-", "    except Exception:  # noqa: BLE001")),
-    (9.2, "act", ("Validate", "7759-86", "crit")),
-    (10.8, "det", ("✗ 3 failed · test_scoped_paths, test_sandbox_dir",
-                   "crit")),
+
+    # WHO is working — the roster the cockpit now mounts. Driven through the
+    # real `AgentRoster`, so the agent view fills in as the demo runs instead
+    # of being described in a line of text.
+    (5.6, "agent", ("spawn", "sub-3f2a", "Explore",
+                    "map every caller of the vision floor")),
+    (6.0, "agent", ("spawn", "sub-9c11", "Review",
+                    "try to refute the containment fix")),
+
+    (7.2, "tool", ("edit_file", "backend/core/ouroboros/governance/"
+                                "risk_tier_floor.py",
+                   _EDIT_RESULT, "success", 90)),
+    (9.2, "tool", ("bash",
+                   "python3 -m pytest tests/governance/"
+                   "test_risk_tier_floor.py -q",
+                   _PYTEST_FAIL, "error", 4120)),
+
+    (11.0, "agent", ("finish", "sub-3f2a", "finished",
+                     "36 findings · 8 tools")),
     # The agora reacting, rendered by the REAL renderer — see `_agora_beats`.
     (11.6, "agora", ()),
+
     (15.2, "act", ("Repair", "L2 · iteration 1/5", "warn")),
     (16.8, "det", ("fixture rebuilt from the live seam",)),
-    (18.0, "act", ("Validate", "7759-86")),
-    (19.4, "det", ("✓ 47 passed", "ok")),
+    (17.4, "agent", ("finish", "sub-9c11", "finished",
+                     "no counterexample · 12 tools")),
+    (18.0, "tool", ("run_tests", "tests/governance/test_risk_tier_floor.py",
+                    _PYTEST_PASS, "success", 3980)),
+
     (20.4, "act", ("Gate", "7759-86 · NOTIFY_APPLY")),
     (21.2, "det", ("applied · verified · committed 90706b8", "ok")),
     (22.4, "act", ("Complete", "7759-86 · 22.4s · $0.011")),
@@ -370,6 +491,129 @@ def _agora_beats() -> List[Any]:
             for i, line in enumerate(lines)]
 
 
+def _tool_beats(at: float, args: Sequence[Any]) -> List[Any]:
+    """One tool call → the lines the COCKPIT would draw for it.
+
+    Routed through `tool_render_view.compose` — the same function
+    `serpent_flow` calls for every real tool round — so this scene exercises
+    the descriptor table, the per-tool icon, both summarizers, the status
+    glyph, the density policy and the `t-N` expansion refs. A hand-written
+    `⏺ Bash(…)` exercised none of them and would have kept looking correct
+    through a regression in every one.
+
+    Body lines are dealt out over the block's duration rather than at its
+    timestamp: a tool that returns forty lines does not return them all in the
+    same instant, and the rhythm is most of what the cockpit feels like.
+    """
+    out: List[Any] = []
+    try:
+        from backend.core.ouroboros.battle_test.tool_render_registry import (
+            ToolStatus,
+        )
+        from backend.core.ouroboros.battle_test.tool_render_view import compose
+
+        name, tool_args, result, status, duration_ms = (
+            list(args) + [None] * 5
+        )[:5]
+        composed = compose(
+            str(name), str(tool_args), str(result),
+            status=ToolStatus.coerce(status),
+            duration_ms=float(duration_ms or 0.0),
+            op_id="7759-86",
+            store=_body_store(),
+        )
+        out.append((at, ""))
+        out.append((at, composed.header_markup))
+        if composed.summary_markup:
+            out.append((at + 0.35, composed.summary_markup))
+        body = list(composed.body_lines_markup)
+        # Spread across the second after the summary, however many there are.
+        step = (0.9 / len(body)) if body else 0.0
+        for i, line in enumerate(body):
+            out.append((at + 0.5 + i * step, line))
+        if composed.expansion_hint:
+            out.append((at + 1.5, composed.expansion_hint))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[OvDemo] tool beat degraded", exc_info=True)
+        out.append((at, f"  (tool render unavailable: {exc})"))
+    return out
+
+
+def _agent_beats(at: float, args: Sequence[Any]) -> List[Any]:
+    """A dispatch or a return, through the REAL roster — at PLAYBACK time.
+
+    Returned as a CALLABLE rather than a line, and that is the whole point.
+    The roster is live state: it holds a start instant and reports elapsed
+    against the clock. Driving it during composition would spawn and finish
+    every agent in the same microsecond, so the demo would open with a roster
+    already full of agents that each ran for `0s` — a surface that is
+    populated before the first frame demonstrates nothing about filling in.
+
+    Executed on the beat, the agent view does what it does in a real session:
+    rows appear as work is dispatched, their durations climb while the deck
+    scrolls past, and they resolve as results land.
+    """
+
+    def _run() -> Optional[str]:
+        try:
+            from backend.core.ouroboros.battle_test.agent_roster import (
+                get_agent_roster,
+            )
+            roster = get_agent_roster()
+            verb = str(args[0]) if args else ""
+            if verb == "spawn":
+                roster.spawn(str(args[1]), str(args[2]), str(args[3]))
+                return None          # the roster row IS the output
+            entry = roster.finish(str(args[1]), str(args[2]), str(args[3]))
+            return roster.finished_notice(entry) or None
+        except Exception:  # noqa: BLE001
+            logger.debug("[OvDemo] agent beat degraded", exc_info=True)
+            return None
+
+    return [(at, ""), (at, _run)]
+
+
+def _agent_view_rows() -> Any:
+    """The daemon cockpit's OWN roster provider, or None.
+
+    `serpent_flow._local_agent_rows` already reads the process singleton and
+    sizes it to this terminal. Importing it means the demo cannot render a
+    roster the cockpit would draw differently — a second provider here would
+    be a second opinion about width, height budget and folding.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.serpent_flow import (
+            _local_agent_rows,
+        )
+        return _local_agent_rows
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] agent view unavailable", exc_info=True)
+        return None
+
+
+def _body_store() -> Any:
+    """A real `BoundedBodyStore`, so `/expand t-N` refs in the demo are REFS.
+
+    A None store still renders — `compose` degrades gracefully — but it emits
+    no expansion hint, and the hint is exactly the affordance an operator
+    needs to learn exists. Demonstrating an elision without its recovery path
+    teaches that elision is loss.
+    """
+    global _STORE
+    try:
+        if _STORE is None:
+            from backend.core.ouroboros.battle_test.tool_render_store import (
+                BoundedBodyStore,
+            )
+            _STORE = BoundedBodyStore()
+        return _STORE
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_STORE: Any = None
+
+
 def compose_live_script() -> List[Any]:
     """`[(seconds, line), ...]` — the beats, composed and block-separated.
 
@@ -381,12 +625,23 @@ def compose_live_script() -> List[Any]:
         if kind == "agora":
             out.extend(_agora_beats())
             continue
+        if kind == "tool":
+            out.extend(_tool_beats(at, args))
+            continue
+        if kind == "agent":
+            out.extend(_agent_beats(at, args))
+            continue
         # The separator rides the SAME timestamp as the line it precedes, so
         # the block opens as one visual event instead of a gap that appears a
         # beat early and reads as the deck stalling.
         if kind in ("act", "voice") and i:
             out.append((at, ""))
         out.append((at, _compose(kind, args)))
+    # Beats now emit blocks rather than single lines, and a block's body can
+    # run past the next beat's timestamp. Sorted so the driver — which sleeps
+    # against the schedule — never meets a target already in the past and
+    # dumps the remainder at once.
+    out.sort(key=lambda pair: pair[0])
     return out
 
 
@@ -456,6 +711,18 @@ async def _drive(mux: Any, app: Any, speed: float,
                 break
             await asyncio.sleep(min(gap, 0.05))
         try:
+            # A beat is either a LINE or an ACTION. Actions exist because
+            # some surfaces are live state rather than text — the agent
+            # roster measures elapsed against the clock, so it has to be
+            # driven on the beat, not populated during composition. An
+            # action may return a line to push, or nothing at all when its
+            # only effect is the state a mounted surface is already drawing.
+            if callable(line):
+                produced = line()
+                app.invalidate()          # the state it changed is drawn
+                if not produced:
+                    continue              # its only effect was that state
+                line = produced
             mux.push_raw(line)
             app.invalidate()
         except Exception:  # noqa: BLE001
@@ -546,6 +813,12 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         on_accept=lambda text: None,          # input is inert in a demo
         toolbar=_live_toolbar(lambda: start[0], clock),
         extra_key_bindings=_live_exit_bindings(),
+        # The agent view, from `serpent_flow`'s own in-process provider. The
+        # scene already drives the roster; without the mount it would fill a
+        # surface nobody is drawing, which is the exact shape of the bug this
+        # scene exists to make visible. Reused rather than reimplemented, so
+        # the demo and the daemon cockpit render it identically.
+        agent_rows=_agent_view_rows(),
     )
     try:
         mux.set_invalidate(app.invalidate)
