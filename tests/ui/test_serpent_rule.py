@@ -166,3 +166,82 @@ class TestItSharesTheCrestsPalette:
         row, _x = sr.cell_at(biting.prey, 64)
         styles = [st for st, _t in sr.rule_fragments(row, 64, period * 0.999)]
         assert any("bold" in st for st in styles)
+
+
+class TestSmoothnessIsStructural:
+    """The jitter was a BEAT FREQUENCY, not a tuning problem.
+
+    Speed used to be 18 cells/second against a 0.1s repaint — 1.8 cells per
+    frame. Cells are integers, so the head actually advanced
+    1, 2, 2, 2, 2, 1, 2, 2, 2, 2, 1 … and that irregular 1 every fifth frame
+    is what an eye reads as stutter. No fraction fixes it; only an integer
+    does.
+    """
+
+    def _steps(self, interval, width=88, frames=40):
+        prev, out = None, []
+        for i in range(frames):
+            head = sr.frame(i * interval, width, interval=interval).head
+            if prev is not None:
+                out.append((head - prev) % sr.path_length(width))
+            prev = head
+        return out
+
+    @pytest.mark.parametrize("interval", [0.05, 0.1, 0.2, 0.5])
+    def test_the_head_advances_by_a_CONSTANT_number_of_cells(self, interval):
+        """At ANY repaint rate — including one this module never sees."""
+        steps = self._steps(interval)
+        assert len(set(steps)) == 1, f"{interval}s → uneven {sorted(set(steps))}"
+
+    def test_the_step_is_exactly_the_configured_cells_per_frame(self):
+        assert set(self._steps(0.1)) == {sr.cells_per_frame()}
+
+    def test_speed_is_DERIVED_from_the_frame_rate(self):
+        """Expressed as whole cells per frame, so seconds fall out. A rate
+        chosen independently of the repaint period is the bug."""
+        assert sr.speed_cells_s(0.1) == sr.cells_per_frame() / 0.1
+        assert sr.speed_cells_s(0.5) == sr.cells_per_frame() / 0.5
+
+    def test_a_faster_setting_stays_smooth(self, monkeypatch):
+        """Two cells per frame is twice the speed and still uniform —
+        the property survives the knob."""
+        monkeypatch.setenv("JARVIS_SERPENT_RULE_CELLS_PER_FRAME", "3")
+        assert set(self._steps(0.1)) == {3}
+
+    def test_the_cockpit_hands_over_its_OWN_repaint_period(self):
+        """A literal in two places is how the animation and the Application
+        silently disagree about the frame rate."""
+        import inspect
+        from backend.core.ouroboros.battle_test import bipartite_layout as bl
+        src = inspect.getsource(bl.build_bipartite_application)
+        assert "interval=_REFRESH_INTERVAL_S" in src
+        assert "refresh_interval=_REFRESH_INTERVAL_S" in src
+
+
+class TestTheChaseIsLegible:
+    def test_both_marks_fit_in_one_glance(self):
+        """A third of the circuit was 58 cells on an 88-column terminal —
+        more than half a rule, so the two were rarely on the same line and
+        the chase read as two unrelated marks."""
+        for width in (40, 88, 200):
+            f = sr.frame(0.0, width)
+            gap = (f.prey - f.head) % f.length
+            assert gap <= sr.lead_cells(), (width, gap)
+
+    def test_the_lead_is_in_CELLS_so_it_means_one_thing_everywhere(self):
+        wide = sr.frame(0.0, 200)
+        narrow = sr.frame(0.0, 88)
+        assert ((wide.prey - wide.head) % wide.length
+                == (narrow.prey - narrow.head) % narrow.length)
+
+    def test_a_narrow_path_cannot_be_handed_a_longer_lead_than_it_has(self):
+        f = sr.frame(0.0, 12)
+        assert (f.prey - f.head) % f.length <= f.length // 4 + 1
+
+    def test_the_gap_closes_monotonically_to_the_bite(self):
+        period = sr.chase_period_s()
+        gaps = []
+        for i in range(30):
+            f = sr.frame(period * i / 30.0, 88)
+            gaps.append((f.prey - f.head) % f.length)
+        assert gaps == sorted(gaps, reverse=True), gaps

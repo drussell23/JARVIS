@@ -45,9 +45,11 @@ logger = logging.getLogger("Ouroboros.SerpentRule")
 SERPENT_RULE_SCHEMA_VERSION = "serpent_rule.v1"
 
 MASTER_FLAG_ENV_VAR = "JARVIS_SERPENT_RULE_ENABLED"
-SPEED_ENV_VAR = "JARVIS_SERPENT_RULE_SPEED"
+CELLS_PER_FRAME_ENV_VAR = "JARVIS_SERPENT_RULE_CELLS_PER_FRAME"
+FRAME_INTERVAL_ENV_VAR = "JARVIS_SERPENT_RULE_FRAME_S"
 CHASE_ENV_VAR = "JARVIS_SERPENT_RULE_CHASE_S"
 BODY_ENV_VAR = "JARVIS_SERPENT_RULE_BODY"
+LEAD_ENV_VAR = "JARVIS_SERPENT_RULE_LEAD"
 
 #: Rows of the path. 0 = the rule above the caret, 1 = the rule below it.
 TOP, BOTTOM = 0, 1
@@ -71,14 +73,48 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
         return default
 
 
-def speed_cells_s() -> float:
-    """Cells per second.
+def frame_interval_s() -> float:
+    """The surface's repaint period — the animation's time quantum.
 
-    Constant SPEED rather than constant laps: a lap is a different distance
-    on an 80-column terminal and a 200-column one, and an operator reads
-    motion at a rate, not as a fraction of a screen they are not measuring.
+    Named and tunable because the smoothness of this animation is a function
+    of it, not of any speed chosen independently. Defaults to the cockpit
+    Application's `refresh_interval`; callers that repaint at a different
+    rate pass their own to :func:`rule_fragments`.
     """
-    return _env_float(SPEED_ENV_VAR, 18.0, 1.0, 120.0)
+    return _env_float(FRAME_INTERVAL_ENV_VAR, 0.1, 0.01, 2.0)
+
+
+def cells_per_frame() -> int:
+    """Cells the head advances on each repaint. An INTEGER, and that is the
+    whole point.
+
+    THE JITTER WAS A BEAT FREQUENCY
+    --------------------------------
+    Speed used to be 18 cells/second against a 0.1s repaint — 1.8 cells per
+    frame. Cells are integers, so the head actually advanced 1, 2, 2, 2, 2,
+    1, 2, 2, 2, 2, 1 … and that irregular 1 every fifth frame is what an eye
+    reads as stutter. Any rate that is not a whole number of cells per frame
+    produces this; it cannot be tuned away by choosing a different fraction,
+    only by choosing an integer.
+
+    So the knob is cells-per-FRAME rather than cells-per-second, and the
+    speed in seconds is derived. Smooth by construction at any repaint rate,
+    including one this module never sees.
+    """
+    try:
+        return max(1, min(8, int(
+            os.environ.get(CELLS_PER_FRAME_ENV_VAR, "") or 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def speed_cells_s(interval: Optional[float] = None) -> float:
+    """Derived, never chosen: whole cells per frame over the frame period."""
+    try:
+        return cells_per_frame() / max(0.001, float(
+            interval if interval is not None else frame_interval_s()))
+    except Exception:  # noqa: BLE001
+        return 10.0
 
 
 def chase_period_s() -> float:
@@ -88,6 +124,15 @@ def chase_period_s() -> float:
     catch — plays out at a pace a glance can follow.
     """
     return _env_float(CHASE_ENV_VAR, 6.0, 0.5, 120.0)
+
+
+def lead_cells() -> int:
+    """How far ahead the prey starts. Cells, so it means the same thing on
+    every terminal."""
+    try:
+        return max(2, min(80, int(os.environ.get(LEAD_ENV_VAR, "") or 14)))
+    except (TypeError, ValueError):
+        return 14
 
 
 def body_length() -> int:
@@ -144,7 +189,9 @@ class ChaseFrame:
         return path_length(self.width)
 
 
-def frame(t: float, width: int) -> Optional[ChaseFrame]:
+def frame(
+    t: float, width: int, *, interval: Optional[float] = None,
+) -> Optional[ChaseFrame]:
     """The chase at time ``t``, or None when it cannot be drawn.
 
     None rather than a degenerate frame: a terminal too narrow to show
@@ -163,16 +210,28 @@ def frame(t: float, width: int) -> Optional[ChaseFrame]:
         if length <= 0:
             return None
 
-        head = int(float(t) * speed_cells_s()) % length
+        # Quantise time to FRAMES first, then advance whole cells. Stepping
+        # `t * speed` and truncating samples a continuous position at
+        # irregular instants — the same beat that made this stutter.
+        step = int(float(t) / max(0.001, float(
+            interval if interval is not None else frame_interval_s())))
+        head = (step * cells_per_frame()) % length
         trail = min(body_length(), max(1, length // 4))
         body = tuple((head - n) % length for n in range(1, trail + 1))
 
         period = chase_period_s()
         progress = (float(t) % period) / period
-        # The prey starts a comfortable lead ahead and is reeled in. Capped
-        # at a third of the circuit so it stays on screen with its pursuer on
-        # a narrow terminal, where a full-lap lead would put them adjacent.
-        max_gap = max(2, min(length // 3, int(length * 0.4)))
+        # The lead is PERCEPTUAL, not a fraction of the circuit.
+        #
+        # A third of the circuit is 58 cells on an 88-column terminal — more
+        # than half a rule, so the two were rarely on the same line and the
+        # chase read as two unrelated marks. What makes a pursuit legible is
+        # holding both in one glance: far enough apart to be clearly separate,
+        # near enough that the closing is the thing you notice.
+        #
+        # Still bounded by the circuit, so a narrow terminal cannot be handed
+        # a lead longer than the path it runs on.
+        max_gap = max(3, min(length // 4, lead_cells()))
         gap = int(round(max_gap * (1.0 - progress)))
         return ChaseFrame(
             head=head,
@@ -247,6 +306,7 @@ def rule_fragments(
     *,
     active: bool = True,
     unicode_ok: Optional[bool] = None,
+    interval: Optional[float] = None,
 ) -> List[Tuple[str, str]]:
     """prompt_toolkit fragments for ONE hairline. NEVER raises.
 
@@ -272,7 +332,7 @@ def rule_fragments(
         plain = [(f"fg:{rule_c}", g_rule * w)]
         if not active:
             return plain
-        f = frame(t, w)
+        f = frame(t, w, interval=interval)
         if f is None:
             return plain
 
@@ -336,7 +396,9 @@ __all__ = [
     "ChaseFrame",
     "MASTER_FLAG_ENV_VAR",
     "SERPENT_RULE_SCHEMA_VERSION",
-    "SPEED_ENV_VAR",
+    "CELLS_PER_FRAME_ENV_VAR",
+    "FRAME_INTERVAL_ENV_VAR",
+    "LEAD_ENV_VAR",
     "TOP",
     "body_length",
     "cell_at",
@@ -345,5 +407,8 @@ __all__ = [
     "path_length",
     "rule_fragments",
     "serpent_enabled",
+    "cells_per_frame",
+    "frame_interval_s",
+    "lead_cells",
     "speed_cells_s",
 ]
