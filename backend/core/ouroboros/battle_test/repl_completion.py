@@ -1406,20 +1406,109 @@ def build_completer(
 # ===========================================================================
 
 
+HISTORY_MAX_ENTRIES_ENV_VAR: str = "JARVIS_REPL_HISTORY_MAX_ENTRIES"
+
+#: One history object per resolved file path. Several surfaces live in ONE
+#: process (the client's cockpit + fallback + ghost-text + Ctrl+R search all
+#: build history); handing each its own ``FileHistory`` on the same path
+#: means multiple write-behind caches racing on one file and Up-arrow state
+#: that disagrees between widgets. Keyed by path so tests with tmp files
+#: stay isolated.
+_HISTORY_SINGLETONS: "dict[str, object]" = {}
+
+
+def _history_max_entries() -> int:
+    """Bound on stored entries — deep enough that yesterday's goal is
+    reachable, bounded so the file cannot grow without limit across a
+    long-lived install. Env: ``JARVIS_REPL_HISTORY_MAX_ENTRIES``."""
+    try:
+        return max(50, int(
+            os.environ.get(HISTORY_MAX_ENTRIES_ENV_VAR, "2000")
+        ))
+    except (TypeError, ValueError):
+        return 2000
+
+
+def _trim_history_file(path: Path, max_entries: int) -> None:
+    """Keep the newest *max_entries*. Rewritten atomically (tmp +
+    ``os.replace``) so a crash mid-trim cannot leave a truncated or empty
+    history. Entry-aware: ``FileHistory`` writes a ``# timestamp`` comment
+    line per entry followed by ``+``-prefixed content, so ENTRIES are
+    counted by their comment lines, never by raw lines. NEVER raises —
+    a failed trim must not cost the operator their history."""
+    try:
+        if not path.exists():
+            return
+        lines = path.read_text(errors="replace").splitlines(keepends=True)
+        starts = [i for i, ln in enumerate(lines) if ln.startswith("#")]
+        if len(starts) <= max_entries:
+            return
+        cut = starts[len(starts) - max_entries]
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text("".join(lines[cut:]))
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        logger.debug("[ReplCompletion] history trim degraded", exc_info=True)
+
+
+def _make_file_history_class():
+    """The deduplicating ``FileHistory`` subclass, created lazily so this
+    module stays importable without prompt_toolkit."""
+    from prompt_toolkit.history import FileHistory
+
+    class _DedupedFileHistory(FileHistory):
+        """Refuses blanks and immediate repeats.
+
+        A history full of one repeated command is one the operator stops
+        pressing Up on. Nothing else is filtered: a heuristic that
+        silently dropped some commands would leave the operator unable
+        to trust that Up shows what they actually did."""
+
+        def append_string(self, string: str) -> None:
+            try:
+                candidate = str(string or "")
+                if not candidate.strip():
+                    return
+                try:
+                    strings = self.get_strings()
+                    last = strings[-1] if strings else None
+                except Exception:  # noqa: BLE001
+                    last = None
+                if candidate == last:
+                    return
+                super().append_string(candidate)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[ReplCompletion] history append degraded",
+                    exc_info=True,
+                )
+
+    return _DedupedFileHistory
+
+
+def reset_history_cache_for_tests() -> None:
+    """Drop the history singletons. Test hook only."""
+    _HISTORY_SINGLETONS.clear()
+
+
 def build_history(
     path: Optional[Path] = None,
 ) -> Optional[object]:
-    """Construct a ``prompt_toolkit.history.History`` instance.
+    """THE ``prompt_toolkit.history.History`` for a surface.
 
-    Defaults to a ``FileHistory`` at ``.jarvis/repl_history``. Falls
-    back to ``InMemoryHistory`` when the file isn't writable. Returns
-    ``None`` when prompt_toolkit isn't available OR history is
-    disabled via :func:`is_history_enabled`.
+    Defaults to a deduplicating ``FileHistory`` at
+    ``.jarvis/repl_history`` — ONE instance per path per process (see
+    ``_HISTORY_SINGLETONS``), created with owner-only permissions (the
+    file is the operator's typing) and trimmed atomically to
+    ``JARVIS_REPL_HISTORY_MAX_ENTRIES`` on first open. Falls back to
+    ``InMemoryHistory`` when the file isn't writable. Returns ``None``
+    when prompt_toolkit isn't available OR history is disabled via
+    :func:`is_history_enabled`.
     """
     if not is_history_enabled():
         return None
     try:
-        from prompt_toolkit.history import FileHistory, InMemoryHistory
+        from prompt_toolkit.history import InMemoryHistory
     except ImportError:
         return None
 
@@ -1430,14 +1519,31 @@ def build_history(
         except Exception:  # noqa: BLE001
             return None
 
+    key = str(eff_path)
+    cached = _HISTORY_SINGLETONS.get(key)
+    if cached is not None:
+        return cached
+
     try:
+        _trim_history_file(eff_path, _history_max_entries())
+        # Owner-only, whether the file is new or inherited from an
+        # earlier install that created it with the default umask.
+        try:
+            if not eff_path.exists():
+                eff_path.touch(mode=0o600)
+            else:
+                os.chmod(eff_path, 0o600)
+        except OSError:
+            pass
         # FileHistory writes atomically per command — no buffering
         # contention with concurrent SIGINT.
-        return FileHistory(str(eff_path))
+        history = _make_file_history_class()(key)
+        _HISTORY_SINGLETONS[key] = history
+        return history
     except Exception:  # noqa: BLE001
         logger.debug(
             "[ReplCompletion] FileHistory(%r) failed; using in-memory",
-            str(eff_path), exc_info=True,
+            key, exc_info=True,
         )
         try:
             return InMemoryHistory()
@@ -1557,6 +1663,7 @@ __all__ = [
     "COMPLETE_WHILE_TYPING_ENV_VAR",
     "CompletionWiring",
     "HISTORY_ENABLED_ENV_VAR",
+    "HISTORY_MAX_ENTRIES_ENV_VAR",
     "HISTORY_PATH_ENV_VAR",
     "INLINE_HELP_ENABLED_ENV_VAR",
     "MASTER_FLAG_ENV_VAR",
@@ -1585,6 +1692,7 @@ __all__ = [
     "parse_arg_spec",
     "unified_registry",
     "register_arg_provider",
+    "reset_history_cache_for_tests",
     "resolve_help_for_buffer",
     "resolve_history_path",
     "suggest_for_typo",
