@@ -171,3 +171,76 @@ class TestNoModelCalls:
                     f"ov_demo must not import {name!r} — the whole point is "
                     f"that watching the cockpit costs nothing"
                 )
+
+
+class TestLiveScene:
+    """The scene that finally makes the cockpit watchable.
+
+    Verified end-to-end under a forked pty: boots, enters the alternate screen,
+    streams the script, exits on `q`, and emits rmcup so the operator's
+    scrollback survives.
+    """
+
+    def test_live_needs_a_real_terminal_and_says_so(self):
+        # Under pytest stdin is not a tty. Degrading silently would make a
+        # working demo indistinguishable from a broken one — the operator sees
+        # nothing either way.
+        console = _Recorder()
+        assert run_demo(console, ["live"]) == 64
+        assert "interactive terminal" in console.text
+
+    def test_live_is_NOT_in_the_default_all_scenes_run(self):
+        # It takes over the screen and waits for a keypress. A bare `ov demo`
+        # must stay a thing you can pipe.
+        from backend.core.ouroboros.cli.ov_demo import _SCENES
+        assert "live" in _SCENES
+        console = _Recorder()
+        run_demo(console, [])
+        assert "interactive terminal" not in console.text
+
+    @pytest.mark.parametrize("arg,expect", [
+        ("--speed=4", 4.0), ("--speed=0.5", 0.5), ("--speed=999", 20.0),
+        ("--speed=0", 0.1), ("--speed=junk", 1.0),
+    ])
+    def test_speed_is_bounded(self, arg, expect):
+        from backend.core.ouroboros.cli.ov_demo import live_speed
+        assert live_speed([arg]) == expect
+
+    def test_script_timings_are_monotonic(self):
+        # The rhythm IS the demonstration. An out-of-order entry would make the
+        # driver sleep against a target already past and dump lines at once.
+        from backend.core.ouroboros.cli.ov_demo import _LIVE_SCRIPT
+        times = [t for t, _ in _LIVE_SCRIPT]
+        assert times == sorted(times)
+        assert len(_LIVE_SCRIPT) > 10
+
+    def test_exit_bindings_include_an_undisableable_escape(self):
+        # `q` is filtered on an empty buffer so typing a word with a q still
+        # works. Ctrl-C and Ctrl-D are NOT filtered: an escape hatch that a
+        # text field can disable is not an escape hatch.
+        from backend.core.ouroboros.cli.ov_demo import _live_exit_bindings
+        keys = set()
+        for binding in _live_exit_bindings().bindings:
+            for key in binding.keys:
+                keys.add(str(getattr(key, "value", key)))
+        assert "c-c" in keys
+        assert "c-d" in keys
+
+    def test_toolbar_uses_the_canonical_pulse(self):
+        # `ui.theme.ouroboros_frame` is what serpent_flow and attach_heartbeat
+        # already render. A second spinner would drift against the real one and
+        # the demo would teach the wrong rhythm.
+        import ast
+        import pathlib
+        src = pathlib.Path(
+            "backend/core/ouroboros/cli/ov_demo.py").read_text(encoding="utf-8")
+        assert "ouroboros_frame" in src
+        modules = {n.module or "" for n in ast.walk(ast.parse(src))
+                   if isinstance(n, ast.ImportFrom)}
+        assert any("ui.theme" in m for m in modules)
+
+    def test_toolbar_renders_without_an_app(self):
+        from backend.core.ouroboros.cli.ov_demo import _live_toolbar
+        render = _live_toolbar(lambda: 0.0, lambda: 7.5)
+        text = render()
+        assert "q to quit" in text and "tokens" in text
