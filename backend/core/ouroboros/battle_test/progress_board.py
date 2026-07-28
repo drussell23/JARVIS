@@ -51,7 +51,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 logger = logging.getLogger("Ouroboros.ProgressBoard")
 
 __all__ = [
-    "FeatureState", "FeatureRow", "BoardReading", "ProgressBoard",
+    "FeatureState", "FeatureRow", "BoardReading", "ProgressBoard", "ENTRY",
     "board_enabled", "scan_roots",
 ]
 
@@ -63,8 +63,9 @@ DARK = "dark"            # ON, present, imported by NOTHING in production
 LIVE = "live"            # ON, present, and something in production imports it
 OFF = "off"              # flag resolves off — deliberately dormant
 UNKNOWN = "unknown"      # cannot be measured; never a guess
+ENTRY = "entry"          # runs via `python -m` / console script, not imports
 
-_STATE_ORDER = (MISSING, DARK, LIVE, OFF, UNKNOWN)
+_STATE_ORDER = (MISSING, DARK, LIVE, ENTRY, OFF, UNKNOWN)
 
 
 class FeatureState:
@@ -75,6 +76,7 @@ class FeatureState:
     LIVE = LIVE
     OFF = OFF
     UNKNOWN = UNKNOWN
+    ENTRY = ENTRY
     ORDER = _STATE_ORDER
 
 
@@ -215,6 +217,9 @@ class ProgressBoard:
         self._flag_sites: Dict[str, str] = {}
         #: flag -> default literal as written at the call site.
         self._flag_defaults: Dict[str, Any] = {}
+        #: modules with a `__main__` guard — reachable by execution,
+        #: never by import.
+        self._entry_modules: Set[str] = set()
         self._scanned = 0
 
     # -- import graph ------------------------------------------------------
@@ -233,6 +238,7 @@ class ProgressBoard:
         counts: Dict[str, int] = {}
         flags: Dict[str, str] = {}
         defaults: Dict[str, Any] = {}
+        entries: Set[str] = set()
         prefix = flag_prefix()
         scanned = 0
         for root in scan_roots():
@@ -266,6 +272,8 @@ class ProgressBoard:
                     # feature shipped this session. Deriving from source makes
                     # the board complete by construction and immune to anyone
                     # forgetting to register.
+                    if _has_main_guard(tree):
+                        entries.add(_module_name(rel))
                     for flag, dflt in _flag_literals(tree, prefix):
                         if flag not in flags:
                             flags[flag] = rel
@@ -273,6 +281,7 @@ class ProgressBoard:
         self._importers = counts
         self._flag_sites = flags
         self._flag_defaults = defaults
+        self._entry_modules = entries
         self._scanned = scanned
         return scanned
 
@@ -378,10 +387,27 @@ class ProgressBoard:
             # Non-boolean flag: "on" is not a meaningful question, so the row
             # reports its VALUE rather than pretending to a state it does not
             # have.
+            #
+            # ENTRY is checked HERE as well as below, because this branch
+            # returns first: `JARVIS_COMMIT_GRANT_ONESHOT` has a non-boolean
+            # default, so it exited through this path and was reported dark
+            # even after entry-point detection shipped. A state check that
+            # only one of two exits consults is not a state check.
+            if importers == 0 and module in self._entry_modules:
+                return FeatureRow(flag, ENTRY, module_rel, category, None, 0,
+                                  "module entry point (__main__ guard)", value)
             state = DARK if importers == 0 else LIVE
             return FeatureRow(flag, state, module_rel, category, None,
                               importers, "non-boolean flag; state from graph",
                               value)
+        if importers == 0 and module in self._entry_modules:
+            # Runs via `python -m` or a console script. Nothing imports
+            # `commit_authority_cli`, and it is emphatically not dead —
+            # the operator invoked it by hand this session. Reachability
+            # by EXECUTION is invisible to an import graph, and a board
+            # that calls every CLI dead is a board nobody reads twice.
+            return FeatureRow(flag, ENTRY, module_rel, category, enabled, 0,
+                              "module entry point (__main__ guard)", value)
         if importers == 0:
             return FeatureRow(
                 flag, DARK, module_rel, category, enabled, 0,
@@ -450,6 +476,29 @@ def _imported_modules(tree: ast.AST) -> Set[str]:
 
 
 
+
+
+def _has_main_guard(tree: ast.AST) -> bool:
+    """Does this module run itself?
+
+    `if __name__ == "__main__":` means the module is reachable by EXECUTION —
+    `python -m pkg.mod`, a console script, a subprocess call. An import graph
+    cannot see any of those, so without this every CLI in the tree reads as
+    inert. The board's own sampling caught this: `commit_authority_cli` was
+    reported dark in the same session the operator ran it by hand.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if (isinstance(test, ast.Compare)
+                and isinstance(test.left, ast.Name)
+                and test.left.id == "__name__"):
+            for comparator in test.comparators:
+                if (isinstance(comparator, ast.Constant)
+                        and comparator.value == "__main__"):
+                    return True
+    return False
 
 def _coerce_bool(value: Any) -> Optional[bool]:
     """A default literal's boolean meaning, or None if it has none.

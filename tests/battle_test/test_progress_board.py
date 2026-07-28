@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from backend.core.ouroboros.battle_test.progress_board import (
-    DARK, LIVE, OFF, ProgressBoard, _coerce_bool, _flag_literals,
+    DARK, ENTRY, LIVE, OFF, ProgressBoard, _coerce_bool, _flag_literals,
     _is_test_path, _module_name, board_enabled, render_board,
 )
 import ast
@@ -188,3 +188,55 @@ class TestHelpers:
 
     def test_production_paths_are_not(self):
         assert not _is_test_path("backend/core/ouroboros/orchestrator.py")
+
+
+class TestEntryPoints:
+    """Reachability by EXECUTION, which an import graph structurally cannot see.
+
+    Found by sampling the board's own output: `commit_authority_cli` was
+    reported dark in the same session the operator ran it by hand.
+    """
+
+    def test_main_guard_is_entry_not_dark(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/cli.py",
+               'import os\n'
+               'X = os.environ.get("JARVIS_CLI_ENABLED", "1")\n'
+               'if __name__ == "__main__":\n    pass\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_CLI_ENABLED"].state == ENTRY
+
+    def test_entry_wins_on_the_non_boolean_path_too(self, tmp_path,
+                                                    monkeypatch):
+        # The precedence bug: a non-boolean default returned from an earlier
+        # branch that never consulted entry-point status, so every CLI knob
+        # with a value default stayed dark. A state check only one of two
+        # exits consults is not a state check.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/cli.py",
+               'import os\n'
+               'X = os.environ.get("JARVIS_CLI_TIMEOUT", "30")\n'
+               'if __name__ == "__main__":\n    pass\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_CLI_TIMEOUT"].state == ENTRY
+
+    def test_an_imported_entry_point_is_live_not_entry(self, tmp_path,
+                                                       monkeypatch):
+        # ENTRY is the fallback for "nothing imports it". A real importer is
+        # stronger evidence and must win.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/cli.py",
+               'import os\n'
+               'X = os.environ.get("JARVIS_CLI_ENABLED", "1")\n'
+               'if __name__ == "__main__":\n    pass\n')
+        _write(tmp_path, "backend/caller.py", "from backend import cli\n")
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_CLI_ENABLED"].state == LIVE
+
+    def test_plain_module_without_a_guard_stays_dark(self, tmp_path,
+                                                     monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/plain.py",
+               'import os\nos.environ.get("JARVIS_PLAIN_ENABLED", "1")\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_PLAIN_ENABLED"].state == DARK
