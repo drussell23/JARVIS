@@ -35,6 +35,32 @@ from backend.core.ouroboros.ui.boot_labels import ui_label as _ui_label
 
 logger = logging.getLogger(__name__)
 
+
+#: The live session CostTracker, published for out-of-harness spenders.
+#: A module seam rather than an import of the harness object because the
+#: harness is constructed once and consulted from everywhere; anything
+#: that spends must be able to ASK without owning a reference.
+_ACTIVE_COST_TRACKER: Any = None
+
+
+def _set_active_cost_tracker(tracker: Any) -> None:
+    """NEVER raises."""
+    global _ACTIVE_COST_TRACKER
+    try:
+        _ACTIVE_COST_TRACKER = tracker
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def get_active_cost_tracker() -> Any:
+    """The session CostTracker, or None when no organism is mounted.
+    NEVER raises."""
+    try:
+        return _ACTIVE_COST_TRACKER
+    except Exception:  # noqa: BLE001
+        return None
+
+
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 #: ov cockpit silence Slice 2 Task 3 (Mandate 4) -- bound on the
@@ -686,6 +712,11 @@ class BattleTestHarness:
             budget_usd=config.cost_cap_usd,
             persist_path=self._session_dir / "cost_tracker.json",
         )
+        # Publish the tracker at the module seam so spenders OUTSIDE the
+        # harness (the chat brain's circuit breaker) fold their cost into
+        # the SAME book the status line renders — one ledger, not two
+        # disagreeing about the same money.
+        _set_active_cost_tracker(self._cost_tracker)
         # PRD §session-budget-preflight: register the CostTracker as
         # the authoritative session-budget provider for governance.
         # Adapter pattern — governance never imports battle_test; this

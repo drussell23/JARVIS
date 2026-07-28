@@ -464,6 +464,7 @@ def build_chat_repl_dispatcher_with_claude(
     default_session_id: str = DEFAULT_SESSION_ID,
     cost_cap_per_call_usd: float = DEFAULT_COST_CAP_PER_CALL_USD,
     session_budget_usd: float = DEFAULT_SESSION_BUDGET_USD,
+    breaker_notify: Any = None,
 ) -> Optional[ChatReplDispatcher]:
     """Build a chat dispatcher with the ClaudeChatActionExecutor
     wired in when ``JARVIS_CHAT_EXECUTOR_CLAUDE_ENABLED`` is truthy.
@@ -543,6 +544,26 @@ def build_chat_repl_dispatcher_with_claude(
         cost_cap_per_call_usd=cost_cap_per_call_usd,
         session_budget_usd=session_budget_usd,
     )
+    # THE CIRCUIT BREAKER. The executor's own caps are per-INSTANCE, and a
+    # reconnect mints a fresh instance with a fresh allowance — ten
+    # reconnects would be ten budgets. The breaker owns process-global,
+    # file-backed session accounting and DEGRADES (routes the turn to the
+    # logging leg, says so once) where the executor merely refuses with a
+    # sentinel token.
+    #
+    # Fail-closed by construction: `wrap_with_breaker` returns the FALLBACK
+    # when the breaker is disabled, so there is no configuration in which a
+    # paid brain answers without a guardrail in front of it.
+    try:
+        from backend.core.ouroboros.governance.chat_cost_breaker import (
+            wrap_with_breaker,
+        )
+        wired_executor = wrap_with_breaker(
+            wired_executor, fb, notify=breaker_notify,
+        )
+    except Exception:  # noqa: BLE001 — no breaker, no brain
+        logger.debug("[ClaudeChatExecutor] breaker unavailable", exc_info=True)
+        wired_executor = fb
     return build_chat_repl_dispatcher(
         orchestrator=orchestrator,
         executor=wired_executor,

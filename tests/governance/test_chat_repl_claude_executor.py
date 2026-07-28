@@ -39,6 +39,9 @@ from typing import List
 
 import pytest
 
+from backend.core.ouroboros.governance.chat_cost_breaker import (
+    CostCapMiddleware,
+)
 from backend.core.ouroboros.governance.chat_repl_claude_executor import (
     AUDIT_SCHEMA_VERSION,
     ClaudeChatActionExecutor,
@@ -589,7 +592,10 @@ def test_factory_claude_on_with_null_provider_when_no_provider(
     monkeypatch.setenv("JARVIS_CHAT_EXECUTOR_CLAUDE_ENABLED", "1")
     disp = build_chat_repl_dispatcher_with_claude(project_root=tmp_path)
     assert disp is not None
-    assert isinstance(disp.executor, ClaudeChatActionExecutor)
+    # The brain is now ALWAYS behind the cost circuit breaker — the
+    # factory refuses to hand back an unguarded paid executor.
+    assert isinstance(disp.executor, CostCapMiddleware)
+    assert isinstance(disp.executor.primary, ClaudeChatActionExecutor)
     out = disp.executor.query_claude(
         "q", _make_turn(turn_id="t-1"), recent_turns=[],
     )
@@ -618,8 +624,11 @@ def test_factory_claude_on_subagent_on_backlog_on_chains_all(
     monkeypatch.setenv("JARVIS_CHAT_EXECUTOR_BACKLOG_ENABLED", "1")
     disp = build_chat_repl_dispatcher_with_claude(project_root=tmp_path)
     assert disp is not None
-    assert isinstance(disp.executor, ClaudeChatActionExecutor)
-    inner = disp.executor._fallback
+    # The brain is now ALWAYS behind the cost circuit breaker — the
+    # factory refuses to hand back an unguarded paid executor.
+    assert isinstance(disp.executor, CostCapMiddleware)
+    assert isinstance(disp.executor.primary, ClaudeChatActionExecutor)
+    inner = disp.executor.primary._fallback
     assert isinstance(inner, SubagentChatActionExecutor)
     inner2 = inner._fallback
     assert isinstance(inner2, BacklogChatActionExecutor)
@@ -632,8 +641,11 @@ def test_factory_claude_on_subagent_off_backlog_on(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_CHAT_EXECUTOR_BACKLOG_ENABLED", "1")
     disp = build_chat_repl_dispatcher_with_claude(project_root=tmp_path)
     assert disp is not None
-    assert isinstance(disp.executor, ClaudeChatActionExecutor)
-    assert isinstance(disp.executor._fallback, BacklogChatActionExecutor)
+    # The brain is now ALWAYS behind the cost circuit breaker — the
+    # factory refuses to hand back an unguarded paid executor.
+    assert isinstance(disp.executor, CostCapMiddleware)
+    assert isinstance(disp.executor.primary, ClaudeChatActionExecutor)
+    assert isinstance(disp.executor.primary._fallback, BacklogChatActionExecutor)
 
 
 def test_factory_claude_on_only(monkeypatch, tmp_path):
@@ -642,8 +654,11 @@ def test_factory_claude_on_only(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_CHAT_EXECUTOR_BACKLOG_ENABLED", "0")
     disp = build_chat_repl_dispatcher_with_claude(project_root=tmp_path)
     assert disp is not None
-    assert isinstance(disp.executor, ClaudeChatActionExecutor)
-    assert isinstance(disp.executor._fallback, LoggingChatActionExecutor)
+    # The brain is now ALWAYS behind the cost circuit breaker — the
+    # factory refuses to hand back an unguarded paid executor.
+    assert isinstance(disp.executor, CostCapMiddleware)
+    assert isinstance(disp.executor.primary, ClaudeChatActionExecutor)
+    assert isinstance(disp.executor.primary._fallback, LoggingChatActionExecutor)
 
 
 def test_factory_chat_master_off_returns_none(monkeypatch, tmp_path):
@@ -662,7 +677,7 @@ def test_factory_explicit_fallback_used_directly(monkeypatch, tmp_path):
         project_root=tmp_path, fallback_executor=custom,
     )
     assert disp is not None
-    assert disp.executor._fallback is custom
+    assert disp.executor.primary._fallback is custom
 
 
 def test_factory_custom_budget_kwargs_propagate(monkeypatch, tmp_path):
