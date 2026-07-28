@@ -1621,6 +1621,80 @@ class SerpentFlow:
         )
         self.console.print()
 
+    def post_inline(self, post: Any) -> str:
+        """Render one Moltbook post into the deck. Returns its placement.
+
+        Reuses `_op_line` — the SAME chokepoint every ⏺/⎿ line already
+        mirrors through — rather than adding a second renderer, so a comment
+        travels the mirror, the op buffer and `/expand` exactly as tool
+        chrome does.
+
+        Placement is DECIDED before anything is written. A reaction is
+        formulated asynchronously, so by the time it lands its parent may
+        have scrolled out of the window or been evicted from the ring, and
+        mutating a committed region is what tears a frame.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.moltbook_inline import (
+                GHOST, INLINE, decide_placement, render_ghost, render_post,
+            )
+
+            deck, window = self._deck_snapshot()
+            placement = decide_placement(
+                post, deck, window=window, posture=self._current_posture(),
+            )
+            if placement.kind == INLINE:
+                for line in render_post(post):
+                    self._op_line(str(getattr(post, "op_id", "")
+                                      or (post or {}).get("op_id", "")), line)
+                return INLINE
+            if placement.kind == GHOST:
+                # The tail, not the parent. A scroll jump to show a joke
+                # would yank the operator off whatever they were reading.
+                ghost = render_ghost(post)
+                if ghost:
+                    self._op_line("", ghost)
+                return GHOST
+            return placement.kind
+        except Exception:  # noqa: BLE001 — a comment must never break the deck
+            logger.debug("[Moltbook] inline render degraded", exc_info=True)
+            return "muted"
+
+    def _deck_snapshot(self) -> tuple:
+        """``(lines, (start, end))`` — the deck and the window ACTUALLY drawn.
+
+        Read from the canvas rather than assumed, because "is the parent still
+        visible" is the only question that decides inline vs ghost.
+        """
+        try:
+            mux = getattr(self, "_bipartite_mux", None) or getattr(
+                self, "_canvas", None,
+            )
+            if mux is None:
+                return ([], None)
+            lines = list(mux._buffer.snapshot())          # noqa: SLF001
+            total, budget = mux.scroll_metrics()
+            offset = getattr(mux._viewport, "offset", 0)  # noqa: SLF001
+            end = max(0, total - offset)
+            return (lines, (max(0, end - budget), end))
+        except Exception:  # noqa: BLE001
+            return ([], None)
+
+    def _current_posture(self) -> str:
+        """The organism's posture, or "" when unknown.
+
+        Unknown resolves to "speak" — a missing signal must not silence the
+        room, because the gate exists to quiet banter during trouble, not to
+        require proof of calm.
+        """
+        try:
+            from backend.core.ouroboros.governance.posture_store import (
+                current_posture,
+            )
+            return str(getattr(current_posture(), "value", "") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _op_line(self, op_id: str, text: str) -> None:
         """Print a line within an active op block, prefixed with │.
 
