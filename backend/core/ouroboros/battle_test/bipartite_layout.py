@@ -589,6 +589,42 @@ def _palette_multicolumn() -> bool:
             .strip().lower() in ("1", "true", "yes", "on"))
 
 
+
+def _mount_region_layout(rows: "list") -> Any:
+    """Derive the root from the arbiter, or fall back to the plain HSplit.
+
+    NEVER raises. This is the root container of the operator's daily surface;
+    a status-quo fallback is always available and is strictly better than a
+    cockpit that will not boot.
+
+    `rows[0]` is the canvas — the deck region. The prompt and toolbar rows are
+    NOT regions: they are chrome that must survive every arbitration, so they
+    stay in the outer HSplit rather than becoming columns the arbiter could
+    decide to hide at 40 columns.
+    """
+    from prompt_toolkit.layout import HSplit
+    try:
+        from backend.core.ouroboros.battle_test.region_layout import (
+            RegionSources, dynamic_region_container, region_layout_enabled,
+        )
+        from backend.core.ouroboros.battle_test.viewport_arbiter import (
+            ViewportArbiter, arbiter_enabled,
+        )
+        if not (region_layout_enabled() and arbiter_enabled()) or not rows:
+            return HSplit(rows)
+
+        body, chrome = rows[0], list(rows[1:])
+        # Only `deck` has a source today. `lanes` and `transcript` return None,
+        # and `build_region_tree` DROPS a region whose factory yields None —
+        # so an unsupplied region costs nothing rather than drawing an empty
+        # panel that looks like a bug.
+        sources = RegionSources(deck=lambda: body)
+        derived = dynamic_region_container(ViewportArbiter(), sources)
+        return HSplit([derived] + chrome)
+    except Exception:  # noqa: BLE001
+        logger.debug("[Bipartite] region layout mount degraded", exc_info=True)
+        return HSplit(rows)
+
 def build_bipartite_application(
     mux: BipartiteLayout,
     *,
@@ -911,7 +947,25 @@ def build_bipartite_application(
             content=FormattedTextControl(_toolbar_fragments, focusable=False),
             height=1, wrap_lines=False,
         ))
-    root: Any = HSplit(rows)
+    # ── Region layout mount (PR #70213's seam, finally consumed) ──────
+    #
+    # `viewport_arbiter` has decided placements since #70187 and
+    # `region_layout.dynamic_region_container` has been able to build them
+    # since #70213 — with nothing reading either. `JARVIS_REGION_LAYOUT_ENABLED`
+    # read DARK on the progress board, which is exactly what that state is for.
+    #
+    # Mounted CONSERVATIVELY on purpose. The arbiter arbitrates over
+    # ("deck", "lanes", "transcript"), and only `deck` has a widget source
+    # today — the nested task tree, collapse/expand and transcript mode are the
+    # features that will supply the other two. So the derived tree is TODAY'S
+    # tree, and the observable surface does not move.
+    #
+    # That is the point, not a limitation. A layout change and a feature change
+    # landing together is unbisectable when the cockpit misbehaves, and this
+    # cockpit is the thing the operator stares at all day. The seam goes live,
+    # `DynamicContainer` starts re-deriving per frame, and the next slice hangs
+    # regions off a surface that has already been watched.
+    root: Any = _mount_region_layout(rows)
     if _palette is not None:
         # Z-INDEX OVERLAY, not a row.
         #
