@@ -57,6 +57,48 @@ _FIXED_TS = datetime(2026, 3, 7, 12, 0, tzinfo=timezone.utc)
 # ---------------------------------------------------------------------------
 
 
+#: The one target path this suite generates against. It was written out
+#: twice before — the candidate's `file_path` and the op's `target_files` —
+#: and a fixture root that disagrees with the candidate is not diagnosable by
+#: reading either one alone.
+_TARGET_REL = "backend/core/utils.py"
+
+#: Set per-test by `_materialise_project_root`. Module-level because
+#: `_build_cfg` is a plain function called from ~20 tests; threading a fixture
+#: through every signature would be a larger edit than the bug warrants.
+_FIXTURE_ROOT: Optional[Path] = None
+
+
+@pytest.fixture(autouse=True)
+def _materialise_project_root(tmp_path):
+    """Give the orchestrator a project root that actually EXISTS.
+
+    `project_root` was hardcoded to `/tmp/test-project-6b`, a directory
+    nothing creates. Every op therefore failed GENERATE with
+    `target_file_missing` and never reached the GATE / APPROVE / APPLY
+    terminals these tests assert on.
+
+    That went unnoticed because the cancel short-circuit terminated each op at
+    POSTMORTEM before GENERATE ran — one dead fake concealing another. Fixing
+    the CancelToken contract is what made this surface.
+
+    `tmp_path` rather than a fixed directory: a shared path under /tmp is
+    order-dependent state between sessions, and on this repo's node policy
+    /tmp is not writable at all.
+    """
+    global _FIXTURE_ROOT
+    target = tmp_path / _TARGET_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Real, parseable content — VALIDATE runs an AST pass, so an empty
+    # placeholder would trade target_file_missing for a SyntaxError.
+    target.write_text("def hello():\n    pass\n", encoding="utf-8")
+    _FIXTURE_ROOT = tmp_path
+    try:
+        yield tmp_path
+    finally:
+        _FIXTURE_ROOT = None
+
+
 def _build_stack(
     *,
     can_write: Tuple[bool, str] = (True, "ok"),
@@ -125,7 +167,7 @@ def _build_generator(
         candidates = (
             {
                 "candidate_id": "c1",
-                "file_path": "backend/core/utils.py",
+                "file_path": _TARGET_REL,
                 "full_content": "def hello():\n    pass\n",
                 "rationale": "stub",
             },
@@ -141,7 +183,7 @@ def _build_generator(
 
 def _build_cfg(**overrides: Any) -> OrchestratorConfig:
     defaults = dict(
-        project_root=Path("/tmp/test-project-6b"),
+        project_root=_FIXTURE_ROOT or Path("/tmp/test-project-6b"),
         generation_timeout_s=5.0,
         validation_timeout_s=5.0,
         approval_timeout_s=5.0,
@@ -155,7 +197,7 @@ def _build_cfg(**overrides: Any) -> OrchestratorConfig:
 
 def _build_ctx(op_id: str = "op-test", **overrides: Any) -> OperationContext:
     defaults: dict = dict(
-        target_files=("backend/core/utils.py",),
+        target_files=(_TARGET_REL,),
         description="dispatch test",
         op_id=op_id,
         _timestamp=_FIXED_TS,
