@@ -180,6 +180,7 @@ async def gate_completion(
     claude_provider: Any = None,
     dw_provider: Any = None,
     dw_model: Optional[str] = None,
+    prefer: Optional[str] = None,
 ) -> str:
     """Single-turn RT completion for a synchronous pipeline gate.
 
@@ -206,12 +207,23 @@ async def gate_completion(
             timeout_s=t, dw_provider=dw_provider, dw_model=dw_model,
         )
 
-    tiers = (_claude, _dw) if claude_first_enabled() else (_dw, _claude)
+    # PER-CALL tier order. `prefer` lets a caller that knows something
+    # about THIS payload (the adaptive lane router weighs it) put the
+    # right tier first, while the other stays the fallback — so a lane
+    # choice biases cost/latency and can never become a single point of
+    # failure. Unset → the global policy decides, exactly as before.
+    _pref = (prefer or "").strip().lower()
+    if _pref == "dw":
+        tiers = (_dw, _claude)
+    elif _pref == "claude":
+        tiers = (_claude, _dw)
+    else:
+        tiers = (_claude, _dw) if claude_first_enabled() else (_dw, _claude)
     for tier in tiers:
         raw = await tier()
         if raw:
             return raw
     raise GateProviderExhaustedError(
         f"gate_completion exhausted all RT tiers (caller={caller_id}, "
-        f"order={'claude,dw' if claude_first_enabled() else 'dw,claude'})"
+        f"order={'dw,claude' if tiers[0] is _dw else 'claude,dw'})"
     )
