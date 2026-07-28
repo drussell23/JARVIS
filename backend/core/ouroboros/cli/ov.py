@@ -628,6 +628,14 @@ class AttachUI:
 
     def __init__(self) -> None:
         self.audio_state: str = "OFFLINE"
+        # A gate that arrives mid-sentence waits. Constructed with the sinks
+        # it needs so the FSM never reaches for a live app: `_shield_show`
+        # renders, `refresh` repaints the badge.
+        self.shield = _build_shield(self)
+        #: Set once the attach client exists. LATE-BOUND for the same reason
+        #: the approval narrator's emit is: the markup sink is built after the
+        #: UI, so a handle captured here would be None forever.
+        self.markup_sink: Any = None
         self._app_ref: Any = None
         # Latest heartbeat frame (the CC-style pulse) + arrival clock —
         # rendered by toolbar() with client-side elapsed advance and a
@@ -992,7 +1000,16 @@ class AttachUI:
                         else " · esc back")
         except Exception:  # noqa: BLE001
             keys = ""
-        return f"{audio.lstrip(' ·')}{keys} · 'detach' to leave"
+        # A pending approval outranks every other hint here: it is the only
+        # one that says the organism is BLOCKED waiting on this operator.
+        # Placed first so it survives a narrow terminal truncating the tail.
+        badge = ""
+        try:
+            badge = self.shield.badge()
+        except Exception:  # noqa: BLE001
+            badge = ""
+        head = f"{badge} · " if badge else ""
+        return f"{head}{audio.lstrip(' ·')}{keys} · 'detach' to leave"
 
     def _mode_lines(self) -> Optional[List[str]]:
         """SELECT / FOCUS rendering, or None to fall through to the deck.
@@ -1239,6 +1256,27 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
             # make the cockpit and the daemon disagree about what was said,
             # and the daemon is where attachment resolution belongs. This
             # confirms the operator was understood; it does not decide.
+            # A gate is on screen and this line is a verdict → it answers
+            # THAT gate, tagged with its id. The daemon refuses a mismatch,
+            # so a verdict written for a gate that has since been superseded
+            # is declined rather than landing on whichever op is armed now.
+            #
+            # Anything that is not a bare verdict falls straight through to
+            # the REPL: the operator answering "later, first fix the tests"
+            # is giving a goal, not a decision.
+            try:
+                shield = getattr(ui, "shield", None)
+                showing = getattr(shield, "showing", None) if shield else None
+                if showing is not None:
+                    from backend.core.ouroboros.battle_test.operator_prompt_bridge import (  # noqa: E501
+                        is_bare_verdict,
+                    )
+                    if is_bare_verdict(text) is not None:
+                        client.send_input(text, prompt_id=showing.prompt_id)
+                        shield.dismiss(showing.prompt_id)
+                        return "sent"
+            except Exception:  # noqa: BLE001
+                pass
             _mentions = _extract_mentions(text)
             if _mentions and ui is not None:
                 try:
@@ -1251,6 +1289,15 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
                 except Exception:  # noqa: BLE001
                     pass
             client.send_input(text)
+            # The buffer is now empty, so a gate deferred while they were
+            # typing surfaces in the lull that follows. This is the half the
+            # operator never has to learn: they send their line and the
+            # question they were shielded from appears.
+            try:
+                if getattr(ui, "shield", None) is not None:
+                    ui.shield.note_buffer("")
+            except Exception:  # noqa: BLE001
+                pass
             return "sent"
         return "empty"
     except Exception:  # noqa: BLE001 — routing must never crash an input loop
@@ -1577,6 +1624,27 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
             fsm.escape()
             ui.refresh()
 
+        @kb.add("c-p")
+        def _release_gate(event: Any) -> None:
+            """Surface a deferred approval on demand.
+
+            Ctrl+P was unbound — verified, not assumed — so this takes no
+            key away from anyone. The binding exists even with an empty
+            queue: a key that works only sometimes teaches the operator not
+            to trust it, so an empty pop simply says so.
+            """
+            try:
+                shield = getattr(ui, "shield", None)
+                if shield is None:
+                    return
+                if shield.pop() is None:
+                    ui.flash(
+                        "no pending approvals" if shield.pending_count == 0
+                        else "a gate is already on screen", seconds=2.0,
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
         try:
             from backend.core.ouroboros.battle_test.input_continuation import (
                 install_newline_binding,
@@ -1608,6 +1676,66 @@ def _not_composing() -> Any:
         return _cond
     except Exception:  # noqa: BLE001
         return True
+
+
+def _build_shield(ui: Any) -> Any:
+    """The client's deferral FSM, wired to this cockpit's surfaces."""
+    try:
+        from backend.core.ouroboros.battle_test.focus_shield import FocusShield
+
+        return FocusShield(
+            show=lambda prompt: _shield_show(ui, prompt),
+            notify=lambda: ui.refresh(),
+        )
+    except Exception:  # noqa: BLE001 — a cockpit without deferral still runs
+        return None
+
+
+def _shield_show(ui: Any, prompt: Any) -> None:
+    """Put a released gate on screen.
+
+    Renders through the SAME markup path every ⏺/⎿ line already takes rather
+    than inventing a second display: the gate then lands in the deck, in
+    order, in the scrollback the operator can page back through — and on the
+    bipartite surface it draws over the canvas Float the palette established,
+    with the deck still visible underneath.
+    """
+    try:
+        risk = f" · {prompt.risk}" if getattr(prompt, "risk", "") else ""
+        left = prompt.seconds_left(time.monotonic())
+        expiry = "" if left == float("inf") else f" · {int(left)}s left"
+        body = str(prompt.text or "approve?").replace("\n", " ").strip()
+        lines = [f"⏺ Iron Gate({prompt.ref}){risk}",
+                 f"  ⎿ {body}  [y/n]{expiry}"]
+        sink = getattr(ui, "markup_sink", None)
+        if callable(sink):
+            for line in lines:
+                # ADDRESSED: a question put to this operator belongs in their
+                # scrollback, not in the ambient deck where it would scroll
+                # away behind autonomous chatter.
+                sink(line, True)
+        else:
+            ui.flash(" ".join(lines), seconds=8.0)
+        ui.refresh()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _on_prompt_frame(ui: Any, frame: Any) -> None:
+    """A gate arrived. Show it only if the operator is not mid-sentence.
+
+    `composing` is answered from the LIVE buffer at the moment of arrival —
+    the one fact that decides everything here, and the reason the FSM takes
+    it as an argument rather than reading a global it cannot be tested
+    against.
+    """
+    try:
+        shield = getattr(ui, "shield", None)
+        if shield is None:
+            return
+        shield.offer(frame, composing=bool(_buffer_text().strip()))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _buffer_text() -> str:
@@ -2197,10 +2325,20 @@ def run_attach(console: Any) -> int:
             on_hydration=_on_hydration, on_line=_print_line,
             on_markup=_markup_sink,
             on_telemetry=ui.on_telemetry,
+            # Gates as DATA — the id + deadline the shield needs to defer one
+            # safely and still answer the right op.
+            on_prompt=lambda frame: _on_prompt_frame(ui, frame),
+            on_prompt_resolved=lambda pid: (
+                ui.shield.dismiss(pid) if ui.shield is not None else None
+            ),
             on_audio_state=ui.on_audio_state,
             on_lane_history=ui.on_lane_history,
             on_lane_reaped=ui.on_lane_reaped,
         )
+        # The shield renders released gates through the SAME markup path
+        # every other ⏺/⎿ line takes — one display, one ordering, and the
+        # gate lands in scrollback the operator can page back to.
+        ui.markup_sink = _markup_sink
         if not await client.connect():
             console.print(_NO_ORGANISM_MESSAGE, markup=False, highlight=False)
             return 1

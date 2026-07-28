@@ -82,6 +82,33 @@ AUDIO_CMDS = (
 _TRUTHY = ("1", "true", "yes", "on")
 
 
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """Does *fn* declare a keyword parameter called *name*?
+
+    Keyword rather than a third positional: the answer's prompt_id is
+    OPTIONAL context, and threading it positionally would make every existing
+    two-argument sink's meaning depend on argument order it never agreed to.
+    A sink that wants it says so by name.
+
+    Defaults to False when the signature cannot be read — the sink is then
+    called exactly as it was before.
+    """
+    try:
+        import inspect
+        sig = inspect.signature(fn)
+        for p in sig.parameters.values():
+            if p.kind is inspect.Parameter.VAR_KEYWORD:
+                return True
+            if p.name == name and p.kind in (
+                inspect.Parameter.KEYWORD_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                return True
+        return False
+    except (TypeError, ValueError):
+        return False
+
+
 def _accepts_two_positional(fn: Any) -> bool:
     """Can *fn* be called with (text, session)?
 
@@ -213,6 +240,8 @@ class CockpitAttachBridge:
         #: SECOND time. A dispatch surface must never guess by re-running the
         #: thing it is dispatching.
         self._input_takes_session = _accepts_two_positional(self._on_input)
+        self._input_takes_prompt_id = _accepts_kwarg(self._on_input,
+                                                     "prompt_id")
         self._path = Path(path) if path is not None else attach_socket_path()
         self._server: Optional[asyncio.AbstractServer] = None
         self._sentinel_task: Optional[asyncio.Task] = None
@@ -436,6 +465,82 @@ class CockpitAttachBridge:
                 loop.call_soon_threadsafe(self._broadcast, msg)
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] markup publish degraded", exc_info=True)
+
+    def publish_prompt(
+        self,
+        prompt_id: str,
+        text: str = "",
+        *,
+        risk: str = "",
+        timeout_s: float = 0.0,
+    ) -> None:
+        """Announce an OPEN interactive gate as structured data.
+
+        The question already travels as a mirrored ``markup`` line, and that
+        stays — it is what puts the gate in the transcript. But a line is
+        prose: a cockpit cannot tell it apart from any other ⏺ chrome, so it
+        cannot know a question is pending, which one, or when it dies.
+
+        With the id and the deadline on the wire, an attached cockpit can
+        defer the gate until its operator is not mid-sentence and still
+        answer the RIGHT op (`resolve` refuses a mismatched ``prompt_id``).
+        Broadcast, never session-addressed: an autonomous gate belongs to no
+        one terminal and every attached operator may answer it.
+
+        Thread-safe; strictly non-blocking; NEVER raises.
+        """
+        try:
+            prompt_id = str(prompt_id or "").strip()
+            if not prompt_id or not self._clients:
+                return
+            msg = {
+                "type": "prompt", "prompt_id": prompt_id,
+                "text": str(text or ""), "risk": str(risk or ""),
+                "timeout_s": float(timeout_s or 0.0), "ts": time.time(),
+            }
+            self.stats["prompts_published"] = (
+                self.stats.get("prompts_published", 0) + 1
+            )
+            self._dispatch(msg)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] prompt publish degraded",
+                         exc_info=True)
+
+    def publish_prompt_resolved(self, prompt_id: str) -> None:
+        """The gate is closed — answered here, elsewhere, or expired.
+
+        Without this a deferred gate would sit in a cockpit's queue and be
+        offered to the operator long after the organism stopped waiting. The
+        queue drops it on pop by deadline too, but only this says *why* and
+        says it immediately.
+        """
+        try:
+            prompt_id = str(prompt_id or "").strip()
+            if not prompt_id or not self._clients:
+                return
+            self._dispatch({
+                "type": "prompt_resolved", "prompt_id": prompt_id,
+                "ts": time.time(),
+            })
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] prompt-resolved degraded",
+                         exc_info=True)
+
+    def _dispatch(self, msg: Dict[str, Any]) -> None:
+        """Hop to the server loop and broadcast. The cross-loop dance every
+        publisher above repeats by hand — written once so a new frame type
+        cannot get it subtly wrong."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            self._broadcast(msg)
+        else:
+            loop.call_soon_threadsafe(self._broadcast, msg)
 
     def publish_audio_state(self, state: str) -> None:
         """Stream one audio-FSM state to every attached terminal
@@ -752,11 +857,17 @@ class CockpitAttachBridge:
                     text = str(frame.get("text", "")).strip()
                     if text:
                         self.stats["inputs_received"] += 1
+                        # Which gate this answers, when the cockpit says so.
+                        # Only forwarded to a sink that asked for it by name.
+                        _kw = {}
+                        _pid = str(frame.get("prompt_id", "")).strip()
+                        if _pid and self._input_takes_prompt_id:
+                            _kw["prompt_id"] = _pid
                         try:
                             if self._input_takes_session:
-                                self._on_input(text, _sid or None)
+                                self._on_input(text, _sid or None, **_kw)
                             else:
-                                self._on_input(text)
+                                self._on_input(text, **_kw)
                         except Exception:  # noqa: BLE001
                             logger.debug(
                                 "[CockpitAttach] input sink degraded",
@@ -813,6 +924,8 @@ class CockpitAttachClient:
         on_line: Optional[Callable[[str], None]] = None,
         on_markup: Optional[Callable[[str], None]] = None,
         on_telemetry: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_prompt: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_prompt_resolved: Optional[Callable[[str], None]] = None,
         on_audio_state: Optional[Callable[[str], None]] = None,
         on_thermal: Optional[Callable[[str], None]] = None,
         on_lane_history: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -827,6 +940,8 @@ class CockpitAttachClient:
         # escaped by conservative clients — never dropped).
         self._on_markup = on_markup
         self._on_telemetry = on_telemetry or (lambda _m: None)
+        self._on_prompt = on_prompt
+        self._on_prompt_resolved = on_prompt_resolved
         self._on_audio_state = on_audio_state or (lambda _s: None)
         self._on_thermal = on_thermal or (lambda _s: None)
         #: Focused-lane hydration payloads (D3). Absent handler = the client
@@ -941,7 +1056,7 @@ class CockpitAttachClient:
         except Exception:  # noqa: BLE001
             return False
 
-    def send_input(self, text: str) -> bool:
+    def send_input(self, text: str, prompt_id: Optional[str] = None) -> bool:
         """Pipe one operator line upstream. Non-blocking; False when
         detached. NEVER raises."""
         try:
@@ -955,6 +1070,12 @@ class CockpitAttachClient:
             # back rather than broadcasting it to every attached cockpit.
             frame = {"type": "input", "text": str(text),
                      "session": self.session_id}
+            if prompt_id:
+                # Tag the answer with the gate it was written for. A deferred
+                # verdict can outlive the slot it was meant for, and the
+                # daemon refuses a mismatch rather than landing "y" on
+                # whichever op happens to be armed now.
+                frame["prompt_id"] = str(prompt_id)
             w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
             return True
         except Exception:  # noqa: BLE001
@@ -992,6 +1113,22 @@ class CockpitAttachClient:
                             pass
                     else:
                         self._safe_cb_text(cb, str(frame.get("text", "")))
+                elif ftype == "prompt":
+                    # An open gate, as data. A client with no handler is a
+                    # pre-shield cockpit: it already received the same
+                    # question as a markup line, so silence here is correct
+                    # and it behaves exactly as it did before.
+                    if self._on_prompt is not None:
+                        try:
+                            self._on_prompt(dict(frame))
+                        except Exception:  # noqa: BLE001
+                            pass
+                elif ftype == "prompt_resolved":
+                    if self._on_prompt_resolved is not None:
+                        self._safe_cb_text(
+                            self._on_prompt_resolved,
+                            str(frame.get("prompt_id", "")),
+                        )
                 elif ftype == "telemetry":
                     try:
                         self._on_telemetry(dict(frame))
