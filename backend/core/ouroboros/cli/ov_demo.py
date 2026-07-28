@@ -116,8 +116,19 @@ def scene_board(console: Any, argv: Sequence[str] = ()) -> int:
     if dynamic:
         _say(console)
         _say(console, "  discovered at runtime (no inbound import):")
+        from backend.core.ouroboros.battle_test.progress_board import (
+            terminal_width,
+        )
+        cols = terminal_width()
+        # Same defect as render_board had: a padded column plus an unclipped
+        # reason wraps the moment it meets a real terminal. Two formatters, one
+        # bug — so both now ask the same source how wide the world is.
+        namew = min(44, max((len(r.flag) for r in dynamic[:6]), default=20))
         for row in dynamic[:6]:
-            _say(console, f"    ◇ {row.flag[:44]:<44} {row.reason[:40]}")
+            room = max(8, cols - namew - 8)
+            reason = row.reason if len(row.reason) <= room else (
+                row.reason[: room - 1] + "…")
+            _say(console, f"    ◇ {row.flag:<{namew}}  {reason}"[:cols])
     _say(console)
     verbs = (f"{len(reading.verbs)} verbs" if reading.verbs_primed
              else "verbs NOT primed")

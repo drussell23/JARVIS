@@ -419,3 +419,91 @@ class TestRegistryPrimedAccessor:
         assert reg.registry_primed() is False   # still false — it did not prime
         reg.prime_registry()
         assert reg.registry_primed() is True
+
+
+class TestRenderRespectsTheTerminal:
+    """`width: int = 78` was a GUESS baked into a signature.
+
+    Rows padded to 44 columns plus an unclipped reason wrapped and broke the
+    layout the moment they met a real terminal — invisible in every unit test,
+    obvious in one second of `ov demo board`.
+    """
+
+    def _reading(self, tmp_path, monkeypatch, n=30):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        for i in range(n):
+            _write(tmp_path, f"backend/pkg{i}/mod_with_a_very_long_name.py",
+                   "import os\n"
+                   f'os.environ.get("JARVIS_A_VERY_LONG_FLAG_NAME_{i}", "1")\n')
+        return _board(tmp_path).read()
+
+    @pytest.mark.parametrize("cols", [40, 60, 80, 120, 200])
+    def test_no_line_ever_exceeds_the_width(self, tmp_path, monkeypatch, cols):
+        reading = self._reading(tmp_path, monkeypatch)
+        for line in render_board(reading, width=cols):
+            assert len(line) <= cols, f"{cols}c overflow: {line!r}"
+
+    def test_width_is_asked_at_render_time_not_hardcoded(self):
+        from backend.core.ouroboros.battle_test.progress_board import (
+            terminal_width,
+        )
+        assert terminal_width() >= 40
+
+    def test_a_truncated_name_ends_in_an_ellipsis(self, tmp_path, monkeypatch):
+        # A blind `line[:cols]` cut flag names mid-word, which reads as a
+        # DIFFERENT flag — worse than an ellipsis, because it is plausible.
+        reading = self._reading(tmp_path, monkeypatch)
+        body = [l for l in render_board(reading, width=48) if "◌" in l]
+        assert body
+        assert any("…" in l for l in body)
+
+
+class TestSwitchesAndKnobsAreDifferentFindings:
+    def test_boolean_default_is_a_switch(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/f.py",
+               'import os\nos.environ.get("JARVIS_F_ENABLED", "1")\n')
+        row = {r.flag: r for r in _board(tmp_path).read().rows}["JARVIS_F_ENABLED"]
+        assert row.kind == "switch"
+
+    def test_value_default_is_a_knob(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/f.py",
+               'import os\nos.environ.get("JARVIS_F_TIMEOUT", "30")\n')
+        row = {r.flag: r for r in _board(tmp_path).read().rows}["JARVIS_F_TIMEOUT"]
+        assert row.kind == "knob"
+
+    def test_switches_sort_before_knobs(self, tmp_path, monkeypatch):
+        # Alphabetical-by-flag put twelve `JARVIS_A*` thresholds first and
+        # nothing else was ever seen. The sort was hiding the signal it existed
+        # to surface.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/aaa_knob.py",
+               'import os\nos.environ.get("JARVIS_AAA_TIMEOUT", "30")\n')
+        _write(tmp_path, "backend/zzz_switch.py",
+               'import os\nos.environ.get("JARVIS_ZZZ_ENABLED", "1")\n')
+        actionable = _board(tmp_path).read().actionable
+        kinds = [r.kind for r in actionable]
+        assert kinds.index("switch") < kinds.index("knob")
+
+    def test_one_module_of_knobs_is_ONE_finding(self, tmp_path, monkeypatch):
+        # Twelve dials on one unimported module is one thing to fix. Listing it
+        # twelve times is how a real finding gets buried under its own repeats.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        body = "import os\n" + "".join(
+            f'os.environ.get("JARVIS_TUNE_{i}_MS", "{i + 2}")\n' for i in range(12))
+        _write(tmp_path, "backend/dials.py", body)
+        reading = _board(tmp_path).read()
+        assert len(reading.actionable) == 12
+        assert len(reading.actionable_modules) == 1
+
+    def test_a_module_with_a_switch_outranks_a_module_of_knobs(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/aaa_dials.py", "import os\n" + "".join(
+            f'os.environ.get("JARVIS_DIAL_{i}_MS", "{i + 2}")\n' for i in range(9)))
+        _write(tmp_path, "backend/zzz_feature.py",
+               'import os\nos.environ.get("JARVIS_FEATURE_ENABLED", "1")\n')
+        first = _board(tmp_path).read().actionable_modules[0]
+        assert "zzz_feature" in first[0]
