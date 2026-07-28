@@ -43,6 +43,34 @@ def _notify_adaptive_input(sample: Any) -> None:
         logger.debug("[Acoustic] adaptive sink degraded: %r", exc)
 
 
+_DEGRADATION_SINK: Optional[Callable[[str, dict], None]] = None
+
+
+def set_degradation_sink(
+    sink: Optional[Callable[[str, dict], None]],
+) -> None:
+    """Register (or clear) the surface that shows degradation to the operator.
+
+    Injected exactly like `set_adaptive_input_sink` above — the attach server
+    is an instance the harness owns, and this module must keep working with
+    no cockpit attached at all.
+    """
+    global _DEGRADATION_SINK
+    _DEGRADATION_SINK = sink
+
+
+def _notify_degradation(kind: str, payload: dict) -> None:
+    """Hand one verdict to the cockpit. NEVER raises: this sits on the STT
+    rejection path and must not be able to break recognition."""
+    sink = _DEGRADATION_SINK
+    if sink is None:
+        return
+    try:
+        sink(kind, dict(payload or {}))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Acoustic] degradation sink degraded: %r", exc)
+
+
 def _controller() -> Any:
     """Lazily built, with the emit and speak seams bound to the real bus and
     the real fast path — both looked up late so an audio host without either
@@ -53,13 +81,28 @@ def _controller() -> Any:
     from backend.audio.acoustic_quality import AcousticFeedbackController
 
     def _emit(kind: str, payload: dict) -> None:
-        # DRY: the audio-state UDS server is the existing event bus. No new
-        # transport, no second socket.
-        try:
-            from backend.audio.audio_state_ipc import broadcast
-            broadcast(kind, payload)
-        except (ImportError, AttributeError, OSError):
-            pass
+        """Publish one degradation verdict. NEVER raises.
+
+        This used to import `backend.audio.audio_state_ipc.broadcast` — a
+        module that does not exist (the real one lives under
+        `governance.comms.duplex`) and a function that does not exist there
+        either. Both failures landed in `except ImportError: pass`, so the
+        gate measured the room correctly, decided correctly, and published
+        into nothing. Every degradation event since it shipped was swallowed.
+
+        It publishes to an INJECTED sink instead. The duplex bus would be the
+        tidier destination — `SYS_TELEMETRY_DEGRADED` is already a member of
+        its closed `EVENT_KINDS` vocabulary — but `publish_event` exists only
+        as a method on a server instance with no module-level accessor, and
+        inventing one to reach it would be a second guess stacked on the
+        first. The sink is how this module already solves exactly this
+        problem for the device manager (`set_adaptive_input_sink`), and the
+        harness owns both instances.
+
+        The payload travels whole (diagnosis, crest, device): a badge that
+        cannot say WHY is a badge nobody acts on.
+        """
+        _notify_degradation(kind, payload)
 
     def _speak(line: str) -> None:
         # Routed through the SAME zero-cost path the phatic acknowledgements
