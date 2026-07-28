@@ -208,6 +208,27 @@ def list_verbs() -> Tuple[str, ...]:
         return tuple(sorted(_VERB_TO_DISPATCHER.keys()))
 
 
+def registry_primed() -> bool:
+    """Has discovery RUN? Distinct from "are there verbs".
+
+    Added because a consumer could not tell the two apart. `list_verbs()`
+    returns an empty tuple both when priming has not happened yet and when it
+    happened and found nothing — and the progress board rendered the first case
+    as `verbs primed 0`, which reads as "this cockpit has no verbs" rather than
+    "nobody has asked yet".
+
+    The alternative was for callers to read `_REGISTRY_PRIMED` directly. That
+    is the same private reach-around the risk-tier ladder has an authority
+    invariant against, and it would have made this module's internals part of
+    its contract by accident.
+
+    Read-only and side-effect-free ON PURPOSE: a status view must be able to
+    ask this WITHOUT triggering the import walk that priming performs.
+    """
+    with _REGISTRY_LOCK:
+        return bool(_REGISTRY_PRIMED)
+
+
 # ---------------------------------------------------------------------------
 # Verb-name extraction from module path
 # ---------------------------------------------------------------------------
@@ -585,6 +606,7 @@ __all__ = [
     "RegistryReport",
     "list_verbs",
     "prime_registry",
+    "registry_primed",
     "repl_dispatch_autodiscovery_enabled",
     "reset_registry_for_tests",
     "try_dispatch",

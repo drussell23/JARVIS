@@ -174,6 +174,10 @@ class BoardReading:
     duration_s: float = 0.0
     degraded: str = ""
     verbs: Tuple[str, ...] = ()
+    #: False means discovery has not RUN — distinct from 'ran and
+    #: found none'. Collapsing the two rendered an unprimed registry
+    #: as 'verbs primed 0', which reads as 'this cockpit has no verbs'.
+    verbs_primed: bool = False
 
     def by_state(self, state: str) -> List[FeatureRow]:
         return [r for r in self.rows if r.state == state]
@@ -201,6 +205,7 @@ class BoardReading:
             "duration_s": round(self.duration_s, 3),
             "degraded": self.degraded,
             "verbs": len(self.verbs),
+            "verbs_primed": self.verbs_primed,
             "rows": [r.to_dict() for r in self.rows],
         }
 
@@ -308,7 +313,7 @@ class ProgressBoard:
                 return reading
             self.build_import_graph()
             reading.scanned_files = self._scanned
-            reading.verbs = self._load_verbs()
+            reading.verbs, reading.verbs_primed = self._load_verbs()
             # Registry specs ENRICH (description, category, declared default);
             # they no longer define the universe. A flag present in the source
             # but absent from the registry is a real feature, not a non-entity.
@@ -357,14 +362,22 @@ class ProgressBoard:
                          exc_info=True)
             return []
 
-    def _load_verbs(self) -> Tuple[str, ...]:
+    def _load_verbs(self) -> Tuple[Tuple[str, ...], bool]:
+        """(verbs, primed). Deliberately does NOT prime.
+
+        A read-only status view must not trigger the import walk that priming
+        performs — that is a side effect the operator did not ask for, and it
+        would make simply LOOKING at the board change what the process has
+        loaded. So the board reports what is true now, and says plainly when
+        discovery has not run.
+        """
         try:
             from backend.core.ouroboros.battle_test.repl_dispatch_registry import (
-                list_verbs,
+                list_verbs, registry_primed,
             )
-            return tuple(list_verbs())
+            return (tuple(list_verbs()), bool(registry_primed()))
         except Exception:  # noqa: BLE001
-            return ()
+            return ((), False)
 
     def _row_for(self, flag: str, site: str,
                  spec: Optional[Any] = None) -> FeatureRow:
