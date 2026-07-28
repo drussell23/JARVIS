@@ -643,8 +643,14 @@ def _mount_region_layout(rows: "list") -> Any:
         logger.debug("[Bipartite] region layout mount degraded", exc_info=True)
         return HSplit(rows)
 
-def build_agent_row(rows: Callable[[], Any]) -> Any:
-    """The agent view — a container that is EXACTLY as tall as the roster.
+def build_dynamic_rows(rows: Callable[[], Any]) -> Any:
+    """A strip that is EXACTLY as tall as whatever it currently holds.
+
+    ONE geometry primitive for every variable-height strip the cockpit grows
+    — the agent view, the search bar, and whatever comes next. Each of those
+    is the same two problems (how tall am I, do I exist at all) and solving
+    them per strip is how a layout ends up with three subtly different answers
+    to "collapse when empty".
 
     ``Dimension.exact``, computed per repaint, for the reason the prompt
     learned the hard way: ``HSplit`` hands each child its preferred size and
@@ -697,8 +703,13 @@ def build_agent_row(rows: Callable[[], Any]) -> Any:
             filter=Condition(lambda: bool(_current())),
         )
     except Exception:  # noqa: BLE001
-        logger.debug("[Bipartite] agent row unavailable", exc_info=True)
+        logger.debug("[Bipartite] dynamic rows unavailable", exc_info=True)
         return None
+
+
+#: The agent view was the first caller and named the primitive; the name is
+#: kept so its regression spine keeps pointing at the thing it pins.
+build_agent_row = build_dynamic_rows
 
 
 def build_bipartite_application(
@@ -714,6 +725,7 @@ def build_bipartite_application(
     auto_suggest: Any = None,
     turn_spinner: Any = None,
     agent_rows: Optional[Callable[[], Any]] = None,
+    search_rows: Optional[Callable[[], Any]] = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
     window fed from ``mux.render_canvas_ansi()`` (re-rendered each frame, so
@@ -997,11 +1009,21 @@ def build_bipartite_application(
     # the present, and the deck is the past.
     if agent_rows is not None:
         try:
-            _agent_row = build_agent_row(agent_rows)
+            _agent_row = build_dynamic_rows(agent_rows)
             if _agent_row is not None:
                 rows += [_agent_row]
         except Exception:  # noqa: BLE001
             logger.debug("[Bipartite] agent row unavailable", exc_info=True)
+    # The search bar sits DIRECTLY above the prompt — closest to the caret,
+    # because while it is open it is what the keyboard is talking to, and the
+    # eye should not have to hunt for the thing currently receiving its keys.
+    if search_rows is not None:
+        try:
+            _search_row = build_dynamic_rows(search_rows)
+            if _search_row is not None:
+                rows += [_search_row]
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] search row unavailable", exc_info=True)
     # The palette is NOT a row. See the FloatContainer below: as an HSplit row
     # it shares the ambient grid with the canvas, so every asynchronous Deck or
     # Lane frame arriving underneath forces the palette's geometry to be
@@ -1263,6 +1285,7 @@ async def run_bipartite_repl(
     auto_suggest: Any = None,
     turn_spinner: Any = None,
     agent_rows: Optional[Callable[[], Any]] = None,
+    search_rows: Optional[Callable[[], Any]] = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
     the live Zone-1 sink (so any producer — the daemon's event router OR the
@@ -1292,6 +1315,7 @@ async def run_bipartite_repl(
             toolbar=toolbar, header=header, header_height=header_height,
             completer=completer, history=history, auto_suggest=auto_suggest,
             turn_spinner=turn_spinner, agent_rows=agent_rows,
+            search_rows=search_rows,
         )
         if watch_alive is not None:
             watcher = asyncio.ensure_future(
@@ -1316,6 +1340,7 @@ __all__ = [
     "bottom_anchor_enabled",
     "build_bipartite_application",
     "get_active_canvas",
+    "build_dynamic_rows",
     "run_bipartite_repl",
     "set_active_canvas",
     "should_run_bipartite",

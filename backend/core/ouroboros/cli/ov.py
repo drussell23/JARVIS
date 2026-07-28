@@ -1973,6 +1973,23 @@ async def _run_client_shell(ui: Any, client: Any, text: str) -> None:
         pass
 
 
+def _transcript_search_rows() -> Any:
+    """The `/` search bar renderer, or None when the hatches are unavailable.
+
+    Resolved ONCE at mount rather than probed per repaint, and returns None
+    rather than an empty lambda when the module is missing — a strip whose
+    provider can never yield anything should not be in the layout at all.
+    NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.transcript_hatches import (
+            search_status,
+        )
+        return search_status
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _client_extra_bindings(ui: Any, client: Any) -> Any:
     """The client-side action set both attach surfaces mount — every key
     remappable via keybindings.json, every action ALSO reachable as a
@@ -3039,6 +3056,11 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
                 ui._agent_lines if ui is not None
                 and hasattr(ui, "_agent_lines") else None
             ),
+            # The `/` search bar. Read from the hatches module rather than
+            # held here: the search session belongs to the transcript key
+            # cluster that drives it, and a copy of its state on the UI would
+            # be a second opinion about what the operator is typing.
+            search_rows=_transcript_search_rows(),
             seed=[
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "
                 "plain words both work · [cyan]wake[/cyan] arms my voice · "
