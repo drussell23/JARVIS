@@ -49,6 +49,7 @@ import logging
 import os
 import sys
 import time
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -962,3 +963,161 @@ def reset_status_line_builder() -> None:
     """Clear the singleton. Primarily for tests."""
     global _DEFAULT_BUILDER
     _DEFAULT_BUILDER = None
+
+
+# ===========================================================================
+# Transport + width adaptation — the cockpit mount (2026-07-28)
+# ===========================================================================
+#
+# `StatusLineBuilder` is a daemon singleton, and the surface that most needs
+# to draw it is `ov attach` — a DIFFERENT PROCESS whose builder is empty by
+# construction. Rendering the client's own would draw an eternally idle
+# organism, which looks exactly like a healthy quiet one.
+#
+# `StatusSnapshot` is already a frozen dataclass of plain fields, and
+# `_format_plain` is already a pure function over it. So the split costs a
+# serializer and a rehydrator, and BOTH processes keep calling the one
+# renderer — no second opinion about what a status line looks like.
+#
+# The other half of mounting it is width. `_format_plain` composes up to ten
+# `·`-joined segments and has never known how wide the terminal is: on the
+# daemon's `bottom_toolbar` prompt_toolkit clipped it, but a fixed-height
+# cockpit row with `wrap_lines=False` truncates mid-token, which reads as a
+# corrupted line rather than an abbreviated one.
+
+STATUS_LINE_SCHEMA_VERSION = "status_line.v1"
+
+#: Segment KEEP-priority. Higher survives longer.
+#:
+#: By meaning, not by position, and expressed as an allowlist of things worth
+#: keeping rather than a denylist of things to drop. The first draft guessed
+#: prefixes for the hotkey legend, guessed wrong, and at 120 columns shed
+#: `Phase:` while keeping `enter to submit` — the headline lost to a hint.
+#:
+#: An UNRECOGNISED segment scores lowest, which is the safe direction: a new
+#: token added by some future slice is decoration until someone says
+#: otherwise, and the alternative is that it silently outranks the phase.
+_KEEP_PRIORITY: tuple = (
+    ("Phase:", 100),        # what the organism is doing — the headline
+    ("⚠", 90),              # a warning is why the operator looked
+    ("dry", 90),            # a dry provider runway may BE the explanation
+    ("Cost:", 80),          # the budget is the other standing question
+    ("[", 60),              # [route·provider] badge
+    ("Op:", 50),
+    ("Idle:", 40),          # a countdown nobody watches while work runs
+)
+
+
+def _segment_priority(segment: str) -> int:
+    """Keep-priority for one `·`-joined segment. NEVER raises."""
+    try:
+        text = segment.strip()
+        for prefix, score in _KEEP_PRIORITY:
+            if text.startswith(prefix):
+                return score
+        return 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def snapshot_to_payload(snap: "StatusSnapshot") -> dict:
+    """A snapshot as a transport-safe dict. NEVER raises."""
+    try:
+        return {
+            "schema_version": STATUS_LINE_SCHEMA_VERSION,
+            "phase": snap.phase,
+            "phase_detail": snap.phase_detail,
+            "cost_spent_usd": round(float(snap.cost_spent_usd), 4),
+            "cost_budget_usd": round(float(snap.cost_budget_usd), 4),
+            "idle_elapsed_s": round(float(snap.idle_elapsed_s), 1),
+            "idle_timeout_s": round(float(snap.idle_timeout_s), 1),
+            "primary_op_id": snap.primary_op_id,
+            "extra_op_count": int(snap.extra_op_count),
+            "route": snap.route,
+            "provider": snap.provider,
+            "liquidity_exhausted": bool(snap.liquidity_exhausted),
+            "liquidity_provider": snap.liquidity_provider,
+            "liquidity_reset_s": snap.liquidity_reset_s,
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def payload_to_snapshot(payload: object) -> Optional["StatusSnapshot"]:
+    """Rehydrate a snapshot that arrived over the bridge, or None.
+
+    Unknown keys are IGNORED rather than passed through: a newer daemon may
+    add a field, and `StatusSnapshot(**payload)` would raise on the first
+    frame from it — turning an additive change into a client crash.
+    """
+    try:
+        if not isinstance(payload, dict) or not payload:
+            return None
+        fields = {f.name for f in dataclasses.fields(StatusSnapshot)}
+        return StatusSnapshot(**{
+            k: v for k, v in payload.items() if k in fields
+        })
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def fit_to_width(line: str, width: Optional[int]) -> str:
+    """Shed whole SEGMENTS, lowest keep-priority first, until the line fits.
+
+    Whole segments, never a slice: `Cost: $0.04 / $0.5` is a number the
+    operator will misread and `Phase: GENERAT` is a phase that does not
+    exist. An abbreviated line has to stay true.
+
+    NEVER raises.
+    """
+    try:
+        if not line or not width or int(width) <= 0:
+            return line
+        cols = int(width)
+        if len(line) <= cols:
+            return line
+        parts = line.split(" · ")
+        # Stable order among equals: drop the RIGHTMOST of the least
+        # important, so a line sheds from the end it was appended at.
+        while len(" · ".join(parts)) > cols and len(parts) > 1:
+            worst, worst_score = 0, None
+            for i, part in enumerate(parts):
+                score = _segment_priority(part)
+                if worst_score is None or score <= worst_score:
+                    worst, worst_score = i, score
+            parts.pop(worst)
+        out = " · ".join(parts)
+        # One segment left and still over: an honest clip WITH a marker, so
+        # the operator can see the line was cut rather than guess.
+        return out if len(out) <= cols else (out[: max(1, cols - 1)] + "…")
+    except Exception:  # noqa: BLE001
+        return line
+
+
+def render_snapshot(
+    snap: Optional["StatusSnapshot"],
+    *,
+    compact: Optional[bool] = None,
+    width: Optional[int] = None,
+) -> str:
+    """Render ANY snapshot — local or rehydrated — at a given width.
+
+    ``compact=None`` resolves from the terminal rather than from the env
+    alone. The env gate stays the explicit override, because an operator who
+    asked for compact means it at every width; what changes is that a narrow
+    terminal no longer needs to be told. NEVER raises.
+    """
+    try:
+        if snap is None or not status_line_enabled():
+            return ""
+        mode = compact_mode_enabled() if compact is None else bool(compact)
+        if compact is None and width and int(width) < _COMPACT_BELOW_COLS:
+            mode = True
+        return fit_to_width(_format_plain(snap, compact=mode), width)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+#: Below this many columns the full line cannot hold its segments, so compact
+#: is the honest default. An env override still wins in both directions.
+_COMPACT_BELOW_COLS = 100

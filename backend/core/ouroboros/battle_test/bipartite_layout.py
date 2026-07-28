@@ -726,6 +726,7 @@ def build_bipartite_application(
     turn_spinner: Any = None,
     agent_rows: Optional[Callable[[], Any]] = None,
     search_rows: Optional[Callable[[], Any]] = None,
+    status_rows: Optional[Callable[[], Any]] = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
     window fed from ``mux.render_canvas_ansi()`` (re-rendered each frame, so
@@ -1014,6 +1015,16 @@ def build_bipartite_application(
                 rows += [_agent_row]
         except Exception:  # noqa: BLE001
             logger.debug("[Bipartite] agent row unavailable", exc_info=True)
+    # The status line sits between the agents and the search bar: it is
+    # ambient state rather than an event, so it belongs below the deck's
+    # flow and above the things the keyboard is currently talking to.
+    if status_rows is not None:
+        try:
+            _status_row = build_dynamic_rows(status_rows)
+            if _status_row is not None:
+                rows += [_status_row]
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] status row unavailable", exc_info=True)
     # The search bar sits DIRECTLY above the prompt — closest to the caret,
     # because while it is open it is what the keyboard is talking to, and the
     # eye should not have to hunt for the thing currently receiving its keys.
@@ -1286,6 +1297,7 @@ async def run_bipartite_repl(
     turn_spinner: Any = None,
     agent_rows: Optional[Callable[[], Any]] = None,
     search_rows: Optional[Callable[[], Any]] = None,
+    status_rows: Optional[Callable[[], Any]] = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
     the live Zone-1 sink (so any producer — the daemon's event router OR the
@@ -1315,7 +1327,7 @@ async def run_bipartite_repl(
             toolbar=toolbar, header=header, header_height=header_height,
             completer=completer, history=history, auto_suggest=auto_suggest,
             turn_spinner=turn_spinner, agent_rows=agent_rows,
-            search_rows=search_rows,
+            search_rows=search_rows, status_rows=status_rows,
         )
         if watch_alive is not None:
             watcher = asyncio.ensure_future(

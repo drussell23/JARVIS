@@ -676,6 +676,8 @@ class AttachUI:
         #: not a local roster: this process dispatches nothing, so it has no
         #: business holding agent state of its own.
         self._agents: dict = {}
+        #: The daemon's `StatusSnapshot`, as of the last heartbeat.
+        self._status: dict = {}
         self._focus_lines: List[str] = []
         self._focus_note: str = ""
         self._flash_text: str = ""
@@ -990,6 +992,35 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return []
 
+    def _status_rows(self) -> List[str]:
+        """CC's status line, from the daemon's snapshot, at THIS terminal.
+
+        Retires on the same staleness window as the pulse and the roster —
+        one definition of "lost contact" across every surface fed by the
+        heartbeat, rather than three that drift apart and leave a dead
+        daemon's phase showing under an idle pulse.
+
+        NEVER raises: a status line is chrome.
+        """
+        try:
+            import time as _time
+            from backend.core.ouroboros.battle_test.attach_heartbeat import (
+                heartbeat_stale_after_s,
+            )
+            from backend.core.ouroboros.battle_test.status_line import (
+                payload_to_snapshot, render_snapshot,
+            )
+            age = max(0.0, _time.monotonic() - float(self._heartbeat_arrived))
+            if not self._heartbeat_arrived or age > heartbeat_stale_after_s():
+                return []
+            snap = payload_to_snapshot(self._status)
+            if snap is None:
+                return []
+            line = render_snapshot(snap, width=self._terminal_size()[0])
+            return [f"  {line}"] if line else []
+        except Exception:  # noqa: BLE001
+            return []
+
     def _terminal_size(self) -> tuple:
         """``(columns, rows)``, or ``(None, None)`` when it cannot be known.
 
@@ -1270,6 +1301,12 @@ class AttachUI:
                 agents = frame.get("agents")
                 if isinstance(agents, dict):
                     self._agents = agents
+                # The daemon's status snapshot. Same wholesale rule and the
+                # same reason: this process's own builder is empty, so a
+                # merge would blend real state with a blank.
+                status = frame.get("status")
+                if isinstance(status, dict):
+                    self._status = status
         except Exception:
             pass
 
@@ -3061,6 +3098,12 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             # cluster that drives it, and a copy of its state on the UI would
             # be a second opinion about what the operator is typing.
             search_rows=_transcript_search_rows(),
+            # CC's status line — phase, cost, route, warnings — from the
+            # daemon's snapshot rather than this process's empty builder.
+            status_rows=(
+                ui._status_rows if ui is not None
+                and hasattr(ui, "_status_rows") else None
+            ),
             seed=[
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "
                 "plain words both work · [cyan]wake[/cyan] arms my voice · "
