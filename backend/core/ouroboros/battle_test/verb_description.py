@@ -42,7 +42,8 @@ from typing import Optional
 
 logger = logging.getLogger("Ouroboros.VerbDescription")
 
-__all__ = ["to_operator_voice", "describe_width", "prose_first_enabled"]
+__all__ = ["to_operator_voice", "describe_width", "prose_first_enabled",
+           "is_contentless"]
 
 #: Openers that describe what the FUNCTION does rather than what the operator
 #: gets. Stripped with their trailing connective so the remainder still reads
@@ -76,6 +77,38 @@ def describe_width() -> int:
         return max(24, int(os.environ.get("JARVIS_PALETTE_DESC_WIDTH", "58")))
     except (TypeError, ValueError):
         return 58
+
+
+#: What is left when a docstring described the FUNCTION and not the verb.
+#: "Parse ``/anticipate`` line. NEVER raises." normalises to "Line" — which is
+#: not a short description, it is the absence of one wearing a capital letter.
+_CONTENTLESS = re.compile(
+    r"^(line|a line|the line|dispatch|handler|command|subcommands?|"
+    r"entry point|canonical entry point|result|handler result)$"
+    r"|^/[\w -]+$"
+    r"|^§|^slice \d|^prd |^path [a-z]\.\d", re.I,
+)
+
+
+def is_contentless(text: str) -> bool:
+    """True when normalisation left no DESCRIPTION behind.
+
+    A docstring existing is not the same as a description existing, and
+    conflating them is how "78/78 verbs documented" was reported while the
+    palette still showed subcommand lists. What survives has to say something
+    about what the verb DOES; "Line" and "§32.11 Slice 4" do not.
+
+    Returning True makes the resolver fall through to the next rung — a
+    subcommand list is a poorer answer than a real sentence but a far better
+    one than a confident fragment.
+    """
+    try:
+        stripped = str(text or "").strip(" .:;,—-")
+        return not stripped or len(stripped) < 12 or bool(
+            _CONTENTLESS.match(stripped),
+        )
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _strip_verb_name(text: str, verb: str) -> str:
@@ -125,6 +158,14 @@ def to_operator_voice(text: Optional[str], verb: str = "",
         raw = " ".join(str(text or "").split())
         if not raw:
             return ""
+        # RST/markdown literal markup, unwrapped before anything else. Every
+        # rule below matches on WORDS, and ``/anticipate`` is not a word —
+        # the verb-name check silently failed on it, leaving "``/anticipate``
+        # line" as the description. Docstrings in this codebase mark up verb
+        # names by convention, so this is the common case, not an edge one.
+        raw = re.sub(r"``([^`]*)``", r"\1", raw)
+        raw = re.sub(r"`([^`]*)`", r"\1", raw)
+        raw = " ".join(raw.split())
         original = raw
 
         # First sentence only. A palette row is one line, and everything
@@ -158,6 +199,11 @@ def to_operator_voice(text: Optional[str], verb: str = "",
         if head and head[0].islower():
             head = head[0].upper() + head[1:]
 
+        if is_contentless(head):
+            # The docstring described the function, not the verb. Say nothing
+            # rather than something empty — the caller falls through to a
+            # rung that at least tells the operator what the verb accepts.
+            return ""
         limit = describe_width() if width is None else max(8, int(width))
         if len(head) > limit:
             head = head[: limit - 1].rstrip(" .,;:—-") + "…"

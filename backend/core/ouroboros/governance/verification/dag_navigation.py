@@ -298,7 +298,9 @@ def dispatch_dag_command(
     *,
     session_id: Optional[str] = None,
 ) -> str:
-    """Dispatch a ``/postmortems dag ...`` subcommand.
+    """Navigate the causality DAG.
+
+    Dispatch a ``/postmortems dag ...`` subcommand.
 
     Subcommands:
       * ``for-record <id>``

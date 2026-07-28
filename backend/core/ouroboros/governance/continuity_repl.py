@@ -84,7 +84,9 @@ def _master_enabled() -> bool:
 async def dispatch_continuity_command(
     line: str,
 ) -> ContinuityReplDispatchResult:
-    """Parse ``/continuity`` line. NEVER raises."""
+    """Session continuity — diff, history and loadable state.
+
+    Parse ``/continuity`` line. NEVER raises."""
     if not _matches(line):
         return ContinuityReplDispatchResult(
             ok=False, text="", matched=False,

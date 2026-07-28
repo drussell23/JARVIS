@@ -84,11 +84,21 @@ def test_capitals_that_carry_meaning_survive() -> None:
     assert "DW" in result
 
 
-def test_a_fragment_falls_back_to_the_authors_words() -> None:
-    """When subtraction eats the sentence, a slightly awkward true line
-    beats a tidy invented one."""
-    assert to_operator_voice("Parse", "parse") != ""
-    assert to_operator_voice("/posture", "posture") != ""
+def test_a_fragment_of_a_REAL_sentence_falls_back_to_the_author() -> None:
+    """When subtraction eats a genuine description, a slightly awkward true
+    line beats a tidy invented one."""
+    assert to_operator_voice(
+        "Handle the posture verb and show what it decided.", "posture",
+    ) != ""
+
+
+def test_a_docstring_that_never_HAD_a_description_returns_nothing() -> None:
+    """Distinct from the case above, and the distinction is the whole point.
+    "Parse" is not a mangled description — it is the absence of one, and
+    returning it would put a fragment in the palette where a subcommand list
+    would at least have been informative."""
+    assert to_operator_voice("Parse", "parse") == ""
+    assert to_operator_voice("/posture", "posture") == ""
 
 
 def test_it_is_clipped_but_never_mid_punctuation() -> None:
@@ -129,3 +139,75 @@ def test_subcommand_rows_read_as_a_LIST_not_a_usage_string() -> None:
     src = (repo / "backend/core/ouroboros/battle_test/"
            "repl_completion.py").read_text()
     assert '" · ".join(mined)' in src
+
+
+# --------------------------------------------------------------------------
+# a docstring existing is not a description existing
+# --------------------------------------------------------------------------
+
+def test_rst_literal_markup_is_unwrapped() -> None:
+    """Every rule here matches on WORDS, and ``/anticipate`` is not a word.
+    The verb-name check silently failed on it and left "``/anticipate`` line"
+    as the description. Docstrings in this codebase mark up verb names by
+    convention, so this is the common case rather than an edge one."""
+    assert to_operator_voice(
+        "Parse ``/breadcrumbs`` and set/show the feed verbosity.",
+        "breadcrumbs",
+    ) == "Set/show the feed verbosity"
+
+
+@pytest.mark.parametrize("doc,verb", [
+    ("Parse ``/anticipate`` line. NEVER raises.", "anticipate"),
+    ("§32.11 Slice 4 canonical entry point — auto-discovered.", "autobiography"),
+    ("Parse a ``/backlog auto-proposed ...`` line and dispatch.",
+     "backlog_auto_proposed"),
+    ("Dispatch a ``/postmortems dag ...`` subcommand.", "dag"),
+])
+def test_an_implementation_contract_is_REFUSED(doc: str, verb: str) -> None:
+    """THE conflation that produced "78/78 documented" while the palette
+    still showed subcommand lists. "Parse ``/anticipate`` line" normalises to
+    "Line" — not a short description, but the ABSENCE of one wearing a
+    capital letter. Refusing lets the resolver fall through to a rung that at
+    least says what the verb accepts."""
+    assert to_operator_voice(doc, verb) == ""
+
+
+def test_a_real_description_is_not_refused() -> None:
+    """The rejection must not be so eager that it eats working prose."""
+    for doc, verb in [
+        ("Show the current governor caps and recent throttles.", "governor"),
+        ("Browse, bookmark and replay past sessions.", "session"),
+        ("Set/show the feed verbosity.", "breadcrumbs"),
+    ]:
+        assert to_operator_voice(doc, verb) != ""
+
+
+def test_every_palette_verb_has_a_real_description() -> None:
+    """THE invariant, asserted on what the resolver actually produces rather
+    than on whether a docstring exists — because those are different facts
+    and conflating them is what let this ship twice."""
+    import ast
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    bare = []
+    for path in (repo / "backend/core/ouroboros").rglob("*.py"):
+        try:
+            tree = ast.parse(path.read_text())
+        except (SyntaxError, OSError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not (node.name.startswith("dispatch_")
+                    and node.name.endswith("_command")):
+                continue
+            verb = node.name[len("dispatch_"):-len("_command")]
+            doc = ast.get_docstring(node) or ""
+            first = " ".join(doc.strip().splitlines()[0].split()) if doc else ""
+            if not to_operator_voice(first, verb):
+                bare.append(verb)
+    assert bare == [], (
+        "these verbs render as a subcommand list because their docstring "
+        "describes the FUNCTION, not the verb:\n  " + "\n  ".join(sorted(bare))
+    )

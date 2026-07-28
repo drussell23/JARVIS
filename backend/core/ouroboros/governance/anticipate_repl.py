@@ -80,7 +80,9 @@ def _master_enabled() -> bool:
 def dispatch_anticipate_command(
     line: str,
 ) -> AnticipateReplDispatchResult:
-    """Parse ``/anticipate`` line. NEVER raises."""
+    """Proactive anticipation surface.
+
+    Parse ``/anticipate`` line. NEVER raises."""
     if not _matches(line):
         return AnticipateReplDispatchResult(
             ok=False, text="", matched=False,

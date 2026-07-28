@@ -77,7 +77,9 @@ def _master_enabled() -> bool:
 def dispatch_fanout_command(
     line: str,
 ) -> FanoutReplDispatchResult:
-    """Parse a ``/fanout`` line. NEVER raises."""
+    """Op fan-out tree.
+
+    Parse a ``/fanout`` line. NEVER raises."""
     if not _matches(line):
         return FanoutReplDispatchResult(
             ok=False, text="", matched=False,

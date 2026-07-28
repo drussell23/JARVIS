@@ -102,7 +102,9 @@ def dispatch_recovery_command(
     session_browser: Optional[Any] = None,
     announcer: Optional[Any] = None,
 ) -> RecoveryDispatchResult:
-    """Parse a ``/recover`` line and dispatch to the right handler.
+    """Recovery guidance for a failed operation.
+
+    Parse a ``/recover`` line and dispatch to the right handler.
 
     Tests inject all three collaborators explicitly. Production wires
     the module-level defaults at boot.
