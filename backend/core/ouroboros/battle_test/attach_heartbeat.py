@@ -110,6 +110,57 @@ _PHASE_VERBS = {
 }
 
 
+def flavour_rotate_s() -> float:
+    """How long a flavour verb holds before the next one.
+
+    Slow enough to read, fast enough to feel alive. CC changes its word on a
+    similar cadence for the same reason: the glyph cannot carry motion on its
+    own once it is an emoji.
+    """
+    try:
+        return max(1.0, min(60.0, float(os.environ.get(
+            "JARVIS_ATTACH_VERB_ROTATE_S", "") or 4.0)))
+    except (TypeError, ValueError):
+        return 4.0
+
+
+def _flavour_verb(op_id: str, now: Optional[float] = None) -> str:
+    """A verb for work with no phase to name — O+V's own register.
+
+    WHY NOT A SECOND WORD LIST
+    ---------------------------
+    `turn_spinner.turn_verbs()` already is one: `Coiling`, `Digesting`,
+    `Unwinding`, `Sensing`, `Reckoning` — the organism's voice, extendable by
+    the operator through `JARVIS_TURN_VERBS` without touching a renderer.
+    Writing a second table here would be two vocabularies drifting apart, and
+    the operator's extras would only reach one of them.
+
+    PHASE TRUTH OUTRANKS FLAVOUR
+    -----------------------------
+    This is the FALLBACK. When the pipeline knows it is in GENERATE, the line
+    says `Synthesizing` because that is what is happening — CC picks a whimsical
+    gerund because it has nothing more specific to say, and trading a true
+    label for a charming one would be a downgrade. Flavour fills the silence;
+    it does not replace the signal.
+
+    Stable within a rotation window and seeded by the op, so two ops working
+    at once do not chant the same word and one op does not flicker between
+    words on consecutive repaints.
+    """
+    try:
+        import time as _time
+        from backend.core.ouroboros.battle_test.turn_spinner import turn_verbs
+        verbs = turn_verbs()
+        if not verbs:
+            return ""
+        t = _time.monotonic() if now is None else float(now)
+        bucket = int(t / flavour_rotate_s())
+        seed = sum(ord(c) for c in str(op_id or "")) + bucket
+        return verbs[seed % len(verbs)]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def heartbeat_interval_s() -> float:
     """Publisher cadence; ``0`` disables. Re-read at call time."""
     try:
@@ -175,7 +226,7 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
             except Exception:  # noqa: BLE001
                 pass
 
-        phase_verb = _PHASE_VERBS.get(phase, "")
+        phase_verb = _PHASE_VERBS.get(phase, "") or _flavour_verb(op_id)
         active = bool(thinking_active or phase_verb)
         if not verb or not thinking_active:
             verb = phase_verb or verb
