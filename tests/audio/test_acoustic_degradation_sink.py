@@ -89,3 +89,65 @@ def test_the_dead_import_is_gone() -> None:
     text = open(src).read()
     assert "from backend.audio.audio_state_ipc import" not in text
     assert "set_degradation_sink" in text
+
+
+# --------------------------------------------------------------------------
+# the surface that was waiting on the other end
+# --------------------------------------------------------------------------
+
+def _ui():
+    import contextlib
+    import io
+
+    with contextlib.redirect_stderr(io.StringIO()):
+        from backend.core.ouroboros.cli.ov import AttachUI
+    return AttachUI()
+
+
+def test_a_verdict_reaches_the_toolbar() -> None:
+    ui = _ui()
+    ui.on_acoustic({"diagnosis": "reverb", "device": "MacBook Pro Microphone",
+                    "spoken": "The room's washing you out"})
+    badge = ui.acoustic_badge()
+    assert "reverb" in badge
+    assert "MacBook Pro Microphone" in badge, (
+        "a verdict with no device cannot distinguish a dropped headset from "
+        "a noisy room, and those have different fixes"
+    )
+    assert badge in ui._key_hints()
+
+
+def test_the_mic_badge_outranks_a_pending_approval() -> None:
+    """Everything else on that line is still working. A degraded mic means
+    the operator's words are not arriving at all."""
+    ui = _ui()
+    ui.on_acoustic({"diagnosis": "reverb", "device": "X"})
+    ui.shield.offer({"prompt_id": "iron-gate:1", "text": "apply?"},
+                    composing=True)
+    hints = ui._key_hints()
+    assert hints.index("🎙") < hints.index("⚠")
+
+
+def test_the_badge_decays() -> None:
+    """The gate fires on a RUN of bad utterances; silence afterwards is
+    indistinguishable from "fixed" and from "stopped talking". A sticky badge
+    would assert something the telemetry never said."""
+    import time
+
+    ui = _ui()
+    ui.on_acoustic({"diagnosis": "reverb", "device": "X"})
+    assert ui.acoustic_badge() != ""
+    ui.acoustic = (time.monotonic() - 10_000, "reverb", "X")
+    assert ui.acoustic_badge() == ""
+
+
+def test_no_verdict_shows_nothing() -> None:
+    assert _ui().acoustic_badge() == ""
+
+
+@pytest.mark.parametrize("junk", [None, {}, "x", 42])
+def test_a_junk_verdict_cannot_break_the_toolbar(junk) -> None:
+    ui = _ui()
+    ui.on_acoustic(junk)
+    assert isinstance(ui.acoustic_badge(), str)
+    assert isinstance(ui._key_hints(), str)

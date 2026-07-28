@@ -537,6 +537,30 @@ class CockpitAttachBridge:
             logger.debug("[CockpitAttach] transcript publish degraded",
                          exc_info=True)
 
+    def publish_acoustic(self, payload: Dict[str, Any]) -> None:
+        """Tell attached cockpits the microphone has gone bad.
+
+        Carries the verdict WHOLE — diagnosis, crest, device — because an
+        operator seeing "degraded" with no cause cannot tell a dropped
+        headset from a noisy room, and those have different fixes.
+        """
+        try:
+            if not self._clients:
+                return
+            self.stats["acoustic_published"] = (
+                self.stats.get("acoustic_published", 0) + 1
+            )
+            self._dispatch({
+                "type": "acoustic", "ts": time.time(),
+                "diagnosis": str(payload.get("diagnosis", "") or ""),
+                "crest_db": float(payload.get("crest_db", 0.0) or 0.0),
+                "device": str(payload.get("device", "") or ""),
+                "spoken": str(payload.get("spoken", "") or ""),
+            })
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] acoustic publish degraded",
+                         exc_info=True)
+
     def publish_prompt_resolved(self, prompt_id: str) -> None:
         """The gate is closed — answered here, elsewhere, or expired.
 
@@ -957,6 +981,7 @@ class CockpitAttachClient:
         on_telemetry: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_prompt: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_transcript: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_acoustic: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_prompt_resolved: Optional[Callable[[str], None]] = None,
         on_audio_state: Optional[Callable[[str], None]] = None,
         on_thermal: Optional[Callable[[str], None]] = None,
@@ -974,6 +999,7 @@ class CockpitAttachClient:
         self._on_telemetry = on_telemetry or (lambda _m: None)
         self._on_prompt = on_prompt
         self._on_transcript = on_transcript
+        self._on_acoustic = on_acoustic
         self._on_prompt_resolved = on_prompt_resolved
         self._on_audio_state = on_audio_state or (lambda _s: None)
         self._on_thermal = on_thermal or (lambda _s: None)
@@ -1162,6 +1188,12 @@ class CockpitAttachClient:
                     if self._on_transcript is not None:
                         try:
                             self._on_transcript(dict(frame))
+                        except Exception:  # noqa: BLE001
+                            pass
+                elif ftype == "acoustic":
+                    if self._on_acoustic is not None:
+                        try:
+                            self._on_acoustic(dict(frame))
                         except Exception:  # noqa: BLE001
                             pass
                 elif ftype == "prompt_resolved":
