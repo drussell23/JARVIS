@@ -53,6 +53,17 @@ def _context_pct(op_id: str) -> float:
         return 0.0
 
 
+def _status_payload(snap: Any) -> Optional[dict]:
+    """The status snapshot as a transport dict, or None. NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.status_line import (
+            snapshot_to_payload,
+        )
+        return snapshot_to_payload(snap) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _context_reading(op_id: str, provider: str, snap: Any) -> Optional[dict]:
     """The context meter's payload for this op, or None.
 
@@ -240,6 +251,13 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
             # with the binding wall named. `context_pct` stays for older
             # clients — additive, never a replacement.
             "context": _context_reading(op_id, provider, snap),
+            # The FULL status snapshot. `snap` is already in hand — this
+            # composer sampled it at the top for phase/route/provider — so
+            # the cockpit's status line costs a serialisation, not a second
+            # pull. Without it the attach client would render its own
+            # builder, which is empty by construction and would draw an
+            # eternally idle organism.
+            "status": _status_payload(snap),
             "effort": effort,
             "provider": provider,
             "provider_label": provider_label,

@@ -736,6 +736,33 @@ def _extract_path_arg(args_summary: str) -> str:
     return text.split(" ", 1)[0].split("=", 1)[-1]
 
 
+def _local_status_rows() -> list:
+    """The status line from THIS process's builder, sized to this terminal.
+
+    The daemon owns the builder, so no bridge is involved — but it renders
+    through the same `render_snapshot` the remote cockpit calls, over the
+    same `StatusSnapshot`. Two sources, one renderer; the surfaces cannot
+    drift into different opinions about what a status line looks like.
+
+    NEVER raises.
+    """
+    try:
+        import shutil
+        from backend.core.ouroboros.battle_test.status_line import (
+            get_status_line_builder, render_snapshot,
+        )
+        builder = get_status_line_builder()
+        if builder is None:
+            return []
+        size = shutil.get_terminal_size(fallback=(100, 30))
+        line = render_snapshot(
+            builder.snapshot(), width=max(20, int(size.columns)),
+        )
+        return [f"  {line}"] if line else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _local_agent_rows() -> list:
     """Roster rows from THIS process's singleton, sized to this terminal.
 
@@ -6261,6 +6288,7 @@ class SerpentREPL:
                     # reason `render_roster` takes a snapshot rather than a
                     # roster: neither surface can drift into its own look.
                     agent_rows=_local_agent_rows,
+                    status_rows=_local_status_rows,
                 )
                 return
         except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL
