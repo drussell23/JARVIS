@@ -159,6 +159,27 @@ def _canvas_dimension() -> Any:
     return Dimension(min=0, max=rows, preferred=rows)
 
 
+def bottom_anchor_enabled() -> bool:
+    """Does the transcript grow UPWARD from the prompt?
+
+    Claude Code's geometry: the input box is fixed at the bottom and the
+    transcript fills toward it, so the newest line is always the one
+    directly above where you type and your eye never travels. A
+    top-aligned canvas puts the conversation at row 0 and leaves a void
+    between it and the prompt — which is what an operator reads as "it
+    does not flow like Claude".
+
+    Only meaningful in the alternate screen, where the canvas owns every
+    remaining row. Inline, the canvas is a bounded live region that must
+    still collapse to nothing when idle, so padding it would nail an
+    empty block open. ``JARVIS_BIPARTITE_BOTTOM_ANCHOR=0`` restores the
+    top-aligned canvas."""
+    raw = os.environ.get("JARVIS_BIPARTITE_BOTTOM_ANCHOR", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return fullscreen_enabled()
+
+
 def _canvas_max_lines() -> int:
     try:
         return canvas_history_lines()
@@ -309,7 +330,7 @@ class BipartiteLayout:
             budget = self._line_budget()
             snap = self._buffer.snapshot()
             if not scrollback_enabled():
-                return list(snap[-budget:])
+                return self._anchor(list(snap[-budget:]))
             visible, above, below = self._viewport.window(
                 # push_count, not len(): once the ring saturates its length
                 # stops changing while the content keeps moving.
@@ -317,12 +338,32 @@ class BipartiteLayout:
             )
             status = self._viewport.status(above, below)
             if status:
-                return list(visible[1:]) + [
+                return self._anchor(list(visible[1:]) + [
                     f"[reverse dim] {status} [/reverse dim]",
-                ]
-            return list(visible)
+                ])
+            return self._anchor(list(visible))
         except Exception:  # noqa: BLE001
             return []
+
+    def _anchor(self, lines: List[str]) -> List[str]:
+        """Pad the TOP so the newest line lands against the prompt.
+
+        Padding rather than a Rich alignment because the canvas body is a
+        Group of independently-styled lines with no shared container to
+        align — and because blank leading rows are exactly what the
+        alternate screen shows above a short conversation anyway. NEVER
+        raises: an unpadded canvas is merely top-aligned, not broken."""
+        try:
+            if not lines or not bottom_anchor_enabled():
+                # An EMPTY canvas keeps its idle message and its resting
+                # hero: padding zero lines to a screenful would replace
+                # "the organism rests" with a wall of blanks.
+                return lines
+            budget = self._line_budget()
+            missing = budget - len(lines)
+            return ([""] * missing) + lines if missing > 0 else lines
+        except Exception:  # noqa: BLE001
+            return lines
 
     def render_canvas(self) -> Any:
         """Zone 1 — a rounded ``rich.panel.Panel`` of the tail telemetry. Never
@@ -1113,6 +1154,7 @@ async def run_bipartite_repl(
 __all__ = [
     "BipartiteLayout",
     "bipartite_enabled",
+    "bottom_anchor_enabled",
     "build_bipartite_application",
     "get_active_canvas",
     "run_bipartite_repl",
