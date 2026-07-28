@@ -189,12 +189,21 @@ class TestSmoothnessIsStructural:
 
     @pytest.mark.parametrize("interval", [0.05, 0.1, 0.2, 0.5])
     def test_the_head_advances_by_a_CONSTANT_number_of_cells(self, interval):
-        """At ANY repaint rate — including one this module never sees."""
+        """At ANY repaint rate — including one this module never sees.
+
+        Compared with a tolerance because the positions are FLOATS now: the
+        step is 0.6 and IEEE gives 0.5999999999999979. Exact equality would
+        fail on representation noise while the property — a constant step,
+        which is what the eye reads — holds perfectly.
+        """
         steps = self._steps(interval)
-        assert len(set(steps)) == 1, f"{interval}s → uneven {sorted(set(steps))}"
+        assert max(steps) - min(steps) < 1e-6, (
+            f"{interval}s → uneven {sorted(set(steps))}"
+        )
 
     def test_the_step_is_exactly_the_configured_cells_per_frame(self):
-        assert set(self._steps(0.1)) == {sr.cells_per_frame()}
+        assert all(abs(x - sr.cells_per_frame()) < 1e-6
+                   for x in self._steps(0.1))
 
     def test_speed_is_DERIVED_from_the_frame_rate(self):
         """Expressed as whole cells per frame, so seconds fall out. A rate
@@ -206,7 +215,7 @@ class TestSmoothnessIsStructural:
         """Two cells per frame is twice the speed and still uniform —
         the property survives the knob."""
         monkeypatch.setenv("JARVIS_SERPENT_RULE_CELLS_PER_FRAME", "3")
-        assert set(self._steps(0.1)) == {3}
+        assert all(abs(x - 3.0) < 1e-6 for x in self._steps(0.1))
 
     def test_the_cockpit_hands_over_its_OWN_repaint_period(self):
         """A literal in two places is how the animation and the Application
@@ -245,3 +254,96 @@ class TestTheChaseIsLegible:
             f = sr.frame(period * i / 30.0, 88)
             gaps.append((f.prey - f.head) % f.length)
         assert gaps == sorted(gaps, reverse=True), gaps
+
+
+class TestSubCellCoverage:
+    """The smoothness a cell grid cannot give.
+
+    An integer step removed the beat but not the steppiness: one whole
+    character every 100 ms is a teleport of a character's width. A cell is
+    the atom of POSITION, so the rest had to come from INTENSITY — the law
+    the crest already uses, where "dimmed edges read as native terminal
+    anti-aliasing".
+    """
+
+    @pytest.fixture(autouse=True)
+    def _truecolor(self, monkeypatch):
+        from backend.core.ouroboros.ui import theme
+        monkeypatch.setattr(theme, "_active_tier_cache",
+                            theme.ColorTier.TRUECOLOR)
+        yield
+
+    def test_a_mark_between_cells_paints_BOTH(self):
+        cover = dict(sr._coverage(12.4, 64))
+        assert set(cover) == {12, 13}
+        assert abs(cover[12] - 0.6) < 1e-6
+        assert abs(cover[13] - 0.4) < 1e-6
+
+    def test_coverage_always_sums_to_one_mark(self):
+        for pos in (0.0, 0.5, 7.25, 63.9, 127.99):
+            assert abs(sum(c for _i, c in sr._coverage(pos, 64)) - 1.0) < 1e-6
+
+    def test_a_mark_on_a_boundary_stays_CRISP(self):
+        """An integer position must not smear across two cells — otherwise
+        every mark is permanently half-lit."""
+        assert sr._coverage(9.0, 64) == ((9, 1.0),)
+
+    def test_coverage_wraps_the_circuit(self):
+        cover = dict(sr._coverage(sr.path_length(64) - 0.5, 64))
+        assert 0 in cover, "the last cell did not blend into the first"
+
+    def test_the_blend_goes_toward_the_RULE_not_black(self):
+        """A partially covered cell is a hairline with some serpent on it.
+        Fading to black would punch a hole in the line this decorates."""
+        rule, serpent = (163, 113, 247), (94, 224, 106)
+        faint = sr._blend(rule, serpent, 0.1)
+        assert all(abs(f - r) < 25 for f, r in zip(faint, rule))
+        assert sum(faint) > sum(c // 2 for c in rule), "faded toward black"
+
+    def test_full_coverage_is_the_mark_itself(self):
+        assert sr._blend((163, 113, 247), (94, 224, 106), 1.0) == (94, 224, 106)
+
+    def test_the_head_outranks_its_own_tail_on_a_shared_cell(self):
+        """Brightest coverage owns the glyph, so a body segment cannot erase
+        the head on the frame they overlap."""
+        f = sr.frame(0.0, 64)
+        head_cells = {c for c, _ in sr._coverage(f.head, 64)}
+        row, x = sr.cell_at(int(f.head), 64)
+        frags = sr.rule_fragments(row, 64, 0.0)
+        assert head_cells and any("bold" in st for st, _t in frags)
+
+    def test_intermediate_positions_produce_DIFFERENT_renders(self):
+        """The proof that motion is continuous: two sub-cell positions the
+        old integer stepper would have rendered identically now differ."""
+        a = sr.rule_fragments(sr.TOP, 64, 0.0)
+        b = sr.rule_fragments(sr.TOP, 64, 0.05)   # half a frame
+        assert a != b
+
+
+class TestSubCellDegradation:
+    def test_a_16_colour_terminal_SNAPS_instead_of_smearing(self, monkeypatch):
+        """Sixteen colours quantise an interpolated green-purple to whichever
+        it is nearer, so the "smooth" render would flicker between rule and
+        serpent — worse than a clean step, and worse only on that terminal.
+        """
+        from backend.core.ouroboros.ui import theme
+        monkeypatch.setattr(theme, "_active_tier_cache",
+                            theme.ColorTier.STANDARD)
+        cover = sr._coverage(12.4, 64)
+        assert cover == ((12, 1.0),), cover
+
+    def test_it_snaps_to_the_NEAREST_cell(self, monkeypatch):
+        from backend.core.ouroboros.ui import theme
+        monkeypatch.setattr(theme, "_active_tier_cache",
+                            theme.ColorTier.STANDARD)
+        assert sr._coverage(12.6, 64) == ((13, 1.0),)
+
+    def test_the_line_keeps_its_length_either_way(self, monkeypatch):
+        from backend.core.ouroboros.ui import theme
+        for tier in (theme.ColorTier.TRUECOLOR, theme.ColorTier.STANDARD,
+                     theme.ColorTier.NONE):
+            monkeypatch.setattr(theme, "_active_tier_cache", tier)
+            for row in (sr.TOP, sr.BOTTOM):
+                text = "".join(t for _s, t in
+                               sr.rule_fragments(row, 64, 1.3))
+                assert len(text) == 64, (tier, len(text))
