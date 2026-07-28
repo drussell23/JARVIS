@@ -466,6 +466,84 @@ class CockpitAttachBridge:
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] markup publish degraded", exc_info=True)
 
+    def publish_history_append(
+        self, text: str, *, origin_session: Optional[str] = None,
+    ) -> None:
+        """Fan one appended history entry out to every attached cockpit
+        EXCEPT the originator — it already has the line; echoing it back
+        would double it in the one terminal guaranteed to have it.
+
+        Server-side exclusion by the session→writer binding, not by a
+        ContextVar: this is a route decision ("everyone but X"), which the
+        addressing scope ("only X") cannot express. ``origin_session=None``
+        means the DAEMON's own terminal typed it — every client receives.
+        The frame still carries ``origin`` so a client can drop its own
+        echo if a rebind ever mis-routes. Thread-safe; strictly
+        non-blocking; NEVER raises."""
+        try:
+            text = str(text or "")
+            if not text.strip() or not self._clients:
+                return
+            msg: Dict[str, Any] = {
+                "type": "history_append", "text": text, "ts": time.time(),
+            }
+            if origin_session:
+                msg["origin"] = origin_session
+            self.stats["history_fanout"] = (
+                self.stats.get("history_fanout", 0) + 1
+            )
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+
+            def _emit() -> None:
+                exclude = (
+                    self._sessions.get(origin_session)
+                    if origin_session else None
+                )
+                data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+                for w in list(self._clients):
+                    if w is exclude:
+                        continue
+                    try:
+                        if w.is_closing():
+                            self._drop(w)
+                            continue
+                        w.write(data)
+                    except Exception:  # noqa: BLE001 — writer fault = drop
+                        self._drop(w)
+
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                _emit()
+            else:
+                loop.call_soon_threadsafe(_emit)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] history fanout degraded",
+                         exc_info=True)
+
+    def _sync_history(self, text: str, origin_session: Optional[str]) -> None:
+        """One operator line became history somewhere — propagate it.
+
+        Fan out to the other cockpits AND inject memory-only into THIS
+        process's singleton, so the daemon terminal's Up-arrow keeps pace
+        with its clients. Gated + fail-soft; NEVER raises."""
+        try:
+            from backend.core.ouroboros.battle_test.history_sync import (
+                inject_history_entry,
+                is_history_sync_enabled,
+            )
+            if not is_history_sync_enabled():
+                return
+            self.publish_history_append(text, origin_session=origin_session)
+            inject_history_entry(text)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] history sync degraded",
+                         exc_info=True)
+
     def publish_prompt(
         self,
         prompt_id: str,
@@ -928,6 +1006,18 @@ class CockpitAttachBridge:
                                 "[CockpitAttach] input sink degraded",
                                 exc_info=True,
                             )
+                        # Distributed history: the daemon already holds
+                        # this line WITH its originating session — the
+                        # fan-out is derived HERE rather than demanding a
+                        # second frame for the same keystroke.
+                        self._sync_history(text, _sid or None)
+                elif ftype == "history_append":
+                    # A line the CLIENT handled locally (/deck, /keys) —
+                    # never dispatched, but every other terminal must
+                    # still recall it.
+                    text = str(frame.get("text", "")).strip()
+                    if text:
+                        self._sync_history(text, _sid or None)
                 elif ftype == "lane":
                     # Hydration request: the client focused a lane and wants
                     # its history. Answered ONLY to the asking cockpit —
@@ -987,6 +1077,7 @@ class CockpitAttachClient:
         on_thermal: Optional[Callable[[str], None]] = None,
         on_lane_history: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_lane_reaped: Optional[Callable[[str], None]] = None,
+        on_history_append: Optional[Callable[[str], None]] = None,
         path: Optional[Path] = None,
     ) -> None:
         self._path = Path(path) if path is not None else attach_socket_path()
@@ -1009,6 +1100,9 @@ class CockpitAttachClient:
         #: A lane stopped existing. The FSM cannot infer this from an absent
         #: heartbeat row — that is indistinguishable from a slow frame.
         self._on_lane_reaped = on_lane_reaped or (lambda _l: None)
+        #: Another terminal's line, for Up-arrow parity. Absent handler =
+        #: a pre-sync cockpit; the frame is simply not dispatched.
+        self._on_history_append = on_history_append
         #: This cockpit's identity for the life of the attachment. Declared
         #: on every outbound frame so the daemon can address answers back to
         #: the terminal that asked, instead of to all of them.
@@ -1115,6 +1209,27 @@ class CockpitAttachClient:
         except Exception:  # noqa: BLE001
             return False
 
+    def send_history(self, text: str) -> bool:
+        """Report one CLIENT-HANDLED line upstream for history fan-out.
+
+        Only for lines that never travel as ``input`` (client-local verbs
+        like ``/deck``) — a line that crosses as input is fanned out from
+        that seam, and sending both would double it everywhere else.
+        Non-blocking; False when detached. NEVER raises."""
+        try:
+            entry = str(text or "").strip()
+            if not entry:
+                return False
+            w = self._writer
+            if not self.connected or w is None or w.is_closing():
+                return False
+            frame = {"type": "history_append", "text": entry,
+                     "session": self.session_id}
+            w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def send_input(self, text: str, prompt_id: Optional[str] = None) -> bool:
         """Pipe one operator line upstream. Non-blocking; False when
         detached. NEVER raises."""
@@ -1172,6 +1287,17 @@ class CockpitAttachClient:
                             pass
                     else:
                         self._safe_cb_text(cb, str(frame.get("text", "")))
+                elif ftype == "history_append":
+                    # Another terminal's line. Drop our own echo — the
+                    # daemon excludes the originator by session binding,
+                    # but a rebound id must not double an entry here.
+                    if self._on_history_append is not None:
+                        _origin = str(frame.get("origin", "") or "")
+                        if not (_origin and _origin == self.session_id):
+                            self._safe_cb_text(
+                                self._on_history_append,
+                                str(frame.get("text", "")),
+                            )
                 elif ftype == "prompt":
                     # An open gate, as data. A client with no handler is a
                     # pre-shield cockpit: it already received the same
