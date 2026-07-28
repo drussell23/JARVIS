@@ -160,18 +160,64 @@ def open_in_editor(event: Any) -> None:
         logger.debug("[Hatches] editor degraded", exc_info=True)
 
 
+def viewport_top() -> Optional[int]:
+    """Index of the transcript line currently at the top of the viewport.
+
+    The single conversion between "where the operator is looking" and "which
+    line that is" — every jump reads it and every jump writes through
+    :func:`scroll_to_index`, so the two cannot disagree about which end
+    ``offset`` counts from. NEVER raises.
+    """
+    try:
+        state = _viewport_state()
+        if state is None:
+            return None
+        viewport, total, budget = state
+        return max(0, total - budget - viewport.offset)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def scroll_to_index(index: int, *, context: int = 0) -> bool:
+    """Put transcript line ``index`` at the top of the viewport.
+
+    ``context`` lifts the target down the screen by that many rows, so a
+    search hit lands with what came BEFORE it visible. A match at the very
+    top of the screen is technically found and practically useless: the lines
+    that explain it are the ones just above.
+
+    Returns whether the viewport moved. NEVER raises.
+    """
+    try:
+        state = _viewport_state()
+        if state is None:
+            return False
+        viewport, total, budget = state
+        target = max(0, int(index) - max(0, int(context)))
+        new_offset = max(0, total - budget - target)
+        # scroll() computes want = offset - lines → aim it exactly.
+        moved = viewport.scroll(
+            viewport.offset - new_offset, total=total, budget=budget,
+        )
+        mux = _canvas()
+        if mux is not None:
+            mux._invalidate_now()  # noqa: SLF001 — the scroll keys' own move
+        return bool(moved)
+    except Exception:  # noqa: BLE001
+        logger.debug("[Hatches] scroll_to_index degraded", exc_info=True)
+        return False
+
+
 def jump_block(event: Any, direction: int) -> None:
     """``{``/``}`` — move the viewport to the previous/next block marker.
     Paging finds a place; this finds a THING. NEVER raises."""
     try:
-        state = _viewport_state()
-        if state is None:
+        top = viewport_top()
+        if top is None:
             return
-        viewport, total, budget = state
         lines = transcript_lines()
         if not lines:
             return
-        top = max(0, total - budget - viewport.offset)
         markers = [
             i for i, ln in enumerate(lines)
             if ln.lstrip().startswith(_BLOCK_MARKERS)
@@ -184,14 +230,7 @@ def jump_block(event: Any, direction: int) -> None:
             target = candidates[0] if candidates else None
         if target is None:
             return
-        new_offset = max(0, total - budget - target)
-        # scroll() computes want = offset - lines → aim it exactly.
-        viewport.scroll(
-            viewport.offset - new_offset, total=total, budget=budget,
-        )
-        mux = _canvas()
-        if mux is not None:
-            mux._invalidate_now()  # noqa: SLF001 — the scroll keys' own move
+        scroll_to_index(target)
     except Exception:  # noqa: BLE001
         logger.debug("[Hatches] jump degraded", exc_info=True)
 
@@ -201,6 +240,324 @@ def force_redraw(event: Any) -> None:
     try:
         event.app.renderer.clear()
         event.app.invalidate()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------------------
+# `/` search — the hatch this module's own docstring called for
+# ---------------------------------------------------------------------------
+#
+# "A ring you can page but not search is a transcript in a locked box." That
+# sentence has opened this file since it shipped, above four hatches and no
+# search. `TranscriptSearch` was written — smart case, wrapping `n`/`N`, Esc
+# restoring your place, 21 tests — and never bound to a key.
+#
+# It mounts HERE rather than in a module of its own because this is already
+# the transcript key cluster: `[`, `v`, `{`, `}` bind under the same
+# scrolled-back doorway, read the same ring through the same accessor, and
+# move the view through the same `scroll_to_index`. A second module would
+# have to reimplement all four of those to have a `/`.
+
+
+#: One session per process, lazily made. The search holds a cursor and a
+#: restore point across keystrokes, so it cannot be rebuilt per press —
+#: `n` means nothing without the search that preceded it.
+_SEARCH: Any = None
+
+
+def get_search() -> Any:
+    """The live search session, bound to the canvas viewport. NEVER raises."""
+    global _SEARCH
+    try:
+        from backend.core.ouroboros.battle_test.transcript_search import (
+            TranscriptSearch,
+        )
+        state = _viewport_state()
+        viewport = state[0] if state is not None else None
+        if _SEARCH is None:
+            _SEARCH = TranscriptSearch(viewport)
+        elif viewport is not None and _SEARCH._viewport is not viewport:  # noqa: SLF001
+            # The cockpit was rebuilt (detach → reattach, resize remount) and
+            # this is a NEW viewport. Rebinding beats keeping a session that
+            # would scroll a container nothing is drawing.
+            _SEARCH = TranscriptSearch(viewport)
+        return _SEARCH
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def reset_search_for_tests() -> None:
+    global _SEARCH
+    _SEARCH = None
+
+
+def _ring_state() -> Tuple[int, int]:
+    """``(push_count, retained)`` — the ring's monotonic counter and depth.
+
+    Read together with the lines in one pass wherever both are needed, so a
+    push landing between two reads cannot skew every ordinal by one. That
+    skew only appears under load, which is exactly when a search is used.
+    """
+    try:
+        mux = _canvas()
+        if mux is None:
+            return 0, 0
+        buf = mux._buffer                      # noqa: SLF001 — the ring
+        retained = int(buf.line_count)
+        return int(getattr(buf, "push_count", retained)), retained
+    except Exception:  # noqa: BLE001
+        return 0, 0
+
+
+def search_is_armed() -> bool:
+    """True while the operator is typing a query. NEVER raises."""
+    try:
+        return bool(_ARMED[0])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: A one-slot latch rather than an attribute on the session: "the bar is
+#: open" and "a query exists" are different states, and conflating them makes
+#: `n` after closing the bar impossible to express.
+_ARMED = [False]
+
+
+def search_status() -> List[str]:
+    """The search bar, or [] when it is closed.
+
+    Returned as ROWS so it mounts through the same dynamic-rows container the
+    agent view uses — one geometry primitive, not a bespoke widget per strip.
+    """
+    try:
+        search = get_search()
+        if search is None:
+            return []
+        if not search_is_armed() and not search.query:
+            return []
+        status = search.status() or f"/{search.query}"
+        return [f"  {status}" + ("▏" if search_is_armed() else "")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _reveal_current(search: Any) -> None:
+    """Scroll to the cursor's match, honestly about eviction. NEVER raises."""
+    try:
+        push, retained = _ring_state()
+        index = search.resolve(
+            search.current, push_count=push, retained=retained,
+        )
+        if index is None:
+            return
+        state = _viewport_state()
+        if state is None:
+            return
+        _viewport, total, budget = state
+        search.reveal(index, total, budget)
+        mux = _canvas()
+        if mux is not None:
+            mux._invalidate_now()              # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        logger.debug("[Hatches] reveal degraded", exc_info=True)
+
+
+def _run_search(search: Any) -> None:
+    """Re-run the query against the CURRENT ring and reveal the first hit.
+
+    Re-run on every keystroke rather than filtered from the previous result:
+    the buffer grows while the operator types, and a filtered search would be
+    confined to whatever the shorter prefix happened to match a second ago.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.transcript_search import (
+            base_ordinal,
+        )
+        # Counter and lines in ONE pass, then the base derived from that pair
+        # — reading them apart would let a push land between and skew every
+        # ordinal by one.
+        push, retained = _ring_state()
+        lines = transcript_lines()
+        search.search(lines, search.query,
+                      base=base_ordinal(push, len(lines) or retained))
+        _reveal_current(search)
+    except Exception:  # noqa: BLE001
+        logger.debug("[Hatches] search degraded", exc_info=True)
+
+
+def install_transcript_search(kb: Any, ui: Any = None) -> int:
+    """Bind `/` `n` `N` and the query capture. Returns the count bound.
+
+    The grammar is CC's, and each key is filtered so it can only fire in the
+    state where it is unambiguous:
+
+      ``/``          arms the bar — while SCROLLED BACK, where `/` cannot be
+                     the command palette because the operator is reading
+                     history rather than issuing commands. No new mode: the
+                     scroll state already distinguishes them.
+      ``<any>``      the query, while armed. Printable characters only, so a
+                     control sequence never lands in a search string.
+      ``backspace``  edit it; on the last character the bar closes, because
+                     an empty bar is a mode with nothing in it.
+      ``enter``      keep the position and close — the operator found it.
+      ``escape``     close AND restore the pre-search offset.
+      ``n`` / ``N``  walk the matches after the bar is closed, which is where
+                     CC puts them and the only place they are unambiguous:
+                     while the bar is open, `n` is a letter.
+
+    NEVER raises.
+    """
+    try:
+        from prompt_toolkit.filters import Condition
+
+        from backend.core.ouroboros.battle_test.keymap import bind_action
+        from backend.core.ouroboros.battle_test.transcript_search import (
+            search_enabled,
+        )
+
+        armed = Condition(search_is_armed)
+        scrolled_idle = Condition(
+            lambda: is_scrolled_back() and not search_is_armed()
+                    and search_enabled()
+        )
+
+        def _flash(text: str) -> None:
+            try:
+                if ui is not None and hasattr(ui, "flash"):
+                    ui.flash(text, seconds=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def _open(event: Any) -> None:
+            search = get_search()
+            if search is None:
+                return
+            search.reset()
+            search.begin()                    # remember where we were
+            _ARMED[0] = True
+            _repaint()
+
+        def _type(event: Any) -> None:
+            search = get_search()
+            if search is None:
+                return
+            ch = getattr(event, "data", "") or ""
+            # Printable only. A stray escape sequence arriving as data would
+            # otherwise be searched for, and the operator would see a query
+            # they never typed.
+            if len(ch) != 1 or not ch.isprintable():
+                return
+            search.query += ch
+            _run_search(search)
+            _repaint()
+
+        def _backspace(event: Any) -> None:
+            search = get_search()
+            if search is None:
+                return
+            search.query = search.query[:-1]
+            if not search.query:
+                _close(restore=False)
+                return
+            _run_search(search)
+            _repaint()
+
+        def _accept(event: Any) -> None:
+            _ARMED[0] = False                 # keep the query for n / N
+            _repaint()
+
+        def _cancel(event: Any) -> None:
+            _close(restore=True)
+
+        def _close(*, restore: bool) -> None:
+            search = get_search()
+            _ARMED[0] = False
+            if search is None:
+                return
+            if restore:
+                search.cancel()
+            else:
+                search.reset()
+            _repaint()
+
+        def _step(forward: bool):
+            def _handler(event: Any) -> None:
+                search = get_search()
+                if search is None or not search.matches:
+                    return
+                push, retained = _ring_state()
+                # Walk until a match that still EXISTS, at most one full lap.
+                for _ in range(len(search.matches)):
+                    ordinal = search.step(forward)
+                    if search.resolve(
+                        ordinal, push_count=push, retained=retained,
+                    ) is not None:
+                        _reveal_current(search)
+                        _repaint()
+                        return
+                _flash("⚠ every match has scrolled out of the transcript")
+            return _handler
+
+        bound = 0
+        bound += bind_action(
+            kb, "transcript:search", ("/",), _open,
+            context="Transcript", filter=scrolled_idle,
+            description="search the transcript (while scrolled)",
+        )
+        # The query capture binds DIRECTLY, not through `bind_action`.
+        #
+        # `<any>` is a wildcard, not a key, and the registry is right to
+        # refuse it: an action is something an operator can rebind, and
+        # "every key on the keyboard" is not a chord anyone can express in
+        # keybindings.json. Routing it through the catalog would either
+        # require teaching the normaliser a fake key or advertise a
+        # rebindable action that silently ignores the rebind.
+        #
+        # So the six real keys stay remappable and this one — the search bar
+        # consuming its own input while open — is a plain binding.
+        try:
+            from prompt_toolkit.keys import Keys
+            kb.add(Keys.Any, filter=armed)(_type)
+            bound += 1
+        except Exception:  # noqa: BLE001
+            logger.debug("[Hatches] query capture degraded", exc_info=True)
+        bound += bind_action(
+            kb, "transcript:searchBack", ("backspace",), _backspace,
+            context="Transcript", filter=armed,
+            description="edit the search query",
+        )
+        bound += bind_action(
+            kb, "transcript:searchAccept", ("enter",), _accept,
+            context="Transcript", filter=armed, eager=True,
+            description="keep the found position and close the search bar",
+        )
+        bound += bind_action(
+            kb, "transcript:searchCancel", ("escape",), _cancel,
+            context="Transcript", filter=armed, eager=True,
+            description="close the search and go back where you were",
+        )
+        bound += bind_action(
+            kb, "transcript:nextMatch", ("n",), _step(True),
+            context="Transcript", filter=scrolled_idle,
+            description="jump to the next match (while scrolled)",
+        )
+        bound += bind_action(
+            kb, "transcript:prevMatch", ("N",), _step(False),
+            context="Transcript", filter=scrolled_idle,
+            description="jump to the previous match (while scrolled)",
+        )
+        return bound
+    except Exception:  # noqa: BLE001
+        logger.debug("[Hatches] search install degraded", exc_info=True)
+        return 0
+
+
+def _repaint() -> None:
+    try:
+        mux = _canvas()
+        if mux is not None:
+            mux._invalidate_now()              # noqa: SLF001
     except Exception:  # noqa: BLE001
         pass
 
@@ -264,6 +621,8 @@ def install_transcript_hatches(kb: Any, ui: Any, client: Any) -> bool:
             context="Global",
             description="toggle live narration normal ↔ verbose (/narrate)",
         )
+        # The search this file has asked for since its first line.
+        bound += install_transcript_search(kb, ui)
         return bound > 0
     except Exception:  # noqa: BLE001
         logger.debug("[Hatches] install degraded", exc_info=True)
@@ -305,6 +664,13 @@ def tmux_bell_warning(*, timeout_s: float = 1.0) -> str:
 __all__ = [
     "TRANSCRIPT_HATCHES_SCHEMA_VERSION",
     "dump_to_scrollback",
+    "get_search",
+    "install_transcript_search",
+    "reset_search_for_tests",
+    "scroll_to_index",
+    "search_is_armed",
+    "search_status",
+    "viewport_top",
     "force_redraw",
     "install_transcript_hatches",
     "is_scrolled_back",

@@ -11,15 +11,28 @@ for position rather than tracking a second one. The viewport already knows
 how to hold a window still while the organism appends; a search that moved
 the view by its own arithmetic would immediately disagree with it.
 
-Matches are indices, not lines
-------------------------------
+Matches are ordinals, not lines and not indices
+------------------------------------------------
 The deck grows while you read it. If a search held the matched TEXT and
 re-found it on every step, an identical line arriving later would silently
 steal the cursor; if it held a screen offset, every append would shift what
-`n` means. It holds absolute indices into the snapshot it searched, and
-re-resolves them against the live buffer — so `n` walks the matches that
-existed when you asked, in the order you asked for them, however much
-arrives underneath.
+`n` means.
+
+An index into the snapshot is not enough either, and this is the subtle one.
+The deck is a bounded RING: once it saturates, every push also drops the
+oldest line, so index 8,412 addresses a different line one second later. The
+failure is silent and confident — `n` scrolls somewhere real, showing content
+that looks plausible, and nothing indicates the cursor moved off the match.
+An append-only list never shows it, which is precisely why it survives being
+tested.
+
+So a match is an ORDINAL: how many lines the ring had ever seen when that one
+arrived, derived from the buffer's own monotonic `push_count`. Resolving one
+back to an index accounts for everything pushed since, and a line that has
+aged out resolves to `None` — reported as gone rather than approximated.
+
+For a plain list the base ordinal is 0 and an ordinal IS an index, so nothing
+about searching a static buffer changed.
 
 Smart case, and no accidental regex
 ------------------------------------
@@ -48,7 +61,10 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.TranscriptSearch")
 
-__all__ = ["TranscriptSearch", "search_enabled", "find_matches", "smart_case"]
+__all__ = [
+    "TranscriptSearch", "base_ordinal", "find_matches", "resolve_ordinal",
+    "search_enabled", "smart_case",
+]
 
 #: Beyond this a query is not a search. Bounded so a paste into the search
 #: bar cannot turn every keystroke into a full-buffer scan.
@@ -104,6 +120,42 @@ def find_matches(lines: Sequence[str], query: str) -> List[int]:
         return []
 
 
+def base_ordinal(push_count: int, retained: int) -> int:
+    """Ordinal of the OLDEST line still in the ring.
+
+    ``push_count`` is monotonic and ``retained`` is bounded, so their
+    difference is exactly how many lines have already fallen off the end —
+    the origin every stored match is measured from. A buffer that has not
+    saturated yet has dropped nothing, so the base is 0 and an ordinal is an
+    index. NEVER raises.
+    """
+    try:
+        return max(0, int(push_count) - int(retained))
+    except (TypeError, ValueError):
+        return 0
+
+
+def resolve_ordinal(
+    ordinal: Optional[int], *, push_count: int, retained: int,
+) -> Optional[int]:
+    """Current ring index for ``ordinal``, or None once it has aged out.
+
+    None is the entire value of this function. A match the ring has since
+    evicted is not a match at some nearby index: clamping would scroll to
+    whatever line happens to occupy that slot now, which is a confident jump
+    to the wrong place with nothing to signal it. NEVER raises.
+    """
+    try:
+        if ordinal is None:
+            return None
+        index = int(ordinal) - base_ordinal(push_count, retained)
+        if index < 0 or index >= max(0, int(retained)):
+            return None
+        return index
+    except (TypeError, ValueError):
+        return None
+
+
 class TranscriptSearch:
     """One search session over the deck, positioned through the viewport."""
 
@@ -117,6 +169,9 @@ class TranscriptSearch:
         self._matches: List[int] = []
         self._cursor: int = -1
         self._restore_offset: Optional[int] = None
+        #: Ordinal of the oldest line in the buffer that was searched. 0 for a
+        #: static list, so an ordinal and an index coincide there.
+        self._base: int = 0
         self.searches = 0
 
     # -- lifecycle ---------------------------------------------------------
@@ -167,18 +222,29 @@ class TranscriptSearch:
 
     # -- searching ---------------------------------------------------------
 
-    def search(self, lines: Sequence[str], query: str) -> int:
+    def search(
+        self, lines: Sequence[str], query: str, *, base: int = 0,
+    ) -> int:
         """Run a search. Returns the match count.
 
         Recomputed from the CURRENT buffer each time rather than filtered
         from a previous result: typing `err` then `error` must not be limited
         to what `err` happened to match in a buffer that has since grown.
+
+        ``base`` is the ordinal of ``lines[0]`` — :func:`base_ordinal` over
+        the live ring. It defaults to 0, which is correct for any buffer that
+        has not evicted anything and keeps a static list behaving exactly as
+        before; pass the real base and every stored match survives eviction.
         """
         try:
             if not search_enabled():
                 return 0
             self.query = str(query or "")[:_MAX_QUERY]
-            self._matches = find_matches(lines, self.query)
+            offset = max(0, int(base))
+            self._base = offset
+            self._matches = [
+                offset + i for i in find_matches(lines, self.query)
+            ]
             self._cursor = 0 if self._matches else -1
             self.searches += 1
             return len(self._matches)
@@ -186,6 +252,21 @@ class TranscriptSearch:
             logger.debug("[TranscriptSearch] search degraded", exc_info=True)
             self._matches, self._cursor = [], -1
             return 0
+
+    def resolve(
+        self, ordinal: Optional[int], *, push_count: int, retained: int,
+    ) -> Optional[int]:
+        """Where a stored match lives NOW, or None once the ring dropped it.
+
+        The re-resolution this class's docstring always promised. Held
+        separately from :meth:`step` so walking the matches and locating them
+        stay independent: `n` must advance the cursor even when the line it
+        lands on has aged out, or an evicted match in the middle of a result
+        set would wedge the walk.
+        """
+        return resolve_ordinal(
+            ordinal, push_count=push_count, retained=retained,
+        )
 
     def step(self, forward: bool = True) -> Optional[int]:
         """`n` / `N`. Returns the absolute line index, or None.
