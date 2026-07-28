@@ -4623,6 +4623,15 @@ class BattleTestHarness:
                     sf = getattr(self, "_serpent_flow", None)
                     if sf is not None:
                         sf.markup_mirror = bridge.publish_markup
+                        # Distributed history — a line typed at the DAEMON
+                        # terminal broadcasts to every attached cockpit
+                        # (origin None = nobody to exclude). Client lines
+                        # fan out at the bridge's input seam instead; this
+                        # only covers the daemon's own REPL surfaces.
+                        try:
+                            sf.history_fanout = bridge.publish_history_append
+                        except Exception:  # noqa: BLE001
+                            pass
                         # THE verb-output gap. `markup_mirror` above carries op
                         # lines and banners; the ~76 dispatch handlers print
                         # straight to `sf.console`, which renders on the

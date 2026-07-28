@@ -1283,6 +1283,7 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
             arg = text.split(None, 1)[1].strip() if " " in text else ""
             if ui is not None and hasattr(ui, "set_deck_size"):
                 ui.flash(ui.set_deck_size(arg))
+            _report_local_history(client, text)
             return "handled"
 
         # /keys is likewise a CLIENT concern when attached: the bindings
@@ -1297,6 +1298,7 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
                 client.send_input(forward)
                 return "sent"
             _render_client_keys(ui, text)
+            _report_local_history(client, text)
             return "handled"
 
         cmd = audio_verbs.get(low)
@@ -1315,6 +1317,9 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
             if cmd in ("wake", "force_wake"):
                 _maybe_summon_audio_plane(client, cmd)
             client.send_audio(cmd)
+            # Audio verbs travel on the audio lane, never as input —
+            # report them so other panes still recall the keystroke.
+            _report_local_history(client, text)
             return "handled"
         if text:
             if ui is not None and ui.should_flush_on_input():
@@ -1690,6 +1695,31 @@ def _render_client_keys(ui: Any, line: str) -> None:
         elif ui is not None and hasattr(ui, "flash"):
             first = str(result.text or "").splitlines() or [""]
             ui.flash(f"{first[0]} — `/keys daemon` for the daemon view")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _build_history_injector() -> Any:
+    """The client's ``on_history_append`` sink, or a no-op when the sync
+    module is unavailable. NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.history_sync import (
+            make_client_injector,
+        )
+        return make_client_injector()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _report_local_history(client: Any, text: str) -> None:
+    """A line this CLIENT handled locally still belongs in every other
+    terminal's recall — it never crosses as ``input``, so it travels as an
+    explicit history_append frame. NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.history_sync import (
+            send_local_append,
+        )
+        send_local_append(client, text)
     except Exception:  # noqa: BLE001
         pass
 
@@ -2689,6 +2719,10 @@ def run_attach(console: Any) -> int:
             on_audio_state=ui.on_audio_state,
             on_lane_history=ui.on_lane_history,
             on_lane_reaped=ui.on_lane_reaped,
+            # Another terminal's line → memory-only injection into THIS
+            # process's history singleton, so Up in this pane recalls
+            # what was just typed in that one (tmux split parity).
+            on_history_append=_build_history_injector(),
         )
         # The shield renders released gates through the SAME markup path
         # every other ⏺/⎿ line takes — one display, one ordering, and the

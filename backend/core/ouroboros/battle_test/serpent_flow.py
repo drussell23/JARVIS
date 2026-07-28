@@ -5496,6 +5496,17 @@ class SerpentREPL:
         handler, and async context is byte-for-byte identical to the
         pre-extraction inline dispatch.
         """
+        # Distributed history: a line typed at the DAEMON terminal must be
+        # recallable in every attached cockpit. The harness installs the
+        # bridge's fan-out here (`history_fanout`), exactly as it installs
+        # `markup_mirror` — origin None = broadcast to all clients (the
+        # daemon terminal is not an attach session to exclude).
+        _fanout = getattr(self, "history_fanout", None)
+        if callable(_fanout) and (line or "").strip():
+            try:
+                _fanout(line)
+            except Exception:  # noqa: BLE001
+                pass
         # Built-in commands
         if line in ("quit", "exit", "q"):
             self._flow.console.print(
