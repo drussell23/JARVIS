@@ -32,6 +32,46 @@ _NAME_COL_MAX_FRACTION = 0.34
 #: Gutter between the name column and the description column.
 _GUTTER = 3
 
+#: Share of visible names the column must fit WITHOUT overflowing. Sizing to
+#: the longest instead lets a single outlier dictate the layout: with
+#: `/backlog_auto_proposed` (22 chars) on screen, `/anticipate` was followed
+#: by fourteen spaces of dead gutter, and the eye has to cross all of it on
+#: every row to reach the description.
+_NAME_FIT_QUANTILE = 0.8
+
+
+def name_fit_quantile() -> float:
+    """How much of the list the name column must fit. Env-tunable.
+
+    A knob because it trades two real costs against each other: a lower value
+    tightens the common rows and ragged-wraps more outliers; a higher one
+    aligns everything and spends the width on gutter.
+    """
+    try:
+        raw = os.environ.get("JARVIS_PALETTE_NAME_QUANTILE", "").strip()
+        return min(1.0, max(0.1, float(raw))) if raw else _NAME_FIT_QUANTILE
+    except (TypeError, ValueError):
+        return _NAME_FIT_QUANTILE
+
+
+def _name_column(names: List[str]) -> int:
+    """Width that fits MOST names, not every name.
+
+    An outlier keeps its full text and simply starts its description one
+    gutter later — one ragged row, instead of every row paying for it. The
+    name is never clipped: it is the thing the operator has to type, and a
+    palette that hides half of `/backlog_auto_prop…` has stopped being a
+    palette.
+    """
+    try:
+        lengths = sorted(len(n) for n in names if n)
+        if not lengths:
+            return 0
+        index = int(round((len(lengths) - 1) * name_fit_quantile()))
+        return lengths[max(0, min(len(lengths) - 1, index))]
+    except Exception:  # noqa: BLE001
+        return max((len(n) for n in names), default=0)
+
 
 def palette_rows() -> int:
     """Maximum entries drawn at once (``JARVIS_PALETTE_HEIGHT``)."""
@@ -117,7 +157,7 @@ def layout_palette(
 
     names = [n for n, _d in entries]
     name_col = min(
-        max((len(n) for n in names), default=0),
+        _name_column(names),
         max(8, int(width * _NAME_COL_MAX_FRACTION)),
     )
     desc_col = max(8, width - name_col - _GUTTER - 2)
@@ -164,10 +204,24 @@ def layout_palette(
                 else "class:completion-menu.completion")
         meta = ("class:completion-menu.meta.completion.current" if current
                 else "class:completion-menu.meta.completion")
-        shown = _ellipsis(str(name), name_col)
+        # The name is NEVER clipped. It is the thing the operator has to
+        # type, and `/backlog_auto_prop…` has stopped being a palette entry.
+        # A name wider than the column OVERFLOWS: it keeps its full text, its
+        # description starts one gutter later, and that single row is ragged
+        # — which is strictly cheaper than every row paying for the outlier.
+        # An outlier overflows the COLUMN but never the fraction cap. Two
+        # invariants bound this and both are right: a palette line must fit
+        # the terminal, and one pathological name must not swallow the
+        # screen. Clipping at the cap satisfies both while still letting an
+        # ordinary long verb — `/backlog_auto_proposed` at 22 against a cap
+        # of 34 — keep its full text, which is the case that motivated this.
+        shown = _ellipsis(str(name), max(8, int(width * _NAME_COL_MAX_FRACTION)))
         pad = " " * max(0, name_col - len(shown))
-        body = _wrap(str(desc), desc_col) if wrap_descriptions else [
-            _ellipsis(str(desc), desc_col)
+        # Re-measured PER ROW, so an overflowing name cannot push its
+        # description past the terminal edge.
+        row_desc_col = max(8, width - len(shown) - len(pad) - _GUTTER - 2)
+        body = _wrap(str(desc), row_desc_col) if wrap_descriptions else [
+            _ellipsis(str(desc), row_desc_col)
         ]
         lines.append([
             (base, f"  {shown}{pad}"),
