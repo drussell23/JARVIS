@@ -338,6 +338,62 @@ def test_expand_declares_a_dynamic_ref_position() -> None:
 
 
 # --------------------------------------------------------------------------
+# 8b. history hardening — singleton, perms, dedupe, bounded file
+# --------------------------------------------------------------------------
+
+@pytest.fixture()
+def history_file(tmp_path, monkeypatch):
+    path = tmp_path / "hist"
+    monkeypatch.setenv(rc.HISTORY_PATH_ENV_VAR, str(path))
+    rc.reset_history_cache_for_tests()
+    yield path
+    rc.reset_history_cache_for_tests()
+
+
+def test_history_is_a_per_path_singleton(history_file) -> None:
+    pytest.importorskip("prompt_toolkit")
+    a = rc.build_history()
+    b = rc.build_history()
+    assert a is b  # two surfaces, ONE write-behind cache per file
+
+
+def test_history_file_is_owner_only(history_file) -> None:
+    pytest.importorskip("prompt_toolkit")
+    import stat
+    rc.build_history()
+    mode = stat.S_IMODE(history_file.stat().st_mode)
+    assert mode == 0o600
+
+
+def test_history_refuses_blanks_and_immediate_repeats(history_file) -> None:
+    pytest.importorskip("prompt_toolkit")
+    hist = rc.build_history()
+    hist.append_string("/status")
+    hist.append_string("/status")     # immediate repeat — dropped
+    hist.append_string("   ")         # blank — dropped
+    hist.append_string("/cost")
+    hist.append_string("/status")     # NOT consecutive — kept
+    assert hist.get_strings() == ["/status", "/cost", "/status"]
+
+
+def test_history_file_is_bounded_and_trim_is_entry_aware(
+    history_file, monkeypatch,
+) -> None:
+    pytest.importorskip("prompt_toolkit")
+    monkeypatch.setenv(rc.HISTORY_MAX_ENTRIES_ENV_VAR, "50")
+    # Write 120 entries in FileHistory's own on-disk grammar.
+    lines = []
+    for i in range(120):
+        lines.append(f"\n# 2026-07-27 00:00:{i:02d}\n")
+        lines.append(f"+cmd-{i}\n")
+    history_file.write_text("".join(lines))
+    hist = rc.build_history()
+    kept = list(hist.load_history_strings())   # newest-first
+    assert len(kept) == 50
+    assert kept[0] == "cmd-119" and kept[-1] == "cmd-70"
+
+
+# --------------------------------------------------------------------------
 # 9. /keys is answered by the process whose bindings it describes
 # --------------------------------------------------------------------------
 
