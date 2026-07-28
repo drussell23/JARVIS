@@ -1005,37 +1005,33 @@ def build_bipartite_application(
                 rows += [_turn_row]
         except Exception:  # noqa: BLE001
             logger.debug("[Bipartite] turn row unavailable", exc_info=True)
-    # WHO is working, directly above WHAT is happening to my turn. Both sit
-    # under the deck and above the prompt because they answer questions about
-    # the present, and the deck is the past.
-    if agent_rows is not None:
+    # AMBIENT state goes BELOW the prompt; ACTIVE surfaces go above.
+    #
+    # This is Claude Code's geometry and it is not arbitrary. Above the input
+    # box sits what is happening to the turn you just took — the working
+    # spinner, the search you are typing into. Below it sits the standing
+    # state: what mode you are in, what is running, what it has cost. The
+    # split is by whether the row is about the NEXT keystroke or about the
+    # session, and an operator reads downward from the thing they just did.
+    #
+    # These three were all mounted above the prompt as they were built, one
+    # per slice, each reasonable in isolation. Together they pushed the caret
+    # steadily down the screen behind a stack of state the operator was not
+    # asking about — the roster's header alone costs three rows every time an
+    # agent runs. `_below_prompt` collects them; the search bar stays above
+    # because while it is open it IS the next keystroke.
+    _below_prompt: list = []
+    for label, provider in (("agent", agent_rows), ("status", status_rows)):
+        if provider is None:
+            continue
         try:
-            _agent_row = build_dynamic_rows(agent_rows)
-            if _agent_row is not None:
-                rows += [_agent_row]
+            row = build_dynamic_rows(provider)
+            if row is not None:
+                _below_prompt.append(row)
         except Exception:  # noqa: BLE001
-            logger.debug("[Bipartite] agent row unavailable", exc_info=True)
-    # The status line sits between the agents and the search bar: it is
-    # ambient state rather than an event, so it belongs below the deck's
-    # flow and above the things the keyboard is currently talking to.
-    if status_rows is not None:
-        try:
-            _status_row = build_dynamic_rows(status_rows)
-            if _status_row is not None:
-                rows += [_status_row]
-        except Exception:  # noqa: BLE001
-            logger.debug("[Bipartite] status row unavailable", exc_info=True)
-    # The search bar sits DIRECTLY above the prompt — closest to the caret,
-    # because while it is open it is what the keyboard is talking to, and the
-    # eye should not have to hunt for the thing currently receiving its keys.
-    if search_rows is not None:
-        try:
-            _search_row = build_dynamic_rows(search_rows)
-            if _search_row is not None:
-                rows += [_search_row]
-        except Exception:  # noqa: BLE001
-            logger.debug("[Bipartite] search row unavailable", exc_info=True)
-    # The palette is NOT a row. See the FloatContainer below: as an HSplit row
+            logger.debug("[Bipartite] %s row unavailable", label,
+                         exc_info=True)
+    # The search bar sits DIRECTLY above the prompt    # The palette is NOT a row. See the FloatContainer below: as an HSplit row
     # it shares the ambient grid with the canvas, so every asynchronous Deck or
     # Lane frame arriving underneath forces the palette's geometry to be
     # recomputed along with everything else.
@@ -1084,6 +1080,8 @@ def build_bipartite_application(
         rows += [_rule(), prompt, _rule()]
         if _toolbar_row is not None:
             rows.append(_toolbar_row)
+    # The standing state, under the box the operator types into.
+    rows += _below_prompt
     # ── Region layout mount (PR #70213's seam, finally consumed) ──────
     #
     # `viewport_arbiter` has decided placements since #70187 and

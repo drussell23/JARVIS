@@ -506,8 +506,10 @@ def _clip(text: Any, width: int) -> str:
     return goal
 
 
-#: Rows the roster spends on itself: the hint, its blank, and `main`.
-_CHROME_ROWS = 3
+#: Rows the roster spends on itself. Just `main` now — the hint and its
+#: blank line were two rows charged on every render to teach two keys once,
+#: and they live in the keybinding registry where `?` and `/keys` find them.
+_CHROME_ROWS = 1
 
 
 def render_roster(
@@ -570,7 +572,17 @@ def render_roster(
         room = cols - (kind_w + 16)
         label_w = room if room >= _MIN_LABEL else 0
 
-        lines = [f"  {roster_hint()}", ""]
+        # NO permanent header.
+        #
+        # The hint and its blank line cost two rows every time an agent runs,
+        # forever, to teach two keys once. Claude Code's task area is the
+        # rows themselves; the keys live in `?`. A surface that re-teaches
+        # itself on every render is spending the operator's screen on their
+        # first minute of using it.
+        #
+        # `main` stays, because it is the row the cursor rests on and the
+        # thing every other row is a child of.
+        lines = []
         lines.append(f"{'❯' if selected is None else ' '} ⏺ main")
         for row in rows:
             state = str(row.get("state") or "running")

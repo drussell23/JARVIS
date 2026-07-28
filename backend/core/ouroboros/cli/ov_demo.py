@@ -687,31 +687,91 @@ def live_speed(argv: Sequence[str]) -> float:
     return 1.0
 
 
-def _live_toolbar(started: Callable[[], float], clock: Callable[[], float]):
-    """The pulse line, built from the CANONICAL frame source.
+def _live_toolbar(
+    started: Callable[[], float],
+    clock: Callable[[], float],
+    *,
+    ends_at: float = 0.0,
+    speed: float = 1.0,
+):
+    """The pulse line, rendered by the CockpitS OWN heartbeat formatter.
 
-    `ui.theme.ouroboros_frame` is what `serpent_flow` and `attach_heartbeat`
-    already render, so every surface shows the same frame at the same instant.
-    A second spinner here would drift against the real one and the demo would
-    be teaching the wrong rhythm.
+    `attach_heartbeat.format_heartbeat_line` is what every attached cockpit
+    draws. Composing a payload for it — rather than formatting a second
+    string here — is the same rule the tool beats follow: a demo with its own
+    draw path agrees with itself while the surface it demonstrates is broken.
+
+    THE ORGANISM STOPS WHEN THE WORK STOPS
+    ---------------------------------------
+    The previous version derived `tokens = elapsed * 780` from an unbounded
+    wall clock, so a demo left open for an hour advertised `74m 18s · ↓
+    3477.4k tokens` for a script that ends at 22.4 seconds. It was inventing
+    work, and the number was the loudest thing on the screen.
+
+    The script has a known end, so past it the payload goes `active=False` —
+    and the formatter's existing contract does the rest: an inactive frame
+    renders EMPTY and the toolbar falls back to its idle text. That is not a
+    clamp bolted onto a counter; it is exactly what the real pulse does when
+    an organism finishes an op, which is the behaviour worth demonstrating.
+
+    Elapsed and tokens are SCRIPT time, scaled by `--speed` like everything
+    else: at `--speed=4` a 22.4s op should read as having taken 22.4s of
+    organism time, not 5.6s of wall time.
     """
     def _render() -> str:
         try:
-            from backend.core.ouroboros.ui.theme import ouroboros_frame
+            from backend.core.ouroboros.battle_test.attach_heartbeat import (
+                format_heartbeat_line,
+            )
             now = clock()
-            elapsed = max(0.0, now - started())
-            glyph = ouroboros_frame(now)
-            phase = "Synthesizing" if any(
-                lo <= elapsed <= hi for lo, hi in _GENERATING) else "Watching"
-            # Derived from elapsed rather than accumulated, so a dropped frame
-            # cannot desynchronise the number from the clock beside it.
-            tokens = int(elapsed * 780)
-            mins, secs = divmod(int(elapsed), 60)
-            return (f"{glyph} {phase}… ({mins}m {secs}s · ↓ {tokens/1000:.1f}k "
-                    f"tokens · DEMO) — q to quit")
+            wall = max(0.0, now - started())
+            # Script time: what the ORGANISM experienced, not the operator.
+            script_t = wall * max(0.01, float(speed))
+            done = bool(ends_at) and script_t >= ends_at
+            elapsed = min(script_t, ends_at) if ends_at else script_t
+            active = not done and any(
+                lo <= elapsed <= hi for lo, hi in _GENERATING
+            )
+            line = format_heartbeat_line(
+                {
+                    "kind": "heartbeat",
+                    "active": True,
+                    "verb": "Synthesizing" if active else "Watching",
+                    "elapsed_s": elapsed,
+                    # Tokens accrue only while the organism is THINKING. A
+                    # counter that climbs during APPLY or while idle is
+                    # telling the operator something untrue about spend.
+                    "tokens_total": int(_generating_seconds(elapsed) * 780),
+                    "provider_label": "DEMO",
+                },
+                now_mono=now, arrival_mono=now,
+            )
+            if done:
+                return f"  ⏺ demo complete · {int(ends_at)}s — q to quit"
+            return f"{line.strip()} — q to quit" if line else (
+                "ov demo live — q to quit")
         except Exception:  # noqa: BLE001
             return "ov demo live — q to quit"
     return _render
+
+
+def _generating_seconds(elapsed: float) -> float:
+    """Seconds spent INSIDE a generating window, up to ``elapsed``.
+
+    Tokens are produced by thinking, not by the clock. Deriving them from
+    total elapsed made the counter climb while the organism was applying a
+    patch or sitting idle — spend the demo never incurred, in a field an
+    operator reads as real.
+    """
+    try:
+        total = 0.0
+        for lo, hi in _GENERATING:
+            if elapsed <= lo:
+                break
+            total += min(elapsed, hi) - lo
+        return max(0.0, total)
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 async def _drive(mux: Any, app: Any, speed: float,
@@ -830,10 +890,18 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
     speed = live_speed(argv)
 
     mux = BipartiteLayout()
+    script = compose_live_script()
     app = build_bipartite_application(
         mux,
         on_accept=lambda text: None,          # input is inert in a demo
-        toolbar=_live_toolbar(lambda: start[0], clock),
+        toolbar=_live_toolbar(
+            lambda: start[0], clock,
+            # The script's own end, derived rather than written: a beat added
+            # to `_LIVE_BEATS` must not leave the pulse claiming the demo
+            # finished while lines are still arriving.
+            ends_at=max((t for t, _ in script), default=0.0),
+            speed=speed,
+        ),
         extra_key_bindings=_live_exit_bindings(),
         # The agent view, from `serpent_flow`'s own in-process provider. The
         # scene already drives the roster; without the mount it would fill a
@@ -846,8 +914,6 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         mux.set_invalidate(app.invalidate)
     except Exception:  # noqa: BLE001
         pass
-
-    script = compose_live_script()
 
     async def _main() -> None:
         start[0] = clock()

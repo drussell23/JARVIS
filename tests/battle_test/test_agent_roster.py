@@ -47,7 +47,10 @@ def test_dispatched_agents_appear_under_main(roster) -> None:
     lines = r.render()
     assert "❯ ⏺ main" in lines
     assert any("Explore" in ln and "Map ov completion" in ln for ln in lines)
-    assert "  ↑/↓ to select · Enter to view" in lines
+    # NO permanent hint row: it cost two rows on every render, forever, to
+    # teach two keys once. They are registered with `keybinding_registry`,
+    # so `/keys` still finds them.
+    assert not any("to select" in ln for ln in lines)
 
 
 def test_a_running_agent_is_hollow_and_a_finished_one_is_filled(roster) -> None:

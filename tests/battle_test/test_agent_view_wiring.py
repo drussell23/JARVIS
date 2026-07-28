@@ -400,10 +400,10 @@ class TestHeightBudget:
         roster = self._swarm(40)
         snap = roster.snapshot(max_rows=10)      # producer already withheld 30
         assert snap["hidden"] == 30
-        # 9 rows − 3 chrome − 1 count row = 5 agents drawn, so 5 more fold.
+        # 9 rows − 1 chrome − 1 count row = 7 agents drawn, so 3 more fold.
         lines = render_roster(snap, width=100, max_lines=9)
         more = [ln for ln in lines if "more" in ln]
-        assert more and "35" in more[0]          # 30 withheld + 5 folded
+        assert more and "33" in more[0]          # 30 withheld + 3 folded
 
     def test_an_unknown_height_does_not_fold_against_a_guess(self):
         from backend.core.ouroboros.battle_test.agent_roster import (
@@ -412,7 +412,9 @@ class TestHeightBudget:
         assert roster_line_budget(None) is None
         assert roster_line_budget(0) is None
         snap = self._swarm(12).snapshot(max_rows=12)
-        assert len(render_roster(snap, width=100, max_lines=None)) == 12 + 3
+        # 12 agent rows + 1 chrome row (`main`) — the hint no longer costs
+        # two of every render.
+        assert len(render_roster(snap, width=100, max_lines=None)) == 12 + 1
 
     def test_the_share_is_proportional_not_a_row_count(self):
         """Eleven rows is a footer on a 60-row terminal and half the cockpit
@@ -423,10 +425,17 @@ class TestHeightBudget:
         assert roster_line_budget(60) > roster_line_budget(24)
 
     def test_an_impossible_budget_renders_nothing_rather_than_chrome(self):
-        """Three rows of hint and `main` with no agents under them is a
-        header for a list that is not there."""
+        """`main` and a count row with no agents between them is a header for
+        a list that is not there.
+
+        The threshold moved when the permanent hint was dropped: chrome is
+        one row now, so a 3-row budget CAN say something honest (main, one
+        agent, "… N more"). Two rows cannot, and that is where it goes
+        silent.
+        """
         snap = self._swarm(5).snapshot()
-        assert render_roster(snap, width=100, max_lines=3) == []
+        assert render_roster(snap, width=100, max_lines=3) != []
+        assert render_roster(snap, width=100, max_lines=2) == []
 
     def test_the_wire_window_is_not_the_display_window(self):
         """A 60-row client and a 24-row one attach to the same daemon.
