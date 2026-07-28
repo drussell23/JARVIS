@@ -4566,6 +4566,48 @@ class BattleTestHarness:
                 except Exception:  # noqa: BLE001
                     return {}
 
+            def _on_autonomy(action: str) -> None:
+                # The Transactional Viewport Lock's execution seam — the
+                # SAME intake pause the pause/resume verbs flip (DRY: one
+                # implementation, two entrances). The bridge refcounts and
+                # only calls on edge transitions; the idempotence guards
+                # here are belt + braces.
+                try:
+                    if action == "pause" and not self._intake_paused:
+                        self._repl_cmd_pause()
+                    elif action == "resume" and self._intake_paused:
+                        self._repl_cmd_resume()
+                except Exception:  # noqa: BLE001
+                    logger.debug("[Attach] autonomy sink degraded",
+                                 exc_info=True)
+
+            def _rewind_provider(limit: int) -> list:
+                # The Esc-Esc menu's data — the EXISTING /undo planner in
+                # preview mode, serialized. No second snapshot system.
+                try:
+                    from backend.core.ouroboros.battle_test.undo_command import (  # noqa: E501
+                        UndoPlanner,
+                    )
+                    plan = UndoPlanner(
+                        Path(self._config.repo_path),
+                        governed_loop_service=self._governed_loop_service,
+                    ).plan(limit, mode="preview")
+                    return [
+                        {
+                            "n": i + 1,
+                            "sha": t.short_sha,
+                            "label": t.display_label,
+                            "is_ov": t.is_ov,
+                            "insertions": t.insertions,
+                            "deletions": t.deletions,
+                        }
+                        for i, t in enumerate(plan.targets)
+                    ]
+                except Exception:  # noqa: BLE001
+                    logger.debug("[Attach] rewind provider degraded",
+                                 exc_info=True)
+                    return []
+
             bridge = CockpitAttachBridge(
                 status_provider=_status_provider,
                 ops_provider=_ops_provider,
@@ -4573,6 +4615,8 @@ class BattleTestHarness:
                 fabrics_provider=_fabrics_provider,
                 on_input=_on_input,
                 on_audio=lambda cmd: self._dispatch_audio_cmd(cmd),
+                on_autonomy=_on_autonomy,
+                rewind_provider=_rewind_provider,
             )
             self._audio_synapse = AudioVisualSynapse(
                 bridge.publish_audio_state,

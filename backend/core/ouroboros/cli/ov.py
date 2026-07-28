@@ -1274,6 +1274,16 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
         low = text.lower()
         if low in ("detach", "exit", "quit"):
             return "detach"
+
+        # `!` shell mode (CC parity): one command on THIS machine, output
+        # into this operator's scrollback. Runs in an executor — a slow
+        # command never blocks a keystroke. A bare "!" falls through as
+        # ordinary text.
+        if text.startswith("!") and text[1:].strip():
+            import asyncio as _aio
+            _aio.ensure_future(_run_client_shell(ui, client, text))
+            return "handled"
+
         audio_verbs = AUDIO_VERBS
         # /deck sizing is a CLIENT concern — two cockpits on different
         # terminals want different amounts of screen, and the daemon has no
@@ -1480,6 +1490,25 @@ async def _split_plane_loop(
             install_history_search(_kb, _hist_controller)
     except Exception:  # noqa: BLE001 — search is a bonus, typing is not
         _hist_controller = None
+    # Rewind source + the client action set — the SAME composition the
+    # bipartite surface mounts, so the two cannot diverge.
+    try:
+        from backend.core.ouroboros.battle_test.rewind_menu import (
+            merge_rewind_completer,
+        )
+        _completer = merge_rewind_completer(
+            _completer, getattr(ui, "rewind", None),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    _extra_kb = _client_extra_bindings(ui, client)
+    if _extra_kb is not None:
+        try:
+            from prompt_toolkit.key_binding import merge_key_bindings
+            _kb = (merge_key_bindings([_kb, _extra_kb])
+                   if _kb is not None else _extra_kb)
+        except Exception:  # noqa: BLE001
+            pass
     # ONE persistent session, dynamic prompt + rigid footer toolbar:
     # both are callables re-evaluated on every repaint, so an
     # audio_state frame morphs the footer via app.invalidate() while
@@ -1695,6 +1724,188 @@ def _render_client_keys(ui: Any, line: str) -> None:
         elif ui is not None and hasattr(ui, "flash"):
             first = str(result.text or "").splitlines() or [""]
             ui.flash(f"{first[0]} — `/keys daemon` for the daemon view")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ring_gate_bell() -> None:
+    """An Iron Gate opened while the operator may be in another pane —
+    ring the terminal (BEL) and post an OSC-9 notification (iTerm2/kitty
+    forward it to the OS). Writes to the REAL stdout, bypassing any
+    patched proxy; a non-TTY gets nothing. Env: JARVIS_GATE_BELL_ENABLED
+    (default true). NEVER raises."""
+    try:
+        if os.environ.get("JARVIS_GATE_BELL_ENABLED", "true").strip().lower() \
+                in ("0", "false", "no", "off"):
+            return
+        out = sys.__stdout__
+        if out is None or not out.isatty():
+            return
+        out.write("\x1b]9;O+V: Iron Gate awaiting approval\x07\a")
+        out.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _on_autonomy_state_frame(ui: Any, frame: Any) -> None:
+    """The viewport lock's broadcast truth — every pane shows the freeze,
+    whoever caused it. NEVER raises."""
+    try:
+        paused = bool(frame.get("paused"))
+        holders = int(frame.get("holders", 0) or 0)
+        try:
+            ui.autonomy_paused = paused
+        except Exception:  # noqa: BLE001
+            pass
+        if paused:
+            ui.flash(f"⏸ autonomy held ({holders} viewer"
+                     f"{'s' if holders != 1 else ''})", seconds=4.0)
+        else:
+            ui.flash("▶ autonomy flowing", seconds=2.0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _run_client_shell(ui: Any, client: Any, text: str) -> None:
+    """``!`` shell mode — run one command on THIS terminal's machine,
+    render its output into the operator's scrollback, report the line to
+    distributed history. Off the event loop (executor) so a slow command
+    never freezes a keystroke. NEVER raises."""
+    import asyncio
+    import subprocess
+
+    cmd = text[1:].strip()
+
+    def _run() -> str:
+        try:
+            proc = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=30,
+            )
+            body = (proc.stdout or "") + (proc.stderr or "")
+            tail = f"\n[exit {proc.returncode}]" if proc.returncode else ""
+            return (body.rstrip() or "(no output)") + tail
+        except subprocess.TimeoutExpired:
+            return "(timed out after 30s)"
+        except Exception as exc:  # noqa: BLE001
+            return f"(shell failed: {exc})"
+
+    try:
+        loop = asyncio.get_running_loop()
+        output = await loop.run_in_executor(None, _run)
+        sink = getattr(ui, "markup_sink", None) if ui is not None else None
+        try:
+            from rich.markup import escape as _escape
+        except Exception:  # noqa: BLE001
+            def _escape(s: str) -> str:
+                return s
+        if callable(sink):
+            sink(_escape(f"⏺ ! {cmd}"), True)
+            for ln in output.splitlines()[:200]:
+                sink("  " + _escape(ln), True)
+        elif ui is not None and hasattr(ui, "flash"):
+            ui.flash(output.splitlines()[0] if output else "(done)")
+        _report_local_history(client, text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _client_extra_bindings(ui: Any, client: Any) -> Any:
+    """The client-side action set both attach surfaces mount — every key
+    remappable via keybindings.json, every action ALSO reachable as a
+    typed verb so keystroke and verb are one code path. Returns a
+    KeyBindings or None. NEVER raises."""
+    try:
+        from prompt_toolkit.filters import Condition
+        from prompt_toolkit.key_binding import KeyBindings
+
+        from backend.core.ouroboros.battle_test.keymap import bind_action
+
+        kb = KeyBindings()
+
+        @Condition
+        def _empty_buffer() -> bool:
+            try:
+                from prompt_toolkit.application.current import get_app_or_none
+                app = get_app_or_none()
+                return app is not None and not app.current_buffer.text
+            except Exception:  # noqa: BLE001
+                return False
+
+        def _cycle_trust(event: Any) -> None:
+            try:
+                client.send_input("/trust cycle")
+                ui.flash("⛨ cycling trust dial…", seconds=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+        bind_action(
+            kb, "app:cycleTrust", ("shift+tab",), _cycle_trust,
+            context="Chat",
+            description="cycle the autonomy trust dial (/trust cycle)",
+        )
+
+        def _show_help(event: Any) -> None:
+            _render_client_keys(ui, "/keys")
+
+        bind_action(
+            kb, "app:help", ("?",), _show_help,
+            context="Chat", filter=_empty_buffer,
+            description="show keyboard shortcuts (empty prompt only)",
+        )
+
+        def _external_editor(event: Any) -> None:
+            _edit_in_external_editor(event)
+
+        bind_action(
+            kb, "chat:externalEditor", ("ctrl+g",), _external_editor,
+            context="Chat",
+            description="edit the prompt in $EDITOR",
+        )
+
+        rewind = getattr(ui, "rewind", None)
+        if rewind is not None:
+            try:
+                from backend.core.ouroboros.battle_test.rewind_menu import (
+                    install_rewind_binding,
+                )
+                install_rewind_binding(kb, rewind)
+            except Exception:  # noqa: BLE001
+                pass
+        return kb
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _edit_in_external_editor(event: Any) -> None:
+    """Ctrl+G — compose in $EDITOR; the buffer comes back as the prompt.
+    Suspends the TUI for the editor's lifetime via prompt_toolkit's own
+    seam. NEVER raises."""
+    try:
+        import subprocess
+        import tempfile
+
+        buf = event.app.current_buffer
+        editor = (os.environ.get("VISUAL") or os.environ.get("EDITOR")
+                  or "vi")
+
+        def _edit() -> None:
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w+", suffix=".ov-prompt", delete=False,
+                ) as fh:
+                    fh.write(buf.text)
+                    path = fh.name
+                subprocess.run([*editor.split(), path], check=False)
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read().rstrip("\n")
+                os.unlink(path)
+                buf.text = content
+                buf.cursor_position = len(content)
+            except Exception:  # noqa: BLE001
+                pass
+
+        from prompt_toolkit.application import run_in_terminal
+        run_in_terminal(_edit)
     except Exception:  # noqa: BLE001
         pass
 
@@ -2098,12 +2309,19 @@ def _prompt_buffer() -> Any:
 def _on_prompt_frame(ui: Any, frame: Any) -> None:
     """A gate arrived. Show it only if the operator is not mid-sentence.
 
+    The bell rings REGARDLESS of composing state — an operator in another
+    tmux pane cannot see a deferred badge, and a gate that expires unseen
+    auto-REJECTs. The Global Bell Arbiter's clear-side already exists:
+    resolution in ANY terminal broadcasts `prompt_resolved`, and every
+    client's shield dismisses the badge.
+
     `composing` is answered from the LIVE buffer at the moment of arrival —
     the one fact that decides everything here, and the reason the FSM takes
     it as an argument rather than reading a global it cannot be tested
     against.
     """
     try:
+        _ring_gate_bell()
         shield = getattr(ui, "shield", None)
         if shield is None:
             return
@@ -2572,6 +2790,30 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             pass
         return base
 
+    # Client action set (trust cycle, ?, Ctrl+G, Esc-Esc rewind) merged
+    # with PTT through the layout's ONE extra-bindings seam.
+    _extra_kb = _client_extra_bindings(ui, client)
+    if _ptt_kb is not None and _extra_kb is not None:
+        try:
+            from prompt_toolkit.key_binding import merge_key_bindings
+            _extra_kb = merge_key_bindings([_ptt_kb, _extra_kb])
+        except Exception:  # noqa: BLE001
+            _extra_kb = _ptt_kb
+    elif _extra_kb is None:
+        _extra_kb = _ptt_kb
+
+    # The rewind menu rides the same palette the verb completions use.
+    _completer = _build_slash_completer()
+    try:
+        from backend.core.ouroboros.battle_test.rewind_menu import (
+            merge_rewind_completer,
+        )
+        _completer = merge_rewind_completer(
+            _completer, getattr(ui, "rewind", None),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
     try:
         await run_bipartite_repl(
             on_accept=_on_accept,
@@ -2580,11 +2822,12 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             watch_alive=_alive,
             header=header_render,
             header_height=header_height,
-            extra_key_bindings=_ptt_kb,
+            extra_key_bindings=_extra_kb,
             # The `/` palette. THIS is the surface the operator actually
             # types into — the bipartite Application, not the split-plane
-            # PromptSession the completer was first wired to.
-            completer=_build_slash_completer(),
+            # PromptSession the completer was first wired to. (Composed
+            # above with the gated rewind source.)
+            completer=_completer,
             # Persistent recall + history ghost-text — the same history
             # file every surface shares, so Up-arrow survives a detach.
             history=_build_prompt_history(),
@@ -2750,7 +2993,27 @@ def run_attach(console: Any) -> int:
             # process's history singleton, so Up in this pane recalls
             # what was just typed in that one (tmux split parity).
             on_history_append=_build_history_injector(),
+            # The viewport lock's broadcast truth — a freeze any pane
+            # causes is visible in this one.
+            on_autonomy_state=lambda f: _on_autonomy_state_frame(ui, f),
+            # Esc-Esc menu hydration, delivered to the controller bound
+            # just below (late-bound: the controller needs the client).
+            on_rewind_list=lambda f: (
+                getattr(ui, "rewind", None) is not None
+                and ui.rewind.deliver(f)
+            ),
         )
+        # The Transactional Viewport Lock's client half. Lives on the ui
+        # so both attach surfaces reach it without new plumbing.
+        try:
+            from backend.core.ouroboros.battle_test.rewind_menu import (
+                RewindController,
+            )
+            ui.rewind = RewindController(
+                client, notify=lambda m: ui.flash(m, seconds=3.0),
+            )
+        except Exception:  # noqa: BLE001
+            ui.rewind = None
         # The shield renders released gates through the SAME markup path
         # every other ⏺/⎿ line takes — one display, one ordering, and the
         # gate lands in scrollback the operator can page back to.
