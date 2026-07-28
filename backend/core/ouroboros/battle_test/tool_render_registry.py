@@ -165,6 +165,14 @@ class ToolRenderDescriptor:
     body_lexer: Optional[str]
     summarize_args: ArgsSummarizer
     summarize_result: ResultSummarizer
+    #: What the ARGUMENT is — "path", "command", "text" or "url".
+    #:
+    #: The header used to style every argument as a file path, because the
+    #: only descriptors reaching that branch WERE file tools. Once every tool
+    #: routed through it, `Bash(python3 -m pytest …)` and `Search("except
+    #: Exception")` rendered blue-underlined like clickable links. A command
+    #: is not a file, and a pattern is not a location.
+    arg_kind: str = "text"
     schema_version: str = TOOL_RENDER_REGISTRY_SCHEMA_VERSION
 
 
@@ -500,6 +508,7 @@ def _make(
     body_lexer: Optional[str],
     args_fn: ArgsSummarizer,
     result_fn: ResultSummarizer,
+    arg_kind: str = "text",
 ) -> ToolRenderDescriptor:
     return ToolRenderDescriptor(
         tool_kind=tool_kind,
@@ -509,6 +518,7 @@ def _make(
         body_lexer=body_lexer,
         summarize_args=_safe_args_summarizer(args_fn),
         summarize_result=_safe_result_summarizer(result_fn),
+        arg_kind=arg_kind,
     )
 
 
@@ -518,21 +528,25 @@ _DESCRIPTORS: Mapping[str, ToolRenderDescriptor] = {
         "read_file", "📄", "Read",
         BodyShape.NONE, None,
         _summarize_path_arg, _summarize_read,
+        arg_kind="path",
     ),
     "list_symbols": _make(
         "list_symbols", "📋", "Symbols",
         BodyShape.MULTI_LINE, "text",
         _summarize_path_arg, _summarize_list_symbols,
+        arg_kind="path",
     ),
     "list_dir": _make(
         "list_dir", "📂", "List",
         BodyShape.MULTI_LINE, "text",
         _summarize_path_arg, _summarize_list_dir,
+        arg_kind="path",
     ),
     "glob_files": _make(
         "glob_files", "📁", "Glob",
         BodyShape.MULTI_LINE, "text",
         _summarize_search_arg, _summarize_glob,
+        arg_kind="path",
     ),
     "search_code": _make(
         "search_code", "🔍", "Search",
@@ -543,38 +557,45 @@ _DESCRIPTORS: Mapping[str, ToolRenderDescriptor] = {
         "get_callers", "🔗", "Callers",
         BodyShape.MULTI_LINE, "text",
         _summarize_default_arg, _summarize_callers,
+        arg_kind="path",
     ),
     # ---- Write-shape (CC-style Update/Write headers) --------------------
     "edit_file": _make(
         "edit_file", "✏️", "Update",
         BodyShape.DIFF, "diff",
         _summarize_path_arg, _summarize_edit,
+        arg_kind="path",
     ),
     "write_file": _make(
         "write_file", "📝", "Write",
         BodyShape.SINGLE_LINE, None,
         _summarize_path_arg, _summarize_write,
+        arg_kind="path",
     ),
     "delete_file": _make(
         "delete_file", "🗑️", "Delete",
         BodyShape.SINGLE_LINE, None,
         _summarize_path_arg, _summarize_delete,
+        arg_kind="path",
     ),
     # ---- Execution-shape (LOG body) -------------------------------------
     "bash": _make(
         "bash", "💻", "Bash",
         BodyShape.LOG, "bash",
         _summarize_bash_arg, _summarize_bash,
+        arg_kind="command",
     ),
     "run_tests": _make(
         "run_tests", "🧪", "Test",
         BodyShape.LOG, "text",
         _summarize_default_arg, _summarize_tests,
+        arg_kind="path",
     ),
     "type_check": _make(
         "type_check", "🔬", "TypeCheck",
         BodyShape.LOG, "text",
         _summarize_default_arg, _summarize_type_check,
+        arg_kind="command",
     ),
     # ---- Git-shape ------------------------------------------------------
     "git_log": _make(
@@ -586,17 +607,20 @@ _DESCRIPTORS: Mapping[str, ToolRenderDescriptor] = {
         "git_diff", "📊", "GitDiff",
         BodyShape.DIFF, "diff",
         _summarize_default_arg, _summarize_git_diff,
+        arg_kind="path",
     ),
     "git_blame": _make(
         "git_blame", "🔎", "GitBlame",
         BodyShape.MULTI_LINE, "text",
         _summarize_path_arg, _summarize_git_blame,
+        arg_kind="path",
     ),
     # ---- Async-native (ToolManifest-only, not in _dispatch) -------------
     "web_fetch": _make(
         "web_fetch", "🌐", "Fetch",
         BodyShape.MULTI_LINE, "text",
         _summarize_default_arg, _summarize_web_fetch,
+        arg_kind="url",
     ),
     "web_search": _make(
         "web_search", "🌐", "WebSearch",
