@@ -86,6 +86,7 @@ def _master_enabled() -> bool:
 def dispatch_proposals_command(
     line: str,
 ) -> ProposalsReplDispatchResult:
+    """Review, accept or reject proposed changes."""
     if not _matches(line):
         return ProposalsReplDispatchResult(
             ok=False, text="", matched=False,

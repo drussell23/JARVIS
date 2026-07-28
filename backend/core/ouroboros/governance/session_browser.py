@@ -847,6 +847,7 @@ def dispatch_session_command(
     *,
     browser: Optional[SessionBrowser] = None,
 ) -> SessionDispatchResult:
+    """Browse, bookmark and replay past sessions."""
     if not _matches(line):
         return SessionDispatchResult(ok=False, text="", matched=False)
     try:

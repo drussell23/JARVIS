@@ -84,6 +84,7 @@ def _master_enabled() -> bool:
 def dispatch_dashboard_command(
     line: str,
 ) -> DashboardReplDispatchResult:
+    """Operator dashboard panes, heatmap and layout."""
     if not _matches(line):
         return DashboardReplDispatchResult(
             ok=False, text="", matched=False,

@@ -269,6 +269,7 @@ def _render_stats() -> str:
 def dispatch_monitor_command(
     line: str,
 ) -> MonitorReplDispatchResult:
+    """Recent monitor samples and counters."""
     if not _matches(line):
         return MonitorReplDispatchResult(
             ok=False, text="", matched=False,

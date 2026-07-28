@@ -164,6 +164,7 @@ def _render_stats() -> str:
 def dispatch_events_command(
     line: str,
 ) -> EventsReplDispatchResult:
+    """L1 event emitter throughput and counters."""
     if not _matches(line):
         return EventsReplDispatchResult(
             ok=False, text="", matched=False,
