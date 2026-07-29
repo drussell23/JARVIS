@@ -67,6 +67,19 @@ def flow_mode_enabled() -> bool:
     return os.environ.get(_FLOW_MODE_ENV_VAR, "0").strip().lower() in _TRUTHY
 
 
+#: Longest single line the deck will carry from a generation. A model can
+#: emit a 40k-character line; the deck is a ring of terminal rows.
+_MIRROR_MAX_LINE_CHARS = 2000
+
+
+def mirror_stream_enabled() -> bool:
+    """Default ON. Off, the generation is invisible on an attached cockpit
+    again — which is the state this exists to end. NEVER raises."""
+    return os.environ.get(
+        "JARVIS_STREAM_MIRROR_ENABLED", "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
 def find_commit_boundary(text: str, start: int = 0) -> int:
     """Return the index up to which ``text`` can be safely committed to
     scrollback: just past the LAST complete blank line that sits OUTSIDE
@@ -184,6 +197,15 @@ class StreamRenderer:
         # the env gate at start() so one op never splits across modes.
         self._flow_mode: bool = False
         self._committed_offset: int = 0
+        #: How much of the buffer has been MIRRORED to attached cockpits.
+        #:
+        #: Separate from `_committed_offset`, which belongs to the local Live
+        #: widget's scrollback commits. They advance on different triggers and
+        #: for different audiences; sharing one cursor would make a local
+        #: terminal's rendering decisions silently truncate a remote deck.
+        self._mirrored_offset: int = 0
+        #: Has this stream announced itself to the deck yet?
+        self._mirror_opened: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -329,6 +351,11 @@ class StreamRenderer:
         # synchronous drain opportunity.
         self._drain_remaining_sync()
 
+        # FINAL mirror flush — the tail after the last newline would
+        # otherwise never reach an attached cockpit, so every generation
+        # would lose its closing sentence.
+        self._mirror_completed_lines(final=True)
+
         if self._live is not None:
             try:
                 from rich.markdown import Markdown
@@ -375,6 +402,8 @@ class StreamRenderer:
         self._queue = None
         self._buffer = ""
         self._committed_offset = 0
+        self._mirrored_offset = 0
+        self._mirror_opened = False
         self._flow_mode = False
         self._op_id = ""
         self._provider = ""
@@ -518,6 +547,9 @@ class StreamRenderer:
                     self._buffer += "".join(pending)
                     pending.clear()
                     self._render_buffer_safe()
+                    # Same batch tick as the local widget, so the remote deck
+                    # and a local terminal see the generation at one cadence.
+                    self._mirror_completed_lines()
                     last_render = now
         except asyncio.CancelledError:
             # Final flush on cancellation (end() path). Any pending
@@ -528,6 +560,79 @@ class StreamRenderer:
                 pending.clear()
                 self._render_buffer_safe()
             raise
+
+    def _mirror_completed_lines(self, *, final: bool = False) -> None:
+        """Send completed LINES of the generation to attached cockpits.
+
+        WHY THIS EXISTS
+        ---------------
+        The Rich `Live` widget is skipped whenever a SerpentREPL is active —
+        it "writes via direct cursor manipulation that bypasses
+        `patch_stdout` and clobbers the input prompt". In `ov` the REPL is
+        always active, so the visible stream has never rendered there, and
+        enabling it would corrupt the line the operator is typing on. The
+        widget cannot be the answer; it is the thing that does not fit.
+
+        What DOES fit is the channel the cockpit already has: a mirrored,
+        line-oriented deck. So the generation arrives as it is written,
+        a line at a time, next to the ⏺ blocks it belongs with.
+
+        WHY NOT `find_commit_boundary`
+        -------------------------------
+        That helper commits at blank lines OUTSIDE fenced code blocks, so
+        Rich can re-parse a complete Markdown block in scrollback. The deck
+        does not re-parse — it draws escaped text. Borrowing that rule here
+        would make a long paragraph or an open code fence show NOTHING until
+        the stream ended, which is the silence this exists to fix. Different
+        medium, different boundary: the last newline.
+
+        NEVER raises, and never blocks — the bridge publish is a queue put.
+        """
+        try:
+            if not mirror_stream_enabled():
+                return
+            end = len(self._buffer)
+            if not final:
+                nl = self._buffer.rfind("\n", self._mirrored_offset)
+                if nl < 0:
+                    return
+                end = nl + 1
+            chunk = self._buffer[self._mirrored_offset:end]
+            if not chunk.strip():
+                self._mirrored_offset = end
+                return
+
+            from backend.core.ouroboros.battle_test.cockpit_attach import (
+                publish_markup_global,
+            )
+            from rich.markup import escape
+
+            lines = chunk.splitlines()
+            sent_any = False
+            for raw in lines:
+                text = raw.rstrip()
+                if not text and not sent_any:
+                    continue
+                # Model output is UNTRUSTED — escaped before it touches a
+                # channel documented as styled chrome around inert data.
+                body = escape(text[:_MIRROR_MAX_LINE_CHARS])
+                if len(text) > _MIRROR_MAX_LINE_CHARS:
+                    body += "…"
+                if not self._mirror_opened:
+                    # One ⏺ opens the block, as assistant prose does in the
+                    # deck's grammar; continuations indent under it.
+                    lead = f"⏺ {body}"
+                    self._mirror_opened = True
+                else:
+                    lead = f"  {body}"
+                if publish_markup_global(lead):
+                    sent_any = True
+            self._mirrored_offset = end
+        except Exception:  # noqa: BLE001 — a mirror must not break a stream
+            logger.debug(
+                "[StreamRender] op=%s mirror degraded", self._op_id,
+                exc_info=True,
+            )
 
     def _render_buffer_safe(self) -> None:
         """Swap the Markdown renderable on Live. Rich handles the
