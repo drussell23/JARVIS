@@ -53,6 +53,15 @@ def _context_pct(op_id: str) -> float:
         return 0.0
 
 
+def _pending_apply_payload() -> Optional[dict]:
+    """Open rejection windows, or None. NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.pending_apply import snapshot
+        return snapshot()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _status_payload(snap: Any) -> Optional[dict]:
     """The status snapshot as a transport dict, or None. NEVER raises."""
     try:
@@ -309,6 +318,11 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
             # builder, which is empty by construction and would draw an
             # eternally idle organism.
             "status": _status_payload(snap),
+            # An apply waiting out its rejection window. Carried here rather
+            # than mirrored as text because a countdown is STATE — the panel
+            # that draws it locally repaints eight times a second, and the
+            # bridge is a line stream.
+            "pending_apply": _pending_apply_payload(),
             "effort": effort,
             "provider": provider,
             "provider_label": provider_label,

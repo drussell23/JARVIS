@@ -3127,6 +3127,7 @@ class SerpentFlow:
             )
             return await self._notify_apply_plain_fallback(
                 delay_s=delay_s, cancel_check=cancel_check,
+                op_id=op_id, reason=reason,
             )
 
         # Optional on-disk dump — never fails loudly.
@@ -3140,12 +3141,14 @@ class SerpentFlow:
         if not should_render(self.console):
             return await self._notify_apply_plain_fallback(
                 delay_s=delay_s, cancel_check=cancel_check,
+                op_id=op_id, reason=reason,
             )
 
         if not changes:
             # Degenerate — still honor the delay so behavior is unchanged.
             return await self._notify_apply_plain_fallback(
                 delay_s=delay_s, cancel_check=cancel_check,
+                op_id=op_id, reason=reason,
             )
 
         try:
@@ -3153,6 +3156,7 @@ class SerpentFlow:
         except Exception:
             return await self._notify_apply_plain_fallback(
                 delay_s=delay_s, cancel_check=cancel_check,
+                op_id=op_id, reason=reason,
             )
 
         renderer = DiffPreviewRenderer()
@@ -3177,6 +3181,7 @@ class SerpentFlow:
             )
             return await self._notify_apply_plain_fallback(
                 delay_s=delay_s, cancel_check=cancel_check,
+                op_id=op_id, reason=reason,
             )
 
         try:
@@ -3226,6 +3231,8 @@ class SerpentFlow:
         *,
         delay_s: float,
         cancel_check: Optional[Any] = None,
+        op_id: str = "",
+        reason: str = "",
     ) -> bool:
         """Legacy plain-sleep path — used when the rich preview is off
         or fails. Polls the cancel flag on the same 250ms cadence so
@@ -3233,25 +3240,59 @@ class SerpentFlow:
         """
         import asyncio
         import time as _time
-        deadline = _time.monotonic() + max(0.0, delay_s)
-        while True:
-            remaining = deadline - _time.monotonic()
-            if remaining <= 0:
-                break
+
+        # PUBLISH THE WINDOW.
+        #
+        # This path is taken whenever the rich preview cannot draw — which,
+        # on a detached daemon, is ALWAYS: `should_render` asks whether this
+        # process's console is a terminal, and a daemon's is not. So the
+        # attached operator was told `/reject <op> to cancel` and then given
+        # five seconds of silence to act in.
+        #
+        # The panel itself cannot be mirrored — `Live` repaints a region
+        # eight times a second and the bridge is a line stream. What crosses
+        # is the STATE, on the heartbeat, drawn by a strip that re-renders
+        # each frame; the shape the roster and status line already use.
+        _pending_op = str(op_id or "").strip()
+        try:
+            from backend.core.ouroboros.battle_test.pending_apply import (
+                note_pending,
+            )
+            note_pending(_pending_op, delay_s=delay_s, reason=reason or "")
+        except Exception:  # noqa: BLE001 — a strip must not gate an apply
+            pass
+
+        try:
+            deadline = _time.monotonic() + max(0.0, delay_s)
+            while True:
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    break
+                if cancel_check is not None:
+                    try:
+                        if cancel_check():
+                            return True
+                    except Exception:
+                        pass
+                await asyncio.sleep(min(0.25, max(0.05, remaining)))
             if cancel_check is not None:
                 try:
                     if cancel_check():
                         return True
                 except Exception:
                     pass
-            await asyncio.sleep(min(0.25, max(0.05, remaining)))
-        if cancel_check is not None:
+            return False
+        finally:
+            # ONE exit for the strip. Rejection returns early from inside the
+            # loop, so clearing on the success path alone would leave a
+            # rejected op counting down forever on every attached cockpit.
             try:
-                if cancel_check():
-                    return True
-            except Exception:
+                from backend.core.ouroboros.battle_test.pending_apply import (
+                    clear_pending,
+                )
+                clear_pending(_pending_op)
+            except Exception:  # noqa: BLE001
                 pass
-        return False
 
     # ── Operation completion ──────────────────────────────────
 
