@@ -1274,7 +1274,7 @@ class SerpentFlow:
                 pass
 
         # ── Legacy multi-section dashboard (unchanged below) ──
-        _on = "[bright_green]ON[/bright_green]"
+        _on = f"[{_SEM['life']}]ON[/]"
         _off = "[dim]OFF[/dim]"
 
         # Header — single bright line, no border.
@@ -1320,7 +1320,7 @@ class SerpentFlow:
             f"  [dim]│[/dim]  {n_sensors} sensors" if n_sensors else ""
         )
         self.console.print(
-            f"[bright_green]🔋 Organism alive[/bright_green]{sensor_str}"
+            f"[{_SEM['life']}]🔋 Organism alive[/]{sensor_str}"
             f"  [dim]│[/dim]  Ctrl+C to stop"
         )
         if log_path:
@@ -1377,8 +1377,8 @@ class SerpentFlow:
         summary_lines = [
             f"[bold]Session[/bold]   {self._session_id}",
             f"[bold]Uptime[/bold]    {mins}m {secs:02d}s",
-            f"[bold]Evolved[/bold]   [green]{self._completed}[/green]  "
-            f"[bold]Shed[/bold] [red]{self._failed}[/red]",
+            f"[bold]Evolved[/bold]   [{_SEM['success']}]{self._completed}[/]  "
+            f"[bold]Shed[/bold] [{_SEM['death']}]{self._failed}[/]",
             f"[bold]Cost[/bold]      ${self._cost_total:.4f} of ${self._cost_cap:.2f}",
         ]
         panel = Panel(
@@ -1790,8 +1790,8 @@ class SerpentFlow:
         short = _short_id(op_id)
         w = self._block_w()
         stats = (
-            f"🐍 [green]✅ {self._completed}[/green]  "
-            f"[red]💀 {self._failed}[/red] [dim]│[/dim] "
+            f"🐍 [{_SEM['success']}]✅ {self._completed}[/]  "
+            f"[{_SEM['death']}]💀 {self._failed}[/] [dim]│[/dim] "
             f"💰 ${self._cost_total:.4f}/${self._cost_cap:.2f}"
         )
         # Attach mirror: session tally at op close (width-agnostic — the
@@ -2485,7 +2485,7 @@ class SerpentFlow:
         # Risk badge
         risk = risk_tier.upper() if risk_tier else ""
         if risk in ("SAFE_AUTO", "LOW"):
-            risk_badge = f"[green]{risk}[/green]"
+            risk_badge = f"[{_SEM['success']}]{risk}[/]"
         elif risk == "MEDIUM":
             risk_badge = f"[{_SEM['heal']}]{risk}[/{_SEM['heal']}]"
         elif risk:
@@ -2995,13 +2995,13 @@ class SerpentFlow:
             self._op_line(
                 op_id,
                 f"[{_SEM['life']}]🛡️ immune[/{_SEM['life']}]      "
-                f"[green]✅ {test_count}/{test_count} passing[/green]",
+                f"[{_SEM['success']}]✅ {test_count}/{test_count} passing[/]",
             )
         else:
             self._op_line(
                 op_id,
                 f"[{_SEM['death']}]🛡️ immune[/{_SEM['death']}]      "
-                f"[red]❌ {failures}/{test_count} failing[/red]",
+                f"[{_SEM['death']}]❌ {failures}/{test_count} failing[/]",
             )
 
     # ── L2 Repair ─────────────────────────────────────────────
@@ -3066,7 +3066,7 @@ class SerpentFlow:
             )
             self._op_line(
                 op_id,
-                f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  [green]✅ {test_total}/{test_total} passing[/green]",
+                f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  [{_SEM['success']}]✅ {test_total}/{test_total} passing[/]",
             )
         else:
             passing = test_total - test_failures
@@ -3076,7 +3076,7 @@ class SerpentFlow:
             )
             self._op_line(
                 op_id,
-                f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  [red]❌ {test_failures} failing, {passing} passing[/red]",
+                f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  [{_SEM['death']}]❌ {test_failures} failing, {passing} passing[/]",
             )
 
     # ── Code preview ──────────────────────────────────────────
@@ -7163,7 +7163,7 @@ class SerpentREPL:
 
         f.console.print()
         f.console.print(
-            f"[cyan]🐍 Organism Status[/cyan]"
+            f"[{_SEM['neural']}]🐍 Organism Status[/]"
             f"  [dim]({mins}m {secs:02d}s elapsed)[/dim]"
         )
         # Compact one-liner from the preserved status_line.py data layer
@@ -7183,8 +7183,8 @@ class SerpentREPL:
             f"  [bold]Session[/bold]      {f._session_id}"
         )
         f.console.print(
-            f"  [bold]Evolved[/bold]      [green]{f._completed}[/green]"
-            f"  [dim]│[/dim]  [bold]Shed[/bold] [red]{f._failed}[/red]"
+            f"  [bold]Evolved[/bold]      [{_SEM['success']}]{f._completed}[/]"
+            f"  [dim]│[/dim]  [bold]Shed[/bold] [{_SEM['death']}]{f._failed}[/]"
             f"  [dim]│[/dim]  [bold]Active[/bold] {len(f._active_ops)}"
             f"  [dim]│[/dim]  [bold]Sensors[/bold] {f._sensors_active}"
         )
@@ -7193,6 +7193,12 @@ class SerpentREPL:
             f" / ${f._cost_cap:.2f}"
             f"  [dim]│[/dim]  [bold]Lessons[/bold] {len(f._session_lessons)}"
             f"  [dim]│[/dim]  [bold]Plan Review[/bold] "
+            # NOT migrated: this quoted string lives INSIDE an f-string
+            # expression, so `_SEM['success']` would reuse the delimiter
+            # and terminate it. Hoisting the styles to locals is the fix,
+            # but this sits inside an implicit string-concatenation block
+            # where a statement cannot be inserted — ast.parse refused it.
+            # Left correct rather than restructured blind.
             f"{'[green]ON[/green]' if f._plan_review_mode else '[dim]OFF[/dim]'}"
         )
         if f._route_costs:
@@ -7508,7 +7514,7 @@ class SerpentREPL:
         ]
         panel = Panel(
             "\n".join(lines),
-            title="[cyan]🐍 Commands[/cyan]",
+            title=f"[{_SEM['neural']}]🐍 Commands[/]",
             border_style="dim",
             width=min(self._flow.console.width, 54),
             padding=(0, 1),

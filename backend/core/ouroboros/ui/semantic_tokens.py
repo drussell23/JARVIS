@@ -81,6 +81,10 @@ _ROLE_TO_SEMANTIC: Dict[str, str] = {
     # deferred from the mechanical pass precisely because no existing role
     # fit: mapping a goal's TAGS to `provider` would have said the tag came
     # from an external brain.
+    # elevated severity — the missing concept behind 21 `bright_*`
+    # literals no existing role could absorb.
+    "alert": "alert",           # emphatic warning, wants the eye NOW
+    "highlight": "highlight",   # picked out of surrounding text
     "milestone": "info",        # a goal reached completion
     "annotation": "venom_purple",   # labels attached to a goal
     # metadata — ids, costs, timings. The most common role, deliberately

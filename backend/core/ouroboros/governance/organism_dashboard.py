@@ -38,6 +38,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -391,7 +399,7 @@ def format_organism_dashboard(
     if not snapshot.rendered_panes:
         return ""
 
-    sections = ["[bright_yellow]🪐 ORGANISM DASHBOARD[/]"]
+    sections = [f"[{_SEM['alert']}]🪐 ORGANISM DASHBOARD[/]"]
     sections.append(
         f"[dim]aggregated {snapshot.aggregated_at_unix:.0f} · "
         f"{len(snapshot.rendered_panes)} panes · "

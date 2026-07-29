@@ -52,6 +52,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -513,7 +521,7 @@ def format_intervention_banner_panel(
         )
     if not banners:
         return ""
-    parts = ["[bright_yellow]🌐 Recently queued by autonomy:[/]"]
+    parts = [f"[{_SEM['alert']}]🌐 Recently queued by autonomy:[/]"]
     for b in banners[-limit:]:
         glyph = {
             BannerKind.SENSOR_INTERVENTION: "🌐",
@@ -561,7 +569,7 @@ def format_prefetch_indicator(
         PrefetchKind.GLOB_FILES: "🗂",
         PrefetchKind.OTHER: "•",
     }
-    parts = ["[bright_cyan]🔍 Pre-fetching:[/]"]
+    parts = [f"[{_SEM['neural']}]🔍 Pre-fetching:[/]"]
     for p in prefetches[-limit:]:
         g = glyphs.get(p.prefetch_kind, "•")
         arg = f" {p.arg_summary}" if p.arg_summary else ""

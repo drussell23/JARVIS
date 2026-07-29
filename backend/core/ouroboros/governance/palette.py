@@ -64,6 +64,14 @@ These are the only ANSI/Rich tokens permitted in
 """
 from __future__ import annotations
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 
 # ---------------------------------------------------------------------------
 # Canonical palette constants — bright-green outcome celebration ONLY
@@ -303,7 +311,7 @@ def lint_governance_for_bright_green_leaks(
             # composed forms.
             # Pattern 2: Rich `bright_green` markup as a
             # substring of any string literal. Catches both
-            # ``"[bright_green]X[/bright_green]"`` Rich tags +
+            # ``f"[{_SEM['life']}]X[/]"`` Rich tags +
             # palette dict entries like ``"life":
             # "bright_green"``.
             if "\033[92m" in v or "bright_green" in v:

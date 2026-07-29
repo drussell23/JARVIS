@@ -511,6 +511,11 @@ def severity_style(rank: int, tier: Optional[ColorTier] = None) -> str:
 # overrides (e.g. a CRITICAL-urgent AWE launch styled venom-green, not red).
 # Values are tier-resolved so a descriptor never carries a raw literal.
 _SEMANTIC_TRUE: Mapping[str, str] = {
+    # Elevated severity: an emphatic warning wanting the operator's eye
+    # NOW — distinct from `warn` (routine caution) and `crit` (failed).
+    # Registered HERE because this module owns colour; a token-layer
+    # override would be a second palette.
+    "alert": "#E3B341", "highlight": "#FFFFFF",
     "crit": "#F85149", "crit_bold": "bold #F85149", "warn": "#E3B341",
     "info": "#58B0F8", "verbose": "#6C7D77", "muted": "#6C7D77",
     "ok": "#3FB950", "ok_bold": "bold #5EE06A", "venom_green": "#5EE06A",
@@ -524,6 +529,7 @@ _SEMANTIC_TRUE: Mapping[str, str] = {
     "ink": PALETTE["ink"], "faint": PALETTE["faint"],
 }
 _SEMANTIC_STD: Mapping[str, str] = {
+    "alert": "bright_yellow", "highlight": "bright_white",
     "crit": "red", "crit_bold": "bold red", "warn": "yellow",
     "info": "cyan", "verbose": "bright_black", "muted": "dim",
     "ok": "green", "ok_bold": "bold green", "venom_green": "green",

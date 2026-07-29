@@ -50,6 +50,14 @@ import logging
 import os
 from typing import Any, Dict, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -262,7 +270,7 @@ def format_posture_aurora_badge(
       * Posture or confidence malformed
 
     ``plain=False`` (default) — returns Rich-markup-wrapped form
-    like ``"[bright_green]🐍 EXPLORE[/bright_green]"``. Uses
+    like ``f"[{_SEM['life']}]🐍 EXPLORE[/]"``. Uses
     Rich-style ``[color]text[/color]`` markup so consumers can
     pass it through any Rich console / Text builder.
 

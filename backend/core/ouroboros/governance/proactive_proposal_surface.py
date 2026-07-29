@@ -47,6 +47,14 @@ from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -649,7 +657,7 @@ def format_proposal_panel(
         )
     if not proposals:
         return ""
-    parts = ["[bright_yellow]🌱 Pending proposals:[/]"]
+    parts = [f"[{_SEM['alert']}]🌱 Pending proposals:[/]"]
     for p in proposals[-limit:]:
         kg = _KIND_GLYPHS.get(p.kind, "•")
         dg = _DECISION_GLYPHS.get(p.decision, "?")

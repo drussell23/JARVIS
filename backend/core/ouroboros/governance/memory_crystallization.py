@@ -36,6 +36,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -546,7 +554,7 @@ def format_crystal_timeline(
     except (TypeError, ValueError):
         cap = 5
 
-    parts = ["[bright_yellow]🪨 Memory crystallization timeline:[/]"]
+    parts = [f"[{_SEM['alert']}]🪨 Memory crystallization timeline:[/]"]
     age_summary_parts = []
     for age in CrystalAge:
         n = timeline.by_age.get(age.value, 0)
