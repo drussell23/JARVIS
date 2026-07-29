@@ -234,3 +234,25 @@ class TestNeverRaises:
                                 "traceback": tb}, max_frames=5)
         assert any("f39.py" in r for r in rows)
         assert not any("f0.py" in r for r in rows)
+
+
+class TestTheDemoShowsIt:
+    def test_the_overlay_appears_in_the_demo(self):
+        from backend.core.ouroboros.cli import ov_demo as d
+        lo, _hi = d._PANIC_AT
+        rows = d._panic_rows(lo + 0.5, 90)
+        assert rows and "FATAL" in rows[0]
+
+    def test_it_is_absent_before_the_fault(self):
+        from backend.core.ouroboros.cli import ov_demo as d
+        assert d._panic_rows(1.0, 90) == []
+
+    def test_it_uses_a_REAL_traceback(self):
+        """A pre-formatted block would keep looking right through a
+        regression in `render_panic`'s frame selection."""
+        import inspect
+
+        from backend.core.ouroboros.cli import ov_demo as d
+        src = inspect.getsource(d._panic_rows)
+        assert "render_panic" in src
+        assert "format_exception" in src

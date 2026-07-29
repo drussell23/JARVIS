@@ -281,3 +281,31 @@ class TestNeverRaises:
         )
         monkeypatch.setenv("JARVIS_OPERATOR_INPUT_QUEUE_ENABLED", "0")
         assert input_queue_enabled() is False
+
+
+class TestTheDemoShowsIt:
+    """`ov demo live` is where this gets WATCHED. A surface only the real
+    organism can drive is a surface nobody checks."""
+
+    def test_the_backlog_appears_and_drains(self):
+        from backend.core.ouroboros.cli import ov_demo as d
+        lo, hi = d._BACKLOG
+        assert d._queue_rows(lo + 0.2, 90), "no backlog during the window"
+        assert d._queue_rows(hi + 2.0, 90) == [], "it never drained"
+
+    def test_it_is_silent_outside_the_window(self):
+        from backend.core.ouroboros.cli import ov_demo as d
+        assert d._queue_rows(1.0, 90) == []
+
+    def test_it_uses_the_COCKPITS_renderer(self):
+        import inspect
+
+        from backend.core.ouroboros.cli import ov_demo as d
+        assert "render_queue" in inspect.getsource(d._queue_rows)
+
+    def test_the_demo_MOUNTS_it(self):
+        import inspect
+
+        from backend.core.ouroboros.cli import ov_demo as d
+        src = inspect.getsource(d.scene_live)
+        assert "queue_rows=" in src and "panic_rows=" in src
