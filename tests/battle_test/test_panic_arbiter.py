@@ -446,3 +446,121 @@ class TestTheStackFrameNecromancer:
         import inspect
         src = inspect.getsource(pa.report)
         assert "tb_text + " in src or "reconstructed from the dying task" in src
+
+
+class TestTheProvenanceTaskFactory:
+    """Spawn context without `loop.set_debug(True)`.
+
+    asyncio ties `source_traceback` to global debug mode, which slows every
+    await to serve a logging side effect. A task factory gets the same
+    fact — who created the task that died — for one cheap frame walk.
+    """
+
+    @pytest.mark.asyncio
+    async def test_it_stamps_without_global_debug(self):
+        loop = asyncio.get_running_loop()
+        assert loop.get_debug() is False
+        assert pa.install_task_factory(loop) is True
+
+        async def worker():
+            return 1
+
+        t = asyncio.ensure_future(worker())
+        await t
+        assert getattr(t, pa.SPAWN_ATTR, None), "task was not stamped"
+        assert loop.get_debug() is False, "debug mode was switched on"
+
+    @pytest.mark.asyncio
+    async def test_the_necromancer_reads_the_stamp(self):
+        """The whole point: a stripped exception names its spawn site."""
+        pa.install_task_factory()
+
+        async def worker():
+            raise Exception("")
+
+        t = asyncio.ensure_future(worker())
+        await asyncio.sleep(0.02)
+        exc = t.exception()
+        exc.__traceback__ = None
+        rebuilt = pa.reconstruct_context({"future": t}, exc)
+        assert rebuilt.get("spawned_at"), rebuilt
+        assert "test_panic_arbiter" in rebuilt["spawned_at"]
+
+    @pytest.mark.asyncio
+    async def test_it_is_idempotent(self):
+        loop = asyncio.get_running_loop()
+        assert pa.install_task_factory(loop) is True
+        first = loop.get_task_factory()
+        assert pa.install_task_factory(loop) is True
+        assert loop.get_task_factory() is first, "the factory re-wrapped itself"
+
+    @pytest.mark.asyncio
+    async def test_it_CHAINS_an_existing_factory(self):
+        """A factory is a single global slot. Clobbering one installed by
+        another subsystem would silently break whatever it was doing."""
+        loop = asyncio.get_running_loop()
+        loop.set_task_factory(None)
+        seen: list = []
+
+        def _prior(loop_, coro, **kw):
+            seen.append(1)
+            return asyncio.Task(coro, loop=loop_, **kw)
+
+        loop.set_task_factory(_prior)
+        pa.install_task_factory(loop)
+
+        async def worker():
+            return 1
+
+        t = asyncio.ensure_future(worker())
+        await t
+        assert seen, "the prior factory was clobbered"
+        assert getattr(t, pa.SPAWN_ATTR, None)
+        loop.set_task_factory(None)
+
+    @pytest.mark.asyncio
+    async def test_task_semantics_are_untouched(self):
+        """`name` and `context` are keyword-only params Task gains across
+        versions; delegating construction keeps them working."""
+        loop = asyncio.get_running_loop()
+        loop.set_task_factory(None)
+        pa.install_task_factory(loop)
+
+        async def worker():
+            return 42
+
+        t = asyncio.ensure_future(worker())
+        t.set_name("named-task")
+        assert await t == 42
+        assert t.get_name() == "named-task"
+        loop.set_task_factory(None)
+
+    def test_capture_skips_asyncio_plumbing(self):
+        """asyncio's own internals are never the interesting caller."""
+        assert all("/asyncio/" not in f for f, _l, _n in pa._capture_spawn())
+
+    def test_formatting_is_DEFERRED_to_panic_time(self):
+        """The walk stores raw tuples; `traceback.extract_stack` reads
+        source from disk and cost 4-38us per task. A session that never
+        crashes must not pay to format a stack nobody reads."""
+        import ast as _ast
+        import inspect
+        import textwrap
+        # Checked as CALLS. The docstring NAMES `extract_stack` precisely
+        # to explain why it is not used, and a substring check cannot tell
+        # an explanation from an invocation — the third time this session
+        # my own prose has failed my own structural test.
+        tree = _ast.parse(textwrap.dedent(inspect.getsource(pa._capture_spawn)))
+        called = {
+            getattr(n.func, "attr", getattr(n.func, "id", ""))
+            for n in _ast.walk(tree) if isinstance(n, _ast.Call)
+        }
+        assert "extract_stack" not in called
+        assert "_getframe" in called
+
+    @pytest.mark.parametrize("junk", [None, (), "x", [(1, 2)], object()])
+    def test_formatting_junk_degrades(self, junk):
+        assert isinstance(pa.format_spawn(junk), str)
+
+    def test_a_factory_failure_never_stops_the_daemon(self):
+        assert pa.install_task_factory(object()) is False

@@ -1303,6 +1303,16 @@ class BattleTestHarness:
                 install_panic_broadcast()
             except Exception:  # noqa: BLE001
                 pass
+            # Stamp every task with its spawn site, so a dying task can
+            # name who started it WITHOUT `loop.set_debug(True)` — which
+            # would slow every await to serve a logging side effect.
+            try:
+                from backend.core.ouroboros.battle_test.panic_arbiter import (
+                    install_task_factory,
+                )
+                install_task_factory(_running_loop)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:
             logger.debug("Failed to install harness asyncio exception handler", exc_info=True)
 
