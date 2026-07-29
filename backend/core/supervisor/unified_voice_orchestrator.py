@@ -1372,6 +1372,22 @@ async def _resolve_voice(preferred: str) -> str:
     return preferred
 
 
+def _voice_muted() -> bool:
+    """Is the organism under an operator-requested silence? NEVER raises.
+
+    Read fresh on every call rather than cached, so `/voice mute` takes
+    effect on the next sentence rather than the next restart — an operator
+    reaching for silence is usually reaching for it NOW.
+    """
+    try:
+        import os as _os
+        return _os.environ.get(
+            "JARVIS_VOICE_MUTED", "0",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def safe_say(
     text: str,
     voice: str = "Daniel",
@@ -1420,6 +1436,24 @@ async def safe_say(
     # ONE primitive the whole process speaks through, rather than in each of
     # the thirteen narrators that call it.
     #
+    # MASTER MUTE — checked before everything, including `skip_gate`.
+    #
+    # There were thirteen voice flags (JARVIS_KAREN_*, JARVIS_*_NARRATOR_*,
+    # JARVIS_APPROVAL_NARRATION_*) and no single answer to "be quiet".
+    # Silencing the organism meant knowing which subsystem was talking,
+    # which is the one thing an operator who wants silence does not want to
+    # think about. One flag at the ONE primitive the whole process speaks
+    # through is the only place that question has a complete answer.
+    #
+    # It outranks `skip_gate` deliberately. That carve-out exists for
+    # messages urgent enough to say whether or not the room is ready — but
+    # an operator who has explicitly asked for silence IS the room, and a
+    # mute that still speaks is not a mute.
+    if _voice_muted():
+        logger.debug("[safe_say:%s] muted — not speaking: %s",
+                     source, text[:60])
+        return False
+
     # `skip_gate` is the deliberate carve-out and it already existed for
     # exactly this class of message: something urgent enough to say whether
     # or not the room is ready for it. Emergencies still speak.
