@@ -625,10 +625,14 @@ class TestAuthorityAllowlist:
         """Slice 4 hot path allowlist; module-owned registration
         functions (``register_flags`` / ``register_shipped_invariants``)
         are STRUCTURALLY exempt — boot-time discovery only."""
-        allowed = {
-            "backend.core.ouroboros.governance.inline_permission_prompt",
-            "backend.core.ouroboros.governance.inline_prompt_gate_runner",
-        }
+        # Read from the module, never restated here. A test with its own
+        # copy of the list enforces a rule the code does not have — and a
+        # duplicated vocabulary is the exact defect this renderer already
+        # shipped once, when its action hint lost `/always`.
+        from backend.core.ouroboros.governance.inline_prompt_gate_renderer import (  # noqa: E501
+            SLICE4_IMPORT_ALLOWLIST,
+        )
+        allowed = set(SLICE4_IMPORT_ALLOWLIST)
         tree = ast.parse(self._renderer_source())
         registration_funcs = {"register_flags", "register_shipped_invariants"}
         exempt_ranges = []

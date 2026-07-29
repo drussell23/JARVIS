@@ -120,6 +120,24 @@ PHASE_BOUNDARY_HEADER: str = "[Phase Boundary]"
 #: prompt_id truncation so the two visual styles align.
 PROMPT_ID_DISPLAY_CHARS: int = 40
 
+#: Modules this renderer may import. Slice 4 is operator-UX, not
+#: authority, and staying scoped is the point of the invariant.
+#:
+#: A module-level constant because the invariant TEST used to keep its own
+#: copy of this set — two hands writing one list, which is the identical
+#: defect this module's `/always` drift came from. The runtime validator
+#: and the test now read the same object, so the list cannot be extended
+#: in one place and enforced in the other.
+SLICE4_IMPORT_ALLOWLIST: frozenset = frozenset({
+    "backend.core.ouroboros.governance.inline_permission_prompt",
+    "backend.core.ouroboros.governance.inline_prompt_gate_runner",
+    # Same tier as this module: composes labels and parses answers, grants
+    # nothing and decides nothing. The controller remains the only
+    # authority. Admitted so the operator vocabulary has ONE source
+    # instead of one per renderer.
+    "backend.core.ouroboros.governance.gate_choices",
+})
+
 #: Verb dictionary for terminal-state rendering. Mirrors the
 #: existing ConsoleInlineRenderer.dismiss vocabulary so operators
 #: see a consistent set of verbs across both phase-boundary and
@@ -132,12 +150,37 @@ TERMINAL_STATE_VERBS: Dict[str, str] = {
 }
 
 #: Action hint rendered with every prompt — points operators at the
-#: existing REPL verbs that resolve the controller Future
-#: (Slice 3 confirmed these work for phase-boundary prompts via
-#: the shared singleton — no new verbs needed).
-PROMPT_ACTIONS_HINT: str = (
+#: existing REPL verbs that resolve the controller Future.
+#:
+#: DERIVED, not written. The hand-written version of this string had
+#: already lost ``/always`` while the sibling renderer in
+#: ``inline_permission_repl`` still listed it — so at a phase-boundary
+#: prompt the operator was never told that "allow and remember" exists,
+#: though the dispatcher accepts it and the store persists it. Two hands
+#: writing the same vocabulary is the defect; composing it from the
+#: choice set means there is nothing left to drift.
+#:
+#: Kept as a module constant because it is exported and pinned, but it is
+#: now a projection of :func:`gate_choices.compose_gate_choices` rather
+#: than an independent claim about what the controller accepts.
+def _default_actions_hint() -> str:
+    try:
+        from backend.core.ouroboros.governance.gate_choices import (
+            compose_gate_choices, render_verbs,
+        )
+        # No grant scope: a phase-boundary projection carries no ``tool``,
+        # so ``/always`` genuinely cannot be described here and is omitted
+        # rather than advertised with an invented scope.
+        return render_verbs(compose_gate_choices()) or _FALLBACK_ACTIONS_HINT
+    except Exception:  # noqa: BLE001
+        return _FALLBACK_ACTIONS_HINT
+
+
+_FALLBACK_ACTIONS_HINT: str = (
     "    actions  : /allow   /deny <reason>   /pause"
 )
+
+PROMPT_ACTIONS_HINT: str = _default_actions_hint()
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +246,10 @@ def format_phase_boundary_block(projection: Dict[str, Any]) -> str:
             f"    rule     : {rule_id}",
             f"    timeout  : {timeout_s:.1f}s",
             f"    prompt_id: {_truncate(prompt_id, max_chars=PROMPT_ID_DISPLAY_CHARS)}",
-            PROMPT_ACTIONS_HINT,
-            "",
         ]
+        lines.extend(_choice_lines(target))
+        lines.append(PROMPT_ACTIONS_HINT)
+        lines.append("")
         return "\n".join(lines)
     except Exception as exc:  # noqa: BLE001 — last-resort defensive
         logger.debug(
@@ -213,6 +257,31 @@ def format_phase_boundary_block(projection: Dict[str, Any]) -> str:
             "degraded: %s", exc,
         )
         return f"\n  {PHASE_BOUNDARY_HEADER} (render degraded)\n"
+
+
+def _choice_lines(target: str) -> list:
+    """The numbered block for a phase-boundary prompt. NEVER raises.
+
+    ``/always`` is omitted here on purpose: this projection carries no
+    ``tool``, so the grant's scope cannot be stated truthfully, and an
+    option inviting the operator to "not ask again" about a boundary they
+    cannot see is worse than one fewer option. The per-tool-call renderer,
+    which DOES know the tool, offers it.
+    """
+    try:
+        from backend.core.ouroboros.governance.gate_choices import (
+            compose_gate_choices, describe_grant_scope, render_choices,
+        )
+        choices = compose_gate_choices(
+            question="What do you want to do?",
+            grant_scope=describe_grant_scope(target_path=target),
+        )
+        rows = render_choices(choices)
+        return [""] + rows if rows else []
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[InlinePromptGateRenderer] choice block degraded", exc_info=True)
+        return []
 
 
 def format_dismiss_line(projection: Dict[str, Any]) -> str:
@@ -418,6 +487,7 @@ __all__ = [
     "PENDING_EVENT",
     "PHASE_BOUNDARY_HEADER",
     "PROMPT_ACTIONS_HINT",
+    "SLICE4_IMPORT_ALLOWLIST",
     "PROMPT_ID_DISPLAY_CHARS",
     "PrintCallback",
     "TERMINAL_EVENTS",
@@ -453,10 +523,7 @@ def register_shipped_invariants() -> list:
         modules. The renderer is operator-UX nicety, not authority
         — staying scoped is critical."""
         violations: list = []
-        allowed = {
-            "backend.core.ouroboros.governance.inline_permission_prompt",
-            "backend.core.ouroboros.governance.inline_prompt_gate_runner",
-        }
+        allowed = set(SLICE4_IMPORT_ALLOWLIST)
         registration_funcs = {
             "register_flags",
             "register_shipped_invariants",
