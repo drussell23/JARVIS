@@ -359,6 +359,19 @@ class BipartiteLayout:
                 return self._anchor(list(visible[1:]) + [
                     f"[reverse dim] {status} [/reverse dim]",
                 ])
+            # At the LIVE TAIL, say that history exists — once.
+            #
+            # `status` is the counterpart and only ever renders while
+            # SCROLLED: it tells a reader how to get back, and nothing told
+            # them they could leave. The alternate screen took the terminal's
+            # own scrollback, so an operator who does not know the key has no
+            # way to reach 20,000 retained lines. It costs the same one row
+            # the status does, and only until they scroll once.
+            hint = self._viewport.tail_hint(above)
+            if hint:
+                return self._anchor(list(visible[1:]) + [
+                    f"[bright_black] {hint} [/bright_black]",
+                ])
             return self._anchor(list(visible))
         except Exception:  # noqa: BLE001
             return []
@@ -642,6 +655,15 @@ def _mount_region_layout(rows: "list") -> Any:
     except Exception:  # noqa: BLE001
         logger.debug("[Bipartite] region layout mount degraded", exc_info=True)
         return HSplit(rows)
+
+#: The cockpit Application's repaint period.
+#:
+#: Named because more than the Application depends on it: `serpent_rule`
+#: advances whole cells per FRAME, so it has to be told the frame period or
+#: its motion beats against the real one. A literal in two places is how
+#: those two silently disagree.
+_REFRESH_INTERVAL_S: float = 0.1
+
 
 def build_dynamic_rows(rows: Callable[[], Any]) -> Any:
     """A strip that is EXACTLY as tall as whatever it currently holds.
@@ -1007,6 +1029,12 @@ def build_bipartite_application(
                         live = False
                     return rule_fragments(
                         _row, width, _t.monotonic(), active=live,
+                        # The Application's OWN repaint period, so the head
+                        # advances a whole number of cells per frame. A speed
+                        # picked independently of the frame rate produces a
+                        # beat — 1.8 cells/frame renders as 1,2,2,2,2,1,… and
+                        # that stray 1 is what an eye reads as stutter.
+                        interval=_REFRESH_INTERVAL_S,
                     )
                 except Exception:  # noqa: BLE001
                     return [("fg:#a371f7", "─" * 80)]
@@ -1259,7 +1287,7 @@ def build_bipartite_application(
         # off on its own by an operator who selects text more than they
         # scroll — keeping the flicker-free rendering either way.
         mouse_support=mouse_enabled(),
-        refresh_interval=0.1,
+        refresh_interval=_REFRESH_INTERVAL_S,
         **({"style": _style} if _style is not None else {}),
         **({"color_depth": _depth} if _depth is not None else {}),
     )

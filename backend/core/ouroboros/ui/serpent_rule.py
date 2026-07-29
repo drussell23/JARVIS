@@ -45,9 +45,11 @@ logger = logging.getLogger("Ouroboros.SerpentRule")
 SERPENT_RULE_SCHEMA_VERSION = "serpent_rule.v1"
 
 MASTER_FLAG_ENV_VAR = "JARVIS_SERPENT_RULE_ENABLED"
-SPEED_ENV_VAR = "JARVIS_SERPENT_RULE_SPEED"
+CELLS_PER_FRAME_ENV_VAR = "JARVIS_SERPENT_RULE_CELLS_PER_FRAME"
+FRAME_INTERVAL_ENV_VAR = "JARVIS_SERPENT_RULE_FRAME_S"
 CHASE_ENV_VAR = "JARVIS_SERPENT_RULE_CHASE_S"
 BODY_ENV_VAR = "JARVIS_SERPENT_RULE_BODY"
+LEAD_ENV_VAR = "JARVIS_SERPENT_RULE_LEAD"
 
 #: Rows of the path. 0 = the rule above the caret, 1 = the rule below it.
 TOP, BOTTOM = 0, 1
@@ -71,14 +73,43 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
         return default
 
 
-def speed_cells_s() -> float:
-    """Cells per second.
+def frame_interval_s() -> float:
+    """The surface's repaint period — the animation's time quantum.
 
-    Constant SPEED rather than constant laps: a lap is a different distance
-    on an 80-column terminal and a 200-column one, and an operator reads
-    motion at a rate, not as a fraction of a screen they are not measuring.
+    Named and tunable because the smoothness of this animation is a function
+    of it, not of any speed chosen independently. Defaults to the cockpit
+    Application's `refresh_interval`; callers that repaint at a different
+    rate pass their own to :func:`rule_fragments`.
     """
-    return _env_float(SPEED_ENV_VAR, 18.0, 1.0, 120.0)
+    return _env_float(FRAME_INTERVAL_ENV_VAR, 0.1, 0.01, 2.0)
+
+
+def cells_per_frame() -> float:
+    """Cells the head advances per repaint. FRACTIONAL, and that is the point.
+
+    An integer step removed the beat but not the steppiness: one whole
+    character every 100 ms is a teleport of a character's width, ten times a
+    second. A cell is the atom of POSITION in a terminal, so the remaining
+    smoothness had to come from somewhere other than position.
+
+    It comes from INTENSITY — see :func:`_coverage`. Once a mark can sit
+    between two cells, fractional steps are not merely allowed, they are
+    required: an exactly-integer step lands on a cell boundary every frame
+    and the sub-cell machinery never engages.
+
+    Default 0.6 — a step small enough that the glide is continuous and large
+    enough that the creature is visibly travelling.
+    """
+    return _env_float(CELLS_PER_FRAME_ENV_VAR, 0.6, 0.05, 8.0)
+
+
+def speed_cells_s(interval: Optional[float] = None) -> float:
+    """Derived, never chosen: cells per frame over the frame period."""
+    try:
+        return cells_per_frame() / max(0.001, float(
+            interval if interval is not None else frame_interval_s()))
+    except Exception:  # noqa: BLE001
+        return 6.0
 
 
 def chase_period_s() -> float:
@@ -88,6 +119,15 @@ def chase_period_s() -> float:
     catch — plays out at a pace a glance can follow.
     """
     return _env_float(CHASE_ENV_VAR, 6.0, 0.5, 120.0)
+
+
+def lead_cells() -> int:
+    """How far ahead the prey starts. Cells, so it means the same thing on
+    every terminal."""
+    try:
+        return max(2, min(80, int(os.environ.get(LEAD_ENV_VAR, "") or 14)))
+    except (TypeError, ValueError):
+        return 14
 
 
 def body_length() -> int:
@@ -133,9 +173,9 @@ def cell_at(index: int, width: int) -> Tuple[int, int]:
 class ChaseFrame:
     """One instant of the chase, as positions along the circuit."""
 
-    head: int
-    body: Tuple[int, ...]
-    prey: int
+    head: float
+    body: Tuple[float, ...]
+    prey: float
     biting: bool
     width: int
 
@@ -144,7 +184,9 @@ class ChaseFrame:
         return path_length(self.width)
 
 
-def frame(t: float, width: int) -> Optional[ChaseFrame]:
+def frame(
+    t: float, width: int, *, interval: Optional[float] = None,
+) -> Optional[ChaseFrame]:
     """The chase at time ``t``, or None when it cannot be drawn.
 
     None rather than a degenerate frame: a terminal too narrow to show
@@ -163,22 +205,39 @@ def frame(t: float, width: int) -> Optional[ChaseFrame]:
         if length <= 0:
             return None
 
-        head = int(float(t) * speed_cells_s()) % length
+        # Quantise time to FRAMES first, then advance whole cells. Stepping
+        # `t * speed` and truncating samples a continuous position at
+        # irregular instants — the same beat that made this stutter.
+        # Time quantised to FRAMES — the position is only ever sampled at
+        # instants the surface will actually draw, so a frame the terminal
+        # skips cannot leave the creature somewhere it was never rendered.
+        # The position itself stays continuous.
+        step = int(float(t) / max(0.001, float(
+            interval if interval is not None else frame_interval_s())))
+        head = (step * cells_per_frame()) % length
         trail = min(body_length(), max(1, length // 4))
-        body = tuple((head - n) % length for n in range(1, trail + 1))
+        body = tuple(float((head - n) % length)
+                     for n in range(1, trail + 1))
 
         period = chase_period_s()
         progress = (float(t) % period) / period
-        # The prey starts a comfortable lead ahead and is reeled in. Capped
-        # at a third of the circuit so it stays on screen with its pursuer on
-        # a narrow terminal, where a full-lap lead would put them adjacent.
-        max_gap = max(2, min(length // 3, int(length * 0.4)))
-        gap = int(round(max_gap * (1.0 - progress)))
+        # The lead is PERCEPTUAL, not a fraction of the circuit.
+        #
+        # A third of the circuit is 58 cells on an 88-column terminal — more
+        # than half a rule, so the two were rarely on the same line and the
+        # chase read as two unrelated marks. What makes a pursuit legible is
+        # holding both in one glance: far enough apart to be clearly separate,
+        # near enough that the closing is the thing you notice.
+        #
+        # Still bounded by the circuit, so a narrow terminal cannot be handed
+        # a lead longer than the path it runs on.
+        max_gap = max(3, min(length // 4, lead_cells()))
+        gap = max_gap * (1.0 - progress)
         return ChaseFrame(
-            head=head,
+            head=float(head),
             body=body,
-            prey=(head + gap) % length,
-            biting=gap <= 0,
+            prey=float((head + gap) % length),
+            biting=gap < 0.5,
             width=w,
         )
     except Exception:  # noqa: BLE001
@@ -247,6 +306,7 @@ def rule_fragments(
     *,
     active: bool = True,
     unicode_ok: Optional[bool] = None,
+    interval: Optional[float] = None,
 ) -> List[Tuple[str, str]]:
     """prompt_toolkit fragments for ONE hairline. NEVER raises.
 
@@ -272,43 +332,68 @@ def rule_fragments(
         plain = [(f"fg:{rule_c}", g_rule * w)]
         if not active:
             return plain
-        f = frame(t, w)
+        f = frame(t, w, interval=interval)
         if f is None:
             return plain
 
-        # cell → (glyph, style). Built for THIS row only; the other row's
-        # cells are simply absent, so one pass over the body serves both.
-        marks = {}
+        # SUB-CELL COVERAGE — the smoothness the cell grid cannot give.
+        #
+        # A terminal's atom of position is one character, so a mark stepping
+        # whole cells teleports a character's width per frame however evenly
+        # it does it. The crest already solved this on its own raster:
+        # boundary cells are DIMMED, and "dimmed edges read as native
+        # terminal anti-aliasing" (`crest._edge_feather`). Same law here — a
+        # mark at 12.4 paints cell 12 at 60% and cell 13 at 40%, and the eye
+        # integrates the pair as one mark sitting four tenths of the way
+        # along. Position becomes continuous without a single new glyph.
+        #
+        # Coverage BLENDS toward the rule rather than toward black, because
+        # the rule is still there underneath: a partially-covered cell is a
+        # hairline with some serpent on it, not a hole.
+        marks: dict = {}
+
+        def _paint(pos: float, glyph: str, rgb, weight: float = 1.0) -> None:
+            for cell, cover in _coverage(pos, w):
+                r, x = cell_at(cell, w)
+                if r != row:
+                    continue
+                amount = cover * max(0.0, min(1.0, weight))
+                prior = marks.get(x)
+                # The head wins a cell it shares with its own tail: brightest
+                # coverage owns the glyph, so a body segment cannot erase the
+                # head on the frame they overlap.
+                if prior is None or amount > prior[2]:
+                    marks[x] = (glyph, rgb, amount)
+
         for n, pos in enumerate(reversed(f.body)):
-            r, x = cell_at(pos, w)
-            if r == row:
-                # Older segments dim toward the rule they are crossing.
-                fade = 0.35 + 0.5 * (n / max(1, len(f.body)))
-                marks[x] = (g_body, f"fg:{_scale(serpent_c, fade)}")
-        r, x = cell_at(f.head, w)
-        if r == row:
-            marks[x] = (g_head, f"fg:{serpent_c} bold")
-        r, x = cell_at(f.prey, w)
-        if r == row:
-            # The bite flashes the prey to its core colour — the one moment
-            # the crest's story resolves, and the only place this line is
-            # allowed to be the brightest thing on screen.
-            rgb = prey_core if f.biting else prey_edge
-            marks[x] = (g_prey, f"fg:{_hex(rgb)}" + (" bold" if f.biting else ""))
+            fade = 0.30 + 0.55 * (n / max(1, len(f.body)))
+            _paint(pos, g_body, _rgb(serpent_c), fade)
+        _paint(f.head, g_head, _rgb(serpent_c), 1.0)
+        # The bite flashes the prey to its core colour — the one moment the
+        # crest's story resolves, and the only place this line is allowed to
+        # be the brightest thing on screen.
+        _paint(f.prey, g_prey, prey_core if f.biting else prey_edge, 1.0)
 
         if not marks:
             return plain
+        rule_rgb = _rgb(rule_c)
         out: List[Tuple[str, str]] = []
         run: List[str] = []
         for x in range(w):
-            if x in marks:
-                if run:
-                    out.append((f"fg:{rule_c}", "".join(run)))
-                    run = []
-                glyph, style = marks[x]
-                out.append((style, glyph))
-            else:
+            mark = marks.get(x)
+            # Below this, a mark is fainter than the rule it sits on and
+            # painting it only smudges the hairline.
+            if mark is None or mark[2] < 0.08:
                 run.append(g_rule)
+                continue
+            if run:
+                out.append((f"fg:{rule_c}", "".join(run)))
+                run = []
+            glyph, rgb, amount = mark
+            style = f"fg:{_hex(_blend(rule_rgb, rgb, amount))}"
+            if amount > 0.85:
+                style += " bold"
+            out.append((style, glyph))
         if run:
             out.append((f"fg:{rule_c}", "".join(run)))
         return out
@@ -317,6 +402,69 @@ def rule_fragments(
         # `cells` is whatever was successfully parsed before the failure —
         # never re-derived from the argument that caused it.
         return [(f"fg:{rule_c}", g_rule * cells)] if cells else []
+
+
+def _subcell_available() -> bool:
+    """Can this terminal express the in-between colours? NEVER raises.
+
+    Sub-cell coverage IS colour interpolation, so it needs a palette that can
+    hold the interpolants. Truecolor and 256 can; 16 cannot, and NONE has no
+    colour at all.
+    """
+    try:
+        from backend.core.ouroboros.ui.theme import ColorTier, active_tier
+        return active_tier() >= ColorTier.C256
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _coverage(pos: float, width: int) -> Tuple[Tuple[int, float], ...]:
+    """``((cell, coverage), …)`` for a mark at fractional ``pos``.
+
+    Linear split across the two cells the mark straddles — the simplest
+    filter that is correct, and the one the eye reads as a single mark at an
+    in-between position. A mark exactly on a boundary returns one cell at
+    full coverage, so an integer step still renders crisply.
+    """
+    try:
+        length = path_length(width)
+        if length <= 0:
+            return ()
+        base = int(pos // 1) % length
+        frac = float(pos) - float(int(pos // 1))
+        if frac <= 1e-6 or not _subcell_available():
+            # A terminal that cannot express the blend gets the NEAREST cell,
+            # crisply. Sixteen colours quantise an interpolated green-purple
+            # to whichever of the two it is closer to, so the "smooth" render
+            # would flicker between rule and serpent — worse than a clean
+            # step, and worse in a way only that terminal would ever show.
+            return ((base if frac < 0.5 else (base + 1) % length, 1.0),)
+        return ((base, 1.0 - frac), ((base + 1) % length, frac))
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def _rgb(hex_colour: str) -> Tuple[int, int, int]:
+    """``#rrggbb`` → ``(r, g, b)``. NEVER raises."""
+    try:
+        h = str(hex_colour).lstrip("#")
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except Exception:  # noqa: BLE001
+        return (163, 113, 247)
+
+
+def _blend(under, over, amount: float):
+    """``under`` toward ``over`` by ``amount`` — the coverage law.
+
+    Toward the RULE, not toward black: a partially covered cell is a
+    hairline with some serpent on it, and fading to black would punch a hole
+    in the line this animation exists to decorate.
+    """
+    try:
+        a = max(0.0, min(1.0, float(amount)))
+        return tuple(int(round(u + (o - u) * a)) for u, o in zip(under, over))
+    except Exception:  # noqa: BLE001
+        return over
 
 
 def _scale(hex_colour: str, factor: float) -> str:
@@ -336,7 +484,9 @@ __all__ = [
     "ChaseFrame",
     "MASTER_FLAG_ENV_VAR",
     "SERPENT_RULE_SCHEMA_VERSION",
-    "SPEED_ENV_VAR",
+    "CELLS_PER_FRAME_ENV_VAR",
+    "FRAME_INTERVAL_ENV_VAR",
+    "LEAD_ENV_VAR",
     "TOP",
     "body_length",
     "cell_at",
@@ -345,5 +495,8 @@ __all__ = [
     "path_length",
     "rule_fragments",
     "serpent_enabled",
+    "cells_per_frame",
+    "frame_interval_s",
+    "lead_cells",
     "speed_cells_s",
 ]
