@@ -256,3 +256,69 @@ class TestTheDemoShowsIt:
         src = inspect.getsource(d._panic_rows)
         assert "render_panic" in src
         assert "format_exception" in src
+
+
+class TestTheOverlayDefectsSeenLive:
+    """Three defects visible in one screenshot: empty fields rendered as
+    `?:` / `origin: ?`, the FATAL notice drawn in the same green as a
+    success, and "esc dismisses" advertised while nothing was bound to it
+    — so the overlay could not be cleared."""
+
+    def test_an_empty_payload_raises_NO_overlay(self):
+        """`?:` and `origin: ?` told the operator nothing while covering
+        their screen. A payload with no content is a bug in whoever built
+        it, not a panic worth showing."""
+        assert pa.render_panic({"exc_type": "", "message": "",
+                                "origin": "", "traceback": ""}) == []
+        assert pa.render_panic({}) == []
+
+    def test_a_partial_payload_still_renders_what_it_HAS(self):
+        rows = pa.render_panic({"exc_type": "ImportError", "message": "",
+                                "origin": "", "traceback": ""})
+        assert rows and "ImportError" in rows[1]
+        assert not any("origin" in r for r in rows)   # absent, not "?"
+
+    def test_a_message_with_no_type_still_names_the_failure(self):
+        rows = pa.render_panic({"message": "the loop stopped"})
+        assert rows and "unknown error" in rows[1]
+
+    def test_the_overlay_is_styled_from_the_SEMANTIC_layer(self):
+        """`class:panic` was never registered in any prompt_toolkit Style,
+        so a FATAL notice inherited the default and rendered green."""
+        import inspect
+
+        from backend.core.ouroboros.battle_test import bipartite_layout
+        src = inspect.getsource(
+            bipartite_layout.build_bipartite_application)
+        assert "style_for(\"alert\")" in src or "style_for('alert')" in src
+        assert 'lambda: [("class:panic"' not in src
+
+    def test_the_rich_style_translates_to_prompt_toolkit(self):
+        """The two engines spell colours differently — Rich says
+        `bright_yellow`, prompt_toolkit says `ansibrightyellow`. Assuming
+        either dialect is how the overlay silently rendered default."""
+        from backend.core.ouroboros.ui.semantic_tokens import style_for
+        raw = style_for("alert")
+        assert raw == "bright_yellow"
+        assert "ansi" + raw.replace("_", "") == "ansibrightyellow"
+
+    def test_esc_is_actually_BOUND_to_dismiss(self):
+        """`dismiss_panic` had ZERO callers. The overlay advertised a key
+        nothing listened for, so the notice was permanent."""
+        import inspect
+
+        from backend.core.ouroboros.cli import ov
+        src = inspect.getsource(ov._client_extra_bindings)
+        assert "dismiss_panic" in src
+        assert "app:dismissPanic" in src
+        assert '("escape",)' in src
+
+    def test_dismiss_clears_the_sticky_notice(self):
+        from backend.core.ouroboros.cli.ov import AttachUI
+        ui = AttachUI()
+        ui.on_telemetry({"kind": "fatal_panic", "exc_type": "RuntimeError",
+                         "message": "boom", "origin": "x",
+                         "traceback": "  File \"a.py\""})
+        assert ui._panic_rows()
+        ui.dismiss_panic()
+        assert ui._panic_rows() == []
