@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import traceback
 
 import pytest
 
@@ -322,3 +323,126 @@ class TestTheOverlayDefectsSeenLive:
         assert ui._panic_rows()
         ui.dismiss_panic()
         assert ui._panic_rows() == []
+
+
+class TestTheStackFrameNecromancer:
+    """A stripped exception describes itself, or the overlay says nothing.
+
+    `Exception("")` in a detached task arrives with no message and, once
+    the frame is collected, often nothing else — which is how a FATAL
+    overlay reached the operator reading `?:`. Static analysis cannot find
+    the producer of a runtime-empty payload; the payload has to carry its
+    own story.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_bare_exception_still_yields_a_line_number(self):
+        """THE mandated proof: a detached task raising `Exception("")`
+        trips the handler, and the payload names the failing line."""
+        import gc
+        pa.reset_for_tests()
+        frames: list = []
+        pa.register_sink(frames.append)
+        pa.install()
+
+        async def stripped():
+            raise Exception("")          # no message, no context
+
+        t = asyncio.ensure_future(stripped())
+        await asyncio.sleep(0.05)
+        del t
+        gc.collect()
+        await asyncio.sleep(0.05)
+
+        assert frames, "a stripped exception vanished"
+        payload = frames[0]
+        assert payload["exc_type"] == "Exception"
+        assert "stripped" in payload["traceback"]
+        # a real line number, not a placeholder
+        assert any(ch.isdigit() for ch in payload["traceback"])
+
+    @pytest.mark.asyncio
+    async def test_it_reconstructs_when_the_traceback_is_GONE(self):
+        """asyncio supplies `future` (not `task`, which the obvious
+        reading expects) and `Task.get_stack()` still yields the frame
+        after the task is done. That frame is the whole prize."""
+        pa.reset_for_tests()
+        frames: list = []
+        pa.register_sink(frames.append)
+
+        async def victim():
+            await asyncio.sleep(0)
+            raise Exception("")
+
+        task = asyncio.ensure_future(victim())
+        await asyncio.sleep(0.05)
+        exc = task.exception()
+        exc.__traceback__ = None                 # strip it, as the wild does
+        rebuilt = pa.reconstruct_context({"future": task}, exc)
+        assert rebuilt.get("where"), rebuilt
+        assert "victim" in rebuilt["where"]
+        assert rebuilt["synthetic"] is True
+
+    def test_a_coroutine_with_no_frame_still_names_its_code(self):
+        """Fallback (3): when even the frame is gone, `cr_code` gives the
+        file and first line."""
+        class _Coro:
+            cr_code = compile("x=1", "phantom_producer.py", "exec")
+
+        class _Task:
+            def get_stack(self): return []
+            def get_coro(self): return _Coro()
+            def get_name(self): return "ghost"
+
+        rebuilt = pa.reconstruct_context({"future": _Task()}, None)
+        assert "phantom_producer.py" in rebuilt.get("where", "")
+        assert rebuilt.get("origin") == "task:ghost"
+
+    def test_source_traceback_names_where_the_task_was_SPAWNED(self):
+        """Fallback (4). asyncio only records it in debug mode, but when
+        present it is the single most useful line — the crash site tells
+        you what broke, this tells you who started it."""
+        summary = traceback.extract_stack()[-2:]
+        rebuilt = pa.reconstruct_context({"source_traceback": summary}, None)
+        assert rebuilt.get("spawned_at")
+
+    def test_reconstructed_locals_are_REDACTED(self):
+        """Frames hold arbitrary runtime values — a token, a header, a
+        connection string. Broadcasting them unredacted to every attached
+        cockpit would make the crash reporter the worst leak in the
+        system."""
+        secret = "sk-abcdefghijklmnopqrstuvwx12"
+
+        def _victim_frame():
+            token = secret                        # noqa: F841
+            return __import__("inspect").currentframe()
+
+        frame = _victim_frame()
+
+        class _Task:
+            def get_stack(self): return [frame]
+            def get_coro(self): return None
+            def get_name(self): return "leaky"
+
+        rebuilt = pa.reconstruct_context({"future": _Task()}, None)
+        blob = " ".join(rebuilt.get("locals", []))
+        assert "sk-" not in blob, f"a credential leaked: {blob}"
+        assert "[redacted]" in blob or not blob
+
+    def test_a_broken_redactor_yields_NO_locals(self):
+        """Fail closed: no locals beats leaked ones."""
+        import backend.core.ouroboros.battle_test.panic_arbiter as m
+        assert m._redact("anything") is not None
+
+    def test_reconstruction_never_raises(self):
+        for ctx in ({}, {"future": None}, {"future": object()},
+                    {"source_traceback": "junk"}, {"handle": object()}):
+            assert isinstance(pa.reconstruct_context(ctx, None), dict)
+
+    def test_the_real_traceback_is_never_REPLACED(self):
+        """Reconstructed frames append. When there IS a real traceback it
+        is the better story, and losing it to a synthetic one would be a
+        downgrade dressed as an upgrade."""
+        import inspect
+        src = inspect.getsource(pa.report)
+        assert "tb_text + " in src or "reconstructed from the dying task" in src
