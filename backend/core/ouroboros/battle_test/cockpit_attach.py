@@ -220,6 +220,23 @@ def publish_markup_global(text: str, *, session: Optional[str] = None) -> bool:
         return False
 
 
+def publish_telemetry_global(payload: dict) -> bool:
+    """Emit one typed telemetry frame to attached cockpits. NEVER raises.
+
+    The control-plane sibling of :func:`publish_markup_global`, for producers
+    with no handle to the bridge. Used by live STATE — a frame dropped here
+    costs one frame of smoothness, never a transcript line.
+    """
+    try:
+        bridge = _ACTIVE_BRIDGE
+        if bridge is None or attached_cockpits() <= 0:
+            return False
+        bridge.publish_telemetry(payload)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def attach_enabled() -> bool:
     """Master gate — default ON. NEVER raises."""
     return os.environ.get(

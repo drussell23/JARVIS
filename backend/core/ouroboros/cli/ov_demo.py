@@ -452,7 +452,12 @@ _LIVE_BEATS: List[Any] = [
     (3.4, "tool", ("search_code", "except Exception",
                    _SEARCH_RESULT, "success", 180)),
 
-    (5.0, "voice", ("the vision floor raises, and the caller swallows it",)),
+    # Lands when its reveal COMPLETES (5.0 + _REVEAL_S), not when the
+    # organism starts composing it — the strip shows the sentence being
+    # written, and this is the moment it becomes transcript.
+    (7.0, "voice", ("the vision floor raises, and the caller swallows it — "
+                    "every guard downstream is reading a tier that was "
+                    "never applied",)),
 
     # WHO is working — the roster the cockpit now mounts. Driven through the
     # real `AgentRoster`, so the agent view fills in as the demo runs instead
@@ -477,6 +482,9 @@ _LIVE_BEATS: List[Any] = [
 
     (15.2, "act", ("Repair", "L2 · iteration 1/5", "warn")),
     (16.8, "det", ("fixture rebuilt from the live seam",)),
+    (17.2, "voice", ("pinning the number it used to return would have made "
+                     "the suite agree with the bug — the seam is the thing "
+                     "to assert on",)),
     (17.4, "agent", ("finish", "sub-9c11", "finished",
                      "no counterexample · 12 tools")),
     (18.0, "tool", ("run_tests", "tests/governance/test_risk_tier_floor.py",
@@ -763,6 +771,80 @@ def _demo_generating(elapsed: float) -> bool:
         return False
 
 
+#: What the organism is WRITING inside each generating window, keyed by the
+#: window's start. The text is the prose that lands in the deck when the
+#: window closes — the strip shows the sentence being composed, and then the
+#: same words become the transcript line, which is precisely the effect.
+_INFLIGHT_TEXT = {
+    5.0: "the vision floor raises, and the caller swallows it — every "
+         "guard downstream is reading a tier that was never applied",
+    15.2: "pinning the number it used to return would have made the "
+          "suite agree with the bug — the seam is the thing to assert on",
+}
+
+#: Seconds a sentence takes to appear. Not the window's full length: the
+#: model finishes writing before the phase ends, and a reveal stretched to
+#: fill the window would crawl in a way no real stream does.
+_REVEAL_S = 2.0
+
+
+def _inflight_text(elapsed: float) -> str:
+    """The partially-written sentence at ``elapsed``, or "". NEVER raises.
+
+    Revealed on WORD boundaries. A character-by-character reveal looks like
+    a typewriter effect, which is a different thing pretending to be this
+    one — a real token stream arrives in word-ish pieces, and mid-word
+    truncation reads as corruption rather than as composition.
+    """
+    try:
+        for lo, hi in _GENERATING:
+            if not (lo <= elapsed <= hi):
+                continue
+            text = _INFLIGHT_TEXT.get(lo)
+            if not text:
+                return ""
+            words = text.split()
+            frac = min(1.0, max(0.0, (elapsed - lo) / max(0.01, _REVEAL_S)))
+            shown = int(round(frac * len(words)))
+            if shown >= len(words):
+                # Written. It belongs to the deck now, and leaving it in the
+                # strip would show the same sentence twice.
+                return ""
+            return " ".join(words[:max(1, shown)])
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _stream_rows(elapsed: float, mux: Any = None) -> List[str]:
+    """Strip rows for the demo, through the COCKPIT's renderer. NEVER raises.
+
+    `stream_renderer.render_inflight` is the same function the attach
+    cockpit calls — imported, never reimplemented, for the reason stated at
+    the top of this module. A demo with its own wrap would keep agreeing
+    with itself while the real one regressed.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.stream_renderer import (
+            render_inflight,
+        )
+        text = _inflight_text(elapsed)
+        if not text:
+            return []
+        width = None
+        try:
+            width = getattr(mux, "width", None) if mux is not None else None
+        except Exception:  # noqa: BLE001
+            width = None
+        if not width:
+            import shutil
+            width = shutil.get_terminal_size((80, 24)).columns
+        return render_inflight(text, width=width)
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] inflight strip unavailable", exc_info=True)
+        return []
+
+
 def _generating_seconds(elapsed: float) -> float:
     """Seconds spent INSIDE a generating window, up to ``elapsed``.
 
@@ -923,6 +1005,14 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         # border that moves forever teaches the operator to stop seeing it.
         serpent_active=lambda: _demo_generating(
             (clock() - start[0]) * speed
+        ),
+        # The sentence being WRITTEN, through the cockpit's own wrapper. The
+        # generating windows used to show a climbing token count and nothing
+        # else — the operator knew spend was happening and could not see what
+        # for. Same words, revealed, then landing in the deck as the line
+        # they became.
+        stream_rows=lambda: _stream_rows(
+            (clock() - start[0]) * speed, mux,
         ),
     )
     try:

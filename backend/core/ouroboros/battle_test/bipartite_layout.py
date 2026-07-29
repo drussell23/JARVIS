@@ -750,6 +750,7 @@ def build_bipartite_application(
     search_rows: Optional[Callable[[], Any]] = None,
     status_rows: Optional[Callable[[], Any]] = None,
     pending_rows: Optional[Callable[[], Any]] = None,
+    stream_rows: Optional[Callable[[], Any]] = None,
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
@@ -1105,6 +1106,18 @@ def build_bipartite_application(
         except Exception:  # noqa: BLE001
             logger.debug("[Bipartite] %s row unavailable", label,
                          exc_info=True)
+    # The sentence being WRITTEN, directly under the deck it is about to
+    # become part of. The deck is bottom-anchored, so its newest entry sits
+    # immediately above this — the in-flight text appears exactly where it
+    # will land, which is what makes it read as inline rather than as a
+    # separate widget.
+    if stream_rows is not None:
+        try:
+            _stream_row = build_dynamic_rows(stream_rows)
+            if _stream_row is not None:
+                rows += [_stream_row]
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] stream row unavailable", exc_info=True)
     # The rejection window, above the search bar and the caret. It is the
     # most time-critical row the cockpit ever draws — the operator has
     # seconds — so it sits where the eye already is.
@@ -1381,6 +1394,7 @@ async def run_bipartite_repl(
     search_rows: Optional[Callable[[], Any]] = None,
     status_rows: Optional[Callable[[], Any]] = None,
     pending_rows: Optional[Callable[[], Any]] = None,
+    stream_rows: Optional[Callable[[], Any]] = None,
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
@@ -1412,7 +1426,8 @@ async def run_bipartite_repl(
             completer=completer, history=history, auto_suggest=auto_suggest,
             turn_spinner=turn_spinner, agent_rows=agent_rows,
             search_rows=search_rows, status_rows=status_rows,
-            pending_rows=pending_rows, serpent_active=serpent_active,
+            pending_rows=pending_rows, stream_rows=stream_rows,
+            serpent_active=serpent_active,
         )
         if watch_alive is not None:
             watcher = asyncio.ensure_future(
