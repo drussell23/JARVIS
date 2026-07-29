@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 import traceback
@@ -281,6 +282,94 @@ def _redact(text: str) -> str:
         return ""          # fail CLOSED — no locals beats leaked ones
 
 
+#: Frames captured at task creation. Four is the caller, its caller, and
+#: enough context to name the subsystem — deeper costs more and says less.
+_SPAWN_DEPTH = 4
+
+#: Attribute stamped on every Task. Underscored and namespaced so it
+#: cannot collide with anything asyncio or a library puts there.
+SPAWN_ATTR = "_ov_spawn_provenance"
+
+
+def _capture_spawn(depth: int = _SPAWN_DEPTH) -> tuple:
+    """Raw (file, line, func) tuples for the creating stack. NEVER raises.
+
+    A frame WALK, not `traceback.extract_stack`. The mandate suggested the
+    latter; measured, it costs 4-38us per task because it reads source
+    lines from disk through linecache, and this runs on EVERY task the
+    daemon creates. The walk is 0.66us and captures the same three facts.
+
+    Formatting is deferred to panic time — a session that never crashes
+    pays only the walk, and a session that does can afford to read a file.
+    That is the same reasoning that kept `loop.set_debug(True)` out: never
+    make every task slower to serve the one that dies.
+    """
+    try:
+        out = []
+        frame = sys._getframe(2)          # skip this fn + the factory
+        while frame is not None and len(out) < max(1, depth):
+            code = frame.f_code
+            name = code.co_filename
+            # asyncio's own plumbing is never the interesting caller.
+            if "/asyncio/" not in name:
+                out.append((name, frame.f_lineno, code.co_name))
+            frame = frame.f_back
+        return tuple(out)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def format_spawn(provenance: object) -> str:
+    """Render captured tuples. Called ONLY when something died."""
+    try:
+        rows = [f"{f}:{ln} in {fn}" for f, ln, fn in (provenance or ())]
+        return " <- ".join(rows[:3])
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def install_task_factory(loop: Any = None) -> bool:
+    """Stamp every task with where it was created. NEVER raises.
+
+    `asyncio` ties `source_traceback` to global debug mode, which slows
+    every await to serve a logging side effect. This gets the same fact —
+    who spawned the task that died — for a frame walk at creation.
+
+    CHAINS any existing factory rather than replacing it: a factory is a
+    single global slot, and clobbering one installed by another subsystem
+    would silently break whatever it was doing.
+    """
+    try:
+        if not panic_arbiter_enabled():
+            return False
+        import asyncio as _a
+        target = loop or _a.get_event_loop()
+        previous = target.get_task_factory()
+        if getattr(previous, "_ov_provenance_factory", False):
+            return True                    # idempotent
+
+        def _factory(loop_, coro, **kwargs):
+            # Delegate construction, never reimplement it: `Task` gains
+            # keyword-only params across versions (`name`, `context`,
+            # `eager_start`) and a hand-rolled call would drop them.
+            if previous is not None:
+                task = previous(loop_, coro, **kwargs)
+            else:
+                task = _a.Task(coro, loop=loop_, **kwargs)
+            try:
+                setattr(task, SPAWN_ATTR, _capture_spawn())
+            except Exception:  # noqa: BLE001
+                pass               # a Task that refuses the stamp still runs
+            return task
+
+        _factory._ov_provenance_factory = True      # type: ignore[attr-defined]
+        target.set_task_factory(_factory)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[PanicArbiter] task factory unavailable", exc_info=True)
+        return False
+
+
 def reconstruct_context(context: dict, exc: Optional[BaseException]) -> dict:
     """Rebuild what a stripped exception lost. NEVER raises.
 
@@ -354,6 +443,14 @@ def reconstruct_context(context: dict, exc: Optional[BaseException]) -> dict:
                 out["synthetic"] = True
 
         # (4) where the task was SPAWNED (asyncio debug mode only)
+        # (4b) our own stamp, when asyncio's debug-only record is absent —
+        # which it always is, because we refuse to pay for global debug.
+        if task is not None and not out.get("spawned_at"):
+            stamped = format_spawn(getattr(task, SPAWN_ATTR, ()))
+            if stamped:
+                out["spawned_at"] = stamped
+                out["synthetic"] = True
+
         src = context.get("source_traceback")
         if src:
             try:
@@ -520,7 +617,10 @@ __all__ = [
     "PANIC_KIND",
     "PANIC_SCHEMA_VERSION",
     "Panic",
+    "SPAWN_ATTR",
     "arbitrate",
+    "format_spawn",
+    "install_task_factory",
     "install",
     "panic_arbiter_enabled",
     "recent_panics",
