@@ -89,6 +89,76 @@ def _matches(line: str) -> bool:
     return first in _COMMANDS
 
 
+def _looks_like_ordinal(line: str) -> bool:
+    """Is the first token a bare number? Pure and cheap. NEVER raises."""
+    try:
+        first = str(line or "").strip().split(None, 1)[0]
+        return first.strip(".)").isdigit()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _handle_ordinal(
+    controller: InlinePromptController, line: str, reviewer: str,
+) -> InlineDispatchResult:
+    """Resolve a numbered answer against the choices THIS prompt offered.
+
+    The choice set is recomposed from the controller's own snapshot — the
+    same ``tool`` / ``target_path`` / ``arg_preview`` the renderer used —
+    so the number the operator is reading and the number resolved here
+    cannot disagree. Recomposition rather than storage keeps a single
+    source; storing the rendered set would let it go stale against a
+    prompt whose state moved on.
+
+    Out of range answers NOTHING. An operator who typed 9 at a 4-choice
+    prompt has not chosen, and picking the nearest — or the first — is how
+    a fat finger becomes a persisted grant.
+    """
+    try:
+        from backend.core.ouroboros.governance.gate_choices import (
+            compose_gate_choices, describe_grant_scope, resolve_answer,
+        )
+        pending = controller.pending_ids()
+        if not pending:
+            return InlineDispatchResult(ok=False, text="", matched=False)
+        pid = pending[0]
+        snap = controller.snapshot(pid) or {}
+        choices = compose_gate_choices(
+            grant_scope=describe_grant_scope(
+                tool=str(snap.get("tool") or ""),
+                target_path=str(snap.get("target_path") or ""),
+                arg_preview=str(snap.get("arg_preview") or ""),
+            ),
+        )
+        answer = resolve_answer(line, choices)
+        if answer.choice is None:
+            return InlineDispatchResult(
+                ok=False,
+                text=(f"  (no option {line.strip().split()[0]} — this prompt "
+                      f"offers 1-{len(choices.choices)}; "
+                      f"/prompts to see it again)"),
+            )
+        # Delegate to the EXISTING handlers. The number is a new way to
+        # name a verb, never a second implementation of one.
+        args = [pid] + ([answer.reason] if answer.reason else [])
+        verb = answer.verb
+        if verb == "/allow":
+            return _handle_allow(controller, args, reviewer, remember=False)
+        if verb == "/always":
+            return _handle_allow(controller, args, reviewer, remember=True)
+        if verb == "/deny":
+            return _handle_deny(controller, args, reviewer)
+        if verb == "/pause":
+            return _handle_pause(controller, args, reviewer)
+        return InlineDispatchResult(ok=False, text="", matched=False)
+    except Exception as exc:  # noqa: BLE001
+        # Fail CLOSED to "nothing happened", never to allow. A degraded
+        # resolver must not decide a permission prompt.
+        logger.debug("[InlinePrompt] ordinal dispatch degraded", exc_info=True)
+        return InlineDispatchResult(
+            ok=False, text=f"  (could not read that answer: {exc})")
+
+
 def _split_id_and_reason(
     controller: InlinePromptController,
     args: Sequence[str],
@@ -141,10 +211,19 @@ def dispatch_inline_command(
     the per-repo singleton lazily so SerpentFlow can pass a single
     ``dispatch_inline_command(line)`` call through the branch.
     """
-    if not _matches(line):
+    if not _matches(line) and not _looks_like_ordinal(line):
         return InlineDispatchResult(ok=False, text="", matched=False)
 
     controller = controller or get_default_controller()
+
+    if not _matches(line):
+        # A bare number. It is an ANSWER only while something is asking:
+        # with nothing pending, "2" is ordinary REPL input and must fall
+        # through untouched. The singleton is only consulted after the
+        # cheap syntactic check, so an ordinary line never instantiates it.
+        if not controller.pending_ids():
+            return InlineDispatchResult(ok=False, text="", matched=False)
+        return _handle_ordinal(controller, line, reviewer)
 
     try:
         tokens = shlex.split(line)
@@ -534,11 +613,62 @@ class ConsoleInlineRenderer:
         lines.append(
             f"    prompt_id: {request.prompt_id}"
         )
-        lines.append(
-            "    actions  : /allow   /deny <reason>   /always   /pause"
-        )
+        # DERIVED. The sibling renderer's hand-written twin of this line
+        # had already lost `/always`; two hands writing one vocabulary is
+        # the defect, so neither writes it now.
+        lines.extend(ConsoleInlineRenderer._choice_lines(request))
+        lines.append(ConsoleInlineRenderer._actions_line())
         lines.append("")
         return "\n".join(lines)
+
+    @staticmethod
+    def _choices(request: InlinePromptRequest):
+        """The choice set for THIS prompt. NEVER raises.
+
+        Unlike the phase-boundary surface, this one knows the tool and the
+        argument, so `/always` can state exactly what it would grant —
+        that tool, that exact path or command, this repo, and the store's
+        own TTL. Where the scope cannot be named, `describe_grant_scope`
+        returns None and the option drops out rather than promising a
+        boundary the operator cannot see.
+        """
+        from backend.core.ouroboros.governance.gate_choices import (
+            compose_gate_choices, describe_grant_scope,
+        )
+        return compose_gate_choices(
+            question=f"Do you want to allow {request.tool}?",
+            grant_scope=describe_grant_scope(
+                tool=request.tool,
+                target_path=request.target_path,
+                arg_preview=request.arg_preview,
+            ),
+        )
+
+    @staticmethod
+    def _choice_lines(request: InlinePromptRequest) -> list:
+        try:
+            from backend.core.ouroboros.governance.gate_choices import (
+                render_choices,
+            )
+            rows = render_choices(ConsoleInlineRenderer._choices(request))
+            return [""] + rows if rows else []
+        except Exception:  # noqa: BLE001
+            return []
+
+    @staticmethod
+    def _actions_line(request: InlinePromptRequest = None) -> str:
+        try:
+            from backend.core.ouroboros.governance.gate_choices import (
+                compose_gate_choices, describe_grant_scope, render_verbs,
+            )
+            scope = (describe_grant_scope(
+                tool=request.tool, target_path=request.target_path,
+                arg_preview=request.arg_preview) if request is not None
+                else "remember it")
+            return render_verbs(compose_gate_choices(grant_scope=scope)) or (
+                "    actions  : /allow   /deny <reason>   /always   /pause")
+        except Exception:  # noqa: BLE001
+            return "    actions  : /allow   /deny <reason>   /always   /pause"
 
 
 # ---------------------------------------------------------------------------
