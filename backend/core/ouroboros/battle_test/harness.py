@@ -4658,7 +4658,7 @@ class BattleTestHarness:
                         # not.
                         try:
                             self._flow._mirror_markup(
-                                f"  [yellow]⚠ {res.reason}[/yellow]")
+                                f"  [{_SEM['heal']}]⚠ {res.reason}[/]")
                         except Exception:  # noqa: BLE001
                             pass
                     return
@@ -5222,17 +5222,17 @@ class BattleTestHarness:
 
     def _repl_cmd_pause(self) -> None:
         if self._intake_paused:
-            self._repl_print("[yellow]Intake already paused.[/yellow]")
+            self._repl_print(f"[{_SEM['heal']}]Intake already paused.[/]")
             return
         self._intake_paused = True
         svc = self._intake_service
         if svc is not None:
             svc._state = type(svc._state)["DEGRADED"] if hasattr(svc._state, "name") else svc._state
-        self._repl_print("[yellow]⏸  Intake paused — no new signals will be accepted.[/yellow]")
+        self._repl_print(f"[{_SEM['heal']}]⏸  Intake paused — no new signals will be accepted.[/]")
 
     def _repl_cmd_resume(self) -> None:
         if not self._intake_paused:
-            self._repl_print("[yellow]Intake is not paused.[/yellow]")
+            self._repl_print(f"[{_SEM['heal']}]Intake is not paused.[/]")
             return
         self._intake_paused = False
         svc = self._intake_service
@@ -5241,7 +5241,7 @@ class BattleTestHarness:
                 svc._state = type(svc._state)["ACTIVE"]
             except (KeyError, TypeError):
                 pass
-        self._repl_print("[green]▶  Intake resumed — signals flowing.[/green]")
+        self._repl_print(f"[{_SEM['success']}]▶  Intake resumed — signals flowing.[/]")
 
     def _repl_cmd_status(self) -> None:
         gls = self._governed_loop_service
@@ -5254,9 +5254,9 @@ class BattleTestHarness:
         )
         cost = self._cost_tracker.total_spent
         cap = self._config.cost_cap_usd
-        paused_tag = "  [yellow](intake paused)[/yellow]" if self._intake_paused else ""
+        paused_tag = f"  [{_SEM['heal']}](intake paused)[/]" if self._intake_paused else ""
         plan_tag = (
-            "  [cyan](plan review on)[/cyan]"
+            f"  [{_SEM['neural']}](plan review on)[/]"
             if self._plan_before_execute else ""
         )
         self._repl_print(
@@ -5281,7 +5281,7 @@ class BattleTestHarness:
             fsm = fsm_ctxs.get(op_id)
             state = getattr(fsm, "state", None)
             state_str = state.name if state is not None else "RUNNING"
-            lines.append(f"  [bold green]▸[/bold green] {short}  [cyan]{state_str}[/cyan]")
+            lines.append(f"  [bold green]▸[/bold green] {short}  [{_SEM['neural']}]{state_str}[/]")
 
         # Recent completed (last 10)
         recent = sorted(
@@ -5295,11 +5295,11 @@ class BattleTestHarness:
             phase_str = phase.name if phase is not None else "?"
             tc = getattr(r, "terminal_class", "")
             if tc in ("PRIMARY_SUCCESS", "FALLBACK_SUCCESS"):
-                tag = "[green]OK[/green]"
+                tag = f"[{_SEM['success']}]OK[/]"
             elif tc == "NOOP":
                 tag = "[dim]NOOP[/dim]"
             else:
-                tag = f"[red]{tc}[/red]"
+                tag = f"[{_SEM['death']}]{tc}[/]"
             lines.append(f"  [dim]•[/dim] {short}  {phase_str}  {tag}")
 
         header = f"[bold]Operations[/bold]  (active={len(active_ids)}, completed={len(completed_map)})"
@@ -5319,14 +5319,14 @@ class BattleTestHarness:
         try:
             amount = float(parts[1].strip().lstrip("$"))
         except ValueError:
-            self._repl_print("[red]Invalid amount. Usage: /budget 1.00[/red]")
+            self._repl_print(f"[{_SEM['death']}]Invalid amount. Usage: /budget 1.00[/]")
             return
         if amount <= 0:
-            self._repl_print("[red]Budget must be positive[/red]")
+            self._repl_print(f"[{_SEM['death']}]Budget must be positive[/]")
             return
         self._config.cost_cap_usd = amount
         self._cost_tracker._budget_usd = amount
-        self._repl_print(f"[green]Budget updated to ${amount:.2f}[/green]")
+        self._repl_print(f"[{_SEM['success']}]Budget updated to ${amount:.2f}[/]")
 
     def _set_plan_review_mode(self, enabled: bool) -> None:
         """Toggle session-scoped plan review before execution."""
@@ -5375,16 +5375,16 @@ class BattleTestHarness:
         if sub in {"on", "enable", "enabled", "true", "1"}:
             self._set_plan_review_mode(True)
             self._repl_print(
-                "[green]🗺 Plan review enabled — the next operation will show a plan "
-                "and wait for approval before GENERATE.[/green]"
+                f"[{_SEM['success']}]🗺 Plan review enabled — the next operation will show a plan "
+                f"and wait for approval before GENERATE.[/]"
             )
             return
         if sub in {"off", "disable", "disabled", "false", "0"}:
             self._set_plan_review_mode(False)
             os.environ["JARVIS_DRY_RUN"] = "0"
             self._repl_print(
-                "[yellow]🗺 Plan review + dry-run both disabled — operations can "
-                "execute normally.[/yellow]"
+                f"[{_SEM['heal']}]🗺 Plan review + dry-run both disabled — operations can "
+                f"execute normally.[/]"
             )
             return
 
@@ -5406,12 +5406,12 @@ class BattleTestHarness:
                 )
             else:
                 self._repl_print(
-                    "[green]🧪 Dry-run disabled — ops can modify files again.[/green]"
+                    f"[{_SEM['success']}]🧪 Dry-run disabled — ops can modify files again.[/]"
                 )
             return
 
         self._repl_print(
-            "[red]Usage:[/red] /plan | /plan status | /plan on | off | "
+            f"[{_SEM['death']}]Usage:[/] /plan | /plan status | /plan on | off | "
             "dry-run [on|off]"
         )
 
@@ -5568,7 +5568,7 @@ class BattleTestHarness:
                 weight = " [dim]low[/dim]"
             tags = ""
             if g.tags:
-                tags = f" [magenta]#{' #'.join(g.tags[:3])}[/magenta]"
+                tags = f" [{_SEM['annotation']}]#{' #'.join(g.tags[:3])}[/]"
             status_color = {
                 GoalStatus.ACTIVE: "green",
                 GoalStatus.PAUSED: "yellow",
@@ -5726,14 +5726,14 @@ class BattleTestHarness:
         elif subcmd == "complete" and len(parts) > 2:
             goal_id = parts[2].strip()
             if tracker.complete(goal_id):
-                self._repl_print(f"[blue]Completed goal: {goal_id}[/blue]")
+                self._repl_print(f"[{_SEM['milestone']}]Completed goal: {goal_id}[/]")
             else:
                 self._repl_print(f"[{_SEM['death']}]No goal matching '{goal_id}'[/]")
 
         elif subcmd == "purge":
             removed = tracker.purge_completed()
             if removed:
-                self._repl_print(f"[blue]Purged {removed} completed goals[/blue]")
+                self._repl_print(f"[{_SEM['milestone']}]Purged {removed} completed goals[/]")
             else:
                 self._repl_print("[dim]No completed goals to purge[/dim]")
 
