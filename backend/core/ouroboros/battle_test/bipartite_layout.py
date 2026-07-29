@@ -318,6 +318,23 @@ class BipartiteLayout:
         await asyncio.sleep(0)   # cooperative yield — the decoupling proof
         self.emit(event_type, payload)
 
+    def set_streaming_tail(self, text: object) -> None:
+        """The line currently being WRITTEN, rendered inside the deck.
+
+        Not a push: this is a view of something still happening, and a
+        pending line that entered the ring would be evicted by maxlen
+        mid-sentence and survive as history if the stream died. `as_text`
+        composes it last on every frame, so it lands at the end of the
+        transcript exactly where it will come to rest — which is CC's
+        actual mechanic, rather than a strip below the deck approximating
+        it. NEVER raises.
+        """
+        try:
+            self._buffer.set_pending(text)
+        except Exception:  # noqa: BLE001
+            return
+        self._invalidate_now()
+
     def push_raw(self, markup_line: str) -> None:
         """Push a pre-formatted Rich-markup line (e.g. piped Sentinel stdout).
         Never raises."""
@@ -761,6 +778,7 @@ def build_bipartite_application(
     stream_rows: Optional[Callable[[], Any]] = None,
     queue_rows: Optional[Callable[[], Any]] = None,
     panic_rows: Optional[Callable[[], Any]] = None,
+    on_mux: Optional[Callable[[Any], None]] = None,
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
@@ -1490,6 +1508,7 @@ async def run_bipartite_repl(
     stream_rows: Optional[Callable[[], Any]] = None,
     queue_rows: Optional[Callable[[], Any]] = None,
     panic_rows: Optional[Callable[[], Any]] = None,
+    on_mux: Optional[Callable[[Any], None]] = None,
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
@@ -1510,6 +1529,16 @@ async def run_bipartite_repl(
         height=max(6, size.lines - max(0, header_height) - 2),
         title=title,
     )
+    # Hand the multiplexer to the caller. Without it the client holds no
+    # reference to the deck, so a seam like `set_streaming_tail` is
+    # reachable in principle and inert in practice — the trap this
+    # codebase has produced five times, most recently inside the fix for
+    # it.
+    if on_mux is not None:
+        try:
+            on_mux(mux)
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] on_mux hook failed", exc_info=True)
     set_active_canvas(mux)
     for ln in (seed or []):
         mux.push_raw(ln)
