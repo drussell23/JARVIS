@@ -56,7 +56,8 @@ SEMANTIC_TOKENS_SCHEMA_VERSION = "semantic_tokens.v1"
 _ROLE_TO_SEMANTIC: Dict[str, str] = {
     # outcomes — the scarce ones. Green means "succeeded" or "added" and
     # nothing else, which is what makes it readable at a glance.
-    "life": "ok_bold",
+    "life": "ok_bold",      # the organism evolved — emphatic
+    "success": "ok",        # a step succeeded — plain
     "code_add": "ok",
     # failure
     "death": "crit",
