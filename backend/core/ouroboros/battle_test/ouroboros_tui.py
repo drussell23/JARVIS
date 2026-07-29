@@ -28,6 +28,14 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as
+#: every other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 # ══════════════════════════════════════════════════════════════════
 # Provider Badges
 # ══════════════════════════════════════════════════════════════════
@@ -211,7 +219,7 @@ class OuroborosConsole:
         args_display = f"  [dim]{args_summary[:80]}[/dim]" if args_summary else ""
 
         self._console.print(
-            f"  {icon} [cyan]Turn {round_index + 1}:[/cyan] "
+            f"  {icon} [{_SEM['neural']}]Turn {round_index + 1}:[/] "
             f"[bold]{tool_name}[/bold]{args_display}"
             f"  [dim]op:{short_id}[/dim]"
         )
@@ -317,7 +325,7 @@ class OuroborosConsole:
         if candidate_files:
             for f in candidate_files[:5]:
                 if f:
-                    self._console.print(f"     \U0001f4c4 [cyan]{f}[/cyan]")
+                    self._console.print(f"     \U0001f4c4 [{_SEM['neural']}]{f}[/]")
 
         # Show code preview if expanded or always show first 200 chars
         if candidate_preview:
@@ -391,7 +399,7 @@ class OuroborosConsole:
             )
         else:
             self._console.print(
-                f"  \U0001f527 [yellow]L2 Repair {progress}:[/yellow] {status}"
+                f"  \U0001f527 [{_SEM['heal']}]L2 Repair {progress}:[/] {status}"
                 f"  [dim]op:{short_id}[/dim]"
             )
 
@@ -405,7 +413,7 @@ class OuroborosConsole:
     def show_diff(self, file_path: str, diff_text: str = "") -> None:
         """Show colored diff for a file."""
         if not self._show_diffs:
-            self._console.print(f"  \U0001f4be [green]APPLY:[/green] {file_path}")
+            self._console.print(f"  \U0001f4be [{_SEM['success']}]APPLY:[/] {file_path}")
             return
 
         if not diff_text:
@@ -426,9 +434,9 @@ class OuroborosConsole:
                 ))
             except Exception:
                 # Fallback to manual coloring
-                self._console.print(f"  \U0001f4be [green]APPLY:[/green] {file_path}")
+                self._console.print(f"  \U0001f4be [{_SEM['success']}]APPLY:[/] {file_path}")
         else:
-            self._console.print(f"  \U0001f4be [green]APPLY:[/green] {file_path}")
+            self._console.print(f"  \U0001f4be [{_SEM['success']}]APPLY:[/] {file_path}")
 
     def _get_git_diff(self, file_path: str) -> str:
         """Get git diff for a file."""
@@ -508,7 +516,7 @@ class OuroborosConsole:
 
         self._console.print(Panel(
             Text.from_markup(
-                f"[red]Reason: {reason}[/red]{phase_str}\n"
+                f"[{_SEM['death']}]Reason: {reason}[/]{phase_str}\n"
                 f"[dim]The organism will learn from this failure.[/dim]"
             ),
             title=f"\u274c [bold red]FAILED[/bold red]  \u23f1 {duration_s:.1f}s",

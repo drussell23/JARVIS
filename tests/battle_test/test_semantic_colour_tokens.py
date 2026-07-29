@@ -29,16 +29,16 @@ class TestOneOwner:
     def test_the_cockpit_palette_is_DERIVED_not_declared(self):
         """`_C` was a second palette. It is now a projection — every
         `_C['death']` in serpent_flow resolves through the theme."""
-        from backend.core.ouroboros.battle_test.serpent_flow import _C
-        assert _C["death"] == style_for("death")
-        assert _C["life"] == style_for("life")
+        from backend.core.ouroboros.battle_test.serpent_flow import _SEM
+        assert _SEM["death"] == style_for("death")
+        assert _SEM["life"] == style_for("life")
 
     def test_it_resolves_LIVE_not_at_import(self):
         """ColorTier is a property of the terminal. A palette frozen at
         import outlives a resize, a --no-color flip, or a client attaching
         from a different terminal than the daemon booted on."""
         from backend.core.ouroboros.battle_test import serpent_flow
-        assert type(serpent_flow._C).__name__ == "_SemanticPalette"
+        assert type(serpent_flow._SEM).__name__ == "_SemanticPalette"
 
     def test_every_role_maps_to_a_theme_semantic(self):
         for role in role_palette():
@@ -48,11 +48,11 @@ class TestOneOwner:
         """The point of one owner. Repaint the theme, and `_C` follows —
         which a second literal dict could never do."""
         from backend.core.ouroboros.ui import theme
-        from backend.core.ouroboros.battle_test.serpent_flow import _C
+        from backend.core.ouroboros.battle_test.serpent_flow import _SEM
         table = dict(getattr(theme, "_SEMANTIC_STD", {}))
         table["crit"] = "bold magenta"
         monkeypatch.setattr(theme, "_SEMANTIC_STD", table, raising=False)
-        assert "magenta" in _C["death"]
+        assert "magenta" in _SEM["death"]
 
 
 class TestTheVocabularyMatchesClaudeCode:
@@ -81,6 +81,80 @@ class TestTheVocabularyMatchesClaudeCode:
         assert style_for("dim") in ("dim", "bright_black", "grey50")
 
 
+class TestTheRegistryCannotCrashARender:
+    """A styling typo must never be able to take down a coroutine."""
+
+    def test_an_EMPTY_style_would_have_crashed_rich(self):
+        """The reason the floor is "none" and not "". Rich raises
+        MarkupError on `[]text[/]` — "closing tag has nothing to close" —
+        so an unresolvable role interpolated into an f-string would take
+        down the line it decorated, and with it whatever was writing."""
+        import io
+
+        import pytest as _pt
+        from rich.console import Console
+        from rich.errors import MarkupError
+        c = Console(file=io.StringIO(), force_terminal=True,
+                    color_system="standard")
+        with _pt.raises(MarkupError):
+            c.print("[]text[/]", highlight=False)
+
+    @pytest.mark.parametrize("role", [
+        "invalid_role", "totally_made_up", "", None, 42, "PROVIDER ",
+    ])
+    def test_a_fabricated_role_renders_SAFELY(self, role):
+        """The mandated failsafe: a rogue plugin or a typo asking for an
+        unregistered role degrades to unstyled text, never an exception."""
+        import io
+
+        from rich.console import Console
+        style = style_for(role)          # type: ignore[arg-type]
+        assert isinstance(style, str) and style, role
+        c = Console(file=io.StringIO(), force_terminal=True,
+                    color_system="standard")
+        c.print(f"[{style}]text[/]", highlight=False)   # must not raise
+        assert "text" in c.file.getvalue()
+
+    def test_the_cockpit_palette_is_KeyError_proof(self):
+        from backend.core.ouroboros.battle_test.serpent_flow import _SEM
+        assert _SEM["no_such_role"]      # non-empty, so markup stays valid
+        assert _SEM.get("no_such_role")
+
+    @pytest.mark.parametrize(("role", "expect"), [
+        ("milestone", "cyan"), ("annotation", "magenta"),
+    ])
+    def test_the_new_domain_roles_render(self, role, expect):
+        """`blue` and `magenta` were deferred from batch 1 because no role
+        fit — mapping a goal's TAGS to `provider` would have claimed the
+        tag came from an external brain."""
+        import io
+
+        from rich.console import Console
+        assert expect in style_for(role)
+        c = Console(file=io.StringIO(), force_terminal=True,
+                    color_system="standard")
+        c.print(f"[{style_for(role)}]goal[/]", highlight=False)
+        assert "goal" in c.file.getvalue()
+
+
+class TestOneSpelling:
+    def test_serpent_flow_uses_SEM_not_C(self):
+        """`_C` was a second spelling of the same idea — and in harness
+        that name is also locally bound to `rich.console.Console`."""
+        from backend.core.ouroboros.battle_test import serpent_flow
+        assert hasattr(serpent_flow, "_SEM")
+        assert not hasattr(serpent_flow, "_C")
+
+    @pytest.mark.parametrize("mod", [
+        "serpent_flow", "harness", "ouroboros_tui",
+    ])
+    def test_every_module_uses_the_same_access_pattern(self, mod):
+        import importlib
+        m = importlib.import_module(
+            f"backend.core.ouroboros.battle_test.{mod}")
+        assert m._SEM["death"] == style_for("death"), mod
+
+
 class TestItNeverBreaksRendering:
     @pytest.mark.parametrize("role", ["", None, "not_a_role", 42])
     def test_an_unknown_role_still_returns_a_string(self, role):
@@ -102,18 +176,19 @@ class TestItNeverBreaksRendering:
             raise RuntimeError("theme unavailable")
 
         monkeypatch.setattr(st, "semantic_for", _boom)
-        assert st.style_for("death") == ""
+        # "none", not "": an empty style makes Rich raise MarkupError.
+        assert st.style_for("death") == st.SAFE_FALLBACK_STYLE
         src = pathlib.Path(
             "backend/core/ouroboros/ui/semantic_tokens.py").read_text()
-        assert "_FALLBACK" not in src, "a second palette grew back"
+        assert "_FALLBACK: Dict" not in src, "a second palette grew back"
 
     def test_the_cockpit_palette_survives_a_dead_theme(self, monkeypatch):
         import backend.core.ouroboros.ui.semantic_tokens as st
-        from backend.core.ouroboros.battle_test.serpent_flow import _C
+        from backend.core.ouroboros.battle_test.serpent_flow import _SEM
         monkeypatch.setattr(
             st, "style_for", lambda *a, **k: (_ for _ in ()).throw(
                 RuntimeError("down")))
-        assert _C["death"] == "red"      # the retained fallback literal
+        assert _SEM["death"] == "red"    # the retained fallback literal
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +204,7 @@ class TestItNeverBreaksRendering:
 #: silently produces plain text and no test notices, which is why the fix
 #: is "stop new ones now, migrate incrementally" rather than one change.
 _RAW_LITERAL_CEILING = {
-    "backend/core/ouroboros/battle_test": 96,
+    "backend/core/ouroboros/battle_test": 42,
     "backend/core/ouroboros/cli": 12,
     "backend/core/ouroboros/ui": 3,
     "backend/core/ouroboros/governance": 106,

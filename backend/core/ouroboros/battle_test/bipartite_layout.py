@@ -34,6 +34,14 @@ import logging
 import os
 from typing import Any, Callable, List, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger("Ouroboros.BipartiteLayout")
 
 from backend.core.ouroboros.battle_test.input_continuation import (

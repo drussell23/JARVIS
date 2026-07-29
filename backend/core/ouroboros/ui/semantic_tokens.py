@@ -48,6 +48,14 @@ logger = logging.getLogger("Ouroboros.SemanticTokens")
 
 SEMANTIC_TOKENS_SCHEMA_VERSION = "semantic_tokens.v1"
 
+#: The structural floor. NOT "" — an empty style is not "unstyled": Rich
+#: raises MarkupError on `[]text[/]` ("closing tag has nothing to close"),
+#: so an unresolvable role rendered through an f-string would take down
+#: the line it was decorating, and with it whatever coroutine was writing.
+#: "none" is the only value that is simultaneously a valid Rich style and
+#: visually absent. A styling typo must never be able to crash a render.
+SAFE_FALLBACK_STYLE = "none"
+
 #: Cockpit ROLE → theme SEMANTIC. The only place the two vocabularies are
 #: connected. Roles are what the operator-facing code already says; the
 #: semantics are what `theme` already resolves. Neither side is rewritten
@@ -69,6 +77,12 @@ _ROLE_TO_SEMANTIC: Dict[str, str] = {
     "code_hunk": "cyan",
     # external brains
     "provider": "venom_purple",
+    # goal lifecycle. Previously written as bare `blue` / `magenta` and
+    # deferred from the mechanical pass precisely because no existing role
+    # fit: mapping a goal's TAGS to `provider` would have said the tag came
+    # from an external brain.
+    "milestone": "info",        # a goal reached completion
+    "annotation": "venom_purple",   # labels attached to a goal
     # metadata — ids, costs, timings. The most common role, deliberately
     # the quietest.
     "dim": "muted",
@@ -123,6 +137,8 @@ def style_for(role: str, *, tier: Optional[object] = None) -> str:
             table = getattr(_theme, "_SEMANTIC_STD", None)
             if isinstance(table, dict):
                 resolved = str(table.get(semantic) or "")
+        if not resolved:
+            resolved = SAFE_FALLBACK_STYLE
         attr_extra = _ROLE_ATTRS.get(key, "")
         if attr_extra and attr_extra not in resolved:
             resolved = f"{resolved} {attr_extra}".strip()
@@ -130,11 +146,7 @@ def style_for(role: str, *, tier: Optional[object] = None) -> str:
     except Exception:  # noqa: BLE001
         logger.debug("[SemanticTokens] resolve degraded for %r", key,
                      exc_info=True)
-        # "" on purpose: the caller's retained seed is the ONE place the
-        # historical literals live, and `_SemanticPalette` falls through
-        # to it. A copy here would be a second palette again — the exact
-        # defect this module exists to remove.
-        return ""
+        return SAFE_FALLBACK_STYLE
 
 
 def sem(role: str) -> str:
@@ -164,6 +176,7 @@ def role_palette() -> Dict[str, str]:
 
 
 __all__ = [
+    "SAFE_FALLBACK_STYLE",
     "SEMANTIC_TOKENS_SCHEMA_VERSION",
     "role_palette",
     "sem",

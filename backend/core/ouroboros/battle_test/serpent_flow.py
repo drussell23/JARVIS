@@ -228,6 +228,12 @@ def is_repl_active() -> bool:
 # Color palette (organism theme)
 # ══════════════════════════════════════════════════════════════
 
+# The cockpit's semantic roles. Named `_SEM` here and in every other
+# module — `_C` was a second spelling of the same idea, and in
+# `harness.py` that name is ALSO locally bound to
+# `rich.console.Console`, which is how a mechanical migration nearly
+# produced `Console['death']` at render time.
+#
 # The cockpit's semantic roles:
 #   life      awakening, success, evolved      code_add   diff: added
 #   neural    thinking, phases                 code_del   diff: removed
@@ -239,13 +245,13 @@ def is_repl_active() -> bool:
 # DERIVED from `ui.semantic_tokens`, not declared. This was a second,
 # independent palette of flat standard-ANSI names while `ui/theme.py`
 # owned a hex PALETTE and a ColorTier ladder — so on a truecolor terminal
-# theme-aware surfaces rendered hex and every `_C` line rendered plain
+# theme-aware surfaces rendered hex and every `_SEM` line rendered plain
 # ANSI, at visibly different fidelity in the same session.
 #
 # A `dict` subclass rather than a snapshot: ColorTier is a property of the
 # TERMINAL, and a palette frozen at import outlives a resize, a
 # `--no-color` flip, or a client attaching from a different terminal than
-# the daemon booted on. Every `_C['death']` in this file keeps working
+# the daemon booted on. Every `_SEM['death']` in this file keeps working
 # unchanged and now resolves live.
 class _SemanticPalette(dict):
     """Role → resolved style, asked fresh. NEVER raises."""
@@ -271,7 +277,7 @@ class _SemanticPalette(dict):
         return self.__getitem__(key) or default
 
 
-_C = _SemanticPalette({
+_SEM = _SemanticPalette({
     # Retained as the last-resort literals ONLY: if the theme cannot be
     # consulted at all, rendering degrades to exactly what shipped before
     # this projection existed — never to uncoloured, never to something new.
@@ -1341,9 +1347,9 @@ class SerpentFlow:
             from backend.core.ouroboros.battle_test.presentation_restraint import (
                 chrome_color,
             )
-            _ribbon_color = chrome_color(default=_C['life'])
+            _ribbon_color = chrome_color(default=_SEM['life'])
         except Exception:
-            _ribbon_color = _C['life']
+            _ribbon_color = _SEM['life']
         c.print()
         c.print(
             f"  [{_ribbon_color}]🐍 ouroboros[/{_ribbon_color}] [dim]│[/dim] "
@@ -1624,18 +1630,18 @@ class SerpentFlow:
         # Attach mirror: the op-open action line — cockpits see a new op
         # begin the moment the daemon does (width-agnostic form).
         self._mirror_markup(
-            f"{self._action_glyph()} {sensor}  [{_C['dim']}]{short}[/{_C['dim']}]"
+            f"{self._action_glyph()} {sensor}  [{_SEM['dim']}]{short}[/{_SEM['dim']}]"
         )
         if self._borderless():
             self._emit_fit(
-                f"{self._action_glyph()} {sensor}  [{_C['dim']}]{short}[/{_C['dim']}]"
+                f"{self._action_glyph()} {sensor}  [{_SEM['dim']}]{short}[/{_SEM['dim']}]"
             )
             return
         w = self._block_w()
         label = f" {short} ── {sensor} "
         pad = max(2, w - len(label) - 2)
         self.console.print(
-            f"  [{_C['border']}]┌{label}{'─' * pad}[/{_C['border']}]",
+            f"  [{_SEM['border']}]┌{label}{'─' * pad}[/{_SEM['border']}]",
             highlight=False,
         )
 
@@ -1704,15 +1710,15 @@ class SerpentFlow:
         """
         short = _short_id(op_id)
         glyph = "✓" if kind == "success" else "✗"
-        glyph_color = _C["life"] if kind == "success" else _C["death"]
+        glyph_color = _SEM["life"] if kind == "success" else _SEM["death"]
         posture_tok = self._read_current_posture_token()
         posture_seg = (
-            f" [{_C['dim']}]·[/{_C['dim']}] posture {posture_tok}"
+            f" [{_SEM['dim']}]·[/{_SEM['dim']}] posture {posture_tok}"
             if posture_tok else ""
         )
-        cost_seg = f" [{_C['dim']}]·[/{_C['dim']}] cost ${cost_usd:.4f}"
+        cost_seg = f" [{_SEM['dim']}]·[/{_SEM['dim']}] cost ${cost_usd:.4f}"
         time_seg = (
-            f" [{_C['dim']}]·[/{_C['dim']}] {elapsed_s:.1f}s"
+            f" [{_SEM['dim']}]·[/{_SEM['dim']}] {elapsed_s:.1f}s"
         )
         tail_seg = ""
         if kind == "failure" and failure_reason:
@@ -1720,8 +1726,8 @@ class SerpentFlow:
                 f" at {failure_phase}" if failure_phase else ""
             )
             tail_seg = (
-                f" [{_C['dim']}]·[/{_C['dim']}] "
-                f"[{_C['death']}]failed{_phase}: {failure_reason[:60]}[/{_C['death']}]"
+                f" [{_SEM['dim']}]·[/{_SEM['dim']}] "
+                f"[{_SEM['death']}]failed{_phase}: {failure_reason[:60]}[/{_SEM['death']}]"
             )
         receipt = (
             f"  [{glyph_color}][{glyph}][/{glyph_color}] "
@@ -1795,7 +1801,7 @@ class SerpentFlow:
         vis = _visible_len(label)
         pad = max(2, w - vis - 2)
         self.console.print(
-            f"  [{_C['border']}]└{label}{'─' * pad}[/{_C['border']}]",
+            f"  [{_SEM['border']}]└{label}{'─' * pad}[/{_SEM['border']}]",
             highlight=False,
         )
         self.console.print()
@@ -1900,11 +1906,11 @@ class SerpentFlow:
             self._mirror_markup(f"  {text}")
             if self._borderless():
                 self._emit_fit(
-                    f"  [{_C['dim']}]{self._result_glyph()}[/{_C['dim']}] {text}"
+                    f"  [{_SEM['dim']}]{self._result_glyph()}[/{_SEM['dim']}] {text}"
                 )
             else:
                 self.console.print(
-                    f"  [{_C['border']}]│[/{_C['border']}]  {text}",
+                    f"  [{_SEM['border']}]│[/{_SEM['border']}]  {text}",
                     highlight=False,
                 )
         else:
@@ -2024,10 +2030,10 @@ class SerpentFlow:
         # expansion is broken.
         tail = ""
         if ref:
-            tail = (f"  [{_C['dim']}]{ref} · {lines} lines · /expand {ref}"
-                    f"[/{_C['dim']}]" if lines
-                    else f"  [{_C['dim']}]{ref} · /expand {ref}[/{_C['dim']}]")
-        line = f"[{_C['neural']}]{label}[/{_C['neural']}]{tail}"
+            tail = (f"  [{_SEM['dim']}]{ref} · {lines} lines · /expand {ref}"
+                    f"[/{_SEM['dim']}]" if lines
+                    else f"  [{_SEM['dim']}]{ref} · /expand {ref}[/{_SEM['dim']}]")
+        line = f"[{_SEM['neural']}]{label}[/{_SEM['neural']}]{tail}"
         self._mirror_markup(f"  {line}")
         try:
             self.console.print(f"  {line}", highlight=False)
@@ -2191,7 +2197,7 @@ class SerpentFlow:
         legacy: a bordered ``│`` spacer)."""
         if op_id and op_id in self._active_ops and not self._borderless():
             self.console.print(
-                f"  [{_C['border']}]│[/{_C['border']}]",
+                f"  [{_SEM['border']}]│[/{_SEM['border']}]",
                 highlight=False,
             )
         else:
@@ -2203,11 +2209,11 @@ class SerpentFlow:
         """Open a nested block within an op (tool call, diff, etc.)."""
         if self._borderless():
             # nested header as a dim result sub-line (no box frame)
-            self._op_line(op_id, f"[{_C['dim']}]{header}[/{_C['dim']}]")
+            self._op_line(op_id, f"[{_SEM['dim']}]{header}[/{_SEM['dim']}]")
             return
         w = self._block_w() - 6  # indent for op border
         pad = max(2, w - _visible_len(header) - 4)
-        border = f"[{_C['border']}]┌─ {header} {'─' * pad}[/{_C['border']}]"
+        border = f"[{_SEM['border']}]┌─ {header} {'─' * pad}[/{_SEM['border']}]"
         self._op_line(op_id, border)
 
     def _nested_line(self, op_id: str, text: str) -> None:
@@ -2219,12 +2225,12 @@ class SerpentFlow:
             elif len(self._active_ops) > 1:
                 short = _short_id(op_id)
                 self.console.print(
-                    f"  [{_C['border']}]│ {short} │[/{_C['border']}]  {text}",
+                    f"  [{_SEM['border']}]│ {short} │[/{_SEM['border']}]  {text}",
                     highlight=False,
                 )
             else:
                 self.console.print(
-                    f"  [{_C['border']}]│  │[/{_C['border']}]  {text}",
+                    f"  [{_SEM['border']}]│  │[/{_SEM['border']}]  {text}",
                     highlight=False,
                 )
         else:
@@ -2235,7 +2241,7 @@ class SerpentFlow:
         if self._borderless():
             return                      # no footer rail in borderless mode
         w = self._block_w() - 6
-        border = f"[{_C['border']}]└{'─' * w}[/{_C['border']}]"
+        border = f"[{_SEM['border']}]└{'─' * w}[/{_SEM['border']}]"
         self._op_line(op_id, border)
 
     # ══════════════════════════════════════════════════════════
@@ -2338,7 +2344,7 @@ class SerpentFlow:
 
         prov = _prov(provider) if provider else ""
         via_str = (
-            f" via [{_C['provider']}]{prov}[/{_C['provider']}]"
+            f" via [{_SEM['provider']}]{prov}[/{_SEM['provider']}]"
             if prov else ""
         )
         # D3 emit-tier wire: TERTIARY only. The "synthesizing" tick is
@@ -2355,7 +2361,7 @@ class SerpentFlow:
         if _emit_synthesizing:
             self._op_line(
                 op_id,
-                f"[{_C['neural']}]🧬 synthesizing[/{_C['neural']}]{via_str}",
+                f"[{_SEM['neural']}]🧬 synthesizing[/{_SEM['neural']}]{via_str}",
             )
 
         # Refactored 2026-05-03: drive the prompt_toolkit
@@ -2378,11 +2384,11 @@ class SerpentFlow:
         token tick)."""
         prov = _prov(self._stream_provider) if self._stream_provider else ""
         prov_seg = (
-            f" via [{_C['provider']}]{prov}[/{_C['provider']}]"
+            f" via [{_SEM['provider']}]{prov}[/{_SEM['provider']}]"
             if prov else ""
         )
         return (
-            f"[{_C['neural']}]Streaming[/{_C['neural']}] "
+            f"[{_SEM['neural']}]Streaming[/{_SEM['neural']}] "
             f"{self._stream_token_count} tokens{prov_seg}"
         )
 
@@ -2422,11 +2428,11 @@ class SerpentFlow:
         self._stop_status()
         if token_count > 0:
             via_seg = (
-                f" via [{_C['provider']}]{prov}[/{_C['provider']}]"
+                f" via [{_SEM['provider']}]{prov}[/{_SEM['provider']}]"
                 if prov else ""
             )
             gen_receipt = (
-                f"  [{_C['life']}][✓][/{_C['life']}] "
+                f"  [{_SEM['life']}][✓][/{_SEM['life']}] "
                 f"Generated {token_count} tokens{via_seg}"
             )
             # Attach mirror: the synthesis receipt (tokens + provider).
@@ -2481,15 +2487,15 @@ class SerpentFlow:
         if risk in ("SAFE_AUTO", "LOW"):
             risk_badge = f"[green]{risk}[/green]"
         elif risk == "MEDIUM":
-            risk_badge = f"[{_C['heal']}]{risk}[/{_C['heal']}]"
+            risk_badge = f"[{_SEM['heal']}]{risk}[/{_SEM['heal']}]"
         elif risk:
-            risk_badge = f"[{_C['death']}]{risk}[/{_C['death']}]"
+            risk_badge = f"[{_SEM['death']}]{risk}[/{_SEM['death']}]"
         else:
             risk_badge = "[dim]—[/dim]"
 
         self._op_line(
             op_id,
-            f"[{_C['neural']}]🔬 sensed[/{_C['neural']}]    "
+            f"[{_SEM['neural']}]🔬 sensed[/{_SEM['neural']}]    "
             f"{goal[:65]}",
         )
         # Risk + target files (compact)
@@ -2499,9 +2505,9 @@ class SerpentFlow:
             if len(primary) > 50:
                 parts = primary.split("/")
                 primary = "/".join(parts[-2:])
-            target_str = f"  [{_C['file']}]{primary}[/{_C['file']}]"
+            target_str = f"  [{_SEM['file']}]{primary}[/{_SEM['file']}]"
             if len(target_files) > 1:
-                target_str += f" [{_C['dim']}]+{len(target_files) - 1}[/{_C['dim']}]"
+                target_str += f" [{_SEM['dim']}]+{len(target_files) - 1}[/{_SEM['dim']}]"
 
         self._op_line(
             op_id,
@@ -2530,7 +2536,7 @@ class SerpentFlow:
         emoji, verb = phase_map.get(phase_upper, ("▸", phase.lower()))
         self._op_line(
             op_id,
-            f"[{_C['neural']}]{emoji} {verb}[/{_C['neural']}]",
+            f"[{_SEM['neural']}]{emoji} {verb}[/{_SEM['neural']}]",
         )
 
     def _render_plan_phase(self, op_id: str, **kwargs: Any) -> None:
@@ -2540,17 +2546,17 @@ class SerpentFlow:
         if complexity:
             # Plan result — show complexity + change count
             color = {
-                "trivial": _C["dim"],
-                "moderate": _C["neural"],
-                "complex": _C["heal"],
-                "architectural": _C["provider"],
-            }.get(complexity, _C["neural"])
+                "trivial": _SEM["dim"],
+                "moderate": _SEM["neural"],
+                "complex": _SEM["heal"],
+                "architectural": _SEM["provider"],
+            }.get(complexity, _SEM["neural"])
             detail = f"[{color}]{complexity}[/{color}]"
             if n_changes:
-                detail += f"  [{_C['dim']}]{n_changes} ordered changes[/{_C['dim']}]"
+                detail += f"  [{_SEM['dim']}]{n_changes} ordered changes[/{_SEM['dim']}]"
             self._op_line(
                 op_id,
-                f"[{_C['neural']}]🗺️  planned[/{_C['neural']}]   {detail}",
+                f"[{_SEM['neural']}]🗺️  planned[/{_SEM['neural']}]   {detail}",
             )
         else:
             # Plan phase starting — D3 emit-tier wire: TERTIARY only.
@@ -2567,8 +2573,8 @@ class SerpentFlow:
                 pass  # gate failure → emit (default-visible)
             self._op_line(
                 op_id,
-                f"[{_C['neural']}]🗺️  planning[/{_C['neural']}]  "
-                f"[{_C['dim']}]reasoning about implementation strategy...[/{_C['dim']}]",
+                f"[{_SEM['neural']}]🗺️  planning[/{_SEM['neural']}]  "
+                f"[{_SEM['dim']}]reasoning about implementation strategy...[/{_SEM['dim']}]",
             )
 
     def _render_commit_phase(self, op_id: str, **kwargs: Any) -> None:
@@ -2577,13 +2583,13 @@ class SerpentFlow:
         pushed = kwargs.get("commit_pushed", False)
         branch = kwargs.get("commit_branch", "")
         if commit_hash:
-            parts = f"[{_C['life']}]{commit_hash}[/{_C['life']}]"
+            parts = f"[{_SEM['life']}]{commit_hash}[/{_SEM['life']}]"
             if pushed and branch:
-                parts += f"  [{_C['dim']}]-> {branch}[/{_C['dim']}]"
+                parts += f"  [{_SEM['dim']}]-> {branch}[/{_SEM['dim']}]"
             self._op_line(
                 op_id,
-                f"[{_C['life']}]📝 committed[/{_C['life']}]  {parts}  "
-                f"[{_C['dim']}]O+V[/{_C['dim']}]",
+                f"[{_SEM['life']}]📝 committed[/{_SEM['life']}]  {parts}  "
+                f"[{_SEM['dim']}]O+V[/{_SEM['dim']}]",
             )
 
     # ── Intent Chain (P3.1: full reasoning chain visibility) ──
@@ -2602,17 +2608,17 @@ class SerpentFlow:
 
         # Sensor origin
         if sensor:
-            parts.append(f"[{_C['dim']}]{sensor}[/{_C['dim']}]")
+            parts.append(f"[{_SEM['dim']}]{sensor}[/{_SEM['dim']}]")
 
         # Complexity badge
         if complexity:
             cx_color = {
-                "trivial": _C["dim"],
-                "light": _C["neural"],
-                "moderate": _C["neural"],
-                "heavy_code": _C["heal"],
-                "complex": _C["provider"],
-            }.get(complexity, _C["dim"])
+                "trivial": _SEM["dim"],
+                "light": _SEM["neural"],
+                "moderate": _SEM["neural"],
+                "heavy_code": _SEM["heal"],
+                "complex": _SEM["provider"],
+            }.get(complexity, _SEM["dim"])
             parts.append(f"[{cx_color}]{complexity}[/{cx_color}]")
 
         # Risk tier badge
@@ -2621,24 +2627,24 @@ class SerpentFlow:
             if rt in ("SAFE_AUTO", "LOW"):
                 rt_color = "green"
             elif rt in ("NOTIFY_APPLY", "MEDIUM"):
-                rt_color = _C["heal"]
+                rt_color = _SEM["heal"]
             else:
-                rt_color = _C["death"]
+                rt_color = _SEM["death"]
             parts.append(f"[{rt_color}]{rt}[/{rt_color}]")
 
         # Routing path hint
         if fast_path:
-            parts.append(f"[{_C['dim']}]fast-path[/{_C['dim']}]")
+            parts.append(f"[{_SEM['dim']}]fast-path[/{_SEM['dim']}]")
         elif auto_approve:
-            parts.append(f"[{_C['dim']}]auto-approve[/{_C['dim']}]")
+            parts.append(f"[{_SEM['dim']}]auto-approve[/{_SEM['dim']}]")
 
         if not parts:
             return
 
-        chain = f" [{_C['dim']}]→[/{_C['dim']}] ".join(parts)
+        chain = f" [{_SEM['dim']}]→[/{_SEM['dim']}] ".join(parts)
         self._op_line(
             op_id,
-            f"[{_C['neural']}]🔗 chain[/{_C['neural']}]     {chain}",
+            f"[{_SEM['neural']}]🔗 chain[/{_SEM['neural']}]     {chain}",
         )
 
     # ── Triage ────────────────────────────────────────────────
@@ -2650,21 +2656,21 @@ class SerpentFlow:
         """Semantic triage decision."""
         d = decision.upper()
         color_map = {
-            "PROCEED": _C["life"], "GENERATE": _C["life"],
-            "NO_OP": _C["dim"], "SKIP": _C["dim"],
-            "REDIRECT": _C["neural"], "ENRICH": _C["heal"],
+            "PROCEED": _SEM["life"], "GENERATE": _SEM["life"],
+            "NO_OP": _SEM["dim"], "SKIP": _SEM["dim"],
+            "REDIRECT": _SEM["neural"], "ENRICH": _SEM["heal"],
         }
         color = color_map.get(d, "white")
 
         parts = f"[{color}]{d}[/{color}]"
         if confidence > 0:
-            parts += f"  [{_C['dim']}]({confidence:.0%})[/{_C['dim']}]"
+            parts += f"  [{_SEM['dim']}]({confidence:.0%})[/{_SEM['dim']}]"
         if d == "NO_OP" and reason:
-            parts += f"  [{_C['dim']}]{reason[:50]}[/{_C['dim']}]"
+            parts += f"  [{_SEM['dim']}]{reason[:50]}[/{_SEM['dim']}]"
 
         self._op_line(
             op_id,
-            f"[{_C['neural']}]🧠 triage[/{_C['neural']}]    {parts}",
+            f"[{_SEM['neural']}]🧠 triage[/{_SEM['neural']}]    {parts}",
         )
 
     # ── Provider routing ──────────────────────────────────────
@@ -2694,8 +2700,8 @@ class SerpentFlow:
         prov = _prov(provider)
         self._op_line(
             op_id,
-            f"[{_C['neural']}]⚡ routing[/{_C['neural']}]    "
-            f"[{_C['provider']}]{prov}[/{_C['provider']}]",
+            f"[{_SEM['neural']}]⚡ routing[/{_SEM['neural']}]    "
+            f"[{_SEM['provider']}]{prov}[/{_SEM['provider']}]",
         )
 
     # ── Generation ────────────────────────────────────────────
@@ -2716,24 +2722,24 @@ class SerpentFlow:
 
         # Token count
         total_tokens = input_tokens + output_tokens
-        token_str = f" [{_C['dim']}]│[/{_C['dim']}] {total_tokens:,} tok" if total_tokens > 0 else ""
+        token_str = f" [{_SEM['dim']}]│[/{_SEM['dim']}] {total_tokens:,} tok" if total_tokens > 0 else ""
         tools_str = f" + 🔧 {tool_count}" if tool_count > 0 else ""
 
         # Per-operation cost (3 decimal places for sub-cent, 2 for larger)
         if cost_usd >= 0.01:
-            cost_str = f" [{_C['dim']}]│[/{_C['dim']}] ${cost_usd:.2f}"
+            cost_str = f" [{_SEM['dim']}]│[/{_SEM['dim']}] ${cost_usd:.2f}"
         elif cost_usd > 0.001:
-            cost_str = f" [{_C['dim']}]│[/{_C['dim']}] ${cost_usd:.3f}"
+            cost_str = f" [{_SEM['dim']}]│[/{_SEM['dim']}] ${cost_usd:.3f}"
         else:
             cost_str = ""
 
         self._op_line(
             op_id,
-            f"[{_C['neural']}]🧬 synthesized[/{_C['neural']}]  "
+            f"[{_SEM['neural']}]🧬 synthesized[/{_SEM['neural']}]  "
             f"{candidates} candidate{'s' if candidates != 1 else ''} via "
-            f"[{_C['provider']}]{model_str}[/{_C['provider']}]"
+            f"[{_SEM['provider']}]{model_str}[/{_SEM['provider']}]"
             f"{tools_str}{token_str}{cost_str}"
-            f"  [{_C['dim']}]({duration_s:.1f}s)[/{_C['dim']}]",
+            f"  [{_SEM['dim']}]({duration_s:.1f}s)[/{_SEM['dim']}]",
         )
 
     # ── Tool calls (Venom) ────────────────────────────────────
@@ -2808,7 +2814,7 @@ class SerpentFlow:
                         self._rendered_preamble_keys.discard(_v)
                 self._op_line(
                     op_id,
-                    f"[{_C['dim']} italic]🗣 {preamble}[/{_C['dim']} italic]",
+                    f"[{_SEM['dim']} italic]🗣 {preamble}[/{_SEM['dim']} italic]",
                 )
 
         # The MIRRORED half of the start event.
@@ -2860,7 +2866,7 @@ class SerpentFlow:
                 tool_name, args_summary, result_preview,
                 status=status, duration_ms=duration_ms,
                 op_id=op_id, round_index=round_index,
-                palette=_C, store=store_for_view(),
+                palette=_SEM, store=store_for_view(),
             )
         except Exception:  # noqa: BLE001 — never crash the render path
             composed = None
@@ -2890,12 +2896,12 @@ class SerpentFlow:
         dur = ""
         if duration_ms > 0:
             dur = (
-                f"  [{_C['dim']}]{duration_ms:.0f}ms[/{_C['dim']}]"
+                f"  [{_SEM['dim']}]{duration_ms:.0f}ms[/{_SEM['dim']}]"
                 if duration_ms < 1000
-                else f"  [{_C['dim']}]{duration_ms / 1000:.1f}s[/{_C['dim']}]"
+                else f"  [{_SEM['dim']}]{duration_ms / 1000:.1f}s[/{_SEM['dim']}]"
             )
 
-        status_mark = "" if status == "success" else f"  [{_C['death']}]✗[/{_C['death']}]"
+        status_mark = "" if status == "success" else f"  [{_SEM['death']}]✗[/{_SEM['death']}]"
 
         # ── CC-style blocks for write/edit tools ──
         if tool_name in ("edit_file", "write_file") and status == "success":
@@ -2934,14 +2940,14 @@ class SerpentFlow:
             path = args_summary[:60] if args_summary else "file"
             self._op_line(
                 op_id,
-                f"[{_C['neural']}]⏺ Write[/{_C['neural']}]"
-                f"([{_C['file']}]{path}[/{_C['file']}]){dur}",
+                f"[{_SEM['neural']}]⏺ Write[/{_SEM['neural']}]"
+                f"([{_SEM['file']}]{path}[/{_SEM['file']}]){dur}",
             )
             if result_preview:
                 n_lines = result_preview.count("\n") + 1
                 self._op_line(
                     op_id,
-                    f"[{_C['dim']}]⎿  {n_lines} line{'s' if n_lines != 1 else ''} written[/{_C['dim']}]",
+                    f"[{_SEM['dim']}]⎿  {n_lines} line{'s' if n_lines != 1 else ''} written[/{_SEM['dim']}]",
                 )
             return
 
@@ -2950,17 +2956,17 @@ class SerpentFlow:
             path = args_summary[:60] if args_summary else "file"
             self._op_line(
                 op_id,
-                f"[{_C['neural']}]⏺ Read[/{_C['neural']}]"
-                f"([{_C['file']}]{path}[/{_C['file']}]){dur}{status_mark}",
+                f"[{_SEM['neural']}]⏺ Read[/{_SEM['neural']}]"
+                f"([{_SEM['file']}]{path}[/{_SEM['file']}]){dur}{status_mark}",
             )
             return
 
         # ── Default: compact one-liner for other tools ──
-        summary = f"  [{_C['dim']}]{args_summary[:40]}[/{_C['dim']}]" if args_summary else ""
+        summary = f"  [{_SEM['dim']}]{args_summary[:40]}[/{_SEM['dim']}]" if args_summary else ""
 
         self._op_line(
             op_id,
-            f"{icon} [{_C['dim']}]T{round_index + 1}[/{_C['dim']}] "
+            f"{icon} [{_SEM['dim']}]T{round_index + 1}[/{_SEM['dim']}] "
             f"{tool_name}{summary}{dur}{status_mark}",
         )
 
@@ -2982,19 +2988,19 @@ class SerpentFlow:
         if test_count == 0:
             self._op_line(
                 op_id,
-                f"[{_C['heal']}]🛡️ immune[/{_C['heal']}]      "
-                f"[{_C['dim']}]no tests found[/{_C['dim']}]",
+                f"[{_SEM['heal']}]🛡️ immune[/{_SEM['heal']}]      "
+                f"[{_SEM['dim']}]no tests found[/{_SEM['dim']}]",
             )
         elif passed:
             self._op_line(
                 op_id,
-                f"[{_C['life']}]🛡️ immune[/{_C['life']}]      "
+                f"[{_SEM['life']}]🛡️ immune[/{_SEM['life']}]      "
                 f"[green]✅ {test_count}/{test_count} passing[/green]",
             )
         else:
             self._op_line(
                 op_id,
-                f"[{_C['death']}]🛡️ immune[/{_C['death']}]      "
+                f"[{_SEM['death']}]🛡️ immune[/{_SEM['death']}]      "
                 f"[red]❌ {failures}/{test_count} failing[/red]",
             )
 
@@ -3005,15 +3011,15 @@ class SerpentFlow:
     ) -> None:
         """Self-healing repair iteration."""
         color = (
-            _C["life"] if status == "converged"
-            else _C["heal"] if status != "failed"
-            else _C["death"]
+            _SEM["life"] if status == "converged"
+            else _SEM["heal"] if status != "failed"
+            else _SEM["death"]
         )
         status_emoji = "✅" if status == "converged" else "🩹" if status != "failed" else "❌"
 
         self._op_line(
             op_id,
-            f"[{_C['heal']}]🩹 repair[/{_C['heal']}]      "
+            f"[{_SEM['heal']}]🩹 repair[/{_SEM['heal']}]      "
             f"iter {iteration}/{max_iters}  "
             f"[{color}]{status_emoji} {status}[/{color}]",
         )
@@ -3047,30 +3053,30 @@ class SerpentFlow:
         if test_total == 0:
             self._op_line(
                 op_id,
-                f"[{_C['heal']}]⏺ Verify[/{_C['heal']}]({files_str})",
+                f"[{_SEM['heal']}]⏺ Verify[/{_SEM['heal']}]({files_str})",
             )
             self._op_line(
                 op_id,
-                f"[{_C['dim']}]⎿  no scoped tests found[/{_C['dim']}]",
+                f"[{_SEM['dim']}]⎿  no scoped tests found[/{_SEM['dim']}]",
             )
         elif passed:
             self._op_line(
                 op_id,
-                f"[{_C['life']}]⏺ Verify[/{_C['life']}]({files_str})",
+                f"[{_SEM['life']}]⏺ Verify[/{_SEM['life']}]({files_str})",
             )
             self._op_line(
                 op_id,
-                f"  [{_C['dim']}]⎿[/{_C['dim']}]  [green]✅ {test_total}/{test_total} passing[/green]",
+                f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  [green]✅ {test_total}/{test_total} passing[/green]",
             )
         else:
             passing = test_total - test_failures
             self._op_line(
                 op_id,
-                f"[{_C['death']}]⏺ Verify[/{_C['death']}]({files_str})",
+                f"[{_SEM['death']}]⏺ Verify[/{_SEM['death']}]({files_str})",
             )
             self._op_line(
                 op_id,
-                f"  [{_C['dim']}]⎿[/{_C['dim']}]  [red]❌ {test_failures} failing, {passing} passing[/red]",
+                f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  [red]❌ {test_failures} failing, {passing} passing[/red]",
             )
 
     # ── Code preview ──────────────────────────────────────────
@@ -3096,12 +3102,12 @@ class SerpentFlow:
             rationale = rationales[i] if i < len(rationales) else ""
             self._op_line(
                 op_id,
-                f"📂 [{_C['file']}]{display_path}[/{_C['file']}]",
+                f"📂 [{_SEM['file']}]{display_path}[/{_SEM['file']}]",
             )
             if rationale:
                 self._op_line(
                     op_id,
-                    f"   [{_C['dim']}]{rationale[:70]}[/{_C['dim']}]",
+                    f"   [{_SEM['dim']}]{rationale[:70]}[/{_SEM['dim']}]",
                 )
 
     # ── Diff display ──────────────────────────────────────────
@@ -3132,8 +3138,8 @@ class SerpentFlow:
         if not diff_text:
             self._op_line(
                 op_id,
-                f"[{_C['neural']}]⏺ Update[/{_C['neural']}]"
-                f"([{_C['file']}]{short_path}[/{_C['file']}])",
+                f"[{_SEM['neural']}]⏺ Update[/{_SEM['neural']}]"
+                f"([{_SEM['file']}]{short_path}[/{_SEM['file']}])",
             )
             return
 
@@ -3143,18 +3149,18 @@ class SerpentFlow:
         # ── Header: ⏺ Update(path) ──
         self._op_line(
             op_id,
-            f"[{_C['neural']}]⏺ Update[/{_C['neural']}]"
-            f"([{_C['file']}]{short_path}[/{_C['file']}])",
+            f"[{_SEM['neural']}]⏺ Update[/{_SEM['neural']}]"
+            f"([{_SEM['file']}]{short_path}[/{_SEM['file']}])",
         )
 
         # ── Summary: ⎿  Added N lines, removed M lines ──
         parts: List[str] = []
         if added:
-            parts.append(f"[{_C['code_add']}]Added {added} line{'s' if added != 1 else ''}[/{_C['code_add']}]")
+            parts.append(f"[{_SEM['code_add']}]Added {added} line{'s' if added != 1 else ''}[/{_SEM['code_add']}]")
         if removed:
-            parts.append(f"[{_C['code_del']}]removed {removed} line{'s' if removed != 1 else ''}[/{_C['code_del']}]")
+            parts.append(f"[{_SEM['code_del']}]removed {removed} line{'s' if removed != 1 else ''}[/{_SEM['code_del']}]")
         summary = ", ".join(parts) if parts else "no changes"
-        self._op_line(op_id, f"[{_C['dim']}]⎿[/{_C['dim']}]  {summary}")
+        self._op_line(op_id, f"[{_SEM['dim']}]⎿[/{_SEM['dim']}]  {summary}")
 
         # ── Reasoning: why the organism made this change ──
         # Check explicit parameter first, then stored per-op reasoning
@@ -3164,7 +3170,7 @@ class SerpentFlow:
             safe_reason = _reason.replace("[", "\\[")[:120]
             self._op_line(
                 op_id,
-                f"[{_C['dim']}]⎿  reasoning: {safe_reason}[/{_C['dim']}]",
+                f"[{_SEM['dim']}]⎿  reasoning: {safe_reason}[/{_SEM['dim']}]",
             )
 
         # ── Contextual diff lines (max 3 hunks, 20 lines each) ──
@@ -3186,22 +3192,22 @@ class SerpentFlow:
                 if kind == "-":
                     self._op_line(
                         op_id,
-                        f"    [{_C['dim']}]{old_lineno:>5}[/{_C['dim']}] "
-                        f"[{_C['code_del']}]- {safe}[/{_C['code_del']}]",
+                        f"    [{_SEM['dim']}]{old_lineno:>5}[/{_SEM['dim']}] "
+                        f"[{_SEM['code_del']}]- {safe}[/{_SEM['code_del']}]",
                     )
                     old_lineno += 1
                 elif kind == "+":
                     self._op_line(
                         op_id,
-                        f"    [{_C['dim']}]{new_lineno:>5}[/{_C['dim']}] "
-                        f"[{_C['code_add']}]+ {safe}[/{_C['code_add']}]",
+                        f"    [{_SEM['dim']}]{new_lineno:>5}[/{_SEM['dim']}] "
+                        f"[{_SEM['code_add']}]+ {safe}[/{_SEM['code_add']}]",
                     )
                     new_lineno += 1
                 else:
                     # Context line
                     self._op_line(
                         op_id,
-                        f"    [{_C['dim']}]{new_lineno:>5}   {safe}[/{_C['dim']}]",
+                        f"    [{_SEM['dim']}]{new_lineno:>5}   {safe}[/{_SEM['dim']}]",
                     )
                     old_lineno += 1
                     new_lineno += 1
@@ -3211,14 +3217,14 @@ class SerpentFlow:
             if remaining_in_hunk > 0:
                 self._op_line(
                     op_id,
-                    f"    [{_C['dim']}]      ... +{remaining_in_hunk} lines[/{_C['dim']}]",
+                    f"    [{_SEM['dim']}]      ... +{remaining_in_hunk} lines[/{_SEM['dim']}]",
                 )
 
         remaining_hunks = len(hunks) - hunk_limit
         if remaining_hunks > 0:
             self._op_line(
                 op_id,
-                f"    [{_C['dim']}]      ... +{remaining_hunks} more hunk{'s' if remaining_hunks != 1 else ''}[/{_C['dim']}]",
+                f"    [{_SEM['dim']}]      ... +{remaining_hunks} more hunk{'s' if remaining_hunks != 1 else ''}[/{_SEM['dim']}]",
             )
 
     def show_diff_preview(
@@ -3250,13 +3256,13 @@ class SerpentFlow:
         if not target_files and diff_text:
             parts_sum: List[str] = []
             if added:
-                parts_sum.append(f"[{_C['code_add']}]+{added}[/{_C['code_add']}]")
+                parts_sum.append(f"[{_SEM['code_add']}]+{added}[/{_SEM['code_add']}]")
             if removed:
-                parts_sum.append(f"[{_C['code_del']}]-{removed}[/{_C['code_del']}]")
+                parts_sum.append(f"[{_SEM['code_del']}]-{removed}[/{_SEM['code_del']}]")
             summary = " ".join(parts_sum) if parts_sum else "no changes"
             self._op_line(
                 op_id,
-                f"[{_C['neural']}]⏺ Proposed changes[/{_C['neural']}]  {summary}",
+                f"[{_SEM['neural']}]⏺ Proposed changes[/{_SEM['neural']}]  {summary}",
             )
 
     # ── NOTIFY_APPLY rich preview (V1) ────────────────────────────
@@ -3314,13 +3320,13 @@ class SerpentFlow:
             _short = _short_id(op_id)
             _n = len(changes) if changes is not None else 0
             self._mirror_markup(
-                f"  [{_C['heal']}]⏳ NOTIFY_APPLY op:{_short} — "
+                f"  [{_SEM['heal']}]⏳ NOTIFY_APPLY op:{_short} — "
                 f"{_n} file(s), applying in {int(delay_s)}s "
-                f"({reason})[/{_C['heal']}]"
+                f"({reason})[/{_SEM['heal']}]"
             )
             self._mirror_markup(
-                f"  [{_C['dim']}]⎿  /reject {_short} to cancel — "
-                f"diff follows as ⏺ Update[/{_C['dim']}]"
+                f"  [{_SEM['dim']}]⎿  /reject {_short} to cancel — "
+                f"diff follows as ⏺ Update[/{_SEM['dim']}]"
             )
         except Exception:  # noqa: BLE001
             pass
@@ -3530,12 +3536,12 @@ class SerpentFlow:
 
         # Evolution line
         files_str = f"{len(files_changed)} file{'s' if len(files_changed) != 1 else ''}"
-        cost_str = f" [{_C['dim']}]│[/{_C['dim']}] 💰 ${cost_usd:.4f}" if cost_usd > 0 else ""
+        cost_str = f" [{_SEM['dim']}]│[/{_SEM['dim']}] 💰 ${cost_usd:.4f}" if cost_usd > 0 else ""
 
         self._op_line(
             op_id,
-            f"[{_C['life']}]✨ evolved[/{_C['life']}]     "
-            f"{files_str} [{_C['dim']}]│[/{_C['dim']}] ⏱ {elapsed:.1f}s{cost_str}",
+            f"[{_SEM['life']}]✨ evolved[/{_SEM['life']}]     "
+            f"{files_str} [{_SEM['dim']}]│[/{_SEM['dim']}] ⏱ {elapsed:.1f}s{cost_str}",
         )
 
         # Close the op block and clean up per-op state
@@ -3575,20 +3581,20 @@ class SerpentFlow:
         self._op_providers.pop(op_id, None)
         self._op_rationales.pop(op_id, None)
 
-        phase_str = f" at [{_C['neural']}]{phase}[/{_C['neural']}]" if phase else ""
+        phase_str = f" at [{_SEM['neural']}]{phase}[/{_SEM['neural']}]" if phase else ""
 
         self._op_line(
             op_id,
-            f"[{_C['death']}]💀 shed[/{_C['death']}]        "
-            f"[{_C['death']}]{reason[:70]}[/{_C['death']}]{phase_str}"
-            f"  [{_C['dim']}]⏱ {elapsed:.1f}s[/{_C['dim']}]",
+            f"[{_SEM['death']}]💀 shed[/{_SEM['death']}]        "
+            f"[{_SEM['death']}]{reason[:70]}[/{_SEM['death']}]{phase_str}"
+            f"  [{_SEM['dim']}]⏱ {elapsed:.1f}s[/{_SEM['dim']}]",
         )
 
         # Actionable next-step based on failure reason
         suggestion = _actionable_suggestion(reason, phase, elapsed)
         self._op_line(
             op_id,
-            f"[{_C['dim']}]             💡 {suggestion}[/{_C['dim']}]",
+            f"[{_SEM['dim']}]             💡 {suggestion}[/{_SEM['dim']}]",
         )
 
         # Close the op block
@@ -3621,11 +3627,11 @@ class SerpentFlow:
         """Triage NO_OP — operation was unnecessary."""
         self._op_starts.pop(op_id, None)
         self._op_providers.pop(op_id, None)
-        reason_str = f"  [{_C['dim']}]{reason[:50]}[/{_C['dim']}]" if reason else ""
+        reason_str = f"  [{_SEM['dim']}]{reason[:50]}[/{_SEM['dim']}]" if reason else ""
 
         self._op_line(
             op_id,
-            f"[{_C['dim']}]⏭️  no-op{reason_str}[/{_C['dim']}]",
+            f"[{_SEM['dim']}]⏭️  no-op{reason_str}[/{_SEM['dim']}]",
         )
 
         # Close the op block (it's done)
@@ -3661,12 +3667,12 @@ class SerpentFlow:
             get_agent_roster().spawn(subagent_id, subagent_type, goal)
         except Exception:  # noqa: BLE001
             pass
-        goal_str = f"  [{_C['dim']}]{goal[:70]}[/{_C['dim']}]" if goal else ""
+        goal_str = f"  [{_SEM['dim']}]{goal[:70]}[/{_SEM['dim']}]" if goal else ""
         self._op_line(
             op_id,
-            f"[{_C.get('neural', 'cyan')}]⏺ Subagent({subagent_type})"
-            f"[/{_C.get('neural', 'cyan')}]  "
-            f"[{_C['dim']}]{short_sub}[/{_C['dim']}]{goal_str}",
+            f"[{_SEM.get('neural', 'cyan')}]⏺ Subagent({subagent_type})"
+            f"[/{_SEM.get('neural', 'cyan')}]  "
+            f"[{_SEM['dim']}]{short_sub}[/{_SEM['dim']}]{goal_str}",
         )
 
     def op_subagent_result(
@@ -3716,7 +3722,7 @@ class SerpentFlow:
         # Marker + color by status
         if status == "completed":
             marker = "✓"
-            color = _C.get("success", "green")
+            color = _SEM.get("success", "green")
             summary = (
                 f"{findings_count} finding{'s' if findings_count != 1 else ''} "
                 f"· diversity={tool_diversity} · "
@@ -3725,35 +3731,35 @@ class SerpentFlow:
             )
         elif status == "partial":
             marker = "⚠"
-            color = _C.get("warn", "yellow")
+            color = _SEM.get("warn", "yellow")
             summary = (
                 f"{findings_count} finding{'s' if findings_count != 1 else ''} "
                 f"· {duration_s:.1f}s · ${cost_usd:.4f}"
             )
         elif status == "diversity_rejected":
             marker = "⊘"
-            color = _C.get("warn", "yellow")
+            color = _SEM.get("warn", "yellow")
             summary = f"Iron Gate: tool_diversity={tool_diversity} below floor"
         elif status == "budget_exhausted":
             marker = "⊘"
-            color = _C.get("warn", "yellow")
+            color = _SEM.get("warn", "yellow")
             summary = f"parent budget exhausted · {duration_s:.1f}s"
         elif status == "cancelled":
             marker = "⊘"
-            color = _C["dim"]
+            color = _SEM["dim"]
             summary = f"cancelled · {duration_s:.1f}s"
         else:
             marker = "✗"
-            color = _C.get("error", "red")
+            color = _SEM.get("error", "red")
             detail = error_class or status or "failed"
             summary = f"{detail} · {duration_s:.1f}s"
 
         self._op_line(
             op_id,
             f"  [{color}]{marker}[/{color}]  "
-            f"[{_C['dim']}]{short_sub}[/{_C['dim']}]  "
+            f"[{_SEM['dim']}]{short_sub}[/{_SEM['dim']}]  "
             f"[{color}]{status or 'unknown'}[/{color}]  "
-            f"[{_C['dim']}]{summary}{fallback_tag}[/{_C['dim']}]",
+            f"[{_SEM['dim']}]{summary}{fallback_tag}[/{_SEM['dim']}]",
         )
 
     # ══════════════════════════════════════════════════════════
@@ -3793,7 +3799,7 @@ class SerpentFlow:
         except Exception:  # noqa: BLE001 — defensive
             pass
         self.console.print(
-            f"  [{_C['neural']}]🧬 discovery[/{_C['neural']}]  "
+            f"  [{_SEM['neural']}]🧬 discovery[/{_SEM['neural']}]  "
             f"cycle {cycle} — {submitted} intent{'s' if submitted != 1 else ''} submitted",
             highlight=False,
         )
@@ -3824,7 +3830,7 @@ class SerpentFlow:
             pass
         title_str = f'  "{title[:40]}"' if title else ""
         self.console.print(
-            f"  [{_C['neural']}]💭 dreaming[/{_C['neural']}]   "
+            f"  [{_SEM['neural']}]💭 dreaming[/{_SEM['neural']}]   "
             f"{blueprints} blueprint{'s' if blueprints != 1 else ''}{title_str}",
             highlight=False,
         )
@@ -3854,7 +3860,7 @@ class SerpentFlow:
         except Exception:  # noqa: BLE001 — defensive
             pass
         self.console.print(
-            f"  [{_C['neural']}]📖 learning[/{_C['neural']}]   "
+            f"  [{_SEM['neural']}]📖 learning[/{_SEM['neural']}]   "
             f"{rules} rules consolidated  trend: {trend}",
             highlight=False,
         )
@@ -3894,24 +3900,24 @@ class SerpentFlow:
             # Render inside the op block
             self._op_line(
                 op_id,
-                f"[{_C['neural']}]📖 lessons[/{_C['neural']}]    "
+                f"[{_SEM['neural']}]📖 lessons[/{_SEM['neural']}]    "
                 f"applying {count} {lesson_word} from this session",
             )
             if safe_latest:
                 self._op_line(
                     op_id,
-                    f"[{_C['dim']}]⎿  latest: {safe_latest}[/{_C['dim']}]",
+                    f"[{_SEM['dim']}]⎿  latest: {safe_latest}[/{_SEM['dim']}]",
                 )
         else:
             # Between ops
             self.console.print(
-                f"  [{_C['neural']}]📖 lessons[/{_C['neural']}]    "
+                f"  [{_SEM['neural']}]📖 lessons[/{_SEM['neural']}]    "
                 f"applying {count} {lesson_word} from this session",
                 highlight=False,
             )
             if safe_latest:
                 self.console.print(
-                    f"  [{_C['dim']}]⎿  latest: {safe_latest}[/{_C['dim']}]",
+                    f"  [{_SEM['dim']}]⎿  latest: {safe_latest}[/{_SEM['dim']}]",
                     highlight=False,
                 )
 
@@ -3949,7 +3955,7 @@ class SerpentFlow:
         if previous == route_norm:
             return
 
-        color = _ROUTE_COLOR.get(route_norm, _C["neural"])
+        color = _ROUTE_COLOR.get(route_norm, _SEM["neural"])
         label = _ROUTE_SHORT.get(route_norm, route_norm[:3].upper())
         meta_bits: List[str] = []
         if isinstance(budget_profile, dict):
@@ -3963,11 +3969,11 @@ class SerpentFlow:
             meta_bits.append(str(budget_profile)[:24])
         if reason:
             meta_bits.append(str(reason)[:48])
-        meta = f"  [{_C['dim']}]{' │ '.join(meta_bits)}[/{_C['dim']}]" if meta_bits else ""
+        meta = f"  [{_SEM['dim']}]{' │ '.join(meta_bits)}[/{_SEM['dim']}]" if meta_bits else ""
         prefix = "↘" if previous and previous != route_norm else "🧭"
         self._op_line(
             op_id,
-            f"[{_C['neural']}]{prefix} route[/{_C['neural']}]    "
+            f"[{_SEM['neural']}]{prefix} route[/{_SEM['neural']}]    "
             f"[{color}]{label}[/{color}]{meta}",
         )
 
@@ -3997,12 +4003,12 @@ class SerpentFlow:
             stats["providers"][prov] = stats["providers"].get(prov, 0.0) + delta
 
         label = _ROUTE_SHORT.get(route_norm, route_norm[:3].upper())
-        color = _ROUTE_COLOR.get(route_norm, _C["dim"])
+        color = _ROUTE_COLOR.get(route_norm, _SEM["dim"])
         prov_str = f" via {prov}" if prov else ""
-        evt_str = f"  [{_C['dim']}]{event}[/{_C['dim']}]" if event else ""
+        evt_str = f"  [{_SEM['dim']}]{event}[/{_SEM['dim']}]" if event else ""
         self._op_line(
             op_id,
-            f"[{_C['dim']}]💸 route spend[/{_C['dim']}]  "
+            f"[{_SEM['dim']}]💸 route spend[/{_SEM['dim']}]  "
             f"[{color}]{label}[/{color}] +${delta:.4f}{prov_str}{evt_str}",
         )
 
@@ -4073,11 +4079,11 @@ class SerpentFlow:
         the active input line.
         """
         color_map = {
-            "critical": _C["death"],
-            "warning": _C["heal"],
-            "info": _C["neural"],
+            "critical": _SEM["death"],
+            "warning": _SEM["heal"],
+            "info": _SEM["neural"],
         }
-        border = color_map.get(severity, _C["neural"])
+        border = color_map.get(severity, _SEM["neural"])
         icon_map = {"critical": "🚨", "warning": "⚠️", "info": "🔔"}
         icon = icon_map.get(severity, "🔔")
 
@@ -4087,7 +4093,7 @@ class SerpentFlow:
         if op_id:
             subtitle_parts.append(f"op:{_short_id(op_id)}")
         subtitle = (
-            f"[{_C['dim']}]{' │ '.join(subtitle_parts)}[/{_C['dim']}]"
+            f"[{_SEM['dim']}]{' │ '.join(subtitle_parts)}[/{_SEM['dim']}]"
             if subtitle_parts else ""
         )
 
@@ -4252,14 +4258,14 @@ class SerpentFlow:
                 # Attach mirror: a watching operator must SEE that the
                 # headless gate auto-approved (§7 — no silent decisions).
                 self._mirror_markup(
-                    f"  [{_C['life']}]✅ auto-approved (headless: "
-                    f"{_headless_reason})[/{_C['life']}]  "
-                    f"[{_C['dim']}]op:{short}[/{_C['dim']}]"
+                    f"  [{_SEM['life']}]✅ auto-approved (headless: "
+                    f"{_headless_reason})[/{_SEM['life']}]  "
+                    f"[{_SEM['dim']}]op:{short}[/{_SEM['dim']}]"
                 )
                 c.print(
-                    f"  [{_C['life']}]✅ auto-approved (headless: "
-                    f"{_headless_reason})[/{_C['life']}]  "
-                    f"[{_C['dim']}]op:{short}[/{_C['dim']}]",
+                    f"  [{_SEM['life']}]✅ auto-approved (headless: "
+                    f"{_headless_reason})[/{_SEM['life']}]  "
+                    f"[{_SEM['dim']}]op:{short}[/{_SEM['dim']}]",
                     highlight=False,
                 )
             except Exception:
@@ -4287,14 +4293,14 @@ class SerpentFlow:
             )
             body_lines.append(f"📂 {files_display}")
         if candidate_rationale:
-            body_lines.append(f"[{_C['dim']}]{candidate_rationale[:120]}[/{_C['dim']}]")
+            body_lines.append(f"[{_SEM['dim']}]{candidate_rationale[:120]}[/{_SEM['dim']}]")
         if risk_reason:
-            body_lines.append(f"[{_C['heal']}]⚡ {risk_reason}[/{_C['heal']}]")
+            body_lines.append(f"[{_SEM['heal']}]⚡ {risk_reason}[/{_SEM['heal']}]")
 
         panel = Panel(
             "\n".join(body_lines),
             title=f"🔒 Iron Gate │ op:{short}",
-            border_style=_C["heal"],
+            border_style=_SEM["heal"],
             expand=False,
             width=min(c.width, 68),
             padding=(0, 1),
@@ -4305,15 +4311,15 @@ class SerpentFlow:
         # the next attached-terminal line resolves the race below.
         try:
             self._mirror_markup(
-                f"  [{_C['heal']}]⏺ Iron Gate[/{_C['heal']}]"
-                f"([{_C['dim']}]op:{short}[/{_C['dim']}]) — approval required"
+                f"  [{_SEM['heal']}]⏺ Iron Gate[/{_SEM['heal']}]"
+                f"([{_SEM['dim']}]op:{short}[/{_SEM['dim']}]) — approval required"
             )
             for _bl in body_lines:
-                self._mirror_markup(f"  [{_C['dim']}]⎿[/{_C['dim']}]  {_bl}")
+                self._mirror_markup(f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  {_bl}")
             self._mirror_markup(
-                f"  [{_C['dim']}]⎿[/{_C['dim']}]  [bold]Apply this change? "
-                f"[Y/n][/bold] [{_C['dim']}]— reply y / n here, or at the "
-                f"daemon terminal[/{_C['dim']}]"
+                f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  [bold]Apply this change? "
+                f"[Y/n][/bold] [{_SEM['dim']}]— reply y / n here, or at the "
+                f"daemon terminal[/{_SEM['dim']}]"
             )
         except Exception:  # noqa: BLE001
             pass
@@ -4385,10 +4391,10 @@ class SerpentFlow:
         # human decision visible everywhere).
         try:
             _mark = "✅ approved" if approved else "⛔ rejected"
-            _col = _C["life"] if approved else _C["death"]
+            _col = _SEM["life"] if approved else _SEM["death"]
             self._mirror_markup(
-                f"  [{_C['dim']}]⎿[/{_C['dim']}]  [{_col}]{_mark}"
-                f"[/{_col}] [{_C['dim']}]via {answered_via}[/{_C['dim']}]"
+                f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  [{_col}]{_mark}"
+                f"[/{_col}] [{_SEM['dim']}]via {answered_via}[/{_SEM['dim']}]"
             )
         except Exception:  # noqa: BLE001
             pass
@@ -4396,12 +4402,12 @@ class SerpentFlow:
         # Step 4: Decision artifact
         if approved:
             c.print(
-                f"  [{_C['life']}]✅ approved[/{_C['life']}]  [{_C['dim']}]op:{short}[/{_C['dim']}]",
+                f"  [{_SEM['life']}]✅ approved[/{_SEM['life']}]  [{_SEM['dim']}]op:{short}[/{_SEM['dim']}]",
                 highlight=False,
             )
         else:
             c.print(
-                f"  [{_C['death']}]❌ rejected[/{_C['death']}]  [{_C['dim']}]op:{short}[/{_C['dim']}]",
+                f"  [{_SEM['death']}]❌ rejected[/{_SEM['death']}]  [{_SEM['dim']}]op:{short}[/{_SEM['dim']}]",
                 highlight=False,
             )
         c.print()
@@ -4445,9 +4451,9 @@ class SerpentFlow:
         if _headless_reason is not None:
             try:
                 c.print(
-                    f"  [{_C['life']}]✅ plan auto-approved (headless: "
-                    f"{_headless_reason})[/{_C['life']}]  "
-                    f"[{_C['dim']}]op:{short}[/{_C['dim']}]",
+                    f"  [{_SEM['life']}]✅ plan auto-approved (headless: "
+                    f"{_headless_reason})[/{_SEM['life']}]  "
+                    f"[{_SEM['dim']}]op:{short}[/{_SEM['dim']}]",
                     highlight=False,
                 )
             except Exception:
@@ -4465,7 +4471,7 @@ class SerpentFlow:
                     f"📝 Implementation Plan │ "
                     f"{complexity or 'unclassified'} │ op:{short}"
                 ),
-                border_style=_C["mind"],
+                border_style=_SEM["mind"],
                 expand=False,
                 width=min(c.width, 90),
                 padding=(0, 1),
@@ -4476,7 +4482,7 @@ class SerpentFlow:
             # Markdown rendering failed — fall back to plain text
             c.print()
             c.print(
-                f"[{_C['mind']}]📝 Implementation Plan │ op:{short}[/{_C['mind']}]"
+                f"[{_SEM['mind']}]📝 Implementation Plan │ op:{short}[/{_SEM['mind']}]"
             )
             c.print(plan_text or "(no plan content)")
 
@@ -4488,14 +4494,14 @@ class SerpentFlow:
             )
             body_lines.append(f"📂 {files_display}")
         body_lines.append(
-            f"[{_C['dim']}]Approve the APPROACH before code is generated. "
-            f"Rejection prevents wasted tokens on a wrong strategy.[/{_C['dim']}]"
+            f"[{_SEM['dim']}]Approve the APPROACH before code is generated. "
+            f"Rejection prevents wasted tokens on a wrong strategy.[/{_SEM['dim']}]"
         )
 
         panel = Panel(
             "\n".join(body_lines),
             title=f"🔒 Plan Gate │ op:{short}",
-            border_style=_C["heal"],
+            border_style=_SEM["heal"],
             expand=False,
             width=min(c.width, 68),
             padding=(0, 1),
@@ -4518,7 +4524,7 @@ class SerpentFlow:
             approved = answer in ("", "y", "yes")
         except ImportError:
             c.print(
-                f"  [{_C['heal']}](prompt_toolkit unavailable — auto-approving plan)[/{_C['heal']}]",
+                f"  [{_SEM['heal']}](prompt_toolkit unavailable — auto-approving plan)[/{_SEM['heal']}]",
                 highlight=False,
             )
             approved = True
@@ -4528,12 +4534,12 @@ class SerpentFlow:
         # Step 4: Decision artifact
         if approved:
             c.print(
-                f"  [{_C['life']}]✅ plan approved[/{_C['life']}]  [{_C['dim']}]op:{short}[/{_C['dim']}]",
+                f"  [{_SEM['life']}]✅ plan approved[/{_SEM['life']}]  [{_SEM['dim']}]op:{short}[/{_SEM['dim']}]",
                 highlight=False,
             )
         else:
             c.print(
-                f"  [{_C['death']}]❌ plan rejected[/{_C['death']}]  [{_C['dim']}]op:{short}[/{_C['dim']}]",
+                f"  [{_SEM['death']}]❌ plan rejected[/{_SEM['death']}]  [{_SEM['dim']}]op:{short}[/{_SEM['dim']}]",
                 highlight=False,
             )
         c.print()
@@ -4547,7 +4553,7 @@ class SerpentFlow:
         """Full-width separator between major sections."""
         width = min(self.console.width, 70)
         self.console.print(
-            f"  [{_C['dim']}]{'━' * width}[/{_C['dim']}]",
+            f"  [{_SEM['dim']}]{'━' * width}[/{_SEM['dim']}]",
             highlight=False,
         )
 
@@ -4651,19 +4657,19 @@ class SerpentFlow:
         pct = int(round(progress.completion_pct() * 100))
         phase_value = getattr(progress.phase, "value", str(progress.phase))
         phase_color = {
-            "created": _C["dim"],
-            "running": _C["neural"],
-            "completed": _C["life"],
-            "failed": _C["death"],
-            "cancelled": _C["heal"],
-        }.get(phase_value, _C["dim"])
+            "created": _SEM["dim"],
+            "running": _SEM["neural"],
+            "completed": _SEM["life"],
+            "failed": _SEM["death"],
+            "cancelled": _SEM["heal"],
+        }.get(phase_value, _SEM["dim"])
 
         header = (
-            f"[{_C['neural']}]⏺ Graph[/{_C['neural']}]"
-            f"([{_C['file']}]{progress.graph_id[:12]}[/{_C['file']}])"
+            f"[{_SEM['neural']}]⏺ Graph[/{_SEM['neural']}]"
+            f"([{_SEM['file']}]{progress.graph_id[:12]}[/{_SEM['file']}])"
             f"  [{phase_color}]{phase_value}[/{phase_color}]"
-            f"  [{_C['dim']}]{pct}% done"
-            f"  {len(progress.units)} units[/{_C['dim']}]"
+            f"  [{_SEM['dim']}]{pct}% done"
+            f"  {len(progress.units)} units[/{_SEM['dim']}]"
         )
         self._op_line(op_id, header)
 
@@ -4675,8 +4681,8 @@ class SerpentFlow:
             )
             self._op_line(
                 op_id,
-                f"[{_C['dim']}]⎿  runtime: {runtime_str}  "
-                f"concurrency: {progress.concurrency_limit}[/{_C['dim']}]",
+                f"[{_SEM['dim']}]⎿  runtime: {runtime_str}  "
+                f"concurrency: {progress.concurrency_limit}[/{_SEM['dim']}]",
             )
 
         # Critical path highlight.
@@ -4688,21 +4694,21 @@ class SerpentFlow:
                 critical_set = set()
             if critical_set:
                 chain_repr = " → ".join(
-                    f"[{_C['heal']}]{uid}[/{_C['heal']}]" if uid in critical_set else uid
+                    f"[{_SEM['heal']}]{uid}[/{_SEM['heal']}]" if uid in critical_set else uid
                     for uid in list(critical_set)[:6]
                 )
                 self._op_line(
                     op_id,
-                    f"[{_C['dim']}]⎿  critical path: {chain_repr}[/{_C['dim']}]",
+                    f"[{_SEM['dim']}]⎿  critical path: {chain_repr}[/{_SEM['dim']}]",
                 )
 
         # Per-unit lanes.
         unit_status_glyph = {
-            "pending": ("○", _C["dim"]),
-            "running": ("◐", _C["neural"]),
-            "completed": ("●", _C["life"]),
-            "failed": ("✗", _C["death"]),
-            "cancelled": ("◌", _C["heal"]),
+            "pending": ("○", _SEM["dim"]),
+            "running": ("◐", _SEM["neural"]),
+            "completed": ("●", _SEM["life"]),
+            "failed": ("✗", _SEM["death"]),
+            "cancelled": ("◌", _SEM["heal"]),
         }
 
         rendered = 0
@@ -4710,7 +4716,7 @@ class SerpentFlow:
             if rendered >= max_units_rendered:
                 break
             state_value = getattr(unit.state, "value", str(unit.state))
-            glyph, color = unit_status_glyph.get(state_value, ("?", _C["dim"]))
+            glyph, color = unit_status_glyph.get(state_value, ("?", _SEM["dim"]))
             is_critical = unit_id in critical_set
 
             # Timing: ms when running, runtime_ms when terminal.
@@ -4721,9 +4727,9 @@ class SerpentFlow:
             timing = ""
             if ms > 0:
                 timing = (
-                    f"  [{_C['dim']}]{ms:.0f}ms[/{_C['dim']}]"
+                    f"  [{_SEM['dim']}]{ms:.0f}ms[/{_SEM['dim']}]"
                     if ms < 1000
-                    else f"  [{_C['dim']}]{ms / 1000:.1f}s[/{_C['dim']}]"
+                    else f"  [{_SEM['dim']}]{ms / 1000:.1f}s[/{_SEM['dim']}]"
                 )
 
             target_repr = ""
@@ -4732,10 +4738,10 @@ class SerpentFlow:
                 if len(first) > 48:
                     parts = first.split("/")
                     first = "/".join(parts[-3:]) if len(parts) >= 3 else first
-                target_repr = f"  [{_C['file']}]{first}[/{_C['file']}]"
+                target_repr = f"  [{_SEM['file']}]{first}[/{_SEM['file']}]"
                 if len(unit.target_files) > 1:
                     target_repr += (
-                        f"  [{_C['dim']}](+{len(unit.target_files) - 1})[/{_C['dim']}]"
+                        f"  [{_SEM['dim']}](+{len(unit.target_files) - 1})[/{_SEM['dim']}]"
                     )
 
             crit_marker = "★ " if is_critical else "  "
@@ -4750,7 +4756,7 @@ class SerpentFlow:
                 err = unit.error.replace("[", "\\[")[:80]
                 self._op_line(
                     op_id,
-                    f"       [{_C['death']}]⎿ {err}[/{_C['death']}]",
+                    f"       [{_SEM['death']}]⎿ {err}[/{_SEM['death']}]",
                 )
             rendered += 1
 
@@ -4758,8 +4764,8 @@ class SerpentFlow:
         if overflow > 0:
             self._op_line(
                 op_id,
-                f"  [{_C['dim']}]... +{overflow} more unit"
-                f"{'s' if overflow != 1 else ''}[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]... +{overflow} more unit"
+                f"{'s' if overflow != 1 else ''}[/{_SEM['dim']}]",
             )
 
         # Merge decisions.
@@ -4771,16 +4777,16 @@ class SerpentFlow:
                 merged = decision.get("merged_unit_ids", [])
                 conflict = decision.get("conflict_units", [])
                 conflict_note = (
-                    f"  [{_C['death']}]{len(conflict)} conflict"
-                    f"{'s' if len(conflict) != 1 else ''}[/{_C['death']}]"
+                    f"  [{_SEM['death']}]{len(conflict)} conflict"
+                    f"{'s' if len(conflict) != 1 else ''}[/{_SEM['death']}]"
                     if conflict
                     else ""
                 )
                 self._op_line(
                     op_id,
-                    f"  [{_C['provider']}]⚭ merge[/{_C['provider']}]"
-                    f"  [{_C['dim']}]{repo}:{barrier}  "
-                    f"{len(merged)} units merged{conflict_note}[/{_C['dim']}]",
+                    f"  [{_SEM['provider']}]⚭ merge[/{_SEM['provider']}]"
+                    f"  [{_SEM['dim']}]{repo}:{barrier}  "
+                    f"{len(merged)} units merged{conflict_note}[/{_SEM['dim']}]",
                 )
 
     def render_graph_event(self, event: Any, op_id: str = "") -> None:
@@ -4794,33 +4800,33 @@ class SerpentFlow:
             return
         kind_value = getattr(event.kind, "value", str(event.kind))
         glyphs = {
-            "graph.submitted": ("⏺", _C["dim"], "submitted"),
-            "graph.started": ("⏵", _C["neural"], "started"),
-            "graph.completed": ("✔", _C["life"], "completed"),
-            "graph.failed": ("✗", _C["death"], "failed"),
-            "graph.cancelled": ("◌", _C["heal"], "cancelled"),
-            "unit.ready": ("◎", _C["dim"], "ready"),
-            "unit.started": ("◐", _C["neural"], "started"),
-            "unit.completed": ("●", _C["life"], "completed"),
-            "unit.failed": ("✗", _C["death"], "failed"),
-            "unit.cancelled": ("◌", _C["heal"], "cancelled"),
-            "merge.decided": ("⚭", _C["provider"], "merged"),
+            "graph.submitted": ("⏺", _SEM["dim"], "submitted"),
+            "graph.started": ("⏵", _SEM["neural"], "started"),
+            "graph.completed": ("✔", _SEM["life"], "completed"),
+            "graph.failed": ("✗", _SEM["death"], "failed"),
+            "graph.cancelled": ("◌", _SEM["heal"], "cancelled"),
+            "unit.ready": ("◎", _SEM["dim"], "ready"),
+            "unit.started": ("◐", _SEM["neural"], "started"),
+            "unit.completed": ("●", _SEM["life"], "completed"),
+            "unit.failed": ("✗", _SEM["death"], "failed"),
+            "unit.cancelled": ("◌", _SEM["heal"], "cancelled"),
+            "merge.decided": ("⚭", _SEM["provider"], "merged"),
         }
-        glyph, color, label = glyphs.get(kind_value, ("·", _C["dim"], kind_value))
+        glyph, color, label = glyphs.get(kind_value, ("·", _SEM["dim"], kind_value))
         target = event.unit_id or event.graph_id[:10]
         payload = event.payload or {}
         extra = ""
         runtime_ms = payload.get("runtime_ms")
         if isinstance(runtime_ms, (int, float)) and runtime_ms > 0:
             extra = (
-                f"  [{_C['dim']}]{runtime_ms:.0f}ms[/{_C['dim']}]"
+                f"  [{_SEM['dim']}]{runtime_ms:.0f}ms[/{_SEM['dim']}]"
                 if runtime_ms < 1000
-                else f"  [{_C['dim']}]{runtime_ms / 1000:.1f}s[/{_C['dim']}]"
+                else f"  [{_SEM['dim']}]{runtime_ms / 1000:.1f}s[/{_SEM['dim']}]"
             )
         self._op_line(
             op_id,
             f"  [{color}]{glyph}[/{color}] {target:<16} "
-            f"[{_C['dim']}]{label}[/{_C['dim']}]{extra}",
+            f"[{_SEM['dim']}]{label}[/{_SEM['dim']}]{extra}",
         )
 
 
@@ -4900,8 +4906,8 @@ class SerpentTransport:
             self._boot_recovery_count += 1
             if self._boot_recovery_count == 1:
                 self._flow.console.print(
-                    f"  [{_C['dim']}]⏭️  boot recovery │ "
-                    f"reconciling stale ledger entries...[/{_C['dim']}]",
+                    f"  [{_SEM['dim']}]⏭️  boot recovery │ "
+                    f"reconciling stale ledger entries...[/{_SEM['dim']}]",
                     highlight=False,
                 )
             return
@@ -4922,13 +4928,13 @@ class SerpentTransport:
                 _files_str += f" +{len(_files) - 3}"
             self._flow._op_line(
                 op_id,
-                f"[{_C['heal']}]⚠ NOTIFY[/{_C['heal']}]     "
-                f"[{_C['dim']}]{reason_code}[/{_C['dim']}]  "
-                f"[{_C['file']}]{_files_str}[/{_C['file']}]",
+                f"[{_SEM['heal']}]⚠ NOTIFY[/{_SEM['heal']}]     "
+                f"[{_SEM['dim']}]{reason_code}[/{_SEM['dim']}]  "
+                f"[{_SEM['file']}]{_files_str}[/{_SEM['file']}]",
             )
             self._flow._op_line(
                 op_id,
-                f"[{_C['dim']}]⎎  auto-applying (Yellow severity — review in git log)[/{_C['dim']}]",
+                f"[{_SEM['dim']}]⎎  auto-applying (Yellow severity — review in git log)[/{_SEM['dim']}]",
             )
             return
 
@@ -4974,8 +4980,8 @@ class SerpentTransport:
                 if self._boot_recovery_count > 0 and not self._boot_recovery_flushed:
                     self._boot_recovery_flushed = True
                     self._flow.console.print(
-                        f"  [{_C['dim']}]⏭️  boot recovery │ "
-                        f"{self._boot_recovery_count} stale entries reconciled[/{_C['dim']}]",
+                        f"  [{_SEM['dim']}]⏭️  boot recovery │ "
+                        f"{self._boot_recovery_count} stale entries reconciled[/{_SEM['dim']}]",
                         highlight=False,
                     )
                     self._flow.console.print()
@@ -5178,9 +5184,9 @@ class SerpentTransport:
                         )
                     self._flow._op_line(
                         op_id,
-                        f"[{_C['dim']}]⎿  {_tier_label} diff preview — "
+                        f"[{_SEM['dim']}]⎿  {_tier_label} diff preview — "
                         f"auto-applying in {_delay:.0f}s "
-                        f"(/reject to cancel)[/{_C['dim']}]",
+                        f"(/reject to cancel)[/{_SEM['dim']}]",
                     )
 
                 # Streaming — dedup: show synthesizing once per op
@@ -5758,7 +5764,7 @@ class SerpentREPL:
                         pass
                     text = format_provider_breadcrumb(payload)
                     healthy = payload.get("state") == "HEALTHY"
-                    color = _C["neural"] if healthy else _C["heal"]
+                    color = _SEM["neural"] if healthy else _SEM["heal"]
                     glyph = "✓" if healthy else "⚠"
                     styled = f"  [{color}]{glyph} {text}[/{color}]"
                     try:
@@ -5819,10 +5825,10 @@ class SerpentREPL:
                     action = str(payload.get("intended_action", "") or "?")
                     aid = str(payload.get("action_id", "") or "?")
                     self._flow.console.print(
-                        f"  [{_C['heal']}]⚠ shadow action trapped[/{_C['heal']}]  "
-                        f"[{_C['neural']}]{organ}[/{_C['neural']}] wants to "
+                        f"  [{_SEM['heal']}]⚠ shadow action trapped[/{_SEM['heal']}]  "
+                        f"[{_SEM['neural']}]{organ}[/{_SEM['neural']}] wants to "
                         f"[bold]{action}[/bold] "
-                        f"[{_C['dim']}](id={aid}) — /endorse to review[/{_C['dim']}]",
+                        f"[{_SEM['dim']}](id={aid}) — /endorse to review[/{_SEM['dim']}]",
                         highlight=False,
                     )
                 except Exception:  # noqa: BLE001 — one bad event never kills the loop
@@ -5923,7 +5929,7 @@ class SerpentREPL:
         # Built-in commands
         if line in ("quit", "exit", "q"):
             self._flow.console.print(
-                f"  [{_C['dim']}]Shutting down…[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]Shutting down…[/{_SEM['dim']}]",
                 highlight=False,
             )
             self._running = False
@@ -6205,7 +6211,7 @@ class SerpentREPL:
             _target = _arg[1].strip() if len(_arg) > 1 else "auto"
             _result = self._flow.set_lens(_target)
             self._flow.console.print(
-                f"  [{_C['dim']}]{_result}[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]{_result}[/{_SEM['dim']}]",
                 highlight=False,
             )
             return True
@@ -6213,7 +6219,7 @@ class SerpentREPL:
             _arg = line.split(None, 1)
             if len(_arg) < 2:
                 self._flow.console.print(
-                    f"  [{_C['dim']}]usage: /show <op_id|short_id>[/{_C['dim']}]",
+                    f"  [{_SEM['dim']}]usage: /show <op_id|short_id>[/{_SEM['dim']}]",
                     highlight=False,
                 )
             else:
@@ -6243,8 +6249,8 @@ class SerpentREPL:
                     return True
             except Exception as exc:  # noqa: BLE001
                 self._flow.console.print(
-                    f"  [{_C['death']}]/plan dispatch error: "
-                    f"{exc}[/{_C['death']}]",
+                    f"  [{_SEM['death']}]/plan dispatch error: "
+                    f"{exc}[/{_SEM['death']}]",
                     highlight=False,
                 )
                 return True
@@ -6270,8 +6276,8 @@ class SerpentREPL:
                     return True
             except Exception as exc:  # noqa: BLE001
                 self._flow.console.print(
-                    f"  [{_C['death']}]inline-permission "
-                    f"dispatch error: {exc}[/{_C['death']}]",
+                    f"  [{_SEM['death']}]inline-permission "
+                    f"dispatch error: {exc}[/{_SEM['death']}]",
                     highlight=False,
                 )
                 return True
@@ -6363,7 +6369,7 @@ class SerpentREPL:
                     await result
             except Exception as exc:
                 self._flow.console.print(
-                    f"  [{_C['death']}]Error: {exc}[/{_C['death']}]",
+                    f"  [{_SEM['death']}]Error: {exc}[/{_SEM['death']}]",
                     highlight=False,
                 )
         return False
@@ -6587,7 +6593,7 @@ class SerpentREPL:
             from prompt_toolkit.patch_stdout import patch_stdout
         except ImportError:
             self._flow.console.print(
-                f"  [{_C['dim']}]REPL disabled: prompt_toolkit not installed[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]REPL disabled: prompt_toolkit not installed[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -7440,7 +7446,7 @@ class SerpentREPL:
         if category:
             target_seg += f" category={category}"
         f.console.print(
-            f"  [{_C['neural']}]{atype:<26s}[/{_C['neural']}] "
+            f"  [{_SEM['neural']}]{atype:<26s}[/{_SEM['neural']}] "
             f"[dim]op-{op_id}[/dim]{target_seg}"
         )
         f.console.print(f"      [dim]{evidence}[/dim]")
@@ -7473,32 +7479,32 @@ class SerpentREPL:
     def _print_help(self) -> None:
         """Print available REPL commands."""
         lines = [
-            f"  [{_C['dim']}]/status[/{_C['dim']}]           organism status snapshot",
-            f"  [{_C['dim']}]/cost[/{_C['dim']}]             cost breakdown by route",
-            f"  [{_C['dim']}]/posture[/{_C['dim']}]          current strategic posture",
-            f"  [{_C['dim']}]/auto-action[/{_C['dim']}]      recent advisory proposals (stats|<op_id>)",
-            f"  [{_C['dim']}]/probe[/{_C['dim']}]            confidence-probe loop status (Move 5)",
-            f"  [{_C['dim']}]/coherence[/{_C['dim']}]        coherence-auditor flags + audits (Priority #1)",
-            f"  [{_C['dim']}]/quorum[/{_C['dim']}]           generative-quorum status + history (Move 6)",
-            f"  [{_C['dim']}]/failures[/{_C['dim']}]         failure-mode memory recurrences (Upgrade 3 / PRD §31.4)",
-            f"  [{_C['dim']}]/outcomes[/{_C['dim']}]         action-outcome memory recall (M11 / PRD §30.5.3)",
-            f"  [{_C['dim']}]/postmortems[/{_C['dim']}]      recent postmortems + DAG (Priority #2)",
-            f"  [{_C['dim']}]/lessons[/{_C['dim']}]          show session lesson buffer",
-            f"  [{_C['dim']}]cancel <id>[/{_C['dim']}]       cancel an in-flight operation",
-            f"  [{_C['dim']}]/risk [tier][/{_C['dim']}]      set risk ceiling",
-            f"  [{_C['dim']}]/budget <usd>[/{_C['dim']}]     adjust session budget",
-            f"  [{_C['dim']}]/plan [on|off][/{_C['dim']}]   show plan before execution",
-            f"  [{_C['dim']}]/goal [add|rm][/{_C['dim']}]    manage active goals",
-            f"  [{_C['dim']}]/memory [...][/{_C['dim']}]     list/add/rm/forbid user-pref memories",
-            f"  [{_C['dim']}]/remember <text>[/{_C['dim']}]  shortcut: add a USER memory",
-            f"  [{_C['dim']}]/forget <id>[/{_C['dim']}]      shortcut: remove a memory by id",
-            f"  [{_C['dim']}]/mutation <src>[/{_C['dim']}]   mutation-test <src> (meta-test: do tests catch bugs?)",
-            f"  [{_C['dim']}]/mutation-gate ...[/{_C['dim']}] APPLY-gate status / dry-run / ledger",
-            f"  [{_C['dim']}]/vision [...][/{_C['dim']}]      VisionSensor: status | resume | boost <seconds>",
-            f"  [{_C['dim']}]/verify-confirm <op> X[/{_C['dim']}] mark Visual VERIFY advisory as agree|disagree",
-            f"  [{_C['dim']}]/verify-undemote[/{_C['dim']}]   clear Slice 4 auto-demotion flag",
-            f"  [{_C['dim']}]help[/{_C['dim']}]              this message",
-            f"  [{_C['dim']}]quit[/{_C['dim']}]              graceful shutdown",
+            f"  [{_SEM['dim']}]/status[/{_SEM['dim']}]           organism status snapshot",
+            f"  [{_SEM['dim']}]/cost[/{_SEM['dim']}]             cost breakdown by route",
+            f"  [{_SEM['dim']}]/posture[/{_SEM['dim']}]          current strategic posture",
+            f"  [{_SEM['dim']}]/auto-action[/{_SEM['dim']}]      recent advisory proposals (stats|<op_id>)",
+            f"  [{_SEM['dim']}]/probe[/{_SEM['dim']}]            confidence-probe loop status (Move 5)",
+            f"  [{_SEM['dim']}]/coherence[/{_SEM['dim']}]        coherence-auditor flags + audits (Priority #1)",
+            f"  [{_SEM['dim']}]/quorum[/{_SEM['dim']}]           generative-quorum status + history (Move 6)",
+            f"  [{_SEM['dim']}]/failures[/{_SEM['dim']}]         failure-mode memory recurrences (Upgrade 3 / PRD §31.4)",
+            f"  [{_SEM['dim']}]/outcomes[/{_SEM['dim']}]         action-outcome memory recall (M11 / PRD §30.5.3)",
+            f"  [{_SEM['dim']}]/postmortems[/{_SEM['dim']}]      recent postmortems + DAG (Priority #2)",
+            f"  [{_SEM['dim']}]/lessons[/{_SEM['dim']}]          show session lesson buffer",
+            f"  [{_SEM['dim']}]cancel <id>[/{_SEM['dim']}]       cancel an in-flight operation",
+            f"  [{_SEM['dim']}]/risk [tier][/{_SEM['dim']}]      set risk ceiling",
+            f"  [{_SEM['dim']}]/budget <usd>[/{_SEM['dim']}]     adjust session budget",
+            f"  [{_SEM['dim']}]/plan [on|off][/{_SEM['dim']}]   show plan before execution",
+            f"  [{_SEM['dim']}]/goal [add|rm][/{_SEM['dim']}]    manage active goals",
+            f"  [{_SEM['dim']}]/memory [...][/{_SEM['dim']}]     list/add/rm/forbid user-pref memories",
+            f"  [{_SEM['dim']}]/remember <text>[/{_SEM['dim']}]  shortcut: add a USER memory",
+            f"  [{_SEM['dim']}]/forget <id>[/{_SEM['dim']}]      shortcut: remove a memory by id",
+            f"  [{_SEM['dim']}]/mutation <src>[/{_SEM['dim']}]   mutation-test <src> (meta-test: do tests catch bugs?)",
+            f"  [{_SEM['dim']}]/mutation-gate ...[/{_SEM['dim']}] APPLY-gate status / dry-run / ledger",
+            f"  [{_SEM['dim']}]/vision [...][/{_SEM['dim']}]      VisionSensor: status | resume | boost <seconds>",
+            f"  [{_SEM['dim']}]/verify-confirm <op> X[/{_SEM['dim']}] mark Visual VERIFY advisory as agree|disagree",
+            f"  [{_SEM['dim']}]/verify-undemote[/{_SEM['dim']}]   clear Slice 4 auto-demotion flag",
+            f"  [{_SEM['dim']}]help[/{_SEM['dim']}]              this message",
+            f"  [{_SEM['dim']}]quit[/{_SEM['dim']}]              graceful shutdown",
         ]
         panel = Panel(
             "\n".join(lines),
@@ -7518,7 +7524,7 @@ class SerpentREPL:
 
         if not lessons:
             f.console.print(
-                f"  [{_C['dim']}]📖 No session lessons yet.[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]📖 No session lessons yet.[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -7531,12 +7537,12 @@ class SerpentREPL:
             icon = _icons.get(ltype, "📝")
             # Escape Rich markup in model-generated text
             safe = text.replace("[", "\\[")[:120]
-            lines.append(f"  {icon} [{_C['dim']}]{i:>2}.[/{_C['dim']}] {safe}")
+            lines.append(f"  {icon} [{_SEM['dim']}]{i:>2}.[/{_SEM['dim']}] {safe}")
 
         panel = Panel(
             "\n".join(lines),
-            title=f"[{_C['neural']}]📖 Session Lessons ({len(lessons)})[/{_C['neural']}]",
-            border_style=_C["neural"],
+            title=f"[{_SEM['neural']}]📖 Session Lessons ({len(lessons)})[/{_SEM['neural']}]",
+            border_style=_SEM["neural"],
             width=min(f.console.width, 80),
             padding=(0, 1),
         )
@@ -7561,7 +7567,7 @@ class SerpentREPL:
         """
         if self._gls is None:
             self._flow.console.print(
-                f"  [{_C['death']}]Cancel not available (no GLS reference)[/{_C['death']}]",
+                f"  [{_SEM['death']}]Cancel not available (no GLS reference)[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7582,8 +7588,8 @@ class SerpentREPL:
                     mine = []
             if not mine:
                 self._flow.console.print(
-                    f"  [{_C['dim']}]nothing of yours is running — "
-                    f"autonomous work keeps going[/{_C['dim']}]",
+                    f"  [{_SEM['dim']}]nothing of yours is running — "
+                    f"autonomous work keeps going[/{_SEM['dim']}]",
                     highlight=False,
                 )
                 return
@@ -7603,17 +7609,17 @@ class SerpentREPL:
                     )
                 )
                 self._flow.console.print(
-                    f"  [{_C['evolved']}]{msg}[/{_C['evolved']}]",
+                    f"  [{_SEM['evolved']}]{msg}[/{_SEM['evolved']}]",
                     highlight=False,
                 )
             else:
                 self._flow.console.print(
-                    f"  [{_C['death']}]No active operation matching '{op_id}'[/{_C['death']}]",
+                    f"  [{_SEM['death']}]No active operation matching '{op_id}'[/{_SEM['death']}]",
                     highlight=False,
                 )
         else:
             self._flow.console.print(
-                f"  [{_C['death']}]GLS does not support cancel (upgrade needed)[/{_C['death']}]",
+                f"  [{_SEM['death']}]GLS does not support cancel (upgrade needed)[/{_SEM['death']}]",
                 highlight=False,
             )
 
@@ -7705,7 +7711,7 @@ class SerpentREPL:
         # parts[0] is "/attach" (or "attach"); parts[1] is path; parts[2] is description
         if len(parts) < 2 or not parts[1].strip():
             self._flow.console.print(
-                f"  [{_C['death']}]Usage: /attach <absolute_path> [description][/{_C['death']}]",
+                f"  [{_SEM['death']}]Usage: /attach <absolute_path> [description][/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7716,7 +7722,7 @@ class SerpentREPL:
         # Step 1: absolute path required (matches Attachment.from_file).
         if not os.path.isabs(path):
             self._flow.console.print(
-                f"  [{_C['death']}]/attach requires absolute path; got {path!r}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/attach requires absolute path; got {path!r}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7724,7 +7730,7 @@ class SerpentREPL:
         # Step 2: file must exist and be a regular file.
         if not os.path.isfile(path):
             self._flow.console.print(
-                f"  [{_C['death']}]/attach: file not found or not regular: {path}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/attach: file not found or not regular: {path}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7737,15 +7743,15 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             self._flow.console.print(
-                f"  [{_C['death']}]/attach: op_context unavailable: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/attach: op_context unavailable: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         _ext = os.path.splitext(path)[1].lower()
         if _ext not in _ATTACHMENT_EXT_TO_MIME:
             self._flow.console.print(
-                f"  [{_C['death']}]/attach: unsupported extension {_ext!r}; allowed: "
-                f"{sorted(_ATTACHMENT_EXT_TO_MIME)}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/attach: unsupported extension {_ext!r}; allowed: "
+                f"{sorted(_ATTACHMENT_EXT_TO_MIME)}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7755,14 +7761,14 @@ class SerpentREPL:
             _size = os.path.getsize(path)
         except OSError as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]/attach: cannot stat {path}: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/attach: cannot stat {path}: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         if _size > _ATTACHMENT_MAX_IMAGE_BYTES_DEFAULT:
             self._flow.console.print(
-                f"  [{_C['death']}]/attach: file is {_size} bytes; cap is "
-                f"{_ATTACHMENT_MAX_IMAGE_BYTES_DEFAULT} (10 MiB)[/{_C['death']}]",
+                f"  [{_SEM['death']}]/attach: file is {_size} bytes; cap is "
+                f"{_ATTACHMENT_MAX_IMAGE_BYTES_DEFAULT} (10 MiB)[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7775,7 +7781,7 @@ class SerpentREPL:
             _reason = _is_protected_path(path)
             if _reason:
                 self._flow.console.print(
-                    f"  [{_C['death']}]/attach: protected path — {_reason}[/{_C['death']}]",
+                    f"  [{_SEM['death']}]/attach: protected path — {_reason}[/{_SEM['death']}]",
                     highlight=False,
                 )
                 return
@@ -7783,7 +7789,7 @@ class SerpentREPL:
             # If the Venom helper is unavailable for any reason, fail
             # closed rather than skip the check.
             self._flow.console.print(
-                f"  [{_C['death']}]/attach: protected-path check unavailable; refusing[/{_C['death']}]",
+                f"  [{_SEM['death']}]/attach: protected-path check unavailable; refusing[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7810,7 +7816,7 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             self._flow.console.print(
-                f"  [{_C['death']}]/attach: envelope build failed: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/attach: envelope build failed: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7818,7 +7824,7 @@ class SerpentREPL:
         _router = getattr(self._gls, "_intake_router", None)
         if _router is None:
             self._flow.console.print(
-                f"  [{_C['death']}]/attach: GLS._intake_router unavailable[/{_C['death']}]",
+                f"  [{_SEM['death']}]/attach: GLS._intake_router unavailable[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7827,15 +7833,15 @@ class SerpentREPL:
             verdict = await _router.ingest(envelope)
         except Exception as exc:  # noqa: BLE001
             self._flow.console.print(
-                f"  [{_C['death']}]/attach: router.ingest raised: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/attach: router.ingest raised: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
 
         _env_id = getattr(envelope, "causal_id", "") or getattr(envelope, "signal_id", "")
         self._flow.console.print(
-            f"  [{_C['evolved']}]✓ /attach submitted: op={_env_id} path={os.path.basename(path)} "
-            f"size={_size}B mime={_ATTACHMENT_EXT_TO_MIME[_ext]} verdict={verdict}[/{_C['evolved']}]",
+            f"  [{_SEM['evolved']}]✓ /attach submitted: op={_env_id} path={os.path.basename(path)} "
+            f"size={_size}B mime={_ATTACHMENT_EXT_TO_MIME[_ext]} verdict={verdict}[/{_SEM['evolved']}]",
             highlight=False,
         )
 
@@ -7874,8 +7880,8 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             self._flow.console.print(
-                f"  [{_C['death']}]/tutorial: substrate import "
-                f"failed: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/tutorial: substrate import "
+                f"failed: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7918,8 +7924,8 @@ class SerpentREPL:
                 )
             except Exception as exc:  # noqa: BLE001
                 self._flow.console.print(
-                    f"  [{_C['death']}]/tutorial setup: render "
-                    f"failed: {exc}[/{_C['death']}]",
+                    f"  [{_SEM['death']}]/tutorial setup: render "
+                    f"failed: {exc}[/{_SEM['death']}]",
                     highlight=False,
                 )
                 return
@@ -7940,8 +7946,8 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             self._flow.console.print(
-                f"  [{_C['death']}]/tutorial: render failed: "
-                f"{exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/tutorial: render failed: "
+                f"{exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7979,8 +7985,8 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             self._flow.console.print(
-                f"  [{_C['death']}]/ask: substrate import "
-                f"failed: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/ask: substrate import "
+                f"failed: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -7992,8 +7998,8 @@ class SerpentREPL:
             question = ""
         if not question:
             self._flow.console.print(
-                f"  [{_C['dim']}]/ask: missing question. "
-                f"Usage: `/ask <question>`[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]/ask: missing question. "
+                f"Usage: `/ask <question>`[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -8008,7 +8014,7 @@ class SerpentREPL:
         # flight — keeps the operator anchored.
         self._flow.console.print()
         self._flow.console.print(
-            f"  [{_C['dim']}]🤔 thinking…[/{_C['dim']}]",
+            f"  [{_SEM['dim']}]🤔 thinking…[/{_SEM['dim']}]",
             highlight=False,
         )
         try:
@@ -8017,8 +8023,8 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             self._flow.console.print(
-                f"  [{_C['death']}]/ask: provider error: "
-                f"{exc!r}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/ask: provider error: "
+                f"{exc!r}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -8029,19 +8035,19 @@ class SerpentREPL:
         if report.verdict is QAVerdict.ANSWERED and report.artifact:
             c.print()
             c.print(
-                f"[{_C['neural']}]💡 Answer[/{_C['neural']}] "
-                f"[{_C['dim']}]· "
+                f"[{_SEM['neural']}]💡 Answer[/{_SEM['neural']}] "
+                f"[{_SEM['dim']}]· "
                 f"ref={report.artifact.ref} · "
                 f"cost=${report.artifact.cost_usd:.5f} · "
                 f"{report.artifact.elapsed_s:.2f}s · "
-                f"{report.artifact.model}[/{_C['dim']}]",
+                f"{report.artifact.model}[/{_SEM['dim']}]",
                 highlight=False,
             )
             for ln in (report.artifact.answer or "").splitlines():
                 c.print(f"  {ln}", highlight=False)
             c.print(
-                f"  [{_C['dim']}](re-expand: `/expand "
-                f"{report.artifact.ref}`)[/{_C['dim']}]",
+                f"  [{_SEM['dim']}](re-expand: `/expand "
+                f"{report.artifact.ref}`)[/{_SEM['dim']}]",
                 highlight=False,
             )
             c.print()
@@ -8054,9 +8060,9 @@ class SerpentREPL:
             # false" or "daily Q&A budget exhausted").
             c.print()
             c.print(
-                f"  [{_C['heal']}]/ask {report.verdict.value}:"
-                f"[/{_C['heal']}] [{_C['dim']}]"
-                f"{report.diagnostic}[/{_C['dim']}]",
+                f"  [{_SEM['heal']}]/ask {report.verdict.value}:"
+                f"[/{_SEM['heal']}] [{_SEM['dim']}]"
+                f"{report.diagnostic}[/{_SEM['dim']}]",
                 highlight=False,
             )
             c.print()
@@ -8076,7 +8082,7 @@ class SerpentREPL:
             render_preflight(self._flow.console)
         except Exception as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]/preflight error: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/preflight error: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
 
@@ -8094,7 +8100,7 @@ class SerpentREPL:
             render_organism(self._flow.console)
         except Exception as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]/organism error: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/organism error: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
 
@@ -8163,7 +8169,7 @@ class SerpentREPL:
                 self._expand_op_block_by_op_id(ref_or_op)
         except Exception as exc:  # noqa: BLE001
             self._flow.console.print(
-                f"  [{_C['death']}]/expand error: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/expand error: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
 
@@ -8176,8 +8182,8 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             self._flow.console.print(
-                f"  [{_C['death']}]/expand {ref}: fast_path_qa "
-                f"unavailable: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/expand {ref}: fast_path_qa "
+                f"unavailable: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -8187,26 +8193,26 @@ class SerpentREPL:
             artifact = None
         if artifact is None:
             self._flow.console.print(
-                f"  [{_C['dim']}]/expand {ref}: not in QA ring "
-                f"(evicted or never recorded)[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]/expand {ref}: not in QA ring "
+                f"(evicted or never recorded)[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
         c = self._flow.console
         c.print()
         c.print(
-            f"[{_C['neural']}]🤔 Q&A {artifact.ref}"
-            f"[/{_C['neural']}] "
-            f"[{_C['dim']}]· cost=${artifact.cost_usd:.5f} · "
-            f"{artifact.elapsed_s:.2f}s · {artifact.model}[/{_C['dim']}]",
+            f"[{_SEM['neural']}]🤔 Q&A {artifact.ref}"
+            f"[/{_SEM['neural']}] "
+            f"[{_SEM['dim']}]· cost=${artifact.cost_usd:.5f} · "
+            f"{artifact.elapsed_s:.2f}s · {artifact.model}[/{_SEM['dim']}]",
             highlight=False,
         )
         c.print(
-            f"  [{_C['dim']}]Q:[/{_C['dim']}] {artifact.question}",
+            f"  [{_SEM['dim']}]Q:[/{_SEM['dim']}] {artifact.question}",
             highlight=False,
         )
         c.print()
-        c.print(f"  [{_C['dim']}]A:[/{_C['dim']}]", highlight=False)
+        c.print(f"  [{_SEM['dim']}]A:[/{_SEM['dim']}]", highlight=False)
         for ln in (artifact.answer or "").splitlines():
             c.print(f"  {ln}", highlight=False)
         c.print()
@@ -8225,7 +8231,7 @@ class SerpentREPL:
             )
         except Exception:
             self._flow.console.print(
-                f"  [{_C['dim']}]/expand: substrate not available[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]/expand: substrate not available[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -8245,44 +8251,44 @@ class SerpentREPL:
             perm_recent = ()
 
         self._flow.console.print(
-            f"  [{_C['neural']}]Recent retrievable refs:[/{_C['neural']}]",
+            f"  [{_SEM['neural']}]Recent retrievable refs:[/{_SEM['neural']}]",
             highlight=False,
         )
         if op_recent:
             self._flow.console.print(
-                f"    [{_C['dim']}]op blocks:[/{_C['dim']}]",
+                f"    [{_SEM['dim']}]op blocks:[/{_SEM['dim']}]",
                 highlight=False,
             )
             for b in op_recent:
                 self._flow.console.print(
-                    f"      [{_C['evolved']}]{b.ref}[/{_C['evolved']}] "
-                    f"[{_C['dim']}]{b.op_id} · {b.line_count} lines · "
-                    f"{b.state.value}[/{_C['dim']}]",
+                    f"      [{_SEM['evolved']}]{b.ref}[/{_SEM['evolved']}] "
+                    f"[{_SEM['dim']}]{b.op_id} · {b.line_count} lines · "
+                    f"{b.state.value}[/{_SEM['dim']}]",
                     highlight=False,
                 )
         if diff_recent:
             self._flow.console.print(
-                f"    [{_C['dim']}]diffs:[/{_C['dim']}]",
+                f"    [{_SEM['dim']}]diffs:[/{_SEM['dim']}]",
                 highlight=False,
             )
             for d in diff_recent:
                 self._flow.console.print(
-                    f"      [{_C['evolved']}]{d.ref}[/{_C['evolved']}] "
-                    f"[{_C['dim']}]{d.op_id} · {len(d.file_paths)} file(s) · "
-                    f"{d.apply_outcome.value}[/{_C['dim']}]",
+                    f"      [{_SEM['evolved']}]{d.ref}[/{_SEM['evolved']}] "
+                    f"[{_SEM['dim']}]{d.op_id} · {len(d.file_paths)} file(s) · "
+                    f"{d.apply_outcome.value}[/{_SEM['dim']}]",
                     highlight=False,
                 )
         if tool_refs:
             self._flow.console.print(
-                f"    [{_C['dim']}]tool bodies:[/{_C['dim']}] "
-                f"[{_C['evolved']}]{', '.join(tool_refs)}[/{_C['evolved']}]",
+                f"    [{_SEM['dim']}]tool bodies:[/{_SEM['dim']}] "
+                f"[{_SEM['evolved']}]{', '.join(tool_refs)}[/{_SEM['evolved']}]",
                 highlight=False,
             )
         if perm_recent:
             self._flow.console.print(
-                f"    [{_C['dim']}]permissions:[/{_C['dim']}] "
-                f"[{_C['evolved']}]{', '.join(perm_recent)}"
-                f"[/{_C['evolved']}]",
+                f"    [{_SEM['dim']}]permissions:[/{_SEM['dim']}] "
+                f"[{_SEM['evolved']}]{', '.join(perm_recent)}"
+                f"[/{_SEM['evolved']}]",
                 highlight=False,
             )
         if (
@@ -8290,11 +8296,11 @@ class SerpentREPL:
             and not tool_refs and not perm_recent
         ):
             self._flow.console.print(
-                f"  [{_C['dim']}]No retrievable refs yet[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]No retrievable refs yet[/{_SEM['dim']}]",
                 highlight=False,
             )
         self._flow.console.print(
-            f"  [{_C['dim']}]Usage: /expand <ref> | /expand <op-id>[/{_C['dim']}]",
+            f"  [{_SEM['dim']}]Usage: /expand <ref> | /expand <op-id>[/{_SEM['dim']}]",
             highlight=False,
         )
 
@@ -8305,18 +8311,18 @@ class SerpentREPL:
         stored = get_default_store().lookup(ref)
         if stored is None:
             self._flow.console.print(
-                f"  [{_C['heal']}]No tool body for {ref}[/{_C['heal']}]",
+                f"  [{_SEM['heal']}]No tool body for {ref}[/{_SEM['heal']}]",
                 highlight=False,
             )
             return
         self._flow.console.print(
-            f"  [{_C['neural']}]⏺ {stored.tool_name}[/{_C['neural']}] "
-            f"[{_C['dim']}]{ref} · {stored.summary}[/{_C['dim']}]",
+            f"  [{_SEM['neural']}]⏺ {stored.tool_name}[/{_SEM['neural']}] "
+            f"[{_SEM['dim']}]{ref} · {stored.summary}[/{_SEM['dim']}]",
             highlight=False,
         )
         for ln in stored.body.splitlines():
             self._flow.console.print(
-                f"    [{_C['dim']}]{ln}[/{_C['dim']}]", highlight=False,
+                f"    [{_SEM['dim']}]{ln}[/{_SEM['dim']}]", highlight=False,
             )
 
     def _expand_diff(self, ref: str) -> None:
@@ -8326,24 +8332,24 @@ class SerpentREPL:
         archived = get_default_archive().lookup(ref)
         if archived is None:
             self._flow.console.print(
-                f"  [{_C['heal']}]No diff for {ref}[/{_C['heal']}]",
+                f"  [{_SEM['heal']}]No diff for {ref}[/{_SEM['heal']}]",
                 highlight=False,
             )
             return
         self._flow.console.print(
-            f"  [{_C['neural']}]⏺ Diff[/{_C['neural']}] "
-            f"[{_C['dim']}]{ref} · {archived.op_id} · "
-            f"{archived.apply_outcome.value}[/{_C['dim']}]",
+            f"  [{_SEM['neural']}]⏺ Diff[/{_SEM['neural']}] "
+            f"[{_SEM['dim']}]{ref} · {archived.op_id} · "
+            f"{archived.apply_outcome.value}[/{_SEM['dim']}]",
             highlight=False,
         )
         if archived.review_branch:
             self._flow.console.print(
-                f"    [{_C['file']}]{archived.review_branch}[/{_C['file']}]",
+                f"    [{_SEM['file']}]{archived.review_branch}[/{_SEM['file']}]",
                 highlight=False,
             )
         for ln in archived.diff_text.splitlines()[:200]:
             self._flow.console.print(
-                f"    [{_C['dim']}]{ln}[/{_C['dim']}]", highlight=False,
+                f"    [{_SEM['dim']}]{ln}[/{_SEM['dim']}]", highlight=False,
             )
 
     def _expand_op_block(self, ref: str) -> None:
@@ -8354,20 +8360,20 @@ class SerpentREPL:
         block = buf.lookup(ref)
         if block is None:
             self._flow.console.print(
-                f"  [{_C['heal']}]No op block for {ref}[/{_C['heal']}]",
+                f"  [{_SEM['heal']}]No op block for {ref}[/{_SEM['heal']}]",
                 highlight=False,
             )
             return
         buf.mark_expanded(ref)
         self._flow.console.print(
-            f"  [{_C['neural']}]⏺ Op {block.op_id}[/{_C['neural']}] "
-            f"[{_C['dim']}]{ref} · {block.line_count} lines · "
-            f"{block.state.value}[/{_C['dim']}]",
+            f"  [{_SEM['neural']}]⏺ Op {block.op_id}[/{_SEM['neural']}] "
+            f"[{_SEM['dim']}]{ref} · {block.line_count} lines · "
+            f"{block.state.value}[/{_SEM['dim']}]",
             highlight=False,
         )
         if block.summary_line:
             self._flow.console.print(
-                f"    [{_C['dim']}]{block.summary_line}[/{_C['dim']}]",
+                f"    [{_SEM['dim']}]{block.summary_line}[/{_SEM['dim']}]",
                 highlight=False,
             )
         for ln in block.lines:
@@ -8381,7 +8387,7 @@ class SerpentREPL:
         matches = get_default_buffer().find_by_op_id(op_id)
         if not matches:
             self._flow.console.print(
-                f"  [{_C['heal']}]No buffered block for {op_id}[/{_C['heal']}]",
+                f"  [{_SEM['heal']}]No buffered block for {op_id}[/{_SEM['heal']}]",
                 highlight=False,
             )
             return
@@ -8402,22 +8408,22 @@ class SerpentREPL:
             )
         except Exception as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]/expand narrative unavailable: "
-                f"{exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/expand narrative unavailable: "
+                f"{exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         frame = get_default_channel().lookup(ref)
         if frame is None:
             self._flow.console.print(
-                f"  [{_C['heal']}]No narrative frame for {ref}[/{_C['heal']}]",
+                f"  [{_SEM['heal']}]No narrative frame for {ref}[/{_SEM['heal']}]",
                 highlight=False,
             )
             return
         self._flow.console.print(
-            f"  [{_C['neural']}]⏺ Narrative[/{_C['neural']}] "
-            f"[{_C['dim']}]{ref} · {frame.op_id} · {frame.kind.value} · "
-            f"{frame.state.value}[/{_C['dim']}]",
+            f"  [{_SEM['neural']}]⏺ Narrative[/{_SEM['neural']}] "
+            f"[{_SEM['dim']}]{ref} · {frame.op_id} · {frame.kind.value} · "
+            f"{frame.state.value}[/{_SEM['dim']}]",
             highlight=False,
         )
         render_to_console(
@@ -8439,24 +8445,24 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             self._flow.console.print(
-                f"  [{_C['death']}]/expand permission unavailable: "
-                f"{exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/expand permission unavailable: "
+                f"{exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         record = get_default_archive().lookup(ref)
         if record is None:
             self._flow.console.print(
-                f"  [{_C['heal']}]No permission decision for {ref}"
-                f"[/{_C['heal']}]",
+                f"  [{_SEM['heal']}]No permission decision for {ref}"
+                f"[/{_SEM['heal']}]",
                 highlight=False,
             )
             return
         self._flow.console.print(
-            f"  [{_C['neural']}]⏺ Permission[/{_C['neural']}] "
-            f"[{_C['dim']}]{ref} · tool={record.tool_name} · "
+            f"  [{_SEM['neural']}]⏺ Permission[/{_SEM['neural']}] "
+            f"[{_SEM['dim']}]{ref} · tool={record.tool_name} · "
             f"op={record.op_id} · "
-            f"decision={record.decision_value}[/{_C['dim']}]",
+            f"decision={record.decision_value}[/{_SEM['dim']}]",
             highlight=False,
         )
         # Re-render the canonical AggregatePermissionDecision
@@ -8468,30 +8474,30 @@ class SerpentREPL:
         detail = str(proj.get("detail", "") or "")[:200]
         if detail:
             self._flow.console.print(
-                f"    [{_C['dim']}]detail: {detail}[/{_C['dim']}]",
+                f"    [{_SEM['dim']}]detail: {detail}[/{_SEM['dim']}]",
                 highlight=False,
             )
         deny_callbacks = proj.get("deny_callbacks") or []
         if deny_callbacks:
             self._flow.console.print(
-                f"    [{_C['dim']}]deny callbacks: "
+                f"    [{_SEM['dim']}]deny callbacks: "
                 f"{', '.join(map(str, deny_callbacks))}"
-                f"[/{_C['dim']}]",
+                f"[/{_SEM['dim']}]",
                 highlight=False,
             )
         ask_callbacks = proj.get("ask_callbacks") or []
         if ask_callbacks:
             self._flow.console.print(
-                f"    [{_C['dim']}]ask callbacks: "
+                f"    [{_SEM['dim']}]ask callbacks: "
                 f"{', '.join(map(str, ask_callbacks))}"
-                f"[/{_C['dim']}]",
+                f"[/{_SEM['dim']}]",
                 highlight=False,
             )
         total = proj.get("total_callbacks")
         if total is not None:
             self._flow.console.print(
-                f"    [{_C['dim']}]total callbacks consulted: "
-                f"{total}[/{_C['dim']}]",
+                f"    [{_SEM['dim']}]total callbacks consulted: "
+                f"{total}[/{_SEM['dim']}]",
                 highlight=False,
             )
 
@@ -8508,16 +8514,16 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             self._flow.console.print(
-                f"  [{_C['death']}]/expand repair branch unavailable: "
-                f"{exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/expand repair branch unavailable: "
+                f"{exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         entry = get_default_archive().get_by_ref(ref)
         if entry is None:
             self._flow.console.print(
-                f"  [{_C['heal']}]No archived branch for {ref}"
-                f"[/{_C['heal']}]",
+                f"  [{_SEM['heal']}]No archived branch for {ref}"
+                f"[/{_SEM['heal']}]",
                 highlight=False,
             )
             return
@@ -8529,20 +8535,20 @@ class SerpentREPL:
             if prune_reason is not None else ""
         )
         self._flow.console.print(
-            f"  [{_C['neural']}]⏺ Repair Branch[/{_C['neural']}] "
-            f"[{_C['dim']}]{ref} · op={entry.op_id} · L{branch.layer_index} · "
+            f"  [{_SEM['neural']}]⏺ Repair Branch[/{_SEM['neural']}] "
+            f"[{_SEM['dim']}]{ref} · op={entry.op_id} · L{branch.layer_index} · "
             f"{outcome}{prune_str} · "
             f"score={branch.validator_score:.2f}"
-            f"[/{_C['dim']}]",
+            f"[/{_SEM['dim']}]",
             highlight=False,
         )
         bid_short = str(branch.branch_id)[:16]
         wt_id = branch.worktree_id or "<no-isolation>"
         self._flow.console.print(
-            f"    [{_C['dim']}]branch_id={bid_short} · "
+            f"    [{_SEM['dim']}]branch_id={bid_short} · "
             f"worktree={wt_id} · cost=${branch.cost_usd:.4f} · "
             f"runs={branch.validation_runs_consumed}"
-            f"[/{_C['dim']}]",
+            f"[/{_SEM['dim']}]",
             highlight=False,
         )
         hyp = (branch.fix_hypothesis or "").strip()
@@ -8550,7 +8556,7 @@ class SerpentREPL:
             if len(hyp) > 200:
                 hyp = hyp[:197] + "..."
             self._flow.console.print(
-                f"    [{_C['dim']}]hypothesis: {hyp}[/{_C['dim']}]",
+                f"    [{_SEM['dim']}]hypothesis: {hyp}[/{_SEM['dim']}]",
                 highlight=False,
             )
         # Diff preview — truncate at ~600 chars (operators wanting more
@@ -8559,7 +8565,7 @@ class SerpentREPL:
         if diff:
             preview = diff[:600] + ("\n..." if len(diff) > 600 else "")
             self._flow.console.print(
-                f"    [{_C['dim']}]diff:\n{preview}[/{_C['dim']}]",
+                f"    [{_SEM['dim']}]diff:\n{preview}[/{_SEM['dim']}]",
                 highlight=False,
             )
 
@@ -8585,17 +8591,17 @@ class SerpentREPL:
                 "JARVIS_NARRATIVE_DENSITY", "(unset — defaults to 'on')",
             )
             self._flow.console.print(
-                f"  [{_C['neural']}]Narrative density:[/{_C['neural']}] {current}\n"
-                f"  [{_C['dim']}]Usage: /narrate "
-                f"{' | '.join(self._NARRATE_DENSITIES)}[/{_C['dim']}]",
+                f"  [{_SEM['neural']}]Narrative density:[/{_SEM['neural']}] {current}\n"
+                f"  [{_SEM['dim']}]Usage: /narrate "
+                f"{' | '.join(self._NARRATE_DENSITIES)}[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
         density = parts[1].strip().lower()
         if density not in self._NARRATE_DENSITIES:
             self._flow.console.print(
-                f"  [{_C['death']}]Invalid density {density!r}. "
-                f"Choose: {', '.join(self._NARRATE_DENSITIES)}[/{_C['death']}]",
+                f"  [{_SEM['death']}]Invalid density {density!r}. "
+                f"Choose: {', '.join(self._NARRATE_DENSITIES)}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -8620,7 +8626,7 @@ class SerpentREPL:
             # provider-side wiring when present)
             os.environ["JARVIS_NARRATIVE_THINKING_VERBOSE"] = "true"
         self._flow.console.print(
-            f"  [{_C['evolved']}]Narrative density set to {density}[/{_C['evolved']}]",
+            f"  [{_SEM['evolved']}]Narrative density set to {density}[/{_SEM['evolved']}]",
             highlight=False,
         )
 
@@ -8636,7 +8642,7 @@ class SerpentREPL:
         parts = line.replace("/accept", "accept", 1).split(None, 1)
         if len(parts) < 2 or not parts[1].strip():
             self._flow.console.print(
-                f"  [{_C['dim']}]Usage: /accept <op-id>[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]Usage: /accept <op-id>[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -8649,18 +8655,18 @@ class SerpentREPL:
             ok = coordinator.record_accept(op_id)
         except Exception as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]/accept error: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/accept error: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         if ok:
             self._flow.console.print(
-                f"  [{_C['evolved']}]✓ Accepted {op_id} — APPLY proceeding[/{_C['evolved']}]",
+                f"  [{_SEM['evolved']}]✓ Accepted {op_id} — APPLY proceeding[/{_SEM['evolved']}]",
                 highlight=False,
             )
         else:
             self._flow.console.print(
-                f"  [{_C['heal']}]No pending review for {op_id}[/{_C['heal']}]",
+                f"  [{_SEM['heal']}]No pending review for {op_id}[/{_SEM['heal']}]",
                 highlight=False,
             )
 
@@ -8673,7 +8679,7 @@ class SerpentREPL:
         parts = line.replace("/reject", "reject", 1).split(None, 1)
         if len(parts) < 2 or not parts[1].strip():
             self._flow.console.print(
-                f"  [{_C['dim']}]Usage: /reject <op-id>[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]Usage: /reject <op-id>[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -8686,18 +8692,18 @@ class SerpentREPL:
             ok = coordinator.record_reject(op_id)
         except Exception as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]/reject error: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/reject error: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         if ok:
             self._flow.console.print(
-                f"  [{_C['heal']}]✗ Rejected {op_id} — APPLY cancelled[/{_C['heal']}]",
+                f"  [{_SEM['heal']}]✗ Rejected {op_id} — APPLY cancelled[/{_SEM['heal']}]",
                 highlight=False,
             )
         else:
             self._flow.console.print(
-                f"  [{_C['heal']}]No pending review for {op_id}[/{_C['heal']}]",
+                f"  [{_SEM['heal']}]No pending review for {op_id}[/{_SEM['heal']}]",
                 highlight=False,
             )
 
@@ -8716,22 +8722,22 @@ class SerpentREPL:
             coordinator = get_default_coordinator()
         except Exception as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]/review error: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/review error: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         manager = coordinator.branch_manager
         if manager is None:
             self._flow.console.print(
-                f"  [{_C['dim']}]Review system not yet initialized "
-                "(orchestrator hasn't booted the branch manager)[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]Review system not yet initialized "
+                "(orchestrator hasn't booted the branch manager)[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
         pending = manager.list_pending()
         if not pending:
             self._flow.console.print(
-                f"  [{_C['dim']}]No pending reviews[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]No pending reviews[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -8744,13 +8750,13 @@ class SerpentREPL:
             )
             if not pending:
                 self._flow.console.print(
-                    f"  [{_C['dim']}]No pending reviews matching "
-                    f"{needle!r}[/{_C['dim']}]",
+                    f"  [{_SEM['dim']}]No pending reviews matching "
+                    f"{needle!r}[/{_SEM['dim']}]",
                     highlight=False,
                 )
                 return
         self._flow.console.print(
-            f"  [{_C['neural']}]Pending reviews ({len(pending)}):[/{_C['neural']}]",
+            f"  [{_SEM['neural']}]Pending reviews ({len(pending)}):[/{_SEM['neural']}]",
             highlight=False,
         )
         for r in pending:
@@ -8759,18 +8765,18 @@ class SerpentREPL:
                 + ("s" if len(r.file_paths) != 1 else "")
             )
             ref_part = (
-                f"[{_C['dim']}]{r.diff_archive_ref}[/{_C['dim']}]"
+                f"[{_SEM['dim']}]{r.diff_archive_ref}[/{_SEM['dim']}]"
                 if r.diff_archive_ref else ""
             )
             self._flow.console.print(
-                f"  [{_C['evolved']}]{r.op_id}[/{_C['evolved']}] "
+                f"  [{_SEM['evolved']}]{r.op_id}[/{_SEM['evolved']}] "
                 f"{ref_part}  "
-                f"[{_C['file']}]{r.branch_name}[/{_C['file']}]  "
-                f"[{_C['dim']}]{file_summary} · {r.risk_tier}[/{_C['dim']}]",
+                f"[{_SEM['file']}]{r.branch_name}[/{_SEM['file']}]  "
+                f"[{_SEM['dim']}]{file_summary} · {r.risk_tier}[/{_SEM['dim']}]",
                 highlight=False,
             )
         self._flow.console.print(
-            f"  [{_C['dim']}]/accept <op-id> · /reject <op-id>[/{_C['dim']}]",
+            f"  [{_SEM['dim']}]/accept <op-id> · /reject <op-id>[/{_SEM['dim']}]",
             highlight=False,
         )
 
@@ -8821,22 +8827,22 @@ class SerpentREPL:
         signal = str(payload.get("triggering_signal", "") or "")
         c.print()
         c.print(
-            f"  [{_C['heal']}]⚠ shadow action trapped[/{_C['heal']}]  "
-            f"[{_C['dim']}]{prompt_text}[/{_C['dim']}]",
+            f"  [{_SEM['heal']}]⚠ shadow action trapped[/{_SEM['heal']}]  "
+            f"[{_SEM['dim']}]{prompt_text}[/{_SEM['dim']}]",
             highlight=False,
         )
         c.print(
-            f"    organ: [{_C['neural']}]{organ}[/{_C['neural']}]  "
+            f"    organ: [{_SEM['neural']}]{organ}[/{_SEM['neural']}]  "
             f"action: [bold]{action}[/bold]"
-            + (f"  signal: [{_C['dim']}]{signal}[/{_C['dim']}]" if signal else ""),
+            + (f"  signal: [{_SEM['dim']}]{signal}[/{_SEM['dim']}]" if signal else ""),
             highlight=False,
         )
 
         # Headless / no-TTY → decline (do NOT execute a kill unattended).
         if _headless_auto_approve_reason() is not None:
             c.print(
-                f"  [{_C['dim']}](headless — declining endorsement; the global "
-                f"shadow shield stays up)[/{_C['dim']}]",
+                f"  [{_SEM['dim']}](headless — declining endorsement; the global "
+                f"shadow shield stays up)[/{_SEM['dim']}]",
                 highlight=False,
             )
             return "n"
@@ -8854,8 +8860,8 @@ class SerpentREPL:
             return answer
         except ImportError:
             c.print(
-                f"  [{_C['dim']}](prompt_toolkit unavailable — declining)"
-                f"[/{_C['dim']}]",
+                f"  [{_SEM['dim']}](prompt_toolkit unavailable — declining)"
+                f"[/{_SEM['dim']}]",
                 highlight=False,
             )
             return "n"
@@ -8878,8 +8884,8 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             c.print(
-                f"  [{_C['death']}]/endorse error: backend unavailable: "
-                f"{exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/endorse error: backend unavailable: "
+                f"{exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -8894,8 +8900,8 @@ class SerpentREPL:
         )
         line = render_endorsement_outcome(result)
         status = str(getattr(result, "status", "") or "")
-        color = _C["life"] if status == "executed" else (
-            _C["death"] if status == "error" else _C["heal"]
+        color = _SEM["life"] if status == "executed" else (
+            _SEM["death"] if status == "error" else _SEM["heal"]
         )
         c.print(f"  [{color}]{line}[/{color}]", highlight=False)
 
@@ -8925,9 +8931,9 @@ class SerpentREPL:
             "JARVIS_REANIMATION_DEBUG_INJECT_ENABLED", "false"
         ).strip().lower() not in ("1", "true", "yes", "on"):
             c.print(
-                f"  [{_C['dim']}]/inject-pressure is disabled — boot with "
+                f"  [{_SEM['dim']}]/inject-pressure is disabled — boot with "
                 f"JARVIS_REANIMATION_DEBUG_INJECT_ENABLED=true to use it."
-                f"[/{_C['dim']}]",
+                f"[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -8943,8 +8949,8 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             c.print(
-                f"  [{_C['death']}]/inject-pressure: tooling unavailable: "
-                f"{exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/inject-pressure: tooling unavailable: "
+                f"{exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -8956,30 +8962,30 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001 — fail-soft, never crash the REPL
             c.print(
-                f"  [{_C['death']}]/inject-pressure failed: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/inject-pressure failed: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
 
         if reached is None:
             c.print(
-                f"  [{_C['death']}]/inject-pressure: not injectable (see log — no "
+                f"  [{_SEM['death']}]/inject-pressure: not injectable (see log — no "
                 f"live kernel, or reanimation not ignited via "
-                f"JARVIS_RESILIENCE_REANIMATION_ENABLED=true).[/{_C['death']}]",
+                f"JARVIS_RESILIENCE_REANIMATION_ENABLED=true).[/{_SEM['death']}]",
                 highlight=False,
             )
             return
 
         c.print(
-            f"  [{_C['life']}]⚡ injected synthetic {signal}[/{_C['life']}] "
-            f"[{_C['dim']}](source={source}) → {reached} organ(s) reached"
-            f"[/{_C['dim']}]",
+            f"  [{_SEM['life']}]⚡ injected synthetic {signal}[/{_SEM['life']}] "
+            f"[{_SEM['dim']}](source={source}) → {reached} organ(s) reached"
+            f"[/{_SEM['dim']}]",
             highlight=False,
         )
         if signal in ("component_degraded", "anomaly_detected"):
             c.print(
-                f"  [{_C['dim']}]if shadow mode is up, a trap is now pending — "
-                f"run /endorse to review the [y/N] prompt.[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]if shadow mode is up, a trap is now pending — "
+                f"run /endorse to review the [y/N] prompt.[/{_SEM['dim']}]",
                 highlight=False,
             )
 
@@ -9006,8 +9012,8 @@ class SerpentREPL:
             )
         except Exception as exc:  # noqa: BLE001
             c.print(
-                f"  [{_C['death']}]/endorse error: backend unavailable: "
-                f"{exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]/endorse error: backend unavailable: "
+                f"{exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -9030,7 +9036,7 @@ class SerpentREPL:
                 await self._endorse_one(target_id, choice=explicit_choice)
             except Exception as exc:  # noqa: BLE001
                 c.print(
-                    f"  [{_C['death']}]/endorse error: {exc}[/{_C['death']}]",
+                    f"  [{_SEM['death']}]/endorse error: {exc}[/{_SEM['death']}]",
                     highlight=False,
                 )
             return
@@ -9042,8 +9048,8 @@ class SerpentREPL:
             count = 0
         if count == 0:
             c.print(
-                f"  [{_C['dim']}]No trapped actions awaiting endorsement."
-                f"[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]No trapped actions awaiting endorsement."
+                f"[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -9060,8 +9066,8 @@ class SerpentREPL:
                 await self._endorse_one(action_id, choice=explicit_choice)
             except Exception as exc:  # noqa: BLE001
                 c.print(
-                    f"  [{_C['death']}]/endorse {action_id} error: "
-                    f"{exc}[/{_C['death']}]",
+                    f"  [{_SEM['death']}]/endorse {action_id} error: "
+                    f"{exc}[/{_SEM['death']}]",
                     highlight=False,
                 )
 
@@ -9080,23 +9086,23 @@ class SerpentREPL:
         if len(parts) < 2:
             current = os.environ.get("JARVIS_RISK_CEILING", "(not set — using per-op classification)")
             self._flow.console.print(
-                f"  [{_C['neural']}]Risk ceiling:[/{_C['neural']}] {current}\n"
-                f"  [{_C['dim']}]Usage: /risk safe_auto | notify_apply | approval_required[/{_C['dim']}]",
+                f"  [{_SEM['neural']}]Risk ceiling:[/{_SEM['neural']}] {current}\n"
+                f"  [{_SEM['dim']}]Usage: /risk safe_auto | notify_apply | approval_required[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
         tier = parts[1].strip().lower()
         if tier not in self._VALID_RISK_TIERS:
             self._flow.console.print(
-                f"  [{_C['death']}]Invalid tier '{tier}'. "
-                f"Choose: {', '.join(self._VALID_RISK_TIERS[:3])}[/{_C['death']}]",
+                f"  [{_SEM['death']}]Invalid tier '{tier}'. "
+                f"Choose: {', '.join(self._VALID_RISK_TIERS[:3])}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         os.environ["JARVIS_RISK_CEILING"] = tier.upper()
         self._flow.console.print(
-            f"  [{_C['evolved']}]Risk ceiling set to {tier.upper()} — "
-            f"takes effect on next operation[/{_C['evolved']}]",
+            f"  [{_SEM['evolved']}]Risk ceiling set to {tier.upper()} — "
+            f"takes effect on next operation[/{_SEM['evolved']}]",
             highlight=False,
         )
 
@@ -9111,8 +9117,8 @@ class SerpentREPL:
             _ct = getattr(self._flow, "_cost_total", 0.0)
             _cap = getattr(self._flow, "_cost_cap", 0.0)
             self._flow.console.print(
-                f"  [{_C['neural']}]Budget:[/{_C['neural']}] ${_ct:.4f} / ${_cap:.2f}\n"
-                f"  [{_C['dim']}]Usage: /budget <amount_usd>[/{_C['dim']}]",
+                f"  [{_SEM['neural']}]Budget:[/{_SEM['neural']}] ${_ct:.4f} / ${_cap:.2f}\n"
+                f"  [{_SEM['dim']}]Usage: /budget <amount_usd>[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -9120,13 +9126,13 @@ class SerpentREPL:
             amount = float(parts[1].strip().lstrip("$"))
         except ValueError:
             self._flow.console.print(
-                f"  [{_C['death']}]Invalid amount. Usage: /budget 1.00[/{_C['death']}]",
+                f"  [{_SEM['death']}]Invalid amount. Usage: /budget 1.00[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         if amount <= 0:
             self._flow.console.print(
-                f"  [{_C['death']}]Budget must be positive[/{_C['death']}]",
+                f"  [{_SEM['death']}]Budget must be positive[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -9135,7 +9141,7 @@ class SerpentREPL:
         # Update env var for subsystems that read it
         os.environ["OUROBOROS_BATTLE_COST_CAP"] = str(amount)
         self._flow.console.print(
-            f"  [{_C['evolved']}]Budget updated to ${amount:.2f}[/{_C['evolved']}]",
+            f"  [{_SEM['evolved']}]Budget updated to ${amount:.2f}[/{_SEM['evolved']}]",
             highlight=False,
         )
 
@@ -9159,12 +9165,12 @@ class SerpentREPL:
                     await result
             except Exception as exc:
                 self._flow.console.print(
-                    f"  [{_C['death']}]Goal error: {exc}[/{_C['death']}]",
+                    f"  [{_SEM['death']}]Goal error: {exc}[/{_SEM['death']}]",
                     highlight=False,
                 )
         else:
             self._flow.console.print(
-                f"  [{_C['dim']}]Goal management requires harness connection[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]Goal management requires harness connection[/{_SEM['dim']}]",
                 highlight=False,
             )
 
@@ -9223,10 +9229,10 @@ class SerpentREPL:
         parts = line.replace("/mutation", "mutation", 1).split(None, 1)
         if len(parts) < 2 or not parts[1].strip():
             self._flow.console.print(
-                f"  [{_C['dim']}]Usage: /mutation [--survivors-only] "
-                f"<src> [-- <test_file> ...][/{_C['dim']}]\n"
-                f"  [{_C['dim']}]Example: /mutation backend/core/ouroboros/governance/"
-                f"intake/sensors/test_failure_sensor.py[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]Usage: /mutation [--survivors-only] "
+                f"<src> [-- <test_file> ...][/{_SEM['dim']}]\n"
+                f"  [{_SEM['dim']}]Example: /mutation backend/core/ouroboros/governance/"
+                f"intake/sensors/test_failure_sensor.py[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -9237,7 +9243,7 @@ class SerpentREPL:
             arg = arg[len("--survivors-only"):].strip()
         if not arg:
             self._flow.console.print(
-                f"  [{_C['dim']}]--survivors-only requires a source path[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]--survivors-only requires a source path[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -9254,14 +9260,14 @@ class SerpentREPL:
             test_paths = self._discover_tests_for(src_path)
         if not src_path.is_file():
             self._flow.console.print(
-                f"  [{_C['death']}]Source file not found: {src_path}[/{_C['death']}]",
+                f"  [{_SEM['death']}]Source file not found: {src_path}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         if not test_paths:
             self._flow.console.print(
-                f"  [{_C['death']}]No test files found for {src_path.name}. "
-                f"Pass explicitly with '-- <paths>'.[/{_C['death']}]",
+                f"  [{_SEM['death']}]No test files found for {src_path.name}. "
+                f"Pass explicitly with '-- <paths>'.[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -9272,12 +9278,12 @@ class SerpentREPL:
             )
         except ImportError as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]Mutation tester unavailable: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]Mutation tester unavailable: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
         self._flow.console.print(
-            f"  [{_C['neural']}]Mutation-testing[/{_C['neural']}] {src_path} "
+            f"  [{_SEM['neural']}]Mutation-testing[/{_SEM['neural']}] {src_path} "
             f"with {len(test_paths)} test file(s) — this can take minutes.",
             highlight=False,
         )
@@ -9311,7 +9317,7 @@ class SerpentREPL:
         tel_logger = _logging.getLogger("Ouroboros.MutationTelemetry")
         f = self._flow
         f.console.print(
-            f"  [{_C['neural']}]Mutation survivors[/{_C['neural']}] — "
+            f"  [{_SEM['neural']}]Mutation survivors[/{_SEM['neural']}] — "
             f"score={result.score:.1%} grade={result.grade} "
             f"caught={result.caught}/{result.total_mutants} "
             f"(survivors={len(result.survivors)})",
@@ -9319,7 +9325,7 @@ class SerpentREPL:
         )
         if not result.survivors:
             f.console.print(
-                f"  [{_C['life']}]No survivors — tests caught every mutant.[/{_C['life']}]",
+                f"  [{_SEM['life']}]No survivors — tests caught every mutant.[/{_SEM['life']}]",
                 highlight=False,
             )
             tel_logger.info(
@@ -9331,7 +9337,7 @@ class SerpentREPL:
             m = s.mutant
             # Terminal line — highlights the bypass for the operator.
             f.console.print(
-                f"  [{_C['death']}]SURVIVED[/{_C['death']}] "
+                f"  [{_SEM['death']}]SURVIVED[/{_SEM['death']}] "
                 f"{m.source_file}:{m.line}  {m.op:<14} "
                 f"{m.original[:24]} -> {m.mutated[:24]}",
                 highlight=False,
@@ -9369,7 +9375,7 @@ class SerpentREPL:
             )
         except ImportError as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]Mutation gate unavailable: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]Mutation gate unavailable: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -9383,33 +9389,33 @@ class SerpentREPL:
         if sub == "prewarm":
             summary = _mg.prewarm_allowlist(project_root=Path("."))
             self._flow.console.print(
-                f"  [{_C['life']}]prewarm[/{_C['life']}] {summary}",
+                f"  [{_SEM['life']}]prewarm[/{_SEM['life']}] {summary}",
                 highlight=False,
             )
             return
         if sub == "dry-run":
             if len(parts) < 3:
                 self._flow.console.print(
-                    f"  [{_C['dim']}]Usage: /mutation-gate dry-run <src>[/{_C['dim']}]",
+                    f"  [{_SEM['dim']}]Usage: /mutation-gate dry-run <src>[/{_SEM['dim']}]",
                     highlight=False,
                 )
                 return
             src = Path(parts[2])
             if not src.is_file():
                 self._flow.console.print(
-                    f"  [{_C['death']}]Source not found: {src}[/{_C['death']}]",
+                    f"  [{_SEM['death']}]Source not found: {src}[/{_SEM['death']}]",
                     highlight=False,
                 )
                 return
             tests = self._discover_tests_for(src)
             if not tests:
                 self._flow.console.print(
-                    f"  [{_C['death']}]No tests discovered for {src.name}[/{_C['death']}]",
+                    f"  [{_SEM['death']}]No tests discovered for {src.name}[/{_SEM['death']}]",
                     highlight=False,
                 )
                 return
             self._flow.console.print(
-                f"  [{_C['neural']}]dry-run[/{_C['neural']}] {src} "
+                f"  [{_SEM['neural']}]dry-run[/{_SEM['neural']}] {src} "
                 f"with {len(tests)} test(s) — force=True, no ledger write",
                 highlight=False,
             )
@@ -9426,8 +9432,8 @@ class SerpentREPL:
             )
             return
         self._flow.console.print(
-            f"  [{_C['dim']}]Usage: /mutation-gate [status|dry-run <src>|"
-            f"ledger [N]|prewarm][/{_C['dim']}]",
+            f"  [{_SEM['dim']}]Usage: /mutation-gate [status|dry-run <src>|"
+            f"ledger [N]|prewarm][/{_SEM['dim']}]",
             highlight=False,
         )
 
@@ -9453,8 +9459,8 @@ class SerpentREPL:
             )
         except Exception as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]/vision: module import failed: {exc}"
-                f"[/{_C['death']}]",
+                f"  [{_SEM['death']}]/vision: module import failed: {exc}"
+                f"[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -9492,8 +9498,8 @@ class SerpentREPL:
             )
         except Exception as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]/verify-confirm: module import failed: {exc}"
-                f"[/{_C['death']}]",
+                f"  [{_SEM['death']}]/verify-confirm: module import failed: {exc}"
+                f"[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -9512,8 +9518,8 @@ class SerpentREPL:
             )
         except Exception as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]/verify-undemote: module import failed: {exc}"
-                f"[/{_C['death']}]",
+                f"  [{_SEM['death']}]/verify-undemote: module import failed: {exc}"
+                f"[/{_SEM['death']}]",
                 highlight=False,
             )
             return
@@ -9666,7 +9672,7 @@ class SerpentREPL:
         entries = mg_mod.read_ledger(last_n=n)
         if not entries:
             f.console.print(
-                f"  [{_C['dim']}]ledger empty[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]ledger empty[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -9676,8 +9682,8 @@ class SerpentREPL:
         )
         for e in entries:
             enforced_badge = (
-                f"[{_C['life']}]enforce[/{_C['life']}]"
-                if e.get("enforced") else f"[{_C['dim']}]shadow[/{_C['dim']}]"
+                f"[{_SEM['life']}]enforce[/{_SEM['life']}]"
+                if e.get("enforced") else f"[{_SEM['dim']}]shadow[/{_SEM['dim']}]"
             )
             color = {
                 "allow": "life",
@@ -9687,7 +9693,7 @@ class SerpentREPL:
             }.get(e.get("decision", "skip"), "dim")
             f.console.print(
                 f"  {e.get('op_id', '?')[:16]}  "
-                f"[{_C[color]}]{e.get('decision', '?'):<20}[/{_C[color]}] "
+                f"[{_SEM[color]}]{e.get('decision', '?'):<20}[/{_SEM[color]}] "
                 f"score={e.get('score', 0):.2f} "
                 f"g={e.get('grade', '?'):<3} "
                 f"{enforced_badge} "
@@ -9725,7 +9731,7 @@ class SerpentREPL:
         """
         if self._on_command is None:
             self._flow.console.print(
-                f"  [{_C['dim']}]{error_label}: requires harness connection[/{_C['dim']}]",
+                f"  [{_SEM['dim']}]{error_label}: requires harness connection[/{_SEM['dim']}]",
                 highlight=False,
             )
             return
@@ -9735,6 +9741,6 @@ class SerpentREPL:
                 await result
         except Exception as exc:
             self._flow.console.print(
-                f"  [{_C['death']}]{error_label}: {exc}[/{_C['death']}]",
+                f"  [{_SEM['death']}]{error_label}: {exc}[/{_SEM['death']}]",
                 highlight=False,
             )
