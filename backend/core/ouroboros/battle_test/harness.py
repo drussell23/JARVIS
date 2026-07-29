@@ -1294,6 +1294,29 @@ class BattleTestHarness:
 
         try:
             _running_loop.set_exception_handler(_harness_loop_exception_handler)
+            # IDENTITY, at boot, unconditionally.
+            #
+            # This stamp already existed — inside
+            # `_start_cockpit_attach_bridge`, so a daemon only recorded what
+            # it was made of IF someone attached a cockpit to it. Its own
+            # comment states the intent exactly ("it outlives the terminal
+            # that started it"), and the placement defeated it: a headless
+            # daemon, which is precisely the one an operator cannot see,
+            # never stamped itself at all.
+            #
+            # A process's identity is a property of the PROCESS, not of
+            # whether anyone is watching it. Written here, before any
+            # surface exists, so `ov attach` can always answer "how old is
+            # this thing and what code is it running" — the question whose
+            # absence sent an operator chasing environment variables at a
+            # daemon that had been up for 23 hours.
+            try:
+                from backend.core.ouroboros.battle_test.daemon_provenance import (  # noqa: E501
+                    write_provenance,
+                )
+                write_provenance()
+            except Exception:  # noqa: BLE001
+                pass
             # Panic broadcast: a traceback in a log file is invisible to
             # someone watching a cockpit.
             try:
