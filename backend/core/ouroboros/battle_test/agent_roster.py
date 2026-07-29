@@ -231,10 +231,11 @@ class AgentEntry:
     """One dispatched agent, and what is known about it."""
 
     __slots__ = ("agent_id", "kind", "goal", "state", "started", "finished",
-                 "detail")
+                 "detail", "op_id", "parent_id", "worktree")
 
     def __init__(self, agent_id: str, kind: str = "", goal: str = "",
-                 started: float = 0.0) -> None:
+                 started: float = 0.0, op_id: str = "",
+                 parent_id: str = "", worktree: str = "") -> None:
         self.agent_id = str(agent_id or "")
         self.kind = str(kind or "agent")
         self.goal = str(goal or "")
@@ -243,6 +244,18 @@ class AgentEntry:
         self.started = float(started)
         self.finished: Optional[float] = None
         self.detail = ""
+        # The organism's agents form a GRAPH — an op fans out to units,
+        # a unit spawns subagents, each may hold its own worktree. The
+        # roster modelled a flat list, so it could show WHO was working
+        # and never what they were working ON, under whom, or in which
+        # isolated tree. Those three facts are the difference between a
+        # list of names and a picture of the work.
+        self.op_id = str(op_id or "")
+        self.parent_id = str(parent_id or "")
+        #: The isolated tree this agent mutates, when it has one. L3
+        #: promises isolation; an operator cannot verify a promise they
+        #: cannot see.
+        self.worktree = str(worktree or "")
 
     @property
     def running(self) -> bool:
@@ -273,13 +286,24 @@ class AgentEntry:
         is carried UNCLIPPED: how much of it fits is the reader's question,
         because the reader is the one who knows how wide its terminal is.
         """
-        return {
+        row = {
             "id": self.agent_id,
             "kind": self.kind,
             "goal": self.goal,
             "state": self.state,
             "elapsed_s": round(self.elapsed(now), 1),
         }
+        # Structural fields ride only when they are KNOWN. An absent key
+        # is "this producer did not say", which a reader can render as
+        # flat; a present-but-empty one would claim the agent has no
+        # parent, and a false claim about the graph is worse than none.
+        if self.op_id:
+            row["op_id"] = self.op_id
+        if self.parent_id:
+            row["parent_id"] = self.parent_id
+        if self.worktree:
+            row["worktree"] = self.worktree
+        return row
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<AgentEntry {self.agent_id!r} {self.kind} {self.state}>"
@@ -314,8 +338,17 @@ class AgentRoster:
 
     # -- the feed ----------------------------------------------------------
 
-    def spawn(self, agent_id: str, kind: str = "", goal: str = "") -> None:
-        """An agent was dispatched. NEVER raises."""
+    def spawn(self, agent_id: str, kind: str = "", goal: str = "",
+              op_id: str = "", parent_id: str = "",
+              worktree: str = "") -> None:
+        """An agent was dispatched. NEVER raises.
+
+        The structural arguments are OPTIONAL and default to empty, so
+        every existing caller keeps working unchanged and a producer that
+        knows more can say more. That is deliberate: this roster had
+        exactly ONE producer for a long time, and the way to fix that is
+        to make joining cheap, not to demand every caller learn a schema.
+        """
         try:
             key = str(agent_id or "").strip()
             if not key:
@@ -327,7 +360,9 @@ class AgentRoster:
                 self._entries[key].started = self._clock()
                 self._entries[key].state = "running"
                 return
-            self._entries[key] = AgentEntry(key, kind, goal, self._clock())
+            self._entries[key] = AgentEntry(
+                key, kind, goal, self._clock(),
+                op_id=op_id, parent_id=parent_id, worktree=worktree)
             self._order.append(key)
             self._evict()
         except Exception:  # noqa: BLE001
@@ -512,6 +547,62 @@ def _clip(text: Any, width: int) -> str:
 _CHROME_ROWS = 1
 
 
+def order_by_lineage(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Depth-first order with a ``depth`` stamped on each row. Pure.
+
+    The organism's agents form a graph — an op fans out to units, a unit
+    spawns subagents. Rendered flat, twelve agents are twelve names; ordered
+    by lineage they are three ops with their work underneath, which is the
+    question an operator actually has.
+
+    Roots are anything whose parent is absent or unknown, so an orphan (a
+    child whose parent already finished and was reaped) still renders at
+    top level rather than vanishing. A cycle — which should be impossible
+    and therefore will happen — is broken by a visited set, not by trusting
+    the data. NEVER raises: a roster that cannot be sorted still lists.
+    """
+    try:
+        by_id = {str(r.get("id") or ""): r for r in rows if r.get("id")}
+        kids: Dict[str, List[Dict[str, Any]]] = {}
+        roots: List[Dict[str, Any]] = []
+        for r in rows:
+            parent = str(r.get("parent_id") or "")
+            if parent and parent in by_id:
+                kids.setdefault(parent, []).append(r)
+            else:
+                roots.append(r)
+        out: List[Dict[str, Any]] = []
+        seen = set()
+
+        def _walk(row: Dict[str, Any], depth: int) -> None:
+            rid = str(row.get("id") or "")
+            if rid in seen or depth > 6:
+                return
+            seen.add(rid)
+            row = dict(row)
+            row["depth"] = depth
+            out.append(row)
+            for child in kids.get(rid, ()):
+                _walk(child, depth + 1)
+
+        for root in roots:
+            _walk(root, 0)
+        # Anything unreachable from a root (a cycle) still gets listed —
+        # losing an agent from the view is worse than losing its indent.
+        for r in rows:
+            if str(r.get("id") or "") not in seen:
+                r = dict(r)
+                r["depth"] = 0
+                out.append(r)
+        return out
+    except Exception:  # noqa: BLE001
+        logger.debug("[AgentRoster] lineage ordering degraded", exc_info=True)
+        try:
+            return list(rows or ())
+        except Exception:  # noqa: BLE001
+            return []
+
+
 def render_roster(
     snapshot: Optional[Dict[str, Any]],
     *,
@@ -549,6 +640,11 @@ def render_roster(
         rows = [r for r in (snapshot.get("rows") or ()) if isinstance(r, dict)]
         if not rows:
             return []
+        # ORDERED BY LINEAGE before anything is measured or drawn: a flat
+        # list of twelve agents is twelve names; the same twelve ordered by
+        # who spawned whom is three ops with their work underneath. The
+        # indent is the only thing that turns a roster into a picture.
+        rows = order_by_lineage(rows)
         age = max(0.0, float(age_s or 0.0))
         # Fold to fit BEFORE anything is formatted: the count line has to
         # include what the height budget dropped, and it cannot if the drop
@@ -592,8 +688,19 @@ def render_roster(
             if state == "running":
                 elapsed += age
             took = f"  {format_duration(elapsed)}"
-            label = _clip(row.get("goal"), label_w) if label_w else ""
-            body = f"{row.get('kind') or 'agent'}  {label}".rstrip()
+            # Depth eats into the GOAL column, not the terminal width: an
+            # indent that pushed the line wider would wrap on exactly the
+            # deep rows it is meant to clarify.
+            depth = max(0, min(4, int(row.get("depth") or 0)))
+            indent = "  " * depth
+            label = (_clip(row.get("goal"), max(8, label_w - len(indent)))
+                     if label_w else "")
+            body = f"{indent}{row.get('kind') or 'agent'}  {label}".rstrip()
+            # The isolated tree this agent mutates. L3 PROMISES isolation;
+            # an operator cannot verify a promise they cannot see.
+            wt = str(row.get("worktree") or "")
+            if wt:
+                body = f"{body}  ⧉{_clip(wt, 18)}"
             lines.append(f"{mark} {glyph} {body}{took}".rstrip())
         # What the PRODUCER withheld plus what the height budget folded. Two
         # separate elisions, one honest number — reporting either alone would

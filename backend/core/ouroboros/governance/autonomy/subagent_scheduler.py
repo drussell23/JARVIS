@@ -72,6 +72,36 @@ def _fmt_opt_float(value: Optional[float]) -> str:
     return repr(float(value))
 
 
+def _retire_from_roster(result: "WorkUnitResult", branch: str = "") -> None:
+    """Mark the unit finished, and record the worktree it actually held.
+
+    Called from the same telemetry seam that already fires on every exit
+    path, so a unit cannot finish without leaving the roster — an agent
+    stuck at "running" forever is worse than one never shown, because it
+    reports work that is not happening. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            get_agent_roster,
+        )
+        uid = str(getattr(result, "unit_id", "") or getattr(result, "id", ""))
+        if not uid:
+            return
+        roster = get_agent_roster()
+        entry = roster._entries.get(uid) if hasattr(roster, "_entries") else None
+        if entry is not None and branch:
+            entry.worktree = str(branch)[:80]
+        status = str(getattr(getattr(result, "status", ""), "name", "")
+                     or getattr(result, "status", ""))
+        roster.finish(
+            uid,
+            state="failed" if "FAIL" in status.upper() else "finished",
+            detail=str(getattr(result, "failure_class", "") or "")[:60],
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _emit_unit_telemetry(result: "WorkUnitResult", branch: str) -> None:
     """Emit the per-unit [L3Telemetry] breadcrumb. Fail-soft + gated."""
     if not _l3_telemetry_enabled():
@@ -154,6 +184,31 @@ class GenerationSubagentExecutor:
         """
         started_at_ns = time.monotonic_ns()
         causal_parent_id = graph.causal_trace_id
+        # ROSTER. An L3 unit was invisible: the roster had exactly one
+        # producer (the Phase B subagent path), so parallel worktree units
+        # ran with no operator-facing trace at all — the isolation L3
+        # PROMISES could not be verified by the person it protects.
+        #
+        # Joined here rather than in a new registry: one model, many
+        # producers. The structural fields are optional, so this costs a
+        # call and teaches the roster the graph it could not previously
+        # express.
+        try:
+            from backend.core.ouroboros.battle_test.agent_roster import (
+                get_agent_roster,
+            )
+            get_agent_roster().spawn(
+                str(getattr(unit, "unit_id", "") or getattr(unit, "id", "")),
+                kind="L3-unit",
+                goal=str(getattr(unit, "goal", "")
+                         or getattr(unit, "description", ""))[:120],
+                op_id=str(getattr(graph, "op_id", "")
+                          or getattr(graph, "graph_id", "")),
+                parent_id=str(getattr(graph, "op_id", "")
+                              or getattr(graph, "graph_id", "")),
+            )
+        except Exception:  # noqa: BLE001
+            pass          # a roster fault must never stop a work unit
         _worktree_path: Optional[Path] = None
         _sandbox: Optional[Any] = self._build_sandbox_for_unit(unit)
         # --- L3 telemetry locals (fail-soft; never affect control flow) ---
@@ -402,6 +457,9 @@ class GenerationSubagentExecutor:
                     )
                 try:
                     _emit_unit_telemetry(_result, _branch_label)
+                    # Same seam, so the roster cannot disagree with
+                    # telemetry about whether this unit finished.
+                    _retire_from_roster(_result, _branch_label)
                 except Exception:  # noqa: BLE001 — telemetry never breaks the unit
                     logger.debug(
                         "[L3Telemetry] per-unit emit raised (non-fatal)",
