@@ -74,13 +74,14 @@ sub-package name (``m10``).
 """
 from __future__ import annotations
 
+import ast
 import inspect
 import logging
 import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,12 @@ _DEFAULT_PROVIDER_PACKAGES: Tuple[str, ...] = (
 # cooperative cancellation; ``/postmortems`` takes argv-style).
 # These retain their legacy custom handlers in
 # :mod:`serpent_flow`.
+#: Verbs that EXIST but are routed by someone else → a provenance note.
+#: Populated at prime time by derivation, never by hand: a hand-written
+#: list is exactly what drifted here before, and a verb added to the
+#: harness chain tomorrow must not need a second edit to be findable.
+_EXTERNAL_VERBS: Dict[str, str] = {}
+
 _CUSTOM_HANDLER_EXCLUSIONS: Tuple[str, ...] = (
     "budget",
     "risk",
@@ -199,13 +206,212 @@ def reset_registry_for_tests() -> None:
     global _REGISTRY_PRIMED
     with _REGISTRY_LOCK:
         _VERB_TO_DISPATCHER.clear()
+        # Both maps, or `list_verbs()` stays non-empty after a reset and
+        # "discovery has not run" becomes indistinguishable from
+        # "discovery found nothing" — a distinction the progress board
+        # reports on and therefore must be able to make.
+        _EXTERNAL_VERBS.clear()
         _REGISTRY_PRIMED = False
 
 
+#: Modules whose if/elif command chains are scanned for verbs that exist
+#: but are dispatched there. A curated LIST OF FILES, not of verbs — the
+#: verbs are derived, so adding one needs no edit here.
+_CHAIN_SOURCES: Tuple[str, ...] = (
+    "backend/core/ouroboros/battle_test/harness.py",
+    "backend/core/ouroboros/battle_test/serpent_flow.py",
+)
+
+#: Names a REPL command chain binds its input to. Structural rather than
+#: positional: the scan finds branches by what they TEST, so the chain can
+#: be reordered, renamed or split without breaking discovery.
+_CHAIN_SUBJECTS = frozenset({"cmd", "command"})
+
+
+def discover_chain_verbs(
+    sources: Optional[Sequence[str]] = None, root: Optional[str] = None,
+) -> Dict[str, str]:
+    """Verbs handled by an if/elif command chain → where. NEVER raises.
+
+    Derived by reading the chain itself, because every hand-maintained
+    alternative drifts. That is not hypothetical here: `/help` lost
+    sixteen verbs precisely because a list said what existed and the code
+    said something else, and nothing compared them.
+
+    The scan is structural — it looks for branches whose test inspects a
+    command-shaped variable (``cmd == "x"``, ``cmd.startswith("/x")``) —
+    so the chain can be reordered, renamed or split and discovery follows.
+    It runs once at prime time on two files and is bounded by that.
+
+    Only literals that look like verbs are admitted, and only from
+    top-level branch TESTS, never from bodies — a string inside a branch
+    is an argument or a message, not a verb.
+    """
+    out: Dict[str, str] = {}
+    try:
+        import os as _os
+        base = root or _os.getcwd()
+        for rel in (sources if sources is not None else _CHAIN_SOURCES):
+            path = _os.path.join(base, rel)
+            try:
+                tree = ast.parse(open(path, "r", encoding="utf-8").read())
+            except Exception:  # noqa: BLE001
+                continue
+            name = _os.path.basename(rel)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.If):
+                    continue
+                if not _branch_routes_somewhere(node):
+                    continue
+                for verb in _verbs_in_test(node.test):
+                    out.setdefault(verb, f"{name}:{node.lineno}")
+    except Exception:  # noqa: BLE001
+        logger.debug("[ReplRegistry] chain discovery degraded", exc_info=True)
+    return out
+
+
+#: Call-name shapes a verb branch routes to. Prefixes rather than exact
+#: names, so a new handler needs no edit here.
+_HANDLER_SHAPES: Tuple[str, ...] = (
+    "_repl_cmd_", "_handle_", "_cmd_", "dispatch_",
+)
+
+
+def _branch_routes_somewhere(node: Any) -> bool:
+    """Does this branch's BODY hand off to a command handler?
+
+    The discriminator between a verb and a coincidence. ``cmd == "ops"``
+    and ``raw == "true"`` are the same shape as tests; they differ in what
+    they do next — one calls ``self._repl_cmd_ops()``, the other assigns a
+    boolean. Asking the body keeps this derived: a denylist of words that
+    merely LOOK like verbs would need an entry every time someone wrote a
+    new env parse.
+
+    Only the branch's own body is inspected, never nested ``If`` bodies,
+    so a sub-command handler inside a verb branch is not mistaken for a
+    second verb. NEVER raises.
+    """
+    try:
+        for stmt in getattr(node, "body", ()) or ():
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.If):
+                    continue
+                if not isinstance(sub, ast.Call):
+                    continue
+                fn = sub.func
+                fname = getattr(fn, "attr", None) or getattr(fn, "id", "")
+                if any(str(fname).startswith(p) for p in _HANDLER_SHAPES):
+                    return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _verbs_in_test(test: Any) -> Tuple[str, ...]:
+    """Verb literals a branch test compares against. Pure. NEVER raises."""
+    found = []
+    try:
+        for node in ast.walk(test):
+            subject = None
+            literals = []
+            if isinstance(node, ast.Compare):
+                subject = node.left
+                literals = [c for c in node.comparators]
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                if (isinstance(fn, ast.Attribute)
+                        and fn.attr in ("startswith", "endswith")):
+                    subject = fn.value
+                    literals = list(node.args)
+            if subject is None:
+                continue
+            # Unwrap `cmd.strip()` / `cmd.lower()` to reach the name.
+            while isinstance(subject, ast.Call) and isinstance(
+                    subject.func, ast.Attribute):
+                subject = subject.func.value
+            if isinstance(subject, ast.Attribute):
+                subject = subject.value
+            if not (isinstance(subject, ast.Name)
+                    and subject.id in _CHAIN_SUBJECTS):
+                continue
+            for lit in literals:
+                if isinstance(lit, (ast.Tuple, ast.List, ast.Set)):
+                    lit_iter = lit.elts
+                else:
+                    lit_iter = [lit]
+                for item in lit_iter:
+                    if not (isinstance(item, ast.Constant)
+                            and isinstance(item.value, str)):
+                        continue
+                    token = item.value.strip().lstrip("/").split()[0] \
+                        if item.value.strip() else ""
+                    token = token.lower()
+                    if (token and len(token) <= 24
+                            and token.replace("_", "").replace(
+                                "-", "").isalnum()
+                            and not token.isdigit()):
+                        found.append(token)
+    except Exception:  # noqa: BLE001
+        return tuple()
+    return tuple(found)
+
+
 def list_verbs() -> Tuple[str, ...]:
-    """Snapshot of registered verb names. Read-only."""
+    """Every verb that EXISTS, however it is dispatched. Read-only.
+
+    Discovery and dispatch are different questions, and fusing them cost
+    16 verbs their visibility. `_CUSTOM_HANDLER_EXCLUSIONS` says it out
+    loud — those verbs "retain their legacy custom handlers" — so the
+    exclusion was a routing decision ("do not auto-dispatch this"), and
+    reading it as an existence claim erased `/goal`, `/budget`, `/risk`,
+    `/plan`, `/undo` and eleven others from `/help`, tab completion, the
+    slash palette and the progress board's count.
+
+    An operator cannot use a verb they cannot find. This returns the
+    union; :func:`try_dispatch` still consults only the dispatcher map,
+    so ROUTING is byte-for-byte unchanged.
+    """
+    with _REGISTRY_LOCK:
+        return tuple(sorted(
+            set(_VERB_TO_DISPATCHER.keys()) | set(_EXTERNAL_VERBS.keys())))
+
+
+def list_dispatchable_verbs() -> Tuple[str, ...]:
+    """Only verbs THIS registry routes. The dispatch half of the split."""
     with _REGISTRY_LOCK:
         return tuple(sorted(_VERB_TO_DISPATCHER.keys()))
+
+
+def external_verbs() -> Dict[str, str]:
+    """Verbs handled elsewhere → where. Read-only snapshot.
+
+    The value is a provenance string (``harness.py:4292``, ``custom
+    handler``) so `/help` can tell an operator where a verb lives rather
+    than implying this registry owns it.
+    """
+    with _REGISTRY_LOCK:
+        return dict(_EXTERNAL_VERBS)
+
+
+def register_external_verb(verb: object, where: object = "") -> bool:
+    """Record that ``verb`` exists and is dispatched somewhere else.
+
+    Discovery only — this NEVER makes the verb routable here, so a
+    mis-registration cannot hijack a line. NEVER raises.
+    """
+    try:
+        name = str(verb or "").strip().lstrip("/").lower()
+        if not name or not name.replace("_", "").replace("-", "").isalnum():
+            return False
+        with _REGISTRY_LOCK:
+            if name in _VERB_TO_DISPATCHER:
+                # Already routable here. Claiming it is also external
+                # would make `/help` ambiguous about who owns it.
+                return False
+            _EXTERNAL_VERBS[name] = str(where or "external handler")[:80]
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def registry_primed() -> bool:
@@ -349,14 +555,20 @@ def prime_registry(
 
     with _REGISTRY_LOCK:
         if _REGISTRY_PRIMED and not force:
+            _known = tuple(sorted(
+                set(_VERB_TO_DISPATCHER.keys()) | set(_EXTERNAL_VERBS.keys())))
             return RegistryReport(
-                verb_count=len(_VERB_TO_DISPATCHER),
-                verbs=tuple(sorted(_VERB_TO_DISPATCHER.keys())),
+                verb_count=len(_known),
+                verbs=_known,
                 excluded=tuple(_CUSTOM_HANDLER_EXCLUSIONS),
                 elapsed_s=time.monotonic() - t0,
             )
         if force:
             _VERB_TO_DISPATCHER.clear()
+            # Rediscovered below from the same two derived sources. Leaving
+            # them would make a forced re-prime cumulative rather than a
+            # fresh read.
+            _EXTERNAL_VERBS.clear()
 
     pkg_list = (
         tuple(packages) if packages is not None
@@ -480,9 +692,30 @@ def prime_registry(
         log_prefix="ReplRegistry",
     )
 
+    # Verbs that EXIST but are routed elsewhere, from two DERIVED sources
+    # so neither can drift into a stale hand-written list:
+    #
+    #  1. the exclusion list itself. Its own comment says these "retain
+    #     their legacy custom handlers" — that is a statement that they
+    #     exist, and reading it as "these do not exist" is what erased
+    #     /goal, /budget, /risk and /plan from every discovery surface.
+    #  2. the if/elif command chains, read structurally.
+    #
+    # Discovery only. `try_dispatch` still consults `_VERB_TO_DISPATCHER`
+    # alone, so routing is byte-for-byte what it was.
+    try:
+        for _verb in exclusions:
+            register_external_verb(_verb, "custom handler")
+        for _verb, _where in discover_chain_verbs().items():
+            register_external_verb(_verb, _where)
+    except Exception:  # noqa: BLE001
+        logger.debug("[ReplRegistry] external verb discovery degraded",
+                     exc_info=True)
+
     with _REGISTRY_LOCK:
         _REGISTRY_PRIMED = True
-        verbs = tuple(sorted(_VERB_TO_DISPATCHER.keys()))
+        verbs = tuple(sorted(
+            set(_VERB_TO_DISPATCHER.keys()) | set(_EXTERNAL_VERBS.keys())))
 
     return RegistryReport(
         verb_count=len(verbs),
