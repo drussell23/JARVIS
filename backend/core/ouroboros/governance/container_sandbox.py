@@ -171,6 +171,7 @@ async def run_in_container(
     seccomp_profile: Optional[str] = None,
     docker_run: Any = None,
     read_only: bool = False,
+    on_output: Any = None,
 ) -> ContainmentResult:
     """Execute ``code`` in a hardened, ephemeral Docker container; pull back
     stdout/stderr across the (async subprocess) IPC bridge. NEVER raises — every
@@ -215,7 +216,15 @@ async def run_in_container(
         seccomp_profile=seccomp_profile, read_only=read_only,
     )
     try:
-        rc, out, err = await docker_run(argv, float(pol.timeout_s))
+        # `on_output` forwarded only when set, so an injected test
+        # runner with the historical two-argument signature keeps
+        # working. A containment layer must not break because an
+        # OBSERVER was added to it.
+        rc, out, err = await (
+            docker_run(argv, float(pol.timeout_s), on_output=on_output)
+            if on_output is not None
+            else docker_run(argv, float(pol.timeout_s))
+        )
     except Exception as exc:  # noqa: BLE001 — docker spawn failure, never propagate
         return ContainmentResult(
             ok=False, breach=ContainmentBreach.SPAWN_FAILED, returncode=None,
@@ -376,6 +385,7 @@ async def run_pytest_in_container(
     image: Optional[str] = None,
     policy: Optional[ContainmentPolicy] = None,
     docker_run: Any = None,
+    on_output: Any = None,
 ) -> PytestContainerResult:
     """Run the project's pytest suite against the read-only worktree mount inside
     the hardened container; parse structured pass/fail telemetry from stdout
@@ -404,7 +414,11 @@ async def run_pytest_in_container(
             )
     argv = build_pytest_container_argv(test_targets, worktree=str(worktree), image=image, policy=pol)
     try:
-        rc, out, err = await docker_run(argv, float(pol.timeout_s))
+        rc, out, err = await (
+            docker_run(argv, float(pol.timeout_s), on_output=on_output)
+            if on_output is not None
+            else docker_run(argv, float(pol.timeout_s))
+        )
     except Exception as exc:  # noqa: BLE001
         return PytestContainerResult(
             ok=False, breach=ContainmentBreach.SPAWN_FAILED, passed=0, failed=0, total=0,

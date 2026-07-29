@@ -221,7 +221,10 @@ def test_bash_routes_through_sandbox_exec(tmp_path: Path, monkeypatch) -> None:
     """_bash must call sandbox_exec.sandbox_run_bash (not raw subprocess)."""
     calls: List[str] = []
 
-    async def _mock_sandbox_bash(command: str, *, worktree: str, docker_run=None):
+    async def _mock_sandbox_bash(command: str, *, worktree: str,
+                                 docker_run=None, on_output=None):
+        # Mirrors the real signature. A mock narrower than the contract
+        # makes the caller look correct while production raises.
         calls.append(command)
         return _make_sandbox_result(stdout="sandboxed-bash-output")
 
@@ -241,7 +244,8 @@ def test_bash_routes_through_sandbox_exec(tmp_path: Path, monkeypatch) -> None:
 
 def test_bash_denied_when_sandbox_denies(tmp_path: Path, monkeypatch) -> None:
     """If the sandbox denies execution, _bash must return a denial message."""
-    async def _mock_denied(command: str, *, worktree: str, docker_run=None):
+    async def _mock_denied(command: str, *, worktree: str,
+                           docker_run=None, on_output=None):
         return _make_sandbox_result(denied=True)
 
     import backend.core.ouroboros.governance.sandbox_exec as _se
