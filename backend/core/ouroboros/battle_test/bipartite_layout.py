@@ -751,6 +751,8 @@ def build_bipartite_application(
     status_rows: Optional[Callable[[], Any]] = None,
     pending_rows: Optional[Callable[[], Any]] = None,
     stream_rows: Optional[Callable[[], Any]] = None,
+    queue_rows: Optional[Callable[[], Any]] = None,
+    panic_rows: Optional[Callable[[], Any]] = None,
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
@@ -1111,6 +1113,15 @@ def build_bipartite_application(
     # immediately above this — the in-flight text appears exactly where it
     # will land, which is what makes it read as inline rather than as a
     # separate widget.
+    # The operator's own backlog, nearest the caret — it is about what
+    # THEY did, so it belongs closest to where they are typing.
+    if queue_rows is not None:
+        try:
+            _q_row = build_dynamic_rows(queue_rows)
+            if _q_row is not None:
+                rows += [_q_row]
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] queue row unavailable", exc_info=True)
     if stream_rows is not None:
         try:
             _stream_row = build_dynamic_rows(stream_rows)
@@ -1296,6 +1307,51 @@ def build_bipartite_application(
     except Exception:  # noqa: BLE001
         _editing_mode = None
 
+    # ── FATAL_PANIC overlay ────────────────────────────────────────────
+    # The SAME FloatContainer architecture the `/` palette established —
+    # one Z-index story, not a second overlay mechanism. Mounted last, so
+    # it draws ABOVE the palette: a completion menu must never occlude the
+    # notice that the organism has died in the background.
+    #
+    # `top=1` rather than `ycursor=True`: a crash is not attached to where
+    # the caret happens to be, and an overlay that moves while the
+    # operator reads a traceback is hostile.
+    if panic_rows is not None:
+        try:
+            from prompt_toolkit.filters import Condition
+            from prompt_toolkit.layout import (
+                ConditionalContainer, Float, FloatContainer, Window,
+            )
+            from prompt_toolkit.layout.controls import FormattedTextControl
+
+            def _panic_visible() -> bool:
+                try:
+                    return bool(panic_rows())
+                except Exception:  # noqa: BLE001
+                    return False
+
+            _panic_win = ConditionalContainer(
+                Window(
+                    FormattedTextControl(
+                        lambda: [("class:panic", "\n".join(panic_rows()))],
+                    ),
+                    wrap_lines=False, style="class:panic",
+                ),
+                filter=Condition(_panic_visible),
+            )
+            if isinstance(root, FloatContainer):
+                root.floats.append(Float(
+                    content=_panic_win, top=1, left=2, right=2,
+                ))
+            else:
+                root = FloatContainer(content=root, floats=[Float(
+                    content=_panic_win, top=1, left=2, right=2,
+                )])
+        except Exception:  # noqa: BLE001
+            # A cockpit that cannot draw the overlay must still RUN — the
+            # panic is already logged and on the telemetry lane.
+            logger.debug("[Bipartite] panic overlay unavailable", exc_info=True)
+
     app = Application(
         layout=PTLayout(root, focused_element=prompt),
         **({"editing_mode": _editing_mode}
@@ -1395,6 +1451,8 @@ async def run_bipartite_repl(
     status_rows: Optional[Callable[[], Any]] = None,
     pending_rows: Optional[Callable[[], Any]] = None,
     stream_rows: Optional[Callable[[], Any]] = None,
+    queue_rows: Optional[Callable[[], Any]] = None,
+    panic_rows: Optional[Callable[[], Any]] = None,
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
@@ -1427,6 +1485,7 @@ async def run_bipartite_repl(
             turn_spinner=turn_spinner, agent_rows=agent_rows,
             search_rows=search_rows, status_rows=status_rows,
             pending_rows=pending_rows, stream_rows=stream_rows,
+            queue_rows=queue_rows, panic_rows=panic_rows,
             serpent_active=serpent_active,
         )
         if watch_alive is not None:

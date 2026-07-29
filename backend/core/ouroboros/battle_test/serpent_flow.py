@@ -6947,6 +6947,17 @@ class SerpentREPL:
         _previous_exc_handler = _running_loop.get_exception_handler()
 
         def _repl_loop_exception_handler(loop_, ctx_):
+            # Panic Arbiter (backstop detector). Delegation rather than a
+            # third `set_exception_handler`: this handler's curated
+            # suppression stays authoritative, and the arbiter adds the
+            # thing a log file cannot — a broadcast the operator sees.
+            try:
+                from backend.core.ouroboros.battle_test.panic_arbiter import (
+                    arbitrate as _arbitrate,
+                )
+                _arbitrate(loop_, ctx_)
+            except Exception:  # noqa: BLE001
+                pass
             msg = ctx_.get("message", "Unhandled exception in event loop")
             exc = ctx_.get("exception")
             extras = " | ".join(

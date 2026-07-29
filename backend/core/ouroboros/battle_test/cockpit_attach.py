@@ -237,6 +237,25 @@ def publish_telemetry_global(payload: dict) -> bool:
         return False
 
 
+def install_panic_broadcast() -> bool:
+    """Route FATAL_PANIC frames onto the UDS telemetry lane. NEVER raises.
+
+    Registered once; the arbiter dedups, so a cascade is one frame. Uses
+    `publish_telemetry_global` — the same lane and envelope the heartbeat,
+    the in-flight stream and the tool tail already ride, so no new
+    transport, no new frame convention, and clients that predate this
+    ignore an unknown `kind` exactly as they always have.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.panic_arbiter import (
+            register_sink,
+        )
+        register_sink(publish_telemetry_global)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def attach_enabled() -> bool:
     """Master gate — default ON. NEVER raises."""
     return os.environ.get(

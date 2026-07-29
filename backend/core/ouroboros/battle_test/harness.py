@@ -1242,6 +1242,17 @@ class BattleTestHarness:
         _running_loop = asyncio.get_event_loop()
 
         def _harness_loop_exception_handler(loop_, ctx_):
+            # Panic Arbiter (backstop detector). Delegation rather than a
+            # third `set_exception_handler`: this handler's curated
+            # suppression stays authoritative, and the arbiter adds the
+            # thing a log file cannot — a broadcast the operator sees.
+            try:
+                from backend.core.ouroboros.battle_test.panic_arbiter import (
+                    arbitrate as _arbitrate,
+                )
+                _arbitrate(loop_, ctx_)
+            except Exception:  # noqa: BLE001
+                pass
             # Interpreter finalization guard (operator paste 2026-07-18):
             # during shutdown the QueueHandler's copy.copy(record) dies
             # with "ImportError: sys.meta_path is None" and logging
@@ -1273,6 +1284,15 @@ class BattleTestHarness:
 
         try:
             _running_loop.set_exception_handler(_harness_loop_exception_handler)
+            # Panic broadcast: a traceback in a log file is invisible to
+            # someone watching a cockpit.
+            try:
+                from backend.core.ouroboros.battle_test.cockpit_attach import (
+                    install_panic_broadcast,
+                )
+                install_panic_broadcast()
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:
             logger.debug("Failed to install harness asyncio exception handler", exc_info=True)
 
@@ -4211,6 +4231,43 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             return ""
 
+    def _operator_input_queue(self, loop: Any) -> Any:
+        """The ordered input queue for attached cockpits, or None.
+
+        None means "fall back to the legacy fire-and-forget task", which
+        is what the master flag off selects and what a construction
+        failure degrades to. Losing ORDER is bad; losing the operator's
+        line entirely would be worse, so the fallback stays.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.operator_input_queue import (  # noqa: E501
+                OperatorInputQueue, input_queue_enabled,
+            )
+            if not input_queue_enabled():
+                return None
+            q = getattr(self, "_op_input_q", None)
+            if q is None:
+                q = OperatorInputQueue(
+                    lambda text, session: self._handle_repl_command_for(
+                        text, session),
+                )
+                self._op_input_q = q
+                q.start()
+                # Publish for read-only observers (the heartbeat), so the
+                # operator can SEE a backlog rather than infer one from
+                # silence.
+                try:
+                    from backend.core.ouroboros.battle_test.operator_input_queue import (  # noqa: E501
+                        set_active_queue,
+                    )
+                    set_active_queue(q)
+                except Exception:  # noqa: BLE001
+                    pass
+            return q
+        except Exception:  # noqa: BLE001
+            logger.debug("[Attach] input queue unavailable", exc_info=True)
+            return None
+
     async def _handle_repl_command_for(
         self, command: str, session: Optional[str],
     ) -> None:
@@ -4572,6 +4629,28 @@ class BattleTestHarness:
                 try:
                     loop = asyncio.get_running_loop()
                 except RuntimeError:
+                    return
+                # ORDERED, matching the local terminal. `create_task` per
+                # line gave the same action two concurrency semantics
+                # depending on which surface it was typed into: `/pause`
+                # then `/status` could report the pre-pause state, and a
+                # pasted block became one racing task per line.
+                #
+                # The queue serializes HANDLERS, not ops — a handler
+                # schedules work and returns, so a long op never delays
+                # the next line the operator types.
+                q = self._operator_input_queue(loop)
+                if q is not None:
+                    res = q.submit(text, session)
+                    if not res.accepted and res.reason not in ("empty",):
+                        # Refused, never dropped: an operator who believes
+                        # a goal landed is worse off than one told it did
+                        # not.
+                        try:
+                            self._flow._mirror_markup(
+                                f"  [yellow]⚠ {res.reason}[/yellow]")
+                        except Exception:  # noqa: BLE001
+                            pass
                     return
                 loop.create_task(self._handle_repl_command_for(text, session))
 
