@@ -111,7 +111,6 @@ class TestTheWatchdogIsIsolated:
             if isinstance(n, ast.FunctionDef)
             and n.name == "_arm_shutdown_deadline"
         )
-        body = ast.get_source_segment(src, node) or ""
         body = _code_of("_arm_shutdown_deadline")
         for forbidden in ("self._orchestrator", "_active_ops",
                           "self._phase"):
@@ -161,10 +160,6 @@ class TestTheGraceIsBounded:
         extend-condition true forever, so the watchdog deadlocks WITH the
         system. The answer to "cleanup needs longer" is a larger STATIC
         budget."""
-        body = ast.get_source_segment(_src(), next(
-            n for n in ast.walk(ast.parse(_src()))
-            if isinstance(n, ast.FunctionDef)
-            and n.name == "_arm_shutdown_deadline")) or ""
         code = _code_of("_arm_shutdown_deadline").lower()
         for waiver in ("extend", "waiver", "refresh", "reset_deadline"):
             assert waiver not in code, waiver
