@@ -28,6 +28,21 @@ SPEECH_ENTRY_POINTS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _isolated(monkeypatch):
+    """No env, and NO real sentinel files.
+
+    These tests read the actual filesystem otherwise — and the moment an
+    operator legitimately mutes their own machine, the suite starts
+    failing for a reason that has nothing to do with the code. Tests that
+    exercise sentinels re-patch `sentinel_paths` themselves.
+    """
+    import backend.core.voice_mute as vm
+    monkeypatch.delenv("JARVIS_VOICE_MUTED", raising=False)
+    monkeypatch.setattr(vm, "sentinel_paths", lambda: ())
+    yield
+
+
 class TestEveryPathIsGuarded:
     @pytest.mark.parametrize("rel", sorted(SPEECH_ENTRY_POINTS))
     def test_the_mute_is_checked(self, rel):
@@ -77,9 +92,24 @@ class TestTheSwitch:
         """A transient env fault must not become permanent silence nobody
         can explain."""
         import backend.core.voice_mute as vm
-        monkeypatch.setattr(
-            vm.os.environ, "get",
-            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("env down")))
+
+        class _Hostile:
+            """Only THIS module's view of os is broken.
+
+            The first version patched `vm.os.environ.get` — and `vm.os` IS
+            the global `os` module, so it broke `os.environ.get` for pytest
+            itself and every test that ran after. A monkeypatch that reaches
+            outside the unit under test is not a test, it is sabotage with a
+            fixture.
+            """
+
+            class environ:
+                @staticmethod
+                def get(*_a, **_k):
+                    raise RuntimeError("env down")
+
+        monkeypatch.setattr(vm, "os", _Hostile)
+        monkeypatch.setattr(vm, "sentinel_paths", lambda: ())
         assert vm.voice_muted() is False
 
 
