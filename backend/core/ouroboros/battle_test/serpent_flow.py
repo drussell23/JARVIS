@@ -1923,15 +1923,100 @@ class SerpentFlow:
             pass
 
     def _maybe_buffer_op_commit(self, op_id: str, summary: str) -> None:
+        """Commit the block AND render its collapsed line. NEVER raises.
+
+        The second half is the point. `JARVIS_OP_COLLAPSE_ENABLED` was
+        named for a collapse that never happened: `_op_line`'s own comment
+        says "non-disruptive parallel recording — existing console output
+        is unchanged", and the only place `summary_line` ever rendered was
+        INSIDE `/expand`, i.e. after the operator had already decided to
+        look. So the feature stored blocks, could expand them, and had no
+        collapsed representation anywhere.
+
+        What that cost, concretely: under the AUTO lens exactly ONE op
+        renders. Every other concurrent op printed nothing at all — not
+        collapsed, SILENT. With three background workers an operator saw
+        one op and two ghosts, and the only way to learn a ghost existed
+        was to guess its `o-N` ref and expand it.
+
+        A terminal cannot unprint, so "collapse on completion" here means
+        EMIT the one-liner at completion rather than retroactively fold —
+        which is what a scrolling CC transcript does too. For a focused op
+        it closes the block and names its ref; for an unfocused one it is
+        the entire visible trace of that op's existence.
+        """
         if not self._op_collapse_enabled():
             return
+        block = None
         try:
             from backend.core.ouroboros.battle_test.op_block_buffer import (
                 get_default_buffer,
             )
-            get_default_buffer().commit(op_id, summary)
+            block = get_default_buffer().commit(op_id, summary)
+        except Exception:
+            pass  # best-effort — never crash the lifecycle
+        try:
+            self._render_collapsed_block(op_id, summary, block)
+        except Exception:
+            pass  # a summary that fails must not fail the op
+
+    def _render_collapsed_block(
+        self, op_id: str, summary: str, block: Any,
+    ) -> None:
+        """One line standing in for a finished op. NEVER raises.
+
+        Goes through BOTH surfaces at the established seam: `_mirror_markup`
+        for attached cockpits, the console for the local terminal — the
+        same pair `_op_line` uses, so a collapsed block cannot appear on
+        one surface and not the other.
+        """
+        if self._lens_mode == "none":
+            # "pure digest mode" promises nothing renders to the viewport.
+            # A mode that promises silence has to stay silent, or the
+            # promise is worth nothing.
+            return
+        label = self._collapsed_label(summary, block)
+        if not label:
+            return
+        ref = str(getattr(block, "ref", "") or "")
+        lines = int(getattr(block, "line_count", 0) or 0)
+        # The ref is advertised ONLY when it exists. Printing `/expand o-7`
+        # for a block the buffer never recorded teaches the operator that
+        # expansion is broken.
+        tail = ""
+        if ref:
+            tail = (f"  [{_C['dim']}]{ref} · {lines} lines · /expand {ref}"
+                    f"[/{_C['dim']}]" if lines
+                    else f"  [{_C['dim']}]{ref} · /expand {ref}[/{_C['dim']}]")
+        line = f"[{_C['neural']}]{label}[/{_C['neural']}]{tail}"
+        self._mirror_markup(f"  {line}")
+        try:
+            self.console.print(f"  {line}", highlight=False)
         except Exception:
             pass
+
+    @staticmethod
+    def _collapsed_label(summary: str, block: Any) -> str:
+        """The operator-readable one-liner for a finished op.
+
+        DERIVED, through `task_panel_aggregator.derive_label` — the pure
+        priority-ordered picker (`summary_line`, else the first non-empty
+        block line, else a fallback) that `op_fanout_tree` already uses. A
+        second label rule here would drift from the panel's the first time
+        either changed, and the two describe the same op.
+        """
+        try:
+            from backend.core.ouroboros.governance.task_panel_aggregator import (
+                derive_label,
+            )
+            return derive_label(
+                block_lines=tuple(getattr(block, "lines", ()) or ()),
+                summary_line=str(summary or ""),
+                op_id=str(getattr(block, "op_id", "") or ""),
+                fallback="",
+            )
+        except Exception:
+            return " ".join(str(summary or "").split())[:120]
 
     def _maybe_set_terminal_title(
         self, *,
