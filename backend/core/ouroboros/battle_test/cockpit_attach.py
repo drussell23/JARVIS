@@ -135,6 +135,69 @@ def _accepts_two_positional(fn: Any) -> bool:
         return False
 
 
+#: The live bridge, for code that cannot be handed one.
+#:
+#: Same pattern as `bipartite_layout.set_active_canvas`: the producer
+#: (the harness, which builds the bridge) and the consumer (the speech
+#: primitive, three packages away) have no handle to each other.
+_ACTIVE_BRIDGE: Any = None
+
+
+def set_active_bridge(bridge: Any) -> None:
+    """Register the live bridge, or clear it with None. NEVER raises."""
+    global _ACTIVE_BRIDGE
+    try:
+        _ACTIVE_BRIDGE = bridge
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def attached_cockpits() -> int:
+    """How many cockpits are listening right now. NEVER raises."""
+    try:
+        clients = getattr(_ACTIVE_BRIDGE, "_clients", None)
+        return len(clients) if clients else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def operator_present() -> bool:
+    """Is there a human who can perceive output right now?
+
+    THE PROBLEM THIS ANSWERS
+    -------------------------
+    `ov` detaches: closing the terminal leaves the organism running, which is
+    the intended behaviour and a good one. But Karen kept NARRATING to a
+    machine whose operator had gone home — audio out of the speakers with no
+    cockpit anywhere to hear it. Text already behaves correctly:
+    `publish_markup` returns early when `_clients` is empty. Speech had no
+    equivalent, so it addressed an empty room.
+
+    Two ways a human can be present, and both count:
+
+      * a cockpit is ATTACHED over the bridge (`ov attach`), or
+      * this process owns a real terminal (a foreground run with its own
+        REPL, where the operator is looking straight at it).
+
+    The TTY arm is also the honest degradation: if the bridge cannot be
+    consulted at all, a detached daemon has no terminal and falls silent
+    while a foreground run keeps its voice — which is the correct answer in
+    both cases, reached without guessing.
+    """
+    try:
+        if attached_cockpits() > 0:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from backend.core.ouroboros.battle_test.presentation_restraint import (
+            real_stdout_isatty,
+        )
+        return bool(real_stdout_isatty())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def attach_enabled() -> bool:
     """Master gate — default ON. NEVER raises."""
     return os.environ.get(
