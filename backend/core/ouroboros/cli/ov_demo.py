@@ -492,6 +492,11 @@ _LIVE_BEATS: List[Any] = [
 
     (20.4, "act", ("Gate", "7759-86 · NOTIFY_APPLY")),
     (21.2, "det", ("applied · verified · committed 90706b8", "ok")),
+    # The op FINISHES, and collapses to one line. Before #70250 nothing
+    # rendered this: an unfocused op left no trace at all, and a focused
+    # one stayed fully expanded forever.
+    (22.0, "collapse", ("⏺ risk_tier_floor.py evolved · ⏱ 21.6s · 💰 $0.0031",
+                        "o-1", 27)),
     (22.4, "act", ("Complete", "7759-86 · 22.4s · $0.011")),
 ]
 
@@ -519,6 +524,39 @@ def _agora_beats() -> List[Any]:
         lines = [f"  (agora unavailable: {exc})"]
     return [(_AGORA_AT[min(i, len(_AGORA_AT) - 1)], line)
             for i, line in enumerate(lines)]
+
+
+def _collapsed_beat(args: Sequence[Any]) -> str:
+    """A finished op, reduced to the one line the cockpit now emits.
+
+    The label comes from `task_panel_aggregator.derive_label` — the same
+    pure picker `serpent_flow._collapsed_label` and `op_fanout_tree` use —
+    so a regression in the label rule shows up here instead of silently
+    producing a plausible-looking demo. Hand-writing the string would
+    exercise none of it.
+    """
+    try:
+        from backend.core.ouroboros.governance.task_panel_aggregator import (
+            derive_label,
+        )
+        summary, ref, lines = (list(args) + ["", "", 0])[:3]
+        label = derive_label(summary_line=str(summary), fallback="op complete")
+        tail = f"{ref} · {lines} lines · /expand {ref}" if ref else ""
+        return (f"  [{_THEME('neural')}]{label}[/{_THEME('neural')}]"
+                f"  [{_THEME('dim')}]{tail}[/{_THEME('dim')}]"
+                if tail else f"  {label}")
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] collapsed beat unavailable", exc_info=True)
+        return "  ⏺ op complete"
+
+
+def _THEME(slot: str) -> str:
+    """One colour slot, from the cockpit's own palette. NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.serpent_flow import _C
+        return _C.get(slot, "white")
+    except Exception:  # noqa: BLE001
+        return "white"
 
 
 def _tool_beats(at: float, args: Sequence[Any]) -> List[Any]:
@@ -657,6 +695,10 @@ def compose_live_script() -> List[Any]:
             continue
         if kind == "tool":
             out.extend(_tool_beats(at, args))
+            continue
+        if kind == "collapse":
+            out.append((at, ""))
+            out.append((at, _collapsed_beat(args)))
             continue
         if kind == "agent":
             out.extend(_agent_beats(at, args))
@@ -816,6 +858,85 @@ def _inflight_text(elapsed: float) -> str:
         return ""
 
 
+#: Windows during which a shell command is RUNNING, and the output it
+#: produces. Deliberately overlapping the tool beats they belong to, so the
+#: live tail and the `⏺ Bash(…)` block describe the same command.
+_RUNNING = {
+    (9.2, 12.4): (
+        "bash",
+        "python3 -m pytest tests/governance/test_risk_tier_floor.py -q",
+        [
+            "collecting ...",
+            "test_risk_tier_floor.py::test_quiet_hours_wraps PASSED",
+            "test_risk_tier_floor.py::test_paranoia_shortcut PASSED",
+            "test_risk_tier_floor.py::test_vision_floor_clamped FAILED",
+            "stderr:E   AssertionError: expected notify_apply, got safe_auto",
+            "1 failed, 42 passed in 3.9s",
+        ],
+    ),
+    (18.0, 20.6): (
+        "bash",
+        "python3 -m pytest tests/governance/test_risk_tier_floor.py -q",
+        [
+            "collecting ...",
+            "test_risk_tier_floor.py::test_vision_floor_clamped PASSED",
+            "43 passed in 4.1s",
+        ],
+    ),
+}
+
+
+def _running_rows(elapsed: float, width: int) -> List[str]:
+    """A shell command's live tail, through the REAL LiveToolStream.
+
+    Not a formatted string: the synthetic bytes go through the same
+    coalescing, `\r` collapsing, ANSI stripping and credential redaction
+    a real container's output does, and come back out of the same
+    `render_inflight(preserve_lines=True)` the cockpit uses. A hand-drawn
+    tail would keep looking right through a regression in any of them.
+
+    NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.live_tool_stream import (
+            LiveToolStream,
+        )
+        from backend.core.ouroboros.battle_test.stream_renderer import (
+            render_inflight,
+        )
+        for (lo, hi), (tool, _cmd, lines) in _RUNNING.items():
+            if not (lo <= elapsed <= hi):
+                continue
+            frames: List[Any] = []
+            clock = [lo]
+            stream = LiveToolStream(
+                tool=tool, op_id="demo", publish=frames.append,
+                clock=lambda: clock[0],
+            )
+            # Deal the lines out over the window, then ask the stream what
+            # it would be showing NOW.
+            shown = int(((elapsed - lo) / max(0.01, hi - lo)) * len(lines))
+            for line in lines[:max(1, shown)]:
+                clock[0] += 0.2
+                if line.startswith("stderr:"):
+                    stream("stderr", line[7:] + "\n")
+                else:
+                    stream("stdout", line + "\n")
+            if not frames:
+                return []
+            frame = frames[-1]
+            head = f"$ {tool} · {elapsed - lo:.0f}s"
+            body = str(frame.get("text") or "")
+            return render_inflight(
+                f"{head}\n{body}" if body else head,
+                width=width, preserve_lines=True, keep_first=True,
+            )
+        return []
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] running-command tail unavailable", exc_info=True)
+        return []
+
+
 def _stream_rows(elapsed: float, mux: Any = None) -> List[str]:
     """Strip rows for the demo, through the COCKPIT's renderer. NEVER raises.
 
@@ -828,9 +949,6 @@ def _stream_rows(elapsed: float, mux: Any = None) -> List[str]:
         from backend.core.ouroboros.battle_test.stream_renderer import (
             render_inflight,
         )
-        text = _inflight_text(elapsed)
-        if not text:
-            return []
         width = None
         try:
             width = getattr(mux, "width", None) if mux is not None else None
@@ -839,6 +957,15 @@ def _stream_rows(elapsed: float, mux: Any = None) -> List[str]:
         if not width:
             import shutil
             width = shutil.get_terminal_size((80, 24)).columns
+        # A running command outranks model prose in the same strip: they
+        # never overlap in a real op either, and the command is the thing
+        # the operator cannot otherwise see.
+        running = _running_rows(elapsed, width)
+        if running:
+            return running
+        text = _inflight_text(elapsed)
+        if not text:
+            return []
         return render_inflight(text, width=width)
     except Exception:  # noqa: BLE001
         logger.debug("[OvDemo] inflight strip unavailable", exc_info=True)

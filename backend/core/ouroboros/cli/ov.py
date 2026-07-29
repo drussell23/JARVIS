@@ -1083,7 +1083,11 @@ class AttachUI:
                 self._stream_inflight, width=self._terminal_size()[0],
                 # Command output keeps its line structure; model prose does
                 # not. The producer is known from the frame that set it.
-                preserve_lines=self._stream_is_tool)
+                preserve_lines=self._stream_is_tool,
+                # Row 0 of a tool tail is `$ bash · 11s` — what is running
+                # and for how long. Eliding it leaves test names with no
+                # subject.
+                keep_first=self._stream_is_tool)
         except Exception:  # noqa: BLE001
             return []
 

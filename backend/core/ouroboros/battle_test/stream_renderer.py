@@ -86,6 +86,7 @@ def render_inflight(
     text: str, *, width: Optional[int] = None,
     max_rows: int = INFLIGHT_MAX_ROWS,
     preserve_lines: bool = False,
+    keep_first: bool = False,
 ) -> List[str]:
     """Wrap an in-flight sentence into strip rows. Pure. NEVER raises.
 
@@ -129,7 +130,20 @@ def render_inflight(
             # Keep the NEWEST rows: the tail is where the writing is
             # happening, and an elided head reads as "there is more above",
             # which is true and about to be in the transcript anyway.
-            wrapped = ["…"] + wrapped[-(rows - 1):] if rows > 1 else ["…"]
+            #
+            # `keep_first` exempts row 0. A running command's first row is
+            # its HEADER — `$ bash · 11s` — which is context rather than
+            # content, and eliding it left a tail of test names with no
+            # indication of what was running or for how long. Caught by
+            # driving this from `ov demo live`, which is what the demo is
+            # for. The caller declares which shape it has, the same way it
+            # declares whether newlines are meaningful.
+            if keep_first and rows > 2:
+                wrapped = [wrapped[0], "…"] + wrapped[-(rows - 2):]
+            elif rows > 1:
+                wrapped = ["…"] + wrapped[-(rows - 1):]
+            else:
+                wrapped = ["…"]
         return [f"  {line}" for line in wrapped]
     except Exception:  # noqa: BLE001
         logger.debug("[StreamRender] inflight wrap degraded", exc_info=True)
