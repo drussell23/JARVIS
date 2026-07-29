@@ -217,11 +217,56 @@ def _render_status() -> VoiceReplDispatchResult:
 
 
 def _set_mute(on: bool) -> VoiceReplDispatchResult:
-    a = _announcer()
-    a.set_mute(on=on)
-    state = "muted" if on else "unmuted"
+    """Silence, at the scope the operator actually meant. NEVER raises.
+
+    This used to flip ONE announcer's in-process flag and reply "Karen
+    muted." It did not touch the other six speech paths
+    (`voice_orchestrator`, `shared_voice_client`, `cross_repo_voice_client`,
+    the TTS engine base class), did not survive a restart, and could not
+    reach any other process. So an operator typed `/voice mute`, was told
+    it worked, and kept hearing her — a false confirmation, which is worse
+    than having no verb at all.
+
+    Now it does both: the announcer flag AND the durable sentinel that
+    every speech path consults. The reply states what was actually
+    achieved rather than asserting a result it cannot verify.
+    """
+    announcer_ok = False
+    try:
+        _announcer().set_mute(on=on)
+        announcer_ok = True
+    except Exception:  # noqa: BLE001
+        pass
+
+    sentinel = ""
+    cleared = 0
+    try:
+        from backend.core.voice_mute import mute as _mute, unmute as _unmute
+        if on:
+            sentinel = _mute()
+        else:
+            cleared = _unmute()
+    except Exception:  # noqa: BLE001
+        pass
+
+    if on:
+        # The sentinel is what makes this durable and process-wide, so its
+        # absence is the part worth reporting — an operator told "muted"
+        # who is still hearing her needs to know which half failed.
+        if sentinel:
+            text = ("  /voice: muted — every speech path, and it survives "
+                    "a restart.")
+        elif announcer_ok:
+            text = ("  /voice: Karen's announcer muted, but the durable "
+                    "sentinel could NOT be written — other speech paths "
+                    "may still talk, and this will not survive a restart.")
+        else:
+            text = "  /voice: could not mute — nothing changed."
+        return VoiceReplDispatchResult(ok=bool(sentinel), text=text)
+
+    freed = f" ({cleared} sentinel{'s' if cleared != 1 else ''} cleared)" if cleared else ""
     return VoiceReplDispatchResult(
-        ok=True, text=f"  /voice: Karen {state}.",
+        ok=True, text=f"  /voice: unmuted{freed}.",
     )
 
 
