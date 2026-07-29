@@ -28,8 +28,12 @@ class _FakeApprovalProvider:
         self.rejected = []
     async def approve(self, request_id, approver):
         self.approved.append((request_id, approver)); return {"ok": True}
-    async def reject(self, request_id, approver, reason=""):
-        self.rejected.append((request_id, approver, reason)); return {"ok": True}
+    async def reject(self, request_id, approver, reason="",
+                     provenance="unstated"):
+        # Mirrors the real signature. A fake narrower than the contract
+        # makes the caller look correct while production would raise.
+        self.rejected.append(
+            (request_id, approver, reason, provenance)); return {"ok": True}
 
 
 class _FakeBridge:

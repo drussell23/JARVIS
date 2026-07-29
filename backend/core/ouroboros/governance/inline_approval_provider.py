@@ -248,6 +248,7 @@ class InlineApprovalProvider:
 
     async def reject(
         self, request_id: str, approver: str, reason: str,
+        provenance: str = "unstated",
     ) -> ApprovalResult:
         pending = self._get_or_raise(request_id)
         if pending.result is not None:
@@ -259,6 +260,7 @@ class InlineApprovalProvider:
             status=ApprovalStatus.REJECTED,
             approver=approver,
             reason=reason,
+            reason_provenance=provenance,
             decided_at=datetime.now(tz=timezone.utc),
             request_id=request_id,
         )

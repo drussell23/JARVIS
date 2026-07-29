@@ -413,6 +413,8 @@ class Slice4bRunner(PhaseRunner):
                             description=ctx.description,
                             target_files=list(ctx.target_files),
                             reason=_reject_reason,
+                            provenance=getattr(
+                                decision, "reason_provenance", "unstated"),
                             approver=getattr(decision, "approver", "human") or "human",
                         )
                     except Exception:

@@ -112,7 +112,13 @@ class GatewayCommandRouter:
                 self._fire_decision(action="approve", op_id=op_id, user_id=str(user_id))
                 return {"ok": True, "action": "approve", "result": res}
             if act == "reject":
-                res = await self._provider.reject(op_id, approver, text or "rejected via Discord")
+                # `text` is what a human typed in Discord; the fallback is
+                # not. Same reason string either way — the provenance is
+                # what decides whether it may become a stored preference.
+                res = await self._provider.reject(
+                    op_id, approver, text or "rejected via Discord",
+                    "stated" if str(text or "").strip() else "unstated",
+                )
                 logger.info("[DiscordGateway] REJECTED_BY_OPERATOR op=%s by=%s", op_id, approver)
                 self._fire_decision(action="reject", op_id=op_id, user_id=str(user_id))
                 return {"ok": True, "action": "reject", "result": res}

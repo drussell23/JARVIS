@@ -713,6 +713,7 @@ class TestPostmortemHooks:
             description="rewrite auth middleware",
             target_files=["src/auth/middleware.py"],
             reason="Legal hasn't signed off on storing session tokens this way",
+            provenance="stated",
         )
         assert mem is not None
         assert mem.type is MemoryType.FEEDBACK
@@ -742,12 +743,14 @@ class TestPostmortemHooks:
             description="rewrite auth middleware",
             target_files=[],
             reason="first reason",
+            provenance="stated",
         )
         mem2 = store.record_approval_rejection(
             op_id="op-2",
             description="rewrite auth middleware",
             target_files=[],
             reason="second reason",
+            provenance="stated",
         )
         assert mem1 is not None
         assert mem2 is not None
@@ -763,6 +766,7 @@ class TestPostmortemHooks:
             target_files=[],
             reason="reason",
             approver="derek",
+            provenance="stated",
         )
         assert mem is not None
         assert "derek" in mem.source
@@ -773,9 +777,43 @@ class TestPostmortemHooks:
             description="desc",
             target_files=[f"src/f{i}.py" for i in range(10)],
             reason="reason",
+            provenance="stated",
         )
         assert mem is not None
         assert len(mem.paths) == 4
+
+    def test_a_reason_no_human_stated_is_NOT_a_preference(self, store):
+        """THE regression. Three call sites passed a code constant here —
+        "rejected via Iron Gate", "plan rejected via Plan Gate", "inline
+        reject" — because the gate returned a bool and the decision parser
+        discarded everything after the verb. Each became a FEEDBACK memory
+        whose content claims to encode "the user's stated reason", rendered
+        to the model under "the user's explicit preferences ... Honour them
+        without asking". A string the CODE wrote, quoted as the human."""
+        for prov in ("unstated", "synthetic", ""):
+            assert store.record_approval_rejection(
+                op_id="op-fab",
+                description="rewrite the permission gate",
+                target_files=["src/gate.py"],
+                reason="rejected via Iron Gate",
+                provenance=prov,
+            ) is None, f"provenance={prov!r} became a binding constraint"
+        assert store.find_by_type(MemoryType.FEEDBACK) == []
+
+    def test_the_gate_is_provenance_not_a_denylist_of_strings(self, store):
+        """A deny-list of the three known constants would rot on the fourth
+        and cannot tell "rejected via Iron Gate" (a constant) from
+        "rejected because the Iron Gate is right" (a sentence). The
+        question asked is whether a human was WITNESSED saying it."""
+        assert store.record_approval_rejection(
+            op_id="op-a", description="d", target_files=[],
+            reason="rejected via Iron Gate", provenance="stated",
+        ) is not None          # same string, witnessed → legitimate
+        assert store.record_approval_rejection(
+            op_id="op-b", description="d2", target_files=[],
+            reason="this genuinely reads like a human sentence",
+            provenance="unstated",
+        ) is None              # human-shaped, unwitnessed → refused
 
     def test_record_rollback_creates_feedback(self, store):
         mem = store.record_rollback(

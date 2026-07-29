@@ -179,7 +179,12 @@ async def handle_reject(
             "not_active: Governed loop is not active."
         )
 
-    result = await service._approval_provider.reject(op_id, approver, reason)
+    # An operator typed this on the command line. A blank one is still a
+    # rejection, just not an explanation of one.
+    result = await service._approval_provider.reject(
+        op_id, approver, reason,
+        "stated" if str(reason or "").strip() else "unstated",
+    )
 
     logger.info(
         "[CLI] reject: op_id=%s status=%s approver=%s reason=%r",
