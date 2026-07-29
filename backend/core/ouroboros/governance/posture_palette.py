@@ -53,6 +53,14 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -224,7 +232,7 @@ def format_posture_badge(
     Rich pipeline.
 
     ``plain=False`` — returns Rich-markup-wrapped form like
-    ``"[green]🐍 EXPLORE[/green]"`` ready for direct emit into
+    ``f"[{_SEM['success']}]🐍 EXPLORE[/]"`` ready for direct emit into
     a Rich console.
     """
     try:

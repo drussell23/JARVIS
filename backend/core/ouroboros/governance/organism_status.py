@@ -60,6 +60,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -225,7 +233,7 @@ def format_risk_tier_badge(
     token. NEVER raises.
 
     ``plain=True`` — returns plain text ``"● GREEN"``.
-    ``plain=False`` — returns Rich-markup ``"[green]● GREEN[/green]"``.
+    ``plain=False`` — returns Rich-markup ``f"[{_SEM['success']}]● GREEN[/]"``.
 
     When light is None, composes :func:`read_current_risk_light_safe`."""
     try:
