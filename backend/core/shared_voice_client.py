@@ -215,6 +215,15 @@ class VoiceClient:
         Returns:
             True if sent immediately, False if queued locally
         """
+        # MASTER MUTE — see backend/core/voice_mute. Every speech
+        # path gets the same answer; a mute honoured by only
+        # some of them is not a mute.
+        try:
+            from backend.core.voice_mute import voice_muted
+            if voice_muted():
+                return False
+        except Exception:  # noqa: BLE001
+            pass
         async with self._lock:
             if self._connected:
                 success = await self._send(text, priority, category, metadata)
@@ -399,6 +408,15 @@ async def announce(
     Returns:
         True if sent immediately, False if queued locally
     """
+    # MASTER MUTE — see backend/core/voice_mute. Every speech
+    # path gets the same answer; a mute honoured by only
+    # some of them is not a mute.
+    try:
+        from backend.core.voice_mute import voice_muted
+        if voice_muted():
+            return False
+    except Exception:  # noqa: BLE001
+        pass
     client = await get_or_create_client(source)
     return await client.announce(
         text=message,

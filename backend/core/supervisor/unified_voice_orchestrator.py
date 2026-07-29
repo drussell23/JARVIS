@@ -1380,10 +1380,8 @@ def _voice_muted() -> bool:
     reaching for silence is usually reaching for it NOW.
     """
     try:
-        import os as _os
-        return _os.environ.get(
-            "JARVIS_VOICE_MUTED", "0",
-        ).strip().lower() in ("1", "true", "yes", "on")
+        from backend.core.voice_mute import voice_muted
+        return voice_muted()
     except Exception:  # noqa: BLE001
         return False
 
