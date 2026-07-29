@@ -85,6 +85,7 @@ INFLIGHT_MAX_ROWS = 4
 def render_inflight(
     text: str, *, width: Optional[int] = None,
     max_rows: int = INFLIGHT_MAX_ROWS,
+    preserve_lines: bool = False,
 ) -> List[str]:
     """Wrap an in-flight sentence into strip rows. Pure. NEVER raises.
 
@@ -103,13 +104,27 @@ def render_inflight(
     """
     try:
         import textwrap
-        flat = " ".join(str(text or "").split())
-        if not flat:
-            return []
         cols = int(width) if width and int(width) > 0 else 80
         room = max(20, cols - 4)
         rows = max(1, int(max_rows))
-        wrapped = textwrap.wrap(flat, width=room) or [flat[:room]]
+        if preserve_lines:
+            # A COMMAND's output. Line breaks are content here — collapsing
+            # them would run a pytest summary and its next test name into
+            # one sentence. Each source line wraps independently so the
+            # structure the command wrote survives the terminal's width.
+            src = [ln for ln in str(text or "").splitlines()]
+            if not any(ln.strip() for ln in src):
+                return []
+            wrapped = []
+            for ln in src:
+                wrapped.extend(textwrap.wrap(ln, width=room) or [""])
+        else:
+            # PROSE. The model streams a sentence whose newlines are an
+            # artefact of token boundaries, not meaning.
+            flat = " ".join(str(text or "").split())
+            if not flat:
+                return []
+            wrapped = textwrap.wrap(flat, width=room) or [flat[:room]]
         if len(wrapped) > rows:
             # Keep the NEWEST rows: the tail is where the writing is
             # happening, and an elided head reads as "there is more above",

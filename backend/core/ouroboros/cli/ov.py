@@ -683,6 +683,9 @@ class AttachUI:
         #: The sentence currently being written, if a generation is live.
         self._stream_inflight: str = ""
         self._stream_arrived: float = 0.0
+        #: Is the strip currently showing COMMAND output rather than model
+        #: prose? Decides whether line breaks are content or artefact.
+        self._stream_is_tool: bool = False
         self._focus_lines: List[str] = []
         self._focus_note: str = ""
         self._flash_text: str = ""
@@ -1077,7 +1080,10 @@ class AttachUI:
             if age > heartbeat_stale_after_s():
                 return []
             return render_inflight(
-                self._stream_inflight, width=self._terminal_size()[0])
+                self._stream_inflight, width=self._terminal_size()[0],
+                # Command output keeps its line structure; model prose does
+                # not. The producer is known from the frame that set it.
+                preserve_lines=self._stream_is_tool)
         except Exception:  # noqa: BLE001
             return []
 
@@ -1383,7 +1389,33 @@ class AttachUI:
                 self._stream_inflight = (
                     "" if frame.get("done") else str(frame.get("text") or "")
                 )
+                self._stream_is_tool = False
                 import time as _time
+                self._stream_arrived = _time.monotonic()
+            elif isinstance(frame, dict) and frame.get("kind") == "tool_stream":
+                # A running command's live tail. It shares the in-flight
+                # strip with the model's sentence rather than owning a
+                # second one: both answer "what is happening right now",
+                # they never overlap in time within an op, and two strips
+                # would compete for the same rows below the deck.
+                #
+                # The header carries the tool and elapsed so a long command
+                # reads as WORKING rather than stalled — which is the whole
+                # complaint a black box produces.
+                import time as _time
+                if frame.get("done"):
+                    self._stream_inflight = ""
+                else:
+                    _tool = str(frame.get("tool") or "tool")
+                    _el = frame.get("elapsed_s") or 0.0
+                    try:
+                        _head = f"$ {_tool} · {float(_el):.0f}s"
+                    except (TypeError, ValueError):
+                        _head = f"$ {_tool}"
+                    _body = str(frame.get("text") or "")
+                    self._stream_inflight = (
+                        f"{_head}\n{_body}" if _body else _head)
+                self._stream_is_tool = True
                 self._stream_arrived = _time.monotonic()
         except Exception:
             pass

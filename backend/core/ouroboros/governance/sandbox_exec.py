@@ -42,6 +42,7 @@ async def sandbox_run_bash(
     *,
     worktree: str,
     docker_run: Any = None,
+    on_output: Any = None,
 ) -> SandboxResult:
     """Run ``command`` in an ephemeral hardened container.
 
@@ -61,7 +62,8 @@ async def sandbox_run_bash(
     # destructive command (e.g. ls && rm -rf …) cannot destroy the repo even
     # inside the air-gapped container.
     res = await run_in_container(
-        command, worktree=worktree, docker_run=docker_run, read_only=True
+        command, worktree=worktree, docker_run=docker_run, read_only=True,
+        on_output=on_output,
     )
 
     breach = getattr(res, "breach", ContainmentBreach.SPAWN_FAILED)
@@ -94,6 +96,7 @@ async def sandbox_run_tests(
     *,
     worktree: str,
     docker_run: Any = None,
+    on_output: Any = None,
 ) -> SandboxResult:
     """Run pytest against ``test_targets`` inside an ephemeral hardened container.
 
@@ -109,7 +112,8 @@ async def sandbox_run_tests(
     )
 
     res = await run_pytest_in_container(
-        test_targets, worktree=worktree, docker_run=docker_run
+        test_targets, worktree=worktree, docker_run=docker_run,
+        on_output=on_output,
     )
 
     breach = getattr(res, "breach", ContainmentBreach.SPAWN_FAILED)

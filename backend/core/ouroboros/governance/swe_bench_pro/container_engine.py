@@ -295,28 +295,105 @@ def build_eval_script(
 DockerRun = Callable[[Sequence[str], float], Awaitable[Tuple[int, str, str]]]
 
 
-async def _real_docker_run(argv: Sequence[str], timeout_s: float) -> Tuple[int, str, str]:
+async def _real_docker_run(
+    argv: Sequence[str], timeout_s: float, *, on_output: Any = None,
+) -> Tuple[int, str, str]:
     """Run ``docker ...`` via asyncio subprocess (same shape as
     scorer._git_apply_patch). Bounded by ``timeout_s``; kills + drains on
-    timeout. NEVER leaves a zombie — ``--rm`` on the run + proc kill here."""
+    timeout. NEVER leaves a zombie — ``--rm`` on the run + proc kill here.
+
+    ``on_output`` — optional ``(stream, text) -> None`` sink called as bytes
+    arrive, where ``stream`` is ``"stdout"`` or ``"stderr"``. This is the
+    ONLY reason this function has two code paths.
+
+    Why two paths rather than always streaming
+    -------------------------------------------
+    ``communicate()`` is not merely convenient: it is what prevents the
+    classic pipe deadlock, where the child blocks writing to a full stderr
+    buffer while the parent waits on stdout. Reading manually means owning
+    that hazard — both pipes must be drained CONCURRENTLY, forever, or a
+    chatty command wedges the container until the timeout kills it.
+
+    So when nobody is watching, the proven path runs untouched and is
+    byte-identical to what it always was. The streaming path exists only
+    when a sink asked for it, and it drains both pipes in parallel tasks
+    for exactly that reason.
+
+    The sink is an OBSERVER. It cannot change ``(rc, out, err)``, and a sink
+    that raises is swallowed — the containment verdict upstream is computed
+    from the returned tuple, and a broken progress renderer must never be
+    able to alter how a sandbox breach is classified.
+    """
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
+    if on_output is None:
+        try:
+            out, err = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            return 124, "", f"docker run exceeded {timeout_s}s"
+        return (
+            proc.returncode if proc.returncode is not None else -1,
+            (out or b"").decode("utf-8", "replace"),
+            (err or b"").decode("utf-8", "replace"),
+        )
+
+    chunks: dict = {"stdout": [], "stderr": []}
+
+    async def _drain(name: str, reader: Any) -> None:
+        """Read one pipe to EOF, buffering and forwarding each line."""
+        if reader is None:
+            return
+        while True:
+            try:
+                # `readline` with no limit can raise on a pathological
+                # single line; `read` of a bounded block cannot, and the
+                # sink re-splits. Correctness beats line fidelity here.
+                block = await reader.read(4096)
+            except Exception:  # noqa: BLE001
+                break
+            if not block:
+                break
+            text = block.decode("utf-8", "replace")
+            chunks[name].append(text)
+            try:
+                on_output(name, text)
+            except Exception:  # noqa: BLE001
+                # An observer NEVER breaks the observed. See the docstring.
+                pass
+
+    drains = [
+        asyncio.ensure_future(_drain("stdout", proc.stdout)),
+        asyncio.ensure_future(_drain("stderr", proc.stderr)),
+    ]
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        await asyncio.wait_for(
+            asyncio.gather(*drains, proc.wait()), timeout=timeout_s)
     except asyncio.TimeoutError:
+        for d in drains:
+            d.cancel()
         try:
             proc.kill()
         except ProcessLookupError:
             pass
         await proc.wait()
+        # Same contract as the buffered path: a timeout reports no output.
+        # Partial output from a killed container is not a result, and the
+        # breach classifier upstream keys on rc=124.
         return 124, "", f"docker run exceeded {timeout_s}s"
     return (
         proc.returncode if proc.returncode is not None else -1,
-        (out or b"").decode("utf-8", "replace"),
-        (err or b"").decode("utf-8", "replace"),
+        "".join(chunks["stdout"]),
+        "".join(chunks["stderr"]),
     )
 
 

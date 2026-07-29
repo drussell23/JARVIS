@@ -2445,9 +2445,34 @@ class ToolExecutor:
 
         # --- Gate 4: Trinity Docker sandbox (fail-closed) --------------------
         from backend.core.ouroboros.governance import sandbox_exec as _sandbox_mod
-        sandbox_result = _run_coroutine_sync(
-            _sandbox_mod.sandbox_run_bash(command, worktree=str(self._repo_root))
-        )
+        # A running command is no longer a black box. The observer is None
+        # when no cockpit is attached, and the runner then takes its proven
+        # buffered path untouched — nobody pays for a display nobody sees.
+        _observer = None
+        try:
+            from backend.core.ouroboros.battle_test.live_tool_stream import (
+                make_tool_observer,
+            )
+            _observer = make_tool_observer(
+                tool="bash", op_id=str(getattr(self, "_op_id", "") or ""),
+                label=command[:80],
+            )
+        except Exception:  # noqa: BLE001
+            _observer = None
+        try:
+            sandbox_result = _run_coroutine_sync(
+                _sandbox_mod.sandbox_run_bash(
+                    command, worktree=str(self._repo_root),
+                    on_output=_observer,
+                )
+            )
+        finally:
+            # In a `finally` so a denied sandbox, a timeout, or a raised
+            # exception all retire the strip. A progress display that
+            # outlives its command tells the operator work is still
+            # happening when it stopped.
+            if _observer is not None:
+                _observer.finish(summary=f"$ {command[:60]}")
         if sandbox_result.denied:
             return f"(bash: sandbox denied — {sandbox_result.reason})"
         output = sandbox_result.stdout or ""
