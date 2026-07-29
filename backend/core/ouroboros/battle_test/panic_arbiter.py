@@ -196,6 +196,7 @@ def recent_panics() -> List[Panic]:
 def report(
     exc: Optional[BaseException], *, message: str = "", origin: str = "",
     clock: Optional[Callable[[], float]] = None,
+    reconstructed: Optional[dict] = None,
 ) -> Optional[Panic]:
     """Record and BROADCAST one background failure. NEVER raises.
 
@@ -214,6 +215,13 @@ def report(
             exc_type = type(exc).__name__
             tb_text = "".join(traceback.format_exception(
                 type(exc), exc, exc.__traceback__))[-4000:]
+        if reconstructed and reconstructed.get("traceback") and (
+                not tb_text.strip() or reconstructed.get("synthetic")):
+            # Reconstructed frames APPEND rather than replace: the real
+            # traceback, when there is one, is still the better story.
+            marker = "  ── reconstructed from the dying task ──\n"
+            tb_text = (tb_text + "\n" + marker
+                       + reconstructed["traceback"])[-4000:]
         sig = _signature(exc_type, tb_text)
         with _LOCK:
             if sig in _SEEN:
@@ -248,6 +256,126 @@ def report(
         return None
 
 
+#: Locals carried per frame. A frame can hold a whole request body; the
+#: operator needs the SHAPE of the failure, not a memory dump.
+_MAX_LOCALS = 6
+_MAX_LOCAL_CHARS = 120
+
+
+def _redact(text: str) -> str:
+    """Mask credential shapes with the firewall's own patterns. NEVER raises.
+
+    Reconstructed locals are arbitrary runtime values — a token, a header,
+    a connection string. Broadcasting them to every attached cockpit
+    unredacted would make the crash reporter the worst leak in the system.
+    Same authority `live_tool_stream` uses; a private copy would rot.
+    """
+    try:
+        from backend.core.ouroboros.governance.semantic_firewall import (
+            _CREDENTIAL_SHAPE_PATTERNS,
+        )
+        for pattern in _CREDENTIAL_SHAPE_PATTERNS:
+            text = pattern.sub("[redacted]", text)
+        return text
+    except Exception:  # noqa: BLE001
+        return ""          # fail CLOSED — no locals beats leaked ones
+
+
+def reconstruct_context(context: dict, exc: Optional[BaseException]) -> dict:
+    """Rebuild what a stripped exception lost. NEVER raises.
+
+    `Exception("")` raised in a detached task arrives with an empty
+    message and, once the frame is gone, often nothing else either — so
+    the overlay had a type and no story. Static analysis cannot find the
+    producer of a runtime-empty payload; the payload has to describe
+    itself.
+
+    Measured rather than assumed: asyncio populates ``future`` for a dead
+    Task (not ``task``, which the obvious reading expects), and
+    ``Task.get_stack()`` still yields the frame AFTER the task is done.
+    That frame is the whole prize — file, line, function and locals at the
+    moment of failure.
+
+    Sources, most-specific first:
+      1. the exception's own ``__traceback__``
+      2. ``Task.get_stack()`` frames
+      3. the coroutine's ``cr_code`` (file + first line) when even the
+         frame is gone
+      4. ``source_traceback`` — where the task was CREATED, which asyncio
+         only records in debug mode but which is the single most useful
+         line when it exists
+      5. the handle's repr, as a last identifier
+
+    Built with `traceback.format_list` / `StackSummary`, never a
+    hand-rolled formatter.
+    """
+    out: Dict[str, Any] = {"synthetic": False}
+    try:
+        if exc is not None and getattr(exc, "__traceback__", None) is not None:
+            frames = traceback.extract_tb(exc.__traceback__)
+            if frames:
+                out["traceback"] = "".join(traceback.format_list(frames))
+        task = context.get("task") or context.get("future")
+
+        # (2) live frames off the dying task
+        if not out.get("traceback") and task is not None:
+            try:
+                stack = task.get_stack() or []
+            except Exception:  # noqa: BLE001
+                stack = []
+            if stack:
+                summary = traceback.StackSummary.extract(
+                    ((f, f.f_lineno) for f in stack), capture_locals=False)
+                out["traceback"] = "".join(traceback.format_list(summary))
+                out["synthetic"] = True
+                frame = stack[-1]
+                out["where"] = (f"{frame.f_code.co_filename}:"
+                                f"{frame.f_lineno} in {frame.f_code.co_name}")
+                locals_ = []
+                for name, val in list(frame.f_locals.items())[:_MAX_LOCALS]:
+                    if name.startswith("__"):
+                        continue
+                    try:
+                        shown = _redact(repr(val))[:_MAX_LOCAL_CHARS]
+                    except Exception:  # noqa: BLE001
+                        shown = "<unrepresentable>"
+                    locals_.append(f"{name}={shown}")
+                if locals_:
+                    out["locals"] = locals_
+
+        # (3) the coroutine's code object, when the frame is gone
+        if not out.get("traceback") and task is not None:
+            coro = getattr(task, "get_coro", lambda: None)()
+            code = getattr(coro, "cr_code", None) or getattr(
+                coro, "gi_code", None)
+            if code is not None:
+                out["where"] = (f"{code.co_filename}:{code.co_firstlineno} "
+                                f"in {code.co_name}")
+                out["synthetic"] = True
+
+        # (4) where the task was SPAWNED (asyncio debug mode only)
+        src = context.get("source_traceback")
+        if src:
+            try:
+                out["spawned_at"] = "".join(
+                    traceback.format_list(src[-3:])).strip()
+                out["synthetic"] = True
+            except Exception:  # noqa: BLE001
+                pass
+
+        # (5) last identifier
+        if not out.get("where") and context.get("handle") is not None:
+            out["where"] = repr(context["handle"])[:160]
+            out["synthetic"] = True
+        if task is not None and not out.get("origin"):
+            name = getattr(task, "get_name", lambda: "")()
+            if name:
+                out["origin"] = f"task:{name}"
+    except Exception:  # noqa: BLE001
+        logger.debug("[PanicArbiter] reconstruction degraded", exc_info=True)
+    return out
+
+
 def arbitrate(loop: Any, context: dict) -> None:
     """``loop.set_exception_handler`` target — the BACKSTOP detector.
 
@@ -263,9 +391,26 @@ def arbitrate(loop: Any, context: dict) -> None:
             f"{k}={ctx[k]!r}" for k in sorted(ctx)
             if k not in ("message", "exception")
         )
-        report(exc if isinstance(exc, BaseException) else None,
-               message=f"{message}{(' | ' + extras) if extras else ''}",
-               origin="loop_handler")
+        exc_obj = exc if isinstance(exc, BaseException) else None
+        # A payload is "empty" when the exception carries no words AND no
+        # frames. That is the shape that reached the operator as `?:` —
+        # a type with no story — and it is a RUNTIME condition, so it is
+        # answered at runtime.
+        thin = not str(exc_obj or "").strip() or (
+            exc_obj is not None
+            and getattr(exc_obj, "__traceback__", None) is None)
+        rebuilt = reconstruct_context(ctx, exc_obj) if thin else {}
+        detail = message
+        if rebuilt.get("where"):
+            detail = f"{detail} | at {rebuilt['where']}"
+        if rebuilt.get("spawned_at"):
+            detail = f"{detail} | spawned {rebuilt['spawned_at']}"
+        if rebuilt.get("locals"):
+            detail = f"{detail} | locals: {', '.join(rebuilt['locals'])}"
+        report(exc_obj,
+               message=f"{detail}{(' | ' + extras) if extras else ''}",
+               origin=rebuilt.get("origin") or "loop_handler",
+               reconstructed=rebuilt or None)
     except Exception:  # noqa: BLE001
         pass
 
