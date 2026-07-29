@@ -115,17 +115,31 @@ def test_discovers_newly_unlocked_verbs():
         )
 
 
-def test_excluded_verbs_not_in_registry():
+def test_excluded_verbs_are_not_DISPATCHED_here():
+    """Excluding a verb is a ROUTING decision, never an existence claim.
+
+    This test previously asserted the excluded verbs were absent from
+    `report.verbs` — i.e. that they did not exist. They do: the exclusion
+    list's own comment says they "retain their legacy custom handlers".
+    Reading a routing decision as an existence claim is what erased
+    /budget, /risk, /goal and /plan from `/help`, tab completion and the
+    slash palette, so the assertion now pins the two halves separately.
+    """
     from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
+        list_dispatchable_verbs,
         prime_registry,
     )
     report = prime_registry(force=True)
+    routable = set(list_dispatchable_verbs())
     for excluded in (
         "budget", "risk", "goal", "cancel", "plan",
         "postmortems", "inline",
     ):
-        assert excluded not in report.verbs, (
-            f"excluded verb {excluded!r} leaked into registry"
+        assert excluded not in routable, (
+            f"excluded verb {excluded!r} became routable here"
+        )
+        assert excluded in report.verbs, (
+            f"excluded verb {excluded!r} is handled but undiscoverable"
         )
 
 
