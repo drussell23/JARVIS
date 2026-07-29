@@ -249,9 +249,36 @@ class TestTheDemoShowsIt:
         assert d._stream_rows(lands - 0.1) != []
 
     def test_it_is_quiet_when_nothing_is_generating(self):
+        """Idle means idle. Times chosen from the windows themselves, not
+        written down — t=12.0 used to be idle and is now inside a running
+        command, and a hardcoded moment silently stops testing what it
+        was named for."""
         from backend.core.ouroboros.cli import ov_demo as d
-        assert d._stream_rows(0.5) == []
-        assert d._stream_rows(12.0) == []
+        busy = list(d._GENERATING) + list(d._RUNNING)
+        idle = [t for t in (0.5, 13.5, 14.5, 21.5)
+                if not any(lo <= t <= hi for lo, hi in busy)]
+        assert idle, "the script has no idle moment left to test"
+        for t in idle:
+            assert d._stream_rows(t) == [], t
+
+    def test_a_RUNNING_command_shows_its_tail(self):
+        """The 40-second black box, made watchable. Driven through the
+        real LiveToolStream, so the demo exercises its coalescing,
+        redaction and stderr tagging rather than a drawn picture."""
+        from backend.core.ouroboros.cli import ov_demo as d
+        (lo, hi) = list(d._RUNNING)[0]
+        rows = d._stream_rows(lo + (hi - lo) * 0.8)
+        assert rows, "a running command showed nothing"
+        assert rows[0].strip().startswith("$"), rows[0]
+
+    def test_the_running_header_survives_elision(self):
+        """Row 0 says WHAT is running and for how long. The elision keeps
+        newest rows, so without an exemption a long tail left test names
+        with no subject."""
+        from backend.core.ouroboros.cli import ov_demo as d
+        (lo, hi) = list(d._RUNNING)[0]
+        rows = d._stream_rows(hi - 0.2)
+        assert rows and rows[0].strip().startswith("$"), rows
 
     def test_the_demo_calls_the_COCKPITS_renderer(self):
         """A second wrap here would keep agreeing with itself while the real
