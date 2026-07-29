@@ -198,6 +198,28 @@ def operator_present() -> bool:
         return False
 
 
+def publish_markup_global(text: str, *, session: Optional[str] = None) -> bool:
+    """Emit one composed line to every attached cockpit. Returns whether it went.
+
+    For producers with no handle to the bridge — the token stream runs three
+    packages away from the harness that owns it. Same registry the presence
+    check uses, so "is anyone listening" and "send it to them" cannot
+    disagree about which bridge is live.
+
+    The caller owns ESCAPING. This channel is styled chrome around inert
+    data; untrusted text must be escaped before it arrives, per
+    `publish_markup`. NEVER raises.
+    """
+    try:
+        bridge = _ACTIVE_BRIDGE
+        if bridge is None or attached_cockpits() <= 0:
+            return False
+        bridge.publish_markup(str(text), session=session)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def attach_enabled() -> bool:
     """Master gate — default ON. NEVER raises."""
     return os.environ.get(
