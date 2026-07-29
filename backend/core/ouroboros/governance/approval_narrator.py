@@ -179,7 +179,9 @@ async def await_decision_with_operator(
                 if answer:
                     await provider.approve(request_id, "operator")
                 else:
-                    await provider.reject(request_id, "operator", "declined")
+                    await provider.reject(
+                        request_id, "operator", "declined", "unstated",
+                    )
             except Exception:  # noqa: BLE001
                 logger.debug("[ApprovalNarrator] decision relay failed",
                              exc_info=True)

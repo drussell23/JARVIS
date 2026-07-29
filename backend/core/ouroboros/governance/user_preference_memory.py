@@ -800,6 +800,7 @@ class UserPreferenceStore:
         target_files: Sequence[str],
         reason: str,
         approver: str = "human",
+        provenance: str = "",
     ) -> Optional[UserMemory]:
         """Convert an approval rejection into a FEEDBACK memory.
 
@@ -808,9 +809,51 @@ class UserPreferenceStore:
         piling up identical entries. Returns the persisted memory, or
         ``None`` if the inputs were too sparse to build a meaningful
         entry.
+
+        Only a reason the human ACTUALLY STATED becomes a memory
+        --------------------------------------------------------
+        The content written here says the entry "encodes the user's stated
+        reason ... and should be treated as a binding constraint", and
+        :meth:`format_for_prompt` renders it under "the user's explicit
+        preferences ... Honour them without asking". Both sentences are
+        promises about provenance, and for a long time neither was true:
+        every interactive rejection arrived carrying a CONSTANT the code
+        had written — ``"rejected via Iron Gate"``, ``"plan rejected via
+        Plan Gate"``, ``"inline reject"`` — because the gate returned a
+        bool and the decision parser discarded everything after the verb.
+        So a string the code authored was injected into every later
+        generation prompt as a binding constraint the human had uttered.
+
+        That is fabricated attribution: the same defect class as a
+        synthetic blast radius presented as measured, and worse than
+        storing nothing, because it is confident and content-free at once.
+
+        ``provenance`` closes it, and closes it by CONTRACT rather than by
+        recognising the bad strings. A deny-list of the three known
+        literals would be hardcoding the symptom: it rots the moment a
+        fourth call site invents a fourth constant, and it cannot tell
+        ``"rejected via Iron Gate"`` (a constant) from ``"rejected because
+        the Iron Gate is right"`` (a sentence). So the question asked here
+        is never "does this string look invented" but "did the caller
+        witness a human say it".
+
+        A caller that does not declare provenance has not witnessed one,
+        and silence is refused. That is deliberately strict — the failure
+        mode it replaces was a silent, confident lie injected into every
+        subsequent prompt, and a lost memory is recoverable in a way a
+        fabricated constraint is not.
         """
         cleaned_reason = (reason or "").strip()
         if not cleaned_reason:
+            return None
+        prov = str(provenance or "").strip().lower()
+        if prov != "stated":
+            logger.debug(
+                "[UserPreferenceStore] op %s rejection not attributable to a "
+                "human (provenance=%r) — recorded as an event, never as a "
+                "preference",
+                op_id, prov or "undeclared",
+            )
             return None
         desc_short = (description or "unknown operation").strip()[:100]
         name = f"rejection_{_slug(desc_short, max_len=40)}"

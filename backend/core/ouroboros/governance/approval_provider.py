@@ -84,6 +84,25 @@ class ApprovalResult:
         Timestamp when the decision was made. ``None`` for PENDING.
     request_id:
         The request identifier (same as the operation's ``op_id``).
+    reason_provenance:
+        WHERE :attr:`reason` came from — ``"stated"`` (a human typed it),
+        ``"unstated"`` (a human decided and said nothing), or
+        ``"synthetic"`` (no human: headless, timeout, policy default).
+
+        It rides on this object rather than travelling as a parallel
+        argument for one reason: a reason and its provenance separated by
+        even one call frame WILL drift, and the consumer that ends up
+        holding a reason without its provenance has no way to ask. That
+        consumer is
+        :meth:`UserPreferenceStore.record_approval_rejection`, which turns
+        a reason into a FEEDBACK memory rendered to the model as "the
+        user's explicit preferences ... honour them without asking".
+
+        The default is ``"unstated"`` and not ``"stated"`` deliberately.
+        A construction site that has not thought about provenance has not
+        witnessed a human speak, and defaulting to the attributable value
+        is precisely how three code constants came to be quoted as the
+        operator's words in every generation prompt.
     """
 
     status: ApprovalStatus
@@ -91,6 +110,7 @@ class ApprovalResult:
     reason: Optional[str]
     decided_at: Optional[datetime]
     request_id: str
+    reason_provenance: str = "unstated"
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +208,8 @@ class ApprovalProvider(Protocol):
         ...  # pragma: no cover
 
     async def reject(
-        self, request_id: str, approver: str, reason: str
+        self, request_id: str, approver: str, reason: str,
+        provenance: str = "unstated",
     ) -> ApprovalResult:
         """Reject a pending request.
 
@@ -427,7 +448,8 @@ class CLIApprovalProvider:
     # -- reject --
 
     async def reject(
-        self, request_id: str, approver: str, reason: str
+        self, request_id: str, approver: str, reason: str,
+        provenance: str = "unstated",
     ) -> ApprovalResult:
         """Reject a pending request.
 
@@ -455,6 +477,7 @@ class CLIApprovalProvider:
             status=ApprovalStatus.REJECTED,
             approver=approver,
             reason=reason,
+            reason_provenance=provenance,
             decided_at=datetime.now(tz=timezone.utc),
             request_id=request_id,
         )

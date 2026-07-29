@@ -153,9 +153,249 @@ def parse_decision_input(text: str) -> InlineApprovalChoice:
     # Strip surrounding whitespace + take first token only (defends
     # against accidental "y\nsomething else").
     first_token = re.split(r"\s+", cleaned)[0]
-    if not first_token:
-        return InlineApprovalChoice.WAIT
-    return _CHOICE_TOKENS.get(first_token, InlineApprovalChoice.WAIT)
+    return _verb_of(first_token) or InlineApprovalChoice.WAIT
+
+
+def _verb_of(token: object) -> Optional[InlineApprovalChoice]:
+    """The choice a single token names, or None if it names none.
+
+    ``None`` rather than ``WAIT`` on purpose: the caller sometimes needs to
+    distinguish "they typed `wait`" from "that was not a verb at all", and
+    a function that answers WAIT to both makes the two indistinguishable.
+    That collapse silently dropped the reason from ``w defer to the PR``.
+
+    Edge punctuation is stripped because operators type the way they speak
+    — ``no, because it loosens the gate`` was scored WAIT purely on the
+    comma, turning an explicit rejection into a deferral. Only the EDGES
+    are stripped, so ``approve-but-wait`` stays the non-verb it is.
+    """
+    try:
+        tok = str(token or "").strip().lower().strip(
+            "\"'`.,;:!?()[]{}<>")
+        if not tok:
+            return None
+        return _CHOICE_TOKENS.get(tok)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ---------------------------------------------------------------------------
+# What the operator actually said
+# ---------------------------------------------------------------------------
+#
+# `parse_decision_input` above is a CLASSIFIER: it takes the first token and
+# discards the rest. That is correct for choosing a branch and catastrophic as
+# the only reading of the input, because every rejection then has to invent a
+# reason — and three call sites did exactly that, with the constants
+# "rejected via Iron Gate", "plan rejected via Plan Gate" and "inline reject".
+#
+# Those constants do not stay in the log. They flow:
+#
+#   reject(reason=<constant>)
+#     -> ApprovalResult.reason
+#     -> record_approval_rejection(reason=...)
+#     -> a FEEDBACK memory whose own text says it "encodes the user's stated
+#        reason ... and should be treated as a binding constraint"
+#     -> UserPreferenceMemory.format_for_prompt(), rendered under
+#        "They represent the user's explicit preferences ... Honour them
+#        without asking - contradicting a memory is a rejection cause."
+#
+# So a string the CODE wrote is presented to the model as something the HUMAN
+# said, as a binding constraint, in every subsequent generation prompt. That
+# is a fabricated attribution, the same defect class as a synthetic
+# blast-radius presented as measured — and it is worse than storing nothing,
+# because it is confident and content-free at once.
+#
+# The fix is not a better constant. It is to (a) stop discarding the words the
+# operator typed, and (b) make "they said nothing" a FIRST-CLASS, recordable
+# answer that is structurally ineligible to become a user preference.
+
+
+class ReasonProvenance(str, enum.Enum):
+    """Where a decision's reason came from — the epistemic ledger.
+
+    Mirrors ``Advisory.blast_provenance``: the question is never only "what
+    is the value" but "is this measured, or did we make it up". A consumer
+    that cannot tell a typed sentence from a code constant will eventually
+    present one as the other.
+    """
+
+    #: The operator's own words. The ONLY provenance eligible to become a
+    #: binding constraint attributed to the human.
+    STATED = "stated"
+    #: A human decided and gave no reason. A real, recordable event — and
+    #: emphatically not a preference. Silence is not a constraint.
+    UNSTATED = "unstated"
+    #: No human was involved: headless auto-approve, timeout, policy
+    #: default. Never a preference, and never presented as one.
+    SYNTHETIC = "synthetic"
+
+
+#: Longest reason retained. A reason is a sentence an operator types at a
+#: gate, not a document; past this it is a paste, and an unbounded string
+#: flows into every later generation prompt.
+MAX_REASON_CHARS = 400
+
+#: Leading connectives an operator naturally types after the verb
+#: ("n because the fixture is wrong"). Stripped so the stored reason reads
+#: as a statement rather than a fragment. Order matters: longest first, so
+#: "because of" is not left as "of".
+_REASON_LEAD_IN = (
+    "because of", "because", "since", "as", "due to", "reason:", "reason",
+    "-", "--", ":", ",",
+)
+
+
+def normalize_reason(text: object) -> str:
+    """The operator's words, or "" when they did not give any. NEVER raises.
+
+    "" is load-bearing: it is what makes :data:`ReasonProvenance.UNSTATED`
+    detectable rather than guessed. Punctuation-only input ("...", "!") is
+    normalized to "" for the same reason — it is not a statement, and
+    treating it as one recreates the fabrication in a smaller font.
+    """
+    try:
+        flat = " ".join(str(text or "").split())
+        if not flat:
+            return ""
+        # Strip a leading connective, case-insensitively, once.
+        low = flat.lower()
+        for lead in _REASON_LEAD_IN:
+            if low.startswith(lead) and len(flat) > len(lead):
+                nxt = flat[len(lead):]
+                if not nxt[:1].isalnum():          # "as" in "assert" is not
+                    flat = nxt.strip(" ,:-")       # a connective
+                    break
+        flat = flat.strip(" ,:-")
+        if not any(ch.isalnum() for ch in flat):
+            return ""                              # punctuation is not a why
+        return flat[:MAX_REASON_CHARS]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+@dataclass(frozen=True)
+class OperatorDecision:
+    """A choice AND what the operator said about it, with provenance.
+
+    The pair is the point. A choice alone forces every downstream consumer
+    that wants a reason to invent one; a reason without provenance lets an
+    invented one pass as a stated one.
+    """
+
+    choice: "InlineApprovalChoice"
+    reason: str = ""
+    provenance: ReasonProvenance = ReasonProvenance.UNSTATED
+
+    @property
+    def is_stated(self) -> bool:
+        """May this become a constraint attributed to the human?"""
+        return (self.provenance is ReasonProvenance.STATED
+                and bool(self.reason))
+
+    def with_reason(self, text: object) -> "OperatorDecision":
+        """Attach words gathered later (a follow-up prompt). NEVER raises.
+
+        Empty input leaves the decision UNSTATED rather than marking it
+        stated-with-nothing — the follow-up being skipped is itself the
+        answer, and must not be laundered into a stated reason.
+        """
+        cleaned = normalize_reason(text)
+        if not cleaned:
+            return self
+        return OperatorDecision(
+            choice=self.choice, reason=cleaned,
+            provenance=ReasonProvenance.STATED,
+        )
+
+
+def parse_gate_answer(
+    text: object, *, empty_means: "InlineApprovalChoice",
+) -> OperatorDecision:
+    """Parse an answer where the PROMPT declared what a bare Enter means.
+
+    Two live prompts make opposite promises with the same parser behind
+    them: ``[Y/n]`` (capital Y) promises Enter = approve, while the inline
+    ``[y]es / [n]o / [s]how / [e]dit / [w]ait`` prompt promises Enter =
+    wait. Baking either into :func:`parse_decision` would silently break
+    the other, and baking BOTH in would mean the parser guessing which
+    surface called it.
+
+    So the default is an argument. The prompt that made the promise is the
+    only party that knows what it promised.
+
+    A bare Enter is always UNSTATED regardless of which choice it maps to —
+    accepting a default is a decision, never an explanation of one.
+    """
+    try:
+        if not str(text or "").strip():
+            return OperatorDecision(choice=empty_means)
+        return parse_decision(str(text))
+    except Exception:  # noqa: BLE001
+        return OperatorDecision(choice=InlineApprovalChoice.WAIT)
+
+
+def synthetic_decision(
+    choice: "InlineApprovalChoice", detail: object = "",
+) -> OperatorDecision:
+    """A decision no human made — headless, timeout, policy default.
+
+    Carries its detail so the event stays auditable (§7), and carries
+    SYNTHETIC so nothing downstream can quote it as the operator.
+    """
+    return OperatorDecision(
+        choice=choice,
+        reason=normalize_reason(detail),
+        provenance=ReasonProvenance.SYNTHETIC,
+    )
+
+
+def parse_decision(text: str) -> OperatorDecision:
+    """Parse operator input into a choice AND their reason. NEVER raises.
+
+    The choice half is delegated to :func:`parse_decision_input`, so the
+    safety-first contract it is pinned to (ambiguous never approves) has
+    exactly one implementation. What is new is that the REMAINDER of the
+    line survives:
+
+        "n"                            -> REJECT, unstated
+        "n the fixture is the wrong shape"
+                                       -> REJECT, STATED, "the fixture is..."
+        "no, because it loosens the gate"
+                                       -> REJECT, STATED, "it loosens the..."
+        "y"                            -> APPROVE, unstated
+
+    A reason on an UNPARSEABLE line is deliberately dropped: that input
+    returns WAIT, and attaching words to a choice the operator did not
+    make is how a typo becomes a stored preference.
+    """
+    try:
+        choice = parse_decision_input(text)
+        # The FIRST LINE only. `y\nrm -rf /` is the accidental-paste shape
+        # the classifier was hardened against; taking the remainder across
+        # the newline would quote a line the operator never meant to send
+        # as their stated reason — the same fabrication in a new costume.
+        raw = str(text or "").splitlines()[0] if str(text or "").strip() else ""
+        # Everything after the verb. `split(maxsplit=1)` rather than a
+        # regex over the whole line, so the reason keeps its own internal
+        # spacing decisions and we only ever remove the token we consumed.
+        parts = raw.strip().split(None, 1)
+        rest = parts[1] if len(parts) > 1 else ""
+        if _verb_of(parts[0] if parts else "") is None:
+            # Not a verb at all. The words are attached to nothing, and
+            # binding them to WAIT is how a typo becomes a stored reason.
+            # Asked as "is this a verb", never as "does it mean WAIT" —
+            # `w` and `defer` mean WAIT legitimately and keep their words.
+            return OperatorDecision(choice=choice)
+        reason = normalize_reason(rest)
+        if not reason:
+            return OperatorDecision(choice=choice)
+        return OperatorDecision(
+            choice=choice, reason=reason,
+            provenance=ReasonProvenance.STATED,
+        )
+    except Exception:  # noqa: BLE001
+        return OperatorDecision(choice=InlineApprovalChoice.WAIT)
 
 
 # ---------------------------------------------------------------------------

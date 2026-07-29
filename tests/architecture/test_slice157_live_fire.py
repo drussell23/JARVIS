@@ -31,8 +31,10 @@ class _FakeProvider:
         self.approved = []
     async def approve(self, rid, approver):
         self.approved.append((rid, approver)); return {"ok": True}
-    async def reject(self, rid, approver, reason=""):
-        self.rejected.append((rid, approver, reason)); return {"ok": True}
+    async def reject(self, rid, approver, reason="",
+                     provenance="unstated"):
+        self.rejected.append(
+            (rid, approver, reason, provenance)); return {"ok": True}
 
 
 class TestLiveFirePayload(unittest.TestCase):

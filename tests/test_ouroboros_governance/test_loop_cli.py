@@ -138,8 +138,25 @@ class TestRejectCommand:
             approver="derek",
             reason="Too risky",
         )
+        # An operator typed "Too risky" at the CLI, so it travels as
+        # STATED and may become a durable constraint. The provenance is
+        # part of the call because a reason separated from where it came
+        # from is how three code constants ended up quoted as the human.
         service._approval_provider.reject.assert_called_once_with(
-            "op-test-001", "derek", "Too risky"
+            "op-test-001", "derek", "Too risky", "stated"
+        )
+
+    async def test_reject_with_blank_reason_is_not_attributed(self) -> None:
+        """A rejection with nothing typed is still a rejection — it is just
+        not an explanation, and must not be stored as one."""
+        from backend.core.ouroboros.governance.loop_cli import handle_reject
+
+        service = _mock_service()
+        await handle_reject(
+            service=service, op_id="op-test-002", approver="derek", reason="",
+        )
+        service._approval_provider.reject.assert_called_once_with(
+            "op-test-002", "derek", "", "unstated"
         )
 
     async def test_reject_with_no_service_raises(self) -> None:

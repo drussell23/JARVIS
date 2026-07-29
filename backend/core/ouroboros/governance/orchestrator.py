@@ -5267,6 +5267,9 @@ class GovernedOrchestrator:
                                         description=f"[PLAN] {ctx.description}",
                                         target_files=list(ctx.target_files),
                                         reason=_reject_reason,
+                                        provenance=getattr(
+                                            _plan_decision,
+                                            "reason_provenance", "unstated"),
                                         approver=(
                                             getattr(_plan_decision, "approver", "human")
                                             or "human"
@@ -10420,6 +10423,8 @@ class GovernedOrchestrator:
                                 description=ctx.description,
                                 target_files=list(ctx.target_files),
                                 reason=_reject_reason,
+                                provenance=getattr(
+                                    decision, "reason_provenance", "unstated"),
                                 approver=getattr(decision, "approver", "human") or "human",
                             )
                         except Exception:

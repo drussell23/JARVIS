@@ -67,7 +67,8 @@ class _Provider:
         self.decided = "APPROVED"
         self.event.set()
 
-    async def reject(self, _rid: str, who: str, why: str) -> None:
+    async def reject(self, _rid: str, who: str, why: str,
+                     provenance: str = "unstated") -> None:
         self.calls.append(f"reject:{who}:{why}")
         self.decided = "REJECTED"
         self.event.set()

@@ -407,9 +407,13 @@ class _FakeProvider:
         self.calls.append(("approve", request_id, approver))
         return self._result(ApprovalStatus.APPROVED, request_id, approver)
 
-    def reject(self, request_id: str, approver: str, reason: str
-               ) -> ApprovalResult:
-        self.calls.append(("reject", request_id, approver, reason))
+    def reject(self, request_id: str, approver: str, reason: str,
+               provenance: str = "unstated") -> ApprovalResult:
+        # Mirrors the REAL signature including provenance. A fake that
+        # accepts less than the contract makes the caller look correct
+        # while the production provider would reject the same call.
+        self.calls.append(
+            ("reject", request_id, approver, reason, provenance))
         return self._result(
             ApprovalStatus.REJECTED, request_id, approver, reason,
         )
@@ -434,7 +438,10 @@ def test_loop_y_calls_approve():
     assert prov.calls[0][0] == "approve"
 
 
-def test_loop_n_calls_reject_with_inline_reason():
+def test_loop_n_alone_rejects_and_claims_no_reason():
+    """A bare `n` still carries the placeholder for the audit line — what
+    changed is that it travels as UNSTATED, so nothing downstream may
+    store it as something the operator said."""
     prov = _FakeProvider()
     req = _make_request(request_id="r1")
     result = run_inline_approval_loop(
@@ -444,7 +451,27 @@ def test_loop_n_calls_reject_with_inline_reason():
         timeout_s=1.0,
     )
     assert result.status is ApprovalStatus.REJECTED
-    assert prov.calls[0] == ("reject", "r1", "operator", "inline reject")
+    assert prov.calls[0] == (
+        "reject", "r1", "operator", "inline reject", "unstated")
+
+
+def test_loop_keeps_the_reason_the_operator_TYPED():
+    """The whole point. Slice 3 hardcoded "inline reject" and left a TODO
+    for Slice 4 to "add a one-line reason capture"; Slice 4 never came, so
+    the placeholder was stored and replayed as the human's stated reason
+    in every later generation prompt."""
+    prov = _FakeProvider()
+    req = _make_request(request_id="r1")
+    result = run_inline_approval_loop(
+        prov, req,
+        stream_in=io.StringIO("n this widens the permission gate\n"),
+        stream_out=io.StringIO(),
+        timeout_s=1.0,
+    )
+    assert result.status is ApprovalStatus.REJECTED
+    assert prov.calls[0] == (
+        "reject", "r1", "operator",
+        "this widens the permission gate", "stated")
 
 
 def test_loop_w_defers_via_await_decision_zero():

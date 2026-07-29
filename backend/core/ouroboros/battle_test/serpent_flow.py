@@ -370,6 +370,93 @@ def _short_id(op_id: str) -> str:
     return hex_only[-6:] if len(hex_only) >= 6 else hex_only
 
 
+def _gate_decision(text: object) -> "OperatorDecision":
+    """Interpret a gate answer, keeping the operator's words. NEVER raises.
+
+    Enter means APPROVE here because the prompt is ``[Y/n]`` — a capital Y
+    is a promise, and the parser is told about it rather than guessing.
+    Everything after the verb survives as the reason:
+
+        ""                                  -> approve, unstated
+        "y"                                 -> approve, unstated
+        "n"                                 -> reject,  unstated
+        "n it loosens the permission gate"  -> reject,  STATED
+
+    Only the third and fourth differ from the old behaviour, and the
+    fourth is the whole point: it is the only shape that can produce a
+    reason a human actually gave.
+    """
+    try:
+        from backend.core.ouroboros.governance.inline_approval import (
+            InlineApprovalChoice, parse_gate_answer,
+        )
+        return parse_gate_answer(
+            text, empty_means=InlineApprovalChoice.APPROVE)
+    except Exception:  # noqa: BLE001
+        return _wordless_reject()
+
+
+def _reject_args(flow: Any, fallback: str) -> Tuple[str, str]:
+    """``(reason, provenance)`` for a rejection the operator just made.
+
+    This is the seam where three constants used to be born. It now RELAYS
+    rather than invents: if the operator typed a reason it is passed with
+    ``stated`` provenance; if they only said "n" the fallback still travels
+    (the audit log deserves to say which gate refused) but it goes as
+    ``unstated``, which makes it structurally ineligible to be stored and
+    replayed as something the human wanted.
+
+    Note what is NOT done here: the fallback is not suppressed. Losing the
+    audit line to protect the memory would be trading one blind spot for
+    another. The string is fine — the LIE was its provenance.
+
+    NEVER raises: a gate that fails to attribute a rejection must still
+    reject it.
+    """
+    try:
+        decision = getattr(flow, "_last_gate_decision", None)
+        if decision is not None and getattr(decision, "is_stated", False):
+            return (str(decision.reason), "stated")
+        prov = getattr(decision, "provenance", None)
+        return (fallback, getattr(prov, "value", None) or "unstated")
+    except Exception:  # noqa: BLE001
+        return (fallback, "unstated")
+
+
+def _synthetic_gate_decision(
+    *, approved: bool, detail: str,
+) -> "OperatorDecision":
+    """A decision no human made — headless bypass, dead surfaces, policy.
+
+    These are legitimate outcomes and must stay auditable (§7), so the
+    detail is carried. What they must never do is masquerade as the
+    operator: SYNTHETIC provenance makes them structurally ineligible to
+    become a preference, without needing anyone downstream to recognise
+    the particular sentence.
+    """
+    from backend.core.ouroboros.governance.inline_approval import (
+        InlineApprovalChoice, synthetic_decision,
+    )
+    return synthetic_decision(
+        InlineApprovalChoice.APPROVE if approved
+        else InlineApprovalChoice.REJECT,
+        detail,
+    )
+
+
+def _wordless_reject() -> "OperatorDecision":
+    """A rejection with nothing said — Ctrl-D, Ctrl-C, a degraded parse.
+
+    Explicitly constructed rather than defaulted into, so that "they said
+    nothing" is a decision the code MAKES and can be read back, instead of
+    an absence some later consumer fills in with a constant.
+    """
+    from backend.core.ouroboros.governance.inline_approval import (
+        InlineApprovalChoice, OperatorDecision,
+    )
+    return OperatorDecision(choice=InlineApprovalChoice.REJECT)
+
+
 def _headless_auto_approve_reason() -> Optional[str]:
     """Return a short reason string when the process is headless and
     should auto-approve, or ``None`` when the interactive prompt should
@@ -3899,9 +3986,18 @@ class SerpentFlow:
 
     async def _race_gate_answer(
         self, bridge_fut: Optional["asyncio.Future"],
-    ) -> Optional[bool]:
+    ) -> Optional["OperatorDecision"]:
         """Race the LOCAL [Y/n] prompt against the Operator Prompt Bridge
         (attached cockpits) — first answer wins, the loser is cancelled.
+
+        Returns the operator's DECISION, not a bool. The line they typed
+        used to be reduced here to ``ans in ("", "y", "yes")`` and dropped,
+        which left every rejection with no reason — so three call sites
+        substituted a constant, and those constants were then stored and
+        replayed to the model as "the user's explicit preferences". A
+        rejection that says WHY is the single most valuable signal this
+        gate can produce, and it was being thrown away one frame after it
+        arrived.
 
         Edge lattice (every surface can die independently):
         * local prompt raises (dead stdin — the Session-H OSError class)
@@ -3946,14 +4042,14 @@ class SerpentFlow:
                     race.discard(w)
                     if bridge_fut is not None and w is bridge_fut:
                         try:
-                            ans = str(w.result() or "").strip().lower()
+                            ans = str(w.result() or "")
                         except Exception:  # noqa: BLE001 — cancelled/superseded
                             continue
                         self._gate_answered_via_cockpit = True
-                        return ans in ("", "y", "yes")
+                        return _gate_decision(ans)
                     try:
-                        ans = str(w.result() or "").strip().lower()
-                        return ans in ("", "y", "yes")
+                        ans = str(w.result() or "")
+                        return _gate_decision(ans)
                     except (EOFError, KeyboardInterrupt):
                         # A REAL terminal's Ctrl-D/Ctrl-C is an explicit
                         # rejection. EOF from a fake/piped stdin (tests,
@@ -3968,7 +4064,10 @@ class SerpentFlow:
                         except Exception:  # noqa: BLE001
                             _tty = False
                         if _tty:
-                            return False
+                            # Explicit rejection, and explicitly wordless.
+                            # Ctrl-D is not an explanation, and recording
+                            # it as one is the bug this file just lost.
+                            return _wordless_reject()
                         deadline = _bridge_only_wait_s()
                         continue
                     except Exception:  # noqa: BLE001 — dead stdin: race on
@@ -4044,6 +4143,8 @@ class SerpentFlow:
                 # the log line is best-effort, the return value is what
                 # matters to the orchestrator.
                 pass
+            self._last_gate_decision = _synthetic_gate_decision(
+                approved=True, detail=f"headless: {_headless_reason}")
             return True
 
         # Step 1: Diff preview
@@ -4121,14 +4222,22 @@ class SerpentFlow:
         except Exception:  # noqa: BLE001
             bridge_fut = None
         try:
-            approved = await self._race_gate_answer(bridge_fut)
-            if approved is None:
-                approved = True        # every surface dead → Session-H parity
-            elif getattr(self, "_gate_answered_via_cockpit", False):
-                answered_via = "cockpit"
+            _decision = await self._race_gate_answer(bridge_fut)
+            if _decision is None:
+                # Every surface dead → Session-H parity. NOT a human
+                # approval, so it is stamped synthetic and can never be
+                # quoted back as something the operator wanted.
+                _decision = _synthetic_gate_decision(
+                    approved=True, detail="every approval surface dead")
+                approved = True
+            else:
+                approved = _decision.choice.name == "APPROVE"
+                if getattr(self, "_gate_answered_via_cockpit", False):
+                    answered_via = "cockpit"
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
+            _decision = _wordless_reject()
             approved = False
         finally:
             try:
@@ -4138,6 +4247,16 @@ class SerpentFlow:
                 get_operator_prompt_bridge().end(bridge_fut)
             except Exception:  # noqa: BLE001
                 pass
+        # Held for the provider seam, which is the layer that actually calls
+        # reject(reason=...). Same instance-stash pattern as
+        # `_gate_answered_via_cockpit` above — the alternative is widening
+        # this method's return type through several bool-typed callers.
+        #
+        # Placed AFTER the whole try/except/finally rather than inside the
+        # `finally`: on CancelledError `_decision` is unbound, and a NameError
+        # raised from a finally block would replace the cancellation with a
+        # bug report about bookkeeping.
+        self._last_gate_decision = _decision
         # Mirror the decision + which surface answered (§7: every
         # human decision visible everywhere).
         try:
@@ -5092,8 +5211,8 @@ class SerpentApprovalProvider:
             if approved:
                 return await self._inner.approve(request_id, "operator")
             return await self._inner.reject(
-                request_id, "operator", "plan rejected via Plan Gate"
-            )
+                request_id, "operator", *_reject_args(
+                    self._flow, "plan rejected via Plan Gate"))
 
         # Generate proposed diff from candidate
         diff_text = ""
@@ -5141,7 +5260,9 @@ class SerpentApprovalProvider:
         if approved:
             return await self._inner.approve(request_id, "operator")
         else:
-            return await self._inner.reject(request_id, "operator", "rejected via Iron Gate")
+            return await self._inner.reject(
+                request_id, "operator", *_reject_args(
+                    self._flow, "rejected via Iron Gate"))
 
     async def list_pending(self) -> List[Dict[str, Any]]:
         """Delegate to inner provider."""

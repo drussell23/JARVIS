@@ -52,8 +52,11 @@ from backend.core.ouroboros.governance.approval_provider import (
 from backend.core.ouroboros.governance.inline_approval import (
     InlineApprovalChoice,
     InlineApprovalRequest,
+    OperatorDecision,
     decision_timeout_s,
     parse_decision_input,
+    parse_gate_answer,
+    synthetic_decision,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,6 +185,21 @@ def prompt_decision(
     timeout_s: Optional[float] = None,
     now_fn=time.monotonic,
 ) -> InlineApprovalChoice:
+    """The CHOICE only — see :func:`prompt_decision_full` for the words.
+
+    Kept because callers and tests are pinned to a choice-returning
+    function; it is now a projection of the full decision rather than a
+    separate read, so the two can never disagree about the same line."""
+    return prompt_decision_full(
+        stream_in=stream_in, timeout_s=timeout_s, now_fn=now_fn,
+    ).choice
+
+
+def prompt_decision_full(
+    stream_in: Optional[IO[str]] = None,
+    timeout_s: Optional[float] = None,
+    now_fn=time.monotonic,
+) -> OperatorDecision:
     """Read one decision line from ``stream_in`` with a hard timeout.
 
     Returns:
@@ -214,16 +232,19 @@ def prompt_decision(
     while True:
         remaining = deadline - now_fn()
         if remaining <= 0:
-            return InlineApprovalChoice.TIMEOUT_DEFERRED
+            return synthetic_decision(
+                InlineApprovalChoice.TIMEOUT_DEFERRED, 'prompt timed out')
         try:
             ready, _, _ = select.select([fileno], [], [], remaining)
         except (OSError, ValueError) as exc:
             logger.warning(
                 "[InlineApprovalRenderer] select failed: %s", exc,
             )
-            return InlineApprovalChoice.WAIT
+            return synthetic_decision(
+                InlineApprovalChoice.WAIT, f'select failed: {exc}')
         if not ready:
-            return InlineApprovalChoice.TIMEOUT_DEFERRED
+            return synthetic_decision(
+                InlineApprovalChoice.TIMEOUT_DEFERRED, 'prompt timed out')
         return _read_one_line_or_safe(stream_in)
 
 
@@ -236,17 +257,27 @@ def _safe_fileno(stream: IO[str]) -> Optional[int]:
         return None
 
 
-def _read_one_line_or_safe(stream: IO[str]) -> InlineApprovalChoice:
-    """Read exactly one line; map empty/EOF/garbage → WAIT."""
+def _read_one_line_or_safe(stream: IO[str]) -> OperatorDecision:
+    """Read exactly one line; map empty/EOF/garbage → WAIT.
+
+    Returns the DECISION, not just the choice. The reason the operator
+    typed lived in this function for exactly one statement before
+    `parse_decision_input` reduced the line to a verb and dropped it, and
+    a placeholder was substituted three frames later.
+    """
     try:
         line = stream.readline()
     except (OSError, ValueError) as exc:
         logger.warning("[InlineApprovalRenderer] readline failed: %s", exc)
-        return InlineApprovalChoice.WAIT
+        return OperatorDecision(choice=InlineApprovalChoice.WAIT)
     if not line:
         # EOF — mirrors Slice 1 contract: no input ≠ approval.
-        return InlineApprovalChoice.WAIT
-    return parse_decision_input(line)
+        return OperatorDecision(choice=InlineApprovalChoice.WAIT)
+    # Enter means WAIT at THIS prompt (`[y]es / [n]o / ... / [w]ait` offers
+    # no default), which is the opposite of the Iron Gate's `[Y/n]`. The
+    # promise belongs to the prompt that made it, so it is declared here
+    # rather than assumed by the parser.
+    return parse_gate_answer(line, empty_means=InlineApprovalChoice.WAIT)
 
 
 # ---------------------------------------------------------------------------
@@ -383,19 +414,27 @@ def run_inline_approval_loop(
         block = render_request_block(request, diff_text=diff_text)
         _safe_print(stream_out, block)
 
-        choice = prompt_decision(
+        decision = prompt_decision_full(
             stream_in=stream_in,
             timeout_s=timeout_s,
         )
+        choice = decision.choice
 
         if choice is InlineApprovalChoice.APPROVE:
             return _await_now(
                 provider.approve(request.request_id, operator),
             )
         if choice is InlineApprovalChoice.REJECT:
+            # The operator's own words when they gave any. Slice 3 wrote
+            # the literal "inline reject" here and left a TODO for Slice 4
+            # to "add a one-line reason capture"; Slice 4 never came, and
+            # the placeholder was being stored downstream as the human's
+            # stated reason and replayed into every generation prompt.
             return _await_now(
                 provider.reject(
-                    request.request_id, operator, "inline reject",
+                    request.request_id, operator,
+                    decision.reason or "inline reject",
+                    "stated" if decision.is_stated else "unstated",
                 ),
             )
         if choice is InlineApprovalChoice.SHOW_STACK:
