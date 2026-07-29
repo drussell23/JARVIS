@@ -43,6 +43,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -576,7 +584,7 @@ def format_constellation_panel(
     if not by_axis:
         return ""
 
-    parts = ["[bright_yellow]🌌 Capability constellation:[/]"]
+    parts = [f"[{_SEM['alert']}]🌌 Capability constellation:[/]"]
     counts = " · ".join(
         f"{b.value}={snapshot.by_brightness.get(b.value, 0)}"
         for b in ConstellationBrightness

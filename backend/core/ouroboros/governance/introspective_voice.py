@@ -45,6 +45,14 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -425,7 +433,7 @@ def format_introspective_voice_panel(
     for f in frames:
         grouped.setdefault(f.axis, []).append(f)
 
-    parts = ["[bright_magenta]🌙 Introspective voice:[/]"]
+    parts = [f"[{_SEM['annotation']}]🌙 Introspective voice:[/]"]
     for axis, _name in _AXIS_KIND_NAMES:
         items = grouped.get(axis, [])
         if not items:

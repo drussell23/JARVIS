@@ -378,7 +378,7 @@ class BipartiteLayout:
             hint = self._viewport.tail_hint(above)
             if hint:
                 return self._anchor(list(visible[1:]) + [
-                    f"[bright_black] {hint} [/bright_black]",
+                    f"[{_SEM['verbose']}] {hint} [/]",
                 ])
             return self._anchor(list(visible))
         except Exception:  # noqa: BLE001
@@ -444,7 +444,7 @@ class BipartiteLayout:
                     border = "cyan"
                 return Panel(
                     body, title=self._title, title_align="left",
-                    subtitle=f"[bright_black]{n} events[/bright_black]", subtitle_align="right",
+                    subtitle=f"[{_SEM['verbose']}]{n} events[/]", subtitle_align="right",
                     box=ROUNDED, border_style=border, padding=(0, 1),
                     height=max(3, self._height - 3),
                 )

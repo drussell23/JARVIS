@@ -27,6 +27,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -459,7 +467,7 @@ def format_session_story(
         else story.session_id
     )
     parts = [
-        f"[bright_yellow]📖 Session story "
+        f"[{_SEM['alert']}]📖 Session story "
         f"({sid_short}):[/]",
         f"  [dim]{story.duration_human} · "
         f"{story.cost_human} · "

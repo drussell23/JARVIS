@@ -62,6 +62,14 @@ def resolve_version() -> str:
 
 from backend.core.ouroboros.ui.alt_screen import alternate_screen
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 
 def version_line() -> str:
     """``ov 0.1.0 “unchained” — ouroboros + venom``. NEVER raises."""
@@ -743,7 +751,7 @@ class AttachUI:
         try:
             import time as _t
             if self._flash_text and _t.monotonic() < self._flash_until:
-                return f"  [yellow]![/yellow] {self._flash_text}"
+                return f"  [{_SEM['heal']}]![/] {self._flash_text}"
             self._flash_text = ""
         except Exception:  # noqa: BLE001
             pass
@@ -2874,14 +2882,14 @@ async def _attach_rms_stream(scope: Any) -> Any:
 #: that matched nothing and rendered silently — the same shape of failure as
 #: a publisher with no subscriber, which this feature exists to end.
 _AUDIO_STATE_LABELS = {
-    "VAD_ACTIVE": "[cyan]🎙 listening…[/cyan]",
+    "VAD_ACTIVE": f"[{_SEM['neural']}]🎙 listening…[/]",
     "TTS_GENERATING": "[rgb(94,224,106)]💭 Karen is thinking…[/rgb(94,224,106)]",
     "AUDIO_PLAYING": "[rgb(94,224,106)]🗣 Karen is speaking…[/rgb(94,224,106)]",
     "AUDIO_IDLE": "[dim]· ready[/dim]",
     "SYSTEM_WARMING": "[dim]· audio plane warming…[/dim]",
     "SYSTEM_READY": "[dim]· audio plane ready[/dim]",
-    "HW_FAULT": "[red]⚠ audio hardware fault[/red]",
-    "SYS_TELEMETRY_DEGRADED": "[yellow]⚠ telemetry degraded[/yellow]",
+    "HW_FAULT": f"[{_SEM['death']}]⚠ audio hardware fault[/]",
+    "SYS_TELEMETRY_DEGRADED": f"[{_SEM['heal']}]⚠ telemetry degraded[/]",
     "SYS_TELEMETRY_RECOVERED": "[dim]· telemetry recovered[/dim]",
 }
 
@@ -3296,8 +3304,8 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             ),
             seed=[
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "
-                "plain words both work · [cyan]wake[/cyan] arms my voice · "
-                "[cyan]detach[/cyan] leaves the organism running",
+                f"plain words both work · [{_SEM['neural']}]wake[/] arms my voice · "
+                f"[{_SEM['neural']}]detach[/] leaves the organism running",
                 # Boot warnings (stale-binary sentinel, …) must survive
                 # the alt-screen mount — a console print alone dies with
                 # the primary buffer the moment the cockpit takes over.

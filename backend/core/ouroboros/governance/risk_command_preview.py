@@ -429,7 +429,7 @@ def format_command_preview(
     glyph = _VERDICT_GLYPHS.get(preview.verdict, "?")
     tint = _VERDICT_TINTS.get(preview.verdict, "white")
     parts = [
-        "[bright_yellow]🔮 Command preview:[/]"
+        f"[{_SEM['alert']}]🔮 Command preview:[/]"
     ]
     if preview.command_summary:
         parts.append(

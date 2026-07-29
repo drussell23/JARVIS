@@ -26,6 +26,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -334,14 +342,14 @@ def format_attention_mirror(
         if not master_enabled():
             return ""
         return (
-            "[bright_yellow]🪞 Attention mirror:[/]\n"
+            f"[{_SEM['alert']}]🪞 Attention mirror:[/]\n"
             "  [dim]idle (no recent attention signals)[/]"
         )
     primary_glyph = _FOCUS_GLYPHS.get(
         snapshot.primary_focus, "⋯",
     )
     parts = [
-        f"[bright_yellow]🪞 Attention mirror:[/] "
+        f"[{_SEM['alert']}]🪞 Attention mirror:[/] "
         f"{primary_glyph} {snapshot.primary_focus.value}",
         f"  [dim](window {snapshot.window_s}s · "
         f"{len(snapshot.items)} signals)[/]",

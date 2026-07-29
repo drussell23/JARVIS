@@ -29,6 +29,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -257,7 +265,7 @@ def format_architecture_viz(
     if not snapshot.cells:
         return ""
 
-    parts = ["[bright_yellow]🧬 Organism architecture:[/]"]
+    parts = [f"[{_SEM['alert']}]🧬 Organism architecture:[/]"]
     parts.append(
         f"  [dim]({snapshot.total_activity} events in "
         "60s window)[/]"

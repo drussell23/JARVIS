@@ -43,6 +43,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -697,7 +705,7 @@ def format_coherence_report(
         "green" if report.overall_stable else "yellow"
     )
     parts = [
-        f"[bright_yellow]🧬 Cross-session coherence:[/] "
+        f"[{_SEM['alert']}]🧬 Cross-session coherence:[/] "
         f"[{summary_tint}]{summary_glyph}[/] "
         f"{report.boundary_count} boundary"
         f"{'s' if report.boundary_count != 1 else ''} "

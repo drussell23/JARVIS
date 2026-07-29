@@ -204,10 +204,10 @@ class TestItNeverBreaksRendering:
 #: silently produces plain text and no test notices, which is why the fix
 #: is "stop new ones now, migrate incrementally" rather than one change.
 _RAW_LITERAL_CEILING = {
-    "backend/core/ouroboros/battle_test": 42,
-    "backend/core/ouroboros/cli": 12,
-    "backend/core/ouroboros/ui": 3,
-    "backend/core/ouroboros/governance": 25,
+    "backend/core/ouroboros/battle_test": 8,
+    "backend/core/ouroboros/cli": 0,
+    "backend/core/ouroboros/ui": 0,
+    "backend/core/ouroboros/governance": 2,
 }
 
 _RAW = re.compile(
@@ -241,7 +241,7 @@ def test_raw_colour_literals_only_ever_decrease(root):
         f"colour — the role keeps meaning the right thing when the palette "
         f"changes."
     )
-    assert found >= ceiling - 40, (
+    assert found >= ceiling - 8, (
         f"{root}: down to {found} from {ceiling} — lower the ceiling in "
         f"_RAW_LITERAL_CEILING so the ratchet keeps holding."
     )

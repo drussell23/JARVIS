@@ -37,6 +37,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -359,10 +367,10 @@ def format_orchestra_recent(
         cues = get_default_ledger().recent(limit=limit)
     if not cues:
         return (
-            "[bright_yellow]🎼 Phase orchestra:[/]\n"
+            f"[{_SEM['alert']}]🎼 Phase orchestra:[/]\n"
             "  [dim]no recent cues[/]"
         )
-    parts = ["[bright_yellow]🎼 Phase orchestra:[/]"]
+    parts = [f"[{_SEM['alert']}]🎼 Phase orchestra:[/]"]
     bell = "\a" if bell_on_cue_enabled() else ""
     bar = []
     for cue in cues[-limit:]:
@@ -397,7 +405,7 @@ def format_orchestra_status() -> str:
         by_note[c.note.value] = (
             by_note.get(c.note.value, 0) + 1
         )
-    parts = ["[bright_yellow]🎼 Phase orchestra status:[/]"]
+    parts = [f"[{_SEM['alert']}]🎼 Phase orchestra status:[/]"]
     parts.append(
         f"  [dim]({len(cues)} recent cues)[/]"
     )
