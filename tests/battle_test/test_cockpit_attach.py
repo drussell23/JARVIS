@@ -13,6 +13,8 @@ CLI item #6 mandates:
 """
 from __future__ import annotations
 
+import ast
+
 import asyncio
 import json
 import os
@@ -380,8 +382,19 @@ def test_harness_mounts_bridge_and_mirrors_chokepoint():
     assert "_start_cockpit_attach_bridge" in src
     body = src[src.index("def _repl_print"):][:2000]
     assert "publish_line" in body                  # chokepoint mirror
-    assert "_handle_repl_command" in src[
-        src.index("def _start_cockpit_attach_bridge"):][:4000]
+    # Structural, not positional. This previously asserted the name
+    # appeared within an arbitrary 4000-character window after the `def`,
+    # so adding a comment block to the function broke it while the wiring
+    # was intact. The claim is "attached input reaches the REPL handler" —
+    # which is a fact about the FUNCTION, not about byte offsets.
+    tree = ast.parse(src)
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name == "_start_cockpit_attach_bridge"
+    )
+    assert "_handle_repl_command" in ast.dump(fn), (
+        "attached operator input no longer reaches the REPL handler")
 
 
 def test_ov_attach_is_real_not_stub():

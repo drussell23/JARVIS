@@ -751,6 +751,7 @@ def build_bipartite_application(
     status_rows: Optional[Callable[[], Any]] = None,
     pending_rows: Optional[Callable[[], Any]] = None,
     stream_rows: Optional[Callable[[], Any]] = None,
+    queue_rows: Optional[Callable[[], Any]] = None,
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
@@ -1111,6 +1112,15 @@ def build_bipartite_application(
     # immediately above this — the in-flight text appears exactly where it
     # will land, which is what makes it read as inline rather than as a
     # separate widget.
+    # The operator's own backlog, nearest the caret — it is about what
+    # THEY did, so it belongs closest to where they are typing.
+    if queue_rows is not None:
+        try:
+            _q_row = build_dynamic_rows(queue_rows)
+            if _q_row is not None:
+                rows += [_q_row]
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] queue row unavailable", exc_info=True)
     if stream_rows is not None:
         try:
             _stream_row = build_dynamic_rows(stream_rows)
@@ -1395,6 +1405,7 @@ async def run_bipartite_repl(
     status_rows: Optional[Callable[[], Any]] = None,
     pending_rows: Optional[Callable[[], Any]] = None,
     stream_rows: Optional[Callable[[], Any]] = None,
+    queue_rows: Optional[Callable[[], Any]] = None,
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
@@ -1427,7 +1438,7 @@ async def run_bipartite_repl(
             turn_spinner=turn_spinner, agent_rows=agent_rows,
             search_rows=search_rows, status_rows=status_rows,
             pending_rows=pending_rows, stream_rows=stream_rows,
-            serpent_active=serpent_active,
+            queue_rows=queue_rows, serpent_active=serpent_active,
         )
         if watch_alive is not None:
             watcher = asyncio.ensure_future(

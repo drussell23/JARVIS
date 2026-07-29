@@ -680,6 +680,8 @@ class AttachUI:
         self._status: dict = {}
         #: Applies waiting out their rejection window, as of the last frame.
         self._pending_apply: dict = {}
+        #: Submitted-but-unprocessed operator lines, as of the last frame.
+        self._input_queue: dict = {}
         #: The sentence currently being written, if a generation is live.
         self._stream_inflight: str = ""
         self._stream_arrived: float = 0.0
@@ -1050,6 +1052,23 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return []
 
+    def _input_queue_rows(self) -> List[str]:
+        """Lines typed but not yet reached. NEVER raises.
+
+        Silent at depth 0 — a queue keeping up should be invisible. It
+        earns a row only when the operator is ahead of the organism,
+        which is exactly when a busy system is otherwise indistinguishable
+        from a dropped keystroke.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.operator_input_queue import (  # noqa: E501
+                render_queue,
+            )
+            return render_queue(
+                self._input_queue, width=self._terminal_size()[0])
+        except Exception:  # noqa: BLE001
+            return []
+
     def _stream_rows(self) -> List[str]:
         """The in-flight sentence, wrapped to THIS terminal. NEVER raises.
 
@@ -1383,6 +1402,11 @@ class AttachUI:
                 # closed, and a countdown that outlives its op is telling the
                 # operator they can still stop something that already ran.
                 self._pending_apply = frame.get("pending_apply") or {}
+                # Lines the operator submitted that the organism has not
+                # reached yet. Cleared by absence for the same reason the
+                # countdown is: a stale backlog tells them work is
+                # pending that already ran.
+                self._input_queue = frame.get("input_queue") or {}
             elif isinstance(frame, dict) and frame.get(
                 "kind",
             ) == "stream_inflight":
@@ -3231,6 +3255,12 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             stream_rows=(
                 ui._stream_rows if ui is not None
                 and hasattr(ui, "_stream_rows") else None
+            ),
+            # The operator's own backlog, directly above the caret where
+            # they are still typing.
+            queue_rows=(
+                ui._input_queue_rows if ui is not None
+                and hasattr(ui, "_input_queue_rows") else None
             ),
             seed=[
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "

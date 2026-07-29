@@ -62,6 +62,17 @@ def _pending_apply_payload() -> Optional[dict]:
         return None
 
 
+def _input_queue_payload() -> dict:
+    """The attached-input queue's depth, or {}. NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.operator_input_queue import (
+            active_queue_snapshot,
+        )
+        return active_queue_snapshot()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _status_payload(snap: Any) -> Optional[dict]:
     """The status snapshot as a transport dict, or None. NEVER raises."""
     try:
@@ -318,6 +329,11 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
             # builder, which is empty by construction and would draw an
             # eternally idle organism.
             "status": _status_payload(snap),
+            # Submitted-but-unprocessed operator lines. Carried here
+            # rather than pushed, for the reason every other live state
+            # is: it is a picture of NOW, and a dropped frame costs a
+            # tick of accuracy rather than a queued line.
+            "input_queue": _input_queue_payload(),
             # An apply waiting out its rejection window. Carried here rather
             # than mirrored as text because a countdown is STATE — the panel
             # that draws it locally repaints eight times a second, and the
