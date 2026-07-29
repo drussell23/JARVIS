@@ -359,6 +359,19 @@ class BipartiteLayout:
                 return self._anchor(list(visible[1:]) + [
                     f"[reverse dim] {status} [/reverse dim]",
                 ])
+            # At the LIVE TAIL, say that history exists — once.
+            #
+            # `status` is the counterpart and only ever renders while
+            # SCROLLED: it tells a reader how to get back, and nothing told
+            # them they could leave. The alternate screen took the terminal's
+            # own scrollback, so an operator who does not know the key has no
+            # way to reach 20,000 retained lines. It costs the same one row
+            # the status does, and only until they scroll once.
+            hint = self._viewport.tail_hint(above)
+            if hint:
+                return self._anchor(list(visible[1:]) + [
+                    f"[bright_black] {hint} [/bright_black]",
+                ])
             return self._anchor(list(visible))
         except Exception:  # noqa: BLE001
             return []

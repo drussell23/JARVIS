@@ -131,6 +131,14 @@ class CanvasViewport:
         #: as a count rather than left implicit — "there is newer output" is
         #: the fact that decides whether they want to jump back to live.
         self.new_since_paused = 0
+        #: Has this operator scrolled yet, this session?
+        #:
+        #: The alternate screen takes the terminal's OWN scrollback, and
+        #: nothing replaces the muscle memory it took with it. So the tail
+        #: teaches the key — ONCE. A surface that re-teaches itself on every
+        #: render spends the operator's screen on their first minute of using
+        #: it, forever.
+        self.taught = False
 
     # -- state -------------------------------------------------------------
 
@@ -142,6 +150,10 @@ class CanvasViewport:
     def following(self) -> bool:
         """True when pinned to the live tail."""
         return self._offset <= 0
+
+    def mark_taught(self) -> None:
+        """The operator has found the scrollback; stop offering the key."""
+        self.taught = True
 
     def reset(self) -> None:
         self._offset = 0
@@ -163,6 +175,7 @@ class CanvasViewport:
             ceiling = max(0, total - budget)
             want = self._offset - int(lines)
             new = max(0, min(ceiling, want))
+            self.taught = True
             self.hit_top = want > ceiling and ceiling > 0
             if new == self._offset:
                 return False
@@ -246,6 +259,30 @@ class CanvasViewport:
             logger.debug("[CanvasViewport] window degraded", exc_info=True)
             tail = list(lines or ())[-max(1, int(budget)):]
             return tail, 0, 0
+
+    def tail_hint(self, hidden_above: int) -> str:
+        """One line at the LIVE TAIL saying history exists, and how to reach it.
+
+        The counterpart to :meth:`status`, which only ever renders while
+        SCROLLED — it tells a reader how to get back, and nothing told them
+        they could leave. In the alternate screen that is not a missing
+        convenience: the terminal's own scrollback is gone, so if the
+        operator does not know this key the history is unreachable.
+
+        Names ``shift+↑``, not PgUp. A MacBook keyboard has no PageUp — it is
+        ``Fn+↑`` — so a hint naming it sends exactly the operator who most
+        needs help to a key they cannot press. Shift+arrow is bound to the
+        same handler and every keyboard can send it.
+
+        Shown only while there IS history above and only until the operator
+        scrolls once. NEVER raises.
+        """
+        try:
+            if self.taught or hidden_above <= 0:
+                return ""
+            return f"↑ {hidden_above} above · shift+↑ to scroll"
+        except Exception:  # noqa: BLE001
+            return ""
 
     def status(self, hidden_above: int, hidden_below: int) -> str:
         """One line telling the operator they are not looking at "now".
