@@ -4322,6 +4322,52 @@ class BattleTestHarness:
             logger.debug("[Attach] input queue unavailable", exc_info=True)
             return None
 
+    def _repl_cmd_rewind(self) -> None:
+        """Show restore points under the viewport lock. NEVER raises.
+
+        Reuses the daemon's EXISTING `/undo` planner as the snapshot source
+        and the cockpit's own `RewindController` for the lock, so there is
+        no second snapshot system and no second lock. What differs is only
+        the transport — local calls instead of bridge frames — and the
+        surface: numbered rows, because the daemon REPL is a PromptSession
+        with no palette Float to host a menu.
+        """
+        try:
+            from pathlib import Path as _Path
+
+            from backend.core.ouroboros.battle_test.rewind_menu import (
+                local_rewind_rows,
+            )
+
+            def _provider(limit: int) -> list:
+                from backend.core.ouroboros.battle_test.undo_command import (
+                    UndoPlanner,
+                )
+                plan = UndoPlanner(
+                    _Path(self._config.repo_path),
+                    governed_loop_service=self._governed_loop_service,
+                ).plan(limit, mode="preview")
+                return [
+                    {
+                        "sha": str(getattr(t, "sha", "") or ""),
+                        "subject": str(getattr(t, "subject", "") or ""),
+                    }
+                    for t in (getattr(plan, "targets", None) or ())
+                ]
+
+            for line in local_rewind_rows(
+                pause=self._repl_cmd_pause,
+                resume=self._repl_cmd_resume,
+                provider=_provider,
+            ):
+                self._repl_print(line)
+        except Exception:  # noqa: BLE001
+            logger.debug("[Rewind] daemon-side rewind degraded", exc_info=True)
+            try:
+                self._repl_print("  (rewind unavailable — see debug.log)")
+            except Exception:  # noqa: BLE001
+                pass
+
     async def _handle_repl_command_for(
         self, command: str, session: Optional[str],
     ) -> None:
@@ -4400,6 +4446,13 @@ class BattleTestHarness:
             self._repl_cmd_remember(command.strip())
         elif cmd.startswith("/forget") or cmd.startswith("forget "):
             self._repl_cmd_forget(command.strip())
+        elif cmd.startswith("/rewind") or cmd == "rewind":
+            # Esc-Esc rewind, for the DAEMON's own terminal. The menu was
+            # client-only because the cockpit is a separate process and had
+            # to ask over the bridge; here the same three calls are local,
+            # through the same controller and the same lock. One
+            # implementation, two entrances.
+            self._repl_cmd_rewind()
         elif cmd.startswith("/undo") or cmd.startswith("undo ") or cmd == "undo":
             # /undo N (revert last N O+V commits); /undo preview [N];
             # /undo --hard N. Async because executor awaits comm emits.
