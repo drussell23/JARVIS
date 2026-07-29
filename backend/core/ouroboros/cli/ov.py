@@ -682,6 +682,9 @@ class AttachUI:
         self._pending_apply: dict = {}
         #: Submitted-but-unprocessed operator lines, as of the last frame.
         self._input_queue: dict = {}
+        #: The last FATAL_PANIC, until the operator dismisses it. Sticky
+        #: on purpose: a crash notice that scrolls away was never seen.
+        self._panic: dict = {}
         #: The sentence currently being written, if a generation is live.
         self._stream_inflight: str = ""
         self._stream_arrived: float = 0.0
@@ -1052,6 +1055,21 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return []
 
+    def _panic_rows(self) -> List[str]:
+        """The crash overlay's content, or []. NEVER raises."""
+        try:
+            from backend.core.ouroboros.battle_test.panic_arbiter import (
+                render_panic,
+            )
+            return render_panic(
+                self._panic, width=self._terminal_size()[0])
+        except Exception:  # noqa: BLE001
+            return []
+
+    def dismiss_panic(self) -> None:
+        """Operator acknowledged the crash. NEVER raises."""
+        self._panic = {}
+
     def _input_queue_rows(self) -> List[str]:
         """Lines typed but not yet reached. NEVER raises.
 
@@ -1420,6 +1438,14 @@ class AttachUI:
                 self._stream_is_tool = False
                 import time as _time
                 self._stream_arrived = _time.monotonic()
+            elif isinstance(frame, dict) and frame.get(
+                    "kind") == "fatal_panic":
+                # A background task died. STICKY — unlike every other live
+                # state here, this is NOT cleared by absence: the organism
+                # may be degraded, and a notice that vanishes on the next
+                # heartbeat is a notice nobody read. `/dismiss` or esc
+                # clears it.
+                self._panic = dict(frame)
             elif isinstance(frame, dict) and frame.get("kind") == "tool_stream":
                 # A running command's live tail. It shares the in-flight
                 # strip with the model's sentence rather than owning a
@@ -3261,6 +3287,12 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             queue_rows=(
                 ui._input_queue_rows if ui is not None
                 and hasattr(ui, "_input_queue_rows") else None
+            ),
+            # The crash overlay — above everything, cleared only by the
+            # operator.
+            panic_rows=(
+                ui._panic_rows if ui is not None
+                and hasattr(ui, "_panic_rows") else None
             ),
             seed=[
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "

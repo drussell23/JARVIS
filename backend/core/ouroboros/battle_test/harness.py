@@ -1242,6 +1242,17 @@ class BattleTestHarness:
         _running_loop = asyncio.get_event_loop()
 
         def _harness_loop_exception_handler(loop_, ctx_):
+            # Panic Arbiter (backstop detector). Delegation rather than a
+            # third `set_exception_handler`: this handler's curated
+            # suppression stays authoritative, and the arbiter adds the
+            # thing a log file cannot — a broadcast the operator sees.
+            try:
+                from backend.core.ouroboros.battle_test.panic_arbiter import (
+                    arbitrate as _arbitrate,
+                )
+                _arbitrate(loop_, ctx_)
+            except Exception:  # noqa: BLE001
+                pass
             # Interpreter finalization guard (operator paste 2026-07-18):
             # during shutdown the QueueHandler's copy.copy(record) dies
             # with "ImportError: sys.meta_path is None" and logging
@@ -1273,6 +1284,15 @@ class BattleTestHarness:
 
         try:
             _running_loop.set_exception_handler(_harness_loop_exception_handler)
+            # Panic broadcast: a traceback in a log file is invisible to
+            # someone watching a cockpit.
+            try:
+                from backend.core.ouroboros.battle_test.cockpit_attach import (
+                    install_panic_broadcast,
+                )
+                install_panic_broadcast()
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:
             logger.debug("Failed to install harness asyncio exception handler", exc_info=True)
 

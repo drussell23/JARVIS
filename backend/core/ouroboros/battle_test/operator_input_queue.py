@@ -178,7 +178,19 @@ class OperatorInputQueue:
                 return self._consumer
             self._waiter = asyncio.Event()
             self._closed = False
-            self._consumer = asyncio.ensure_future(self._drain())
+            # SUPERVISED. This object holds a reference to its own
+            # consumer, which is exactly the case the loop handler never
+            # sees: asyncio only surfaces an unretrieved task exception at
+            # garbage collection, and a live reference defers that
+            # forever. The done-callback fires immediately instead.
+            try:
+                from backend.core.ouroboros.battle_test.panic_arbiter import (
+                    spawn_supervised,
+                )
+                self._consumer = spawn_supervised(
+                    self._drain(), origin="operator_input_queue.drain")
+            except Exception:  # noqa: BLE001
+                self._consumer = asyncio.ensure_future(self._drain())
             return self._consumer
         except Exception:  # noqa: BLE001
             logger.debug("[OperatorInput] consumer start degraded",
