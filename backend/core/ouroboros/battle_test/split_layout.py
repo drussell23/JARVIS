@@ -92,11 +92,31 @@ def _region_title() -> Dict[str, str]:
 
 @dataclass
 class RegionBuffer:
-    """Bounded append-only text buffer for one region."""
+    """Bounded append-only HISTORY, plus one uncommitted tail.
+
+    The ring stays append-only — that is correct and load-bearing, because
+    it holds the session's history and nothing should be able to rewrite
+    it. What was missing is that `as_text` COMPOSES on every read, so an
+    in-flight line does not need the ring to mutate: it only needs to be
+    joined on at render time.
+
+    That distinction was the whole blocker. Believing the tail had to be
+    written INTO the ring implied per-stream anchors, a rule for a
+    competing producer appending mid-sentence, and a re-wrap on every
+    delta. Composition needs none of them: the pending tail is one string,
+    always last, and a push simply lands in front of it.
+
+    The result is CC's actual mechanic — tokens appearing at the END of
+    the transcript, in place — rather than a separate strip below it.
+    """
     name: str
     maxlen: int
     _lines: Deque[str] = field(default_factory=deque)
     _push_count: int = 0
+    #: The line currently being written. NOT history: it is unbounded by
+    #: maxlen, never evicted, and replaced wholesale rather than appended
+    #: to, because the producer always sends the whole tail it has.
+    _pending: str = ""
 
     def push(self, line: str) -> None:
         # Bound maxlen once the buffer crosses threshold.
@@ -105,14 +125,39 @@ class RegionBuffer:
         while len(self._lines) > self.maxlen:
             self._lines.popleft()
 
+    def set_pending(self, text: object) -> None:
+        """The in-flight tail. "" clears it. NEVER raises.
+
+        Deliberately NOT a push: a pending line that entered the ring
+        would be evicted by maxlen mid-sentence, and would survive as
+        history if the stream died before completing. It is a view of
+        something still happening, not a record of something that did.
+        """
+        try:
+            self._pending = str(text or "")
+        except Exception:  # noqa: BLE001
+            self._pending = ""
+
+    @property
+    def pending(self) -> str:
+        return self._pending
+
     def snapshot(self) -> Tuple[str, ...]:
         return tuple(self._lines)
 
     def as_text(self) -> str:
+        # Composed, so the tail is always LAST regardless of what any
+        # other producer pushed while the stream was open. No anchor, no
+        # ordering rule, no re-wrap — the frame is rebuilt anyway.
+        if self._pending:
+            if self._lines:
+                return "\n".join(self._lines) + "\n" + self._pending
+            return self._pending
         return "\n".join(self._lines)
 
     def clear(self) -> None:
         self._lines.clear()
+        self._pending = ""
 
     @property
     def push_count(self) -> int:

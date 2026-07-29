@@ -1063,6 +1063,34 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return []
 
+    def _push_tail_to_deck(self) -> None:
+        """Compose the in-flight text into the transcript. NEVER raises.
+
+        Wrapped by the deck's own renderer at its own width, so nothing
+        here needs to know the terminal size — which is why this can live
+        on the producer side at all.
+        """
+        try:
+            mux = getattr(self, "_mux", None)
+            if mux is None or not hasattr(mux, "set_streaming_tail"):
+                return
+            mux.set_streaming_tail(self._stream_inflight or "")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _deck_carries_tail(self) -> bool:
+        """Is the in-flight text already inside the transcript? NEVER raises.
+
+        The strip predates the deck being able to hold it. Both exist so
+        the fallback survives — a cockpit whose mux lacks the seam still
+        streams, below the deck, exactly as before.
+        """
+        try:
+            mux = getattr(self, "_mux", None)
+            return mux is not None and hasattr(mux, "set_streaming_tail")
+        except Exception:  # noqa: BLE001
+            return False
+
     def _panic_rows(self) -> List[str]:
         """The crash overlay's content, or []. NEVER raises."""
         try:
@@ -1123,6 +1151,12 @@ class AttachUI:
                 return []
             age = max(0.0, _time.monotonic() - float(self._stream_arrived))
             if age > heartbeat_stale_after_s():
+                return []
+            # When the deck can carry the tail itself, the strip stands
+            # down: rendering the same text twice is worse than either
+            # placement alone. The deck is the better home — the words
+            # appear where they will come to rest.
+            if self._deck_carries_tail():
                 return []
             return render_inflight(
                 self._stream_inflight, width=self._terminal_size()[0],
@@ -1446,6 +1480,7 @@ class AttachUI:
                 self._stream_is_tool = False
                 import time as _time
                 self._stream_arrived = _time.monotonic()
+                self._push_tail_to_deck()
             elif isinstance(frame, dict) and frame.get(
                     "kind") == "fatal_panic":
                 # A background task died. STICKY — unlike every other live
@@ -1479,6 +1514,7 @@ class AttachUI:
                         f"{_head}\n{_body}" if _body else _head)
                 self._stream_is_tool = True
                 self._stream_arrived = _time.monotonic()
+                self._push_tail_to_deck()
         except Exception:
             pass
 
@@ -3272,8 +3308,18 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
         pass
 
     try:
+        def _capture_mux(m: Any) -> None:
+            # The deck's own buffer, so in-flight text can be composed
+            # INTO the transcript rather than approximated by a strip
+            # beneath it.
+            try:
+                setattr(ui, "_mux", m)
+            except Exception:  # noqa: BLE001
+                pass
+
         await run_bipartite_repl(
             on_accept=_on_accept,
+            on_mux=_capture_mux,
             title="◇ O+V · proactive canvas",
             toolbar=_toolbar_with_mode if ui is not None else None,
             watch_alive=_alive,
