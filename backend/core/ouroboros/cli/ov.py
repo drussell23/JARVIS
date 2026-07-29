@@ -680,6 +680,9 @@ class AttachUI:
         self._status: dict = {}
         #: Applies waiting out their rejection window, as of the last frame.
         self._pending_apply: dict = {}
+        #: The sentence currently being written, if a generation is live.
+        self._stream_inflight: str = ""
+        self._stream_arrived: float = 0.0
         self._focus_lines: List[str] = []
         self._focus_note: str = ""
         self._flash_text: str = ""
@@ -1044,6 +1047,40 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return []
 
+    def _stream_rows(self) -> List[str]:
+        """The in-flight sentence, wrapped to THIS terminal. NEVER raises.
+
+        This half is STATE — what was last received, and when. The SHAPE is
+        `stream_renderer.render_inflight`, shared with every other surface
+        that draws in-flight text, so no two of them can disagree about it.
+        The wrap is necessarily client-side (the daemon may serve two
+        cockpits of different widths, and the canvas draws with
+        `wrap_lines=False`, so an unwrapped sentence is clipped at the right
+        edge and appears to stop growing) — but a second OPINION about the
+        shape is exactly what the roster and status line already paid for.
+
+        Retires on the same staleness window as every other heartbeat-fed
+        surface: a dead daemon must not leave half a sentence hanging on
+        screen as though it were still being written.
+        """
+        try:
+            import time as _time
+            from backend.core.ouroboros.battle_test.attach_heartbeat import (
+                heartbeat_stale_after_s,
+            )
+            from backend.core.ouroboros.battle_test.stream_renderer import (
+                render_inflight,
+            )
+            if not self._stream_inflight or not self._stream_arrived:
+                return []
+            age = max(0.0, _time.monotonic() - float(self._stream_arrived))
+            if age > heartbeat_stale_after_s():
+                return []
+            return render_inflight(
+                self._stream_inflight, width=self._terminal_size()[0])
+        except Exception:  # noqa: BLE001
+            return []
+
     def _terminal_size(self) -> tuple:
         """``(columns, rows)``, or ``(None, None)`` when it cannot be known.
 
@@ -1336,6 +1373,18 @@ class AttachUI:
                 # closed, and a countdown that outlives its op is telling the
                 # operator they can still stop something that already ran.
                 self._pending_apply = frame.get("pending_apply") or {}
+            elif isinstance(frame, dict) and frame.get(
+                "kind",
+            ) == "stream_inflight":
+                # The sentence the model is in the middle of. STATE, so the
+                # last frame wins outright — no accumulation to drift, and a
+                # dropped frame costs one tick of smoothness rather than a
+                # word. `done` clears it: everything is in the deck by then.
+                self._stream_inflight = (
+                    "" if frame.get("done") else str(frame.get("text") or "")
+                )
+                import time as _time
+                self._stream_arrived = _time.monotonic()
         except Exception:
             pass
 
@@ -3140,6 +3189,12 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             pending_rows=(
                 ui._pending_apply_rows if ui is not None
                 and hasattr(ui, "_pending_apply_rows") else None
+            ),
+            # The sentence being written — directly under the deck it is
+            # about to become part of.
+            stream_rows=(
+                ui._stream_rows if ui is not None
+                and hasattr(ui, "_stream_rows") else None
             ),
             seed=[
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "

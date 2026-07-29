@@ -40,7 +40,7 @@ import logging
 import os
 import sys
 import time
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 logger = logging.getLogger("Ouroboros.StreamRenderer")
 
@@ -70,6 +70,55 @@ def flow_mode_enabled() -> bool:
 #: Longest single line the deck will carry from a generation. A model can
 #: emit a 40k-character line; the deck is a ring of terminal rows.
 _MIRROR_MAX_LINE_CHARS = 2000
+
+#: Longest in-flight tail carried per frame. Past this the model
+#: has stopped writing a sentence and started writing a document.
+_INFLIGHT_MAX_CHARS = 800
+
+
+#: Rows an in-flight sentence may occupy before it is elided. It is one
+#: thought, not a document; past this the strip would push the deck off
+#: screen to show text that is about to become deck content.
+INFLIGHT_MAX_ROWS = 4
+
+
+def render_inflight(
+    text: str, *, width: Optional[int] = None,
+    max_rows: int = INFLIGHT_MAX_ROWS,
+) -> List[str]:
+    """Wrap an in-flight sentence into strip rows. Pure. NEVER raises.
+
+    Lives HERE, beside the producer, and is called by every surface that
+    draws in-flight text — the attach cockpit and the demo. The daemon
+    cannot do this wrap itself (it may serve two cockpits of different
+    widths, and only each client knows its own), so the wrap is necessarily
+    client-side; what must NOT be client-side is a second opinion about what
+    the shape is. That is the same split the roster and the status line use:
+    state crosses the bridge, one renderer draws it.
+
+    Indented as a continuation, because that is what it is — the line the
+    deck is about to receive. A bottom-anchored deck puts its newest entry
+    directly above this strip, so the sentence appears exactly where it will
+    land, which is what makes it read as inline rather than as a widget.
+    """
+    try:
+        import textwrap
+        flat = " ".join(str(text or "").split())
+        if not flat:
+            return []
+        cols = int(width) if width and int(width) > 0 else 80
+        room = max(20, cols - 4)
+        rows = max(1, int(max_rows))
+        wrapped = textwrap.wrap(flat, width=room) or [flat[:room]]
+        if len(wrapped) > rows:
+            # Keep the NEWEST rows: the tail is where the writing is
+            # happening, and an elided head reads as "there is more above",
+            # which is true and about to be in the transcript anyway.
+            wrapped = ["…"] + wrapped[-(rows - 1):] if rows > 1 else ["…"]
+        return [f"  {line}" for line in wrapped]
+    except Exception:  # noqa: BLE001
+        logger.debug("[StreamRender] inflight wrap degraded", exc_info=True)
+        return []
 
 
 def mirror_stream_enabled() -> bool:
@@ -206,6 +255,8 @@ class StreamRenderer:
         self._mirrored_offset: int = 0
         #: Has this stream announced itself to the deck yet?
         self._mirror_opened: bool = False
+        #: Last tail published, so an idle frame costs nothing.
+        self._last_inflight: str = ""
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -355,6 +406,8 @@ class StreamRenderer:
         # otherwise never reach an attached cockpit, so every generation
         # would lose its closing sentence.
         self._mirror_completed_lines(final=True)
+        # Clear the strip: everything is in the transcript now.
+        self._publish_inflight_tail(done=True)
 
         if self._live is not None:
             try:
@@ -404,6 +457,7 @@ class StreamRenderer:
         self._committed_offset = 0
         self._mirrored_offset = 0
         self._mirror_opened = False
+        self._last_inflight = ""
         self._flow_mode = False
         self._op_id = ""
         self._provider = ""
@@ -550,6 +604,9 @@ class StreamRenderer:
                     # Same batch tick as the local widget, so the remote deck
                     # and a local terminal see the generation at one cadence.
                     self._mirror_completed_lines()
+                    # The in-flight sentence, on the same tick — so the strip
+                    # and the deck never disagree about where the boundary is.
+                    self._publish_inflight_tail()
                     last_render = now
         except asyncio.CancelledError:
             # Final flush on cancellation (end() path). Any pending
@@ -560,6 +617,63 @@ class StreamRenderer:
                 pending.clear()
                 self._render_buffer_safe()
             raise
+
+    def _publish_inflight_tail(self, *, done: bool = False) -> None:
+        """Send the sentence currently being WRITTEN to attached cockpits.
+
+        WHAT THIS IS AND IS NOT
+        ------------------------
+        `_mirror_completed_lines` sends finished lines into the deck, where
+        they stay. This sends the UNCOMMITTED remainder — the text after the
+        last newline, which is the sentence the model is in the middle of.
+        The two never overlap: everything before `_mirrored_offset` has
+        already landed in the transcript, everything after it is in flight.
+
+        WHY NOT MUTATE THE DECK'S TAIL
+        -------------------------------
+        The obvious shape is "replace the last line as it grows", and the
+        deck's ring is APPEND-ONLY (`RegionBuffer.push`). Adding tail
+        mutation would need an anchor per stream, a rule for what happens
+        when another producer appends mid-sentence, and a re-wrap on every
+        delta — a lot of new failure modes in the structure that holds the
+        session's history.
+
+        The cockpit already has a primitive for live, self-re-rendering
+        state: the dynamic strip the agent view, status line and countdown
+        all use. A strip sits directly under a bottom-anchored deck, so an
+        in-flight sentence appears exactly where the next line will land —
+        it reads as inline, and nothing has to mutate history to do it.
+
+        Carried on the telemetry lane rather than the markup lane because it
+        is STATE, not a transcript entry: the last frame wins, and a dropped
+        one costs a frame of smoothness rather than a lost line.
+
+        NEVER raises, and never blocks.
+        """
+        try:
+            if not mirror_stream_enabled():
+                return
+            tail = "" if done else self._buffer[self._mirrored_offset:]
+            if tail == self._last_inflight and not done:
+                return          # nothing new — do not spend a frame
+            self._last_inflight = tail
+            from backend.core.ouroboros.battle_test.cockpit_attach import (
+                publish_telemetry_global,
+            )
+            publish_telemetry_global({
+                "kind": "stream_inflight",
+                "op_id": str(self._op_id or ""),
+                # Bounded: the wrap happens on the client, which knows its
+                # width, but an unbounded tail would still cross the bridge
+                # every frame. A sentence that long has stopped being one.
+                "text": tail[-_INFLIGHT_MAX_CHARS:],
+                "done": bool(done),
+            })
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[StreamRender] op=%s inflight degraded", self._op_id,
+                exc_info=True,
+            )
 
     def _mirror_completed_lines(self, *, final: bool = False) -> None:
         """Send completed LINES of the generation to attached cockpits.
