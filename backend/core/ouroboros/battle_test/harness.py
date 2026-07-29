@@ -4659,6 +4659,16 @@ class BattleTestHarness:
             )
             if await bridge.start():
                 self._cockpit_attach_bridge = bridge
+                # Publish it for code that cannot be handed one — the speech
+                # primitive lives three packages away and needs to know
+                # whether anybody is listening before it talks.
+                try:
+                    from backend.core.ouroboros.battle_test.cockpit_attach import (
+                        set_active_bridge,
+                    )
+                    set_active_bridge(bridge)
+                except Exception:  # noqa: BLE001
+                    pass
                 # Tool-activity mirror (2026-07-23): wire SerpentFlow's
                 # op-scoped render chokepoint to the bridge's typed
                 # markup channel — attached `ov` cockpits see the SAME
@@ -4821,9 +4831,23 @@ class BattleTestHarness:
                                  exc_info=True)
             else:
                 self._cockpit_attach_bridge = None
+            try:
+                from backend.core.ouroboros.battle_test.cockpit_attach import (
+                    set_active_bridge,
+                )
+                set_active_bridge(None)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] mount degraded", exc_info=True)
             self._cockpit_attach_bridge = None
+            try:
+                from backend.core.ouroboros.battle_test.cockpit_attach import (
+                    set_active_bridge,
+                )
+                set_active_bridge(None)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _qos_emit_signal(self, envelope: Any) -> None:
         """Route a UX_DEGRADATION_EVENT into O+V's intake — the SAME

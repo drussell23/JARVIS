@@ -1408,6 +1408,35 @@ async def safe_say(
     if not text or not text.strip():
         return False
 
+    # 0. IS ANYBODY THERE?
+    #
+    # `ov` detaches: closing the terminal leaves the organism running, which
+    # is intended and good. But speech kept coming out of the machine's
+    # speakers after the operator had gone — audio addressed to an empty
+    # room, and no way to stop it short of killing the daemon.
+    #
+    # Text already behaves correctly: `publish_markup` returns early when no
+    # cockpit is attached. Speech had no equivalent, so this is that — at the
+    # ONE primitive the whole process speaks through, rather than in each of
+    # the thirteen narrators that call it.
+    #
+    # `skip_gate` is the deliberate carve-out and it already existed for
+    # exactly this class of message: something urgent enough to say whether
+    # or not the room is ready for it. Emergencies still speak.
+    if not skip_gate:
+        try:
+            from backend.core.ouroboros.battle_test.cockpit_attach import (
+                operator_present,
+            )
+            if not operator_present():
+                logger.debug(
+                    "[safe_say:%s] no operator present — not speaking: %s",
+                    source, text[:60],
+                )
+                return False
+        except Exception:  # noqa: BLE001 — presence is a courtesy, not a gate
+            pass
+
     # 1. Dedup check (broker-level, across all subsystems)
     if not skip_dedup:
         if global_speech_dedup_check(text):
