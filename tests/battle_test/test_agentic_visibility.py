@@ -142,3 +142,134 @@ class TestTheProducersActuallyJOIN:
         )
         src = inspect.getsource(subagent_scheduler._retire_from_roster)
         assert "except Exception" in src
+
+
+class TestOneAdapterEveryProducer:
+    """chunk_swarm and BackgroundAgentPool without touching either.
+
+    Both already publish task events on the canonical broker. Wiring each
+    subsystem by hand would have been the third and fourth per-producer
+    edit — and the fifth would have been forgotten. The roster listens
+    instead, so a producer joins by publishing an event it already
+    publishes.
+    """
+
+    @staticmethod
+    def _fresh():
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            install_task_event_adapter,
+        )
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            reset_local_observers,
+        )
+        reset_local_observers()
+        install_task_event_adapter()
+
+    @pytest.mark.parametrize(("event", "verb"), [
+        ("swarm_node_spawned", "begin"), ("worker_op_claimed", "begin"),
+        ("swarm_scatter", "begin"), ("swarm_node_vaporized", "end"),
+        ("swarm_stitched", "end"), ("soak_chunk_quarantined", "end"),
+        ("posture_changed", ""), ("noise", ""),
+    ])
+    def test_lifecycle_is_DERIVED_from_the_name(self, event, verb):
+        """The codebase already names events consistently, so a suffix
+        rule covers all 191 types — and the 192nd automatically. A
+        hand-kept table of event types is what drifted last time."""
+        from backend.core.ouroboros.battle_test.agent_roster import lifecycle_of
+        assert lifecycle_of(event) == verb
+
+    def test_an_ambiguous_name_reads_as_ENDED(self):
+        """`worker_spawn_failed` carries both markers. The truthful
+        reading of a name carrying both is that the thing ended."""
+        from backend.core.ouroboros.battle_test.agent_roster import lifecycle_of
+        assert lifecycle_of("worker_spawn_failed") == "end"
+
+    def test_a_swarm_node_appears_and_retires(self):
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            get_agent_roster,
+        )
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            publish_task_event,
+        )
+        self._fresh()
+        publish_task_event("swarm_node_spawned", "op-x",
+                           {"node_id": "n9", "goal": "chunk", "branch": "wt-9"})
+        rows = {r["id"]: r for r in get_agent_roster().snapshot()["rows"]}
+        assert "node-n9" in rows
+        assert rows["node-n9"]["state"] == "running"
+        assert rows["node-n9"]["worktree"] == "wt-9"
+        publish_task_event("swarm_node_vaporized", "op-x", {"node_id": "n9"})
+        rows = {r["id"]: r for r in get_agent_roster().snapshot()["rows"]}
+        assert rows["node-n9"]["state"] == "finished"
+
+    def test_a_pool_worker_appears(self):
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            get_agent_roster,
+        )
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            publish_task_event,
+        )
+        self._fresh()
+        publish_task_event("worker_op_claimed", "op-y",
+                           {"worker_id": 3, "goal": "harden the floor"})
+        ids = [r["id"] for r in get_agent_roster().snapshot()["rows"]]
+        assert "worker-3" in ids
+
+    def test_a_quarantine_reads_as_FAILED_not_finished(self):
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            get_agent_roster,
+        )
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            publish_task_event,
+        )
+        self._fresh()
+        publish_task_event("swarm_node_spawned", "op-z", {"node_id": "bad"})
+        publish_task_event("soak_chunk_quarantined", "op-z",
+                           {"node_id": "bad", "reason": "3 strikes"})
+        row = next(r for r in get_agent_roster().snapshot()["rows"]
+                   if r["id"] == "node-bad")
+        assert row["state"] == "failed"
+
+    def test_an_unidentified_worker_does_not_become_a_PHANTOM(self):
+        """A worker with no id falls back to the op — one row per op is a
+        truthful under-count. Inventing a synthetic id would create agents
+        that never retire, because nothing would ever name them again."""
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            observe_task_event,
+        )
+        assert observe_task_event("swarm_node_spawned", "op-q", {}) == "op-q"
+        assert observe_task_event("swarm_node_spawned", "", {}) is None
+
+
+class TestTheTapIsNotTheSSEPath:
+    def test_local_observers_fire_regardless_of_the_stream_flag(self, monkeypatch):
+        """`subscribe()` is bounded to 8 SSE slots and gated on
+        `stream_enabled()`. Feeding the roster through it would consume a
+        slot meant for an HTTP client and make agent visibility die
+        whenever an unrelated observability flag is off."""
+        from backend.core.ouroboros.governance import (
+            ide_observability_stream as st,
+        )
+        monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "0")
+        st.reset_local_observers()
+        seen: list = []
+        st.add_local_observer(lambda t, o, p: seen.append(t))
+        st.publish_task_event("worker_op_claimed", "op-1", {"worker_id": 1})
+        assert seen == ["worker_op_claimed"]
+
+    def test_a_broken_observer_never_stops_the_producer(self):
+        from backend.core.ouroboros.governance import (
+            ide_observability_stream as st,
+        )
+        st.reset_local_observers()
+        ok: list = []
+        st.add_local_observer(lambda *a: (_ for _ in ()).throw(RuntimeError()))
+        st.add_local_observer(lambda t, o, p: ok.append(t))
+        st.publish_task_event("worker_op_claimed", "op-1", {"worker_id": 1})
+        assert ok, "one broken consumer swallowed the event for the others"
+
+    def test_the_adapter_is_installed_at_boot(self):
+        import inspect
+
+        from backend.core.ouroboros.battle_test import harness
+        assert "install_task_event_adapter" in inspect.getsource(harness)

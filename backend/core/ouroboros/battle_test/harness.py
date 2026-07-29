@@ -1313,6 +1313,17 @@ class BattleTestHarness:
                 install_task_factory(_running_loop)
             except Exception:  # noqa: BLE001
                 pass
+            # One adapter, every producer. Any subsystem that already
+            # publishes a task event gains roster presence without an edit
+            # of its own — which is how a registry with ONE producer stops
+            # being one permanently rather than three times.
+            try:
+                from backend.core.ouroboros.battle_test.agent_roster import (
+                    install_task_event_adapter,
+                )
+                install_task_event_adapter()
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:
             logger.debug("Failed to install harness asyncio exception handler", exc_info=True)
 

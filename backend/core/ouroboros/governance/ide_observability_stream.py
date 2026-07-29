@@ -2414,6 +2414,40 @@ def reset_default_broker() -> None:
         _default_broker = None
 
 
+#: In-process consumers of task events. Distinct from SSE subscribers:
+#: synchronous, unbounded in count, and NOT gated on `stream_enabled()`.
+_LOCAL_OBSERVERS: List[Any] = []
+
+
+def add_local_observer(fn: Any) -> None:
+    """Register an in-process task-event consumer. NEVER raises."""
+    try:
+        if fn not in _LOCAL_OBSERVERS:
+            _LOCAL_OBSERVERS.append(fn)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def reset_local_observers() -> None:
+    _LOCAL_OBSERVERS.clear()
+
+
+def _notify_local_observers(
+    event_type: str, op_id: str, payload: Optional[Mapping[str, Any]],
+) -> None:
+    """Fan out to in-process observers. NEVER raises, never blocks.
+
+    An observer that throws is dropped from THIS call only — a broken
+    consumer must not stop the event reaching the others, and must never
+    stop the producer that published it.
+    """
+    for fn in list(_LOCAL_OBSERVERS):
+        try:
+            fn(event_type, op_id, dict(payload or {}))
+        except Exception:  # noqa: BLE001
+            logger.debug("[Stream] local observer failed", exc_info=True)
+
+
 def publish_task_event(
     event_type: str,
     op_id: str,
@@ -2424,6 +2458,15 @@ def publish_task_event(
     Returns the event_id on successful publish, None on any failure
     (stream disabled, invalid event_type, or broker exception).
     """
+    # LOCAL observers fire FIRST, and unconditionally.
+    #
+    # The obvious wiring was `subscribe()` — but that is the SSE path:
+    # bounded to 8 slots and gated on `stream_enabled()`. Feeding an
+    # in-process consumer through it would consume a slot meant for an
+    # HTTP client and, worse, make that consumer go dark whenever an
+    # unrelated observability flag is off. Agent visibility must not
+    # depend on whether anyone is watching over HTTP.
+    _notify_local_observers(event_type, op_id, payload)
     if not stream_enabled():
         return None
     try:
