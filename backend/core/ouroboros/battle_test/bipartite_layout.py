@@ -1338,12 +1338,41 @@ def build_bipartite_application(
                 except Exception:  # noqa: BLE001
                     return False
 
+            # `class:panic` was never registered in any prompt_toolkit
+            # Style, so the overlay inherited the default and a FATAL
+            # notice rendered in the same green as a success. The style
+            # comes from the semantic layer instead — `alert` is the role
+            # that exists precisely for "wants the operator's eye NOW" —
+            # resolved to a prompt_toolkit style string.
+            def _panic_style() -> str:
+                """Rich style -> prompt_toolkit style. NEVER raises.
+
+                The two engines spell colours differently: Rich says
+                `bright_yellow`, prompt_toolkit says `ansibrightyellow`,
+                and both accept `#RRGGBB`. Translating is the ONLY honest
+                option — assuming either dialect is how `class:panic`
+                silently rendered as the default in the first place.
+                """
+                try:
+                    from backend.core.ouroboros.ui.semantic_tokens import (
+                        style_for,
+                    )
+                    raw = (style_for("alert") or "").strip()
+                    if not raw:
+                        return "bold"
+                    if raw.startswith("#"):
+                        return f"bold {raw}"
+                    return "bold fg:ansi" + raw.replace("_", "")
+                except Exception:  # noqa: BLE001
+                    return "bold"
+
+            _p_style = _panic_style()
             _panic_win = ConditionalContainer(
                 Window(
                     FormattedTextControl(
-                        lambda: [("class:panic", "\n".join(panic_rows()))],
+                        lambda: [(_p_style, "\n".join(panic_rows()))],
                     ),
-                    wrap_lines=False, style="class:panic",
+                    wrap_lines=False, style=_p_style,
                 ),
                 filter=Condition(_panic_visible),
             )

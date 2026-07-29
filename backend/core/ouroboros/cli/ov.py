@@ -2234,6 +2234,31 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
             description="cycle the autonomy trust dial (/trust cycle)",
         )
 
+        @Condition
+        def _panic_showing() -> bool:
+            try:
+                return bool(getattr(ui, "_panic", None))
+            except Exception:  # noqa: BLE001
+                return False
+
+        def _dismiss_panic(event: Any) -> None:
+            try:
+                ui.dismiss_panic()
+                ui.flash("☠ panic dismissed — /status to check the organism",
+                         seconds=3.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # The overlay SAYS "esc dismisses". Nothing was bound to it, so a
+        # FATAL notice covered the cockpit permanently — advertising a key
+        # that does nothing is worse than advertising none. Filtered on the
+        # overlay being up, so esc keeps its existing meaning otherwise.
+        bind_action(
+            kb, "app:dismissPanic", ("escape",), _dismiss_panic,
+            context="Chat", filter=_panic_showing,
+            description="dismiss the FATAL panic overlay",
+        )
+
         def _show_help(event: Any) -> None:
             _render_client_keys(ui, "/keys")
 

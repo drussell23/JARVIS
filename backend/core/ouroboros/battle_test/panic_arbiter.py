@@ -339,13 +339,24 @@ def render_panic(payload: Optional[dict], *, width: Optional[int] = None,
         if not isinstance(payload, dict):
             return []
         cols = int(width) if width and int(width) > 0 else 80
+        exc_type = str(payload.get("exc_type") or "").strip()
+        message = str(payload.get("message") or "").strip()
+        origin = str(payload.get("origin") or "").strip()
+        tb_text = str(payload.get("traceback") or "").strip()
+        # A payload with NOTHING in it is not a panic worth an overlay —
+        # it is a bug in whoever built it, and "?:" / "origin: ?" told the
+        # operator nothing while covering their screen. Refuse to raise
+        # the overlay rather than raise an empty one.
+        if not (exc_type or message or tb_text):
+            return []
         rows = [
             "☠  FATAL — a background task died",
-            f"   {payload.get('exc_type', '?')}: "
-            f"{str(payload.get('message') or '')[:200]}",
-            f"   origin: {payload.get('origin', '?')}",
-            "",
+            f"   {exc_type or 'unknown error'}"
+            + (f": {message[:200]}" if message else ""),
         ]
+        if origin:
+            rows.append(f"   origin: {origin}")
+        rows.append("")
         tb = str(payload.get("traceback") or "").splitlines()
         if tb:
             kept = tb[-max_frames:]
