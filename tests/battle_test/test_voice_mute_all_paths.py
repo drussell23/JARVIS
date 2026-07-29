@@ -28,6 +28,21 @@ SPEECH_ENTRY_POINTS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _isolated(monkeypatch):
+    """No env, and NO real sentinel files.
+
+    These tests read the actual filesystem otherwise — and the moment an
+    operator legitimately mutes their own machine, the suite starts
+    failing for a reason that has nothing to do with the code. Tests that
+    exercise sentinels re-patch `sentinel_paths` themselves.
+    """
+    import backend.core.voice_mute as vm
+    monkeypatch.delenv("JARVIS_VOICE_MUTED", raising=False)
+    monkeypatch.setattr(vm, "sentinel_paths", lambda: ())
+    yield
+
+
 class TestEveryPathIsGuarded:
     @pytest.mark.parametrize("rel", sorted(SPEECH_ENTRY_POINTS))
     def test_the_mute_is_checked(self, rel):
@@ -77,9 +92,24 @@ class TestTheSwitch:
         """A transient env fault must not become permanent silence nobody
         can explain."""
         import backend.core.voice_mute as vm
-        monkeypatch.setattr(
-            vm.os.environ, "get",
-            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("env down")))
+
+        class _Hostile:
+            """Only THIS module's view of os is broken.
+
+            The first version patched `vm.os.environ.get` — and `vm.os` IS
+            the global `os` module, so it broke `os.environ.get` for pytest
+            itself and every test that ran after. A monkeypatch that reaches
+            outside the unit under test is not a test, it is sabotage with a
+            fixture.
+            """
+
+            class environ:
+                @staticmethod
+                def get(*_a, **_k):
+                    raise RuntimeError("env down")
+
+        monkeypatch.setattr(vm, "os", _Hostile)
+        monkeypatch.setattr(vm, "sentinel_paths", lambda: ())
         assert vm.voice_muted() is False
 
 
@@ -97,3 +127,66 @@ class TestItActuallySilences:
         from backend.core.supervisor.unified_voice_orchestrator import safe_say
         monkeypatch.setenv("JARVIS_VOICE_MUTED", "1")
         assert await safe_say("urgent", skip_gate=True, source="test") is False
+
+
+class TestARunningDaemonCanBeSilenced:
+    """`export` cannot reach a process that is already running.
+
+    The operator exported the flag and still heard her. That was not a bug
+    in the flag — it is what an environment IS: `export` affects processes
+    started AFTERWARDS in that shell, and a running process's environment
+    was fixed at its launch. The daemon (up for 23 hours, headless,
+    started from a different shell) never saw it. Correct behaviour,
+    useless outcome.
+    """
+
+    def test_a_sentinel_FILE_silences_without_a_restart(self, tmp_path,
+                                                        monkeypatch):
+        import backend.core.voice_mute as vm
+        monkeypatch.delenv("JARVIS_VOICE_MUTED", raising=False)
+        target = tmp_path / ".jarvis" / "voice_muted"
+        monkeypatch.setattr(vm, "sentinel_paths", lambda: (str(target),))
+        assert vm.voice_muted() is False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x")
+        # No restart, no re-import, no IPC.
+        assert vm.voice_muted() is True
+
+    def test_either_scope_silences(self, tmp_path, monkeypatch):
+        """Repo-local for a soak, home for "I typed it once". An operator
+        asking twice for quiet should not have to learn which one this
+        daemon happens to read."""
+        import backend.core.voice_mute as vm
+        monkeypatch.delenv("JARVIS_VOICE_MUTED", raising=False)
+        a, b = tmp_path / "a", tmp_path / "b"
+        monkeypatch.setattr(vm, "sentinel_paths", lambda: (str(a), str(b)))
+        for which in (a, b):
+            which.write_text("x")
+            assert vm.voice_muted() is True
+            which.unlink()
+            assert vm.voice_muted() is False
+
+    def test_unmute_clears_EVERY_sentinel(self, tmp_path, monkeypatch):
+        """Not the first found: a half-cleared mute that still silences is
+        exactly as confusing as a mute that does not."""
+        import backend.core.voice_mute as vm
+        monkeypatch.delenv("JARVIS_VOICE_MUTED", raising=False)
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.write_text("x"); b.write_text("x")
+        monkeypatch.setattr(vm, "sentinel_paths", lambda: (str(a), str(b)))
+        assert vm.unmute() == 2
+        assert vm.voice_muted() is False
+
+    def test_the_env_var_still_works(self, monkeypatch):
+        """Both, not either: env for a fresh launch, sentinel for a live
+        one."""
+        import backend.core.voice_mute as vm
+        monkeypatch.setattr(vm, "sentinel_paths", lambda: ())
+        monkeypatch.setenv("JARVIS_VOICE_MUTED", "1")
+        assert vm.voice_muted() is True
+
+    def test_an_unreadable_sentinel_path_never_silences(self, monkeypatch):
+        import backend.core.voice_mute as vm
+        monkeypatch.delenv("JARVIS_VOICE_MUTED", raising=False)
+        monkeypatch.setattr(vm, "sentinel_paths", lambda: (None, 42))
+        assert vm.voice_muted() is False

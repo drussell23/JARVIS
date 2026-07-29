@@ -16,8 +16,17 @@ from backend.core.supervisor.unified_voice_orchestrator import (
 
 
 @pytest.fixture(autouse=True)
-def _unmuted(monkeypatch):
+def _isolated(monkeypatch):
+    """No env, and NO real sentinel files.
+
+    These tests read the actual filesystem otherwise — and the moment an
+    operator legitimately mutes their own machine, the suite starts
+    failing for a reason that has nothing to do with the code. Tests that
+    exercise sentinels re-patch `sentinel_paths` themselves.
+    """
+    import backend.core.voice_mute as vm
     monkeypatch.delenv("JARVIS_VOICE_MUTED", raising=False)
+    monkeypatch.setattr(vm, "sentinel_paths", lambda: ())
     yield
 
 
@@ -70,8 +79,13 @@ class TestOneSwitch:
     def test_a_broken_env_read_never_silences_by_accident(self, monkeypatch):
         """Fail OPEN: an unreadable flag must not mute the organism, or a
         transient fault becomes permanent silence nobody can explain."""
+        import backend.core.voice_mute as vm
         import backend.core.supervisor.unified_voice_orchestrator as u
-        monkeypatch.setattr(
-            u.os.environ, "get",
-            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("env down")))
+
+        def _boom():
+            raise RuntimeError("env down")
+
+        # Patch the LEAF the orchestrator delegates to — patching the
+        # shared `os` module would break every later test in the session.
+        monkeypatch.setattr(vm, "voice_muted", _boom)
         assert u._voice_muted() is False
