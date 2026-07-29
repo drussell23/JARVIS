@@ -1,0 +1,171 @@
+"""What a colour MEANS, resolved once, for every surface.
+
+`ui/theme.py` owns colour: a hex `PALETTE`, a `_SEMANTIC_STD` map, and a
+`ColorTier` ladder (NONE / STANDARD / C256 / TRUECOLOR) that resolves a
+meaning to the best form a given terminal can actually show.
+
+`serpent_flow._C` was a second, independent palette — a flat dict of
+standard-ANSI names. So the two did not merely risk drifting apart: on a
+truecolor terminal the theme-aware surfaces rendered hex while every
+`_C`-coloured line rendered plain ANSI, at visibly different fidelity, in
+the same session.
+
+And 256 call sites bypassed both, writing bracketed colour names directly. The
+question "what colour is a failure" was answered independently 256 times,
+with nothing able to detect divergence.
+
+The vocabulary was never the problem
+====================================
+`_C`'s roles are good, and map almost exactly onto Claude Code's scheme —
+which is *semantic, not decorative*: the action verb is bold and
+uncoloured, paths are cyan, green appears only for additions and
+outcomes, yellow means "needs you", dim means metadata. The load-bearing
+rule is SCARCITY: when green is also chrome, a successful outcome stops
+being visible.
+
+So this module does not invent a vocabulary. It gives the existing one a
+single owner:
+
+    role  ("death", "life", "file", …)   what the cockpit calls it
+      ↓
+    semantic ("crit", "ok", "info", …)   what the theme calls it
+      ↓
+    tier-resolved style                  what THIS terminal can show
+
+`_C` becomes a projection of this, so no call site changes and nothing
+breaks — but there is exactly one answer to every colour question, and it
+is tier-aware everywhere instead of in half the codebase.
+
+NEVER raises. A surface that cannot resolve a colour must still render
+text; losing the colour is a cosmetic failure, losing the line is not.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Dict, Optional
+
+logger = logging.getLogger("Ouroboros.SemanticTokens")
+
+SEMANTIC_TOKENS_SCHEMA_VERSION = "semantic_tokens.v1"
+
+#: Cockpit ROLE → theme SEMANTIC. The only place the two vocabularies are
+#: connected. Roles are what the operator-facing code already says; the
+#: semantics are what `theme` already resolves. Neither side is rewritten
+#: to suit the other — a translation table between two existing, correct
+#: vocabularies is smaller and safer than a migration of either.
+_ROLE_TO_SEMANTIC: Dict[str, str] = {
+    # outcomes — the scarce ones. Green means "succeeded" or "added" and
+    # nothing else, which is what makes it readable at a glance.
+    "life": "ok_bold",
+    "code_add": "ok",
+    # failure
+    "death": "crit",
+    "code_del": "crit",
+    # needs-you
+    "heal": "warn",
+    # thinking / structure
+    "neural": "cyan",
+    "code_hunk": "cyan",
+    # external brains
+    "provider": "venom_purple",
+    # metadata — ids, costs, timings. The most common role, deliberately
+    # the quietest.
+    "dim": "muted",
+    "border": "faint",
+    "verbose": "verbose",
+    # paths get their own treatment below (underline is not a colour).
+    "file": "info",
+}
+
+#: Roles whose rendering carries a non-colour attribute. Kept separate
+#: because a tier that cannot do colour can still do underline, and
+#: conflating them loses the affordance on exactly the terminals that
+#: need it most.
+_ROLE_ATTRS: Dict[str, str] = {
+    "file": "underline",
+}
+
+def semantic_for(role: str) -> str:
+    """The theme semantic a cockpit role maps to. Pure. NEVER raises."""
+    try:
+        return _ROLE_TO_SEMANTIC.get(str(role or "").strip().lower(), "ink")
+    except Exception:  # noqa: BLE001
+        return "ink"
+
+
+def style_for(role: str, *, tier: Optional[object] = None) -> str:
+    """The resolved style string for ``role`` on this terminal.
+
+    Asks `theme` rather than restating it, so a palette change or a tier
+    downgrade reaches every surface at once. NEVER raises, and returns ""
+    when it cannot resolve — the caller's retained seed is the ONE place
+    the historical literals live, so this module never holds a second
+    copy of them. A missing colour is cosmetic; a missing line is not.
+    """
+    key = str(role or "").strip().lower()
+    try:
+        from backend.core.ouroboros.ui import theme as _theme
+        semantic = semantic_for(key)
+        resolved = ""
+        # `theme` is the authority. Its accessor has changed shape before,
+        # so ask in order of specificity rather than binding to one name.
+        for attr in ("semantic_style", "style_for_semantic", "resolve_style"):
+            fn = getattr(_theme, attr, None)
+            if callable(fn):
+                try:
+                    resolved = str(fn(semantic) or "")
+                except Exception:  # noqa: BLE001
+                    resolved = ""
+                if resolved:
+                    break
+        if not resolved:
+            table = getattr(_theme, "_SEMANTIC_STD", None)
+            if isinstance(table, dict):
+                resolved = str(table.get(semantic) or "")
+        attr_extra = _ROLE_ATTRS.get(key, "")
+        if attr_extra and attr_extra not in resolved:
+            resolved = f"{resolved} {attr_extra}".strip()
+        return resolved
+    except Exception:  # noqa: BLE001
+        logger.debug("[SemanticTokens] resolve degraded for %r", key,
+                     exc_info=True)
+        # "" on purpose: the caller's retained seed is the ONE place the
+        # historical literals live, and `_SemanticPalette` falls through
+        # to it. A copy here would be a second palette again — the exact
+        # defect this module exists to remove.
+        return ""
+
+
+def sem(role: str) -> str:
+    """Short alias — the call-site spelling.
+
+    Named for the QUESTION ("what does this mean") rather than the answer
+    ("red"), which is the whole point: a call site that says `sem("death")`
+    keeps meaning the right thing when the palette changes, and one that
+    says a literal colour does not.
+    """
+    return style_for(role)
+
+
+def role_palette() -> Dict[str, str]:
+    """Every role → its resolved style. The projection `_C` becomes.
+
+    Built fresh rather than cached: `ColorTier` is a property of the
+    terminal, and a cached palette computed during import would outlive a
+    resize, a `--no-color` flip, or a client attaching from a different
+    terminal than the daemon booted on. The cost is a dict comprehension
+    over a dozen keys.
+    """
+    try:
+        return {role: style_for(role) for role in _ROLE_TO_SEMANTIC}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+__all__ = [
+    "SEMANTIC_TOKENS_SCHEMA_VERSION",
+    "role_palette",
+    "sem",
+    "semantic_for",
+    "style_for",
+]

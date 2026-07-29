@@ -228,19 +228,58 @@ def is_repl_active() -> bool:
 # Color palette (organism theme)
 # ══════════════════════════════════════════════════════════════
 
-_C = {
-    "life": "bright_green",      # awakening, success, evolved
-    "neural": "cyan",            # thinking, processing, phases
-    "provider": "magenta",       # external brains (DW, Claude, J-Prime)
-    "file": "blue underline",    # file paths — clickable feel
-    "heal": "yellow",            # repair, immune response, caution
-    "death": "red",              # failure, rejection, shed
-    "dim": "dim",                # metadata (IDs, costs, timestamps)
-    "border": "dim",             # box-drawing borders
-    "code_add": "green",         # diff: added lines
-    "code_del": "red",           # diff: removed lines
-    "code_hunk": "cyan",         # diff: @@ hunk headers
-}
+# The cockpit's semantic roles:
+#   life      awakening, success, evolved      code_add   diff: added
+#   neural    thinking, phases                 code_del   diff: removed
+#   provider  external brains (DW/Claude)      code_hunk  diff: @@ headers
+#   file      paths — clickable feel           dim        metadata
+#   heal      repair, caution                  border     box-drawing
+#   death     failure, rejection, shed
+#
+# DERIVED from `ui.semantic_tokens`, not declared. This was a second,
+# independent palette of flat standard-ANSI names while `ui/theme.py`
+# owned a hex PALETTE and a ColorTier ladder — so on a truecolor terminal
+# theme-aware surfaces rendered hex and every `_C` line rendered plain
+# ANSI, at visibly different fidelity in the same session.
+#
+# A `dict` subclass rather than a snapshot: ColorTier is a property of the
+# TERMINAL, and a palette frozen at import outlives a resize, a
+# `--no-color` flip, or a client attaching from a different terminal than
+# the daemon booted on. Every `_C['death']` in this file keeps working
+# unchanged and now resolves live.
+class _SemanticPalette(dict):
+    """Role → resolved style, asked fresh. NEVER raises."""
+
+    def __missing__(self, key):
+        try:
+            from backend.core.ouroboros.ui.semantic_tokens import style_for
+            return style_for(key)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def __getitem__(self, key):
+        try:
+            from backend.core.ouroboros.ui.semantic_tokens import style_for
+            resolved = style_for(key)
+            if resolved:
+                return resolved
+        except Exception:  # noqa: BLE001
+            pass
+        return dict.get(self, key, "")
+
+    def get(self, key, default=""):
+        return self.__getitem__(key) or default
+
+
+_C = _SemanticPalette({
+    # Retained as the last-resort literals ONLY: if the theme cannot be
+    # consulted at all, rendering degrades to exactly what shipped before
+    # this projection existed — never to uncoloured, never to something new.
+    "life": "bright_green", "neural": "cyan", "provider": "magenta",
+    "file": "blue underline", "heal": "yellow", "death": "red",
+    "dim": "dim", "border": "dim", "code_add": "green",
+    "code_del": "red", "code_hunk": "cyan",
+})
 
 # Provider display names
 _PROV = {
