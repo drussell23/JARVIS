@@ -80,6 +80,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -407,7 +415,7 @@ class ClaudeStyleTransport:
                 if len(files) > 1:
                     files_repr += f" [dim]+{len(files) - 1}[/dim]"
             self._safe_print(
-                f"[green]{OpStatusGlyph.DONE.value}[/green] "
+                f"[{_SEM['success']}]{OpStatusGlyph.DONE.value}[/] "
                 f"[bold]{state.sensor}[/bold]([dim]{state.short_id}[/dim])"
                 f" done [dim]({elapsed})[/dim]{files_repr}"
             )
@@ -418,9 +426,9 @@ class ClaudeStyleTransport:
         if outcome in ("failed", "postmortem"):
             reason = str(payload.get("reason_code", "") or "")[:60]
             self._safe_print(
-                f"[red]{OpStatusGlyph.FAILED.value}[/red] "
+                f"[{_SEM['death']}]{OpStatusGlyph.FAILED.value}[/] "
                 f"[bold]{state.sensor}[/bold]([dim]{state.short_id}[/dim])"
-                f" shed: [red]{reason}[/red] [dim]({elapsed})[/dim]"
+                f" shed: [{_SEM['death']}]{reason}[/] [dim]({elapsed})[/dim]"
             )
             self._failed_count += 1
             self._feed_composer()
@@ -441,13 +449,13 @@ class ClaudeStyleTransport:
             files_repr = ""
             if files:
                 first = str(files[0])[:40]
-                files_repr = f" [yellow]{first}[/yellow]"
+                files_repr = f" [{_SEM['heal']}]{first}[/]"
                 if len(files) > 1:
                     files_repr += f" [dim]+{len(files) - 1}[/dim]"
             self._safe_print(
-                f"[yellow]{OpStatusGlyph.RUNNING.value}[/yellow] "
+                f"[{_SEM['heal']}]{OpStatusGlyph.RUNNING.value}[/] "
                 f"[bold]{state.sensor}[/bold]([dim]{state.short_id}[/dim])"
-                f" [yellow]NOTIFY[/yellow] auto-applying"
+                f" [{_SEM['heal']}]NOTIFY[/] auto-applying"
                 f"{files_repr} [dim]({elapsed})[/dim]"
             )
             return
@@ -455,9 +463,9 @@ class ClaudeStyleTransport:
         if outcome == "escalated":
             reason = str(payload.get("reason_code", "") or "")[:50]
             self._safe_print(
-                f"[yellow]{OpStatusGlyph.RUNNING.value}[/yellow] "
+                f"[{_SEM['heal']}]{OpStatusGlyph.RUNNING.value}[/] "
                 f"[bold]{state.sensor}[/bold]([dim]{state.short_id}[/dim])"
-                f" [yellow]escalated[/yellow] [dim]{reason}"
+                f" [{_SEM['heal']}]escalated[/] [dim]{reason}"
                 f" ({elapsed})[/dim]"
             )
             return
@@ -481,9 +489,9 @@ class ClaudeStyleTransport:
         short = state.short_id if state else _short_id(op_id)
         reason = str(payload.get("root_cause", "unknown") or "unknown")[:60]
         self._safe_print(
-            f"[red]{OpStatusGlyph.FAILED.value}[/red] "
+            f"[{_SEM['death']}]{OpStatusGlyph.FAILED.value}[/] "
             f"[bold]{sensor}[/bold]([dim]{short}[/dim])"
-            f" postmortem: [red]{reason}[/red] [dim]({elapsed})[/dim]"
+            f" postmortem: [{_SEM['death']}]{reason}[/] [dim]({elapsed})[/dim]"
         )
 
     # -- helpers -----------------------------------------------------
@@ -597,7 +605,7 @@ class ClaudeStyleTransport:
             diff_text = str(metadata.get("diff_text", "") or "")
             self._safe_print(
                 f"  [bold]Update[/bold]("
-                f"[cyan]{path}{line_repr}[/cyan])"
+                f"[{_SEM['neural']}]{path}{line_repr}[/])"
             )
             if added is not None or removed is not None:
                 stats = []

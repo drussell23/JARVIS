@@ -61,6 +61,14 @@ from backend.core.ouroboros.governance.plan_approval import (
     get_default_controller,
 )
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 
 # --- Result dataclass ------------------------------------------------------
 
@@ -112,7 +120,7 @@ def dispatch_plan_command(
         parts = shlex.split(stripped)
     except ValueError as exc:
         return PlanDispatchResult(
-            ok=False, text="[red]Malformed /plan line: %s[/red]" % exc,
+            ok=False, text=f"[{_SEM['death']}]Malformed /plan line: %s[/]" % exc,
         )
     assert parts[0] == "/plan"
     args = parts[1:]
@@ -128,7 +136,7 @@ def dispatch_plan_command(
         return PlanDispatchResult(
             ok=False,
             text=(
-                "[red]Unknown /plan subcommand: %s[/red]  "
+                f"[{_SEM['death']}]Unknown /plan subcommand: %s[/]  "
                 "([dim]try [bold]/plan help[/bold][/dim])"
             ) % sub,
         )
@@ -147,7 +155,7 @@ def _cmd_mode(
     env = os.environ.get("JARVIS_PLAN_APPROVAL_MODE", "false")
     current = env.strip().lower() == "true"
     if not args:
-        state = "[green]ON[/green]" if current else "[dim]OFF[/dim]"
+        state = f"[{_SEM['success']}]ON[/]" if current else "[dim]OFF[/dim]"
         pending = controller.pending_count
         return PlanDispatchResult(
             ok=True,
@@ -163,20 +171,20 @@ def _cmd_mode(
         os.environ["JARVIS_PLAN_APPROVAL_MODE"] = "true"
         return PlanDispatchResult(
             ok=True,
-            text="[green]Plan approval mode ENABLED[/green]  "
+            text=f"[{_SEM['success']}]Plan approval mode ENABLED[/]  "
             "[dim](next op with a plan will halt for review)[/dim]",
         )
     if toggle == "off":
         os.environ["JARVIS_PLAN_APPROVAL_MODE"] = "false"
         return PlanDispatchResult(
             ok=True,
-            text="[yellow]Plan approval mode DISABLED[/yellow]  "
+            text=f"[{_SEM['heal']}]Plan approval mode DISABLED[/]  "
             "[dim](complex ops still gated via the complexity "
             "heuristic)[/dim]",
         )
     return PlanDispatchResult(
         ok=False,
-        text="[red]/plan mode takes 'on' or 'off'[/red]",
+        text=f"[{_SEM['death']}]/plan mode takes 'on' or 'off'[/]",
     )
 
 
@@ -208,7 +216,7 @@ def _cmd_pending(
         )
         preview = (approach or "(no approach)")[:60]
         lines.append(
-            "  [cyan]%s[/cyan]  [dim]expires in %ds[/dim]  %s" % (
+            f"  [{_SEM['neural']}]%s[/]  [dim]expires in %ds[/dim]  %s" % (
                 s["op_id"], int(remaining), preview,
             )
         )
@@ -228,14 +236,14 @@ def _cmd_show(
     if not args:
         return PlanDispatchResult(
             ok=False,
-            text="[red]/plan show requires an op-id[/red]",
+            text=f"[{_SEM['death']}]/plan show requires an op-id[/]",
         )
     op_id = args[0]
     snap = controller.snapshot(op_id)
     if snap is None:
         return PlanDispatchResult(
             ok=False,
-            text="[red]No plan registered for op=%s[/red]" % op_id,
+            text=f"[{_SEM['death']}]No plan registered for op=%s[/]" % op_id,
         )
     return PlanDispatchResult(ok=True, text=render_plan_detail(snap))
 
@@ -249,7 +257,7 @@ def _cmd_approve(
     if not args:
         return PlanDispatchResult(
             ok=False,
-            text="[red]/plan approve requires an op-id[/red]",
+            text=f"[{_SEM['death']}]/plan approve requires an op-id[/]",
         )
     op_id = args[0]
     try:
@@ -257,12 +265,12 @@ def _cmd_approve(
     except PlanApprovalStateError as exc:
         return PlanDispatchResult(
             ok=False,
-            text="[red]Cannot approve %s: %s[/red]" % (op_id, exc),
+            text=f"[{_SEM['death']}]Cannot approve %s: %s[/]" % (op_id, exc),
         )
     return PlanDispatchResult(
         ok=True,
         text=(
-            "[green]✓ Plan APPROVED for %s[/green]  "
+            f"[{_SEM['success']}]✓ Plan APPROVED for %s[/]  "
             "[dim](reviewer=%s, elapsed=%.1fs)[/dim]"
         ) % (op_id, outcome.reviewer, outcome.elapsed_s),
     )
@@ -278,7 +286,7 @@ def _cmd_reject(
         return PlanDispatchResult(
             ok=False,
             text=(
-                "[red]/plan reject requires <op-id> and a reason[/red]  "
+                f"[{_SEM['death']}]/plan reject requires <op-id> and a reason[/]  "
                 "[dim](rejection reason is mandatory — it feeds back "
                 "into future PLAN attempts)[/dim]"
             ),
@@ -290,12 +298,12 @@ def _cmd_reject(
     except PlanApprovalStateError as exc:
         return PlanDispatchResult(
             ok=False,
-            text="[red]Cannot reject %s: %s[/red]" % (op_id, exc),
+            text=f"[{_SEM['death']}]Cannot reject %s: %s[/]" % (op_id, exc),
         )
     return PlanDispatchResult(
         ok=True,
         text=(
-            "[yellow]✗ Plan REJECTED for %s[/yellow]  "
+            f"[{_SEM['heal']}]✗ Plan REJECTED for %s[/]  "
             "[dim](reviewer=%s, reason=%s)[/dim]"
         ) % (op_id, outcome.reviewer, outcome.reason),
     )
@@ -312,7 +320,7 @@ def _cmd_history(
     except ValueError:
         return PlanDispatchResult(
             ok=False,
-            text="[red]/plan history takes an integer limit[/red]",
+            text=f"[{_SEM['death']}]/plan history takes an integer limit[/]",
         )
     limit = max(1, min(limit, 500))
     history = controller.history()
@@ -363,14 +371,14 @@ _HANDLERS = {
 def _render_help() -> str:
     return (
         "[bold]/plan[/bold] commands:\n"
-        "  [cyan]/plan mode[/cyan]               show current plan-mode state\n"
-        "  [cyan]/plan mode on|off[/cyan]        toggle session-wide plan mode\n"
-        "  [cyan]/plan pending[/cyan]            list pending plans\n"
-        "  [cyan]/plan show <op-id>[/cyan]       render full plan detail\n"
-        "  [cyan]/plan approve <op-id>[/cyan]    approve a pending plan\n"
-        "  [cyan]/plan reject <op-id> <reason>[/cyan] reject with reason\n"
-        "  [cyan]/plan history [N][/cyan]        last N resolved plans (default 10)\n"
-        "  [cyan]/plan help[/cyan]               this message"
+        f"  [{_SEM['neural']}]/plan mode[/]               show current plan-mode state\n"
+        f"  [{_SEM['neural']}]/plan mode on|off[/]        toggle session-wide plan mode\n"
+        f"  [{_SEM['neural']}]/plan pending[/]            list pending plans\n"
+        f"  [{_SEM['neural']}]/plan show <op-id>[/]       render full plan detail\n"
+        f"  [{_SEM['neural']}]/plan approve <op-id>[/]    approve a pending plan\n"
+        f"  [{_SEM['neural']}]/plan reject <op-id> <reason>[/] reject with reason\n"
+        f"  [{_SEM['neural']}]/plan history [N][/]        last N resolved plans (default 10)\n"
+        f"  [{_SEM['neural']}]/plan help[/]               this message"
     )
 
 
@@ -427,19 +435,19 @@ def render_plan_detail(snap: dict) -> str:
                 fp = ch.get("file_path", "") or ch.get("file", "")
                 action = ch.get("action", "modify")
                 reason = ch.get("reason", "") or ch.get("rationale", "")
-                head = "  [cyan]%d.[/cyan] %s  [dim]%s[/dim]" % (i, fp, action)
+                head = f"  [{_SEM['neural']}]%d.[/] %s  [dim]%s[/dim]" % (i, fp, action)
                 parts.append(head)
                 if reason:
                     for line in textwrap.wrap(reason, width=70):
                         parts.append("     [dim]%s[/dim]" % line)
             else:
-                parts.append("  [cyan]%d.[/cyan] %s" % (i, ch))
+                parts.append(f"  [{_SEM['neural']}]%d.[/] %s" % (i, ch))
         parts.append("")
 
     if risks:
         parts.append("[bold]Risks[/bold]")
         for r in risks:
-            parts.append("  [yellow]▸[/yellow] %s" % r)
+            parts.append(f"  [{_SEM['heal']}]▸[/] %s" % r)
         parts.append("")
 
     if tests:

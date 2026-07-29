@@ -207,7 +207,7 @@ _RAW_LITERAL_CEILING = {
     "backend/core/ouroboros/battle_test": 42,
     "backend/core/ouroboros/cli": 12,
     "backend/core/ouroboros/ui": 3,
-    "backend/core/ouroboros/governance": 106,
+    "backend/core/ouroboros/governance": 25,
 }
 
 _RAW = re.compile(

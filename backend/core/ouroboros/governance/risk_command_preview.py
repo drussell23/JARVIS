@@ -35,6 +35,14 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+#: Semantic colour roles — the SAME name and access pattern as every
+#: other module. One vocabulary, one spelling, one owner.
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -449,7 +457,7 @@ def format_command_preview(
         )
     if preview.governor_emergency:
         parts.append(
-            "  [red]⚠ governor emergency brake active[/]"
+            f"  [{_SEM['death']}]⚠ governor emergency brake active[/]"
         )
     if preview.diagnostic:
         parts.append(
