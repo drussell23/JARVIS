@@ -1781,9 +1781,17 @@ async def _split_plane_loop(
     # verb with old behaviour while looking perfectly healthy.
     try:
         from backend.core.ouroboros.battle_test.daemon_provenance import (
+            env_drift_line,
             staleness_line,
         )
         _stale = staleness_line()
+        # The OTHER half of "why isn't this daemon doing what I asked".
+        # Stale code and a stale environment are different failures with
+        # the same symptom, and showing only one sent an operator chasing
+        # a flag at a process that could never have seen it.
+        _drift = env_drift_line()
+        if _drift:
+            _stale = f"{_stale}\n{_drift}" if _stale else _drift
         if _stale:
             console.print(_stale, markup=False, highlight=False)
     except Exception:  # noqa: BLE001 — provenance must never block an attach

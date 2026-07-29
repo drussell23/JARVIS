@@ -26,12 +26,12 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("Ouroboros.Provenance")
 
 __all__ = ["client_binary_warning", "read_provenance", "staleness_line",
-           "write_provenance"]
+           "write_provenance", "env_drift", "env_drift_line"]
 
 _STAMP = ".jarvis/daemon_provenance.json"
 
@@ -52,6 +52,61 @@ def _git(*args: str, root: Optional[Path] = None) -> str:
         return ""
 
 
+def _jarvis_env() -> Dict[str, str]:
+    """The JARVIS_* environment, for staleness comparison. NEVER raises.
+
+    VALUES are kept, not just keys: "the daemon has JARVIS_VOICE_MUTED=0
+    and you have =1" is actionable, while "the daemon has different env"
+    is another thing to go and check.
+    """
+    try:
+        import os as _os
+        return {
+            k: str(v)[:80] for k, v in _os.environ.items()
+            if k.startswith("JARVIS_")
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def env_drift(provenance: Optional[Dict[str, Any]] = None) -> List[str]:
+    """JARVIS_* settings that differ between this shell and that daemon.
+
+    Returns human-readable differences, most actionable first. Empty when
+    they agree — or when the daemon predates this field, which is stated
+    rather than guessed at: an older daemon has no `env` key, and claiming
+    agreement we cannot verify is how the last three answers went wrong.
+
+    NEVER raises.
+    """
+    try:
+        data = provenance if provenance is not None else read_provenance()
+        if not isinstance(data, dict) or "env" not in data:
+            return []
+        theirs = data.get("env")
+        # `env: null` means the daemon recorded NOTHING, not that it ran
+        # with an empty environment. Treating the two alike reported every
+        # local setting as "absent in the daemon" — a confident answer
+        # built on a field that was never written.
+        if not isinstance(theirs, dict) or not theirs:
+            return []
+        mine = _jarvis_env()
+        out: List[str] = []
+        for key in sorted(set(mine) | set(theirs)):
+            a, b = theirs.get(key), mine.get(key)
+            if a == b:
+                continue
+            if a is None:
+                out.append(f"{key}={b} is set here, ABSENT in the daemon")
+            elif b is None:
+                out.append(f"{key}={a} in the daemon, unset here")
+            else:
+                out.append(f"{key}: daemon={a}, here={b}")
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def write_provenance(path: Optional[Path] = None) -> Optional[Path]:
     """Stamp what this daemon booted from. Called once, at boot."""
     target = path or (_repo_root() / _STAMP)
@@ -61,6 +116,19 @@ def write_provenance(path: Optional[Path] = None) -> Optional[Path]:
             "pid": os.getpid(),
             "booted_at": time.time(),
             "commit": _git("rev-parse", "HEAD"),
+            # The daemon's ENVIRONMENT, as it was at launch.
+            #
+            # Code staleness was already covered; this is the other half,
+            # and it is the half that actually bit: an operator exported
+            # JARVIS_VOICE_MUTED=1 and the daemon kept talking, because
+            # `export` reaches processes started AFTERWARDS and this one
+            # was a day old. Same commit, so no warning fired — the code
+            # was current and the environment was not.
+            #
+            # Only JARVIS_* is captured: everything else is the machine's
+            # business, and a full environ dump on disk is a credential
+            # leak waiting for a postmortem to read it.
+            "env": _jarvis_env(),
             "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
         }), encoding="utf-8")
         return target
@@ -120,6 +188,26 @@ def staleness_line(
         # transcribed pid, and a `kill`.
         return (f"⚠ daemon booted {_age(age_s)} ago on {commit[:7]} · "
                 f"{detail} · run `ov restart` to load current code")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def env_drift_line(max_shown: int = 3) -> str:
+    """One line naming the settings this daemon cannot see. NEVER raises.
+
+    Separate from `staleness_line` because the remedies differ: stale CODE
+    wants a restart, a stale ENVIRONMENT wants a restart too — but only
+    after the operator knows WHICH setting is being ignored, or they will
+    restart and set it in the wrong shell again.
+    """
+    try:
+        drift = env_drift()
+        if not drift:
+            return ""
+        shown = " · ".join(drift[:max_shown])
+        more = f" (+{len(drift) - max_shown} more)" if len(drift) > max_shown else ""
+        return (f"⚠ this daemon's environment predates your shell — {shown}"
+                f"{more} · `export` cannot reach a running process; restart it")
     except Exception:  # noqa: BLE001
         return ""
 
