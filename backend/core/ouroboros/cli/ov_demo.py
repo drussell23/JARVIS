@@ -937,6 +937,83 @@ def _running_rows(elapsed: float, width: int) -> List[str]:
         return []
 
 
+#: When the operator is AHEAD of the organism — lines typed that it has
+#: not reached yet. Overlaps a busy window on purpose: a backlog only
+#: exists while something else is running.
+_BACKLOG = (11.0, 14.6)
+_BACKLOG_LINES = ("harden the vision floor", "then re-run the suite",
+                  "and open a PR")
+
+#: When a background task dies. Late, so the operator has watched a normal
+#: session first and sees the contrast.
+_PANIC_AT = (24.0, 30.0)
+
+
+def _queue_rows(elapsed: float, width: int) -> List[str]:
+    """The operator's own backlog, through the REAL renderer. NEVER raises.
+
+    Built from an actual queue snapshot shape rather than a drawn string,
+    so a regression in `render_queue` — the depth-0 silence rule, the
+    next-item preview, the refusal notice — shows up here.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.operator_input_queue import (
+            render_queue,
+        )
+        lo, hi = _BACKLOG
+        if not (lo <= elapsed <= hi):
+            return []
+        # Drain one line at a time across the window.
+        done = int(((elapsed - lo) / max(0.01, hi - lo)) * (
+            len(_BACKLOG_LINES) + 1))
+        pending = list(_BACKLOG_LINES[done:])
+        if not pending:
+            return []
+        return render_queue({
+            "depth": len(pending),
+            "refused": 0,
+            "running": _BACKLOG_LINES[max(0, done - 1)],
+            "pending": pending,
+        }, width=width)
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] queue strip unavailable", exc_info=True)
+        return []
+
+
+def _panic_rows(elapsed: float, width: int) -> List[str]:
+    """The FATAL_PANIC overlay, through the REAL renderer. NEVER raises.
+
+    The traceback is a genuine one — captured by actually raising — so the
+    demo exercises `render_panic`'s frame selection (it keeps the LAST
+    frames, because a traceback's head is framework scaffolding) rather
+    than a pre-formatted block that would keep looking right forever.
+    """
+    try:
+        import traceback as _tb
+
+        from backend.core.ouroboros.battle_test.panic_arbiter import (
+            render_panic,
+        )
+        lo, hi = _PANIC_AT
+        if not (lo <= elapsed <= hi):
+            return []
+        try:
+            raise RuntimeError(
+                "cannot import name 'get_active_harness' from harness")
+        except RuntimeError as exc:
+            tb = "".join(_tb.format_exception(type(exc), exc,
+                                              exc.__traceback__))
+        return render_panic({
+            "exc_type": "ImportError",
+            "message": "cannot import name 'get_active_harness' from harness",
+            "origin": "doc_staleness.sweep",
+            "traceback": tb,
+        }, width=width)
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] panic overlay unavailable", exc_info=True)
+        return []
+
+
 def _stream_rows(elapsed: float, mux: Any = None) -> List[str]:
     """Strip rows for the demo, through the COCKPIT's renderer. NEVER raises.
 
@@ -1138,6 +1215,16 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         # else — the operator knew spend was happening and could not see what
         # for. Same words, revealed, then landing in the deck as the line
         # they became.
+        # The operator's backlog and the crash overlay, both through the
+        # cockpit's own renderers.
+        queue_rows=lambda: _queue_rows(
+            (clock() - start[0]) * speed,
+            __import__("shutil").get_terminal_size((80, 24)).columns,
+        ),
+        panic_rows=lambda: _panic_rows(
+            (clock() - start[0]) * speed,
+            __import__("shutil").get_terminal_size((80, 24)).columns,
+        ),
         stream_rows=lambda: _stream_rows(
             (clock() - start[0]) * speed, mux,
         ),
