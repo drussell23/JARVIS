@@ -749,6 +749,7 @@ def build_bipartite_application(
     agent_rows: Optional[Callable[[], Any]] = None,
     search_rows: Optional[Callable[[], Any]] = None,
     status_rows: Optional[Callable[[], Any]] = None,
+    pending_rows: Optional[Callable[[], Any]] = None,
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
@@ -1104,6 +1105,16 @@ def build_bipartite_application(
         except Exception:  # noqa: BLE001
             logger.debug("[Bipartite] %s row unavailable", label,
                          exc_info=True)
+    # The rejection window, above the search bar and the caret. It is the
+    # most time-critical row the cockpit ever draws — the operator has
+    # seconds — so it sits where the eye already is.
+    if pending_rows is not None:
+        try:
+            _pending_row = build_dynamic_rows(pending_rows)
+            if _pending_row is not None:
+                rows += [_pending_row]
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] pending row unavailable", exc_info=True)
     # The search bar sits DIRECTLY above the prompt    # The palette is NOT a row. See the FloatContainer below: as an HSplit row
     # it shares the ambient grid with the canvas, so every asynchronous Deck or
     # Lane frame arriving underneath forces the palette's geometry to be
@@ -1369,6 +1380,7 @@ async def run_bipartite_repl(
     agent_rows: Optional[Callable[[], Any]] = None,
     search_rows: Optional[Callable[[], Any]] = None,
     status_rows: Optional[Callable[[], Any]] = None,
+    pending_rows: Optional[Callable[[], Any]] = None,
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Launch the full-screen Bipartite REPL: build the multiplexer, register it as
@@ -1400,7 +1412,7 @@ async def run_bipartite_repl(
             completer=completer, history=history, auto_suggest=auto_suggest,
             turn_spinner=turn_spinner, agent_rows=agent_rows,
             search_rows=search_rows, status_rows=status_rows,
-            serpent_active=serpent_active,
+            pending_rows=pending_rows, serpent_active=serpent_active,
         )
         if watch_alive is not None:
             watcher = asyncio.ensure_future(

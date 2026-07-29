@@ -115,7 +115,7 @@ class KarenConfig:
 
     #: Master kill switch (shared with VoiceNarrator). False → no-op.
     master_enabled: bool = field(
-        default_factory=lambda: _env_bool("OUROBOROS_NARRATOR_ENABLED", True)
+        default_factory=lambda: _env_bool("OUROBOROS_NARRATOR_ENABLED", False)
     )
     #: Sub-switch specific to tool-call preambles. False → no-op even
     #: when the master is on, so operators can silence Karen's tool

@@ -88,7 +88,7 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
 
 def narrator_enabled() -> bool:
     """Master switch — shared with Karen tool-call + VoiceNarrator surfaces."""
-    return _env_bool("OUROBOROS_NARRATOR_ENABLED", True)
+    return _env_bool("OUROBOROS_NARRATOR_ENABLED", False)
 
 
 def recovery_voice_enabled() -> bool:

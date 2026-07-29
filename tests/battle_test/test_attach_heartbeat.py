@@ -54,18 +54,24 @@ def test_formatter_renders_cc_shape():
 
 
 def test_formatter_pulse_is_the_ouroboros_identity_spinner():
-    """The pulse is O+V's OWN animation — the theme's canonical Ouroboros
-    frames (snake → bite → reopen), not a borrowed star. Clock-driven:
-    different instants render different frames; the same instant renders
-    the SAME frame the daemon's REPL spinner would show."""
+    """The pulse wears O+V's glyph in Claude Code's SLOT.
+
+    It used to animate `🐍·····○` → `🐍◯`, eight cells wide, and this pinned
+    that consecutive instants differ. The operator's rule is CC's grammar
+    with O+V's content, and CC's working line is one cell of glyph then a
+    verb — so the frames collapsed to a single `🐍` and the motion moved to
+    where CC also puts it: the elapsed seconds and a changing verb.
+
+    What still has to hold is the ONE-AUTHORITY property: this pulse renders
+    exactly what the theme says, so every surface shows the same mark.
+    """
     from backend.core.ouroboros.ui.theme import ouroboros_frame
     a = format_heartbeat_line(_hb(), now_mono=100.00, arrival_mono=100.0)
-    b = format_heartbeat_line(_hb(), now_mono=100.30, arrival_mono=100.0)
     ga = a.split(" Synthesizing")[0]
-    gb = b.split(" Synthesizing")[0]
-    assert ga != gb                            # the snake advances
     assert "🐍" in ga                          # it IS the ouroboros
     assert ga.strip() == ouroboros_frame(100.00, unicode=True)  # ONE authority
+    # One cell, because a hairline and a status row are length-sensitive.
+    assert len(ga.strip()) == 1
 
 
 def test_spinner_single_authority_theme_serves_serpent_too():
@@ -76,8 +82,10 @@ def test_spinner_single_authority_theme_serves_serpent_too():
     assert sf._OUROBOROS_FRAMES is theme.OUROBOROS_SPINNER_FRAMES
     assert sf._OUROBOROS_FRAME_INTERVAL_S == theme.OUROBOROS_SPINNER_INTERVAL_S
     assert sf._frame_for_now() in theme.OUROBOROS_SPINNER_FRAMES
-    # ASCII degradation keeps the same story on dumb terminals.
-    assert theme.ouroboros_frame(0.0, unicode=False) == "s.....o"
+    # ASCII degradation still yields ONE cell — the story is the glyph's
+    # identity now, not a tail that has to be spelled out.
+    ascii_frame = theme.ouroboros_frame(0.0, unicode=False)
+    assert len(ascii_frame) == 1 and ascii_frame != "🐍"
 
 
 def test_formatter_elapsed_advances_client_side():

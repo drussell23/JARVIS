@@ -678,6 +678,8 @@ class AttachUI:
         self._agents: dict = {}
         #: The daemon's `StatusSnapshot`, as of the last heartbeat.
         self._status: dict = {}
+        #: Applies waiting out their rejection window, as of the last frame.
+        self._pending_apply: dict = {}
         self._focus_lines: List[str] = []
         self._focus_note: str = ""
         self._flash_text: str = ""
@@ -1021,6 +1023,27 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return []
 
+    def _pending_apply_rows(self) -> List[str]:
+        """The rejection window, counting down. NEVER raises.
+
+        Retires on the same staleness window as the pulse, the roster and
+        the status line — a dead daemon must not leave a countdown ticking
+        toward an apply that will never happen.
+        """
+        try:
+            import time as _time
+            from backend.core.ouroboros.battle_test.attach_heartbeat import (
+                heartbeat_stale_after_s,
+            )
+            from backend.core.ouroboros.battle_test.pending_apply import render
+            age = max(0.0, _time.monotonic() - float(self._heartbeat_arrived))
+            if not self._heartbeat_arrived or age > heartbeat_stale_after_s():
+                return []
+            return render(self._pending_apply, age_s=age,
+                          width=self._terminal_size()[0])
+        except Exception:  # noqa: BLE001
+            return []
+
     def _terminal_size(self) -> tuple:
         """``(columns, rows)``, or ``(None, None)`` when it cannot be known.
 
@@ -1307,6 +1330,12 @@ class AttachUI:
                 status = frame.get("status")
                 if isinstance(status, dict):
                     self._status = status
+                # A pending apply is CLEARED by absence, unlike the roster and
+                # the status line. Those keep their last value because a
+                # missing key means an older daemon; here it means the window
+                # closed, and a countdown that outlives its op is telling the
+                # operator they can still stop something that already ran.
+                self._pending_apply = frame.get("pending_apply") or {}
         except Exception:
             pass
 
@@ -3103,6 +3132,14 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             status_rows=(
                 ui._status_rows if ui is not None
                 and hasattr(ui, "_status_rows") else None
+            ),
+            # The rejection window, directly under the caret: while it is
+            # open, `/reject` is the only thing the operator may want to
+            # type, and the row is about the NEXT keystroke rather than the
+            # session.
+            pending_rows=(
+                ui._pending_apply_rows if ui is not None
+                and hasattr(ui, "_pending_apply_rows") else None
             ),
             seed=[
                 "[bold]💭 Karen ▸[/bold] attached — I'm listening. verbs or "

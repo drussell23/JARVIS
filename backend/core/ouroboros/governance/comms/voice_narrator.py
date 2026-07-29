@@ -57,7 +57,7 @@ class VoiceNarrator:
         synthesizer: Optional[Any] = None,
         arbiter: Optional[Any] = None,
     ) -> None:
-        self._enabled = os.environ.get("OUROBOROS_NARRATOR_ENABLED", "true").lower() in ("true", "1", "yes")
+        self._enabled = os.environ.get("OUROBOROS_NARRATOR_ENABLED", "false").lower() in ("true", "1", "yes")
         self._say_fn = say_fn
         self._debounce_s = debounce_s
         self._source = source
