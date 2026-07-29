@@ -547,6 +547,108 @@ def _clip(text: Any, width: int) -> str:
 _CHROME_ROWS = 1
 
 
+#: Lifecycle verbs, DERIVED from the event name rather than listed per
+#: event type. The codebase already names its events consistently —
+#: `swarm_node_spawned` / `swarm_node_vaporized`, `worker_op_claimed`,
+#: `swarm_scatter` / `swarm_stitched` — so a suffix rule covers all 191
+#: types and, more importantly, covers the 192nd automatically. A
+#: hand-maintained table of event types is exactly the thing that drifted
+#: when this roster had one producer.
+_BEGIN_MARKERS = ("spawned", "claimed", "scatter", "started", "dispatched")
+_END_MARKERS = ("vaporized", "stitched", "committed", "quarantined",
+                "finished", "completed", "failed", "reaped", "cancelled")
+
+#: Payload keys that identify the WORKER, most specific first. A worker
+#: without its own id falls back to the op — one row per op is a truthful
+#: under-count; inventing a synthetic id would create phantom agents that
+#: never retire.
+_IDENTITY_KEYS = ("node_id", "unit_id", "worker_id", "agent_id", "chunk_id")
+
+
+def lifecycle_of(event_type: str) -> str:
+    """``begin`` / ``end`` / ``""`` for an event name. Pure. NEVER raises.
+
+    End is checked FIRST: `swarm_node_vaporized` contains neither begin
+    marker, but a future `worker_spawn_failed` contains both, and the
+    truthful reading of a name carrying both is that the thing ended.
+    """
+    try:
+        name = str(event_type or "").strip().lower()
+        if not name:
+            return ""
+        if any(m in name for m in _END_MARKERS):
+            return "end"
+        if any(m in name for m in _BEGIN_MARKERS):
+            return "begin"
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def observe_task_event(
+    event_type: str, op_id: str, payload: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Map ONE task event onto the roster. NEVER raises.
+
+    The single adapter that replaces N per-subsystem wirings. Every
+    producer that already publishes a task event — BackgroundAgentPool's
+    `worker_op_claimed`, chunk_swarm's `swarm_node_spawned`, and whatever
+    is written next — gains roster presence without an edit of its own.
+    Returns the agent id it touched, or None.
+    """
+    try:
+        verb = lifecycle_of(event_type)
+        if not verb:
+            return None
+        data = dict(payload or {})
+        op = str(op_id or "")
+        ident = ""
+        for key in _IDENTITY_KEYS:
+            if data.get(key) not in (None, ""):
+                ident = f"{key.split('_')[0]}-{data[key]}"
+                break
+        agent_id = ident or op
+        if not agent_id:
+            return None
+        roster = get_agent_roster()
+        if verb == "begin":
+            roster.spawn(
+                agent_id,
+                kind=str(event_type).split("_")[0][:12] or "agent",
+                goal=str(data.get("goal") or data.get("description") or "")[:120],
+                op_id=op,
+                # An identified worker hangs under its op; a row that IS
+                # the op has no parent, which keeps it at top level rather
+                # than making it its own child.
+                parent_id=op if ident else "",
+                worktree=str(data.get("worktree") or data.get("branch") or ""),
+            )
+        else:
+            roster.finish(
+                agent_id,
+                state="failed" if "fail" in str(event_type).lower()
+                or "quarantin" in str(event_type).lower() else "finished",
+                detail=str(data.get("reason") or data.get("error") or "")[:60],
+            )
+        return agent_id
+    except Exception:  # noqa: BLE001
+        logger.debug("[AgentRoster] task-event adapter degraded", exc_info=True)
+        return None
+
+
+def install_task_event_adapter() -> bool:
+    """Subscribe the roster to the in-process task-event tap. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            add_local_observer,
+        )
+        add_local_observer(observe_task_event)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[AgentRoster] adapter install degraded", exc_info=True)
+        return False
+
+
 def order_by_lineage(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Depth-first order with a ``depth`` stamped on each row. Pure.
 
