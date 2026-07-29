@@ -203,7 +203,7 @@ class DaemonConfig:
             saga_step_timeout_s=_env_float("OUROBOROS_SAGA_STEP_TIMEOUT_S", 300.0),
             saga_total_timeout_s=_env_float("OUROBOROS_SAGA_TOTAL_TIMEOUT_S", 3600.0),
             acceptance_timeout_s=_env_float("OUROBOROS_ACCEPTANCE_TIMEOUT_S", 120.0),
-            narrator_enabled=_env_bool("OUROBOROS_NARRATOR_ENABLED", True),
+            narrator_enabled=_env_bool("OUROBOROS_NARRATOR_ENABLED", False),
             narrator_rate_limit_s=_env_float("OUROBOROS_NARRATOR_RATE_LIMIT_S", 60.0),
             narrator_voice=os.environ.get("OUROBOROS_NARRATOR_VOICE", "Samantha"),
         )
