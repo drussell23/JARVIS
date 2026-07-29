@@ -68,6 +68,7 @@ What this module does NOT do
 """
 from __future__ import annotations
 
+import contextvars
 import enum
 import logging
 import os
@@ -318,6 +319,68 @@ def _safe_str(raw: object) -> str:
 # ===========================================================================
 
 
+#: Who is executing right now, per async task.
+#:
+#: A ContextVar rather than a parameter because that is exactly what an
+#: async parent/child relationship IS: a value scoped to the task that set
+#: it, inherited by everything that task spawns, and invisible to its
+#: siblings. Threading `parent_op_id` through signatures would have to be
+#: repeated at every new spawn pattern — and the fact that nobody did it
+#: even once is why `register_parent` had zero callers.
+_ACTIVE_PARENT_OP: contextvars.ContextVar = contextvars.ContextVar(
+    "ov_active_parent_op", default="",
+)
+
+
+class executing:
+    """Mark the op whose execution this frame belongs to.
+
+    Both a context manager and re-entrant by nesting. Uses the token
+    returned by `set()` and `reset()`s it, rather than restoring a saved
+    value — under concurrency those differ: `reset(token)` restores THIS
+    frame's predecessor, while assigning a saved value can clobber a
+    sibling task that ran in between.
+
+    NEVER raises. A failure to mark causality must not stop the op.
+    """
+
+    __slots__ = ("_op_id", "_token")
+
+    def __init__(self, op_id: object) -> None:
+        self._op_id = _safe_str(op_id)
+        self._token = None
+
+    def __enter__(self) -> "executing":
+        try:
+            if self._op_id:
+                self._token = _ACTIVE_PARENT_OP.set(self._op_id)
+        except Exception:  # noqa: BLE001
+            self._token = None
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        try:
+            if self._token is not None:
+                _ACTIVE_PARENT_OP.reset(self._token)
+        except Exception:  # noqa: BLE001
+            pass
+        return False          # never swallow the body's exception
+
+    async def __aenter__(self) -> "executing":
+        return self.__enter__()
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return self.__exit__(*exc)
+
+
+def active_parent_op() -> str:
+    """The op executing in THIS async frame, or "". NEVER raises."""
+    try:
+        return _ACTIVE_PARENT_OP.get("")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 class OpBlockBuffer:
     """Thread-safe bounded FIFO of :class:`OpBlock` records.
 
@@ -455,6 +518,31 @@ class OpBlockBuffer:
 
     # ---- mutating API -------------------------------------------------
 
+    def _auto_link_from_context(self, child_op_id: str) -> None:
+        """Link a freshly-minted op to whoever is executing. NEVER raises.
+
+        The causality flows through the async CONTEXT rather than through
+        function signatures. `register_parent` had zero callers because
+        every candidate call site would have needed a `parent_op_id`
+        threaded down to it — so nobody threaded it, and a 777-line
+        renderer sat over a graph with no edges.
+
+        A ContextVar is the right shape because it is exactly what an
+        async parent/child relationship IS: a value scoped to the task
+        that set it, inherited by anything that task spawns, and invisible
+        to its siblings. Passing the id down would have to be repeated at
+        every new spawn pattern; the context is inherited by construction.
+        """
+        try:
+            parent = _ACTIVE_PARENT_OP.get("")
+            if not parent or parent == child_op_id:
+                return
+            self.register_parent(
+                child_op_id=child_op_id, parent_op_id=parent,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     def start_op(self, op_id: object) -> Optional[OpBlock]:
         """Begin buffering for ``op_id``. Returns the newly-created
         :class:`OpBlock` (state=BUFFERING).
@@ -468,6 +556,7 @@ class OpBlockBuffer:
         op_id_safe = _safe_str(op_id)
         if not op_id_safe:
             return None
+        _newly_minted = op_id_safe not in self._active_op_ids
         with self._lock:
             existing_ref = self._active_op_ids.get(op_id_safe)
             if existing_ref is not None:
@@ -485,7 +574,14 @@ class OpBlockBuffer:
             self._items[ref] = block
             self._active_op_ids[op_id_safe] = ref
             self._evict_if_needed()
-            return block
+        # Linked OUTSIDE the lock: `register_parent` acquires it too, and
+        # re-entering a non-reentrant lock deadlocks. The block is already
+        # registered, so the only observable window is microseconds in
+        # which a reader sees an op with no parent — exactly what every
+        # reader saw before this existed.
+        if _newly_minted:
+            self._auto_link_from_context(op_id_safe)
+        return block
 
     def append(self, op_id: object, line: object) -> bool:
         """Append a rendered line to the active block for ``op_id``.
@@ -667,6 +763,34 @@ class OpBlockBuffer:
 
         NEVER raises.
         """
+        # ACYCLIC GUARANTEE. `op_fanout_tree` walks this graph to render
+        # it; a cycle would spin that walk forever, and the render happens
+        # on the operator's frame. Refuse the edge rather than defend
+        # inside every future reader.
+        #
+        # Walked from the PROPOSED PARENT upward: if the child already
+        # sits above it, this edge would close a loop. Depth-capped as
+        # well as visited-guarded, because a corrupt store could present a
+        # chain with no cycle and no end.
+        try:
+            _c = _safe_str(child_op_id)
+            _p = _safe_str(parent_op_id)
+            if _c and _c == _p:
+                return False          # self-parent is the shortest cycle
+            _seen, _cur, _hops = set(), _p, 0
+            while _cur and _hops < 64:
+                if _cur == _c:
+                    logger.debug(
+                        "[OpBlockBuffer] refused cyclic edge %s -> %s",
+                        _p, _c)
+                    return False
+                if _cur in _seen:
+                    break             # pre-existing cycle; do not add to it
+                _seen.add(_cur)
+                _cur = self.get_parent_op_id(_cur) or ""
+                _hops += 1
+        except Exception:  # noqa: BLE001
+            return False              # cannot prove acyclic -> refuse
         if not op_dependency_graph_enabled():
             return False
         child_safe = _safe_str(child_op_id)

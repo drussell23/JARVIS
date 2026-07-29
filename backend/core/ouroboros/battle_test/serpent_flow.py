@@ -1967,6 +1967,26 @@ class SerpentFlow:
         except Exception:
             pass
 
+    def op_execution_scope(self, op_id: str) -> Any:
+        """Mark this frame as executing ``op_id``. NEVER raises.
+
+        The EXECUTION BOUNDARY. Any op minted inside this scope — by this
+        coroutine or anything it spawns — records itself as a child,
+        without a single call site passing a parent id down.
+
+        Exposed here rather than reaching into `op_block_buffer` from the
+        orchestrator, so the boundary lives beside the mint it pairs with
+        and a caller cannot enter one without the other being obvious.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.op_block_buffer import (
+                executing,
+            )
+            return executing(op_id)
+        except Exception:  # noqa: BLE001
+            import contextlib
+            return contextlib.nullcontext()
+
     def _maybe_buffer_op_commit(self, op_id: str, summary: str) -> None:
         """Commit the block AND render its collapsed line. NEVER raises.
 
