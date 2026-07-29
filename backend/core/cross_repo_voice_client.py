@@ -276,6 +276,15 @@ class CrossRepoVoiceClient:
         Returns:
             (success: bool, reason: str) tuple
         """
+        # MASTER MUTE — see backend/core/voice_mute. Every speech path
+        # gets the same answer; a mute honoured by only some of them
+        # is not a mute.
+        try:
+            from backend.core.voice_mute import voice_muted
+            if voice_muted():
+                return False
+        except Exception:  # noqa: BLE001
+            pass
         if not self._initialized:
             await self.initialize()
 

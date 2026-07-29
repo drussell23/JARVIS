@@ -899,6 +899,14 @@ class TTSEngine(ABC):
         timeout: Optional[float] = None
     ) -> bool:
         """Speak message with circuit breaker protection."""
+        # MASTER MUTE — at the engine base class, which every TTS engine
+        # (pyttsx3, `say -o` + afplay) passes through. The first attempt
+        # put this only in `safe_say`, trusting that function's docstring
+        # calling itself canonical; it is one of at least five speech
+        # paths, and the operator still heard her.
+        from backend.core.voice_mute import voice_muted
+        if voice_muted():
+            return False
         timeout = timeout or self.config.engine_timeout
 
         # Check circuit breaker

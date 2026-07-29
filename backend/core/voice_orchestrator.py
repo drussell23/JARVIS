@@ -334,6 +334,15 @@ class SerializedSpeaker:
         Returns:
             True if completed, False if timeout/interrupted
         """
+        # MASTER MUTE — see backend/core/voice_mute. Every speech path
+        # gets the same answer; a mute honoured by only some of them
+        # is not a mute.
+        try:
+            from backend.core.voice_mute import voice_muted
+            if voice_muted():
+                return False
+        except Exception:  # noqa: BLE001
+            pass
         timeout_s = timeout_s or float(os.environ.get("VOICE_PLAYBACK_TIMEOUT_S", "30"))
 
         async with self._playback_lock:
@@ -534,6 +543,15 @@ class VoiceOrchestrator:
 
         For kernel messages that originate within the same process.
         """
+        # MASTER MUTE — see backend/core/voice_mute. Every speech path
+        # gets the same answer; a mute honoured by only some of them
+        # is not a mute.
+        try:
+            from backend.core.voice_mute import voice_muted
+            if voice_muted():
+                return False
+        except Exception:  # noqa: BLE001
+            pass
         try:
             prio = VoicePriority[priority]
         except KeyError:
