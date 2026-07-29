@@ -33,6 +33,16 @@ from backend.core.ouroboros.battle_test.session_recorder import SessionRecorder
 
 from backend.core.ouroboros.ui.boot_labels import ui_label as _ui_label
 
+#: Semantic colour roles, resolved live through `ui.semantic_tokens`.
+#: NOT named `_C`: this module already binds that name locally to
+#: `rich.console.Console`, and shadowing it would turn every styled
+#: line into a TypeError at render time that no import test catches.
+from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
+    role_palette as _role_palette,
+)
+
+_SEM = _role_palette()
+
 logger = logging.getLogger(__name__)
 
 
@@ -5544,7 +5554,7 @@ class BattleTestHarness:
                 ActiveGoal, GoalStatus, GoalTracker,
             )
         except ImportError:
-            self._repl_print("[red]GoalTracker not available[/red]")
+            self._repl_print(f"[{_SEM['death']}]GoalTracker not available[/]")
             return
 
         tracker = GoalTracker(self._config.repo_path)
@@ -5566,7 +5576,7 @@ class BattleTestHarness:
             }.get(g.status, "white")
             status_tag = f" [{status_color}]{g.status.value}[/{status_color}]"
             return (
-                f"  [cyan]{g.goal_id}[/cyan]{status_tag}  {g.description}"
+                f"  [{_SEM['neural']}]{g.goal_id}[/]{status_tag}  {g.description}"
                 f"{tags}  [dim]({kw}){weight}[/dim]"
             )
 
@@ -5614,7 +5624,7 @@ class BattleTestHarness:
                 elif g.priority_weight <= 0.5:
                     weight_tag = " [dim]low[/dim]"
                 self._repl_print(
-                    f"  {indent}{branch}[cyan]{g.goal_id}[/cyan] "
+                    f"  {indent}{branch}[{_SEM['neural']}]{g.goal_id}[/] "
                     f"[{status_color}]{g.status.value}[/{status_color}]"
                     f"{weight_tag}  [dim]{g.description[:60]}[/dim]"
                 )
@@ -5623,7 +5633,7 @@ class BattleTestHarness:
             goal_id = parts[2].strip()
             g = tracker.get(goal_id)
             if g is None:
-                self._repl_print(f"[red]No goal matching '{goal_id}'[/red]")
+                self._repl_print(f"[{_SEM['death']}]No goal matching '{goal_id}'[/]")
                 return
             self._repl_print(f"[bold cyan]{g.goal_id}[/bold cyan]  [dim]({g.status.value})[/dim]")
             self._repl_print(f"  description: {g.description}")
@@ -5651,16 +5661,16 @@ class BattleTestHarness:
                 tokens = rest.split(None, 2)
                 if len(tokens) < 3:
                     self._repl_print(
-                        "[red]Usage: /goal add --parent <parent-id> "
-                        "<description>[/red]"
+                        f"[{_SEM['death']}]Usage: /goal add --parent <parent-id> "
+                        f"<description>[/]"
                     )
                     return
                 parent_id = tokens[1].strip()
                 rest = tokens[2].strip()
                 if tracker.get(parent_id) is None:
                     self._repl_print(
-                        f"[red]Parent '{parent_id}' not found — "
-                        f"run /goal tree to see available ids[/red]"
+                        f"[{_SEM['death']}]Parent '{parent_id}' not found — "
+                        f"run /goal tree to see available ids[/]"
                     )
                     return
             desc = rest.strip("'\"")
@@ -5678,8 +5688,8 @@ class BattleTestHarness:
             # tracker heals this anyway but we surface the reason.
             if parent_id and tracker.has_cycle(slug, parent_id):
                 self._repl_print(
-                    f"[yellow]Note: parent '{parent_id}' would cycle — "
-                    f"installing '{slug}' as root[/yellow]"
+                    f"[{_SEM['heal']}]Note: parent '{parent_id}' would cycle — "
+                    f"installing '{slug}' as root[/]"
                 )
             tracker.add_goal(goal)
             stored = tracker.get(slug)
@@ -5687,7 +5697,7 @@ class BattleTestHarness:
             if stored and stored.parent_id:
                 parent_note = f"  [dim]parent: {stored.parent_id}[/dim]"
             self._repl_print(
-                f"[green]Goal added:[/green] [cyan]{slug}[/cyan]  "
+                f"[{_SEM['success']}]Goal added:[/] [{_SEM['neural']}]{slug}[/]  "
                 f"[dim]keywords: {', '.join(keywords) or '(none)'}[/dim]"
                 f"{parent_note}"
             )
@@ -5695,30 +5705,30 @@ class BattleTestHarness:
         elif subcmd in ("remove", "rm") and len(parts) > 2:
             goal_id = parts[2].strip()
             if tracker.remove_goal(goal_id):
-                self._repl_print(f"[green]Removed goal: {goal_id}[/green]")
+                self._repl_print(f"[{_SEM['success']}]Removed goal: {goal_id}[/]")
             else:
-                self._repl_print(f"[red]No goal matching '{goal_id}'[/red]")
+                self._repl_print(f"[{_SEM['death']}]No goal matching '{goal_id}'[/]")
 
         elif subcmd == "pause" and len(parts) > 2:
             goal_id = parts[2].strip()
             if tracker.pause(goal_id):
-                self._repl_print(f"[yellow]Paused goal: {goal_id}[/yellow]")
+                self._repl_print(f"[{_SEM['heal']}]Paused goal: {goal_id}[/]")
             else:
-                self._repl_print(f"[red]No goal matching '{goal_id}'[/red]")
+                self._repl_print(f"[{_SEM['death']}]No goal matching '{goal_id}'[/]")
 
         elif subcmd == "resume" and len(parts) > 2:
             goal_id = parts[2].strip()
             if tracker.resume(goal_id):
-                self._repl_print(f"[green]Resumed goal: {goal_id}[/green]")
+                self._repl_print(f"[{_SEM['success']}]Resumed goal: {goal_id}[/]")
             else:
-                self._repl_print(f"[red]No goal matching '{goal_id}'[/red]")
+                self._repl_print(f"[{_SEM['death']}]No goal matching '{goal_id}'[/]")
 
         elif subcmd == "complete" and len(parts) > 2:
             goal_id = parts[2].strip()
             if tracker.complete(goal_id):
                 self._repl_print(f"[blue]Completed goal: {goal_id}[/blue]")
             else:
-                self._repl_print(f"[red]No goal matching '{goal_id}'[/red]")
+                self._repl_print(f"[{_SEM['death']}]No goal matching '{goal_id}'[/]")
 
         elif subcmd == "purge":
             removed = tracker.purge_completed()
@@ -5737,7 +5747,7 @@ class BattleTestHarness:
             self._repl_goal_explain(parts[2].strip())
 
         elif subcmd == "explain":
-            self._repl_print("[red]Usage: /goal explain <op-id>[/red]")
+            self._repl_print(f"[{_SEM['death']}]Usage: /goal explain <op-id>[/]")
 
         else:
             self._repl_print(
@@ -5757,7 +5767,7 @@ class BattleTestHarness:
                 GoalActivityLedger,
             )
         except ImportError:
-            self._repl_print("[red]GoalActivityLedger not available[/red]")
+            self._repl_print(f"[{_SEM['death']}]GoalActivityLedger not available[/]")
             return None
         return GoalActivityLedger(self._config.repo_path)
 
@@ -5788,11 +5798,11 @@ class BattleTestHarness:
                 try:
                     limit = max(1, int(tokens[i + 1]))
                 except ValueError:
-                    self._repl_print(f"[red]Invalid --limit '{tokens[i + 1]}'[/red]")
+                    self._repl_print(f"[{_SEM['death']}]Invalid --limit '{tokens[i + 1]}'[/]")
                     return
                 i += 2
             else:
-                self._repl_print(f"[red]Unknown token '{tok}'[/red]")
+                self._repl_print(f"[{_SEM['death']}]Unknown token '{tok}'[/]")
                 return
 
         try:
@@ -5802,7 +5812,7 @@ class BattleTestHarness:
                 limit=limit,
             )
         except Exception as exc:  # noqa: BLE001
-            self._repl_print(f"[red]Ledger read failed: {exc}[/red]")
+            self._repl_print(f"[{_SEM['death']}]Ledger read failed: {exc}[/]")
             return
 
         if not rows:
@@ -5837,7 +5847,7 @@ class BattleTestHarness:
             color = {"direct": "green", "ancestor": "cyan", "sibling": "yellow"}.get(kind, "white")
             self._repl_print(
                 f"  {op_id}  [{color}]{kind:<8}[/{color}]  "
-                f"[cyan]{gid}[/cyan]  [bold]{score_f:.2f}[/bold]  "
+                f"[{_SEM['neural']}]{gid}[/]  [bold]{score_f:.2f}[/bold]  "
                 f"[dim]{reason_str}[/dim]"
             )
 
@@ -5849,7 +5859,7 @@ class BattleTestHarness:
         try:
             summary = ledger.compute_drift(session_id=self._session_id)
         except Exception as exc:  # noqa: BLE001
-            self._repl_print(f"[red]Drift compute failed: {exc}[/red]")
+            self._repl_print(f"[{_SEM['death']}]Drift compute failed: {exc}[/]")
             return
 
         status = summary.status
@@ -5873,7 +5883,7 @@ class BattleTestHarness:
             )
         else:
             self._repl_print(
-                f"[green]Strategic drift: ok[/green]  "
+                f"[{_SEM['success']}]Strategic drift: ok[/]  "
                 f"({drifted}/{total} missed, {ratio_s})  "
                 f"[dim]threshold: {warn_ratio:.0%}[/dim]"
             )
@@ -5884,12 +5894,12 @@ class BattleTestHarness:
         if ledger is None:
             return
         if not op_id:
-            self._repl_print("[red]Usage: /goal explain <op-id>[/red]")
+            self._repl_print(f"[{_SEM['death']}]Usage: /goal explain <op-id>[/]")
             return
         try:
             rows = ledger.read(session_id=self._session_id, op_id=op_id)
         except Exception as exc:  # noqa: BLE001
-            self._repl_print(f"[red]Ledger read failed: {exc}[/red]")
+            self._repl_print(f"[{_SEM['death']}]Ledger read failed: {exc}[/]")
             return
         if not rows:
             self._repl_print(
@@ -5898,7 +5908,7 @@ class BattleTestHarness:
             )
             return
         self._repl_print(
-            f"[bold]Explain op[/bold] [cyan]{op_id}[/cyan]  "
+            f"[bold]Explain op[/bold] [{_SEM['neural']}]{op_id}[/]  "
             f"[dim]({len(rows)} row(s))[/dim]"
         )
         for row in rows:
@@ -5920,7 +5930,7 @@ class BattleTestHarness:
             reason_str = ", ".join(str(r) for r in reasons)
             color = {"direct": "green", "ancestor": "cyan", "sibling": "yellow"}.get(kind, "white")
             self._repl_print(
-                f"  [cyan]{gid}[/cyan]  [{color}]{kind}[/{color}]  "
+                f"  [{_SEM['neural']}]{gid}[/]  [{color}]{kind}[/{color}]  "
                 f"[bold]{score_f:.2f}[/bold]{src_note}"
             )
             if reason_str:
@@ -5939,12 +5949,12 @@ class BattleTestHarness:
                 get_default_store,
             )
         except ImportError:
-            self._repl_print("[red]UserPreferenceStore not available[/red]")
+            self._repl_print(f"[{_SEM['death']}]UserPreferenceStore not available[/]")
             return None
         try:
             return get_default_store(self._config.repo_path)
         except Exception as exc:  # noqa: BLE001
-            self._repl_print(f"[red]Store init failed: {exc}[/red]")
+            self._repl_print(f"[{_SEM['death']}]Store init failed: {exc}[/]")
             return None
 
     def _repl_cmd_memory(self, line: str) -> None:
@@ -5993,10 +6003,10 @@ class BattleTestHarness:
             )
             self._repl_print(header)
             for m in mems:
-                type_tag = f"[cyan]{m.type.value}[/cyan]"
+                type_tag = f"[{_SEM['neural']}]{m.type.value}[/]"
                 tag_str = f" [dim]{', '.join(m.tags)}[/dim]" if m.tags else ""
                 path_str = (
-                    f" [yellow]paths={', '.join(m.paths)}[/yellow]" if m.paths else ""
+                    f" [{_SEM['heal']}]paths={', '.join(m.paths)}[/]" if m.paths else ""
                 )
                 self._repl_print(
                     f"  {type_tag}  [bold]{m.name}[/bold] "
@@ -6008,48 +6018,48 @@ class BattleTestHarness:
             # Format: /memory add <type> <name> | <description>
             if "|" not in rest:
                 self._repl_print(
-                    "[red]Usage: /memory add <type> <name> | <description>[/red]"
+                    f"[{_SEM['death']}]Usage: /memory add <type> <name> | <description>[/]"
                 )
                 return
             head, _, description = rest.partition("|")
             head_parts = head.strip().split(None, 1)
             if len(head_parts) < 2:
                 self._repl_print(
-                    "[red]Usage: /memory add <type> <name> | <description>[/red]"
+                    f"[{_SEM['death']}]Usage: /memory add <type> <name> | <description>[/]"
                 )
                 return
             type_raw, name = head_parts[0], head_parts[1].strip()
             description = description.strip()
             if not name or not description:
                 self._repl_print(
-                    "[red]Name and description must both be non-empty[/red]"
+                    f"[{_SEM['death']}]Name and description must both be non-empty[/]"
                 )
                 return
             try:
                 mem_type = MemoryType.from_str(type_raw)
                 mem = store.add(mem_type, name, description, source="repl")
                 self._repl_print(
-                    f"[green]Memory added:[/green] [cyan]{mem.type.value}[/cyan]  "
+                    f"[{_SEM['success']}]Memory added:[/] [{_SEM['neural']}]{mem.type.value}[/]  "
                     f"[bold]{mem.name}[/bold] [dim]({mem.id})[/dim]"
                 )
             except ValueError as exc:
-                self._repl_print(f"[red]{exc}[/red]")
+                self._repl_print(f"[{_SEM['death']}]{exc}[/]")
             return
 
         if subcmd in ("rm", "remove", "delete"):
             if not rest:
-                self._repl_print("[red]Usage: /memory rm <id>[/red]")
+                self._repl_print(f"[{_SEM['death']}]Usage: /memory rm <id>[/]")
                 return
             if store.delete(rest):
-                self._repl_print(f"[green]Removed memory: {rest}[/green]")
+                self._repl_print(f"[{_SEM['success']}]Removed memory: {rest}[/]")
             else:
-                self._repl_print(f"[red]No memory matching '{rest}'[/red]")
+                self._repl_print(f"[{_SEM['death']}]No memory matching '{rest}'[/]")
             return
 
         if subcmd == "forbid":
             if not rest:
                 self._repl_print(
-                    "[red]Usage: /memory forbid <path-substring>[/red]"
+                    f"[{_SEM['death']}]Usage: /memory forbid <path-substring>[/]"
                 )
                 return
             try:
@@ -6063,20 +6073,20 @@ class BattleTestHarness:
                     source="repl",
                 )
                 self._repl_print(
-                    f"[green]Forbidden path added:[/green] [yellow]{rest}[/yellow] "
+                    f"[{_SEM['success']}]Forbidden path added:[/] [{_SEM['heal']}]{rest}[/] "
                     f"[dim]({mem.id})[/dim]"
                 )
             except ValueError as exc:
-                self._repl_print(f"[red]{exc}[/red]")
+                self._repl_print(f"[{_SEM['death']}]{exc}[/]")
             return
 
         if subcmd == "show":
             if not rest:
-                self._repl_print("[red]Usage: /memory show <id>[/red]")
+                self._repl_print(f"[{_SEM['death']}]Usage: /memory show <id>[/]")
                 return
             mem = store.get(rest)
             if mem is None:
-                self._repl_print(f"[red]No memory matching '{rest}'[/red]")
+                self._repl_print(f"[{_SEM['death']}]No memory matching '{rest}'[/]")
                 return
             self._render_memory_detail_panel(mem)
             return
@@ -6088,7 +6098,7 @@ class BattleTestHarness:
 
         if subcmd == "search":
             if not rest:
-                self._repl_print("[red]Usage: /memory search <query>[/red]")
+                self._repl_print(f"[{_SEM['death']}]Usage: /memory search <query>[/]")
                 return
             self._render_memory_search(store, rest)
             return
@@ -6134,12 +6144,12 @@ class BattleTestHarness:
                 register_default_engine,
             )
         except Exception:
-            self._repl_print("[red]Goal inference module unavailable.[/red]")
+            self._repl_print(f"[{_SEM['death']}]Goal inference module unavailable.[/]")
             return
 
         if not inference_enabled():
             self._repl_print(
-                "[yellow]Goal inference disabled.[/yellow]  "
+                f"[{_SEM['heal']}]Goal inference disabled.[/]  "
                 "[dim]Set JARVIS_GOAL_INFERENCE_ENABLED=1 and retry.[/dim]"
             )
             return
@@ -6156,7 +6166,7 @@ class BattleTestHarness:
         if sub == "refresh":
             result = engine.build(force=True)
             self._repl_print(
-                f"[green]✓ rebuilt[/green]  hypotheses={len(result.inferred)}  "
+                f"[{_SEM['success']}]✓ rebuilt[/]  hypotheses={len(result.inferred)}  "
                 f"samples={result.total_samples}  build_ms={result.build_ms}"
             )
             sub = ""   # fall through to render
@@ -6174,7 +6184,7 @@ class BattleTestHarness:
         if sub in ("accept", "reject"):
             if not arg:
                 self._repl_print(
-                    f"[red]Usage: /infer {sub} <id>[/red]"
+                    f"[{_SEM['death']}]Usage: /infer {sub} <id>[/]"
                 )
                 return
             result = engine.get_current() or engine.build()
@@ -6184,7 +6194,7 @@ class BattleTestHarness:
             )
             if target is None:
                 self._repl_print(
-                    f"[red]No inferred goal with id {arg!r}[/red]"
+                    f"[{_SEM['death']}]No inferred goal with id {arg!r}[/]"
                 )
                 return
             if sub == "accept":
@@ -6307,7 +6317,7 @@ class BattleTestHarness:
             from backend.core.ouroboros.plugins import plugins_enabled
             if not plugins_enabled():
                 self._repl_print(
-                    "[yellow]Plugins disabled.[/yellow] "
+                    f"[{_SEM['heal']}]Plugins disabled.[/] "
                     "[dim]Set JARVIS_PLUGINS_ENABLED=1 and restart.[/dim]"
                 )
             else:
@@ -6415,7 +6425,7 @@ class BattleTestHarness:
             output = await plugin.run(args.strip())
         except Exception as exc:
             self._repl_print(
-                f"[red]/{head}: plugin raised {type(exc).__name__}: {exc}[/red]"
+                f"[{_SEM['death']}]/{head}: plugin raised {type(exc).__name__}: {exc}[/]"
             )
             return True
         if output:
@@ -6449,7 +6459,7 @@ class BattleTestHarness:
         gls = self._governed_loop_service
         if gls is None:
             self._repl_print(
-                "[red]/tdd: governed_loop_service not booted yet[/red]"
+                f"[{_SEM['death']}]/tdd: governed_loop_service not booted yet[/]"
             )
             return
 
@@ -6477,20 +6487,20 @@ class BattleTestHarness:
                             pass
                         matched = True
                         self._repl_print(
-                            f"[green]✓ /tdd[/green]  op=[bold]{op_id}[/bold] "
+                            f"[{_SEM['success']}]✓ /tdd[/]  op=[bold]{op_id}[/bold] "
                             "marked TDD-shaped (prompt directive active at "
                             "next CONTEXT_EXPANSION)"
                         )
                     except Exception as exc:
                         self._repl_print(
-                            f"[red]/tdd failed for {op_id}:[/red] {exc}"
+                            f"[{_SEM['death']}]/tdd failed for {op_id}:[/] {exc}"
                         )
                     break
         except Exception:
             pass
         if not matched:
             self._repl_print(
-                f"[yellow]/tdd:[/yellow] no active op matching [bold]{target}[/bold]. "
+                f"[{_SEM['heal']}]/tdd:[/] no active op matching [bold]{target}[/bold]. "
                 "Set intake-time via evidence[tdd_mode]=True, or retry "
                 "after the op reaches CLASSIFY."
             )
@@ -6659,7 +6669,7 @@ class BattleTestHarness:
             f"[bold]Search[/bold]  [dim]query='{query}'  hits={len(hits)}[/dim]"
         )
         for m in hits[:25]:
-            type_tag = f"[cyan]{m.type.value}[/cyan]"
+            type_tag = f"[{_SEM['neural']}]{m.type.value}[/]"
             self._repl_print(
                 f"  {type_tag}  [bold]{m.name}[/bold] "
                 f"[dim]({m.id})[/dim]  {m.description[:80]}"
@@ -6685,7 +6695,7 @@ class BattleTestHarness:
         for m in all_mems:
             ts = m.updated_at or m.created_at or ""
             ts_short = ts[:19] if ts else ""
-            type_tag = f"[cyan]{m.type.value}[/cyan]"
+            type_tag = f"[{_SEM['neural']}]{m.type.value}[/]"
             self._repl_print(
                 f"  [dim]{ts_short}[/dim]  {type_tag}  "
                 f"[bold]{m.name}[/bold] [dim]({m.id})[/dim]  "
@@ -6712,7 +6722,7 @@ class BattleTestHarness:
 
         parts = line.replace("/remember", "remember", 1).split(None, 1)
         if len(parts) < 2 or not parts[1].strip():
-            self._repl_print("[red]Usage: /remember <text>[/red]")
+            self._repl_print(f"[{_SEM['death']}]Usage: /remember <text>[/]")
             return
         text = parts[1].strip()
         # Derive a short memory name from the first ~40 chars.
@@ -6725,11 +6735,11 @@ class BattleTestHarness:
                 source="repl:remember",
             )
             self._repl_print(
-                f"[green]Remembered:[/green] [cyan]user[/cyan]  "
+                f"[{_SEM['success']}]Remembered:[/] [{_SEM['neural']}]user[/]  "
                 f"[bold]{mem.name}[/bold] [dim]({mem.id})[/dim]"
             )
         except ValueError as exc:
-            self._repl_print(f"[red]{exc}[/red]")
+            self._repl_print(f"[{_SEM['death']}]{exc}[/]")
 
     def _repl_cmd_forget(self, line: str) -> None:
         """Shortcut for /memory rm: removes a memory by id.
@@ -6743,13 +6753,13 @@ class BattleTestHarness:
 
         parts = line.replace("/forget", "forget", 1).split(None, 1)
         if len(parts) < 2 or not parts[1].strip():
-            self._repl_print("[red]Usage: /forget <id>[/red]")
+            self._repl_print(f"[{_SEM['death']}]Usage: /forget <id>[/]")
             return
         mem_id = parts[1].strip()
         if store.delete(mem_id):
-            self._repl_print(f"[green]Forgotten: {mem_id}[/green]")
+            self._repl_print(f"[{_SEM['success']}]Forgotten: {mem_id}[/]")
         else:
-            self._repl_print(f"[red]No memory matching '{mem_id}'[/red]")
+            self._repl_print(f"[{_SEM['death']}]No memory matching '{mem_id}'[/]")
 
     async def _repl_cmd_undo(self, line: str) -> None:
         """/undo N — revert the last N O+V auto-commits.
@@ -6777,13 +6787,13 @@ class BattleTestHarness:
                 render_plan,
             )
         except Exception:
-            self._repl_print("[red]Undo module unavailable.[/red]")
+            self._repl_print(f"[{_SEM['death']}]Undo module unavailable.[/]")
             return
 
         n, mode, parse_err = parse_undo_args(line)
         if parse_err:
             self._repl_print(
-                f"[red]/undo: {parse_err}[/red]\n"
+                f"[{_SEM['death']}]/undo: {parse_err}[/]\n"
                 f"[dim]usage: /undo [N] | /undo preview [N] | /undo --hard N[/dim]"
             )
             return
@@ -6868,13 +6878,13 @@ class BattleTestHarness:
                 render_plan,
             )
         except Exception:
-            self._repl_print("[red]Resume module unavailable.[/red]")
+            self._repl_print(f"[{_SEM['death']}]Resume module unavailable.[/]")
             return
 
         mode, op_prefix, err = parse_resume_args(line)
         if err:
             self._repl_print(
-                f"[red]/resume: {err}[/red]\n"
+                f"[{_SEM['death']}]/resume: {err}[/]\n"
                 f"[dim]usage: /resume | /resume list | /resume all | /resume <op-prefix>[/dim]"
             )
             return
@@ -6901,7 +6911,7 @@ class BattleTestHarness:
             return
         if plan.resumable_count == 0:
             self._repl_print(
-                "[yellow]No resumable orphans.[/yellow]"
+                f"[{_SEM['heal']}]No resumable orphans.[/]"
             )
             return
 
@@ -9541,7 +9551,7 @@ class BattleTestHarness:
                     )
                 else:
                     _line = (
-                        f"[green]Strategic drift: ok[/green] "
+                        f"[{_SEM['success']}]Strategic drift: ok[/] "
                         f"({_drifted}/{_total} missed, {_ratio_s})"
                     )
                 _c = self._serpent_flow.console if hasattr(self, "_serpent_flow") and self._serpent_flow else None

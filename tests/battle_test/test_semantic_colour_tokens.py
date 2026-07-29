@@ -61,7 +61,11 @@ class TestTheVocabularyMatchesClaudeCode:
         nothing else. When green is also chrome, a successful outcome
         stops being visible."""
         greens = [r for r, s in role_palette().items() if "green" in s]
-        assert set(greens) <= {"life", "code_add"}, greens
+        # All three ARE outcomes-or-additions, which is the actual rule:
+        # `life` (the organism evolved, emphatic), `success` (a step
+        # succeeded, plain) and `code_add` (a diff addition). What must
+        # never appear here is chrome — a border, a heading, a label.
+        assert set(greens) <= {"life", "success", "code_add"}, greens
 
     def test_paths_are_cyan_and_underlined(self):
         """CC renders paths as clickable-feeling. Underline is carried
@@ -125,7 +129,7 @@ class TestItNeverBreaksRendering:
 #: silently produces plain text and no test notices, which is why the fix
 #: is "stop new ones now, migrate incrementally" rather than one change.
 _RAW_LITERAL_CEILING = {
-    "backend/core/ouroboros/battle_test": 244,
+    "backend/core/ouroboros/battle_test": 96,
     "backend/core/ouroboros/cli": 12,
     "backend/core/ouroboros/ui": 3,
     "backend/core/ouroboros/governance": 106,
