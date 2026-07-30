@@ -450,3 +450,91 @@ class TestTheWiring:
         assert calls
         passed = {kw.arg for c in calls for kw in c.keywords if kw.arg}
         assert "diff_rows" in passed
+
+
+class TestOverlaysOcclude:
+    """An overlay that does not cover what is beneath it is not an overlay.
+
+    Reproduced from a screenshot: the FATAL traceback had deck bullets (`⏺`, `💭`,
+    `●`) running down its left margin. The float was inset at `left=2`, so the
+    deck's GLYPH GUTTER — columns 0-2 — stayed visible beside it, and a crash
+    report read as interleaved with the transcript underneath.
+    """
+
+    def _render(self, **kwargs):
+        """One real frame, floats included. Call from an ASYNC test.
+
+        The Application's input buffer schedules a history load on the running
+        loop, so a synchronous caller dies with "no running event loop" — the same
+        constraint the arbiter's KeyProcessor tests hit.
+
+        `write_to_screen` DEFERS float drawing; `Screen.draw_all_floats()` is what
+        actually paints them. Without that call the first version of this test
+        reported no overlay at all and would have "passed" for a float that never
+        rendered.
+        """
+        from prompt_toolkit.layout.containers import to_container
+        from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+        from prompt_toolkit.layout.screen import Screen, WritePosition
+
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout, build_bipartite_application,
+        )
+        mux = BipartiteLayout()
+        for i in range(40):
+            mux.push_raw(f"CANVAS-LINE-{i}")
+        app = build_bipartite_application(
+            mux, on_accept=lambda _t: None, **kwargs)
+        width, height = 60, 20
+        screen = Screen(default_char=None, initial_width=width,
+                        initial_height=height)
+        to_container(app.layout.container).write_to_screen(
+            screen, MouseHandlers(), WritePosition(0, 0, width, height),
+            "", False, None)
+        screen.draw_all_floats()
+        return [
+            "".join(screen.data_buffer[y][x].char for x in range(width))
+            for y in range(height)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_panic_overlay_hides_the_deck_beneath_it(self):
+        rows = self._render(
+            panic_rows=lambda: ["FATAL LINE A", "", "", "FATAL LINE D"])
+        overlay = rows[1:5]
+        assert any("FATAL LINE A" in r for r in overlay)
+        for r in overlay:
+            assert "CANVAS-" not in r, (
+                f"deck bled through the overlay: {r.rstrip()!r} — the float is "
+                f"inset again and the glyph gutter shows beside it")
+
+    @pytest.mark.asyncio
+    async def test_a_blank_overlay_line_still_occludes(self):
+        """The subtle half. Rows 2 and 3 of the payload are EMPTY, and an empty
+        line that paints nothing lets the transcript show through the middle of a
+        traceback."""
+        rows = self._render(
+            panic_rows=lambda: ["HEADER", "", "", "FOOTER"])
+        assert "CANVAS-" not in rows[2]
+        assert "CANVAS-" not in rows[3]
+
+    @pytest.mark.asyncio
+    async def test_the_diff_overlay_occludes_too(self):
+        """Same contract, same helpers — it would be pointless to fix one."""
+        rows = self._render(diff_rows=lambda: ["DIFF HEADER", "", "+ added"])
+        for r in rows[1:4]:
+            assert "CANVAS-" not in r
+
+    def test_both_overlays_share_one_position_contract(self):
+        """Two spellings of "where does an overlay sit" is how one of them gets
+        inset again."""
+        from backend.core.ouroboros.battle_test import bipartite_layout as bl
+        assert bl._OVERLAY_FLOAT_POSITION["left"] == 0
+        assert bl._OVERLAY_FLOAT_POSITION["right"] == 0
+
+    def test_the_overlay_style_carries_a_background(self):
+        """A foreground-only style leaves prompt_toolkit painting the float's
+        cells with the DEFAULT background, which on a themed terminal is not the
+        deck's — so the overlay reads as text floating on the transcript."""
+        from backend.core.ouroboros.battle_test import bipartite_layout as bl
+        assert "bg:" in bl._overlay_style("alert")

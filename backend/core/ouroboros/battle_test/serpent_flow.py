@@ -6693,6 +6693,10 @@ class SerpentREPL:
                     # `/expand d-N` opens this. The daemon owns the archive, so
                     # this is the only surface that can render a diff locally.
                     diff_rows=_mount.get("diff_rows"),
+                    # The crest. The process that IS the organism showed no
+                    # emblem while a thin viewer of it drew one.
+                    header=_mount.get("header"),
+                    header_height=_mount.get("header_height") or 0,
                 )
                 return
         except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL
