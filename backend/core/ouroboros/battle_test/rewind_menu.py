@@ -58,6 +58,95 @@ def _reply_timeout_s() -> float:
         return 5.0
 
 
+class LocalRewindClient:
+    """The daemon terminal's half of the Transactional Viewport Lock.
+
+    `RewindController` needs exactly three things from a "client":
+    ``send_autonomy("pause")``, ``send_rewind_request()`` and
+    ``send_autonomy("resume")``. Nothing about the lock is bridge-specific
+    — the bridge existed because the cockpit is a SEPARATE PROCESS and had
+    to ask the daemon to pause. At the daemon's own terminal there is no
+    second process, so the same three calls are local.
+
+    So the lock is not reimplemented here. This is the second entrance to
+    one implementation — the pattern `_on_autonomy` already states in its
+    own comment ("the SAME intake pause the pause/resume verbs flip: one
+    implementation, two entrances").
+
+    The snapshot arrives SYNCHRONOUSLY, which the bridge path cannot do.
+    `deliver()` is therefore called from inside `send_rewind_request()`,
+    before it returns — the controller tolerates this because it only ever
+    required delivery to happen once, not later.
+
+    NEVER raises: a rewind menu that can break the REPL it opens in is
+    worse than no menu.
+    """
+
+    __slots__ = ("_pause", "_resume", "_provider", "_deliver", "_limit",
+                 "_held")
+
+    def __init__(
+        self,
+        *,
+        pause: Callable[[], Any],
+        resume: Callable[[], Any],
+        provider: Callable[[int], Any],
+        deliver: Optional[Callable[[Any], Any]] = None,
+        limit: int = 10,
+    ) -> None:
+        self._pause = pause
+        self._resume = resume
+        self._provider = provider
+        self._deliver = deliver
+        self._limit = max(1, int(limit))
+        #: Whether WE acquired the hold. A resume we did not pause for
+        #: would release someone else's lock — the refcount upstream is
+        #: what makes concurrent holders safe, and lying to it defeats it.
+        self._held = False
+
+    def bind_deliver(self, deliver: Callable[[Any], Any]) -> None:
+        self._deliver = deliver
+
+    def send_autonomy(self, action: str) -> bool:
+        try:
+            if str(action) == "pause":
+                self._pause()
+                self._held = True
+                return True
+            if str(action) == "resume":
+                if not self._held:
+                    return True      # nothing of ours to release
+                self._resume()
+                self._held = False
+                return True
+            return False
+        except Exception:  # noqa: BLE001
+            logger.debug("[Rewind] local autonomy %s failed", action,
+                         exc_info=True)
+            return False
+
+    def send_rewind_request(self) -> bool:
+        """Fetch and deliver the snapshot in one step. NEVER raises.
+
+        Returns False when the planner yields nothing — the controller
+        treats that as an empty list and releases the hold, which is the
+        correct outcome: an empty menu must not leave intake paused.
+        """
+        try:
+            rows = list(self._provider(self._limit) or ())
+        except Exception:  # noqa: BLE001
+            logger.debug("[Rewind] local provider failed", exc_info=True)
+            return False
+        if self._deliver is None:
+            return False
+        try:
+            self._deliver({"candidates": rows})
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug("[Rewind] local deliver failed", exc_info=True)
+            return False
+
+
 class RewindController:
     """The lock's client half + the menu's state machine.
 
@@ -251,6 +340,87 @@ class RewindCompleter(_completer_base()):  # type: ignore[misc]
             return
 
 
+def render_restore_points(
+    candidates: Any, *, width: Optional[int] = None,
+) -> List[str]:
+    """The restore points as plain rows. Pure. NEVER raises.
+
+    A plain list rather than a Float, because the DAEMON's own REPL is a
+    `PromptSession` and has no palette overlay — the Float belongs to the
+    cockpit's `FloatContainer`. Rendering rows means the same snapshot is
+    usable on a surface that cannot host a menu, instead of the daemon
+    terminal having no rewind at all.
+
+    Numbered to match `/undo N` exactly, so the reading and the command
+    cannot disagree — and NOT auto-executed: a rollback should never be
+    one accidental keystroke, which is the same reason the cockpit menu
+    only INSERTS the command.
+    """
+    try:
+        rows = [c for c in (candidates or ()) if isinstance(c, dict)]
+        if not rows:
+            return ["  (no restore points — nothing committed to undo)"]
+        cols = int(width) if width and int(width) > 0 else 80
+        # The HEADER is clipped too. Clipping only the data rows left the
+        # one line that names the command running past a narrow terminal —
+        # and that line is the affordance.
+        out = [
+            "  ⏪ restore points — `/undo N` to revert (Enter confirms)"[:cols]
+        ]
+        for i, c in enumerate(rows, start=1):
+            sha = str(c.get("sha") or c.get("commit") or "")[:9]
+            subject = " ".join(str(
+                c.get("subject") or c.get("summary") or "").split())
+            when = str(c.get("age") or c.get("when") or "")
+            line = f"    {i:>2}. {sha}  {subject}"
+            if when:
+                line = f"{line}  ({when})"
+            out.append(line[:cols])
+        return out
+    except Exception:  # noqa: BLE001
+        logger.debug("[Rewind] render degraded", exc_info=True)
+        return ["  (restore points unavailable)"]
+
+
+def local_rewind_rows(
+    *,
+    pause: Callable[[], Any],
+    resume: Callable[[], Any],
+    provider: Callable[[int], Any],
+    limit: int = 10,
+    width: Optional[int] = None,
+) -> List[str]:
+    """Take the lock, snapshot, render, RELEASE. NEVER raises.
+
+    The whole daemon-side sequence in one call, through the same
+    controller the cockpit uses. The release is in a `finally`: a snapshot
+    that leaves intake paused because rendering raised would be strictly
+    worse than no rewind — the organism would sit idle and nothing would
+    say why.
+    """
+    client = LocalRewindClient(
+        pause=pause, resume=resume, provider=provider, limit=limit,
+    )
+    captured: List[Any] = []
+    client.bind_deliver(lambda payload: captured.append(payload))
+    controller = RewindController(client)
+    try:
+        controller.open()
+        rows = (captured[-1].get("candidates") if captured else ()) or ()
+        return render_restore_points(rows, width=width)
+    except Exception:  # noqa: BLE001
+        logger.debug("[Rewind] local sequence degraded", exc_info=True)
+        return ["  (rewind unavailable)"]
+    finally:
+        try:
+            controller.close()
+        except Exception:  # noqa: BLE001
+            # Belt and braces — the controller releases exactly once, but a
+            # paused organism with no explanation is the one outcome worth
+            # a second guard.
+            client.send_autonomy("resume")
+
+
 def merge_rewind_completer(
     base_completer: Any, controller: Optional[RewindController],
 ) -> Any:
@@ -301,6 +471,9 @@ def install_rewind_binding(kb: Any, controller: RewindController) -> bool:
 
 
 __all__ = [
+    "LocalRewindClient",
+    "local_rewind_rows",
+    "render_restore_points",
     "MASTER_FLAG_ENV_VAR",
     "REWIND_ACTION",
     "REWIND_DEFAULT_KEYS",
