@@ -1107,6 +1107,32 @@ def build_bipartite_application(
         def create_content(self, width, height=None):  # noqa: ANN001
             try:
                 if mux.observe_allotment(width, height):
+                    # The text this control produces DEPENDS on the allotment we
+                    # just learned, so the cached text is now stale. Clearing it is
+                    # the whole reason a changed allotment is worth detecting.
+                    #
+                    # prompt_toolkit renders a frame in TWO passes: a measurement
+                    # pass with `height=None`, then the draw pass with the real
+                    # height. `create_content` pulls its text through
+                    # `_get_formatted_text_cached`, so without this the draw pass
+                    # REUSES the measurement pass's text — computed against
+                    # whatever budget was in effect before anything was measured.
+                    #
+                    # Measured, greedy canvas, 400 lines in a 30-row terminal:
+                    #
+                    #   asked_h=None  mux.h=24 (stale seed)  ->  24 lines
+                    #   asked_h=12    mux.h=12 (correct)     ->  24 lines  <-- stale
+                    #
+                    # Twenty-four lines painted into twelve rows, clipped from the
+                    # BOTTOM: the newest output lost. Recording the right height was
+                    # never enough — #70280's claim of a "zero-lag, same-frame"
+                    # observation held only while the two passes happened to agree,
+                    # which is why content-sizing hid this and greedy exposed it.
+                    for attr in ("_fragment_cache", "_content_cache"):
+                        cache = getattr(self, attr, None)
+                        clear = getattr(cache, "clear", None)
+                        if callable(clear):
+                            clear()
                     mux._invalidate_now()
             except Exception:  # noqa: BLE001 — never break a frame to measure it
                 logger.debug("[Bipartite] allotment observation degraded",
