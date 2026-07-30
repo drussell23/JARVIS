@@ -51,7 +51,7 @@ import sys
 import time
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("Ouroboros.StatusLine")
 
@@ -159,6 +159,17 @@ def _custom_segment() -> str:
         import subprocess
         proc = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=1.0,
+            # THE contract, not just a pipe. Claude Code's status line
+            # "receives JSON session data on stdin and displays whatever your
+            # script prints", and scripts written against it parse that
+            # object — so a runner that offered stdout-only would run
+            # somebody's existing statusline and hand it nothing to read.
+            #
+            # Shaped like CC's payload rather than like our internals for the
+            # same reason: the whole value of a status-line contract is that
+            # a script written once works in both, and inventing a private
+            # schema would make every such script ov-specific.
+            input=_statusline_payload(),
         )
         line = (proc.stdout or "").strip().splitlines()
         text = line[0][:80] if line else ""
@@ -166,6 +177,67 @@ def _custom_segment() -> str:
         return text
     except Exception:  # noqa: BLE001
         return _CUSTOM_SEGMENT_CACHE.get("text", "")
+
+
+def _statusline_payload(snapshot: Any = None) -> str:
+    """The JSON a status-line script reads on stdin. NEVER raises.
+
+    Mirrors Claude Code's documented shape — `model`, `workspace`, `cost`,
+    `context_window`, `session_id` — so a script written for CC runs here
+    unchanged. Keys ov cannot answer are OMITTED rather than faked: a script
+    reading `.cost.total_cost_usd` gets a real number or nothing, never a
+    zero that looks like a free session.
+
+    Additive by the same rule the heartbeat follows: a consumer that has
+    never heard of a key ignores it, and one expecting a key we do not send
+    falls back the way it would against an older CC.
+    """
+    import json
+
+    payload: Dict[str, Any] = {"schema_version": STATUS_LINE_SCHEMA_VERSION}
+    try:
+        import os as _os
+        cwd = _os.getcwd()
+        payload["cwd"] = cwd
+        payload["workspace"] = {"current_dir": cwd, "project_dir": cwd}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        snap = snapshot if snapshot is not None else _current_snapshot()
+        if snap is not None:
+            # `phase` and `route` have no CC counterpart and are the two
+            # things an O+V operator most wants on a status line, so they
+            # ride alongside rather than being contorted into CC's shape.
+            payload["phase"] = getattr(snap, "phase", "") or "IDLE"
+            if getattr(snap, "route", ""):
+                payload["route"] = snap.route
+            if getattr(snap, "provider", ""):
+                payload["model"] = {"id": snap.provider,
+                                    "display_name": snap.provider}
+            spent = getattr(snap, "cost_spent_usd", None)
+            if spent is not None:
+                cost: Dict[str, Any] = {"total_cost_usd": round(float(spent), 6)}
+                budget = getattr(snap, "cost_budget_usd", None)
+                if budget:
+                    cost["budget_usd"] = round(float(budget), 6)
+                payload["cost"] = cost
+            if getattr(snap, "primary_op_id", ""):
+                payload["session_id"] = snap.primary_op_id
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return json.dumps(payload)
+    except Exception:  # noqa: BLE001
+        return "{}"
+
+
+def _current_snapshot() -> Any:
+    """The live snapshot, or None. NEVER raises."""
+    try:
+        builder = get_status_line_builder()
+        return builder.snapshot() if builder is not None else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class StatusLineBuilder:

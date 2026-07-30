@@ -1220,7 +1220,23 @@ def build_bipartite_application(
         # actually given. `_MeasuredCanvasControl` below now supplies the real
         # number before this callable runs, so by here the budget is already
         # correct for THIS frame.
-        return ANSI(mux.render_canvas_ansi())
+        base = ANSI(mux.render_canvas_ansi())
+        # The selection highlight. Applied HERE, over the fragments the
+        # canvas already produced, so there is no second render path and no
+        # widget — and it costs nothing when nothing is selected, because
+        # `apply_selection` returns its input untouched and the ANSI object
+        # is handed straight through without ever being expanded to a list.
+        try:
+            from backend.core.ouroboros.battle_test.canvas_selection import (
+                apply_selection, current_selection,
+            )
+            selection = current_selection()
+            if selection is None or selection.empty:
+                return base
+            from prompt_toolkit.formatted_text import to_formatted_text
+            return apply_selection(to_formatted_text(base), selection)
+        except Exception:  # noqa: BLE001 — a highlight never breaks a frame
+            return base
 
     class _MeasuredCanvasControl(FormattedTextControl):
         """A canvas control that tells the mux how big it really is.
@@ -1278,8 +1294,37 @@ def build_bipartite_application(
                              exc_info=True)
             return super().create_content(width, height)
 
+    _canvas_control = _MeasuredCanvasControl(_canvas_fragments,
+                                             focusable=False)
+    # Click-to-expand. `mouse_support` was already on — the wheel scrolled —
+    # but there were no MouseEventType handlers anywhere, so every click fell
+    # on the floor. Installed on THIS control because it is the one that draws
+    # the transcript; the rows it resolves against are the rendered ANSI, so
+    # the panel border and the anchor padding need no arithmetic.
+    #
+    # A click SUBMITS `/expand <ref>` through `on_accept` — the same callable
+    # a typed line goes through — so every surface routes a click exactly the
+    # way it already routes typing, and the whole `/expand` ref family works
+    # without any of it being reimplemented for the mouse.
+    try:
+        from backend.core.ouroboros.battle_test.canvas_mouse import (
+            install_canvas_mouse,
+        )
+        install_canvas_mouse(
+            _canvas_control,
+            lambda: mux.render_canvas_ansi().splitlines(),
+            lambda line: (on_accept(line) if callable(on_accept) else None),
+            # Copy notices land in the deck rather than a print: printing
+            # from a mouse handler inside a full-screen Application draws
+            # over the frame. Which clipboard path was used matters — they
+            # fail differently — so this is not decoration.
+            notify=lambda msg: mux.push_raw(f"  [dim]{msg}[/dim]"),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Bipartite] canvas mouse unavailable", exc_info=True)
+
     canvas = Window(
-        content=_MeasuredCanvasControl(_canvas_fragments, focusable=False),
+        content=_canvas_control,
         wrap_lines=False,
         # Content-sized, so a short deck sits directly under the header
         # instead of being padded down against the prompt.
@@ -1429,6 +1474,90 @@ def build_bipartite_application(
         install_stash_binding(kb, lambda: prompt.buffer)
     except Exception:  # noqa: BLE001
         pass
+    # The completion menu and the gate, made remappable. Both WORKED and
+    # neither could be rebound — `/keys` could not list them and
+    # keybindings.json could not move them.
+    #
+    # Registered AFTER prompt_toolkit's own bindings and gated on
+    # `has_completions` / a pending gate, so they win exactly while those
+    # states hold and are absent otherwise. Nothing is unbound and nothing is
+    # monkeypatched.
+    try:
+        from backend.core.ouroboros.battle_test.menu_bindings import (
+            install_completion_actions, install_confirm_actions,
+        )
+        install_completion_actions(kb)
+        # Through `on_accept` — the same callable a typed `/accept` goes
+        # through — so the risk tier, the audit trail and the countdown clear
+        # exactly as they do for the verb. A key that bypassed the verb would
+        # be a second approval path, and here that is a governance problem
+        # rather than a UI one.
+        install_confirm_actions(
+            kb,
+            submit=(lambda line: on_accept(line)
+                    if callable(on_accept) else None),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Bipartite] menu bindings unavailable", exc_info=True)
+    # Ctrl+_ / Ctrl+Shift+- — undo the last input edit. CC binds `chat:undo`
+    # to exactly these, and prompt_toolkit already ships the command; it was
+    # simply never bound, so the prompt accepted paragraphs with no way back
+    # from a mis-typed `Ctrl+W` or `Ctrl+U`.
+    #
+    # Delegated to pt's own `undo` rather than tracking edits here: the buffer
+    # owns its undo stack, and a second history of the same text would
+    # disagree with it the first time a completion inserted anything.
+    try:
+        from backend.core.ouroboros.battle_test.keymap import bind_action
+        from prompt_toolkit.key_binding.bindings.named_commands import (
+            get_by_name,
+        )
+        _undo = get_by_name("undo")
+
+        def _do_undo(event: Any) -> None:
+            try:
+                _undo.handler(event)
+            except Exception:  # noqa: BLE001
+                pass
+
+        bind_action(
+            kb, "chat:undo", ("ctrl+_", "ctrl+shift+-"), _do_undo,
+            context="Chat", description="undo the last input edit",
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Bipartite] undo binding unavailable", exc_info=True)
+    # Ctrl+Z — suspend to the shell, `fg` to come back. CC binds it and this
+    # cockpit did not, which is a gap the alternate screen CREATES rather than
+    # inherits: a normal terminal turns Ctrl+Z into SIGTSTP itself, but a
+    # full-screen app holds the terminal in raw mode, so the keystroke arrives
+    # as an ordinary key and the shell never sees it. The operator's habit
+    # silently stopped working the day the cockpit went full-screen.
+    #
+    # `suspend_to_background` is prompt_toolkit's own: it leaves the alternate
+    # screen, restores cooked mode, raises SIGTSTP, and repaints on SIGCONT.
+    # Doing this by hand means owning terminal-state restoration across a
+    # signal, and getting it wrong leaves the operator at a shell with no echo.
+    #
+    # Bound HERE so every surface that builds this Application inherits it —
+    # the daemon cockpit and the attach client alike — which is the same
+    # reasoning the SIGWINCH handler below is registered on.
+    try:
+        import signal as _sig
+        if hasattr(_sig, "SIGTSTP"):        # Unix only, as CC documents
+            from backend.core.ouroboros.battle_test.keymap import bind_action
+
+            def _suspend(event: Any) -> None:
+                try:
+                    event.app.suspend_to_background()
+                except Exception:  # noqa: BLE001
+                    logger.debug("[Bipartite] suspend degraded", exc_info=True)
+
+            bind_action(
+                kb, "app:suspend", ("ctrl+z",), _suspend, context="Global",
+                description="suspend to the shell (`fg` to resume)",
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Bipartite] suspend binding unavailable", exc_info=True)
     # Scrollback keys. In the alternate screen the terminal no longer offers
     # its own, so these ARE the scrollback — not a convenience layered on it.
     # SIGWINCH → the layout. `handle_sigwinch` existed, read the live

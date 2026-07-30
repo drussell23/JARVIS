@@ -235,13 +235,115 @@ def jump_block(event: Any, direction: int) -> None:
         logger.debug("[Hatches] jump degraded", exc_info=True)
 
 
+#: `Ctrl+L` pressed twice CLEARS. One latch, module-level, because the two
+#: presses are two separate key events and the state between them has to
+#: outlive the first handler.
+_CLEAR_LATCH: Any = None
+
+
+def _clear_latch() -> Any:
+    """The double-press latch, built once. NEVER raises; None if unavailable."""
+    global _CLEAR_LATCH
+    if _CLEAR_LATCH is None:
+        try:
+            from backend.core.ouroboros.battle_test.confirm_chord import (
+                ConfirmLatch,
+            )
+            # CC's window for this gesture is TWO seconds, not the three its
+            # `Ctrl+X Ctrl+K` uses — and the difference is the point. Killing
+            # every agent deserves a longer think than redrawing a screen, so
+            # the window is pinned here rather than inherited from the shared
+            # default.
+            _CLEAR_LATCH = ConfirmLatch(window_s=_clear_window_s())
+        except Exception:  # noqa: BLE001
+            return None
+    return _CLEAR_LATCH
+
+
+def _clear_window_s() -> float:
+    """``JARVIS_CLEAR_DOUBLE_PRESS_S`` (default 2.0, CC's). NEVER raises."""
+    try:
+        return max(0.5, min(10.0, float(
+            os.environ.get("JARVIS_CLEAR_DOUBLE_PRESS_S", "") or 2.0)))
+    except (TypeError, ValueError):
+        return 2.0
+
+
 def force_redraw(event: Any) -> None:
-    """``Ctrl+L`` — recover a garbled screen. NEVER raises."""
+    """``Ctrl+L`` — recover a garbled screen; twice in 2s clears. NEVER raises.
+
+    Claude Code: "if you press `Ctrl+L` once, Claude Code redraws the screen
+    and also shows a hint that pressing it again runs `/clear`. If you press
+    it twice within two seconds, Claude Code runs `/clear`."
+
+    The redraw happens on BOTH presses, and that ordering is the whole design:
+    the first press must do its own job completely, because an operator
+    reaching for Ctrl+L is usually recovering a garbled screen and has no
+    intention of clearing anything. Arming is a side effect of a key that
+    already worked, never a mode it puts them into.
+
+    Reuses `ConfirmLatch` — the primitive built for `Ctrl+X Ctrl+K`, whose
+    docstring already named this as CC's second use of the shape. A second
+    timer here would be two answers to "did they press it twice".
+    """
     try:
         event.app.renderer.clear()
         event.app.invalidate()
     except Exception:  # noqa: BLE001
         pass
+    try:
+        latch = _clear_latch()
+        if latch is None:
+            return
+        if not latch.press():
+            _flash_clear_hint(event)
+            return
+        _submit_clear(event)
+    except Exception:  # noqa: BLE001
+        logger.debug("[Hatches] clear latch degraded", exc_info=True)
+
+
+def _flash_clear_hint(event: Any) -> None:
+    """Say that a second press clears. NEVER raises.
+
+    Without this the gesture is undiscoverable AND dangerous: an operator who
+    happens to hit Ctrl+L twice while fixing a garbled screen would lose their
+    transcript with no warning that it was about to happen.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            get_active_canvas,
+        )
+        canvas = get_active_canvas()
+        if canvas is not None:
+            # `push_raw`, not `emit`: `emit` renders through the typed
+            # event registry, and an unregistered type falls to the null
+            # renderer, which prints the TYPE NAME. This surfaced as a
+            # transcript line reading `· line`.
+            canvas.push_raw(
+                f"  [dim]press ctrl+l again within "
+                f"{_clear_window_s():.0f}s to clear the transcript[/dim]")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _submit_clear(event: Any) -> None:
+    """Run `/clear` the way a typed line would. NEVER raises.
+
+    Through the prompt buffer's own accept handler rather than by calling a
+    clear function directly: `/clear` is a verb every surface already routes,
+    and reaching past that router would mean this key clears on some surfaces
+    and not others.
+    """
+    try:
+        buf = event.app.current_buffer
+        if buf is None:
+            return
+        buf.text = "/clear"
+        buf.cursor_position = len("/clear")
+        buf.validate_and_handle()
+    except Exception:  # noqa: BLE001
+        logger.debug("[Hatches] clear submit degraded", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +672,15 @@ def install_transcript_hatches(kb: Any, ui: Any, client: Any) -> bool:
 
         from backend.core.ouroboros.battle_test.keymap import bind_action
 
-        scrolled = Condition(is_scrolled_back)
+        # The viewer, OR a scrolled-back canvas. Widened rather than
+        # replaced: scrolled-back was the ONLY way these keys ever became
+        # live, and an operator with that habit must not lose it because a
+        # mode arrived. `transcript_surface_active` is the one predicate both
+        # states resolve through, so the two cannot drift.
+        from backend.core.ouroboros.battle_test.transcript_mode import (
+            transcript_surface_active,
+        )
+        scrolled = Condition(transcript_surface_active)
         bound = 0
 
         bound += bind_action(
@@ -617,7 +727,13 @@ def install_transcript_hatches(kb: Any, ui: Any, client: Any) -> bool:
                 pass
 
         bound += bind_action(
-            kb, "narrate:toggle", ("ctrl+o",), _toggle_narrate,
+            # MOVED off Ctrl+O, which Claude Code owns for the transcript
+            # viewer. Three actions claimed that one key here — this, the
+            # deck's `lanes`, and the legacy TUI's expand — which is one more
+            # than a key can serve. Narration loses the least by moving: it
+            # is the only one of the three with a typed verb (`/narrate`)
+            # that does exactly the same thing.
+            kb, "narrate:toggle", ("ctrl+x ctrl+n",), _toggle_narrate,
             context="Global",
             description="toggle live narration normal ↔ verbose (/narrate)",
         )

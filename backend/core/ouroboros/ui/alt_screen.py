@@ -61,19 +61,59 @@ logger = logging.getLogger("Ouroboros.AltScreen")
 
 __all__ = ["alt_screen_enabled", "alternate_screen", "in_alternate_screen"]
 
-#: Enter the alternate screen, then home the cursor. The cursor move matters:
-#: the alternate buffer retains whatever a previous occupant left in it on
-#: some terminals, so a boot that starts drawing at the old cursor position
-#: renders halfway down the screen.
-_ENTER = "\x1b[?1049h\x1b[H"
-
-#: Leave. No clear first — the point is to hand the normal buffer back
-#: exactly as it was found.
-_LEAVE = "\x1b[?1049l"
+#: Last-resort literals, used when terminfo cannot answer.
+#:
+#: ANSI `smcup`/`rmcup` as xterm and every terminal that copied it define
+#: them. Kept as a FALLBACK rather than the definition — see `_capability`,
+#: which asks the terminal's own description first. The cursor-home after
+#: enter matters: the alternate buffer retains whatever a previous occupant
+#: left in it on some terminals, so a boot that starts drawing at the old
+#: cursor position renders halfway down the screen.
+_ENTER_FALLBACK = "\x1b[?1049h"
+_LEAVE_FALLBACK = "\x1b[?1049l"
+_HOME = "\x1b[H"
 
 _LOCK = threading.RLock()
 _DEPTH = 0
 _ATEXIT_TOKEN: Any = None
+
+# ---------------------------------------------------------------------------
+# The async-signal-safe half
+# ---------------------------------------------------------------------------
+#
+# Everything below this comment may run inside a signal handler, and a signal
+# handler in CPython is delivered at an ARBITRARY bytecode boundary — inside a
+# weakref callback, a ``__del__``, an ``atexit`` handler, a ``finally``. Three
+# things are therefore forbidden on this path, each of them measured rather
+# than assumed:
+#
+#   * **Taking a lock.** `_restore_now` acquired `_LOCK`, and a handler that
+#     blocks on a lock another thread holds hangs the main thread inside the
+#     handler — 2001 ms in the reproduction, and unbounded if that thread is
+#     itself waiting on the main one. The restore is idempotent, so it needs
+#     no mutual exclusion at all: the worst a race can do is emit `rmcup`
+#     twice, and `rmcup` twice is `rmcup`.
+#
+#   * **Writing through a Python stream.** `TextIOWrapper.write` takes the
+#     stream's own internal lock. A signal delivered while the main thread was
+#     mid-`print` therefore deadlocks the handler against the very stream it
+#     is trying to restore. `os.write` on a file descriptor takes no such lock
+#     and is one syscall.
+#
+#   * **Allocating what can be prepared in advance.** The bytes are encoded at
+#     resolution time and the descriptor is captured on entry, so the handler
+#     performs one `os.write` and nothing else.
+#
+#: Cell rather than a plain global: rebinding a module attribute and reading
+#: it are each a single bytecode under the GIL, which is all the atomicity an
+#: idempotent restore needs — and it lets the signal path avoid `global`,
+#: which is how the locked path and this one stay visibly separate.
+_ARMED = [False]
+_SIGNAL_FD = [-1]
+_LEAVE_BYTES = [b"\x1b[?1049l"]
+_IN_HANDLER = [False]
+_SUSPENDED = [False]
+_ENTER_BYTES = [b"\x1b[?1049h\x1b[H"]
 
 
 def alt_screen_enabled() -> bool:
@@ -115,8 +155,66 @@ def _out() -> Any:
     return sys.__stdout__ or sys.stdout
 
 
+def _capability(name: str, fallback: str) -> str:
+    """One terminal capability, from the terminal's OWN description.
+
+    `smcup`/`rmcup` are not universal facts — they are entries in a terminfo
+    record, and a terminal that does not define them does not HAVE an
+    alternate screen. Writing xterm's literal at such a terminal prints
+    garbage into the operator's session, and hardcoding the literal is what
+    made that indistinguishable from success.
+
+    Resolution order is deliberate: terminfo, then the ANSI literal. The
+    fallback stays because terminfo is frequently unavailable in exactly the
+    environments that DO support the sequence — a stripped container with no
+    `TERM`, a CI runner, a pty with `TERM=dumb` set by a wrapper — and
+    refusing the alternate screen there would be a regression dressed as
+    correctness.
+
+    NEVER raises: `curses` is optional, `setupterm` fails on an unknown TERM,
+    and neither is worth a boot.
+    """
+    try:
+        import curses
+        try:
+            curses.setupterm()
+        except Exception:  # noqa: BLE001 — unknown/absent TERM
+            return fallback
+        value = curses.tigetstr(name)
+        if value:
+            return value.decode("ascii", "ignore")
+        # DEFINED-AS-ABSENT is a real answer, distinct from "could not ask".
+        # `tigetstr` returning None/empty for a terminal that HAS a
+        # description means this terminal genuinely lacks the capability.
+        return ""
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+def _resolve_sequences() -> bool:
+    """Fill the pre-encoded enter/leave buffers. True if the terminal has an
+    alternate screen at all. NEVER raises.
+
+    Encoded ONCE, here, because the leave sequence is written from a signal
+    handler and a handler must not be encoding strings.
+    """
+    try:
+        enter = _capability("smcup", _ENTER_FALLBACK)
+        leave = _capability("rmcup", _LEAVE_FALLBACK)
+        if not enter or not leave:
+            return False
+        _ENTER_BYTES[0] = (enter + _HOME).encode("ascii", "ignore")
+        _LEAVE_BYTES[0] = leave.encode("ascii", "ignore")
+        return True
+    except Exception:  # noqa: BLE001
+        return True         # keep the literals already in the cells
+
+
 def _write(seq: str) -> bool:
     """Emit a control sequence and flush immediately. NEVER raises.
+
+    The BLOCKING path — the context manager and the atexit backstop, where
+    taking a stream lock is fine. Signal handlers use `_emit_signal_safe`.
 
     Flushed rather than buffered because the next thing that happens may be
     a crash, and a restore sitting in a buffer is a restore that did not
@@ -133,14 +231,71 @@ def _write(seq: str) -> bool:
         return False
 
 
+def _emit_signal_safe(payload: bytes) -> bool:
+    """One `os.write` to the captured descriptor. NEVER raises.
+
+    No lock, no encoding, no Python stream — see the contract above this
+    module's `_ARMED` cell for why each of those is forbidden here. Partial
+    writes are looped rather than ignored: a control sequence delivered
+    half-way is worse than one not delivered at all, because the terminal
+    then interprets the remainder as text.
+    """
+    fd = _SIGNAL_FD[0]
+    if fd < 0:
+        return False
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                return False
+            view = view[written:]
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _capture_fd() -> None:
+    """Remember the real stdout's descriptor while it is safe to ask.
+
+    Captured at ENTRY, not at restore time: `sys.__stdout__` may be closed or
+    replaced by the time a handler runs, and `fileno()` on a closed stream
+    raises — inside a signal handler, during shutdown, on the one path whose
+    entire job is to leave the terminal usable.
+    """
+    try:
+        stream = _out()
+        _SIGNAL_FD[0] = int(stream.fileno()) if stream is not None else -1
+    except Exception:  # noqa: BLE001
+        _SIGNAL_FD[0] = -1
+
+
+def _restore_signal_safe() -> bool:
+    """Leave the alternate screen from a signal handler. NEVER raises.
+
+    Idempotent by construction, which is what buys the lock-free flag: two
+    concurrent callers both emit `rmcup`, and `rmcup` twice is `rmcup`.
+    """
+    if not _ARMED[0]:
+        return False
+    _ARMED[0] = False
+    return _emit_signal_safe(_LEAVE_BYTES[0])
+
+
 def _restore_now() -> None:
-    """Unconditional return to the normal buffer. Safe to call repeatedly."""
+    """Unconditional return to the normal buffer. Safe to call repeatedly.
+
+    The blocking path. Clears the signal-path flag too so the two cannot
+    disagree about whether the buffer is still borrowed.
+    """
     global _DEPTH
     with _LOCK:
         if _DEPTH <= 0:
+            _ARMED[0] = False
             return
         _DEPTH = 0
-    _write(_LEAVE)
+    _ARMED[0] = False
+    _write(_LEAVE_BYTES[0].decode("ascii", "ignore"))
 
 
 def _install_backstops() -> None:
@@ -172,6 +327,28 @@ def _install_backstops() -> None:
             logger.debug("[AltScreen] atexit backstop unavailable",
                          exc_info=True)
 
+    # The unraisable guard, armed for exactly as long as we are borrowing the
+    # screen. THE fix for the traceback an operator sees on Ctrl+C:
+    #
+    #   Exception ignored in: <function WeakValueDictionary...remove>
+    #     File ".../alt_screen.py", line ..., in _handler
+    #       _prev(signum, frame)
+    #   KeyboardInterrupt:
+    #
+    # A signal is delivered at an arbitrary bytecode boundary, so `_prev` —
+    # `signal.default_int_handler`, whose whole contract is to RAISE — can be
+    # called from inside a weakref callback or a `__del__`, where there is no
+    # caller to catch anything. The interpreter routes that to
+    # `sys.unraisablehook`, which is where it has to be answered; catching it
+    # here would swallow a KeyboardInterrupt the operator is entitled to.
+    try:
+        from backend.core.ouroboros.governance.exit_guard import (
+            install_unraisable_guard,
+        )
+        install_unraisable_guard()
+    except Exception:  # noqa: BLE001
+        logger.debug("[AltScreen] unraisable guard unavailable", exc_info=True)
+
     try:
         import signal
 
@@ -180,25 +357,75 @@ def _install_backstops() -> None:
             # backstop still covers this case.
             return
 
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            try:
-                previous = signal.getsignal(sig)
-                if getattr(previous, "_ov_alt_screen_chained", False):
-                    continue
+        def _chain(sig: Any, kind: str) -> None:
+            previous = signal.getsignal(sig)
+            if getattr(previous, "_ov_alt_screen_chained", False):
+                return
 
-                def _handler(signum: int, frame: Any,
-                             _prev: Any = previous) -> None:
-                    _restore_now()
+            def _handler(signum: int, frame: Any, _prev: Any = previous,
+                         _kind: str = kind) -> None:
+                # PHASE 1 — the async-signal-safe part, always, first, and
+                # unconditionally. One `os.write`. Whatever else goes wrong
+                # from here on, the operator gets their terminal back.
+                if _kind == "cont":
+                    # Resuming from a stop we handed the buffer back for.
+                    if _SUSPENDED[0]:
+                        _SUSPENDED[0] = False
+                        _ARMED[0] = True
+                        _emit_signal_safe(_ENTER_BYTES[0])
+                else:
+                    if _kind == "stop":
+                        _SUSPENDED[0] = _ARMED[0]
+                    _restore_signal_safe()
+
+                # PHASE 2 — chaining, which is NOT signal-safe and is
+                # therefore guarded on re-entry. A second Ctrl+C arriving
+                # while a slow predecessor runs (the harness writes a partial
+                # summary here) previously re-entered this handler and ran it
+                # again; an impatient operator must get the process to leave,
+                # not a deeper stack.
+                if _IN_HANDLER[0]:
+                    try:
+                        signal.signal(signum, signal.SIG_DFL)
+                        os.kill(os.getpid(), signum)
+                    except Exception:  # noqa: BLE001
+                        os._exit(128 + int(signum))
+                    return
+                _IN_HANDLER[0] = True
+                try:
                     if callable(_prev):
                         _prev(signum, frame)
                     elif _prev == signal.SIG_DFL:
                         # Re-raise with the default disposition so the exit
-                        # status still reports the signal honestly.
+                        # status still reports the signal honestly — and so a
+                        # stop signal actually stops the process.
                         signal.signal(signum, signal.SIG_DFL)
                         os.kill(os.getpid(), signum)
+                    # SIG_IGN falls through: the predecessor asked for this
+                    # signal to do nothing, and restoring the screen is not a
+                    # reason to overrule them.
+                finally:
+                    _IN_HANDLER[0] = False
 
-                _handler._ov_alt_screen_chained = True  # type: ignore[attr-defined]
-                signal.signal(sig, _handler)
+            _handler._ov_alt_screen_chained = True  # type: ignore[attr-defined]
+            signal.signal(sig, _handler)
+
+        for name, kind in (
+            ("SIGINT", "exit"), ("SIGTERM", "exit"), ("SIGHUP", "exit"),
+            # SIGTSTP/SIGCONT are NOT speculative here. prompt_toolkit wraps
+            # its own Ctrl+Z in `run_in_terminal`, so it hands the buffer back
+            # while IT owns the screen — but this module claims the buffer for
+            # the whole BOOT, before the cockpit mounts and after it exits, and
+            # nothing owns the screen in that window. A `kill -TSTP` there, or
+            # a Ctrl+Z during the crest, left the shell drawing its prompt on
+            # the alternate buffer.
+            ("SIGTSTP", "stop"), ("SIGCONT", "cont"),
+        ):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue        # Windows has neither TSTP nor CONT
+            try:
+                _chain(sig, kind)
             except (OSError, ValueError, RuntimeError):
                 continue
     except Exception:  # noqa: BLE001
@@ -225,9 +452,27 @@ def alternate_screen(enabled: Optional[bool] = None) -> Iterator[bool]:
     if want:
         with _LOCK:
             if _DEPTH == 0:
-                entered = _write(_ENTER)
-                if entered:
-                    _DEPTH = 1
+                # Resolve, capture and arm BEFORE the first byte goes out.
+                # Ordering is the whole safety argument: if the process dies
+                # between the write and the arm, nothing knows to restore.
+                # Arming first costs at most one redundant `rmcup` at a
+                # terminal we never entered, which is a no-op.
+                if not _resolve_sequences():
+                    # The terminal has a description and it says there is no
+                    # alternate screen. Writing xterm's literal anyway would
+                    # print it as text into the operator's session.
+                    logger.debug("[AltScreen] terminal has no smcup/rmcup")
+                    want = False
+                else:
+                    _capture_fd()
+                    _ARMED[0] = True
+                    entered = _write(
+                        _ENTER_BYTES[0].decode("ascii", "ignore"),
+                    )
+                    if entered:
+                        _DEPTH = 1
+                    else:
+                        _ARMED[0] = False
             else:
                 _DEPTH += 1
                 entered = True
@@ -241,4 +486,5 @@ def alternate_screen(enabled: Optional[bool] = None) -> Iterator[bool]:
                 _DEPTH = max(0, _DEPTH - 1)
                 leaving = _DEPTH == 0
             if leaving:
-                _write(_LEAVE)
+                _ARMED[0] = False
+                _write(_LEAVE_BYTES[0].decode("ascii", "ignore"))

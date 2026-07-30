@@ -574,3 +574,105 @@ class TestTheDemoDeclaresItsOwnDensity:
         import backend.core.ouroboros.battle_test.tool_render_policy as tp
         monkeypatch.delattr(tp, "DensityPolicy", raising=False)
         assert d._demo_density() is None
+
+
+# ---------------------------------------------------------------------------
+# The demo boots the REAL Application, so it must carry the real keys
+# ---------------------------------------------------------------------------
+
+
+class TestLiveSceneCarriesTheShippingSurface:
+    """`ov demo live` exists to show the cockpit an operator actually runs.
+
+    A key bound on both shipping surfaces and absent here makes the demo a
+    picture of a cockpit nobody runs — which is the defect class that let
+    `search_rows` ship routed-and-dark on the real client while the demo
+    looked complete.
+    """
+
+    def _keys(self):
+        from backend.core.ouroboros.cli import ov_demo
+
+        kb = ov_demo._live_exit_bindings()
+        return kb, {
+            " ".join(str(k).replace("Keys.", "") for k in b.keys)
+            for b in kb.bindings
+        }
+
+    def test_the_transcript_viewer_is_reachable(self):
+        _kb, keys = self._keys()
+        assert "ControlO" in keys
+        for movement in ("j", "k", "g", "G", "ControlU", "ControlB", "?"):
+            assert movement in keys, f"{movement} is dark in the demo"
+
+    def test_the_stop_all_chord_is_reachable(self):
+        _kb, keys = self._keys()
+        assert "ControlX ControlK" in keys
+
+    def test_q_leaves_the_viewer_rather_than_killing_the_demo(self):
+        """THE trap, one key over from the Escape defect this scene already
+        records: `q` quits the demo, and `q` leaves the transcript viewer in
+        `ov`. Bound naively, the one surface built to demonstrate the cockpit
+        would teach that `q` kills your session.
+
+        The two filters must be mutually exclusive, so exactly one can fire
+        for any keystroke — prompt_toolkit resolving by registration order is
+        not something to depend on.
+        """
+        from backend.core.ouroboros.battle_test import transcript_mode as tm
+
+        kb, _keys = self._keys()
+        q_bindings = [b for b in kb.bindings
+                      if [str(k) for k in b.keys] == ["q"]]
+        assert len(q_bindings) == 2, "expected the viewer's q and the demo's q"
+
+        try:
+            tm.reset_transcript_mode_for_tests()
+            live = [b for b in q_bindings if bool(b.filter())]
+            assert len(live) == 1, "exactly one q may be live at a time"
+
+            tm.enter_transcript_mode()
+            live_inside = [b for b in q_bindings if bool(b.filter())]
+            assert len(live_inside) == 1
+            assert live_inside[0] is not live[0], (
+                "the same q fires inside and outside the viewer — pressing q "
+                "while reading the transcript would end the demo"
+            )
+        finally:
+            tm.reset_transcript_mode_for_tests()
+
+    def test_escape_also_stands_down_inside_the_viewer(self):
+        from backend.core.ouroboros.battle_test import transcript_mode as tm
+
+        kb, _keys = self._keys()
+        escapes = [b for b in kb.bindings
+                   if [str(k) for k in b.keys] == ["Keys.Escape"]]
+        assert escapes, "the demo lost its escape hatch"
+        try:
+            tm.enter_transcript_mode()
+            demo_quits = [b for b in escapes if bool(b.filter())
+                          and "transcript" not in repr(b.handler)]
+            # Whatever remains live must be the viewer's exit, never a quit
+            # that would close the demo out from under a reader.
+            assert len(demo_quits) <= 1
+        finally:
+            tm.reset_transcript_mode_for_tests()
+
+    def test_the_demo_shows_the_chord_instead_of_pretending_it_worked(self):
+        """An inert `send_input` would make the chord look identical whether
+        it worked or not — the failure this scene exists to make visible."""
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.cli import ov_demo
+
+        src = inspect.getsource(ov_demo._live_exit_bindings)
+        assert "_DemoOrganism" in src
+        tree = ast.parse(src.lstrip())
+        sends = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "send_input"
+        ]
+        assert sends, "the demo shim has no send_input"
+        assert len(sends[0].body) > 1 or not isinstance(
+            sends[0].body[0], ast.Pass), "the shim is a silent no-op"

@@ -306,20 +306,124 @@ def daemon_key_bindings(repl: Any = None) -> Any:
     try:
         from prompt_toolkit.key_binding import KeyBindings
 
+        from backend.core.ouroboros.battle_test.subagent_control import (
+            install_stop_all_binding,
+        )
         from backend.core.ouroboros.battle_test.transcript_hatches import (
             install_transcript_hatches,
+        )
+        from backend.core.ouroboros.battle_test.transcript_mode import (
+            install_transcript_mode_bindings,
         )
         send = getattr(repl, "_dispatch_verb", None) or getattr(
             repl, "handle_input", None)
         shim = LocalCockpitClient(send_input=send)
         kb = KeyBindings()
-        if not install_transcript_hatches(kb, shim, shim):
+        hatches = install_transcript_hatches(kb, shim, shim)
+        # Ctrl+O and the less-style viewer table. Mounted beside the hatches
+        # because they are two halves of one surface: the hatches are the
+        # keys, this is the state that makes them unambiguous.
+        install_transcript_mode_bindings(
+            kb, notify=lambda out: _daemon_notice(
+                repl, out if isinstance(out, str) else "\n".join(out),
+            ),
+        )
+        # Ctrl+X Ctrl+K, through the SAME shim: the chord sends `/stop-all`
+        # and `_dispatch_repl_command` does the rest, so the daemon and the
+        # attach client reach one authority by one route.
+        stop_all = install_stop_all_binding(
+            kb, shim,
+            notify=lambda msg: _daemon_notice(repl, msg),
+            running=_local_running_agents,
+        )
+        # Bound if EITHER cluster took. Returning None when only the hatches
+        # failed would silently drop the stop-all chord along with them.
+        if not (hatches or stop_all):
             return None
         return kb
     except Exception:  # noqa: BLE001
         logger.debug("[CockpitMount] daemon key bindings unavailable",
                      exc_info=True)
         return None
+
+
+def _daemon_notice(repl: Any, message: str) -> None:
+    """One transient line on the daemon's own console. NEVER raises.
+
+    The client answers this with `ui.flash`, which the daemon cockpit has no
+    equivalent of — its transient surface IS the console. Kept to a plain
+    dim line rather than reaching for the deck: an arming prompt that has
+    three seconds to live must not join a scrollback the operator will read
+    later.
+    """
+    try:
+        flow = getattr(repl, "_flow", None)
+        console = getattr(flow, "console", None)
+        if console is None:
+            return
+        console.print(f"  [dim]{message}[/dim]", highlight=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _local_running_agents() -> int:
+    """Agents running in THIS process's roster. NEVER raises.
+
+    The daemon dispatches them, so its own singleton is the truth here — no
+    snapshot age, no bridge. The attach client asks its `AttachUI` instead,
+    which holds the daemon's last frame.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            get_agent_roster,
+        )
+        return int(get_agent_roster().running_count)   # a property
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def daemon_stream_rows() -> Any:
+    """The sentence being written, at the daemon's own terminal. NEVER raises.
+
+    This hook was UNSET, and the reason was recorded honestly rather than
+    waived: there was no process-global in-flight text to read, because
+    every stream published its frames and kept none. The daemon composed the
+    words, shipped them across the bridge, and could not draw them.
+
+    `inflight_registry` closes that by recording each frame where it is
+    COMPOSED — before `publish_telemetry_global`, which returns early with no
+    cockpit attached and would otherwise leave this strip working only while
+    somebody else was watching.
+
+    Renders through `stream_renderer.render_inflight`, the same function the
+    attach client calls, so the two surfaces cannot disagree about the shape.
+    Only the WIDTH is local, which is the one thing the daemon genuinely
+    cannot know for a remote client and genuinely does know for itself.
+    """
+    def _rows() -> Any:
+        try:
+            import shutil
+            from backend.core.ouroboros.battle_test.inflight_registry import (
+                current_inflight,
+            )
+            from backend.core.ouroboros.battle_test.stream_renderer import (
+                render_inflight,
+            )
+            entry = current_inflight()
+            if entry is None or not entry.text:
+                return []
+            size = shutil.get_terminal_size(fallback=(100, 30))
+            return render_inflight(
+                entry.text, width=max(20, int(size.columns)),
+                # Command output keeps its line structure; model prose does
+                # not. Carried on the entry rather than guessed, because the
+                # frame's `kind` is the only place that is known for certain.
+                preserve_lines=entry.is_tool,
+                keep_first=entry.is_tool,
+            )
+        except Exception:  # noqa: BLE001
+            return []
+    return _rows
 
 
 def daemon_toolbar() -> Any:
@@ -518,15 +622,15 @@ def build_daemon_mount(repl: Any = None) -> "dict":
     # `header`/`header_height` are left ABSENT rather than waived here because the
     # mount is a dict of values, not a call site — `capability_handoff` reads the
     # waiver at the place the argument is passed, which is `serpent_flow`.
-    # `stream_rows` is deliberately absent, and this is the reason rather than an
-    # oversight: there is NO process-global in-flight text to read.
-    # `live_tool_stream.make_tool_observer` creates a stream per tool CALL and
-    # nothing publishes a current frame, so a provider here would have to invent
-    # one — and an in-flight strip that shows the wrong sentence is worse than no
-    # strip. The correct fix is a `set_active_stream` registry mirroring the
-    # `set_active_canvas` / `set_active_queue` pattern this codebase already uses
-    # twice, which needs a producer-side audit of every stream construction site.
-    # Left UNSET rather than waived so `capability_handoff` keeps reporting it.
+    # `stream_rows` is now FILLED. It was UNSET because there was no
+    # process-global in-flight text to read — every stream published its
+    # frames and kept none, so the daemon composed the words and could not
+    # draw them. `inflight_registry` records each frame at its composition
+    # site, which is strictly better than the `set_active_stream` registry
+    # this comment used to call for: that would have needed every stream
+    # CONSTRUCTION site to remember to register, and a producer that forgets
+    # is silently dark. Emission is the seam no producer can skip.
+    mount["stream_rows"] = daemon_stream_rows()
     return mount
 
 
@@ -538,4 +642,5 @@ __all__ = [
     "daemon_queue_rows",
     "daemon_search_rows",
     "daemon_serpent_active",
+    "daemon_stream_rows",
 ]
