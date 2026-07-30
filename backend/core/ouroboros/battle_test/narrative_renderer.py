@@ -360,7 +360,25 @@ def render_to_console(
     if not callable(print_fn):
         return False
     try:
-        print_fn(rendered.markup, highlight=False)
+        # Every frame on this channel is the MODEL's voice — that is the
+        # module's premise ("the assistant narrates its work"). Marked as
+        # such so plausible prose is never read as an observation.
+        #
+        # Declared rather than asserted: `claiming` takes the STRICTER of
+        # ambient and argument, so when the caller has already declared
+        # SYNTHETIC — the deterministic preamble template, which produces a
+        # frame indistinguishable from the model's own — the weaker footing
+        # wins automatically and no per-kind table is needed here.
+        markup = rendered.markup
+        try:
+            from backend.core.ouroboros.ui.provenance import (
+                Provenance, annotate, claiming,
+            )
+            with claiming(Provenance.MODELED) as resolved:
+                markup = annotate(markup, resolved)
+        except Exception:  # noqa: BLE001 — an unmarked line beats no line
+            markup = rendered.markup
+        print_fn(markup, highlight=False)
         return True
     except Exception:  # noqa: BLE001
         logger.debug(
