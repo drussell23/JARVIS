@@ -650,6 +650,44 @@ def _accepts_session(fn) -> bool:
         return False
 
 
+def _write_notebook_fault(session_dir: Any, exc: BaseException) -> bool:
+    """Record why the notebook is missing, in the session it is missing from.
+
+    NEVER raises: a tombstone that can take down the shutdown sequence is strictly
+    worse than no tombstone. Every failure mode here (an unwritable directory, a
+    disk that just filled, an interpreter mid-teardown) ends in a silent False.
+
+    Written with `os.replace` for the same reason the notebook is: teardown is
+    exactly when a write gets interrupted, and a truncated traceback reads as a
+    different bug than the one that actually happened.
+    """
+    try:
+        import os
+        import traceback
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        directory = Path(session_dir)
+        if not directory.is_dir():
+            return False
+        target = directory / ".notebook_fault.log"
+        tmp = directory / ".notebook_fault.log.tmp"
+        stamp = datetime.now(timezone.utc).isoformat()
+        body = (
+            f"notebook generation failed at {stamp}\n"
+            f"{type(exc).__name__}: {exc}\n\n"
+            + "".join(traceback.format_exception(type(exc), exc,
+                                                 exc.__traceback__))
+        )
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
 class BattleTestHarness:
     """Orchestrates the full Ouroboros boot, event-driven session loop, and shutdown.
 
@@ -9760,16 +9798,39 @@ class BattleTestHarness:
                 logger.debug("[Harness] drift line render failed: %s", exc)
 
         # --- Notebook ---
+        #
+        # Written into THE SESSION DIRECTORY, beside the `summary.json` it is
+        # derived from. It used to go to a shared `notebooks/` with the fixed name
+        # `report.ipynb`, so every session overwrote the last: 764 sessions with a
+        # summary produced exactly ONE notebook, and that one was ten weeks stale
+        # because the failure below was swallowed. Session output belongs in the
+        # session's own directory; a timestamped filename in a global folder would
+        # be a workaround for the same mistake.
         try:
             from backend.core.ouroboros.battle_test.notebook_generator import NotebookGenerator
 
             summary_json_path = self._session_dir / "summary.json"
             if summary_json_path.exists():
                 nb_gen = NotebookGenerator(summary_path=summary_json_path)
-                nb_path = nb_gen.generate(output_dir=self._notebook_output_dir)
+                # The SAME `_session_dir` that resolved `summary.json` above —
+                # one path authority, not a second one to drift from it.
+                nb_path = nb_gen.generate(output_dir=self._session_dir)
                 logger.info("Notebook generated at %s", nb_path)
         except Exception as exc:
+            # A TOMBSTONE, not just a log line.
+            #
+            # This runs during teardown, when the prompt_toolkit UI may already be
+            # unmounted, so there is no reliable surface to show a panic on. A
+            # `logger.warning` alone is what let this fail silently for ten weeks —
+            # nobody reads a warning from a shutdown hook. The traceback goes into
+            # the session directory instead, next to the artifact that is missing,
+            # so the evidence is found by whoever goes looking for the notebook.
+            #
+            # Deliberately NOT re-raised: the notebook is a report, and losing the
+            # rest of the shutdown sequence (the summary write, the worktree reap)
+            # to a reporting failure would trade a nuisance for real damage.
             logger.warning("Notebook generation failed: %s", exc)
+            _write_notebook_fault(self._session_dir, exc)
 
         # --- Clear session id (Increment 3) ---
         # Release the strategic_direction module global so that a subsequent

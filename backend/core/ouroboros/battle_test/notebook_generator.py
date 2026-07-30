@@ -19,6 +19,62 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _atomic_write(path: "Path", render: "Callable[[Path], None]") -> "Path":
+    """Write via a temp sibling, fsync, then `os.replace`. NEVER leaves a partial.
+
+    This runs during SHUTDOWN, which is exactly when the process is least likely to
+    be allowed to finish: a SIGTERM from the harness's own deadline, a preemption on
+    a volatile cloud node, an operator's second Ctrl-C. A plain write interrupted
+    mid-stream leaves a truncated `.ipynb` — and a corrupt notebook is worse than an
+    absent one, because it looks like an artifact and fails only when someone tries
+    to open it months later.
+
+    Three steps, none of them optional:
+
+      * a TEMP SIBLING in the same directory, so the final `replace` is a rename
+        within one filesystem and therefore atomic. A temp file in `/tmp` would make
+        it a cross-device copy, which is not.
+      * `flush()` then `os.fsync()`, because a rename can otherwise be committed
+        while the DATA is still in the page cache — the metadata lands, the bytes do
+        not, and the file reads as zeros after a hard kill.
+      * `os.replace()`, which is atomic on POSIX and Windows alike: a reader either
+        sees the old file or the complete new one, never a half-written notebook.
+
+    The temp file is removed on ANY failure, so a crashed run does not leave
+    `.report.ipynb.tmp` litter behind for the next session to wonder about.
+    """
+    import os
+
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        render(tmp)
+        # `render` closed its own handle; reopen to force the bytes to disk. The
+        # fsync has to happen on the DATA file, before the rename, or the ordering
+        # guarantee this whole function exists for is not there.
+        with open(tmp, "rb+") as fh:
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        return path
+    except BaseException:
+        # BaseException, not Exception, and that distinction is the whole point.
+        # The interruption this function exists to survive is a SIGTERM or a
+        # Ctrl-C, which arrive as `KeyboardInterrupt` / `SystemExit` — neither of
+        # which is an `Exception`. Catching the narrower type left the half-written
+        # `.report.ipynb.tmp` on disk in precisely the scenario the atomicity was
+        # for, and a test that simulated a mid-write SIGTERM is what found it.
+        #
+        # Re-raised unchanged below: this cleans up, it does not decide that a
+        # shutdown signal should be ignored.
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+
+
 class NotebookGenerator:
     """Generate a Jupyter notebook or Markdown report from a battle test summary.
 
@@ -288,7 +344,8 @@ class NotebookGenerator:
             "version": "3.9",
         }
 
-        nbformat.write(nb, str(output_path))
+        _atomic_write(output_path,
+                      lambda tmp: nbformat.write(nb, str(tmp)))
         logger.info("NotebookGenerator: notebook written to %s", output_path)
         return output_path.resolve()
 
@@ -445,6 +502,9 @@ class NotebookGenerator:
             "",
         ]
 
-        output_path.write_text("\n".join(lines))
+        _atomic_write(
+            output_path,
+            lambda tmp: tmp.write_text("\n".join(lines)),
+        )
         logger.info("NotebookGenerator: markdown report written to %s", output_path)
         return output_path.resolve()
