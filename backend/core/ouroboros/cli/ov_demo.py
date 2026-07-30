@@ -38,7 +38,7 @@ DEMO_HELP = """ov demo -- watch the cockpit, no model calls
   ov demo             board + transcript
   ov demo board       what is LIVE vs DARK right now (derived from the tree)
   ov demo surfaces    which of the 3 surfaces can REACH each module
-  ov demo transcript  the CC-style deck: ops, diffs, agora threads
+  ov demo transcript  the CC-style deck: ops, diffs, agora threads\n  ov demo epistemics  reach gutter, provenance marks, voice roster
   ov demo live        the COCKPIT running, driven by synthetic events
                       (needs a real terminal; --speed=N to fast-forward)
   ov demo scenes      list available scenes
@@ -210,6 +210,16 @@ _SCRIPT: List[Any] = [
     ("diff", (414, "-", "    except Exception:  # noqa: BLE001")),
     ("act", ("Validate", "7759-86")),
     ("det", ("✗ 3 failed · test_scoped_paths, test_sandbox_dir", "crit")),
+    # Four claims that USED to render identically. The test result above is
+    # observed and stays clean; everything below is softer than it looks.
+    ("prov", ("modeled", "det",
+              ("the fixture is stale — the loader caches by path",))),
+    ("prov", ("synthetic", "det",
+              ("🗣 I'll read the file first",))),
+    ("prov", ("unknown", "det",
+              ("blast radius 50 files",))),
+    ("prov", ("stated", "det",
+              ('operator: "reject — that except clause is load-bearing"',))),
 ]
 
 
@@ -234,6 +244,19 @@ def _compose(kind: str, args: Sequence[Any]) -> str:
             return deck.diff(*args)
         if kind == "voice":
             return deck.voice(*args)
+        if kind == "prov":
+            # `(provenance, inner_kind, inner_args)`. Composed INSIDE a real
+            # `claiming(...)` and marked by the real `annotate`, which is how
+            # production does it at the `_op_line` chokepoint — declare the
+            # footing at a boundary, let everything rendered inside inherit.
+            # A demo that stamped the glyph itself would show a mark the
+            # cockpit might no longer produce.
+            from backend.core.ouroboros.ui.provenance import (
+                annotate, claiming,
+            )
+            with claiming(args[0]) as resolved:
+                inner = _compose(args[1], args[2])
+                return annotate(inner, resolved)
         return deck.blank()
     except Exception:  # noqa: BLE001 — a demo must never be what breaks
         logger.debug("[OvDemo] beat degraded: %s", kind, exc_info=True)
@@ -251,6 +274,94 @@ _THREAD: List[dict] = [
     {"handle": "@cassandra", "op_id": "op-7759-86", "kind": "conflict",
      "body": "REVIEW disagrees: that except clause still swallows I2"},
 ]
+
+
+def scene_epistemics(console: Any, argv: Sequence[str] = ()) -> int:
+    """What the cockpit knows, and how well — the three honesty surfaces.
+
+    Same rule as every other scene: the REAL renderers. The reach column is
+    produced by `DiffPreviewRenderer._build_file_tree` itself, so a
+    regression in the gate's own preview shows up here rather than in a
+    parallel drawing that agrees with itself.
+
+    The advisor cache is seeded for three of four files, deliberately. A
+    fully-resolved gutter would be a lie about the common case: reach is
+    cached per key, a multi-file op leaves only its aggregate behind, and a
+    cold scan is a 39-43s burn no display surface may trigger. `?` is what
+    an operator will usually see, so `?` is what the demo shows.
+    """
+    _rule(console, "what it knows, and how well")
+
+    _say(console, "  reach — which file in this change should you read hardest")
+    _say(console)
+    try:
+        from backend.core.ouroboros.battle_test.diff_preview import (
+            DiffPreviewRenderer, FileChange,
+        )
+        from backend.core.ouroboros.ui import blast_gutter as _bg
+        seeded = {
+            "backend/core/ouroboros/governance/orchestrator.py":
+                (47, "measured"),
+            "backend/core/ouroboros/ui/theme.py":
+                (12, "localized_lower_bound"),
+            "tests/battle_test/test_thing.py": (0, "measured"),
+        }
+        # Through the RESOLVER seam, never the advisor's own cache. That
+        # cache is read by live GATE decisions, so a display surface writing
+        # to it — even briefly, even with cleanup — could let a demo change
+        # what the organism decides. A demo may lie to itself; it may never
+        # lie to the gate.
+        _bg.set_resolver(
+            lambda paths, root=None: seeded.get(list(paths)[0])
+            if paths else None
+        )
+        try:
+            changes = [
+                FileChange(path=path, old_content="a\nb\n",
+                           new_content="a\nB\n")
+                for path in seeded
+            ] + [FileChange(path="docs/notes.md", old_content="",
+                            new_content="new\n")]
+            console.print(DiffPreviewRenderer()._build_file_tree(changes))
+        finally:
+            _bg.set_resolver(None)
+        _say(console)
+        _say(console, "  · 0 is a MEASURED zero. ? was never measured.")
+        _say(console, "  ≥ means a localized scan proved a lower bound.")
+    except Exception as exc:  # noqa: BLE001
+        _say(console, f"  reach gutter unavailable: {exc}")
+
+    _say(console)
+    _say(console, "  provenance — /provenance")
+    _say(console)
+    try:
+        from backend.core.ouroboros.ui.provenance import annotate, legend
+        _markup(console, "    unmarked  observed, or derived from observation")
+        for label, _glyph, meaning in legend():
+            _markup(console, f"    {annotate('', label).strip()}  {meaning}")
+    except Exception as exc:  # noqa: BLE001
+        _say(console, f"  legend unavailable: {exc}")
+
+    _say(console)
+    _say(console, "  voices — /narrate")
+    _say(console)
+    try:
+        from backend.core.ouroboros.ui.narrative_density import (
+            current_density, roster,
+        )
+        rows = roster()
+        heard = [r for r in rows if r.verdict.heard]
+        _say(console, f"    {current_density().label} · "
+                      f"{len(heard)}/{len(rows)} audible")
+        for r in rows:
+            glyph = "•" if r.verdict.heard else "◦"
+            why = "" if r.verdict.heard else f"  needs {r.voice.min_density.label}"
+            if r.voice.exempt:
+                why = "  alarm, never muted"
+            _say(console, f"    {glyph} {r.voice.name}{why}")
+    except Exception as exc:  # noqa: BLE001
+        _say(console, f"  roster unavailable: {exc}")
+    return 0
 
 
 def scene_transcript(console: Any, argv: Sequence[str] = ()) -> int:
@@ -1270,6 +1381,7 @@ _SCENES: "dict[str, Callable[[Any, Sequence[str]], int]]" = {
     "board": scene_board,
     "surfaces": scene_surfaces,
     "transcript": scene_transcript,
+    "epistemics": scene_epistemics,
     # NOT in the default all-scenes run: it takes over the screen and
     # waits for a keypress, so it must be asked for by name.
     "live": scene_live,

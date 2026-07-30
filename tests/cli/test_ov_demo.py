@@ -10,6 +10,8 @@ silently blesses regressions.
 """
 from __future__ import annotations
 
+import ast
+import pathlib
 import pytest
 
 from backend.core.ouroboros.cli.ov import resolve
@@ -250,3 +252,93 @@ class TestLiveScene:
         render = _live_toolbar(lambda: 0.0, lambda: 7.5)
         text = render()
         assert "q to quit" in text and "tokens" in text
+
+
+class TestEpistemicsScene:
+    """The three surfaces that say how well the organism knows a thing."""
+
+    def test_it_is_a_derived_scene(self):
+        from backend.core.ouroboros.cli.ov_demo import demo_scenes
+        assert "epistemics" in demo_scenes()
+
+    def test_it_NEVER_writes_the_advisors_live_cache(self):
+        """The load-bearing invariant.
+
+        That cache is read by live GATE decisions, so a display surface
+        writing to it — even briefly, even with cleanup — could let a
+        demonstration change what the organism decides. A demo may lie to
+        itself; it may never lie to the gate.
+        """
+        from rich.console import Console
+        from backend.core.ouroboros.cli.ov_demo import scene_epistemics
+        from backend.core.ouroboros.governance import operation_advisor as oa
+        oa._BLAST_RADIUS_CACHE_SHARED.clear()
+        oa._BLAST_PROVENANCE_SHARED.clear()
+        scene_epistemics(Console(force_terminal=True, width=80))
+        assert oa._BLAST_RADIUS_CACHE_SHARED == {}
+        assert oa._BLAST_PROVENANCE_SHARED == {}
+
+    def test_the_source_never_names_the_advisor_cache(self):
+        """Structural backstop: the runtime check above also passes for a
+        scene that writes and then cleans up perfectly, and the hazard is
+        the WINDOW, not the residue."""
+        import backend.core.ouroboros.cli.ov_demo as mod
+        src = pathlib.Path(mod.__file__).read_text()
+        assert "_BLAST_RADIUS_CACHE_SHARED" not in src
+        assert "_BLAST_PROVENANCE_SHARED" not in src
+
+    def test_the_resolver_override_is_always_released(self):
+        """Left installed, every later gutter in the process would show the
+        demo's numbers."""
+        from rich.console import Console
+        from backend.core.ouroboros.cli.ov_demo import scene_epistemics
+        from backend.core.ouroboros.ui import blast_gutter as bg
+        scene_epistemics(Console(force_terminal=True, width=80))
+        assert bg._RESOLVER is None
+
+    def test_it_renders_the_REAL_diff_tree(self):
+        """Not a parallel drawing that agrees with itself while the gate's
+        own preview is broken."""
+        import backend.core.ouroboros.cli.ov_demo as mod
+        src = pathlib.Path(mod.__file__).read_text()
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "scene_epistemics")
+        called = {ast.unparse(n.func) for n in ast.walk(fn)
+                  if isinstance(n, ast.Call)}
+        assert "DiffPreviewRenderer()._build_file_tree" in called
+        assert "legend" in called and "roster" in called
+
+    def test_a_broken_surface_degrades_instead_of_crashing(self, monkeypatch):
+        from rich.console import Console
+        from backend.core.ouroboros.cli import ov_demo as mod
+        from backend.core.ouroboros.ui import blast_gutter as bg
+        monkeypatch.setattr(bg, "set_resolver", lambda *_a: (
+            _ for _ in ()).throw(RuntimeError("boom")))
+        assert mod.scene_epistemics(Console(force_terminal=True)) == 0
+
+
+class TestProvenanceBeats:
+    def test_the_marks_come_from_the_REAL_annotator(self):
+        """A demo that stamped the glyph itself would keep showing a mark
+        the cockpit no longer produces."""
+        import backend.core.ouroboros.cli.ov_demo as mod
+        src = pathlib.Path(mod.__file__).read_text()
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_compose")
+        called = {ast.unparse(n.func) for n in ast.walk(fn)
+                  if isinstance(n, ast.Call)}
+        assert {"annotate", "claiming"} <= called
+
+    def test_every_marked_rung_appears_in_the_transcript(self):
+        from backend.core.ouroboros.cli.ov_demo import _SCRIPT, _compose
+        rendered = " ".join(_compose(k, a) for k, a in _SCRIPT)
+        for glyph in ("‹model›", "‹synthetic›",
+                      "‹unverified›", "‹stated›"):
+            assert glyph in rendered, glyph
+
+    def test_observed_beats_stay_CLEAN(self):
+        """Scarcity: a demo that marked every line would be showing a
+        transcript the cockpit does not produce."""
+        from backend.core.ouroboros.cli.ov_demo import _compose
+        assert "‹" not in _compose("det", ("Read 847 lines",))
