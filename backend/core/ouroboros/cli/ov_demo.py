@@ -260,7 +260,17 @@ def _compose(kind: str, args: Sequence[Any]) -> str:
             return deck.detail(args[0], tone=(args[1] if len(args) > 1
                                               else "muted"))
         if kind == "diff":
-            return deck.diff(*args)
+            # `(lineno, sign, code)` positionally, plus the PATH the hunk belongs
+            # to so `deck.diff` can infer the language, and the terminal WIDTH so
+            # the add/del band reaches a common right edge instead of stopping at
+            # each line's text. Both keyword-only, so the three-tuple call shape
+            # every other beat uses is unchanged.
+            import shutil
+            return deck.diff(
+                *args[:3],
+                path=(args[3] if len(args) > 3 else None),
+                width=shutil.get_terminal_size((100, 30)).columns,
+            )
         if kind == "voice":
             return deck.voice(*args)
         if kind == "prov":
@@ -479,6 +489,10 @@ _SEARCH_RESULT = "\n".join(
 )
 
 
+#: The file the edit hunk belongs to. Named once: `deck.diff` infers the lexer
+#: from it, so a typo here silently costs the highlighting rather than raising.
+_EDIT_PATH = "backend/core/ouroboros/governance/risk_tier_floor.py"
+
 _EDIT_RESULT = (
     "--- a/backend/core/ouroboros/governance/risk_tier_floor.py\n"
     "+++ b/backend/core/ouroboros/governance/risk_tier_floor.py\n"
@@ -588,6 +602,23 @@ _LIVE_BEATS: List[Any] = [
     (7.2, "tool", ("edit_file", "backend/core/ouroboros/governance/"
                                 "risk_tier_floor.py",
                    _EDIT_RESULT, "success", 90)),
+    # The edit's own hunk, syntax-highlighted with an add/del band — the
+    # `Update(file)` block Claude Code draws. The 4th beat arg is the PATH, which
+    # is what lets the language be inferred rather than declared.
+    (7.9, "act", ("Update", "risk_tier_floor.py", "ok")),
+    (8.0, "det", ("Added 4 lines · removed 2",)),
+    (8.1, "diff", (410, " ", "    try:", _EDIT_PATH)),
+    (8.2, "diff", (411, " ", "        return _resolve_floor(raw)", _EDIT_PATH)),
+    (8.3, "diff", (412, "-", "    except Exception:  # noqa: BLE001",
+                   _EDIT_PATH)),
+    (8.4, "diff", (413, "-", "        return SAFE_AUTO", _EDIT_PATH)),
+    (8.5, "diff", (412, "+", "    except RiskFloorConfigError:", _EDIT_PATH)),
+    (8.6, "diff", (413, "+", "        # A malformed floor is the ONE case that "
+                             "must not degrade", _EDIT_PATH)),
+    (8.7, "diff", (414, "+", "        # quietly: SAFE_AUTO turns a broken config "
+                             "into permission", _EDIT_PATH)),
+    (8.8, "diff", (415, "+", "        raise", _EDIT_PATH)),
+
     (9.2, "tool", ("bash",
                    "python3 -m pytest tests/governance/"
                    "test_risk_tier_floor.py -q",

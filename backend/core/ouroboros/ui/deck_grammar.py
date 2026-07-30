@@ -186,21 +186,127 @@ def voice(text: str) -> str:
         return f"  {text}"
 
 
-def diff(lineno: Optional[int], sign: str, code: str) -> str:
+def _highlight_to_markup(code: str, path: Optional[str], bg: str) -> str:
+    """Syntax-highlight ``code`` and return DECK MARKUP. NEVER raises.
+
+    A diff line carries two independent facts and the deck was collapsing them
+    into one: the SIGN (was this added or removed) and the SYNTAX (what is this
+    code). Tinting the whole line by its sign made every added line uniformly
+    green, so the code inside a hunk stopped reading as code — the operator can
+    see that something changed but not what it says.
+
+    Claude Code keeps them separate: background from the sign, foreground from the
+    highlighter. That is what this restores.
+
+    Markup, not ANSI, and that is a contract decision rather than a preference.
+    The transcript ring decodes either since #70290, but `ov demo transcript`
+    prints these lines through a Rich MARKUP console — handing it ANSI would print
+    the escapes. Returning markup keeps every existing consumer working, so the
+    highlighting is additive rather than a migration.
+
+    The lexer is INFERRED by Rich from the path (`Syntax.guess_lexer`), never from
+    a table here. A hardcoded extension map is wrong the first time someone edits
+    a `.toml`, and Rich already owns that knowledge — it resolves `.py` to python,
+    `.md` to markdown, and a bare `Makefile` to make, none of which this module
+    should be in the business of knowing.
+    """
+    try:
+        from rich.console import Console
+        from rich.syntax import Syntax
+        from rich.text import Text
+
+        # No path means no language to guess. Highlighting against a default
+        # lexer would colour arbitrary tokens confidently and wrongly, which is
+        # worse than not highlighting: a wrong colour is a claim.
+        lexer = None
+        if path:
+            try:
+                lexer = Syntax.guess_lexer(str(path), code)
+            except Exception:  # noqa: BLE001
+                lexer = None
+        if not lexer:
+            return _tint(_escape(code), bg) if bg else _escape(code)
+
+        text: Any = Syntax(code, lexer, theme="ansi_dark").highlight(code)
+        # `highlight` appends a trailing newline; inside a one-line deck entry it
+        # would split the row and shove the gutter of the NEXT line out of column.
+        if isinstance(text, Text):
+            text.rstrip()
+        out: list = []
+        for segment in text.render(Console(width=max(20, len(code) + 8),
+                                           force_terminal=False)):
+            piece = segment.text
+            if not piece or piece == "\n":
+                continue
+            style = str(segment.style or "").strip()
+            # Compose the sign's background UNDER the token's own colour, so a
+            # keyword keeps its foreground while the hunk keeps its band. Order
+            # matters: Rich resolves later tokens last, so the background is
+            # written first and the syntax colour wins the foreground.
+            combined = f"{bg} {style}".strip() if bg else style
+            if combined and combined != "none":
+                out.append(f"[{combined}]{_escape(piece)}[/{combined}]")
+            else:
+                out.append(_escape(piece))
+        return "".join(out) or (_tint(_escape(code), bg) if bg
+                                else _escape(code))
+    except Exception:  # noqa: BLE001
+        # A highlighter that fails must not cost the operator the diff.
+        return _tint(_escape(code), bg) if bg else _escape(code)
+
+
+def diff(lineno: Optional[int], sign: str, code: str,
+         *, path: Optional[str] = None, width: Optional[int] = None) -> str:
     """``     412 +    except RiskFloorConfigError:`` — a hunk under a result.
 
     Anchored on :data:`DETAIL_COLUMN`, so it cannot step out from under the
     ``⎿`` summary that introduced it. The line number is what makes a hunk
     reviewable rather than decorative: without it the operator knows a line
     changed but not where to look.
+
+    ``path`` enables syntax highlighting — the language is inferred from it, so a
+    caller that knows which file a hunk belongs to gets highlighted code for free
+    and one that does not keeps the previous single-tone rendering. Additive by
+    construction: no call site has to change to keep working.
+
+    ``width`` pads the background band to a fixed column so an added block reads as
+    a solid slab rather than a ragged right edge that stops at each line's text.
     """
     try:
         gutter = (f"{int(lineno):>{GUTTER_WIDTH}}" if lineno is not None
                   else " " * GUTTER_WIDTH)
-        tone = {"+": "ok", "-": "crit"}.get(sign, "muted")
+        # The BAND belongs to the sign. `code_add`/`code_del` are the roles the
+        # palette already declares for exactly this and which nothing has been
+        # consuming for the hunk body — only for the "Added N lines" summary.
+        # From `role_palette`, NOT `_style`. `_style` maps this module's own tone
+        # vocabulary (ok / crit / faint / muted) and resolves an unknown name to
+        # "" — so asking it for a semantic ROLE silently produced no band at all,
+        # which is how the first version of this shipped highlighted code with no
+        # slab behind it. `role_palette` is the declared owner of `code_add` /
+        # `code_del`, and the roles have existed unconsumed for the hunk body since
+        # the colour migration.
+        band = ""
+        try:
+            from backend.core.ouroboros.ui.semantic_tokens import role_palette
+            band = {"+": "code_add", "-": "code_del"}.get(sign, "")
+            band = (role_palette().get(band) or "") if band else ""
+        except Exception:  # noqa: BLE001
+            band = ""
+        bg = f"on {band}" if band else ""
+        body = _highlight_to_markup(code, path, bg)
+        # Padding is applied to the RAW text length, never to the markup string:
+        # markup carries style tags that occupy no columns, so measuring it would
+        # over-pad by however many tags the highlighter happened to emit.
+        pad = ""
+        if width:
+            visible = len(code) + 2          # the code plus "<sign> "
+            room = max(0, int(width) - DETAIL_COLUMN - GUTTER_WIDTH - 1 - visible)
+            if room and bg:
+                pad = _tint(" " * room, bg)
+        sign_mark = _tint(f"{sign} ", bg) if bg else f"{sign} "
         return (" " * DETAIL_COLUMN
                 + _tint(gutter, _style("faint")) + " "
-                + _tint(f"{sign} {_escape(code)}", _style(tone)))
+                + sign_mark + body + pad)
     except Exception:  # noqa: BLE001
         return f"     {sign} {code}"
 
