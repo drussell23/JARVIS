@@ -70,6 +70,151 @@ DIFF_OVERLAY_SCHEMA_VERSION = "diff_overlay.v1"
 OVERLAY_NAME = "diff_preview"
 
 
+def highlight_diff_body(payload: "dict") -> List[str]:
+    """Syntax-highlight a unified diff. THE WORKER — runs in a child process.
+
+    Module-level and taking plain data, because `ProcessPoolExecutor` pickles both
+    the callable and its arguments: the obvious `self._render_blocking` cannot
+    cross a process boundary at all — it is bound to a controller holding a lock,
+    an archive and callbacks, none of which pickle.
+
+    Ships ONLY the expensive half. `asyncio.to_thread` was never wrong about
+    wanting this off the loop; it was wrong that a thread achieves it, because
+    Pygments is pure Python and holds the GIL for the whole lex. Measured: ~480ms
+    of lexing that stalls the loop under load, against 155ms for a child to import
+    rich+pygments ONCE and 14ms for this module — so a persistent worker amortises
+    its startup after a single render, while a per-render process would cost more
+    than the bug.
+
+    The header and the file tree stay in the PARENT deliberately. They are cheap
+    (string formatting and one `_build_file_tree` call) and the tree reaches into
+    `diff_preview`, which would drag the ouroboros tree into the child and turn a
+    155ms warm-up into something far worse. Moving only what is expensive is what
+    keeps the child's import surface to `rich`.
+
+    NEVER raises across the boundary: an exception in a worker arrives as a
+    `BrokenProcessPool` or an unpicklable traceback at the caller, so failure is
+    reported as CONTENT the operator can read instead.
+    """
+    try:
+        from io import StringIO
+
+        from rich.console import Console
+        from rich.syntax import Syntax
+
+        text = str(payload.get("diff_text") or "")
+        width = int(payload.get("width") or 100)
+        if not text.strip():
+            return ["    (no diff text archived for this ref)"]
+        buf = StringIO()
+        Console(file=buf, force_terminal=True, color_system="truecolor",
+                width=max(20, width - 4), highlight=False,
+                emoji=True).print(
+            Syntax(text, "diff", theme="ansi_dark", word_wrap=False,
+                   background_color="default"))
+        return buf.getvalue().rstrip("\n").split("\n")
+    except Exception:  # noqa: BLE001
+        # Plain text beats nothing: an operator wanting to read a diff is not
+        # served by a highlighter's absence.
+        return [f"    {ln}" for ln in
+                str(payload.get("diff_text") or "").splitlines()]
+
+
+_POOL: Any = None
+_POOL_LOCK = threading.RLock()
+_POOL_BROKEN = False
+
+
+def _render_pool() -> Any:
+    """The persistent highlight pool, or None. NEVER raises.
+
+    ONE worker, not a fleet: renders are serialised by the epoch guard anyway (only
+    the newest matters), so extra workers would buy nothing and cost a 155ms import
+    each. A single child also keeps the shutdown story simple, which matters because
+    `graceful_preemption.halt_child_workers` already SIGTERMs this process's
+    children at teardown — this pool must be something that path can kill, not a
+    second lifecycle competing with it.
+
+    Once broken, STAYS broken. A pool whose worker was halted raises
+    `BrokenProcessPool` on every submit, and retrying per render would pay the
+    failure cost forever; the thread fallback is correct from then on.
+    """
+    global _POOL, _POOL_BROKEN
+    if _POOL_BROKEN:
+        return None
+    with _POOL_LOCK:
+        if _POOL_BROKEN:
+            return None
+        if _POOL is None:
+            try:
+                from concurrent.futures import ProcessPoolExecutor
+                _POOL = ProcessPoolExecutor(max_workers=1)
+            except Exception:  # noqa: BLE001 — sandbox, frozen app, no spawn
+                logger.debug("[DiffOverlay] render pool unavailable",
+                             exc_info=True)
+                _POOL_BROKEN = True
+                return None
+        return _POOL
+
+
+def shutdown_render_pool(*, wait: bool = False) -> bool:
+    """Release the worker. Idempotent. NEVER raises.
+
+    Registered with `atexit` so a cockpit that exits normally does not leave a
+    child behind, and callable by name so the existing preemption path can release
+    it deliberately rather than having to discover it.
+
+    ``wait=False`` by default: shutdown runs on the operator's exit path, and a
+    render in flight is worth abandoning rather than waiting on.
+    """
+    global _POOL, _POOL_BROKEN
+    with _POOL_LOCK:
+        pool, _POOL = _POOL, None
+        _POOL_BROKEN = True
+    if pool is None:
+        return False
+    try:
+        pool.shutdown(wait=wait, cancel_futures=True)
+    except TypeError:            # cancel_futures is 3.9+
+        try:
+            pool.shutdown(wait=wait)
+        except Exception:  # noqa: BLE001
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+try:
+    import atexit as _atexit
+    _atexit.register(shutdown_render_pool)
+except Exception:  # noqa: BLE001
+    pass
+
+
+def reset_render_pool_for_tests() -> None:
+    """Forget that the pool was ever retired. NEVER raises.
+
+    `shutdown_render_pool` sets a module-global broken flag ON PURPOSE — a halted
+    worker must not be retried per render — but that flag then outlives a single
+    test and silently pushes every later one onto the thread path. Which is not
+    hypothetical: it made the #70283 stall assertion fail depending on test ORDER,
+    reporting a regression in code that had not changed.
+
+    Exposed here rather than reached into from a test, so the reset and the flag
+    that needs resetting stay in one module.
+    """
+    global _POOL, _POOL_BROKEN
+    with _POOL_LOCK:
+        pool, _POOL = _POOL, None
+        _POOL_BROKEN = False
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _terminal_width(fallback: int = 100) -> int:
     """Resolved per call — a diff wrapped to a stale width is clipped, not
     reflowed, because the canvas draws with ``wrap_lines=False``."""
@@ -225,7 +370,43 @@ class DiffOverlayController:
         try:
             import asyncio
             width = self._width_fn()
-            rows = await asyncio.to_thread(self._render_blocking, entry, width)
+            # Cheap halves stay here: header formatting and one `_build_file_tree`
+            # call. Shipping them would drag `diff_preview` into the child and turn
+            # a 155ms warm-up into something far worse.
+            rows = list(self._header_rows(entry))
+            rows.extend(self._tree_rows(entry, width))
+            payload = {
+                "diff_text": str(getattr(entry, "diff_text", "") or ""),
+                "width": width,
+            }
+            body: List[str] = []
+            # Constructed OFF the loop. `ProcessPoolExecutor(...)` spawns a child
+            # synchronously, and doing that inline stalled the loop for ~154ms on
+            # the very first render — the pool paying for itself out of the frame
+            # budget it exists to protect. Warming it in a thread is safe because
+            # the construction releases the GIL in the OS spawn, unlike the Pygments
+            # work this is all for.
+            pool = await asyncio.to_thread(_render_pool)
+            if pool is not None:
+                try:
+                    loop = asyncio.get_running_loop()
+                    body = await loop.run_in_executor(
+                        pool, highlight_diff_body, payload)
+                except Exception:  # noqa: BLE001
+                    # BrokenProcessPool (a halted worker), a pickling failure, a
+                    # sandbox that forbids spawn — every one of them means the
+                    # child is not available NOW, and the operator still wants the
+                    # diff. Retire the pool and fall through to the thread.
+                    logger.debug("[DiffOverlay] render pool failed; "
+                                 "falling back to a thread", exc_info=True)
+                    shutdown_render_pool()
+                    body = []
+            if not body:
+                # The thread still holds the GIL — this is the DEGRADED path, kept
+                # because losing the diff is worse than a stalled frame, not because
+                # a thread was ever adequate.
+                body = await asyncio.to_thread(highlight_diff_body, payload)
+            rows.extend(body)
             self._absorb(epoch, rows)
         except Exception:  # noqa: BLE001
             logger.debug("[DiffOverlay] async render degraded", exc_info=True)
@@ -307,6 +488,14 @@ class DiffOverlayController:
 
     def _diff_rows(self, entry: Any, width: int) -> List[str]:
         """The diff body, syntax-highlighted. The expensive half."""
+        # Through the same module-level worker the pool calls, so the in-process
+        # path and the child path cannot drift into two different renderings.
+        return highlight_diff_body({
+            "diff_text": str(getattr(entry, "diff_text", "") or ""),
+            "width": width,
+        })
+
+    def _diff_rows_unused(self, entry: Any, width: int) -> List[str]:
         text = str(getattr(entry, "diff_text", "") or "")
         if not text.strip():
             return ["    (no diff text archived for this ref)"]
