@@ -146,14 +146,87 @@ class TestTheMount:
                 for b in kb.bindings for k in b.keys}
         assert "/" in keys, "the hatch install did not bring search"
 
-    def test_the_cockpit_receives_a_search_bar_renderer(self):
-        """Pinned at the seam: a renderer with no mount is the exact shape of
-        the bug this change exists to close."""
-        import inspect
-        from backend.core.ouroboros.cli.ov import _bipartite_attach_loop
+    def test_the_cockpit_actually_draws_the_search_bar_it_was_given(self):
+        """The bar must reach the LAYOUT, not merely reach the signature.
 
-        src = inspect.getsource(_bipartite_attach_loop)
-        assert "search_rows=" in src
+        This test used to read ``assert "search_rows=" in src`` against
+        `_bipartite_attach_loop` — proving only that the CALLER passes the
+        argument, which it always did. `build_bipartite_application` accepted
+        the parameter and never read it, so transcript search was dark on the
+        shipping client, and this test passed throughout. It asserted the half
+        of the handoff that was never broken.
+
+        So it now builds the real Application and looks for the provider's
+        output in the container tree. That fails if the mount is removed, which
+        is the whole job.
+        """
+        from prompt_toolkit.formatted_text import to_formatted_text
+        from prompt_toolkit.layout import walk
+        from prompt_toolkit.layout.controls import FormattedTextControl
+
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout, build_bipartite_application,
+        )
+
+        def drawn(app):
+            """Every string the layout's text controls would render.
+
+            Fragments are JOINED per control, never inspected individually:
+            `to_formatted_text` on an ``ANSI`` value yields ONE FRAGMENT PER
+            CHARACTER, so a substring search over the fragment list can never
+            match a multi-character sentinel. The first version of this helper
+            did exactly that and reported the mount missing while it was
+            working — an assertion that fails for a reason unrelated to the
+            behaviour is worse than none.
+            """
+            out = []
+            for node in walk(app.layout.container):
+                control = getattr(node, "content", None)
+                if not isinstance(control, FormattedTextControl):
+                    continue
+                try:
+                    value = (control.text() if callable(control.text)
+                             else control.text)
+                    out.append("".join(f[1] for f in to_formatted_text(value)))
+                except Exception:  # noqa: BLE001
+                    continue
+            return out
+
+        mark = "SEARCH-BAR-SENTINEL 3/17"
+        with_bar = build_bipartite_application(
+            BipartiteLayout(), on_accept=lambda _t: None,
+            search_rows=lambda: [mark],
+        )
+        assert any(mark in line for line in drawn(with_bar)), (
+            "search_rows was accepted and never mounted — the search bar is "
+            "dark on every surface that passes it"
+        )
+
+    def test_the_bar_costs_nothing_when_no_provider_is_given(self):
+        """The complement, and not a formality: a mount that draws the row
+        unconditionally would pass the test above while stealing a line from
+        every cockpit that has no search bar."""
+        from prompt_toolkit.formatted_text import to_formatted_text
+        from prompt_toolkit.layout import walk
+        from prompt_toolkit.layout.controls import FormattedTextControl
+
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout, build_bipartite_application,
+        )
+
+        app = build_bipartite_application(
+            BipartiteLayout(), on_accept=lambda _t: None)
+        for node in walk(app.layout.container):
+            control = getattr(node, "content", None)
+            if not isinstance(control, FormattedTextControl):
+                continue
+            try:
+                value = (control.text() if callable(control.text)
+                         else control.text)
+                text = "".join(f[1] for f in to_formatted_text(value))
+            except Exception:  # noqa: BLE001
+                continue
+            assert "SEARCH-BAR-SENTINEL" not in text
 
     def test_the_bar_is_silent_until_it_is_opened(self):
         """A search bar that always occupies a row spends it saying nothing,

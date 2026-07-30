@@ -274,6 +274,13 @@ class BipartiteLayout:
         self._title = title
         self._resize_count = 0
         self._sprite: Any = None            # the DORMANT/WAKING hero animation
+        # The seed above is an ESTIMATE: the terminal's size stands in for the
+        # canvas's own allotment because nothing has measured the canvas yet.
+        # It is a fair guess and it is the best available before the first frame
+        # — a cockpit still has to draw something. `observe_allotment` replaces
+        # it with the framework's real number on that first render and flips
+        # this, so no reader ever mistakes the stand-in for the measurement.
+        self._allotment_measured = False
 
     # -- the Ouroboros hero animation -----------------------------------
 
@@ -374,8 +381,90 @@ class BipartiteLayout:
 
     # -- rendering ------------------------------------------------------
 
+    def observe_allotment(self, width: Optional[int],
+                          height: Optional[int]) -> bool:
+        """Record the rows and columns this canvas was ACTUALLY given.
+
+        The whole clipping defect in one sentence: the canvas was sizing itself
+        against the TERMINAL when what bounds it is the REGION its parent
+        `HSplit` hands it, and those are the same number only in a cockpit with
+        no header, no toolbar, no status row, no search bar, no pending strip,
+        no turn row and no agent view.
+
+        Measured, at 200x60 with a 12-row crest mounted: the mux believed it had
+        39 rows and produced 39 lines into a window that was given 8. Thirty-one
+        lines were dropped — and because a `Window` draws a content block from
+        its TOP, the rows it kept were the OLDEST of them. The operator was left
+        watching a window parked thirty-one lines behind the live tail, which is
+        the precise reason the last beats of a script "never rendered".
+
+        Predicting the answer is what failed, and every version of predicting
+        fails the same way. `_canvas_fragments` reserved exactly one row for
+        chrome (`size.rows - 1`), which was true when the cockpit was a canvas
+        and a prompt; each strip added since made it wronger, silently, because
+        nothing compared the prediction to reality. Deducting the strips instead
+        would mean this class re-deriving its parent's layout arithmetic — two
+        implementations of one truth, drifting the next time a row is added.
+
+        So it is OBSERVED, at the seam the framework already provides for it:
+        `UIControl.create_content(width, height)` is prompt_toolkit telling a
+        control exactly what it has. That is authoritative rather than inferred,
+        it needs no knowledge of what the siblings cost, and it stays correct
+        through a resize, a palette opening, a strip appearing mid-session, and
+        any row some future arc adds — none of which this method has to know
+        about.
+
+        Returns whether the allotment changed. NEVER raises.
+
+        A zero or ``None`` height is REFUSED rather than recorded. Those are
+        real states — a `ConditionalContainer` collapsed, a control asked to
+        measure rather than draw — and treating them as a budget would render an
+        empty deck and then invalidate on the emptiness. The last good
+        measurement is a better answer than a degenerate fresh one.
+        """
+        try:
+            changed = False
+            if width is not None and int(width) > 0:
+                new_width = max(10, int(width))
+                if new_width != self._width:
+                    self._width, changed = new_width, True
+            if height is not None and int(height) > 0:
+                new_height = max(3, int(height))
+                if new_height != self._height:
+                    self._height, changed = new_height, True
+                # Provenance is set even when the number is unchanged: an
+                # estimate that happens to equal the measurement is still an
+                # estimate until something measures it, and `allotment_measured`
+                # is what tells a reader which one they are looking at. Same
+                # rule the advisor follows about a cap that coincides with a
+                # real blast radius.
+                self._allotment_measured = True
+            return changed
+        except (TypeError, ValueError):
+            return False
+
+    @property
+    def allotment_measured(self) -> bool:
+        """Has a real render told us our size, or are we still guessing?
+
+        Exposed because "38 rows, measured" and "38 rows, assumed" are different
+        facts, and a surface that cannot tell them apart is how a hardcoded 24
+        survived long enough to be found by accident. The estimate is a
+        legitimate fallback before the first frame; it must simply never wear a
+        measurement's authority.
+        """
+        return bool(getattr(self, "_allotment_measured", False))
+
     def _line_budget(self) -> int:
-        """Rows the canvas may draw into, frame chrome deducted."""
+        """Rows the canvas may draw into, frame chrome deducted.
+
+        ``self._height`` is the canvas's OWN allotment — observed from the
+        framework once a frame has rendered (see :meth:`observe_allotment`),
+        estimated from the terminal before that. The chrome deduction is
+        unchanged and still means what it always meant: rows this canvas spends
+        on its own panel border and title. It was never wrong; it was being
+        subtracted from the wrong number.
+        """
         chrome = 4 if os.environ.get(
             "JARVIS_BIPARTITE_BORDER", "",
         ).strip().lower() in ("1", "true", "yes", "on") else 1
@@ -806,7 +895,19 @@ def build_bipartite_application(
     stream_rows: Optional[Callable[[], Any]] = None,
     queue_rows: Optional[Callable[[], Any]] = None,
     panic_rows: Optional[Callable[[], Any]] = None,
-    on_mux: Optional[Callable[[Any], None]] = None,
+    # NOTE: no `on_mux` here, deliberately. It belongs to `run_bipartite_repl`,
+    # which CONSTRUCTS the multiplexer and therefore has something to hand
+    # back. A caller of this function already holds the mux — it passes it in
+    # as the first argument — so an `on_mux` callback here could only ever
+    # return the caller's own object to it.
+    #
+    # It was in this signature, read by nothing, passed by nobody: dead API
+    # surface that invited exactly one mistake, and duly caused it. Planning
+    # this work, I recommended "pass `on_mux` in the demo so in-transcript
+    # streaming demos its real mechanic" — which would have silently done
+    # nothing, because `ov demo live` calls THIS function directly. Removed
+    # rather than documented; a parameter that cannot be correct to pass should
+    # not be offered.
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> Any:
     """Construct the full-screen ``prompt_toolkit.Application``: Zone 1 an ANSI
@@ -824,19 +925,50 @@ def build_bipartite_application(
     from prompt_toolkit.key_binding import KeyBindings
 
     def _canvas_fragments():
-        # Re-sync dims to the live terminal each render → SIGWINCH handled for free.
-        try:
-            app = _APP_REF.get("app")
-            if app is not None and app.output is not None:
-                size = app.output.get_size()
-                if (size.columns, size.rows) != (mux.width, mux.height):
-                    mux.on_resize(size.columns, max(4, size.rows - 1))  # reserve deck row
-        except Exception:  # noqa: BLE001
-            pass
+        # NO terminal probe here any more, and no `size.rows - 1`.
+        #
+        # This used to re-sync the mux to `app.output.get_size()` minus one row
+        # "for the deck", which is a PREDICTION of what the surrounding HSplit
+        # would leave over. It was right while the cockpit was a canvas and a
+        # prompt, and every strip added since made it wronger by a row or twelve
+        # — silently, because nothing ever compared it to what the canvas was
+        # actually given. `_MeasuredCanvasControl` below now supplies the real
+        # number before this callable runs, so by here the budget is already
+        # correct for THIS frame.
         return ANSI(mux.render_canvas_ansi())
 
+    class _MeasuredCanvasControl(FormattedTextControl):
+        """A canvas control that tells the mux how big it really is.
+
+        `create_content(width, height)` is prompt_toolkit handing a control its
+        exact allotment for the frame about to be drawn. Recording it here — and
+        crucially, BEFORE delegating to ``super()``, which is what invokes the
+        text callable — means the very frame being measured is also the frame
+        that renders at the corrected size. There is no lag and no first-frame
+        flash of clipped content.
+
+        The alternative was to read ``window.render_info`` after a render, which
+        is the same measurement one frame late; every resize would then show a
+        single wrong frame, and a resize is exactly when an operator is looking.
+
+        A resize is published through the mux's existing invalidate so any
+        surface hanging off it repaints — the same hook `attach_sprite` and the
+        ReactiveTheme already use. Only on CHANGE: invalidating every frame from
+        inside a render is a repaint loop, and `observe_allotment` returning a
+        changed-flag is what keeps that honest.
+        """
+
+        def create_content(self, width, height=None):  # noqa: ANN001
+            try:
+                if mux.observe_allotment(width, height):
+                    mux._invalidate_now()
+            except Exception:  # noqa: BLE001 — never break a frame to measure it
+                logger.debug("[Bipartite] allotment observation degraded",
+                             exc_info=True)
+            return super().create_content(width, height)
+
     canvas = Window(
-        content=FormattedTextControl(_canvas_fragments, focusable=False),
+        content=_MeasuredCanvasControl(_canvas_fragments, focusable=False),
         wrap_lines=False, height=_canvas_dimension(),
     )
     # Ctrl+R history search rides the SAME completion menu the palette
@@ -1207,7 +1339,29 @@ def build_bipartite_application(
                 rows += [_pending_row]
         except Exception:  # noqa: BLE001
             logger.debug("[Bipartite] pending row unavailable", exc_info=True)
-    # The search bar sits DIRECTLY above the prompt    # The palette is NOT a row. See the FloatContainer below: as an HSplit row
+    # The search bar sits DIRECTLY above the prompt: while it is open it IS the
+    # next keystroke, which is the rule `_below_prompt` states for what goes
+    # above the caret versus what goes below it.
+    #
+    # This mount is a REPAIR. The comment above survived an edit that lost the
+    # code, leaving `search_rows` accepted by the signature, forwarded here by
+    # `run_bipartite_repl`, resolved by `ov.py::_transcript_search_rows` — and
+    # read by nothing. Transcript search was dark on the SHIPPING client, not
+    # merely in a demo, and the test guarding it asserted `"search_rows=" in
+    # src` so it passed for the entire period the feature did nothing.
+    #
+    # `build_dynamic_rows`' own docstring names this row — "the agent view, the
+    # search bar, and whatever comes next" — so the geometry primitive was
+    # built for it and then never handed it. Found by
+    # `ui/capability_handoff.py`, which exists because of this defect.
+    if search_rows is not None:
+        try:
+            _search_row = build_dynamic_rows(search_rows)
+            if _search_row is not None:
+                rows += [_search_row]
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] search row unavailable", exc_info=True)
+    # The palette is NOT a row. See the FloatContainer below: as an HSplit row
     # it shares the ambient grid with the canvas, so every asynchronous Deck or
     # Lane frame arriving underneath forces the palette's geometry to be
     # recomputed along with everything else.
