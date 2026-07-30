@@ -852,11 +852,22 @@ def _agent_view_rows() -> Any:
     sizes it to this terminal. Importing it means the demo cannot render a
     roster the cockpit would draw differently — a second provider here would
     be a second opinion about width, height budget and folding.
+
+    The demo turns the roster ON explicitly. In the cockpit it is hidden by
+    default and asked for with `/tasks`, which is right for a surface someone
+    works in all day and wrong for one whose entire purpose is to SHOW the
+    surfaces. Sharing the provider means the demo cannot silently keep
+    rendering a roster the cockpit has stopped drawing — it has to state that
+    it wants it, right here, in one line a reader can find.
     """
     try:
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            set_roster_visible,
+        )
         from backend.core.ouroboros.battle_test.serpent_flow import (
             _local_agent_rows,
         )
+        set_roster_visible(True)
         return _local_agent_rows
     except Exception:  # noqa: BLE001
         logger.debug("[OvDemo] agent view unavailable", exc_info=True)

@@ -903,6 +903,17 @@ def _local_agent_rows() -> list:
     takes the snapshot, so the local and remote surfaces run identical code
     over identical data and cannot diverge in appearance.
 
+    Gated on `roster_visible` — the roster mounts BELOW the caret, and Claude
+    Code puts nothing standing there ("the input box stays fixed at the bottom
+    of the screen"; running subagents are what `/tasks` is for). Hidden by
+    default, so an idle cockpit does not spend five rows under the cursor
+    listing workers nobody asked about. The snapshot keeps updating either
+    way, so `/tasks` answers instantly rather than warming up.
+
+    The gate is HERE rather than in `render_roster` because this is the
+    function that decides whether a cockpit row exists; the renderer only
+    decides what one looks like.
+
     NEVER raises: the agent view is chrome, and chrome does not get to take
     down the REPL.
     """
@@ -910,7 +921,10 @@ def _local_agent_rows() -> list:
         import shutil
         from backend.core.ouroboros.battle_test.agent_roster import (
             get_agent_roster, render_roster, roster_line_budget,
+            roster_visible,
         )
+        if not roster_visible():
+            return []
         size = shutil.get_terminal_size(fallback=(100, 30))
         return render_roster(
             get_agent_roster().snapshot(),
@@ -6201,6 +6215,16 @@ class SerpentREPL:
         if line.startswith("/provenance") or line.startswith("provenance "):
             self._handle_provenance()
             return True
+        # CC's background-task view, which its docs keep deliberately separate
+        # from the Ctrl+T checklist. On THIS surface the roster is local, so
+        # the verb toggles this process's own visibility flag; an attached
+        # cockpit intercepts `/tasks` in `ov._route_operator_line` and never
+        # sends it here, because that terminal's rows are that client's.
+        if line in ("/tasks", "tasks") or line.startswith(
+            ("/tasks ", "tasks "),
+        ):
+            self._handle_tasks(line)
+            return True
 
         # Gap #7 Slice 1 — /preflight + /organism (moved boot content)
         if line in ("/preflight", "preflight"):
@@ -8742,6 +8766,75 @@ class SerpentREPL:
     # ── Gap #6 Slice 4 — /narrate REPL verb ─────────────────────
 
     _NARRATE_DENSITIES = ("off", "preambles", "on", "verbose")
+
+    def _handle_tasks(self, line: str) -> None:
+        """``/tasks [on|off]`` — the running-subagent roster, on demand.
+
+        Claude Code separates the ambient checklist from the background-task
+        view and says so plainly: the `Ctrl+T` checklist "is separate from the
+        background-task view. To see running shells and subagents, use
+        `/tasks` instead." Under fullscreen, "the input box stays fixed at the
+        bottom of the screen" — nothing standing lives beneath the caret.
+
+        This cockpit had the roster mounted permanently below the prompt, so
+        an idle session spent five rows under the operator's cursor listing
+        workers they had not asked about. The rows are now asked for.
+
+        The verb prints the roster whenever it turns it ON, so the operator
+        gets the answer in the same keystroke rather than turning a surface on
+        and then waiting a frame to read it. NEVER raises.
+        """
+        try:
+            import shutil
+            from backend.core.ouroboros.battle_test.agent_roster import (
+                get_agent_roster, render_roster, roster_line_budget,
+                roster_visible, set_roster_visible, toggle_roster,
+            )
+            arg = (line.split(None, 1)[1].strip().lower()
+                   if " " in line.strip() else "")
+            if arg in ("on", "show"):
+                shown = set_roster_visible(True)
+            elif arg in ("off", "hide"):
+                shown = set_roster_visible(False)
+            elif arg:
+                state = "shown" if roster_visible() else "hidden"
+                self._flow.console.print(
+                    f"  [{_SEM['dim']}]tasks: {state} "
+                    f"(on | off)[/{_SEM['dim']}]", highlight=False,
+                )
+                return
+            else:
+                shown = toggle_roster()
+            if not shown:
+                self._flow.console.print(
+                    f"  [{_SEM['dim']}]tasks: hidden[/{_SEM['dim']}]",
+                    highlight=False,
+                )
+                return
+            size = shutil.get_terminal_size(fallback=(100, 30))
+            # Straight to the renderer, which holds no opinion about
+            # visibility — the gate lives in the row PROVIDERS. A verb that
+            # consulted the flag it had just flipped would have to be careful
+            # about ordering; this one cannot get that wrong.
+            rows = render_roster(
+                get_agent_roster().snapshot(),
+                width=max(20, int(size.columns)),
+                max_lines=roster_line_budget(max(4, int(size.lines))),
+            )
+            if not rows:
+                # Claude Code's own edge, stated in its docs: "when Claude
+                # hasn't created any checklist items yet, the toggle has no
+                # visible effect because there's nothing to display." An
+                # empty roster and a broken verb look identical unless one
+                # of them says which it is.
+                self._flow.console.print(
+                    f"  [{_SEM['dim']}]tasks: shown · nothing running"
+                    f"[/{_SEM['dim']}]", highlight=False,
+                )
+                return
+            self._flow.console.print("\n".join(rows), highlight=False)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _handle_provenance(self) -> None:
         """``/provenance`` — what the marks in the transcript mean.

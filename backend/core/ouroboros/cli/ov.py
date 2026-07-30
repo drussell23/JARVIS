@@ -106,6 +106,8 @@ CLIENT_VERB_HELP = {
     "ptt stop": "close the push-to-talk hold",
     "force-wake": "seize the mic from another terminal",
     "deck": "deck height — off | compact | full",
+    "tasks": "show/hide the running-subagent roster",
+    "keys": "the bindings this terminal answers to",
     "detach": "leave; the organism keeps running",
 }
 
@@ -118,7 +120,11 @@ def client_verbs() -> "dict":
     switches on) and the local-only verbs are listed once here."""
     out = {v: CLIENT_VERB_HELP.get(v, f"audio: {AUDIO_VERBS[v]}")
            for v in AUDIO_VERBS}
-    for v in ("deck", "detach"):
+    # `keys` and `tasks` were routed in `_route_operator_line` but missing
+    # here, so neither appeared in the `/` palette — routed and unreachable
+    # unless you already knew the word. A verb the operator cannot discover
+    # is a verb that does not exist.
+    for v in ("deck", "tasks", "keys", "detach"):
         out[v] = CLIENT_VERB_HELP.get(v, "")
     return out
 
@@ -771,6 +777,58 @@ class AttachUI:
         self._invalidate()
         return f"deck: {mode}"
 
+    def set_task_view(self, mode: str) -> str:
+        """``/tasks [on|off]`` — show or hide the running-subagent roster.
+
+        The same client concern `/deck` is, and for a sharper reason: the
+        roster mounts BELOW the caret, so every row it takes is a row between
+        the operator's cursor and the bottom of their screen. Three workers
+        and a sentinel cost five of them on an idle session.
+
+        Claude Code separates these two surfaces explicitly — the `Ctrl+T`
+        checklist is ambient, and "to see running shells and subagents, use
+        `/tasks`". This is that verb: the roster is data the daemon streams
+        continuously and the operator asks to LOOK at, not a permanent
+        fixture under the prompt.
+
+        A bare `/tasks` toggles, because that is what an operator reaching for
+        it wants nine times in ten. Explicit `on`/`off` exists so a keybinding
+        or a script can be idempotent."""
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            roster_visible, set_roster_visible, toggle_roster,
+        )
+        mode = str(mode or "").strip().lower()
+        if mode in ("on", "show"):
+            shown = set_roster_visible(True)
+        elif mode in ("off", "hide"):
+            shown = set_roster_visible(False)
+        elif mode:
+            state = "shown" if roster_visible() else "hidden"
+            return f"tasks: {state} (on | off)"
+        else:
+            shown = toggle_roster()
+        self._invalidate()
+        if not shown:
+            return "tasks: hidden"
+        # The COUNT, not just the state. "shown" on an empty roster looks
+        # identical to a verb that did nothing, and Claude Code hit the same
+        # edge: "when Claude hasn't created any checklist items yet, the
+        # toggle has no visible effect because there's nothing to display."
+        # Saying how many there are is what distinguishes the two.
+        return f"tasks: shown · {self._agent_count()} running"
+
+    def _agent_count(self) -> int:
+        """Running agents in the daemon's last snapshot. NEVER raises."""
+        try:
+            rows = (self._agents or {}).get("rows") or ()
+            return sum(
+                1 for r in rows
+                if isinstance(r, dict)
+                and str(r.get("state") or "running") == "running"
+            )
+        except Exception:  # noqa: BLE001
+            return 0
+
     def refresh(self) -> None:
         """Repaint after a mode change. Alias of the invalidate seam so key
         handlers read as intent rather than mechanism."""
@@ -992,16 +1050,27 @@ class AttachUI:
         that composed the snapshot does not. Passing it means the goal column
         is clipped to the screen the operator is actually looking at.
 
+        **Rows are asked for, not assumed.** The roster mounts BELOW the
+        caret, so each of its rows sits between the operator's cursor and the
+        bottom of the screen — and Claude Code puts nothing standing there
+        ("the input box stays fixed at the bottom of the screen"), keeping the
+        running-subagent view behind `/tasks`. Hidden by default here for the
+        same reason: three workers and a sentinel cost five rows under the
+        cursor of an idle session. The daemon keeps streaming the snapshot
+        while it is hidden, so `/tasks` answers from live data immediately.
+
         NEVER raises — an unrenderable roster costs its rows, not the cockpit.
         """
         try:
             import time as _time
             from backend.core.ouroboros.battle_test.agent_roster import (
-                render_roster, roster_line_budget,
+                render_roster, roster_line_budget, roster_visible,
             )
             from backend.core.ouroboros.battle_test.attach_heartbeat import (
                 heartbeat_stale_after_s,
             )
+            if not roster_visible():
+                return []
             age = max(0.0, _time.monotonic() - float(self._heartbeat_arrived))
             if not self._heartbeat_arrived or age > heartbeat_stale_after_s():
                 return []
@@ -1648,6 +1717,20 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
             arg = text.split(None, 1)[1].strip() if " " in text else ""
             if ui is not None and hasattr(ui, "set_deck_size"):
                 ui.flash(ui.set_deck_size(arg))
+            _report_local_history(client, text)
+            return "handled"
+
+        # /tasks is a CLIENT concern for the same reason /deck is — it spends
+        # THIS terminal's rows — and routed here rather than relayed for a
+        # second one: the daemon's own `agent_roster` visibility flag governs
+        # the daemon's cockpit, not this one. Forwarding would toggle a
+        # roster nobody attached is looking at. (The two-process trap: a verb
+        # that runs on the wrong side of the socket reports success and
+        # changes nothing the operator can see.)
+        if low in ("/tasks", "tasks") or low.startswith(("/tasks ", "tasks ")):
+            arg = text.split(None, 1)[1].strip() if " " in text else ""
+            if ui is not None and hasattr(ui, "set_task_view"):
+                ui.flash(ui.set_task_view(arg))
             _report_local_history(client, text)
             return "handled"
 
