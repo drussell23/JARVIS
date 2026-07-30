@@ -431,3 +431,103 @@ class TestTheCanvasIsContentSized:
         assert dimension.max == dimension.preferred, (
             "max must equal preferred or the child absorbs slack and the void "
             "returns")
+
+
+class TestTheTwoPassRender:
+    """A frame is rendered TWICE, and the passes must not disagree.
+
+    prompt_toolkit measures with `height=None`, then draws with the real height.
+    `create_content` pulls its text through `_get_formatted_text_cached`, so
+    without invalidation the DRAW pass reuses the MEASUREMENT pass's text —
+    computed against whatever budget was in effect before anything was measured.
+
+    Measured before the fix (greedy canvas, 400 lines, 30-row terminal):
+
+        asked_h=None  mux.h=24 (stale seed)  ->  24 lines
+        asked_h=12    mux.h=12 (correct)     ->  24 lines   <-- stale
+
+    Twenty-four lines painted into twelve rows, clipped from the BOTTOM: the
+    newest output lost. #70280's claim of a "zero-lag, same-frame" observation
+    held only while the two passes happened to agree, which is why content-sizing
+    hid this and a greedy canvas exposed it.
+    """
+
+    def _paint(self, *, greedy, header_rows, screen_rows, lines=1000):
+        from prompt_toolkit.layout.containers import to_container
+        from prompt_toolkit.layout.dimension import Dimension
+        from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+        from prompt_toolkit.layout.screen import Screen, WritePosition
+
+        from backend.core.ouroboros.battle_test import bipartite_layout as bl
+
+        original = bl._canvas_dimension
+        if greedy:
+            bl._canvas_dimension = lambda mux=None: Dimension(weight=1)
+        try:
+            mux = bl.BipartiteLayout()
+            for i in range(lines):
+                mux.push_raw(f"DECK-{i}")
+            extra = ({} if not header_rows else dict(
+                header=lambda: "\n".join(f"C{i}" for i in range(header_rows)),
+                header_height=header_rows))
+            app = bl.build_bipartite_application(
+                mux, on_accept=lambda _t: None, toolbar=lambda: "tb",
+                status_rows=lambda: ["status"],
+                pending_rows=lambda: ["pending"],
+                agent_rows=lambda: ["agent"], **extra)
+            width = 60
+            screen = Screen(default_char=None, initial_width=width,
+                            initial_height=screen_rows)
+            to_container(app.layout.container).write_to_screen(
+                screen, MouseHandlers(),
+                WritePosition(0, 0, width, screen_rows), "", False, None)
+            return ["".join(screen.data_buffer[y][x].char
+                            for x in range(width)).rstrip()
+                    for y in range(screen_rows)]
+        finally:
+            bl._canvas_dimension = original
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("screen_rows", [24, 30, 40, 60, 80])
+    @pytest.mark.parametrize("header_rows", [0, 12])
+    async def test_a_thousand_line_deck_never_loses_its_tail(
+        self, fullscreen, screen_rows, header_rows,
+    ):
+        """THE mandate. Parameterised over HEIGHT because the defect is
+        height-dependent: it passed at 40 rows and failed at 30, which is exactly
+        how a single-height test let it through the first time."""
+        rows = self._paint(greedy=True, header_rows=header_rows,
+                           screen_rows=screen_rows)
+        assert any("DECK-999" in r for r in rows), (
+            f"the newest line is not painted at {screen_rows} rows with a "
+            f"{header_rows}-row header — content was rendered for a budget the "
+            f"window does not have and clipped from the bottom")
+        assert any(r.startswith("❯") for r in rows), "the prompt was squeezed out"
+
+    def test_a_changed_allotment_invalidates_the_cached_text(self):
+        """The mechanism, directly. Recording the height is not enough — the text
+        cache has to be dropped, or the draw pass reuses the measurement pass's
+        render."""
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout,
+        )
+        mux = BipartiteLayout()
+        for i in range(400):
+            mux.push_raw(f"x{i}")
+        mux.observe_allotment(80, 30)
+        first = len(mux.render_canvas_ansi().rstrip("\n").split("\n"))
+        assert mux.observe_allotment(80, 12) is True
+        second = len(mux.render_canvas_ansi().rstrip("\n").split("\n"))
+        assert second < first, (
+            f"the canvas produced {second} lines after shrinking to 12 rows, "
+            f"having produced {first} at 30 — the budget did not take effect")
+
+    def test_an_unchanged_allotment_does_not_thrash_the_cache(self):
+        """Clearing on every pass would recompute the whole deck twice per frame
+        for no reason. The changed-flag is what keeps the invalidation honest."""
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout,
+        )
+        mux = BipartiteLayout()
+        mux.observe_allotment(80, 24)
+        assert mux.observe_allotment(80, 24) is False
