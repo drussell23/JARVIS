@@ -1278,8 +1278,32 @@ def build_bipartite_application(
                              exc_info=True)
             return super().create_content(width, height)
 
+    _canvas_control = _MeasuredCanvasControl(_canvas_fragments,
+                                             focusable=False)
+    # Click-to-expand. `mouse_support` was already on — the wheel scrolled —
+    # but there were no MouseEventType handlers anywhere, so every click fell
+    # on the floor. Installed on THIS control because it is the one that draws
+    # the transcript; the rows it resolves against are the rendered ANSI, so
+    # the panel border and the anchor padding need no arithmetic.
+    #
+    # A click SUBMITS `/expand <ref>` through `on_accept` — the same callable
+    # a typed line goes through — so every surface routes a click exactly the
+    # way it already routes typing, and the whole `/expand` ref family works
+    # without any of it being reimplemented for the mouse.
+    try:
+        from backend.core.ouroboros.battle_test.canvas_mouse import (
+            install_canvas_mouse,
+        )
+        install_canvas_mouse(
+            _canvas_control,
+            lambda: mux.render_canvas_ansi().splitlines(),
+            lambda line: (on_accept(line) if callable(on_accept) else None),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Bipartite] canvas mouse unavailable", exc_info=True)
+
     canvas = Window(
-        content=_MeasuredCanvasControl(_canvas_fragments, focusable=False),
+        content=_canvas_control,
         wrap_lines=False,
         # Content-sized, so a short deck sits directly under the header
         # instead of being padded down against the prompt.
