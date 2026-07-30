@@ -306,6 +306,9 @@ def daemon_key_bindings(repl: Any = None) -> Any:
     try:
         from prompt_toolkit.key_binding import KeyBindings
 
+        from backend.core.ouroboros.battle_test.subagent_control import (
+            install_stop_all_binding,
+        )
         from backend.core.ouroboros.battle_test.transcript_hatches import (
             install_transcript_hatches,
         )
@@ -313,13 +316,59 @@ def daemon_key_bindings(repl: Any = None) -> Any:
             repl, "handle_input", None)
         shim = LocalCockpitClient(send_input=send)
         kb = KeyBindings()
-        if not install_transcript_hatches(kb, shim, shim):
+        hatches = install_transcript_hatches(kb, shim, shim)
+        # Ctrl+X Ctrl+K, through the SAME shim: the chord sends `/stop-all`
+        # and `_dispatch_repl_command` does the rest, so the daemon and the
+        # attach client reach one authority by one route.
+        stop_all = install_stop_all_binding(
+            kb, shim,
+            notify=lambda msg: _daemon_notice(repl, msg),
+            running=_local_running_agents,
+        )
+        # Bound if EITHER cluster took. Returning None when only the hatches
+        # failed would silently drop the stop-all chord along with them.
+        if not (hatches or stop_all):
             return None
         return kb
     except Exception:  # noqa: BLE001
         logger.debug("[CockpitMount] daemon key bindings unavailable",
                      exc_info=True)
         return None
+
+
+def _daemon_notice(repl: Any, message: str) -> None:
+    """One transient line on the daemon's own console. NEVER raises.
+
+    The client answers this with `ui.flash`, which the daemon cockpit has no
+    equivalent of — its transient surface IS the console. Kept to a plain
+    dim line rather than reaching for the deck: an arming prompt that has
+    three seconds to live must not join a scrollback the operator will read
+    later.
+    """
+    try:
+        flow = getattr(repl, "_flow", None)
+        console = getattr(flow, "console", None)
+        if console is None:
+            return
+        console.print(f"  [dim]{message}[/dim]", highlight=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _local_running_agents() -> int:
+    """Agents running in THIS process's roster. NEVER raises.
+
+    The daemon dispatches them, so its own singleton is the truth here — no
+    snapshot age, no bridge. The attach client asks its `AttachUI` instead,
+    which holds the daemon's last frame.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            get_agent_roster,
+        )
+        return int(get_agent_roster().running_count)   # a property
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def daemon_toolbar() -> Any:

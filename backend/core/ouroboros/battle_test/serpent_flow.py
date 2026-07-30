@@ -6225,6 +6225,12 @@ class SerpentREPL:
         ):
             self._handle_tasks(line)
             return True
+        # The verb behind CC's Ctrl+X Ctrl+K. A verb as well as a chord
+        # because the attach client cannot cancel anything itself — it holds
+        # no governed loop — so its keystroke has to arrive here as a line.
+        if line in ("/stop-all", "stop-all"):
+            self._handle_stop_all()
+            return True
 
         # Gap #7 Slice 1 — /preflight + /organism (moved boot content)
         if line in ("/preflight", "preflight"):
@@ -8766,6 +8772,55 @@ class SerpentREPL:
     # ── Gap #6 Slice 4 — /narrate REPL verb ─────────────────────
 
     _NARRATE_DENSITIES = ("off", "preambles", "on", "verbose")
+
+    def _handle_stop_all(self) -> None:
+        """``/stop-all`` — ask every running op to stop at its next boundary.
+
+        Claude Code's `Ctrl+X Ctrl+K`: "stop all running background subagents
+        in this session". ov ran L3 subagents with no keyboard control over
+        them at all — the largest functional gap against CC's interactive
+        surface, because the one thing an operator watching work go wrong
+        wants is a way to stop it.
+
+        Broad where `Esc` is narrow. Bare `Esc` cancels the operator's OWN
+        most recent op precisely so a reflex cannot kill a soak; this reaches
+        autonomous work too, and pays for that reach with the chord and its
+        repeat rather than with a warning nobody reads.
+
+        Cooperative: ops stop at their next phase transition. Saying so
+        matters — an operator told "stopped" who then watches a VERIFY finish
+        concludes the verb is broken, when it is the phase model working.
+        NEVER raises.
+        """
+        try:
+            if self._gls is None or not hasattr(
+                self._gls, "request_cancel_all",
+            ):
+                self._flow.console.print(
+                    f"  [{_SEM['death']}]stop-all unavailable (no governed "
+                    f"loop on this surface)[/{_SEM['death']}]",
+                    highlight=False,
+                )
+                return
+            stopped = self._gls.request_cancel_all() or []
+            if not stopped:
+                self._flow.console.print(
+                    f"  [{_SEM['dim']}]nothing running[/{_SEM['dim']}]",
+                    highlight=False,
+                )
+                return
+            noun = "op" if len(stopped) == 1 else "ops"
+            self._flow.console.print(
+                f"  [{_SEM['evolved']}]stopping {len(stopped)} {noun} — "
+                f"each halts at its next phase boundary[/{_SEM['evolved']}]\n"
+                + "\n".join(
+                    f"    [{_SEM['dim']}]{op}[/{_SEM['dim']}]"
+                    for op in stopped
+                ),
+                highlight=False,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _handle_tasks(self, line: str) -> None:
         """``/tasks [on|off]`` — the running-subagent roster, on demand.

@@ -2698,6 +2698,23 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
             description="interrupt your own in-flight work (/cancel)",
         )
 
+        # Ctrl+X Ctrl+K — CC's stop-all, the one keyboard control ov lacked
+        # over the L3 subagents it actually runs. Bound through the shared
+        # installer so this surface and the daemon's cannot disagree about
+        # what the chord means; both just send `/stop-all`.
+        try:
+            from backend.core.ouroboros.battle_test.subagent_control import (
+                install_stop_all_binding,
+            )
+            install_stop_all_binding(
+                kb, client,
+                notify=lambda msg: ui.flash(msg, seconds=3.5),
+                running=(ui._agent_count if hasattr(ui, "_agent_count")
+                         else None),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
         def _esc(event: Any) -> None:
             fsm.escape()
             ui.refresh()
