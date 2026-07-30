@@ -2285,7 +2285,13 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
             except Exception:  # noqa: BLE001
                 return False
 
-        def _dismiss_panic(event: Any) -> None:
+        def _dismiss_panic_now() -> None:
+            """The dismissal itself, with no key event attached.
+
+            The arbiter calls this; the legacy `bind_action` fallback wraps it.
+            Split so the behaviour is written once — an overlay's dismiss is a
+            fact about the overlay, not about the keystroke that asked for it.
+            """
             try:
                 ui.dismiss_panic()
                 ui.flash("☠ panic dismissed — /status to check the organism",
@@ -2293,15 +2299,42 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
             except Exception:  # noqa: BLE001
                 pass
 
-        # The overlay SAYS "esc dismisses". Nothing was bound to it, so a
-        # FATAL notice covered the cockpit permanently — advertising a key
-        # that does nothing is worse than advertising none. Filtered on the
-        # overlay being up, so esc keeps its existing meaning otherwise.
-        bind_action(
-            kb, "app:dismissPanic", ("escape",), _dismiss_panic,
-            context="Chat", filter=_panic_showing,
-            description="dismiss the FATAL panic overlay",
-        )
+        def _dismiss_panic(event: Any) -> None:
+            _dismiss_panic_now()
+
+        # The overlay SAYS "esc dismisses", and this is what makes the key mean
+        # it. Routed through `overlay_arbiter` rather than bound here, because
+        # `Escape` is over-subscribed: rewind owns `esc esc`, so a plain
+        # (non-eager) binding needed the sequence to TIME OUT before the panic
+        # would close — the overlay advertised a key that answered late — while
+        # `eager=True` would have made `esc esc` unreachable forever.
+        #
+        # The arbiter binds ONE Escape whose `eager` is a FILTER, so eagerness is
+        # decided per keystroke by whether anything is actually on screen. The
+        # panic is REGISTERED rather than hardcoded into that filter: the Iron
+        # Gate prompt and the diff preview are equally dismissable, and a list of
+        # them inside the arbiter would need editing every time the cockpit grows
+        # a surface.
+        try:
+            from backend.core.ouroboros.battle_test.overlay_arbiter import (
+                Z_PANIC, install_escape_arbiter, register_overlay,
+            )
+            register_overlay(
+                "panic", z=Z_PANIC,
+                is_active=lambda: bool(getattr(ui, "_panic", None)),
+                dismiss=_dismiss_panic_now,
+            )
+            # `rewind` is deliberately NOT passed: `install_rewind_binding` below
+            # already owns the sequence together with its empty-prompt filter,
+            # and re-binding it here would be a second opinion about when a
+            # draft's double-Esc means "clear" instead of "rewind".
+            install_escape_arbiter(kb)
+        except Exception:  # noqa: BLE001 — a cockpit must boot without the arbiter
+            bind_action(
+                kb, "app:dismissPanic", ("escape",), _dismiss_panic,
+                context="Chat", filter=_panic_showing,
+                description="dismiss the FATAL panic overlay",
+            )
 
         def _show_help(event: Any) -> None:
             _render_client_keys(ui, "/keys")
