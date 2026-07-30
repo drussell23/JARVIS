@@ -142,6 +142,54 @@ def fullscreen_enabled() -> bool:
     return _real_tty()
 
 
+#: Where an overlay float sits, and how wide. ONE answer for every overlay.
+#:
+#: `top=1` rather than `ycursor=True`: an overlay is not attached to where the
+#: caret happens to be, and one that moves while the operator reads a traceback is
+#: hostile.
+#:
+#: `left=0, right=0` — FULL WIDTH — and that is a fix, not a preference. Inset at
+#: `left=2` the float began at column 2, so the deck's GLYPH GUTTER (columns 0-2,
+#: where `⏺`/`💭`/`●` live) stayed visible beside it. A FATAL traceback then read
+#: as interleaved with the transcript underneath: deck bullets running down the
+#: left margin of a crash report. Proven by rendering a float over a filled canvas
+#: and finding `CAFATAL LINE A` — two canvas columns, then the overlay.
+#:
+#: An overlay that does not occlude is not an overlay. Blank lines WITHIN a
+#: full-width float do paint over what is beneath them (verified), so opacity
+#: comes free once the inset is gone.
+_OVERLAY_FLOAT_POSITION = {"top": 1, "left": 0, "right": 0}
+
+
+def _overlay_style(role: str) -> str:
+    """Semantic role -> prompt_toolkit style, WITH a background. NEVER raises.
+
+    Extracted from the panic overlay's own `_panic_style`, which had the whole
+    translation argument right and only ever needed to be said once: Rich spells a
+    colour `bright_yellow`, prompt_toolkit spells it `ansibrightyellow`, and both
+    accept `#RRGGBB`. Assuming either dialect is how `class:panic` silently
+    rendered as the default in the first place.
+
+    The background is the half the panic version lacked. A foreground-only style
+    leaves prompt_toolkit painting the float's cells with the DEFAULT background,
+    which on a themed terminal is not necessarily the deck's — so the overlay read
+    as text floating on the transcript rather than as a surface on top of it.
+    """
+    try:
+        from backend.core.ouroboros.ui.semantic_tokens import style_for
+        raw = (style_for(role) or "").strip()
+        fg = ""
+        if raw.startswith("#"):
+            fg = raw
+        elif raw:
+            fg = "ansi" + raw.replace("_", "")
+        # `bg:default` is deliberately NOT used: it means "whatever was there",
+        # which is exactly the transparency being fixed.
+        return f"bold bg:#0b0b0b fg:{fg}" if fg else "bold bg:#0b0b0b"
+    except Exception:  # noqa: BLE001
+        return "bold bg:#0b0b0b"
+
+
 def _canvas_dimension() -> Any:
     """How much room the live canvas takes.
 
@@ -1605,12 +1653,16 @@ def build_bipartite_application(
                         lambda: ANSI("\n".join(diff_rows())),
                     ),
                     wrap_lines=False,
+                    # Opaque, so the deck does not show through a diff. The rows
+                    # carry their own Rich colours, so this contributes only the
+                    # background the float needs to occlude with.
+                    style="bg:#0b0b0b",
                 ),
                 filter=Condition(_diff_visible),
             )
             if isinstance(root, FloatContainer):
                 root.floats.append(Float(
-                    content=_diff_win, top=1, left=2, right=2,
+                    content=_diff_win, **_OVERLAY_FLOAT_POSITION,
                 ))
         except Exception:  # noqa: BLE001
             logger.debug("[Bipartite] diff overlay unavailable", exc_info=True)
@@ -1657,7 +1709,7 @@ def build_bipartite_application(
                 except Exception:  # noqa: BLE001
                     return "bold"
 
-            _p_style = _panic_style()
+            _p_style = _overlay_style("alert")
             _panic_win = ConditionalContainer(
                 Window(
                     FormattedTextControl(
@@ -1673,7 +1725,7 @@ def build_bipartite_application(
             # `overlay_arbiter` agree on.
             if isinstance(root, FloatContainer):
                 root.floats.append(Float(
-                    content=_panic_win, top=1, left=2, right=2,
+                    content=_panic_win, **_OVERLAY_FLOAT_POSITION,
                 ))
         except Exception:  # noqa: BLE001
             # A cockpit that cannot draw the overlay must still RUN — the

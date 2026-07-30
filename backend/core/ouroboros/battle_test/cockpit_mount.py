@@ -376,6 +376,84 @@ def daemon_diff_rows() -> Any:
         return None
 
 
+def daemon_header() -> "tuple":
+    """``(render, height)`` for the crest above the deck, or ``(None, 0)``.
+
+    The daemon cockpit had no identity surface at all: the process that IS the
+    organism showed no emblem, while the attach client — a thin viewer of it — drew
+    one. Rendered by `crest_animator`'s own `render_cockpit_header`, so all three
+    surfaces draw the same emblem and none can drift into its own look.
+
+    `ensure_frames` is scheduled with `ensure_future` and that is safe HERE
+    specifically because the daemon builds its mount from inside an already-async
+    `SerpentREPL.start`. The identical line in `ov_demo` was a bug — it ran before
+    `asyncio.run`, so the coroutine was never awaited and the crest stayed on its
+    unbuilt fallback. The call is not portable; its context is what makes it
+    correct.
+    """
+    try:
+        from backend.core.ouroboros.ui.crest_animator import (
+            MiniCrest, render_cockpit_header,
+        )
+        mini = MiniCrest()
+        if not mini.available:
+            return (None, 0)
+        try:
+            import asyncio
+            asyncio.get_running_loop()
+            asyncio.ensure_future(mini.ensure_frames())
+        except RuntimeError:
+            # No loop: the emblem draws its static fallback rather than raising.
+            # Scheduling onto nothing is what produced the never-awaited warning.
+            pass
+
+        def _render() -> str:
+            try:
+                import time
+                return render_cockpit_header(
+                    mini, _daemon_header_lines(), _terminal_width(),
+                    now=time.monotonic(),
+                )
+            except Exception:  # noqa: BLE001
+                return ""
+
+        return (_render, max(3, int(getattr(mini, "rows", 3) or 3)))
+    except Exception:  # noqa: BLE001
+        logger.debug("[CockpitMount] crest header unavailable", exc_info=True)
+        return (None, 0)
+
+
+def _daemon_header_lines() -> List[Any]:
+    """Rich ``Text`` beside the emblem — never markup strings.
+
+    `render_cockpit_header` accepts "Rich renderable Texts (or plain strings)", so a
+    markup string is the PLAIN case and `[dim]…[/dim]` reaches the operator
+    verbatim. That shipped once already, in the demo's header.
+
+    Says DAEMON explicitly: this cockpit and the attach client's look alike, and an
+    operator who cannot tell which process they are typing at will eventually pause
+    autonomy on the wrong one.
+    """
+    try:
+        from rich.text import Text
+
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        palette = role_palette()
+        dim = palette.get("dim") or "dim"
+        first = Text()
+        first.append("◇ ", style=palette.get("neural") or "cyan")
+        first.append("O+V", style="bold")
+        first.append(" · daemon cockpit", style=dim)
+        return [
+            first,
+            Text("the organism itself · this process dispatches", style=dim),
+            Text("/ for verbs · esc-esc rewind · ctrl+r search", style=dim),
+        ]
+    except Exception:  # noqa: BLE001
+        return ["◇ O+V · daemon cockpit", "the organism itself",
+                "/ for verbs"]
+
+
 def build_daemon_mount(repl: Any = None) -> "dict":
     """Every in-process hook the daemon cockpit can fill, as a plain dict.
 
@@ -391,7 +469,7 @@ def build_daemon_mount(repl: Any = None) -> "dict":
     local action sink (`daemon_key_bindings`). Every other provider reads
     process-global state.
     """
-    return {
+    mount: dict = {
         "pending_rows": daemon_pending_rows,
         "panic_rows": daemon_panic_rows,
         "queue_rows": daemon_queue_rows,
@@ -409,6 +487,21 @@ def build_daemon_mount(repl: Any = None) -> "dict":
         # open it is a row that can never appear.
         "extra_key_bindings": daemon_key_bindings(repl),
     }
+    # The crest and its height travel TOGETHER — `header_height` sizes the region
+    # `header` draws into, so a mount carrying one without the other either
+    # reserves rows nothing fills or draws an emblem into zero rows. Unpacked from
+    # one call rather than resolved twice, so they cannot disagree.
+    mount["header"], mount["header_height"] = daemon_header()
+    # `stream_rows` is deliberately absent, and this is the reason rather than an
+    # oversight: there is NO process-global in-flight text to read.
+    # `live_tool_stream.make_tool_observer` creates a stream per tool CALL and
+    # nothing publishes a current frame, so a provider here would have to invent
+    # one — and an in-flight strip that shows the wrong sentence is worse than no
+    # strip. The correct fix is a `set_active_stream` registry mirroring the
+    # `set_active_canvas` / `set_active_queue` pattern this codebase already uses
+    # twice, which needs a producer-side audit of every stream construction site.
+    # Left UNSET rather than waived so `capability_handoff` keeps reporting it.
+    return mount
 
 
 __all__ = [
