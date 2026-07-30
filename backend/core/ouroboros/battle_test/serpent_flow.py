@@ -6662,9 +6662,13 @@ class SerpentREPL:
                 _mount = {}
                 try:
                     from backend.core.ouroboros.battle_test.cockpit_mount import (  # noqa: E501
-                        build_daemon_mount,
+                        build_daemon_mount, seed_daemon_masthead,
                     )
                     _mount = build_daemon_mount(self)
+                    # The identity block, as the first lines of the transcript
+                    # rather than a fixed top region. Idempotent, so a boot-time
+                    # resize storm cannot stack emblems into an append-only ring.
+                    seed_daemon_masthead(get_active_canvas())
                 except Exception:  # noqa: BLE001 — strips never gate the cockpit
                     _mount = {}
                 await run_bipartite_repl(
@@ -6693,10 +6697,6 @@ class SerpentREPL:
                     # `/expand d-N` opens this. The daemon owns the archive, so
                     # this is the only surface that can render a diff locally.
                     diff_rows=_mount.get("diff_rows"),
-                    # The crest. The process that IS the organism showed no
-                    # emblem while a thin viewer of it drew one.
-                    header=_mount.get("header"),
-                    header_height=_mount.get("header_height") or 0,
                 )
                 return
         except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL

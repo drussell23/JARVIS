@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Any, Callable, List, Optional, Tuple
 
 from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
@@ -248,10 +249,28 @@ def _canvas_dimension(mux: Any = None) -> Any:
 
     def _dimension() -> Any:
         try:
-            want = int(mux.content_height())
-            if not fullscreen_enabled():
-                want = min(want, rows)
-            want = max(1, want)
+            # IN THE ALTERNATE SCREEN THE CANVAS IS GREEDY, and that is Claude
+            # Code's geometry: the input is pinned to the BOTTOM and the transcript
+            # flows UPWARD into it, so the newest line is always the one directly
+            # above where you type and the eye never travels.
+            #
+            # Safe as of the two-pass cache invalidation (#70288). Before it, a
+            # greedy region lost its tail at small terminal heights because the
+            # measurement pass's text was reused by the draw pass — content
+            # rendered for a budget the window did not have, clipped from the
+            # bottom. Content-sizing hid that by making the two passes agree; it
+            # also collapsed the whole stack to the top of the screen, which is the
+            # thing an operator actually complained about.
+            #
+            # The blank band content-sizing was reaching for was never the canvas's
+            # fault — it came from mounting the crest as a FIXED region. That now
+            # lives in the transcript (`seed_masthead`).
+            if fullscreen_enabled():
+                return Dimension(weight=1)
+            # Inline, the app does not own the screen: a greedy canvas would reserve
+            # its height every repaint and turn the restored scrollback into a wall
+            # of blanks. There it stays a content-sized bounded region.
+            want = max(1, min(int(mux.content_height()), rows))
             return Dimension(min=0, max=want, preferred=want)
         except Exception:  # noqa: BLE001
             # Degrade to the greedy region rather than to nothing: a canvas that
@@ -375,6 +394,11 @@ class BipartiteLayout:
         # it with the framework's real number on that first render and flips
         # this, so no reader ever mistakes the stand-in for the measurement.
         self._allotment_measured = False
+        # Masthead claims, and the lock that makes the claim atomic with the push.
+        # A plain bool plus a later `if not seeded` is check-then-act: two boot
+        # threads both read False before either writes and both seed.
+        self._masthead_lock = threading.RLock()
+        self._masthead_seeded: set = set()
 
     # -- the Ouroboros hero animation -----------------------------------
 
@@ -548,6 +572,78 @@ class BipartiteLayout:
         measurement's authority.
         """
         return bool(getattr(self, "_allotment_measured", False))
+
+    def seed_masthead(self, render: Any, *, key: str = "masthead") -> int:
+        """Push the identity block into the TRANSCRIPT, exactly once. NEVER raises.
+
+        Claude Code's banner is not a fixed region — it is the top of the
+        scrollback. It sits directly above the first thing that happens and scrolls
+        away as work arrives, because a masthead is only interesting until there is
+        something better in its place.
+
+        Mounting it as `header`/`header_height` instead is what stranded the emblem
+        at row 0 while a bottom-anchored deck hugged the prompt, with a band between
+        that belonged to neither. As transcript content it needs no reserved rows,
+        cannot strand itself, and participates in the scrollback the operator pages
+        back through.
+
+        IDEMPOTENT, and that is the load-bearing part
+        --------------------------------------------
+        Boot is exactly when a terminal emits a flurry of SIGWINCH: the app mounts,
+        the alternate screen is claimed, the crest warms off-thread, and any of
+        those can drive a layout rebuild. A masthead pushed per rebuild would stack
+        three emblems into the ring, and the ring is append-only — nothing would
+        take them back out.
+
+        Guarded by a claim under the SAME lock that guards the push, not by a
+        check-then-act: two threads that both read "not yet seeded" before either
+        writes would both proceed, which is the classic double-seed. The flag is
+        keyed, so a surface with a genuinely different banner can seed its own
+        without either being able to suppress the other.
+
+        Returns the number of lines seeded — 0 when it was already done, which lets
+        a caller tell "I seeded" from "someone beat me to it" without inspecting the
+        ring.
+        """
+        try:
+            with self._masthead_lock:
+                if key in self._masthead_seeded:
+                    return 0
+                # Claimed BEFORE rendering. Rendering the crest is slow enough to
+                # be preempted, and a claim taken afterwards would leave the whole
+                # render inside the race it exists to close.
+                self._masthead_seeded.add(key)
+                text = render() if callable(render) else render
+                lines = str(text or "").split("\n")
+                # Trailing blanks from a renderer that ends with a newline would
+                # open a gap between the emblem and the first event — the very
+                # thing this exists to close.
+                while lines and not lines[-1].strip():
+                    lines.pop()
+                if not lines:
+                    # Nothing to show: release the claim so a later call with a
+                    # warmed renderer can still seed. An empty masthead is not a
+                    # seeded masthead, and holding the claim would make a cold
+                    # boot permanently emblem-less.
+                    self._masthead_seeded.discard(key)
+                    return 0
+                for line in lines:
+                    self._buffer.push(line)
+                # One blank BETWEEN the masthead and the feed — the deck's only
+                # grouping cue, the same separator `compose_live_script` puts
+                # before each action.
+                self._buffer.push("")
+            self._invalidate_now()
+            return len(lines) + 1
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] masthead seed degraded", exc_info=True)
+            return 0
+
+    def masthead_seeded(self, key: str = "masthead") -> bool:
+        """Has this banner already been laid down? For tests and for a caller
+        that wants to skip an expensive render it does not need."""
+        with self._masthead_lock:
+            return key in self._masthead_seeded
 
     def content_height(self) -> int:
         """Rows the canvas WANTS — its content plus its own chrome. NEVER raises.

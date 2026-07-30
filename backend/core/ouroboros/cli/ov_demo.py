@@ -1926,10 +1926,15 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         history=_demo_history(),
         auto_suggest=_demo_auto_suggest(),
         turn_spinner=_demo_turn_spinner(clock, lambda: start[0], speed),
-        # The crest, mountable again now that the canvas measures its own
-        # allotment instead of predicting it (`_LAYOUT_CLIPPING_NOTE`).
-        header=_header,
-        header_height=_header_height,
+        # NO fixed masthead. The crest is seeded INTO the transcript (below), so
+        # it sits directly on top of the deck and scrolls away as work arrives —
+        # Claude Code's own banner behaviour. Mounted as a region it was nailed to
+        # row 0 while the bottom-anchored deck hugged the prompt.
+        header=waived(
+            "the crest is transcript content, not a region — seeded once via "
+            "seed_masthead so it flows upward with the deck"
+        ),
+        header_height=waived("no fixed header region is mounted"),
         status_rows=_demo_status_rows(),
         search_rows=_demo_search_rows(),
         pending_rows=lambda: _pending_rows(
@@ -1946,6 +1951,12 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         # The emblem's frames, built now that a loop exists. Scheduling this at
         # header-construction time created a coroutine nobody awaited.
         await _warm_crest(_crest)
+        # AFTER the warmup: seeded before it, `render_cockpit_header` has no frames
+        # and returns nothing, so the emblem was silently absent from the deck.
+        # `seed_masthead` is idempotent, so a resize storm during boot cannot stack
+        # a second copy into an append-only ring.
+        if _header is not None:
+            mux.seed_masthead(_header)
         start[0] = clock()
         driver = asyncio.ensure_future(
             _drive(mux, app, speed, lambda: start[0], clock, script))
