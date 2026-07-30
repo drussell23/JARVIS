@@ -1474,6 +1474,31 @@ def build_bipartite_application(
         install_stash_binding(kb, lambda: prompt.buffer)
     except Exception:  # noqa: BLE001
         pass
+    # The completion menu and the gate, made remappable. Both WORKED and
+    # neither could be rebound — `/keys` could not list them and
+    # keybindings.json could not move them.
+    #
+    # Registered AFTER prompt_toolkit's own bindings and gated on
+    # `has_completions` / a pending gate, so they win exactly while those
+    # states hold and are absent otherwise. Nothing is unbound and nothing is
+    # monkeypatched.
+    try:
+        from backend.core.ouroboros.battle_test.menu_bindings import (
+            install_completion_actions, install_confirm_actions,
+        )
+        install_completion_actions(kb)
+        # Through `on_accept` — the same callable a typed `/accept` goes
+        # through — so the risk tier, the audit trail and the countdown clear
+        # exactly as they do for the verb. A key that bypassed the verb would
+        # be a second approval path, and here that is a governance problem
+        # rather than a UI one.
+        install_confirm_actions(
+            kb,
+            submit=(lambda line: on_accept(line)
+                    if callable(on_accept) else None),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Bipartite] menu bindings unavailable", exc_info=True)
     # Ctrl+_ / Ctrl+Shift+- — undo the last input edit. CC binds `chat:undo`
     # to exactly these, and prompt_toolkit already ships the command; it was
     # simply never bound, so the prompt accepted paragraphs with no way back
