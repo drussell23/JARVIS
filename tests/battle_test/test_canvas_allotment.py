@@ -114,24 +114,37 @@ class TestTheOperatorVisibleSymptom:
             f"produced {len(_visible(mux))} lines into {mux.height} rows"
         )
 
-    def test_a_taller_header_costs_the_deck_rows_not_its_tail(self, fullscreen):
-        """A bigger header should make the deck SHORTER, never make it lose the
-        end. Before the fix a 12-row crest cost the deck its last four beats
-        while the deck went on believing it had the whole terminal."""
+    def test_a_taller_header_never_costs_the_deck_its_tail(self, fullscreen):
+        """A bigger header may make the deck shorter; it must never make it lose
+        the end. Before the allotment fix a 12-row crest cost the deck its last
+        four beats while the deck went on believing it had the whole terminal.
+
+        This used to also assert the allotment shrank MONOTONICALLY with header
+        size, and that assertion encoded the greedy canvas: when the canvas took
+        every leftover row, a taller header necessarily left it fewer. Now the
+        canvas is CONTENT-SIZED, so whichever of {content, terminal, leftover} is
+        smallest decides — and with a full ring the content ceiling binds first,
+        so all three header sizes legitimately settle on the same height. Keeping
+        the old assertion would have meant reverting the fix to satisfy a test of
+        the behaviour the fix removed.
+
+        What must hold in every regime is the tail, which is what an operator
+        actually loses, so that is what is asserted per header size.
+        """
         from backend.core.ouroboros.battle_test.bipartite_layout import (
-            BipartiteLayout,
+            BipartiteLayout, _terminal_size,
         )
-        heights = {}
+        ceiling = max(3, _terminal_size()[1])
         for header_rows in (3, 12, 20):
             mux = BipartiteLayout()
             for i in range(200):
                 mux.push_raw(f"row{i}")
             _render_once(_heavy_app(mux, header_rows=header_rows))
-            heights[header_rows] = mux.height
             assert any("row199" in ln for ln in _visible(mux)), (
                 f"tail lost with a {header_rows}-row header")
-        assert heights[3] > heights[12] > heights[20], (
-            f"the deck did not shrink as the header grew: {heights}")
+            assert mux.height <= ceiling, (
+                f"allotment {mux.height} exceeds the terminal with a "
+                f"{header_rows}-row header")
 
 
 class TestObservationReplacesPrediction:
@@ -278,3 +291,143 @@ class TestNoPredictionRemains:
         assert mux.height != 999, (
             "a render did not reach observe_allotment — the measuring control "
             "is not mounted on the canvas window")
+
+
+class TestTheCanvasIsContentSized:
+    """The crest must sit DIRECTLY above the deck.
+
+    The canvas was `Dimension(weight=1)` — the greedy flex child — so it was handed
+    every leftover row and `_anchor` padded the TOP to push a short deck down
+    against the prompt. With a 12-row crest that produced an emblem, ~30 blank rows,
+    and four transcript lines: two islands with a void between them.
+    """
+
+    def _rows(self, mux, screen_rows=40, header_rows=12):
+        from prompt_toolkit.layout.containers import to_container
+        from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+        from prompt_toolkit.layout.screen import Screen, WritePosition
+
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            build_bipartite_application,
+        )
+        app = build_bipartite_application(
+            mux, on_accept=lambda _t: None,
+            header=lambda: "\n".join(f"CREST-{i}" for i in range(header_rows)),
+            header_height=header_rows, toolbar=lambda: "toolbar")
+        width = 60
+        screen = Screen(default_char=None, initial_width=width,
+                        initial_height=screen_rows)
+        to_container(app.layout.container).write_to_screen(
+            screen, MouseHandlers(), WritePosition(0, 0, width, screen_rows),
+            "", False, None)
+        return ["".join(screen.data_buffer[y][x].char for x in range(width)
+                        ).rstrip() for y in range(screen_rows)]
+
+    @pytest.mark.asyncio
+    async def test_no_blank_band_between_the_crest_and_a_short_deck(self, fullscreen):
+        """THE regression. Measured as a GAP rather than as a dimension, so it
+        fails for any future cause of the void, not only this one."""
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout,
+        )
+        mux = BipartiteLayout()
+        for line in ("Signal(test_failure)", "  2 source loci",
+                     "Read(risk_tier_floor.py)", "  847 lines read"):
+            mux.push_raw(line)
+        rows = self._rows(mux)
+        last_crest = max(y for y, r in enumerate(rows) if "CREST-" in r)
+        first_deck = next(y for y, r in enumerate(rows) if "Signal(" in r)
+        assert first_deck - last_crest - 1 == 0, (
+            f"{first_deck - last_crest - 1} blank rows between the crest and the "
+            f"deck — the canvas is greedy again")
+
+    @pytest.mark.asyncio
+    async def test_a_deck_longer_than_the_screen_still_shows_its_tail(self, fullscreen):
+        """`Dimension.exact` would have been tidier and BREAKS THIS: an exact 30
+        rows inside 10 available renders `Window too small...` and nothing else,
+        because HSplit refuses rather than clamps. `min=0` is what makes the region
+        shrinkable."""
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout,
+        )
+        mux = BipartiteLayout()
+        for i in range(400):
+            mux.push_raw(f"DECK-{i}")
+        rows = self._rows(mux, screen_rows=30)
+        assert not any("too small" in r for r in rows)
+        assert any(r.startswith("❯") for r in rows), "the prompt was squeezed out"
+        assert any("DECK-399" in r for r in rows), "the newest line is not visible"
+
+    def test_the_wanted_height_tracks_the_ring_not_the_budget(self):
+        """`content_height` must read `len(snapshot())`. Asking `_line_budget()`
+        closes a loop — the budget is allotment-minus-chrome and the allotment is
+        this value, so 4 lines → allot 4 → budget 3 → show 3 → allot 3 … a collapse
+        spiral of one row per frame."""
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout,
+        )
+        mux = BipartiteLayout()
+        empty = mux.content_height()
+        for i in range(4):
+            mux.push_raw(f"x{i}")
+        four = mux.content_height()
+        assert four > empty
+        # Stable under repeated measurement — a spiral would shrink each call.
+        assert [mux.content_height() for _ in range(5)] == [four] * 5
+
+    def test_the_wanted_height_is_capped_by_the_terminal(self):
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout, _terminal_size,
+        )
+        mux = BipartiteLayout()
+        for i in range(5000):
+            mux.push_raw(f"x{i}")
+        assert mux.content_height() <= max(3, _terminal_size()[1])
+
+    def test_an_idle_canvas_keeps_room_for_its_hero(self):
+        """Collapsing to one row when nothing has happened would replace the
+        DORMANT animated emblem with a line of idle text."""
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout,
+        )
+        mux = BipartiteLayout()
+
+        class _Sprite:
+            rows = 10
+
+            def set_invalidate(self, _fn):
+                pass
+
+        mux.attach_sprite(_Sprite())
+        if mux._hero_active():
+            assert mux.content_height() >= 10
+
+    def test_the_dimension_is_recomputed_per_frame(self):
+        """A `Dimension` baked at build time cannot follow content that grows.
+        prompt_toolkit accepts a callable, which is the idiom `build_dynamic_rows`
+        already uses for every other variable-height strip."""
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout, _canvas_dimension,
+        )
+        mux = BipartiteLayout()
+        dim = _canvas_dimension(mux)
+        assert callable(dim), "the canvas dimension is static again"
+        before = dim().preferred
+        for i in range(6):
+            mux.push_raw(f"grow {i}")
+        assert dim().preferred > before
+
+    def test_the_region_can_shrink_so_hsplit_never_refuses(self):
+        """`min=0` is the difference between degrading to the tail and rendering
+        `Window too small...`."""
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout, _canvas_dimension,
+        )
+        mux = BipartiteLayout()
+        for i in range(50):
+            mux.push_raw(f"x{i}")
+        dimension = _canvas_dimension(mux)()
+        assert dimension.min == 0
+        assert dimension.max == dimension.preferred, (
+            "max must equal preferred or the child absorbs slack and the void "
+            "returns")

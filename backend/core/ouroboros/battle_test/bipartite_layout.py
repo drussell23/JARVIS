@@ -190,29 +190,75 @@ def _overlay_style(role: str) -> str:
         return "bold bg:#0b0b0b"
 
 
-def _canvas_dimension() -> Any:
-    """How much room the live canvas takes.
+def _canvas_dimension(mux: Any = None) -> Any:
+    """How much room the live canvas takes — CONTENT-SIZED, recomputed per frame.
 
-    In the alternate screen it takes what is left — there is nowhere else for
-    history to live, so it should be as large as possible.
+    Returns a CALLABLE, because a `Dimension` computed once at build time cannot
+    follow content that grows. prompt_toolkit accepts `AnyDimension`, so a callable
+    is its own supported idiom, and it is the one `build_dynamic_rows` already uses
+    for every other variable-height strip. The canvas was the last region still
+    sized by a constant.
 
-    Outside it, a greedy canvas would push the prompt to the bottom of a
-    screen the app does not own, and prompt_toolkit would reserve that height
-    on every repaint — turning the scrollback we just restored into a wall of
-    blank rows. It becomes a bounded live region instead: recent activity
-    stays visible, and everything older scrolls into the terminal's own
-    history where it belongs.
+    ONE shape for both modes
+    -----------------------
+        Dimension(min=0, max=want, preferred=want)
+
+    Which is EXACTLY what the inline branch already used — it simply had `want`
+    hardcoded to 8 rather than derived. So this is the existing shape, given a real
+    number, rather than a new mechanism.
+
+    Every part of that triple is load-bearing, and two plausible alternatives are
+    both wrong in ways only a render reveals:
+
+    * ``Dimension(weight=1)`` (the old fullscreen branch) makes the canvas the
+      greedy flex child. It is handed every leftover row, and `_anchor` then pads
+      the TOP to push a short deck down against the prompt — which is precisely how
+      a 12-row crest, thirty blank rows and four transcript lines ended up on one
+      screen.
+    * ``Dimension.exact(want)`` looks tidier and BREAKS THE COCKPIT. Verified: an
+      exact 30 rows inside 10 available renders `Window too small...` and nothing
+      else — HSplit refuses rather than clamps. ``min=0`` is what makes the region
+      shrinkable, so a deck longer than the terminal degrades to the tail instead of
+      to an error.
+    * ``max=want`` is what stops the void coming back. Without a ceiling the child
+      absorbs slack by weight — the trap `build_dynamic_rows` documents about an
+      eight-row black slab nailed open above the prompt.
+
+    Outside the alternate screen the derived height is additionally capped by
+    ``JARVIS_BIPARTITE_LIVE_ROWS``: there the app does not own the screen, and a
+    canvas that grows with its content would reserve that height on every repaint,
+    turning the scrollback we just restored into a wall of blank rows.
+
+    ``mux=None`` keeps the old signature working and falls back to the previous
+    constant behaviour, so a caller that has no multiplexer to measure is not
+    forced to invent one.
     """
     from prompt_toolkit.layout.dimension import Dimension
-    if fullscreen_enabled():
-        return Dimension(weight=1)
+
     try:
         rows = max(0, int(os.environ.get("JARVIS_BIPARTITE_LIVE_ROWS", "8")))
     except (TypeError, ValueError):
         rows = 8
-    # min=0 so an idle organism shows no empty frame at all — the cockpit
-    # should occupy exactly the prompt when there is nothing happening.
-    return Dimension(min=0, max=rows, preferred=rows)
+
+    if mux is None:
+        # No content to measure: preserve exactly what this function did before.
+        if fullscreen_enabled():
+            return Dimension(weight=1)
+        return Dimension(min=0, max=rows, preferred=rows)
+
+    def _dimension() -> Any:
+        try:
+            want = int(mux.content_height())
+            if not fullscreen_enabled():
+                want = min(want, rows)
+            want = max(1, want)
+            return Dimension(min=0, max=want, preferred=want)
+        except Exception:  # noqa: BLE001
+            # Degrade to the greedy region rather than to nothing: a canvas that
+            # cannot size itself must still be able to show the transcript.
+            return Dimension(weight=1)
+
+    return _dimension
 
 
 def bottom_anchor_enabled() -> bool:
@@ -502,6 +548,54 @@ class BipartiteLayout:
         measurement's authority.
         """
         return bool(getattr(self, "_allotment_measured", False))
+
+    def content_height(self) -> int:
+        """Rows the canvas WANTS — its content plus its own chrome. NEVER raises.
+
+        This is what makes the crest sit directly above the deck. The canvas used
+        to be `Dimension(weight=1)`, the greedy flex child, so it was handed every
+        leftover row and `_anchor` padded the TOP to push its few lines down
+        against the prompt. With a 12-row crest mounted the result was an emblem,
+        thirty blank rows, and four lines of transcript: two islands with a void
+        between them.
+
+        Derived from the RING, never from `_line_budget()`, and that is the whole
+        reason this is a separate method rather than a call to the budget. The
+        budget is `allotment - chrome`, and the allotment is now what this returns,
+        so asking the budget would close a loop: 4 lines → allot 4 → budget 3 →
+        show 3 → allot 3 → budget 2 … a collapse spiral, one row per frame.
+        Reading `len(snapshot())` breaks it, because the ring's size does not depend
+        on how tall the canvas is.
+
+        Clamped by the TERMINAL, not by ``self._height``, for the same reason: the
+        observed allotment is this function's own output, and clamping a value by
+        itself is the loop again wearing a hat. The terminal is an external fact.
+
+        An IDLE canvas keeps room for its resting hero. Collapsing to one row when
+        nothing has happened would replace the animated emblem — the DORMANT
+        centrepiece — with a single line of idle text, which is a regression
+        disguised as tightness.
+        """
+        try:
+            chrome = 4 if os.environ.get(
+                "JARVIS_BIPARTITE_BORDER", "",
+            ).strip().lower() in ("1", "true", "yes", "on") else 1
+            _cols, term_rows = _terminal_size()
+            # Leave the surrounding chrome (prompt, toolbar, strips, a header) room
+            # to exist. Without a ceiling a long deck would claim the whole screen
+            # and prompt_toolkit would shrink the prompt to nothing.
+            ceiling = max(3, int(term_rows) - 2)
+            if self._hero_active():
+                hero = getattr(self._sprite, "rows", None)
+                want = int(hero) if isinstance(hero, int) and hero > 0 else 12
+                return max(3, min(want + chrome, ceiling))
+            lines = len(self._buffer.snapshot())
+            if lines <= 0:
+                # Not zero: the idle line still needs somewhere to be drawn.
+                return min(1 + chrome, ceiling)
+            return max(1, min(lines + chrome, ceiling))
+        except Exception:  # noqa: BLE001
+            return max(3, self._height)
 
     def _line_budget(self) -> int:
         """Rows the canvas may draw into, frame chrome deducted.
@@ -1021,7 +1115,10 @@ def build_bipartite_application(
 
     canvas = Window(
         content=_MeasuredCanvasControl(_canvas_fragments, focusable=False),
-        wrap_lines=False, height=_canvas_dimension(),
+        wrap_lines=False,
+        # Content-sized, so a short deck sits directly under the header
+        # instead of being padded down against the prompt.
+        height=_canvas_dimension(mux),
     )
     # Ctrl+R history search rides the SAME completion menu the palette
     # renders — a gated completer that yields nothing until the
