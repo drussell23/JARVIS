@@ -6638,6 +6638,35 @@ class SerpentREPL:
                     _bp_wiring = build_completion_wiring(self)
                 except Exception:  # noqa: BLE001
                     _bp_wiring = None
+                # The strips this process PRODUCES and could not see.
+                #
+                # `capability_handoff` measured this surface at 7 of 18 hooks
+                # while `ov attach` filled nearly all of them, and the direction
+                # of the gap was the finding: the daemon calls `note_pending` /
+                # `clear_pending`, so it is the source of the NOTIFY_APPLY
+                # countdown and never mounted the strip that draws it; it calls
+                # `panic_arbiter.arbitrate` from its own loop exception handler,
+                # so it is where a task actually dies and the FATAL overlay only
+                # ever rendered on a remote client. An operator at the daemon's
+                # own terminal could not see a gate this process was running or a
+                # task it had just lost.
+                #
+                # Assembled by `cockpit_mount.build_daemon_mount` rather than
+                # listed here, so the next hook is taught in one place — the same
+                # move `build_completion_wiring` already made for the three hooks
+                # above, and for the same stated reason: one factory, both
+                # surfaces, so the vocabularies cannot diverge. Passed by NAME
+                # rather than splatted, because `capability_handoff` reads a
+                # `**kwargs` splat as OPAQUE and a mount that spread itself would
+                # blind the audit that found these gaps.
+                _mount = {}
+                try:
+                    from backend.core.ouroboros.battle_test.cockpit_mount import (  # noqa: E501
+                        build_daemon_mount,
+                    )
+                    _mount = build_daemon_mount(self)
+                except Exception:  # noqa: BLE001 — strips never gate the cockpit
+                    _mount = {}
                 await run_bipartite_repl(
                     on_accept=_on_accept,
                     completer=getattr(_bp_wiring, "completer", None),
@@ -6651,6 +6680,16 @@ class SerpentREPL:
                     # roster: neither surface can drift into its own look.
                     agent_rows=_local_agent_rows,
                     status_rows=_local_status_rows,
+                    # Same rule, extended to the strips that were missing it.
+                    pending_rows=_mount.get("pending_rows"),
+                    panic_rows=_mount.get("panic_rows"),
+                    queue_rows=_mount.get("queue_rows"),
+                    search_rows=_mount.get("search_rows"),
+                    serpent_active=_mount.get("serpent_active"),
+                    toolbar=_mount.get("toolbar"),
+                    # The KEY for the search bar above. Mounting the strip alone
+                    # would have added a row nothing could ever open.
+                    extra_key_bindings=_mount.get("extra_key_bindings"),
                 )
                 return
         except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL

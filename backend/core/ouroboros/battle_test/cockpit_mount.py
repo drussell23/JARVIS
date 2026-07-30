@@ -1,0 +1,397 @@
+"""What a cockpit mount CONSISTS of — assembled once, for the surface asking.
+
+`ov` has three surfaces that render, and all three hand-assemble their own
+argument list for `build_bipartite_application`. So they drift, and the drift is
+invisible: nothing compares them, so a hook added for one surface is simply
+absent on the others until an operator notices a feature they were promised.
+
+`serpent_flow` already says this out loud, about the last time it happened:
+
+    The daemon-side cockpit is a surface the operator TYPES into, and it ran
+    with zero completion, zero persistent history and zero ghost-text while the
+    attach cockpit had all three wired at ov.py — the two-surfaces split, again.
+
+That was fixed for three hooks by `repl_completion.build_completion_wiring` — one
+factory, both surfaces, "so the vocabularies cannot diverge". Eleven more hooks
+were still in the same state, and this module is that same fix generalised rather
+than a second mechanism beside it.
+
+The daemon was blind to state it PRODUCES
+=========================================
+The worst of it is not that the daemon cockpit was missing decoration. It is the
+direction of the blindness:
+
+    `pending_apply`   the daemon calls `note_pending` / `clear_pending`. It is
+                      the source of the NOTIFY_APPLY countdown, and it never
+                      mounted the strip that draws it.
+    `panic_arbiter`   the daemon calls `arbitrate` from its own event-loop
+                      exception handler. It is where the crash HAPPENS, and the
+                      FATAL overlay only ever rendered on a remote client.
+
+An operator sitting at the daemon's own terminal could not see a gate the daemon
+was running or a task the daemon had just lost. The state was produced locally
+and legible only from somewhere else.
+
+Same renderer, different source
+===============================
+The rule this module is built on is already stated at `_local_agent_rows`:
+
+    Same renderer as the remote cockpit, different source, which is the entire
+    reason `render_roster` takes a snapshot rather than a roster: neither
+    surface can drift into its own look.
+
+So every provider here resolves an IN-PROCESS snapshot and hands it to the SHARED
+renderer the attach client already calls. Nothing is drawn twice, and a
+regression in a strip shows up on both surfaces at once instead of on whichever
+one happened to keep its own copy.
+
+The asymmetry that stays
+------------------------
+The attach client gates its strips on heartbeat STALENESS — a dead daemon must
+not leave a countdown ticking toward an apply that will never happen. The daemon
+has no such concept and must not grow one: it IS the source, so there is no
+transport to go stale and no last-arrival to measure. Staleness is a property of
+a bridge, not of the state, and importing that check here would mean the daemon
+retiring its own live truth on a timer.
+
+No new flags
+------------
+Every strip already owns its own master switch (`pending_apply.strip_enabled`,
+`panic_arbiter.panic_arbiter_enabled`, `operator_input_queue.input_queue_enabled`,
+and so on) and each returns an empty list when off. Mounting a provider therefore
+cannot force a surface on, and adding a gate here would be a second answer to a
+question those modules already answer — the mistake `narrative_density` refused
+when it declined to absorb posture.
+
+Width is resolved PER FRAME, never captured
+-------------------------------------------
+Every renderer takes a width and the canvas draws with ``wrap_lines=False``, so a
+row wrapped to a stale width is clipped at the right edge rather than reflowed.
+A provider closing over the width it saw at mount would be correct until the
+first resize.
+
+NEVER raises. A strip that cannot resolve returns no rows; a cockpit that cannot
+draw a strip still draws the cockpit.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Callable, List, Optional
+
+logger = logging.getLogger("Ouroboros.CockpitMount")
+
+COCKPIT_MOUNT_SCHEMA_VERSION = "cockpit_mount.v1"
+
+
+def _terminal_width(fallback: int = 100) -> int:
+    """This frame's width. Resolved on every call, deliberately — see module doc."""
+    try:
+        import shutil
+        return max(20, int(shutil.get_terminal_size((fallback, 30)).columns))
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+# ---------------------------------------------------------------------------
+# In-process providers — local snapshot → the SHARED renderer
+# ---------------------------------------------------------------------------
+
+
+def daemon_pending_rows() -> List[str]:
+    """The NOTIFY_APPLY countdown, for the process that owns the gate.
+
+    `snapshot()` drops expired entries where the clock that set them lives, so
+    this reader never decides whether an op has run out — it would be guessing
+    from a frame that is already a second old.
+
+    ``age_s=0.0`` and not a measured age: in-process there is no transport
+    between the snapshot and the render, so the age IS zero. The attach client
+    passes a real age because its snapshot crossed a bridge and the countdown has
+    to keep ticking between 1 Hz heartbeats.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.pending_apply import (
+            render, snapshot,
+        )
+        return render(snapshot(), age_s=0.0, width=_terminal_width())
+    except Exception:  # noqa: BLE001
+        logger.debug("[CockpitMount] pending rows unavailable", exc_info=True)
+        return []
+
+
+def daemon_panic_rows() -> List[str]:
+    """The FATAL overlay, on the process where the task actually died.
+
+    `recent_panics()` is the arbiter's own deduplicated record — the daemon's
+    loop exception handler calls `arbitrate`, which is what fills it. Rendering
+    the most recent one mirrors the client, which holds a single `self._panic`.
+
+    The overlay is the loudest thing a cockpit draws, so it must not be summoned
+    by an EMPTY record: `render_panic(None)` already answers `[]`, and passing a
+    falsy payload through unchanged keeps that one decision in one place.
+
+    The field names do NOT line up, and the mismatch is silent. `Panic` stores
+    ``traceback_text``; `render_panic` reads ``"traceback"`` — the wire spelling
+    the attach client receives over the bridge. Handing the dataclass's own
+    ``__dict__`` straight over therefore produces a FATAL overlay with an empty
+    traceback: the alarm fires, correctly, and drops the only part of it anybody
+    needs. So the adapter is explicit and `_panic_payload` is pinned by a test
+    that derives the expected keys from `render_panic` itself, rather than
+    restating them here where they could rot apart again.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.panic_arbiter import (
+            recent_panics, render_panic,
+        )
+        panics = recent_panics() or []
+        if not panics:
+            return []
+        return render_panic(_panic_payload(panics[-1]),
+                            width=_terminal_width())
+    except Exception:  # noqa: BLE001
+        logger.debug("[CockpitMount] panic rows unavailable", exc_info=True)
+        return []
+
+
+def _panic_payload(panic: Any) -> Optional[dict]:
+    """A `Panic` in the shape `render_panic` reads. NEVER raises.
+
+    A dict is passed through untouched — that is already the wire shape, and
+    re-mapping it would corrupt the client's own payload if this were ever reused
+    on that side.
+    """
+    if panic is None:
+        return None
+    if isinstance(panic, dict):
+        return panic
+    try:
+        return {
+            "exc_type": getattr(panic, "exc_type", "") or "",
+            "message": getattr(panic, "message", "") or "",
+            "origin": getattr(panic, "origin", "") or "",
+            # The rename that would otherwise have shipped an empty overlay.
+            "traceback": getattr(panic, "traceback_text", "") or "",
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def daemon_queue_rows() -> List[str]:
+    """The operator's own backlog — lines typed ahead of the organism."""
+    try:
+        from backend.core.ouroboros.battle_test.operator_input_queue import (
+            active_queue_snapshot, render_queue,
+        )
+        return render_queue(active_queue_snapshot(), width=_terminal_width())
+    except Exception:  # noqa: BLE001
+        logger.debug("[CockpitMount] queue rows unavailable", exc_info=True)
+        return []
+
+
+def daemon_search_rows() -> Any:
+    """The `/` transcript search bar, or None when the hatches are absent.
+
+    None rather than a lambda yielding nothing: a strip whose provider can never
+    produce anything should not be in the layout at all, which is the contract
+    `ov.py::_transcript_search_rows` already states.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.transcript_hatches import (
+            search_status,
+        )
+        return search_status
+    except Exception:  # noqa: BLE001
+        logger.debug("[CockpitMount] search rows unavailable", exc_info=True)
+        return None
+
+
+def daemon_serpent_active() -> bool:
+    """Is the organism THINKING right now?
+
+    Drives the serpent hairline border. Read from `build_heartbeat_payload` — the
+    same pure-pull payload the turn spinner and the toolbar pulse consume — so the
+    border, the verb and the token counter cannot disagree about whether work is
+    happening. A border that moves while the toolbar says idle teaches an operator
+    to stop believing both.
+
+    This hook was filled by NEITHER shipping surface: the animation existed and
+    only ever ran in `ov demo live`.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.attach_heartbeat import (
+            build_heartbeat_payload,
+        )
+        payload = build_heartbeat_payload() or {}
+        return bool(payload.get("active"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class LocalCockpitClient:
+    """The daemon terminal's stand-in for the attach client's `ui`/`client`.
+
+    `install_transcript_hatches(kb, ui, client)` needs exactly three things:
+    ``ui.flash(...)``, a mutable ``ui._narrate_verbose`` and
+    ``client.send_input(...)``. None of that is bridge-specific — the bridge
+    exists because the cockpit is a SEPARATE PROCESS and had to ask the daemon to
+    act. At the daemon's own terminal there is no second process, so the same
+    three calls are local.
+
+    This is `LocalRewindClient`'s argument applied to the hatches: the second
+    ENTRANCE to one implementation, never a second implementation. It is why the
+    keys are not reimplemented here — the daemon gets the identical remappable
+    action set, so `keybindings.json` cannot mean two different things depending
+    on which terminal an operator is sitting at.
+
+    Serves as BOTH `ui` and `client`: the installer only ever asks for those
+    three members, and splitting them into two shims would invent a distinction
+    the callee does not make.
+
+    NEVER raises. A keybinding that can break the REPL it is bound in is worse
+    than an unbound key.
+    """
+
+    __slots__ = ("_send", "_flash", "_narrate_verbose")
+
+    def __init__(self, *, send_input: Any, flash: Any = None) -> None:
+        self._send = send_input
+        self._flash = flash
+        #: Read AND written by the hatch action, so it has to be a real
+        #: attribute rather than a property — the installer toggles it.
+        self._narrate_verbose = False
+
+    def send_input(self, text: str) -> None:
+        try:
+            if self._send is not None:
+                self._send(str(text))
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitMount] local send_input degraded",
+                         exc_info=True)
+
+    def flash(self, message: str, *_args: Any, **_kwargs: Any) -> None:
+        """Surface a transient notice. Falls back to the canvas.
+
+        The attach client owns a flash region; the daemon cockpit does not, and
+        the canvas is the surface an operator is already reading. Swallowing the
+        message instead would make a bound key look broken.
+        """
+        try:
+            if self._flash is not None:
+                self._flash(str(message))
+                return
+            from backend.core.ouroboros.battle_test.bipartite_layout import (
+                get_active_canvas,
+            )
+            canvas = get_active_canvas()
+            if canvas is not None:
+                canvas.push_raw(str(message))
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitMount] local flash degraded", exc_info=True)
+
+
+def daemon_key_bindings(repl: Any = None) -> Any:
+    """The hatch/search action set, bound locally. None when nothing bound.
+
+    Mounted for a reason that is easy to miss: the search BAR without the search
+    KEY is decoration. `search_rows` gives the daemon cockpit a strip that
+    renders when a search is open, and on this surface nothing could open one —
+    `extra_key_bindings` was unset, so `/` was never bound. Shipping the strip
+    alone would have added a row that could never appear and called the gap
+    closed.
+
+    Returns a `KeyBindings` the caller merges through the layout's existing
+    `extra_key_bindings` seam, so there is no layout surgery and the daemon and
+    attach surfaces stay one code path.
+    """
+    try:
+        from prompt_toolkit.key_binding import KeyBindings
+
+        from backend.core.ouroboros.battle_test.transcript_hatches import (
+            install_transcript_hatches,
+        )
+        send = getattr(repl, "_dispatch_verb", None) or getattr(
+            repl, "handle_input", None)
+        shim = LocalCockpitClient(send_input=send)
+        kb = KeyBindings()
+        if not install_transcript_hatches(kb, shim, shim):
+            return None
+        return kb
+    except Exception:  # noqa: BLE001
+        logger.debug("[CockpitMount] daemon key bindings unavailable",
+                     exc_info=True)
+        return None
+
+
+def daemon_toolbar() -> Any:
+    """The pulse line, or None. NEVER raises.
+
+    `format_heartbeat_line` is what every attached cockpit draws, fed by the same
+    pure-pull `build_heartbeat_payload` the turn spinner and `serpent_active`
+    read. The daemon had no toolbar at all: the process that knows the provider,
+    the elapsed and the token count showed none of it at its own terminal.
+
+    ``now_mono``/``arrival_mono`` are the same instant here. The client passes a
+    real arrival because its payload crossed a bridge and the elapsed has to
+    advance between 1 Hz frames; in-process there is no transport, so claiming an
+    age would be inventing one.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.attach_heartbeat import (
+            build_heartbeat_payload, format_heartbeat_line,
+        )
+
+        def _render() -> str:
+            try:
+                import time
+                now = time.monotonic()
+                return format_heartbeat_line(
+                    build_heartbeat_payload(), now_mono=now, arrival_mono=now,
+                ) or ""
+            except Exception:  # noqa: BLE001
+                return ""
+
+        return _render
+    except Exception:  # noqa: BLE001
+        logger.debug("[CockpitMount] toolbar unavailable", exc_info=True)
+        return None
+
+
+def build_daemon_mount(repl: Any = None) -> "dict":
+    """Every in-process hook the daemon cockpit can fill, as a plain dict.
+
+    Returned as VALUES for the caller to pass explicitly, and deliberately not
+    splatted at the call site. `ui/capability_handoff` reads a `**kwargs` splat as
+    OPAQUE — it cannot see which names a splat covers, and rightly refuses to
+    guess — so a mount that spread itself would blind the very audit that found
+    these eleven gaps. The composition removes the duplicated LOGIC; the call
+    sites stay named so coverage remains measurable, and `divergence()` still
+    flags any surface that forgets one.
+
+    ``repl`` is the daemon REPL, consulted only for the one provider that needs a
+    local action sink (`daemon_key_bindings`). Every other provider reads
+    process-global state.
+    """
+    return {
+        "pending_rows": daemon_pending_rows,
+        "panic_rows": daemon_panic_rows,
+        "queue_rows": daemon_queue_rows,
+        # Resolved (not a factory): a strip whose provider can never yield should
+        # not be in the layout at all.
+        "search_rows": daemon_search_rows(),
+        "serpent_active": daemon_serpent_active,
+        "toolbar": daemon_toolbar(),
+        # Bound here so the search bar above is REACHABLE. A strip with no key to
+        # open it is a row that can never appear.
+        "extra_key_bindings": daemon_key_bindings(repl),
+    }
+
+
+__all__ = [
+    "COCKPIT_MOUNT_SCHEMA_VERSION",
+    "build_daemon_mount",
+    "daemon_panic_rows",
+    "daemon_pending_rows",
+    "daemon_queue_rows",
+    "daemon_search_rows",
+    "daemon_serpent_active",
+]
