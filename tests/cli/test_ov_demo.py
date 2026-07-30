@@ -331,8 +331,8 @@ class TestProvenanceBeats:
         assert {"annotate", "claiming"} <= called
 
     def test_every_marked_rung_appears_in_the_transcript(self):
-        from backend.core.ouroboros.cli.ov_demo import _SCRIPT, _compose
-        rendered = " ".join(_compose(k, a) for k, a in _SCRIPT)
+        from backend.core.ouroboros.cli.ov_demo import transcript_lines
+        rendered = " ".join(transcript_lines())
         for glyph in ("‹model›", "‹synthetic›",
                       "‹unverified›", "‹stated›"):
             assert glyph in rendered, glyph
@@ -342,3 +342,53 @@ class TestProvenanceBeats:
         transcript the cockpit does not produce."""
         from backend.core.ouroboros.cli.ov_demo import _compose
         assert "‹" not in _compose("det", ("Read 847 lines",))
+
+
+class TestOneStoryTwoProjections:
+    """There used to be two hand-authored beat lists telling the same op in
+    two presentations, and they drifted: provenance beats added to the
+    transcript never reached the live cockpit."""
+
+    def test_the_transcript_is_DERIVED_from_the_live_beats(self):
+        import backend.core.ouroboros.cli.ov_demo as mod
+        src = pathlib.Path(mod.__file__).read_text()
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "transcript_lines")
+        called = {ast.unparse(n.func) for n in ast.walk(fn)
+                  if isinstance(n, ast.Call)}
+        assert "compose_live_script" in called
+
+    def test_there_is_no_second_beat_list(self):
+        import backend.core.ouroboros.cli.ov_demo as mod
+        src = pathlib.Path(mod.__file__).read_text()
+        assigns = [t.id for n in ast.walk(ast.parse(src))
+                   if isinstance(n, ast.AnnAssign) and isinstance(n.target,
+                                                                  ast.Name)
+                   for t in (n.target,)
+                   if t.id.endswith("BEATS") or t.id == "_SCRIPT"]
+        assert assigns == ["_LIVE_BEATS"], assigns
+
+    def test_callable_beats_are_dropped_not_CALLED(self):
+        """`_agent_beats` emits closures that mutate the real AgentRoster.
+        A static transcript has no panel to mutate; calling them would leave
+        a real roster populated by a scene that never showed it."""
+        from backend.core.ouroboros.cli.ov_demo import transcript_lines
+        assert all(isinstance(x, str) for x in transcript_lines())
+
+    def test_the_agora_renders_exactly_once(self):
+        """The scene used to call the thread renderer itself AND inherit it
+        from the projection."""
+        from backend.core.ouroboros.cli.ov_demo import transcript_lines
+        joined = "\n".join(transcript_lines())
+        assert joined.count("@cassandra") == 1
+
+    def test_the_reach_gutter_reaches_BOTH_scenes(self):
+        from backend.core.ouroboros.cli.ov_demo import (
+            compose_live_script, transcript_lines,
+        )
+        live = " ".join(l for _a, l in compose_live_script()
+                        if isinstance(l, str))
+        for token in ("≥12", "unmeasured"):
+            assert token in live, token
+            assert token in " ".join(transcript_lines()), token

@@ -31,7 +31,8 @@ from typing import Any, Callable, List, Optional, Sequence
 
 logger = logging.getLogger("Ouroboros.OvDemo")
 
-__all__ = ["run_demo", "demo_scenes", "DEMO_HELP"]
+__all__ = ["run_demo", "demo_scenes", "DEMO_HELP",
+           "transcript_lines"]
 
 DEMO_HELP = """ov demo -- watch the cockpit, no model calls
 
@@ -200,27 +201,41 @@ def _limit(argv: Sequence[str]) -> int:
 #: Deliberately a FAILING op: the deck's whole grammar — `⎿` results, an agora
 #: thread reacting to a failure — only shows itself when something goes wrong,
 #: and a demo of the happy path shows the least interesting third of it.
-_SCRIPT: List[Any] = [
-    ("act", ("Read", "backend/core/ouroboros/governance/risk_tier_floor.py")),
-    ("det", ("Read 847 lines",)),
-    ("act", ("Update", "risk_tier_floor.py")),
-    ("det", ("Updated risk_tier_floor.py with 18 additions and 3 removals",)),
-    ("diff", (412, "+", "    except RiskFloorConfigError:")),
-    ("diff", (413, "+", "        raise")),
-    ("diff", (414, "-", "    except Exception:  # noqa: BLE001")),
-    ("act", ("Validate", "7759-86")),
-    ("det", ("✗ 3 failed · test_scoped_paths, test_sandbox_dir", "crit")),
-    # Four claims that USED to render identically. The test result above is
-    # observed and stays clean; everything below is softer than it looks.
-    ("prov", ("modeled", "det",
-              ("the fixture is stale — the loader caches by path",))),
-    ("prov", ("synthetic", "det",
-              ("🗣 I'll read the file first",))),
-    ("prov", ("unknown", "det",
-              ("blast radius 50 files",))),
-    ("prov", ("stated", "det",
-              ('operator: "reject — that except clause is load-bearing"',))),
-]
+def transcript_lines() -> List[str]:
+    """The story, with the clock removed.
+
+    There used to be a SECOND hand-authored beat list here telling the same
+    op — 7759-86 on `risk_tier_floor.py` — in a different presentation. Two
+    scripts, one story, and they drifted exactly as you would expect: the
+    provenance beats added to the transcript never reached the live cockpit,
+    because nothing connected them.
+
+    So the transcript is now a PROJECTION of `_LIVE_BEATS` rather than a
+    rival of it. `compose_live_script` already renders every beat kind —
+    tools, agents, the agora, collapse, reach — so the only difference
+    between the two scenes is whether the timestamps are obeyed. A beat
+    added once now appears in both, and the transcript can never again show
+    something the cockpit does not.
+
+    NEVER raises.
+
+    The live script carries two kinds of beat: LINES to print, and CALLABLES
+    the driver invokes for their side effect — `_agent_beats` emits closures
+    that mutate the real `AgentRoster` so the cockpit's agent panel fills in
+    as the demo runs. A static transcript has no panel to mutate and no
+    clock to mutate it on, so callables are dropped rather than called.
+    Calling them here would leave a real roster populated by a scene that
+    never showed it.
+    """
+    try:
+        return [
+            line for _at, line in compose_live_script()
+            if isinstance(line, str)
+        ]
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] transcript projection degraded", exc_info=True)
+        return []
+
 
 
 def _compose(kind: str, args: Sequence[Any]) -> str:
@@ -370,23 +385,11 @@ def scene_transcript(console: Any, argv: Sequence[str] = ()) -> int:
     # A blank line before each new action is the deck's only grouping cue.
     # Without it nine correct lines read as one paragraph, which is what
     # "it doesn't look like Claude Code" actually means most of the time.
-    for i, (kind, args) in enumerate(_SCRIPT):
-        if kind in ("act", "voice") and i:
-            _markup(console, "")
-        _markup(console, _compose(kind, args))
+    # `compose_live_script` already inserts the blank separators before each
+    # new action, so the projection carries the deck's grouping with it.
+    for line in transcript_lines():
+        _markup(console, line)
 
-    try:
-        from backend.core.ouroboros.battle_test.moltbook_inline import (
-            render_thread,
-        )
-        # `_markup`, not `_say`: the thread renderer tints its glyph and
-        # handle now, and printing that through a markup=False path shows the
-        # operator `[#58B0F8]💬[/#58B0F8]` — and then wraps the line, because
-        # the tags are counted as visible width.
-        for line in render_thread(_THREAD, width=76):
-            _markup(console, line)
-    except Exception as exc:  # noqa: BLE001
-        _say(console, f"  (agora unavailable: {exc})")
 
     _say(console)
     _rule(console, "palette")
@@ -591,7 +594,18 @@ _LIVE_BEATS: List[Any] = [
     # The agora reacting, rendered by the REAL renderer — see `_agora_beats`.
     (11.6, "agora", ()),
 
+    # Four claims the deck used to render identically. The pytest result at
+    # 9.2 is OBSERVED and stays clean; these are each softer than they look,
+    # and the operator deciding at the gate is the person who needs to know
+    # which is which.
+    (12.4, "prov", ("modeled", "det",
+                    ("the fixture is stale — the loader caches by path",))),
+    (12.9, "prov", ("unknown", "det", ("blast radius 50 files",))),
+    (13.4, "prov", ("stated", "det",
+                    ('operator: "that except clause is load-bearing"',))),
+
     (15.2, "act", ("Repair", "L2 · iteration 1/5", "warn")),
+    (15.7, "prov", ("synthetic", "det", ("🗣 I'll rebuild the fixture",))),
     (16.8, "det", ("fixture rebuilt from the live seam",)),
     (17.2, "voice", ("pinning the number it used to return would have made "
                      "the suite agree with the bug — the seam is the thing "
@@ -602,6 +616,9 @@ _LIVE_BEATS: List[Any] = [
                     _PYTEST_PASS, "success", 3980)),
 
     (20.4, "act", ("Gate", "7759-86 · NOTIFY_APPLY")),
+    # What the gate's own preview shows: which file in this change reaches
+    # furthest. Rendered by the REAL gutter — see `_reach_beats`.
+    (20.8, "reach", ()),
     (21.2, "det", ("applied · verified · committed 90706b8", "ok")),
     # The op FINISHES, and collapses to one line. Before #70250 nothing
     # rendered this: an unfocused op left no trace at all, and a focused
@@ -793,6 +810,49 @@ def _body_store() -> Any:
 _STORE: Any = None
 
 
+def _reach_beats(at: float) -> List[Any]:
+    """The reach gutter as deck lines. NEVER raises.
+
+    Through `blast_gutter.set_resolver`, never the advisor's own cache: that
+    cache is read by live GATE decisions, so a display surface writing to it
+    could let a demonstration change what the organism decides.
+
+    Not every file resolves, deliberately. Reach is cached per key, a
+    multi-file op leaves only its aggregate behind, and a cold scan is a
+    39-43s burn no display surface may trigger — so `?` is what an operator
+    will usually see, and a fully-resolved gutter would be a lie about the
+    common case.
+    """
+    try:
+        from backend.core.ouroboros.ui import blast_gutter as bg
+        seeded = {
+            "backend/core/ouroboros/governance/risk_tier_floor.py":
+                (47, "measured"),
+            "backend/core/ouroboros/governance/vision_floor.py":
+                (12, "localized_lower_bound"),
+            "tests/governance/test_risk_tier_floor.py": (0, "measured"),
+        }
+        paths = list(seeded) + ["docs/RISK_TIERS.md"]
+        bg.set_resolver(
+            lambda ps, root=None: seeded.get(list(ps)[0]) if ps else None)
+        try:
+            rows = bg.annotate_set(bg.peek(paths))
+            summary = bg.summary(bg.peek(paths))
+        finally:
+            bg.set_resolver(None)
+        # `summary` already opens with "reach"; prefixing it again produced
+        # "reach · reach 47 · 1 unmeasured".
+        out: List[Any] = [(at, _compose("det", (summary,)))]
+        for row in rows:
+            name = row.reach.path.rsplit("/", 1)[-1]
+            out.append((at, _compose(
+                "det", (f"  {row.bar} {row.label:>4}  {name}", "muted"))))
+        return out
+    except Exception:  # noqa: BLE001 — a demo must never be what breaks
+        logger.debug("[OvDemo] reach beat degraded", exc_info=True)
+        return []
+
+
 def compose_live_script() -> List[Any]:
     """`[(seconds, line), ...]` — the beats, composed and block-separated.
 
@@ -813,6 +873,10 @@ def compose_live_script() -> List[Any]:
             continue
         if kind == "agent":
             out.extend(_agent_beats(at, args))
+            continue
+        if kind == "reach":
+            out.append((at, ""))
+            out.extend(_reach_beats(at))
             continue
         # The separator rides the SAME timestamp as the line it precedes, so
         # the block opens as one visual event instead of a gap that appears a
