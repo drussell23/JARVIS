@@ -31,6 +31,10 @@ from typing import Any, Callable, List, Optional, Sequence
 
 logger = logging.getLogger("Ouroboros.OvDemo")
 
+# A declared decline, readable by `ui/capability_handoff`'s audit. Returns None,
+# so passing `hook=waived(reason)` is identical at runtime to omitting the hook.
+from backend.core.ouroboros.ui.capability_handoff import waived
+
 __all__ = ["run_demo", "demo_scenes", "DEMO_HELP",
            "transcript_lines"]
 
@@ -1290,6 +1294,296 @@ async def _drive(mux: Any, app: Any, speed: float,
 
 
 
+# ---------------------------------------------------------------------------
+# The INPUT surface — the half of the cockpit the demo used to leave dark
+# ---------------------------------------------------------------------------
+#
+# `ov demo live` built the same Application `ov attach` builds and filled 8 of
+# its 19 hooks. Every unfilled one was an input-or-state surface, so an entire
+# merged arc — remappable keybindings, one verb registry, argument completion,
+# ghost text, Ctrl+R search — had no demo presence at all. The operator's
+# report was "there are features I never see", and they were right about the
+# cause more than the symptom: nothing bound the demo's coverage to the
+# cockpit's capability, so a hook could land and drift with nothing to notice.
+#
+# `ui/capability_handoff.py` is the structural answer (a builder's parameter
+# list IS the self-updating statement of what it can be given). These helpers
+# are the demo's side of it: every one resolves the REAL collaborator the
+# attach client uses, for the reason stated at the top of this module.
+
+
+def _demo_completer() -> Any:
+    """The `/` palette, from the LIVE verb registry. NEVER raises.
+
+    The same `_build_slash_completer` the attach client mounts, so the demo
+    shows the operator's actual verb set — 83 today, whatever it is tomorrow —
+    rather than a sample that would rot. `_demo_palette` already proved this
+    approach in the transcript scene; this puts it on the surface an operator
+    types into.
+    """
+    try:
+        from backend.core.ouroboros.cli.ov import _build_slash_completer
+        _ensure_primed()
+        return _build_slash_completer()
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] completer unavailable", exc_info=True)
+        return None
+
+
+def _demo_history() -> Any:
+    """Recall for Ctrl+R and the Up arrow — IN MEMORY, never the real file.
+
+    `ov.py::_build_prompt_history` returns a `FileHistory` on the shared
+    `.jarvis/repl_history`, and mounting that here would make watching a demo
+    write into the operator's own recall. Same hazard the reach gutter refused
+    when it stopped seeding the advisor's live cache: a demo may lie to itself,
+    it may never leave a mark on the organism.
+
+    Seeded from the script's own operator lines so Ctrl+R has something true to
+    find — derived from `_BACKLOG_LINES` rather than invented, so the recall and
+    the queue strip cannot disagree about what was typed.
+    """
+    try:
+        from prompt_toolkit.history import InMemoryHistory
+        history = InMemoryHistory()
+        for line in _BACKLOG_LINES:
+            history.append_string(line)
+        return history
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] history unavailable", exc_info=True)
+        return None
+
+
+def _demo_auto_suggest() -> Any:
+    """History ghost-text, through the cockpit's own factory. NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.repl_completion import (
+            build_auto_suggest,
+        )
+        return build_auto_suggest()
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] auto-suggest unavailable", exc_info=True)
+        return None
+
+
+def _demo_status_rows() -> Any:
+    """The standing status line, from `serpent_flow`'s own provider.
+
+    Imported rather than rebuilt for the same reason `_agent_view_rows` is: a
+    second provider here would be a second opinion about what a status line
+    looks like, and the demo would keep agreeing with itself after the real one
+    regressed.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.serpent_flow import (
+            _local_status_rows,
+        )
+        return _local_status_rows
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] status rows unavailable", exc_info=True)
+        return None
+
+
+def _demo_search_rows() -> Any:
+    """The transcript search bar, from the module that owns it.
+
+    Worth stating why this row exists at all: `search_rows` was accepted by
+    `build_bipartite_application` and read by NOTHING, so this bar was dark on
+    the shipping attach client — not merely absent from the demo. Mounting it
+    here means a regression in the mount shows up in the one scene an operator
+    watches.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.transcript_hatches import (
+            search_status,
+        )
+        return search_status
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] search rows unavailable", exc_info=True)
+        return None
+
+
+#: When the Gate's rejection window is open. Straddles the GATE beat at 20.4 so
+#: the countdown and the `Gate · NOTIFY_APPLY` line describe one moment.
+_PENDING_AT = (20.4, 22.0)
+
+
+def _pending_rows(elapsed: float, width: int) -> List[str]:
+    """The NOTIFY_APPLY countdown, through the REAL renderer. NEVER raises.
+
+    `pending_apply.render` takes a transport snapshot, so the demo composes one
+    rather than drawing a strip — the countdown arithmetic, the width clipping
+    and the `applying…` end state are all the shipping renderer's, and a
+    regression in any of them surfaces here.
+
+    ``age_s`` advances the countdown DOWN between frames, which is what makes
+    the seconds tick rather than step. Derived from the demo clock so it obeys
+    ``--speed`` like everything else.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.pending_apply import render
+        lo, hi = _PENDING_AT
+        if not (lo <= elapsed <= hi):
+            return []
+        total = max(0.01, hi - lo)
+        return render(
+            {
+                "schema_version": "pending_apply.v1",
+                "entries": [{
+                    "op_id": "7759-86",
+                    "summary": "risk_tier_floor.py · 1 file · NOTIFY_APPLY",
+                    "remaining_s": total,
+                }],
+            },
+            age_s=max(0.0, elapsed - lo), width=width,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] pending strip unavailable", exc_info=True)
+        return []
+
+
+def _demo_turn_spinner(clock: Callable[[], float],
+                       started: Callable[[], float],
+                       speed: float) -> Any:
+    """The in-place turn spinner, bound to the demo's own clock. NEVER raises.
+
+    A real `TurnSpinner` reading a synthetic heartbeat: it renders the verb, the
+    elapsed and the token count for the question the operator just asked, in
+    place, between the deck and the prompt. The demo drives it from the same
+    `_GENERATING` windows the pulse and the serpent border use, so all three
+    agree about whether the organism is thinking — a spinner that runs while
+    the toolbar says idle teaches an operator to trust neither.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.turn_spinner import TurnSpinner
+
+        def _heartbeat() -> Any:
+            script_t = max(0.0, clock() - started()) * max(0.01, speed)
+            if not _demo_generating(script_t):
+                return None
+            return {
+                "kind": "heartbeat",
+                "active": True,
+                "verb": "Synthesizing",
+                "elapsed_s": script_t,
+                "tokens_total": int(_generating_seconds(script_t) * 780),
+                "provider_label": "DEMO",
+            }
+
+        return TurnSpinner(heartbeat_fn=_heartbeat, now_fn=clock)
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] turn spinner unavailable", exc_info=True)
+        return None
+
+
+def _header_lines() -> List[str]:
+    """The text beside the crest — what this cockpit IS, in three lines.
+
+    Says DEMO explicitly. A header identical to the attach client's would make a
+    screenshot of a synthetic session indistinguishable from a real one, and the
+    entire value of this scene is that an operator can trust what it shows.
+    """
+    dim = _THEME("dim")
+    return [
+        "◇ O+V · demo canvas",
+        f"[{dim}]synthetic events · no provider, no tokens[/{dim}]",
+        f"[{dim}]q to quit · / for verbs · ctrl+r to search[/{dim}]",
+    ]
+
+
+def _demo_header() -> "tuple[Any, int]":
+    """``(render, height)`` for the crest above the deck, or ``(None, 0)``.
+
+    Rendered by `crest_animator`'s own `render_cockpit_header`, so the demo
+    cannot show an emblem the cockpit no longer draws — the failure that
+    produced "the logos don't match" in the first place.
+
+    This was WAIVED for most of a session, and the reason is worth keeping: at
+    its natural 12 rows the crest made the last four beats of the script vanish.
+    Not a crest bug. The canvas was budgeting against the TERMINAL instead of
+    against the rows its parent actually gave it, so a header simply exposed an
+    arithmetic error that any strip would have exposed eventually. Capping the
+    height from here was tried and rejected as a workaround — it trades the
+    emblem for the transcript and leaves every other row unaccounted.
+
+    `BipartiteLayout.observe_allotment` fixed it at the root by measuring the
+    allotment at prompt_toolkit's own `create_content` seam, so the header costs
+    the deck nothing it has not accounted for and can be mounted honestly.
+    """
+    try:
+        from backend.core.ouroboros.ui.crest_animator import (
+            MiniCrest, render_cockpit_header,
+        )
+        mini = MiniCrest()
+        if not mini.available:
+            return (None, 0)
+        # Frames are built off-thread; the attach client kicks the same coroutine
+        # at mount. Without it the crest draws its static fallback rather than
+        # the animated emblem — correct, and not what the arc was about.
+        try:
+            import asyncio
+            asyncio.ensure_future(mini.ensure_frames())
+        except Exception:  # noqa: BLE001
+            pass
+
+        def _render() -> str:
+            try:
+                import shutil
+                import time
+                width = shutil.get_terminal_size(fallback=(100, 30)).columns
+                return render_cockpit_header(
+                    mini, _header_lines(), width, now=time.monotonic(),
+                )
+            except Exception:  # noqa: BLE001
+                return ""
+
+        return (_render, max(3, int(getattr(mini, "rows", 3) or 3)))
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] crest header unavailable", exc_info=True)
+        return (None, 0)
+
+
+#: A defect found by WATCHING this scene — FIXED at the root, kept as the record.
+#:
+#: Mounting a 12-row crest header made the last four beats of the script — the
+#: Gate, the reach gutter, the collapse line and Complete — disappear from a
+#: 200x60 terminal. Proven not to be the driver: a headless run of `_drive`
+#: against a recording multiplexer delivers all 89 beats, Complete included.
+#: Proven to be the header: with `_demo_header` stubbed to `(None, 0)` and
+#: nothing else changed, `Gate(`, `reach` and `≥12` all render again.
+#:
+#: Root cause: `BipartiteLayout` seeds its canvas budget from the TERMINAL size
+#: (#70279 corrected it from a hardcoded 24 to the live terminal, which was the
+#: right fix for the bug it was chasing) and `_line_budget` deducts only the
+#: canvas's own chrome. It does not know what the surrounding `HSplit` spends on
+#: a header, a toolbar, a status row, a search bar, a pending strip, a turn row
+#: or the agent view. So the canvas renders more lines than its window can hold
+#: and prompt_toolkit clips the overflow — from the BOTTOM, which is where the
+#: newest and only interesting lines are.
+#:
+#: It was never a demo problem. `ov attach` mounts a 12-row crest through the
+#: same builder, so the shipping cockpit was clipping the tail of its own
+#: transcript too — simply harder to notice where lines arrive minutes apart
+#: rather than in a 22-second script.
+#:
+#: FIXED at the root in `BipartiteLayout.observe_allotment`: the canvas now takes
+#: its size from the allotment prompt_toolkit hands `create_content`, which is
+#: authoritative rather than inferred and needs no knowledge of what the siblings
+#: cost. Capping the header from this caller was tried and REJECTED as a
+#: workaround — it trades the emblem for the transcript and leaves every other
+#: row unaccounted, so the clipping returns the next time a strip is added. It
+#: did, immediately, from the status/search/pending strips added in the same
+#: session; the workaround would have hidden that too.
+#:
+#: Kept as the record because the shape recurs: a dimension nobody measured,
+#: standing in for one nobody could see. Regression spine:
+#: `tests/battle_test/test_canvas_allotment.py`.
+_LAYOUT_CLIPPING_NOTE = (
+    "FIXED — the canvas measures the region it is given (observe_allotment) "
+    "instead of predicting it from the terminal"
+)
+
+
 def _live_exit_bindings() -> Any:
     """Keys that end the demo. NEVER raises.
 
@@ -1360,9 +1654,14 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
 
     mux = BipartiteLayout()
     script = compose_live_script()
+    _header, _header_height = _demo_header()
     app = build_bipartite_application(
         mux,
-        on_accept=lambda text: None,          # input is inert in a demo
+        # Typed input executes NOTHING — this scene has no organism to act on
+        # it. The palette, completion, ghost text and Ctrl+R below are all
+        # buffer-level, so they are fully live regardless; what stays inert is
+        # only the consequence of pressing Enter.
+        on_accept=lambda text: None,
         toolbar=_live_toolbar(
             lambda: start[0], clock,
             # The script's own end, derived rather than written: a beat added
@@ -1402,6 +1701,26 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         ),
         stream_rows=lambda: _stream_rows(
             (clock() - start[0]) * speed, mux,
+        ),
+        # ------------------------------------------------------------------
+        # The INPUT half. Unfilled until now, which is why a whole merged arc
+        # of keybinding and completion work had no demo presence — see the
+        # helpers above and `ui/capability_handoff.py` for why that drifted
+        # silently rather than being noticed.
+        # ------------------------------------------------------------------
+        completer=_demo_completer(),
+        history=_demo_history(),
+        auto_suggest=_demo_auto_suggest(),
+        turn_spinner=_demo_turn_spinner(clock, lambda: start[0], speed),
+        # The crest, mountable again now that the canvas measures its own
+        # allotment instead of predicting it (`_LAYOUT_CLIPPING_NOTE`).
+        header=_header,
+        header_height=_header_height,
+        status_rows=_demo_status_rows(),
+        search_rows=_demo_search_rows(),
+        pending_rows=lambda: _pending_rows(
+            (clock() - start[0]) * speed,
+            __import__("shutil").get_terminal_size((80, 24)).columns,
         ),
     )
     try:
