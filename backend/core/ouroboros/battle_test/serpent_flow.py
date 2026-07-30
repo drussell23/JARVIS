@@ -1377,7 +1377,7 @@ class SerpentFlow:
         summary_lines = [
             f"[bold]Session[/bold]   {self._session_id}",
             f"[bold]Uptime[/bold]    {mins}m {secs:02d}s",
-            f"[bold]Evolved[/bold]   [{_SEM['success']}]{self._completed}[/]  "
+            f"[bold]Evolved[/bold]   [{_SEM['life']}]{self._completed}[/]  "
             f"[bold]Shed[/bold] [{_SEM['death']}]{self._failed}[/]",
             f"[bold]Cost[/bold]      ${self._cost_total:.4f} of ${self._cost_cap:.2f}",
         ]
@@ -1790,7 +1790,7 @@ class SerpentFlow:
         short = _short_id(op_id)
         w = self._block_w()
         stats = (
-            f"🐍 [{_SEM['success']}]✅ {self._completed}[/]  "
+            f"🐍 [{_SEM['life']}]✅ {self._completed}[/]  "
             f"[{_SEM['death']}]💀 {self._failed}[/] [dim]│[/dim] "
             f"💰 ${self._cost_total:.4f}/${self._cost_cap:.2f}"
         )
@@ -2505,7 +2505,7 @@ class SerpentFlow:
         # Risk badge
         risk = risk_tier.upper() if risk_tier else ""
         if risk in ("SAFE_AUTO", "LOW"):
-            risk_badge = f"[{_SEM['success']}]{risk}[/]"
+            risk_badge = f"[{_SEM['life']}]{risk}[/]"
         elif risk == "MEDIUM":
             risk_badge = f"[{_SEM['heal']}]{risk}[/{_SEM['heal']}]"
         elif risk:
@@ -2804,9 +2804,20 @@ class SerpentFlow:
         # ``/narrate off``.
         if not preamble:
             try:
-                _fallback_on = os.environ.get(
-                    "JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED", "true",
-                ).strip().lower() not in ("0", "false", "no", "off")
+                # Through the dial: an explicitly set
+                # JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED still wins,
+                # otherwise the operator's /narrate level decides. Default
+                # true is preserved — preambles are audible from the
+                # `preambles` rung up, and the default density is ON.
+                try:
+                    from backend.core.ouroboros.ui.narrative_density import (
+                        audible as _density_audible,
+                    )
+                    _fallback_on = _density_audible("narrative.tool_preamble")
+                except Exception:  # noqa: BLE001
+                    _fallback_on = os.environ.get(
+                        "JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED", "true",
+                    ).strip().lower() not in ("0", "false", "no", "off")
                 if _fallback_on:
                     from backend.core.ouroboros.governance.tool_preamble_synthesizer import (
                         synthesize_preamble,
@@ -3015,7 +3026,7 @@ class SerpentFlow:
             self._op_line(
                 op_id,
                 f"[{_SEM['life']}]🛡️ immune[/{_SEM['life']}]      "
-                f"[{_SEM['success']}]✅ {test_count}/{test_count} passing[/]",
+                f"[{_SEM['life']}]✅ {test_count}/{test_count} passing[/]",
             )
         else:
             self._op_line(
@@ -3086,7 +3097,7 @@ class SerpentFlow:
             )
             self._op_line(
                 op_id,
-                f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  [{_SEM['success']}]✅ {test_total}/{test_total} passing[/]",
+                f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  [{_SEM['life']}]✅ {test_total}/{test_total} passing[/]",
             )
         else:
             passing = test_total - test_failures
@@ -7203,7 +7214,7 @@ class SerpentREPL:
             f"  [bold]Session[/bold]      {f._session_id}"
         )
         f.console.print(
-            f"  [bold]Evolved[/bold]      [{_SEM['success']}]{f._completed}[/]"
+            f"  [bold]Evolved[/bold]      [{_SEM['life']}]{f._completed}[/]"
             f"  [dim]│[/dim]  [bold]Shed[/bold] [{_SEM['death']}]{f._failed}[/]"
             f"  [dim]│[/dim]  [bold]Active[/bold] {len(f._active_ops)}"
             f"  [dim]│[/dim]  [bold]Sensors[/bold] {f._sensors_active}"
@@ -7214,7 +7225,7 @@ class SerpentREPL:
             f"  [dim]│[/dim]  [bold]Lessons[/bold] {len(f._session_lessons)}"
             f"  [dim]│[/dim]  [bold]Plan Review[/bold] "
             # NOT migrated: this quoted string lives INSIDE an f-string
-            # expression, so `_SEM['success']` would reuse the delimiter
+            # expression, so `_SEM['life']` would reuse the delimiter
             # and terminate it. Hoisting the styles to locals is the fix,
             # but this sits inside an implicit string-concatenation block
             # where a statement cannot be inserted — ast.parse refused it.
@@ -8613,15 +8624,7 @@ class SerpentREPL:
         """
         parts = line.replace("/narrate", "narrate", 1).split(None, 1)
         if len(parts) < 2 or not parts[1].strip():
-            current = os.environ.get(
-                "JARVIS_NARRATIVE_DENSITY", "(unset — defaults to 'on')",
-            )
-            self._flow.console.print(
-                f"  [{_SEM['neural']}]Narrative density:[/{_SEM['neural']}] {current}\n"
-                f"  [{_SEM['dim']}]Usage: /narrate "
-                f"{' | '.join(self._NARRATE_DENSITIES)}[/{_SEM['dim']}]",
-                highlight=False,
-            )
+            self._print_narrate_roster()
             return
         density = parts[1].strip().lower()
         if density not in self._NARRATE_DENSITIES:
@@ -8631,30 +8634,66 @@ class SerpentREPL:
                 highlight=False,
             )
             return
-        os.environ["JARVIS_NARRATIVE_DENSITY"] = density
-        # Compose the per-density env state. The downstream subsystems
-        # (intent_prompter / preamble synthesizer / channel) read these
-        # individual flags so the operator can tune via /narrate without
-        # touching env vars manually.
-        if density == "off":
-            os.environ["JARVIS_NARRATIVE_INTENT_ENABLED"] = "false"
-            os.environ["JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED"] = "false"
-        elif density == "preambles":
-            os.environ["JARVIS_NARRATIVE_INTENT_ENABLED"] = "false"
-            os.environ["JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED"] = "true"
-        elif density == "on":
-            os.environ["JARVIS_NARRATIVE_INTENT_ENABLED"] = "true"
-            os.environ["JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED"] = "true"
-        elif density == "verbose":
-            os.environ["JARVIS_NARRATIVE_INTENT_ENABLED"] = "true"
-            os.environ["JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED"] = "true"
-            # Verbose enables extended-thinking surfacing too (read by
-            # provider-side wiring when present)
-            os.environ["JARVIS_NARRATIVE_THINKING_VERBOSE"] = "true"
-        self._flow.console.print(
-            f"  [{_SEM['evolved']}]Narrative density set to {density}[/{_SEM['evolved']}]",
-            highlight=False,
-        )
+        # ONE write. The old body also set each producer's own master flag,
+        # which was wrong twice over: it reached a hardcoded three of the
+        # organism's voices (Moltbook's thirteen residents kept talking
+        # through `/narrate off`), and it made every later read of those
+        # flags look operator-set, so an explicit preference could never
+        # again be distinguished from the dial's own echo.
+        from backend.core.ouroboros.ui.narrative_density import set_density
+        set_density(density)
+        self._print_narrate_roster(header=f"Narrative density → {density}")
+
+    def _print_narrate_roster(self, *, header: str = "") -> None:
+        """Print the dial's reach: what speaks, what is silenced, and why.
+
+        The verb used to assert a density and stop. It could not have listed
+        its own effect, because it had none to list — the value it wrote had
+        no readers anywhere in the repo. Reading the roster means `/narrate`
+        can no longer claim a silence it did not deliver. NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.ui.narrative_density import (
+                current_density, roster,
+            )
+            level = current_density()
+            rows = roster()
+            heard = [r for r in rows if r.verdict.heard]
+            muted = [r for r in rows if not r.verdict.heard]
+            out = [
+                f"  [{_SEM['neural']}]"
+                f"{header or 'Narrative density'}[/{_SEM['neural']}] "
+                f"[{_SEM['dim']}]({level.label} · {len(heard)}/{len(rows)} "
+                f"voices audible)[/{_SEM['dim']}]"
+            ]
+            for r in heard:
+                why = ""
+                if r.voice.exempt:
+                    why = f" [{_SEM['dim']}]— alarm, never muted[/{_SEM['dim']}]"
+                elif r.verdict.reason.startswith("explicit:"):
+                    why = (f" [{_SEM['heal']}]— forced on by "
+                           f"{r.verdict.reason.split(':', 1)[1]}[/{_SEM['heal']}]")
+                out.append(f"    [{_SEM['life']}]•[/{_SEM['life']}] "
+                           f"{r.voice.name}{why}")
+            for r in muted:
+                why = ""
+                if r.verdict.reason.startswith("explicit:"):
+                    why = (f" [{_SEM['heal']}]— forced off by "
+                           f"{r.verdict.reason.split(':', 1)[1]}[/{_SEM['heal']}]")
+                else:
+                    why = (f" [{_SEM['dim']}]— needs "
+                           f"{r.voice.min_density.label}[/{_SEM['dim']}]")
+                out.append(f"    [{_SEM['dim']}]◦ {r.voice.name}[/{_SEM['dim']}]"
+                           f"{why}")
+            out.append(f"  [{_SEM['dim']}]Usage: /narrate "
+                       f"{' | '.join(self._NARRATE_DENSITIES)}[/{_SEM['dim']}]")
+            self._flow.console.print("\n".join(out), highlight=False)
+        except Exception:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_SEM['dim']}]Usage: /narrate "
+                f"{' | '.join(self._NARRATE_DENSITIES)}[/{_SEM['dim']}]",
+                highlight=False,
+            )
 
     # ── Gap #4 Slice 4 — IDE-native review verbs ────────────────
 

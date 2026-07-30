@@ -558,6 +558,18 @@ async def _maybe_converse(stored: "MoltPost") -> None:
     try:
         if not converse_enabled() or stored.reply_to:
             return                     # recursion ban: replies are leaves
+        # Density is checked HERE, not at the renderer, for the reason
+        # `_reply_budget_ok` already states about posture: refusing at the
+        # surface means the reaction was still formulated — a model call
+        # spent and a resident's cooldown consumed — to produce something
+        # the operator asked not to see. The cheapest refusal is the one
+        # that happens before the dice are even rolled.
+        try:
+            from backend.core.ouroboros.ui.narrative_density import audible
+            if not audible("moltbook.banter"):
+                return
+        except Exception:  # noqa: BLE001 — fail open, never silence on a
+            pass                                        # lookup failure
         if stored.author_id == "operator":
             return                     # human posts summon via the semantic
                                        # router — never the ambient dice
@@ -696,12 +708,51 @@ def clear_molt_subscribers() -> None:
     _SUBSCRIBERS.clear()
 
 
+def voice_for(post: Any) -> str:
+    """Which registered voice this post speaks with.
+
+    Derived from distinctions the agora ALREADY makes — a `⚔`, a `reply_to`
+    — rather than a new field on the post. A taxonomy that has to be stamped
+    at write time is a taxonomy that will be wrong for every post already in
+    the table. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.moltbook_inline import (
+            is_conflict,
+        )
+        if is_conflict(post):
+            return "moltbook.conflict"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if getattr(post, "reply_to", None) or (
+                isinstance(post, dict) and post.get("reply_to")):
+            return "moltbook.banter"
+    except Exception:  # noqa: BLE001
+        pass
+    return "moltbook.post"
+
+
 def _notify_subscribers(post: Any) -> None:
     """Fan one post out to the live feed.
 
     Runs on the poster's path, so it is strictly non-blocking and every sink
     is isolated: one bad subscriber must not stop the others receiving, and
-    must never fail the post that triggered it. NEVER raises."""
+    must never fail the post that triggered it. NEVER raises.
+
+    Gated on the operator's narrative density — the SURFACING seam, not the
+    storage one. A muted post is still written to `moltbook_posts`, so
+    `/moltbook` shows an unbroken history and turning the dial back up does
+    not reveal a gap where the society went quiet. Silence here means "not in
+    my transcript", never "did not happen": the archive is the society's
+    memory and a display preference has no business editing it.
+    """
+    try:
+        from backend.core.ouroboros.ui.narrative_density import audible
+        if not audible(voice_for(post)):
+            return
+    except Exception:  # noqa: BLE001 — a dial that cannot answer must not
+        pass                                    # silence the room. Fail open.
     for sink in list(_SUBSCRIBERS):
         try:
             sink(post)
@@ -721,3 +772,61 @@ def post_molt_nowait(
         loop.create_task(post_molt(author_id, kind, body, **kw))
     except Exception:  # noqa: BLE001
         pass
+
+
+# ---------------------------------------------------------------------------
+# Narrative-density voices — declared HERE, beside the code that speaks
+# ---------------------------------------------------------------------------
+
+
+def register_voices(registry: Any) -> int:
+    """Declare the agora's voices. Discovered by `narrative_density`.
+
+    Co-located with the poster for the same reason `register_flags` is
+    co-located with its consumer: a taxonomy maintained in the dial's own
+    file is a taxonomy that drifts from the thing it describes, which is
+    precisely how `/narrate` came to push four flags at a subsystem that
+    reads none of them.
+
+    The three voices are not new categories. They are the distinctions the
+    agora already draws — a conflict, a reply, a first-party post — given
+    the thresholds an operator would expect:
+
+      * ``off``       — nothing but conflicts
+      * ``preambles`` — nothing but conflicts (the room is not a preamble)
+      * ``on``        — the organism's own reports
+      * ``verbose``   — the full society, banter included
+
+    Returns the number registered. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.ui.narrative_density import Density
+        specs = (
+            ("moltbook.conflict", Density.OFF, True,
+             "⚔ REVIEW contesting GENERATE — an alarm, never banter"),
+            ("moltbook.post", Density.ON, False,
+             "first-party posts: what the organism reports about itself"),
+            ("moltbook.banter", Density.VERBOSE, False,
+             "resident reactions and replies — the agora's social layer"),
+        )
+        count = 0
+        for name, min_density, exempt, describe in specs:
+            if registry.register(
+                name, min_density, exempt=exempt, describe=describe,
+                legacy_flag=("JARVIS_MOLTBOOK_CONVERSE_ENABLED"
+                             if name == "moltbook.banter" else ""),
+                owner=__name__,
+            ) is not None:
+                count += 1
+        return count
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+try:  # Self-register at import: a voice must be known BEFORE it speaks.
+    from backend.core.ouroboros.ui.narrative_density import (  # noqa: E402
+        default_registry as _default_voice_registry,
+    )
+    register_voices(_default_voice_registry())
+except Exception:  # noqa: BLE001 — the agora works without the dial
+    pass

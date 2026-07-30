@@ -88,11 +88,28 @@ _MAX_MAX_TOKENS: int = 200
 
 
 def is_master_flag_enabled() -> bool:
-    """``JARVIS_NARRATIVE_INTENT_ENABLED``. **Default true** post Slice 5
-    graduation (2026-05-04). Operators set ``=false`` to suppress the
-    intent prompt's micro-LLM call at op_started. NEVER raises."""
-    raw = os.environ.get(MASTER_FLAG_ENV_VAR, "true")
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+    """Should the intent prompt's micro-LLM call happen at op_started?
+
+    Resolved through `narrative_density`, which composes two answers this
+    function used to know only half of: an explicitly set
+    ``JARVIS_NARRATIVE_INTENT_ENABLED`` still wins (operator specificity
+    beats a global dial), and otherwise the operator's `/narrate` level
+    decides. Default true post Slice 5 graduation (2026-05-04) — preserved,
+    because the default density is ON and intent is audible at ON.
+
+    Checked here rather than at the renderer because this gate is a COST
+    gate: refusing later would mean the model call was already spent to
+    produce prose the operator asked not to see.
+
+    Falls back to the original read if the dial is unavailable, so this
+    module keeps working standalone. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.ui.narrative_density import audible
+        return audible("narrative.intent")
+    except Exception:  # noqa: BLE001
+        raw = os.environ.get(MASTER_FLAG_ENV_VAR, "true")
+        return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 def read_timeout_s() -> float:

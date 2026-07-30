@@ -334,6 +334,21 @@ def render_to_console(
 
     NEVER raises.
     """
+    # The SURFACING seam for the model's voice, and therefore where the
+    # operator's `/narrate` density applies. Deliberately not `start_frame`:
+    # the channel is a ring the operator can page back through with `n-N`,
+    # so gating admission would edit the record instead of the view, and a
+    # frame the dial hid at ON would be permanently missing after the dial
+    # went back to VERBOSE. Same reasoning as Moltbook's `_notify_subscribers`
+    # — the archive is not a display preference's to edit.
+    try:
+        from backend.core.ouroboros.ui.narrative_density import audible
+        kind = str(getattr(getattr(frame, "kind", ""), "value", "")
+                   or getattr(frame, "kind", "") or "").strip().lower()
+        if kind and not audible(f"narrative.{kind}"):
+            return False
+    except Exception:  # noqa: BLE001 — a dial that cannot answer must never
+        pass                                       # swallow the organism's voice
     rendered = compose(
         frame,
         op_active=op_active,

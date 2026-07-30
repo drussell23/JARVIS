@@ -972,3 +972,73 @@ def register_shipped_invariants() -> list:
             validate=_validate_op_started_intent_prompt,
         ),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Narrative-density voices — one per kind, derived from the enum
+# ---------------------------------------------------------------------------
+
+def _kind_density_table() -> Dict[str, tuple]:
+    """(min_density, legacy_flag) per kind value. NEVER raises.
+
+    Keyed by the ENUM member's value, not by a parallel list of literals,
+    so a renamed kind cannot silently lose its threshold — the same
+    discipline as `_validate_renderer_covers_all_kinds`, which exists
+    because a kind without a style renders as nothing at all.
+
+    A kind absent from this table resolves to ON rather than being dropped:
+    the failure mode of a forgotten entry must be "slightly too talkative",
+    never "invisible", because only one of those is noticeable.
+    """
+    return {
+        # The preamble IS the `preambles` level — it is what that rung of
+        # the ladder was named after.
+        NarrativeKind.TOOL_PREAMBLE.value: (
+            "preambles", "JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED"),
+        NarrativeKind.INTENT.value: ("on", "JARVIS_NARRATIVE_INTENT_ENABLED"),
+        NarrativeKind.PLAN_PROSE.value: ("on", ""),
+        NarrativeKind.L2_REPAIR_PROSE.value: ("on", ""),
+        NarrativeKind.DREAM.value: ("verbose", ""),
+        # Extended thinking is the only thing `verbose` ever promised, and
+        # the flag it wrote had no reader. This is that promise acquiring
+        # a consumer.
+        NarrativeKind.THINKING.value: (
+            "verbose", "JARVIS_NARRATIVE_THINKING_VERBOSE"),
+        # A failure report is audible at every level. Not `exempt`: an
+        # operator who explicitly silences postmortems has made a decision,
+        # and only alarms outrank an explicit decision.
+        NarrativeKind.POSTMORTEM_PROSE.value: ("off", ""),
+    }
+
+
+def register_voices(registry) -> int:
+    """Declare one voice per narrative kind. NEVER raises.
+
+    Iterating the enum rather than a hand-written list means a kind added
+    later gets a voice automatically — the property whose absence is the
+    whole defect: `/narrate` hardcoded four flags and was never updated
+    when the organism learned to speak in new ways.
+    """
+    try:
+        table = _kind_density_table()
+        count = 0
+        for kind in NarrativeKind:
+            min_density, legacy = table.get(kind.value, ("on", ""))
+            if registry.register(
+                f"narrative.{kind.value}", min_density,
+                legacy_flag=legacy, owner=__name__,
+                describe=f"NarrativeKind.{kind.name} frames",
+            ) is not None:
+                count += 1
+        return count
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+try:  # Self-register at import — a voice must be known BEFORE it speaks.
+    from backend.core.ouroboros.ui.narrative_density import (  # noqa: E402
+        default_registry as _default_voice_registry,
+    )
+    register_voices(_default_voice_registry())
+except Exception:  # noqa: BLE001
+    pass
