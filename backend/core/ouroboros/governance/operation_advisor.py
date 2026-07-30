@@ -2886,3 +2886,50 @@ __all__ = [
     "envelope_repo_root_status",
     "guard_envelope_repo_root",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Read-only reach lookup — for surfaces, never for decisions
+# ---------------------------------------------------------------------------
+
+
+def peek_blast(
+    target_files: "Sequence[str]",
+    root: "Optional[str]" = None,
+) -> "Optional[Tuple[int, str]]":
+    """``(count, provenance)`` if this reach is ALREADY known, else None.
+
+    The read-only half of :meth:`_compute_blast_radius`. It reads the same
+    shared cache under the same lock with the same key and honours the same
+    TTL — and it will NEVER compute, scan, or populate anything.
+
+    That restriction is the entire point. A cold blast scan is a 39–43s
+    burn (soak bt-2026-07-21-205755, the failure that produced the whole
+    locality-bounding arc), and a display surface that triggered one per
+    file would turn a diff preview into a minutes-long freeze. Worse, it
+    would do so on the operator's critical path while they wait at a gate.
+
+    A miss is honestly a miss. It must NOT be reported as zero: the cache
+    deliberately stores only MEASURED-class results, so "absent" means
+    "never established", and the last time this system let an unestablished
+    reach wear a number, the fabricated cap was cached and poisoned every
+    op sharing the key for the TTL.
+
+    NEVER raises.
+    """
+    try:
+        if not target_files:
+            return None
+        scan_root = root if root is not None else str(Path.cwd())
+        cache_key = (frozenset(target_files), str(scan_root))
+        with _BLAST_RADIUS_CACHE_LOCK:
+            entry = _BLAST_RADIUS_CACHE_SHARED.get(cache_key)
+            if entry is None:
+                return None
+            computed_at, count = entry
+            if time.time() - computed_at >= _BLAST_RADIUS_CACHE_TTL_S:
+                return None            # stale is not known
+            provenance = _BLAST_PROVENANCE_SHARED.get(cache_key, "")
+        return (int(count), str(provenance or ""))
+    except Exception:  # noqa: BLE001
+        return None

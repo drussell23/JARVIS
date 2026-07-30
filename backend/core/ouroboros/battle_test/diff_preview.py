@@ -270,6 +270,24 @@ class DiffPreviewRenderer:
             ),
             guide_style="muted",
         )
+        # Reach per file, from what is ALREADY known. `peek` cannot scan —
+        # a cold blast scan is a 39–43s burn, and paying it per file here
+        # would freeze the preview while the operator waits at a gate.
+        # Computed for the whole set at once because the bar's scale is a
+        # property of the SET: 12 dependents means nothing until you know
+        # whether it is the largest number on screen or the smallest.
+        gutter_rows = {}
+        gutter_summary = ""
+        try:
+            from backend.core.ouroboros.ui import blast_gutter as _bg
+            if _bg.gutter_enabled():
+                reaches = _bg.peek([c.path for c in changes])
+                gutter_rows = {
+                    row.reach.path: row for row in _bg.annotate_set(reaches)
+                }
+                gutter_summary = _bg.summary(reaches)
+        except Exception:  # noqa: BLE001 — a lost column, never a lost diff
+            gutter_rows = {}
         for c in changes:
             label = Text()
             label.append(c.path)
@@ -283,7 +301,19 @@ class DiffPreviewRenderer:
             elif c.is_binary:
                 label.append("  ")
                 label.append("[binary]", style="muted")
+            row = gutter_rows.get(c.path)
+            if row is not None:
+                label.append("  ")
+                label.append(row.bar, style=_reach_style(row.role))
+                label.append(f" {row.label}", style=_reach_style(row.role))
             tree.add(label)
+        if gutter_summary:
+            # The header carries the set-level finding — most importantly
+            # "unmeasured", because a column that is mostly `?` IS the
+            # finding: nothing here has been measured, so read the diff.
+            tree.label = Text.assemble(
+                tree.label, ("  ", ""), (gutter_summary, "muted"),
+            )
         return tree
 
     def _build_file_panel(self, change: FileChange) -> Any:
@@ -405,6 +435,24 @@ def _badge(status: str) -> "Text":  # type: ignore[name-defined]
     else:
         t.append(f"[? {status}]", style="muted")
     return t
+
+
+def _reach_style(role: str) -> str:
+    """Semantic role → a style this renderer can use. NEVER raises.
+
+    Asks `semantic_tokens` first so the gutter tracks the theme and its
+    tier, and falls back to the style vocabulary this module already uses
+    (``muted`` / ``warning``) when the palette is unavailable — the renderer
+    is documented to degrade to Rich defaults rather than fail.
+    """
+    try:
+        from backend.core.ouroboros.ui.semantic_tokens import sem
+        resolved = sem(role)
+        if resolved and resolved != "none":
+            return resolved
+    except Exception:  # noqa: BLE001
+        pass
+    return {"heal": "warning", "alert": "warning"}.get(role, "muted")
 
 
 def _status_color(status: str) -> str:
