@@ -288,7 +288,13 @@ def diff(lineno: Optional[int], sign: str, code: str,
         band = ""
         try:
             from backend.core.ouroboros.ui.semantic_tokens import role_palette
-            band = {"+": "code_add", "-": "code_del"}.get(sign, "")
+            # The BACKGROUND roles, not the foreground ones. `code_add` resolves
+            # to a foreground green, and `on green` is a saturated slab that makes
+            # every syntax colour drawn over it illegible — a dim comment on bright
+            # green cannot be read, which is exactly how the first version looked
+            # on screen. `code_add_bg` is a dark tint chosen so a keyword, a string
+            # and a comment all keep their own hue on top of the band.
+            band = {"+": "code_add_bg", "-": "code_del_bg"}.get(sign, "")
             band = (role_palette().get(band) or "") if band else ""
         except Exception:  # noqa: BLE001
             band = ""
