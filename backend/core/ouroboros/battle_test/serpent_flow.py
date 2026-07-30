@@ -6727,6 +6727,11 @@ class SerpentREPL:
                     # `/expand d-N` opens this. The daemon owns the archive, so
                     # this is the only surface that can render a diff locally.
                     diff_rows=_mount.get("diff_rows"),
+                    # The sentence being written, at the terminal of the
+                    # process writing it. This was the daemon's oldest blind
+                    # spot in the other direction: it COMPOSED every in-flight
+                    # frame, shipped it over the bridge, and could not draw it.
+                    stream_rows=_mount.get("stream_rows"),
                 )
                 return
         except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL

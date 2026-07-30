@@ -1622,18 +1622,19 @@ class AttachUI:
                 # reads as WORKING rather than stalled — which is the whole
                 # complaint a black box produces.
                 import time as _time
-                if frame.get("done"):
-                    self._stream_inflight = ""
-                else:
-                    _tool = str(frame.get("tool") or "tool")
-                    _el = frame.get("elapsed_s") or 0.0
-                    try:
-                        _head = f"$ {_tool} · {float(_el):.0f}s"
-                    except (TypeError, ValueError):
-                        _head = f"$ {_tool}"
-                    _body = str(frame.get("text") or "")
-                    self._stream_inflight = (
-                        f"{_head}\n{_body}" if _body else _head)
+                # Composed by the SHARED function rather than here. The header
+                # `$ bash · 11s` is what makes a long command read as WORKING
+                # rather than stalled, and the daemon now draws this strip at
+                # its own terminal too — so a second copy of the composition
+                # would be a second opinion about what an in-flight tool tail
+                # looks like, which is the defect the roster and the status
+                # line each already paid for once.
+                from backend.core.ouroboros.battle_test.inflight_registry import (  # noqa: E501
+                    compose_inflight_text,
+                )
+                self._stream_inflight = (
+                    "" if frame.get("done") else compose_inflight_text(frame)
+                )
                 self._stream_is_tool = True
                 self._stream_arrived = _time.monotonic()
                 self._push_tail_to_deck()
