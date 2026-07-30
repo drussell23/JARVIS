@@ -729,6 +729,33 @@ def _THEME(slot: str) -> str:
         return "white"
 
 
+
+def _demo_density() -> Any:
+    """A VERBOSE density for the demo, or None. NEVER raises.
+
+    Returning None falls back to the ambient providers, so a failure here degrades
+    to the previous behaviour rather than to a blank block.
+
+    `max_body_lines` is generous but BOUNDED: the point is that the body renders,
+    not that a 6000-line payload does. The registry's own elision markers and
+    `/expand t-N` refs still do their job above that cap — demonstrating truncation
+    AND its recovery path is part of what the scene is for.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.tool_render_policy import (
+            DensityLevel, DensityPolicy,
+        )
+        return DensityPolicy(
+            level=DensityLevel.VERBOSE,
+            max_body_lines=14,
+            max_summary_chars=200,
+            provenance="ov_demo",
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] explicit density unavailable", exc_info=True)
+        return None
+
+
 def _tool_beats(at: float, args: Sequence[Any]) -> List[Any]:
     """One tool call → the lines the COCKPIT would draw for it.
 
@@ -755,6 +782,17 @@ def _tool_beats(at: float, args: Sequence[Any]) -> List[Any]:
         )[:5]
         composed = compose(
             str(name), str(tool_args), str(result),
+            # The demo declares its OWN density instead of inheriting the ambient
+            # one, and that is the difference between a demonstration and a
+            # coin flip. `resolve_density_via_providers` with the defaults answers
+            # `show_body=False, max_body_lines=0` — correct for a quiet cockpit,
+            # and it means the tool BODY (the diff, the pytest tail) may not render
+            # at all depending on posture and layout mode. A scene whose whole
+            # purpose is to show what a tool block looks like cannot leave that to
+            # ambient state: an operator who runs `ov demo live` and sees an
+            # `Update(path)` header with nothing under it learns the wrong thing
+            # about the cockpit.
+            explicit_density=_demo_density(),
             status=ToolStatus.coerce(status),
             duration_ms=float(duration_ms or 0.0),
             op_id="7759-86",

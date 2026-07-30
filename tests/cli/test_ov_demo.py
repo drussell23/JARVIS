@@ -518,3 +518,59 @@ class TestTheDemoShowsTheLatestFeatures:
         unset = sorted(f.hook for f in fills if f.state.name == "UNSET")
         assert not unset, (
             f"ov demo live leaves these cockpit hooks dark: {unset}")
+
+
+class TestTheDemoDeclaresItsOwnDensity:
+    """A demonstration cannot leave "does the body render" to ambient state.
+
+    `resolve_density_via_providers` with the defaults answers `show_body=False,
+    max_body_lines=0` — correct for a quiet cockpit, and it means the tool BODY (the
+    diff, the pytest tail) may not render at all depending on posture and layout
+    mode. An operator who runs `ov demo live` and sees an `Update(path)` header with
+    nothing under it learns the wrong thing about the cockpit.
+    """
+
+    def test_the_demo_pins_a_verbose_density(self):
+        from backend.core.ouroboros.cli import ov_demo as d
+        policy = d._demo_density()
+        assert policy is not None and policy.show_body is True
+        assert policy.max_body_lines > 0
+
+    def test_the_cap_is_bounded_not_unlimited(self):
+        """The point is that the body renders, not that a 6000-line payload does —
+        the elision markers and `/expand t-N` refs above the cap are themselves part
+        of what the scene demonstrates."""
+        from backend.core.ouroboros.cli import ov_demo as d
+        assert d._demo_density().max_body_lines <= 40
+
+    def test_the_edit_beat_actually_renders_a_banded_hunk(self):
+        """End to end through the real tool renderer: this is the assertion that
+        would have caught a header with nothing beneath it."""
+        from backend.core.ouroboros.cli import ov_demo as d
+        beats = d._tool_beats(
+            7.2, ("edit_file", "x/risk_tier_floor.py", d._EDIT_RESULT,
+                  "success", 90))
+        banded = [l for _at, l in beats if isinstance(l, str) and "on #" in l]
+        assert banded, "the Update block rendered no hunk"
+
+    def test_a_banded_comment_uses_a_colour_not_the_dim_attribute(self):
+        """The contrast fix, visible where the operator actually looks. `dim` on a
+        band reduces intensity RELATIVE TO THE BAND and the comment sinks in."""
+        from backend.core.ouroboros.cli import ov_demo as d
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        verbose = role_palette()["verbose"]
+        banded = [l for _at, l in d.compose_live_script()
+                  if isinstance(l, str) and "on #" in l]
+        assert banded, "no banded hunk in the live script"
+        assert not any(" dim" in l for l in banded), (
+            "a comment is still asking for dim on a band")
+        assert any("#" in l and verbose in l for l in banded), (
+            "no banded comment picked up the verbose colour")
+
+    def test_a_broken_density_falls_back_rather_than_blanking(self, monkeypatch):
+        """Returning None inherits the ambient providers — the previous behaviour —
+        instead of producing an empty block."""
+        from backend.core.ouroboros.cli import ov_demo as d
+        import backend.core.ouroboros.battle_test.tool_render_policy as tp
+        monkeypatch.delattr(tp, "DensityPolicy", raising=False)
+        assert d._demo_density() is None
