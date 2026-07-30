@@ -1062,17 +1062,13 @@ class AttachUI:
         NEVER raises — an unrenderable roster costs its rows, not the cockpit.
         """
         try:
-            import time as _time
             from backend.core.ouroboros.battle_test.agent_roster import (
                 render_roster, roster_line_budget, roster_visible,
             )
-            from backend.core.ouroboros.battle_test.attach_heartbeat import (
-                heartbeat_stale_after_s,
-            )
             if not roster_visible():
                 return []
-            age = max(0.0, _time.monotonic() - float(self._heartbeat_arrived))
-            if not self._heartbeat_arrived or age > heartbeat_stale_after_s():
+            age = self._heartbeat_age()
+            if age is None:
                 return []
             size = self._terminal_size()
             return render_roster(
@@ -1093,15 +1089,10 @@ class AttachUI:
         NEVER raises: a status line is chrome.
         """
         try:
-            import time as _time
-            from backend.core.ouroboros.battle_test.attach_heartbeat import (
-                heartbeat_stale_after_s,
-            )
             from backend.core.ouroboros.battle_test.status_line import (
                 payload_to_snapshot, render_snapshot,
             )
-            age = max(0.0, _time.monotonic() - float(self._heartbeat_arrived))
-            if not self._heartbeat_arrived or age > heartbeat_stale_after_s():
+            if self._heartbeat_age() is None:
                 return []
             snap = payload_to_snapshot(self._status)
             if snap is None:
@@ -1111,6 +1102,72 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return []
 
+    def _heartbeat_age(self) -> Optional[float]:
+        """Seconds since the daemon's last frame, or None when contact is lost.
+
+        ONE definition of "lost contact", which is what three separate
+        docstrings on this class were already asking for in prose — the
+        roster's ("the roster expires on the SAME window the pulse uses — one
+        clock, one definition"), the status line's ("rather than three that
+        drift apart and leave a dead daemon's phase showing under an idle
+        pulse") and the countdown's. All three then implemented it inline, and
+        the serpent border was about to make it four.
+
+        The failure that discipline prevents is specific and reads as normal
+        operation: if the daemon dies mid-dispatch, the last frame this
+        process holds says three agents are running, phase is GENERATE and the
+        border should be moving — and it will say that forever. Every surface
+        fed by this heartbeat has to retire on the same clock or the cockpit
+        shows a confident, coherent, wrong picture of a dead organism.
+
+        Returns the AGE rather than a bool because callers need it: running
+        agents advance by it so seconds tick smoothly between 1 Hz frames, and
+        the apply countdown subtracts it. A bool would force every caller to
+        recompute the number the predicate already had.
+
+        NEVER raises — a surface that cannot ask degrades to "lost", which is
+        the safe direction: it stops drawing rather than inventing them.
+        """
+        try:
+            import time as _time
+            from backend.core.ouroboros.battle_test.attach_heartbeat import (
+                heartbeat_stale_after_s,
+            )
+            arrived = float(self._heartbeat_arrived or 0.0)
+            if not arrived:
+                return None
+            age = max(0.0, _time.monotonic() - arrived)
+            return None if age > heartbeat_stale_after_s() else age
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _serpent_active(self) -> bool:
+        """Is the organism THINKING right now, as far as THIS terminal knows?
+
+        Drives the serpent hairline that frames the caret. The daemon answers
+        this from `build_heartbeat_payload` in-process; an attach client has
+        no organism to ask, so it reads the `active` flag off the last frame
+        that crossed the bridge. Same question, same field, two sources —
+        which is the property that keeps the border, the toolbar verb and the
+        token counter from disagreeing about whether work is happening.
+
+        `capability_handoff` measured this hook UNSET on `ov`, so the
+        animation ran in `ov demo live` and on the daemon's own terminal and
+        was dead on the surface an operator actually attaches with. The border
+        simply never moved, which is indistinguishable from an organism that
+        is never busy.
+
+        Staleness retires it, and that is the load-bearing half: a border that
+        keeps animating after the daemon dies is the cockpit asserting work is
+        in flight when nothing is running at all.
+        """
+        try:
+            if self._heartbeat_age() is None:
+                return False
+            return bool((self._heartbeat or {}).get("active"))
+        except Exception:  # noqa: BLE001
+            return False
+
     def _pending_apply_rows(self) -> List[str]:
         """The rejection window, counting down. NEVER raises.
 
@@ -1119,13 +1176,9 @@ class AttachUI:
         toward an apply that will never happen.
         """
         try:
-            import time as _time
-            from backend.core.ouroboros.battle_test.attach_heartbeat import (
-                heartbeat_stale_after_s,
-            )
             from backend.core.ouroboros.battle_test.pending_apply import render
-            age = max(0.0, _time.monotonic() - float(self._heartbeat_arrived))
-            if not self._heartbeat_arrived or age > heartbeat_stale_after_s():
+            age = self._heartbeat_age()
+            if age is None:
                 return []
             return render(self._pending_apply, age_s=age,
                           width=self._terminal_size()[0])
@@ -3515,6 +3568,16 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             agent_rows=(
                 ui._agent_lines if ui is not None
                 and hasattr(ui, "_agent_lines") else None
+            ),
+            # The serpent runs the hairlines while the organism is THINKING.
+            # Measured UNSET here by `capability_handoff`, which meant the
+            # animation ran in the demo and on the daemon's own terminal and
+            # was dead on the surface an operator actually attaches with — a
+            # border that never moves is indistinguishable from an organism
+            # that is never busy.
+            serpent_active=(
+                ui._serpent_active if ui is not None
+                and hasattr(ui, "_serpent_active") else None
             ),
             # The `/` search bar. Read from the hatches module rather than
             # held here: the search session belongs to the transcript key

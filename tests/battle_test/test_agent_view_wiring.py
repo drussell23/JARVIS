@@ -602,3 +602,136 @@ class TestVisibility:
         assert roster_visible() is False
         ov_demo._agent_view_rows()
         assert roster_visible() is True
+
+
+# ---------------------------------------------------------------------------
+# One clock for every surface the heartbeat feeds
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatStaleness:
+    """Three docstrings on `AttachUI` already asked for this in prose — the
+    roster's ("one clock, one definition of 'lost contact'"), the status
+    line's ("rather than three that drift apart and leave a dead daemon's
+    phase showing under an idle pulse") and the countdown's. All three then
+    implemented the rule inline, and the serpent border was about to make a
+    fourth copy.
+
+    The failure it prevents reads as normal operation: a daemon that dies
+    mid-dispatch leaves a last frame saying three agents are running, phase
+    GENERATE, border moving — forever.
+    """
+
+    def _fresh(self, busy):
+        from backend.core.ouroboros.cli.ov import AttachUI
+
+        roster, _clock = busy
+        ui = AttachUI()
+        ui.on_telemetry({"kind": "heartbeat", "active": True,
+                         "agents": roster.snapshot()})
+        return ui
+
+    def test_no_heartbeat_is_not_a_zero_age(self, busy):
+        """A process that has never heard from the daemon has NOT just heard
+        from it. `_heartbeat_arrived == 0.0` compared against a monotonic
+        clock would read as an enormous age on some platforms and as fresh on
+        others — so absence is None, explicitly."""
+        from backend.core.ouroboros.cli.ov import AttachUI
+
+        assert AttachUI()._heartbeat_age() is None
+
+    def test_a_fresh_frame_yields_an_age(self, busy):
+        age = self._fresh(busy)._heartbeat_age()
+        assert age is not None and age >= 0.0
+
+    def test_every_surface_retires_on_the_same_clock(self, busy, shown):
+        """THE property. Not "each one expires eventually" — the SAME
+        instant, or the cockpit shows a coherent, confident, wrong picture of
+        a dead organism."""
+        import time
+
+        ui = self._fresh(busy)
+        assert ui._agent_lines()
+        assert ui._serpent_active() is True
+
+        ui._heartbeat_arrived = time.monotonic() - 10_000
+        assert ui._heartbeat_age() is None
+        assert ui._agent_lines() == []
+        assert ui._status_rows() == []
+        assert ui._pending_apply_rows() == []
+        assert ui._serpent_active() is False
+
+    def test_the_rule_is_declared_once(self):
+        """Not a style point. Four copies of a staleness window drift, and
+        the drift is invisible until a daemon dies."""
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.cli import ov
+
+        callers = 0
+        for name in ("_agent_lines", "_status_rows", "_pending_apply_rows",
+                     "_serpent_active"):
+            src = inspect.getsource(getattr(ov.AttachUI, name)).lstrip()
+            tree = ast.parse(src)
+            names = {
+                n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+            }
+            assert "_heartbeat_age" in names, (
+                f"{name} does not consult the shared predicate"
+            )
+            assert "heartbeat_stale_after_s" not in inspect.getsource(
+                getattr(ov.AttachUI, name)), (
+                f"{name} re-implements the staleness window inline"
+            )
+            callers += 1
+        assert callers == 4
+
+
+class TestSerpentActive:
+    """`capability_handoff` measured this hook UNSET on `ov`: the animation
+    ran in the demo and on the daemon's own terminal, and was dead on the
+    surface an operator attaches with. A border that never moves is
+    indistinguishable from an organism that is never busy."""
+
+    def _ui(self, active, agents=None):
+        from backend.core.ouroboros.cli.ov import AttachUI
+
+        ui = AttachUI()
+        ui.on_telemetry({"kind": "heartbeat", "active": active})
+        return ui
+
+    def test_it_follows_the_daemons_own_flag(self):
+        assert self._ui(True)._serpent_active() is True
+        assert self._ui(False)._serpent_active() is False
+
+    def test_a_dead_daemon_stops_the_border(self):
+        """The load-bearing half: a border still animating after the daemon
+        dies is the cockpit asserting work is in flight when nothing runs."""
+        import time
+
+        ui = self._ui(True)
+        ui._heartbeat_arrived = time.monotonic() - 10_000
+        assert ui._serpent_active() is False
+
+    def test_a_frame_without_the_field_is_not_active(self):
+        """An older daemon that predates `active` must not animate forever."""
+        from backend.core.ouroboros.cli.ov import AttachUI
+
+        ui = AttachUI()
+        ui.on_telemetry({"kind": "heartbeat"})
+        assert ui._serpent_active() is False
+
+    def test_the_hook_is_actually_handed_to_the_cockpit(self):
+        """The defect class this whole audit exists for: a provider that
+        exists, works, and is never passed."""
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.cli import ov
+
+        tree = ast.parse(inspect.getsource(ov))
+        assert any(
+            isinstance(node, ast.keyword) and node.arg == "serpent_active"
+            for node in ast.walk(tree)
+        ), "ov builds the cockpit without handing it serpent_active"
