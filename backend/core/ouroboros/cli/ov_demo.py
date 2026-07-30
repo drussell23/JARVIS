@@ -260,17 +260,13 @@ def _compose(kind: str, args: Sequence[Any]) -> str:
             return deck.detail(args[0], tone=(args[1] if len(args) > 1
                                               else "muted"))
         if kind == "diff":
-            # `(lineno, sign, code)` positionally, plus the PATH the hunk belongs
-            # to so `deck.diff` can infer the language, and the terminal WIDTH so
-            # the add/del band reaches a common right edge instead of stopping at
-            # each line's text. Both keyword-only, so the three-tuple call shape
-            # every other beat uses is unchanged.
-            import shutil
-            return deck.diff(
-                *args[:3],
-                path=(args[3] if len(args) > 3 else None),
-                width=shutil.get_terminal_size((100, 30)).columns,
-            )
+            # Kept for the beat KIND, not for a caller: the script carries no
+            # `diff` beats since the tool renderer began highlighting its own
+            # hunks. It no longer resolves a width — `deck.diff` asks
+            # `resolve_deck_width`, the one authority both diff surfaces use, and
+            # a third opinion here is exactly what #70298 removed elsewhere.
+            return deck.diff(*args[:3],
+                             path=(args[3] if len(args) > 3 else None))
         if kind == "voice":
             return deck.voice(*args)
         if kind == "prov":
@@ -1341,6 +1337,30 @@ def _open_demo_diff() -> Optional[str]:
     return None
 
 
+
+def _deck_width() -> int:
+    """This frame's width, from the ONE authority. NEVER raises.
+
+    The strips used to call `shutil.get_terminal_size((80, 24))` each, three times,
+    with a fallback that disagreed with the deck's own (100x30) and with no
+    knowledge of the live prompt_toolkit application. So on a resize the queue, the
+    panic overlay and the in-flight strip could each be measuring a different
+    terminal than the diff bands beside them.
+
+    `resolve_deck_width` prefers the mounted application, which learns about a
+    SIGWINCH before the process environment does — the reason it exists.
+    """
+    try:
+        from backend.core.ouroboros.ui.deck_grammar import resolve_deck_width
+        return int(resolve_deck_width())
+    except Exception:  # noqa: BLE001
+        try:
+            import shutil
+            return int(shutil.get_terminal_size((100, 30)).columns)
+        except Exception:  # noqa: BLE001
+            return 100
+
+
 def _panic_rows(elapsed: float, width: int) -> List[str]:
     """The FATAL_PANIC overlay, through the REAL renderer. NEVER raises.
 
@@ -1398,8 +1418,10 @@ def _stream_rows(elapsed: float, mux: Any = None) -> List[str]:
         except Exception:  # noqa: BLE001
             width = None
         if not width:
-            import shutil
-            width = shutil.get_terminal_size((80, 24)).columns
+            # The mux's own width when it has one, else the shared authority —
+            # never a private `shutil` call with a fallback that disagrees with
+            # the deck's.
+            width = _deck_width()
         # A running command outranks model prose in the same strip: they
         # never overlap in a real op either, and the command is the thing
         # the operator cannot otherwise see.
@@ -1729,11 +1751,13 @@ def _demo_header() -> "tuple[Any, int, Any]":
 
         def _render() -> str:
             try:
-                import shutil
                 import time
-                width = shutil.get_terminal_size(fallback=(100, 30)).columns
+                # Same authority as every other surface: the masthead is seeded
+                # INTO the transcript, so it must wrap to the width the deck
+                # believes in, not to one it measured for itself.
                 return render_cockpit_header(
-                    mini, _header_lines(), width, now=time.monotonic(),
+                    mini, _header_lines(), _deck_width(),
+                    now=time.monotonic(),
                 )
             except Exception:  # noqa: BLE001
                 return ""
@@ -1960,11 +1984,11 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         # cockpit's own renderers.
         queue_rows=lambda: _queue_rows(
             (clock() - start[0]) * speed,
-            __import__("shutil").get_terminal_size((80, 24)).columns,
+            _deck_width(),
         ),
         panic_rows=lambda: _panic_rows(
             (clock() - start[0]) * speed,
-            __import__("shutil").get_terminal_size((80, 24)).columns,
+            _deck_width(),
         ),
         stream_rows=lambda: _stream_rows(
             (clock() - start[0]) * speed, mux,
@@ -1996,7 +2020,7 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         search_rows=_demo_search_rows(),
         pending_rows=lambda: _pending_rows(
             (clock() - start[0]) * speed,
-            __import__("shutil").get_terminal_size((80, 24)).columns,
+            _deck_width(),
         ),
     )
     try:
