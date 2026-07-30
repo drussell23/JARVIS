@@ -29,11 +29,19 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 import re
 import subprocess
 import sys
 import time
+
+#: Module logger. SIX `except` handlers in this file called `logger.debug`
+#: and nothing defined it, so each raised `NameError` FROM THE HANDLER —
+#: turning a swallowed degradation into a crash and making every
+#: "NEVER raises" docstring above them false. Found by Pyright while a
+#: seventh was being added.
+logger = logging.getLogger("Ouroboros.SerpentFlow")
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -6587,6 +6595,13 @@ class SerpentREPL:
                 run_bipartite_repl,
                 should_run_bipartite,
             )
+            # Imported UNALIASED: `capability_handoff` matches the
+            # call-site spelling derived from the function's own
+            # name, so `as _waived` would make the waiver invisible
+            # to the auditor it exists for.
+            from backend.core.ouroboros.ui.capability_handoff import (
+                waived,
+            )
             if should_run_bipartite():
                 import asyncio as _aio
 
@@ -6739,6 +6754,25 @@ class SerpentREPL:
                     # spot in the other direction: it COMPOSED every in-flight
                     # frame, shipped it over the bridge, and could not draw it.
                     stream_rows=_mount.get("stream_rows"),
+                    # DECLINED, not overlooked — and said here because a
+                    # waiver is read at the call site, which is why
+                    # `cockpit_mount` could not declare it from inside a dict
+                    # of values.
+                    #
+                    # An identity header would strand the emblem at row 0
+                    # while the bottom-anchored deck hugs the prompt, leaving
+                    # a band that belongs to neither. The daemon puts its
+                    # identity in the TRANSCRIPT instead (`seed_daemon_
+                    # masthead`), where it scrolls with the work it names.
+                    # `waived()` returns None, so this is byte-identical at
+                    # runtime to omitting the argument; what changes is that
+                    # the omission stops being silent, and the audit stops
+                    # reporting a design decision as an unfilled hook.
+                    header=waived(
+                        "the daemon's identity lives in the transcript "
+                        "masthead, not in a header row"),
+                    header_height=waived(
+                        "no header row to size — see `header`"),
                 )
                 return
         except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL
