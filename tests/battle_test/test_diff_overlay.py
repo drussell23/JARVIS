@@ -538,3 +538,113 @@ class TestOverlaysOcclude:
         deck's — so the overlay reads as text floating on the transcript."""
         from backend.core.ouroboros.battle_test import bipartite_layout as bl
         assert "bg:" in bl._overlay_style("alert")
+
+
+class TestTheRenderPool:
+    @pytest.fixture(autouse=True)
+    def _restore_pool(self):
+        """These tests retire the pool deliberately, and the broken flag is
+        module-global BY DESIGN. Without restoring it, every later test in the
+        process silently runs on the thread path — which is exactly how the
+        #70283 stall assertion started failing on test ORDER rather than on a
+        change to the code it guards."""
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        do.reset_render_pool_for_tests()
+        yield
+        do.reset_render_pool_for_tests()
+
+
+    """Pygments holds the GIL, so `to_thread` never actually freed the loop.
+
+    #70283 asserted "no stall > 150ms" and passed on an idle machine — that
+    threshold is not sensitive enough to see GIL contention, which is why the claim
+    survived a merge. The measure that DOES see it is how many times the loop got to
+    run while the render was in flight:
+
+        with the pool   131 loop ticks
+        thread only      25 loop ticks
+
+    ~5.2x, on a loop kept deliberately busy. Wall time is LONGER with the pool (a
+    child pays 155ms to import rich, plus IPC for the payload) and that is the right
+    trade: the operator cares that the cockpit stays responsive, not that a
+    background render finishes sooner.
+    """
+
+    def test_the_worker_is_module_level_and_takes_plain_data(self):
+        """`ProcessPoolExecutor` pickles the callable AND its arguments, so a bound
+        method on a controller holding a lock, an archive and callbacks cannot cross
+        the boundary at all."""
+        import pickle
+
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        payload = {"diff_text": "--- a\n+++ b\n@@ -1 +1 @@\n+x = 1\n",
+                   "width": 80}
+        assert pickle.loads(pickle.dumps(do.highlight_diff_body)) is not None
+        assert pickle.loads(pickle.dumps(payload)) == payload
+
+    def test_the_worker_renders_without_any_controller(self):
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        rows = do.highlight_diff_body(
+            {"diff_text": "--- a\n+++ b\n@@ -1 +1 @@\n+x = 1\n", "width": 80})
+        assert rows and any("x = 1" in r for r in rows)
+
+    def test_an_empty_payload_is_reported_not_blank(self):
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        assert "no diff text" in "\n".join(
+            do.highlight_diff_body({"diff_text": "", "width": 80}))
+
+    def test_a_broken_pool_degrades_to_the_thread_and_still_renders(self):
+        """The pool cannot start in a sandbox, in a frozen app, or where
+        `multiprocessing` spawn has no importable `__main__` — and its worker can be
+        SIGTERM'd mid-render by `graceful_preemption.halt_child_workers`, which
+        already reaps this process's children. Every one of those means the child is
+        unavailable NOW, and the operator still wants the diff."""
+        import asyncio
+
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        from backend.core.ouroboros.battle_test.diff_archive import DiffArchive
+
+        do.shutdown_render_pool()          # marks the pool permanently broken
+        assert do._render_pool() is None
+
+        archive = DiffArchive()
+        entry = archive.add(op_id="op", risk_tier="NOTIFY_APPLY",
+                            file_paths=("x.py",),
+                            diff_text="--- a\n+++ b\n@@ -1 +1 @@\n+fallback\n",
+                            summary="s")
+
+        async def drive():
+            controller = do.DiffOverlayController(archive=archive,
+                                                  width_fn=lambda: 80)
+            controller.open(entry.ref)
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if len(controller.rows()) > 3:
+                    break
+            return controller.rows()
+
+        rows = asyncio.run(drive())
+        assert any("fallback" in r for r in rows), (
+            "the thread fallback did not render — a broken pool must never cost "
+            "the operator the diff")
+
+    def test_a_retired_pool_stays_retired(self):
+        """A pool whose worker was halted raises on every submit. Retrying per
+        render would pay the failure cost forever."""
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        do.shutdown_render_pool()
+        assert do._render_pool() is None
+        assert do._render_pool() is None
+
+    def test_shutdown_is_idempotent(self):
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        do.shutdown_render_pool()
+        assert do.shutdown_render_pool() is False
+
+    def test_shutdown_is_registered_so_no_child_outlives_the_cockpit(self):
+        import inspect
+
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        src = inspect.getsource(do)
+        assert "atexit" in src and "shutdown_render_pool" in src, (
+            "an unreaped worker keeps the process alive at exit")
