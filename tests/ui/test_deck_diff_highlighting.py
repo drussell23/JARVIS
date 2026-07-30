@@ -140,15 +140,28 @@ class TestTheDemoShowsIt:
     styles.
     """
 
-    def test_the_composed_script_carries_a_banded_hunk(self):
-        from backend.core.ouroboros.cli import ov_demo as d
+    def test_the_tool_renderer_bands_a_diff_body(self):
+        """Asserted at the RENDERER, not through `compose_live_script`.
+
+        The composed-script version of this was WIDTH-DEPENDENT: it passed when
+        #70294 was committed and failed on a later run in a differently-sized
+        terminal, because `tool_render_view`'s density policy elides the entire diff
+        body at some widths — the block then renders its `Update(path)` header and
+        summary with nothing underneath. That elision is a real open bug, and it is
+        NOT this test's job to be the thing that notices it flakily; a test whose
+        result depends on the terminal it runs in cannot protect anything.
+
+        So this pins the deterministic half — given a diff line, the deck bands and
+        highlights it — and the elision is filed separately rather than asserted
+        against here.
+        """
         from backend.core.ouroboros.ui.semantic_tokens import role_palette
         palette = role_palette()
-        marks = (f"on {palette['code_add_bg']}", f"on {palette['code_del_bg']}")
-        banded = [l for _at, l in d.compose_live_script()
-                  if isinstance(l, str) and any(m in l for m in marks)]
-        assert banded, "ov demo live shows no banded hunk"
-        assert any("bright_blue" in l or "blue" in l for l in banded), (
+        added = dg.diff(412, "+", "    except RiskFloorConfigError:", path=PATH)
+        removed = dg.diff(412, "-", "    except Exception:", path=PATH)
+        assert f"on {palette['code_add_bg']}" in added
+        assert f"on {palette['code_del_bg']}" in removed
+        assert "bright_blue" in added or "blue" in added, (
             "the hunk has a band but no syntax colour")
 
     def test_the_highlighting_comes_from_the_tool_renderer(self):
@@ -190,3 +203,57 @@ class TestTheDemoShowsIt:
         wrap = _diff_wrapper_for(["some log output", "more output"])
         assert wrap("some log output", None) is not None
         assert wrap("+ not really a diff", None) is not None
+
+
+class TestCommentsStayLegibleOnABand:
+    """`dim` is not a colour — it is SGR 2, "reduce the intensity of whatever this
+    is" — and Pygments' comment token carries EXACTLY that, with no foreground at
+    all. Over the deck's normal background that reads as secondary text, correctly.
+    Over a diff band it reduces intensity RELATIVE TO THE BAND, so the comment sinks
+    into it: legible in principle, unreadable in practice.
+    """
+
+    def test_the_comment_token_really_is_only_dim(self):
+        """The premise. If Pygments ever gives comments a concrete colour, this
+        whole translation becomes unnecessary and should be deleted rather than
+        left running."""
+        from rich.console import Console
+        from rich.syntax import Syntax
+        code = "    # a comment here"
+        text = Syntax(code, "python", theme="ansi_dark").highlight(code)
+        styles = {str(s.style) for s in text.render(Console(width=60))
+                  if s.text.strip()}
+        assert "dim" in styles, f"comment styling changed: {styles}"
+
+    def test_a_banded_comment_gets_a_real_colour(self):
+        out = dg.diff(413, "+", "        # a malformed floor", path=PATH)
+        assert "dim" not in out, (
+            "the comment is still asking for a relative intensity on a band it "
+            "cannot be relative to")
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        assert role_palette()["verbose"] in out
+
+    def test_an_unbanded_comment_keeps_plain_dim(self):
+        """Context lines have no band, so the reference point never moved and `dim`
+        is exactly right there. Rewriting it everywhere would be inventing a theme
+        rather than repairing a broken reference."""
+        out = dg.diff(410, " ", "    # a context comment", path=PATH)
+        assert "dim" in out
+
+    def test_only_dim_is_translated(self):
+        """`bold`, `italic` and every concrete colour already have a fixed
+        appearance a background cannot dilute."""
+        from backend.core.ouroboros.ui.deck_grammar import _legible_over_band
+        assert _legible_over_band("bold bright_blue", True) == "bold bright_blue"
+        assert _legible_over_band("", True) == ""
+
+    def test_other_attributes_survive_the_translation(self):
+        """Pygments emits `dim italic` too. Dropping the whole style to fix one
+        word would take the italic with it."""
+        from backend.core.ouroboros.ui.deck_grammar import _legible_over_band
+        out = _legible_over_band("dim italic", True)
+        assert "italic" in out and "dim" not in out
+
+    def test_unbanded_styles_are_untouched(self):
+        from backend.core.ouroboros.ui.deck_grammar import _legible_over_band
+        assert _legible_over_band("dim italic", False) == "dim italic"
