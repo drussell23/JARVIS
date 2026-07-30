@@ -484,12 +484,11 @@ def _diff_wrapper_for(body_lines: Any,
             if stripped.startswith(("+++", "---")):
                 return _wrap_diff_line(text, palette)
             from backend.core.ouroboros.ui import deck_grammar as _deck
+            # None, deliberately: `deck.diff` asks `resolve_deck_width` itself, and
+            # that is the ONE authority both diff surfaces now use. Resolving a
+            # width here was the second opinion that gave the same hunk two right
+            # edges depending on which path drew it.
             width = None
-            try:
-                import shutil
-                width = shutil.get_terminal_size((100, 30)).columns
-            except Exception:  # noqa: BLE001
-                width = None
             if stripped.startswith("+"):
                 lineno = state["new"] or None
                 state["new"] += 1

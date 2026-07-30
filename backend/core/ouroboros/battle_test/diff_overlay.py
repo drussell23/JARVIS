@@ -241,10 +241,17 @@ def _terminal_width(fallback: int = 100) -> int:
     """Resolved per call — a diff wrapped to a stale width is clipped, not
     reflowed, because the canvas draws with ``wrap_lines=False``."""
     try:
-        import shutil
-        return max(40, int(shutil.get_terminal_size((fallback, 30)).columns))
+        # The SAME resolver the inline tool path uses. Two functions answering
+        # "how wide is the deck" is what banded one hunk to two different right
+        # edges, and it also meant a SIGWINCH moved one surface and not the other.
+        from backend.core.ouroboros.ui.deck_grammar import resolve_deck_width
+        return max(40, int(resolve_deck_width()))
     except Exception:  # noqa: BLE001
-        return fallback
+        try:
+            import shutil
+            return max(40, int(shutil.get_terminal_size((fallback, 30)).columns))
+        except Exception:  # noqa: BLE001
+            return fallback
 
 
 class DiffOverlayController:

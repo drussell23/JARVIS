@@ -61,6 +61,9 @@ DETAIL_COLUMN: int = 5
 
 #: Width of the diff line-number gutter. Right-aligned, so the numbers form a
 #: column instead of drifting as the file passes 999 lines.
+#: A band narrower than this is not a band — a floor, not a guess.
+_MIN_DECK_WIDTH = 20
+
 GUTTER_WIDTH: int = 4
 
 
@@ -185,6 +188,66 @@ def voice(text: str) -> str:
     except Exception:  # noqa: BLE001
         return f"  {text}"
 
+
+
+
+def resolve_deck_width(explicit: Optional[int] = None) -> int:
+    """The column count a deck surface should fill RIGHT NOW. NEVER raises.
+
+    ONE answer for both diff surfaces. The inline tool renderer resolved its own
+    width from `shutil` while the overlay used a Console sized somewhere else, so
+    the same hunk banded to two different right edges depending on which path drew
+    it — the jagged edge was two functions disagreeing, not a padding bug.
+
+    Resolved PER CALL, never captured. A band whose width was measured once is
+    correct until the first SIGWINCH and then either falls short of the new edge or
+    overruns it and wraps — and the canvas draws with ``wrap_lines=False``, so an
+    overrun is clipped rather than reflowed. Asking every time is what makes the
+    band stretch and shrink elastically instead of shattering.
+
+    Prefers the LIVE prompt_toolkit application when one is mounted, because that is
+    the surface actually being drawn into and it knows about a resize before the
+    process environment does. Falls back to the terminal, then to a floor that keeps
+    a band visible rather than collapsing it to nothing.
+    """
+    try:
+        if explicit and int(explicit) > 0:
+            return max(_MIN_DECK_WIDTH, int(explicit))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from prompt_toolkit.application.current import get_app_or_none
+        app = get_app_or_none()
+        if app is not None and app.output is not None:
+            columns = int(app.output.get_size().columns)
+            if columns > 0:
+                return max(_MIN_DECK_WIDTH, columns)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import shutil
+        return max(_MIN_DECK_WIDTH,
+                   int(shutil.get_terminal_size((100, 30)).columns))
+    except Exception:  # noqa: BLE001
+        return 100
+
+
+def band_fill(visible_len: int, width: Optional[int] = None,
+              *, indent: int = 0) -> int:
+    """Columns of background needed to carry a band to the right edge.
+
+    Takes the VISIBLE length — the plain text — never the markup string. Style tags
+    occupy no columns, so measuring markup over-pads by however many tags the
+    highlighter happened to emit, and a long line then wraps.
+
+    Clamped at zero: a line already wider than the terminal needs no fill, and a
+    negative repeat count would raise inside a render.
+    """
+    try:
+        total = resolve_deck_width(width)
+        return max(0, total - int(indent) - int(visible_len))
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _legible_over_band(style: str, banded: bool) -> str:
@@ -349,10 +412,16 @@ def diff(lineno: Optional[int], sign: str, code: str,
         # markup carries style tags that occupy no columns, so measuring it would
         # over-pad by however many tags the highlighter happened to emit.
         pad = ""
-        if width:
-            visible = len(code) + 2          # the code plus "<sign> "
-            room = max(0, int(width) - DETAIL_COLUMN - GUTTER_WIDTH - 1 - visible)
-            if room and bg:
+        if bg:
+            # ONE padding authority, shared with the overlay. `band_fill` resolves
+            # the width per call, so a SIGWINCH between frames stretches or shrinks
+            # the band instead of leaving it at yesterday's edge.
+            room = band_fill(
+                len(code) + 2,               # the code plus "<sign> "
+                width,
+                indent=DETAIL_COLUMN + GUTTER_WIDTH + 1,
+            )
+            if room:
                 pad = _tint(" " * room, bg)
         sign_mark = _tint(f"{sign} ", bg) if bg else f"{sign} "
         return (" " * DETAIL_COLUMN

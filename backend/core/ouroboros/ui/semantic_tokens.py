@@ -74,7 +74,16 @@ _ROLE_TO_SEMANTIC: Dict[str, str] = {
     "heal": "warn",
     # thinking / structure
     "neural": "cyan",
-    "code_hunk": "cyan",
+    # Structural metadata RECEDES. A `@@ -410,7 +410,22 @@` header tells you where
+    # a hunk sits; it is not the change and must not compete with it for attention.
+    # It was `cyan` here and Pygments paints it magenta in the overlay — two loud
+    # colours for a coordinate. `structural_dim` is the role that says "this is
+    # scaffolding", so the code changes stay the focal point.
+    # Both point at the SEMANTIC, not at each other: `_ROLE_TO_SEMANTIC` is
+    # role -> semantic, and chaining `code_hunk -> structural_dim` made `style_for`
+    # resolve a role name it does not know and return "none" — an invisible header.
+    "code_hunk": "verbose",
+    "structural_dim": "verbose",
     # external brains
     "provider": "venom_purple",
     # goal lifecycle. Previously written as bare `blue` / `magenta` and

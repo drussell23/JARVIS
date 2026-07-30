@@ -90,12 +90,19 @@ class TestTheLexerIsInferredNeverDeclared:
 
 
 class TestTheBandIsSolid:
-    def test_width_pads_the_band_to_a_common_edge(self):
+    def test_a_wider_terminal_gives_a_wider_band(self):
         """Without padding an added block has a ragged right edge that stops at
-        each line's text instead of reading as one slab."""
-        narrow = dg.diff(1, "+", "raise", path=PATH)
-        padded = dg.diff(1, "+", "raise", path=PATH, width=90)
-        assert len(padded) > len(narrow)
+        each line's text instead of reading as one slab.
+
+        This used to compare "no width" against an explicit one, on the premise
+        that omitting the width meant no padding. That premise is gone by design:
+        `band_fill` RESOLVES a width when none is passed, so a band always reaches
+        the edge and the comparison has to be between two explicit widths. The old
+        form failed once the ambient terminal happened to be wider than the explicit
+        argument — a test measuring the wrong thing, passing by coincidence."""
+        narrow = dg.diff(1, "+", "raise", path=PATH, width=60)
+        wide = dg.diff(1, "+", "raise", path=PATH, width=110)
+        assert len(wide) > len(narrow)
 
     def test_padding_measures_the_CODE_not_the_markup(self):
         """Markup tags occupy no columns. Measuring the markup string would
@@ -257,3 +264,91 @@ class TestCommentsStayLegibleOnABand:
     def test_unbanded_styles_are_untouched(self):
         from backend.core.ouroboros.ui.deck_grammar import _legible_over_band
         assert _legible_over_band("dim italic", False) == "dim italic"
+
+
+class TestOneWidthAuthority:
+    """The jagged right edge was two functions disagreeing, not a padding bug.
+
+    The inline tool renderer resolved its own width from `shutil` while the overlay
+    used a Console sized somewhere else, so the same hunk banded to two different
+    edges depending on which path drew it — and a SIGWINCH moved one surface and not
+    the other.
+    """
+
+    def test_the_fill_scales_with_the_terminal(self):
+        """The mandated check: mocked 80 vs 120 columns must yield different fills,
+        and the difference must be exactly the column difference."""
+        from backend.core.ouroboros.ui.deck_grammar import band_fill
+        narrow = band_fill(30, 80, indent=12)
+        wide = band_fill(30, 120, indent=12)
+        assert wide > narrow
+        assert wide - narrow == 40, f"{wide} - {narrow} != 40"
+
+    def test_the_fill_is_never_negative(self):
+        """A line already wider than the terminal needs no fill, and a negative
+        repeat count would raise inside a render."""
+        from backend.core.ouroboros.ui.deck_grammar import band_fill
+        assert band_fill(500, 80, indent=12) == 0
+
+    def test_a_resize_between_calls_changes_the_answer(self):
+        """Resolved PER CALL, never captured. A band measured once is correct until
+        the first SIGWINCH and then clipped — the canvas draws with
+        `wrap_lines=False`, so an overrun is cut rather than reflowed."""
+        import shutil
+
+        from backend.core.ouroboros.ui import deck_grammar as dg
+        sizes = iter([shutil.os.terminal_size((120, 30)),
+                      shutil.os.terminal_size((80, 30))])
+        original = shutil.get_terminal_size
+        shutil.get_terminal_size = lambda *_a, **_k: next(sizes)
+        try:
+            first = dg.resolve_deck_width()
+            second = dg.resolve_deck_width()
+        finally:
+            shutil.get_terminal_size = original
+        assert (first, second) == (120, 80)
+
+    def test_a_degenerate_width_floors_rather_than_collapsing(self):
+        from backend.core.ouroboros.ui.deck_grammar import resolve_deck_width
+        assert resolve_deck_width(3) >= 20
+        assert resolve_deck_width(0) > 0
+
+    def test_both_surfaces_call_the_same_resolver(self):
+        """Structural, by AST — the comments name `shutil` in prose to explain what
+        was removed, so a substring search matches the explanation."""
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        from backend.core.ouroboros.battle_test import tool_render_view as tv
+
+        for module, fn_name in ((do, "_terminal_width"),
+                                (tv, "_diff_wrapper_for")):
+            fn = getattr(module, fn_name)
+            names = {
+                n.name for node in ast.walk(ast.parse(
+                    inspect.getsource(fn).lstrip()))
+                if isinstance(node, ast.ImportFrom) for n in node.names
+            }
+            assert "resolve_deck_width" in names or "deck_grammar" in names, (
+                f"{fn_name} no longer routes through the shared width authority")
+
+
+class TestStructuralMetadataRecedes:
+    def test_the_hunk_header_is_subordinate(self):
+        """`@@ -410,7 +410,22 @@` tells you WHERE a hunk sits; it is not the change
+        and must not compete with it. It was cyan here and magenta in the overlay —
+        two loud colours for a coordinate."""
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        palette = role_palette()
+        assert palette["code_hunk"] == palette["structural_dim"]
+        assert palette["code_hunk"] not in ("cyan", "magenta")
+
+    def test_it_is_still_distinguishable_from_the_code(self):
+        """Subordinate, not invisible — a header the operator cannot find is a
+        different bug than one that shouts."""
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        palette = role_palette()
+        assert palette["code_hunk"]
+        assert palette["code_hunk"] not in ("none", "")
+        assert palette["code_hunk"] != palette["code_add"]
