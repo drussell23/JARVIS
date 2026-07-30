@@ -7196,6 +7196,101 @@ class BattleTestHarness:
         except NotImplementedError:
             logger.warning("Signal handlers not supported on this platform")
 
+    def _arm_shutdown_deadline(self, reason: str = "shutdown") -> None:
+        """Bound the EXIT, not just the run. NEVER raises. Idempotent.
+
+        Observed 2026-07-29: a soak ignored SIGTERM for 12+ seconds and
+        needed SIGKILL. The signal handler fired correctly — a 53KB
+        summary.json landed — and then graceful shutdown never finished.
+
+        Root cause: shutdown had no ceiling anywhere. `--max-wall-seconds`
+        bounds the RUN; every subsystem's cleanup is then awaited with no
+        deadline, so any single hanging await wedges the exit permanently
+        and an external SIGKILL is the only recourse. A process that
+        cannot be asked to stop is not shutting down, it is leaking.
+
+        Deliberately BLIND to shutdown progress, per the Watchdog
+        Isolation Invariant this file already documents for the wall-clock
+        cap: a watchdog that consults the inner state-ledger deadlocks
+        WITH the system it guards. Slice 47 rejected an "adaptive budget
+        waiver" for exactly this reason — a wedged VERIFY keeps the
+        extend-condition true forever. So this thread reads only
+        `time.monotonic()`, and the correct answer to "cleanup needs
+        longer" is a larger STATIC budget, never an activity-gated one.
+
+        Resource-zero, mirroring the wall-clock watchdog: a daemon thread,
+        a raw dup of fd 2 captured at ARM time (a poisoned logging lock
+        cannot wedge `os.write`), and `os.kill` rather than anything that
+        re-enters the interpreter's shutdown machinery — which is the very
+        thing suspected of being stuck.
+        """
+        try:
+            if getattr(self, "_shutdown_deadline_armed", False):
+                return                      # idempotent across signals
+            self._shutdown_deadline_armed = True
+
+            raw = os.environ.get("JARVIS_SHUTDOWN_GRACE_S", "").strip()
+            try:
+                grace_s = max(5.0, min(300.0, float(raw) if raw else 25.0))
+            except (TypeError, ValueError):
+                grace_s = 25.0
+
+            # Captured NOW, pre-wedge.
+            try:
+                panic_fd = os.dup(2)
+            except Exception:  # noqa: BLE001
+                panic_fd = 2
+            pid = os.getpid()
+            deadline = time.monotonic() + grace_s
+            done = threading.Event()
+            self._shutdown_deadline_done = done
+
+            def _reaper() -> None:
+                # A poll rather than one long wait, so a host suspend that
+                # pauses the process cannot skip the deadline entirely.
+                while not done.is_set():
+                    if time.monotonic() >= deadline:
+                        try:
+                            os.write(panic_fd, (
+                                f"\n[ShutdownWatchdog] graceful shutdown "
+                                f"({reason}) exceeded {grace_s:.0f}s — "
+                                f"SIGKILL {pid}. Cleanup was wedged; see "
+                                f"debug.log for the last phase reached.\n"
+                            ).encode("utf-8", "replace"))
+                        except Exception:  # noqa: BLE001
+                            pass
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except Exception:  # noqa: BLE001
+                            os._exit(75)     # last resort, never a return
+                        return
+                    done.wait(0.25)
+
+            threading.Thread(
+                target=_reaper, name="ov-shutdown-watchdog", daemon=True,
+            ).start()
+            logger.warning(
+                "[ShutdownWatchdog] armed: %s must complete within %.0fs "
+                "(JARVIS_SHUTDOWN_GRACE_S) or the process is killed.",
+                reason, grace_s,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[ShutdownWatchdog] arm degraded", exc_info=True)
+
+    def _disarm_shutdown_deadline(self) -> None:
+        """Graceful shutdown finished in time. NEVER raises.
+
+        Called on the CLEAN completion path only. If it is never called,
+        the reaper fires — which is the correct default: an exit that
+        cannot confirm it finished should be forced, not trusted.
+        """
+        try:
+            done = getattr(self, "_shutdown_deadline_done", None)
+            if done is not None:
+                done.set()
+        except Exception:  # noqa: BLE001
+            pass
+
     def _handle_shutdown_signal(self, signal_name: Optional[str] = None) -> None:
         """Bound callback fired by asyncio on SIGHUP/SIGINT/SIGTERM.
 
@@ -7221,6 +7316,11 @@ class BattleTestHarness:
         contract that the ``register_signal_handlers`` production path
         always supplies the signal name.
         """
+        # Armed FIRST, before the partial-summary write and before the
+        # shutdown event. Everything after this line can wedge — the 2026
+        # -07-29 hang did exactly that, after the summary landed — and a
+        # deadline armed later would be armed by code that never runs.
+        self._arm_shutdown_deadline(str(signal_name or "signal"))
         # Harness Epic Slice 1 — arm the bounded-shutdown watchdog FIRST
         # (before any of the existing async / partial-summary work). If
         # the rest of this handler (or the downstream asyncio shutdown
@@ -9703,6 +9803,10 @@ class BattleTestHarness:
             reset_ops_digest_observer()
         except Exception:
             logger.debug("reset_ops_digest_observer(clear) failed", exc_info=True)
+        # The clean path completed, so the reaper is no longer needed. NOT
+        # disarmed anywhere else: an exit that cannot confirm it finished
+        # should be forced, not trusted.
+        self._disarm_shutdown_deadline()
 
 
 # ---------------------------------------------------------------------------
