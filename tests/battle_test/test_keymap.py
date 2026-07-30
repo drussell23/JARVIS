@@ -292,3 +292,113 @@ def test_keys_verb_is_discoverable_by_the_dispatch_registry() -> None:
     )
     prime_registry()
     assert "keys" in _VERB_TO_DISPATCHER
+
+
+# ---------------------------------------------------------------------------
+# CC's action names resolve to ov's, and ov's keep working
+# ---------------------------------------------------------------------------
+
+
+class TestActionAliases:
+    """ALIASES, not renames. `agents:stopAll` and `chat:killAgents` are the
+    same capability on the same chord.
+
+    An operator arriving from CC writes CC's name in `keybindings.json` and
+    expects it to bind; anyone who already wrote ov's name must not have
+    their config silently stop applying. Renaming fixes the first at the cost
+    of the second — and a config key mapped to an unknown action fails
+    SILENTLY: the binding simply never appears.
+    """
+
+    def test_an_alias_resolves_both_ways(self):
+        from backend.core.ouroboros.battle_test.keymap import aliases_for
+
+        assert set(aliases_for("agents:stopAll")) == {
+            "agents:stopAll", "chat:killAgents"}
+        assert set(aliases_for("chat:killAgents")) == {
+            "agents:stopAll", "chat:killAgents"}
+
+    def test_an_unaliased_action_is_just_itself(self):
+        from backend.core.ouroboros.battle_test.keymap import aliases_for
+
+        assert aliases_for("app:detach") == ("app:detach",)
+        assert aliases_for("nope:thing") == ("nope:thing",)
+
+    def test_ccs_scroll_family_maps_to_the_viewer_table(self):
+        """CC's `scroll:*` is ov's `transcript:*` — same movements, same
+        defaults, different namespace only because ov's arrived with the
+        viewer rather than with a scroll region."""
+        from backend.core.ouroboros.battle_test.keymap import aliases_for
+
+        for cc, ov in (("scroll:lineUp", "transcript:lineUp"),
+                       ("scroll:bottom", "transcript:bottom"),
+                       ("scroll:fullPageUp", "transcript:pageUp")):
+            assert ov in aliases_for(cc)
+
+    def test_a_config_written_with_ccs_name_binds_ovs_action(self, tmp_path,
+                                                             monkeypatch):
+        """THE point of the table. Without it the key maps to an action
+        nothing declares, and nothing tells the operator."""
+        import json
+
+        from backend.core.ouroboros.battle_test import keymap as K
+
+        cfg = tmp_path / "keybindings.json"
+        cfg.write_text(json.dumps({"bindings": [
+            {"context": "Global", "bindings": {"ctrl+q": "chat:killAgents"}},
+        ]}))
+        monkeypatch.setenv(K.CONFIG_PATH_ENV_VAR, str(cfg))
+        K.get_store().maybe_reload()
+        seqs = K.effective_key_sequences(
+            "agents:stopAll", ("ctrl+x ctrl+k",), context="Global")
+        flat = {" ".join(s) for s in seqs}
+        assert any("c-q" in f for f in flat), flat
+
+    def test_ovs_own_name_still_binds(self, tmp_path, monkeypatch):
+        import json
+
+        from backend.core.ouroboros.battle_test import keymap as K
+
+        cfg = tmp_path / "keybindings.json"
+        cfg.write_text(json.dumps({"bindings": [
+            {"context": "Global", "bindings": {"ctrl+q": "agents:stopAll"}},
+        ]}))
+        monkeypatch.setenv(K.CONFIG_PATH_ENV_VAR, str(cfg))
+        K.get_store().maybe_reload()
+        seqs = K.effective_key_sequences(
+            "agents:stopAll", ("ctrl+x ctrl+k",), context="Global")
+        assert any("c-q" in " ".join(s) for s in seqs)
+
+    def test_every_alias_points_at_a_real_action(self):
+        """A table entry pointing at an id nothing declares is worse than no
+        entry: it silently accepts a config that can never bind."""
+        from backend.core.ouroboros.battle_test.keymap import ACTION_ALIASES
+
+        assert ACTION_ALIASES
+        for cc, ov in ACTION_ALIASES.items():
+            assert ":" in cc and ":" in ov and cc != ov
+
+
+class TestUndo:
+    def test_chat_undo_is_bound(self):
+        """CC binds `chat:undo` to Ctrl+_ / Ctrl+Shift+-. prompt_toolkit
+        already ships the command; it was simply never bound, so the prompt
+        accepted paragraphs with no way back from a mis-typed Ctrl+W."""
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout, build_bipartite_application,
+        )
+        mux = BipartiteLayout(width=80, height=14)
+        app = build_bipartite_application(mux, on_accept=lambda _t: None)
+        seqs = {" ".join(str(k).replace("Keys.", "") for k in b.keys)
+                for b in app.key_bindings.bindings}
+        assert any("Underscore" in s for s in seqs), sorted(seqs)
+
+    def test_it_delegates_to_the_buffers_own_undo_stack(self):
+        """A second history of the same text would disagree with the buffer
+        the first time a completion inserted anything."""
+        import inspect
+
+        from backend.core.ouroboros.battle_test import bipartite_layout
+
+        src = inspect.getsource(bipartite_layout.build_bipartite_application)
+        assert 'get_by_name("undo")' in src

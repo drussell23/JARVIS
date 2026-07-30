@@ -1474,6 +1474,33 @@ def build_bipartite_application(
         install_stash_binding(kb, lambda: prompt.buffer)
     except Exception:  # noqa: BLE001
         pass
+    # Ctrl+_ / Ctrl+Shift+- — undo the last input edit. CC binds `chat:undo`
+    # to exactly these, and prompt_toolkit already ships the command; it was
+    # simply never bound, so the prompt accepted paragraphs with no way back
+    # from a mis-typed `Ctrl+W` or `Ctrl+U`.
+    #
+    # Delegated to pt's own `undo` rather than tracking edits here: the buffer
+    # owns its undo stack, and a second history of the same text would
+    # disagree with it the first time a completion inserted anything.
+    try:
+        from backend.core.ouroboros.battle_test.keymap import bind_action
+        from prompt_toolkit.key_binding.bindings.named_commands import (
+            get_by_name,
+        )
+        _undo = get_by_name("undo")
+
+        def _do_undo(event: Any) -> None:
+            try:
+                _undo.handler(event)
+            except Exception:  # noqa: BLE001
+                pass
+
+        bind_action(
+            kb, "chat:undo", ("ctrl+_", "ctrl+shift+-"), _do_undo,
+            context="Chat", description="undo the last input edit",
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Bipartite] undo binding unavailable", exc_info=True)
     # Ctrl+Z — suspend to the shell, `fg` to come back. CC binds it and this
     # cockpit did not, which is a gap the alternate screen CREATES rather than
     # inherits: a normal terminal turns Ctrl+Z into SIGTSTP itself, but a

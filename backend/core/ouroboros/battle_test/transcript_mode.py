@@ -19,29 +19,26 @@ An explicit mode answers all of that at once: inside it every key is
 unambiguous, so the whole `less`-style table becomes bindable, and there is
 somewhere honest to put `?`.
 
-What this mode does NOT do
---------------------------
-It does not pause auto-follow on entry, and that is a property of the
-viewport rather than an omission here. `CanvasViewport.following` is
-DERIVED — `self._offset <= 0` — so "pinned to the tail" and "showing the
-newest line" are one state with one variable. There is no honest way to
-stop following without also moving the view, and moving it would throw away
-the line the operator pressed the key while reading, which is the only line
-they certainly care about.
+Entering PINS the page
+----------------------
+It does now, and that is a change from how this shipped. `CanvasViewport`
+originally derived `following` from `_offset <= 0`, so "pinned to the tail"
+and "showing the newest line" were one state with one variable and there was
+no honest way to stop following without also moving the view — which would
+have thrown away the line the operator pressed the key while reading. This
+module documented that limitation rather than faking a pin.
 
-So entering at the live tail gives a keyboard mode, not a frozen page: new
-output still arrives and the view still follows until the operator scrolls.
-One press of `k` pauses it, because any non-zero offset is what "paused"
-MEANS here. CC does better — "scrolling up pauses auto-follow so new output
-doesn't pull you back to the bottom" is a real independent flag there — and
-matching it needs a `paused` field on the viewport plus an audit of every
-consumer of `following` (the status line, the tail hint, the emit path).
-That is its own change; claiming it in this one would be a pin that does
-not pin.
+The viewport now carries a real `paused` flag, so entering freezes the page
+WITHOUT moving it: arriving output is held, `new_since_paused` counts what
+landed, and the sentence the operator was reading stays where it was. That
+is CC's stated property — "scrolling up pauses auto-follow so new output
+doesn't pull you back to the bottom" — with the explicit half now available
+as well as the scroll-implied one.
 
-Leaving DOES return to the tail, which works and matters: the organism keeps
-running while the operator reads, and an exit that left the view in history
-would hand back a cockpit that looks live and is showing minutes-old output.
+Leaving returns to the tail AND resumes, which works and matters: the
+organism keeps running while the operator reads, and an exit that left the
+view in history would hand back a cockpit that looks live while showing
+minutes-old output.
 
 Scrolled-back is still a way IN (unchanged, so nobody's habit breaks) but no
 longer the only one, and the mode is the way the operator is TOLD they are
@@ -115,19 +112,32 @@ def transcript_surface_active() -> bool:
 
 
 def enter_transcript_mode() -> bool:
-    """Enter the viewer. NEVER raises; True if it changed.
+    """Enter the viewer and PIN the page. NEVER raises; True if it changed.
 
-    Deliberately does NOT move the view. Entering where the operator was
-    reading is the whole contract — a viewer that jumped on entry would
-    discard the line they pressed the key while looking at. See the module
-    docstring for why it cannot pause auto-follow either.
+    Deliberately does not MOVE the view — entering where the operator was
+    reading is the whole contract, and a viewer that jumped on entry would
+    discard the line they pressed the key while looking at. It does now
+    freeze it: `CanvasViewport.pause` holds arriving output without touching
+    the offset, which is the distinction the derived `following` could not
+    express.
     """
     with _LOCK:
         changed = not _ACTIVE[0]
         _ACTIVE[0] = True
     if changed:
+        _pause_viewport()
         _repaint()
     return changed
+
+
+def _pause_viewport() -> None:
+    """Hold auto-follow without moving the view. NEVER raises."""
+    try:
+        vp = _viewport()
+        if vp is not None and hasattr(vp, "pause"):
+            vp.pause()
+    except Exception:  # noqa: BLE001
+        logger.debug("[TranscriptMode] pause degraded", exc_info=True)
 
 
 def exit_transcript_mode() -> bool:

@@ -305,3 +305,107 @@ def test_BOTH_end_and_ctrl_end_return_to_live() -> None:
     combos = {tuple(str(k) for k in b.keys) for b in kb.bindings}
     assert ("Keys.End",) in combos and ("Keys.ControlEnd",) in combos
     assert ("Keys.Home",) in combos and ("Keys.ControlHome",) in combos
+
+
+# ---------------------------------------------------------------------------
+# Auto-follow pause — an explicit hold, not a derived one
+# ---------------------------------------------------------------------------
+
+
+class TestAutoFollowPause:
+    """`following` was DERIVED from `_offset <= 0`, so "pinned to the tail"
+    and "showing the newest line" were one state with one variable. There was
+    no honest way to stop following without also moving the view, and moving
+    it discards the line the operator was reading — which is why the
+    transcript viewer shipped documenting the limitation instead of faking a
+    pin.
+    """
+
+    def _v(self):
+        from backend.core.ouroboros.battle_test.canvas_viewport import (
+            CanvasViewport,
+        )
+        return CanvasViewport(), [f"l{i}" for i in range(50)]
+
+    def test_a_fresh_viewport_follows(self):
+        v, _lines = self._v()
+        assert v.following is True and v.paused is False
+
+    def test_pause_stops_following_without_moving(self):
+        """THE property the derived version could not express."""
+        v, lines = self._v()
+        v.window(lines, 10, appended=50)
+        before = v.offset
+        assert v.pause() is True
+        assert v.following is False
+        assert v.offset == before, "pausing moved the view"
+
+    def test_arriving_output_is_held_while_paused(self):
+        """CC: 'scrolling up pauses auto-follow so new output doesn't pull
+        you back to the bottom.' The explicit half of the same property."""
+        v, lines = self._v()
+        v.window(lines, 10, appended=50)
+        v.pause()
+        v.window(lines + ["n1", "n2", "n3"], 10, appended=53)
+        assert v.offset == 3, "the view moved under a paused reader"
+        assert v.new_since_paused == 3
+
+    def test_resume_follows_again(self):
+        v, lines = self._v()
+        v.window(lines, 10, appended=50)
+        v.pause()
+        assert v.resume() is True
+        assert v.paused is False
+
+    def test_resume_does_not_move_either(self):
+        """A caller wanting the tail calls `to_bottom`; one that wants to
+        keep reading while output resumes behind it gets exactly that."""
+        v, lines = self._v()
+        v.window(lines, 10, appended=50)
+        v.pause()
+        v.window(lines + ["n1"], 10, appended=51)
+        held = v.offset
+        v.resume()
+        assert v.offset == held
+
+    def test_returning_to_live_clears_the_pause(self):
+        """A view pinned AT the bottom that never updates is the most
+        confusing possible state — it looks exactly like a working tail on a
+        dead organism."""
+        v, lines = self._v()
+        v.pause()
+        v.reset()
+        assert v.paused is False and v.following is True
+
+    def test_a_short_transcript_does_not_silently_resume(self):
+        """`total <= budget` returns early. Clearing the flag on a frame that
+        happened to fit would resume follow underneath the operator."""
+        v, _lines = self._v()
+        v.pause()
+        v.window(["a", "b"], 10, appended=2)
+        assert v.paused is True
+
+    def test_pause_and_resume_report_whether_they_changed_anything(self):
+        v, _lines = self._v()
+        assert v.pause() is True and v.pause() is False
+        assert v.resume() is True and v.resume() is False
+
+    def test_auto_scroll_off_holds_everything(self, monkeypatch):
+        """CC's own escape hatch: 'turn auto-follow off entirely so the view
+        stays where you leave it'."""
+        from backend.core.ouroboros.battle_test import canvas_viewport as CV
+
+        monkeypatch.setenv("JARVIS_AUTO_SCROLL", "0")
+        assert CV.auto_scroll_enabled() is False
+        v, lines = self._v()
+        v.window(lines, 10, appended=50)
+        v.window(lines + ["n1", "n2"], 10, appended=52)
+        assert v.offset == 2, "auto-scroll off still followed"
+
+    def test_scrolling_still_pauses_implicitly(self):
+        """The pre-existing behaviour must survive: an operator who scrolls
+        up is paused by position, with no flag involved."""
+        v, lines = self._v()
+        v.window(lines, 10, appended=50)
+        v.scroll(-3, total=50, budget=10)
+        assert v.following is False and v.paused is False
