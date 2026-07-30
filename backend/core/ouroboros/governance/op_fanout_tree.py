@@ -312,7 +312,18 @@ def aggregate_fanout_rows(
                 continue
             parent = getattr(block, "parent_op_id", "")
             depths[block.op_id] = depths.get(parent, 0) + 1
-        for block in subtree:
+        # DEPTH-FIRST for RENDERING, from a breadth-first walk.
+        #
+        # `walk_subtree` promises BFS and other callers rely on that, so the
+        # conversion belongs here rather than there. It matters because
+        # `format_fanout_tree` indents by `depth` IN ROW ORDER: fed BFS, a
+        # grandchild emitted after its uncle renders nested under the uncle.
+        #
+        # That is not a cosmetic defect. The tree's whole claim is "this op
+        # caused that one", and drawn from BFS rows it asserts a parentage
+        # the graph does not record — a surface confidently showing the wrong
+        # answer, which is worse than showing none.
+        for block in _depth_first(subtree, root.op_id):
             if len(rows) >= line_clamp:
                 break
             row = _block_to_row(
@@ -320,6 +331,51 @@ def aggregate_fanout_rows(
             )
             rows.append(row)
     return tuple(rows)
+
+
+def _depth_first(subtree: Any, root_op_id: str) -> List[Any]:
+    """Reorder a BFS subtree depth-first, parent immediately before its
+    children. Pure. NEVER raises.
+
+    Sibling order is PRESERVED from the input, because the BFS order is
+    spawn order and that is meaningful — the first subagent dispatched
+    should read first.
+
+    Any block unreachable from the root is appended at the end rather than
+    dropped: an edge lost to eviction must not make an op vanish from the
+    tree, and a visible orphan is a far better failure than a silent one.
+    """
+    try:
+        blocks = list(subtree or ())
+        if not blocks:
+            return []
+        children: Dict[str, List[Any]] = {}
+        for block in blocks:
+            parent = str(getattr(block, "parent_op_id", "") or "")
+            if parent:
+                children.setdefault(parent, []).append(block)
+        ordered: List[Any] = []
+        seen: set = set()
+
+        def _walk(block: Any) -> None:
+            op_id = str(getattr(block, "op_id", "") or "")
+            if not op_id or op_id in seen:
+                return          # visited-guard: a cycle cannot spin this
+            seen.add(op_id)
+            ordered.append(block)
+            for child in children.get(op_id, ()):
+                _walk(child)
+
+        for block in blocks:
+            if str(getattr(block, "op_id", "") or "") == str(root_op_id):
+                _walk(block)
+                break
+        for block in blocks:               # orphans, visibly, at the end
+            if str(getattr(block, "op_id", "") or "") not in seen:
+                _walk(block)
+        return ordered
+    except Exception:  # noqa: BLE001
+        return list(subtree or ())
 
 
 def _block_to_row(
