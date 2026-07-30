@@ -219,3 +219,150 @@ class TestOnTheRealApplication:
             for n in ast.walk(tree)
         )
         assert "on_accept(line)" in src
+
+
+# ---------------------------------------------------------------------------
+# Cmd/Ctrl+click — model-authored text handed to the OS
+# ---------------------------------------------------------------------------
+
+
+def _mod_ev(y, kind="MOUSE_UP", mod="CONTROL"):
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.mouse_events import (
+        MouseButton, MouseEvent, MouseEventType, MouseModifier,
+    )
+    return MouseEvent(Point(x=4, y=y), getattr(MouseEventType, kind),
+                      MouseButton.LEFT,
+                      frozenset({getattr(MouseModifier, mod)}))
+
+
+class TestOpenTargets:
+    """This is the ONE cockpit surface that takes something the organism
+    wrote and hands it to the operating system. Containment — not pattern
+    cleverness — is what makes that safe: a path is offered only when it
+    resolves INSIDE the repo and already exists.
+    """
+
+    def test_a_real_repo_path_is_offered(self):
+        line = "⏺ Read(backend/core/ouroboros/battle_test/canvas_mouse.py)"
+        kind, value = M.target_in_line(line)
+        assert kind == "path" and value.endswith("canvas_mouse.py")
+
+    def test_an_https_url_is_offered(self):
+        kind, value = M.target_in_line("see https://example.com/a/b for more")
+        assert kind == "url" and value == "https://example.com/a/b"
+
+    def test_trailing_punctuation_is_not_part_of_the_url(self):
+        _kind, value = M.target_in_line("docs at https://example.com/x.")
+        assert value == "https://example.com/x"
+
+    @pytest.mark.parametrize("line", [
+        "⏺ Read(/etc/passwd)",
+        "⏺ Read(../../../../etc/passwd)",
+        "cat ~/.ssh/id_rsa",
+        "⏺ Read(/Users/someone/.aws/credentials)",
+    ])
+    def test_paths_outside_the_repo_are_refused(self, line):
+        """Traversal and absolutes are answered by resolving THEN containing,
+        so no regex has to enumerate what to forbid."""
+        assert M.target_in_line(line) is None
+
+    @pytest.mark.parametrize("line", [
+        "open file:///etc/passwd",
+        "click javascript:alert(1) now",
+        "try data:text/html,<script>x</script>",
+    ])
+    def test_dangerous_schemes_are_refused(self, line):
+        """The scheme IS the capability: file:// reaches local disk and
+        javascript:/data: are execution vectors."""
+        assert M.target_in_line(line) is None
+
+    def test_a_path_that_does_not_exist_is_refused(self):
+        assert M.target_in_line("⏺ Read(backend/nope_does_not_exist.py)") is None
+
+    def test_open_target_refuses_a_non_http_url(self):
+        assert M.open_target("url", "file:///etc/passwd") is False
+        assert M.open_target("url", "javascript:alert(1)") is False
+        assert M.open_target("path", "") is False
+
+    def test_open_target_never_uses_a_shell(self):
+        """The value came from the transcript. A shell string would make
+        every metacharacter in it executable."""
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(M.open_target)))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.keyword) and node.arg == "shell":
+                assert node.value.value is False, "shell=True in open_target"
+        src = inspect.getsource(M.open_target)
+        assert "shell=True" not in src
+        assert "os.system" not in src
+
+
+class TestTheOpenGesture:
+    def _wire(self, rows, opened):
+        control = type("_C", (), {})()
+        M.install_canvas_mouse(control, lambda: rows, lambda _l: None)
+        return control
+
+    def test_a_plain_click_never_opens(self, monkeypatch):
+        """The guard that matters most: a bare click must not launch
+        anything, on any terminal."""
+        opened = []
+        monkeypatch.setattr(M, "open_target",
+                            lambda k, v: opened.append((k, v)) or True)
+        submitted = []
+        control = type("_C", (), {})()
+        M.install_canvas_mouse(
+            control,
+            lambda: ["⏺ Read(backend/core/ouroboros/battle_test/canvas_mouse.py)"],
+            submitted.append)
+        control.mouse_handler(_ev(0, "MOUSE_UP"))
+        assert opened == []
+
+    def test_a_modified_click_opens(self, monkeypatch):
+        opened = []
+        monkeypatch.setattr(M, "open_target",
+                            lambda k, v: opened.append((k, v)) or True)
+        control = type("_C", (), {})()
+        M.install_canvas_mouse(control, lambda: ["see https://example.com/x"],
+                               lambda _l: None)
+        control.mouse_handler(_mod_ev(0))
+        assert opened and opened[0][0] == "url"
+
+    def test_the_modifier_decides_when_a_line_offers_both(self, monkeypatch):
+        """`⏺ Read(x.py) · /expand t-3` is a path AND an expansion. The
+        modifier is the operator saying which they meant."""
+        opened, submitted = [], []
+        monkeypatch.setattr(M, "open_target",
+                            lambda k, v: opened.append((k, v)) or True)
+        row = ("⏺ Read(backend/core/ouroboros/battle_test/canvas_mouse.py)"
+               " · /expand t-3")
+        control = type("_C", (), {})()
+        M.install_canvas_mouse(control, lambda: [row], submitted.append)
+
+        control.mouse_handler(_ev(0, "MOUSE_UP"))
+        assert submitted == ["/expand t-3"] and opened == []
+
+        control.mouse_handler(_mod_ev(0))
+        assert len(opened) == 1 and submitted == ["/expand t-3"]
+
+    def test_a_modified_click_on_nothing_openable_is_not_consumed(self):
+        control = type("_C", (), {})()
+        M.install_canvas_mouse(control, lambda: ["⏺ Read(/etc/passwd)"],
+                               lambda _l: None)
+        assert control.mouse_handler(_mod_ev(0)) is NotImplemented
+
+    def test_alt_also_counts_as_the_gesture(self, monkeypatch):
+        """CC documents that the terminal mouse protocol cannot encode Cmd,
+        so this asks for a modifier the protocol CAN carry."""
+        opened = []
+        monkeypatch.setattr(M, "open_target",
+                            lambda k, v: opened.append(v) or True)
+        control = type("_C", (), {})()
+        M.install_canvas_mouse(control, lambda: ["https://example.com/y"],
+                               lambda _l: None)
+        control.mouse_handler(_mod_ev(0, mod="ALT"))
+        assert opened

@@ -85,6 +85,22 @@ _EXPAND_RE = re.compile(r"/expand\s+([a-z]-\d+)")
 _BARE_REF_RE = re.compile(r"(?:^|[\s·|(\[])([a-z]-\d+)(?=$|[\s·|)\].,])")
 
 
+#: A URL worth offering to open. HTTP(S) ONLY, and that restriction is the
+#: security boundary rather than a convenience: the transcript carries
+#: MODEL-AUTHORED text, so this is the one surface that takes something the
+#: organism wrote and hands it to the operating system. `file://` would open
+#: arbitrary local paths, and the `javascript:` / `data:` family is a
+#: browser-side execution vector. Neither is worth a convenience.
+_URL_RE = re.compile(r"\bhttps?://[^\s<>\"'`)\]]+")
+
+#: A path-shaped token. Deliberately loose, because the containment check —
+#: not the pattern — is what makes opening safe. A pattern strict enough to
+#: be a security control would also miss half the paths the transcript
+#: prints; a permissive pattern plus "must resolve INSIDE the repo and must
+#: already exist" is both safer and more useful.
+_PATH_RE = re.compile(r"[\w./\-]*[\w\-]+\.[A-Za-z][\w]{0,9}\b")
+
+
 def canvas_mouse_enabled() -> bool:
     """``JARVIS_CANVAS_MOUSE_ENABLED`` (default true). NEVER raises.
 
@@ -160,6 +176,128 @@ def resolve_click(rows: Sequence[Any], row: Any) -> Optional[str]:
     return f"/expand {ref}" if ref else None
 
 
+# ---------------------------------------------------------------------------
+# Cmd/Ctrl+click — the one surface that hands model text to the OS
+# ---------------------------------------------------------------------------
+
+
+def _repo_root() -> Any:
+    from pathlib import Path
+    return Path(__file__).resolve().parents[4]
+
+
+def target_in_line(line: Any, *, root: Any = None) -> Optional[tuple]:
+    """``("url"|"path", value)`` a line offers to open, or None. NEVER raises.
+
+    Containment, not pattern-matching, is what makes this safe. The
+    transcript is MODEL-AUTHORED, so a path is offered only when it resolves
+    INSIDE the repository and already EXISTS on disk — which rules out
+    `/etc/passwd`, `~/.ssh/id_rsa` and `../../` traversal without needing a
+    regex clever enough to enumerate them. A file that does not exist is not
+    openable anyway, so the check costs nothing an operator would miss.
+
+    URLs are restricted to http(s) at the pattern, because there the scheme
+    IS the capability: `file://` reaches the local disk and `javascript:` is
+    execution.
+    """
+    try:
+        from pathlib import Path
+
+        text = str(line or "")
+        try:
+            from backend.core.ouroboros.battle_test.append_only import (
+                strip_ansi,
+            )
+            text = strip_ansi(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+        found = _URL_RE.search(text)
+        if found:
+            # Trailing punctuation belongs to the sentence, not the URL.
+            return ("url", found.group(0).rstrip(".,;:!?"))
+
+        base = Path(root) if root is not None else _repo_root()
+        try:
+            base = base.resolve()
+        except Exception:  # noqa: BLE001
+            return None
+        for match in _PATH_RE.finditer(text):
+            raw = match.group(0).strip()
+            if not raw or raw.startswith("-"):
+                continue
+            try:
+                candidate = (base / raw).resolve()
+            except Exception:  # noqa: BLE001
+                continue
+            # `is_relative_to` on the RESOLVED path, so `..` segments and
+            # symlinks are both answered by the same check rather than by a
+            # string prefix whose shape an attacker chooses. Available since
+            # 3.9, which is this repo's floor.
+            if candidate.is_relative_to(base) and candidate.is_file():
+                return ("path", str(candidate))
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def open_target(kind: Any, value: Any) -> bool:
+    """Hand one target to the platform opener. NEVER raises; True if launched.
+
+    `subprocess` with an ARGV LIST and never a shell string: the value came
+    from the transcript, and a shell would make every metacharacter in it
+    executable. The opener is chosen from `sys.platform` rather than hardcoded
+    so this is not macOS-only.
+
+    Fire-and-forget: the operator asked to open something, not to wait for it,
+    and a browser cold-start must not stall the render loop that dispatched
+    the click.
+    """
+    try:
+        import subprocess
+        import sys
+
+        target = str(value or "")
+        if not target:
+            return False
+        if str(kind) == "url" and not target.startswith(("http://", "https://")):
+            return False        # belt and braces — the pattern already forbids it
+        if sys.platform == "darwin":
+            argv = ["open", target]
+        elif sys.platform.startswith("win"):
+            argv = ["cmd", "/c", "start", "", target]
+        else:
+            argv = ["xdg-open", target]
+        subprocess.Popen(
+            argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[CanvasMouse] open degraded", exc_info=True)
+        return False
+
+
+def _is_open_gesture(mouse_event: Any) -> bool:
+    """Did the operator ask to OPEN rather than to expand? NEVER raises.
+
+    Claude Code documents the awkward truth here: "the terminal mouse
+    protocol has no way to encode the Cmd key, so Claude Code receives it as
+    a plain click." So this asks for any modifier the protocol CAN carry —
+    Control or Alt — and does not pretend Cmd is available. An operator on a
+    terminal that sends neither still has `/expand` and the path in the line
+    to copy; what they must never get is a plain click silently launching
+    something.
+    """
+    try:
+        from prompt_toolkit.mouse_events import MouseModifier
+
+        mods = getattr(mouse_event, "modifiers", None) or frozenset()
+        return bool(mods & {MouseModifier.CONTROL, MouseModifier.ALT})
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def install_canvas_mouse(
     control: Any,
     rows_fn: Callable[[], Sequence[Any]],
@@ -193,7 +331,19 @@ def install_canvas_mouse(
                 ):
                     raise _Unhandled
                 row = getattr(getattr(mouse_event, "position", None), "y", None)
-                line = resolve_click(list(rows_fn() or ()), row)
+                rows = list(rows_fn() or ())
+                # A MODIFIED click asks to open, and is checked FIRST because
+                # a line can offer both — `⏺ Read(backend/x.py) · /expand t-3`
+                # is a path and an expansion, and the modifier is the operator
+                # saying which one they meant.
+                if _is_open_gesture(mouse_event):
+                    target = target_in_line(
+                        rows[row] if isinstance(row, int)
+                        and 0 <= row < len(rows) else "")
+                    if target and open_target(*target):
+                        return None
+                    raise _Unhandled
+                line = resolve_click(rows, row)
                 if not line:
                     raise _Unhandled
                 submit(line)
