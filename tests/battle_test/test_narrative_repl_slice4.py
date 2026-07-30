@@ -51,20 +51,17 @@ def test_handle_narrate_method_defined():
 
 
 def test_handle_narrate_supports_four_densities():
-    src = _src()
-    tree = ast.parse(src)
-    handler_src = ""
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name == "_handle_narrate":
-                handler_src = ast.unparse(node)
-                break
-    assert handler_src
-    for density in ("off", "preambles", "on", "verbose"):
-        assert (
-            f"'{density}'" in handler_src
-            or f'"{density}"' in handler_src
-        ), f"_handle_narrate missing density {density!r}"
+    """Behavioural: each level RESOLVES, rather than merely appearing as a
+    literal in the handler's source.
+
+    The previous form asserted `"off" in ast.unparse(handler)` — satisfied
+    by a docstring, a comment, or a dead branch. It passed throughout the
+    period when `/narrate off` left thirteen Moltbook residents talking.
+    """
+    from backend.core.ouroboros.ui import narrative_density as nd
+    for name in ("off", "preambles", "on", "verbose"):
+        assert nd.set_density(name).label == name
+        assert nd.current_density().label == name
 
 
 # ===========================================================================
@@ -182,32 +179,57 @@ def test_intent_prompt_uses_create_task():
 # ===========================================================================
 
 
-def test_narrate_off_disables_intent_and_preambles():
-    src = _src()
-    tree = ast.parse(src)
-    handler = ""
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name == "_handle_narrate":
-                handler = ast.unparse(node)
-                break
-    assert handler
-    # density=off must explicitly turn off both flags
-    assert "JARVIS_NARRATIVE_INTENT_ENABLED" in handler
-    assert "JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED" in handler
+def test_narrate_off_silences_intent_and_preambles(monkeypatch):
+    """Behavioural, and checked at the REAL consumer.
+
+    `intent_prompter.is_master_flag_enabled` is the function that decides
+    whether the micro-LLM call happens. Asserting a flag name appears in the
+    verb's source never established that anything downstream agreed.
+    """
+    from backend.core.ouroboros.ui import narrative_density as nd
+    from backend.core.ouroboros.governance import intent_prompter
+    monkeypatch.delenv("JARVIS_NARRATIVE_INTENT_ENABLED", raising=False)
+    monkeypatch.delenv("JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED", raising=False)
+    nd.ensure_discovered()
+
+    nd.set_density("on")
+    assert intent_prompter.is_master_flag_enabled() is True
+    assert nd.audible("narrative.tool_preamble") is True
+
+    nd.set_density("off")
+    assert intent_prompter.is_master_flag_enabled() is False
+    assert nd.audible("narrative.tool_preamble") is False
 
 
-def test_narrate_verbose_enables_thinking_surfacing():
-    src = _src()
-    tree = ast.parse(src)
-    handler = ""
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name == "_handle_narrate":
-                handler = ast.unparse(node)
-                break
-    assert handler
-    assert "JARVIS_NARRATIVE_THINKING_VERBOSE" in handler
+def test_an_explicit_flag_outranks_the_dial(monkeypatch):
+    """Operator specificity beats a global dial — and this is why the verb
+    had to stop writing those flags. While it did, every read after the
+    first `/narrate` saw a flag that looked operator-set, so the dial
+    permanently shadowed itself."""
+    from backend.core.ouroboros.ui import narrative_density as nd
+    from backend.core.ouroboros.governance import intent_prompter
+    nd.ensure_discovered()
+    nd.set_density("off")
+    monkeypatch.setenv("JARVIS_NARRATIVE_INTENT_ENABLED", "true")
+    assert intent_prompter.is_master_flag_enabled() is True
+    verdict = nd.permits("narrative.intent")
+    assert verdict.reason == "explicit:JARVIS_NARRATIVE_INTENT_ENABLED"
+
+
+def test_narrate_verbose_enables_thinking_surfacing(monkeypatch):
+    """`verbose`'s one promise, finally with a consumer.
+
+    The previous form asserted the handler mentioned
+    JARVIS_NARRATIVE_THINKING_VERBOSE. That flag had ZERO readers in the
+    repository, so the test passed while the feature did not exist.
+    """
+    from backend.core.ouroboros.ui import narrative_density as nd
+    monkeypatch.delenv("JARVIS_NARRATIVE_THINKING_VERBOSE", raising=False)
+    nd.ensure_discovered()
+    nd.set_density("on")
+    assert nd.audible("narrative.thinking") is False
+    nd.set_density("verbose")
+    assert nd.audible("narrative.thinking") is True
 
 
 # ===========================================================================
