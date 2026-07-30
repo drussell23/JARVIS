@@ -302,6 +302,7 @@ def install_canvas_mouse(
     control: Any,
     rows_fn: Callable[[], Sequence[Any]],
     submit: Callable[[str], Any],
+    notify: Optional[Callable[[str], Any]] = None,
 ) -> bool:
     """Give a control click-to-expand. NEVER raises; True when installed.
 
@@ -322,14 +323,33 @@ def install_canvas_mouse(
 
         def _handler(mouse_event: Any) -> Any:
             try:
+                kind = getattr(mouse_event, "event_type", None)
+                point = getattr(mouse_event, "position", None)
+                at = (getattr(point, "y", None), getattr(point, "x", None))
+
+                # --- selection: press anchors, drag extends ---------------
+                if kind is MouseEventType.MOUSE_DOWN:
+                    _drag_start(at)
+                    raise _Unhandled     # pt still gets its own default
+                if kind is MouseEventType.MOUSE_MOVE:
+                    if _drag_extend(at):
+                        return None      # consumed: this IS the drag
+                    raise _Unhandled
+
                 # MOUSE_UP, not DOWN: a click is a press AND a release in the
                 # same place, and acting on the press would fire while the
                 # operator is still deciding — including at the start of a
                 # drag they meant as a selection.
-                if getattr(mouse_event, "event_type", None) is not (
-                    MouseEventType.MOUSE_UP
-                ):
+                if kind is not MouseEventType.MOUSE_UP:
                     raise _Unhandled
+
+                # A release that ENDED A DRAG is a selection, not a click.
+                # Checked before every other gesture: the press that began it
+                # was over some line, and treating the release as a click
+                # would expand whatever the drag happened to start on.
+                copied = _drag_finish(at, rows_fn, notify)
+                if copied:
+                    return None
                 row = getattr(getattr(mouse_event, "position", None), "y", None)
                 rows = list(rows_fn() or ())
                 # A MODIFIED click asks to open, and is checked FIRST because
@@ -368,3 +388,92 @@ def install_canvas_mouse(
 
 class _Unhandled(Exception):
     """Internal: this event is not ours. Never escapes the handler."""
+
+
+# ---------------------------------------------------------------------------
+# drag-to-select
+# ---------------------------------------------------------------------------
+
+
+def _valid(at: Any) -> bool:
+    return (isinstance(at, tuple) and len(at) == 2
+            and isinstance(at[0], int) and isinstance(at[1], int))
+
+
+def _drag_start(at: Any) -> None:
+    """Anchor a possible selection. NEVER raises.
+
+    Every press anchors, because a press cannot yet be distinguished from
+    the start of a drag. An anchor with no movement stays `empty`, which is
+    exactly what lets the release fall through to click-to-expand.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.canvas_selection import (
+            Selection, selection_enabled, set_current_selection,
+        )
+        if not selection_enabled() or not _valid(at):
+            return
+        set_current_selection(Selection((at[0], at[1])))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _drag_extend(at: Any) -> bool:
+    """Grow the selection under a held button. True when consumed."""
+    try:
+        from backend.core.ouroboros.battle_test.canvas_selection import (
+            current_selection, set_current_selection,
+        )
+        sel = current_selection()
+        if sel is None or not sel.active or not _valid(at):
+            return False
+        set_current_selection(sel.extend_to(at[0], at[1]))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _drag_finish(at: Any, rows_fn: Any, notify: Any) -> bool:
+    """End a drag, copying what it covered. True when it WAS a drag.
+
+    False for a press-and-release in one place, which is the whole reason
+    the anchor is kept even for a plain click: the release has to be able to
+    tell a selection from a click, and only the anchor knows.
+
+    The selection is CLEARED once copied. A highlight that outlives the
+    gesture is a cockpit asserting the operator still has something selected
+    when they have moved on — and the next click would extend it.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.canvas_selection import (
+            copy_on_release, current_selection, extract_text,
+            set_current_selection,
+        )
+        sel = current_selection()
+        if sel is None:
+            return False
+        if _valid(at):
+            sel = sel.extend_to(at[0], at[1])
+        if sel.empty:
+            set_current_selection(None)
+            return False           # a click, not a drag
+        text = extract_text(list(rows_fn() or ()), sel)
+        set_current_selection(None)
+        if not text or not copy_on_release():
+            return True            # it WAS a drag; there was nothing to copy
+        from backend.core.ouroboros.battle_test.clipboard_write import (
+            copy_text, describe_path,
+        )
+        path = copy_text(text)
+        if notify is not None:
+            lines = text.count("\n") + 1
+            where = describe_path(path or "") if path else (
+                "no clipboard tool available — nothing copied")
+            try:
+                notify(f"{where} · {lines} line{'s' if lines != 1 else ''}")
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[CanvasMouse] drag finish degraded", exc_info=True)
+        return False
