@@ -392,3 +392,129 @@ class TestOneStoryTwoProjections:
         for token in ("≥12", "unmeasured"):
             assert token in live, token
             assert token in " ".join(transcript_lines()), token
+
+
+class TestTheDemoShowsTheLatestFeatures:
+    """The demo must not teach a keybinding the cockpit does not have.
+
+    `capability_handoff` reported `extra_key_bindings` as FILLED and was right —
+    it measures whether a hook is GIVEN a value, not whether the value is current.
+    A stale filler is invisible to it, which is the instrument's own limit and the
+    reason these are behavioural tests rather than another coverage check.
+    """
+
+    def _fresh(self):
+        from backend.core.ouroboros.battle_test import overlay_arbiter as oa
+        oa.reset_for_tests()
+        return oa
+
+    def test_escape_is_no_longer_bound_eagerly_to_quit(self):
+        """It was `kb.add("escape", eager=True)(_quit)` while this same scene
+        mounts a FATAL overlay whose text reads "esc dismisses" — so Escape closed
+        the DEMO instead of the overlay, teaching the exact inverse of #70282."""
+        from prompt_toolkit.filters import Filter
+
+        from backend.core.ouroboros.cli import ov_demo as d
+        self._fresh()
+        kb = d._live_exit_bindings()
+        escapes = [b for b in kb.bindings
+                   if len(b.keys) == 1
+                   and str(getattr(b.keys[0], "value", b.keys[0])) == "escape"]
+        assert escapes, "escape is not bound at all"
+        assert not any(b.eager is True for b in escapes), (
+            "escape is eager unconditionally again — `esc` can no longer reach an "
+            "overlay and the demo quits instead of dismissing")
+        assert any(isinstance(b.eager, Filter) for b in escapes), (
+            "no per-keystroke eager filter — the arbiter is not mounted")
+
+    def test_escape_dismisses_the_scripted_panic(self):
+        """Through the REAL arbiter, so the demo and the cockpit answer the key
+        identically. The demo's panic is clock-driven rather than stored, which is
+        why `register_overlay` takes a predicate instead of a flag."""
+        from backend.core.ouroboros.cli import ov_demo as d
+        oa = self._fresh()
+        clock = [26.0]                      # inside _PANIC_AT
+        d._register_demo_overlays(lambda: clock[0])
+        assert oa.overlay_active() is True
+        assert d._panic_rows(26.0, 100), "the panic strip drew nothing"
+        assert oa.dismiss_top() == "demo_panic"
+        assert d._panic_rows(26.0, 100) == [], (
+            "the overlay advertises 'esc dismisses' and ignored it")
+
+    def test_nothing_is_dismissable_before_the_panic_window(self):
+        """So Escape still quits during the ordinary run — the complement filter
+        has to actually be a complement."""
+        from backend.core.ouroboros.cli import ov_demo as d
+        oa = self._fresh()
+        d._register_demo_overlays(lambda: 10.0)
+        assert oa.overlay_active() is False
+
+    def test_a_previous_run_cannot_leave_an_overlay_up(self):
+        """A stale registration answering with a dead clock would hold Escape
+        eager forever and silently delete every other meaning of the key."""
+        from backend.core.ouroboros.cli import ov_demo as d
+        oa = self._fresh()
+        d._register_demo_overlays(lambda: 26.0)
+        assert oa.overlay_active() is True
+        d._register_demo_overlays(lambda: 5.0)      # a new run, clock reset
+        assert oa.overlay_active() is False
+
+    def test_the_diff_overlay_is_mounted_and_openable(self):
+        from backend.core.ouroboros.cli import ov_demo as d
+        oa = self._fresh()
+        provider = d._demo_diff_rows()
+        assert callable(provider)
+        assert provider() == []
+        d._open_demo_diff()
+        assert oa.overlay_active() is True
+        assert oa.dismiss_top() == "diff_preview"
+
+    def test_the_diff_overlay_never_touches_the_process_archive(self):
+        """The singleton reads `get_default_archive()` — the archive a real daemon
+        files candidates into. Same refusal the reach gutter makes by going through
+        `set_resolver` instead of seeding the advisor's live cache: a demo may lie
+        to itself, never to the organism.
+
+        Checked against the CODE with docstrings stripped via AST. The docstring
+        names both singletons precisely to explain why they are refused, so a
+        substring search over the source matches the explanation and fails a
+        correct implementation — the fifth prose false-positive this session, and
+        the same fix the shutdown watchdog's structural tests generalised to.
+        """
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.cli import ov_demo as d
+
+        tree = ast.parse(inspect.getsource(d._demo_diff_rows).lstrip())
+        for node in ast.walk(tree):
+            # Drop the docstring node, leaving only executable statements.
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if (node.body and isinstance(node.body[0], ast.Expr)
+                        and isinstance(node.body[0].value, ast.Constant)
+                        and isinstance(node.body[0].value.value, str)):
+                    node.body = node.body[1:]
+        code = ast.dump(tree)
+        assert "get_default_controller" not in code, (
+            "the demo reaches for the process-wide controller, which reads the "
+            "archive a real daemon files candidates into")
+        assert "get_default_archive" not in code
+        assert "DiffArchive" in code, "the demo must own its archive"
+
+    def test_the_script_carries_a_beat_that_opens_the_diff(self):
+        """A mounted overlay nothing opens is a float that can never appear."""
+        from backend.core.ouroboros.cli import ov_demo as d
+        assert any(kind == "diffopen" for _at, kind, _args in d._LIVE_BEATS)
+        script = d.compose_live_script()
+        assert sum(1 for _at, line in script if callable(line)) >= 1
+
+    def test_the_demo_fills_every_hook_the_cockpit_offers(self):
+        """The ratchet for THIS surface. A new Application hook now fails here
+        until the demo either fills it or declares a waiver."""
+        from backend.core.ouroboros.ui.capability_handoff import audit
+        fills = [f for f in audit().fills
+                 if f.surface.endswith("ov_demo")
+                 and "build_bipartite_application" in f.sink]
+        unset = sorted(f.hook for f in fills if f.state.name == "UNSET")
+        assert not unset, (
+            f"ov demo live leaves these cockpit hooks dark: {unset}")

@@ -623,6 +623,9 @@ _LIVE_BEATS: List[Any] = [
     # What the gate's own preview shows: which file in this change reaches
     # furthest. Rendered by the REAL gutter — see `_reach_beats`.
     (20.8, "reach", ()),
+    # The archived diff, opened on the surface that owns it. A CALLABLE beat:
+    # the overlay IS the output, so there is no line to push.
+    (21.0, "diffopen", ()),
     (21.2, "det", ("applied · verified · committed 90706b8", "ok")),
     # The op FINISHES, and collapses to one line. Before #70250 nothing
     # rendered this: an unfocused op left no trace at all, and a focused
@@ -893,6 +896,14 @@ def compose_live_script() -> List[Any]:
             continue
         if kind == "agent":
             out.extend(_agent_beats(at, args))
+            continue
+        if kind == "diffopen":
+            # A lambda, not the function object: `_LIVE_SCRIPT` is composed at
+            # IMPORT time and `_open_demo_diff` is defined further down the
+            # module, so binding the name here would raise NameError before the
+            # module finishes loading. Deferring the lookup to playback also
+            # means a test that swaps the opener gets the swapped one.
+            out.append((at, lambda: _open_demo_diff()))
             continue
         if kind == "reach":
             out.append((at, ""))
@@ -1175,6 +1186,104 @@ def _queue_rows(elapsed: float, width: int) -> List[str]:
         return []
 
 
+#: Overlays the operator has closed in THIS scene. Reset per run, because a
+#: module-level flag surviving into the next `ov demo live` would open the scene
+#: with the FATAL already dismissed and no way to see it.
+_DISMISSED: "dict[str, bool]" = {}
+
+
+def _register_demo_overlays(elapsed_fn: Callable[[], float]) -> None:
+    """Declare the scene's overlays to the real arbiter. NEVER raises.
+
+    The demo's panic is scripted, so "is it up" is a function of the CLOCK rather
+    than of a stored crash — but the arbiter never asked for a stored anything, it
+    asked for a predicate. That is why registration takes callables: a surface
+    knows its own liveness, and the arbiter only orders them by Z.
+
+    Registered through the SAME `register_overlay` the client and the daemon use,
+    so `Escape` behaves identically here. A demo with its own dismissal rule would
+    be teaching a keybinding the cockpit does not have.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.overlay_arbiter import (
+            Z_PANIC, register_overlay, reset_for_tests,
+        )
+        # A previous run's registrations would otherwise keep answering with a
+        # dead clock — an overlay reporting "up" forever holds Escape eager and
+        # silently deletes every other meaning of the key.
+        reset_for_tests()
+        _DISMISSED.clear()
+
+        def _panic_up() -> bool:
+            if _DISMISSED.get("panic"):
+                return False
+            lo, hi = _PANIC_AT
+            return lo <= elapsed_fn() <= hi
+
+        register_overlay(
+            "demo_panic", z=Z_PANIC, is_active=_panic_up,
+            dismiss=lambda: _DISMISSED.__setitem__("panic", True),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] overlay registration degraded", exc_info=True)
+
+
+def _demo_diff_rows() -> Any:
+    """The archived-diff overlay, over a DEMO-LOCAL archive. NEVER raises.
+
+    Deliberately NOT `diff_overlay.get_default_controller()`. That singleton reads
+    `get_default_archive()` — the process-wide archive a real daemon files
+    candidates into — and a demo must never touch the organism's own state. Same
+    refusal the reach gutter makes when it goes through `blast_gutter.set_resolver`
+    instead of seeding the advisor's live cache: a demo may lie to itself, never to
+    the organism.
+
+    So the controller is constructed over a private `DiffArchive` seeded with the
+    scene's own candidate. Everything else is the REAL machinery — the same
+    controller class, the same off-thread render, the same `d-N` refs, the same
+    arbiter registration — so a regression in any of it shows up here.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.diff_archive import DiffArchive
+        from backend.core.ouroboros.battle_test.diff_overlay import (
+            DiffOverlayController,
+        )
+        archive = DiffArchive()
+        archive.add(
+            op_id="7759-86", risk_tier="NOTIFY_APPLY",
+            file_paths=("backend/core/ouroboros/governance/risk_tier_floor.py",
+                        "tests/governance/test_risk_tier_floor.py"),
+            diff_text=_EDIT_RESULT,
+            summary="raise the vision floor, stop the caller swallowing it",
+        )
+        controller = DiffOverlayController(archive=archive,
+                                           width_fn=lambda: 100)
+        controller.register()
+        global _DIFF_CONTROLLER
+        _DIFF_CONTROLLER = controller
+        return controller.rows
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] diff overlay unavailable", exc_info=True)
+        return None
+
+
+_DIFF_CONTROLLER: Any = None
+
+
+def _open_demo_diff() -> Optional[str]:
+    """Script beat: open the archived diff. Returns nothing to print.
+
+    The overlay IS the output — pushing a line as well would describe a surface
+    the operator can already see.
+    """
+    try:
+        if _DIFF_CONTROLLER is not None:
+            _DIFF_CONTROLLER.open()
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] diff open degraded", exc_info=True)
+    return None
+
+
 def _panic_rows(elapsed: float, width: int) -> List[str]:
     """The FATAL_PANIC overlay, through the REAL renderer. NEVER raises.
 
@@ -1191,6 +1300,11 @@ def _panic_rows(elapsed: float, width: int) -> List[str]:
         )
         lo, hi = _PANIC_AT
         if not (lo <= elapsed <= hi):
+            return []
+        # Closed by Escape, through the real arbiter. Without this the overlay
+        # advertises "esc dismisses" and then ignores the key — the defect the
+        # arbiter exists to end, reproduced inside its own demonstration.
+        if _DISMISSED.get("panic"):
             return []
         try:
             raise RuntimeError(
@@ -1671,7 +1785,42 @@ def _live_exit_bindings() -> Any:
         event.app.exit()
 
     kb.add("q", filter=_buffer_empty)(_quit)
-    kb.add("escape", filter=_buffer_empty, eager=True)(_quit)
+
+    # `escape` used to be `eager=True` here, bound straight to QUIT — and this
+    # scene MOUNTS a FATAL overlay whose own text reads "esc dismisses". So the
+    # one surface built to demonstrate the cockpit taught the exact opposite of
+    # what the cockpit does: Escape closed the demo instead of the overlay.
+    #
+    # The hook audit could not see it. `extra_key_bindings` was FILLED, so
+    # `capability_handoff` reported coverage — it measures whether a hook is
+    # given a value, not whether the value is current. A stale filler is
+    # invisible to it, which is worth knowing about the instrument.
+    #
+    # Routed through the real arbiter instead: one `Escape` whose eagerness is a
+    # per-keystroke FILTER, active only while something dismissable is up. With
+    # the deck clear the arbiter's binding is inactive and the quit below fires;
+    # with the panic up, Escape dismisses it and the demo stays open.
+    try:
+        from backend.core.ouroboros.battle_test.overlay_arbiter import (
+            install_escape_arbiter, overlay_active,
+        )
+        install_escape_arbiter(kb)
+
+        @Condition
+        def _nothing_to_dismiss() -> bool:
+            try:
+                return not overlay_active()
+            except Exception:  # noqa: BLE001
+                return True
+
+        # The COMPLEMENT of the arbiter's filter, so the two can never both fire
+        # for one keystroke. Not eager: with an overlay up this must lose to the
+        # arbiter, and with none up there is no sequence competing for the prefix.
+        kb.add("escape", filter=_buffer_empty & _nothing_to_dismiss)(_quit)
+    except Exception:  # noqa: BLE001
+        # A demo must still be closable if the arbiter is unavailable.
+        kb.add("escape", filter=_buffer_empty, eager=True)(_quit)
+
     kb.add("c-c")(_quit)
     kb.add("c-d")(_quit)
     return kb
@@ -1713,6 +1862,9 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
     mux = BipartiteLayout()
     script = compose_live_script()
     _header, _header_height, _crest = _demo_header()
+    # Declared before the Application is built, so the Escape arbiter's filter has
+    # something to ask about on the very first keystroke.
+    _register_demo_overlays(lambda: (clock() - start[0]) * speed)
     app = build_bipartite_application(
         mux,
         # Typed input executes NOTHING — this scene has no organism to act on
@@ -1760,6 +1912,10 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         stream_rows=lambda: _stream_rows(
             (clock() - start[0]) * speed, mux,
         ),
+        # The archived-diff overlay — the last hook the demo left dark, and the
+        # only one `capability_handoff` still reported as diverging from the
+        # daemon. Over a DEMO-LOCAL archive: see `_demo_diff_rows`.
+        diff_rows=_demo_diff_rows(),
         # ------------------------------------------------------------------
         # The INPUT half. Unfilled until now, which is why a whole merged arc
         # of keybinding and completion work had no demo presence — see the
