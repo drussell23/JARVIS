@@ -132,9 +132,8 @@ class TestTheOperatorVisibleSymptom:
         actually loses, so that is what is asserted per header size.
         """
         from backend.core.ouroboros.battle_test.bipartite_layout import (
-            BipartiteLayout, _terminal_size,
+            BipartiteLayout,
         )
-        ceiling = max(3, _terminal_size()[1])
         for header_rows in (3, 12, 20):
             mux = BipartiteLayout()
             for i in range(200):
@@ -142,8 +141,15 @@ class TestTheOperatorVisibleSymptom:
             _render_once(_heavy_app(mux, header_rows=header_rows))
             assert any("row199" in ln for ln in _visible(mux)), (
                 f"tail lost with a {header_rows}-row header")
-            assert mux.height <= ceiling, (
-                f"allotment {mux.height} exceeds the terminal with a "
+            # The allotment is whatever region the layout GAVE the canvas, which
+            # under a greedy dimension is the leftover after chrome. It is NOT
+            # bounded by `_terminal_size()` here: this harness renders into a
+            # synthetic screen larger than the real terminal, and an earlier
+            # version of this assertion conflated the two and failed a correct
+            # render. What must hold is that the canvas never claims MORE than the
+            # screen it was handed.
+            assert mux.height <= 60, (
+                f"allotment {mux.height} exceeds the rendered screen with a "
                 f"{header_rows}-row header")
 
 
@@ -323,23 +329,25 @@ class TestTheCanvasIsContentSized:
         return ["".join(screen.data_buffer[y][x].char for x in range(width)
                         ).rstrip() for y in range(screen_rows)]
 
-    @pytest.mark.asyncio
-    async def test_no_blank_band_between_the_crest_and_a_short_deck(self, fullscreen):
-        """THE regression. Measured as a GAP rather than as a dimension, so it
-        fails for any future cause of the void, not only this one."""
+    def test_the_masthead_is_contiguous_with_the_deck(self):
+        """This used to mount a header REGION and assert a zero-row gap to the
+        deck. No surface mounts one any more — the masthead is transcript content,
+        so adjacency is now structural rather than something to measure: both live
+        in the same ring, separated by exactly the one blank the deck grammar puts
+        before every action.
+
+        Rewritten rather than deleted, because the guarantee it protected (the
+        emblem must not be stranded away from the feed) still matters — it is just
+        enforced by construction now instead of by geometry.
+        """
         from backend.core.ouroboros.battle_test.bipartite_layout import (
             BipartiteLayout,
         )
         mux = BipartiteLayout()
-        for line in ("Signal(test_failure)", "  2 source loci",
-                     "Read(risk_tier_floor.py)", "  847 lines read"):
-            mux.push_raw(line)
-        rows = self._rows(mux)
-        last_crest = max(y for y, r in enumerate(rows) if "CREST-" in r)
-        first_deck = next(y for y, r in enumerate(rows) if "Signal(" in r)
-        assert first_deck - last_crest - 1 == 0, (
-            f"{first_deck - last_crest - 1} blank rows between the crest and the "
-            f"deck — the canvas is greedy again")
+        mux.seed_masthead(lambda: "CREST-A\nCREST-B")
+        mux.push_raw("Signal(test_failure)")
+        ring = list(mux._buffer.snapshot())
+        assert ring == ["CREST-A", "CREST-B", "", "Signal(test_failure)"], ring
 
     @pytest.mark.asyncio
     async def test_a_deck_longer_than_the_screen_still_shows_its_tail(self, fullscreen):
@@ -531,3 +539,149 @@ class TestTheTwoPassRender:
         mux = BipartiteLayout()
         mux.observe_allotment(80, 24)
         assert mux.observe_allotment(80, 24) is False
+
+
+class TestTheMastheadIsSeededExactlyOnce:
+    """Boot is exactly when a terminal emits a flurry of SIGWINCH.
+
+    The app mounts, the alternate screen is claimed, the crest warms off-thread —
+    any of those can drive a layout rebuild. The ring is APPEND-ONLY, so a masthead
+    pushed per rebuild stacks emblems that nothing can take back out.
+    """
+
+    MARK = "MASTHEAD-IDENTITY"
+
+    def _mux(self):
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout,
+        )
+        return BipartiteLayout()
+
+    def test_a_second_seed_is_a_no_op(self):
+        mux = self._mux()
+        assert mux.seed_masthead(lambda: f"{self.MARK}\nb") == 3
+        assert mux.seed_masthead(lambda: f"{self.MARK}\nb") == 0
+        assert sum(1 for l in mux._buffer.snapshot() if self.MARK in l) == 1
+
+    def test_an_empty_render_releases_the_claim(self):
+        """A cold crest renders nothing. Holding the claim would make that boot
+        permanently emblem-less — an empty masthead is not a seeded masthead."""
+        mux = self._mux()
+        assert mux.seed_masthead(lambda: "") == 0
+        assert mux.masthead_seeded() is False
+        assert mux.seed_masthead(lambda: f"{self.MARK}") == 2
+
+    def test_distinct_keys_do_not_suppress_each_other(self):
+        mux = self._mux()
+        assert mux.seed_masthead(lambda: "A", key="demo") == 2
+        assert mux.seed_masthead(lambda: "B", key="daemon") == 2
+
+    @pytest.mark.asyncio
+    async def test_a_resize_storm_concurrent_with_warmup_seeds_once(self):
+        """THE mandated race. 24 seeders against 200 dimension mutations.
+
+        A check-then-act guard passes this most runs and fails under load, which is
+        the worst possible failure mode — so the claim is taken under the SAME lock
+        as the push, and taken BEFORE the render, because rendering a crest is slow
+        enough to be preempted.
+        """
+        import threading
+
+        mux = self._mux()
+        stop = threading.Event()
+        errors = []
+
+        def resizer():
+            try:
+                n = 0
+                while not stop.is_set() and n < 200:
+                    mux.observe_allotment(60 + (n % 40), 20 + (n % 25))
+                    n += 1
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def seeder():
+            try:
+                mux.seed_masthead(lambda: f"{self.MARK}\nsecond\nthird")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        resizers = [threading.Thread(target=resizer) for _ in range(4)]
+        seeders = [threading.Thread(target=seeder) for _ in range(24)]
+        for t in resizers + seeders:
+            t.start()
+        for t in seeders:
+            t.join(timeout=10)
+        stop.set()
+        for t in resizers:
+            t.join(timeout=10)
+
+        assert not errors, f"the race raised: {errors[:3]}"
+        snapshot = list(mux._buffer.snapshot())
+        assert sum(1 for l in snapshot if self.MARK in l) == 1, (
+            f"masthead seeded {sum(1 for l in snapshot if self.MARK in l)} times "
+            f"under concurrent resizes — the claim is check-then-act")
+        assert len(snapshot) == 4, f"ring holds {len(snapshot)} lines, expected 4"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("screen_rows", [24, 30, 40, 60])
+    async def test_the_tail_survives_a_seeded_masthead_at_a_thousand_lines(
+        self, fullscreen, screen_rows,
+    ):
+        """The two mandates together: the masthead is in the transcript AND the
+        newest line is still painted, with the prompt pinned near the bottom."""
+        from prompt_toolkit.layout.containers import to_container
+        from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+        from prompt_toolkit.layout.screen import Screen, WritePosition
+
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            build_bipartite_application,
+        )
+        mux = self._mux()
+        mux.seed_masthead(lambda: f"{self.MARK}\nline2\nline3")
+        for i in range(1000):
+            mux.push_raw(f"DECK-{i}")
+        app = build_bipartite_application(
+            mux, on_accept=lambda _t: None, toolbar=lambda: "tb",
+            status_rows=lambda: ["status"], pending_rows=lambda: ["pending"])
+        width = 60
+        screen = Screen(default_char=None, initial_width=width,
+                        initial_height=screen_rows)
+        to_container(app.layout.container).write_to_screen(
+            screen, MouseHandlers(), WritePosition(0, 0, width, screen_rows),
+            "", False, None)
+        rows = ["".join(screen.data_buffer[y][x].char for x in range(width)
+                        ).rstrip() for y in range(screen_rows)]
+        assert any("DECK-999" in r for r in rows), (
+            f"tail lost at {screen_rows} rows with a seeded masthead")
+        prompt = next((y for y, r in enumerate(rows) if r.startswith("❯")), None)
+        assert prompt is not None and prompt >= screen_rows - 5, (
+            f"the prompt is at row {prompt} of {screen_rows} — it must be pinned "
+            f"near the bottom with the transcript flowing up into it")
+
+    def test_no_surface_mounts_a_top_header_region_any_more(self):
+        """A fixed region stranded the emblem at row 0 while a bottom-anchored deck
+        hugged the prompt. Pinned by AST rather than substring: the comments around
+        these call sites name `header` in prose to explain why it is gone."""
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.battle_test import cockpit_mount as cm
+
+        assert "header" not in cm.build_daemon_mount(None), (
+            "the daemon mount carries a header region again")
+
+        from backend.core.ouroboros.cli import ov_demo as d
+
+        call = [
+            n for n in ast.walk(ast.parse(inspect.getsource(d.scene_live)
+                                          .lstrip()))
+            if isinstance(n, ast.Call)
+            and (getattr(n.func, "id", "") or getattr(n.func, "attr", ""))
+            == "build_bipartite_application"
+        ][0]
+        for kw in call.keywords:
+            if kw.arg in ("header", "header_height"):
+                assert isinstance(kw.value, ast.Call) and (
+                    getattr(kw.value.func, "id", "") == "waived"), (
+                    f"ov demo live mounts a real {kw.arg} region again")

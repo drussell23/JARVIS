@@ -376,6 +376,29 @@ def daemon_diff_rows() -> Any:
         return None
 
 
+def seed_daemon_masthead(mux: Any) -> int:
+    """Lay the daemon's identity block into its transcript. NEVER raises.
+
+    The orphan from unmounting the header: the identity line had nowhere else to
+    live, and an operator who cannot tell WHICH process they are typing at will
+    eventually pause autonomy on the wrong one.
+
+    Idempotent via `seed_masthead`'s own claim, so the resize storm a terminal emits
+    during boot cannot stack emblems into an append-only ring. Safe to call from
+    every mount path for exactly that reason.
+    """
+    try:
+        if mux is None:
+            return 0
+        render, _height = daemon_header()
+        if render is None:
+            return 0
+        return int(mux.seed_masthead(render, key="daemon"))
+    except Exception:  # noqa: BLE001
+        logger.debug("[CockpitMount] masthead seed degraded", exc_info=True)
+        return 0
+
+
 def daemon_header() -> "tuple":
     """``(render, height)`` for the crest above the deck, or ``(None, 0)``.
 
@@ -487,11 +510,14 @@ def build_daemon_mount(repl: Any = None) -> "dict":
         # open it is a row that can never appear.
         "extra_key_bindings": daemon_key_bindings(repl),
     }
-    # The crest and its height travel TOGETHER — `header_height` sizes the region
-    # `header` draws into, so a mount carrying one without the other either
-    # reserves rows nothing fills or draws an emblem into zero rows. Unpacked from
-    # one call rather than resolved twice, so they cannot disagree.
-    mount["header"], mount["header_height"] = daemon_header()
+    # NO header region. The crest is TRANSCRIPT content now — see
+    # `seed_daemon_masthead`, called once at cockpit mount. A fixed top region
+    # stranded the emblem at row 0 while the bottom-anchored deck hugged the
+    # prompt, and the band between belonged to neither.
+    #
+    # `header`/`header_height` are left ABSENT rather than waived here because the
+    # mount is a dict of values, not a call site — `capability_handoff` reads the
+    # waiver at the place the argument is passed, which is `serpent_flow`.
     # `stream_rows` is deliberately absent, and this is the reason rather than an
     # oversight: there is NO process-global in-flight text to read.
     # `live_tool_stream.make_tool_observer` creates a stream per tool CALL and
