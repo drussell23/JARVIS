@@ -1429,6 +1429,38 @@ def build_bipartite_application(
         install_stash_binding(kb, lambda: prompt.buffer)
     except Exception:  # noqa: BLE001
         pass
+    # Ctrl+Z — suspend to the shell, `fg` to come back. CC binds it and this
+    # cockpit did not, which is a gap the alternate screen CREATES rather than
+    # inherits: a normal terminal turns Ctrl+Z into SIGTSTP itself, but a
+    # full-screen app holds the terminal in raw mode, so the keystroke arrives
+    # as an ordinary key and the shell never sees it. The operator's habit
+    # silently stopped working the day the cockpit went full-screen.
+    #
+    # `suspend_to_background` is prompt_toolkit's own: it leaves the alternate
+    # screen, restores cooked mode, raises SIGTSTP, and repaints on SIGCONT.
+    # Doing this by hand means owning terminal-state restoration across a
+    # signal, and getting it wrong leaves the operator at a shell with no echo.
+    #
+    # Bound HERE so every surface that builds this Application inherits it —
+    # the daemon cockpit and the attach client alike — which is the same
+    # reasoning the SIGWINCH handler below is registered on.
+    try:
+        import signal as _sig
+        if hasattr(_sig, "SIGTSTP"):        # Unix only, as CC documents
+            from backend.core.ouroboros.battle_test.keymap import bind_action
+
+            def _suspend(event: Any) -> None:
+                try:
+                    event.app.suspend_to_background()
+                except Exception:  # noqa: BLE001
+                    logger.debug("[Bipartite] suspend degraded", exc_info=True)
+
+            bind_action(
+                kb, "app:suspend", ("ctrl+z",), _suspend, context="Global",
+                description="suspend to the shell (`fg` to resume)",
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Bipartite] suspend binding unavailable", exc_info=True)
     # Scrollback keys. In the alternate screen the terminal no longer offers
     # its own, so these ARE the scrollback — not a convenience layered on it.
     # SIGWINCH → the layout. `handle_sigwinch` existed, read the live
