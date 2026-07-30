@@ -343,3 +343,110 @@ class TestTheFloatMount:
         unconditionally changes the container tree for every cockpit that has no
         overlays and buys nothing."""
         assert self._floats(self._app()) == []
+
+
+class TestTheWiring:
+    """`/expand d-N` → overlay → mounted float, all one controller."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_singleton(self):
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        do.reset_default_controller_for_tests()
+        yield
+        do.reset_default_controller_for_tests()
+
+    def test_the_verb_and_the_mount_share_one_controller(self):
+        """The whole wiring, in one assertion. Two instances would give
+        `/expand d-N` a surface to fill that nothing renders — the
+        wired-but-inert shape, reached from a third direction."""
+        from backend.core.ouroboros.battle_test import cockpit_mount as cm
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        provider = cm.build_daemon_mount(None)["diff_rows"]
+        assert provider is not None
+        assert provider.__self__ is do.get_default_controller()
+
+    def test_the_singleton_registers_itself_with_the_arbiter(self):
+        """So `Escape` closes it without any surface remembering to ask."""
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        from backend.core.ouroboros.battle_test import overlay_arbiter as oa
+        controller = do.get_default_controller()
+        assert oa.overlay_active() is False
+        controller.open()      # empty archive still opens (explains itself)
+        assert oa.overlay_active() is True
+        assert oa.dismiss_top() == "diff_preview"
+
+    def test_the_singleton_reads_the_process_archive(self):
+        """Bound to `get_default_archive()` rather than taking one, so the
+        controller and the archive cannot drift apart."""
+        from backend.core.ouroboros.battle_test.diff_archive import (
+            get_default_archive,
+        )
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        entry = get_default_archive().add(
+            op_id="wired", risk_tier="NOTIFY_APPLY", file_paths=("x.py",),
+            diff_text="--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+wired\n",
+            summary="wired")
+        controller = do.get_default_controller()
+        controller.open(entry.ref)
+        assert entry.ref in "\n".join(controller.rows())
+
+    def test_binding_invalidate_reaches_the_singleton(self):
+        """Without it the rows land and nothing redraws until an unrelated
+        frame — indistinguishable from the blocking render this avoided."""
+        from backend.core.ouroboros.battle_test import diff_overlay as do
+        beats = []
+        assert do.bind_invalidate(lambda: beats.append(1)) is True
+        do.get_default_controller().open()
+        assert beats, "opening the overlay did not request a repaint"
+
+    def test_expand_diff_falls_back_to_the_console_with_no_app(self):
+        """`_open_diff_overlay` gates on a LIVE Application, not on the
+        controller existing — the singleton builds on first touch whether or not
+        a cockpit is up, so asking it alone would claim the diff is on screen
+        while the operator stares at a console."""
+        import inspect
+
+        from backend.core.ouroboros.battle_test import serpent_flow as sf
+
+        src = inspect.getsource(sf.SerpentREPL._open_diff_overlay
+                                if hasattr(sf, "SerpentREPL")
+                                else sf._open_diff_overlay)
+        assert "get_app_or_none" in src
+
+    def test_expand_routes_d_refs_through_the_overlay_first(self):
+        """Structural, and by AST rather than substring: the docstrings around
+        this handler name the overlay in prose to explain the design, and a text
+        search matches the explanation instead of the call."""
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.battle_test import serpent_flow as sf
+
+        fn = [
+            n for n in ast.walk(ast.parse(inspect.getsource(sf)))
+            if isinstance(n, ast.FunctionDef) and n.name == "_expand_diff"
+        ][0]
+        called = {
+            (getattr(c.func, "attr", "") or getattr(c.func, "id", ""))
+            for c in ast.walk(fn) if isinstance(c, ast.Call)
+        }
+        assert "_open_diff_overlay" in called, (
+            "/expand d-N no longer tries the overlay — it would print a flat, "
+            "unhighlighted diff on a cockpit that can draw a real one")
+
+    def test_the_daemon_cockpit_passes_diff_rows(self):
+        """The float has to be mounted, not merely available."""
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.battle_test import serpent_flow as sf
+
+        calls = [
+            n for n in ast.walk(ast.parse(inspect.getsource(sf)))
+            if isinstance(n, ast.Call)
+            and (getattr(n.func, "id", "") or getattr(n.func, "attr", ""))
+            == "run_bipartite_repl"
+        ]
+        assert calls
+        passed = {kw.arg for c in calls for kw in c.keywords if kw.arg}
+        assert "diff_rows" in passed

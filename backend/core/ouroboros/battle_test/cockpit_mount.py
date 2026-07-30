@@ -356,6 +356,26 @@ def daemon_toolbar() -> Any:
         return None
 
 
+def daemon_diff_rows() -> Any:
+    """The archived-diff overlay's rows, or None. NEVER raises.
+
+    Returns the singleton controller's bound method, so the verb that OPENS a diff
+    and this hook that DRAWS it are the same object. Handing back a fresh
+    controller would give `/expand d-N` a surface to fill that nothing renders.
+
+    None when the controller cannot be built: a float whose provider can never
+    yield anything should not be in the layout.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.diff_overlay import (
+            get_default_controller,
+        )
+        return get_default_controller().rows
+    except Exception:  # noqa: BLE001
+        logger.debug("[CockpitMount] diff overlay unavailable", exc_info=True)
+        return None
+
+
 def build_daemon_mount(repl: Any = None) -> "dict":
     """Every in-process hook the daemon cockpit can fill, as a plain dict.
 
@@ -380,6 +400,11 @@ def build_daemon_mount(repl: Any = None) -> "dict":
         "search_rows": daemon_search_rows(),
         "serpent_active": daemon_serpent_active,
         "toolbar": daemon_toolbar(),
+        # The archived-diff overlay. The DAEMON owns the archive — it is the
+        # process that files a candidate — so this is the only surface that can
+        # render one locally. `rows` is the controller's pure-pull read: O(1),
+        # never blocking, filled off-thread.
+        "diff_rows": daemon_diff_rows(),
         # Bound here so the search bar above is REACHABLE. A strip with no key to
         # open it is a row that can never appear.
         "extra_key_bindings": daemon_key_bindings(repl),
