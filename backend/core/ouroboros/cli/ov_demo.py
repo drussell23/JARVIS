@@ -1876,7 +1876,78 @@ def _live_exit_bindings() -> Any:
     def _quit(event) -> None:  # noqa: ANN001
         event.app.exit()
 
-    kb.add("q", filter=_buffer_empty)(_quit)
+    # The transcript viewer and the subagent chord, mounted from the SAME
+    # installers the daemon cockpit and the attach client use. The point of
+    # this scene is that it boots the real Application; a key that exists on
+    # both shipping surfaces and not here makes the demo a picture of a
+    # cockpit nobody runs.
+    #
+    # `notify` writes into the deck through `push_raw` — the seam the daemon
+    # bridge uses — rather than printing, because printing from a key handler
+    # inside a full-screen Application draws over the frame.
+    @Condition
+    def _not_reading_transcript() -> bool:
+        try:
+            from backend.core.ouroboros.battle_test.transcript_mode import (
+                is_transcript_mode,
+            )
+            return not is_transcript_mode()
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _demo_notice(out: Any) -> None:
+        try:
+            from backend.core.ouroboros.battle_test.bipartite_layout import (
+                get_active_canvas,
+            )
+            canvas = get_active_canvas()
+            if canvas is None:
+                return
+            lines = out.splitlines() if isinstance(out, str) else list(out)
+            for line in lines:
+                canvas.emit("line", {"text": str(line)})
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        from backend.core.ouroboros.battle_test.transcript_mode import (
+            install_transcript_mode_bindings,
+        )
+        install_transcript_mode_bindings(kb, notify=_demo_notice)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            get_agent_roster,
+        )
+        from backend.core.ouroboros.battle_test.subagent_control import (
+            install_stop_all_binding,
+        )
+
+        class _DemoOrganism:
+            """Nothing to cancel, so the verb is SHOWN rather than sent.
+
+            An inert `send_input` would make the chord look identical whether
+            it worked or not, which is the failure this scene exists to make
+            visible."""
+
+            def send_input(self, line: str) -> None:
+                _demo_notice(f"  ⏺ {line} — (demo: no organism to stop)")
+
+        install_stop_all_binding(
+            kb, _DemoOrganism(), notify=_demo_notice,
+            running=lambda: get_agent_roster().running_count,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # `q` QUITS THE DEMO — except inside the transcript viewer, where `q`
+    # leaves the viewer. Exactly the trap the Escape comment below records,
+    # one key over: without this filter the one surface built to demonstrate
+    # the cockpit would teach that `q` kills your session, when in `ov` it
+    # closes a pane.
+    kb.add("q", filter=_buffer_empty & _not_reading_transcript)(_quit)
 
     # `escape` used to be `eager=True` here, bound straight to QUIT — and this
     # scene MOUNTS a FATAL overlay whose own text reads "esc dismisses". So the
@@ -1908,10 +1979,14 @@ def _live_exit_bindings() -> Any:
         # The COMPLEMENT of the arbiter's filter, so the two can never both fire
         # for one keystroke. Not eager: with an overlay up this must lose to the
         # arbiter, and with none up there is no sequence competing for the prefix.
-        kb.add("escape", filter=_buffer_empty & _nothing_to_dismiss)(_quit)
+        # `_not_reading_transcript` joins for the same reason `q` needed it —
+        # Escape leaves the viewer in `ov`, so it must not end the demo here.
+        kb.add("escape", filter=(_buffer_empty & _nothing_to_dismiss
+                                 & _not_reading_transcript))(_quit)
     except Exception:  # noqa: BLE001
         # A demo must still be closable if the arbiter is unavailable.
-        kb.add("escape", filter=_buffer_empty, eager=True)(_quit)
+        kb.add("escape", filter=_buffer_empty & _not_reading_transcript,
+               eager=True)(_quit)
 
     kb.add("c-c")(_quit)
     kb.add("c-d")(_quit)
