@@ -1905,7 +1905,7 @@ def _live_exit_bindings() -> Any:
                 return
             lines = out.splitlines() if isinstance(out, str) else list(out)
             for line in lines:
-                canvas.emit("line", {"text": str(line)})
+                canvas.push_raw(str(line))
         except Exception:  # noqa: BLE001
             pass
 

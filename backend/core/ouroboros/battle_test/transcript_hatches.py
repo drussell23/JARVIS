@@ -316,10 +316,13 @@ def _flash_clear_hint(event: Any) -> None:
         )
         canvas = get_active_canvas()
         if canvas is not None:
-            canvas.emit("line", {
-                "text": f"  press ctrl+l again within "
-                        f"{_clear_window_s():.0f}s to clear the transcript",
-            })
+            # `push_raw`, not `emit`: `emit` renders through the typed
+            # event registry, and an unregistered type falls to the null
+            # renderer, which prints the TYPE NAME. This surfaced as a
+            # transcript line reading `· line`.
+            canvas.push_raw(
+                f"  [dim]press ctrl+l again within "
+                f"{_clear_window_s():.0f}s to clear the transcript[/dim]")
     except Exception:  # noqa: BLE001
         pass
 

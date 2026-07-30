@@ -1318,7 +1318,7 @@ def build_bipartite_application(
             # from a mouse handler inside a full-screen Application draws
             # over the frame. Which clipboard path was used matters — they
             # fail differently — so this is not decoration.
-            notify=lambda msg: mux.emit("line", {"text": f"  {msg}"}),
+            notify=lambda msg: mux.push_raw(f"  [dim]{msg}[/dim]"),
         )
     except Exception:  # noqa: BLE001
         logger.debug("[Bipartite] canvas mouse unavailable", exc_info=True)
