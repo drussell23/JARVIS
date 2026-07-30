@@ -1220,7 +1220,23 @@ def build_bipartite_application(
         # actually given. `_MeasuredCanvasControl` below now supplies the real
         # number before this callable runs, so by here the budget is already
         # correct for THIS frame.
-        return ANSI(mux.render_canvas_ansi())
+        base = ANSI(mux.render_canvas_ansi())
+        # The selection highlight. Applied HERE, over the fragments the
+        # canvas already produced, so there is no second render path and no
+        # widget — and it costs nothing when nothing is selected, because
+        # `apply_selection` returns its input untouched and the ANSI object
+        # is handed straight through without ever being expanded to a list.
+        try:
+            from backend.core.ouroboros.battle_test.canvas_selection import (
+                apply_selection, current_selection,
+            )
+            selection = current_selection()
+            if selection is None or selection.empty:
+                return base
+            from prompt_toolkit.formatted_text import to_formatted_text
+            return apply_selection(to_formatted_text(base), selection)
+        except Exception:  # noqa: BLE001 — a highlight never breaks a frame
+            return base
 
     class _MeasuredCanvasControl(FormattedTextControl):
         """A canvas control that tells the mux how big it really is.
@@ -1298,6 +1314,11 @@ def build_bipartite_application(
             _canvas_control,
             lambda: mux.render_canvas_ansi().splitlines(),
             lambda line: (on_accept(line) if callable(on_accept) else None),
+            # Copy notices land in the deck rather than a print: printing
+            # from a mouse handler inside a full-screen Application draws
+            # over the frame. Which clipboard path was used matters — they
+            # fail differently — so this is not decoration.
+            notify=lambda msg: mux.emit("line", {"text": f"  {msg}"}),
         )
     except Exception:  # noqa: BLE001
         logger.debug("[Bipartite] canvas mouse unavailable", exc_info=True)
