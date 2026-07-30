@@ -685,3 +685,62 @@ class TestTheMastheadIsSeededExactlyOnce:
                 assert isinstance(kw.value, ast.Call) and (
                     getattr(kw.value.func, "id", "") == "waived"), (
                     f"ov demo live mounts a real {kw.arg} region again")
+
+
+class TestTheRingDecodesByEncoding:
+    """The transcript ring holds two encodings now, and one decoder must serve both.
+
+    It was a MARKUP ring — every producer pushed Rich markup and the seam called
+    `Text.from_markup` on all of it. Then the masthead arrived as an ANSI string
+    (`render_cockpit_header` targets a prompt_toolkit ANSI window), `from_markup`
+    consumed the ESC, and the numeric payload of every truecolor SGR printed as
+    literal text across the emblem:
+
+        2;192;144;166;48;2;199;150;170m   ;156;66;48;2;47;43;17m   [0m
+    """
+
+    def test_an_ansi_line_is_decoded_not_shredded(self):
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            _line_to_text,
+        )
+        text = _line_to_text("\x1b[38;2;192;144;166mPIXEL\x1b[0m")
+        assert text.plain == "PIXEL", (
+            f"the SGR payload leaked into visible text: {text.plain!r}")
+        assert text.spans, "the colour was dropped along with the escape"
+
+    def test_a_markup_line_is_still_markup(self):
+        """The regression risk in the other direction: routing everything through
+        `from_ansi` would print every `[bold]` literally."""
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            _line_to_text,
+        )
+        text = _line_to_text("[bold]markup[/bold]")
+        assert text.plain == "markup"
+        assert text.spans
+
+    def test_a_seeded_masthead_leaks_no_escape_payload(self):
+        """End to end through the real render, which is where it actually showed."""
+        import re
+
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout,
+        )
+        mux = BipartiteLayout()
+        mux.seed_masthead(
+            lambda: "\x1b[38;2;94;224;106m██\x1b[0m EMBLEM\n"
+                    "\x1b[38;2;108;125;119mo+v\x1b[0m")
+        mux.push_raw("Signal(test_failure)")
+        rendered = mux.render_canvas_ansi()
+        visible = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", rendered)
+        assert "EMBLEM" in visible
+        assert "38;2;" not in visible, (
+            f"escape payload printed as text: {visible!r}")
+        assert "[0m" not in visible
+
+    def test_an_undecodable_line_never_takes_the_frame_down(self):
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            _line_to_text,
+        )
+        # A truncated escape is exactly what a clipped producer emits.
+        assert _line_to_text("\x1b[38;2;1") is not None
+        assert _line_to_text("") is not None

@@ -191,6 +191,49 @@ def _overlay_style(role: str) -> str:
         return "bold bg:#0b0b0b"
 
 
+
+def _line_to_text(line: str) -> Any:
+    """One transcript line -> a Rich ``Text``, decoded by its OWN encoding.
+
+    The ring is a MARKUP ring: every producer pushes Rich markup and this seam
+    called `Text.from_markup` on all of it. That held while markup was the only
+    thing anyone pushed.
+
+    Then the masthead arrived. `render_cockpit_header` returns an ANSI string — it
+    was built for a prompt_toolkit ANSI window — and pushing it through a markup
+    decoder shredded it: `from_markup` consumed the ESC, then printed the numeric
+    payload of every truecolor SGR as literal text. On screen that is
+
+        2;192;144;166;48;2;199;150;170m   ;156;66;48;2;47;43;17m   [0m
+
+    smeared across the emblem. Two incompatible encodings meeting at one decoder.
+
+    So the decoder SNIFFS instead of assuming. A line carrying ESC is ANSI and goes
+    through `Text.from_ansi`, which is Rich's own decoder for exactly this; anything
+    else is markup and is unchanged. That fixes the CLASS rather than the masthead:
+    any producer may now push either encoding — a mirrored daemon line, a captured
+    subprocess tail, a syntax-highlighted diff — and the ring stops caring.
+
+    ANSI wins when a line somehow contains both, because a half-decoded escape is
+    unreadable garbage while a literal `[bold]` is merely ugly. Mixing the two in
+    one line is a producer bug either way, and this makes it look like one.
+
+    NEVER raises: an undecodable line renders as plain text rather than taking the
+    frame down with it.
+    """
+    try:
+        from rich.text import Text
+        if "\x1b" in line:
+            return Text.from_ansi(line)
+        return Text.from_markup(line)
+    except Exception:  # noqa: BLE001
+        try:
+            from rich.text import Text
+            return Text(str(line))
+        except Exception:  # noqa: BLE001
+            return str(line)
+
+
 def _canvas_dimension(mux: Any = None) -> Any:
     """How much room the live canvas takes — CONTENT-SIZED, recomputed per frame.
 
@@ -796,7 +839,7 @@ class BipartiteLayout:
                 except Exception:  # noqa: BLE001
                     body = Text("  O + V", style="bold #5EE06A", justify="center")
             elif lines:
-                body = Group(*[Text.from_markup(ln) for ln in lines])
+                body = Group(*[_line_to_text(ln) for ln in lines])
             else:
                 body = Text("  idle — waiting for the organism to act", style="bright_black")
             n = self._buffer.line_count if hasattr(self._buffer, "line_count") else len(lines)
