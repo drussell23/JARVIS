@@ -80,6 +80,15 @@ _VIEWER_ACTIONS: Tuple[Tuple[str, Tuple[str, ...], str], ...] = (
 )
 
 _ACTIVE = [False]
+#: Where the claim walk is standing, in RING coordinates.
+#:
+#: Without it, each press re-derives its starting point from the newest
+#: VISIBLE line — and after landing on a claim that line is below the claim,
+#: so searching backward finds the same one again and `C` sticks. Every
+#: `n`/`N` an operator has used carries a cursor for exactly this reason.
+#:
+#: None means "not walking": the next press starts from where the eye is.
+_CLAIM_CURSOR: List[Optional[int]] = [None]
 _LOCK = threading.Lock()
 
 
@@ -124,6 +133,7 @@ def enter_transcript_mode() -> bool:
     with _LOCK:
         changed = not _ACTIVE[0]
         _ACTIVE[0] = True
+        _CLAIM_CURSOR[0] = None
     if changed:
         _pause_viewport()
         _repaint()
@@ -150,6 +160,7 @@ def exit_transcript_mode() -> bool:
     with _LOCK:
         changed = bool(_ACTIVE[0])
         _ACTIVE[0] = False
+        _CLAIM_CURSOR[0] = None
     if changed:
         _resume_viewport()
     return changed
@@ -167,6 +178,7 @@ def toggle_transcript_mode() -> bool:
 def reset_transcript_mode_for_tests() -> None:
     with _LOCK:
         _ACTIVE[0] = False
+        _CLAIM_CURSOR[0] = None
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +210,89 @@ def _metrics() -> Tuple[int, int]:
         return int(total), int(budget)
     except Exception:  # noqa: BLE001
         return 0, 0
+
+
+def _all_lines() -> list:
+    """Every RETAINED line, oldest first. NEVER raises.
+
+    The full ring, not the rendered window — and that distinction is the
+    whole feature. Classifying only what is drawn finds claims that are
+    already on screen, so `c` would move nowhere and look broken. The point
+    of walking claims is reaching the ones twenty thousand lines back.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            get_active_canvas,
+        )
+        canvas = get_active_canvas()
+        if canvas is None:
+            return []
+        return list(canvas._buffer.snapshot() or ())
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _visible_index(total: int, budget: int, offset: int) -> int:
+    """Buffer index of the NEWEST visible line. NEVER raises.
+
+    The one place the two coordinate systems meet: the viewport counts back
+    from the tail, the ring counts forward from the oldest. Everything else
+    stays in ring coordinates so there is only ever this one conversion to
+    get wrong.
+    """
+    try:
+        return max(0, int(total) - max(0, int(offset)) - 1)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _seek_to_index(vp: Any, index: int, total: int, budget: int) -> None:
+    """Scroll so buffer line ``index`` is on screen. NEVER raises.
+
+    Placed a third of a screen down rather than at an edge: a claim pinned to
+    the top row has no context above it, and one pinned to the bottom is
+    about to be pushed off by the next arriving line.
+
+    Expressed as a RELATIVE scroll because the viewport owns its clamping —
+    an absolute offset computed here would be stale against a ring that drops
+    lines as it rotates.
+    """
+    try:
+        if vp is None or total <= 0:
+            return
+        lead = max(1, int(budget) // 3)
+        end = min(int(total), max(1, int(index) + 1 + lead))
+        want = max(0, int(total) - end)
+        delta = int(getattr(vp, "offset", 0) or 0) - want
+        # `scroll` takes NEGATIVE for older. `want > offset` means going
+        # BACK, so the difference is negated exactly once, here — the same
+        # sign trap `CanvasViewport.page` records having been got backwards.
+        if delta:
+            vp.scroll(delta, total=total, budget=budget)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _say_no_claims(summary: str) -> None:
+    """Tell the operator the search found nothing, and what IS there.
+
+    A jump key that silently does nothing is indistinguishable from a broken
+    one — the same reason an unknown `/expand` ref lists what is available.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            get_active_canvas,
+        )
+        canvas = get_active_canvas()
+        if canvas is None:
+            return
+        # `push_raw`, not `emit` — see `transcript_hatches._flash_clear_hint`.
+        canvas.push_raw(
+            f"  [dim]no unobserved claims · {summary}[/dim]" if summary else
+            "  [dim]no unobserved claims retained — everything on record "
+            "was observed or derived[/dim]")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _repaint() -> None:
@@ -403,6 +498,59 @@ def install_transcript_mode_bindings(
                     logger.debug("[TranscriptMode] move degraded",
                                  exc_info=True)
             return _handler
+
+        # --- beyond CC: jump by EPISTEMIC STATE -------------------------
+        #
+        # CC's viewer jumps between search matches and prompts. It cannot
+        # jump between claims, because nothing in it records which sentences
+        # were observed and which were asserted. O+V marks every one at the
+        # `_op_line` chokepoint and has never navigated by it.
+        #
+        # Pressing `c` through a session asks the question no other tool can
+        # answer: show me every place this thing asserted something it did
+        # not observe.
+        def _claim(direction: int) -> Any:
+            def _handler(event: Any) -> None:
+                try:
+                    from backend.core.ouroboros.battle_test.epistemic_filter import (  # noqa: E501
+                        epistemic_filter_enabled, next_claim_row, summarise,
+                    )
+                    if not epistemic_filter_enabled():
+                        return
+                    lines = _all_lines()
+                    if not lines:
+                        return
+                    vp = _viewport()
+                    total, budget = _metrics()
+                    with _LOCK:
+                        cursor = _CLAIM_CURSOR[0]
+                    here = cursor if cursor is not None else _visible_index(
+                        total or len(lines), budget,
+                        int(getattr(vp, "offset", 0) or 0),
+                    )
+                    target = next_claim_row(lines, here, direction)
+                    if target is None:
+                        _say_no_claims(summarise(lines))
+                        return
+                    with _LOCK:
+                        _CLAIM_CURSOR[0] = target
+                    _seek_to_index(vp, target, total or len(lines), budget)
+                    _repaint()
+                except Exception:  # noqa: BLE001
+                    logger.debug("[TranscriptMode] claim jump degraded",
+                                 exc_info=True)
+            return _handler
+
+        for action, keys, direction, desc in (
+            ("transcript:nextClaim", ("c",), +1,
+             "jump to the next unobserved claim"),
+            ("transcript:prevClaim", ("C",), -1,
+             "jump to the previous unobserved claim"),
+        ):
+            bound += bind_action(
+                kb, action, keys, _claim(direction),
+                context="Transcript", filter=inside, description=desc,
+            )
 
         _KINDS = {
             "transcript:lineUp": ("line", -1),
