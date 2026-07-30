@@ -1141,6 +1141,91 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return None
 
+    def diff_controller(self, client: Any = None) -> Any:
+        """This cockpit's diff overlay, backed by the daemon's archive.
+
+        NOT a second overlay. `DiffOverlayController` takes its archive as a
+        constructor argument — it was built transport-agnostic and nobody had
+        used that — so the client gets the same renderer, the same epoch
+        guard, the same `Escape` arbitration and the same off-thread Pygments
+        pass that keeps the loop unstalled. A regression in the daemon's diff
+        surfaces here too, instead of in a parallel drawing that agrees with
+        itself.
+
+        Built lazily and once: the controller that the `/expand d-N` verb
+        OPENS and the `diff_rows` hook that DRAWS must be the same object, or
+        the verb fills a surface nothing renders.
+        """
+        existing = getattr(self, "_diff_controller", None)
+        if existing is not None:
+            return existing
+        try:
+            from backend.core.ouroboros.battle_test.diff_bridge import (
+                RemoteDiffArchive,
+            )
+            from backend.core.ouroboros.battle_test.diff_overlay import (
+                DiffOverlayController,
+            )
+
+            def _request(ref: str) -> None:
+                # Issued from a RENDER path, so it must never block. The verb
+                # travels on the ordinary input lane and the answer comes back
+                # addressed on the telemetry lane.
+                try:
+                    if client is not None:
+                        client.send_input(f"/diff-fetch {ref}")
+                except Exception:  # noqa: BLE001
+                    pass
+
+            archive = RemoteDiffArchive(request=_request)
+            controller = DiffOverlayController(
+                archive=archive,
+                invalidate=self._invalidate,
+                width_fn=lambda: self._terminal_size()[0] or 100,
+            )
+            self._diff_archive = archive
+            self._diff_controller = controller
+            try:
+                controller.register()
+            except Exception:  # noqa: BLE001
+                pass
+            return controller
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _ingest_diff_catalog(self, rows: Any) -> None:
+        """Absorb the heartbeat's diff catalog. NEVER raises."""
+        try:
+            archive = getattr(self, "_diff_archive", None)
+            if archive is not None:
+                archive.ingest_catalog(rows)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ingest_diff_payload(self, frame: Any) -> None:
+        """Absorb a fetched diff and re-render if it is the one on screen.
+
+        Re-OPENING is what turns a late arrival into a repaint: the
+        controller's epoch guard already makes a stale render harmless, so
+        asking it to open the same ref again is the whole mechanism — no
+        second code path for "the body finally landed". NEVER raises.
+        """
+        try:
+            archive = getattr(self, "_diff_archive", None)
+            controller = getattr(self, "_diff_controller", None)
+            if archive is None:
+                return
+            ref = archive.ingest_payload(frame)
+            if not ref or controller is None:
+                return
+            # Only if THIS ref is the one the operator is looking at. A fetch
+            # that lands after they moved on must not yank the overlay back.
+            if controller.is_active() and getattr(
+                    controller, "_ref", None) == ref:
+                controller.open(ref)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _serpent_active(self) -> bool:
         """Is the organism THINKING right now, as far as THIS terminal knows?
 
@@ -1589,6 +1674,15 @@ class AttachUI:
                 # countdown is: a stale backlog tells them work is
                 # pending that already ran.
                 self._input_queue = frame.get("input_queue") or {}
+                # The diff CATALOG — refs and metadata, no bytes. Replaced
+                # wholesale by the archive itself for the same reason the
+                # countdown is cleared by absence: the archive is a RING, so
+                # a ref that stopped being advertised was evicted, and a
+                # merge would let it live forever in a client that saw it
+                # once. `all_refs()` feeding "no such diff — available: …"
+                # is only honest if this is current.
+                if frame.get(_DIFF_CATALOG_KEY) is not None:
+                    self._ingest_diff_catalog(frame.get(_DIFF_CATALOG_KEY))
             elif isinstance(frame, dict) and frame.get(
                 "kind",
             ) == "stream_inflight":
@@ -1603,6 +1697,10 @@ class AttachUI:
                 import time as _time
                 self._stream_arrived = _time.monotonic()
                 self._push_tail_to_deck()
+            elif isinstance(frame, dict) and frame.get(
+                    "kind") == _DIFF_PAYLOAD_KIND:
+                # The bytes of a diff we asked for, addressed to this cockpit.
+                self._ingest_diff_payload(frame)
             elif isinstance(frame, dict) and frame.get(
                     "kind") == "fatal_panic":
                 # A background task died. STICKY — unlike every other live
@@ -1733,6 +1831,20 @@ def _short_path(path: str) -> str:
     return "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else "")
 
 
+#: The reply frame `RemoteDiffArchive` waits for. Read from the bridge module
+#: rather than spelled again here — a kind string that disagrees between
+#: producer and consumer is a frame silently dropped, which is exactly how
+#: `_VALID_EVENT_TYPES` bit this codebase before.
+try:
+    from backend.core.ouroboros.battle_test.diff_bridge import (
+        CATALOG_KEY as _DIFF_CATALOG_KEY,
+        DIFF_PAYLOAD_KIND as _DIFF_PAYLOAD_KIND,
+    )
+except Exception:  # noqa: BLE001
+    _DIFF_PAYLOAD_KIND = "diff_payload"
+    _DIFF_CATALOG_KEY = "diffs"
+
+
 def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
     """THE one operator-line router — shared by the legacy split-plane loop AND
     the Bipartite cockpit (DRY: verbs behave identically on both surfaces).
@@ -1787,6 +1899,24 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
                 ui.flash(ui.set_task_view(arg))
             _report_local_history(client, text)
             return "handled"
+
+        # `/expand d-N` is a CLIENT concern for a reason the other refs are
+        # not: the diff OVERLAY is drawn on this terminal. Relayed, it opened
+        # the diff on the daemon's own cockpit and mirrored back a line saying
+        # it had opened — the operator was told a diff was on screen and shown
+        # nothing. Only `d-` is intercepted; `t-`/`o-`/`n-` refs keep
+        # round-tripping and mirroring as markup, which already works.
+        if low.startswith(("/expand d-", "expand d-")):
+            arg = text.split(None, 1)[1].strip() if " " in text else ""
+            controller = (ui.diff_controller(client)
+                          if ui is not None and hasattr(ui, "diff_controller")
+                          else None)
+            if controller is not None and controller.open(arg):
+                _report_local_history(client, text)
+                return "handled"
+            # No controller (no prompt_toolkit, degraded mount): fall through
+            # and let the daemon answer in the transcript rather than
+            # swallowing the operator's request.
 
         # /keys is likewise a CLIENT concern when attached: the bindings
         # that govern THIS terminal (deck selection, Esc-interrupt,
@@ -3569,6 +3699,15 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             agent_rows=(
                 ui._agent_lines if ui is not None
                 and hasattr(ui, "_agent_lines") else None
+            ),
+            # The archived-diff overlay, backed by the daemon's archive over
+            # the bridge. Measured UNSET here: the daemon owns the archive, so
+            # this was the surface that could not draw the one thing it exists
+            # to review.
+            diff_rows=(
+                (lambda: ui.diff_controller(client).rows())
+                if ui is not None and hasattr(ui, "diff_controller")
+                else None
             ),
             # The serpent runs the hairlines while the organism is THINKING.
             # Measured UNSET here by `capability_handoff`, which meant the

@@ -236,6 +236,61 @@ class ArchivedDiff:
             d["diff_text"] = self.diff_text
         return d
 
+    @classmethod
+    def from_dict(cls, payload: Any) -> Optional["ArchivedDiff"]:
+        """The inverse of :meth:`to_dict`. NEVER raises; None if unusable.
+
+        Exists so a process that did not ARCHIVE a diff can still hold the
+        real record rather than a look-alike. An attach client renders diffs
+        through the same `DiffOverlayController` the daemon uses, and that
+        controller reads a dozen fields off the entry — handing it a duck-typed
+        stand-in would mean every field it learns to read next has to be
+        remembered here too, and the day one is forgotten the remote overlay
+        silently renders a blank where the local one shows a risk tier.
+
+        Reconstructing the frozen dataclass makes that class of drift
+        impossible: a field added to `ArchivedDiff` travels or fails loudly.
+
+        Tolerant on INPUT because the sender may be older: a missing field
+        takes the same default the archive would have used, and an unknown one
+        is ignored. That is the same additive contract `to_dict`'s consumers
+        already rely on.
+        """
+        try:
+            if not isinstance(payload, dict):
+                return None
+            ref = _safe_str(payload.get("ref"))
+            if not ref:
+                return None
+            return cls(
+                ref=ref,
+                op_id=_safe_str(payload.get("op_id")),
+                risk_tier=_safe_str(payload.get("risk_tier")),
+                file_paths=_safe_path_tuple(payload.get("file_paths")),
+                # Absent means "not shipped", which is not the same as empty —
+                # but the record cannot represent the difference, and the
+                # catalog projection deliberately omits it. Callers that need
+                # the text ask whether `diff_text` is truthy.
+                diff_text=_safe_str(payload.get("diff_text")),
+                summary=_safe_str(payload.get("summary")),
+                review_branch=(
+                    _safe_str(payload.get("review_branch")) or None
+                ),
+                apply_outcome=DiffOutcome.coerce(payload.get("apply_outcome")),
+                verify_outcome=VerifyOutcome.coerce(
+                    payload.get("verify_outcome")),
+                apply_error=_safe_str(payload.get("apply_error")),
+                # Monotonic clocks are per-process origins, so a timestamp
+                # from the daemon means nothing here. Zero is the honest
+                # value: this reader does not know when it was archived, and
+                # inventing a local `monotonic()` would be a plausible lie.
+                archived_at=0.0,
+                terminal_at=0.0,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[DiffArchive] from_dict degraded", exc_info=True)
+            return None
+
 
 @dataclass(frozen=True)
 class ArchiveSnapshot:

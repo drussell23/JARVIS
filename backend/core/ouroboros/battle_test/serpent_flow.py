@@ -6231,6 +6231,13 @@ class SerpentREPL:
         if line in ("/stop-all", "stop-all"):
             self._handle_stop_all()
             return True
+        # A cockpit asking for a diff's BYTES. Not an operator verb — it is
+        # issued by `RemoteDiffArchive` when an overlay opens — so it is
+        # deliberately absent from the palette and answers on the telemetry
+        # lane rather than the transcript.
+        if line.startswith("/diff-fetch "):
+            self._serve_diff_fetch(line.split(None, 1)[1])
+            return True
 
         # Gap #7 Slice 1 — /preflight + /organism (moved boot content)
         if line in ("/preflight", "preflight"):
@@ -8777,6 +8784,68 @@ class SerpentREPL:
     # ── Gap #6 Slice 4 — /narrate REPL verb ─────────────────────
 
     _NARRATE_DENSITIES = ("off", "preambles", "on", "verbose")
+
+    def _serve_diff_fetch(self, ref: str) -> bool:
+        """Ship one archived diff to the cockpit that asked. NEVER raises.
+
+        The daemon owns the `DiffArchive`, so before this an `/expand d-3`
+        typed at an attached cockpit opened the diff on the DAEMON's overlay
+        and mirrored back one line saying it had opened. The operator was told
+        a diff was on screen and shown nothing — on the surface they review
+        changes from, the review surface was the one thing that did not cross.
+
+        Published ADDRESSED, not broadcast. The bridge reads the requesting
+        session from a ContextVar set at dispatch, and an addressed frame
+        whose cockpit has since detached is dropped rather than sprayed at
+        everyone — so two operators reviewing different diffs cannot overwrite
+        each other's overlay.
+
+        A ref the archive does not hold is answered with an explicit
+        `missing`, never with silence: the client records the negative and
+        stops asking, where silence would leave it re-issuing the fetch at the
+        frame rate against a ref that will never arrive.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.cockpit_attach import (
+                publish_telemetry_global,
+            )
+            from backend.core.ouroboros.battle_test.diff_archive import (
+                get_default_archive,
+            )
+            from backend.core.ouroboros.battle_test.diff_bridge import (
+                DIFF_PAYLOAD_KIND, diff_bridge_enabled, max_diff_chars,
+            )
+            if not diff_bridge_enabled():
+                return False
+            entry = get_default_archive().lookup(str(ref or "").strip())
+            if entry is None:
+                publish_telemetry_global({
+                    "kind": DIFF_PAYLOAD_KIND,
+                    "ref": str(ref or ""),
+                    "missing": True,
+                })
+                return True
+            payload = entry.to_dict(include_diff_text=True)
+            text = str(payload.get("diff_text") or "")
+            cap = max_diff_chars()
+            if len(text) > cap:
+                # ANNOUNCED, not silent. A diff that simply stops is
+                # indistinguishable from one that ended, and an operator
+                # reviewing a truncated patch as though it were whole is the
+                # worst outcome this surface can produce.
+                dropped = len(text) - cap
+                payload["diff_text"] = (
+                    text[:cap]
+                    + f"\n… {dropped} more characters not shown "
+                      f"(JARVIS_DIFF_MAX_CHARS={cap})\n"
+                )
+                payload["truncated"] = True
+            payload["kind"] = DIFF_PAYLOAD_KIND
+            publish_telemetry_global(payload)
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug("[SerpentFlow] diff fetch degraded", exc_info=True)
+            return False
 
     def _handle_stop_all(self) -> None:
         """``/stop-all`` — ask every running op to stop at its next boundary.
