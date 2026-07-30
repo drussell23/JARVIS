@@ -403,8 +403,68 @@ class DiffOverlayController:
             return False
 
 
+_default_controller: Optional[DiffOverlayController] = None
+_singleton_lock = threading.RLock()
+
+
+def get_default_controller() -> DiffOverlayController:
+    """The process-wide controller, constructed lazily. NEVER raises.
+
+    A singleton for the same reason `get_default_archive` is one: the verb that
+    OPENS a diff (`/expand d-N`, in the REPL) and the hook that DRAWS it
+    (`diff_rows`, in the layout) run in different call stacks and must be talking
+    about the same overlay. Two instances would give a verb that reports success
+    while the mounted surface never changes — the wired-but-inert shape, arrived
+    at from a third direction.
+
+    Bound to `get_default_archive()` rather than taking one, so the controller and
+    the archive cannot drift apart: there is exactly one archive per process and
+    exactly one overlay reading it.
+
+    Registers with `overlay_arbiter` on FIRST construction so `Escape` closes it
+    without any surface remembering to ask. Idempotent — registration is by name.
+    """
+    global _default_controller
+    with _singleton_lock:
+        if _default_controller is None:
+            from backend.core.ouroboros.battle_test.diff_archive import (
+                get_default_archive,
+            )
+            _default_controller = DiffOverlayController(
+                archive=get_default_archive(),
+            )
+            _default_controller.register()
+        return _default_controller
+
+
+def reset_default_controller_for_tests() -> None:
+    global _default_controller
+    with _singleton_lock:
+        _default_controller = None
+
+
+def bind_invalidate(invalidate: Callable[[], None]) -> bool:
+    """Point the default controller's repaint at a live cockpit. NEVER raises.
+
+    The controller is built before any Application exists — a verb may open a diff
+    on a surface that has not mounted yet — so the repaint hook is attached when
+    the cockpit appears rather than passed at construction. Without it the rows
+    land correctly and nothing redraws until the next unrelated frame, which reads
+    as the overlay taking seconds to open.
+    """
+    try:
+        controller = get_default_controller()
+        controller._invalidate = invalidate  # noqa: SLF001 — its own module
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 __all__ = [
     "DIFF_OVERLAY_SCHEMA_VERSION",
     "OVERLAY_NAME",
     "DiffOverlayController",
+    "bind_invalidate",
+    "get_default_controller",
+    "reset_default_controller_for_tests",
 ]

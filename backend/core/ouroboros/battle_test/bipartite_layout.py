@@ -1701,6 +1701,27 @@ def build_bipartite_application(
     )
     _APP_REF["app"] = app
     mux.set_invalidate(app.invalidate)
+    # The diff overlay's repaint, attached now that an Application exists.
+    #
+    # The controller is a process singleton built on first touch — a verb can open
+    # a diff before any cockpit has mounted — so it cannot be handed an
+    # `invalidate` at construction. Without this the off-thread render completes,
+    # the rows land correctly, and NOTHING redraws until the next unrelated frame:
+    # the overlay appears to take seconds to open, which is indistinguishable from
+    # the blocking render it was built to avoid.
+    #
+    # Bound unconditionally rather than only when `diff_rows` was passed: the
+    # binding is what makes an already-open overlay repaint, and a surface that
+    # mounts the float later in the session would otherwise inherit a dead hook.
+    if diff_rows is not None:
+        try:
+            from backend.core.ouroboros.battle_test.diff_overlay import (
+                bind_invalidate,
+            )
+            bind_invalidate(app.invalidate)
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] diff repaint hook unavailable",
+                         exc_info=True)
     # Register the app's invalidate with the Reactive Theme so a state transition
     # (DORMANT→ARMED→SOAKING→DEGRADED→HEALTHY) repaints the border IN PLACE — no
     # Application teardown/rebuild (zero-flicker mandate).

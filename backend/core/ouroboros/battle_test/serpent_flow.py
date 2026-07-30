@@ -6690,6 +6690,9 @@ class SerpentREPL:
                     # The KEY for the search bar above. Mounting the strip alone
                     # would have added a row nothing could ever open.
                     extra_key_bindings=_mount.get("extra_key_bindings"),
+                    # `/expand d-N` opens this. The daemon owns the archive, so
+                    # this is the only surface that can render a diff locally.
+                    diff_rows=_mount.get("diff_rows"),
                 )
                 return
         except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL
@@ -8441,6 +8444,21 @@ class SerpentREPL:
             )
 
     def _expand_diff(self, ref: str) -> None:
+        # A cockpit gets the OVERLAY; a console gets the print.
+        #
+        # Not a new verb. `/expand` already routes `d-N` here, already mines live
+        # `d-N` refs for its argument completion, and already appears in `/help` —
+        # a `/diff` alongside it would be a second spelling for one action, and the
+        # operator's existing muscle memory would go to the worse one.
+        #
+        # The overlay is strictly better where it can be drawn: syntax
+        # highlighting, the reach gutter from the gate's own file tree, `Escape` to
+        # close, and a render that runs off the event loop. But it needs a mounted
+        # Application, and this method is also reached from the legacy flowing REPL
+        # and from a non-TTY session — so the console path below is not a fallback
+        # to be removed, it is the correct rendering for a surface with no floats.
+        if self._open_diff_overlay(ref):
+            return
         from backend.core.ouroboros.battle_test.diff_archive import (
             get_default_archive,
         )
@@ -8466,6 +8484,39 @@ class SerpentREPL:
             self._flow.console.print(
                 f"    [{_SEM['dim']}]{ln}[/{_SEM['dim']}]", highlight=False,
             )
+
+    def _open_diff_overlay(self, ref: str) -> bool:
+        """Show ``ref`` in the mounted overlay. False when there is none.
+
+        Gated on a LIVE Application, not on the controller existing: the singleton
+        builds on first touch whether or not a cockpit is up, so asking it alone
+        would claim the diff is on screen while an operator stares at a console.
+        `get_app_or_none` is the honest question — "is there a surface with floats
+        to draw into" — and it is the same probe `rewind_menu` uses before
+        offering a Float-hosted menu.
+
+        NEVER raises: `/expand` must degrade to its console rendering rather than
+        fail, and a broken overlay must not cost the operator the diff.
+        """
+        try:
+            from prompt_toolkit.application.current import get_app_or_none
+            if get_app_or_none() is None:
+                return False
+            from backend.core.ouroboros.battle_test.diff_overlay import (
+                get_default_controller,
+            )
+            controller = get_default_controller()
+            if not controller.open(ref):
+                return False
+            self._flow.console.print(
+                f"  [{_SEM['dim']}]⏺ {ref} — esc closes[/{_SEM['dim']}]",
+                highlight=False,
+            )
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug("[SerpentFlow] diff overlay open degraded",
+                         exc_info=True)
+            return False
 
     def _expand_op_block(self, ref: str) -> None:
         from backend.core.ouroboros.battle_test.op_block_buffer import (
