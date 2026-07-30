@@ -95,6 +95,20 @@ _ROLE_TO_SEMANTIC: Dict[str, str] = {
     # paths get their own treatment below (underline is not a colour).
     "file": "info",
 }
+#: Background tints for diff bands. Separate roles because a colour that reads
+#: correctly as FOREGROUND does not read correctly as BACKGROUND: `code_add`
+#: resolves to a foreground green, and `on green` is a saturated slab that makes
+#: every syntax colour drawn over it illegible. These are deliberately dark, so a
+#: keyword, a string and a comment all keep their own hue on top of the band —
+#: which is the whole point of highlighting a hunk rather than tinting it.
+#:
+#: Hex rather than an ANSI name: the 16-colour names have no dark variants, and a
+#: band is one of the few places the exact luminance matters more than the
+#: terminal's palette preference. `style_for` passes hex through unchanged.
+_ROLE_BACKGROUNDS: Dict[str, str] = {
+    "code_add_bg": "#16261a",
+    "code_del_bg": "#2b1618",
+}
 
 #: Roles whose rendering carries a non-colour attribute. Kept separate
 #: because a tier that cannot do colour can still do underline, and
@@ -174,7 +188,11 @@ def role_palette() -> Dict[str, str]:
     over a dozen keys.
     """
     try:
-        return {role: style_for(role) for role in _ROLE_TO_SEMANTIC}
+        resolved = {role: style_for(role) for role in _ROLE_TO_SEMANTIC}
+        # Backgrounds bypass `style_for`: they are literal tints, not
+        # semantics to be resolved against a ColorTier.
+        resolved.update(_ROLE_BACKGROUNDS)
+        return resolved
     except Exception:  # noqa: BLE001
         return {}
 

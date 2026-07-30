@@ -19,19 +19,41 @@ PATH = "backend/core/ouroboros/governance/risk_tier_floor.py"
 
 class TestSyntaxAndSignAreSeparate:
     def test_an_added_line_carries_both_a_band_and_syntax(self):
+        # Asserted against the ROLE, never a literal colour: the band moved from
+        # `green` to a dark tint precisely because a saturated slab made every
+        # syntax colour on top illegible, and a test naming the colour would have
+        # to be edited each time the tint is tuned — then quietly stop protecting
+        # the property it was written for.
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        band = role_palette()["code_add_bg"]
         out = dg.diff(412, "+", "    except RiskFloorConfigError:", path=PATH)
-        assert "on green" in out, "the add band is missing"
+        assert f"on {band}" in out, "the add band is missing"
         assert "bright_blue" in out or "blue" in out, (
             "the keyword lost its syntax colour — the line is flat again")
 
     def test_a_removed_line_uses_the_del_role(self):
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
         out = dg.diff(412, "-", "    except Exception:", path=PATH)
-        assert "on red" in out
+        assert f"on {role_palette()['code_del_bg']}" in out
 
     def test_an_unchanged_line_gets_no_band(self):
         """Context lines must not be painted, or the whole hunk reads as changed."""
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        palette = role_palette()
         out = dg.diff(410, " ", "    try:", path=PATH)
-        assert "on green" not in out and "on red" not in out
+        assert f"on {palette['code_add_bg']}" not in out
+        assert f"on {palette['code_del_bg']}" not in out
+
+    def test_the_background_roles_are_distinct_from_the_foreground_ones(self):
+        """A colour that reads correctly as FOREGROUND does not read correctly as
+        BACKGROUND. `code_add` is a foreground green; `on green` is a saturated slab
+        that makes a dim comment on top unreadable, which is what shipped first."""
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        palette = role_palette()
+        assert palette["code_add"] != palette["code_add_bg"]
+        assert palette["code_add_bg"].startswith("#"), (
+            "a band needs an explicit dark tint; the 16-colour names have no dark "
+            "variants")
 
     def test_the_band_comes_from_the_semantic_roles(self):
         """`_style` maps this module's OWN tone vocabulary and resolves an unknown
@@ -108,8 +130,11 @@ class TestTheDemoShowsIt:
     def test_the_script_carries_a_banded_update_block(self):
         from backend.core.ouroboros.cli import ov_demo as d
         script = d.compose_live_script()
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        palette = role_palette()
+        marks = (f"on {palette['code_add_bg']}", f"on {palette['code_del_bg']}")
         banded = [l for _at, l in script
-                  if isinstance(l, str) and ("on green" in l or "on red" in l)]
+                  if isinstance(l, str) and any(m in l for m in marks)]
         assert banded, "ov demo live shows no syntax-highlighted hunk"
         assert any("bright_blue" in l or "blue" in l for l in banded), (
             "the demo's hunk has a band but no syntax colour")
