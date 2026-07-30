@@ -895,6 +895,10 @@ def build_bipartite_application(
     stream_rows: Optional[Callable[[], Any]] = None,
     queue_rows: Optional[Callable[[], Any]] = None,
     panic_rows: Optional[Callable[[], Any]] = None,
+    #: The archived-diff overlay (`diff_overlay.DiffOverlayController.rows`).
+    #: Rows arrive PRE-COLOURED by Rich, so this float renders them as ANSI
+    #: rather than under a single prompt_toolkit style.
+    diff_rows: Optional[Callable[[], Any]] = None,
     # NOTE: no `on_mux` here, deliberately. It belongs to `run_bipartite_repl`,
     # which CONSTRUCTS the multiplexer and therefore has something to hand
     # back. A caller of this function already holds the mux — it passes it in
@@ -1538,6 +1542,79 @@ def build_bipartite_application(
     # `top=1` rather than `ycursor=True`: a crash is not attached to where
     # the caret happens to be, and an overlay that moves while the
     # operator reads a traceback is hostile.
+    # ONE float host, established before any overlay wants it.
+    #
+    # This used to be implicit: whichever overlay block ran first found `root`
+    # was not a `FloatContainer` and wrapped it, and later blocks appended to the
+    # container the first one happened to create. With a single overlay that is
+    # invisible. With two it is a silent drop — the diff float was added under an
+    # `isinstance(root, FloatContainer)` guard that was False, because the block
+    # that creates the container runs AFTER it, so the overlay mounted nothing
+    # and reported nothing.
+    #
+    # Hoisting the host makes every overlay block a pure append, in source order,
+    # which is also the draw order. No block has to know whether it is first, and
+    # the next overlay added cannot reintroduce this by being placed anywhere in
+    # particular.
+    if diff_rows is not None or panic_rows is not None:
+        try:
+            from prompt_toolkit.layout import FloatContainer
+            if not isinstance(root, FloatContainer):
+                # Only when an overlay actually exists: an empty FloatContainer
+                # renders identically, but wrapping unconditionally would change
+                # the container tree for every cockpit that has no overlays and
+                # buys nothing.
+                root = FloatContainer(content=root, floats=[])
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] float host unavailable", exc_info=True)
+
+    # The diff preview goes on FIRST, and the order is load-bearing.
+    #
+    # prompt_toolkit draws `root.floats` in list order, so a float appended later
+    # renders ON TOP. The panic overlay must win that contest: a crash outranks a
+    # diff the operator opened for themselves, and an overlay stack whose z-order
+    # depends on which block happens to run first is the kind of thing that
+    # silently inverts the next time this function is reorganised.
+    #
+    # It matches `overlay_arbiter`'s Z constants deliberately — Z_DIFF_PREVIEW <
+    # Z_PANIC — so the surface an operator SEES on top is the same one `Escape`
+    # closes first. Two orderings that disagree would mean pressing Escape
+    # dismissing something other than what they are looking at.
+    if diff_rows is not None:
+        try:
+            from prompt_toolkit.filters import Condition
+            from prompt_toolkit.layout import (
+                ConditionalContainer, Float, FloatContainer, Window,
+            )
+            from prompt_toolkit.layout.controls import FormattedTextControl
+            from prompt_toolkit.formatted_text import ANSI
+
+            def _diff_visible() -> bool:
+                try:
+                    return bool(diff_rows())
+                except Exception:  # noqa: BLE001
+                    return False
+
+            # ANSI, not a style tuple: the rows arrive already coloured by Rich
+            # (the syntax highlighting is the whole point of the overlay), and
+            # wrapping pre-escaped text in a single prompt_toolkit style would
+            # print the escapes and flatten the diff to one colour.
+            _diff_win = ConditionalContainer(
+                Window(
+                    FormattedTextControl(
+                        lambda: ANSI("\n".join(diff_rows())),
+                    ),
+                    wrap_lines=False,
+                ),
+                filter=Condition(_diff_visible),
+            )
+            if isinstance(root, FloatContainer):
+                root.floats.append(Float(
+                    content=_diff_win, top=1, left=2, right=2,
+                ))
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] diff overlay unavailable", exc_info=True)
+
     if panic_rows is not None:
         try:
             from prompt_toolkit.filters import Condition
@@ -1590,14 +1667,14 @@ def build_bipartite_application(
                 ),
                 filter=Condition(_panic_visible),
             )
+            # Append-only. The host is hoisted above, so this block no longer
+            # has to be the one that creates it — and the diff float appended
+            # before it stays underneath, which is the z-order both this and
+            # `overlay_arbiter` agree on.
             if isinstance(root, FloatContainer):
                 root.floats.append(Float(
                     content=_panic_win, top=1, left=2, right=2,
                 ))
-            else:
-                root = FloatContainer(content=root, floats=[Float(
-                    content=_panic_win, top=1, left=2, right=2,
-                )])
         except Exception:  # noqa: BLE001
             # A cockpit that cannot draw the overlay must still RUN — the
             # panic is already logged and on the telemetry lane.
@@ -1704,6 +1781,7 @@ async def run_bipartite_repl(
     stream_rows: Optional[Callable[[], Any]] = None,
     queue_rows: Optional[Callable[[], Any]] = None,
     panic_rows: Optional[Callable[[], Any]] = None,
+    diff_rows: Optional[Callable[[], Any]] = None,
     on_mux: Optional[Callable[[Any], None]] = None,
     serpent_active: Optional[Callable[[], bool]] = None,
 ) -> None:
@@ -1748,6 +1826,7 @@ async def run_bipartite_repl(
             search_rows=search_rows, status_rows=status_rows,
             pending_rows=pending_rows, stream_rows=stream_rows,
             queue_rows=queue_rows, panic_rows=panic_rows,
+            diff_rows=diff_rows,
             serpent_active=serpent_active,
         )
         if watch_alive is not None:
