@@ -1895,6 +1895,21 @@ class SerpentFlow:
         Non-disruptive parallel recording — existing console output
         is unchanged.
         """
+        # Provenance rides the ONE chokepoint. Applied here, above every
+        # consumer, so the local console, the cockpit mirror, the op buffer
+        # replayed by `/expand`, and the swarm digest cannot disagree about
+        # how a line was known — a mark applied per-surface would be four
+        # chances to render the same claim with four different authorities.
+        #
+        # Ambient by design: no call site passes anything. A producer
+        # declares its footing once via `claiming(...)` and everything it
+        # renders inherits, so adding a producer cannot silently promote
+        # its output to "measured" the way a per-callsite argument would.
+        try:
+            from backend.core.ouroboros.ui.provenance import annotate
+            text = annotate(text)
+        except Exception:  # noqa: BLE001 — an unmarked line beats no line
+            pass
         # Always update swarm so the digest stays accurate
         self._record_swarm_event(op_id, _strip_markup_short(text))
         # Gap #3 Slice 3 — parallel buffer record (master-flag-gated)
@@ -2802,6 +2817,7 @@ class SerpentFlow:
         # Default-TRUE post Slice 5 graduation (2026-05-04). Operators
         # disable per-tool narration via ``=false`` or via
         # ``/narrate off``.
+        preamble_provenance = None
         if not preamble:
             try:
                 # Through the dial: an explicitly set
@@ -2822,11 +2838,25 @@ class SerpentFlow:
                     from backend.core.ouroboros.governance.tool_preamble_synthesizer import (
                         synthesize_preamble,
                     )
+                    # The demonstration case for provenance: this sentence
+                    # is a TEMPLATE the code filled in because the model did
+                    # not supply one — and it renders identically to a
+                    # preamble the model actually wrote. Declared SYNTHETIC
+                    # so the reader can tell which one they are looking at.
                     preamble = synthesize_preamble(
                         tool_name, args_summary,
                         existing_preamble="",
                         fallback_only=True,
                     )
+                    # Ambient context spans a SCOPE; this value outlives
+                    # the scope that made it — computed here, rendered
+                    # thirty lines below. So the footing rides the value.
+                    # Ambient is right when producing and rendering share a
+                    # frame; it silently marks nothing when they do not, and
+                    # a mark that silently does not appear is the failure
+                    # this whole module is about.
+                    preamble_provenance = "synthetic"
+
             except Exception:
                 pass  # silent fallback per the §7 contract
 
@@ -2843,10 +2873,16 @@ class SerpentFlow:
                     _victims = list(self._rendered_preamble_keys)[:256]
                     for _v in _victims:
                         self._rendered_preamble_keys.discard(_v)
-                self._op_line(
-                    op_id,
-                    f"[{_SEM['dim']} italic]🗣 {preamble}[/{_SEM['dim']} italic]",
+                _line = (
+                    f"[{_SEM['dim']} italic]🗣 {preamble}"
+                    f"[/{_SEM['dim']} italic]"
                 )
+                try:
+                    from backend.core.ouroboros.ui.provenance import annotate
+                    _line = annotate(_line, preamble_provenance)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._op_line(op_id, _line)
 
         # The MIRRORED half of the start event.
         #
@@ -6161,6 +6197,9 @@ class SerpentREPL:
         # Gap #6 Slice 4 — /narrate density control
         if line.startswith("/narrate") or line.startswith("narrate "):
             self._handle_narrate(line)
+            return
+        if line.startswith("/provenance") or line.startswith("provenance "):
+            self._handle_provenance()
             return True
 
         # Gap #7 Slice 1 — /preflight + /organism (moved boot content)
@@ -8609,6 +8648,31 @@ class SerpentREPL:
     # ── Gap #6 Slice 4 — /narrate REPL verb ─────────────────────
 
     _NARRATE_DENSITIES = ("off", "preambles", "on", "verbose")
+
+    def _handle_provenance(self) -> None:
+        """``/provenance`` — what the marks in the transcript mean.
+
+        The legend lists ONLY the marked rungs. Listing `observed` and
+        `derived` would describe the vocabulary rather than the surface:
+        those render clean, so an operator will never see them on a line
+        and a legend entry for them is a promise the transcript does not
+        keep. NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.ui.provenance import annotate, legend
+            rows = [
+                f"  [{_SEM['neural']}]How the organism knows what it "
+                f"says[/{_SEM['neural']}]",
+                f"    [{_SEM['dim']}]unmarked — observed, or derived from "
+                f"observation[/{_SEM['dim']}]",
+            ]
+            for label, _glyph, meaning in legend():
+                sample = annotate("", label).strip()
+                rows.append(f"    {sample} [{_SEM['dim']}]{meaning}"
+                            f"[/{_SEM['dim']}]")
+            self._flow.console.print("\n".join(rows), highlight=False)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _handle_narrate(self, line: str) -> None:
         """``/narrate {off|preambles|on|verbose}`` controls density:
