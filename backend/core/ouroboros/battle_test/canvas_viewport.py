@@ -108,6 +108,20 @@ def canvas_history_lines() -> int:
     return _DEFAULT_HISTORY_LINES
 
 
+def auto_scroll_enabled() -> bool:
+    """``JARVIS_AUTO_SCROLL`` (default true). NEVER raises.
+
+    Claude Code's own escape hatch: "To turn auto-follow off entirely so the
+    view stays where you leave it, open `/config` and set Auto-scroll to
+    off." Off, the view never moves on its own and every arriving line is
+    held — which is what an operator reading a long trace while the organism
+    keeps working actually wants.
+    """
+    return os.environ.get(
+        "JARVIS_AUTO_SCROLL", "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
 class CanvasViewport:
     """Which slice of the history is on screen, and how the operator moves it.
 
@@ -131,6 +145,22 @@ class CanvasViewport:
         #: as a count rather than left implicit — "there is newer output" is
         #: the fact that decides whether they want to jump back to live.
         self.new_since_paused = 0
+        #: Auto-follow held OFF explicitly, independent of the offset.
+        #:
+        #: Until this existed, "pinned to the tail" and "showing the newest
+        #: line" were ONE state with one variable — `following` was derived
+        #: from `_offset <= 0` — so there was no honest way to stop following
+        #: without also moving the view. The transcript viewer documented
+        #: that limitation rather than faking a pin, and this is the field
+        #: that removes it: a reader can freeze the page they are on at the
+        #: live tail, and arriving output holds still instead of scrolling
+        #: the sentence they are mid-way through off the screen.
+        #:
+        #: Claude Code states the same property — "scrolling up pauses
+        #: auto-follow so new output doesn't pull you back to the bottom" —
+        #: and separately allows turning follow off entirely. Scrolling still
+        #: pauses implicitly via the offset; this is the explicit half.
+        self._paused = False
         #: Has this operator scrolled yet, this session?
         #:
         #: The alternate screen takes the terminal's OWN scrollback, and
@@ -148,8 +178,41 @@ class CanvasViewport:
 
     @property
     def following(self) -> bool:
-        """True when pinned to the live tail."""
-        return self._offset <= 0
+        """True when new output will pull the view along.
+
+        BOTH conditions, because they are genuinely different reasons not to
+        follow: an operator who scrolled up (`_offset > 0`) and one who froze
+        the page they are on (`_paused`). Deriving this from the offset alone
+        is what made a pin-without-moving impossible.
+        """
+        return self._offset <= 0 and not self._paused
+
+    @property
+    def paused(self) -> bool:
+        """Auto-follow explicitly held, regardless of position."""
+        return self._paused
+
+    def pause(self) -> bool:
+        """Freeze the view where it is. True if this changed anything.
+
+        Deliberately does NOT move the offset. Freezing by scrolling would
+        discard the line the operator was reading when they asked — which is
+        the whole reason the derived version could not do this.
+        """
+        changed = not self._paused
+        self._paused = True
+        return changed
+
+    def resume(self) -> bool:
+        """Follow again. True if this changed anything.
+
+        Does not move either: a caller that wants the tail calls
+        `to_bottom`, and one that wants to keep reading where it is while
+        letting output resume behind it gets exactly that.
+        """
+        changed = self._paused
+        self._paused = False
+        return changed
 
     def mark_taught(self) -> None:
         """The operator has found the scrollback; stop offering the key."""
@@ -159,6 +222,11 @@ class CanvasViewport:
         self._offset = 0
         self.hit_top = False
         self.new_since_paused = 0
+        # Returning to live means FOLLOWING again. Leaving the flag set would
+        # give an operator who jumped to the bottom a view pinned at the
+        # bottom that never updates — the most confusing possible state,
+        # because it looks exactly like a working tail on a dead organism.
+        self._paused = False
 
     # -- movement ----------------------------------------------------------
 
@@ -207,8 +275,16 @@ class CanvasViewport:
         return self.scroll(-max(0, int(total)), total=total, budget=budget)
 
     def to_bottom(self) -> bool:
-        """Return to live. The one move that is always available."""
-        if self._offset == 0:
+        """Return to live. The one move that is always available.
+
+        "Already at offset 0" is NOT "already following" now that a pause can
+        hold the tail without moving it. The early return used to be correct
+        because the two were the same fact; with an explicit flag it left a
+        reader who paused AT the tail permanently un-following — and every
+        surface gated on `is_scrolled_back` then behaved as though they were
+        still in history after they had left the viewer.
+        """
+        if self._offset == 0 and not self._paused:
             return False
         self.reset()
         return True
@@ -240,13 +316,18 @@ class CanvasViewport:
             # plain list in tests.
             marker = total if appended is None else int(appended)
             previous, self._last_appended = self._last_appended, marker
-            if self._offset > 0 and previous is not None and marker > previous:
+            held = self._offset > 0 or self._paused or not auto_scroll_enabled()
+            if held and previous is not None and marker > previous:
                 arrived = marker - previous
                 self._offset += arrived
                 self.new_since_paused += arrived
 
             if total <= budget:
                 # Everything fits; there is no history to be inside of.
+                # `_paused` is NOT cleared here: a short transcript that grows
+                # past the budget while the operator is reading must stay
+                # held, and clearing the flag on a frame that happened to fit
+                # would silently resume follow underneath them.
                 self._offset = 0
                 return snap, 0, 0
             ceiling = total - budget

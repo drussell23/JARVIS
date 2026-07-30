@@ -85,6 +85,51 @@ RESERVED_KEYSTROKES: Dict[str, str] = {
     "ctrl+m": "identical to Enter in terminals (both send CR)",
 }
 
+#: Claude Code's name for an action ov already has under its own.
+#:
+#: ALIASES, not renames. `agents:stopAll` and `chat:killAgents` are the same
+#: capability on the same chord, and both must resolve — an operator arriving
+#: from CC writes CC's name in `keybindings.json` and expects it to work,
+#: while anyone who already bound ov's name must not have their config
+#: silently stop applying. Renaming would fix the first at the cost of the
+#: second, and a config key that maps to nothing fails SILENTLY: the binding
+#: simply never appears.
+#:
+#: Read left-to-right: CC's spelling -> ov's canonical id.
+ACTION_ALIASES: Dict[str, str] = {
+    "chat:killAgents": "agents:stopAll",
+    "app:toggleTranscript": "transcript:toggle",
+    "app:toggleTodos": "app:toggleChecklist",
+    "app:interrupt": "chat:interrupt",
+    "chat:cycleMode": "app:cycleTrust",
+    # CC's `scroll:*` family is ov's `transcript:*` viewer table — same
+    # movements, same defaults, different namespace because ov's arrived
+    # with the viewer rather than with a scroll region.
+    "scroll:lineUp": "transcript:lineUp",
+    "scroll:lineDown": "transcript:lineDown",
+    "scroll:halfPageUp": "transcript:halfUp",
+    "scroll:halfPageDown": "transcript:halfDown",
+    "scroll:fullPageUp": "transcript:pageUp",
+    "scroll:fullPageDown": "transcript:pageDown",
+    "scroll:top": "transcript:top",
+    "scroll:bottom": "transcript:bottom",
+}
+
+
+def aliases_for(action: str) -> Tuple[str, ...]:
+    """Every spelling that means *action*, itself included. NEVER raises."""
+    try:
+        target = str(action or "")
+        names = {target}
+        names.update(a for a, canon in ACTION_ALIASES.items()
+                     if canon == target)
+        if target in ACTION_ALIASES:
+            names.add(ACTION_ALIASES[target])
+        return tuple(sorted(names))
+    except Exception:  # noqa: BLE001
+        return (str(action or ""),)
+
+
 #: Rebindable, but the operator deserves a heads-up.
 TERMINAL_CONFLICTS: Dict[str, str] = {
     "ctrl+b": "tmux prefix (tmux swallows it unless pressed twice)",
@@ -597,13 +642,16 @@ def effective_key_sequences(
         overrides: Dict[str, Optional[str]] = {}
         for ctx in ("Global", context):
             overrides.update(cfg.blocks.get(ctx, {}))
+        # Any spelling of this action counts. A config written against CC's
+        # name must bind ov's action, and vice versa — see `ACTION_ALIASES`.
+        names = set(aliases_for(action))
         kept = [
             canon for canon, _ in defaults
-            if canon not in overrides or overrides[canon] == action
+            if canon not in overrides or overrides[canon] in names
         ]
         added = [
             canon for canon, mapped in overrides.items()
-            if mapped == action and canon not in kept
+            if mapped in names and canon not in kept
         ]
         seen: set = set()
         out: List[Tuple[str, ...]] = []
@@ -876,6 +924,8 @@ def write_config_template() -> Optional[str]:
 
 
 __all__ = [
+    "ACTION_ALIASES",
+    "aliases_for",
     "ActionSpec",
     "CONFIG_PATH_ENV_VAR",
     "CONFIG_TEMPLATE",
