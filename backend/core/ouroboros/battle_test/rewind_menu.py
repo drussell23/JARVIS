@@ -452,7 +452,27 @@ def install_rewind_binding(kb: Any, controller: RewindController) -> bool:
                     get_app_or_none,
                 )
                 app = get_app_or_none()
-                return app is not None and not app.current_buffer.text
+                if app is None or app.current_buffer.text:
+                    return False
+                # ...and nothing dismissable is on screen.
+                #
+                # `overlay_arbiter` binds a single `Escape` whose eagerness is a
+                # per-keystroke FILTER, active only while an overlay is up. This
+                # is the COMPLEMENT of that filter, and the pair is what removes
+                # the collision rather than arbitrating it: with a panic showing,
+                # the first Escape closes it eagerly and this sequence must not
+                # also be live, or two presses would dismiss AND rewind. With the
+                # cockpit clear the eager binding is inactive, so the input
+                # processor buffers `esc esc` naturally — no timer, no custom
+                # processor, no polling.
+                #
+                # Asked here rather than in the arbiter because this filter
+                # already owns "when does a double-Esc mean rewind", and that
+                # question has exactly one right place to be answered.
+                from backend.core.ouroboros.battle_test.overlay_arbiter import (
+                    overlay_active,
+                )
+                return not overlay_active()
             except Exception:  # noqa: BLE001
                 return False
 

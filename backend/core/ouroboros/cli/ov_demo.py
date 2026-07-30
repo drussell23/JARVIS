@@ -683,10 +683,26 @@ def _collapsed_beat(args: Sequence[Any]) -> str:
 
 
 def _THEME(slot: str) -> str:
-    """One colour slot, from the cockpit's own palette. NEVER raises."""
+    """One colour slot, from the semantic-role owner. NEVER raises.
+
+    This read `serpent_flow._C`, which does not exist — the import raised
+    ImportError on every call and the `except` handed back the fallback, so every
+    slot in this module resolved to plain `"white"` and had done since it was
+    written. Visible in the demo as a flat white collapse line, and in the crest
+    header as a literal `[white]…[/white]` where a dim style should have been.
+
+    A total `except` around a hardcoded fallback is what let it hide: the module
+    kept working, in one colour, and nothing said the palette was never reached.
+
+    `ui.semantic_tokens.role_palette()` is the one owner of what a colour MEANS
+    (#70256-#70260 migrated 365 raw literals into it) and is the same accessor,
+    spelled the same way, that `bipartite_layout._SEM` uses. One vocabulary, one
+    spelling, one owner — so a role renamed there cannot leave this module
+    quietly monochrome again.
+    """
     try:
-        from backend.core.ouroboros.battle_test.serpent_flow import _C
-        return _C.get(slot, "white")
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        return role_palette().get(slot) or "white"
     except Exception:  # noqa: BLE001
         return "white"
 
@@ -1476,22 +1492,41 @@ def _demo_turn_spinner(clock: Callable[[], float],
         return None
 
 
-def _header_lines() -> List[str]:
+def _header_lines() -> List[Any]:
     """The text beside the crest — what this cockpit IS, in three lines.
 
     Says DEMO explicitly. A header identical to the attach client's would make a
     screenshot of a synthetic session indistinguishable from a real one, and the
     entire value of this scene is that an operator can trust what it shows.
+
+    Returned as Rich ``Text``, not markup strings. `render_cockpit_header`
+    composes its lines beside the emblem and takes "Rich renderable Texts (or
+    plain strings)" — a markup string is the PLAIN case, so `[dim]…[/dim]` was
+    printed to the operator verbatim rather than interpreted. Building `Text`
+    with explicit styles is what `ov.py::_header_lines` already does, so both
+    surfaces hand this function the same type.
     """
-    dim = _THEME("dim")
-    return [
-        "◇ O+V · demo canvas",
-        f"[{dim}]synthetic events · no provider, no tokens[/{dim}]",
-        f"[{dim}]q to quit · / for verbs · ctrl+r to search[/{dim}]",
-    ]
+    try:
+        from rich.text import Text
+        dim = _THEME("dim")
+        first = Text()
+        first.append("◇ ", style=_THEME("neural"))
+        first.append("O+V", style="bold")
+        first.append(" · demo canvas", style=dim)
+        return [
+            first,
+            Text("synthetic events · no provider, no tokens", style=dim),
+            Text("q to quit · / for verbs · ctrl+r to search", style=dim),
+        ]
+    except Exception:  # noqa: BLE001 — plain strings are the documented fallback
+        return [
+            "◇ O+V · demo canvas",
+            "synthetic events · no provider, no tokens",
+            "q to quit · / for verbs · ctrl+r to search",
+        ]
 
 
-def _demo_header() -> "tuple[Any, int]":
+def _demo_header() -> "tuple[Any, int, Any]":
     """``(render, height)`` for the crest above the deck, or ``(None, 0)``.
 
     Rendered by `crest_animator`'s own `render_cockpit_header`, so the demo
@@ -1516,15 +1551,10 @@ def _demo_header() -> "tuple[Any, int]":
         )
         mini = MiniCrest()
         if not mini.available:
-            return (None, 0)
-        # Frames are built off-thread; the attach client kicks the same coroutine
-        # at mount. Without it the crest draws its static fallback rather than
-        # the animated emblem — correct, and not what the arc was about.
-        try:
-            import asyncio
-            asyncio.ensure_future(mini.ensure_frames())
-        except Exception:  # noqa: BLE001
-            pass
+            # Three elements, like every other exit. A 2-tuple here would raise
+            # ValueError at the caller's unpack on exactly the terminals that
+            # cannot draw an emblem — the ones least able to show the traceback.
+            return (None, 0, None)
 
         def _render() -> str:
             try:
@@ -1537,10 +1567,38 @@ def _demo_header() -> "tuple[Any, int]":
             except Exception:  # noqa: BLE001
                 return ""
 
-        return (_render, max(3, int(getattr(mini, "rows", 3) or 3)))
+        return (_render, max(3, int(getattr(mini, "rows", 3) or 3)), mini)
     except Exception:  # noqa: BLE001
         logger.debug("[OvDemo] crest header unavailable", exc_info=True)
-        return (None, 0)
+        return (None, 0, None)
+
+
+async def _warm_crest(mini: Any) -> None:
+    """Build the emblem's frames, INSIDE a running loop. NEVER raises.
+
+    This was `asyncio.ensure_future(mini.ensure_frames())` at header-construction
+    time, which is before `asyncio.run` — so there was no running loop, the
+    coroutine was created and never scheduled, and Python said so:
+
+        RuntimeWarning: coroutine 'MiniCrest.ensure_frames' was never awaited
+
+    The visible result was a crest stuck on its unbuilt fallback: a partial
+    emblem in the corner, which is exactly what the screenshot showed. `ov.py`
+    gets away with the same call because it makes it from inside an already-async
+    `_bipartite_attach_loop`; copying the line without its context dropped the
+    only thing making it work.
+
+    Awaited rather than fire-and-forget: the frames are what the first painted
+    header draws from, and a task racing the first frame is the difference
+    between an emblem and a placeholder. `MiniCrest` caches, so the cost is paid
+    once per session and the loop is not blocked — `ensure_frames` is a
+    coroutine that hands off while the rings are built.
+    """
+    try:
+        if mini is not None:
+            await mini.ensure_frames()
+    except Exception:  # noqa: BLE001 — a cockpit without an emblem still flies
+        logger.debug("[OvDemo] crest warmup degraded", exc_info=True)
 
 
 #: A defect found by WATCHING this scene — FIXED at the root, kept as the record.
@@ -1654,7 +1712,7 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
 
     mux = BipartiteLayout()
     script = compose_live_script()
-    _header, _header_height = _demo_header()
+    _header, _header_height, _crest = _demo_header()
     app = build_bipartite_application(
         mux,
         # Typed input executes NOTHING — this scene has no organism to act on
@@ -1729,6 +1787,9 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         pass
 
     async def _main() -> None:
+        # The emblem's frames, built now that a loop exists. Scheduling this at
+        # header-construction time created a coroutine nobody awaited.
+        await _warm_crest(_crest)
         start[0] = clock()
         driver = asyncio.ensure_future(
             _drive(mux, app, speed, lambda: start[0], clock, script))
