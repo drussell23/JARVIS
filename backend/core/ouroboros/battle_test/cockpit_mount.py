@@ -312,11 +312,22 @@ def daemon_key_bindings(repl: Any = None) -> Any:
         from backend.core.ouroboros.battle_test.transcript_hatches import (
             install_transcript_hatches,
         )
+        from backend.core.ouroboros.battle_test.transcript_mode import (
+            install_transcript_mode_bindings,
+        )
         send = getattr(repl, "_dispatch_verb", None) or getattr(
             repl, "handle_input", None)
         shim = LocalCockpitClient(send_input=send)
         kb = KeyBindings()
         hatches = install_transcript_hatches(kb, shim, shim)
+        # Ctrl+O and the less-style viewer table. Mounted beside the hatches
+        # because they are two halves of one surface: the hatches are the
+        # keys, this is the state that makes them unambiguous.
+        install_transcript_mode_bindings(
+            kb, notify=lambda out: _daemon_notice(
+                repl, out if isinstance(out, str) else "\n".join(out),
+            ),
+        )
         # Ctrl+X Ctrl+K, through the SAME shim: the chord sends `/stop-all`
         # and `_dispatch_repl_command` does the rest, so the daemon and the
         # attach client reach one authority by one route.

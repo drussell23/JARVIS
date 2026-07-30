@@ -1380,7 +1380,7 @@ class AttachUI:
             )
             keys = ""
             if selection_enabled() and self.fsm is not None:
-                keys = (" · ^O lanes" if self.fsm.mode == MODE_FLOW
+                keys = (" · ^X ^L lanes" if self.fsm.mode == MODE_FLOW
                         else " · esc back")
         except Exception:  # noqa: BLE001
             keys = ""
@@ -2419,12 +2419,31 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
                 description="dismiss the FATAL panic overlay",
             )
 
+        @Condition
+        def _not_in_transcript() -> bool:
+            """`?` means something else inside the transcript viewer.
+
+            CC: "press `?` in the transcript viewer to see available
+            shortcuts THERE" — a different table from the cockpit's. Both
+            bindings' filters pass inside the viewer with an empty prompt, so
+            without this the winner is decided by which was registered last.
+            That happens to be correct today and would silently invert the
+            day someone reorders two mounts.
+            """
+            try:
+                from backend.core.ouroboros.battle_test.transcript_mode import (
+                    is_transcript_mode,
+                )
+                return not is_transcript_mode()
+            except Exception:  # noqa: BLE001
+                return True
+
         def _show_help(event: Any) -> None:
             _render_client_keys(ui, "/keys")
 
         bind_action(
             kb, "app:help", ("?",), _show_help,
-            context="Chat", filter=_empty_buffer,
+            context="Chat", filter=_empty_buffer & _not_in_transcript,
             description="show keyboard shortcuts (empty prompt only)",
         )
 
@@ -2446,14 +2465,31 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
                 install_rewind_binding(kb, rewind)
             except Exception:  # noqa: BLE001
                 pass
-        # The transcript escape hatches: [ v { } while scrolled, Ctrl+L
-        # repaint, Ctrl+O narration toggle — the "see what it is doing /
-        # what it did" cluster.
+        # The transcript escape hatches: [ v { } inside the viewer or while
+        # scrolled, Ctrl+L repaint, Ctrl+X Ctrl+N narration toggle — the
+        # "see what it is doing / what it did" cluster.
         try:
             from backend.core.ouroboros.battle_test.transcript_hatches import (
                 install_transcript_hatches,
             )
             install_transcript_hatches(kb, ui, client)
+        except Exception:  # noqa: BLE001
+            pass
+        # Ctrl+O and the less-style viewer table. The hatches are the keys;
+        # this is the state that makes them unambiguous — and the reason the
+        # whole j/k/g/G/Space table can be bound at all, since at the live
+        # tail every one of those types as itself.
+        try:
+            from backend.core.ouroboros.battle_test.transcript_mode import (
+                install_transcript_mode_bindings,
+            )
+            install_transcript_mode_bindings(
+                kb,
+                notify=lambda out: ui.flash(
+                    out if isinstance(out, str) else "\n".join(out),
+                    seconds=8.0 if not isinstance(out, str) else 2.5,
+                ),
+            )
         except Exception:  # noqa: BLE001
             pass
         # Large pastes collapse to a chip; the full text splices back in
@@ -2620,7 +2656,10 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
             ui.refresh()
 
         bind_action(
-            kb, "deck:open", ("ctrl+o",), _open,
+            # MOVED off Ctrl+O so the transcript viewer can have it, as in
+            # Claude Code. Lanes keep a chord rather than losing a key: this
+            # is the deck's doorway and there is no verb that opens it.
+            kb, "deck:open", ("ctrl+x ctrl+l",), _open,
             context="Deck", filter=can_open,
             description="enter deck selection (empty buffer only)",
         )
