@@ -186,6 +186,50 @@ def voice(text: str) -> str:
         return f"  {text}"
 
 
+
+def _legible_over_band(style: str, banded: bool) -> str:
+    """Make a token style readable ON a background band. NEVER raises.
+
+    `dim` is not a colour. It is SGR 2 — "reduce the intensity of whatever this
+    is" — and Pygments' comment token carries EXACTLY that, with no explicit
+    foreground at all. Over the deck's normal background that reads as secondary
+    text, which is right. Over a diff band it reduces intensity RELATIVE TO THE
+    BAND, so the comment sinks into it: legible in principle, unreadable in
+    practice, which is what the operator saw on the added hunk.
+
+    The fix is not to brighten the band or to pick a colour for comments. It is to
+    stop asking for a relative attribute in a place where the reference point moved.
+    A band invalidates `dim`, so on a band `dim` becomes the palette's `verbose`
+    role — an actual colour. Hierarchy survives as HUE instead of as intensity, the
+    comment stays visibly secondary, and no new colour is invented for it.
+
+    Attribute-wise rather than whole-style: Pygments emits `dim italic` and
+    `bold dim` too, and dropping the whole style to fix one word would take the
+    italic with it.
+
+    Only `dim` is touched. `bold`, `italic` and every concrete colour already have
+    a fixed appearance that a background cannot dilute — rewriting them would be
+    inventing a theme rather than repairing a broken reference.
+    """
+    try:
+        if not banded or not style:
+            return style
+        parts = [p for p in str(style).split() if p]
+        if "dim" not in parts:
+            return style
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        replacement = (role_palette().get("verbose") or "").strip()
+        out = []
+        for part in parts:
+            if part != "dim":
+                out.append(part)
+            elif replacement and replacement != "dim":
+                out.append(replacement)
+        return " ".join(out)
+    except Exception:  # noqa: BLE001
+        return style
+
+
 def _highlight_to_markup(code: str, path: Optional[str], bg: str) -> str:
     """Syntax-highlight ``code`` and return DECK MARKUP. NEVER raises.
 
@@ -243,7 +287,8 @@ def _highlight_to_markup(code: str, path: Optional[str], bg: str) -> str:
             # keyword keeps its foreground while the hunk keeps its band. Order
             # matters: Rich resolves later tokens last, so the background is
             # written first and the syntax colour wins the foreground.
-            combined = f"{bg} {style}".strip() if bg else style
+            combined = f"{bg} {_legible_over_band(style, bool(bg))}".strip() \
+                if bg else style
             if combined and combined != "none":
                 out.append(f"[{combined}]{_escape(piece)}[/{combined}]")
             else:
