@@ -213,6 +213,22 @@ def _canvas_max_lines() -> int:
         return _DEFAULT_MAX_LINES
 
 
+def _terminal_size() -> "tuple":
+    """``(columns, lines)`` from the live terminal. NEVER raises.
+
+    The fallback is only for a genuinely sizeless stdout (a pipe, a CI
+    runner). It is deliberately NOT the old 100x24 default: a value that
+    silently stands in for a real measurement is how a hardcoded 24 survived
+    long enough to clip the deck.
+    """
+    try:
+        import shutil
+        sz = shutil.get_terminal_size(fallback=(100, 24))
+        return (int(sz.columns), int(sz.lines))
+    except Exception:  # noqa: BLE001
+        return (100, 24)
+
+
 class BipartiteLayout:
     """The TUI multiplexer: a bounded Zone-1 telemetry ring + Rich composition of
     the two zones + resize recompute. Pure/headless-testable — the live
@@ -224,8 +240,8 @@ class BipartiteLayout:
         *,
         registry: Any = None,
         max_lines: Optional[int] = None,
-        width: int = 100,
-        height: int = 24,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
         invalidate: Optional[Callable[[], None]] = None,
         title: str = "◇ O+V · proactive canvas",
     ) -> None:
@@ -240,8 +256,20 @@ class BipartiteLayout:
         )
         self._viewport = CanvasViewport()
         self._registry = registry
-        self._width = max(10, int(width))
-        self._height = max(3, int(height))
+        # Seeded from the LIVE terminal, not from a constant. `height=24`
+        # was a hardcoded dimension every caller that omitted it inherited
+        # forever: `_line_budget` deducts chrome from `self._height`, so a
+        # frozen 24 clipped the deck identically at LINES=30 and LINES=120,
+        # and `scroll_metrics` handed the scroll keys that same stale budget
+        # — the deck could neither show its tail nor be scrolled to it.
+        #
+        # SIGWINCH keeps it true afterwards (see `handle_sigwinch`, wired at
+        # application build). Seeding matters independently: SIGWINCH fires
+        # on CHANGE, so a cockpit booted into an 80x50 terminal that is never
+        # resized would otherwise run its whole life believing it had 24 rows.
+        seed_w, seed_h = _terminal_size()
+        self._width = max(10, int(seed_w if width is None else width))
+        self._height = max(3, int(seed_h if height is None else height))
         self._invalidate = invalidate
         self._title = title
         self._resize_count = 0
@@ -957,6 +985,20 @@ def build_bipartite_application(
         pass
     # Scrollback keys. In the alternate screen the terminal no longer offers
     # its own, so these ARE the scrollback — not a convenience layered on it.
+    # SIGWINCH → the layout. `handle_sigwinch` existed, read the live
+    # terminal, and had NO CALLER: a resize never reached `_line_budget`, so
+    # the deck kept clipping to whatever height the constructor was given.
+    # Registered here rather than in each caller so every surface that builds
+    # this Application inherits it — the demo and the daemon cockpit alike.
+    #
+    # Best-effort by design: signal handlers may only be installed on the
+    # main thread, and a cockpit hosted on a worker must still render. It
+    # degrades to the constructor seed, which is now the live size anyway.
+    try:
+        import signal as _signal
+        _signal.signal(_signal.SIGWINCH, mux.handle_sigwinch)
+    except (ValueError, OSError, AttributeError):
+        pass
     try:
         install_scroll_bindings(
             kb, mux._viewport, mux.scroll_metrics, mux._invalidate_now,
