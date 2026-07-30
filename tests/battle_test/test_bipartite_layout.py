@@ -143,3 +143,61 @@ async def test_active_canvas_sink_redirect():
     finally:
         set_active_canvas(None)
         assert get_active_canvas() is None
+
+
+# ---------------------------------------------------------------------------
+# Ctrl+Z — a habit the alternate screen took away
+# ---------------------------------------------------------------------------
+
+
+class TestSuspend:
+    """A normal terminal turns Ctrl+Z into SIGTSTP itself. A full-screen app
+    holds the terminal in raw mode, so the keystroke arrives as an ordinary
+    key and the shell never sees it — the operator's habit silently stopped
+    working the day this cockpit went full-screen.
+    """
+
+    def _app(self):
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout, build_bipartite_application,
+        )
+        mux = BipartiteLayout(width=100, height=30)
+        return build_bipartite_application(mux, on_accept=lambda _t: None)
+
+    def test_ctrl_z_is_bound_on_the_cockpit(self):
+        app = self._app()
+        sequences = [
+            tuple(str(k) for k in b.keys) for b in app.key_bindings.bindings
+        ]
+        assert ("Keys.ControlZ",) in sequences
+
+    def test_it_is_remappable(self):
+        from backend.core.ouroboros.battle_test.keymap import action_catalog
+
+        self._app()
+        assert any(s.action == "app:suspend" for s in action_catalog())
+
+    def test_it_delegates_terminal_restoration(self):
+        """`suspend_to_background` leaves the alternate screen, restores
+        cooked mode, raises SIGTSTP and repaints on SIGCONT. Hand-rolling
+        that means owning terminal state across a signal, and getting it
+        wrong strands the operator at a shell with no echo."""
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            build_bipartite_application,
+        )
+        tree = ast.parse(
+            inspect.getsource(build_bipartite_application).lstrip(),
+        )
+        attrs = {
+            node.func.attr for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+        assert "suspend_to_background" in attrs
+        assert not (attrs & {"raise_signal", "kill", "killpg"}), (
+            "the cockpit reached for a raw signal instead of prompt_toolkit's "
+            "own suspend, which owns the terminal state"
+        )

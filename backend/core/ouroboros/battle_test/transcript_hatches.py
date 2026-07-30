@@ -570,7 +570,15 @@ def install_transcript_hatches(kb: Any, ui: Any, client: Any) -> bool:
 
         from backend.core.ouroboros.battle_test.keymap import bind_action
 
-        scrolled = Condition(is_scrolled_back)
+        # The viewer, OR a scrolled-back canvas. Widened rather than
+        # replaced: scrolled-back was the ONLY way these keys ever became
+        # live, and an operator with that habit must not lose it because a
+        # mode arrived. `transcript_surface_active` is the one predicate both
+        # states resolve through, so the two cannot drift.
+        from backend.core.ouroboros.battle_test.transcript_mode import (
+            transcript_surface_active,
+        )
+        scrolled = Condition(transcript_surface_active)
         bound = 0
 
         bound += bind_action(
@@ -617,7 +625,13 @@ def install_transcript_hatches(kb: Any, ui: Any, client: Any) -> bool:
                 pass
 
         bound += bind_action(
-            kb, "narrate:toggle", ("ctrl+o",), _toggle_narrate,
+            # MOVED off Ctrl+O, which Claude Code owns for the transcript
+            # viewer. Three actions claimed that one key here — this, the
+            # deck's `lanes`, and the legacy TUI's expand — which is one more
+            # than a key can serve. Narration loses the least by moving: it
+            # is the only one of the three with a typed verb (`/narrate`)
+            # that does exactly the same thing.
+            kb, "narrate:toggle", ("ctrl+x ctrl+n",), _toggle_narrate,
             context="Global",
             description="toggle live narration normal ↔ verbose (/narrate)",
         )

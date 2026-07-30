@@ -106,6 +106,8 @@ CLIENT_VERB_HELP = {
     "ptt stop": "close the push-to-talk hold",
     "force-wake": "seize the mic from another terminal",
     "deck": "deck height — off | compact | full",
+    "tasks": "show/hide the running-subagent roster",
+    "keys": "the bindings this terminal answers to",
     "detach": "leave; the organism keeps running",
 }
 
@@ -118,7 +120,11 @@ def client_verbs() -> "dict":
     switches on) and the local-only verbs are listed once here."""
     out = {v: CLIENT_VERB_HELP.get(v, f"audio: {AUDIO_VERBS[v]}")
            for v in AUDIO_VERBS}
-    for v in ("deck", "detach"):
+    # `keys` and `tasks` were routed in `_route_operator_line` but missing
+    # here, so neither appeared in the `/` palette — routed and unreachable
+    # unless you already knew the word. A verb the operator cannot discover
+    # is a verb that does not exist.
+    for v in ("deck", "tasks", "keys", "detach"):
         out[v] = CLIENT_VERB_HELP.get(v, "")
     return out
 
@@ -771,6 +777,58 @@ class AttachUI:
         self._invalidate()
         return f"deck: {mode}"
 
+    def set_task_view(self, mode: str) -> str:
+        """``/tasks [on|off]`` — show or hide the running-subagent roster.
+
+        The same client concern `/deck` is, and for a sharper reason: the
+        roster mounts BELOW the caret, so every row it takes is a row between
+        the operator's cursor and the bottom of their screen. Three workers
+        and a sentinel cost five of them on an idle session.
+
+        Claude Code separates these two surfaces explicitly — the `Ctrl+T`
+        checklist is ambient, and "to see running shells and subagents, use
+        `/tasks`". This is that verb: the roster is data the daemon streams
+        continuously and the operator asks to LOOK at, not a permanent
+        fixture under the prompt.
+
+        A bare `/tasks` toggles, because that is what an operator reaching for
+        it wants nine times in ten. Explicit `on`/`off` exists so a keybinding
+        or a script can be idempotent."""
+        from backend.core.ouroboros.battle_test.agent_roster import (
+            roster_visible, set_roster_visible, toggle_roster,
+        )
+        mode = str(mode or "").strip().lower()
+        if mode in ("on", "show"):
+            shown = set_roster_visible(True)
+        elif mode in ("off", "hide"):
+            shown = set_roster_visible(False)
+        elif mode:
+            state = "shown" if roster_visible() else "hidden"
+            return f"tasks: {state} (on | off)"
+        else:
+            shown = toggle_roster()
+        self._invalidate()
+        if not shown:
+            return "tasks: hidden"
+        # The COUNT, not just the state. "shown" on an empty roster looks
+        # identical to a verb that did nothing, and Claude Code hit the same
+        # edge: "when Claude hasn't created any checklist items yet, the
+        # toggle has no visible effect because there's nothing to display."
+        # Saying how many there are is what distinguishes the two.
+        return f"tasks: shown · {self._agent_count()} running"
+
+    def _agent_count(self) -> int:
+        """Running agents in the daemon's last snapshot. NEVER raises."""
+        try:
+            rows = (self._agents or {}).get("rows") or ()
+            return sum(
+                1 for r in rows
+                if isinstance(r, dict)
+                and str(r.get("state") or "running") == "running"
+            )
+        except Exception:  # noqa: BLE001
+            return 0
+
     def refresh(self) -> None:
         """Repaint after a mode change. Alias of the invalidate seam so key
         handlers read as intent rather than mechanism."""
@@ -992,18 +1050,25 @@ class AttachUI:
         that composed the snapshot does not. Passing it means the goal column
         is clipped to the screen the operator is actually looking at.
 
+        **Rows are asked for, not assumed.** The roster mounts BELOW the
+        caret, so each of its rows sits between the operator's cursor and the
+        bottom of the screen — and Claude Code puts nothing standing there
+        ("the input box stays fixed at the bottom of the screen"), keeping the
+        running-subagent view behind `/tasks`. Hidden by default here for the
+        same reason: three workers and a sentinel cost five rows under the
+        cursor of an idle session. The daemon keeps streaming the snapshot
+        while it is hidden, so `/tasks` answers from live data immediately.
+
         NEVER raises — an unrenderable roster costs its rows, not the cockpit.
         """
         try:
-            import time as _time
             from backend.core.ouroboros.battle_test.agent_roster import (
-                render_roster, roster_line_budget,
+                render_roster, roster_line_budget, roster_visible,
             )
-            from backend.core.ouroboros.battle_test.attach_heartbeat import (
-                heartbeat_stale_after_s,
-            )
-            age = max(0.0, _time.monotonic() - float(self._heartbeat_arrived))
-            if not self._heartbeat_arrived or age > heartbeat_stale_after_s():
+            if not roster_visible():
+                return []
+            age = self._heartbeat_age()
+            if age is None:
                 return []
             size = self._terminal_size()
             return render_roster(
@@ -1024,15 +1089,10 @@ class AttachUI:
         NEVER raises: a status line is chrome.
         """
         try:
-            import time as _time
-            from backend.core.ouroboros.battle_test.attach_heartbeat import (
-                heartbeat_stale_after_s,
-            )
             from backend.core.ouroboros.battle_test.status_line import (
                 payload_to_snapshot, render_snapshot,
             )
-            age = max(0.0, _time.monotonic() - float(self._heartbeat_arrived))
-            if not self._heartbeat_arrived or age > heartbeat_stale_after_s():
+            if self._heartbeat_age() is None:
                 return []
             snap = payload_to_snapshot(self._status)
             if snap is None:
@@ -1042,6 +1102,157 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return []
 
+    def _heartbeat_age(self) -> Optional[float]:
+        """Seconds since the daemon's last frame, or None when contact is lost.
+
+        ONE definition of "lost contact", which is what three separate
+        docstrings on this class were already asking for in prose — the
+        roster's ("the roster expires on the SAME window the pulse uses — one
+        clock, one definition"), the status line's ("rather than three that
+        drift apart and leave a dead daemon's phase showing under an idle
+        pulse") and the countdown's. All three then implemented it inline, and
+        the serpent border was about to make it four.
+
+        The failure that discipline prevents is specific and reads as normal
+        operation: if the daemon dies mid-dispatch, the last frame this
+        process holds says three agents are running, phase is GENERATE and the
+        border should be moving — and it will say that forever. Every surface
+        fed by this heartbeat has to retire on the same clock or the cockpit
+        shows a confident, coherent, wrong picture of a dead organism.
+
+        Returns the AGE rather than a bool because callers need it: running
+        agents advance by it so seconds tick smoothly between 1 Hz frames, and
+        the apply countdown subtracts it. A bool would force every caller to
+        recompute the number the predicate already had.
+
+        NEVER raises — a surface that cannot ask degrades to "lost", which is
+        the safe direction: it stops drawing rather than inventing them.
+        """
+        try:
+            import time as _time
+            from backend.core.ouroboros.battle_test.attach_heartbeat import (
+                heartbeat_stale_after_s,
+            )
+            arrived = float(self._heartbeat_arrived or 0.0)
+            if not arrived:
+                return None
+            age = max(0.0, _time.monotonic() - arrived)
+            return None if age > heartbeat_stale_after_s() else age
+        except Exception:  # noqa: BLE001
+            return None
+
+    def diff_controller(self, client: Any = None) -> Any:
+        """This cockpit's diff overlay, backed by the daemon's archive.
+
+        NOT a second overlay. `DiffOverlayController` takes its archive as a
+        constructor argument — it was built transport-agnostic and nobody had
+        used that — so the client gets the same renderer, the same epoch
+        guard, the same `Escape` arbitration and the same off-thread Pygments
+        pass that keeps the loop unstalled. A regression in the daemon's diff
+        surfaces here too, instead of in a parallel drawing that agrees with
+        itself.
+
+        Built lazily and once: the controller that the `/expand d-N` verb
+        OPENS and the `diff_rows` hook that DRAWS must be the same object, or
+        the verb fills a surface nothing renders.
+        """
+        existing = getattr(self, "_diff_controller", None)
+        if existing is not None:
+            return existing
+        try:
+            from backend.core.ouroboros.battle_test.diff_bridge import (
+                RemoteDiffArchive,
+            )
+            from backend.core.ouroboros.battle_test.diff_overlay import (
+                DiffOverlayController,
+            )
+
+            def _request(ref: str) -> None:
+                # Issued from a RENDER path, so it must never block. The verb
+                # travels on the ordinary input lane and the answer comes back
+                # addressed on the telemetry lane.
+                try:
+                    if client is not None:
+                        client.send_input(f"/diff-fetch {ref}")
+                except Exception:  # noqa: BLE001
+                    pass
+
+            archive = RemoteDiffArchive(request=_request)
+            controller = DiffOverlayController(
+                archive=archive,
+                invalidate=self._invalidate,
+                width_fn=lambda: self._terminal_size()[0] or 100,
+            )
+            self._diff_archive = archive
+            self._diff_controller = controller
+            try:
+                controller.register()
+            except Exception:  # noqa: BLE001
+                pass
+            return controller
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _ingest_diff_catalog(self, rows: Any) -> None:
+        """Absorb the heartbeat's diff catalog. NEVER raises."""
+        try:
+            archive = getattr(self, "_diff_archive", None)
+            if archive is not None:
+                archive.ingest_catalog(rows)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ingest_diff_payload(self, frame: Any) -> None:
+        """Absorb a fetched diff and re-render if it is the one on screen.
+
+        Re-OPENING is what turns a late arrival into a repaint: the
+        controller's epoch guard already makes a stale render harmless, so
+        asking it to open the same ref again is the whole mechanism — no
+        second code path for "the body finally landed". NEVER raises.
+        """
+        try:
+            archive = getattr(self, "_diff_archive", None)
+            controller = getattr(self, "_diff_controller", None)
+            if archive is None:
+                return
+            ref = archive.ingest_payload(frame)
+            if not ref or controller is None:
+                return
+            # Only if THIS ref is the one the operator is looking at. A fetch
+            # that lands after they moved on must not yank the overlay back.
+            if controller.is_active() and getattr(
+                    controller, "_ref", None) == ref:
+                controller.open(ref)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _serpent_active(self) -> bool:
+        """Is the organism THINKING right now, as far as THIS terminal knows?
+
+        Drives the serpent hairline that frames the caret. The daemon answers
+        this from `build_heartbeat_payload` in-process; an attach client has
+        no organism to ask, so it reads the `active` flag off the last frame
+        that crossed the bridge. Same question, same field, two sources —
+        which is the property that keeps the border, the toolbar verb and the
+        token counter from disagreeing about whether work is happening.
+
+        `capability_handoff` measured this hook UNSET on `ov`, so the
+        animation ran in `ov demo live` and on the daemon's own terminal and
+        was dead on the surface an operator actually attaches with. The border
+        simply never moved, which is indistinguishable from an organism that
+        is never busy.
+
+        Staleness retires it, and that is the load-bearing half: a border that
+        keeps animating after the daemon dies is the cockpit asserting work is
+        in flight when nothing is running at all.
+        """
+        try:
+            if self._heartbeat_age() is None:
+                return False
+            return bool((self._heartbeat or {}).get("active"))
+        except Exception:  # noqa: BLE001
+            return False
+
     def _pending_apply_rows(self) -> List[str]:
         """The rejection window, counting down. NEVER raises.
 
@@ -1050,13 +1261,9 @@ class AttachUI:
         toward an apply that will never happen.
         """
         try:
-            import time as _time
-            from backend.core.ouroboros.battle_test.attach_heartbeat import (
-                heartbeat_stale_after_s,
-            )
             from backend.core.ouroboros.battle_test.pending_apply import render
-            age = max(0.0, _time.monotonic() - float(self._heartbeat_arrived))
-            if not self._heartbeat_arrived or age > heartbeat_stale_after_s():
+            age = self._heartbeat_age()
+            if age is None:
                 return []
             return render(self._pending_apply, age_s=age,
                           width=self._terminal_size()[0])
@@ -1311,7 +1518,7 @@ class AttachUI:
             )
             keys = ""
             if selection_enabled() and self.fsm is not None:
-                keys = (" · ^O lanes" if self.fsm.mode == MODE_FLOW
+                keys = (" · ^X ^L lanes" if self.fsm.mode == MODE_FLOW
                         else " · esc back")
         except Exception:  # noqa: BLE001
             keys = ""
@@ -1467,6 +1674,15 @@ class AttachUI:
                 # countdown is: a stale backlog tells them work is
                 # pending that already ran.
                 self._input_queue = frame.get("input_queue") or {}
+                # The diff CATALOG — refs and metadata, no bytes. Replaced
+                # wholesale by the archive itself for the same reason the
+                # countdown is cleared by absence: the archive is a RING, so
+                # a ref that stopped being advertised was evicted, and a
+                # merge would let it live forever in a client that saw it
+                # once. `all_refs()` feeding "no such diff — available: …"
+                # is only honest if this is current.
+                if frame.get(_DIFF_CATALOG_KEY) is not None:
+                    self._ingest_diff_catalog(frame.get(_DIFF_CATALOG_KEY))
             elif isinstance(frame, dict) and frame.get(
                 "kind",
             ) == "stream_inflight":
@@ -1481,6 +1697,10 @@ class AttachUI:
                 import time as _time
                 self._stream_arrived = _time.monotonic()
                 self._push_tail_to_deck()
+            elif isinstance(frame, dict) and frame.get(
+                    "kind") == _DIFF_PAYLOAD_KIND:
+                # The bytes of a diff we asked for, addressed to this cockpit.
+                self._ingest_diff_payload(frame)
             elif isinstance(frame, dict) and frame.get(
                     "kind") == "fatal_panic":
                 # A background task died. STICKY — unlike every other live
@@ -1500,18 +1720,19 @@ class AttachUI:
                 # reads as WORKING rather than stalled — which is the whole
                 # complaint a black box produces.
                 import time as _time
-                if frame.get("done"):
-                    self._stream_inflight = ""
-                else:
-                    _tool = str(frame.get("tool") or "tool")
-                    _el = frame.get("elapsed_s") or 0.0
-                    try:
-                        _head = f"$ {_tool} · {float(_el):.0f}s"
-                    except (TypeError, ValueError):
-                        _head = f"$ {_tool}"
-                    _body = str(frame.get("text") or "")
-                    self._stream_inflight = (
-                        f"{_head}\n{_body}" if _body else _head)
+                # Composed by the SHARED function rather than here. The header
+                # `$ bash · 11s` is what makes a long command read as WORKING
+                # rather than stalled, and the daemon now draws this strip at
+                # its own terminal too — so a second copy of the composition
+                # would be a second opinion about what an in-flight tool tail
+                # looks like, which is the defect the roster and the status
+                # line each already paid for once.
+                from backend.core.ouroboros.battle_test.inflight_registry import (  # noqa: E501
+                    compose_inflight_text,
+                )
+                self._stream_inflight = (
+                    "" if frame.get("done") else compose_inflight_text(frame)
+                )
                 self._stream_is_tool = True
                 self._stream_arrived = _time.monotonic()
                 self._push_tail_to_deck()
@@ -1610,6 +1831,20 @@ def _short_path(path: str) -> str:
     return "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else "")
 
 
+#: The reply frame `RemoteDiffArchive` waits for. Read from the bridge module
+#: rather than spelled again here — a kind string that disagrees between
+#: producer and consumer is a frame silently dropped, which is exactly how
+#: `_VALID_EVENT_TYPES` bit this codebase before.
+try:
+    from backend.core.ouroboros.battle_test.diff_bridge import (
+        CATALOG_KEY as _DIFF_CATALOG_KEY,
+        DIFF_PAYLOAD_KIND as _DIFF_PAYLOAD_KIND,
+    )
+except Exception:  # noqa: BLE001
+    _DIFF_PAYLOAD_KIND = "diff_payload"
+    _DIFF_CATALOG_KEY = "diffs"
+
+
 def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
     """THE one operator-line router — shared by the legacy split-plane loop AND
     the Bipartite cockpit (DRY: verbs behave identically on both surfaces).
@@ -1650,6 +1885,38 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
                 ui.flash(ui.set_deck_size(arg))
             _report_local_history(client, text)
             return "handled"
+
+        # /tasks is a CLIENT concern for the same reason /deck is — it spends
+        # THIS terminal's rows — and routed here rather than relayed for a
+        # second one: the daemon's own `agent_roster` visibility flag governs
+        # the daemon's cockpit, not this one. Forwarding would toggle a
+        # roster nobody attached is looking at. (The two-process trap: a verb
+        # that runs on the wrong side of the socket reports success and
+        # changes nothing the operator can see.)
+        if low in ("/tasks", "tasks") or low.startswith(("/tasks ", "tasks ")):
+            arg = text.split(None, 1)[1].strip() if " " in text else ""
+            if ui is not None and hasattr(ui, "set_task_view"):
+                ui.flash(ui.set_task_view(arg))
+            _report_local_history(client, text)
+            return "handled"
+
+        # `/expand d-N` is a CLIENT concern for a reason the other refs are
+        # not: the diff OVERLAY is drawn on this terminal. Relayed, it opened
+        # the diff on the daemon's own cockpit and mirrored back a line saying
+        # it had opened — the operator was told a diff was on screen and shown
+        # nothing. Only `d-` is intercepted; `t-`/`o-`/`n-` refs keep
+        # round-tripping and mirroring as markup, which already works.
+        if low.startswith(("/expand d-", "expand d-")):
+            arg = text.split(None, 1)[1].strip() if " " in text else ""
+            controller = (ui.diff_controller(client)
+                          if ui is not None and hasattr(ui, "diff_controller")
+                          else None)
+            if controller is not None and controller.open(arg):
+                _report_local_history(client, text)
+                return "handled"
+            # No controller (no prompt_toolkit, degraded mount): fall through
+            # and let the daemon answer in the transcript rather than
+            # swallowing the operator's request.
 
         # /keys is likewise a CLIENT concern when attached: the bindings
         # that govern THIS terminal (deck selection, Esc-interrupt,
@@ -2336,12 +2603,31 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
                 description="dismiss the FATAL panic overlay",
             )
 
+        @Condition
+        def _not_in_transcript() -> bool:
+            """`?` means something else inside the transcript viewer.
+
+            CC: "press `?` in the transcript viewer to see available
+            shortcuts THERE" — a different table from the cockpit's. Both
+            bindings' filters pass inside the viewer with an empty prompt, so
+            without this the winner is decided by which was registered last.
+            That happens to be correct today and would silently invert the
+            day someone reorders two mounts.
+            """
+            try:
+                from backend.core.ouroboros.battle_test.transcript_mode import (
+                    is_transcript_mode,
+                )
+                return not is_transcript_mode()
+            except Exception:  # noqa: BLE001
+                return True
+
         def _show_help(event: Any) -> None:
             _render_client_keys(ui, "/keys")
 
         bind_action(
             kb, "app:help", ("?",), _show_help,
-            context="Chat", filter=_empty_buffer,
+            context="Chat", filter=_empty_buffer & _not_in_transcript,
             description="show keyboard shortcuts (empty prompt only)",
         )
 
@@ -2363,14 +2649,31 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
                 install_rewind_binding(kb, rewind)
             except Exception:  # noqa: BLE001
                 pass
-        # The transcript escape hatches: [ v { } while scrolled, Ctrl+L
-        # repaint, Ctrl+O narration toggle — the "see what it is doing /
-        # what it did" cluster.
+        # The transcript escape hatches: [ v { } inside the viewer or while
+        # scrolled, Ctrl+L repaint, Ctrl+X Ctrl+N narration toggle — the
+        # "see what it is doing / what it did" cluster.
         try:
             from backend.core.ouroboros.battle_test.transcript_hatches import (
                 install_transcript_hatches,
             )
             install_transcript_hatches(kb, ui, client)
+        except Exception:  # noqa: BLE001
+            pass
+        # Ctrl+O and the less-style viewer table. The hatches are the keys;
+        # this is the state that makes them unambiguous — and the reason the
+        # whole j/k/g/G/Space table can be bound at all, since at the live
+        # tail every one of those types as itself.
+        try:
+            from backend.core.ouroboros.battle_test.transcript_mode import (
+                install_transcript_mode_bindings,
+            )
+            install_transcript_mode_bindings(
+                kb,
+                notify=lambda out: ui.flash(
+                    out if isinstance(out, str) else "\n".join(out),
+                    seconds=8.0 if not isinstance(out, str) else 2.5,
+                ),
+            )
         except Exception:  # noqa: BLE001
             pass
         # Large pastes collapse to a chip; the full text splices back in
@@ -2537,7 +2840,10 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
             ui.refresh()
 
         bind_action(
-            kb, "deck:open", ("ctrl+o",), _open,
+            # MOVED off Ctrl+O so the transcript viewer can have it, as in
+            # Claude Code. Lanes keep a chord rather than losing a key: this
+            # is the deck's doorway and there is no verb that opens it.
+            kb, "deck:open", ("ctrl+x ctrl+l",), _open,
             context="Deck", filter=can_open,
             description="enter deck selection (empty buffer only)",
         )
@@ -2614,6 +2920,23 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
             context="Chat", filter=in_flow_working, eager=_not_composing(),
             description="interrupt your own in-flight work (/cancel)",
         )
+
+        # Ctrl+X Ctrl+K — CC's stop-all, the one keyboard control ov lacked
+        # over the L3 subagents it actually runs. Bound through the shared
+        # installer so this surface and the daemon's cannot disagree about
+        # what the chord means; both just send `/stop-all`.
+        try:
+            from backend.core.ouroboros.battle_test.subagent_control import (
+                install_stop_all_binding,
+            )
+            install_stop_all_binding(
+                kb, client,
+                notify=lambda msg: ui.flash(msg, seconds=3.5),
+                running=(ui._agent_count if hasattr(ui, "_agent_count")
+                         else None),
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         def _esc(event: Any) -> None:
             fsm.escape()
@@ -3376,6 +3699,25 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             agent_rows=(
                 ui._agent_lines if ui is not None
                 and hasattr(ui, "_agent_lines") else None
+            ),
+            # The archived-diff overlay, backed by the daemon's archive over
+            # the bridge. Measured UNSET here: the daemon owns the archive, so
+            # this was the surface that could not draw the one thing it exists
+            # to review.
+            diff_rows=(
+                (lambda: ui.diff_controller(client).rows())
+                if ui is not None and hasattr(ui, "diff_controller")
+                else None
+            ),
+            # The serpent runs the hairlines while the organism is THINKING.
+            # Measured UNSET here by `capability_handoff`, which meant the
+            # animation ran in the demo and on the daemon's own terminal and
+            # was dead on the surface an operator actually attaches with — a
+            # border that never moves is indistinguishable from an organism
+            # that is never busy.
+            serpent_active=(
+                ui._serpent_active if ui is not None
+                and hasattr(ui, "_serpent_active") else None
             ),
             # The `/` search bar. Read from the hatches module rather than
             # held here: the search session belongs to the transcript key

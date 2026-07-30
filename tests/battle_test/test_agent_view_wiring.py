@@ -26,6 +26,10 @@ from backend.core.ouroboros.battle_test.agent_roster import (
     AgentRoster,
     render_roster,
     reset_roster_for_tests,
+    reset_roster_visibility_for_tests,
+    roster_visible,
+    set_roster_visible,
+    toggle_roster,
 )
 
 
@@ -40,8 +44,30 @@ class _Clock:
 @pytest.fixture(autouse=True)
 def _isolated():
     reset_roster_for_tests()
+    reset_roster_visibility_for_tests()
     yield
     reset_roster_for_tests()
+    reset_roster_visibility_for_tests()
+
+
+@pytest.fixture
+def shown():
+    """The roster VISIBLE, for the tests that are about what it draws.
+
+    Visibility is off by default in production — the roster mounts below the
+    caret and is asked for with `/tasks`. The tests below are about staleness,
+    elapsed time, width and folding, none of which is a question about the
+    mode, so they opt in explicitly rather than inherit it.
+
+    Explicit rather than autouse, and that distinction is load-bearing: an
+    autouse fixture would have quietly kept
+    `test_a_frame_without_agents_does_not_clear_the_roster` passing on
+    `[] == []` when the gate turned it off, which is the shape of a test that
+    guards nothing while reporting green.
+    """
+    set_roster_visible(True)
+    yield
+    reset_roster_visibility_for_tests()
 
 
 @pytest.fixture
@@ -117,7 +143,7 @@ class TestCrossesTheProcessBoundary:
 
 
 class TestStaleness:
-    def test_a_stale_frame_retires_the_roster(self, busy, monkeypatch):
+    def test_a_stale_frame_retires_the_roster(self, busy, shown, monkeypatch):
         """If the daemon dies mid-dispatch, the last frame says three agents
         are running and will say so forever. The roster expires on the SAME
         window as the pulse — one definition of "lost contact", not two that
@@ -137,7 +163,7 @@ class TestStaleness:
         ui._heartbeat_arrived = time.monotonic() - 10_000
         assert ui._agent_lines() == []
 
-    def test_a_frame_without_agents_does_not_clear_the_roster(self, busy):
+    def test_a_frame_without_agents_does_not_clear_the_roster(self, busy, shown):
         """An older daemon that has never heard of `agents` is not a daemon
         reporting an empty roster. Clearing on absence would blank the view
         against a peer that simply predates the field."""
@@ -151,7 +177,7 @@ class TestStaleness:
         ui.on_telemetry({"kind": "heartbeat", "active": True})   # no key
         assert ui._agent_lines() == before
 
-    def test_an_explicit_empty_snapshot_does_clear_it(self, busy):
+    def test_an_explicit_empty_snapshot_does_clear_it(self, busy, shown):
         """That daemon IS saying "nothing is running", which is news."""
         from backend.core.ouroboros.cli.ov import AttachUI
 
@@ -461,3 +487,251 @@ class TestHeightBudget:
             drawn = sum(1 for ln in lines if "Chunk" in ln)
             more = [ln for ln in lines if "more" in ln]
             assert more and str(40 - drawn) in more[0]
+
+
+# ---------------------------------------------------------------------------
+# Rows below the caret are ASKED FOR
+# ---------------------------------------------------------------------------
+
+
+class TestVisibility:
+    """The roster mounts BELOW the input, so every row it takes sits between
+    the operator's cursor and the bottom of their screen.
+
+    Claude Code puts nothing standing there — "the input box stays fixed at
+    the bottom of the screen" — and keeps the running-subagent view behind a
+    verb, stating the separation outright: the Ctrl+T checklist "is separate
+    from the background-task view. To see running shells and subagents, use
+    `/tasks` instead."
+
+    This cockpit had it mounted permanently, so three workers and a sentinel
+    cost five rows under the caret of an IDLE session.
+    """
+
+    def test_hidden_by_default(self):
+        assert roster_visible() is False
+
+    def test_the_env_seeds_the_session_and_the_verb_owns_it(self, monkeypatch):
+        """Lazy resolution, not import-time: the flag is read from a render
+        path, and a harness that imports this module before configuring its
+        environment would otherwise be pinned to a value it never chose."""
+        monkeypatch.setenv("JARVIS_AGENT_VIEW_ROSTER_VISIBLE", "1")
+        reset_roster_visibility_for_tests()
+        assert roster_visible() is True
+        assert set_roster_visible(False) is False
+        assert roster_visible() is False, "the verb must outrank the seed"
+
+    def test_toggle_round_trips(self):
+        assert toggle_roster() is True
+        assert toggle_roster() is False
+
+    def test_a_hidden_roster_costs_zero_rows_on_the_daemon_cockpit(self, busy):
+        from backend.core.ouroboros.battle_test import serpent_flow
+
+        assert serpent_flow._local_agent_rows() == []
+        set_roster_visible(True)
+        # Whether THIS process has agents is beside the point; what must be
+        # true is that the provider stops short of the renderer when hidden
+        # and reaches it when shown.
+        assert isinstance(serpent_flow._local_agent_rows(), list)
+
+    def test_a_hidden_roster_costs_zero_rows_on_the_attach_client(self, busy):
+        from backend.core.ouroboros.cli.ov import AttachUI
+
+        roster, _clock = busy
+        ui = AttachUI()
+        ui.on_telemetry({"kind": "heartbeat", "active": True,
+                         "agents": roster.snapshot()})
+        assert ui._agent_lines() == []
+        set_roster_visible(True)
+        assert ui._agent_lines(), "shown, the same frame must draw"
+
+    def test_the_renderer_holds_no_opinion_about_visibility(self, busy):
+        """The gate belongs to the PROVIDERS.
+
+        Putting it in `render_roster` made every caller that wanted the
+        picture — `/tasks` included — opt out of a mode question it had not
+        asked, and broke seventeen tests that were only ever about folding,
+        width and glyphs.
+        """
+        roster, _clock = busy
+        assert roster_visible() is False
+        assert render_roster(roster.snapshot(), width=100), (
+            "the renderer draws what it is given; the surface decides "
+            "whether to ask"
+        )
+
+    def test_every_provider_is_gated(self):
+        """A PRODUCER-side audit, not a consumer-side one.
+
+        Two of three providers gated is the shape of defect this repo keeps
+        finding late: the surface an operator does not happen to open that
+        week keeps drawing rows the others have stopped drawing, and nothing
+        fails. So the assertion is over the SET of providers, and a fourth
+        one added tomorrow lands in this list or fails here.
+        """
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.battle_test import serpent_flow
+        from backend.core.ouroboros.cli import ov
+
+        providers = (
+            serpent_flow._local_agent_rows,
+            ov.AttachUI._agent_lines,
+        )
+        for fn in providers:
+            tree = ast.parse(inspect.getsource(fn).lstrip())
+            called = {
+                node.func.id for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+            }
+            assert "roster_visible" in called, (
+                f"{fn.__qualname__} draws roster rows without consulting "
+                "roster_visible — it will keep spending rows below the caret "
+                "after /tasks hides them everywhere else"
+            )
+
+    def test_the_demo_opts_in_explicitly(self):
+        """The demo exists to SHOW the surfaces, so it turns the roster on —
+        and has to say so in code rather than inherit a default, or it would
+        silently keep rendering a roster the cockpit had stopped drawing."""
+        from backend.core.ouroboros.cli import ov_demo
+
+        assert roster_visible() is False
+        ov_demo._agent_view_rows()
+        assert roster_visible() is True
+
+
+# ---------------------------------------------------------------------------
+# One clock for every surface the heartbeat feeds
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatStaleness:
+    """Three docstrings on `AttachUI` already asked for this in prose — the
+    roster's ("one clock, one definition of 'lost contact'"), the status
+    line's ("rather than three that drift apart and leave a dead daemon's
+    phase showing under an idle pulse") and the countdown's. All three then
+    implemented the rule inline, and the serpent border was about to make a
+    fourth copy.
+
+    The failure it prevents reads as normal operation: a daemon that dies
+    mid-dispatch leaves a last frame saying three agents are running, phase
+    GENERATE, border moving — forever.
+    """
+
+    def _fresh(self, busy):
+        from backend.core.ouroboros.cli.ov import AttachUI
+
+        roster, _clock = busy
+        ui = AttachUI()
+        ui.on_telemetry({"kind": "heartbeat", "active": True,
+                         "agents": roster.snapshot()})
+        return ui
+
+    def test_no_heartbeat_is_not_a_zero_age(self, busy):
+        """A process that has never heard from the daemon has NOT just heard
+        from it. `_heartbeat_arrived == 0.0` compared against a monotonic
+        clock would read as an enormous age on some platforms and as fresh on
+        others — so absence is None, explicitly."""
+        from backend.core.ouroboros.cli.ov import AttachUI
+
+        assert AttachUI()._heartbeat_age() is None
+
+    def test_a_fresh_frame_yields_an_age(self, busy):
+        age = self._fresh(busy)._heartbeat_age()
+        assert age is not None and age >= 0.0
+
+    def test_every_surface_retires_on_the_same_clock(self, busy, shown):
+        """THE property. Not "each one expires eventually" — the SAME
+        instant, or the cockpit shows a coherent, confident, wrong picture of
+        a dead organism."""
+        import time
+
+        ui = self._fresh(busy)
+        assert ui._agent_lines()
+        assert ui._serpent_active() is True
+
+        ui._heartbeat_arrived = time.monotonic() - 10_000
+        assert ui._heartbeat_age() is None
+        assert ui._agent_lines() == []
+        assert ui._status_rows() == []
+        assert ui._pending_apply_rows() == []
+        assert ui._serpent_active() is False
+
+    def test_the_rule_is_declared_once(self):
+        """Not a style point. Four copies of a staleness window drift, and
+        the drift is invisible until a daemon dies."""
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.cli import ov
+
+        callers = 0
+        for name in ("_agent_lines", "_status_rows", "_pending_apply_rows",
+                     "_serpent_active"):
+            src = inspect.getsource(getattr(ov.AttachUI, name)).lstrip()
+            tree = ast.parse(src)
+            names = {
+                n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+            }
+            assert "_heartbeat_age" in names, (
+                f"{name} does not consult the shared predicate"
+            )
+            assert "heartbeat_stale_after_s" not in inspect.getsource(
+                getattr(ov.AttachUI, name)), (
+                f"{name} re-implements the staleness window inline"
+            )
+            callers += 1
+        assert callers == 4
+
+
+class TestSerpentActive:
+    """`capability_handoff` measured this hook UNSET on `ov`: the animation
+    ran in the demo and on the daemon's own terminal, and was dead on the
+    surface an operator attaches with. A border that never moves is
+    indistinguishable from an organism that is never busy."""
+
+    def _ui(self, active, agents=None):
+        from backend.core.ouroboros.cli.ov import AttachUI
+
+        ui = AttachUI()
+        ui.on_telemetry({"kind": "heartbeat", "active": active})
+        return ui
+
+    def test_it_follows_the_daemons_own_flag(self):
+        assert self._ui(True)._serpent_active() is True
+        assert self._ui(False)._serpent_active() is False
+
+    def test_a_dead_daemon_stops_the_border(self):
+        """The load-bearing half: a border still animating after the daemon
+        dies is the cockpit asserting work is in flight when nothing runs."""
+        import time
+
+        ui = self._ui(True)
+        ui._heartbeat_arrived = time.monotonic() - 10_000
+        assert ui._serpent_active() is False
+
+    def test_a_frame_without_the_field_is_not_active(self):
+        """An older daemon that predates `active` must not animate forever."""
+        from backend.core.ouroboros.cli.ov import AttachUI
+
+        ui = AttachUI()
+        ui.on_telemetry({"kind": "heartbeat"})
+        assert ui._serpent_active() is False
+
+    def test_the_hook_is_actually_handed_to_the_cockpit(self):
+        """The defect class this whole audit exists for: a provider that
+        exists, works, and is never passed."""
+        import ast
+        import inspect
+
+        from backend.core.ouroboros.cli import ov
+
+        tree = ast.parse(inspect.getsource(ov))
+        assert any(
+            isinstance(node, ast.keyword) and node.arg == "serpent_active"
+            for node in ast.walk(tree)
+        ), "ov builds the cockpit without handing it serpent_active"

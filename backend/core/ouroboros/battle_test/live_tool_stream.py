@@ -293,6 +293,24 @@ class LiveToolStream:
         self._send(payload)
 
     def _send(self, payload: dict) -> None:
+        # THE seam, and deliberately here rather than at the construction
+        # site. `cockpit_mount` recorded the correct fix as "a
+        # `set_active_stream` registry ... which needs a producer-side audit
+        # of every stream construction site" — but construction sites can
+        # multiply, and a producer that forgets to register is silently dark.
+        # Every frame a stream ever emits passes through this one method
+        # regardless of how the stream was made, so recording here cannot be
+        # forgotten by a future caller.
+        #
+        # Before the `self._publish` branch, so an injected publisher (the
+        # demo, the tests) records identically to the real bridge.
+        try:
+            from backend.core.ouroboros.battle_test.inflight_registry import (
+                note_inflight_frame,
+            )
+            note_inflight_frame(payload)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             if self._publish is not None:
                 self._publish(payload)

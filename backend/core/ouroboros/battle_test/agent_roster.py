@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -80,6 +81,7 @@ logger = logging.getLogger("Ouroboros.AgentRoster")
 __all__ = [
     "ROSTER_SCHEMA_VERSION", "AgentEntry", "AgentRoster", "agent_view_enabled",
     "format_duration", "render_roster", "roster_hint",
+    "roster_visible", "set_roster_visible", "toggle_roster",
 ]
 
 #: Additive schema. A reader that does not know a field ignores it; a reader
@@ -110,6 +112,67 @@ def agent_view_enabled() -> bool:
     return os.environ.get(
         "JARVIS_AGENT_VIEW_ENABLED", "1",
     ).strip().lower() not in ("0", "false", "no", "off")
+
+
+#: Whether the roster OCCUPIES ROWS, as distinct from whether it EXISTS.
+#:
+#: Claude Code draws exactly this distinction and states it in its own docs:
+#: the `Ctrl+T` checklist "is separate from the background-task view. To see
+#: running shells and subagents, use `/tasks` instead." The checklist is
+#: ambient; the running-subagent view is asked for. Under fullscreen "the
+#: input box stays fixed at the bottom of the screen" — nothing standing sits
+#: beneath the caret.
+#:
+#: This cockpit had the roster mounted permanently below the prompt, so three
+#: workers and a sentinel cost five rows under the caret on an IDLE session,
+#: forever. `agent_view_enabled` could not fix that: it is the KILL SWITCH,
+#: and turning the feature off to reclaim the rows also throws away the
+#: snapshot, the bridge and `/tasks` itself. Visibility is the separate,
+#: cheaper question — the data keeps flowing either way.
+#:
+#: Process-local by design. Two cockpits attached to one daemon are two
+#: operators with two screens and two opinions about what is worth five rows;
+#: a shared flag would let one of them redraw the other's terminal.
+_VISIBLE: Optional[bool] = None
+_VISIBLE_LOCK = threading.Lock()
+
+
+def roster_visible() -> bool:
+    """Whether the roster may draw right now. NEVER raises.
+
+    Resolved from ``JARVIS_AGENT_VIEW_ROSTER_VISIBLE`` on first read (default
+    OFF) and thereafter from whatever `/tasks` last set, so the env var seeds
+    the session and the verb owns it. Lazy rather than at import: the flag is
+    read from a render path, and an import-time snapshot would miss an env
+    change made by a harness that imports this module before it configures.
+    """
+    global _VISIBLE
+    with _VISIBLE_LOCK:
+        if _VISIBLE is None:
+            _VISIBLE = os.environ.get(
+                "JARVIS_AGENT_VIEW_ROSTER_VISIBLE", "0",
+            ).strip().lower() in ("1", "true", "yes", "on")
+        return bool(_VISIBLE)
+
+
+def set_roster_visible(value: object) -> bool:
+    """Show or hide the roster; returns the new state. NEVER raises."""
+    global _VISIBLE
+    with _VISIBLE_LOCK:
+        _VISIBLE = bool(value)
+        return _VISIBLE
+
+
+def toggle_roster() -> bool:
+    """Flip visibility; returns the new state. NEVER raises."""
+    return set_roster_visible(not roster_visible())
+
+
+def reset_roster_visibility_for_tests() -> None:
+    """Drop back to the unresolved state so the next read re-reads the env."""
+    global _VISIBLE
+    with _VISIBLE_LOCK:
+        _VISIBLE = None
 
 
 def _stale_after_s() -> float:
@@ -735,6 +798,14 @@ def render_roster(
     beyond the budget are folded into the "… N more" count rather than
     silently dropped, because a roster that quietly shows six of forty is
     worse than one that says so.
+
+    This function does NOT consult :func:`roster_visible`, and that is a
+    decision rather than an omission. Visibility is a question about a
+    SURFACE — does this cockpit spend rows on the roster right now — and this
+    is the renderer, which answers "what does a roster look like". Gating
+    here made every caller that wanted the picture opt out of a mode question
+    it had not asked, `/tasks` included; the providers own the mode. See
+    :func:`roster_visible` for where the gate actually lives.
     """
     try:
         if not agent_view_enabled() or not isinstance(snapshot, dict):

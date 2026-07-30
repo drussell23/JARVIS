@@ -298,6 +298,28 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
         except Exception:  # noqa: BLE001 — a rosterless heartbeat still beats
             agents = None
 
+        # The diff CATALOG — refs, file counts, summaries, risk tiers, and
+        # deliberately no diff text. Small enough to ride 1 Hz, and it is what
+        # makes two things on a remote overlay CORRECT rather than guessed:
+        # an unknown ref can list what IS available (the archive is a ring, so
+        # a ref read minutes ago may have been evicted), and the loading
+        # placeholder can name the real file count before the body arrives.
+        #
+        # The TEXT is fetched only when a diff is opened. Diffs are the one
+        # payload on this lane with no natural bound, and putting them here
+        # would ship megabytes per second to draw nothing.
+        try:
+            from backend.core.ouroboros.battle_test.diff_archive import (
+                get_default_archive,
+            )
+            from backend.core.ouroboros.battle_test.diff_bridge import (
+                build_diff_catalog, diff_bridge_enabled,
+            )
+            diffs = (build_diff_catalog(get_default_archive())
+                     if diff_bridge_enabled() else None)
+        except Exception:  # noqa: BLE001 — a catalogue-less heartbeat beats
+            diffs = None
+
         return {
             "kind": "heartbeat",
             "schema_version": HEARTBEAT_SCHEMA_VERSION,
@@ -306,6 +328,11 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
             # heard of `agents` ignores the key, and a newer client that does
             # not receive one renders no roster. Neither is a version error.
             "agents": agents,
+            # Additive under heartbeat.v1, exactly as `agents` was: a client
+            # that has never heard of it ignores the key, and a daemon that
+            # sends none leaves the client with an empty catalog rather than
+            # a version error.
+            "diffs": diffs,
             "active": active,
             "verb": verb,
             "phase": phase,

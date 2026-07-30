@@ -3444,6 +3444,42 @@ class GovernedLoopService:
         logger.info("[GovernedLoop] Cancel requested for op(s): %s", matched)
         return True
 
+    def request_cancel_all(self) -> list:
+        """Request cooperative cancellation of EVERY in-flight op.
+
+        Returns the op ids newly marked, sorted — the caller reports what it
+        actually stopped rather than a count it assumed, and an empty list is
+        the honest answer to "stop everything" when nothing was running.
+
+        Deliberately broader than :meth:`operator_ops_active`, which backs the
+        bare `Esc` / `/cancel` path and is narrow on purpose ("stop what I
+        asked for", never "stop the organism" — one key that reached
+        autonomous work could kill a soak). This is the other half of that
+        pair, and the friction lives in the KEYSTROKE: Claude Code binds the
+        equivalent to `Ctrl+X Ctrl+K` pressed twice within three seconds, so
+        reaching it takes four deliberate presses and cannot be a mis-hit.
+
+        Cooperative, like every other cancel here: the orchestrator observes
+        `is_cancel_requested` at phase transitions, so this asks the ops to
+        stop at their next boundary rather than severing them mid-APPLY. A
+        hard kill would leave exactly the half-written trees the phase model
+        exists to prevent.
+        """
+        try:
+            already = self._cancel_requested
+            newly = sorted(op for op in self._active_ops if op not in already)
+            for op_id in newly:
+                self._cancel_requested.add(op_id)
+            if newly:
+                logger.info(
+                    "[GovernedLoop] Cancel-all requested for %d op(s): %s",
+                    len(newly), newly,
+                )
+            return newly
+        except Exception:  # noqa: BLE001
+            logger.debug("[GovernedLoop] cancel-all degraded", exc_info=True)
+            return []
+
     def is_cancel_requested(self, op_id: str) -> bool:
         """Check if cancellation was requested for this operation."""
         return op_id in self._cancel_requested

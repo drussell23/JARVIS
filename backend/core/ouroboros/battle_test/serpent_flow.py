@@ -903,6 +903,17 @@ def _local_agent_rows() -> list:
     takes the snapshot, so the local and remote surfaces run identical code
     over identical data and cannot diverge in appearance.
 
+    Gated on `roster_visible` — the roster mounts BELOW the caret, and Claude
+    Code puts nothing standing there ("the input box stays fixed at the bottom
+    of the screen"; running subagents are what `/tasks` is for). Hidden by
+    default, so an idle cockpit does not spend five rows under the cursor
+    listing workers nobody asked about. The snapshot keeps updating either
+    way, so `/tasks` answers instantly rather than warming up.
+
+    The gate is HERE rather than in `render_roster` because this is the
+    function that decides whether a cockpit row exists; the renderer only
+    decides what one looks like.
+
     NEVER raises: the agent view is chrome, and chrome does not get to take
     down the REPL.
     """
@@ -910,7 +921,10 @@ def _local_agent_rows() -> list:
         import shutil
         from backend.core.ouroboros.battle_test.agent_roster import (
             get_agent_roster, render_roster, roster_line_budget,
+            roster_visible,
         )
+        if not roster_visible():
+            return []
         size = shutil.get_terminal_size(fallback=(100, 30))
         return render_roster(
             get_agent_roster().snapshot(),
@@ -6201,6 +6215,29 @@ class SerpentREPL:
         if line.startswith("/provenance") or line.startswith("provenance "):
             self._handle_provenance()
             return True
+        # CC's background-task view, which its docs keep deliberately separate
+        # from the Ctrl+T checklist. On THIS surface the roster is local, so
+        # the verb toggles this process's own visibility flag; an attached
+        # cockpit intercepts `/tasks` in `ov._route_operator_line` and never
+        # sends it here, because that terminal's rows are that client's.
+        if line in ("/tasks", "tasks") or line.startswith(
+            ("/tasks ", "tasks "),
+        ):
+            self._handle_tasks(line)
+            return True
+        # The verb behind CC's Ctrl+X Ctrl+K. A verb as well as a chord
+        # because the attach client cannot cancel anything itself — it holds
+        # no governed loop — so its keystroke has to arrive here as a line.
+        if line in ("/stop-all", "stop-all"):
+            self._handle_stop_all()
+            return True
+        # A cockpit asking for a diff's BYTES. Not an operator verb — it is
+        # issued by `RemoteDiffArchive` when an overlay opens — so it is
+        # deliberately absent from the palette and answers on the telemetry
+        # lane rather than the transcript.
+        if line.startswith("/diff-fetch "):
+            self._serve_diff_fetch(line.split(None, 1)[1])
+            return True
 
         # Gap #7 Slice 1 — /preflight + /organism (moved boot content)
         if line in ("/preflight", "preflight"):
@@ -6697,6 +6734,11 @@ class SerpentREPL:
                     # `/expand d-N` opens this. The daemon owns the archive, so
                     # this is the only surface that can render a diff locally.
                     diff_rows=_mount.get("diff_rows"),
+                    # The sentence being written, at the terminal of the
+                    # process writing it. This was the daemon's oldest blind
+                    # spot in the other direction: it COMPOSED every in-flight
+                    # frame, shipped it over the bridge, and could not draw it.
+                    stream_rows=_mount.get("stream_rows"),
                 )
                 return
         except Exception:  # noqa: BLE001 — cockpit failure NEVER bricks the REPL
@@ -8742,6 +8784,186 @@ class SerpentREPL:
     # ── Gap #6 Slice 4 — /narrate REPL verb ─────────────────────
 
     _NARRATE_DENSITIES = ("off", "preambles", "on", "verbose")
+
+    def _serve_diff_fetch(self, ref: str) -> bool:
+        """Ship one archived diff to the cockpit that asked. NEVER raises.
+
+        The daemon owns the `DiffArchive`, so before this an `/expand d-3`
+        typed at an attached cockpit opened the diff on the DAEMON's overlay
+        and mirrored back one line saying it had opened. The operator was told
+        a diff was on screen and shown nothing — on the surface they review
+        changes from, the review surface was the one thing that did not cross.
+
+        Published ADDRESSED, not broadcast. The bridge reads the requesting
+        session from a ContextVar set at dispatch, and an addressed frame
+        whose cockpit has since detached is dropped rather than sprayed at
+        everyone — so two operators reviewing different diffs cannot overwrite
+        each other's overlay.
+
+        A ref the archive does not hold is answered with an explicit
+        `missing`, never with silence: the client records the negative and
+        stops asking, where silence would leave it re-issuing the fetch at the
+        frame rate against a ref that will never arrive.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.cockpit_attach import (
+                publish_telemetry_global,
+            )
+            from backend.core.ouroboros.battle_test.diff_archive import (
+                get_default_archive,
+            )
+            from backend.core.ouroboros.battle_test.diff_bridge import (
+                DIFF_PAYLOAD_KIND, diff_bridge_enabled, max_diff_chars,
+            )
+            if not diff_bridge_enabled():
+                return False
+            entry = get_default_archive().lookup(str(ref or "").strip())
+            if entry is None:
+                publish_telemetry_global({
+                    "kind": DIFF_PAYLOAD_KIND,
+                    "ref": str(ref or ""),
+                    "missing": True,
+                })
+                return True
+            payload = entry.to_dict(include_diff_text=True)
+            text = str(payload.get("diff_text") or "")
+            cap = max_diff_chars()
+            if len(text) > cap:
+                # ANNOUNCED, not silent. A diff that simply stops is
+                # indistinguishable from one that ended, and an operator
+                # reviewing a truncated patch as though it were whole is the
+                # worst outcome this surface can produce.
+                dropped = len(text) - cap
+                payload["diff_text"] = (
+                    text[:cap]
+                    + f"\n… {dropped} more characters not shown "
+                      f"(JARVIS_DIFF_MAX_CHARS={cap})\n"
+                )
+                payload["truncated"] = True
+            payload["kind"] = DIFF_PAYLOAD_KIND
+            publish_telemetry_global(payload)
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug("[SerpentFlow] diff fetch degraded", exc_info=True)
+            return False
+
+    def _handle_stop_all(self) -> None:
+        """``/stop-all`` — ask every running op to stop at its next boundary.
+
+        Claude Code's `Ctrl+X Ctrl+K`: "stop all running background subagents
+        in this session". ov ran L3 subagents with no keyboard control over
+        them at all — the largest functional gap against CC's interactive
+        surface, because the one thing an operator watching work go wrong
+        wants is a way to stop it.
+
+        Broad where `Esc` is narrow. Bare `Esc` cancels the operator's OWN
+        most recent op precisely so a reflex cannot kill a soak; this reaches
+        autonomous work too, and pays for that reach with the chord and its
+        repeat rather than with a warning nobody reads.
+
+        Cooperative: ops stop at their next phase transition. Saying so
+        matters — an operator told "stopped" who then watches a VERIFY finish
+        concludes the verb is broken, when it is the phase model working.
+        NEVER raises.
+        """
+        try:
+            if self._gls is None or not hasattr(
+                self._gls, "request_cancel_all",
+            ):
+                self._flow.console.print(
+                    f"  [{_SEM['death']}]stop-all unavailable (no governed "
+                    f"loop on this surface)[/{_SEM['death']}]",
+                    highlight=False,
+                )
+                return
+            stopped = self._gls.request_cancel_all() or []
+            if not stopped:
+                self._flow.console.print(
+                    f"  [{_SEM['dim']}]nothing running[/{_SEM['dim']}]",
+                    highlight=False,
+                )
+                return
+            noun = "op" if len(stopped) == 1 else "ops"
+            self._flow.console.print(
+                f"  [{_SEM['evolved']}]stopping {len(stopped)} {noun} — "
+                f"each halts at its next phase boundary[/{_SEM['evolved']}]\n"
+                + "\n".join(
+                    f"    [{_SEM['dim']}]{op}[/{_SEM['dim']}]"
+                    for op in stopped
+                ),
+                highlight=False,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _handle_tasks(self, line: str) -> None:
+        """``/tasks [on|off]`` — the running-subagent roster, on demand.
+
+        Claude Code separates the ambient checklist from the background-task
+        view and says so plainly: the `Ctrl+T` checklist "is separate from the
+        background-task view. To see running shells and subagents, use
+        `/tasks` instead." Under fullscreen, "the input box stays fixed at the
+        bottom of the screen" — nothing standing lives beneath the caret.
+
+        This cockpit had the roster mounted permanently below the prompt, so
+        an idle session spent five rows under the operator's cursor listing
+        workers they had not asked about. The rows are now asked for.
+
+        The verb prints the roster whenever it turns it ON, so the operator
+        gets the answer in the same keystroke rather than turning a surface on
+        and then waiting a frame to read it. NEVER raises.
+        """
+        try:
+            import shutil
+            from backend.core.ouroboros.battle_test.agent_roster import (
+                get_agent_roster, render_roster, roster_line_budget,
+                roster_visible, set_roster_visible, toggle_roster,
+            )
+            arg = (line.split(None, 1)[1].strip().lower()
+                   if " " in line.strip() else "")
+            if arg in ("on", "show"):
+                shown = set_roster_visible(True)
+            elif arg in ("off", "hide"):
+                shown = set_roster_visible(False)
+            elif arg:
+                state = "shown" if roster_visible() else "hidden"
+                self._flow.console.print(
+                    f"  [{_SEM['dim']}]tasks: {state} "
+                    f"(on | off)[/{_SEM['dim']}]", highlight=False,
+                )
+                return
+            else:
+                shown = toggle_roster()
+            if not shown:
+                self._flow.console.print(
+                    f"  [{_SEM['dim']}]tasks: hidden[/{_SEM['dim']}]",
+                    highlight=False,
+                )
+                return
+            size = shutil.get_terminal_size(fallback=(100, 30))
+            # Straight to the renderer, which holds no opinion about
+            # visibility — the gate lives in the row PROVIDERS. A verb that
+            # consulted the flag it had just flipped would have to be careful
+            # about ordering; this one cannot get that wrong.
+            rows = render_roster(
+                get_agent_roster().snapshot(),
+                width=max(20, int(size.columns)),
+                max_lines=roster_line_budget(max(4, int(size.lines))),
+            )
+            if not rows:
+                # Claude Code's own edge, stated in its docs: "when Claude
+                # hasn't created any checklist items yet, the toggle has no
+                # visible effect because there's nothing to display." An
+                # empty roster and a broken verb look identical unless one
+                # of them says which it is.
+                self._flow.console.print(
+                    f"  [{_SEM['dim']}]tasks: shown · nothing running"
+                    f"[/{_SEM['dim']}]", highlight=False,
+                )
+                return
+            self._flow.console.print("\n".join(rows), highlight=False)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _handle_provenance(self) -> None:
         """``/provenance`` — what the marks in the transcript mean.

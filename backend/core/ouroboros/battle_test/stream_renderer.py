@@ -689,7 +689,7 @@ class StreamRenderer:
             from backend.core.ouroboros.battle_test.cockpit_attach import (
                 publish_telemetry_global,
             )
-            publish_telemetry_global({
+            frame = {
                 "kind": "stream_inflight",
                 "op_id": str(self._op_id or ""),
                 # Bounded: the wrap happens on the client, which knows its
@@ -697,7 +697,23 @@ class StreamRenderer:
                 # every frame. A sentence that long has stopped being one.
                 "text": tail[-_INFLIGHT_MAX_CHARS:],
                 "done": bool(done),
-            })
+            }
+            # Recorded HERE, before the transport decision, and handed the
+            # very dict that is about to cross the wire.
+            #
+            # `publish_telemetry_global` returns early when no cockpit is
+            # attached, so a daemon with nobody watching publishes nothing —
+            # which is exactly when its OWN cockpit is the surface being
+            # looked at. Feeding the registry after that call would give the
+            # daemon a strip that works only while someone else is watching.
+            try:
+                from backend.core.ouroboros.battle_test.inflight_registry import (  # noqa: E501
+                    note_inflight_frame,
+                )
+                note_inflight_frame(frame)
+            except Exception:  # noqa: BLE001
+                pass
+            publish_telemetry_global(frame)
         except Exception:  # noqa: BLE001
             logger.debug(
                 "[StreamRender] op=%s inflight degraded", self._op_id,
