@@ -320,7 +320,8 @@ class ProgressBoard:
                 is_test = _is_test_path(rel)
                 if not is_test:
                     self_mod = _module_name(rel)
-                    for name in _imported_modules(tree):
+                    for name in _imported_modules(
+                            tree, self_mod, rel.endswith("__init__.py")):
                         # A module importing ITSELF is not a caller. Without
                         # this every module would look live, which is the same
                         # as having no signal at all.
@@ -541,15 +542,62 @@ def _normalise_source(source: str) -> str:
     return src + ".py"
 
 
-def _imported_modules(tree: ast.AST) -> Set[str]:
-    """Every module this file imports, in both syntaxes."""
+def _resolve_relative(self_mod: str, level: int, module: str,
+                      is_package: bool = False) -> str:
+    """``from ..x import y`` inside ``a.b.c`` -> ``a.x``. NEVER raises.
+
+    `level` counts dots: 1 is the current package, 2 its parent. The
+    importing module's OWN dotted name carries the package, so this needs no
+    filesystem walk — which is what the previous `continue` assumed it did.
+
+    ``is_package`` is load-bearing and easy to miss. `_module_name` strips
+    `__init__`, so a package's own `__init__.py` is already NAMED for the
+    package — `level=1` there means itself, not its parent, and stripping a
+    segment walks one level too far. That single off-by-one is what kept the
+    sensors dark after relative imports were resolved: `sensors/__init__.py`
+    re-exporting `.backlog_sensor` resolved to `intake.backlog_sensor`, a
+    module that does not exist.
+    """
+    try:
+        parts = str(self_mod or "").split(".")
+        strip = max(0, int(level) - 1) if is_package else int(level)
+        keep = len(parts) - strip
+        if keep < 0:
+            return ""
+        base = ".".join(parts[:keep])
+        if not base:
+            return str(module or "")
+        return f"{base}.{module}" if module else base
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _imported_modules(tree: ast.AST, self_mod: str = "",
+                      is_package: bool = False) -> Set[str]:
+    """Every module this file imports, in both syntaxes.
+
+    RELATIVE imports are resolved rather than skipped, and that omission was
+    a systematic false-DARK rather than a rounding error. A package that
+    re-exports — `sensors/__init__.py` doing `from .backlog_sensor import
+    BacklogSensor` — is the ONLY edge between a consumer and the module the
+    flag lives in: the consumer writes `from ...sensors import BacklogSensor`,
+    which names a CLASS, and a class name never matches a module name. With
+    the re-export skipped there was no path at all, so every module reached
+    that way reported DARK while being imported on every boot.
+    """
     found: Set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 found.add(alias.name)
         elif isinstance(node, ast.ImportFrom):
-            if node.level:  # relative import — not resolvable without a package walk
+            if node.level:
+                resolved = _resolve_relative(
+                    self_mod, node.level, node.module or "", is_package)
+                if resolved:
+                    found.add(resolved)
+                    for alias in node.names:
+                        found.add(f"{resolved}.{alias.name}")
                 continue
             module = node.module or ""
             if module:
