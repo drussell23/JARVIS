@@ -633,34 +633,11 @@ _LIVE_BEATS: List[Any] = [
     (18.0, "tool", ("run_tests", "tests/governance/test_risk_tier_floor.py",
                     _PYTEST_PASS, "success", 3980)),
 
-    # The hunk, syntax-highlighted with a dark add/del band — the `Update(file)`
-    # block Claude Code draws.
-    #
-    # Placed in the script's LARGEST empty window (13.8-15.2), and that is a
-    # measurement rather than a guess. A tool beat's body is dealt out over ~1.5s,
-    # so the first version — at 7.9, beside the `edit_file` beat at 7.2 — landed
-    # INSIDE that spread and the operator saw two renderings of one hunk
-    # alternating line by line. Moving it to 19.0 hit `run_tests`' body for the
-    # same reason. The gap is found by sorting the composed timestamps, so a beat
-    # added later cannot silently reintroduce the overlap without the window
-    # shrinking visibly.
-    #
-    # The 4th beat arg is the PATH, which is what lets the language be inferred.
-    #
-    # Long term this belongs INSIDE `tool_render_view`, so every tool round is
-    # highlighted rather than this one scripted block — see the note in the PR.
-    (13.9, "act", ("Update", "risk_tier_floor.py", "ok")),
-    (14.0, "det", ("+4 −2 · reviewed before the gate",)),
-    (14.1, "diff", (410, " ", "    try:", _EDIT_PATH)),
-    (14.2, "diff", (411, " ", "        return _resolve_floor(raw)", _EDIT_PATH)),
-    (14.3, "diff", (412, "-", "    except Exception:  # noqa: BLE001",
-                    _EDIT_PATH)),
-    (14.4, "diff", (413, "-", "        return SAFE_AUTO", _EDIT_PATH)),
-    (14.5, "diff", (412, "+", "    except RiskFloorConfigError:", _EDIT_PATH)),
-    (14.6, "diff", (413, "+", "        # A malformed floor must not degrade "
-                              "quietly", _EDIT_PATH)),
-    (14.7, "diff", (414, "+", "        raise", _EDIT_PATH)),
-
+    # NO scripted Update block. The `edit_file` tool beat at 7.2 now renders its
+    # hunk through `deck_grammar.diff` (see `tool_render_view._diff_wrapper_for`),
+    # so the gutter, the syntax and the dark band arrive on EVERY tool round rather
+    # than on one hand-built block beside them. Keeping this would narrate the same
+    # edit twice in two places — which is what the operator saw.
     (20.4, "act", ("Gate", "7759-86 · NOTIFY_APPLY")),
     # What the gate's own preview shows: which file in this change reaches
     # furthest. Rendered by the REAL gutter — see `_reach_beats`.

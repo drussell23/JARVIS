@@ -215,6 +215,28 @@ def reset_render_pool_for_tests() -> None:
             pass
 
 
+
+def _outcome_text(outcome: Any) -> str:
+    """A `DiffOutcome` / `VerifyOutcome` as the operator's word. NEVER raises.
+
+    `str()` on an enum MEMBER yields `DiffOutcome.PENDING` — the Python identity,
+    not the fact. That reached the overlay header verbatim
+    (`apply DiffOutcome.PENDING · verify VerifyOutcome.PENDING`), which reads as an
+    unfinished surface rather than as a status.
+
+    `.value` first because both are `(str, Enum)` and their values ARE the
+    operator-facing vocabulary (`pending`, `applied`, `failed`); falling back to
+    `str()` keeps a plain string or a future non-enum working rather than blanking
+    the field.
+    """
+    try:
+        if outcome is None:
+            return ""
+        return str(getattr(outcome, "value", outcome) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _terminal_width(fallback: int = 100) -> int:
     """Resolved per call — a diff wrapped to a stale width is clipped, not
     reflowed, because the canvas draws with ``wrap_lines=False``."""
@@ -459,8 +481,8 @@ class DiffOverlayController:
         # Outcome is the question an operator opening an ARCHIVED diff is
         # actually asking — "did this land?" — and it is the one thing a
         # transient gate preview could never tell them.
-        apply_outcome = str(getattr(entry, "apply_outcome", "") or "")
-        verify = str(getattr(entry, "verify_outcome", "") or "")
+        apply_outcome = _outcome_text(getattr(entry, "apply_outcome", None))
+        verify = _outcome_text(getattr(entry, "verify_outcome", None))
         if apply_outcome or verify:
             rows.append(f"    apply {apply_outcome or '?'} · "
                         f"verify {verify or '?'}")

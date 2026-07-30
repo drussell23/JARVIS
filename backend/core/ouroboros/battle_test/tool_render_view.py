@@ -415,6 +415,108 @@ def _wrap_diff_line(
     return _escape(line)
 
 
+def _diff_wrapper_for(body_lines: Any,
+                      fallback_path: Optional[str] = None) -> Any:
+    """A per-line diff styler that KNOWS the file and the line numbers.
+
+    `_wrap_diff_line` colours by prefix and nothing else, so an `Update(f.py)`
+    block rendered a flat red/green wall while `deck_grammar.diff` — used by one
+    scripted beat — rendered the same change with a gutter, syntax highlighting and
+    a dark band. Two visual languages for one fact, in one session.
+
+    The fix is not to thread a path down from the caller. A unified diff ALREADY
+    carries both things:
+
+        +++ b/backend/.../risk_tier_floor.py     <- the path, so the lexer
+        @@ -410,7 +410,22 @@                     <- the numbering origin
+
+    So this walks the body ONCE, derives them, and returns a closure with the same
+    ``(line, palette)`` signature every other wrapper has. No new parameter, no
+    caller changes, and nothing hardcoded — a diff for a `.toml` highlights as toml
+    because the diff says so.
+
+    Numbering follows the two files separately: a removed line belongs to the OLD
+    side and a context or added line to the NEW one. Conflating them makes the
+    gutter confidently wrong, which is worse than absent.
+
+    Degrades in place: a body with no `@@` (a `git log`, a truncated fragment) gets
+    no numbers, and a body with no `+++` gets no highlighting, both landing exactly
+    on the previous flat rendering rather than on an error.
+    """
+    # The diff's own `+++` header is authoritative when present, but the density
+    # policy STRIPS the `---`/`+++` pair before a wrapper ever sees the body — it
+    # elides them as noise, correctly, since the header line duplicates the block's
+    # own `Update(path)` title. So the tool's ARGUMENT is the fallback, and for
+    # `edit_file` that argument IS the file. Header first, argument second: a diff
+    # that carries its own path should win, because a multi-file patch's argument
+    # names only one of them.
+    path: Optional[str] = fallback_path or None
+    try:
+        for raw in list(body_lines or ()):
+            text = str(raw)
+            if text.startswith("+++"):
+                # `+++ b/path` — strip the diff's own `b/` prefix, which is not
+                # part of the filename and would defeat extension inference.
+                candidate = text[3:].strip().split("\t")[0].strip()
+                if candidate.startswith(("a/", "b/")):
+                    candidate = candidate[2:]
+                if candidate and candidate != "/dev/null":
+                    path = candidate
+                break
+    except Exception:  # noqa: BLE001
+        path = None
+
+    state = {"old": 0, "new": 0}
+
+    def _wrap(line: str, palette: Optional[Mapping[str, str]]) -> str:
+        try:
+            text = str(line)
+            stripped = text.lstrip()
+            if stripped.startswith("@@"):
+                # Reset both counters from the hunk header. `-a,b +c,d` — the two
+                # origins are independent and both are needed.
+                import re as _re
+                m = _re.search(r"-(\d+)(?:,\d+)?\s+\+(\d+)", stripped)
+                if m:
+                    state["old"] = int(m.group(1))
+                    state["new"] = int(m.group(2))
+                return _wrap_diff_line(text, palette)
+            if stripped.startswith(("+++", "---")):
+                return _wrap_diff_line(text, palette)
+            from backend.core.ouroboros.ui import deck_grammar as _deck
+            width = None
+            try:
+                import shutil
+                width = shutil.get_terminal_size((100, 30)).columns
+            except Exception:  # noqa: BLE001
+                width = None
+            if stripped.startswith("+"):
+                lineno = state["new"] or None
+                state["new"] += 1
+                return _deck.diff(lineno, "+", stripped[1:], path=path,
+                                  width=width)
+            if stripped.startswith("-"):
+                lineno = state["old"] or None
+                state["old"] += 1
+                return _deck.diff(lineno, "-", stripped[1:], path=path,
+                                  width=width)
+            # Context: advances BOTH sides, and is shown against the new file
+            # because that is the one the operator is about to be living with.
+            lineno = state["new"] or None
+            if state["new"]:
+                state["new"] += 1
+            if state["old"]:
+                state["old"] += 1
+            body = stripped[1:] if stripped.startswith(" ") else stripped
+            return _deck.diff(lineno, " ", body, path=path, width=width)
+        except Exception:  # noqa: BLE001
+            # The previous rendering is a perfectly good fallback; losing the diff
+            # to a styling failure is not.
+            return _wrap_diff_line(str(line), palette)
+
+    return _wrap
+
+
 def _wrap_log_line(
     line: str, palette: Optional[Mapping[str, str]],
 ) -> str:
@@ -803,6 +905,12 @@ def compose(
         wrapper = _BODY_WRAPPERS.get(
             descriptor.body_shape, _wrap_text_line,
         )
+        # A diff body is the one shape whose styling needs CONTEXT — the file it
+        # belongs to and where its hunks start — and both are carried in the body
+        # itself. Built per compose, so the numbering cannot leak between blocks.
+        if wrapper is _wrap_diff_line:
+            wrapper = _diff_wrapper_for(rendered.body_lines,
+                                        fallback_path=str(args_str or "") or None)
     # ONE seam for the indent, not four wrappers each remembering to.
     #
     # Every body line lands in the deck's body column, so a pytest traceback

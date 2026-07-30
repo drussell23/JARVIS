@@ -127,21 +127,66 @@ class TestItNeverBreaksTheDeck:
 
 
 class TestTheDemoShowsIt:
-    def test_the_script_carries_a_banded_update_block(self):
+    """The demo's hunk is highlighted by the TOOL RENDERER, not by a scripted beat.
+
+    It used to be both, and that was the defect the operator photographed: the
+    `edit_file` tool block rendered a flat red/green wall while a hand-built
+    `Update` beat rendered the same change with a gutter, syntax and a band — two
+    visual languages for one fact. Routing `tool_render_view`'s diff bodies through
+    `deck_grammar.diff` made the scripted block redundant, so it is gone.
+
+    These assert the ROUTE as well as the result: a future change that re-adds a
+    parallel scripted block should fail here rather than quietly reintroduce two
+    styles.
+    """
+
+    def test_the_composed_script_carries_a_banded_hunk(self):
         from backend.core.ouroboros.cli import ov_demo as d
-        script = d.compose_live_script()
         from backend.core.ouroboros.ui.semantic_tokens import role_palette
         palette = role_palette()
         marks = (f"on {palette['code_add_bg']}", f"on {palette['code_del_bg']}")
-        banded = [l for _at, l in script
+        banded = [l for _at, l in d.compose_live_script()
                   if isinstance(l, str) and any(m in l for m in marks)]
-        assert banded, "ov demo live shows no syntax-highlighted hunk"
+        assert banded, "ov demo live shows no banded hunk"
         assert any("bright_blue" in l or "blue" in l for l in banded), (
-            "the demo's hunk has a band but no syntax colour")
+            "the hunk has a band but no syntax colour")
 
-    def test_the_hunk_beats_name_a_path(self):
-        """The 4th beat arg is what lets the language be inferred."""
+    def test_the_highlighting_comes_from_the_tool_renderer(self):
+        """Not from a scripted `diff` beat. The whole point of the change is that
+        EVERY tool round is highlighted, not one curated block."""
         from backend.core.ouroboros.cli import ov_demo as d
-        hunks = [args for _at, kind, args in d._LIVE_BEATS if kind == "diff"]
-        assert hunks, "no diff beats in the script"
-        assert all(len(a) > 3 and str(a[3]).endswith(".py") for a in hunks)
+        assert not [a for _at, kind, a in d._LIVE_BEATS if kind == "diff"], (
+            "a scripted diff beat is back — the tool renderer already highlights, "
+            "so this would narrate the same edit twice")
+        assert any(kind == "tool" and args and args[0] == "edit_file"
+                   for _at, kind, args in d._LIVE_BEATS), (
+            "no edit_file beat left to carry the hunk")
+
+    def test_the_tool_wrapper_infers_path_and_numbers_from_the_diff(self):
+        """No parameter threading: a unified diff carries `+++ b/path` and `@@`,
+        so the styler derives both from the body it is given."""
+        from backend.core.ouroboros.battle_test.tool_render_view import (
+            _diff_wrapper_for,
+        )
+        wrap = _diff_wrapper_for([
+            "--- a/x/risk_tier_floor.py", "+++ b/x/risk_tier_floor.py",
+            "@@ -410,7 +410,22 @@", "     try:", "+        raise",
+        ])
+        wrap("--- a/x/risk_tier_floor.py", None)
+        wrap("+++ b/x/risk_tier_floor.py", None)
+        wrap("@@ -410,7 +410,22 @@", None)
+        ctx = wrap("     try:", None)
+        added = wrap("+        raise", None)
+        assert "410" in ctx, "the hunk origin was not read from @@"
+        assert "bright_blue" in added or "blue" in added, (
+            "the path was not read from +++, so no language was inferred")
+
+    def test_a_body_without_a_diff_header_degrades_in_place(self):
+        """A `git log` or a truncated fragment has no `@@` and no `+++`. It must
+        land on the previous flat rendering, not on an error."""
+        from backend.core.ouroboros.battle_test.tool_render_view import (
+            _diff_wrapper_for,
+        )
+        wrap = _diff_wrapper_for(["some log output", "more output"])
+        assert wrap("some log output", None) is not None
+        assert wrap("+ not really a diff", None) is not None
