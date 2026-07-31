@@ -1,6 +1,6 @@
 ---
 title: Project Oracle Sqlite Persistence
-modules: [scripts/benchmarks/oracle_persistence_benchmark.py, backend/core/ouroboros/oracle_persistence.py, tests/governance/test_oracle_persistence.py, scripts/soaks/oracle_sqlite_soak.py, scripts/soaks/oracle_lazy_traversal_soak.py, backend/core/ouroboros/oracle.py, backend/core/ouroboros/oracle_graph_backend.py, scripts/ouroboros_battle_test.py, conftest.py]
+modules: [scripts/benchmarks/oracle_persistence_benchmark.py, backend/core/ouroboros/oracle_persistence.py, tests/governance/test_oracle_persistence.py, scripts/soaks/oracle_sqlite_soak.py, scripts/soaks/oracle_lazy_traversal_soak.py, backend/core/ouroboros/oracle.py, backend/core/ouroboros/oracle_graph_backend.py, scripts/ouroboros_battle_test.py, conftest.py, docs/architecture/ORACLE_LAZY_TRAVERSAL_ADD.md, docs/architecture/ORACLE_PERSISTENCE_BENCHMARK_RESULTS.md, docs/architecture/ORACLE_SQLITE_HOTPATH_SOAK.md]
 status: open
 source: project_oracle_sqlite_persistence.md
 ---

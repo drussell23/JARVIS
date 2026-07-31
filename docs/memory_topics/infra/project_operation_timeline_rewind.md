@@ -1,6 +1,6 @@
 ---
 title: Project Operation Timeline Rewind
-modules: [backend/core/ouroboros/governance/operation_timeline.py, tests/governance/test_operation_timeline.py, backend/core/ouroboros/governance/ops_digest_observer.py, backend/core/ouroboros/governance/flag_registry_seed.py, orchestrator.py]
+modules: [backend/core/ouroboros/governance/operation_timeline.py, tests/governance/test_operation_timeline.py, backend/core/ouroboros/governance/ops_digest_observer.py, backend/core/ouroboros/governance/flag_registry_seed.py, orchestrator.py, docs/architecture/OUROBOROS_VENOM_PRD.md]
 status: historical
 source: project_operation_timeline_rewind.md
 ---

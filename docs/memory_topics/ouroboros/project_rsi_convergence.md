@@ -1,6 +1,6 @@
 ---
 title: Project Rsi Convergence
-modules: [backend/core/ouroboros/governance/, backend/core/ouroboros/governance/composite_score.py, backend/core/ouroboros/governance/convergence_tracker.py, backend/core/ouroboros/governance/oracle_prescorer.py, backend/core/ouroboros/governance/transition_tracker.py, backend/core/ouroboros/governance/vindication_reflector.py, backend/core/ouroboros/governance/graduation_orchestrator.py]
+modules: [backend/core/ouroboros/governance/, backend/core/ouroboros/governance/composite_score.py, backend/core/ouroboros/governance/convergence_tracker.py, backend/core/ouroboros/governance/oracle_prescorer.py, backend/core/ouroboros/governance/transition_tracker.py, backend/core/ouroboros/governance/vindication_reflector.py, backend/core/ouroboros/governance/graduation_orchestrator.py, docs/architecture/RSI_CONVERGENCE_FRAMEWORK.md, docs/superpowers/plans/2026-04-06-rsi-convergence-improvements.md]
 status: historical
 source: project_rsi_convergence.md
 ---

@@ -1,6 +1,6 @@
 ---
 title: Project Phd Strategic Path
-modules: []
+modules: [docs/personal/PHD_STRATEGIC_PATH.md]
 status: historical
 source: project_phd_strategic_path.md
 ---
