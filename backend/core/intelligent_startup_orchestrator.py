@@ -3,7 +3,12 @@
 DEPRECATED — v270.2 (2026-02-24)
 =================================
 This module is NOT imported by any active code path.  Its only consumer
-was ``_deprecated_run_supervisor.py``.
+was ``_deprecated_run_supervisor.py``, which has since been DELETED — so
+this file is now orphaned outright rather than merely unused, and it is the
+next candidate for removal. The only thing importing it today is
+``tests/unit/core/test_control_plane_authority.py``, which asserts that it
+is deprecated: a test whose subject is the deprecation itself, not the
+behaviour, and which therefore goes with the module whenever it goes.
 
 Canonical authority chain for startup orchestration:
   unified_supervisor.py  (kernel — phases, timeouts, mode management)
