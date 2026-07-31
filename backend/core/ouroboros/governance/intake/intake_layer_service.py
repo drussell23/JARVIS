@@ -987,6 +987,52 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] DocStalenessSensor skipped: %s", exc)
 
+        # ---- MemoryHygieneSensor (memory reports defects in ITSELF) ----
+        #
+        # Constructed UNCONDITIONALLY and gated by its own
+        # ``sensor_enabled()``, mirroring VisionSensor. A sensor that is only
+        # constructed when its flag is on cannot be seen in the boot log when
+        # it is off — "absent" and "registered but disabled" render
+        # identically, which is exactly how these two shipped registered in
+        # three source registries and never built at all.
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.memory_hygiene_sensor import (
+                MemoryHygieneSensor, sensor_enabled as _mem_hyg_enabled,
+            )
+            _mem_hyg_sensor = MemoryHygieneSensor(
+                repo="jarvis",
+                router=self._router,
+                project_root=self._config.project_root,
+            )
+            self._sensors.append(_mem_hyg_sensor)
+            self._memory_hygiene_sensor = _mem_hyg_sensor
+            logger.info(
+                "[IntakeLayer] MemoryHygieneSensor registered enabled=%s "
+                "(set JARVIS_MEMORY_HYGIENE_SENSOR_ENABLED=1)",
+                _mem_hyg_enabled(),
+            )
+        except Exception as exc:
+            logger.debug("[IntakeLayer] MemoryHygieneSensor skipped: %s", exc)
+
+        # ---- CageHygieneSensor (synthesized worker cages report on themselves) ----
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.cage_hygiene_sensor import (
+                CageHygieneSensor, sensor_enabled as _cage_hyg_enabled,
+            )
+            _cage_hyg_sensor = CageHygieneSensor(
+                repo="jarvis",
+                router=self._router,
+            )
+            self._sensors.append(_cage_hyg_sensor)
+            self._cage_hygiene_sensor = _cage_hyg_sensor
+            logger.info(
+                "[IntakeLayer] CageHygieneSensor registered enabled=%s "
+                "(set JARVIS_CAGE_HYGIENE_SENSOR_ENABLED=1)",
+                _cage_hyg_enabled(),
+            )
+        except Exception as exc:
+            logger.debug("[IntakeLayer] CageHygieneSensor skipped: %s", exc)
+
         # ---- GitHubIssueSensor (auto-resolve issues across Trinity repos) ----
         if _sensor_disabled("GITHUB_ISSUE_SENSOR"):
             logger.info(
