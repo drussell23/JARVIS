@@ -1115,6 +1115,25 @@ class TrinityEventBus:
         Returns:
             Subscription ID
         """
+        # Dynamic-dispatch breadcrumb, on the EXISTING subscribe seam rather
+        # than a parallel tracker. A pub/sub handler leaves no static call
+        # edge, so `capability_liveness` reads it as unreachable — its own
+        # verdict text says "may be dynamically dispatched". This is where
+        # that ambiguity is resolved, at the one place every subscription
+        # passes through.
+        #
+        # This records REGISTRATION only. Subscribing proves the handler
+        # asked to be called, never that it was — and treating those as the
+        # same fact would clear the exact bug the audit hunts. Invocation is
+        # recorded at delivery; see `_deliver_event`.
+        try:
+            from backend.core.ouroboros.governance.dynamic_dispatch_registry import (
+                register as _dd_register,
+            )
+            _dd_register(getattr(handler, "__module__", ""), channel=pattern)
+        except Exception:  # noqa: BLE001 — a breadcrumb must never break a subscribe
+            pass
+
         sub = Subscription(
             pattern=pattern,
             handler=handler,
@@ -1365,6 +1384,20 @@ class TrinityEventBus:
         event: TrinityEvent,
     ) -> None:
         """Execute a subscription handler."""
+        # Invocation breadcrumb — the fact that EARNS `FIRING_DYNAMICALLY`.
+        # Recorded here and not at subscribe time because those are different
+        # claims: a handler that subscribed at boot and never fired is still
+        # severed, and that is precisely the case the liveness audit exists
+        # to surface.
+        try:
+            from backend.core.ouroboros.governance.dynamic_dispatch_registry import (
+                note_invocation as _dd_invoked,
+            )
+            _dd_invoked(getattr(sub.handler, "__module__", ""),
+                        channel=getattr(event, "topic", ""))
+        except Exception:  # noqa: BLE001 — never fail a delivery for telemetry
+            pass
+
         try:
             await asyncio.wait_for(
                 sub.handler(event),
