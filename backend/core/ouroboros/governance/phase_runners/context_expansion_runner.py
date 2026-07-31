@@ -243,6 +243,38 @@ class ContextExpansionRunner(PhaseRunner):
         except Exception:
             logger.debug("[ModuleRouter] injection skipped", exc_info=True)
 
+        # ---- OperatorRules: path-scoped human rules ----
+        # The operator's own rules, delivered only where they apply. The
+        # store, the `paths:` field, and FORBIDDEN_PATH enforcement all
+        # existed; the injection that lets a rule GUIDE a generation rather
+        # than only BLOCK a write was documented in
+        # `user_preference_memory`'s docstring and never built. Authority-
+        # free and fail-soft, exactly like the router above.
+        try:
+            from backend.core.ouroboros.governance.operator_rules import (
+                compose_for_op as _rules_compose,
+            )
+            _rules_section = _rules_compose(
+                orch._config.project_root,
+                list(ctx.target_files),
+                ctx.description,
+                op_id=ctx.op_id,
+                consumer="main",
+            )
+            if _rules_section:
+                _r_existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=ctx.strategic_intent_id or "operator-rules-v1",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=(
+                        _r_existing + "\n\n" + _rules_section
+                        if _r_existing else _rules_section
+                    ),
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+        except Exception:
+            logger.debug("[OperatorRules] injection skipped", exc_info=True)
+
         ctx = ctx.advance(OperationPhase.PLAN)
         # ---- end verbatim transcription ----
 

@@ -1,6 +1,6 @@
 ---
 title: Memory corpus authority + admission ledger
-modules: [backend/core/ouroboros/governance/memory_scope.py, backend/core/ouroboros/governance/subagent_orchestrator.py, backend/core/ouroboros/governance/subagent_contracts.py, backend/core/ouroboros/governance/memory_utility.py, backend/core/ouroboros/governance/ops_digest_observer.py, backend/core/ouroboros/governance/memory_corpus.py, backend/core/ouroboros/governance/memory_admission.py, backend/core/ouroboros/governance/module_routing.py, backend/core/ouroboros/battle_test/memory_surface.py, backend/core/ouroboros/governance/phase_runners/context_expansion_runner.py]
+modules: [backend/core/ouroboros/governance/operator_rules.py, backend/core/ouroboros/governance/user_preference_memory.py, backend/core/ouroboros/governance/memory_scope.py, backend/core/ouroboros/governance/subagent_orchestrator.py, backend/core/ouroboros/governance/subagent_contracts.py, backend/core/ouroboros/governance/memory_utility.py, backend/core/ouroboros/governance/ops_digest_observer.py, backend/core/ouroboros/governance/memory_corpus.py, backend/core/ouroboros/governance/memory_admission.py, backend/core/ouroboros/governance/module_routing.py, backend/core/ouroboros/battle_test/memory_surface.py, backend/core/ouroboros/governance/phase_runners/context_expansion_runner.py]
 status: active
 source: session 2026-07-30, CC-parity memory arc
 ---
@@ -232,6 +232,63 @@ some construction sites is one that does not exist.
 Live: parent admits 3 topics → explore 0c, plan 1931c inherited, review 1929c
 with 3 parent topics excluded, general 0c. Verb `/memory scope`. 29 tests;
 452 green across all subagent suites.
+
+## Slice 3 — path-scoped operator rules (`operator_rules.py`)
+
+**The third integration point was fiction.** `user_preference_memory`'s
+docstring describes `StrategicDirectionService` accepting a `user_prefs` param
+and appending a "User Preferences" section "filtered by relevance to the op"
+scored by "path overlap + tag match + type weight".
+`StrategicDirectionService.__init__` takes `project_root` ALONE, `user_prefs`
+appears nowhere in that module, and no relevance function was ever written.
+(#2 FORBIDDEN_PATH → `tool_executor` and #3 rejection-learning → orchestrator
+are both live; verified.)
+
+So operator rules could BLOCK a write and be LEARNED from a rejection, but
+could never GUIDE a generation. One layer further out than the rest of this
+arc: not a value dropped before the eye, but a value the OPERATOR supplied
+that never reached the model at all.
+
+**Glob matching is path-aware, because `fnmatch` is not.** `fnmatch`'s `*`
+matches `/`, so `*.md` matched `docs/README.md` — an operator scoping a rule
+to top-level markdown would silently have it fire on every nested file. The
+over-matching twin of the substring problem and just as invisible.
+`_glob_re` translates explicitly: `**` spans directories, `*` stops at a
+separator, `?` is one non-separator, `[!...]`→`[^...]`, everything else
+escaped. Directory-prefix shorthand (`backend/voice`) is honoured before the
+glob path because operators write directories far more often than `/**`.
+Case-SENSITIVE because git is.
+
+**The widening invariant.** `UserMemory.matches_path` is a SECURITY path —
+FORBIDDEN_PATH consults it before every mutating tool call. Glob support is a
+UNION with the legacy substring test, never a replacement. Replacing it would
+have looked cleaner and quietly UNPROTECTED every entry written in the old
+style: `backend/voice` stops matching `backend/voice/x.py` under pure glob.
+Widen a guard; never narrow one as a side effect of improving it.
+
+Scoring: `0.6·specificity + 0.25·coverage + 0.15·tag_overlap`, times a
+per-type weight. Specificity is derived from the pattern's own shape
+(saturating `1-0.5^literal_segments`), so it needs no importance table against
+a tree that moves weekly. Unscoped rules are GLOBAL and eligible (CC
+semantics) but outranked by any scoped match — the budget goes to the rule
+that knows something about THIS op.
+
+Edge cases: negation (`!backend/vendor/**`); absolute target files
+relativised; zero-target ops get global rules only; ORPHANED rules (paths
+matching nothing in the repo) are withheld, reusing `Drift.ORPHANED`'s idea —
+and the repo probe FAILS OPEN so an unreadable tree cannot discard a live
+rule.
+
+Rules ride the SAME admission ledger as topics (`corpus_provenance:
+"operator_rules"`), so `/memory context` answers "what was in that prompt"
+once rather than twice. `compose_for_op` is the single entry point and records
+as a side effect — a caller cannot inject rules without the injection being
+observable. Wired on BOTH CONTEXT_EXPANSION paths, pinned by a test.
+
+Live: a governance op gets `async-first` + the global rule and NOT the voice
+rule; a voice op gets `voice-latency` FIRST (deeper scope), then `async-first`,
+then the global. Verb `/memory rules`. 39 tests; 194 green across
+preference/forbidden/protected/tool_executor/context_expansion suites.
 
 ## Ghost reconciliation (2026-07-30)
 

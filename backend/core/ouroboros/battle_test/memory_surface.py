@@ -300,6 +300,12 @@ def compose_memory_lines(arg: str = "") -> List[str]:
         # answer. Dispatched before the search branch so "context" is never
         # read as a topic-name needle.
         head, _, rest = term.partition(" ")
+        if head.lower() == "rules":
+            from backend.core.ouroboros.governance.operator_rules import (
+                render_rules_lines,
+            )
+            return _clamp_payload(render_rules_lines())
+
         if head.lower() == "scope":
             from backend.core.ouroboros.governance.memory_scope import (
                 render_scope_lines,
@@ -360,7 +366,8 @@ def compose_memory_lines(arg: str = "") -> List[str]:
         out.append("  [dim]/memory topics <term> searches names · "
                    "/memory context shows what loaded · "
                    "/memory utility shows what helped · "
-                   "/memory scope shows the subagent boundary[/dim]")
+                   "/memory scope shows the subagent boundary · "
+                   "/memory rules shows path-scoped operator rules[/dim]")
         return _clamp_payload(out)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[MemorySurface] compose degraded", exc_info=True)
