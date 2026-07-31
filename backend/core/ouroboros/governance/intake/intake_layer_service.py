@@ -1014,6 +1014,26 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] MemoryHygieneSensor skipped: %s", exc)
 
+        # ---- LivenessSensor (the organism notices its own dead limbs) ----
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.liveness_sensor import (
+                LivenessSensor, sensor_enabled as _liveness_enabled,
+            )
+            _liveness_sensor = LivenessSensor(
+                repo="jarvis",
+                router=self._router,
+                project_root=self._config.project_root,
+            )
+            self._sensors.append(_liveness_sensor)
+            self._liveness_sensor = _liveness_sensor
+            logger.info(
+                "[IntakeLayer] LivenessSensor registered enabled=%s "
+                "(set JARVIS_LIVENESS_SENSOR_ENABLED=1)",
+                _liveness_enabled(),
+            )
+        except Exception as exc:
+            logger.debug("[IntakeLayer] LivenessSensor skipped: %s", exc)
+
         # ---- CageHygieneSensor (synthesized worker cages report on themselves) ----
         try:
             from backend.core.ouroboros.governance.intake.sensors.cage_hygiene_sensor import (

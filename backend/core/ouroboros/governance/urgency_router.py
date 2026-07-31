@@ -158,6 +158,10 @@ _BACKGROUND_SOURCES = frozenset({
     # severity would let an attacker who can trigger denials force IMMEDIATE
     # routing and burn the Claude tier. Severity rides in evidence instead.
     "cage_hygiene",
+    # Severance is archaeology, not an incident. Even a high-severity finding
+    # stays BACKGROUND: escalating the route would put repo-wide static
+    # analysis on the Claude tier, and severity rides in the evidence.
+    "capability_severance",
 })
 
 # Sources that produce SPECULATIVE-eligible signals
