@@ -4794,6 +4794,8 @@ class GovernedOrchestrator:
                         _mr_result = await _mr_router.route(
                             list(ctx.target_files),
                             ctx.description,
+                            op_id=ctx.op_id,
+                            consumer="main",
                         )
                         if _mr_result.section:
                             _mr_existing = getattr(ctx, "strategic_memory_prompt", "") or ""
@@ -4806,10 +4808,13 @@ class GovernedOrchestrator:
                                 ),
                                 strategic_memory_digest=ctx.strategic_memory_digest,
                             )
+                            _mr_rec = getattr(_mr_result, "record", None)
                             logger.info(
                                 "[ModuleRouter] op=%s topics=%d inject_site=context_expansion_inline "
-                                "prompt_chars=%d",
+                                "prompt_chars=%d corpus=%s/%s",
                                 ctx.op_id, len(_mr_result.topics), len(_mr_result.section),
+                                getattr(_mr_rec, "corpus_size", "?"),
+                                getattr(_mr_rec, "corpus_provenance", "unrecorded"),
                             )
                 except Exception:
                     logger.debug("[ModuleRouter] inline injection skipped", exc_info=True)

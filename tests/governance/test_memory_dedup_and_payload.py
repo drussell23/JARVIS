@@ -46,7 +46,7 @@ async def test_identical_payloads_under_different_names_load_once(
     (topics / "project_blast_provenance.md").write_text(body, encoding="utf-8")
     (topics / "zzz_unrelated_filename.md").write_text(body, encoding="utf-8")
 
-    frags = _load_topic_fragments_worker(
+    frags, _listing = _load_topic_fragments_worker(
         str(tmp_path / "docs" / "memory_topics"), str(tmp_path))
 
     assert len(frags) == 1, (
@@ -76,7 +76,7 @@ async def test_transport_artefacts_do_not_defeat_the_hash(
     (topics / "b.md").write_text(
         body.replace("\n", "\r\n") + "   \n", encoding="utf-8")
 
-    frags = _load_topic_fragments_worker(str(topics), str(tmp_path))
+    frags, _listing = _load_topic_fragments_worker(str(topics), str(tmp_path))
     assert len(frags) == 1, "CRLF/trailing-space copy loaded as a second topic"
 
 
@@ -98,7 +98,7 @@ async def test_genuinely_different_topics_both_survive(tmp_path: Path) -> None:
     (topics / "b.md").write_text("# A\n\nOne fact. And another.\n",
                                  encoding="utf-8")
 
-    frags = _load_topic_fragments_worker(str(topics), str(tmp_path))
+    frags, _listing = _load_topic_fragments_worker(str(topics), str(tmp_path))
     assert len(frags) == 2, "distinct documents were merged — memory was lost"
 
 

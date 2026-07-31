@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 logger = logging.getLogger("Ouroboros.MemorySurface")
 
@@ -77,43 +77,27 @@ def memory_surface_enabled() -> bool:
 _MAX_PAYLOAD_BYTES = 8192
 
 
-def _tracked_topic_paths(root: Path) -> Optional[List[Path]]:
-    """The topic files the REPO declares, or None if git cannot say.
+def _listing():
+    """The corpus, from the ONE authority. NEVER raises.
 
-    This is the root fix, and it is not a filter.
+    This surface used to carry its own `git ls-files` call. That was the
+    right answer in the wrong place: the display asked the repository what
+    the corpus was while `ModuleContextRouter` — the thing that actually
+    feeds GENERATE prompts — went on walking the working tree, so the
+    operator was shown 383 topics while 684 were live, 301 of them diverged
+    iCloud snapshots. Two readers, two definitions, and the one that mattered
+    was the one nobody was looking at.
 
-    The corpus is not "every .md under a directory" — it is what the
-    repository tracks. Reading the working tree instead made the surface
-    count things the repo has explicitly disowned: iCloud conflict copies
-    (`battle_test 2/`, created because this repo lives under a synced
-    `~/Documents`) are UNTRACKED and already gitignored at `.gitignore:270`.
-    Nothing in iCloud is part of O+V's memory; the sync client simply
-    littered inside the working tree.
-
-    So the answer is to ask the authority that already knows. That
-    generalises past iCloud for free — editor backups, a vendored second
-    checkout, stray downloads — because "ignored" is the repo stating that a
-    file is not part of itself, and no pattern list has to be maintained to
-    keep up.
-
-    Returns None (not an empty list) when git is unavailable, so the caller
-    can fall back to walking the tree rather than reporting a corpus of zero.
-    An absent VCS must not read as an empty mind.
+    `memory_corpus` is now the single definition both consume, which is why
+    the duplicate here is gone rather than kept in sync.
     """
     try:
-        import subprocess
-
-        proc = subprocess.run(
-            ["git", "ls-files", "-z", "--", "docs/memory_topics"],
-            cwd=str(root), capture_output=True, timeout=10.0, check=False,
+        from backend.core.ouroboros.governance.memory_corpus import (
+            corpus_listing_sync,
         )
-        if proc.returncode != 0:
-            return None
-        names = [n for n in proc.stdout.decode(
-            "utf-8", "replace").split("\0") if n.endswith(".md")]
-        return [root / n for n in names]
+        return corpus_listing_sync(_repo_root())
     except Exception:  # noqa: BLE001
-        logger.debug("[MemorySurface] git ls-files unavailable", exc_info=True)
+        logger.debug("[MemorySurface] corpus listing degraded", exc_info=True)
         return None
 
 
@@ -180,22 +164,10 @@ def topic_counts() -> Dict[str, int]:
     """
     out: Dict[str, int] = {}
     try:
-        root = _repo_root() / "docs" / "memory_topics"
-        if not root.is_dir():
-            return out
-        tracked = _tracked_topic_paths(_repo_root())
-        if tracked is not None:
-            for path in tracked:
-                domain = path.parent.name
-                out[domain] = out.get(domain, 0) + 1
-            return out
-        # git unavailable — walk the tree, and say nothing false about it.
-        for child in sorted(root.iterdir()):
-            if not child.is_dir():
-                continue
-            n = sum(1 for _ in child.glob("*.md"))
-            if n:
-                out[child.name] = n
+        listing = _listing()
+        for path in (getattr(listing, "paths", ()) or ()):
+            domain = path.parent.name
+            out[domain] = out.get(domain, 0) + 1
     except Exception:  # noqa: BLE001
         logger.debug("[MemorySurface] topic scan degraded", exc_info=True)
     return out
@@ -214,14 +186,8 @@ def search_topics(term: str, limit: int = _DEFAULT_LIMIT) -> List[str]:
         needle = str(term or "").strip().lower()
         if not needle:
             return []
-        root = _repo_root() / "docs" / "memory_topics"
-        if not root.is_dir():
-            return []
         hits: List[str] = []
-        tracked = _tracked_topic_paths(_repo_root())
-        candidates = (sorted(tracked) if tracked is not None
-                      else sorted(root.rglob("*.md")))
-        for path in candidates:
+        for path in (getattr(_listing(), "paths", ()) or ()):
             if needle in path.name.lower():
                 hits.append(f"    {path.parent.name}/{path.name}")
                 if len(hits) >= max(1, int(limit)):
@@ -244,6 +210,12 @@ def _routing_row() -> str:
     memory that exists and memory that reaches a GENERATE prompt are different
     things, and this codebase has repeatedly shipped the first while believing
     it shipped the second.
+
+    A flag plus an importable module was never enough to claim the second.
+    Both were true the whole time the router was injecting ghost copies, so
+    this now reports the last OBSERVED pass — a fact only an actual injection
+    can produce — and says "no pass recorded" when there is none, rather than
+    letting "on · available" stand in for evidence.
     """
     try:
         flag = os.environ.get("JARVIS_MEMORY_ROUTING_ENABLED", "1")
@@ -253,8 +225,20 @@ def _routing_row() -> str:
             present = "available"
         except Exception:  # noqa: BLE001
             present = "UNAVAILABLE"
-        return (f"    routing: {'on' if on else 'off'} · "
-                f"ModuleContextRouter {present}")
+        row = f"    routing: {'on' if on else 'off'} · ModuleContextRouter {present}"
+        try:
+            from backend.core.ouroboros.governance.memory_admission import (
+                latest_record,
+            )
+            rec = latest_record()
+            if rec is not None:
+                row += (f" · last pass {rec.admitted_count}/{rec.considered} "
+                        f"→ {rec.op_id}")
+            else:
+                row += " · [dim]no pass recorded[/dim]"
+        except Exception:  # noqa: BLE001
+            pass
+        return row
     except Exception:  # noqa: BLE001
         return "    routing: unknown"
 
@@ -311,6 +295,18 @@ def compose_memory_lines(arg: str = "") -> List[str]:
         term = str(arg or "").strip()
         out: List[str] = []
 
+        # `/memory context` — what actually LOADED, which is a different
+        # question from what is remembered and the one `/memory` could not
+        # answer. Dispatched before the search branch so "context" is never
+        # read as a topic-name needle.
+        head, _, rest = term.partition(" ")
+        if head.lower() == "context":
+            from backend.core.ouroboros.governance.memory_admission import (
+                render_admission_lines,
+            )
+            return _clamp_payload(render_admission_lines(
+                verbose=rest.strip() in ("-v", "--verbose", "verbose")))
+
         if term:
             hits = search_topics(term)
             out.append(f"  [bold]memory · topics matching[/bold] {term!r}")
@@ -328,9 +324,20 @@ def compose_memory_lines(arg: str = "") -> List[str]:
         else:
             out.append("    [dim](nothing recorded yet)[/dim]")
 
+        listing = _listing()
         counts = topic_counts()
         total = sum(counts.values())
-        out.append(f"  [dim]written topics[/dim] · {total}")
+        prov = getattr(getattr(listing, "provenance", None), "value", "unknown")
+        excluded = getattr(listing, "excluded", 0)
+        # The provenance rides with the count. "684 topics" and "383 topics
+        # (git-tracked, 381 untracked excluded)" are different claims, and a
+        # bare number asserts the stronger one whichever is true.
+        head_row = f"  [dim]written topics[/dim] · {total} [{prov}]"
+        if excluded:
+            head_row += f" [dim]· {excluded} untracked excluded[/dim]"
+        if prov == "walk_fallback":
+            head_row += " [dim]⚠ unverified[/dim]"
+        out.append(head_row)
         if counts:
             ranked = sorted(counts.items(), key=lambda kv: -kv[1])[:6]
             out.append("    " + " · ".join(f"{d} {n}" for d, n in ranked))
@@ -338,7 +345,8 @@ def compose_memory_lines(arg: str = "") -> List[str]:
             out.append("    [dim](docs/memory_topics not found)[/dim]")
 
         out.append(_routing_row())
-        out.append("  [dim]/memory topics <term> searches topic names[/dim]")
+        out.append("  [dim]/memory topics <term> searches names · "
+                   "/memory context shows what loaded[/dim]")
         return _clamp_payload(out)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[MemorySurface] compose degraded", exc_info=True)

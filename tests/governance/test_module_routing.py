@@ -779,7 +779,7 @@ class TestLoadTopicFragmentsOffload:
             return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)
 
         monkeypatch.setattr(cooperative_fs_io, "offload", _spy_offload)
-        frags = await _load_topic_fragments(topics_dir, tmp_path)
+        frags, listing = await _load_topic_fragments(topics_dir, tmp_path)
 
         assert calls["n"] == 1, "_load_topic_fragments must route through offload"
         assert calls["cpu_bound"] is False, (
@@ -788,6 +788,9 @@ class TestLoadTopicFragmentsOffload:
         )
         assert len(frags) == 1
         assert frags[0].title == "Topic A"
+        # The listing travels WITH the fragments so the admission record can
+        # state which corpus was offered without scanning a second time.
+        assert listing is not None
 
     async def test_parity_with_direct_sync_scan(self, tmp_path):
         topics_dir = tmp_path / "topics"
@@ -798,18 +801,24 @@ class TestLoadTopicFragmentsOffload:
         from backend.core.ouroboros.governance.module_routing import (
             _load_topic_fragments,
         )
-        frags = await _load_topic_fragments(topics_dir, tmp_path)
+        frags, _listing = await _load_topic_fragments(topics_dir, tmp_path)
         titles = {f.title for f in frags}
         assert titles == {"A", "B"}
 
     async def test_missing_topics_dir_returns_empty(self, tmp_path):
+        from backend.core.ouroboros.governance.memory_corpus import (
+            CorpusProvenance,
+        )
         from backend.core.ouroboros.governance.module_routing import (
             _load_topic_fragments,
         )
-        frags = await _load_topic_fragments(
+        frags, listing = await _load_topic_fragments(
             tmp_path / "does_not_exist", tmp_path,
         )
         assert frags == []
+        # Empty, and it says WHY it is empty — the distinction the admission
+        # ledger exists to preserve.
+        assert listing.provenance is CorpusProvenance.ABSENT
 
     async def test_offload_error_degrades_to_empty_no_raise(self, tmp_path, monkeypatch):
         topics_dir = tmp_path / "topics"
@@ -833,5 +842,10 @@ class TestLoadTopicFragmentsOffload:
             )
 
         monkeypatch.setattr(cooperative_fs_io, "offload", _boom_offload)
-        frags = await _load_topic_fragments(topics_dir, tmp_path)
+        frags, listing = await _load_topic_fragments(topics_dir, tmp_path)
         assert frags == []
+        # A scan that FAILED must not report an empty corpus as a verified
+        # fact — the operator has to be able to tell "nothing is written"
+        # from "we could not look".
+        assert listing.provenance.value == "absent"
+        assert "offload" in listing.detail
