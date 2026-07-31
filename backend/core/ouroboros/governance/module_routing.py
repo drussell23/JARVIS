@@ -786,6 +786,7 @@ class ModuleContextRouter:
         token_budget: int = 2000,
         op_id: str = "",
         consumer: str = "main",
+        exclude_hashes: Sequence[str] = (),
     ) -> RoutedContext:
         """Select and render the most relevant memory topics for this op.
 
@@ -811,6 +812,14 @@ class ModuleContextRouter:
             choice either way, which meant four call sites were making it by
             accident.  Naming the consumer turns an accident into something
             readable off the ledger.
+        exclude_hashes:
+            Content hashes to withhold from selection.  Used by the REVIEW
+            subagent's ``COMPLEMENT`` scope: a reviewer handed the same
+            topics the author had inherits the author's blind spot and
+            cannot catch a mistake the memory itself caused.  Excluded
+            topics are still RECORDED, with a distinct reason — "you were
+            deliberately not shown this" and "this ranked low" are different
+            facts about the same absence.
 
         Returns
         -------
@@ -833,7 +842,8 @@ class ModuleContextRouter:
 
         try:
             return await self._route_impl(
-                target_files, query, max_topics, token_budget, op_id, consumer)
+                target_files, query, max_topics, token_budget, op_id, consumer,
+                tuple(exclude_hashes or ()))
         except Exception:  # noqa: BLE001 — advisory path, never break pipeline
             logger.warning("[ModuleRouter] route() failed — returning empty context", exc_info=True)
             return RoutedContext.empty()
@@ -850,6 +860,7 @@ class ModuleContextRouter:
         token_budget: int,
         op_id: str = "",
         consumer: str = "main",
+        exclude_hashes: Tuple[str, ...] = (),
     ) -> RoutedContext:
         # 1. Load the DECLARED topic corpus (git-tracked, drift-graded)
         all_topics, listing = await _load_topic_fragments(
@@ -930,8 +941,18 @@ class ModuleContextRouter:
         selected: List[TopicFragment] = []
         rows: List[Any] = []
         char_used = 0
+        excluded = set(exclude_hashes or ())
         for score, topic in combined:
             chars = len(topic.summary)
+            if topic.content_hash in excluded:
+                # Withheld on purpose, and recorded as such. Folding this
+                # into "ranked below cutoff" would erase the only evidence
+                # that a scoping POLICY acted — leaving an operator to
+                # conclude the ranker simply disliked the topic.
+                rows.append(self._row(topic, score, chars, admitted=False,
+                                      why="scope_excluded",
+                                      structural=structural_map))
+                continue
             if len(selected) >= max_topics:
                 rows.append(self._row(topic, score, chars, admitted=False,
                                       why="max_topics_reached",
@@ -996,7 +1017,9 @@ class ModuleContextRouter:
                 # An orphaned topic that also lost is reported as orphaned:
                 # "it ranked low" invites raising max_topics, while "its
                 # declared modules no longer exist" invites deleting it.
-                if topic.drift == "orphaned":
+                if why == "scope_excluded":
+                    reason = AdmissionReason.SCOPE_EXCLUDED
+                elif topic.drift == "orphaned":
                     reason = AdmissionReason.ORPHANED_SUBJECT
                 elif why == "budget_exhausted":
                     reason = AdmissionReason.BUDGET_EXHAUSTED

@@ -1,6 +1,6 @@
 ---
 title: Memory corpus authority + admission ledger
-modules: [backend/core/ouroboros/governance/memory_utility.py, backend/core/ouroboros/governance/ops_digest_observer.py, backend/core/ouroboros/governance/memory_corpus.py, backend/core/ouroboros/governance/memory_admission.py, backend/core/ouroboros/governance/module_routing.py, backend/core/ouroboros/battle_test/memory_surface.py, backend/core/ouroboros/governance/phase_runners/context_expansion_runner.py]
+modules: [backend/core/ouroboros/governance/memory_scope.py, backend/core/ouroboros/governance/subagent_orchestrator.py, backend/core/ouroboros/governance/subagent_contracts.py, backend/core/ouroboros/governance/memory_utility.py, backend/core/ouroboros/governance/ops_digest_observer.py, backend/core/ouroboros/governance/memory_corpus.py, backend/core/ouroboros/governance/memory_admission.py, backend/core/ouroboros/governance/module_routing.py, backend/core/ouroboros/battle_test/memory_surface.py, backend/core/ouroboros/governance/phase_runners/context_expansion_runner.py]
 status: active
 source: session 2026-07-30, CC-parity memory arc
 ---
@@ -175,6 +175,63 @@ E2E through the real telemetry seam: route → 3 topics at 1.0 → listener arme
 → `on_verify_completed(0/6)` → 3 observations → a second passing op sets the
 corpus mean to 0.75 → the failed op's topics demote to ×0.96 at confidence
 0.28. 31 tests.
+
+## Slice 2 — subagent memory scoping (`memory_scope.py`)
+
+The defect was NOT "subagents lack memory". It was a boundary whose crossing
+rule existed only as the ABSENCE of code — answered by omission, at four call
+sites, unreadable afterwards.
+
+**Reach, stated up front.** Three of the four subagents are deterministic:
+EXPLORE greps, PLAN partitions (`llm_planner` never wired), REVIEW scores
+(`provider_used="deterministic"`). Only GENERAL drives a model
+(`run_general_tool_loop` via a wired `llm_driver`) — and its policy is NONE.
+So the rendered SECTION has exactly one potential consumer and is deliberately
+denied to it; the POLICY and its audit trail are live now. Injecting a section
+into three subagents that cannot read one would have been the wired-but-inert
+trap in its purest form.
+
+Per-type defaults, each argued from epistemic role, not tuned:
+- **EXPLORE = NONE** — its value is INDEPENDENT evidence. The parent's memory
+  is the hypothesis; EXPLORE is the test. Feeding the hypothesis to the test
+  is how a search finds what it was told to expect.
+- **REVIEW = COMPLEMENT** — route fresh, then EXCLUDE what the parent was
+  shown. A reviewer handed the author's topics inherits the author's blind
+  spot and cannot catch a mistake the memory itself caused. **This scope does
+  not exist in Claude Code** — it requires knowing what the parent actually
+  saw, which is what the admission ledger records.
+- **PLAN = INHERIT** — shares the parent's goal rather than checking it;
+  reusing the rendered section costs nothing and cannot disagree with it.
+- **GENERAL = NONE** — Semantic Firewall, most injection-vulnerable surface;
+  memory is attack surface with no bearing on its mechanical tasks.
+
+**GENERAL cannot be widened by an env var.** `_FORBIDDEN` refuses
+inherit/independent/complement with a logged reason. A policy a deployment can
+widen by setting a string routes around the firewall's reasoning without ever
+touching the firewall. Narrowing is always allowed — the refusal is
+directional.
+
+`SCOPE_EXCLUDED` is its own admission reason: "deliberately not shown" and
+"ranked low" are different facts about the same absence, and folding them
+together erases the only evidence a policy acted.
+
+Every dispatch files an admission record under its own consumer — **including
+the denied ones**, where the record is the only evidence a boundary decision
+was made rather than forgotten. Applied at `_apply_memory_scope`, called on
+BOTH dispatch paths (parallel legs concurrently via `asyncio.gather`), kept
+OUT of `_build_sub_context` so the builder stays a pure sync constructor.
+
+**Enforcement, not just declaration.** An AST invariant asserts no executor
+reads `strategic_memory_prompt` / `human_instructions` off `parent_ctx`
+(attribute walk + `getattr` string form). AST rather than grep because these
+files are mostly prose and a substring match would fail on a docstring
+forever. A second test proves the detector detects, and a third pins
+`SubagentContext(` to exactly one construction site — a boundary enforced at
+some construction sites is one that does not exist.
+
+Live: parent admits 3 topics → explore 0c, plan 1931c inherited, review 1929c
+with 3 parent topics excluded, general 0c. Verb `/memory scope`. 29 tests;
+452 green across all subagent suites.
 
 ## Ghost reconciliation (2026-07-30)
 

@@ -185,6 +185,12 @@ class AdmissionReason(str, enum.Enum):
     BUDGET_EXHAUSTED = "budget_exhausted"
     DUPLICATE_PAYLOAD = "duplicate_payload"
     UNTRACKED_GHOST = "untracked_ghost"
+    #: Withheld because a scoping POLICY said so — the REVIEW subagent's
+    #: COMPLEMENT scope withholding what the parent already saw. Kept
+    #: distinct from RANK_BELOW_CUTOFF because folding them together erases
+    #: the only evidence that a boundary decision acted, leaving an operator
+    #: to conclude the ranker simply disliked the topic.
+    SCOPE_EXCLUDED = "scope_excluded"
     ORPHANED_SUBJECT = "orphaned_subject"
     UNREADABLE = "unreadable"
 
