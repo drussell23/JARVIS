@@ -97,6 +97,9 @@ class SignalSource(str, Enum):
     # memory_hygiene (the topic corpus) and from runtime_health (the OS
     # layer): this is about the least-privilege derivation being wrong.
     CAGE_HYGIENE = "cage_hygiene"
+    # A declared capability with no reachable caller — the reachability
+    # bottleneck made autonomic.
+    CAPABILITY_SEVERANCE = "capability_severance"
     AUTO_PROPOSED = "auto_proposed"
     VISION_SENSOR = "vision_sensor"
     CADENCE_SYNTHETIC = "cadence_synthetic"

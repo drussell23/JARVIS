@@ -60,6 +60,11 @@ _VALID_SOURCES = frozenset({
     # names the rule as the fix. Clustered + token-bucketed at the sensor so
     # a runaway worker cannot flood the intake through this door.
     "cage_hygiene",
+    # LivenessSensor (2026-07-31) — the organism reporting capabilities it
+    # DECLARES and cannot reach. Distinct from runtime_health (the OS layer)
+    # and meta_dormancy_alarm (a subsystem disabling itself): this is a
+    # capability that was never wired at all.
+    "capability_severance",
     # P1 Slice 3 (2026-04-26) — SelfGoalFormationEngine proposals reach
     # the intake via BacklogSensor's second-source ledger reader. The
     # distinct source ("auto_proposed") lets routers, sensors, and the
