@@ -46,6 +46,7 @@ executor, NO new bus/sandbox/worktree. It is purely the routing seam.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Callable, Optional
 
@@ -109,6 +110,62 @@ def is_graph_parallelizable(graph: ExecutionGraph) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def require_preshaped_units() -> bool:
+    """``JARVIS_SWARM_REQUIRE_PRESHAPED_UNITS`` (default false).
+
+    The ROLLBACK for the eligibility fix below, not a second gate. ON
+    restores the original predicate exactly — swarm only for units that
+    already carry a shape — which is the behaviour that made the master gate
+    inert. It exists so the change can be reverted without touching
+    ``JARVIS_SWARM_ORCHESTRATOR_ENABLED``, never as a default.
+    """
+    return os.environ.get(
+        "JARVIS_SWARM_REQUIRE_PRESHAPED_UNITS", "false",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def swarm_eligible(unit: WorkUnitSpec) -> bool:
+    """Whether this unit CAN be shaped into a caged swarm worker. NEVER raises.
+
+    The bug this replaces was circular. The predicate asked
+    ``unit.is_swarm_worker`` — True only when the unit ALREADY carries a
+    ``system_prompt_template`` / ``allowed_tools`` / ``worker_role``. But the
+    invoker's whole job is to SYNTHESIZE that shape, and every production
+    graph builder (``parallel_dispatch``, ``iteration_planner``,
+    ``providers``, ``meta_goal_aggregator``, ``graph_coalescer``) leaves all
+    five fields ``None``. The only writer is ``SwarmOrchestrator.define_worker``,
+    which has no production caller.
+
+    So the invoker would only shape a unit that was already shaped, and
+    ``JARVIS_SWARM_ORCHESTRATOR_ENABLED=true`` still did nothing — the same
+    class of defect this module's own docstring says it closed, one layer
+    further in. It closed "nothing CALLS the swarm"; it left "nothing is ever
+    ELIGIBLE for it".
+
+    The fix is to ask what the synthesizer actually needs rather than what a
+    marking says. ``worker_synthesizer`` derives the shape from the sub-goal's
+    ``target_files`` (stdlib ``ast``) and its ``goal`` text, so a unit with
+    both is synthesizable and a unit without either is not.
+
+    Fail-CLOSED in the same direction as everything downstream: no target
+    files or no goal → legacy executor, byte-identical. A unit that cannot be
+    inspected cannot be caged, and an uncaged worker must never run.
+    """
+    try:
+        # An explicitly pre-shaped unit stays eligible — the orchestrator's
+        # own `define_worker` path keeps working unchanged.
+        if bool(getattr(unit, "is_swarm_worker", False)):
+            return True
+        if require_preshaped_units():
+            return False
+        # Synthesizable: the two inputs `synthesize_worker_spec` inspects.
+        if not tuple(getattr(unit, "target_files", ()) or ()):
+            return False
+        return bool(str(getattr(unit, "goal", "") or "").strip())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class SwarmUnitInvoker:
     """Per-unit routing seam: legacy executor <-> dynamic worker synthesis.
 
@@ -167,7 +224,7 @@ class SwarmUnitInvoker:
     # -- routing decision -------------------------------------------------
 
     def _should_route_swarm(self, graph: ExecutionGraph, unit: WorkUnitSpec) -> bool:
-        """Swarm iff master gate ON AND graph parallelizable AND swarm unit."""
+        """Swarm iff master gate ON AND graph parallelizable AND unit ELIGIBLE."""
         try:
             from backend.core.ouroboros.governance.autonomy.swarm_orchestrator import (
                 is_orchestrator_enabled,
@@ -177,7 +234,7 @@ class SwarmUnitInvoker:
                 return False
             if not is_graph_parallelizable(graph):
                 return False
-            return bool(getattr(unit, "is_swarm_worker", False))
+            return swarm_eligible(unit)
         except Exception:  # noqa: BLE001 -- any decision error -> legacy (safe).
             logger.debug(
                 "[SwarmInvoker] route decision raised -> legacy (non-fatal)",
@@ -198,6 +255,17 @@ class SwarmUnitInvoker:
             return self._failed(
                 graph, unit, "swarm_synthesis", f"worker_synthesis_failed:{exc}"
             )
+
+        # Calibrate the PRIOR against observed evidence for this shape class.
+        # Tighten-only and fail-open: a broken calibrator returns the
+        # synthesizer's output unchanged, so this can cost the op nothing.
+        try:
+            from backend.core.ouroboros.governance.autonomy.cage_calibration import (
+                calibrate_shape,
+            )
+            shape = calibrate_shape(shape)
+        except Exception:  # noqa: BLE001 -- calibration is advisory, never fatal.
+            logger.debug("[SwarmInvoker] cage calibration skipped", exc_info=True)
 
         try:
             built = self._cage(graph, unit, shape)
@@ -227,7 +295,19 @@ class SwarmUnitInvoker:
         #    catch it and convert to a FAILED unit (never a hang, never a
         #    silent loss -- DAGComposer treats FAILED as ComposeFailure).
         try:
-            return await self._legacy.execute(graph, unit)
+            _result = await self._legacy.execute(graph, unit)
+            # The ONE seam where a caged worker finishes. Recording here means
+            # a worker cannot complete without leaving evidence of what it
+            # actually did with what it was granted.
+            try:
+                from backend.core.ouroboros.governance.autonomy.cage_calibration import (
+                    observe_unit,
+                )
+                observe_unit(shape, getattr(built, "backend", None), _result)
+            except Exception:  # noqa: BLE001 -- telemetry never fails the unit.
+                logger.debug("[SwarmInvoker] cage observation skipped",
+                             exc_info=True)
+            return _result
         except Exception as exc:  # noqa: BLE001 -- deadlock or worker fault.
             if self._is_deadlock(exc):
                 logger.warning(

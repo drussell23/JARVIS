@@ -239,11 +239,87 @@ async def test_swarm_on_single_node_uses_legacy_no_swarm(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_swarm_on_legacy_unit_in_multi_graph_uses_legacy(monkeypatch):
-    """A non-swarm unit (no synthesized fields) -> legacy even in a multi DAG."""
+async def test_unshaped_unit_in_multi_graph_is_now_SWARMED(monkeypatch):
+    """A production-shaped unit in a parallel DAG must reach the swarm.
+
+    This test previously asserted the OPPOSITE — "a non-swarm unit (no
+    synthesized fields) -> legacy even in a multi DAG" — and that assertion
+    was the defect written down as a contract. Every production graph builder
+    leaves the swarm fields None, so under the old predicate NO real unit was
+    ever eligible: `JARVIS_SWARM_ORCHESTRATOR_ENABLED=true` did nothing, and
+    this suite stayed green while the feature was dead.
+
+    The invoker's job is to SYNTHESIZE the shape. Requiring the shape to
+    already exist was circular. See `swarm_invoker.swarm_eligible`.
+    """
     from backend.core.ouroboros.governance.autonomy import swarm_invoker as si
 
     _set_swarm(monkeypatch, "true")
+    inner = _RecordingExecutor()
+    define_calls: list = []
+
+    class _Shape:
+        is_mutating = True
+        read_only = False
+        allowed_tools = ("read_file", "edit_file")
+        mutation_budget = 3
+        role = "python-source mutator"
+
+    def _define(sg):
+        define_calls.append(getattr(sg, "unit_id", sg))
+        return _Shape()
+
+    invoker = si.SwarmUnitInvoker(
+        legacy_executor=inner,
+        define_worker=_define,
+        build_worker=lambda *a, **k: None,
+    )
+
+    graph = _multi_node_graph([_legacy_unit("u1", "a.py"), _legacy_unit("u2", "b.py")])
+    result = await invoker.execute(graph, graph.unit_map["u1"])
+
+    # Routed to the swarm: the shaper ran and the legacy executor did not.
+    assert define_calls, "unshaped unit never reached the shaper"
+    assert inner.calls == []
+    # `build_worker` returning None is no cage -> fail-CLOSED, never uncaged.
+    assert result.status is WorkUnitState.FAILED
+    assert "uncaged" in (result.error or "")
+
+
+async def test_unshapeable_unit_still_uses_legacy(monkeypatch):
+    """What genuinely stays legacy: a unit the synthesizer cannot inspect.
+
+    The eligibility predicate is fail-CLOSED — no goal means nothing to derive
+    a cage from, and an uncageable worker must not run at all.
+    """
+    from backend.core.ouroboros.governance.autonomy import swarm_invoker as si
+
+    _set_swarm(monkeypatch, "true")
+    inner = _RecordingExecutor()
+    define_calls: list = []
+
+    invoker = si.SwarmUnitInvoker(
+        legacy_executor=inner,
+        define_worker=lambda sg: define_calls.append(sg),
+        build_worker=lambda *a, **k: None,
+    )
+
+    goalless = WorkUnitSpec(unit_id="u1", repo="JARVIS", goal="   ",
+                            target_files=("a.py",), owned_paths=("a.py",))
+    graph = _multi_node_graph([goalless, _legacy_unit("u2", "b.py")])
+    result = await invoker.execute(graph, graph.unit_map["u1"])
+
+    assert result.status is WorkUnitState.COMPLETED
+    assert inner.calls == ["u1"]
+    assert define_calls == []
+
+
+async def test_rollback_flag_restores_the_preshaped_only_contract(monkeypatch):
+    """`JARVIS_SWARM_REQUIRE_PRESHAPED_UNITS` reverts to the old predicate."""
+    from backend.core.ouroboros.governance.autonomy import swarm_invoker as si
+
+    _set_swarm(monkeypatch, "true")
+    monkeypatch.setenv("JARVIS_SWARM_REQUIRE_PRESHAPED_UNITS", "1")
     inner = _RecordingExecutor()
     define_calls: list = []
 
