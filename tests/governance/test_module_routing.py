@@ -103,11 +103,19 @@ TOPIC_UNRELATED = textwrap.dedent("""\
 # ---------------------------------------------------------------------------
 
 class TestRoutingEnabled:
-    def test_default_false(self, monkeypatch):
-        """routing_enabled() must be False when env var is absent."""
+    def test_default_true(self, monkeypatch):
+        """routing_enabled() is True when the env var is absent.
+
+        Graduated 2026-07-31 on soak evidence (bt-2026-07-31-185316: a real
+        op routed 3 topics from a 387-topic git-tracked corpus into a
+        GENERATE prompt). Default-OFF meant the admission ledger and the
+        outcome loop were enabled but starved, and `/memory` reported
+        "routing: on" the whole time because it read the same env var with
+        its own opposite default.
+        """
         monkeypatch.delenv("JARVIS_MEMORY_ROUTING_ENABLED", raising=False)
         from backend.core.ouroboros.governance.module_routing import routing_enabled
-        assert routing_enabled() is False
+        assert routing_enabled() is True
 
     def test_truthy_values(self, monkeypatch):
         from backend.core.ouroboros.governance.module_routing import routing_enabled
@@ -115,11 +123,25 @@ class TestRoutingEnabled:
             monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", val)
             assert routing_enabled() is True, f"expected True for {val!r}"
 
-    def test_falsy_values(self, monkeypatch):
+    def test_falsy_values_still_disable(self, monkeypatch):
+        """The rollback path. An explicit falsy value must still turn it off."""
         from backend.core.ouroboros.governance.module_routing import routing_enabled
-        for val in ("0", "false", "False", "no", "off", ""):
+        for val in ("0", "false", "False", "no", "off"):
             monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", val)
             assert routing_enabled() is False, f"expected False for {val!r}"
+
+    def test_empty_string_means_UNSET_not_off(self, monkeypatch):
+        """`FOO=` is indistinguishable from unset in most shells.
+
+        Under default-OFF both read as False and the distinction never
+        mattered. Under default-ON it decides the outcome, so it is pinned:
+        an empty value is absence, and absence takes the default.
+        """
+        from backend.core.ouroboros.governance.module_routing import routing_enabled
+        monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "")
+        assert routing_enabled() is True
+        monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "   ")
+        assert routing_enabled() is True
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +150,13 @@ class TestRoutingEnabled:
 
 class TestFlagOff:
     async def test_route_returns_empty_when_flag_off(self, tmp_path, monkeypatch):
-        """When JARVIS_MEMORY_ROUTING_ENABLED is false, route() returns empty."""
-        monkeypatch.delenv("JARVIS_MEMORY_ROUTING_ENABLED", raising=False)
+        """When JARVIS_MEMORY_ROUTING_ENABLED is false, route() returns empty.
+
+        Sets the flag EXPLICITLY. It used to delete it and rely on the
+        default being off — so the day the default flipped, this stopped
+        testing the flag-off path and started testing the flag-on one.
+        """
+        monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "0")
 
         topics_dir = tmp_path / "memory_topics"
         topics_dir.mkdir()

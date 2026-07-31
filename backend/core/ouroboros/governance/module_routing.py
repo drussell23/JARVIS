@@ -4,7 +4,7 @@ Given an op's target files, injects ONLY the architecture-memory topics
 relevant to the module under work.  Routing signal = Oracle dependency graph
 (AST-bound), NOT filename string-matching.
 
-Gated default-OFF (``JARVIS_MEMORY_ROUTING_ENABLED``).
+Gated default-ON (``JARVIS_MEMORY_ROUTING_ENABLED``, graduated 2026-07-31).
 Authority-free / advisory: produces prompt text only, fail-silent like
 StrategicDirection.  Never imports oracle / semantic_index / source_crawlers
 at module level — all three are lazy-imported inside methods to avoid reverse
@@ -37,11 +37,30 @@ _ENV_FLAG = "JARVIS_MEMORY_ROUTING_ENABLED"
 
 
 def routing_enabled() -> bool:
-    """Return True iff ``JARVIS_MEMORY_ROUTING_ENABLED`` is set to a truthy value.
+    """Whether architecture-memory routing is active. NEVER raises.
 
-    Default: False (gated default-OFF per spec).
+    Default: **True** (graduated 2026-07-31).
+
+    THE definition of this flag. `memory_surface._routing_row` used to read
+    the same env var with its own default of ``"1"`` while this defaulted to
+    OFF — so ``/memory`` reported ``routing: on`` for the entire period
+    routing was silently disabled. One knob, two answers, and the surface
+    built to tell an operator the truth was the one asserting the falsehood.
+
+    Graduated on evidence, not on age: soak bt-2026-07-31-185316 showed a
+    real op routing 3 topics from a 387-topic git-tracked corpus into a
+    GENERATE prompt, with the admission ledger recording
+    ``considered=387 admitted=3``. The path is fail-soft end to end — any
+    error returns an empty context and the pipeline continues — so the
+    downside of default-ON is a wasted corpus scan, while the downside of
+    default-OFF was an entire subsystem that looked alive and was not.
+
+    ``JARVIS_MEMORY_ROUTING_ENABLED=0`` restores the previous behaviour
+    exactly: `route()` returns empty before any I/O.
     """
     raw = os.environ.get(_ENV_FLAG, "").strip().lower()
+    if not raw:
+        return True
     return raw in {"1", "true", "yes", "on"}
 
 
