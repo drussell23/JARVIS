@@ -156,3 +156,38 @@ class TestScanRootsIncludeScripts:
         rows = ProgressBoard().read().rows
         assert any(r.state == "dark" for r in rows)
         assert any(r.state == "live" for r in rows)
+
+
+class TestBarePrefixImports:
+    """`backend/` is on `sys.path`, so siblings import each other bare.
+
+    597 files write `from core.x import y` rather than
+    `from backend.core.x import y`. The board resolves FILE PATHS to the
+    fully-qualified form, so the two never matched and every module imported
+    that way counted zero importers and reported DARK.
+
+    Found via `transport_handlers`: flagged dark-and-enabled with destructive
+    COMPUTER_USE defaults, and imported three times from `backend/api/` as
+    `from core.transport_handlers import ...`. It was one edit away from
+    being defaulted off as "unreached" while it was live on the unlock path.
+    """
+
+    def test_a_bare_prefix_importer_counts(self):
+        from backend.core.ouroboros.battle_test.progress_board import (
+            ProgressBoard,
+        )
+        rows = ProgressBoard().read().rows
+        dark_on = {r.flag for r in rows if r.state == "dark" and r.enabled}
+        assert "JARVIS_COMPUTER_USE_ENABLED" not in dark_on
+
+    def test_the_board_still_discriminates(self):
+        """Three blindness fixes in one day moved 546 dark to 205. If the
+        fixes ever launder everything to LIVE the signal is gone, which is
+        the same as having no board."""
+        from backend.core.ouroboros.battle_test.progress_board import (
+            ProgressBoard,
+        )
+        rows = ProgressBoard().read().rows
+        assert any(r.state == "dark" for r in rows)
+        assert any(r.state == "live" for r in rows)
+        assert any(r.state == "off" for r in rows)
