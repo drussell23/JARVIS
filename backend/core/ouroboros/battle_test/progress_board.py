@@ -100,7 +100,17 @@ def scan_roots() -> Tuple[str, ...]:
     raw = os.environ.get("JARVIS_PROGRESS_BOARD_ROOTS", "").strip()
     if raw:
         return tuple(p.strip() for p in raw.split(",") if p.strip())
-    return ("backend",)
+    # `scripts` is production. `scripts/ouroboros_battle_test.py` is THE entry
+    # point that boots the six-layer stack — it is how this system actually
+    # runs — and 361 backend modules are reachable from `scripts/` and from
+    # nowhere else. Scanning only `backend` reported every one of them DARK
+    # while they were imported on every session.
+    #
+    # Found via `aegis/preflight.py`: flagged dark-and-enabled, imported at
+    # `scripts/ouroboros_battle_test.py:1997`. Same shape as the relative-
+    # import blindness — the board was right about its own graph and the
+    # graph was missing an edge.
+    return ("backend", "scripts")
 
 
 #: Directories that are not this codebase. A venv vendored under the scan root

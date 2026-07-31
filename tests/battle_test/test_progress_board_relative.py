@@ -108,3 +108,51 @@ class TestAgainstTheRealTree:
         rows = ProgressBoard().read().rows
         assert any(r.state == "dark" for r in rows)
         assert any(r.state == "live" for r in rows)
+
+
+class TestScanRootsIncludeScripts:
+    """`scripts/` is production.
+
+    `scripts/ouroboros_battle_test.py` is THE entry point that boots the
+    six-layer stack — it is how this system actually runs — and 361 backend
+    modules are reachable from `scripts/` and nowhere else. Scanning only
+    `backend` reported every one of them DARK while they were imported on
+    every session.
+
+    Found via `aegis/preflight.py`: flagged dark-and-enabled, imported at
+    `scripts/ouroboros_battle_test.py:1997`.
+    """
+
+    def test_scripts_is_a_default_root(self):
+        from backend.core.ouroboros.battle_test.progress_board import scan_roots
+
+        assert "scripts" in scan_roots()
+        assert "backend" in scan_roots()
+
+    def test_the_env_override_still_wins(self, monkeypatch):
+        """A knob, not a constant: what counts as production differs between
+        this repo and a consumer of it."""
+        from backend.core.ouroboros.battle_test.progress_board import scan_roots
+
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "lib, pkg")
+        assert scan_roots() == ("lib", "pkg")
+
+    def test_a_module_imported_only_from_scripts_is_not_dark(self):
+        """THE regression. `preflight` is imported by the battle-test entry
+        point and by nothing under `backend/`."""
+        from backend.core.ouroboros.battle_test.progress_board import (
+            ProgressBoard,
+        )
+        rows = ProgressBoard().read().rows
+        dark_on = {r.flag for r in rows if r.state == "dark" and r.enabled}
+        assert "JARVIS_AEGIS_DEP_VALIDATION_ENABLED" not in dark_on
+
+    def test_the_board_still_discriminates(self):
+        """Widening the roots must not launder everything to LIVE. A board
+        with nothing dark has no signal, which is the same as no board."""
+        from backend.core.ouroboros.battle_test.progress_board import (
+            ProgressBoard,
+        )
+        rows = ProgressBoard().read().rows
+        assert any(r.state == "dark" for r in rows)
+        assert any(r.state == "live" for r in rows)
