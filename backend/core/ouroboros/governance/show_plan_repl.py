@@ -391,7 +391,9 @@ def _render_complexity_distribution() -> str:
 def dispatch_show_plan_command(
     line: str,
 ) -> ShowPlanReplDispatchResult:
-    """Parse a ``/show_plan`` line and dispatch. NEVER raises."""
+    """Show the model-reasoned PLAN output for an operation.
+
+    Parse a ``/show_plan`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return ShowPlanReplDispatchResult(
             ok=False, text="", matched=False,

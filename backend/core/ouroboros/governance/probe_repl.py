@@ -114,7 +114,9 @@ def _master_enabled() -> bool:
 
 
 def dispatch_probe_command(line: str) -> ProbeDispatchResult:
-    """Parse a ``/probe`` line and dispatch. NEVER raises."""
+    """Show probe readings for recent operations.
+
+    Parse a ``/probe`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return ProbeDispatchResult(
             ok=False, text="", matched=False,

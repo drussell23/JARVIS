@@ -163,7 +163,9 @@ def _parse_limit(args, *, default, ceiling):
 def dispatch_decisions_command(
     line: str,
 ) -> DecisionsReplDispatchResult:
-    """Parse a ``/decisions`` line and dispatch. NEVER raises."""
+    """Review recorded decisions and the reasoning behind them.
+
+    Parse a ``/decisions`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return DecisionsReplDispatchResult(
             ok=False, text="", matched=False,

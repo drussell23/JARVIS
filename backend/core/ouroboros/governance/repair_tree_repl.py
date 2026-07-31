@@ -161,7 +161,9 @@ def _parse_limit(
 def dispatch_repair_tree_command(
     line: str,
 ) -> RepairTreeReplDispatchResult:
-    """Parse a ``/repair_tree`` line and dispatch. NEVER raises."""
+    """Inspect the repair-tree archive of past repair attempts.
+
+    Parse a ``/repair_tree`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return RepairTreeReplDispatchResult(
             ok=False, text="", matched=False,

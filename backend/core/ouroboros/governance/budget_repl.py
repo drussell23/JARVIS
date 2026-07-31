@@ -140,7 +140,9 @@ def dispatch_budget_command(
     *,
     tracker: Optional[EpistemicBudgetTracker] = None,
 ) -> BudgetReplDispatchResult:
-    """Parse a ``/budget`` line and dispatch. NEVER raises."""
+    """Show and tune the epistemic exploration budget.
+
+    Parse a ``/budget`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return BudgetReplDispatchResult(
             ok=False, text="", matched=False,

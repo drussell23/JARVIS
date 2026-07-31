@@ -54,6 +54,11 @@ _IMPL_OPENERS = (
     "parse", "handle", "dispatch", "implement", "process", "route",
     "execute", "perform", "run the", "entry point for", "entrypoint for",
     "helper for", "wrapper for", "callback for", "hook for",
+    # Naming-cage scaffolding. "canonical entry point — auto-discovered"
+    # describes how the REGISTRY finds the verb, which is a fact about the
+    # dispatch convention and tells an operator nothing about what typing it
+    # does. Left in, it surfaced as the description "Auto-discovered".
+    "canonical entry point", "auto-discovered", "auto discovered",
 )
 
 #: Connectives left dangling after an opener is removed.
@@ -262,8 +267,20 @@ def _strip_verb_name(text: str, verb: str) -> str:
     )
     if named.search(text):
         return named.sub("", text, count=1)
+    # IDEMPOTENT: matches with OR without the leading slash.
+    #
+    # This is called twice — once before the dangling-article sweep and once
+    # after — and the first pass rewrites "/attach a file" to "attach a
+    # file". With `^/` required, the second pass no longer recognised the
+    # acting form, fell through to the catch-all below, and deleted the word
+    # the first pass had just protected. The result was "File or image to the
+    # next generation": a fragment about files where an instruction to attach
+    # one used to be, produced by the very rule written to prevent it.
+    #
+    # A transform applied more than once has to be a fixed point, or the
+    # number of times it runs becomes part of its contract.
     acting = re.compile(
-        rf"^/{re.escape(name)}\b(?=\s+(?:a|an|the|to|for|with|from|into|on)\b)",
+        rf"^/?{re.escape(name)}\b(?=\s+(?:a|an|the|to|for|with|from|into|on)\b)",
         re.IGNORECASE,
     )
     if acting.search(text):

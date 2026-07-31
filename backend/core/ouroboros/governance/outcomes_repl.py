@@ -129,7 +129,9 @@ def _parse_limit(args: List[str]) -> int:
 
 
 def dispatch_outcomes_command(line: str) -> OutcomesDispatchResult:
-    """Parse an ``/outcomes`` line and dispatch. NEVER raises."""
+    """Review recorded action outcomes and their weights.
+
+    Parse an ``/outcomes`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return OutcomesDispatchResult(
             ok=False, text="", matched=False,

@@ -69,7 +69,9 @@ def _matches(line: str) -> bool:
 
 
 def dispatch_scope_command(line: str) -> ScopeDispatchResult:
-    """Parse a ``/scope`` line and dispatch. NEVER raises."""
+    """Inspect and register per-component tool scopes.
+
+    Parse a ``/scope`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return ScopeDispatchResult(
             ok=False, text="", matched=False,

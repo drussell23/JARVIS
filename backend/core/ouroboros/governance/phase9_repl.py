@@ -67,7 +67,9 @@ def _matches(line: str) -> bool:
 
 
 def dispatch_phase9_command(line: str) -> Phase9DispatchResult:
-    """Parse a ``/phase9`` line and dispatch. NEVER raises."""
+    """Show the Phase 9 orchestrator dashboard.
+
+    Parse a ``/phase9`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return Phase9DispatchResult(
             ok=False, text="", matched=False,

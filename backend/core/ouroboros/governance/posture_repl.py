@@ -142,7 +142,9 @@ def dispatch_posture_command(
     override_state: Optional[Any] = None,
     audit_sink: Optional[Any] = None,
 ) -> PostureDispatchResult:
-    """Parse a ``/posture`` line and dispatch.
+    """Show or override the inferred strategic posture.
+
+    Parse a ``/posture`` line and dispatch.
 
     Tests inject collaborators explicitly; production wires defaults.
     ``audit_sink`` is optional — when ``None`` the handler falls back

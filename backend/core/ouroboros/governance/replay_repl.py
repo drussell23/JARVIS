@@ -365,7 +365,9 @@ def _render_show_session_phase(
 def dispatch_replay_command(
     line: str,
 ) -> ReplayReplDispatchResult:
-    """Parse a ``/replay`` line and dispatch. NEVER raises."""
+    """Replay an operation deterministically from its recorded trace.
+
+    Parse a ``/replay`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return ReplayReplDispatchResult(
             ok=False, text="", matched=False,

@@ -376,7 +376,9 @@ def dispatch_help_command(
     verb_registry: Optional[VerbRegistry] = None,
     current_posture_fn: Optional[Callable[[], Optional[Any]]] = None,
 ) -> HelpDispatchResult:
-    """Parse a ``/help`` line and dispatch.
+    """List every REPL verb and every registered env flag.
+
+    Parse a ``/help`` line and dispatch.
 
     ``flag_registry`` defaults to ``ensure_seeded()`` from flag_registry.
     ``verb_registry`` defaults to the module singleton.

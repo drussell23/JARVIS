@@ -173,7 +173,9 @@ def dispatch_curiosity_command(
     *,
     collector: Optional[CuriosityCollector] = None,
 ) -> CuriosityReplDispatchResult:
-    """Parse a ``/curiosity`` line and dispatch. NEVER raises."""
+    """Show what the organism chose to explore, and why.
+
+    Parse a ``/curiosity`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return CuriosityReplDispatchResult(
             ok=False, text="", matched=False,

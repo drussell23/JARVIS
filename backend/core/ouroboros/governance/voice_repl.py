@@ -109,7 +109,9 @@ def _matches(line: str) -> bool:
 def dispatch_voice_command(
     line: str,
 ) -> VoiceReplDispatchResult:
-    """Parse a ``/voice`` line and dispatch. NEVER raises."""
+    """Control Karen's voice — status, mute and announcements.
+
+    Parse a ``/voice`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return VoiceReplDispatchResult(
             ok=False, text="", matched=False,

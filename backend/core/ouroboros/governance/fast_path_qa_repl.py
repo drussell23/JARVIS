@@ -193,7 +193,9 @@ def _parse_limit(
 def dispatch_fast_path_qa_command(
     line: str,
 ) -> FastPathQAReplDispatchResult:
-    """Parse a ``/fast_path_qa`` line and dispatch. NEVER raises."""
+    """Inspect the fast-path QA ring of recent answers.
+
+    Parse a ``/fast_path_qa`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return FastPathQAReplDispatchResult(
             ok=False, text="", matched=False,

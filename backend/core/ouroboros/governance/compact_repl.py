@@ -163,7 +163,9 @@ def dispatch_compact_command(
     dialogue_entries: Optional[List[Dict[str, Any]]] = None,
     op_id: Optional[str] = None,
 ) -> CompactDispatchResult:
-    """Parse a ``/compact`` line + dispatch.
+    """Inspect context-compaction config and what is queued to compact.
+
+    Parse a ``/compact`` line + dispatch.
 
     ``compactor`` is the substrate ``ContextCompactor`` instance —
     tests inject; production calls ``set_default_compactor`` at

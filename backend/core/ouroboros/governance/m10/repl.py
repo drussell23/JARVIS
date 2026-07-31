@@ -158,7 +158,9 @@ def _parse_limit(args, *, default, ceiling):
 
 
 def dispatch_m10_command(line: str) -> M10ReplDispatchResult:
-    """Parse a ``/m10`` line and dispatch. NEVER raises."""
+    """Inspect the M10 substrate ledger.
+
+    Parse a ``/m10`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return M10ReplDispatchResult(
             ok=False, text="", matched=False,

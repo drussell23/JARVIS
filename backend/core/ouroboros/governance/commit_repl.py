@@ -137,7 +137,9 @@ def _parse_opts(args: List[str]) -> dict:
 
 
 async def dispatch_commit_command(line: str) -> CommitDispatchResult:
-    """Parse a ``/commit`` line and dispatch. ``matched=False``
+    """Grant, revoke and review operator commit authority.
+
+    Parse a ``/commit`` line and dispatch. ``matched=False``
     short-circuit lets the registry fall through. NEVER raises.
 
     ``async`` because ``/commit status`` awaits

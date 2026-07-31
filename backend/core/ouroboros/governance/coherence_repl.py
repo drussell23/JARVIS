@@ -134,7 +134,9 @@ def _parse_limit(args: List[str]) -> int:
 def dispatch_coherence_command(
     line: str,
 ) -> CoherenceDispatchResult:
-    """Parse a ``/coherence`` line and dispatch. NEVER raises."""
+    """Show coherence readings for recent operations.
+
+    Parse a ``/coherence`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return CoherenceDispatchResult(
             ok=False, text="", matched=False,

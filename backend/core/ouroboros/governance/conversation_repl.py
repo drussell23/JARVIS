@@ -450,7 +450,9 @@ def _parse_limit(
 def dispatch_conversation_command(
     line: str,
 ) -> ConversationReplDispatchResult:
-    """Parse a ``/conversation`` line and dispatch. NEVER raises."""
+    """Export and inspect the live conversation bridge buffer.
+
+    Parse a ``/conversation`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return ConversationReplDispatchResult(
             ok=False, text="", matched=False,

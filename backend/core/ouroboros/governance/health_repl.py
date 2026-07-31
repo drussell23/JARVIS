@@ -366,7 +366,9 @@ def _render_unhealthy() -> str:
 def dispatch_health_command(
     line: str,
 ) -> HealthReplDispatchResult:
-    """Parse a ``/health`` line and dispatch. NEVER raises."""
+    """Show per-component health state and transition history.
+
+    Parse a ``/health`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return HealthReplDispatchResult(
             ok=False, text="", matched=False,

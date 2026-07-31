@@ -134,7 +134,9 @@ def _matches(line: str) -> bool:
 def dispatch_graduation_command(
     line: str,
 ) -> GraduationReplDispatchResult:
-    """Parse a ``/graduation`` line and dispatch. NEVER raises —
+    """Show which capabilities have graduated and which are pending.
+
+    Parse a ``/graduation`` line and dispatch. NEVER raises —
     exceptions surface as non-ok results.
 
     Auto-discovered by :mod:`repl_dispatch_registry` (§32.11

@@ -128,7 +128,9 @@ def _matches(line: str) -> bool:
 
 
 def dispatch_render_command(line: str) -> RenderDispatchResult:
-    """Parse a ``/render`` line and dispatch.
+    """Inspect the render conductor — flags, backends and observers.
+
+    Parse a ``/render`` line and dispatch.
 
     Read-only: never mutates substrate state. Subcommands map to
     private ``_status / _flags / _backends / _observers`` handlers.

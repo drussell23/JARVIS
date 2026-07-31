@@ -98,7 +98,9 @@ def _master_enabled() -> bool:
 def dispatch_radar_command(
     line: str,
 ) -> RadarReplDispatchResult:
-    """Parse a ``/radar`` line and dispatch. NEVER raises."""
+    """Show the activity radar — what is moving right now.
+
+    Parse a ``/radar`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return RadarReplDispatchResult(
             ok=False, text="", matched=False,

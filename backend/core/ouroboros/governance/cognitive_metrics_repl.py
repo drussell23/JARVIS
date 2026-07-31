@@ -200,7 +200,9 @@ def dispatch_cognitive_command(
     project_root: Optional[Path] = None,
     service: Optional[CognitiveMetricsService] = None,
 ) -> CognitiveDispatchResult:
-    """Parse `/cognitive ...` and dispatch.
+    """Inspect the cognitive-metrics audit ledger.
+
+    Parse `/cognitive ...` and dispatch.
 
     Tests inject ``service`` directly; production resolves a singleton
     via ``cognitive_metrics.get_default_service``."""
