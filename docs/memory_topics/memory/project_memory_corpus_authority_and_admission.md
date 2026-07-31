@@ -1,6 +1,6 @@
 ---
 title: Memory corpus authority + admission ledger
-modules: [backend/core/ouroboros/governance/operator_rules.py, backend/core/ouroboros/governance/user_preference_memory.py, backend/core/ouroboros/governance/memory_scope.py, backend/core/ouroboros/governance/subagent_orchestrator.py, backend/core/ouroboros/governance/subagent_contracts.py, backend/core/ouroboros/governance/memory_utility.py, backend/core/ouroboros/governance/ops_digest_observer.py, backend/core/ouroboros/governance/memory_corpus.py, backend/core/ouroboros/governance/memory_admission.py, backend/core/ouroboros/governance/module_routing.py, backend/core/ouroboros/battle_test/memory_surface.py, backend/core/ouroboros/governance/phase_runners/context_expansion_runner.py]
+modules: [backend/core/ouroboros/governance/intake/sensors/memory_hygiene_sensor.py, backend/core/ouroboros/governance/operator_rules.py, backend/core/ouroboros/governance/user_preference_memory.py, backend/core/ouroboros/governance/memory_scope.py, backend/core/ouroboros/governance/subagent_orchestrator.py, backend/core/ouroboros/governance/subagent_contracts.py, backend/core/ouroboros/governance/memory_utility.py, backend/core/ouroboros/governance/ops_digest_observer.py, backend/core/ouroboros/governance/memory_corpus.py, backend/core/ouroboros/governance/memory_admission.py, backend/core/ouroboros/governance/module_routing.py, backend/core/ouroboros/battle_test/memory_surface.py, backend/core/ouroboros/governance/phase_runners/context_expansion_runner.py]
 status: active
 source: session 2026-07-30, CC-parity memory arc
 ---
@@ -289,6 +289,56 @@ Live: a governance op gets `async-first` + the global rule and NOT the voice
 rule; a voice op gets `voice-latency` FIRST (deeper scope), then `async-first`,
 then the global. Verb `/memory rules`. 39 tests; 194 green across
 preference/forbidden/protected/tool_executor/context_expansion suites.
+
+## Slice 4 — PROACTIVE memory (`memory_hygiene_sensor.py`)
+
+Everything above is PULL: `route()` answers at CONTEXT_EXPANSION,
+`compose_for_op()` at the same seam, utility read at the next pull. Memory
+only spoke when spoken to — right for a reactive assistant, wrong as the
+PRIMARY shape for an organism that self-initiates.
+
+In this codebase proactive has a precise meaning: **being a SIGNAL SOURCE**,
+emitting `IntentSignal` envelopes into `UnifiedIntakeRouter` so the governed
+loop schedules work nobody asked for. A background thread recomputing a score
+is not proactive; it is a cache warmer. So memory became the 18th sensor. The
+reactive path is untouched and stays SECONDARY.
+
+Five finding kinds, each possible ONLY because the earlier slices produced the
+evidence: `drifted` / `orphaned` (from `memory_corpus`), `unreachable` (the
+admission ledger watched a topic lose N times and never win — before the
+ledger there was no way to tell that from "nobody needed it yet"), `suspect`
+(**`memory_utility` says this topic correlates with FAILED ops — memory
+reporting its own suspected falsity**, which CC structurally cannot produce),
+`uncovered`.
+
+**Event-primary** per Gap #4: `fs.changed.*` filtered to `docs/memory_topics`,
+plus a NEW registry-wide listener on `AdmissionRegistry` — a routing pass IS
+the event that changes what "unreachable" means. Per-op ledgers are created
+lazily, so a subscriber wanting "every pass" had nothing to attach to until
+the registry grew `add_listener`. Polling is the 1h fallback, not the hot path.
+
+**Bounds, because the flood was real.** Live scan: **234 findings** (232
+drifted, 2 orphaned). Uncapped that is 234 chore-ops on first boot. Debounce
+the FS burst, cap 3/scan, rank orphaned>suspect>drifted>unreachable>uncovered,
+dedup on `(kind, content_hash)` — payload-keyed so a repair SELF-CLEARS and
+the repaired text is re-judged on its merits (a path key would suppress the
+finding forever after one failed repair). A rejected envelope is not marked
+seen.
+
+**Cost**: registered in all THREE places — `_VALID_SOURCES` (else every
+envelope is dropped), `SignalSource` (else typed consumers can't classify),
+`_BACKGROUND_SOURCES` (else 15x on Claude). Envelopes carry `urgency="low"`.
+The whitelist's own comment records the last miss: $0.53 burned on doc scans.
+
+**Defect found + fixed**: `add_listener` idempotency used `is`, but
+`obj.method` builds a NEW object per access — the sensor subscribes with
+`self._on_admission`, so a re-subscribe would double-count the very evidence
+`unreachable` is counted from. `_same_callable` compares the
+(instance, function) pair.
+
+Default **OFF** (`JARVIS_MEMORY_HYGIENE_SENSOR_ENABLED`) — a sensor that
+enqueues autonomous work earns default-on via a soak, not by being new.
+20 tests; 179 green across the memory subsystem.
 
 ## Ghost reconciliation (2026-07-30)
 

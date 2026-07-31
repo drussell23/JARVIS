@@ -46,6 +46,14 @@ _VALID_SOURCES = frozenset({
     # cognition-layer, not the OS/runtime-layer.
     "meta_dormancy_alarm",
     "web_intelligence",
+    # MemoryHygieneSensor (2026-07-30) — the proactive half of the memory
+    # arc. O+V's memory was pull-only: it answered at CONTEXT_EXPANSION and
+    # never initiated. This source carries memory's findings ABOUT ITSELF
+    # (drifted / orphaned / unreachable / suspect topics) into the intake so
+    # the organism repairs its own knowledge unprompted. Registered in
+    # urgency_router._BACKGROUND_SOURCES too — these are chores, and the
+    # comment above records what misdeclaring a source costs.
+    "memory_hygiene",
     # P1 Slice 3 (2026-04-26) — SelfGoalFormationEngine proposals reach
     # the intake via BacklogSensor's second-source ledger reader. The
     # distinct source ("auto_proposed") lets routers, sensors, and the

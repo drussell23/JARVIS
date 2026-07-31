@@ -158,6 +158,34 @@ class MemoryConsumer(str, enum.Enum):
         return cls.UNKNOWN
 
 
+def _same_callable(a: Any, b: Any) -> bool:
+    """Whether two callables are the SAME subscription. NEVER raises.
+
+    Identity is the wrong test for bound methods. ``obj.method`` builds a new
+    method object on every attribute access, so ``obj.method is obj.method``
+    is False — and an idempotency guard written with ``is`` silently admits a
+    duplicate every time a subscriber re-registers.
+
+    That is not hypothetical here: the memory-hygiene sensor subscribes with
+    ``self._on_admission``, and ``subscribe_to_bus`` can be called again on a
+    reconnect. Double registration would double-count every routing pass,
+    which is exactly the evidence the "unreachable" finding is counted from.
+
+    So compare the underlying (instance, function) pair, and fall back to
+    identity for plain functions and callable objects.
+    """
+    try:
+        if a is b:
+            return True
+        a_self = getattr(a, "__self__", None)
+        b_self = getattr(b, "__self__", None)
+        if a_self is not None and a_self is b_self:
+            return getattr(a, "__func__", None) is getattr(b, "__func__", None)
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class AdmissionDecision(str, enum.Enum):
     """Whether a topic's text reached the rendered section."""
 
@@ -399,6 +427,7 @@ class AdmissionRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._ledgers: Dict[str, AdmissionLedger] = {}
+        self._listeners: List[Callable[[Dict[str, Any]], None]] = []
         #: Wall-clock of the newest record per op, so `latest_record()` can
         #: answer "the last op to route memory" without scanning payloads.
         self._recency: Dict[str, float] = {}
@@ -416,6 +445,39 @@ class AdmissionRegistry:
                     self._ledgers.pop(oldest, None)
                     self._recency.pop(oldest, None)
             return ledger
+
+    def add_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
+        """Subscribe to EVERY routing pass, across all ops. Idempotent.
+
+        Distinct from :meth:`AdmissionLedger.add_listener`, which only ever
+        hears about one op — and since ledgers are created lazily per op, a
+        subscriber that wanted "every pass" could not find one to attach to.
+        That is the seam the proactive memory sensor needs: a routing pass is
+        the event that changes what "this topic never wins" means.
+        """
+        with self._lock:
+            if not any(_same_callable(existing, fn)
+                       for existing in self._listeners):
+                self._listeners.append(fn)
+
+    def remove_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
+        with self._lock:
+            self._listeners = [x for x in self._listeners if x is not fn]
+
+    def _notify(self, payload: Dict[str, Any]) -> None:
+        """Fan a filed record out to registry listeners. NEVER raises.
+
+        Isolated per listener: an observer must never be able to fail the
+        routing pass it is observing.
+        """
+        with self._lock:
+            listeners = list(self._listeners)
+        for listener in listeners:
+            try:
+                listener(payload)
+            except Exception:  # noqa: BLE001
+                logger.debug("[MemoryAdmission] registry listener raised",
+                             exc_info=True)
 
     def note_recency(self, op_id: str, when: float) -> None:
         with self._lock:
@@ -481,6 +543,9 @@ def record_admission(record: AdmissionRecord) -> Optional[AdmissionRecord]:
         registry = get_default_registry()
         registry.ledger_for(record.op_id).append(record)
         registry.note_recency(record.op_id, record.recorded_at)
+        # Registry-wide fan-out AFTER the record is durable, so a listener
+        # that reads the ledger back sees the pass it was told about.
+        registry._notify(record.as_payload())
         logger.info(
             "[MemoryAdmission] op=%s consumer=%s corpus=%d/%s considered=%d "
             "admitted=%d chars=%d/%d",
