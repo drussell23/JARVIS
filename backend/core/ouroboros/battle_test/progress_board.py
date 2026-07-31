@@ -613,10 +613,32 @@ def _imported_modules(tree: ast.AST, self_mod: str = "",
     that way reported DARK while being imported on every boot.
     """
     found: Set[str] = set()
+    #: Candidate edges from a lazy table — kept only if this file turns out
+    #: to import dynamically. Collected in THIS walk rather than a second
+    #: one: the board parses thousands of files, and a extra `ast.walk` per
+    #: file is a real cost for an instrument people run interactively.
+    lazy: Set[str] = set()
+    dynamic = False
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 found.add(alias.name)
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            if (getattr(fn, "attr", None) or getattr(fn, "id", None)) in (
+                    "import_module", "__import__"):
+                dynamic = True
+        elif isinstance(node, ast.Constant):
+            # Rejection is INLINE and the call is not. String constants are
+            # the most common node in this codebase by a wide margin, and a
+            # function call per literal cost 34% of a scan that was already
+            # the slowest thing this instrument does. Two `startswith`
+            # checks reject essentially all of them.
+            v = node.value
+            if type(v) is str and (v[:1] == "." or v[:8] == "backend."):
+                edge = _lazy_edge(v, self_mod, is_package)
+                if edge:
+                    lazy.add(edge)
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 resolved = _resolve_relative(
@@ -633,7 +655,47 @@ def _imported_modules(tree: ast.AST, self_mod: str = "",
                 # which is how most of this codebase reaches its siblings.
                 for alias in node.names:
                     found.add(f"{module}.{alias.name}")
+    # Only a file that actually imports dynamically gets its string literals
+    # counted. A dotted-looking literal elsewhere is a message, a regex or a
+    # config key — counting it would trade one false DARK for a much larger
+    # class of false LIVE, and a board that over-reports reachability hides
+    # dead code, which is strictly worse than one that under-reports and only
+    # asks for a second look.
+    if dynamic:
+        found |= lazy
     return found
+
+
+def _lazy_edge(value: Any, self_mod: str, is_package: bool) -> str:
+    """A module path named as a STRING, resolved. "" when it is not one.
+
+    The fourth blind spot of this instrument, and the same shape as the other
+    three: an edge that exists at runtime with no `import` statement to find.
+    `backend/core/__init__.py` maps public names to `(".jarvis_core",
+    "JARVISCore")` and resolves them in a PEP 562 `__getattr__` — so
+    `jarvis_core` is imported on essentially every boot and was reported DARK,
+    because a string constant is not an import node.
+
+    Relative forms go through `_resolve_relative`, the same function the
+    `ImportFrom` branch uses, so the two syntaxes cannot disagree about what
+    they name. Absolute forms are `backend.`-anchored so an arbitrary dotted
+    string — a version, a hostname, a metric key — cannot enter.
+
+    Deliberately does NOT model which BRANCH resolves a given entry. A lazy
+    table is a promise that every entry is reachable; proving which ones a
+    particular run takes needs execution, and this instrument is static.
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    if " " in value or "\n" in value:
+        return ""
+    if value.startswith("."):
+        level = len(value) - len(value.lstrip("."))
+        return _resolve_relative(
+            self_mod, level, value.lstrip("."), is_package) or ""
+    if value.startswith("backend."):
+        return value
+    return ""
 
 
 
