@@ -461,7 +461,24 @@ class ProgressBoard:
                               value=value)
 
         module = _module_name(module_rel)
+        # BOTH spellings of the same module.
+        #
+        # `backend/` is on `sys.path` at runtime, so 597 files import their
+        # siblings as `from core.x import y` rather than
+        # `from backend.core.x import y`. This resolves FILE PATHS to the
+        # fully-qualified form, so the two never matched and every module
+        # imported that way counted zero importers and reported DARK.
+        #
+        # Found via `transport_handlers`: flagged dark-and-enabled with
+        # destructive COMPUTER_USE defaults, and imported three times from
+        # `backend/api/` as `from core.transport_handlers import ...`. It was
+        # one edit away from being defaulted off as "unreached" while live.
         importers = int(self._importers.get(module, 0))
+        for root in scan_roots():
+            prefix = f"{root}."
+            if module.startswith(prefix):
+                importers += int(
+                    self._importers.get(module[len(prefix):], 0))
 
         if enabled is False:
             return FeatureRow(flag, OFF, module_rel, category, enabled,
