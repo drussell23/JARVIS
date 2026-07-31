@@ -64,3 +64,44 @@ to assert wrapping by SHAPE.
 
 21 tests; 447 green across palette/completion/bipartite. ⚠️ Not confirmed by
 the operator in a real terminal.
+
+## Slice 2 — adaptive fluid breakpoints (width starvation)
+
+Strict alignment introduced a geometric failure: on a narrow terminal the
+description column collapses and every entry becomes a tower one or two words
+wide. The table stops conveying anything exactly when there is least room.
+
+**The snap is derived from the DESCRIPTION column, not the terminal width.**
+A fixed "stack below 60" measures the wrong quantity, and two cases prove it:
+
+- width **61** with a 40-char verb → two-column leaves ~15 columns of
+  description. That is the tower a breakpoint exists to prevent, and a
+  column-count rule sails past it.
+- width **59** with 8-char verbs → ample room, and the same rule stacks for
+  no reason.
+
+`stacked_mode(width, name_col)` computes
+`width - name_col - _GUTTER - 2 < min_desc_col()`, with
+`absolute_stack_floor()` (56) kept as a backstop for degenerate terminals and
+because "when does it stack?" deserves an answer that does not require
+knowing the verb table. Both env-tunable.
+
+**Only the yield sequence changes.** Same `_ellipsis`, same `_wrap`, same
+style classes — a second layout engine would be a second place for theme and
+truncation to drift, and the two would disagree first on the narrow terminal
+nobody tests on.
+
+**`_rendered_height` learned the mode.** A stacked entry costs
+`1 + description lines`; a budget that assumed two-column would overrun by
+one line per entry on exactly the narrow terminal with least slack.
+
+**Stacked names use the FULL width** — with no description sharing the row,
+the 34% fraction cap would be clipping to protect a column that no longer
+exists. Still ellipsised against the terminal, so a 200-char verb at width 30
+cannot overflow.
+
+Evaluated per call, so a SIGWINCH re-decides on the next frame: the function
+is pure and the cockpit calls it every render.
+
+31 tests; parametrised no-overflow across widths 200→12. 478 green across
+palette/completion/bipartite.
