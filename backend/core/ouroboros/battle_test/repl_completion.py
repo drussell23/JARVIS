@@ -178,6 +178,54 @@ def is_unified_registry_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+def slash_completion_triggers(text_before_cursor: str) -> bool:
+    """Whether the VERB completer owns this cursor position. Pure.
+
+    The verb completer's own gate, lifted to a named function so the Tab
+    arbiter can ask the same question the completer answers. NEVER raises.
+    """
+    try:
+        return str(text_before_cursor or "").startswith("/")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def mention_completion_triggers(text_before_cursor: str) -> bool:
+    """Whether the MENTION (`@path`) completer owns this position. Pure.
+
+    Mirrors ``MentionPathCompleter.get_completions``: an `@` must be present
+    and the fragment after it must still be one unfinished token — an `@`
+    earlier in a finished sentence is not an open mention. NEVER raises.
+    """
+    try:
+        text = str(text_before_cursor or "")
+        at = text.rfind("@")
+        if at < 0:
+            return False
+        fragment = text[at + 1:]
+        return " " not in fragment and "\n" not in fragment
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def completion_would_trigger(text_before_cursor: str) -> bool:
+    """Whether ANY completer would offer candidates here. Pure. NEVER raises.
+
+    The single definition of "this is completion territory", consulted by
+    both the completers and the Tab arbiter.
+
+    It exists because the arbiter cannot simply ASK: the completer is
+    threaded, so querying it is asynchronous by construction and a key
+    handler that waited on it would block the keystroke it is servicing.
+    Deciding by context is synchronous and exact — but only while there is
+    ONE rule. Two copies would drift the first time a trigger character was
+    added, and the symptom would be a dead Tab again, which is the bug this
+    whole seam exists to fix.
+    """
+    return (slash_completion_triggers(text_before_cursor)
+            or mention_completion_triggers(text_before_cursor))
+
+
 def build_auto_suggest() -> Optional[object]:
     """History ghost-text, threaded so a large history file never lands
     on a keystroke. Returns ``None`` when disabled or prompt_toolkit is
@@ -1300,7 +1348,12 @@ def build_completer(
             # Only trigger when input starts with a slash. Operators
             # typing prose / goals / content shouldn't see verb
             # suggestions interleaved with their natural input.
-            if not text.startswith("/"):
+            #
+            # Via the shared predicate, not an inline test: the Tab arbiter
+            # decides whether Tab means "complete" or "accept the ghost
+            # text" by asking the SAME question, and a second copy of the
+            # rule would drift the first time a trigger changed.
+            if not slash_completion_triggers(text):
                 return
             # §41.3 Slice 3 #14 — when the operator has typed past
             # the verb name (text contains a space), dispatch to
@@ -2044,14 +2097,13 @@ class MentionPathCompleter(_pt_completer_base()):  # type: ignore[misc]
         from prompt_toolkit.completion import Completion
         try:
             text = document.text_before_cursor or ""
-            at = text.rfind("@")
-            if at < 0:
-                return
-            # Only the token being typed — an `@` earlier in a finished
+            # Shared predicate — see `completion_would_trigger`. Only the
+            # token being typed counts: an `@` earlier in a finished
             # sentence must not re-open the menu on every later keystroke.
-            fragment = text[at + 1:]
-            if " " in fragment or "\n" in fragment:
+            if not mention_completion_triggers(text):
                 return
+            at = text.rfind("@")
+            fragment = text[at + 1:]
             root = self._repo_root()
             if not root.is_dir():
                 return
