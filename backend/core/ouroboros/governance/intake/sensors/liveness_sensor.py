@@ -71,6 +71,7 @@ __all__ = [
     "LivenessSensor",
     "critical_categories",
     "sensor_enabled",
+    "effective_firing",
     "severity_for",
 ]
 
@@ -202,18 +203,60 @@ class LivenessFinding:
         return (0 if self.severity == "high" else 1, -self.fraction_severed)
 
 
-def severity_for(category: str, firing: str, fraction: float) -> str:
-    """``high`` / ``low``. Pure. NEVER raises.
+def effective_firing(source_file: str, firing: str) -> str:
+    """AST/telemetry firing state, corrected by the dynamic registry.
+
+    Static reachability cannot see a pub/sub handler, an ``importlib`` load,
+    or a ``getattr`` route, so a live capability reads as dead.
+    `dynamic_dispatch_registry` records what actually happened at those
+    seams, and this is where the two are intersected.
+
+    Only INVOCATION clears a finding. A module that merely REGISTERED asked
+    to be called and may never have been — reporting that as alive would let
+    the audit confidently clear the exact failure it exists to catch, so it
+    is surfaced under its own name instead. ``REGISTERED_NEVER_INVOKED`` is
+    a sharper verdict than ``SILENT``, not a softer one: it rules out the
+    innocent explanation that nothing ever tried.
+    """
+    try:
+        from backend.core.ouroboros.governance.dynamic_dispatch_registry import (
+            FIRING_DYNAMICALLY, REGISTERED_NEVER_INVOKED, dynamic_verdict,
+        )
+        verdict = dynamic_verdict(source_file)
+        if verdict == FIRING_DYNAMICALLY:
+            return FIRING_DYNAMICALLY
+        if verdict == REGISTERED_NEVER_INVOKED:
+            return REGISTERED_NEVER_INVOKED
+    except Exception:  # noqa: BLE001 — registry absent -> static verdict stands
+        pass
+    return str(firing or "UNKNOWN")
+
+
+def severity_for(category: str, firing: str, fraction: float,
+                 source_file: str = "") -> str:
+    """``high`` / ``low``. NEVER raises.
 
     HIGH requires BOTH a critical category AND telemetry that has never
     fired. Either alone is weaker evidence than it looks: a safety capability
     with FIRING telemetry is alive whatever the AST says, and a SILENT
     experimental helper is not worth waking anyone for.
+
+    ``FIRING_DYNAMICALLY`` demotes to low — the module demonstrably ran, and
+    a static index that could not see the edge is the index's limitation, not
+    the module's fault. ``REGISTERED_NEVER_INVOKED`` stays eligible for high:
+    it is evidence OF severance, not against it.
     """
     try:
+        from backend.core.ouroboros.governance.dynamic_dispatch_registry import (
+            FIRING_DYNAMICALLY,
+        )
+        resolved = effective_firing(source_file, firing) if source_file else (
+            str(firing or ""))
+        if resolved == FIRING_DYNAMICALLY:
+            return "low"
         crit = str(category or "").strip().lower() in critical_categories()
-        silent = str(firing or "").strip().upper() == "SILENT"
-        if crit and silent and float(fraction or 0.0) >= _severed_floor():
+        dead = resolved.strip().upper() in ("SILENT", "REGISTERED_NEVER_INVOKED")
+        if crit and dead and float(fraction or 0.0) >= _severed_floor():
             return "high"
         return "low"
     except Exception:  # noqa: BLE001
@@ -300,20 +343,32 @@ class LivenessSensor:
         counts: Dict[str, int] = {}
         for row in candidates:
             try:
-                firing = str(row.get("firing") or "UNKNOWN")
+                source_file = str(row.get("source_file") or "?").split("/")[-1]
+                # Correct the STATIC verdict with runtime evidence before
+                # anything downstream counts or ranks it — otherwise the
+                # health projection reports a severance the sensor has
+                # already decided is a false positive.
+                firing = effective_firing(
+                    source_file, str(row.get("firing") or "UNKNOWN"))
                 counts[firing] = counts.get(firing, 0) + 1
                 fraction = float(row.get("fraction_severed") or 0.0)
                 if fraction < floor:
                     continue
                 category = str(row.get("category") or "")
+                severity = severity_for(category, firing, fraction, source_file)
+                if firing == "FIRING_DYNAMICALLY":
+                    # Demonstrably ran. Reporting it would train the operator
+                    # to ignore this sensor, which costs more than the finding
+                    # is worth.
+                    continue
                 out.append(LivenessFinding(
-                    source_file=str(row.get("source_file") or "?").split("/")[-1],
+                    source_file=source_file,
                     category=category,
                     flag=str(row.get("flag") or ""),
                     firing=firing,
                     fraction_severed=fraction,
                     severed_symbols=tuple(row.get("severed_symbols") or ()),
-                    severity=severity_for(category, firing, fraction),
+                    severity=severity,
                 ))
             except Exception:  # noqa: BLE001
                 continue
