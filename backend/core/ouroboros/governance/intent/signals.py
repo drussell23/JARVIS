@@ -93,6 +93,10 @@ class SignalSource(str, Enum):
     # this is about the architecture-memory corpus being wrong, unreachable,
     # or correlated with failed operations.
     MEMORY_HYGIENE = "memory_hygiene"
+    # The synthesized worker CAGE reporting on itself — distinct from
+    # memory_hygiene (the topic corpus) and from runtime_health (the OS
+    # layer): this is about the least-privilege derivation being wrong.
+    CAGE_HYGIENE = "cage_hygiene"
     AUTO_PROPOSED = "auto_proposed"
     VISION_SENSOR = "vision_sensor"
     CADENCE_SYNTHETIC = "cadence_synthetic"
