@@ -71,3 +71,52 @@ Cage failure → `FAILED/swarm_cage`, never uncaged.
   This one.
 
 Both still default-OFF. ⚠️ Not soaked.
+
+## Slice 2 — the cage learns (`autonomy/cage_calibration.py`)
+
+Making the synthesizer reachable exposed that it is **open-loop**: a derived
+PRIOR with no posterior. A worker granted `mutation_budget=3` that never used
+more than one taught it nothing; the same shape was re-derived, identically
+wrong, forever. Exactly the defect `memory_utility` fixed for topics, one
+layer down.
+
+`ScopedToolBackend` was recording the evidence all along — `mutations_count`
+vs `max_mutations`, `call_records` stamped `authorized`/`type_denied`/
+`count_denied`. Nobody consumed it for learning.
+
+**Tighten autonomously; NEVER widen.** The asymmetry is the whole design.
+Observed under-use is safe to act on — dropping to what evidence shows grants
+strictly less than the prior already did. Observed DENIAL is not: widening a
+cage because a worker kept asking builds a privilege-escalation ramp out of
+persistence, reachable by any worker including a prompt-injected one. So
+denials become a FINDING naming `worker_synthesizer`'s RULE as the thing to
+fix — the root cause. A learned per-class exception would erode the cage one
+class at a time.
+
+Note this is the OPPOSITE direction from `UserMemory.matches_path`, where the
+safe move was to widen a guard. The invariant is not "always widen" or
+"always tighten" — it is *move only in the direction that cannot grant
+something new*. Deny-list → widen. Allow-list → tighten.
+
+`_is_tightening` asserts the post-condition rather than trusting it: tools
+must be a SUBSET and budget `<=`, or the prior is returned. A calibrator is
+not permitted to be the thing that grants privilege.
+
+**Learning key = the synthesizer's own clustering.** `role` + `read_only`,
+both already derived. No second taxonomy to drift; a new role invented by
+inspection tomorrow becomes a new learning class with zero code change.
+
+**Reuse:** two `memory_utility.UtilityStore` instances (outcome, headroom) —
+already an opaque-key store of decayed, confidence-weighted observations with
+a corpus-mean baseline. A second implementation would be a second definition
+of "how fast does evidence age".
+
+Refusals: cold start → prior unchanged; thin evidence → prior; FAILED units
+never teach the cage to shrink (a crash's low usage is not "needs less");
+unattributable shapes are not recorded at all.
+
+Wired at the ONE seam in `_execute_swarm` — calibrate between synthesis and
+cage, observe after execution. Both fail-open.
+
+Default **OFF** (`JARVIS_CAGE_CALIBRATION_ENABLED`) — it narrows a live
+security boundary from data. 18 tests; 761 green across autonomy.

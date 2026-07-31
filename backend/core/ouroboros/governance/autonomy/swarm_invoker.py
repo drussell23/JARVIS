@@ -256,6 +256,17 @@ class SwarmUnitInvoker:
                 graph, unit, "swarm_synthesis", f"worker_synthesis_failed:{exc}"
             )
 
+        # Calibrate the PRIOR against observed evidence for this shape class.
+        # Tighten-only and fail-open: a broken calibrator returns the
+        # synthesizer's output unchanged, so this can cost the op nothing.
+        try:
+            from backend.core.ouroboros.governance.autonomy.cage_calibration import (
+                calibrate_shape,
+            )
+            shape = calibrate_shape(shape)
+        except Exception:  # noqa: BLE001 -- calibration is advisory, never fatal.
+            logger.debug("[SwarmInvoker] cage calibration skipped", exc_info=True)
+
         try:
             built = self._cage(graph, unit, shape)
         except Exception as exc:  # noqa: BLE001 -- cage failure -> fail-CLOSED.
@@ -284,7 +295,19 @@ class SwarmUnitInvoker:
         #    catch it and convert to a FAILED unit (never a hang, never a
         #    silent loss -- DAGComposer treats FAILED as ComposeFailure).
         try:
-            return await self._legacy.execute(graph, unit)
+            _result = await self._legacy.execute(graph, unit)
+            # The ONE seam where a caged worker finishes. Recording here means
+            # a worker cannot complete without leaving evidence of what it
+            # actually did with what it was granted.
+            try:
+                from backend.core.ouroboros.governance.autonomy.cage_calibration import (
+                    observe_unit,
+                )
+                observe_unit(shape, getattr(built, "backend", None), _result)
+            except Exception:  # noqa: BLE001 -- telemetry never fails the unit.
+                logger.debug("[SwarmInvoker] cage observation skipped",
+                             exc_info=True)
+            return _result
         except Exception as exc:  # noqa: BLE001 -- deadlock or worker fault.
             if self._is_deadlock(exc):
                 logger.warning(
