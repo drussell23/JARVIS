@@ -303,6 +303,17 @@ def observe_unit(shape: Any, backend: Any, result: Any) -> Optional[CageObservat
         if headroom is not None and granted > 0 and succeeded:
             headroom.add([Observation(signature, obs.headroom, now)])
         if denied or count_denied:
+            # Feed the aggregating sensor from the SAME seam, so no second
+            # instrumentation point exists to fall out of date. Fail-soft:
+            # the sensor must never be able to fail a unit's telemetry.
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.cage_hygiene_sensor import (
+                    note_denials,
+                )
+                note_denials(signature, denied, count_denied)
+            except Exception:  # noqa: BLE001
+                logger.debug("[CageCalibration] denial aggregation skipped",
+                             exc_info=True)
             denial = _store("denial")
             if denial is not None:
                 denial.add([Observation(signature, 1.0, now,

@@ -153,6 +153,11 @@ _BACKGROUND_SOURCES = frozenset({
     # own notes never has deadline pressure, and routing it to Claude would
     # repeat exactly the burn this set's comment documents.
     "memory_hygiene",
+    # Cage findings are engineering chores about a synthesis rule. Kept
+    # BACKGROUND even when classified suspicious: escalating urgency by
+    # severity would let an attacker who can trigger denials force IMMEDIATE
+    # routing and burn the Claude tier. Severity rides in evidence instead.
+    "cage_hygiene",
 })
 
 # Sources that produce SPECULATIVE-eligible signals

@@ -1023,13 +1023,21 @@ def get_active_canvas() -> Optional[BipartiteLayout]:
 
 def _palette_height() -> int:
     """Rows the `/` menu may occupy. Bounded so a 76-verb palette cannot
-    swallow the canvas — it scrolls instead."""
+    swallow the canvas — it scrolls instead.
+
+    Delegates to `palette_render.palette_rows`, which OWNS
+    ``JARVIS_PALETTE_HEIGHT``. This read the same env var with its own
+    default of 12 while the page palette used 4, so the height an operator
+    got depended on which renderer mounted — and with the var unset the two
+    surfaces disagreed by a factor of three. One knob, one definition.
+    """
     try:
-        return max(3, min(24, int(
-            os.environ.get("JARVIS_PALETTE_HEIGHT", "12") or 12,
-        )))
-    except (TypeError, ValueError):
-        return 12
+        from backend.core.ouroboros.battle_test.palette_render import (
+            palette_rows,
+        )
+        return palette_rows()
+    except Exception:  # noqa: BLE001 — the fallback menu still needs a height
+        return 10
 
 
 def _palette_multicolumn() -> bool:

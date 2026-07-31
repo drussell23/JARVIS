@@ -32,12 +32,28 @@ _NAME_COL_MAX_FRACTION = 0.34
 #: Gutter between the name column and the description column.
 _GUTTER = 3
 
-#: Share of visible names the column must fit WITHOUT overflowing. Sizing to
-#: the longest instead lets a single outlier dictate the layout: with
-#: `/backlog_auto_proposed` (22 chars) on screen, `/anticipate` was followed
-#: by fourteen spaces of dead gutter, and the eye has to cross all of it on
-#: every row to reach the description.
-_NAME_FIT_QUANTILE = 0.8
+#: Share of visible names the column must fit WITHOUT overflowing.
+#:
+#: 1.0 — every name fits, so EVERY description starts in the same column.
+#: That is what Claude Code's palette does, and a uniform column is the whole
+#: reason the eye can scan descriptions vertically instead of hunting for
+#: where each one begins.
+#:
+#: This was 0.8, to stop one long verb dictating the layout: with
+#: `/backlog_auto_proposed` (22 chars) on screen, `/anticipate` got fourteen
+#: spaces of dead gutter. The concern was real; the mechanism was redundant.
+#: `_NAME_COL_MAX_FRACTION` already bounds the column, and `_ellipsis`
+#: already truncates a name that exceeds it — a 60-char verb at width 80
+#: renders as `/xxxxxxxxxxxxxxxxxxxxxxxxx…` with every description still
+#: aligned. So the quantile was a SECOND mechanism guarding a case the cap
+#: already handled, and the price it charged was the alignment itself: three
+#: rows lined up and the fourth ragged, which reads as a rendering bug rather
+#: than as a considered trade.
+#:
+#: Kept as a knob because a dense-row preference is legitimate; changed as a
+#: default because uniformity is what was asked for and what the cap makes
+#: safe.
+_NAME_FIT_QUANTILE = 1.0
 
 
 def name_fit_quantile() -> float:
@@ -73,14 +89,27 @@ def _name_column(names: List[str]) -> int:
         return max((len(n) for n in names), default=0)
 
 
+#: Default rows the palette draws. Four showed less than a third of a screen
+#: that had room for far more, and a menu that cannot show the verb you are
+#: reaching for is one you dismiss and retype blind.
+_DEFAULT_ROWS = 10
+
+
 def palette_rows() -> int:
-    """Maximum entries drawn at once (``JARVIS_PALETTE_HEIGHT``)."""
+    """Maximum entries drawn at once (``JARVIS_PALETTE_HEIGHT``).
+
+    THE definition of that env var. `bipartite_layout` used to read the same
+    name with its own default of 12 while this read 4 — one knob, two
+    answers, and which one an operator got depended on which renderer
+    happened to mount. It now delegates here.
+    """
     try:
         return max(3, min(30, int(
-            os.environ.get("JARVIS_PALETTE_HEIGHT", "4") or 4,
+            os.environ.get("JARVIS_PALETTE_HEIGHT", str(_DEFAULT_ROWS))
+            or _DEFAULT_ROWS,
         )))
     except (TypeError, ValueError):
-        return 4
+        return _DEFAULT_ROWS
 
 
 def _ellipsis(text: str, width: int) -> str:

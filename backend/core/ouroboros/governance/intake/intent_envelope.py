@@ -54,6 +54,12 @@ _VALID_SOURCES = frozenset({
     # urgency_router._BACKGROUND_SOURCES too — these are chores, and the
     # comment above records what misdeclaring a source costs.
     "memory_hygiene",
+    # CageHygieneSensor (2026-07-31) — AGGREGATED findings about synthesized
+    # worker cages: a role repeatedly denied a tool means the synthesizer's
+    # inspection rule under-grants for that class. Never widens the cage;
+    # names the rule as the fix. Clustered + token-bucketed at the sensor so
+    # a runaway worker cannot flood the intake through this door.
+    "cage_hygiene",
     # P1 Slice 3 (2026-04-26) — SelfGoalFormationEngine proposals reach
     # the intake via BacklogSensor's second-source ledger reader. The
     # distinct source ("auto_proposed") lets routers, sensors, and the

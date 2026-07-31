@@ -120,3 +120,59 @@ cage, observe after execution. Both fail-open.
 
 Default **OFF** (`JARVIS_CAGE_CALIBRATION_ENABLED`) — it narrows a live
 security boundary from data. 18 tests; 761 green across autonomy.
+
+## Slice 3 — the findings sensor (`intake/sensors/cage_hygiene_sensor.py`)
+
+`findings()` had no emission surface. Giving it one naively would have opened
+two holes at once, **both attacker-reachable** — anything that can make a
+worker ask for a forbidden tool can make it ask a thousand times:
+
+1. **DoS against O+V's own intake** — one signal per denial = 100 ops
+   enqueued ahead of real work.
+2. **Alert fatigue** — the one finding that mattered buried in 99 that didn't.
+
+**Aggregate-first, structurally.** Cluster by `(role, tool)` over a rolling
+window; 100 identical denials become ONE cluster carrying `occurrences=100`.
+The count is not lost — it becomes the WEIGHT, strictly more informative than
+100 signals and costs one. Plus a **token bucket** (capacity 3, refill
+1/300s): aggregation collapses a burst of the SAME cluster, the bucket bounds
+a drip of DISTINCT ones. **Either alone leaves the other attack open.** Plus
+dedup on cluster identity — a persistent condition reports once, and only
+re-reports when it gets materially worse (≥2×), because "it got ten times
+worse" is new information.
+
+The aggregator itself is bounded (`MAX_CLUSTERS`): an attacker varying the
+tool name on every call must not grow it without limit.
+
+**Severity does NOT escalate the route.** Every envelope is `urgency="low"`
+on BACKGROUND, including `Suspicious_Injection`. Escalating by severity would
+look responsible and would hand an attacker a cost-amplification lever —
+trigger denials, force IMMEDIATE routing, burn the Claude tier. Severity
+rides in evidence and on the operator surface, where it is visible
+immediately and free.
+
+**The classifier is DETERMINISTIC, and that is a security decision.** Asking
+a model to inspect denial context would mean reading attacker-influenced
+content to decide whether that content is an attack — an injection surface
+guarding against injection, and unbounded work on an attacker-triggerable
+path. Instead:
+
+- `subagent_contracts.TOOL_CLASS_MAP` covers exactly the read-only
+  exploration vocabulary, so a denied tool ABSENT from it (`bash`,
+  `write_file`, `web_fetch`) is boundary-crossing **by the taxonomy that
+  already exists** — no new list to maintain or get wrong.
+- **Breadth** — distinct tools denied to one role. One plausible neighbour
+  looks like a model guessing; sweeping several looks like probing.
+
+`Benign_Hallucination` (read-only, low breadth) / `Suspicious_Injection`
+(boundary-crossing or broad) / `Undetermined` — which exists because a
+classifier without one lies whenever it is unsure.
+
+Fed from `cage_calibration.observe_unit`, the seam that already sees every
+caged worker finish — no second instrumentation point to fall out of date.
+Emission names `worker_synthesizer.py` as the target: the RULE is the fix,
+never the cage.
+
+Registered in all three places (`_VALID_SOURCES`, `SignalSource`,
+`_BACKGROUND_SOURCES`). Default **OFF**. 25 tests incl. the mandate case —
+50 denials in <1s → exactly 1 signal with `occurrences=50`.
