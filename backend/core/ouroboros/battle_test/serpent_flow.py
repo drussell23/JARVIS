@@ -9664,7 +9664,45 @@ class SerpentREPL:
           /memory rm <id>                 — remove a memory by id
           /memory forbid <path>           — shortcut: add a FORBIDDEN_PATH memory
           /memory show <id>               — print a single memory's full content
+          /memory topics [term]           — the written corpus + whether
+                                            ModuleContextRouter is injecting it
+
+        ``topics`` is handled HERE rather than at the harness, and is the one
+        subcommand that reads something other than `UserPreferenceStore`.
+        Preferences are what the operator taught the organism; topics are what
+        it was told about its own architecture, and until now nothing could
+        ask about the second — 382 written topics with no verb.
+
+        It answers the question the CRUD half cannot: whether any of it
+        actually reaches a GENERATE prompt. Memory that exists and memory that
+        is INJECTED are different facts, and this codebase has shipped the
+        first believing it shipped the second more than once.
+
+        Composed, then mirrored. `compose_memory_lines` returns text and takes
+        no console, so the daemon terminal and the attach cockpit render the
+        same rows through their own sinks — the handlers that `console.print`
+        directly are invisible on the attach client.
         """
+        arg = str(line or "").strip()
+        for prefix in ("/memory", "memory"):
+            if arg.startswith(prefix):
+                arg = arg[len(prefix):].strip()
+                break
+        if arg.split(" ", 1)[0].lower() == "topics":
+            try:
+                from backend.core.ouroboros.battle_test.memory_surface import (
+                    compose_memory_lines,
+                )
+                term = arg.split(" ", 1)[1].strip() if " " in arg else ""
+                for row in compose_memory_lines(term):
+                    self._flow._mirror_markup(row)
+                    self._flow.console.print(row, highlight=False)
+            except Exception as exc:  # noqa: BLE001
+                self._flow.console.print(
+                    f"  [{_SEM['death']}]/memory topics error: {exc}"
+                    f"[/{_SEM['death']}]", highlight=False,
+                )
+            return
         await self._delegate_to_harness(line, error_label="Memory error")
 
     async def _handle_remember(self, line: str) -> None:
