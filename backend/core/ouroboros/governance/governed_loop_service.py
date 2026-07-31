@@ -5823,9 +5823,54 @@ class GovernedLoopService:
         # file context + AST index, making expansion less critical.
         _dw_primary = getattr(self, "_doubleword_is_primary", False)
         _ctx_expansion = self._config.context_expansion_enabled if hasattr(self._config, "context_expansion_enabled") else True
-        if _dw_primary:
+
+        # Operator override wins over any inference below. NEVER raises.
+        _ctx_override = os.environ.get(
+            "JARVIS_CONTEXT_EXPANSION_ENABLED", "",
+        ).strip().lower()
+        if _ctx_override in ("0", "false", "no", "off"):
             _ctx_expansion = False
-            logger.info("[GovernedLoop] Context expansion disabled (Doubleword primary — batch API too slow for plan())")
+            logger.info("[GovernedLoop] Context expansion disabled "
+                        "(JARVIS_CONTEXT_EXPANSION_ENABLED=0)")
+        elif _ctx_override in ("1", "true", "yes", "on"):
+            _ctx_expansion = True
+            logger.info("[GovernedLoop] Context expansion forced ON "
+                        "(JARVIS_CONTEXT_EXPANSION_ENABLED=1)")
+        elif _dw_primary:
+            # This used to disable expansion whenever DoubleWord was primary,
+            # full stop, because DW was BATCH-ONLY and a plan() round-trip took
+            # 2-4 minutes. That judgement was right for its time and its
+            # PREMISE has since changed: DW's realtime plane (SSE + priority
+            # service_tier) is the default now, with TTFT measured in seconds.
+            #
+            # The question the guard is really asking is "will an expansion
+            # call come back fast enough to be worth making" — a LATENCY
+            # question. Phrased as "is DoubleWord primary" it silently
+            # answered a provider question instead, and kept answering the old
+            # way after the latency changed.
+            #
+            # The cost of getting it wrong is not small: skipping
+            # CONTEXT_EXPANSION skips the ENTIRE architecture-memory arc
+            # (ModuleContextRouter, the admission ledger, operator rules) plus
+            # Oracle dependency injection. A 28-minute armed soak
+            # (bt-2026-07-31-171143) ran 79 ops and logged zero memory
+            # routing for exactly this reason.
+            from backend.core.ouroboros.governance.doubleword_provider import (
+                dw_realtime_plane_active,
+            )
+            if dw_realtime_plane_active():
+                logger.info(
+                    "[GovernedLoop] Context expansion KEPT — DoubleWord is "
+                    "primary but on the REALTIME plane (SSE + service_tier); "
+                    "the batch-latency rationale does not apply",
+                )
+            else:
+                _ctx_expansion = False
+                logger.info(
+                    "[GovernedLoop] Context expansion disabled — DoubleWord "
+                    "primary on the BATCH plane (async lane is too slow for "
+                    "plan(); set JARVIS_CONTEXT_EXPANSION_ENABLED=1 to force)",
+                )
 
         orch_config = OrchestratorConfig(
             project_root=self._config.project_root,

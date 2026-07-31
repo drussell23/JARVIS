@@ -912,6 +912,26 @@ def _dw_tier_param_known_unsupported(model_id: str) -> bool:
         return False
 
 
+def dw_realtime_plane_active() -> bool:
+    """True when DW generation goes down the REALTIME plane, not the batch one.
+
+    The realtime plane is SSE + the ``service_tier`` selector; the batch plane
+    is the cheap asynchronous lane. They differ in latency by two orders of
+    magnitude — RT TTFT is measured in seconds (p50 8.9s in the 2026-07-21
+    soak), batch in minutes — so any decision phrased as "is this fast enough
+    to be worth doing" has to read the PLANE, never merely "is DoubleWord the
+    primary provider".
+
+    Derived from the same two knobs ``apply_rt_service_tier`` consults, so
+    there is one definition of "RT is in play" and it cannot drift from the
+    code that actually stamps the request.
+    """
+    try:
+        return dw_service_tier_enabled() and bool(_dw_rt_service_tier())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def apply_rt_service_tier(body: dict, model_id: str) -> dict:
     """Stamp the realtime-plane tier selector onto a /chat/completions body.
 
