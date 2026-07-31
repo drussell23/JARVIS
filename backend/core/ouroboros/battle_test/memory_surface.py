@@ -218,10 +218,16 @@ def _routing_row() -> str:
     letting "on · available" stand in for evidence.
     """
     try:
-        flag = os.environ.get("JARVIS_MEMORY_ROUTING_ENABLED", "1")
-        on = flag.strip().lower() not in ("0", "false", "no", "off")
+        # ASK the owner; do not re-derive. This read the same env var with
+        # its own default of "1" while `routing_enabled()` defaulted to OFF,
+        # so this row reported "routing: on" for the entire period routing
+        # was disabled — the surface built to tell the truth asserting the
+        # one falsehood that mattered.
         try:
-            from backend.core.ouroboros.governance import module_routing  # noqa: F401
+            from backend.core.ouroboros.governance.module_routing import (
+                routing_enabled,
+            )
+            on = routing_enabled()
             present = "available"
         except Exception:  # noqa: BLE001
             present = "UNAVAILABLE"
