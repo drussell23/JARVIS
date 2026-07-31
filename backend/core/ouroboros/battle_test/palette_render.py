@@ -148,19 +148,88 @@ def _wrap(text: str, width: int) -> List[str]:
     return out or [""]
 
 
-def _rendered_height(desc: Any, desc_col: int, wrap: bool) -> int:
+#: Absolute terminal width below which the palette always stacks. A hard
+#: backstop, not the primary signal — see `stacked_mode`.
+_ABSOLUTE_STACK_FLOOR = 56
+
+#: Narrowest description column the two-column layout is allowed to leave.
+#: Below this a description is not wrapping, it is being shredded into a
+#: tower one or two words wide, and the table it is nominally part of has
+#: stopped conveying anything.
+_MIN_DESC_COL = 28
+
+
+def absolute_stack_floor() -> int:
+    """``JARVIS_PALETTE_STACK_FLOOR`` — hard width backstop. NEVER raises."""
+    try:
+        raw = os.environ.get("JARVIS_PALETTE_STACK_FLOOR", "").strip()
+        return max(0, min(200, int(raw))) if raw else _ABSOLUTE_STACK_FLOOR
+    except (TypeError, ValueError):
+        return _ABSOLUTE_STACK_FLOOR
+
+
+def min_desc_col() -> int:
+    """``JARVIS_PALETTE_MIN_DESC_COL`` — legibility floor. NEVER raises."""
+    try:
+        raw = os.environ.get("JARVIS_PALETTE_MIN_DESC_COL", "").strip()
+        return max(4, min(200, int(raw))) if raw else _MIN_DESC_COL
+    except (TypeError, ValueError):
+        return _MIN_DESC_COL
+
+
+def stacked_mode(width: int, name_col: int) -> bool:
+    """Whether to snap to the one-column stacked layout. Pure. NEVER raises.
+
+    Derived from the DESCRIPTION column, not from the terminal width, and
+    that distinction is the whole point.
+
+    A fixed column threshold measures the wrong quantity. At width 61 with a
+    40-character verb on screen, two-column leaves ~15 columns of
+    description — a tower one or two words wide, which is precisely the
+    failure a breakpoint is supposed to prevent, and a "> 60 so we are fine"
+    rule sails straight past it. At width 59 with nothing but 8-character
+    verbs there is ample room, and the same rule stacks for no reason.
+
+    What actually determines legibility is how much room the description
+    gets AFTER the name column and gutter are taken — which depends on the
+    entries, not just the window. So that is what is measured.
+
+    The absolute floor is kept as a backstop for the degenerate case where
+    the terminal is so narrow that even a short name leaves nothing, and
+    because an operator asking "when does it stack?" deserves an answer that
+    does not require knowing the verb table.
+    """
+    try:
+        w = int(width)
+        if w <= 0:
+            return False
+        if w < absolute_stack_floor():
+            return True
+        return (w - int(name_col) - _GUTTER - 2) < min_desc_col()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _rendered_height(desc: Any, desc_col: int, wrap: bool,
+                     stacked: bool = False) -> int:
     """How many LINES an entry will occupy once drawn.
 
     Deliberately calls the same ``_wrap`` the renderer uses rather than
     estimating from ``len(desc) / desc_col``: an estimate and a renderer that
     disagree by one line produce a palette that overflows its own budget,
-    which is the failure this budget exists to prevent."""
-    if not wrap:
-        return 1
+    which is the failure this budget exists to prevent.
+
+    In stacked mode the name owns a line of its own, so the cost is
+    ``1 + description lines``. Teaching the budget about the mode rather
+    than leaving it to assume two-column is what keeps the block inside its
+    height when the layout snaps — otherwise every entry silently costs one
+    more line than the budget believes, on exactly the narrow terminal with
+    the least room to absorb it."""
     try:
-        return max(1, len(_wrap(str(desc), desc_col)))
+        body = 1 if not wrap else max(1, len(_wrap(str(desc), desc_col)))
+        return body + (1 if stacked else 0)
     except Exception:  # noqa: BLE001
-        return 1
+        return 2 if stacked else 1
 
 
 def layout_palette(
@@ -189,7 +258,16 @@ def layout_palette(
         _name_column(names),
         max(8, int(width * _NAME_COL_MAX_FRACTION)),
     )
-    desc_col = max(8, width - name_col - _GUTTER - 2)
+    # Evaluated per call, so a SIGWINCH mid-session re-decides on the next
+    # frame rather than carrying a stale mode: `layout_palette` is pure and
+    # the cockpit calls it every render.
+    stacked = stacked_mode(width, name_col)
+    #: Indent of a stacked description under its name. Two columns past the
+    #: name's own indent — enough to read as subordinate, not so much that a
+    #: 30-column terminal loses a tenth of its width to it.
+    stack_indent = 4
+    desc_col = (max(8, width - stack_indent - 2) if stacked
+                else max(8, width - name_col - _GUTTER - 2))
 
     # The budget is RENDERED LINES, not entries.
     #
@@ -216,7 +294,7 @@ def layout_palette(
     visible: List[Tuple[str, str]] = []
     spent = 0
     for entry in entries[start:]:
-        cost = _rendered_height(entry[1], desc_col, wrap_descriptions)
+        cost = _rendered_height(entry[1], desc_col, wrap_descriptions, stacked)
         # Always admit the first entry, even if it alone exceeds the budget:
         # showing nothing is worse than showing one tall thing, and the
         # selected row must never be the one that gets dropped.
@@ -244,6 +322,25 @@ def layout_palette(
         # screen. Clipping at the cap satisfies both while still letting an
         # ordinary long verb — `/backlog_auto_proposed` at 22 against a cap
         # of 34 — keep its full text, which is the case that motivated this.
+        if stacked:
+            # ONE column: name on its line, description indented beneath.
+            #
+            # Only the yield sequence changes — the same `_ellipsis`, the
+            # same `_wrap`, the same style classes. A second layout engine
+            # here would be a second place for the theme and the truncation
+            # rules to drift, and the two would disagree first on exactly the
+            # narrow terminal nobody tests on.
+            #
+            # The name may use the FULL width now: there is no description
+            # sharing the row, so the fraction cap would be clipping to
+            # protect a column that no longer exists.
+            stacked_name = _ellipsis(str(name), max(8, width - 2))
+            lines.append([(base, f"  {stacked_name}")])
+            for chunk in (_wrap(str(desc), desc_col) if wrap_descriptions
+                          else [_ellipsis(str(desc), desc_col)]):
+                lines.append([(meta, " " * stack_indent + chunk)])
+            continue
+
         shown = _ellipsis(str(name), max(8, int(width * _NAME_COL_MAX_FRACTION)))
         pad = " " * max(0, name_col - len(shown))
         # Re-measured PER ROW, so an overflowing name cannot push its
