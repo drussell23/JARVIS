@@ -401,15 +401,17 @@ def create_voice_handler(voice_engine: Optional[Any] = None, voice_integration: 
         except Exception:
             pass
 
-    # Don't auto-detect voice_integration for display monitor
-    # We want immediate audio feedback via macOS say, not queued notifications
-    # if voice_integration is None:
-    #     try:
-    #         from vision.voice_integration_handler import VoiceIntegrationHandler
-    #         voice_integration = VoiceIntegrationHandler()
-    #         logger.info("[DISPLAY VOICE] Auto-detected VoiceIntegrationHandler")
-    #     except:
-    #         pass
+    # Don't auto-detect voice_integration for display monitor: we want
+    # immediate audio feedback via macOS `say`, not queued notifications.
+    #
+    # The commented-out branch that used to sit here constructed a
+    # `VoiceIntegrationHandler` from `vision/voice_integration_handler.py`.
+    # That module has been DELETED — this comment was its only reference in
+    # the entire tree, and a decision recorded as a comment kept it alive on
+    # the flag board for months while claiming three enabled capabilities
+    # nothing could reach. Restoring the behaviour means writing it again,
+    # not uncommenting; leaving the code here would have been an import that
+    # fails the moment anyone believed it.
 
     return DisplayVoiceHandler(voice_engine, voice_integration=None)
 
