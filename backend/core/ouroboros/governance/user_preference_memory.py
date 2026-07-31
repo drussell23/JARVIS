@@ -193,13 +193,40 @@ class UserMemory:
     updated_at: str = ""                      # ISO 8601 UTC
 
     def matches_path(self, rel_path: str) -> bool:
-        """Substring match over ``paths`` — used by forbidden-path checks."""
+        """Substring OR glob match over ``paths``. NEVER raises.
+
+        This is a SECURITY path: ``FORBIDDEN_PATH`` consults it before every
+        mutating tool call, through ``register_protected_path_provider``.
+
+        The legacy semantics were substring, which cannot express
+        ``backend/**/*.py`` — an operator writing that got a rule matching
+        nothing, silently. Glob support is therefore added as a UNION with
+        the old test rather than a replacement.
+
+        The direction is the whole point. A union can only ever match MORE
+        paths than before, so no path that was protected yesterday becomes
+        unprotected today. Replacing substring with glob would have been the
+        cleaner-looking change and would have quietly unprotected every entry
+        written in the old style — ``backend/voice`` stops matching
+        ``backend/voice/x.py`` under pure ``fnmatch``. Widen a guard; never
+        narrow one as a side effect of improving it.
+        """
         if not self.paths or not rel_path:
             return False
-        norm = rel_path.replace("\\", "/")
+        norm = str(rel_path).replace("\\", "/")
         for p in self.paths:
-            if p and p in norm:
+            if not p:
+                continue
+            if p in norm:
                 return True
+            try:
+                from backend.core.ouroboros.governance.operator_rules import (
+                    match_pattern,
+                )
+                if match_pattern(p, norm):
+                    return True
+            except Exception:  # noqa: BLE001 — substring result still stands
+                pass
         return False
 
     def matches_app(self, bundle_id: str) -> bool:

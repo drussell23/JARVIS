@@ -1,6 +1,6 @@
 ---
 title: Project Validation Infra Flakiness
-modules: [tests/governance/intake/sensors/test_test_failure_sensor_dedup.py, orchestrator.py, test_runner.py]
+modules: [tests/governance/intake/sensors/test_test_failure_sensor_dedup.py, orchestrator.py, test_runner.py, docs/architecture/OUROBOROS.md]
 status: historical
 source: project_validation_infra_flakiness.md
 ---

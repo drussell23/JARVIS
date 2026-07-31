@@ -726,6 +726,59 @@ class SubagentOrchestrator:
     # Single-dispatch path
     # ------------------------------------------------------------------
 
+    async def _apply_memory_scope(
+        self,
+        ctx: SubagentContext,
+        parent_ctx: "OperationContext",
+    ) -> SubagentContext:
+        """Stamp the DECLARED memory-crossing rule onto *ctx*. NEVER raises.
+
+        Placed immediately after construction, on both the single and
+        parallel paths, because ``_build_sub_context`` is the one site where
+        a SubagentContext comes into existence — and a boundary rule enforced
+        at some construction sites is a boundary rule that does not exist.
+
+        Kept OUT of ``_build_sub_context`` itself: resolution is async (a
+        COMPLEMENT scope routes the corpus), and making the builder async
+        would force that cost onto every caller including tests that only
+        want a context object. The builder stays a pure constructor; this is
+        the policy step.
+
+        Fail-soft to ``none``. If the policy layer cannot answer, nothing
+        crosses — the safe direction for an undecided boundary.
+        """
+        try:
+            from pathlib import Path as _Path
+
+            from backend.core.ouroboros.governance.memory_scope import (
+                resolve_scope,
+            )
+            resolution = await resolve_scope(
+                subagent_type=ctx.subagent_type,
+                parent_op_id=ctx.parent_op_id,
+                parent_ctx=parent_ctx,
+                subagent_id=ctx.subagent_id,
+                goal=ctx.request.goal,
+                target_files=ctx.request.target_files,
+                project_root=getattr(self, "_project_root", None)
+                or getattr(parent_ctx, "project_root", None) or _Path("."),
+            )
+            ctx.memory_scope = resolution.scope.value
+            ctx.memory_section = resolution.section
+            logger.info(
+                "[MemoryScope] sub=%s type=%s scope=%s topics=%d "
+                "parent_excluded=%d — %s",
+                ctx.subagent_id, ctx.subagent_type.value,
+                resolution.scope.value, resolution.topic_count,
+                resolution.excluded_parent_topics, resolution.detail,
+            )
+        except Exception:  # noqa: BLE001
+            ctx.memory_scope = "none"
+            ctx.memory_section = ""
+            logger.debug("[MemoryScope] scope application degraded",
+                         exc_info=True)
+        return ctx
+
     async def _dispatch_single(
         self,
         parent_ctx: "OperationContext",
@@ -733,6 +786,7 @@ class SubagentOrchestrator:
         scope: str,
     ) -> SubagentResult:
         ctx = self._build_sub_context(parent_ctx, request, scope=scope)
+        ctx = await self._apply_memory_scope(ctx, parent_ctx)
         self._comm.emit_spawn(
             ctx.parent_op_id, ctx.subagent_id, ctx.subagent_type, request.goal
         )
@@ -760,6 +814,12 @@ class SubagentOrchestrator:
         contexts = [
             self._build_sub_context(parent_ctx, request, scope=s) for s in scopes
         ]
+        # Scope every fan-out leg, concurrently. A COMPLEMENT resolution
+        # routes the corpus, so serialising N legs would add N routes to the
+        # critical path of a fan-out whose entire purpose is parallelism.
+        contexts = list(await asyncio.gather(*(
+            self._apply_memory_scope(c, parent_ctx) for c in contexts
+        )))
         for ctx in contexts:
             self._comm.emit_spawn(
                 ctx.parent_op_id, ctx.subagent_id, ctx.subagent_type, request.goal

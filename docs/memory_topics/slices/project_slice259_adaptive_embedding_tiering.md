@@ -1,6 +1,6 @@
 ---
 title: Project Slice259 Adaptive Embedding Tiering
-modules: [backend/core/embedding_service.py, tests/core/test_slice259_adaptive_embedding_tiering.py]
+modules: [backend/core/embedding_service.py, tests/core/test_slice259_adaptive_embedding_tiering.py, backend/core/arm64_simd_asm.s]
 status: historical
 source: project_slice259_adaptive_embedding_tiering.md
 ---

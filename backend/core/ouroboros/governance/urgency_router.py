@@ -149,6 +149,10 @@ _BACKGROUND_SOURCES = frozenset({
     "architecture",
     "todo_scanner",
     "doc_staleness",
+    # Memory hygiene is chores by construction — repairing the organism's
+    # own notes never has deadline pressure, and routing it to Claude would
+    # repeat exactly the burn this set's comment documents.
+    "memory_hygiene",
 })
 
 # Sources that produce SPECULATIVE-eligible signals

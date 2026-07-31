@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Literal, Optional, Protocol
+from typing import Any, List, Literal, Optional, Protocol, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -131,8 +131,75 @@ class _NoopObserver:
         return
 
 
+class _FanOut:
+    """Delivers every callback to the primary observer and each listener.
+
+    Why this exists
+    ---------------
+    The registry held ONE slot, and the harness's ``SessionRecorder`` owns
+    it. Any second consumer of APPLY/VERIFY/commit telemetry therefore had
+    exactly two options: displace session recording, or duplicate the call at
+    every emitting site. Both are the same defect — a single-slot registry is
+    the reason a second consumer cannot exist — so the slot became a list.
+
+    ``register_ops_digest_observer`` keeps its exact meaning (set the
+    primary). Additive subscribers use :func:`add_ops_digest_listener`.
+
+    Isolation: a listener that raises is logged and skipped. A telemetry
+    observer must never be able to fail the op it is observing, and one
+    listener must never be able to starve another.
+    """
+
+    def __init__(self, primary: "OpsDigestObserver",
+                 listeners: Sequence["OpsDigestObserver"]) -> None:
+        self._targets = [primary, *listeners]
+
+    def _dispatch(self, name: str, **kwargs: Any) -> None:
+        for target in self._targets:
+            try:
+                getattr(target, name)(**kwargs)
+            except Exception:  # noqa: BLE001
+                logger.debug("[OpsDigest] %s listener raised", name,
+                             exc_info=True)
+
+    def on_apply_succeeded(self, *, op_id: str, mode: str, files: int) -> None:
+        self._dispatch("on_apply_succeeded", op_id=op_id, mode=mode,
+                       files=files)
+
+    def on_verify_completed(
+        self, *, op_id: str, passed: int, total: int,
+        scoped_to_applied_op: bool = True,
+    ) -> None:
+        self._dispatch("on_verify_completed", op_id=op_id, passed=passed,
+                       total=total, scoped_to_applied_op=scoped_to_applied_op)
+
+    def on_commit_succeeded(self, *, op_id: str, commit_hash: str) -> None:
+        self._dispatch("on_commit_succeeded", op_id=op_id,
+                       commit_hash=commit_hash)
+
+
 _OBSERVER_LOCK = threading.Lock()
 _OBSERVER: OpsDigestObserver = _NoopObserver()
+_LISTENERS: List[OpsDigestObserver] = []
+
+
+def add_ops_digest_listener(listener: OpsDigestObserver) -> None:
+    """Subscribe *listener* additively, alongside the primary observer.
+
+    Idempotent by identity, so a module that arms itself lazily on several
+    code paths cannot register itself twice and double-count.
+    """
+    global _LISTENERS  # noqa: PLW0603
+    with _OBSERVER_LOCK:
+        if not any(existing is listener for existing in _LISTENERS):
+            _LISTENERS.append(listener)
+
+
+def remove_ops_digest_listener(listener: OpsDigestObserver) -> None:
+    """Unsubscribe *listener*. Silent when it was never registered."""
+    global _LISTENERS  # noqa: PLW0603
+    with _OBSERVER_LOCK:
+        _LISTENERS = [x for x in _LISTENERS if x is not listener]
 
 
 def register_ops_digest_observer(observer: Optional[OpsDigestObserver]) -> None:
@@ -149,11 +216,22 @@ def register_ops_digest_observer(observer: Optional[OpsDigestObserver]) -> None:
 
 
 def get_ops_digest_observer() -> OpsDigestObserver:
-    """Return the currently-registered observer (never ``None``)."""
+    """Return the observer call sites should notify (never ``None``).
+
+    With no additive listeners this returns the primary object ITSELF, not a
+    wrapper — so ``get_ops_digest_observer() is my_recorder`` stays true for
+    every existing caller and test. The fan-out proxy appears only once a
+    second consumer actually exists, which is the only moment it is needed.
+    """
     with _OBSERVER_LOCK:
-        return _OBSERVER
+        if not _LISTENERS:
+            return _OBSERVER
+        return _FanOut(_OBSERVER, tuple(_LISTENERS))
 
 
 def reset_ops_digest_observer() -> None:
-    """Restore the default no-op observer. Primarily for tests."""
+    """Restore the default no-op observer and drop listeners. For tests."""
+    global _LISTENERS  # noqa: PLW0603
     register_ops_digest_observer(None)
+    with _OBSERVER_LOCK:
+        _LISTENERS = []

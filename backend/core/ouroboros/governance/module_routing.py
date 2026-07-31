@@ -14,6 +14,7 @@ Python 3.9+, ``from __future__ import annotations``.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -135,6 +136,11 @@ class TopicFragment:
     summary: str      # first ~500 chars of content
     modules: Tuple[str, ...]  # parsed ``modules:`` frontmatter entries
     content_hash: str
+    #: Referential staleness verdict from :mod:`memory_corpus` — whether the
+    #: modules this topic DECLARES have moved since it was written. Defaults
+    #: to ``"unknown"``, which is never penalised: absence of evidence must
+    #: not quietly re-rank the corpus.
+    drift: str = "unknown"
 
 
 def _hash_content(text: str) -> str:
@@ -172,20 +178,47 @@ def _extract_title(content: str, path: Path) -> str:
 
 def _load_topic_fragments_worker(
     topics_dir_str: str, project_root_str: str,
-) -> List[TopicFragment]:
+) -> Tuple[List[TopicFragment], Any]:
     """Module-level worker for :func:`_load_topic_fragments`.
 
     Dispatched into the shared ``advisor-blast`` thread pool via
     ``cooperative_fs_io.offload`` (fs-hot-tier Batch 3, row 21). Lifted
     to module level so the offload trampoline doesn't capture any
-    caller-local state. Returns ``[]`` if the directory does not
-    exist. NEVER raises — a single unreadable/malformed topic file is
-    skipped, matching the original per-file fail-soft semantics.
+    caller-local state. NEVER raises — a single unreadable/malformed
+    topic file is skipped, matching the original per-file fail-soft
+    semantics.
+
+    Returns ``(fragments, listing)``. The listing travels with the
+    fragments because the ADMISSION record needs to state which corpus
+    was offered and how confidently it was known, and recomputing that
+    downstream would mean scanning twice and could disagree with itself
+    if the tree moved in between.
+
+    The corpus comes from :mod:`memory_corpus`, not from ``rglob``. This
+    loader used to walk the working tree and inject whatever the
+    filesystem held — which, in a repo living under a synced
+    ``~/Documents``, meant 764 files where git tracks 383. Hash dedup
+    caught the byte-identical conflict copies and left 301 DIVERGED ones
+    standing as first-class topics: same title, same ``modules:``, older
+    body, competing for the same three slots in every GENERATE prompt.
+
+    Asking the repository what it declares fixes that cause and every
+    sibling cause at once — editor backups, a vendored second checkout,
+    stray downloads — because "ignored" is the repo stating a file is not
+    part of itself. The hash dedup below stays as the second line: it
+    catches duplication the VCS cannot see, such as one topic
+    copy-pasted into two tracked paths.
     """
     topics_dir = Path(topics_dir_str)
     project_root = Path(project_root_str)
-    if not topics_dir.is_dir():
-        return []
+
+    from backend.core.ouroboros.governance.memory_corpus import (
+        corpus_listing_sync, drift_readings_sync, read_topic_text,
+    )
+
+    listing = corpus_listing_sync(project_root, topics_dir)
+    if not listing.paths:
+        return [], listing
 
     fragments: List[TopicFragment] = []
     #: content_hash -> the URI that claimed it first. Identity is the PAYLOAD,
@@ -209,9 +242,11 @@ def _load_topic_fragments_worker(
     #: recorded provenance does not shuffle between runs.
     seen_hashes: Dict[str, str] = {}
     duplicates = 0
-    for md_file in sorted(topics_dir.rglob("*.md")):
+    for md_file in listing.paths:
         try:
-            content = md_file.read_text(encoding="utf-8", errors="replace")
+            content = read_topic_text(md_file)
+            if not content:
+                continue
             try:
                 uri = str(md_file.relative_to(project_root))
             except ValueError:
@@ -251,31 +286,45 @@ def _load_topic_fragments_worker(
         except Exception:  # noqa: BLE001 — fail-soft per spec
             logger.debug("[ModuleRouter] skipping topic file %s (read error)", md_file, exc_info=True)
 
-    if duplicates:
-        logger.info(
-            "[ModuleRouter] corpus %d topics (%d duplicate payloads dropped)",
-            len(fragments), duplicates,
-        )
-    return fragments
+    # Grade referential staleness in ONE history pass over the whole batch.
+    # Per-topic grading would be ~1,400 `git log -1` spawns for this corpus;
+    # `drift_readings_sync` walks history once and answers all of them.
+    try:
+        readings = drift_readings_sync(
+            project_root, [(f.uri, f.modules) for f in fragments])
+        fragments = [
+            dataclasses.replace(
+                f, drift=readings[f.uri].drift.value) if f.uri in readings else f
+            for f in fragments
+        ]
+    except Exception:  # noqa: BLE001 — advisory signal; corpus stands without it
+        logger.debug("[ModuleRouter] drift grading skipped", exc_info=True)
+
+    logger.info(
+        "[ModuleRouter] corpus %d topics [%s] (%d untracked excluded, "
+        "%d duplicate payloads dropped)",
+        len(fragments), listing.provenance.value, listing.excluded, duplicates,
+    )
+    return fragments, listing
 
 
 async def _load_topic_fragments(
     topics_dir: Path, project_root: Path,
-) -> List[TopicFragment]:
-    """Recursively load all ``.md`` files under *topics_dir* as TopicFragments.
+) -> Tuple[List[TopicFragment], Any]:
+    """Load the declared topic corpus as ``(fragments, listing)``. NEVER raises.
 
-    Returns an empty list if the directory does not exist. NEVER
-    raises.
-
-    fs-hot-tier Batch 3 (row 21): the rglob + per-file read is
+    fs-hot-tier Batch 3 (row 21): the corpus scan + per-file read is
     dispatched off the asyncio loop via
     ``cooperative_fs_io.offload(cpu_bound=False)`` — thread pool (read
     + light parse is IO-bound). Fail-soft: an ``OffloadError``
-    degrades to ``[]``, the same empty result a missing/empty topics
-    dir gives.
+    degrades to an empty corpus carrying an ABSENT listing, so the
+    admission record can still say WHY nothing was offered rather than
+    reporting an empty corpus as a verified fact.
     """
+    from backend.core.ouroboros.governance.memory_corpus import CorpusListing
+
     if not topics_dir.is_dir():
-        return []
+        return [], CorpusListing.absent(f"{topics_dir} is not a directory")
 
     from backend.core.ouroboros.governance.cooperative_fs_io import (
         offload,
@@ -289,9 +338,9 @@ async def _load_topic_fragments(
     if is_offload_error(result):
         logger.debug(
             "[ModuleRouter] _load_topic_fragments offload failed — "
-            "degrading to empty list",
+            "degrading to empty corpus",
         )
-        return []
+        return [], CorpusListing.absent("corpus scan offload failed")
     return result
 
 
@@ -538,6 +587,60 @@ def _path_tail(path: str) -> str:
     return Path(path).name
 
 
+_utility_armed = False
+
+
+def _arm_utility_listener_once() -> None:
+    """Subscribe the utility store to VERIFY telemetry. NEVER raises."""
+    global _utility_armed  # noqa: PLW0603
+    if _utility_armed:
+        return
+    try:
+        from backend.core.ouroboros.governance.memory_utility import (
+            arm_outcome_listener, utility_enabled,
+        )
+        if utility_enabled():
+            _utility_armed = arm_outcome_listener()
+    except Exception:  # noqa: BLE001
+        logger.debug("[ModuleRouter] utility listener not armed", exc_info=True)
+
+
+def _utility_multiplier(content_hash: str) -> float:
+    """Outcome-learned rank weight for a topic. NEVER raises.
+
+    Lazy-imported and fail-open at 1.0, so a missing or broken utility store
+    costs the ranker exactly nothing — the closed loop is an improvement on
+    the open one, never a dependency of it.
+    """
+    try:
+        from backend.core.ouroboros.governance.memory_utility import (
+            utility_for,
+        )
+        return utility_for(content_hash)
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
+def _drift_multiplier(drift: str) -> float:
+    """Rank weight for a staleness verdict. NEVER raises.
+
+    Only ``drifted`` is penalised. ``unknown`` — history could not decide —
+    weighs exactly 1.0, so a topic older than the scan window ranks precisely
+    as it did before staleness existed. Penalising on absence of evidence
+    would bury the oldest half of the corpus under a heuristic that never
+    measured it, which is a rewrite disguised as a hint.
+    """
+    try:
+        if str(drift) != "drifted":
+            return 1.0
+        from backend.core.ouroboros.governance.memory_corpus import (
+            staleness_penalty,
+        )
+        return staleness_penalty()
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
 def _structural_score(
     topic: TopicFragment,
     related_modules: Sequence[str],
@@ -611,10 +714,15 @@ class RoutedContext:
 
     topics: Tuple[TopicFragment, ...]
     section: str
+    #: The :class:`memory_admission.AdmissionRecord` this pass filed, when
+    #: the ledger is on. Carried so a caller can log the corpus provenance it
+    #: actually got instead of asserting one — the difference between
+    #: "3 topics injected" and "3 of 383 git-tracked, 2 cut by budget".
+    record: Any = None
 
     @classmethod
     def empty(cls) -> "RoutedContext":
-        return cls(topics=(), section="")
+        return cls(topics=(), section="", record=None)
 
 
 def _render_section(topics: List[TopicFragment]) -> str:
@@ -676,6 +784,9 @@ class ModuleContextRouter:
         *,
         max_topics: int = 3,
         token_budget: int = 2000,
+        op_id: str = "",
+        consumer: str = "main",
+        exclude_hashes: Sequence[str] = (),
     ) -> RoutedContext:
         """Select and render the most relevant memory topics for this op.
 
@@ -690,6 +801,25 @@ class ModuleContextRouter:
         token_budget:
             Approximate character budget for topic summaries (chars / 4 ≈
             tokens).  Topics are dropped once this budget is exhausted.
+        op_id:
+            The operation this routing pass serves.  Recorded on the
+            admission ledger so ``/memory context`` can answer "what did
+            THIS op load".
+        consumer:
+            Who is asking — ``main`` or one of the EXPLORE / REVIEW / PLAN /
+            GENERAL subagents.  Claude Code deliberately does not inherit
+            conversation memory into subagents; O+V had never made that
+            choice either way, which meant four call sites were making it by
+            accident.  Naming the consumer turns an accident into something
+            readable off the ledger.
+        exclude_hashes:
+            Content hashes to withhold from selection.  Used by the REVIEW
+            subagent's ``COMPLEMENT`` scope: a reviewer handed the same
+            topics the author had inherits the author's blind spot and
+            cannot catch a mistake the memory itself caused.  Excluded
+            topics are still RECORDED, with a distinct reason — "you were
+            deliberately not shown this" and "this ranked low" are different
+            facts about the same absence.
 
         Returns
         -------
@@ -701,8 +831,19 @@ class ModuleContextRouter:
         if not routing_enabled():
             return RoutedContext.empty()
 
+        # Arm the outcome listener at the first real route. Deliberately here
+        # rather than at import or at boot: the subscription is only
+        # meaningful once memory is actually being injected, and this is the
+        # one code path that proves it is. A boot-time hook would have to
+        # guess, and a flag flipped mid-session would leave it unarmed —
+        # which is precisely the wired-but-inert failure this codebase keeps
+        # rediscovering. Idempotent, so paying it per-call is free.
+        _arm_utility_listener_once()
+
         try:
-            return await self._route_impl(target_files, query, max_topics, token_budget)
+            return await self._route_impl(
+                target_files, query, max_topics, token_budget, op_id, consumer,
+                tuple(exclude_hashes or ()))
         except Exception:  # noqa: BLE001 — advisory path, never break pipeline
             logger.warning("[ModuleRouter] route() failed — returning empty context", exc_info=True)
             return RoutedContext.empty()
@@ -717,10 +858,24 @@ class ModuleContextRouter:
         query: str,
         max_topics: int,
         token_budget: int,
+        op_id: str = "",
+        consumer: str = "main",
+        exclude_hashes: Tuple[str, ...] = (),
     ) -> RoutedContext:
-        # 1. Load topic fragments
-        all_topics = await _load_topic_fragments(self._topics_dir, self._project_root)
+        # 1. Load the DECLARED topic corpus (git-tracked, drift-graded)
+        all_topics, listing = await _load_topic_fragments(
+            self._topics_dir, self._project_root)
         if not all_topics:
+            # An empty corpus is still a routing pass, and saying WHY it was
+            # empty is the whole point of the ledger. "nothing loaded because
+            # the topics dir is missing" and "nothing loaded because nothing
+            # scored" are different diagnoses that render identically as an
+            # absent record.
+            self._file_record(
+                op_id, consumer, rows=[], listing=listing,
+                token_budget=token_budget, query=query,
+                target_files=target_files,
+            )
             return RoutedContext.empty()
 
         # 2. AST-bound candidate set via Oracle (fail-soft → empty)
@@ -757,31 +912,170 @@ class ModuleContextRouter:
         for topic in all_topics:
             struct_s = structural_map.get(topic.source_id, 0.0)
             sem_s = sem_map.get(topic.source_id, 0.0)
-            score = struct_s * _STRUCT_WEIGHT + sem_s * _SEM_WEIGHT
-            combined.append((score, topic))
+            base = struct_s * _STRUCT_WEIGHT + sem_s * _SEM_WEIGHT
+            # Referential staleness is a WEIGHT, never a filter. A topic whose
+            # subject has moved is still the best surviving record of why that
+            # subject looks the way it does; the right response is to prefer a
+            # current one when both are available, not to forget the decision.
+            # UNKNOWN multiplies by 1.0 — absence of evidence must not re-rank
+            # the corpus.
+            # Two independent, multiplicative advisories on top of the
+            # measured relevance signals. Both default to 1.0 when they have
+            # nothing to say, so a cold corpus ranks exactly as it did before
+            # either existed.
+            combined.append((
+                base
+                * _drift_multiplier(topic.drift)
+                * _utility_multiplier(topic.content_hash),
+                topic,
+            ))
 
         # Sort descending by score, then by title for determinism
         combined.sort(key=lambda x: (-x[0], x[1].title))
 
-        # 7. Apply max_topics + token_budget
+        # 7. Apply max_topics + token_budget, recording every outcome.
+        #    Each topic leaves a row whether or not it got in: "these three
+        #    loaded" is inferable from the prompt, while "this one lost to
+        #    budget by 200 characters" is the fact that explains a bad
+        #    generation, and it exists nowhere else.
         selected: List[TopicFragment] = []
+        rows: List[Any] = []
         char_used = 0
+        excluded = set(exclude_hashes or ())
         for score, topic in combined:
+            chars = len(topic.summary)
+            if topic.content_hash in excluded:
+                # Withheld on purpose, and recorded as such. Folding this
+                # into "ranked below cutoff" would erase the only evidence
+                # that a scoping POLICY acted — leaving an operator to
+                # conclude the ranker simply disliked the topic.
+                rows.append(self._row(topic, score, chars, admitted=False,
+                                      why="scope_excluded",
+                                      structural=structural_map))
+                continue
             if len(selected) >= max_topics:
-                break
-            topic_chars = len(topic.summary)
-            if char_used + topic_chars > token_budget:
-                # Skip if it would blow the budget, unless nothing selected yet
-                if selected:
-                    continue
+                rows.append(self._row(topic, score, chars, admitted=False,
+                                      why="max_topics_reached",
+                                      structural=structural_map))
+                continue
+            if char_used + chars > token_budget and selected:
+                rows.append(self._row(topic, score, chars, admitted=False,
+                                      why="budget_exhausted",
+                                      structural=structural_map))
+                continue
             selected.append(topic)
-            char_used += topic_chars
+            char_used += chars
+            rows.append(self._row(topic, score, chars, admitted=True, why="",
+                                  structural=structural_map))
+
+        record = self._file_record(
+            op_id, consumer, rows=rows, listing=listing,
+            token_budget=token_budget, query=query, target_files=target_files,
+        )
 
         if not selected:
-            return RoutedContext.empty()
+            return RoutedContext(topics=(), section="", record=record)
 
         section = _render_section(selected)
-        return RoutedContext(topics=tuple(selected), section=section)
+        return RoutedContext(
+            topics=tuple(selected), section=section, record=record)
+
+    # ------------------------------------------------------------------
+    # Admission bookkeeping
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _row(
+        topic: TopicFragment,
+        score: float,
+        chars: int,
+        *,
+        admitted: bool,
+        why: str,
+        structural: Dict[str, float],
+    ) -> Any:
+        """One :class:`AdmissionRow`. NEVER raises — returns None on failure.
+
+        Reason attribution mirrors ``context_manifest.reason_for_keep``:
+        exactly one structured code per row, strongest signal first, with the
+        score breakdown carried alongside for the detail a code cannot hold.
+        """
+        try:
+            from backend.core.ouroboros.governance.memory_admission import (
+                AdmissionDecision, AdmissionReason, AdmissionRow,
+            )
+            struct = structural.get(topic.source_id, 0.0)
+            if admitted:
+                if struct >= 1.0:
+                    reason = AdmissionReason.STRUCTURAL_TARGET
+                elif struct > 0.0:
+                    reason = AdmissionReason.STRUCTURAL_RELATED
+                else:
+                    reason = AdmissionReason.SEMANTIC
+                decision = AdmissionDecision.ADMITTED
+            else:
+                # An orphaned topic that also lost is reported as orphaned:
+                # "it ranked low" invites raising max_topics, while "its
+                # declared modules no longer exist" invites deleting it.
+                if why == "scope_excluded":
+                    reason = AdmissionReason.SCOPE_EXCLUDED
+                elif topic.drift == "orphaned":
+                    reason = AdmissionReason.ORPHANED_SUBJECT
+                elif why == "budget_exhausted":
+                    reason = AdmissionReason.BUDGET_EXHAUSTED
+                elif why == "max_topics_reached":
+                    reason = AdmissionReason.MAX_TOPICS_REACHED
+                else:
+                    reason = AdmissionReason.RANK_BELOW_CUTOFF
+                decision = AdmissionDecision.WITHHELD
+            return AdmissionRow(
+                source_id=topic.source_id, uri=topic.uri,
+                content_hash=topic.content_hash, decision=decision,
+                reason=reason, score=float(score), chars=int(chars),
+                drift=topic.drift,
+                breakdown=(("structural", round(struct, 4)),
+                           ("drift_weight", _drift_multiplier(topic.drift))),
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _file_record(
+        self,
+        op_id: str,
+        consumer: str,
+        *,
+        rows: Sequence[Any],
+        listing: Any,
+        token_budget: int,
+        query: str,
+        target_files: Sequence[str],
+    ) -> Any:
+        """File the pass with the admission ledger. NEVER raises.
+
+        Fail-soft in both directions: a broken ledger must not cost the op
+        its memory, and a routing pass that produced nothing must still leave
+        a record saying so.
+        """
+        try:
+            from backend.core.ouroboros.governance.memory_admission import (
+                AdmissionRecord, MemoryConsumer, record_admission,
+            )
+            return record_admission(AdmissionRecord.of(
+                op_id=op_id or "unattributed",
+                consumer=MemoryConsumer.coerce(consumer),
+                rows=[r for r in rows if r is not None],
+                corpus_size=getattr(listing, "size", 0),
+                corpus_provenance=getattr(
+                    getattr(listing, "provenance", None), "value", "unknown"),
+                corpus_excluded=getattr(listing, "excluded", 0),
+                char_budget=int(token_budget),
+                query=query,
+                target_files=target_files,
+                extra={"corpus_detail": getattr(listing, "detail", "")},
+            ))
+        except Exception:  # noqa: BLE001
+            logger.debug("[ModuleRouter] admission record skipped", exc_info=True)
+            return None
 
     def _semantic_scores(
         self,

@@ -2685,6 +2685,22 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
             install_paste_collapse(kb)
         except Exception:  # noqa: BLE001
             pass
+
+        # Tab arbitration. The prompt carries TWO completion sources — the
+        # verb/mention completer and history ghost-text — and prompt_toolkit
+        # gives them different keys, so on prose like `wha` the completer
+        # correctly offered nothing and Tab correctly did nothing while a
+        # suggestion sat visible on screen. This makes Tab a dispatcher over
+        # both. Mounted HERE because this builder is the one action set both
+        # attach surfaces share; binding it at either call site would fix the
+        # surface that was looked at and leave the other one dead.
+        try:
+            from backend.core.ouroboros.battle_test.completion_arbiter import (
+                install_completion_arbiter,
+            )
+            install_completion_arbiter(kb)
+        except Exception:  # noqa: BLE001
+            pass
         return kb
     except Exception:  # noqa: BLE001
         return None

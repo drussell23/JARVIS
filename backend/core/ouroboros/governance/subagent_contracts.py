@@ -726,6 +726,16 @@ class SubagentContext:
     primary_provider_name: str = ""         # inherited from parent
     fallback_provider_name: str = "claude-api"   # Nervous System Reflex target
     tool_loop: Optional[Any] = None         # ToolLoopCoordinator; forward ref
+    #: The DECLARED memory-crossing rule for this dispatch (`memory_scope`).
+    #: Present even when nothing crosses: a boundary whose rule exists only
+    #: as the absence of code is one nobody can audit, which is the defect
+    #: `memory_scope` was written to end.
+    memory_scope: str = "none"
+    #: Architecture-memory block this subagent is permitted to see. Empty for
+    #: `none`, which is the default for EXPLORE (independent evidence must
+    #: not be primed by the parent's hypothesis) and for GENERAL (Semantic
+    #: Firewall — every extra token is attack surface).
+    memory_section: str = ""
 
     def request_yield(self) -> None:
         """Cooperative cancellation — signals the subagent to exit at next checkpoint."""

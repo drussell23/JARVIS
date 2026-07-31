@@ -2028,6 +2028,18 @@ def _live_exit_bindings() -> Any:
 
     kb.add("c-c")(_quit)
     kb.add("c-d")(_quit)
+    # Tab arbitration, so the demo cannot silently diverge from `ov attach`
+    # on the one interaction an operator tries first. The audit that found
+    # `search_rows` dark on the shipping client was exactly this class: a
+    # capability present on one surface and absent on the other, with no
+    # decidable difference visible until someone typed.
+    try:
+        from backend.core.ouroboros.battle_test.completion_arbiter import (
+            install_completion_arbiter,
+        )
+        install_completion_arbiter(kb)
+    except Exception:  # noqa: BLE001
+        pass
     return kb
 
 def scene_live(console: Any, argv: Sequence[str] = ()) -> int:

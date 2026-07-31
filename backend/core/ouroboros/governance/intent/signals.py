@@ -88,6 +88,11 @@ class SignalSource(str, Enum):
     SECURITY_ADVISORY = "security_advisory"
     META_DORMANCY_ALARM = "meta_dormancy_alarm"
     WEB_INTELLIGENCE = "web_intelligence"
+    # Memory reporting defects in ITSELF — the proactive half of the memory
+    # arc. Distinct from doc_staleness: that is about undocumented source,
+    # this is about the architecture-memory corpus being wrong, unreachable,
+    # or correlated with failed operations.
+    MEMORY_HYGIENE = "memory_hygiene"
     AUTO_PROPOSED = "auto_proposed"
     VISION_SENSOR = "vision_sensor"
     CADENCE_SYNTHETIC = "cadence_synthetic"
