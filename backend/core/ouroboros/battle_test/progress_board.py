@@ -110,7 +110,27 @@ def scan_roots() -> Tuple[str, ...]:
     # `scripts/ouroboros_battle_test.py:1997`. Same shape as the relative-
     # import blindness — the board was right about its own graph and the
     # graph was missing an edge.
-    return ("backend", "scripts")
+    # "." is the REPO ROOT, and leaving it out was the fifth blindness.
+    #
+    # `unified_supervisor.py` — the 102K-line kernel, the thing that actually
+    # boots this system — lives at the root, so none of its import edges were
+    # ever scanned. Every module reached ONLY from the kernel read DARK.
+    #
+    # Found via `elite_dashboard.py`: flagged dark-and-enabled and one step
+    # from deletion, while the kernel imports it at Zone 6.14, calls
+    # `get_elite_dashboard()`, `await start()`, `install_narrator_hook()` and
+    # keeps the instance. A dashboard that runs on every boot, invisible to
+    # the board that exists to say what runs.
+    #
+    # Same shape as the four before it: the board was right about its own
+    # graph, and the graph was missing an edge. This one was the largest —
+    # the entry point itself.
+    #
+    # The walker already prunes `_EXCLUDE_DIRS`, so adding "." costs the
+    # root's own files plus directories not otherwise listed; it does not
+    # re-walk `backend` twice, because paths are normalised to module names
+    # and the set is deduplicated.
+    return (".", "backend", "scripts")
 
 
 #: Directories that are not this codebase. A venv vendored under the scan root
