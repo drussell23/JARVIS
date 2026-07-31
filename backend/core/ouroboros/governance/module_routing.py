@@ -21,7 +21,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover
     pass
@@ -138,7 +138,27 @@ class TopicFragment:
 
 
 def _hash_content(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    """SHA-256 of the NORMALISED payload, truncated. Pure. NEVER raises.
+
+    Normalisation is what makes this an identity rather than a checksum.
+    Two copies of one topic differ in ways that are not content: CRLF from a
+    Windows checkout, a trailing newline an editor added, indentation
+    whitespace a sync client rewrote. Hashing the raw bytes would call those
+    different documents and defeat the deduplication they are supposed to
+    enable.
+
+    Deliberately does NOT strip interior blank lines or normalise case: two
+    topics that differ only in emphasis or paragraphing ARE different
+    documents, and a hash aggressive enough to merge them would silently drop
+    real memory. Normalise transport artefacts; preserve authorship.
+    """
+    normalised = "\n".join(
+        line.rstrip() for line in str(text or "").replace("\r\n", "\n")
+                                                 .replace("\r", "\n")
+                                                 .split("\n")
+    ).strip()
+    return hashlib.sha256(
+        normalised.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 def _extract_title(content: str, path: Path) -> str:
@@ -168,6 +188,27 @@ def _load_topic_fragments_worker(
         return []
 
     fragments: List[TopicFragment] = []
+    #: content_hash -> the URI that claimed it first. Identity is the PAYLOAD,
+    #: never the path.
+    #
+    #: This loader walked `rglob("*.md")` and injected whatever the filesystem
+    #: held, so an iCloud conflict copy (`battle_test 2/`, from this repo
+    #: living under a synced `~/Documents`) was loaded as a SECOND topic —
+    #: every duplicated fragment paying full tokens in a GENERATE prompt to
+    #: say what the first one already said.
+    #
+    #: Filtering the name would have fixed that one cause and no other.
+    #: Hashing the payload immunises against every cause at once — sync
+    #: copies, symlink loops, a hand copy-paste, a vendored second checkout —
+    #: because none of them can change what the document IS. `_hash_content`
+    #: was already computed here for every fragment and simply never
+    #: consulted; the deduplication was one comparison away the whole time.
+    #:
+    #: FIRST path wins, and `sorted()` above makes "first" deterministic: the
+    #: same corpus yields the same surviving URI on every boot, so a topic's
+    #: recorded provenance does not shuffle between runs.
+    seen_hashes: Dict[str, str] = {}
+    duplicates = 0
     for md_file in sorted(topics_dir.rglob("*.md")):
         try:
             content = md_file.read_text(encoding="utf-8", errors="replace")
@@ -183,6 +224,20 @@ def _load_topic_fragments_worker(
             modules = tuple(_parse_modules_frontmatter(content))
             content_hash = _hash_content(content)
 
+            first = seen_hashes.get(content_hash)
+            if first is not None:
+                # Silently, per the mandate — but COUNTED. A dedup that
+                # leaves no trace is indistinguishable from a loader that
+                # never saw the file, and the difference matters the day
+                # someone asks why a topic they wrote is not in a prompt.
+                duplicates += 1
+                logger.debug(
+                    "[ModuleRouter] duplicate payload %s == %s (hash %s)",
+                    uri, first, content_hash,
+                )
+                continue
+            seen_hashes[content_hash] = uri
+
             fragments.append(
                 TopicFragment(
                     source_id=source_id,
@@ -196,6 +251,11 @@ def _load_topic_fragments_worker(
         except Exception:  # noqa: BLE001 — fail-soft per spec
             logger.debug("[ModuleRouter] skipping topic file %s (read error)", md_file, exc_info=True)
 
+    if duplicates:
+        logger.info(
+            "[ModuleRouter] corpus %d topics (%d duplicate payloads dropped)",
+            len(fragments), duplicates,
+        )
     return fragments
 
 

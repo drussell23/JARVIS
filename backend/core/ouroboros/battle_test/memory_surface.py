@@ -63,27 +63,58 @@ def memory_surface_enabled() -> bool:
     ).strip().lower() not in ("0", "false", "no", "off")
 
 
-#: iCloud's conflict-copy suffix: `battle_test 2`, `slices 3`. This repo lives
-#: under a `.nosync` mount precisely because iCloud corrupted `.git` once, and
-#: the duplicate DIRECTORIES it left behind are still on disk.
+#: Hard ceiling on what one `/memory` may put on the wire.
 #:
-#: Counting them doubled every number on first render — "763 topics" for a
-#: corpus of ~382. That is the one failure mode a memory surface must not
-#: have: it does not merely mis-count, it tells the operator the organism
-#: knows twice what it does, in the exact place they came to find out.
-_CLOUD_DUP = __import__("re").compile(r"^.+ \d+$")
+#: The verb sends per-domain COUNTS and a capped hit list — never the corpus —
+#: so a bare `/memory` is ~700 bytes and a search is bounded by `limit`. This
+#: is the guard that keeps it that way: a future section, or a corpus that
+#: grows an order of magnitude, cannot quietly turn a summary into a flood
+#: that costs the TUI its frame budget.
+#:
+#: Enforced by TRUNCATION with a visible marker rather than by refusing to
+#: answer. An operator who asked what the organism knows should get a short
+#: answer that says it was shortened, never an error.
+_MAX_PAYLOAD_BYTES = 8192
 
 
-def _is_cloud_duplicate(name: str) -> bool:
-    """True for an iCloud conflict copy. Pure. NEVER raises.
+def _tracked_topic_paths(root: Path) -> Optional[List[Path]]:
+    """The topic files the REPO declares, or None if git cannot say.
 
-    Matches a trailing space-and-digits, which is iCloud's format and not a
-    convention any real topic domain here uses.
+    This is the root fix, and it is not a filter.
+
+    The corpus is not "every .md under a directory" — it is what the
+    repository tracks. Reading the working tree instead made the surface
+    count things the repo has explicitly disowned: iCloud conflict copies
+    (`battle_test 2/`, created because this repo lives under a synced
+    `~/Documents`) are UNTRACKED and already gitignored at `.gitignore:270`.
+    Nothing in iCloud is part of O+V's memory; the sync client simply
+    littered inside the working tree.
+
+    So the answer is to ask the authority that already knows. That
+    generalises past iCloud for free — editor backups, a vendored second
+    checkout, stray downloads — because "ignored" is the repo stating that a
+    file is not part of itself, and no pattern list has to be maintained to
+    keep up.
+
+    Returns None (not an empty list) when git is unavailable, so the caller
+    can fall back to walking the tree rather than reporting a corpus of zero.
+    An absent VCS must not read as an empty mind.
     """
     try:
-        return bool(_CLOUD_DUP.match(str(name or "")))
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "ls-files", "-z", "--", "docs/memory_topics"],
+            cwd=str(root), capture_output=True, timeout=10.0, check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        names = [n for n in proc.stdout.decode(
+            "utf-8", "replace").split("\0") if n.endswith(".md")]
+        return [root / n for n in names]
     except Exception:  # noqa: BLE001
-        return False
+        logger.debug("[MemorySurface] git ls-files unavailable", exc_info=True)
+        return None
 
 
 def _repo_root() -> Path:
@@ -152,8 +183,15 @@ def topic_counts() -> Dict[str, int]:
         root = _repo_root() / "docs" / "memory_topics"
         if not root.is_dir():
             return out
+        tracked = _tracked_topic_paths(_repo_root())
+        if tracked is not None:
+            for path in tracked:
+                domain = path.parent.name
+                out[domain] = out.get(domain, 0) + 1
+            return out
+        # git unavailable — walk the tree, and say nothing false about it.
         for child in sorted(root.iterdir()):
-            if not child.is_dir() or _is_cloud_duplicate(child.name):
+            if not child.is_dir():
                 continue
             n = sum(1 for _ in child.glob("*.md"))
             if n:
@@ -180,9 +218,10 @@ def search_topics(term: str, limit: int = _DEFAULT_LIMIT) -> List[str]:
         if not root.is_dir():
             return []
         hits: List[str] = []
-        for path in sorted(root.rglob("*.md")):
-            if _is_cloud_duplicate(path.parent.name):
-                continue
+        tracked = _tracked_topic_paths(_repo_root())
+        candidates = (sorted(tracked) if tracked is not None
+                      else sorted(root.rglob("*.md")))
+        for path in candidates:
             if needle in path.name.lower():
                 hits.append(f"    {path.parent.name}/{path.name}")
                 if len(hits) >= max(1, int(limit)):
@@ -225,6 +264,37 @@ def _routing_row() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _clamp_payload(rows: List[str],
+                   limit: int = _MAX_PAYLOAD_BYTES) -> List[str]:
+    """Rows truncated to fit ``limit`` bytes, with a visible marker.
+
+    The guard, not the design. This verb sends per-domain COUNTS and a capped
+    hit list — never the corpus — so it is ~700 bytes today and nothing about
+    it wants to grow. What this prevents is a LATER section, or a corpus an
+    order of magnitude larger, quietly turning a summary into a flood that
+    costs the TUI its frame budget across the socket.
+
+    Truncates rather than refusing. An operator who asked what the organism
+    knows should get a short answer that admits it was shortened, never an
+    error — and never a silent tail-drop, which would read as "that is all
+    there is". Pure. NEVER raises.
+    """
+    try:
+        out: List[str] = []
+        used = 0
+        for row in rows or ():
+            size = len(str(row).encode("utf-8", "replace")) + 1
+            if used + size > int(limit):
+                out.append(f"  [dim]… truncated at {int(limit)} bytes "
+                           f"({len(rows) - len(out)} rows withheld)[/dim]")
+                break
+            out.append(row)
+            used += size
+        return out
+    except Exception:  # noqa: BLE001
+        return list(rows or ())
+
+
 def compose_memory_lines(arg: str = "") -> List[str]:
     """Markup lines for ``/memory [search-term]``. NEVER raises.
 
@@ -245,7 +315,7 @@ def compose_memory_lines(arg: str = "") -> List[str]:
             hits = search_topics(term)
             out.append(f"  [bold]memory · topics matching[/bold] {term!r}")
             out.extend(hits or ["    [dim](no topic name matches)[/dim]"])
-            return out
+            return _clamp_payload(out)
 
         out.append("  [bold]memory[/bold]")
 
@@ -268,8 +338,8 @@ def compose_memory_lines(arg: str = "") -> List[str]:
             out.append("    [dim](docs/memory_topics not found)[/dim]")
 
         out.append(_routing_row())
-        out.append("  [dim]/memory <term> searches topic names[/dim]")
-        return out
+        out.append("  [dim]/memory topics <term> searches topic names[/dim]")
+        return _clamp_payload(out)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[MemorySurface] compose degraded", exc_info=True)
         return [f"  [dim]memory surface degraded: "
