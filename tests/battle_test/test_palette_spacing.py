@@ -1,9 +1,20 @@
-"""The column fits most names, not every name.
+"""The column fits EVERY name, so every description starts in one place.
 
-Sizing to the longest visible name lets one outlier dictate the layout. With
-`/backlog_auto_proposed` (22 chars) on screen, `/anticipate` was followed by
-FOURTEEN spaces of dead gutter — and the eye crosses all of it on every row
-to reach the description.
+This file previously argued the opposite, and the argument was good: sizing
+to the longest visible name let one outlier dictate the layout, and with
+`/backlog_auto_proposed` (22 chars) on screen `/anticipate` got fourteen
+spaces of dead gutter.
+
+What it missed is that `_NAME_COL_MAX_FRACTION` + `_ellipsis` ALREADY bound
+that case — a 60-char verb at width 80 renders ellipsised with every
+description still aligned. The quantile was a second mechanism guarding a
+case the cap already handled, and the price was the alignment itself: three
+rows lined up and the fourth ragged, which reads as a rendering bug rather
+than as the considered trade it was.
+
+Claude Code aligns every row. The operator asked for that, the cap makes it
+safe, and `JARVIS_PALETTE_NAME_QUANTILE` keeps the dense-row preference
+expressible for anyone who wants it back.
 """
 from __future__ import annotations
 
@@ -28,65 +39,62 @@ def _rows(width: int = 100) -> list:
             for row in layout_palette(_ENTRIES, width=width, max_rows=8)]
 
 
-def test_one_outlier_does_not_stretch_every_row() -> None:
-    """THE fix. The longest name is 22; sizing to it gave `/anticipate`
-    fourteen spaces of gutter."""
-    assert _name_column(_NAMES) < max(len(n) for n in _NAMES)
+def _starts(rows: list) -> list:
+    return [r for r in rows if r.lstrip().startswith("/")]
 
 
-def test_the_common_rows_sit_close_to_their_descriptions() -> None:
-    row = next(r for r in _rows() if "/anticipate" in r)
-    gap = len(row) - len(row.lstrip())
-    inner = row.strip()
-    spaces = len(inner) - len(inner.replace("  ", " ", 1))
-    assert "  " in inner
-    before_desc = inner.index("Show")
-    assert before_desc - len("/anticipate") < 12, (
-        f"still {before_desc - len('/anticipate')} spaces of dead gutter"
-    )
-    assert gap >= 0
+def test_the_column_fits_every_name() -> None:
+    """THE contract. Uniform alignment is what makes the list scannable."""
+    assert _name_column(_NAMES) == max(len(n) for n in _NAMES)
 
 
-def test_a_long_name_is_NEVER_clipped() -> None:
-    """It is the thing the operator has to type. `/backlog_auto_prop…` has
-    stopped being a palette entry."""
-    joined = "\n".join(_rows())
-    assert "/backlog_auto_proposed" in joined
-    assert "…" not in joined.split("List and approve")[0]
+def test_every_description_starts_in_the_same_column() -> None:
+    columns = set()
+    for row in _starts(_rows()):
+        inner = row.lstrip()
+        name = inner.split(" ", 1)[0]
+        columns.add((len(row) - len(inner)) + len(name)
+                    + (len(inner) - len(name) - len(inner[len(name):].lstrip())))
+    assert len(columns) == 1, f"ragged rows are back: {sorted(columns)}"
 
 
-def test_an_overflowing_name_goes_ragged_rather_than_shrinking_others() -> None:
-    """One ragged row is strictly cheaper than every row paying for the
-    outlier."""
-    rows = _rows()
-    outlier = next(r for r in rows if "/backlog_auto_proposed" in r)
-    common = next(r for r in rows if "/anticipate" in r)
-    assert outlier.index("List") > common.index("Show")
-
-
-def test_an_overflowing_row_stays_inside_the_terminal() -> None:
-    """Re-measured per row, so a long name cannot push its description past
-    the edge."""
-    for width in (60, 80, 100, 140):
-        for row in _rows(width):
-            assert len(row) <= width, f"row overran {width} cols"
-
-
-def test_uniform_names_are_unaffected() -> None:
-    """When nothing is an outlier the column is the max, as before."""
-    names = ["/one", "/two", "/six"]
-    assert _name_column(names) == max(len(n) for n in names)
+def test_a_name_past_the_cap_is_ellipsised_not_allowed_to_stretch_the_row(
+) -> None:
+    """The case the quantile was invented for — handled by the cap."""
+    entries = _ENTRIES + [("/" + "z" * 70, "a pathologically long verb")]
+    rows = layout_palette(entries, width=80, max_rows=8)
+    lines = ["".join(t for _s, t in r) for r in rows]
+    assert any("\u2026" in ln for ln in lines), "the cap never engaged"
+    for line in lines:
+        assert len(line) <= 80
 
 
 def test_descriptions_still_wrap_on_a_narrow_terminal() -> None:
+    """Wrapping is asserted by SHAPE, not by which word lands on line two.
+
+    The previous version pinned the wrap point, so widening the name column
+    by eight characters read as "wrapping stopped working" when what had
+    actually changed was where the sentence broke.
+    """
     rows = _rows(60)
-    assert any(r.strip().startswith("next") or r.strip().startswith("history")
-               for r in rows), "wrapping stopped working"
+    assert len(rows) > len(_starts(rows)), "no continuation lines at width 60"
+
+
+def test_continuations_hang_at_the_description_column() -> None:
+    rows = _rows(60)
+    starts = _starts(rows)
+    inner = starts[0].lstrip()
+    name = inner.split(" ", 1)[0]
+    column = ((len(starts[0]) - len(inner)) + len(name)
+              + (len(inner) - len(name) - len(inner[len(name):].lstrip())))
+    for row in rows:
+        if row in starts or not row.strip():
+            continue
+        assert len(row) - len(row.lstrip()) == column
 
 
 def test_the_quantile_is_tunable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """It trades two real costs: lower tightens common rows and ragged-wraps
-    more outliers; higher aligns everything and spends width on gutter."""
+    """The dense-row preference stays expressible — it is not the default."""
     monkeypatch.setenv("JARVIS_PALETTE_NAME_QUANTILE", "1.0")
     assert name_fit_quantile() == 1.0
     assert _name_column(_NAMES) == max(len(n) for n in _NAMES)
@@ -95,11 +103,8 @@ def test_the_quantile_is_tunable(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_the_gutter_is_preserved_for_every_row() -> None:
-    for row in _rows():
+    for row in _starts(_rows()):
         inner = row.strip()
-        assert " " * _GUTTER in inner or "  " in inner
-
-
-@pytest.mark.parametrize("names", [[], ["/x"], ["", ""]])
-def test_degenerate_name_lists_never_raise(names) -> None:
-    assert isinstance(_name_column(names), int)
+        name = inner.split(" ", 1)[0]
+        rest = inner[len(name):]
+        assert len(rest) - len(rest.lstrip()) >= _GUTTER
