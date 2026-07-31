@@ -386,7 +386,9 @@ def _render_stats() -> str:
 def dispatch_listen_command(
     line: str,
 ) -> ListenReplDispatchResult:
-    """Parse a ``/listen`` line and dispatch. NEVER raises."""
+    """Watch the live event stream the IDE consumers see.
+
+    Parse a ``/listen`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return ListenReplDispatchResult(
             ok=False, text="", matched=False,

@@ -103,7 +103,9 @@ def _master_enabled() -> bool:
 def dispatch_doll_metric_command(
     line: str,
 ) -> DollMetricReplDispatchResult:
-    """Canonical §32.11 Slice 4 entry point — auto-discovered by
+    """Show per-axis doll-completion stages and the overall ratio.
+
+    Canonical §32.11 Slice 4 entry point — auto-discovered by
     naming convention (``dispatch_<basename>_command``).
     """
     if not _matches(line):

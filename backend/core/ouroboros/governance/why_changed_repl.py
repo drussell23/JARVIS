@@ -389,7 +389,9 @@ def _render_config() -> str:
 def dispatch_why_changed_command(
     line: str,
 ) -> WhyChangedReplDispatchResult:
-    """Parse a ``/why_changed`` line and dispatch. NEVER raises."""
+    """Explain why the organism changed its behaviour.
+
+    Parse a ``/why_changed`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return WhyChangedReplDispatchResult(
             ok=False, text="", matched=False,

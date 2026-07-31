@@ -93,7 +93,9 @@ def _matches(line: str) -> bool:
 
 
 def dispatch_canvas_command(line: str) -> CanvasDispatchResult:
-    """Parse a ``/canvas`` line and dispatch. NEVER raises."""
+    """Show the op dependency canvas — parent/child tree and parallel fan-out.
+
+    Parse a ``/canvas`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return CanvasDispatchResult(
             ok=False, text="", matched=False,

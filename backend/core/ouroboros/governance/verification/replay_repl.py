@@ -101,7 +101,9 @@ def _master_enabled() -> bool:
 def dispatch_replay_command(
     line: str,
 ) -> ReplayDispatchResult:
-    """Parse ``/replay ...`` and dispatch. NEVER raises — every
+    """Show counterfactual replay state and recurrence reduction.
+
+    Parse ``/replay ...`` and dispatch. NEVER raises — every
     error path produces a friendly text result.
 
     The dispatcher is sync but ``run`` subcommand wraps Slice 2's

@@ -73,7 +73,9 @@ def _matches(line: str) -> bool:
 
 
 def dispatch_history_command(line: str) -> HistoryDispatchResult:
-    """Parse a ``/history`` line and dispatch. NEVER raises."""
+    """Query the session archive by flag, date or text.
+
+    Parse a ``/history`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return HistoryDispatchResult(
             ok=False, text="", matched=False,

@@ -122,7 +122,9 @@ def _parse_limit(args: List[str]) -> int:
 
 
 def dispatch_failures_command(line: str) -> FailuresDispatchResult:
-    """Parse a ``/failures`` line and dispatch. NEVER raises."""
+    """Review recorded failure modes and their mitigations.
+
+    Parse a ``/failures`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return FailuresDispatchResult(
             ok=False, text="", matched=False,

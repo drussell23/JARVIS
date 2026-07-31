@@ -177,7 +177,9 @@ def _parse_limit(
 def dispatch_tool_permissions_command(
     line: str,
 ) -> ToolPermissionsReplDispatchResult:
-    """Parse a ``/tool_permissions`` line and dispatch. NEVER raises."""
+    """Review recorded tool-permission decisions.
+
+    Parse a ``/tool_permissions`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return ToolPermissionsReplDispatchResult(
             ok=False, text="", matched=False,

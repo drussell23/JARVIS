@@ -142,7 +142,9 @@ def _matches(line: str) -> bool:
 def dispatch_semantic_budget_command(
     line: str,
 ) -> SemanticBudgetReplDispatchResult:
-    """Parse a ``/semantic_budget`` line and dispatch. NEVER
+    """Show cross-op semantic budget spend and headroom.
+
+    Parse a ``/semantic_budget`` line and dispatch. NEVER
     raises — exceptions surface as non-ok results.
 
     Auto-discovered by :mod:`repl_dispatch_registry` (§32.11

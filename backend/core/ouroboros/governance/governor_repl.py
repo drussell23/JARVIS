@@ -95,7 +95,9 @@ def dispatch_governor_command(
     governor: Any = None,
     gate: Any = None,
 ) -> GovernorDispatchResult:
-    """Parse ``/governor ...`` and dispatch. Tests inject collaborators."""
+    """Show sensor budget caps, memory pressure and brake status.
+
+    Parse ``/governor ...`` and dispatch. Tests inject collaborators."""
     if not _matches(line):
         return GovernorDispatchResult(ok=False, text="", matched=False)
     try:

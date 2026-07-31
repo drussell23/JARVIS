@@ -131,7 +131,9 @@ def _parse_limit(args: List[str]) -> Optional[int]:
 
 
 def dispatch_quorum_command(line: str) -> QuorumDispatchResult:
-    """Parse a ``/quorum`` line and dispatch. NEVER raises."""
+    """Show generative-quorum readings and agreement.
+
+    Parse a ``/quorum`` line and dispatch. NEVER raises."""
     if not _matches(line):
         return QuorumDispatchResult(
             ok=False, text="", matched=False,

@@ -68,7 +68,9 @@ def _matches(line: str) -> bool:
 
 
 def dispatch_mode_command(line: str) -> ModeDispatchResult:
-    """Parse a ``/mode`` line and dispatch.
+    """Show or set the current operation mode.
+
+    Parse a ``/mode`` line and dispatch.
 
     Returns a :class:`ModeDispatchResult` with ``matched=True``
     only when the line begins with ``/mode``. Other input
