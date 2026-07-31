@@ -587,6 +587,40 @@ def _path_tail(path: str) -> str:
     return Path(path).name
 
 
+_utility_armed = False
+
+
+def _arm_utility_listener_once() -> None:
+    """Subscribe the utility store to VERIFY telemetry. NEVER raises."""
+    global _utility_armed  # noqa: PLW0603
+    if _utility_armed:
+        return
+    try:
+        from backend.core.ouroboros.governance.memory_utility import (
+            arm_outcome_listener, utility_enabled,
+        )
+        if utility_enabled():
+            _utility_armed = arm_outcome_listener()
+    except Exception:  # noqa: BLE001
+        logger.debug("[ModuleRouter] utility listener not armed", exc_info=True)
+
+
+def _utility_multiplier(content_hash: str) -> float:
+    """Outcome-learned rank weight for a topic. NEVER raises.
+
+    Lazy-imported and fail-open at 1.0, so a missing or broken utility store
+    costs the ranker exactly nothing — the closed loop is an improvement on
+    the open one, never a dependency of it.
+    """
+    try:
+        from backend.core.ouroboros.governance.memory_utility import (
+            utility_for,
+        )
+        return utility_for(content_hash)
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
 def _drift_multiplier(drift: str) -> float:
     """Rank weight for a staleness verdict. NEVER raises.
 
@@ -788,6 +822,15 @@ class ModuleContextRouter:
         if not routing_enabled():
             return RoutedContext.empty()
 
+        # Arm the outcome listener at the first real route. Deliberately here
+        # rather than at import or at boot: the subscription is only
+        # meaningful once memory is actually being injected, and this is the
+        # one code path that proves it is. A boot-time hook would have to
+        # guess, and a flag flipped mid-session would leave it unarmed —
+        # which is precisely the wired-but-inert failure this codebase keeps
+        # rediscovering. Idempotent, so paying it per-call is free.
+        _arm_utility_listener_once()
+
         try:
             return await self._route_impl(
                 target_files, query, max_topics, token_budget, op_id, consumer)
@@ -865,7 +908,16 @@ class ModuleContextRouter:
             # current one when both are available, not to forget the decision.
             # UNKNOWN multiplies by 1.0 — absence of evidence must not re-rank
             # the corpus.
-            combined.append((base * _drift_multiplier(topic.drift), topic))
+            # Two independent, multiplicative advisories on top of the
+            # measured relevance signals. Both default to 1.0 when they have
+            # nothing to say, so a cold corpus ranks exactly as it did before
+            # either existed.
+            combined.append((
+                base
+                * _drift_multiplier(topic.drift)
+                * _utility_multiplier(topic.content_hash),
+                topic,
+            ))
 
         # Sort descending by score, then by title for determinism
         combined.sort(key=lambda x: (-x[0], x[1].title))

@@ -1,6 +1,6 @@
 ---
 title: Memory corpus authority + admission ledger
-modules: [backend/core/ouroboros/governance/memory_corpus.py, backend/core/ouroboros/governance/memory_admission.py, backend/core/ouroboros/governance/module_routing.py, backend/core/ouroboros/battle_test/memory_surface.py, backend/core/ouroboros/governance/phase_runners/context_expansion_runner.py]
+modules: [backend/core/ouroboros/governance/memory_utility.py, backend/core/ouroboros/governance/ops_digest_observer.py, backend/core/ouroboros/governance/memory_corpus.py, backend/core/ouroboros/governance/memory_admission.py, backend/core/ouroboros/governance/module_routing.py, backend/core/ouroboros/battle_test/memory_surface.py, backend/core/ouroboros/governance/phase_runners/context_expansion_runner.py]
 status: active
 source: session 2026-07-30, CC-parity memory arc
 ---
@@ -125,6 +125,70 @@ ghosts included.
 `corpus 383 [git_tracked] · 381 untracked excluded · admitted 3/383
 considered · 1500/2000 chars (75%)`. Drift census over the ranked head:
 54 drifted, 8 fresh, 1 orphaned, 1 unbound.
+
+## Slice 1 — the outcome-feedback loop (`memory_utility.py`)
+
+Selection was open-loop. A topic in forty verified ops and one in twelve
+failed ops ranked identically forever. `content_hash` is the join key — a
+topic that MOVES keeps its history; a topic that is EDITED starts neutral,
+because the evidence was about the old text.
+
+Reuses rather than redeclares: polarity (`_outcome_polarity_weight`) and the
+exponential half-life (`action_outcome_recency_halflife_days`) both come from
+`action_outcome_memory`; near-duplicate detection reads the `content_hash`-keyed
+embedding cache `module_routing` already persists.
+
+**Neutral is the decayed CORPUS MEAN, not a constant.** A fixed midpoint would
+drift the whole corpus up or down together during a good or bad week, so every
+topic would be re-ranked by the weather rather than its own contribution.
+Measuring against the corpus cancels that exactly and needs no magic number.
+
+Refusals are the load-bearing part:
+- cold start → 1.0, never negative (same invariant as `Drift.UNKNOWN`)
+- a zero-total VERIFY proves nothing and is not credited as a pass
+- `scoped_to_applied_op=False` (repo-wide health) is NOT this op's result
+- confidence saturates `1 - exp(-mass/scale)`, so one coincidence moves a
+  topic ~4% and a sustained pattern moves it more — the false-attribution
+  guard, since an op usually fails for reasons unrelated to its three topics
+- near-duplicate propagation is NEGATIVE-only and similarity-scaled: demoting
+  a topic without its twin leaves the router a free fallback into the same
+  failure, while spreading praise would rank a redundant corpus above a
+  concise one
+
+**`ops_digest_observer` grew a fan-out.** The registry held ONE slot, owned by
+the harness's `SessionRecorder`, so a second consumer had to displace it or
+duplicate the call at every emit site — both the same defect. `register_*`
+keeps its meaning; `add_ops_digest_listener` is additive; `get_*` returns the
+primary OBJECT ITSELF when no listener exists, so every existing identity
+assertion still holds. A raising listener is isolated.
+
+The listener arms at the first real `route()` — not at import or boot, because
+the subscription is only meaningful once memory is actually being injected and
+this is the one path that proves it. Verb: `/memory utility`.
+
+Flags: `JARVIS_MEMORY_UTILITY_ENABLED` · `_GAIN` (0.5) · `_EVIDENCE_SCALE`
+(3.0, a scale not a threshold — nothing switches when crossed) · `_MIN`/`_MAX`
+clamp · `_MAX_OBS` · `JARVIS_MEMORY_NEAR_DUP_COSINE` (0.97) ·
+`JARVIS_MEMORY_NEAR_DUP_PROPAGATION`.
+
+E2E through the real telemetry seam: route → 3 topics at 1.0 → listener armed
+→ `on_verify_completed(0/6)` → 3 observations → a second passing op sets the
+corpus mean to 0.75 → the failed op's topics demote to ×0.96 at confidence
+0.28. 31 tests.
+
+## Ghost reconciliation (2026-07-30)
+
+`scripts/reconcile_ghost_topics.py`. 381 ghosts: 80 IDENTICAL, 244
+STALE_SUBSET, 57 DIVERGED (module unions only), 0 ORPHANED, 0 CONFLICT.
+57 files changed, one `modules:` line each, **zero body changes**. On disk ==
+tracked == 384; zero ghost dirs.
+
+The DIVERGED bucket nearly did damage: its first cut would have re-added
+`modules:` entries a later enrichment pass had PRUNED. An entry is reclaimable
+only if it resolves to a regular file — the structural test for "could this
+ever be a routing signal", since `_structural_score` matches on path-tail and
+a directory entry can never match while its tail (`voice`, `api`) CAN collide
+spuriously. The 27 excluded entries are NAMED, not counted.
 
 ## Still open
 

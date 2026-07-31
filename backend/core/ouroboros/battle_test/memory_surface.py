@@ -300,6 +300,12 @@ def compose_memory_lines(arg: str = "") -> List[str]:
         # answer. Dispatched before the search branch so "context" is never
         # read as a topic-name needle.
         head, _, rest = term.partition(" ")
+        if head.lower() == "utility":
+            from backend.core.ouroboros.governance.memory_utility import (
+                render_utility_lines,
+            )
+            return _clamp_payload(render_utility_lines())
+
         if head.lower() == "context":
             from backend.core.ouroboros.governance.memory_admission import (
                 render_admission_lines,
@@ -346,7 +352,8 @@ def compose_memory_lines(arg: str = "") -> List[str]:
 
         out.append(_routing_row())
         out.append("  [dim]/memory topics <term> searches names · "
-                   "/memory context shows what loaded[/dim]")
+                   "/memory context shows what loaded · "
+                   "/memory utility shows what helped[/dim]")
         return _clamp_payload(out)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[MemorySurface] compose degraded", exc_info=True)
