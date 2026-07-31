@@ -107,10 +107,15 @@ class InfrastructureConfig:
 
     # Feature toggles
     on_demand_enabled: bool = field(
-        default_factory=lambda: os.getenv("JARVIS_INFRA_ON_DEMAND", "true").lower() == "true"
+        default_factory=lambda: os.getenv("JARVIS_INFRA_ON_DEMAND", "false").lower() == "true"
     )
+    # DEFAULT-OFF: superseded. `gcp_vm_manager` (34 production files)
+    # and `failover_lifecycle` (12) own GCP lifecycle now; nothing has
+    # imported THIS module since 2025-12-24. An ON default was harmless
+    # only because nobody wired it — the moment anyone did, shutdown
+    # would run `terraform destroy` with `--auto-approve`, by default.
     auto_destroy_on_shutdown: bool = field(
-        default_factory=lambda: os.getenv("JARVIS_INFRA_AUTO_DESTROY", "true").lower() == "true"
+        default_factory=lambda: os.getenv("JARVIS_INFRA_AUTO_DESTROY", "false").lower() == "true"
     )
 
     # Terraform settings
@@ -124,7 +129,7 @@ class InfrastructureConfig:
         default_factory=lambda: int(os.getenv("JARVIS_TERRAFORM_TIMEOUT", "300"))
     )
     terraform_auto_approve: bool = field(
-        default_factory=lambda: os.getenv("JARVIS_TERRAFORM_AUTO_APPROVE", "true").lower() == "true"
+        default_factory=lambda: os.getenv("JARVIS_TERRAFORM_AUTO_APPROVE", "false").lower() == "true"
     )
 
     # Resource thresholds for intelligent provisioning
