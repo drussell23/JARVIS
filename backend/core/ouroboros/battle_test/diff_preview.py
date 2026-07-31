@@ -286,6 +286,24 @@ class DiffPreviewRenderer:
                     row.reach.path: row for row in _bg.annotate_set(reaches)
                 }
                 gutter_summary = _bg.summary(reaches)
+                # RIGHT ORDER, not just the right numbers. The reach was
+                # already measured and drawn; the tree still rendered in
+                # whatever sequence the diff produced, so a one-line change to
+                # a leaf could sit above a rewrite forty modules import. An
+                # operator reviewing under a five-second countdown reads from
+                # the top.
+                #
+                # Unresolved files sort FIRST. A reach that could not be
+                # established is not a safe file, it is an unmeasured one —
+                # the same rule the advisor's own repair settled when it made
+                # `?` never render as `0`.
+                from backend.core.ouroboros.ui import blast_bands as _bb
+                order = {
+                    path: i for i, path in enumerate(
+                        _bb.order_paths([c.path for c in changes], reaches))
+                }
+                changes = sorted(
+                    changes, key=lambda c: order.get(c.path, len(order)))
         except Exception:  # noqa: BLE001 — a lost column, never a lost diff
             gutter_rows = {}
         for c in changes:

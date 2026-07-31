@@ -1917,6 +1917,44 @@ def _live_exit_bindings() -> Any:
     except Exception:  # noqa: BLE001
         pass
 
+    # The transcript HATCHES — `Ctrl+L`'s clear chord, `[` dump, `v` editor,
+    # `{`/`}` block jumps, `Ctrl+X Ctrl+N`, and the `/` search this scene
+    # already mounts a ROW for.
+    #
+    # Their absence was the exact defect `_demo_search_rows` was written to
+    # prevent, one layer down: the search BAR was mounted and the search KEY
+    # was not, so the strip could never appear. A PTY pressing `Ctrl+L` found
+    # it — the binding fell through to prompt_toolkit's own clear-screen, so
+    # the demo showed a repaint with no arming hint and taught a gesture the
+    # cockpit does not have.
+    #
+    # `LocalCockpitClient` is reused rather than re-shimmed: the installer
+    # wants exactly `send_input`, `flash` and a mutable `_narrate_verbose`,
+    # and `cockpit_mount` already argued why that is one implementation with
+    # a second ENTRANCE rather than two implementations.
+    try:
+        from backend.core.ouroboros.battle_test.cockpit_mount import (
+            LocalCockpitClient,
+        )
+        from backend.core.ouroboros.battle_test.transcript_hatches import (
+            install_transcript_hatches,
+        )
+
+        # Verbs are SHOWN, not swallowed — the same choice `_DemoOrganism`
+        # below makes and for the same reason: an inert `send_input` makes a
+        # working key indistinguishable from a broken one.
+        shim = LocalCockpitClient(
+            send_input=lambda line: _demo_notice(
+                f"  ⏺ {line} — (demo: no organism to run it)"),
+            flash=lambda msg, *_a, **_k: _demo_notice(f"  {msg}"),
+        )
+        # One shim serves as both `ui` and `client`; the installer only ever
+        # reaches for the three members above, and splitting it would invent
+        # a distinction the callee does not make.
+        install_transcript_hatches(kb, shim, shim)
+    except Exception:  # noqa: BLE001
+        logger.debug("[OvDemo] transcript hatches unavailable", exc_info=True)
+
     try:
         from backend.core.ouroboros.battle_test.agent_roster import (
             get_agent_roster,
@@ -2016,7 +2054,7 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
 
     try:
         from backend.core.ouroboros.battle_test.bipartite_layout import (
-            BipartiteLayout, build_bipartite_application,
+            BipartiteLayout, build_bipartite_application, set_active_canvas,
         )
     except Exception as exc:  # noqa: BLE001
         _say(console, f"  cockpit unavailable: {exc}")
@@ -2127,9 +2165,28 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         start[0] = clock()
         driver = asyncio.ensure_future(
             _drive(mux, app, speed, lambda: start[0], clock, script))
+        # REGISTER the deck as the live sink, exactly as `run_bipartite_repl`
+        # does around its own `app.run_async()`.
+        #
+        # This scene builds its Application directly — deliberately, because
+        # it drives a script rather than a socket — and inherited none of that
+        # function's lifecycle. `set_active_canvas` is how sixteen call sites
+        # across `transcript_mode`, `transcript_hatches`, `serpent_flow` and
+        # `ov` find the deck to write into, and here it was never called: they
+        # all reached for `get_active_canvas()`, got None, and silently wrote
+        # nowhere. The Ctrl+O viewer this scene DOES install was among them.
+        #
+        # A pty pressing Ctrl+L is what surfaced it. The chord was bound, the
+        # latch armed, the hint was composed — and then handed to a canvas
+        # registry nobody had filled. Registration belongs to whoever owns the
+        # RUN, not to `build_bipartite_application`: a canvas registered at
+        # build time would outlive an app that is never run, and two built
+        # apps would overwrite each other's sink.
+        set_active_canvas(mux)
         try:
             await app.run_async()
         finally:
+            set_active_canvas(None)
             # The driver holds a reference to the Application; leaving it
             # running after the app exits keeps invalidating a dead surface
             # and the process never returns.
