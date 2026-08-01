@@ -6476,6 +6476,27 @@ class SerpentREPL:
             except Exception:
                 pass  # best-effort; never break the REPL
 
+        # LAST RESORT BEFORE THE EXTERNAL HANDLER: the discovered `_handle_*`
+        # convention, dispatched generically.
+        #
+        # `repl_completion._HANDLER_PREFIX` is `"_handle_"`, and
+        # `discover_verbs` walks this class for those methods to BUILD THE
+        # PALETTE. So the codebase already treats `_handle_<verb>` as the
+        # definition of a verb — it just never dispatched on it. Execution was
+        # 30 hand-written `self._handle_*(...)` calls in a 495-line ladder,
+        # with no generic path at all.
+        #
+        # A convention wired for DISPLAY but not for EXECUTION drifts in
+        # exactly one direction: `_handle_trace` is discovered, appears in the
+        # palette, and had no route to run. Advertised and inert.
+        #
+        # Placed AFTER the auto-dispatch registry, deliberately. Before it, a
+        # `_handle_<verb>` would shadow a registered module dispatcher — which
+        # is the defect `/cost` and `/posture` already demonstrate, and adding
+        # a second source of it while closing the first would be absurd.
+        if await self._dispatch_discovered_verb(line):
+            return True
+
         # Delegate to external handler
         if self._on_command is not None:
             try:
@@ -6488,6 +6509,69 @@ class SerpentREPL:
                     highlight=False,
                 )
         return False
+
+    async def _dispatch_discovered_verb(self, line: str) -> bool:
+        """Route `/verb` to `_handle_verb` when nothing else claimed it.
+
+        Closes the loop on a convention that was already half-wired: the
+        palette is BUILT from these methods (`repl_completion.discover_verbs`
+        walks `_handle_*`), so a verb that exists for display and not for
+        dispatch is a row the operator can select and cannot run.
+
+        Adapts by SIGNATURE rather than by a table, because the handlers
+        genuinely differ and a table would be a third place to keep in step:
+        22 take `(line)`, 5 take `()`, and both sync and async forms exist.
+        A handler needing more than one argument is left alone — `_handle_cancel`
+        takes `(op_id, immediate)` and is hand-routed above with the parsing
+        that implies.
+
+        NEVER raises: a verb that throws is reported and swallowed, exactly as
+        the hand-written branches do. Returns True only when a handler
+        actually ran, so an unknown verb still reaches the typo suggestion.
+        """
+        try:
+            text = (line or "").strip()
+            if not text:
+                return False
+            verb = text.split(None, 1)[0].lstrip("/")
+            # The `getattr` is on ATTACKER-INFLUENCED text, so the name is
+            # constrained before it is used: lowercase identifier only. Without
+            # this, `/__class__` or `/_flow` would reach attributes that are
+            # not verbs at all — and the prefix alone does not save you,
+            # because `_handle_` + arbitrary text is still arbitrary.
+            if not verb or not verb.replace("_", "").isalnum():
+                return False
+            if not verb[0].isalpha() or verb != verb.lower():
+                return False
+            handler = getattr(self, f"_handle_{verb}", None)
+            if not callable(handler):
+                return False
+
+            import inspect as _inspect
+            try:
+                params = [
+                    p for p in _inspect.signature(handler).parameters.values()
+                    if p.kind in (p.POSITIONAL_OR_KEYWORD, p.POSITIONAL_ONLY)
+                ]
+            except (TypeError, ValueError):
+                return False
+            required = [p for p in params if p.default is _inspect.Parameter.empty]
+            if len(required) > 1:
+                return False        # bespoke — the ladder owns it
+
+            result = handler(text) if required else handler()
+            if _inspect.isawaitable(result):
+                await result
+            return True
+        except Exception as exc:  # noqa: BLE001 — a verb must not kill the REPL
+            try:
+                self._flow.console.print(
+                    f"  [{_SEM['death']}]Error: {exc}[/{_SEM['death']}]",
+                    highlight=False,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
 
     def _register_completion_providers(self) -> None:
         """Register the dynamic arg-completion providers. Idempotent —

@@ -193,11 +193,59 @@ class TestItIsSafeToRun:
 
 class TestAgainstTheRealTree:
     def test_it_finds_the_asymmetry_that_motivated_it(self):
-        """`rewind_menu` is reached from `ov.py` and from nothing else — the
-        shape that has now recurred five times."""
+        """The instrument must still distinguish one surface from another.
+
+        SUPERSEDED 2026-08-01: was
+        ``by.get("rewind_menu") == frozenset({"attach"})``.
+
+        `rewind_menu` WAS attach-only, and that was the shape this module was
+        built to find. It is now reached by all three — the daemon gained a
+        diff overlay (`diff_overlay` → `overlay_arbiter` → `rewind_menu`) and
+        the cockpit followed. The capability spread; the test did not, and it
+        had been failing on that basis before anything in this branch touched
+        it.
+
+        Pinning a single module name made the test a hostage to the codebase
+        improving. What the module actually promises is that a surface's
+        reach is DISTINGUISHABLE from its neighbours' — so that is what is
+        asserted, over whatever the tree currently contains. Today: attach
+        reaches 27 modules alone, cockpit 9, daemon 8.
+
+        A specific example is still checked, but derived rather than
+        transcribed: if it ever becomes empty the message says which surface
+        stopped being distinguishable, which is the fact worth having.
+        """
+        reading = sr.audit()
+        solo: dict = {}
+        for module in reading.modules:
+            if len(module.reached_by) == 1:
+                solo.setdefault(next(iter(module.reached_by)), []).append(
+                    module.short)
+
+        for label in reading.surface_labels:
+            assert solo.get(label), (
+                f"no module is reached by {label!r} alone — either the "
+                f"surfaces have converged or `_reach`'s barriers stopped "
+                f"cutting, and the second would make every asymmetry "
+                f"finding vanish silently"
+            )
+
+    def test_the_original_case_is_recorded_even_though_it_healed(self):
+        """`rewind_menu` reached by everything is a RESULT, not a regression.
+
+        Kept as a named check so the healing is visible: a future change that
+        made it attach-only again would be a capability the other surfaces
+        lost, and that deserves to be noticed rather than silently matching an
+        old assertion.
+        """
         reading = sr.audit()
         by = {m.short: m.reached_by for m in reading.modules}
-        assert by.get("rewind_menu") == frozenset({"attach"})
+        assert by.get("rewind_menu") == frozenset(
+            {"attach", "cockpit", "daemon"}), (
+            "rewind_menu's reach changed — if it narrowed, a surface lost the "
+            "rewind overlay; if it widened, this expectation needs updating "
+            "with the reason"
+        )
 
     def test_the_three_surfaces_all_resolve(self):
         reading = sr.audit()
