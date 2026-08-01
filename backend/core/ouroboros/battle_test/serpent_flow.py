@@ -6725,6 +6725,37 @@ class SerpentREPL:
                     _mount = {}
                 await run_bipartite_repl(
                     on_accept=_on_accept,
+                    # THE THREE HOOKS THIS SURFACE DECLINES, and why.
+                    #
+                    # `capability_handoff` reported all three as the daemon
+                    # dropping capabilities the attach client passes. It is
+                    # the right question — a hook one surface fills and
+                    # another ignores is usually a gap — and here the answer
+                    # is no in three different ways. Declared rather than
+                    # left silent, because "this surface has no use for it"
+                    # and "nobody noticed it existed" need opposite responses
+                    # and an omission cannot tell them apart.
+                    #
+                    # Each `waived(...)` is runtime-identical to omitting the
+                    # argument: the callee's `is not None` guard sees exactly
+                    # what it saw before.
+                    watch_alive=waived(
+                        "the client polls bool(client.connected) so it can "
+                        "exit when the daemon dies; this IS the daemon, and "
+                        "a process watching its own liveness either always "
+                        "says yes or races its own shutdown"),
+                    seed=waived(
+                        "supplied by another route — seed_daemon_masthead() "
+                        "writes the identity block straight onto the active "
+                        "canvas above, which is idempotent under a boot-time "
+                        "resize storm in a way a seed list is not"),
+                    on_mux=waived(
+                        "the client captures the mux to call "
+                        "set_streaming_tail(), composing in-flight model text "
+                        "INTO the transcript. This process has no in-flight "
+                        "text producer — grep set_streaming_tail: only "
+                        "bipartite_layout and ov.py — so capturing the mux "
+                        "here would wire an object nothing reads"),
                     completer=getattr(_bp_wiring, "completer", None),
                     history=getattr(_bp_wiring, "history", None),
                     auto_suggest=getattr(_bp_wiring, "auto_suggest", None),

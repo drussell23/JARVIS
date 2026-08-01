@@ -59,13 +59,79 @@ class TestTheCollisionItself:
         assert not composes, (
             f"compose collisions are back: {composes}")
 
-    def test_the_real_findings_SURVIVE(self):
-        """Suppression would also have cleared the list. The daemon genuinely
-        does not pass these to `run_bipartite_repl`; the attach client does."""
-        divergences = ch.audit().divergence()
-        params = {d[1] for d in divergences
-                  if d[0].endswith("run_bipartite_repl")}
-        assert {"on_mux", "seed", "title", "watch_alive"} <= params
+    def test_the_real_findings_ARE_STILL_VISIBLE(self):
+        """SUPERSEDED 2026-08-01: was ``<= divergent params``.
+
+        When this was written the four `run_bipartite_repl` hooks were open
+        divergences, and asserting their survival was how the resolver was
+        held to resolving rather than suppressing — a blanket drop of
+        ambiguous matches would also have taken 11 to 4.
+
+        They are no longer divergences, and not because anything was
+        suppressed: investigation showed the daemon declines three of them for
+        three different real reasons, which are now DECLARED via
+        ``waived(...)``, and that `title` was never a finding at all — `ov`
+        passes the signature's own default, so omitting it is the identical
+        call.
+
+        The original purpose is kept and sharpened. Vanishing and being
+        declined are different outcomes, and only one of them is acceptable:
+        each hook must still be VISIBLE, carrying a reason a reader can check.
+        """
+        fills = ch.audit().fills
+        waived = {
+            f.hook: f.reason for f in fills
+            if f.sink.endswith("run_bipartite_repl")
+            and f.state is ch.FillState.WAIVED
+        }
+        assert {"on_mux", "seed", "watch_alive"} <= set(waived), (
+            f"a declined hook went silent instead of declared: {waived}")
+        for hook, reason in waived.items():
+            assert reason and len(reason) > 20, (
+                f"{hook} is waived with no usable reason — a waiver without "
+                f"one is a shrug, which is the state it exists to replace")
+
+    def test_title_was_never_a_finding(self):
+        """`ov` passes ``title="◇ O+V · proactive canvas"``, which is
+        character-for-character the sink's default. The daemon omits it and
+        gets the same title. Reporting that as a dropped capability named a
+        real surface and a real parameter and was still wrong."""
+        fills = ch.audit().fills
+        titles = [f for f in fills
+                  if f.sink.endswith("run_bipartite_repl") and f.hook == "title"]
+        assert titles, "the hook stopped being analysed entirely"
+        assert any(f.state is ch.FillState.DEFAULTED for f in titles)
+        assert not any(f.state is ch.FillState.FILLED for f in titles)
+
+    def test_the_auditor_can_still_find_a_REAL_divergence(self):
+        """Zero findings must mean "nothing diverges", never "the instrument
+        stopped working" — the failure this fix already shipped once, when a
+        recursion bug took the count to zero and read as a clean bill.
+
+        A synthetic sink with one filling caller and one omitting caller must
+        still be reported."""
+        reading = ch.HandoffReading(
+            sinks=(),
+            fills=(
+                ch.Fill("surface_a", "m.sink", "hook", ch.FillState.FILLED),
+                ch.Fill("surface_b", "m.sink", "hook", ch.FillState.UNSET),
+            ),
+        )
+        found = reading.divergence()
+        assert len(found) == 1
+        assert found[0][1] == "hook"
+        assert found[0][2] == ("surface_a",) and found[0][3] == ("surface_b",)
+
+    def test_a_defaulted_fill_does_not_manufacture_a_divergence(self):
+        """The other half: DEFAULTED must not read as FILLED."""
+        reading = ch.HandoffReading(
+            sinks=(),
+            fills=(
+                ch.Fill("surface_a", "m.sink", "hook", ch.FillState.DEFAULTED),
+                ch.Fill("surface_b", "m.sink", "hook", ch.FillState.UNSET),
+            ),
+        )
+        assert reading.divergence() == []
 
     def test_the_collided_sink_is_still_ANALYSED(self):
         """The strongest check that this resolved rather than dropped: fills

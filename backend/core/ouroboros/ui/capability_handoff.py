@@ -218,6 +218,12 @@ class FillState(enum.Enum):
     UNSET = "unset"
     #: The caller splats ``**kwargs``, so no call site enumerates the name.
     OPAQUE = "opaque"
+    #: The caller passed exactly the sink's own default. Distinct from FILLED
+    #: because it is NOT evidence of a capability: a surface that omits the
+    #: parameter makes the identical call, so this must not make that surface
+    #: look deficient by comparison. Distinct from UNSET because the caller
+    #: did write it down, which is worth seeing when defaults later change.
+    DEFAULTED = "defaulted"
 
 
 @dataclass(frozen=True)
@@ -231,6 +237,11 @@ class Hook:
     consumption: Consumption
     #: Sinks this parameter is handed onward to, unexamined.
     forwards_to: Tuple[str, ...] = ()
+    #: The sink's OWN default for this parameter, rendered from its AST, or
+    #: None when it has none. Carried so a caller that passes exactly the
+    #: default can be told apart from one that passes something else — see
+    #: `_default_equivalent`.
+    default_repr: Optional[str] = None
 
     @property
     def short_sink(self) -> str:
@@ -663,6 +674,58 @@ def _resolve_callee(call: ast.Call, scopes: Sequence[Dict[str, Optional[str]]],
     return None
 
 
+def _default_reprs(fn: Any) -> Dict[str, str]:
+    """``parameter -> rendered default`` for every default the sink declares.
+
+    Rendered with ``ast.unparse`` rather than evaluated: the analyser never
+    executes the code it audits, and a default may reference module state it
+    has no business importing.
+    """
+    out: Dict[str, str] = {}
+    try:
+        args = fn.args
+        pairs = [
+            (args.args[len(args.args) - len(args.defaults):], args.defaults),
+            (args.kwonlyargs, args.kw_defaults),
+        ]
+        for names, values in pairs:
+            for arg, value in zip(names, values):
+                if value is None:
+                    continue          # kwonly with no default
+                try:
+                    out[arg.arg] = ast.unparse(value)
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
+def _default_equivalent(hook: Hook, value: ast.AST) -> bool:
+    """Is this argument literally the sink's own default?
+
+    Then passing it and omitting it are the SAME CALL, and reporting the
+    omission as a missing capability is a false finding — the loudest kind,
+    because it names a real surface and a real parameter.
+
+    `ov` passes ``title="◇ O+V · proactive canvas"``, which is character-for-
+    character `run_bipartite_repl`'s default. The daemon omits it and gets the
+    identical title. That divergence was reported as the daemon dropping a
+    capability; it drops nothing.
+
+    Compared as rendered SOURCE, deliberately. Evaluating both sides would
+    mean executing audited code, and equality on unparsed text is exactly the
+    question being asked: did the caller write the same thing the signature
+    already says?
+    """
+    if hook.default_repr is None:
+        return False
+    try:
+        return ast.unparse(value).strip() == hook.default_repr.strip()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _reads_opaquely(fn: Any) -> bool:
     """Does the body reach its own scope dynamically?
 
@@ -772,6 +835,7 @@ def analyse_sink(spec: SinkSpec, *,
         if fn is None:
             return []
         names, kwargs_opaque = _hook_names(fn)
+        defaults = _default_reprs(fn)
         opaque_body = _reads_opaquely(fn)
         onward = set(sink_names or ())
         out: List[Hook] = []
@@ -781,6 +845,7 @@ def analyse_sink(spec: SinkSpec, *,
             else:
                 consumption, forwards = _classify(fn, name, onward)
             out.append(Hook(name=name, sink=spec.qualname,
+                            default_repr=defaults.get(name),
                             positional=positional, required=required,
                             consumption=consumption, forwards_to=forwards))
         return out
@@ -1000,6 +1065,13 @@ def _fills_for_call(surface: str, call: ast.Call,
         if reason is not None:
             out.append(Fill(surface, sink, hook.name, FillState.WAIVED,
                             reason=reason, line=line))
+        elif _default_equivalent(hook, value):
+            # Passing the signature's own default is not supplying a
+            # capability — it is writing down what would happen anyway. A
+            # caller that omits it makes the IDENTICAL call, so this must not
+            # count as evidence that the omitting surface is missing something.
+            out.append(Fill(surface, sink, hook.name, FillState.DEFAULTED,
+                            line=line))
         else:
             out.append(Fill(surface, sink, hook.name, FillState.FILLED,
                             line=line))
