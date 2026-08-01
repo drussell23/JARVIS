@@ -80,7 +80,9 @@ __all__ = [
     "DispatchRecord",
     "dynamic_verdict",
     "dynamically_dispatched",
+    "flush_interval_s",
     "note_invocation",
+    "read_ledger",
     "register",
     "registry_enabled",
     "reset_for_tests",
@@ -138,10 +140,11 @@ _dropped = 0
 
 def reset_for_tests() -> None:
     """Clear every breadcrumb. Test-only."""
-    global _records, _dropped  # noqa: PLW0603
+    global _records, _dropped, _last_flush_mono  # noqa: PLW0603
     with _lock:
         _records = {}
         _dropped = 0
+        _last_flush_mono = 0.0
 
 
 def _normalise(module: Any) -> str:
@@ -196,6 +199,105 @@ def register(module: Any, *, channel: str = "") -> None:
         logger.debug("[DynamicDispatch] register degraded", exc_info=True)
 
 
+#: Where the registry writes itself down, and why it must.
+#:
+#: An in-memory registry can only be READ from inside its own process, and a
+#: new reader can only be installed by RESTARTING that process. Both halves bit
+#: on the same day: a soak ran for three and a half hours holding a fully
+#: populated registry, `/liveness` was written to show it, and the verb could
+#: not be delivered to the daemon because the daemon predates the module. The
+#: only way to observe the organism was to kill it.
+#:
+#: So it leaves evidence on disk. Same principle as ``__firing_ledgers__``
+#: earlier in this file's history — durable, dated work is the only kind that
+#: survives the process that did it — and the same canonical writer every
+#: other ledger here uses (`cross_process_jsonl.flock_append_line`, flock-
+#: serialized, never raises). A `.jarvis/**/*.jsonl` stem is also exactly what
+#: `capability_firing` already treats as evidence-of-work, so the registry's
+#: own liveness becomes provable by the mechanism it exists to serve.
+_LEDGER_PATH = ".jarvis/ouroboros/dynamic_dispatch.jsonl"
+_last_flush_mono: float = 0.0
+
+
+def flush_interval_s() -> float:
+    """``JARVIS_DYNAMIC_DISPATCH_FLUSH_S`` (default 30). ``0`` disables.
+
+    A debounce, not a schedule: the write happens on the invocation that
+    crosses the interval, so there is no timer to start, no task to own, and
+    nothing to go inert when a caller forgets to drive it.
+    """
+    try:
+        return max(0.0, float(os.environ.get(
+            "JARVIS_DYNAMIC_DISPATCH_FLUSH_S", "30") or 30))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _maybe_flush() -> None:
+    """Append one snapshot line if the debounce has elapsed. NEVER raises.
+
+    Called from the invocation path, which is the honest "something happened"
+    signal — registration alone proves nothing, exactly as the verdicts above
+    insist. Deliberately NOT on the hot path's critical section: the lock is
+    released first, the interval check is a monotonic compare, and any failure
+    (lock contention, read-only fs, missing fcntl) is swallowed. Observability
+    that can stall delivery is worse than no observability.
+    """
+    global _last_flush_mono  # noqa: PLW0603
+    try:
+        interval = flush_interval_s()
+        if interval <= 0.0:
+            return
+        now = time.monotonic()
+        if (now - _last_flush_mono) < interval:
+            return
+        _last_flush_mono = now
+        payload = snapshot()
+        payload["written_at_unix"] = time.time()
+        payload["pid"] = os.getpid()
+        import json as _json
+        from pathlib import Path as _Path
+        from backend.core.ouroboros.governance.cross_process_jsonl import (
+            flock_append_line,
+        )
+        flock_append_line(
+            _Path(_LEDGER_PATH),
+            _json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            timeout_s=0.25,      # never wait on a reader
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[DynamicDispatch] flush degraded", exc_info=True)
+
+
+def read_ledger(path: str = "") -> Optional[Dict[str, Any]]:
+    """The NEWEST persisted snapshot, or None. NEVER raises.
+
+    This is what makes the registry readable from a process that did not
+    produce it — a fresh `ov` client, a post-mortem, a different machine
+    reading a synced tree.
+    """
+    try:
+        from pathlib import Path as _Path
+        import json as _json
+        target = _Path(path or _LEDGER_PATH)
+        if not target.is_file():
+            return None
+        newest = None
+        # Tail-read: the file is append-only and the last complete line wins.
+        with open(target, "r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    newest = _json.loads(raw)
+                except ValueError:
+                    continue      # a torn line is skipped, never fatal
+        return newest if isinstance(newest, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def note_invocation(module: Any, *, channel: str = "") -> None:
     """Record "actually ran". NEVER raises.
 
@@ -221,6 +323,10 @@ def note_invocation(module: Any, *, channel: str = "") -> None:
             rec.last_invoked_at = now
             if channel and channel not in rec.channels:
                 rec.channels = rec.channels + (str(channel),)
+        # OUTSIDE the lock: the flush takes a file lock, and holding the
+        # registry lock across it would let a slow disk serialise every
+        # producer on the bus.
+        _maybe_flush()
     except Exception:  # noqa: BLE001
         logger.debug("[DynamicDispatch] invocation degraded", exc_info=True)
 
