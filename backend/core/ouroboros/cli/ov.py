@@ -112,14 +112,108 @@ CLIENT_VERB_HELP = {
 }
 
 
+def _alias_help(verb: str) -> str:
+    """Help for an audio verb with no entry of its own. NEVER raises.
+
+    The old fallback rendered ``f"audio: {AUDIO_VERBS[verb]}"``, so six rows of
+    the palette read "audio: force_wake", "audio: ptt_stop", "audio: flush" —
+    an internal action identifier presented as a description. It answers
+    nothing, and it is the one thing the palette must never do: look like help.
+
+    But the map already carries the answer. ``AUDIO_VERBS`` is a SYNONYM table
+    — ``wake!``, ``force-wake`` and ``force wake`` all resolve to
+    ``force_wake`` — so a verb without help has siblings, and at least one of
+    them is documented. Saying "alias of /force-wake" is both true and more
+    useful than a fresh sentence would be, because it tells the operator these
+    are the same word rather than three things to learn.
+
+    Derived from the routing table itself, per this module's own rule that a
+    verb "cannot exist in one and be missing from the other". A second
+    transcription of which spellings are synonyms is exactly how a palette
+    starts lying about what the CLI accepts.
+    """
+    try:
+        action = AUDIO_VERBS.get(verb)
+        if not action:
+            return ""
+        # Preference order, deliberately: the spelling that IS the action name
+        # (``flush`` -> ``flush``), then the first documented sibling in table
+        # order. Both are stable, so the palette does not reshuffle between
+        # runs — an alias target that moves is worse than none.
+        siblings = [v for v, a in AUDIO_VERBS.items()
+                    if a == action and v != verb and CLIENT_VERB_HELP.get(v)]
+        if not siblings:
+            return ""
+        canonical = next((v for v in siblings if v == action), siblings[0])
+        return f"alias of /{canonical} — {CLIENT_VERB_HELP[canonical]}"
+    except Exception:  # noqa: BLE001 — a palette must never throw
+        return ""
+
+
+def _daemon_owns(verb: str) -> bool:
+    """Does the DAEMON dispatch this verb? NEVER raises.
+
+    Fails CLOSED — an unreadable table answers True, so the client declines to
+    intercept and the line goes where it goes today. A guard that guesses
+    "mine" when it cannot tell would silently swallow verbs on a degraded
+    boot, and swallowing is the harder failure to diagnose.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.repl_dispatch_registry import (
+            _VERB_TO_DISPATCHER, registry_primed,
+        )
+        if not registry_primed():
+            return True
+        return verb in _VERB_TO_DISPATCHER
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _resolve_audio_verb(low: str, audio_verbs: "dict") -> "Optional[str]":
+    """The audio command for an operator line, slash form included.
+
+    ``AUDIO_VERBS`` is keyed on BARE words — ``wake``, ``ptt stop``,
+    ``force-wake`` — and the lookup was ``audio_verbs.get(low)`` where ``low``
+    is whatever the operator typed. The palette enumerates the same table and
+    renders every entry with a leading slash, so ``/wake`` was offered in the
+    menu, missed the table on selection, and was relayed to a daemon that has
+    no ``/wake`` dispatcher. The verb appeared in the palette and did nothing.
+
+    The neighbouring branches show the shape of the bug: ``/deck``, ``/tasks``
+    and ``/keys`` each test ``low == "deck" or low.startswith("/deck")`` by
+    hand. Every client-handled verb was patched for slash forms one at a time,
+    and the table lookup — which covers fifteen of them — never was.
+
+    **Daemon wins on collision**, matching `registry_from_dispatch`, which
+    adds a client verb only ``if slash not in known``. ``voice`` and ``listen``
+    sit in ``AUDIO_VERBS`` *and* have real daemon dispatchers, so a blind
+    strip would hijack ``/voice`` away from the verb the palette describes.
+    Deferring to the same precedence means the menu and the router cannot
+    disagree about who answers — which is the property this module already
+    claims when it says a verb "cannot exist in one and be missing from the
+    other". NEVER raises.
+    """
+    try:
+        cmd = audio_verbs.get(low)
+        if cmd is not None:
+            return cmd               # bare form — unchanged
+        if not low.startswith("/"):
+            return None
+        bare = low[1:].strip()
+        if not bare or bare not in audio_verbs:
+            return None
+        return None if _daemon_owns(bare) else audio_verbs[bare]
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def client_verbs() -> "dict":
     """Verbs this cockpit answers WITHOUT the daemon. NEVER raises.
 
     Derived from the live dispatch tables rather than transcribed beside
     them: the audio words come from AUDIO_VERBS (the same object the router
     switches on) and the local-only verbs are listed once here."""
-    out = {v: CLIENT_VERB_HELP.get(v, f"audio: {AUDIO_VERBS[v]}")
-           for v in AUDIO_VERBS}
+    out = {v: CLIENT_VERB_HELP.get(v) or _alias_help(v) for v in AUDIO_VERBS}
     # `keys` and `tasks` were routed in `_route_operator_line` but missing
     # here, so neither appeared in the `/` palette — routed and unreachable
     # unless you already knew the word. A verb the operator cannot discover
@@ -1933,7 +2027,7 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
             _report_local_history(client, text)
             return "handled"
 
-        cmd = audio_verbs.get(low)
+        cmd = _resolve_audio_verb(low, audio_verbs)
         if cmd is not None:
             # AUTO-SPAWN REFLEX. `ov` boots ouroboros_battle_test.py, which has
             # no audio pipeline; the mic lives in unified_supervisor.py. Arming

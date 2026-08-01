@@ -132,13 +132,38 @@ def test_the_palette_uses_it() -> None:
 
 def test_subcommand_rows_read_as_a_LIST_not_a_usage_string() -> None:
     """A pipe borrows grammar from a usage string. These rows are the honest
-    answer to "nobody wrote a description, but it does accept these"."""
-    from pathlib import Path
+    answer to "nobody wrote a description, but it does accept these".
 
-    repo = Path(__file__).resolve().parents[2]
-    src = (repo / "backend/core/ouroboros/battle_test/"
-           "repl_completion.py").read_text()
-    assert '" · ".join(mined)' in src
+    SUPERSEDED 2026-07-31: was ``assert '" · ".join(mined)' in src`` — a grep
+    of `repl_completion.py`'s own source text.
+
+    That assertion tested a SPELLING, not a separator. It broke the moment the
+    join moved inside a deferred supplier (same join, same middot, different
+    local name) and it would equally have PASSED had the line been dead code,
+    commented out, or in a branch nothing reaches. A source-text assertion
+    cannot tell "this behaviour holds" from "this string is present".
+
+    Rewritten against the rendered row: build a dispatcher whose only
+    resolvable help is its mined vocabulary, and read what the palette shows.
+    """
+    def dispatch_widget_command(line: str):
+        # No prose anywhere -- the ONLY thing resolvable is the vocabulary the
+        # body compares against, which is the rung under test.
+        sub = (line or "").split()[-1]
+        if sub == "status":
+            return "s"
+        if sub == "history":
+            return "h"
+        if sub == "explain":
+            return "e"
+        return ""
+
+    from backend.core.ouroboros.battle_test import repl_completion
+
+    row = repl_completion._describe(dispatch_widget_command)
+    assert "·" in row, row
+    assert "|" not in row, row
+    assert "status" in row and "history" in row
 
 
 # --------------------------------------------------------------------------

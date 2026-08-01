@@ -113,6 +113,8 @@ def dispatch_cost_command(
 ) -> CostDispatchResult:
     """Parse a ``/cost`` REPL line and return the rendered result.
 
+    Operator: Spend so far, per phase and per provider, against the cap.
+
     Tests can inject an explicit ``governor`` and/or ``session_browser``
     without touching the module singletons.
     """

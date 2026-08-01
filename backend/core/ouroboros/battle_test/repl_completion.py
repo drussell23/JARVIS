@@ -1775,9 +1775,30 @@ __all__ = [
 _MAINTAINER_NOISE = (
     r"NEVER\s+raises?\.?",
     r"Never\s+raises?\.?",
-    r"Parse\s+(a\s+)?``?/?[\w.\- ]+``?\s+line(\s*\+?\s*and\s+dispatch)?\.?",
-    r"Parse\s+(a\s+)?``?/?[\w.\- ]+``?\s+line\s*\+\s*dispatch\.?",
-    r"``?matched=(True|False)``?\.?",
+    # ``(?:``)?`` — an OPTIONAL PAIR of backticks.
+    #
+    # These read ```` ``? ```` for months, which is not "optional double
+    # backtick": it is one REQUIRED backtick followed by an optional one. The
+    # patterns therefore only ever matched text that still carried markup —
+    # and markup was unwrapped two lines later, so by the time anything looked
+    # at these strings the backticks were gone from some and present in
+    # others. In practice the pattern never fired at all.
+    #
+    # It is the highest-value line in the tuple: ``Parse a ``/cost`` REPL line
+    # and return the rendered result`` is the single most common docstring
+    # template in the dispatch packages. With the pattern dead, only the bare
+    # opener "Parse" came off downstream, and the palette rendered the
+    # leftovers — "REPL line and return the rendered result", "Line and render
+    # the dashboard" — as though they were descriptions.
+    #
+    # A quantifier that binds to one character of a two-character token is
+    # invisible on inspection and silent at runtime; the only symptom is a
+    # rule that appears to be enforced and is not. Markup is now unwrapped
+    # BEFORE this tuple runs, so the backticks are redundant — they are kept,
+    # correctly grouped, so the patterns still hold if that order changes.
+    r"Parse\s+(a\s+)?(?:``)?/?[\w.\- ]+(?:``)?\s+line(\s*\+?\s*and\s+dispatch)?\.?",
+    r"Parse\s+(a\s+)?(?:``)?/?[\w.\- ]+(?:``)?\s+line\s*\+\s*dispatch\.?",
+    r"(?:``)?matched=(True|False)(?:``)?\.?",
     r"auto-discovered\.?",
     r"canonical\s+entry\s+point\.?",
     r"operator\s+surface\.?",
@@ -1797,54 +1818,77 @@ _PROVENANCE = (
 )
 
 
-def _humanise(line: str) -> str:
+def _humanise(line: str, verb: str = "") -> str:
     """One docstring line -> operator prose, or "" if nothing survives.
 
     Docstrings are written for whoever maintains the function. Their first
     line is usually a contract ("NEVER raises") or a restatement of the
-    plumbing ("Parse ``/canvas`` line and dispatch") — both true, both useless
+    plumbing ("Parse ``/canvas`` line and dispatch") -- both true, both useless
     in a menu that is supposed to answer "what does this do for me?".
 
-    Rules, not exceptions: strip RST markup, drop maintainer boilerplate and
-    provenance markers, then judge what remains. Returning "" is a real answer
-    and lets the caller fall through to the module docstring, which for these
-    single-purpose ``*_repl.py`` files is usually the sentence we wanted."""
+    Two changes of substance from the version that shipped for months:
+
+    **Markup is unwrapped BEFORE the noise patterns run.** They were running
+    first, and every one of them matches on WORDS -- so ``Parse a ``/cost``
+    REPL line`` never matched the ``Parse ... line`` pattern that exists to
+    delete it, because backticks sat where the pattern expected a word. Only
+    the bare opener "Parse" came off later, and what reached the palette was
+    **"REPL line and return the rendered result"**: not a description, and
+    fluent enough that an operator would act on it.
+
+    **Acceptance is delegated to `verb_description.assess`.** The gauntlet
+    that used to live here -- a 12-character floor, a four-WORD floor, a
+    fragment-head list, a dangling-tail list -- was a second, weaker copy of
+    the judgement `is_contentless` already owned, and the copies disagreed.
+    The four-word floor was the expensive one: it discarded "Op fan-out tree",
+    "Capability flag star-map" and "Proactive anticipation surface" -- three
+    real descriptions, sitting in the source, thrown away for being short. The
+    palette showed mined subcommand lists in their place, and
+    `verb_description`'s own module docstring then concluded from that display
+    that those verbs had "NO PROSE AT ALL". They had prose. This function was
+    eating it.
+
+    A description's quality is not its length. What remains here is pure
+    subtraction; judging happens in exactly one place."""
     text = str(line or "").strip()
     if not text:
         return ""
+    # Markup FIRST -- see above. Every pattern below matches words.
+    text = text.replace("``", "").replace("`", "")
     for pattern in _MAINTAINER_NOISE + _PROVENANCE:
         text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
-    text = text.replace("``", "").replace("`", "")
     text = re.sub(r"\s+", " ", text)
-    text = text.strip(" .,;:—-\u2014")
-    # A fragment that is only punctuation, a bare verb echo, or two words of
-    # residue is worse than falling through — it looks like a description and
-    # carries none.
-    if len(text) < 12:
+    text = text.strip(" .,;:\u2014-")
+    if not text:
         return ""
-    low = text.lower().lstrip("/")
-    # Reject a line that only ECHOES the verb. "/anticipate REPL" and
-    # "/causal REPL dispatcher" are what survives stripping a docstring that
-    # never described anything, and a menu entry reading "<verb> REPL" beside
-    # the verb is worse than a blank: it looks like help and answers nothing.
-    if re.fullmatch(r"[\w\-]+(\s+(repl|verb|dispatcher|surface|command))+", low):
+    text = text[0].upper() + text[1:]
+    # NORMALISE, THEN judge -- in that order, and the order is load-bearing.
+    #
+    # Judging first rejected candidates for faults the normaliser exists to
+    # remove. /enqueue_soak's module docstring opens
+    # "``/enqueue_soak <target_path>`` — stage a crash-immortal Swarm soak":
+    # assessed raw it begins with a slash, scores RESIDUE and is discarded, so
+    # the verb fell through to its function docstring and the palette read
+    # "Async — walks the target off the event loop". The sentence was there.
+    # It was being thrown away for wearing a usage lede that the very next
+    # step would have taken off.
+    text = _operator_voice(text, verb)
+    if not text:
         return ""
-    # Reject sentence fragments — residue from a stripped clause, not prose.
-    if low.split()[0] in ("and", "or", "but", "with", "then", "returns",
-                          "short-circuit", "lets"):
-        return ""
-    if not re.search(r"[a-z]{3,}\s+[a-z]{3,}", low):
-        return ""
-    words = low.split()
-    # A clause that was cut mid-thought. "Canonical entry point — by" is what a
-    # stripped provenance marker leaves behind, and it reads as a description
-    # right up until you try to use it.
-    if len(words) < 4 or words[-1] in (
-        "by", "for", "with", "and", "or", "the", "a", "an", "to", "of", "in",
-        "on", "from", "when", "that", "is", "are",
-    ):
-        return ""
-    return text[0].upper() + text[1:]
+    try:
+        from backend.core.ouroboros.battle_test.verb_description import (
+            Shape, assess,
+        )
+        # RESIDUE and EMPTY only. IMPLEMENTATION deliberately SURVIVES: it is
+        # a poor candidate, not an invalid one, and the arbiter has to be able
+        # to weigh it against an even poorer alternative. Rejecting it here
+        # would reinstate the boolean acceptance this cascade just stopped
+        # doing.
+        if assess(text, verb).shape in (Shape.EMPTY, Shape.RESIDUE):
+            return ""
+    except Exception:  # noqa: BLE001
+        pass
+    return text
 
 
 def _help_bound(text: str) -> str:
@@ -1892,16 +1936,43 @@ def describe_dispatcher(fn: object) -> str:
 def _describe(fn: object) -> str:
     """One line of operator-facing help for a dispatcher. NEVER raises.
 
-    Cascade, because no single source is reliably operator-facing:
+    An ARBITRATION, not a cascade. Every source nominates a candidate, each
+    candidate is classified and scored by `verb_description.assess`, and the
+    best one wins.
 
-      1. the function's docstring, HUMANISED — nearest the behaviour, so it is
-         the line most likely to be corrected when behaviour changes;
-      2. its MODULE's docstring, humanised — these verbs live in
-         single-purpose ``*_repl.py`` files whose header describes the feature
-         rather than the function;
-      3. an honest placeholder. Never a blank, and never maintainer jargon
-         dressed up as help."""
-    def _first_line(doc: object) -> str:
+    The distinction is the whole fix. What stood here before was a ladder of
+    ``if source: return source`` -- so each rung asked only "did I get a
+    non-empty string?", which is a test of PRESENCE and not of quality. Three
+    consequences, all of them live on the operator's screen:
+
+      * rank was ABSOLUTE, so residue from a high rung beat prose from a low
+        one and no better candidate could ever supersede a worse one that
+        merely arrived first;
+      * ``/multi_prior`` showed "Er for /multi_prior REPL verb" -- non-empty,
+        therefore accepted, and not a word;
+      * the module docstring was banned OUTRIGHT because it so often carries
+        provenance ("§38.11-F operator surface"). ``/provider`` therefore read
+        "[undocumented]" while the sentence "operator-facing DoubleWord
+        resilience dashboard" sat one scope up, unread.
+
+    That last one is the shape of the whole class: a source was excluded by
+    POLICY because nothing could judge its output. With judgement in place the
+    policy is unnecessary -- a provenance-heavy module docstring now scores as
+    RESIDUE and loses on its merits, and a good one wins on its merits.
+
+    Source rank survives as a PRIOR rather than a decision: an ``Operator:``
+    line was written for the person typing the verb, so it starts ahead. It
+    can still be beaten, which is the point.
+
+    Authored ``__verb_help__`` is the one exception and short-circuits. A
+    maintainer who names a verb's description explicitly is not offering a
+    candidate for scoring; the score would be second-guessing the only source
+    that is unambiguously addressed to an operator."""
+    from backend.core.ouroboros.battle_test.verb_description import (
+        Candidate, Shape, best_candidate, shape_ceiling,
+    )
+
+    def _first_line(doc: object, verb: str) -> str:
         text = doc if isinstance(doc, str) else ""
         text = text.strip()
         if not text:
@@ -1909,7 +1980,7 @@ def _describe(fn: object) -> str:
         # Prefer the first line, but a docstring that opens with a bare
         # ``/verb`` heading keeps its meaning on the NEXT line.
         for raw in text.splitlines()[:3]:
-            human = _humanise(raw)
+            human = _humanise(raw, verb)
             if human:
                 return human
         return ""
@@ -1918,94 +1989,108 @@ def _describe(fn: object) -> str:
         import sys as _sys
         mod = _sys.modules.get(getattr(fn, "__module__", "") or "")
 
-        # 1. AUTHORED help. The only source written FOR an operator.
-        #
-        # A module opts in with a dict beside its ``__aliases__``:
-        #
-        #     __verb_help__ = {"moltbook": "read the agora feed"}
-        #
-        # Same convention as __aliases__, so there is one place a module
-        # declares palette metadata. This exists because the humanisation
-        # below cannot invent what nobody wrote: these docstrings are
-        # contracts for maintainers, and stripping them yields "<verb> REPL".
         name = str(getattr(fn, "__name__", ""))
         verb = name[len("dispatch_"):-len("_command")] if (
             name.startswith("dispatch_") and name.endswith("_command")
         ) else name
 
+        # 0. AUTHORED help -- the only source written FOR an operator, and the
+        #    only one that bypasses scoring. A module opts in beside its
+        #    ``__aliases__``:
+        #
+        #        __verb_help__ = {"moltbook": "read the agora feed"}
         authored = getattr(mod, "__verb_help__", None)
         if isinstance(authored, dict):
             text = authored.get(verb) or authored.get(f"/{verb}")
             if isinstance(text, str) and text.strip():
                 return _help_bound(text)
 
-        # 1b. An ``Operator:`` section in the function's OWN docstring.
-        #
-        #     Ranked with authored help rather than with the humanised
-        #     docstring below, because it is the same KIND of thing: a
-        #     sentence someone wrote for the person typing the verb. It sits
-        #     beside the implementation instead of in a dict at the top of
-        #     the module, which is the only reason to prefer one over the
-        #     other, and 45 verbs were never going to get dict entries.
+        nominations = []
+
+        # An ``Operator:`` section in the function's OWN docstring. Same KIND
+        # of thing as authored help -- a sentence for the person typing the
+        # verb -- but it lives beside the implementation instead of in a dict
+        # at the top of the module, so it is scored rather than trusted.
         operator_line = extract_operator_section(getattr(fn, "__doc__", None))
         if operator_line:
-            return _help_bound(_operator_voice(operator_line, verb))
+            nominations.append(Candidate(
+                _operator_voice(operator_line, verb), "operator-section", 0.25))
 
-        # 2. The FUNCTION docstring, humanised — accepted only if it survives
-        #    as prose.
-        #
-        #    The module docstring is deliberately NOT a fallback. It is a file
-        #    header: it narrates the feature's history and provenance ("Wave 1
-        #    #8", "§38.11-F operator surface"), which is the wrong GENRE, not
-        #    merely the wrong wording. Mining it produced entries like
-        #    "/autobiography REPL — Wave 1 #8" — confident, well-formed, and
-        #    useless. A blank is the honest state for "nobody has written this
-        #    yet"; plausible noise is not.
-        own = _first_line(getattr(fn, "__doc__", ""))
+        # The FUNCTION docstring. Nearest the behaviour, so it is the line most
+        # likely to be corrected when behaviour changes -- hence a prior, but a
+        # small one, because it is written for a maintainer.
+        own = _first_line(getattr(fn, "__doc__", ""), verb)
         if own:
-            # Normalised to the OPERATOR's voice. A docstring is written for
-            # an implementer and it shows — "Parse /breadcrumbs and set/show
-            # the feed verbosity" opens with the verb the FUNCTION performs
-            # and then repeats the verb name, which is already the left-hand
-            # column. Subtractive only: no word appears that the author did
-            # not write, because a palette that paraphrases can be
-            # confidently wrong and the operator acts on it.
-            return _help_bound(_operator_voice(own, verb))
+            # Already in the operator's voice -- `_humanise` normalises before
+            # it judges. Re-applying `_operator_voice` here would run a
+            # subtractive transform twice, and `_strip_verb_name` documents at
+            # length why that is not free: it has to be a FIXED POINT or the
+            # number of times it runs becomes part of its contract.
+            nominations.append(Candidate(own, "function-docstring", 0.10))
 
-        # 3. No prose anywhere — mine the verb's own SUBCOMMAND VOCABULARY.
-        #
-        #    Ranked above signature derivation because it is strictly more
-        #    informative here: every dispatcher takes the whole line as one
-        #    string, so the signature says "(line)" while the body knows the
-        #    verb accepts status | history | explain. That is the single most
-        #    useful thing a palette can tell someone about a verb they have
-        #    not used, and it was sitting unread in the source.
-        mined = mine_subcommands(fn)
-        if mined:
-            # A middot reads as a LIST of options; a pipe reads as grammar
-            # borrowed from a usage string. This row is not a usage string —
-            # it is the honest answer to "nobody wrote a description, but the
-            # verb does accept these".
-            return _help_bound(" · ".join(mined))
+        # The MODULE docstring -- readmitted, and only for modules inside the
+        # dispatch naming cage. `_extract_verb_name` is that cage: reusing it
+        # means "is this a verb surface?" has ONE definition, and a test module
+        # that happens to define a dispatcher locally contributes nothing.
+        if _is_verb_surface(mod):
+            module_line = _first_line(getattr(mod, "__doc__", ""), verb)
+            if module_line:
+                nominations.append(Candidate(
+                    module_line, "module-docstring", 0.0))
 
-        # 4. No prose anywhere. The SIGNATURE still knows what the verb
-        #    takes, and "what arguments does this want" is most of what an
-        #    operator wants from a palette entry anyway. Translated to POSIX
-        #    brackets and stripped of injected plumbing — a raw Python
-        #    signature would be worse than the blank it replaces.
-        derived = derive_usage(fn, verb)
-        if derived:
-            return _help_bound(derived)
+        # The verb's own SUBCOMMAND VOCABULARY, mined from its body. Every
+        # dispatcher takes the whole line as one string, so the signature says
+        # "(line)" while the body knows the verb accepts status | history |
+        # explain. Honest and useful -- and strictly worse than a sentence,
+        # which is why it must be able to LOSE to one. It could not before.
+        # DEFERRED. `mine_subcommands` costs an `inspect.getsource` plus an
+        # `ast.parse`; across the table that is 340ms, on a surface that has
+        # to render between keystrokes. `best_candidate` calls the supplier
+        # only when this source's CEILING could still win — an exact bound, so
+        # the winner is identical to evaluating it every time.
+        nominations.append(Candidate(
+            "", "mined-subcommands", 0.0,
+            supplier=lambda: " · ".join(mine_subcommands(fn)),
+            ceiling=shape_ceiling(Shape.SUBCOMMAND_LIST)))
+
+        # The SIGNATURE, translated to POSIX brackets and stripped of injected
+        # plumbing. A raw Python signature would be worse than the blank.
+        nominations.append(Candidate(
+            "", "derived-usage", 0.0,
+            supplier=lambda: derive_usage(fn, verb),
+            ceiling=shape_ceiling(Shape.USAGE)))
+
+        winner = best_candidate(nominations, verb)
+        if winner is not None:
+            return _help_bound(winner.text)
     except Exception:  # noqa: BLE001
         pass
-    # 5. Nothing authored, nothing extractable, nothing to derive. Say so
-    #    plainly rather than printing residue: fabricated prose reads as a
-    #    description that happens to be wrong, and the operator acts on it.
+    # Nothing authored, nothing extractable, nothing to derive. Say so plainly
+    # rather than printing residue: fabricated prose reads as a description
+    # that happens to be wrong, and the operator acts on it.
     #
-    #    UNDOCUMENTED rather than "" so the gap is VISIBLE and countable —
-    #    ``/help --undocumented`` can list exactly what still needs writing,
-    #    which a blank column cannot.
+    # UNDOCUMENTED rather than "" so the gap is VISIBLE and countable --
+    # ``/help --undocumented`` can list exactly what still needs writing,
+    # which a blank column cannot.
     return UNDOCUMENTED
+
+
+def _is_verb_surface(mod: object) -> bool:
+    """Is *mod* one of the dispatch naming cage's verb-surface modules?
+
+    Delegated to `repl_dispatch_registry._extract_verb_name` rather than
+    re-testing the ``*_repl`` suffix here. Two copies of "what counts as a
+    verb surface" would drift, and the registry's copy is the one that
+    actually decides which modules get scanned -- so a surface it accepts and
+    this rejected would be a verb whose module docstring is unreadable for no
+    reason visible at either site. NEVER raises."""
+    try:
+        from backend.core.ouroboros.battle_test.repl_dispatch_registry import (
+            _extract_verb_name,
+        )
+        return bool(_extract_verb_name(getattr(mod, "__name__", "") or ""))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _operator_voice(text: str, verb: str) -> str:
