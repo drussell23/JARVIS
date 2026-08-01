@@ -4745,10 +4745,56 @@ class BattleTestHarness:
                             "tokens_remaining": tokens,
                             "seconds_to_reset": secs,
                         }
-                    return {
+                    payload = {
                         "providers": providers,
                         "any_exhausted": any_runway_exhausted(),
                     }
+                    # ECONOMIC DEATH IS A DIFFERENT AXIS FROM RATE LIMIT.
+                    #
+                    # This ledger records `anthropic-ratelimit-tokens-remaining`
+                    # — a per-period bucket that REFILLS. An account with no
+                    # credit has a full bucket and cannot spend a token of it,
+                    # so the cockpit rendered
+                    # `liquidity anthropic: 5,000,000 tokens` for 20 hours
+                    # while every request returned 400 "Your credit balance is
+                    # too low" (soak bt-2026-08-01-015739: 23 ops, 0 completed,
+                    # $0.00).
+                    #
+                    # The system KNEW. `claude_circuit_breaker` had recorded an
+                    # economic exhaustion and Slice 238 was suppressing the
+                    # lane as "known-dead" on every op. That state simply never
+                    # reached the surface an operator reads, so maximum
+                    # displayed health and total inability to spend looked
+                    # identical.
+                    #
+                    # Read-only, fail-soft: a breaker that cannot be inspected
+                    # leaves the ledger exactly as it was.
+                    try:
+                        from backend.core.ouroboros.governance.claude_circuit_breaker import (  # noqa: E501
+                            get_claude_circuit_breaker,
+                        )
+                        breaker = get_claude_circuit_breaker().snapshot()
+                        economic = int(
+                            breaker.get("consecutive_economic_failures") or 0)
+                        if economic > 0 or str(
+                            breaker.get("state") or "").lower() == "open":
+                            payload["economic"] = {
+                                "claude": {
+                                    "state": breaker.get("state"),
+                                    "consecutive_economic_failures": economic,
+                                    "recovery_window_s": breaker.get(
+                                        "effective_recovery_window_s"),
+                                }
+                            }
+                            # An economically dead lane IS an exhausted runway,
+                            # whatever the rate-limit bucket says. Without this
+                            # the banner keeps its cheerful token count and the
+                            # `any_exhausted` warning never fires.
+                            if economic > 0:
+                                payload["any_exhausted"] = True
+                    except Exception:  # noqa: BLE001 — telemetry, never fatal
+                        pass
+                    return payload
                 except Exception:  # noqa: BLE001
                     return {}
 
