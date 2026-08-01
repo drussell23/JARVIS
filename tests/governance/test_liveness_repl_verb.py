@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import threading
 
 import pytest
@@ -44,8 +45,23 @@ from backend.core.ouroboros.governance import dynamic_dispatch_registry as dd
 from backend.core.ouroboros.governance import liveness_repl as lr
 
 
+#: The SHIPPING default, captured before any fixture redirects it. Asserting
+#: against the patched value would only prove the fixture works.
+_DEFAULT_LEDGER_PATH = dd._LEDGER_PATH
+
+
 @pytest.fixture(autouse=True)
-def _clean():
+def _clean(tmp_path, monkeypatch):
+    """Isolate memory AND disk.
+
+    Without the path redirect these tests read the REAL
+    `.jarvis/ouroboros/dynamic_dispatch.jsonl`, so "the registry is empty"
+    depends on whether anything on this machine has ever dispatched — which
+    made `test_an_empty_registry_...` pass or fail according to whether an
+    unrelated probe had run earlier. A test whose result depends on the
+    developer's shell history is not a test.
+    """
+    monkeypatch.setattr(dd, "_LEDGER_PATH", str(tmp_path / "dispatch.jsonl"))
     dd.reset_for_tests()
     lr.reset_cache_for_tests()
     yield
@@ -353,6 +369,133 @@ class TestFilteringAndLoopLiveness:
             "covered by test_the_ttl_is_env_tunable"
         )
 
+class TestTheEvidenceOutlivesTheProcess:
+    """An in-memory registry is readable only from inside its own process, and
+    a new reader can only be installed by RESTARTING that process.
+
+    Both halves bit on the same day: a soak held a populated registry for
+    three and a half hours, `/liveness` was written to show it, and the verb
+    could not be delivered because the daemon predates the module. The only
+    way to observe the organism was to kill it.
+
+    So it writes itself down — the same principle as ``__firing_ledgers__``,
+    through the same canonical `cross_process_jsonl.flock_append_line` every
+    other ledger here uses.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _ledger(self, monkeypatch):
+        # Path isolation comes from the module-level `_clean` fixture; this
+        # only shortens the debounce so a test does not wait 30s for a flush.
+        monkeypatch.setenv("JARVIS_DYNAMIC_DISPATCH_FLUSH_S", "0.01")
+        yield
+
+    def test_invocation_persists_a_snapshot(self):
+        dd.register("alpha", channel="bus")
+        dd.note_invocation("alpha", channel="bus")
+        import time as _t
+        _t.sleep(0.03)
+        dd.note_invocation("alpha")
+        persisted = dd.read_ledger()
+        assert persisted is not None
+        assert persisted["tracked"] >= 1
+        assert persisted["pid"] > 0
+        assert persisted["written_at_unix"] > 0
+
+    def test_registration_alone_does_not_flush(self):
+        """The flush rides the INVOCATION path, matching the verdicts: only
+        running is evidence. A registration-driven flush would write a file
+        full of modules that never ran."""
+        dd.register("alpha")
+        dd.register("beta")
+        assert dd.read_ledger() is None
+
+    @pytest.mark.asyncio
+    async def test_a_reader_that_produced_nothing_can_still_see_it(self):
+        """THE point. This is every fresh client, every post-mortem."""
+        dd.register("alpha", channel="fs")
+        dd.note_invocation("alpha", channel="fs")
+        import time as _t
+        _t.sleep(0.03)
+        dd.note_invocation("alpha")
+
+        dd.reset_for_tests()                 # a different process's memory
+        out = await lr.dispatch_liveness_command("/liveness")
+        assert "alpha" in out.text
+        assert "from ledger" in out.text     # provenance is STATED
+
+    @pytest.mark.asyncio
+    async def test_live_memory_always_beats_the_file(self):
+        """A live registry is fresher than any file. Preferring the file would
+        show stale numbers on the very process generating new ones."""
+        dd.register("stale_mod")
+        dd.note_invocation("stale_mod")
+        import time as _t
+        _t.sleep(0.03)
+        dd.note_invocation("stale_mod")
+
+        dd.reset_for_tests()
+        dd.register("fresh_mod")
+        dd.note_invocation("fresh_mod")
+        out = await lr.dispatch_liveness_command("/liveness")
+        assert "fresh_mod" in out.text
+        assert "from ledger" not in out.text
+
+    def test_the_debounce_bounds_the_write_rate(self):
+        """A file write per bus delivery would make observability the most
+        expensive thing on the hot path."""
+        import time as _t
+        os.environ["JARVIS_DYNAMIC_DISPATCH_FLUSH_S"] = "30"
+        try:
+            dd.register("x")
+            for _ in range(50):
+                dd.note_invocation("x")
+            first = dd.read_ledger()
+            for _ in range(50):
+                dd.note_invocation("x")
+            second = dd.read_ledger()
+            # One flush crossed the interval; the other 99 were debounced.
+            assert first is not None
+            assert second["written_at_unix"] == first["written_at_unix"]
+        finally:
+            os.environ["JARVIS_DYNAMIC_DISPATCH_FLUSH_S"] = "0.01"
+            _t.sleep(0)
+
+    def test_flushing_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_DYNAMIC_DISPATCH_FLUSH_S", "0")
+        dd.register("x")
+        for _ in range(10):
+            dd.note_invocation("x")
+        assert dd.read_ledger() is None
+
+    def test_a_torn_line_is_skipped_not_fatal(self, tmp_path, monkeypatch):
+        """Append-only files get truncated by crashes and full disks. A
+        post-mortem reader must survive the artefact of the crash it is
+        there to investigate."""
+        path = tmp_path / "torn.jsonl"
+        path.write_text('{"tracked": 1, "rows": []}\n{"tracked": 2, "row\n',
+                        encoding="utf-8")
+        got = dd.read_ledger(str(path))
+        assert got is not None and got["tracked"] == 1
+
+    def test_a_missing_ledger_is_not_an_error(self, tmp_path):
+        assert dd.read_ledger(str(tmp_path / "nope.jsonl")) is None
+
+    def test_an_unwritable_target_never_raises(self, monkeypatch):
+        monkeypatch.setattr(dd, "_LEDGER_PATH", "/proc/definitely/not/writable.jsonl")
+        dd.register("x")
+        for _ in range(5):
+            dd.note_invocation("x")   # must not raise into event delivery
+
+    def test_the_stem_is_discoverable_as_firing_evidence(self):
+        """`.jarvis/**/*.jsonl` is exactly what `capability_firing` treats as
+        evidence-of-work, so the registry's own liveness becomes provable by
+        the mechanism it exists to serve."""
+        assert _DEFAULT_LEDGER_PATH.endswith(".jsonl")
+        assert ".jarvis" in _DEFAULT_LEDGER_PATH
+
+
+class TestScanTTL:
     def test_the_ttl_is_env_tunable(self, monkeypatch):
         monkeypatch.setenv("JARVIS_LIVENESS_REPL_SCAN_TTL_S", "5")
         assert lr.scan_ttl_s() == 5.0

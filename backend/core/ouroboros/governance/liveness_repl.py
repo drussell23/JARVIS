@@ -138,11 +138,38 @@ def _render_dispatch() -> str:
                 "(JARVIS_DYNAMIC_DISPATCH_REGISTRY_ENABLED=0) — every verdict "
                 "falls back to the static index[/dim]")
 
+    # CROSS-PROCESS FALLBACK.
+    #
+    # An empty in-process registry is the NORMAL state for a fresh reader —
+    # a client, a post-mortem, anything that did not itself dispatch. The
+    # registry persists a debounced snapshot to
+    # `.jarvis/ouroboros/dynamic_dispatch.jsonl`, so the evidence outlives the
+    # process that produced it and can be read by one that did not.
+    #
+    # Only consulted when memory is empty: a live registry is always fresher
+    # than a file, and preferring the file would show an operator stale
+    # numbers on the very process generating new ones.
+    provenance = "live"
+    if not snap.get("tracked"):
+        try:
+            from backend.core.ouroboros.governance.dynamic_dispatch_registry import (
+                read_ledger,
+            )
+            persisted = read_ledger()
+        except Exception:  # noqa: BLE001
+            persisted = None
+        if persisted and persisted.get("tracked"):
+            age = max(0, int(time.time() - float(
+                persisted.get("written_at_unix") or 0)))
+            snap = persisted
+            provenance = (f"from ledger · pid {persisted.get('pid', '?')} · "
+                          f"{age}s old")
+
     rows = list(snap.get("rows") or ())
     out: List[str] = [
         "  [bold cyan]dispatch registry[/bold cyan] "
         f"[dim]— {snap.get('tracked', 0)} module(s) tracked, "
-        f"{snap.get('dropped', 0)} dropped[/dim]",
+        f"{snap.get('dropped', 0)} dropped · {provenance}[/dim]",
         "",
         f"    [green]{snap.get('firing', 0)}[/green] firing dynamically     "
         f"[yellow]{snap.get('registered_never_invoked', 0)}[/yellow] "
@@ -151,10 +178,11 @@ def _render_dispatch() -> str:
     if not rows:
         out += [
             "",
-            "  [dim]nothing recorded yet. The registry fills as handlers "
-            "subscribe and fire — an empty registry in a live session means "
-            "no instrumented dispatch has run, not that the registry is "
-            "broken.[/dim]",
+            "  [dim]nothing recorded yet, in memory or on disk. The registry "
+            "fills as handlers subscribe and fire, and persists a debounced "
+            "snapshot to .jarvis/ouroboros/dynamic_dispatch.jsonl — so an "
+            "empty view means no instrumented dispatch has run, not that the "
+            "registry is broken.[/dim]",
         ]
         return "\n".join(out)
 
