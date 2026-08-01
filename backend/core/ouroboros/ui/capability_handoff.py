@@ -95,7 +95,8 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import (Any, Dict, FrozenSet, Iterable, List, Optional,
+                    Sequence, Set, Tuple)
 
 logger = logging.getLogger("Ouroboros.CapabilityHandoff")
 
@@ -477,6 +478,191 @@ def _callee_name(call: ast.Call) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Callee resolution — a name is not an identity
+# ---------------------------------------------------------------------------
+#
+# Matching a call to a sink by its BARE last segment was the analyser's
+# sharpest blind spot, and it produced confident false findings rather than
+# quiet ones. `serpent_flow` calls ``narrative_renderer.compose``; the audit
+# reported it as failing to fill seven parameters of
+# ``tool_render_view.compose`` — a different function that happens to share a
+# name. There are SIX distinct ``compose`` definitions under these roots, so
+# every caller of any of them was judged against all of them.
+#
+# Seven of eleven reported divergences came from that one collision. An
+# auditor wrong most of the time is an auditor nobody reads, and the real
+# finding underneath it (the daemon cockpit genuinely dropping four
+# capabilities the attach client passes) was sitting in the same list.
+#
+# It is also the SAME defect this codebase keeps rediscovering: the caller
+# index that read ``repair_engine`` 40% severed did so because it keyed on
+# bare symbol names and could not see
+# ``self._config.repair_engine.run(...)``. Unqualified names are not
+# identities. This resolves them.
+
+#: Names that are never a module, so ``x.compose(...)`` through them is a
+#: METHOD call and cannot be a module-level sink. Without this, every
+#: ``self.compose(...)`` in the tree matched every module-level ``compose``.
+_NON_MODULE_ROOTS = frozenset({"self", "cls", "super"})
+
+#: Calls whose target the AST could not settle, kept so the audit can REPORT
+#: its own blind spot instead of silently dropping them. A tool that quietly
+#: discards what it cannot resolve looks identical to one with nothing to
+#: find — the distinction this codebase spent today learning to make.
+_UNRESOLVED_CALLS: List[Tuple[str, str, int]] = []
+
+
+def unresolved_calls() -> Tuple[Tuple[str, str, int], ...]:
+    """``(module, callee, line)`` the resolver refused to guess at."""
+    return tuple(_UNRESOLVED_CALLS)
+
+
+def _relative_base(module: str, is_init: bool, level: int) -> Optional[str]:
+    """Absolute package a relative import resolves against, or None.
+
+    The rule is CPython's and is already stated once in
+    `reverse_dep_resolver._add_relative_import_edges`; it is restated here
+    rather than imported because that function resolves EDGES into a set and
+    this needs the BASE to build a binding from. Same algorithm, different
+    return type — importing it would mean reconstructing the base from its
+    output, which is the more fragile coupling.
+    """
+    if is_init:
+        package = module
+    elif "." in module:
+        package = module.rsplit(".", 1)[0]
+    else:
+        package = ""
+    parts = package.split(".") if package else []
+    drop = max(0, level - 1)
+    if drop > len(parts):
+        return None                       # escapes the tree — unresolvable
+    return ".".join(parts[: len(parts) - drop])
+
+
+def _bindings_from(nodes: Iterable[ast.AST], module: str,
+                   is_init: bool) -> Dict[str, Optional[str]]:
+    """``local name -> absolute dotted target``, or None where AMBIGUOUS.
+
+    ``None`` is a real value here: a scope that binds one name to two
+    different targets cannot resolve a call to either, and guessing would
+    reintroduce exactly the confident-wrong-answer this replaces.
+
+    Both spellings are recorded because both appear at call sites:
+
+        from x import compose            ->  compose -> x.compose
+        from x import compose as c       ->  c       -> x.compose
+        import x                         ->  x       -> x
+        import x.y as z                  ->  z       -> x.y
+    """
+    out: Dict[str, Optional[str]] = {}
+
+    def _bind(name: str, target: str) -> None:
+        if not name or not target:
+            return
+        if name in out and out[name] != target:
+            out[name] = None              # ambiguous in this scope
+            return
+        out.setdefault(name, target)
+
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if not alias.name:
+                    continue
+                # `import a.b.c` with no alias binds the ROOT package `a`;
+                # with an alias it binds the alias to the full path.
+                if alias.asname:
+                    _bind(alias.asname, alias.name)
+                else:
+                    _bind(alias.name.split(".", 1)[0],
+                          alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level and node.level > 0:
+                base = _relative_base(module, is_init, node.level)
+                if base is None:
+                    continue
+                target_module = (f"{base}.{node.module}" if node.module
+                                 else base)
+            else:
+                target_module = node.module or ""
+            if not target_module:
+                continue
+            for alias in node.names:
+                if not alias.name or alias.name == "*":
+                    continue
+                _bind(alias.asname or alias.name,
+                      f"{target_module}.{alias.name}")
+    return out
+
+
+def _direct_children(scope: ast.AST) -> List[ast.AST]:
+    """Every node inside *scope* EXCLUDING nested function bodies.
+
+    Nested scopes get their own maps; folding them in would let a helper's
+    local import shadow its parent's, which is the ambiguity this is trying
+    to avoid rather than create.
+    """
+    out: List[ast.AST] = []
+    stack: List[ast.AST] = list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
+        out.append(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            # YIELDED but not DESCENDED INTO. The caller needs to see the
+            # nested scope in order to recurse with its own bindings;
+            # dropping it here (the first version did) meant `_visit` never
+            # found a single nested function and scanned module level only —
+            # which silently took the audit from 11 findings to 0 and looked
+            # like a clean bill of health.
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    return out
+
+
+def _resolve_callee(call: ast.Call, scopes: Sequence[Dict[str, Optional[str]]],
+                    local_defs: FrozenSet[str], module: str) -> Optional[str]:
+    """Absolute dotted target of *call*, or None when unprovable.
+
+    None is returned for anything the AST cannot settle — an unbound name, an
+    ambiguous binding, a call through a variable, a method on an instance.
+    Every one of those used to MATCH, on the strength of the last path
+    segment alone.
+
+    Scope order is innermost-first, which matters because this codebase
+    imports inside functions constantly: a module-level
+    ``from tool_render_view import compose`` and a function-local
+    ``from narrative_renderer import compose`` are both correct, and the call
+    means whichever one encloses it.
+    """
+    func = call.func
+    if isinstance(func, ast.Name):
+        name = func.id
+        for scope in scopes:
+            if name in scope:
+                target = scope[name]
+                return target             # None => ambiguous, honestly so
+        # A module-level def in THIS file shadows nothing and binds locally.
+        if name in local_defs:
+            return f"{module}.{name}"
+        return None
+    if isinstance(func, ast.Attribute):
+        value = func.value
+        if not isinstance(value, ast.Name):
+            return None                  # a.b.c(...) / expr().m(...) — no
+        root = value.id
+        if root in _NON_MODULE_ROOTS:
+            return None                  # a METHOD, never a module sink
+        for scope in scopes:
+            if root in scope:
+                base = scope[root]
+                return f"{base}.{func.attr}" if base else None
+        return None
+    return None
+
+
 def _reads_opaquely(fn: Any) -> bool:
     """Does the body reach its own scope dynamically?
 
@@ -733,21 +919,51 @@ def analyse_surface(module: str, path: Path, hooks: Sequence[Hook],
         tree = _parse(path)
         if tree is None:
             return []
-        by_sink: Dict[str, List[Hook]] = {}
+        # Sinks keyed by their FULL dotted qualname. The previous index keyed
+        # on the last segment, so `tool_render_view.compose` and
+        # `narrative_renderer.compose` — six such collisions exist under these
+        # roots — were the same key, and every caller of either was judged
+        # against both.
+        by_qualname: Dict[str, List[Hook]] = {}
         for hook in hooks:
-            by_sink.setdefault(hook.sink.rsplit(".", 1)[0] + "|" +
-                               hook.sink.rsplit(".", 1)[-1], []).append(hook)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            callee = _callee_name(node)
-            if callee not in sink_functions:
-                continue
-            targets = [h for h in hooks
-                       if h.sink.rsplit(".", 1)[-1] == callee]
-            if not targets:
-                continue
-            out.extend(_fills_for_call(module, node, targets))
+            by_qualname.setdefault(hook.sink, []).append(hook)
+
+        is_init = path.name == "__init__.py"
+        module_scope = _bindings_from(_direct_children(tree), module, is_init)
+        local_defs = frozenset(
+            n.name for n in ast.iter_child_nodes(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+
+        # (call, enclosing scope chain) — innermost first. Walking scopes
+        # rather than the whole tree is what lets a function-local import
+        # shadow a module-level one, which this codebase does constantly.
+        def _visit(scope: ast.AST,
+                   chain: Sequence[Dict[str, Optional[str]]]) -> None:
+            body = _direct_children(scope)
+            for node in body:
+                if isinstance(node, ast.Call):
+                    resolved = _resolve_callee(
+                        node, chain, local_defs, module)
+                    if resolved is None:
+                        # Unprovable, and recorded as such rather than
+                        # matched. `_callee_name` still names it for the
+                        # blind-spot report below.
+                        name = _callee_name(node)
+                        if name in sink_functions:
+                            _UNRESOLVED_CALLS.append(
+                                (module, name, getattr(node, "lineno", 0)))
+                        continue
+                    targets = by_qualname.get(resolved)
+                    if targets:
+                        out.extend(_fills_for_call(module, node, targets))
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                       ast.ClassDef)):
+                    inner = _bindings_from(
+                        _direct_children(node), module, is_init)
+                    _visit(node, (inner,) + tuple(chain) if inner else chain)
+
+        _visit(tree, (module_scope,))
     except Exception:  # noqa: BLE001
         logger.debug("[CapabilityHandoff] surface analysis degraded: %s",
                      module, exc_info=True)
