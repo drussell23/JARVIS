@@ -107,16 +107,60 @@ def test_deck_resolves_to_itself_not_to_noise() -> None:
 
 
 def test_the_palette_and_the_router_share_one_table() -> None:
-    """DRY, asserted: a verb the router dispatches must be offerable, so the
-    menu cannot drift from what the CLI actually accepts."""
+    """DRY, asserted: a verb the router dispatches must be REACHABLE, so the
+    menu cannot drift from what the CLI actually accepts.
+
+    SUPERSEDED 2026-07-31: was ``verb in {row.slash_form for row in ...}`` —
+    every router verb had to be its own ROW.
+
+    That measured presence-as-a-row because `VerbDescriptor.aliases` was empty
+    on every row in the registry, so row-set and reachable-set were the same
+    set and the difference could not show. It stopped being true when the
+    audio synonyms folded: ``wake!``, ``shh``, ``hush``, ``mute``, ``ptt off``
+    and ``ptt-stop`` are all still accepted, still completable, and no longer
+    rows of their own — which is the point, since they were eleven rows
+    carrying four meanings.
+
+    The property was never "has a row"; it was "the operator can get there".
+    Asserted two ways now, both stronger than the original: the verb resolves
+    to a descriptor, AND typing it actually completes. A verb that were truly
+    dropped would fail both.
+    """
+    from backend.core.ouroboros.battle_test.repl_completion import (
+        fuzzy_match, unified_registry,
+    )
     from backend.core.ouroboros.cli.ov import AUDIO_VERBS, client_verbs
 
-    offered = {t.lstrip("/") for t, _m in _completions("/")}
+    registry = unified_registry(None)
     for verb in AUDIO_VERBS:
-        if " " in verb:          # multi-word forms are typed, not completed
-            continue
-        assert verb in offered, f"router accepts {verb!r}; palette omits it"
+        slash = f"/{verb}"
+        resolved = [v for v in registry.verbs if v.matches(slash)]
+        assert resolved, f"router accepts {verb!r}; palette cannot resolve it"
+        # And it must be TYPEABLE, not merely present in a data structure.
+        assert fuzzy_match(slash, registry, max_results=3), (
+            f"router accepts {verb!r}; typing it completes to nothing"
+        )
     assert "deck" in client_verbs()
+
+
+def test_a_folded_alias_is_not_a_second_row() -> None:
+    """The other half of the invariant above, and the reason it changed.
+
+    Reachability must not be bought back by re-listing: if a folded spelling
+    reappeared as its own row the duplicates would return, and both tests
+    would pass."""
+    from backend.core.ouroboros.battle_test.repl_completion import (
+        unified_registry,
+    )
+    from backend.core.ouroboros.cli.ov import audio_alias_families
+
+    rows = {v.slash_form for v in unified_registry(None).verbs}
+    for canonical, aliases in audio_alias_families().items():
+        assert f"/{canonical}" in rows, canonical
+        for alias in aliases:
+            assert f"/{alias}" not in rows, (
+                f"/{alias} is folded into /{canonical} and still has a row"
+            )
 
 
 # --------------------------------------------------------------------------
