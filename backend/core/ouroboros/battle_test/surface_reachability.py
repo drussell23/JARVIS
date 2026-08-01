@@ -82,6 +82,137 @@ _DEFAULT_ROOTS: Tuple[str, ...] = (
 )
 
 
+#: Where the package DECLARES its console entry points. Read rather than
+#: transcribed: a script added tomorrow becomes a root with no edit here.
+_PYPROJECT = "pyproject.toml"
+
+#: Scripts invoked directly rather than imported. The battle-test harness is
+#: reached this way and reaches a large subtree nothing else does.
+_SCRIPT_DIR = "scripts"
+
+
+def _pyproject_entry_modules(base: "Path") -> List[str]:
+    """Dotted modules named by ``[project.scripts]``. NEVER raises.
+
+    ``ov = "backend.core.ouroboros.cli.ov:main"`` → the module before the
+    colon. Parsed with the stdlib TOML reader when available and by a narrow
+    line match when not, because this must work on 3.9 where `tomllib` does
+    not exist and the audit is not worth a dependency.
+    """
+    out: List[str] = []
+    try:
+        path = base / _PYPROJECT
+        if not path.is_file():
+            return []
+        text = path.read_text(encoding="utf-8", errors="replace")
+        try:
+            import tomllib          # 3.11+
+            table = tomllib.loads(text).get("project", {}).get("scripts", {})
+            for target in table.values():
+                mod = str(target).split(":", 1)[0].strip()
+                if mod:
+                    out.append(mod)
+            return out
+        except Exception:  # noqa: BLE001 — fall through to the line reader
+            pass
+        in_scripts = False
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("["):
+                in_scripts = line == "[project.scripts]"
+                continue
+            if not in_scripts or "=" not in line or line.startswith("#"):
+                continue
+            value = line.split("=", 1)[1].strip().strip('"\'')
+            mod = value.split(":", 1)[0].strip()
+            if mod:
+                out.append(mod)
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
+def _main_guarded(index: Mapping[str, "Path"]) -> List[str]:
+    """Modules with an ``if __name__ == "__main__":`` block.
+
+    A module that can be run is a module that can be entered, and nothing
+    in-tree needs to import it for that to be true.
+    """
+    out: List[str] = []
+    for module, path in index.items():
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            try:
+                test = ast.unparse(node.test).replace(" ", "")
+            except Exception:  # noqa: BLE001
+                continue
+            if test.startswith("__name__=="):
+                out.append(module)
+                break
+    return out
+
+
+def _script_reached(base: "Path", index: Mapping[str, "Path"]) -> List[str]:
+    """Modules imported by a top-level ``scripts/*.py``.
+
+    THE case that dominated this audit. ``scripts/ouroboros_battle_test.py``
+    imports `harness`, which boots the six-layer stack — so the harness and
+    everything it owns (termination hooks, session recording, watchdogs,
+    preflight, telemetry) sits at the head of a large subtree.
+
+    The direction is what made it invisible: the harness BOOTS the rendering
+    surfaces, and a surface never imports the thing that started it. Measuring
+    reachability from the surfaces alone therefore reported an entire
+    entry-point's worth of live code as unreachable.
+    """
+    out: List[str] = []
+    try:
+        directory = base / _SCRIPT_DIR
+        if not directory.is_dir():
+            return []
+        for path in sorted(directory.glob("*.py")):
+            for edge in _edges(path):
+                if edge in index:
+                    out.append(edge)
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
+def derived_entries(base: "Path",
+                    index: Mapping[str, "Path"]) -> Tuple[Tuple[str, str], ...]:
+    """Entry points DISCOVERED rather than transcribed. NEVER raises.
+
+    The audit measured three RENDERING surfaces, which is a fair question and
+    the wrong root set for "is this module dead". The package declares three
+    console scripts, ships modules that run themselves, and boots its primary
+    workload from ``scripts/``; of 39 reported orphans, **32 were reachable
+    from an entry point the audit did not know about**.
+
+    Adding those three names to `_DEFAULT_SURFACES` would have fixed today's
+    number and rotted on the next script. Each source here is a structural
+    fact — a declaration in ``pyproject.toml``, a ``__main__`` guard, an
+    import from ``scripts/`` — so the root set tracks the package.
+    """
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for label, modules in (
+        ("script", _pyproject_entry_modules(base)),
+        ("runnable", _main_guarded(index)),
+        ("soak", _script_reached(base, index)),
+    ):
+        for module in modules:
+            if module in index and module not in seen:
+                seen.add(module)
+                out.append((label, module))
+    return tuple(out)
+
+
 def audit_enabled() -> bool:
     """Default ON. This reads source; it never imports or executes it."""
     return os.environ.get(
@@ -149,6 +280,10 @@ class SurfaceReading:
     unresolved_entries: Tuple[str, ...] = ()
     #: Modules that IMPORT a surface — boot paths, above the graph.
     roots: FrozenSet[str] = frozenset()
+    #: Reachable from ANY entry point by a plain closure. Distinct from
+    #: `reached_by`, which is per-surface and barriered: that answers "who
+    #: reaches it first", this answers "is it alive at all".
+    entry_reachable: FrozenSet[str] = frozenset()
     schema_version: str = SURFACE_REACHABILITY_SCHEMA_VERSION
 
     def asymmetric(self) -> List[ModuleReach]:
@@ -159,12 +294,25 @@ class SurfaceReading:
         )
 
     def orphans(self) -> List[ModuleReach]:
-        """Unreached AND not a boot path. `harness` reaches every surface and
-        nothing reaches it; calling that an orphan would bury the real ones
-        under the entry points of the program."""
+        """Unreached by any SURFACE, any ENTRY POINT, and not a boot path.
+
+        `harness` reaches every surface and nothing reaches it; calling that an
+        orphan would bury the real ones under the entry points of the program.
+
+        ``entry_reachable`` is the correction that mattered most. The surface
+        walk answers "does the cockpit reach this on its own", which needs the
+        other surfaces as barriers — and that same barrier makes it the wrong
+        instrument for "is this dead". Of 39 modules once reported orphaned,
+        **32 were reachable from an entry point the audit never knew about**:
+        three console scripts declared in ``pyproject.toml``, modules that run
+        themselves, and the battle-test harness that ``scripts/`` boots. The
+        harness case is the instructive one — it BOOTS the rendering surfaces,
+        and a surface never imports what started it, so an entire entry
+        point's subtree read as unreachable."""
         return sorted(
             (m for m in self.modules
-             if m.orphan and m.module not in self.roots),
+             if m.orphan and m.module not in self.roots
+             and m.module not in self.entry_reachable),
             key=lambda m: m.module,
         )
 
@@ -208,12 +356,15 @@ def _index(roots: Tuple[str, ...]) -> Dict[str, Path]:
     return out
 
 
-def _edges(path: Path) -> Set[str]:
+def _edges(path: Path, module: str = "") -> Set[str]:
     """Modules this file imports — module-level AND inside functions.
 
-    Reuses the board's extractor rather than writing a second one: two AST
-    walkers over the same syntax would eventually disagree about which
-    import shapes count, and the disagreement would be invisible.
+    Reuses the canonical extractor rather than writing a second one: two AST
+    walkers over the same syntax would eventually disagree about which import
+    shapes count, and the disagreement would be invisible.
+
+    ``module`` is the importing module's dotted name, required to resolve
+    relative imports against its package.
     """
     try:
         source = path.read_text(encoding="utf-8", errors="replace")
@@ -221,12 +372,31 @@ def _edges(path: Path) -> Set[str]:
     except Exception:  # noqa: BLE001 — a file that will not parse has no edges
         return set()
     try:
-        from backend.core.ouroboros.battle_test.progress_board import (
-            _imported_modules,
+        # `reverse_dep_resolver` calls itself "THE single import extractor"
+        # and is the only one here that RESOLVES RELATIVE IMPORTS.
+        #
+        # The board's extractor returns the bare tail for
+        # ``from .wake_sequence import X`` — a name matching no indexed
+        # module, so the edge dangles and the target reads as unreachable.
+        # `wake_sequence` was reported orphaned on exactly that basis while
+        # `awakening.py` imports it on line 45.
+        #
+        # Third import shape this audit could not see, after entry points and
+        # `scripts/`. Same disease every time: an edge the extractor cannot
+        # spell becomes an absence it reports as a finding.
+        from backend.core.ouroboros.governance.reverse_dep_resolver import (
+            extract_module_imports,
         )
-        return set(_imported_modules(tree))
+        return set(extract_module_imports(
+            tree, module, path.name == "__init__.py"))
     except Exception:  # noqa: BLE001
-        return set()
+        try:
+            from backend.core.ouroboros.battle_test.progress_board import (
+                _imported_modules,
+            )
+            return set(_imported_modules(tree))
+        except Exception:  # noqa: BLE001
+            return set()
 
 
 def _reach(
@@ -270,7 +440,7 @@ def _reach(
         path = index.get(current)
         if path is None:
             continue
-        for target in _edges(path):
+        for target in _edges(path, current):
             # Only follow edges that stay in scope. Third-party and
             # governance-core imports are real, and out of this question.
             if target in index and target not in seen:
@@ -289,7 +459,7 @@ def _roots(index: Mapping[str, Path], entries: FrozenSet[str]) -> Set[str]:
     for module, path in index.items():
         if module in entries:
             continue
-        if _edges(path) & entries:
+        if _edges(path, module) & entries:
             out.add(module)
     return out
 
@@ -310,8 +480,28 @@ def audit(
         if not audit_enabled():
             return reading
         scope = roots or audit_roots()
-        table = entries or surfaces()
         index = _index(scope)
+        # SURFACES ONLY. Entry points are deliberately NOT added here.
+        #
+        # `_reach` treats every other surface as a BARRIER — reached but not
+        # traversed — because a plain closure "reported that every module is
+        # reachable from every surface, which is true and useless". Feeding
+        # the package's entry points into this table therefore does the
+        # opposite of what it looks like: each new entry becomes another wall,
+        # every surface's reach SHRINKS, and the orphan count goes UP. Adding
+        # 20 discovered entries here took 39 orphans to 23 the wrong way, by
+        # making live modules look less reachable rather than more.
+        #
+        # Two different questions were being answered by one number:
+        #
+        #   ASYMMETRY  — does THIS surface reach it on its own? Needs the
+        #                barriers, and is what `_DEFAULT_SURFACES` is for.
+        #   ORPHANHOOD — does ANY entry point reach it at all? Needs a plain
+        #                closure over every entry, and barriers would be
+        #                actively wrong.
+        #
+        # They are computed separately below.
+        table = entries or surfaces()
         reading.scanned = len(index)
         reading.surface_labels = tuple(label for label, _ in table)
 
@@ -329,6 +519,30 @@ def audit(
             reach[label] = _reach(entry, index, barriers=entry_set)
         reading.unresolved_entries = tuple(missing)
         reading.roots = frozenset(_roots(index, entry_set))
+
+        # ORPHANHOOD, computed separately and WITHOUT barriers. A module is
+        # dead only if no entry point reaches it at all; which particular
+        # surface got there first is the asymmetry question, answered above.
+        entry_reachable: Set[str] = set()
+        try:
+            for _, entry in derived_entries(_repo_root(), index):
+                entry_reachable |= _reach(entry, index, barriers=frozenset())
+            for _, entry in table:
+                if entry in index:
+                    entry_reachable |= _reach(
+                        entry, index, barriers=frozenset())
+        except Exception:  # noqa: BLE001 — a failed walk must not invent deaths
+            entry_reachable = set()
+        # A PACKAGE is reachable if any of its modules is. Nothing imports
+        # `backend.core.ouroboros.cli` by name — importing
+        # `...cli.ov` executes the package `__init__` implicitly — so an
+        # `__init__.py` is structurally invisible to an import-edge walk and
+        # was reported as an orphan on that basis alone.
+        for module in list(entry_reachable):
+            parts = module.split(".")
+            for depth in range(1, len(parts)):
+                entry_reachable.add(".".join(parts[:depth]))
+        reading.entry_reachable = frozenset(entry_reachable)
 
         entry_modules = entry_set
         for module in sorted(index):
