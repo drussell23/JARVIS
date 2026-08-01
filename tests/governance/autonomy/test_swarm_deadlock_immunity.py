@@ -31,10 +31,11 @@ hang. Three layers deliver it, and the middle one had no test at all:
                   planner's builder, not for the scheduler's own entry);
   * fail-fast   — a failed unit terminates its graph immediately, so a
                   dependent whose prerequisite died is never left spinning;
-  * starvation  — if a ready set is ever emptied downstream, the loop stops
-                  with ``no_schedulable_ready_units`` instead of waiting. Its
-                  PRECONDITION is covered here; the branch itself still is
-                  not — see `TestSchedulerTerminatesOnUnschedulableGraphs`;
+  * starvation  — if a ready set is ever emptied, the loop STOPS with
+                  ``no_schedulable_ready_units`` (``_finish_graph`` then
+                  ``return``) rather than waiting. Its precondition is covered
+                  here; the branch is defensive and unreachable by design —
+                  see `TestSchedulerTerminatesOnUnschedulableGraphs`;
   * epistemic   — ``EpistemicDeadlockBreaker`` kills two agents talking past
                   each other (covered in test_swarm_invoker.py case (d)).
 
@@ -265,11 +266,29 @@ class TestSchedulerTerminatesOnUnschedulableGraphs:
     guard, and saying otherwise would have been a test passing for a reason
     its own documentation got wrong.
 
-    ``no_schedulable_ready_units`` STILL has no coverage. Reaching it needs
-    ``_select_ready_batch`` or the MemoryPressureGate clamp to empty a
-    non-empty ready set — a gate-injection test, not this file.
-    ``test_starvation_is_computed_correctly`` below covers its precondition
-    directly.
+    ``no_schedulable_ready_units`` has no coverage, and a second pass says
+    that is because it is DEFENSIVE, not because it was overlooked. The guess
+    written here first — "reaching it needs `_select_ready_batch` or the
+    MemoryPressureGate to empty a non-empty ready set" — is wrong on both
+    counts:
+
+      * `_select_ready_batch` selects the FIRST ready unit unconditionally
+        (``owned_paths`` starts empty, so the conflict test cannot fire on it).
+        A non-empty ready set always yields a non-empty batch.
+      * the gate cannot clamp to zero. ``warn/high/critical_fanout_cap`` are
+        each ``_env_int(..., minimum=1)``, so even
+        ``JARVIS_MEMORY_PRESSURE_CRITICAL_FANOUT_CAP=0`` resolves to 1, and
+        ``can_fanout`` documents ``n_allowed`` as "0 only when n_requested=0"
+        — which the ``if selected:`` guard upstream already excludes.
+
+    So ``not selected`` implies ``ready`` is empty; and since any failed unit
+    terminates its graph immediately, an empty ready set with live units left
+    is a state the rest of the design prevents. The branch guards an
+    inconsistent scheduler, which is worth keeping and is not worth a test
+    that would have to fabricate the inconsistency to reach it.
+
+    ``test_starvation_is_computed_correctly`` covers the precondition
+    directly, which is the part that can be asserted honestly.
     """
 
     def test_starvation_is_computed_correctly(self, tmp_path):
@@ -301,6 +320,64 @@ class TestSchedulerTerminatesOnUnschedulableGraphs:
             "would be the dropped constraint that cycle severance performs "
             "deliberately"
         )
+
+    def test_the_memory_gate_cannot_clamp_fanout_to_zero(self, monkeypatch):
+        """The starvation-deadlock hypothesis, closed at its source.
+
+        "Memory pressure clamps concurrency to 0 and the swarm starves
+        forever" is the natural reading of a gate that reduces fan-out. It
+        cannot happen: all three caps are ``_env_int(..., minimum=1)``, so at
+        least one unit always proceeds and the graph always advances. Asserted
+        against a HOSTILE configuration — an operator explicitly setting every
+        cap to zero or negative — because that is the only way the value could
+        arrive, and the floor is the entire defence.
+        """
+        from backend.core.ouroboros.governance import memory_pressure_gate as g
+
+        for var in ("JARVIS_MEMORY_PRESSURE_WARN_FANOUT_CAP",
+                    "JARVIS_MEMORY_PRESSURE_HIGH_FANOUT_CAP",
+                    "JARVIS_MEMORY_PRESSURE_CRITICAL_FANOUT_CAP"):
+            monkeypatch.setenv(var, "0")
+        assert g.warn_fanout_cap() >= 1
+        assert g.high_fanout_cap() >= 1
+        assert g.critical_fanout_cap() >= 1
+
+        for var in ("JARVIS_MEMORY_PRESSURE_WARN_FANOUT_CAP",
+                    "JARVIS_MEMORY_PRESSURE_HIGH_FANOUT_CAP",
+                    "JARVIS_MEMORY_PRESSURE_CRITICAL_FANOUT_CAP"):
+            monkeypatch.setenv(var, "-5")
+        assert min(g.warn_fanout_cap(), g.high_fanout_cap(),
+                   g.critical_fanout_cap()) >= 1
+
+    def test_a_non_empty_ready_set_always_yields_a_batch(self):
+        """The other half of "``not selected`` implies ``ready`` is empty".
+
+        `_select_ready_batch` cannot starve a ready set: the first unit meets
+        an empty ``owned_paths``, so the conflict test cannot exclude it.
+        Asserted with units that ALL collide on one path — the worst case for
+        the conflict rule, and still exactly one gets through.
+        """
+        from backend.core.ouroboros.governance.autonomy.subagent_scheduler import (
+            SubagentScheduler,
+        )
+        from backend.core.ouroboros.governance.autonomy.subagent_types import (
+            ExecutionGraph, WorkUnitSpec,
+        )
+        collide = tuple(
+            WorkUnitSpec(unit_id=uid, repo="jarvis", goal=f"g {uid}",
+                         target_files=("jarvis/shared.py",),
+                         owned_paths=("jarvis/shared.py",))
+            for uid in ("u1", "u2", "u3")
+        )
+        graph = ExecutionGraph(
+            graph_id="graph-collide", op_id="op", planner_id="p",
+            schema_version="2d.1", concurrency_limit=3, units=collide,
+        )
+        selected, deferred = SubagentScheduler._select_ready_batch(
+            None, graph, ["u1", "u2", "u3"],  # type: ignore[arg-type]
+        )
+        assert len(selected) == 1, (selected, deferred)
+        assert sorted(deferred) == ["u2", "u3"], deferred
 
     @pytest.mark.asyncio
     async def test_a_failed_dependency_does_not_wedge_the_graph(self, tmp_path):
