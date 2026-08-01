@@ -38,12 +38,17 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Optional
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.VerbDescription")
 
 __all__ = ["to_operator_voice", "describe_width", "prose_first_enabled",
-           "is_contentless", "implementation_vocabulary"]
+           "is_contentless", "implementation_vocabulary",
+           "Shape", "Assessment", "Candidate", "assess", "best_candidate",
+           "shape_ceiling",
+           "runtime_vocabulary"]
 
 #: Openers that describe what the FUNCTION does rather than what the operator
 #: gets. Stripped with their trailing connective so the remainder still reads
@@ -59,6 +64,25 @@ _IMPL_OPENERS = (
     # dispatch convention and tells an operator nothing about what typing it
     # does. Left in, it surfaced as the description "Auto-discovered".
     "canonical entry point", "auto-discovered", "auto discovered",
+)
+
+#: The openers above, anchored to a WORD boundary.
+#:
+#: ``str.startswith`` matched them as character prefixes, so "dispatch" fired
+#: on the word "Dispatcher" and cut it mid-morpheme. ``/multi_prior``'s
+#: docstring — "Dispatcher for ``/multi_prior`` REPL verb" — became the palette
+#: row **"Er for /multi_prior REPL verb"**, which is not a description, a
+#: usage, or even a word.
+#:
+#: The class of bug matters more than the instance: a subtractive rule that
+#: operates below the token level can produce output no author wrote, which is
+#: precisely the failure mode "SUBTRACTIVE only" was chosen to prevent. Every
+#: remaining opener is at risk of the same thing — "process" inside
+#: "processor", "route" inside "router", "run the" inside nothing but "parse"
+#: inside "parser" — so this is fixed at the matcher, not per opener.
+_IMPL_OPENER_RE = tuple(
+    re.compile(rf"^{re.escape(o)}(?![\w-])", re.IGNORECASE)
+    for o in sorted(_IMPL_OPENERS, key=len, reverse=True)
 )
 
 #: Connectives left dangling after an opener is removed.
@@ -79,9 +103,17 @@ _DANGLING = re.compile(r"^(?:and\s+|then\s+|to\s+|the\s+|a\s+|an\s+)+", re.I)
 _CITATION = re.compile(
     r"^(?P<head>[^—-]{0,64}?)\s*[—–]\s*(?P<rest>.+)$", re.S,
 )
+#:
+#: ``^[A-Z]\d+$`` — the WHOLE head, not merely its first token. As ``^[A-Z]\d+\b``
+#: this fired on "L3 execution graph", read the tier prefix as a citation and
+#: threw the phrase away: /graph's row became "Units, edges and stats", a
+#: sentence with no subject. A bare identifier is weak evidence of a citation
+#: and only conclusive when it is ALL there is; every real citation in this
+#: tree carries a second marker ("M11 Slice 5", "Upgrade 3 Slice 5") and still
+#: matches on that.
 _CITATION_MARKER = re.compile(
     r"§|\bslice\b|\bphase\s*\d|\bmove\s*\d|\bwave\s*\d|\bupgrade\s*\d"
-    r"|\btier\s*\d|\bprd\b|\bstep\s*\d|^[A-Z]\d+\b|\bv\d+\b",
+    r"|\btier\s*\d|\bprd\b|\bstep\s*\d|^[A-Z]\d+$|\bv\d+\b",
     re.I,
 )
 
@@ -91,6 +123,11 @@ _SURFACE_OPENERS = (
     "repl surface for", "repl surface", "repl verb for", "repl verb",
     "operator-facing cli surface for", "operator-facing cli surface",
     "operator-facing surface for", "operator-facing surface",
+    # Bare, as well as compounded. /provider's module docstring opens
+    # "operator-facing DoubleWord resilience dashboard" — the adjective is
+    # true of every verb in this palette, so it distinguishes nothing and
+    # costs 16 of the description's ~58 columns.
+    "operator-facing", "operator facing",
     "operator surface for", "operator surface", "read-only inspection of",
     "dashboard for", "cli surface for", "cli surface",
 )
@@ -123,13 +160,19 @@ def _humanise_symbol(match: "re.Match") -> str:
     return spaced.strip().lower()
 
 
-def _strip_citation(text: str) -> str:
-    """Drop a leading spec reference, keeping the sentence it introduces."""
+def _strip_citation(text: str, verb: str = "") -> str:
+    """Drop a leading spec reference or self-address, keeping what follows.
+
+    Two ledes are empty for different reasons and both were being kept:
+    one CITES the spec that commissioned the verb, the other RE-STATES the
+    verb. ``_CITATION_MARKER`` only ever saw the first.
+    """
     match = _CITATION.match(text.strip())
     if not match:
         return text
     head, rest = match.group("head"), match.group("rest")
-    if head and not _CITATION_MARKER.search(head):
+    if head and not (_CITATION_MARKER.search(head)
+                     or _is_vacuous_head(head, verb)):
         return text            # a real sentence that merely contains a dash
     return rest.strip() or text
 
@@ -285,9 +328,73 @@ def _strip_verb_name(text: str, verb: str) -> str:
     )
     if acting.search(text):
         return acting.sub(name, text, count=1)
+    # ``(?![\w-])`` rather than ``\b``: a word boundary sits INSIDE a
+    # hyphenated compound, so "embodied" matched the first half of
+    # "Embodied-state" and ``[\s:,—-]*`` then ate the hyphen. The palette row
+    # for /embodied read "State views: arch, aura, attention, portrait" — a
+    # sentence about state, produced by decapitating a sentence about embodied
+    # state. Same class as the opener bug above: a token-level rule applied
+    # below the token level invents text nobody wrote.
     return re.compile(
-        rf"^/?{re.escape(name)}\b[\s:,—-]*", re.IGNORECASE,
+        rf"^/?{re.escape(name)}(?![\w-])[\s:,—-]*", re.IGNORECASE,
     ).sub("", text, count=1)
+
+
+#: Nouns that name the SURFACE rather than its subject. A lede built only from
+#: these plus the verb's own name carries no information — it is an address.
+_STRUCTURAL_NOUNS = frozenset({
+    "repl", "cli", "tui", "verb", "verbs", "command", "commands", "dispatcher",
+    "dispatch", "surface", "handler", "operator", "facing", "operator-facing",
+    "entry", "point", "module", "view", "panel", "screen",
+})
+
+#: Grammatical glue. Present so a lede made ONLY of scaffolding is recognised
+#: even when the scaffolding is joined into a phrase: "Dispatcher for
+#: /multi_prior REPL verb" is five words of pure address, and without "for" in
+#: this set it read as content and shipped as that verb's description.
+_GLUE_WORDS = frozenset({
+    "a", "an", "the", "and", "or", "for", "of", "to", "in", "on", "with",
+    "from", "into", "this", "that", "its", "it", "is", "are", "be",
+})
+
+#: An argument placeholder in a usage lede — ``<target_path>``, ``[flag]``.
+_PLACEHOLDER = re.compile(r"[<\[][^>\]]*[>\]]")
+
+
+def _is_vacuous_head(head: str, verb: str) -> bool:
+    """True when a dash-led lede is pure address, not content.
+
+    ``_CITATION_MARKER`` recognises a lede that CITES a spec ("§38 Slice 4 —").
+    It does not recognise one that merely re-states the surface, and those are
+    just as empty::
+
+        "``/enqueue_soak <target_path>`` — stage a crash-immortal Swarm soak"
+        "``/cost`` REPL dispatcher — Slice 4 of the Per-Phase Cost arc"
+
+    Both ledes reduce to the verb's own name plus scaffolding. Left in place
+    they burned the description's whole width on an address the operator had
+    just typed; ``/enqueue_soak`` showed "Async — walks the target off the
+    event loop", having fallen through to the function docstring instead.
+
+    Checked STRUCTURALLY — what survives after removing the verb name,
+    placeholders and surface nouns — rather than by listing lede shapes. A
+    blocklist of ledes is a blocklist of the ones already written.
+    """
+    try:
+        text = _PLACEHOLDER.sub(" ", str(head or ""))
+        name = str(verb or "").lstrip("/").strip().lower()
+        words = [w for w in re.findall(r"[\w-]+", text.lower()) if w]
+        if not words:
+            return True
+        for word in words:
+            if word == name or word.replace("_", "") == name.replace("_", ""):
+                continue
+            if word in _STRUCTURAL_NOUNS or word in _GLUE_WORDS:
+                continue
+            return False        # something real survives — keep the lede
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def to_operator_voice(text: Optional[str], verb: str = "",
@@ -315,7 +422,7 @@ def to_operator_voice(text: Optional[str], verb: str = "",
         # Citation first, THEN the verb name, THEN surface scaffolding. Order
         # matters: the verb name usually sits inside the clause the citation
         # introduces, so stripping the citation last leaves nothing to match.
-        raw = _strip_citation(raw)
+        raw = _strip_citation(raw, verb)
         original = raw
 
         # First sentence only. A palette row is one line, and everything
@@ -323,10 +430,10 @@ def to_operator_voice(text: Optional[str], verb: str = "",
         # while scanning.
         head = re.split(r"(?<=[.!?])\s+", raw, maxsplit=1)[0]
 
-        lowered = head.lower()
-        for opener in _IMPL_OPENERS:
-            if lowered.startswith(opener):
-                head = head[len(opener):]
+        for pattern in _IMPL_OPENER_RE:
+            match = pattern.match(head)
+            if match:
+                head = head[match.end():]
                 break
 
         # Dangling articles are cleared BEFORE the name check as well as
@@ -376,3 +483,375 @@ def to_operator_voice(text: Optional[str], verb: str = "",
         return head
     except Exception:  # noqa: BLE001
         return " ".join(str(text or "").split())[: describe_width()]
+
+
+# ===========================================================================
+# Judgement — the organ the cascade never had
+# ===========================================================================
+#
+# Every rung of the description cascade asked one question: "did this source
+# return a non-empty string?" That is a test of PRESENCE, not of quality, and
+# the two come apart constantly:
+#
+#   * "Er for /multi_prior REPL verb" is non-empty and is not a description;
+#   * "Op fan-out tree" is a perfect description and was DISCARDED by a
+#     four-word floor, so the palette showed "help · show · depth · status";
+#   * "operator-facing DoubleWord resilience dashboard" sits in /provider's
+#     module docstring, which the cascade banned wholesale — so the row read
+#     "[undocumented]" while the sentence sat one scope up.
+#
+# Boolean acceptance also makes rank ABSOLUTE: residue from a high rung beats
+# prose from a low one, and no better candidate can ever supersede a worse one
+# that happened to arrive first. Every one of the defects above is that single
+# design fact wearing different clothes.
+#
+# So sources stop deciding and start NOMINATING. Each produces a candidate,
+# every candidate is classified by SHAPE and scored, and the best one wins —
+# with source rank demoted from decision to prior. A description is now
+# something the pipeline can recognise rather than something it assumes.
+
+
+class Shape(str, Enum):
+    """What a candidate string IS, independent of where it came from."""
+
+    EMPTY = "empty"
+    #: Text that survived subtraction as a fragment — a dangling connective, a
+    #: decapitated word, a bare citation. Reads as help; answers nothing.
+    RESIDUE = "residue"
+    #: True prose about the FUNCTION rather than the verb. "Async — walks the
+    #: target off the event loop" is accurate and useless to an operator.
+    IMPLEMENTATION = "implementation"
+    USAGE = "usage"
+    #: A mined vocabulary, "help · show · depth · status". Honest, and strictly
+    #: worse than a sentence — which is why it must be able to LOSE to one.
+    SUBCOMMAND_LIST = "subcommand_list"
+    #: A short contentful label: "Op fan-out tree", "Capability flag star-map".
+    NOUN_PHRASE = "noun_phrase"
+    PROSE = "prose"
+
+
+#: Floor score per shape, and the span density may add on top. Overlapping
+#: spans are deliberate: a dense noun phrase SHOULD beat thin prose, because
+#: "Op fan-out tree" tells an operator more than "Show the thing for the op".
+_SHAPE_FLOOR = {
+    Shape.EMPTY: 0.00,
+    Shape.RESIDUE: 0.05,
+    Shape.IMPLEMENTATION: 0.20,
+    Shape.USAGE: 0.30,
+    Shape.SUBCOMMAND_LIST: 0.42,
+    Shape.NOUN_PHRASE: 0.62,
+    Shape.PROSE: 0.70,
+}
+_DENSITY_SPAN = 0.25
+
+#: Below this, nothing is worth showing and the caller says so plainly.
+ACCEPT_FLOOR = 0.30
+
+#: A first word that cannot begin a description. Two families, both fragments:
+#: connectives left by a stripped clause, and morphological debris left by a
+#: stripped word-prefix ("Dispatcher" − "dispatch" = "er").
+_FRAGMENT_HEADS = frozenset({
+    "and", "or", "but", "then", "with", "to", "of", "for", "in", "on", "from",
+    "by", "that", "which", "is", "are", "be", "was", "were", "as", "at", "if",
+    "when", "its", "it", "returns", "return", "lets", "short-circuit", "also",
+    "er", "ers", "ed", "ing", "es", "ion", "ment", "ly",
+})
+
+#: A last word that means the sentence was cut mid-thought.
+_DANGLING_TAILS = frozenset({
+    "by", "for", "with", "and", "or", "the", "a", "an", "to", "of", "in", "on",
+    "from", "when", "that", "is", "are", "as", "at", "into", "über",
+})
+
+#: Machinery an operator never touches. Distinct from
+#: `implementation_vocabulary`, which is about GRAMMAR and plumbing nouns:
+#: these words can only appear in a sentence describing a RUNTIME mechanism,
+#: so two of them together are near-proof the docstring is addressing a
+#: maintainer. One alone is not — "L1 event emitter throughput" is a real
+#: description that happens to contain "event".
+_RUNTIME_WORDS = frozenset({
+    "async", "await", "asyncio", "coroutine", "thread", "threading", "mutex",
+    "singleton", "kwargs", "stdout", "stderr", "traceback", "monkeypatch",
+    "subprocess", "idempotent", "memoised", "memoized", "lru", "gc",
+})
+_RUNTIME_PHRASES = ("event loop", "under the hood", "in place", "off the loop",
+                    "fire and forget", "fire-and-forget", "no-op")
+
+
+def runtime_vocabulary() -> frozenset:
+    """Words that can only describe a RUNTIME mechanism.
+
+    Env-overridable via ``JARVIS_PALETTE_RUNTIME_WORDS`` for the same reason
+    `implementation_vocabulary` is: what counts as machinery is a property of
+    the codebase, and a fork must be able to say so without editing this file.
+    """
+    raw = os.environ.get("JARVIS_PALETTE_RUNTIME_WORDS", "").strip()
+    if raw:
+        return frozenset(w.strip().lower() for w in raw.split(",") if w.strip())
+    return _RUNTIME_WORDS
+
+
+#: Subjects that name an AUDIENCE rather than an effect. "Tests can inject an
+#: explicit governor and/or session_browser without touching the module
+#: singletons" is fluent, specific, dense in domain words — and addressed to
+#: whoever writes the tests. It scored as clean PROSE and became /cost's
+#: palette row.
+#:
+#: Vocabulary cannot catch this one: every word is legitimate. The tell is
+#: grammatical. A description says what the OPERATOR gets, so its subject is
+#: never the reader, the caller, or the test suite — and a sentence that opens
+#: by naming one of those is answering a different question than the palette
+#: asked.
+_MAINTAINER_SUBJECTS = frozenset({
+    "tests", "test", "callers", "caller", "subclasses", "subclass",
+    "implementors", "implementers", "maintainers", "consumers", "we", "you",
+})
+
+#: A verb-echo: the name plus scaffolding and nothing else. "/causal REPL",
+#: "/continuity REPL dispatcher" — beside the verb in the left column this is
+#: worse than a blank, because it LOOKS like help.
+_ECHO_RE = re.compile(
+    r"^[\w\-]+(\s+(repl|verb|dispatcher|surface|command|cli|handler))+$", re.I)
+
+#: A candidate that is only a citation.
+_BARE_CITATION_RE = re.compile(
+    r"^\s*(§|slice\s+\d|phase\s+\d|prd\b|wave\s+\d|move\s+\d|path\s+[a-z]\.\d"
+    r"|v\d+\.\d+|\d{4}-\d{2}-\d{2})", re.I)
+
+#: Separators a mined vocabulary is joined with.
+_LIST_SPLIT = re.compile(r"\s*[·|]\s*")
+
+
+@dataclass(frozen=True)
+class Assessment:
+    """What a candidate is, how good it is, and WHY — the third field matters.
+
+    Without ``reasons`` a rejected description is indistinguishable from an
+    absent one, and the hygiene question ("which verbs still need a sentence,
+    and what is wrong with what they have?") becomes unanswerable.
+    """
+
+    shape: Shape
+    score: float
+    reasons: Tuple[str, ...] = ()
+
+    @property
+    def acceptable(self) -> bool:
+        return self.score >= ACCEPT_FLOOR
+
+
+def _words(text: str) -> List[str]:
+    return re.findall(r"[A-Za-z][A-Za-z0-9_'\-]*", str(text or "").lower())
+
+
+def _density(words: Iterable[str]) -> float:
+    """Fraction of words naming something in the OPERATOR's world."""
+    items = list(words)
+    if not items:
+        return 0.0
+    vocabulary = implementation_vocabulary()
+    return sum(1 for w in items if w not in vocabulary) / float(len(items))
+
+
+def _looks_like_list(text: str) -> bool:
+    """A mined vocabulary rather than a sentence.
+
+    Every segment short, no segment a clause. Checked on SHAPE so a list
+    joined with a different separator tomorrow is still recognised, and so a
+    real sentence containing a middot is not mistaken for one.
+    """
+    parts = [p.strip() for p in _LIST_SPLIT.split(text) if p.strip()]
+    if len(parts) < 2:
+        return False
+    return all(len(p.split()) <= 2 and len(p) <= 18 for p in parts)
+
+
+def assess(text: Optional[str], verb: str = "") -> Assessment:
+    """Classify and score one candidate description. NEVER raises.
+
+    Order is significant: the disqualifying shapes are tested first, because a
+    fragment that happens to be dense in domain words ("Er for /multi_prior
+    REPL verb" scores 3/5 on density) must not be rescued by its density.
+    """
+    try:
+        raw = " ".join(str(text or "").split())
+        if not raw or len(raw) < 8:
+            return Assessment(Shape.EMPTY, 0.0, ("blank-or-too-short",))
+
+        words = _words(raw)
+        if len(words) < 2:
+            return Assessment(Shape.EMPTY, 0.0, ("single-word",))
+
+        reasons: List[str] = []
+
+        # --- disqualifying shapes -----------------------------------------
+        if not raw[0].isalnum() and raw[0] not in "\"'“‘(":
+            return Assessment(Shape.RESIDUE, _SHAPE_FLOOR[Shape.RESIDUE],
+                              ("leading-punctuation",))
+        if words[0] in _FRAGMENT_HEADS:
+            return Assessment(Shape.RESIDUE, _SHAPE_FLOOR[Shape.RESIDUE],
+                              (f"fragment-head:{words[0]}",))
+        if words[-1] in _DANGLING_TAILS:
+            return Assessment(Shape.RESIDUE, _SHAPE_FLOOR[Shape.RESIDUE],
+                              (f"dangling-tail:{words[-1]}",))
+        if _ECHO_RE.match(raw.lstrip("/")):
+            return Assessment(Shape.RESIDUE, _SHAPE_FLOOR[Shape.RESIDUE],
+                              ("verb-echo",))
+        if _BARE_CITATION_RE.match(raw):
+            return Assessment(Shape.RESIDUE, _SHAPE_FLOOR[Shape.RESIDUE],
+                              ("bare-citation",))
+        if _is_vacuous_head(raw, verb):
+            # The WHOLE candidate reduces to the verb's own name plus
+            # scaffolding — the same emptiness `_strip_citation` removes from a
+            # lede, here occupying the entire row.
+            return Assessment(Shape.RESIDUE, _SHAPE_FLOOR[Shape.RESIDUE],
+                              ("self-address",))
+
+        density = _density(words)
+
+        # --- informative but not a description ----------------------------
+        if raw.lower().startswith("usage:"):
+            return Assessment(Shape.USAGE,
+                              _SHAPE_FLOOR[Shape.USAGE] + _DENSITY_SPAN * density,
+                              ("usage-line",))
+        if _looks_like_list(raw):
+            return Assessment(Shape.SUBCOMMAND_LIST,
+                              _SHAPE_FLOOR[Shape.SUBCOMMAND_LIST],
+                              ("mined-vocabulary",))
+
+        lowered = raw.lower()
+        if words[0] in _MAINTAINER_SUBJECTS:
+            # IMPLEMENTATION, not RESIDUE: it is well-formed prose, merely
+            # addressed to the wrong reader, so it should still beat a bare
+            # usage line if nothing better exists.
+            return Assessment(Shape.IMPLEMENTATION,
+                              _SHAPE_FLOOR[Shape.IMPLEMENTATION],
+                              (f"maintainer-subject:{words[0]}",))
+        runtime_hits = sum(1 for w in words if w in runtime_vocabulary())
+        runtime_hits += sum(1 for p in _RUNTIME_PHRASES if p in lowered)
+        if runtime_hits >= 2:
+            return Assessment(Shape.IMPLEMENTATION,
+                              _SHAPE_FLOOR[Shape.IMPLEMENTATION]
+                              + _DENSITY_SPAN * density,
+                              (f"runtime-vocabulary:{runtime_hits}",))
+        if density < 0.34:
+            # Almost every word is plumbing. "Line and dispatch" cleared the
+            # old 12-character floor and shipped for months.
+            return Assessment(Shape.IMPLEMENTATION,
+                              _SHAPE_FLOOR[Shape.IMPLEMENTATION]
+                              + _DENSITY_SPAN * density,
+                              (f"low-density:{density:.2f}",))
+
+        # --- a real description -------------------------------------------
+        #
+        # The split is LENGTH only, and deliberately so. Deciding "is this a
+        # sentence or a label" needs a part-of-speech tagger; guessing at it
+        # with a verb blocklist would reject "Show the activity radar" on one
+        # list and accept "Op fan-out tree" on another for no principled
+        # reason. Both are good rows; longer ones tend to carry more, so they
+        # get a slightly higher floor and the tie resolves itself.
+        shape = Shape.PROSE if len(words) >= 4 else Shape.NOUN_PHRASE
+        if runtime_hits:
+            reasons.append(f"runtime-vocabulary:{runtime_hits}")
+        return Assessment(shape,
+                          _SHAPE_FLOOR[shape] + _DENSITY_SPAN * density,
+                          tuple(reasons) or (f"density:{density:.2f}",))
+    except Exception:  # noqa: BLE001 — a palette must never throw
+        logger.debug("[VerbDescription] assessment degraded", exc_info=True)
+        return Assessment(Shape.EMPTY, 0.0, ("assessment-failed",))
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One nomination, from one source.
+
+    ``prior`` is how much the SOURCE is trusted, not how good the text is —
+    an ``Operator:`` line was written for the person typing the verb, so it
+    starts ahead of a docstring mined for the same information. It is a
+    thumb on the scale, never a veto: a mangled authored line still loses to
+    a clean derived one, which is the whole reason rank stopped deciding.
+    """
+
+    text: str
+    source: str
+    prior: float = 0.0
+    assessment: Optional[Assessment] = field(default=None, compare=False)
+    #: Deferred producer, for sources that cost real work to evaluate.
+    supplier: Optional[Callable[[], str]] = field(default=None, compare=False)
+    #: The HIGHEST weight this source could possibly reach. Only meaningful
+    #: alongside ``supplier``; see :func:`best_candidate`.
+    ceiling: float = 1.0
+
+    def weight(self) -> float:
+        return (self.assessment.score if self.assessment else 0.0) + self.prior
+
+
+def shape_ceiling(shape: Shape) -> float:
+    """The greatest score *shape* can reach. Exact, not an estimate.
+
+    ``SUBCOMMAND_LIST`` returns its floor flat — a mined vocabulary carries no
+    density bonus because its density is an artefact of which words the verb
+    happens to accept. Everything else may add the full span.
+    """
+    if shape is Shape.SUBCOMMAND_LIST:
+        return _SHAPE_FLOOR[shape]
+    return _SHAPE_FLOOR[shape] + _DENSITY_SPAN
+
+
+def best_candidate(candidates: Iterable[Candidate],
+                   verb: str = "") -> Optional[Candidate]:
+    """The best nomination, or ``None`` when none clears the floor.
+
+    ``None`` is a real answer and the caller must be able to act on it: an
+    honest "[undocumented]" is worth more than a confident fragment, because
+    the operator acts on what the palette says.
+
+    A candidate carrying a ``supplier`` is evaluated only if its ``ceiling``
+    could still beat the best score so far. This is an EXACT bound, not a
+    heuristic: a mined subcommand list can never exceed 0.42 and a usage line
+    never 0.55, so once a real sentence is in hand the answer is provably
+    unchanged by looking at either. The result is identical to evaluating
+    everything — which matters, because the cheap version of this idea is
+    "stop at the first source that answers", and that is the boolean
+    acceptance the arbiter exists to replace. Skipping work whose outcome is
+    determined is not the same as letting order decide.
+
+    Worth the care: the arbiter nominates eagerly by default, and
+    `mine_subcommands` costs an ``inspect.getsource`` plus an ``ast.parse``
+    per verb — 340ms across the table, on a surface that renders between
+    keystrokes.
+    """
+    try:
+        scored: List[Candidate] = []
+        best_weight = 0.0
+        for cand in candidates:
+            if cand is None:
+                continue
+            text = str(cand.text or "")
+            if not text.strip() and cand.supplier is not None:
+                if cand.ceiling + cand.prior <= best_weight:
+                    continue        # outcome already determined
+                try:
+                    text = str(cand.supplier() or "")
+                except Exception:  # noqa: BLE001
+                    text = ""
+            if not text.strip():
+                continue
+            evaluated = Candidate(
+                text=text, source=cand.source, prior=cand.prior,
+                assessment=assess(text, verb),
+            )
+            scored.append(evaluated)
+            best_weight = max(best_weight, evaluated.weight())
+        if not scored:
+            return None
+        # Ties break on the source's own order, which is why this is `max` over
+        # a stable list rather than a sort: equal weights keep nomination
+        # order, and callers nominate most-authored first.
+        winner = max(scored, key=lambda c: c.weight())
+        if winner.assessment is None or not winner.assessment.acceptable:
+            return None
+        return winner
+    except Exception:  # noqa: BLE001
+        logger.debug("[VerbDescription] arbitration degraded", exc_info=True)
+        return None

@@ -59,7 +59,10 @@ def dispatch_multi_prior_command(
     line: str,
 ) -> MultiPriorDispatchResult:
     """Dispatcher for ``/multi_prior`` REPL verb. NEVER
-    raises."""
+    raises.
+
+    Operator: Multi-prior verification readings and per-op agreement.
+    """
     raw = (line or "").strip()
     if raw.startswith("/multi_prior"):
         raw = raw[len("/multi_prior"):].strip()
