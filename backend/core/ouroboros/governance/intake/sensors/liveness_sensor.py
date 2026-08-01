@@ -233,7 +233,8 @@ def effective_firing(source_file: str, firing: str) -> str:
 
 
 def severity_for(category: str, firing: str, fraction: float,
-                 source_file: str = "") -> str:
+                 source_file: str = "",
+                 ledger_backed: Optional[bool] = None) -> str:
     """``high`` / ``low``. NEVER raises.
 
     HIGH requires BOTH a critical category AND telemetry that has never
@@ -245,6 +246,33 @@ def severity_for(category: str, firing: str, fraction: float,
     a static index that could not see the edge is the index's limitation, not
     the module's fault. ``REGISTERED_NEVER_INVOKED`` stays eligible for high:
     it is evidence OF severance, not against it.
+
+    ``ledger_backed`` decides whether a SILENT verdict is PROOF
+    -------------------------------------------------------------
+    `capability_firing.firing_verdict` says it outright: a ``ledger`` channel
+    is reliable evidence-of-work, whereas a ``log``-only channel "is ambiguous
+    (an absent log tag may mean 'ran silently' — an observability gap — not
+    proven dormancy)". `capability_liveness` acts on that distinction, sorting
+    ALIVE capabilities into ``dormant`` (ledger-backed) and
+    ``observability_gaps`` (log-only), and publishes ``ledger_backed`` on
+    every verdict.
+
+    This function ignored it. Measured against the live snapshot, **11 of the
+    12 rows scoring HIGH did so on log-only silence** — the sensor escalating
+    capabilities whose dormancy is not merely unproven but *unprovable*. One
+    of them was ``JARVIS_L2_ENABLED``: the loop that closes the Ouroboros
+    cycle, reported severed because it delegates its bookkeeping to
+    ``repair_tree`` and so writes no ``.jsonl`` literal of its own.
+
+    An auditor that cries wolf 11 times out of 12 gets ignored on the twelfth,
+    which is the one that mattered. So a SILENT verdict now escalates only
+    when it is ledger-backed.
+
+    ``None`` — the row did not carry the field — is treated as NOT proven, for
+    the same reason `firing_verdict` refuses to turn "no derivable markers"
+    into SILENT: absence of evidence is not evidence of absence, in either
+    direction. A finding is still EMITTED at ``low``; nothing is hidden, it
+    just stops being an alarm.
     """
     try:
         from backend.core.ouroboros.governance.dynamic_dispatch_registry import (
@@ -255,7 +283,13 @@ def severity_for(category: str, firing: str, fraction: float,
         if resolved == FIRING_DYNAMICALLY:
             return "low"
         crit = str(category or "").strip().lower() in critical_categories()
-        dead = resolved.strip().upper() in ("SILENT", "REGISTERED_NEVER_INVOKED")
+        state = resolved.strip().upper()
+        if state == "SILENT" and ledger_backed is not True:
+            # Unprovable silence. NOT the same as REGISTERED_NEVER_INVOKED
+            # below, which is positive evidence: the module declared itself
+            # reachable and still never ran.
+            return "low"
+        dead = state in ("SILENT", "REGISTERED_NEVER_INVOKED")
         if crit and dead and float(fraction or 0.0) >= _severed_floor():
             return "high"
         return "low"
@@ -355,7 +389,15 @@ class LivenessSensor:
                 if fraction < floor:
                     continue
                 category = str(row.get("category") or "")
-                severity = severity_for(category, firing, fraction, source_file)
+                # `ledger_backed` rides along from the verdict. Computing the
+                # distinction upstream and dropping it here is what let 11 of
+                # 12 HIGH findings rest on unprovable silence.
+                raw_backed = row.get("ledger_backed")
+                severity = severity_for(
+                    category, firing, fraction, source_file,
+                    ledger_backed=(bool(raw_backed)
+                                   if raw_backed is not None else None),
+                )
                 if firing == "FIRING_DYNAMICALLY":
                     # Demonstrably ran. Reporting it would train the operator
                     # to ignore this sensor, which costs more than the finding

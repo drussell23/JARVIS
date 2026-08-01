@@ -58,6 +58,13 @@ def _candidate(**kw):
         "category": "safety",
         "flag": "JARVIS_L2_ENABLED",
         "firing": "SILENT",
+        # LEDGER-BACKED, because the real row now is. `repair_engine` declares
+        # `__firing_ledgers__ = ("repair_tree",)` — the durable evidence L2
+        # writes two hops away, through `repair_tree._archive_result` — so its
+        # silence is PROVABLE rather than merely unobserved. A fixture still
+        # carrying log-only silence would model a row that no longer exists
+        # and would quietly stop exercising the escalation path.
+        "ledger_backed": True,
         "fraction_severed": 1.0,
         "severed_symbols": ["repair_once", "run_repair_loop"],
     }
@@ -74,8 +81,13 @@ def _stub_snapshot(sensor, rows):
                 category=r["category"], flag=r["flag"], firing=r["firing"],
                 fraction_severed=r["fraction_severed"],
                 severed_symbols=tuple(r["severed_symbols"]),
+                # Mirrors the production `scan()` seam, which forwards
+                # `ledger_backed` from the verdict. A stub that dropped it
+                # would score every fixture `low` and silently stop testing
+                # severity at all.
                 severity=severity_for(r["category"], r["firing"],
-                                      r["fraction_severed"]),
+                                      r["fraction_severed"],
+                                      ledger_backed=r.get("ledger_backed")),
             ))
         findings.sort(key=lambda f: f.rank)
         return findings
@@ -110,17 +122,58 @@ async def test_a_component_with_zero_reachability_emits_high_severity():
 
 
 @pytest.mark.asyncio
-async def test_severity_requires_BOTH_criticality_and_silence():
-    """Either signal alone over-reports.
+async def test_severity_requires_criticality_and_PROVEN_silence():
+    """Either signal alone over-reports, and SILENT is two different claims.
 
     A safety capability whose telemetry is FIRING is alive whatever the AST
     says — dynamic dispatch leaves no static edge. A SILENT experimental
     helper is not worth waking anyone for.
+
+    SUPERSEDED 2026-07-31: was ``severity_for("safety", "SILENT", 1.0) ==
+    "high"`` with no third state.
+
+    `capability_firing.firing_verdict` distinguishes them and says so plainly:
+    a ``ledger`` channel is reliable evidence-of-work, a ``log``-only channel
+    "is ambiguous (an absent log tag may mean 'ran silently' — an
+    observability gap — not proven dormancy)". Measured against the live
+    snapshot, 11 of the 12 rows this function scored HIGH did so on log-only
+    silence. An auditor wrong 11 times in 12 is ignored on the twelfth.
     """
-    assert severity_for("safety", "SILENT", 1.0) == "high"
-    assert severity_for("safety", "FIRING", 1.0) == "low"
-    assert severity_for("experimental", "SILENT", 1.0) == "low"
-    assert severity_for("safety", "UNKNOWN", 1.0) == "low"
+    assert severity_for("safety", "SILENT", 1.0, ledger_backed=True) == "high"
+    assert severity_for("safety", "FIRING", 1.0, ledger_backed=True) == "low"
+    assert severity_for("experimental", "SILENT", 1.0, ledger_backed=True) == "low"
+    assert severity_for("safety", "UNKNOWN", 1.0, ledger_backed=True) == "low"
+
+
+@pytest.mark.asyncio
+async def test_unprovable_silence_does_not_raise_an_alarm():
+    """A log-only SILENT is an observability gap, not a severance.
+
+    Still EMITTED — at ``low``. Nothing is hidden; it stops being an alarm.
+    """
+    assert severity_for("safety", "SILENT", 1.0, ledger_backed=False) == "low"
+
+
+@pytest.mark.asyncio
+async def test_absent_provenance_is_not_treated_as_proof():
+    """``None`` — the row carried no ``ledger_backed`` — is not evidence.
+
+    Same discipline `firing_verdict` applies when it refuses to turn "no
+    derivable markers" into SILENT: absence of evidence is not evidence of
+    absence, in either direction.
+    """
+    assert severity_for("safety", "SILENT", 1.0) == "low"
+    assert severity_for("safety", "SILENT", 1.0, ledger_backed=None) == "low"
+
+
+@pytest.mark.asyncio
+async def test_registered_never_invoked_still_escalates():
+    """Positive evidence OF severance, and unaffected by the ledger question.
+
+    The module declared itself reachable by dispatch and still never ran —
+    which rules out the innocent explanation a SILENT log channel leaves open.
+    """
+    assert severity_for("safety", "REGISTERED_NEVER_INVOKED", 1.0) == "high"
 
 
 def test_criticality_is_derived_from_the_existing_taxonomy():
@@ -137,7 +190,7 @@ def test_criticality_is_derived_from_the_existing_taxonomy():
 def test_critical_categories_are_widenable_without_code(monkeypatch):
     monkeypatch.setenv("JARVIS_LIVENESS_CRITICAL_CATEGORIES", "safety,routing")
     assert critical_categories() == frozenset({"safety", "routing"})
-    assert severity_for("routing", "SILENT", 0.9) == "high"
+    assert severity_for("routing", "SILENT", 0.9, ledger_backed=True) == "high"
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +258,7 @@ async def test_below_the_floor_is_not_reported(monkeypatch):
         _severed_floor,
     )
     assert _severed_floor() == 0.5
-    assert severity_for("safety", "SILENT", 0.2) == "low"
+    assert severity_for("safety", "SILENT", 0.2, ledger_backed=True) == "low"
 
 
 @pytest.mark.asyncio
