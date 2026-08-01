@@ -520,7 +520,8 @@ def _render_hydration(console: Any, payload: dict) -> None:
         if ops:
             console.print(_active_ops_line(ops), markup=False, highlight=False)
         for line in _liquidity_lines(liq.get("providers") or {},
-                                     any_exhausted=liq.get("any_exhausted")):
+                                     any_exhausted=liq.get("any_exhausted"),
+                                     economic=liq.get("economic")):
             console.print(line, markup=False, highlight=False)
         console.print(
             "⎿ type verbs or plain text · Ctrl+C detaches (the organism "
@@ -660,7 +661,8 @@ def _active_ops_line(ops: Any) -> str:
     return f"⎿ {len(items)} active op{'s' if len(items) != 1 else ''}: {body}{suffix}"
 
 
-def _liquidity_lines(providers: Any, *, any_exhausted: Any = None) -> list:
+def _liquidity_lines(providers: Any, *, any_exhausted: Any = None,
+                     economic: Any = None) -> list:
     """Provider runways, ordered by what an operator needs to act on.
 
     Three defects this replaces, and they compounded:
@@ -727,13 +729,37 @@ def _liquidity_lines(providers: Any, *, any_exhausted: Any = None) -> list:
         mark = " ← dry" if _dry(row) else ""
         lines.append(f"⎿ liquidity {name}: {amount}{mark}")
 
+    # ECONOMIC DEATH, said FIRST and said plainly.
+    #
+    # A rate-limit bucket and an account balance are different axes, and the
+    # cockpit only ever showed the first. During soak bt-2026-08-01-015739 it
+    # displayed `liquidity anthropic: 5,000,000 tokens` for 20 hours while
+    # every request returned 400 "Your credit balance is too low" — 23 ops, 0
+    # completed, $0.00 spent. Maximum displayed health and total inability to
+    # spend rendered identically.
+    #
+    # "Add credits" is also the one remedy in this whole banner the operator
+    # can act on immediately, so it leads.
+    for provider, detail in sorted((economic or {}).items()):
+        try:
+            failures = int(detail.get("consecutive_economic_failures") or 0)
+        except Exception:  # noqa: BLE001
+            failures = 0
+        if failures <= 0:
+            continue
+        lines.append(
+            f"⚠ {provider}: OUT OF CREDIT — the lane is economically dead "
+            f"({failures} billing refusal(s)); the token count above is a "
+            f"RATE LIMIT, not a balance. Add credits to restore it."
+        )
+
     if dry_names:
         # NAME them. "a provider" is the one thing the operator cannot look up.
         lines.append(
             f"⚠ runway exhausted: {', '.join(dry_names)} — "
             f"routing will fall through to the remaining providers"
         )
-    elif any_exhausted:
+    elif any_exhausted and not economic:
         # The aggregate flag disagrees with every row we can see. Say that,
         # rather than repeating a claim nothing supports.
         lines.append(
