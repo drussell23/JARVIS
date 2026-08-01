@@ -136,18 +136,88 @@ def _alias_help(verb: str) -> str:
         action = AUDIO_VERBS.get(verb)
         if not action:
             return ""
-        # Preference order, deliberately: the spelling that IS the action name
-        # (``flush`` -> ``flush``), then the first documented sibling in table
-        # order. Both are stable, so the palette does not reshuffle between
-        # runs — an alias target that moves is worse than none.
         siblings = [v for v, a in AUDIO_VERBS.items()
                     if a == action and v != verb and CLIENT_VERB_HELP.get(v)]
         if not siblings:
             return ""
-        canonical = next((v for v in siblings if v == action), siblings[0])
+        # Canonical selection is `_canonical_of`'s job, not a second copy of
+        # the same preference order. This text names a verb, and
+        # `audio_alias_families` decides which verb the palette SHOWS — two
+        # implementations that drifted would point the operator at a row that
+        # had been folded away.
+        canonical = _canonical_of(action, siblings)
         return f"alias of /{canonical} — {CLIENT_VERB_HELP[canonical]}"
     except Exception:  # noqa: BLE001 — a palette must never throw
         return ""
+
+
+def audio_alias_families() -> "dict":
+    """``{canonical verb: (synonyms, ...)}``, derived from AUDIO_VERBS.
+
+    ``AUDIO_VERBS`` is a SYNONYM table — ``wake!``, ``force-wake`` and
+    ``force wake`` all resolve to ``force_wake`` — and the palette enumerated
+    its KEYS, so eleven rows carried four meanings::
+
+        /flush      halt outbound audio now (ducking)
+        /hush       alias of /flush — halt outbound audio now (ducking)
+        /shh        alias of /flush — halt outbound audio now (ducking)
+
+    Three rows for one capability, two of them spending their description
+    saying so. `VerbDescriptor.aliases` exists precisely to express this and
+    was empty on every row in the registry, while four consumers — typo
+    suggestion, prefix matching, ``matches()`` and ``/verb --help`` — were
+    already reading it.
+
+    Sameness is DERIVED from the routing table rather than listed: two verbs
+    are aliases exactly when they fire the same audio command. A hand-written
+    list of families would be a fourth place to state a fact the table already
+    holds, and the first one to go stale.
+
+    Two subtleties that a naive "group by action" gets wrong:
+
+    * ``voice`` and ``listen`` map to ``wake`` here AND have real daemon
+      dispatchers with their own descriptions. They are separate verbs that
+      happen to share an audio effect, so folding them would delete two
+      capabilities from the palette. Deferred to `_daemon_owns`, the same
+      precedence `_resolve_audio_verb` uses.
+    * the canonical is chosen deterministically — the spelling that IS the
+      action, else the first DOCUMENTED sibling in table order. An alias
+      target that reshuffles between runs is worse than none.
+
+    NEVER raises.
+    """
+    try:
+        by_action: "dict" = {}
+        for verb, action in AUDIO_VERBS.items():
+            if _daemon_owns(verb):
+                continue        # a real verb that merely shares an effect
+            by_action.setdefault(action, []).append(verb)
+        families: "dict" = {}
+        for action, verbs in by_action.items():
+            if len(verbs) < 2:
+                continue
+            canonical = _canonical_of(action, verbs)
+            families[canonical] = tuple(v for v in verbs if v != canonical)
+        return families
+    except Exception:  # noqa: BLE001 — a palette must never throw
+        return {}
+
+
+def _canonical_of(action: str, verbs: "Sequence[str]") -> str:
+    """Which spelling of a synonym group is the one to show. NEVER raises.
+
+    ONE definition, shared with :func:`_alias_help` — the alias text says
+    "alias of /X" and the palette shows row X, so if the two disagreed the
+    menu would point at a verb it had also hidden.
+    """
+    try:
+        exact = next((v for v in verbs if v == action), None)
+        if exact:
+            return exact
+        documented = next((v for v in verbs if CLIENT_VERB_HELP.get(v)), None)
+        return documented or verbs[0]
+    except Exception:  # noqa: BLE001
+        return verbs[0] if verbs else ""
 
 
 def _daemon_owns(verb: str) -> bool:

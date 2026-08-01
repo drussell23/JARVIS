@@ -507,6 +507,71 @@ class TestEveryLiveVerbHasADescription:
                 in (Shape.USAGE, Shape.SUBCOMMAND_LIST)]
         assert not weak, f"verbs still without prose: {weak}"
 
+    def test_no_two_rows_carry_the_same_meaning(self):
+        """Eleven rows carried four meanings::
+
+            /flush   halt outbound audio now (ducking)
+            /hush    alias of /flush — halt outbound audio now (ducking)
+            /shh     alias of /flush — halt outbound audio now (ducking)
+
+        `VerbDescriptor.aliases` exists to say exactly this and was empty on
+        every row, while four consumers — typo suggestion, prefix matching,
+        `matches()` and `/verb --help` — were already reading it.
+
+        Asserted over the LIVE registry and by MEANING rather than by known
+        family, so a duplicate arriving from a source nobody has written yet
+        is caught by the same test. Two dispatch verbs pointing at one
+        function would be a different origin and the identical symptom."""
+        from collections import defaultdict
+        by_meaning = defaultdict(list)
+        for v in self._registry():
+            by_meaning[v.description.strip().lower()].append(v.slash_form)
+        dupes = {k: v for k, v in by_meaning.items() if len(v) > 1}
+        assert not dupes, f"rows sharing one meaning: {dupes}"
+
+    def test_no_row_advertises_itself_as_an_alias(self):
+        """A row explaining that it is a duplicate is a row that should not
+        exist. `/exit` spent its description on "alias for /quit" — the
+        aliasing stated in the one column an operator scans for what a verb
+        DOES."""
+        for v in self._registry():
+            assert "alias of" not in v.description.lower(), v.slash_form
+            assert "alias for" not in v.description.lower(), v.slash_form
+
+    def test_every_folded_alias_stays_reachable(self):
+        """Collapsing the DISPLAY must not shrink the ACCEPT set. The router
+        reads AUDIO_VERBS directly and is untouched; this pins the palette
+        side, since a fold that quietly removed a verb would look identical
+        in the row count."""
+        from backend.core.ouroboros.battle_test.repl_completion import (
+            fuzzy_match,
+        )
+        registry = rc.unified_registry(None)
+        aliased = [(v, a) for v in registry.verbs for a in v.aliases]
+        assert aliased, "fixture assumes the registry folds something"
+        for verb, alias in aliased:
+            assert verb.matches(alias), (verb.slash_form, alias)
+            hits = fuzzy_match(alias, registry, max_results=3)
+            assert verb.slash_form in [h.slash_form for h in hits], (
+                f"typing {alias} does not reach {verb.slash_form}")
+
+    def test_folding_did_not_orphan_the_alias_help_text(self):
+        """`_alias_help` names a canonical verb and `audio_alias_families`
+        decides which verb the palette SHOWS. Two implementations of "which
+        spelling is canonical" would eventually point the operator at a row
+        that had been folded away, so they share `_canonical_of`."""
+        from backend.core.ouroboros.battle_test.repl_completion import (
+            unified_registry,
+        )
+        from backend.core.ouroboros.cli import ov
+        rows = {v.slash_form for v in unified_registry(None).verbs}
+        for verb in ov.AUDIO_VERBS:
+            text = ov._alias_help(verb)
+            if not text.startswith("alias of /"):
+                continue
+            target = "/" + text[len("alias of /"):].split(" — ")[0]
+            assert target in rows, f"{verb} points at {target}, which has no row"
+
     def test_no_row_echoes_only_its_own_name(self):
         for v in self._registry():
             name = v.slash_form.lstrip("/").replace("_", " ").lower()

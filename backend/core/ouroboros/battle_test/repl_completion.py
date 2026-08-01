@@ -102,14 +102,26 @@ _HANDLER_PREFIX: str = "_handle_"
 # Built-in verbs that don't have ``_handle_*`` methods (handled
 # directly in the REPL dispatch loop). They're registered here so
 # the palette is complete.
-_BUILTIN_VERBS: Tuple[Tuple[str, str], ...] = (
-    ("/help", "show available commands"),
-    ("/status", "current op + cost + posture snapshot"),
-    ("/cost", "session cost breakdown"),
-    ("/posture", "current strategic posture (EXPLORE / HARDEN / ...)"),
-    ("/lessons", "session lessons (infra/code tagged learnings)"),
-    ("/quit", "shut down the organism"),
-    ("/exit", "shut down the organism (alias for /quit)"),
+#
+# The third column is ALIASES, and it replaces a row.
+#
+# ``/exit`` used to be its own entry described as "shut down the organism
+# (alias for /quit)" — the aliasing stated in PROSE, in the one column the
+# operator scans for what a verb DOES, while `VerbDescriptor.aliases` (the
+# field built to carry exactly this, and read by typo-suggestion, prefix
+# matching and ``/verb --help``) sat empty on every row in the registry.
+#
+# So the palette showed both spellings as though they were two capabilities,
+# and the second spent its description explaining that it was not. Declaring
+# the alias where the verb is declared costs one tuple element and lights up
+# four existing consumers.
+_BUILTIN_VERBS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
+    ("/help", "show available commands", ()),
+    ("/status", "current op + cost + posture snapshot", ()),
+    ("/cost", "session cost breakdown", ()),
+    ("/posture", "current strategic posture (EXPLORE / HARDEN / ...)", ()),
+    ("/lessons", "session lessons (infra/code tagged learnings)", ()),
+    ("/quit", "shut down the organism", ("/exit",)),
 )
 
 
@@ -1292,15 +1304,20 @@ def discover_verbs(repl_instance: object) -> VerbRegistry:
     # Layer in built-ins (don't override discovered descriptions —
     # but `/help`, `/status`, etc. don't have `_handle_*` so this is
     # additive in practice).
-    for slash, desc in _BUILTIN_VERBS:
+    for slash, desc, aliases in _BUILTIN_VERBS:
         if slash in seen:
             continue
+        # An alias is claimed by its canonical form, so it never becomes a row
+        # of its own. It stays fully reachable: `VerbDescriptor.matches`,
+        # prefix completion and typo suggestion all read `aliases` already.
         seen.add(slash)
+        seen.update(aliases)
         discovered.append(
             VerbDescriptor(
                 slash_form=slash,
                 handler_method="",
                 description=desc,
+                aliases=tuple(aliases),
             )
         )
 
@@ -2362,16 +2379,37 @@ def registry_from_dispatch() -> VerbRegistry:
     # the fuzzy fallback, which answered "/deck" with "/bus, /cost". A palette
     # that invents plausible wrong answers is worse than one that says nothing.
     try:
-        from backend.core.ouroboros.cli.ov import client_verbs
+        from backend.core.ouroboros.cli.ov import (
+            audio_alias_families, client_verbs,
+        )
         known = {d.slash_form for d in descriptors}
+
+        # SYNONYMS COLLAPSE INTO THEIR CANONICAL ROW.
+        #
+        # `client_verbs()` enumerates every spelling the cockpit ACCEPTS,
+        # which is the right answer for routing and the wrong one for a menu:
+        # eleven of its keys carried four meanings, so `/flush`, `/hush` and
+        # `/shh` were three rows for one capability and two of them spent
+        # their description saying "alias of /flush".
+        #
+        # The accept-set is unchanged — `_resolve_audio_verb` still reads
+        # AUDIO_VERBS directly, so every spelling still works. Only the
+        # DISPLAY collapses, and the folded spellings stay discoverable
+        # through `VerbDescriptor.aliases`, which prefix completion, typo
+        # suggestion, `matches()` and `/verb --help` were already reading and
+        # finding empty on every row.
+        families = audio_alias_families()
+        folded = {f"/{a}" for aliases in families.values() for a in aliases}
+
         for verb, help_text in sorted(client_verbs().items()):
             slash = f"/{verb}"
-            if slash in known:
+            if slash in known or slash in folded:
                 continue
             descriptors.append(
                 VerbDescriptor(
                     slash_form=slash, handler_method="",
                     description=help_text or "handled by this cockpit",
+                    aliases=tuple(f"/{a}" for a in families.get(verb, ())),
                 )
             )
     except Exception:  # noqa: BLE001 — daemon verbs alone still complete
