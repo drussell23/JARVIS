@@ -57,6 +57,42 @@ _LEDGER_STEM_RE = re.compile(r"""([A-Za-z0-9_]{2,64})\.jsonl""")
 # A bracket marker present in a debug.log line: ``[MerkleCartographer]``.
 _LOGLINE_TAG_RE = re.compile(r"\[([A-Z][A-Za-z0-9_.]{1,48})\]")
 
+# A module DECLARING evidence it writes through a collaborator:
+#
+#     __firing_ledgers__ = ("repair_tree",)
+#     __firing_tags__ = ("Treefinement",)
+#
+# Marker derivation is SOURCE-LOCAL: a stem is found only if the literal
+# ``name.jsonl`` appears in the capability's own text. That is right for a
+# module that opens its own file and wrong for one that delegates, and
+# delegating is the better design — so the observability layer was penalising
+# exactly the code that separates concerns.
+#
+# ``repair_engine`` is the case that surfaced it. L2 persists every attempt:
+# `repair_engine` → `repair_tree._archive_result` → `repair_tree_archive` →
+# ``.jarvis/ouroboros/repair_tree.jsonl``, via the canonical flock append. Two
+# hops, so ``repair_engine.py`` contains no ``.jsonl`` literal, so it derived
+# LOG TAGS ONLY — and a log-only silence is explicitly ambiguous (see
+# `firing_verdict`). L2 was therefore unprovable rather than dormant, and the
+# liveness sensor scored that unprovability as a HIGH-severity severance of a
+# ``safety`` capability.
+#
+# Following import edges instead was considered and rejected: `repair_engine`
+# imports a dozen modules, most of which write ledgers of their own, and
+# inheriting all of them would make every capability look FIRING — trading a
+# false-dead for a false-alive, which is strictly worse for an auditor.
+#
+# So the module says so itself. This is the convention this codebase already
+# uses for module-level metadata (``__verb_help__``, ``__aliases__``), and it
+# keeps the declaration next to the code that would change if the evidence
+# path did. Parsed from TEXT, not imported — derivation must stay pure and
+# must never execute a capability to ask about it.
+_DECLARED_LEDGERS_RE = re.compile(
+    r"""__firing_ledgers__\s*=\s*\(([^)]*)\)""", re.S)
+_DECLARED_TAGS_RE = re.compile(
+    r"""__firing_tags__\s*=\s*\(([^)]*)\)""", re.S)
+_STRING_ITEM_RE = re.compile(r"""["']([A-Za-z0-9_.\-]{1,64})["']""")
+
 
 # ---------------------------------------------------------------------------
 # Env knobs — additive, clamped, read-only
@@ -137,6 +173,17 @@ def derive_markers(source: str) -> DerivedMarkers:
                 tags.add(comp)
         for m in _LEDGER_STEM_RE.finditer(source):
             ledgers.add(m.group(1))
+        # Evidence written THROUGH a collaborator, declared by the module that
+        # causes it. Unioned with the scanned markers rather than replacing
+        # them: a module may both open its own ledger and drive another's.
+        for m in _DECLARED_LEDGERS_RE.finditer(source):
+            for item in _STRING_ITEM_RE.finditer(m.group(1)):
+                stem = item.group(1)
+                ledgers.add(stem[:-len(".jsonl")]
+                            if stem.endswith(".jsonl") else stem)
+        for m in _DECLARED_TAGS_RE.finditer(source):
+            for item in _STRING_ITEM_RE.finditer(m.group(1)):
+                tags.add(item.group(1).split(".")[-1])
     except Exception:  # noqa: BLE001
         pass
     # Drop generic/noise tags that would over-match (common Python builtins that

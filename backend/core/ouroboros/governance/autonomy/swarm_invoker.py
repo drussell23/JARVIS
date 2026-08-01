@@ -48,7 +48,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 from backend.core.ouroboros.governance.autonomy.subagent_types import (
     ExecutionGraph,
@@ -124,32 +124,62 @@ def require_preshaped_units() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
-def swarm_eligible(unit: WorkUnitSpec) -> bool:
+def swarm_eligible(unit: WorkUnitSpec, *, shape: Any = None) -> bool:
     """Whether this unit CAN be shaped into a caged swarm worker. NEVER raises.
 
-    The bug this replaces was circular. The predicate asked
-    ``unit.is_swarm_worker`` — True only when the unit ALREADY carries a
-    ``system_prompt_template`` / ``allowed_tools`` / ``worker_role``. But the
-    invoker's whole job is to SYNTHESIZE that shape, and every production
-    graph builder (``parallel_dispatch``, ``iteration_planner``,
-    ``providers``, ``meta_goal_aggregator``, ``graph_coalescer``) leaves all
-    five fields ``None``. The only writer is ``SwarmOrchestrator.define_worker``,
-    which has no production caller.
+    THE PREDICATE CARRIED ALMOST NO INFORMATION
+    --------------------------------------------
+    The version this replaces asked for a non-empty ``target_files`` and a
+    non-empty ``goal``. ``WorkUnitSpec.__post_init__`` already raises without
+    either, so the ``target_files`` branch could never be False for a
+    constructible unit — the original circularity inverted rather than
+    repaired: the first predicate answered no to everything (``eligible ⟺
+    already shaped``), the second answered yes to nearly everything.
 
-    So the invoker would only shape a unit that was already shaped, and
-    ``JARVIS_SWARM_ORCHESTRATOR_ENABLED=true`` still did nothing — the same
-    class of defect this module's own docstring says it closed, one layer
-    further in. It closed "nothing CALLS the swarm"; it left "nothing is ever
-    ELIGIBLE for it".
+    "Nearly", and the exception is instructive. ``if not self.goal`` is False
+    for ``"   "``, so a whitespace-only goal IS constructible and the
+    ``goal.strip()`` branch really did reject it. That check is kept below —
+    measured, a taskless unit against a parseable file still scores
+    ``confidence=0.50``, because confidence blends "I read the targets" with
+    "I understood the task". Deleting it as redundant would have widened
+    eligibility to workers with no instruction.
 
-    The fix is to ask what the synthesizer actually needs rather than what a
-    marking says. ``worker_synthesizer`` derives the shape from the sub-goal's
-    ``target_files`` (stdlib ``ast``) and its ``goal`` text, so a unit with
-    both is synthesizable and a unit without either is not.
+    What both versions shared is guessing at proxies for a judgement that
+    lives somewhere else.
 
-    Fail-CLOSED in the same direction as everything downstream: no target
-    files or no goal → legacy executor, byte-identical. A unit that cannot be
-    inspected cannot be caged, and an uncaged worker must never run.
+    So this asks the component that actually knows. ``synthesize_worker_spec``
+    inspects the target files by AST and classifies the goal's intent, and it
+    reports what it managed with ``confidence`` — 0.90 for a goal it
+    understood against a file it parsed, 0.00 for the degenerate read-only
+    fallback it emits when the sub-goal is unparseable or the files are not
+    there. Eligibility is that verdict, not a re-derivation of it.
+
+    ``shape`` lets the caller pass a shape it has ALREADY synthesized.
+    Synthesis reads and parses every target file; the routing decision and the
+    execution path both need it, and doing it twice per unit would be the cost
+    of asking the question in the first place. Passing it through means the
+    honest predicate is also the cheaper one.
+
+    THE ORIGINAL BUG, kept because both failures share one cause
+    -------------------------------------------------------------
+    The first predicate asked ``unit.is_swarm_worker`` — True only when the
+    unit ALREADY carried a ``system_prompt_template`` / ``allowed_tools`` /
+    ``worker_role``. But the invoker's whole job is to SYNTHESIZE that shape,
+    and every production graph builder (``parallel_dispatch``,
+    ``iteration_planner``, ``providers``, ``meta_goal_aggregator``,
+    ``graph_coalescer``) leaves all five fields ``None``. The only writer is
+    ``SwarmOrchestrator.define_worker``, which has no production caller. So
+    the invoker would only shape a unit that was already shaped, and
+    ``JARVIS_SWARM_ORCHESTRATOR_ENABLED=true`` still did nothing.
+
+    Both versions failed the same way: each invented a LOCAL test for a
+    question the synthesizer answers. Marking, then preconditions, now the
+    synthesizer's own verdict — and only the third one cannot drift from it,
+    because it IS it.
+
+    Fail-CLOSED in the same direction as everything downstream: no derivable
+    shape → legacy executor, byte-identical. A unit that cannot be inspected
+    cannot be caged, and an uncaged worker must never run.
     """
     try:
         # An explicitly pre-shaped unit stays eligible — the orchestrator's
@@ -158,12 +188,83 @@ def swarm_eligible(unit: WorkUnitSpec) -> bool:
             return True
         if require_preshaped_units():
             return False
-        # Synthesizable: the two inputs `synthesize_worker_spec` inspects.
-        if not tuple(getattr(unit, "target_files", ()) or ()):
+        if shape is None:
+            from backend.core.ouroboros.governance.autonomy.worker_synthesizer import (  # noqa: E501
+                synthesize_worker_spec,
+            )
+            shape = synthesize_worker_spec(unit)
+        if not _has_instruction(unit):
             return False
+        if shape is None:
+            return False
+        # ABSENT confidence is not zero confidence.
+        #
+        # The floor below is `synthesize_worker_spec`'s own fail-CLOSED signal
+        # read back, so it means something only for shapes IT produced. A
+        # shape from an injected `define_worker` — the orchestrator's
+        # `define_worker` path, or a test's — may carry no `confidence` field
+        # at all, and defaulting that to 0.0 rejected it: a perfectly good
+        # custom shape silently routed to the legacy executor, which is the
+        # inertness class this whole predicate exists to have escaped.
+        #
+        # Present-and-0.0 still fails: that IS the synthesizer reporting it
+        # could not read the sub-goal.
+        confidence = getattr(shape, "confidence", None)
+        if confidence is None:
+            return True
+        try:
+            return float(confidence) > _min_shape_confidence()
+        except (TypeError, ValueError):
+            return True      # unreadable field -> not ours to judge
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _has_instruction(unit: Any) -> bool:
+    """Does this unit tell a worker what to DO? NEVER raises.
+
+    A worker with no instruction cannot be caged usefully however well its
+    files parse. ``WorkUnitSpec.__post_init__`` rejects ``goal=""`` but
+    accepts ``goal="   "`` — ``if not self.goal`` is False for whitespace — so
+    this catches a unit the type system lets through, and measured, the
+    synthesizer scores that unit ``confidence=0.50`` on the strength of the
+    FILES alone. Confidence blends "I read the targets" with "I understood the
+    task"; a taskless worker fails the second even when the first went
+    perfectly.
+
+    Separate from the confidence floor because it must run BEFORE synthesis:
+    synthesis reads and parses every target file, and paying that for a unit
+    already known to be ineligible is waste the routing path should not incur.
+    """
+    try:
         return bool(str(getattr(unit, "goal", "") or "").strip())
     except Exception:  # noqa: BLE001
         return False
+
+
+def _min_shape_confidence() -> float:
+    """The floor a synthesized shape must clear to be worth caging.
+
+    Default ``0.0``, and the comparison is STRICTLY greater — so the bar is
+    "the synthesizer derived something", not a tuned number.
+
+    That is not an arbitrary constant, it is the synthesizer's own fail-CLOSED
+    signal read back. ``synthesize_worker_spec`` documents that "an
+    unparseable / empty sub-goal yields the minimal read-only shape", and
+    measured against real units that shape carries ``confidence=0.00`` while
+    every unit it could actually inspect scores 0.40–0.90. Zero is the value
+    the synthesizer emits when it could not do its job.
+
+    Raising it (``JARVIS_SWARM_MIN_SHAPE_CONFIDENCE=0.5``) narrows the swarm to
+    high-confidence shapes without touching this file — the knob an operator
+    wants after watching a soak, expressed in the units the synthesizer
+    already reports.
+    """
+    try:
+        return max(0.0, min(1.0, float(os.environ.get(
+            "JARVIS_SWARM_MIN_SHAPE_CONFIDENCE", "0.0") or 0.0)))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class SwarmUnitInvoker:
@@ -217,40 +318,80 @@ class SwarmUnitInvoker:
         legacy executor (byte-identical). Eligible -> synthesize + cage +
         caged execute, fail-CLOSED on synthesis/cage failure, deadlock-aware.
         """
-        if not self._should_route_swarm(graph, unit):
+        route, shape = self._route_decision(graph, unit)
+        if not route:
             return await self._legacy.execute(graph, unit)
-        return await self._execute_swarm(graph, unit)
+        # The shape the DECISION was made on is the shape that gets caged.
+        # Re-synthesizing here would parse every target file a second time and,
+        # worse, could disagree with the verdict that routed the unit — a
+        # worker caged from a shape nobody approved.
+        return await self._execute_swarm(graph, unit, shape=shape)
 
     # -- routing decision -------------------------------------------------
 
-    def _should_route_swarm(self, graph: ExecutionGraph, unit: WorkUnitSpec) -> bool:
-        """Swarm iff master gate ON AND graph parallelizable AND unit ELIGIBLE."""
+    def _route_decision(
+        self, graph: ExecutionGraph, unit: WorkUnitSpec,
+    ) -> Tuple[bool, Any]:
+        """``(route_to_swarm, shape)``. Swarm iff master gate ON AND graph
+        parallelizable AND unit ELIGIBLE.
+
+        Returns the SHAPE alongside the verdict because eligibility is now the
+        synthesizer's verdict rather than a guess about it — so deciding
+        produces the very artefact the swarm path needs. Handing it forward
+        keeps synthesis to once per unit and makes it impossible for the shape
+        that was judged and the shape that gets caged to differ.
+
+        The cheap gates run FIRST: with the master flag off, no file is read
+        and no AST is parsed, so an OFF swarm costs exactly what it did before.
+        """
         try:
             from backend.core.ouroboros.governance.autonomy.swarm_orchestrator import (
                 is_orchestrator_enabled,
             )
 
             if not is_orchestrator_enabled():
-                return False
+                return False, None
             if not is_graph_parallelizable(graph):
-                return False
-            return swarm_eligible(unit)
+                return False, None
+            if bool(getattr(unit, "is_swarm_worker", False)):
+                # Pre-shaped: `_synthesize` honours the injected
+                # `define_worker`, so let the swarm path resolve it as before.
+                return True, None
+            if require_preshaped_units():
+                return False, None
+            # CHEAP GATES BEFORE SYNTHESIS. `_synthesize` runs the injected
+            # `define_worker` and otherwise reads + AST-parses every target
+            # file; a unit that cannot be eligible must not pay for that, and
+            # a definer must not be called about a unit that was already
+            # refused.
+            if not _has_instruction(unit):
+                return False, None
+            shape = self._synthesize(unit)
+            return swarm_eligible(unit, shape=shape), shape
         except Exception:  # noqa: BLE001 -- any decision error -> legacy (safe).
             logger.debug(
                 "[SwarmInvoker] route decision raised -> legacy (non-fatal)",
                 exc_info=True,
             )
-            return False
+            return False, None
+
+    def _should_route_swarm(self, graph: ExecutionGraph, unit: WorkUnitSpec) -> bool:
+        """Back-compat boolean view of :meth:`_route_decision`. NEVER raises."""
+        return self._route_decision(graph, unit)[0]
 
     # -- the swarm path ---------------------------------------------------
 
     async def _execute_swarm(
-        self, graph: ExecutionGraph, unit: WorkUnitSpec
+        self, graph: ExecutionGraph, unit: WorkUnitSpec, *, shape: Any = None,
     ) -> WorkUnitResult:
         # 1. + 2. synthesize the worker shape + build its cage. Fail-CLOSED:
         #    any failure here -> FAILED unit, NEVER an uncaged execution.
+        #
+        # `shape` arrives from the routing decision, which had to synthesize it
+        # to judge eligibility. None (a pre-shaped unit, or a direct call) ->
+        # synthesize here, unchanged.
         try:
-            shape = self._synthesize(unit)
+            shape = shape if shape is not None else self._synthesize(unit)
         except Exception as exc:  # noqa: BLE001 -- synthesis failure -> fail-CLOSED.
             return self._failed(
                 graph, unit, "swarm_synthesis", f"worker_synthesis_failed:{exc}"

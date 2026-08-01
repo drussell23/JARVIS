@@ -86,8 +86,10 @@ def _stub(sensor, rows):
                 source_file=sf, category=r["category"], flag=r["flag"],
                 firing=firing, fraction_severed=r["fraction_severed"],
                 severed_symbols=tuple(r["severed_symbols"]),
-                severity=ls.severity_for(r["category"], firing,
-                                         r["fraction_severed"], sf)))
+                severity=ls.severity_for(
+                    r["category"], firing, r["fraction_severed"], sf,
+                    # Mirrors the production `scan()` seam.
+                    ledger_backed=r.get("ledger_backed", True))))
         out.sort(key=lambda f: f.rank)
         return out
     sensor.collect_findings = _collect
@@ -238,6 +240,15 @@ def test_the_event_bus_records_registration_and_invocation_separately():
 
 
 def test_severity_demotes_only_on_real_invocation():
-    assert severity_for("safety", "SILENT", 1.0, "ghost.py") == "high"
+    """``ledger_backed=True`` because this test is about the DYNAMIC registry.
+
+    Since 2026-07-31 a SILENT verdict escalates only when it is ledger-backed
+    — log-only silence is an observability gap, not proven dormancy. Passing
+    it here holds that new axis fixed so the assertion still isolates the one
+    it is about: whether a runtime invocation demotes the severity.
+    """
+    assert severity_for("safety", "SILENT", 1.0, "ghost.py",
+                        ledger_backed=True) == "high"
     note_invocation("ghost.py")
-    assert severity_for("safety", "SILENT", 1.0, "ghost.py") == "low"
+    assert severity_for("safety", "SILENT", 1.0, "ghost.py",
+                        ledger_backed=True) == "low"

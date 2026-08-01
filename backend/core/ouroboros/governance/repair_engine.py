@@ -39,6 +39,27 @@ _logger = logging.getLogger(__name__)
 # L2 test target resolution (Slice 9 — real failing tests, not the candidate)
 # ---------------------------------------------------------------------------
 
+#: Durable evidence L2 causes, declared because it is written two hops away.
+#:
+#: Every repair attempt lands in ``.jarvis/ouroboros/repair_tree.jsonl``:
+#: this module drives ``repair_tree``, whose ``_archive_result`` calls
+#: ``repair_tree_archive``, which flock-appends the row. The work is durable
+#: and dated — exactly the "evidence of work" `capability_firing` treats as
+#: reliable — but marker derivation is source-local, and this file contains no
+#: ``.jsonl`` literal.
+#:
+#: So L2 derived LOG TAGS ONLY, and a log-only silence is documented as
+#: AMBIGUOUS: an absent tag may mean "ran silently", not "never ran". The
+#: liveness sensor read that ambiguity as proven death and scored
+#: ``JARVIS_L2_ENABLED`` — a ``safety`` capability — a HIGH-severity
+#: severance. The loop that closes the Ouroboros cycle looked dead because it
+#: delegates its bookkeeping.
+#:
+#: Declaring the stem makes the verdict PROVABLE in both directions. If L2
+#: genuinely has not run, that becomes ledger-backed dormancy — a real signal
+#: worth acting on — instead of an unfalsifiable one.
+__firing_ledgers__ = ("repair_tree",)
+
 
 def _l2_test_threading_enabled() -> bool:
     return os.environ.get(
