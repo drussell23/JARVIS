@@ -720,9 +720,9 @@ def _active_ops_line(ops: Any) -> str:
     try:
         items = [str(o) for o in (ops or []) if str(o).strip()]
     except Exception:  # noqa: BLE001
-        return "⎿ active ops: (unreadable)"
+        return _glyph("detail", "-") + " active ops: (unreadable)"
     if not items:
-        return "⎿ active ops: none"
+        return _glyph("detail", "-") + " active ops: none"
 
     def _short(op_id: str) -> str:
         # Whole trailing SEGMENTS, never a raw character slice: cutting
@@ -738,7 +738,9 @@ def _active_ops_line(ops: Any) -> str:
     body = ", ".join(_short(o) for o in shown)
     more = len(items) - len(shown)
     suffix = f" (+{more} more)" if more > 0 else ""
-    return f"⎿ {len(items)} active op{'s' if len(items) != 1 else ''}: {body}{suffix}"
+    return _glyph("detail", "-") + (
+        f" {len(items)} active op{'s' if len(items) != 1 else ''}: "
+        f"{body}{suffix}")
 
 
 def _liquidity_lines(providers: Any, *, any_exhausted: Any = None,
@@ -1216,9 +1218,11 @@ class AttachUI:
         if waited > self._ignition_deadline():
             # Still nothing. Do not keep implying progress that is not
             # happening; name the suspicion and let the operator act.
-            return ("  ⚠ daemon unreachable — no telemetry in "
-                    f"{int(waited)}s · 'detach' to leave")
-        return "  ⏺ awaiting daemon telemetry…"
+            return ("  " + _glyph("warn", "!")
+                    + " daemon unreachable — no telemetry in "
+                    + f"{int(waited)}s "
+                    + _glyph("dot", "-") + " 'detach' to leave")
+        return "  " + _glyph("action", "*") + " awaiting daemon telemetry…"
 
     #: Set by the surface that has nowhere else to draw the palette. Default
     #: False so the cockpit, which floats it, never double-renders.
@@ -1754,7 +1758,8 @@ class AttachUI:
                 self.acoustic = None
                 return ""
             where = f" ({device})" if device else ""
-            return f"🎙 mic: {diagnosis or 'degraded'}{where}"
+            return (_glyph("audio", "mic") + ": "
+                    + f"{diagnosis or 'degraded'}{where}")
         except Exception:  # noqa: BLE001
             return ""
 
