@@ -128,7 +128,7 @@ def validate_tool_call(call: ToolCall) -> Tuple[bool, str]:
 
     Returns (is_safe, reason). If is_safe is False, the call MUST NOT execute.
     """
-    if call.name not in TOOL_SCHEMAS:
+    if call.name not in TOOL_SCHEMAS and call.name not in derived_tool_names():
         return False, f"Unknown tool '{call.name}' — blocked"
 
     if call.name == "bash":
@@ -195,8 +195,13 @@ async def execute_tool(
             return ToolResult(call_id=call.call_id, name=call.name, success=True,
                               output=f"Vision action '{call.name}' dispatched to VLA pipeline.")
         else:
-            return ToolResult(call_id=call.call_id, name=call.name, success=False,
-                              output="", error=f"No executor for tool '{call.name}'")
+            # THE SEAM. The hand-written list above covers 9 generic tools; the
+            # derived registry knows 42 named macOS capabilities, and
+            # `lock_screen` was simply never in the list. Rather than a tenth
+            # hand-written branch — which is how the list drifted from the
+            # machine in the first place — unknown names route through the
+            # capability boundary, which gates them by declared effect.
+            return await _exec_derived_capability(call)
     except Exception as exc:
         return ToolResult(call_id=call.call_id, name=call.name, success=False,
                           output="", error=str(exc))
@@ -322,3 +327,63 @@ def _discover_app(name: str) -> str:
         except OSError:
             continue
     return name  # Return as-is, let macOS try
+
+
+def derived_tool_names() -> frozenset:
+    """Capabilities the registry derives from `macos_controller`. NEVER raises.
+
+    Read per call rather than snapshotted at import: a capability annotated
+    tomorrow becomes callable without a restart, which is the whole point of
+    deriving rather than declaring.
+    """
+    try:
+        from backend.system_control.capability_registry import (
+            get_capability_registry,
+        )
+        return frozenset(get_capability_registry().names())
+    except Exception:  # noqa: BLE001 — the hand-written tools still work
+        return frozenset()
+
+
+def derived_tool_schemas() -> Dict[str, Dict[str, Any]]:
+    """`TOOL_SCHEMAS` UNION the derived capabilities, for the prompt.
+
+    The hand-written entries win on a name collision: `take_screenshot` exists
+    in both, and the hand-written one is wired to the vision analyzer while the
+    derived one is not. Deriving must never silently downgrade a tool that was
+    deliberately specialised.
+    """
+    try:
+        from backend.system_control.capability_registry import (
+            get_capability_registry,
+        )
+        merged = dict(get_capability_registry().tool_schemas())
+        merged.update(TOOL_SCHEMAS)
+        return merged
+    except Exception:  # noqa: BLE001
+        return dict(TOOL_SCHEMAS)
+
+
+async def _exec_derived_capability(call: "ToolCall") -> "ToolResult":
+    """Route a derived capability through the consent boundary. NEVER raises.
+
+    Returns rather than raises on every outcome — a SUSPENDED call is not an
+    error, and the model needs the note in its context to end the turn cleanly
+    rather than retry.
+    """
+    try:
+        from backend.system_control.capability_router import (
+            Outcome, get_capability_router,
+        )
+        routed = await get_capability_router().route(
+            call.name, dict(call.args or {}), op_id=call.call_id or "")
+        return ToolResult(
+            call_id=call.call_id, name=call.name,
+            success=(routed.outcome == Outcome.EXECUTED.value),
+            output=routed.context_note or "",
+            error=("" if routed.outcome == Outcome.EXECUTED.value
+                   else routed.detail or routed.outcome),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return ToolResult(call_id=call.call_id, name=call.name, success=False,
+                          output="", error=f"capability route failed: {exc}")
