@@ -146,15 +146,66 @@ class TestEnumerationIsDerived:
         one would hide a config smell the operator should see."""
         monkeypatch.setenv("JARVIS_GOVERNED_CLAUDE_MODEL", "claude-a")
         monkeypatch.setenv("CLAUDE_MODEL", "claude-b")
-        assert mr.available_models()["claude"] == ("claude-a", "claude-b")
+        # The policy's cheap tier may follow; what matters is that BOTH
+        # disagreeing declarations survive, in declaration order.
+        assert mr.available_models()["claude"][:2] == ("claude-a", "claude-b")
 
-    def test_a_lane_that_cannot_be_asked_is_omitted_not_empty(self, monkeypatch):
-        """"claude: (none)" is a claim about Anthropic; silence is a claim
-        about this process."""
+    def test_the_cheap_tier_is_reachable_too(self, monkeypatch):
+        """The economic failover model lives in the POLICY, not the env, so a
+        catalogue built from env alone omitted the one Claude id the failover
+        path actually reaches — the single model an operator could not pin.
+
+        Read through `economic_router.economic_failover_model` rather than
+        re-parsing the yaml, so the catalogue and the router cannot come to
+        different conclusions about the same key.
+        """
         for key in ("JARVIS_GOVERNED_CLAUDE_MODEL", "CLAUDE_MODEL",
                     "JARVIS_CLAUDE_MODEL"):
             monkeypatch.delenv(key, raising=False)
+        from backend.core.ouroboros.governance.economic_router import (
+            economic_failover_model,
+        )
+        cheap = economic_failover_model()
+        if not cheap:
+            pytest.skip("this policy declares no cheap tier")
+        assert cheap in mr.available_models().get("claude", ())
+
+    def test_the_operator_env_still_leads(self, monkeypatch):
+        """Order is the claim about precedence. The configured model must come
+        first or the list implies the cheap tier is what runs."""
+        monkeypatch.setenv("JARVIS_GOVERNED_CLAUDE_MODEL", "claude-configured")
+        claude = mr.available_models().get("claude", ())
+        assert claude and claude[0] == "claude-configured"
+
+    def test_a_lane_that_cannot_be_asked_is_omitted_not_empty(self, monkeypatch):
+        """"claude: (none)" is a claim about Anthropic; silence is a claim
+        about this process.
+
+        The condition tightened when the policy's cheap tier joined the
+        catalogue: the lane now goes silent only when NEITHER the env nor the
+        policy can name a model, which is the honest bar. Env alone was never
+        the right test — it was the right test for a catalogue that was
+        missing half its sources.
+        """
+        for key in ("JARVIS_GOVERNED_CLAUDE_MODEL", "CLAUDE_MODEL",
+                    "JARVIS_CLAUDE_MODEL"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setattr(mr, "_claude_models", lambda: ())
         assert "claude" not in mr.available_models()
+
+    def test_the_lane_is_NOT_silent_while_the_policy_can_answer(self,
+                                                               monkeypatch):
+        """The other half of the same claim — omission must mean 'cannot be
+        asked', never 'was not asked properly'."""
+        for key in ("JARVIS_GOVERNED_CLAUDE_MODEL", "CLAUDE_MODEL",
+                    "JARVIS_CLAUDE_MODEL"):
+            monkeypatch.delenv(key, raising=False)
+        from backend.core.ouroboros.governance.economic_router import (
+            economic_failover_model,
+        )
+        if not economic_failover_model():
+            pytest.skip("this policy declares no cheap tier")
+        assert "claude" in mr.available_models()
 
 
 class TestOperatorInput:
