@@ -62,6 +62,20 @@ def _pending_apply_payload() -> Optional[dict]:
         return None
 
 
+def _forensics_payload() -> Optional[list]:
+    """Pending crashed-step confirmations, or None. NEVER raises.
+
+    None rather than [] — "nothing crashed" and "the daemon never told us" are
+    different facts, and conflating them would have a remote operator conclude
+    the machine is healthy because a bridge went quiet.
+    """
+    try:
+        from backend.vision.black_box import snapshot
+        return snapshot()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _input_queue_payload() -> dict:
     """The attached-input queue's depth, or {}. NEVER raises."""
     try:
@@ -366,6 +380,12 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
             # that draws it locally repaints eight times a second, and the
             # bridge is a line stream.
             "pending_apply": _pending_apply_payload(),
+            # A crashed UI step awaiting confirm/abort. Carried as STATE
+            # for the same reason the countdown is: the strip repaints
+            # locally and the bridge is a line stream. It is also the
+            # only way a remote operator learns the daemon lost a step —
+            # the crash happens where they are not sitting.
+            "forensics": _forensics_payload(),
             "effort": effort,
             "provider": provider,
             "provider_label": provider_label,

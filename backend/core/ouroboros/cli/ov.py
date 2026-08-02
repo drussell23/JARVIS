@@ -969,6 +969,11 @@ class AttachUI:
         self._status: dict = {}
         #: Applies waiting out their rejection window, as of the last frame.
         self._pending_apply: dict = {}
+        #: Crashed-step confirmations from the daemon's heartbeat. None
+        #: means the daemon has not said — distinct from [] meaning
+        #: nothing is pending, which is why the strip can tell an idle
+        #: organism from a silent bridge.
+        self._forensics: Optional[list] = None
         #: Submitted-but-unprocessed operator lines, as of the last frame.
         self._input_queue: dict = {}
         #: The last FATAL_PANIC, until the operator dismisses it. Sticky
@@ -1547,6 +1552,26 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return []
 
+    def _forensic_rows(self) -> List[str]:
+        """A crashed UI step's black box, as seen from the other process.
+
+        Same renderer as the daemon's own strip — `forensic_delta.rows_for` —
+        different source, which is the rule `cockpit_mount` states: neither
+        surface learns where the other's state came from.
+
+        Retires on the same staleness window as the countdown and the roster.
+        A dead daemon must not leave a confirmation prompt on screen: the
+        operator would answer a question about a process that is gone, and the
+        answer would go nowhere.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.forensic_delta import rows_for
+            if self._heartbeat_age() is None:
+                return []
+            return rows_for(self._forensics, width=self._terminal_size()[0])
+        except Exception:  # noqa: BLE001
+            return []
+
     def _push_tail_to_deck(self) -> None:
         """Compose the in-flight text into the transcript. NEVER raises.
 
@@ -1947,6 +1972,7 @@ class AttachUI:
                 # closed, and a countdown that outlives its op is telling the
                 # operator they can still stop something that already ran.
                 self._pending_apply = frame.get("pending_apply") or {}
+                self._forensics = frame.get("forensics")
                 # Lines the operator submitted that the organism has not
                 # reached yet. Cleared by absence for the same reason the
                 # countdown is: a stale backlog tells them work is
@@ -4031,6 +4057,14 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             pending_rows=(
                 ui._pending_apply_rows if ui is not None
                 and hasattr(ui, "_pending_apply_rows") else None
+            ),
+            # The crashed-step confirmation. Passed by NAME like every other
+            # hook: `capability_handoff` reads a `**splat` as OPAQUE, so a
+            # mount that spread itself would blind the audit that proves this
+            # strip reached both surfaces.
+            forensic_rows=(
+                ui._forensic_rows if ui is not None
+                and hasattr(ui, "_forensic_rows") else None
             ),
             # The sentence being written — directly under the deck it is
             # about to become part of.

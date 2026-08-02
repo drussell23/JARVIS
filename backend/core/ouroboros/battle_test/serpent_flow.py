@@ -6853,6 +6853,12 @@ class SerpentREPL:
                     status_rows=_local_status_rows,
                     # Same rule, extended to the strips that were missing it.
                     pending_rows=_mount.get("pending_rows"),
+                    # The crashed-step confirmation. THIS process runs the
+                    # step executor, so it is where the crash happens and
+                    # the only one that can see the machine either side of
+                    # it — the same direction of blindness `cockpit_mount`
+                    # was written about.
+                    forensic_rows=_mount.get("forensic_rows"),
                     panic_rows=_mount.get("panic_rows"),
                     queue_rows=_mount.get("queue_rows"),
                     search_rows=_mount.get("search_rows"),

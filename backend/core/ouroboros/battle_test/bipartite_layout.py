@@ -1181,6 +1181,7 @@ def build_bipartite_application(
     search_rows: Optional[Callable[[], Any]] = None,
     status_rows: Optional[Callable[[], Any]] = None,
     pending_rows: Optional[Callable[[], Any]] = None,
+    forensic_rows: Optional[Callable[[], Any]] = None,
     stream_rows: Optional[Callable[[], Any]] = None,
     queue_rows: Optional[Callable[[], Any]] = None,
     panic_rows: Optional[Callable[[], Any]] = None,
@@ -1783,6 +1784,19 @@ def build_bipartite_application(
     # The rejection window, above the search bar and the caret. It is the
     # most time-critical row the cockpit ever draws — the operator has
     # seconds — so it sits where the eye already is.
+    # A crashed step's forensic delta sits directly ABOVE the countdown, for
+    # the same reason the countdown sits where it does: it is a decision the
+    # operator has to make NOW, and it must not be discovered by scrolling.
+    # It is above rather than below because a pending apply is a clock running
+    # down and this is a question already waiting — the clock keeps the seat
+    # nearest the caret.
+    if forensic_rows is not None:
+        try:
+            _forensic_row = build_dynamic_rows(forensic_rows)
+            if _forensic_row is not None:
+                rows += [_forensic_row]
+        except Exception:  # noqa: BLE001
+            logger.debug("[Bipartite] forensic row unavailable", exc_info=True)
     if pending_rows is not None:
         try:
             _pending_row = build_dynamic_rows(pending_rows)
@@ -2250,6 +2264,7 @@ async def run_bipartite_repl(
     search_rows: Optional[Callable[[], Any]] = None,
     status_rows: Optional[Callable[[], Any]] = None,
     pending_rows: Optional[Callable[[], Any]] = None,
+    forensic_rows: Optional[Callable[[], Any]] = None,
     stream_rows: Optional[Callable[[], Any]] = None,
     queue_rows: Optional[Callable[[], Any]] = None,
     panic_rows: Optional[Callable[[], Any]] = None,
@@ -2296,7 +2311,8 @@ async def run_bipartite_repl(
             completer=completer, history=history, auto_suggest=auto_suggest,
             turn_spinner=turn_spinner, agent_rows=agent_rows,
             search_rows=search_rows, status_rows=status_rows,
-            pending_rows=pending_rows, stream_rows=stream_rows,
+            pending_rows=pending_rows, forensic_rows=forensic_rows,
+            stream_rows=stream_rows,
             queue_rows=queue_rows, panic_rows=panic_rows,
             diff_rows=diff_rows,
             serpent_active=serpent_active,
