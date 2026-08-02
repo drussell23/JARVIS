@@ -43,6 +43,7 @@ import ast
 import asyncio
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -126,10 +127,15 @@ def scan_roots() -> Tuple[str, ...]:
     # graph, and the graph was missing an edge. This one was the largest —
     # the entry point itself.
     #
-    # The walker already prunes `_EXCLUDE_DIRS`, so adding "." costs the
-    # root's own files plus directories not otherwise listed; it does not
-    # re-walk `backend` twice, because paths are normalised to module names
-    # and the set is deduplicated.
+    # "." CONTAINS `backend` and `scripts`, and this comment used to claim the
+    # overlap was free "because paths are normalised to module names and the
+    # set is deduplicated". That was false. `flags` was deduplicated by
+    # `if flag not in flags`; `counts` was incremented unconditionally, so
+    # 3,810 of 14,830 files were parsed twice and every importer total under
+    # those two roots was close to double. `_iter_source_files` now yields
+    # each real path exactly once, which is what makes the overlap actually
+    # free — and makes `FeatureRow.importers` a count of importers rather than
+    # a count of walks that reached one.
     return (".", "backend", "scripts")
 
 
@@ -137,6 +143,12 @@ def scan_roots() -> Tuple[str, ...]:
 #: turned a 900-file walk into 20,121 files and 119 seconds — unusable from a
 #: live cockpit, and every vendored module counted as a production importer,
 #: which would quietly launder dark modules into live ones.
+#:
+#: This list stays a list because these names are CONVENTIONS with no property
+#: to detect — nothing about a directory says "I am a build output". Anything
+#: that CAN be detected structurally belongs in a rule instead, which is why
+#: `.worktrees` is absent here and handled by `_nested_checkout`: naming it
+#: would have fixed this repo and left submodules and vendored clones counted.
 _EXCLUDE_DIRS = frozenset({
     "venv", ".venv", "site-packages", "node_modules", "__pycache__",
     ".git", ".mypy_cache", ".pytest_cache", "build", "dist", ".tox",
@@ -151,6 +163,113 @@ def flag_prefix() -> str:
 
 def _excluded(path: Path) -> bool:
     return any(part in _EXCLUDE_DIRS for part in path.parts)
+
+
+def nested_checkout_pruning() -> bool:
+    """``JARVIS_PROGRESS_BOARD_PRUNE_NESTED`` (default on). NEVER raises."""
+    return os.environ.get(
+        "JARVIS_PROGRESS_BOARD_PRUNE_NESTED", "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _nested_checkout(directory: Path) -> bool:
+    """Is this directory the root of a DIFFERENT working tree?
+
+    A `.git` entry inside a directory is git saying that directory is a
+    checkout in its own right: a linked worktree (where `.git` is a FILE
+    holding a gitdir pointer), a submodule, or a vendored clone. In every one
+    of those the Python underneath is a COPY of code that already exists in
+    this tree, and counting a copy's imports as production importers is
+    precisely the laundering `_EXCLUDE_DIRS` was written to prevent — its own
+    docstring says so about vendored venvs.
+
+    DERIVED, never listed. `.worktrees` was the instance that prompted this
+    (7,382 files, 26% of the walk on this repo), but adding that name to the
+    exclusion set would leave submodules, vendored clones, and whatever the
+    next directory is called still counted. The rule is the property, not the
+    name — so a fork that puts its worktrees somewhere else is configurably
+    right rather than silently wrong.
+
+    Measured, not assumed: a linked worktree here carries `.git` as a 126-byte
+    regular file while the repo root carries a directory, so a check for
+    either shape alone would have caught one and missed the other.
+    `exists()` covers both and follows symlinks — this repo's `.git` has been
+    one under the iCloud `.nosync` layout — and `is_symlink()` catches a
+    dangling link, which is still evidence of a checkout that was there.
+    """
+    marker = directory / ".git"
+    try:
+        return marker.exists() or marker.is_symlink()
+    except OSError:  # permission, or a path that races away mid-walk
+        return False
+
+
+def _iter_source_files(repo_root: Path,
+                       roots: Sequence[str]) -> Iterable[Tuple[str, Path]]:
+    """Every production `.py` under `roots` — exactly once, pruned at the directory.
+
+    Three properties the previous `rglob` pass did not have, each of which was
+    costing something measurable.
+
+    **Pruned, not filtered.** `rglob` enumerates a whole tree and then discards
+    what `_excluded` rejects, so an excluded directory is paid for in full
+    before being thrown away. `os.walk(topdown=True)` publishes `dirnames` for
+    the caller to edit, and removing an entry there means the walker never
+    descends into it at all.
+
+    **Deduplicated across roots.** `scan_roots()` returns
+    ``(".", "backend", "scripts")`` and "." CONTAINS the other two. The comment
+    there claimed module-name normalisation deduplicated the overlap; it did
+    not. `flags` was deduplicated by `if flag not in flags`, but `counts` was
+    incremented unconditionally, so every import in an overlapping file was
+    counted TWICE and every importer total under `backend/` and `scripts/` was
+    close to double. Measured on this repo: 3,810 of 14,830 unique files were
+    parsed twice. That is a wrong number in `FeatureRow.importers`, not merely
+    wasted time — which is why the fix belongs here and not in a cache.
+
+    **Blind to other checkouts.** See :func:`_nested_checkout`.
+
+    A scan root that IS itself a nested checkout is still scanned: only
+    children are pruned. Someone who names `vendor/thing` in
+    ``JARVIS_PROGRESS_BOARD_ROOTS`` has asked for it, and an instrument that
+    silently refuses an explicit request is worse than one that costs a little.
+
+    Symlinked directories are NOT followed — `os.walk` defaults to
+    ``followlinks=False`` and that default is kept deliberately, because a
+    symlink pointing at an ancestor is an infinite walk and a status view that
+    can hang is worse than one that misses a directory. Measured before
+    relying on it: every symlinked directory under the scan roots here lives in
+    `.build` or `venv`, both already excluded, so nothing real is lost. A tree
+    that genuinely reaches source through a symlink should name the real path
+    in ``JARVIS_PROGRESS_BOARD_ROOTS`` — explicit, and still cycle-free.
+    """
+    seen: Set[str] = set()
+    prune_nested = nested_checkout_pruning()
+    for root in roots:
+        base = repo_root / root
+        if not base.is_dir() or _excluded(base):
+            continue
+        for dirpath, dirnames, filenames in os.walk(base, topdown=True):
+            here = Path(dirpath)
+            # In place, and it must be: `os.walk` re-reads this list to decide
+            # what to descend into. Rebinding the name would prune nothing.
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _EXCLUDE_DIRS
+                and not (prune_nested and _nested_checkout(here / d))
+            ]
+            for name in filenames:
+                if not name.endswith(".py"):
+                    continue
+                path = here / name
+                try:
+                    rel = str(path.relative_to(repo_root))
+                except ValueError:
+                    continue
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                yield rel, path
 
 
 def _is_test_path(rel: str) -> bool:
@@ -309,6 +428,11 @@ class ProgressBoard:
         self._entry_modules: Set[str] = set()
         #: module -> why a runtime registry would discover it.
         self._shadow_edges: Dict[str, str] = {}
+        #: module -> a production file that spells its dotted name as a
+        #: STRING. Evidence of a relationship, never of liveness: the only
+        #: such list in this repo that is not a provider-package list is an
+        #: EXCLUSION list. Annotates a dark row; decides nothing.
+        self._string_refs: Dict[str, str] = {}
         self._scanned = 0
 
     # -- import graph ------------------------------------------------------
@@ -329,49 +453,93 @@ class ProgressBoard:
         defaults: Dict[str, Any] = {}
         entries: Set[str] = set()
         shadows: Dict[str, str] = {}
+        #: alias -> canonical module name, for BOTH spellings (see `_row_for`).
+        #: Built during the walk so string references can be resolved against
+        #: real modules afterwards rather than believed on sight.
+        aliases: Dict[str, str] = {}
+        #: dotted string literal -> the production file that spelled it.
+        string_refs: Dict[str, str] = {}
+        roots = scan_roots()
         prefix = flag_prefix()
         scanned = 0
-        for root in scan_roots():
-            base = self._repo_root / root
-            if not base.is_dir():
+        for rel, path in _iter_source_files(self._repo_root, roots):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
                 continue
-            for path in base.rglob("*.py"):
-                if _excluded(path):
-                    continue
-                try:
-                    rel = str(path.relative_to(self._repo_root))
-                except ValueError:
-                    continue
-                try:
-                    tree = ast.parse(path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
-                    continue
-                scanned += 1
-                is_test = _is_test_path(rel)
-                if not is_test:
-                    self_mod = _module_name(rel)
-                    for name in _imported_modules(
-                            tree, self_mod, rel.endswith("__init__.py")):
-                        # A module importing ITSELF is not a caller. Without
-                        # this every module would look live, which is the same
-                        # as having no signal at all.
-                        if name and name != self_mod:
-                            counts[name] = counts.get(name, 0) + 1
-                    # The flag universe comes from where flags are actually
-                    # READ, not from the registry: `get_default_registry()` is
-                    # a CURATED SEED (52 entries) and knew nothing about any
-                    # feature shipped this session. Deriving from source makes
-                    # the board complete by construction and immune to anyone
-                    # forgetting to register.
-                    if _has_main_guard(tree):
-                        entries.add(_module_name(rel))
-                    marker = _semantic_marker(tree, rel)
-                    if marker:
-                        shadows[_module_name(rel)] = marker
-                    for flag, dflt in _flag_literals(tree, prefix):
-                        if flag not in flags:
-                            flags[flag] = rel
-                            defaults[flag] = dflt
+            scanned += 1
+            self_mod = _module_name(rel)
+            # Every module gets an alias entry regardless of test-ness: this is
+            # the NAME index, not the evidence index. Excluding test modules
+            # here would only mean a string reference to one resolved to
+            # nothing, which is silence where a decision belongs.
+            aliases.setdefault(self_mod, self_mod)
+            for root in roots:
+                root_prefix = f"{root}."
+                if self_mod.startswith(root_prefix):
+                    aliases.setdefault(self_mod[len(root_prefix):], self_mod)
+            is_test = _is_test_path(rel)
+            if not is_test:
+                for name in _imported_modules(
+                        tree, self_mod, rel.endswith("__init__.py")):
+                    # A module importing ITSELF is not a caller. Without
+                    # this every module would look live, which is the same
+                    # as having no signal at all.
+                    if name and name != self_mod:
+                        counts[name] = counts.get(name, 0) + 1
+                # The flag universe comes from where flags are actually
+                # READ, not from the registry: `get_default_registry()` is
+                # a CURATED SEED (52 entries) and knew nothing about any
+                # feature shipped this session. Deriving from source makes
+                # the board complete by construction and immune to anyone
+                # forgetting to register.
+                if _has_main_guard(tree):
+                    entries.add(self_mod)
+                marker = _semantic_marker(tree, rel)
+                if marker:
+                    shadows[self_mod] = marker
+                if string_ref_edges_enabled():
+                    for dotted in _dotted_module_strings(tree):
+                        # A module naming ITSELF proves nothing, and a
+                        # registry listing its own package would otherwise
+                        # vouch for itself.
+                        if dotted != self_mod:
+                            string_refs.setdefault(dotted, rel)
+                for flag, dflt in _flag_literals(tree, prefix):
+                    if flag not in flags:
+                        flags[flag] = rel
+                        defaults[flag] = dflt
+
+        # -- resolve string references into ANNOTATIONS, never into edges ----
+        #
+        # Deliberately AFTER the walk: a reference can only be resolved once
+        # the module index is complete, and resolving eagerly would make the
+        # answer depend on directory order.
+        #
+        # This started out promoting a referenced module to DYNAMIC_LIVE and
+        # that was WRONG, in the most instructive way available. The only two
+        # production sites in this repo that name modules as dotted strings are
+        # `repl_dispatch_registry`'s provider PACKAGES and
+        # `observability_route_registry._SUBSTRATE_EXCLUSIONS` — and the second
+        # is a list of modules the registry refuses to mount. Being named by a
+        # registry is not being mounted by one; eight flags were promoted on
+        # the strength of an exclusion list before that was checked.
+        #
+        # Distinguishing a mount list from an exclusion list statically means
+        # dataflow analysis, which is guessing with extra steps. So the
+        # detection is kept and the CONCLUSION is dropped: a string reference
+        # annotates a dark row with the file to go read, and changes no state.
+        # Actual mounting is measured where it is measurable — by the
+        # `register_routes` / `dispatch_*_command` conventions the registries
+        # really dispatch on (see `marker_functions`).
+        resolved_refs: Dict[str, str] = {}
+        for dotted, ref_file in string_refs.items():
+            canonical = aliases.get(dotted)
+            if not canonical or canonical == _module_name(ref_file):
+                continue
+            resolved_refs.setdefault(canonical, ref_file)
+        self._string_refs = resolved_refs
+
         self._importers = counts
         self._flag_sites = flags
         self._flag_defaults = defaults
@@ -524,9 +692,17 @@ class ProgressBoard:
                 return FeatureRow(flag, ENTRY, module_rel, category, None, 0,
                                   "module entry point (__main__ guard)", value)
             state = DARK if importers == 0 else LIVE
+            # The annotation belongs on BOTH dark exits, for the reason this
+            # branch's own comment gives about ENTRY: a check that only one of
+            # two exits consults is not a check. `JARVIS_IDE_POLICY_ROUTER_*`
+            # is three non-boolean knobs and one switch on the same module, and
+            # without this the switch carried the pointer to
+            # `observability_route_registry` while the three knobs beside it
+            # said only "state from graph".
+            reason = ("non-boolean flag; state from graph" if state == LIVE
+                      else f"non-boolean flag; {self._dark_reason(module)}")
             return FeatureRow(flag, state, module_rel, category, None,
-                              importers, "non-boolean flag; state from graph",
-                              value)
+                              importers, reason, value)
         if importers == 0 and module in self._shadow_edges:
             # A runtime registry finds this by convention. NOT live:
             # 'discovered by a registry' and 'imported by a caller'
@@ -545,10 +721,30 @@ class ProgressBoard:
         if importers == 0:
             return FeatureRow(
                 flag, DARK, module_rel, category, enabled, 0,
-                "enabled but NOTHING in production imports it", value,
+                self._dark_reason(module), value,
             )
         return FeatureRow(flag, LIVE, module_rel, category, enabled, importers,
                           f"{importers} production importer(s)", value)
+
+    def _dark_reason(self, module: str) -> str:
+        """Why it is dark — and, when there is one, where to go look.
+
+        A bare "nothing imports it" is true and leaves the operator to find
+        out for themselves whether it is unreachable or merely reached by a
+        mechanism an import graph cannot see. When some production file spells
+        this module's dotted name as a string, that file is the first place
+        worth opening, and saying so costs one clause.
+
+        It stays a QUESTION rather than becoming an answer, because the answer
+        genuinely differs per site: in this repo the same shape is a provider
+        list in one registry and an exclusion list in another.
+        """
+        base = "enabled but NOTHING in production imports it"
+        ref = self._string_refs.get(module)
+        if not ref:
+            return base
+        return (f"{base} — but {ref} names it as a string; "
+                f"check whether that list mounts or excludes")
 
 
 # -- helpers ---------------------------------------------------------------
@@ -749,7 +945,22 @@ def marker_functions() -> Tuple[str, ...]:
     raw = os.environ.get("JARVIS_PROGRESS_BOARD_FN_MARKERS", "").strip()
     if raw:
         return tuple(x.strip() for x in raw.split(",") if x.strip())
-    return ("dispatch_*_command",)
+    # Both entries were MEASURED against the registry that consumes them, not
+    # guessed from a plausible-looking shape.
+    #
+    #   dispatch_*_command  `repl_dispatch_registry` walks `*_repl` modules for
+    #                       module-level callables of this name.
+    #   register_routes     `observability_route_registry` walks its provider
+    #                       packages for a module-level callable named exactly
+    #                       this and mounts it on the HTTP app at boot.
+    #
+    # The second was the sixth missing edge. Eleven modules define
+    # `register_routes` and are imported by NOTHING — `decisions_observability`,
+    # `bus_observability`, `causal_observability` and eight more — so they read
+    # DARK while serving routes on every session. Naming the individual modules
+    # would have been a list that rots; naming the CONVENTION is the same
+    # measured move that made `dispatch_*_command` correct.
+    return ("dispatch_*_command", "register_routes")
 
 
 def marker_modules() -> Tuple[str, ...]:
@@ -784,6 +995,93 @@ def _glob_match(name: str, pattern: str) -> bool:
     head, _, tail = pattern.partition("*")
     return (name.startswith(head) and name.endswith(tail)
             and len(name) >= len(head) + len(tail))
+
+
+def string_ref_edges_enabled() -> bool:
+    """``JARVIS_PROGRESS_BOARD_STRING_REFS`` (default on). NEVER raises."""
+    return os.environ.get(
+        "JARVIS_PROGRESS_BOARD_STRING_REFS", "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+#: A dotted path with identifier-shaped segments and nothing else. The
+#: anchors matter: without them `"see backend.core.x for details"` matches on
+#: a substring and prose starts voting on reachability.
+_DOTTED_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")
+
+
+def _docstring_constants(tree: ast.AST) -> Set[int]:
+    """Node ids of every docstring, so prose cannot be read as a reference.
+
+    This is the single most-repeated defect in this codebase's audit tooling
+    and it has now appeared four times: a docstring is an `ast.Constant` like
+    any other string, so a module that DOCUMENTS its collaborator
+    (``"the HTTP write surface lives in ide_policy_router.py"``) would vouch
+    for it as loudly as a registry that actually mounts it.
+
+    Position is the only reliable discriminator — a docstring is the first
+    statement of a module, class, or function body — so that is what is
+    matched, rather than any guess from the content.
+    """
+    out: Set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef,
+                                 ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if (isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            out.add(id(first.value))
+    return out
+
+
+def _dotted_module_strings(tree: ast.AST) -> Set[str]:
+    """Dotted module paths spelled as STRING LITERALS in executable positions.
+
+    The mechanism this exists for is real and this codebase uses it twice:
+    `observability_route_registry` and `repl_dispatch_registry` both hold
+    tuples of dotted module names that are mounted through
+    `importlib.import_module` at boot. Nothing imports those modules, so the
+    graph reports them DARK while they serve HTTP on every session — the sixth
+    time the board has been right about its own graph and the graph has been
+    missing an edge.
+
+    Three filters, each earning its place:
+
+      * **docstrings excluded** — see :func:`_docstring_constants`.
+      * **anchored identifier shape** — kills prose, `"e.g."`, version
+        strings, URLs and dotted attribute chains in messages.
+      * **`.py` suffix rejected** — `"category_weight_rebalancer.py"` passes
+        the identifier shape (both segments are valid identifiers) and is a
+        FILENAME in prose, not a module path. This codebase writes exactly
+        that, repeatedly, in the loader docstrings that first misled this
+        audit.
+
+    An f-string (`ast.JoinedStr`) is deliberately NOT resolved: its value is
+    not knowable statically, and inventing one would make this instrument the
+    kind of thing it was built to catch. Unresolvable stays unreported.
+
+    The real gate is downstream — a string only becomes an edge if it resolves
+    to a module the walk actually found — so this can afford to be generous
+    and let the index be strict.
+    """
+    docs = _docstring_constants(tree)
+    out: Set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or id(node) in docs:
+            continue
+        value = node.value
+        if not isinstance(value, str) or "." not in value:
+            continue
+        if len(value) > 256 or value.endswith(".py"):
+            continue
+        if _DOTTED_RE.match(value):
+            out.add(value)
+    return out
 
 
 def _semantic_marker(tree: ast.AST, rel: str) -> str:

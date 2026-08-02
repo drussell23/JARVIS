@@ -507,3 +507,397 @@ class TestSwitchesAndKnobsAreDifferentFindings:
                'import os\nos.environ.get("JARVIS_FEATURE_ENABLED", "1")\n')
         first = _board(tmp_path).read().actionable_modules[0]
         assert "zzz_feature" in first[0]
+
+
+class TestOtherCheckoutsAreNotThisCodebase:
+    """A `.git` inside a directory means git considers it a checkout of its own.
+
+    `.worktrees` was the instance — 7,382 files, 26% of the walk — but the fix
+    is the PROPERTY, not the name, because naming it would have left submodules
+    and vendored clones counted as production importers of the real modules.
+    """
+
+    def test_a_worktree_copy_does_not_launder_a_dark_module(
+        self, tmp_path, monkeypatch,
+    ):
+        # THE defect. A stale copy importing a module main has orphaned would
+        # report it LIVE — the exact laundering `_EXCLUDE_DIRS` was written for.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", ".")
+        _write(tmp_path, "backend/feature.py",
+               'import os\nos.environ.get("JARVIS_FEATURE_ENABLED", "1")\n')
+        # A LINKED WORKTREE: `.git` is a FILE holding a gitdir pointer, which
+        # is why a directory-only check would have missed every one of them.
+        _write(tmp_path, ".worktrees/old/.git", "gitdir: /elsewhere/.git\n")
+        _write(tmp_path, ".worktrees/old/backend/caller.py",
+               "from backend import feature\n")
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_FEATURE_ENABLED"].state == DARK
+        assert rows["JARVIS_FEATURE_ENABLED"].importers == 0
+
+    def test_a_submodule_is_pruned_by_the_same_rule(self, tmp_path, monkeypatch):
+        # Not a worktree, not named `.worktrees`, caught anyway — which is the
+        # whole reason the rule is structural.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", ".")
+        _write(tmp_path, "backend/feature.py",
+               'import os\nos.environ.get("JARVIS_FEATURE_ENABLED", "1")\n')
+        (tmp_path / "vendor" / "dep" / ".git").mkdir(parents=True)  # dir form
+        _write(tmp_path, "vendor/dep/caller.py", "from backend import feature\n")
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_FEATURE_ENABLED"].state == DARK
+
+    def test_a_dangling_git_symlink_still_counts_as_a_checkout(
+        self, tmp_path, monkeypatch,
+    ):
+        # This repo's own `.git` has been a symlink under the iCloud `.nosync`
+        # layout. `exists()` returns False on a broken one, so the symlink
+        # check is what keeps a moved checkout from silently rejoining the scan.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", ".")
+        _write(tmp_path, "backend/feature.py",
+               'import os\nos.environ.get("JARVIS_FEATURE_ENABLED", "1")\n')
+        (tmp_path / "linked").mkdir()
+        (tmp_path / "linked" / ".git").symlink_to(tmp_path / "nowhere")
+        _write(tmp_path, "linked/caller.py", "from backend import feature\n")
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_FEATURE_ENABLED"].state == DARK
+
+    def test_the_repo_root_is_never_pruned_by_its_own_git(
+        self, tmp_path, monkeypatch,
+    ):
+        # The root carries `.git` too. Pruning on it would scan nothing at all
+        # and report an empty board as a clean one.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", ".")
+        (tmp_path / ".git").mkdir()
+        _write(tmp_path, "backend/feature.py",
+               'import os\nos.environ.get("JARVIS_FEATURE_ENABLED", "1")\n')
+        _write(tmp_path, "backend/caller.py", "from backend import feature\n")
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_FEATURE_ENABLED"].state == LIVE
+
+    def test_pruning_is_a_knob_not_a_law(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", ".")
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_PRUNE_NESTED", "0")
+        _write(tmp_path, "backend/feature.py",
+               'import os\nos.environ.get("JARVIS_FEATURE_ENABLED", "1")\n')
+        _write(tmp_path, ".worktrees/old/.git", "gitdir: /elsewhere/.git\n")
+        _write(tmp_path, ".worktrees/old/backend/caller.py",
+               "from backend import feature\n")
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_FEATURE_ENABLED"].state == LIVE
+
+
+class TestOverlappingRootsAreWalkedOnce:
+    """`scan_roots()` returns `(".", "backend", "scripts")` and "." contains both.
+
+    The old comment claimed the overlap was free because module names were
+    deduplicated. `flags` was; `counts` was not — so every import in an
+    overlapping file was counted twice and `importers` was close to double.
+    """
+
+    def test_one_importer_is_counted_once_across_overlapping_roots(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", ".,backend")
+        _write(tmp_path, "backend/feature.py",
+               'import os\nos.environ.get("JARVIS_FEATURE_ENABLED", "1")\n')
+        _write(tmp_path, "backend/caller.py", "from backend import feature\n")
+        row = {r.flag: r for r in _board(tmp_path).read().rows}["JARVIS_FEATURE_ENABLED"]
+        assert row.state == LIVE
+        assert row.importers == 1, (
+            "one caller, walked through two overlapping roots, is still one caller"
+        )
+
+    def test_scanned_count_is_files_not_visits(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", ".,backend")
+        _write(tmp_path, "backend/a.py",
+               'import os\nos.environ.get("JARVIS_A_ENABLED", "1")\n')
+        _write(tmp_path, "backend/b.py", "x = 1\n")
+        assert _board(tmp_path).read().scanned_files == 2
+
+
+class TestRegistryMountingConventions:
+    """A registry mounts what it RECOGNISES, and recognition is a convention.
+
+    `observability_route_registry` walks its provider packages for a
+    module-level callable named exactly `register_routes` and mounts it on the
+    HTTP app at boot. Eleven modules in this repo define one and are imported
+    by nothing, so they read DARK while serving routes on every session — the
+    sixth time the board was right about its own graph and the graph was
+    missing an edge.
+    """
+
+    def test_register_routes_is_recognised_as_a_mount(self, tmp_path,
+                                                      monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/bus_observability.py",
+               'import os\n'
+               'os.environ.get("JARVIS_BUS_OBS_ENABLED", "1")\n'
+               'def register_routes(app, **kw):\n    return None\n')
+        row = {r.flag: r for r in _board(tmp_path).read().rows}["JARVIS_BUS_OBS_ENABLED"]
+        assert row.state == DYNAMIC_LIVE
+        assert "register_routes" in row.reason
+
+    def test_a_register_routes_METHOD_is_not_a_module_level_mount(
+        self, tmp_path, monkeypatch,
+    ):
+        # The registry's own exclusion comment says why: a class-based router
+        # exposes `register_routes` as a METHOD, and the module-level lookup
+        # hits the class object instead. `_semantic_marker` walks module level
+        # only, so the two agree without either knowing about the other.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/classy.py",
+               'import os\n'
+               'os.environ.get("JARVIS_CLASSY_ENABLED", "1")\n'
+               'class Router:\n'
+               '    def register_routes(self, app):\n        return None\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_CLASSY_ENABLED"].state == DARK
+
+
+class TestStringReferencesAnnotateButNeverPromote:
+    """Being NAMED by a registry is not being MOUNTED by one.
+
+    This mechanism first shipped promoting a referenced module to
+    DYNAMIC_LIVE, and it was wrong in the most instructive way available: the
+    only two production sites in this repo that spell module names as dotted
+    strings are `repl_dispatch_registry`'s provider PACKAGES and
+    `observability_route_registry._SUBSTRATE_EXCLUSIONS` — and the second is a
+    list of modules the registry refuses to mount. Eight flags were promoted
+    on the strength of an exclusion list before anyone read it.
+
+    Telling a mount list from an exclusion list statically is dataflow
+    analysis, which is guessing with extra steps. So the detection stays and
+    the conclusion goes: the reference annotates a dark row with the file to
+    open, and decides nothing.
+    """
+
+    def test_a_reference_annotates_the_dark_row(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/registry.py",
+               'ROUTERS = ("backend.router",)\n')
+        row = {r.flag: r for r in _board(tmp_path).read().rows}["JARVIS_ROUTER_ENABLED"]
+        assert row.state == DARK, "a name in a list is not a mount"
+        assert "registry.py" in row.reason, (
+            "the annotation must name the file to open"
+        )
+
+    def test_a_non_boolean_knob_gets_the_annotation_too(self, tmp_path,
+                                                        monkeypatch):
+        # Both dark exits, for the reason `_row_for`'s own comment already
+        # gives about ENTRY: a check only one of two exits consults is not a
+        # check. `ide_policy_router` carries three non-boolean knobs and one
+        # switch, and the knobs took the other branch.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_CORS_ORIGINS", "*")\n')
+        _write(tmp_path, "backend/registry.py", 'R = ("backend.router",)\n')
+        row = {r.flag: r for r in
+               _board(tmp_path).read().rows}["JARVIS_ROUTER_CORS_ORIGINS"]
+        assert row.state == DARK
+        assert "registry.py" in row.reason
+
+    def test_an_exclusion_list_does_not_promote(self, tmp_path, monkeypatch):
+        # THE regression. Verbatim the shape of
+        # `observability_route_registry._SUBSTRATE_EXCLUSIONS`: a tuple of
+        # dotted names listing exactly the modules that must NOT be mounted.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/registry.py",
+               "_SUBSTRATE_EXCLUSIONS = (\n"
+               '    "backend.router",   # never mount this one\n'
+               ")\n")
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_ROUTER_ENABLED"].state == DARK
+
+    def test_a_docstring_mention_is_NOT_an_edge(self, tmp_path, monkeypatch):
+        # The single most-repeated defect in this repo's audit tooling. A
+        # docstring is an `ast.Constant` like any other string, so a module
+        # DOCUMENTING its collaborator would vouch for it as loudly as a
+        # registry that actually mounts it.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/prose.py",
+               '"""The write surface lives in backend.router, see also."""\n'
+               "x = 1\n")
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_ROUTER_ENABLED"].state == DARK
+
+    def test_a_filename_in_prose_is_NOT_an_edge(self, tmp_path, monkeypatch):
+        # `"router.py"` passes an identifier-shaped dotted test — both segments
+        # are valid identifiers — and this codebase writes exactly that shape
+        # in the loader docstrings that first misled the audit.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/mentions.py",
+               'NOTE = "backend.router.py"\nOTHER = "router.py"\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_ROUTER_ENABLED"].state == DARK
+
+    def test_a_string_that_resolves_to_nothing_is_not_an_edge(
+        self, tmp_path, monkeypatch,
+    ):
+        # The real gate. Generous shape-matching is only safe because a string
+        # becomes an edge solely by resolving to a module the walk found.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/registry.py",
+               'ROUTERS = ("backend.does_not_exist", "logging.handlers")\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_ROUTER_ENABLED"].state == DARK
+
+    def test_a_module_naming_itself_proves_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\n'
+               'os.environ.get("JARVIS_ROUTER_ENABLED", "1")\n'
+               'SELF = "backend.router"\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_ROUTER_ENABLED"].state == DARK
+
+    def test_a_package_string_does_NOT_vouch_for_its_members(
+        self, tmp_path, monkeypatch,
+    ):
+        # THE laundering risk. `repl_dispatch_registry` lists PACKAGES and
+        # discovers `*_repl` members by naming convention. If a package string
+        # vouched for everything underneath, `meta_governor` — same package,
+        # no caller anywhere — would be laundered into DYNAMIC_LIVE.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/pkg/__init__.py", "")
+        _write(tmp_path, "backend/pkg/orphan.py",
+               'import os\nos.environ.get("JARVIS_ORPHAN_ENABLED", "1")\n')
+        _write(tmp_path, "backend/registry.py", 'PACKAGES = ("backend.pkg",)\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_ORPHAN_ENABLED"].state == DARK
+
+    def test_a_package_string_composes_with_the_naming_convention(
+        self, tmp_path, monkeypatch,
+    ):
+        # ...and the member that DOES carry the convention is still found, by
+        # the mechanism that already existed. The two compose precisely because
+        # the string edge refuses to generalise.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/pkg/__init__.py", "")
+        _write(tmp_path, "backend/pkg/thing_repl.py",
+               'import os\n'
+               'os.environ.get("JARVIS_THING_ENABLED", "1")\n'
+               'def dispatch_thing_command(line):\n    return None\n')
+        _write(tmp_path, "backend/registry.py", 'PACKAGES = ("backend.pkg",)\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_THING_ENABLED"].state == DYNAMIC_LIVE
+
+    def test_a_test_file_reference_does_NOT_make_it_live(
+        self, tmp_path, monkeypatch,
+    ):
+        # Same rule imports already obey: a module exercised only by tests is
+        # inert in production, whichever mechanism reaches it.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/tests/test_router.py",
+               'TARGET = "backend.router"\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_ROUTER_ENABLED"].state == DARK
+
+    def test_a_real_importer_still_beats_a_string_reference(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/registry.py", 'R = ("backend.router",)\n')
+        _write(tmp_path, "backend/caller.py", "from backend import router\n")
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_ROUTER_ENABLED"].state == LIVE
+
+    def test_the_relative_spelling_resolves_too(self, tmp_path, monkeypatch):
+        # `backend/` is on sys.path at runtime, so 597 files in this repo spell
+        # their siblings `core.x` rather than `backend.core.x`, and a registry
+        # may legitimately do the same. `_row_for` already counts importers
+        # under both spellings; a string edge that understood only one would
+        # report half of them dark.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", ".,backend")
+        _write(tmp_path, "backend/core/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/registry.py", 'R = ("core.router",)\n')
+        row = {r.flag: r for r in _board(tmp_path).read().rows}["JARVIS_ROUTER_ENABLED"]
+        assert "registry.py" in row.reason
+
+    def test_a_bare_single_segment_name_is_NOT_an_edge(self, tmp_path,
+                                                       monkeypatch):
+        # The boundary of the relative spelling, and it has to be drawn here.
+        # A top-level module's relative name is one bare word — `"router"` —
+        # which is indistinguishable from a mode name, a dict key, or a log
+        # tag. Accepting it would let any string in the tree vouch for a
+        # module that happens to share its name. Requiring a dot is what keeps
+        # the generous shape-match safe, so the ambiguous case stays DARK and
+        # honest rather than laundered.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", ".,backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/registry.py",
+               'R = ("router",)\nMODE = "router"\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_ROUTER_ENABLED"].state == DARK
+
+    def test_an_fstring_is_left_unresolved_rather_than_guessed(
+        self, tmp_path, monkeypatch,
+    ):
+        # A dynamically-built name is not knowable statically. Inventing one
+        # would make this instrument the thing it was built to catch.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/registry.py",
+               'pkg = "backend"\nR = (f"{pkg}.router",)\n')
+        rows = {r.flag: r for r in _board(tmp_path).read().rows}
+        assert rows["JARVIS_ROUTER_ENABLED"].state == DARK
+
+    def test_annotation_is_a_knob_not_a_law(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_STRING_REFS", "0")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/registry.py", 'R = ("backend.router",)\n')
+        row = {r.flag: r for r in _board(tmp_path).read().rows}["JARVIS_ROUTER_ENABLED"]
+        assert row.state == DARK
+        assert "registry.py" not in row.reason
+
+    @pytest.mark.parametrize("src,why", [
+        ('"""Docs mention backend.router in prose."""\nx = 1\n',
+         "a docstring is an ast.Constant like any other string"),
+        ('NOTE = "backend.router.py"\n',
+         "a .py suffix is a filename in prose, not a module path"),
+        ('pkg = "backend"\nR = (f"{pkg}.router",)\n',
+         "an f-string value is not knowable statically"),
+        ('R = ("backend.does_not_exist",)\n',
+         "a string that resolves to no module is not evidence"),
+    ])
+    def test_non_references_leave_the_reason_clean(self, tmp_path, monkeypatch,
+                                                   src, why):
+        # A false annotation is cheaper than a false promotion and still costs
+        # the operator a file to open for nothing, so the filters are pinned
+        # on the reason text too, not just on the state.
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/other.py", src)
+        row = {r.flag: r for r in _board(tmp_path).read().rows}["JARVIS_ROUTER_ENABLED"]
+        assert row.state == DARK
+        assert "other.py" not in row.reason, why
+
+    @pytest.mark.asyncio
+    async def test_async_read_annotates_identically(self, tmp_path,
+                                                    monkeypatch):
+        monkeypatch.setenv("JARVIS_PROGRESS_BOARD_ROOTS", "backend")
+        _write(tmp_path, "backend/router.py",
+               'import os\nos.environ.get("JARVIS_ROUTER_ENABLED", "1")\n')
+        _write(tmp_path, "backend/registry.py", 'R = ("backend.router",)\n')
+        board = _board(tmp_path)
+        rows = {r.flag: r for r in (await board.read_async()).rows}
+        row = rows["JARVIS_ROUTER_ENABLED"]
+        assert row.state == DARK and "registry.py" in row.reason
