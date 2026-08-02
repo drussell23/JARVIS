@@ -26,6 +26,7 @@ import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
@@ -48,6 +49,70 @@ _WINDOW_S = float(os.environ.get("JARVIS_CU_FAILURE_WINDOW_S", "86400"))  # 24h
 _EMIT_COOLDOWN_S = float(
     os.environ.get("JARVIS_CU_EMIT_COOLDOWN_S", "3600")
 )  # 1 hour
+
+
+# ---------------------------------------------------------------------------
+# Durability (the crash window IS the boot window)
+# ---------------------------------------------------------------------------
+#
+# Deferring an emission until a router attaches survives a slow boot. It does
+# not survive the process dying first — and the window in which the router is
+# missing is exactly the window in which a boot is most likely to fail. The
+# evidence lived only in RAM, so a crash during governance boot lost precisely
+# the failures a user had just experienced.
+#
+# The intake router's WAL cannot help: it persists envelopes AFTER ingest, and
+# this gap is entirely before it.
+#
+# EVENT-SOURCED, NOT SNAPSHOTTED. The journal is append-only, which is what
+# `cross_process_jsonl` — "the single source of truth for cross-process JSONL
+# append safety", already backing three ledgers — is built for. Rebuilding
+# state by replaying occurrences means no read-modify-write on the hot path,
+# and it persists the cooldown for free: an emission is just another entry.
+#
+# Persisting the cooldown is not a detail. Without it, a restart re-emits every
+# pattern that had already graduated, so the durability fix would manufacture
+# duplicate governance work — a worse failure than the one it repairs.
+
+def _journal_enabled() -> bool:
+    """Master gate. Default TRUE — the state is small, bounded and local.
+    NEVER raises."""
+    return (os.environ.get("JARVIS_CU_JOURNAL_ENABLED", "true")
+            or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _journal_path() -> Path:
+    """Durable location, resolved through the canonical workspace seam so a
+    worktree run does not write to the operator's tree. NEVER raises."""
+    raw = (os.environ.get("JARVIS_CU_JOURNAL_PATH", "") or "").strip()
+    return Path(raw) if raw else Path(".jarvis") / "cu_failure_journal.jsonl"
+
+
+def _journal_max_lines() -> int:
+    """Compaction trigger. NEVER raises."""
+    try:
+        return max(64, int(os.environ.get("JARVIS_CU_JOURNAL_MAX_LINES", "2000")))
+    except (TypeError, ValueError):
+        return 2000
+
+
+def _journal_redacts() -> bool:
+    """Drop the free-text payload before it reaches disk.
+
+    A CU record carries the operator's spoken goal and a contact's name.
+    Holding that in RAM for 24h and writing it to disk are materially
+    different privacy postures, so the choice is explicit rather than implied.
+    Default FALSE — `.jarvis/user_preferences/` already persists personal
+    context and the envelope is far less useful without the goal — but an
+    operator on a shared machine can flip it, and the envelope then says so.
+    NEVER raises."""
+    return (os.environ.get("JARVIS_CU_JOURNAL_REDACT", "")
+            or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+#: Tolerance for clock skew. An entry stamped in the future would never expire
+#: out of the rolling window, so it is clamped rather than trusted.
+_MAX_FUTURE_SKEW_S = 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +244,21 @@ class CUExecutionSensor:
         # time, the next `record()` reconciles instead.
         self._needs_reconcile = False
         self._reconciling = False
+        # The in-flight reconcile. Tracked, not fired-and-forgotten: the sweep
+        # now awaits a journal write on a worker thread, so it outlives the
+        # tick that started it and could otherwise still be running after
+        # `stop()` — an orphan task holding a reference to a torn-down sensor.
+        self._reconcile_task: Optional["asyncio.Task"] = None
+        # Durability counters (§7). `corrupt_lines` non-zero is the signature of
+        # a process killed mid-append — expected occasionally, alarming if it
+        # grows every boot.
+        self._journal_replayed = 0
+        self._journal_corrupt_lines = 0
+        self._journal_write_failures = 0
+
+        # Replay BEFORE anything can record, so a pattern that graduated in the
+        # previous life is already at threshold in this one.
+        self._hydrate()
 
         logger.info("[CUExecutionSensor] initialized")
 
@@ -186,13 +266,198 @@ class CUExecutionSensor:
         """No-op — this sensor is event-driven, not polling."""
         logger.info("[CUExecutionSensor] started (event-driven mode)")
 
+    async def drain(self) -> None:
+        """Await any in-flight reconcile. NEVER raises.
+
+        A shutdown that tears the sensor down mid-sweep loses the emission it
+        was in the middle of filing, which is the same class of loss this whole
+        arc closes — so the shutdown path has a way to wait. Also what makes
+        the behaviour deterministic for a caller that needs to observe the
+        result rather than guess at a tick count.
+        """
+        task = self._reconcile_task
+        if task is None or task.done():
+            return
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+
     def stop(self) -> None:
         """Clear tracking state."""
+        task = self._reconcile_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._reconcile_task = None
         self._failure_window.clear()
         self._latest_by_sig.clear()
         self._last_emitted.clear()
         self._needs_reconcile = False
         logger.info("[CUExecutionSensor] stopped")
+
+    # ------------------------------------------------------------------
+    # Durability — replay, append, compact
+    # ------------------------------------------------------------------
+
+    def _hydrate(self) -> None:
+        """Rebuild in-memory state from the journal. NEVER raises.
+
+        Tolerant per LINE, not per file: a process killed mid-append leaves a
+        torn final line, and discarding the whole journal because its last byte
+        is missing would lose the very evidence this exists to keep.
+        """
+        if not _journal_enabled():
+            return
+        try:
+            import json
+            from backend.core.ouroboros.governance.workspace_resolver import (
+                resolve_durable_path,
+            )
+            path = resolve_durable_path(_journal_path())
+            if not path.exists():
+                return
+            now = time.time()
+            cutoff = now - _WINDOW_S
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            for raw in lines:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except Exception:  # noqa: BLE001 — torn or corrupt line
+                    self._journal_corrupt_lines += 1
+                    continue
+                if not isinstance(entry, dict):
+                    self._journal_corrupt_lines += 1
+                    continue
+                if entry.get("repo") not in (None, self._repo):
+                    continue          # another repo's journal, same machine
+                ts = entry.get("t")
+                sig = entry.get("sig")
+                if not isinstance(ts, (int, float)) or not isinstance(sig, str):
+                    self._journal_corrupt_lines += 1
+                    continue
+                ts = min(float(ts), now + _MAX_FUTURE_SKEW_S)
+                if ts < cutoff:
+                    continue          # outside the rolling window
+                kind = entry.get("k")
+                if kind == "e":
+                    # An emission already happened; replaying it restores the
+                    # cooldown so a restart does not re-file the same work.
+                    self._last_emitted[sig] = max(
+                        self._last_emitted.get(sig, 0.0), ts)
+                elif kind == "f":
+                    self._failure_window[sig].append(ts)
+                    rec = entry.get("rec")
+                    if isinstance(rec, dict):
+                        try:
+                            self._latest_by_sig[sig] = CUExecutionRecord(**rec)
+                        except Exception:  # noqa: BLE001 — schema drift
+                            self._journal_corrupt_lines += 1
+                else:
+                    self._journal_corrupt_lines += 1
+            self._journal_replayed = sum(
+                len(v) for v in self._failure_window.values())
+            if self._journal_replayed or self._last_emitted:
+                logger.info(
+                    "[CUExecutionSensor] journal replayed — %d occurrences "
+                    "across %d patterns, %d cooldowns restored%s",
+                    self._journal_replayed, len(self._failure_window),
+                    len(self._last_emitted),
+                    f", {self._journal_corrupt_lines} unreadable lines skipped"
+                    if self._journal_corrupt_lines else "",
+                )
+            if len(lines) > _journal_max_lines():
+                self._compact(cutoff)
+        except Exception:  # noqa: BLE001 — durability must never break boot
+            logger.debug("[CUExecutionSensor] journal replay degraded",
+                         exc_info=True)
+
+    def _compact(self, cutoff: float) -> None:
+        """Drop entries that can no longer influence a decision. NEVER raises.
+
+        Under the cross-process lock, because this is the read-trim-write that
+        a plain append cannot express — the same pattern InvariantDriftStore
+        uses for its history ring.
+        """
+        try:
+            import json
+            from backend.core.ouroboros.governance.cross_process_jsonl import (
+                flock_critical_section,
+            )
+            from backend.core.ouroboros.governance.workspace_resolver import (
+                resolve_durable_path,
+            )
+            path = resolve_durable_path(_journal_path())
+            with flock_critical_section(path) as ok:
+                if not ok:
+                    return        # another writer holds it; try again next boot
+                kept = []
+                for raw in path.read_text(
+                        encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        e = json.loads(raw)
+                        if float(e.get("t", 0)) >= cutoff:
+                            kept.append(raw)
+                    except Exception:  # noqa: BLE001
+                        continue   # a corrupt line is dropped by compaction
+                tmp = path.with_suffix(path.suffix + ".compact")
+                tmp.write_text("\n".join(kept) + ("\n" if kept else ""),
+                               encoding="utf-8")
+                os.replace(tmp, path)
+                logger.info("[CUExecutionSensor] journal compacted → %d lines",
+                            len(kept))
+        except Exception:  # noqa: BLE001
+            logger.debug("[CUExecutionSensor] compaction degraded", exc_info=True)
+
+    async def _journal(self, kind: str, sig: str,
+                       rec: Optional["CUExecutionRecord"] = None) -> None:
+        """Append one entry. NEVER raises, never blocks the loop.
+
+        Off-thread deliberately: ``flock`` is microseconds uncontended, but
+        under contention it blocks up to ``lock_timeout_s``. That is a stall on
+        the HUD's dispatch path, and the whole point of this sensor is that it
+        must not cost the thing it observes.
+        """
+        if not _journal_enabled():
+            return
+        try:
+            import json
+            from dataclasses import asdict
+            entry: Dict[str, Any] = {
+                "v": 1, "k": kind, "t": time.time(), "sig": sig,
+                "repo": self._repo,
+            }
+            if kind == "f" and rec is not None:
+                entry["t"] = min(float(rec.timestamp),
+                                 time.time() + _MAX_FUTURE_SKEW_S)
+                payload = asdict(rec)
+                if _journal_redacts():
+                    payload["goal"] = "[redacted]"
+                    payload["contact"] = None
+                    entry["redacted"] = True
+                entry["rec"] = payload
+            line = json.dumps(entry, separators=(",", ":"), default=str)
+
+            def _write() -> bool:
+                from backend.core.ouroboros.governance.cross_process_jsonl import (
+                    flock_append_line,
+                )
+                return flock_append_line(_journal_path(), line)
+
+            ok = await asyncio.to_thread(_write)
+            if not ok:
+                self._journal_write_failures += 1
+                if self._journal_write_failures in (1, 10, 100):
+                    logger.warning(
+                        "[CUExecutionSensor] journal append failed (%d so far) "
+                        "— state is in-memory only until this clears",
+                        self._journal_write_failures)
+        except Exception:  # noqa: BLE001
+            self._journal_write_failures += 1
+            logger.debug("[CUExecutionSensor] journal append degraded",
+                         exc_info=True)
 
     # ------------------------------------------------------------------
     # Router attachment — turning a missed decision into a deferred one
@@ -221,7 +486,7 @@ class CUExecutionSensor:
                 "reconcile deferred to next record()")
             return
         try:
-            loop.create_task(self._reconcile())
+            self._reconcile_task = loop.create_task(self._reconcile())
         except Exception:  # noqa: BLE001 — the flag still covers us
             logger.debug("[CUExecutionSensor] eager reconcile not scheduled",
                          exc_info=True)
@@ -344,6 +609,9 @@ class CUExecutionSensor:
         # a 24h window judged on arrival time would be judging the wrong thing.
         self._failure_window[sig].append(rec.timestamp)
         self._latest_by_sig[sig] = rec
+        # Durable BEFORE the decision: if this process dies between here and
+        # the emission, the next one replays the occurrence and re-decides.
+        await self._journal("f", sig, rec)
 
         now = time.time()
         count = self._live_count(sig, now)
@@ -456,6 +724,10 @@ class CUExecutionSensor:
             result = await self._router.ingest(envelope)
             self._last_emitted[signature] = time.time()
             self._total_envelopes_emitted += 1
+            # Persist the cooldown. Without this a restart re-files every
+            # pattern that had already graduated — durability manufacturing
+            # duplicate governance work is worse than the gap it closes.
+            await self._journal("e", signature)
             logger.info(
                 "[CUExecutionSensor] Envelope emitted for '%s' → %s "
                 "(count=%d%s)",
@@ -496,6 +768,10 @@ class CUExecutionSensor:
             "reconciled_emissions": self._reconciled_emissions,
             "router_attached": self._router is not None,
             "pending_reconcile": self._needs_reconcile,
+            "journal_enabled": _journal_enabled(),
+            "journal_replayed": self._journal_replayed,
+            "journal_corrupt_lines": self._journal_corrupt_lines,
+            "journal_write_failures": self._journal_write_failures,
             "active_patterns": len(self._failure_window),
             "pattern_counts": {
                 sig: len(timestamps)

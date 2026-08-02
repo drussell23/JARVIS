@@ -94,6 +94,18 @@ def _fail(goal: str = "message alice saying hi", app: str = "Messages",
     return rec
 
 
+async def _settle(sensor=None):
+    """Await the reconcile sweep.
+
+    `asyncio.sleep(0)` used to be enough — reconcile finished inside one
+    tick. It now awaits a journal write on a worker thread, so a single
+    tick returns before the emission lands. `drain()` is deterministic;
+    sleeping longer would only be flaky in a slower place.
+    """
+    s = sensor or CUExecutionSensor()
+    await s.drain()
+
+
 async def _fail_n(sensor, n: int, **kw):
     for _ in range(n):
         await sensor.record(_fail(**kw))
@@ -122,7 +134,7 @@ class TestTheRaceItself:
         await _fail_n(sensor, ces._GRADUATION_THRESHOLD)
         router = _Router()
         CUExecutionSensor(router=router)
-        await asyncio.sleep(0)
+        await _settle()
         ev = router.ingested[0]
         evidence = getattr(ev, "evidence", None) or ev["evidence"]
         assert evidence["deferred_by_boot"] is True
@@ -144,7 +156,7 @@ class TestTheRaceItself:
         await _fail_n(sensor, ces._GRADUATION_THRESHOLD - 1)
         router = _Router()
         CUExecutionSensor(router=router)
-        await asyncio.sleep(0)
+        await _settle()
         assert router.ingested == []
         await sensor.record(_fail())          # the one that qualifies
         assert len(router.ingested) == 1
@@ -159,7 +171,7 @@ class TestItCannotStorm:
         await _fail_n(sensor, 20)
         router = _Router()
         CUExecutionSensor(router=router)
-        await asyncio.sleep(0)
+        await _settle()
         assert len(router.ingested) == 1
 
     @pytest.mark.asyncio
@@ -169,7 +181,7 @@ class TestItCannotStorm:
         await _fail_n(sensor, ces._GRADUATION_THRESHOLD, app="Slack")
         router = _Router()
         CUExecutionSensor(router=router)
-        await asyncio.sleep(0)
+        await _settle()
         assert len(router.ingested) == 2
 
     @pytest.mark.asyncio
@@ -180,7 +192,7 @@ class TestItCannotStorm:
         router = _Router()
         for _ in range(4):
             CUExecutionSensor(router=router)
-            await asyncio.sleep(0)
+            await _settle()
         assert len(router.ingested) == 1
 
     @pytest.mark.asyncio
@@ -204,7 +216,7 @@ class TestTheWindowStaysHonest:
             await sensor.record(_fail(ts=old))
         router = _Router()
         CUExecutionSensor(router=router)
-        await asyncio.sleep(0)
+        await _settle()
         assert router.ingested == []
 
     @pytest.mark.asyncio
@@ -320,7 +332,7 @@ class TestDegradedPaths:
         assert s["router_attached"] is False
         assert s["deferred_emissions"] >= 1
         CUExecutionSensor(router=_Router())
-        await asyncio.sleep(0)
+        await _settle()
         s2 = sensor.get_stats()
         assert s2["router_attached"] is True
         assert s2["reconciled_emissions"] >= 1

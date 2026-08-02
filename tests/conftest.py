@@ -178,3 +178,39 @@ async def _cancel_pending_async_tasks():
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_durable_sensor_state(tmp_path, monkeypatch):
+    """Keep test runs out of the operator's real ``.jarvis/`` state.
+
+    `CUExecutionSensor` gained an append-only journal so failure evidence
+    survives a crash during governance boot. That made the sensor stateful
+    ACROSS PROCESS RUNS — which is the point, and which also means a test run
+    starting from the repo root would read and write the operator's live
+    journal.
+
+    It is not a hypothetical: the first full run after the journal landed wrote
+    29KB of synthetic failures into `.jarvis/cu_failure_journal.jsonl`, and the
+    emission cooldowns it recorded then suppressed three unrelated tests in the
+    same session. Two distinct harms — polluting real state, and one test
+    silently deciding another's outcome.
+
+    Fixed HERE rather than in the sensor: a production module that behaves
+    differently under pytest is the kind of shortcut that makes green
+    meaningless. Test isolation is the test layer's job.
+
+    PER TEST, not per session. A session-scoped journal was tried first and was
+    not enough: the spine tests all use one failure signature, so the emission
+    cooldown written by the first still silenced the rest. Durable state has to
+    be reset on the same cadence as the singleton it belongs to.
+
+    A test that sets ``JARVIS_CU_JOURNAL_PATH`` itself still wins — `monkeypatch`
+    applies in fixture order, and module-level fixtures run after this one — so
+    the durability suite can point at its own file and exercise real restarts.
+    """
+    monkeypatch.setenv(
+        "JARVIS_CU_JOURNAL_PATH",
+        str(tmp_path / "cu_journal" / "cu_failure_journal.jsonl"),
+    )
+    yield
