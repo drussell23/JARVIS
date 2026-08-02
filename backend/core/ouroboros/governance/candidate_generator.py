@@ -1956,6 +1956,18 @@ class FailureMode(Enum):
     #                             zero primary penalty, zero retry, immediate cascade.
     #                             The op's budget was too tight for any DW lane; the
     #                             NEXT op with a normal budget must still use DW.
+    LOCAL_DEFECT = auto()       # A bug in OUR code on the primary call path —
+    #                             TypeError/AttributeError/NameError/ImportError.
+    #                             NOT a provider fact at all. Every unrecognised
+    #                             exception used to land on the TIMEOUT default,
+    #                             so ONE signature drift locked DoubleWord out
+    #                             (should_attempt_primary False after a single
+    #                             occurrence) and silently billed every
+    #                             subsequent op to Claude — with the logs
+    #                             blaming an upstream that was never asked.
+    #                             Zero primary penalty; still cascades so the
+    #                             op is not dropped; logged at ERROR because
+    #                             this one is ours to fix.
 
 
 # Mode-specific recovery parameters for exponential backoff.
@@ -1983,7 +1995,55 @@ _RECOVERY_PARAMS: dict[FailureMode, dict[str, float]] = {
     # because RemoteProtocolError fell through to the TIMEOUT default and the
     # CONNECTION_ERROR-only deep-backoff guard never engaged.
     FailureMode.TRANSIENT_TRANSPORT: {"base_s": 5.0, "max_s": 30.0},
+    # LOCAL_DEFECT: our own bug, not the provider's. Zero backoff — there is
+    # nothing upstream to wait for, and waiting would only hide the defect
+    # behind an outage-shaped delay. Same zero profile as CONTENT_FAILURE.
+    FailureMode.LOCAL_DEFECT:    {"base_s": 0.0,   "max_s": 0.0},
 }
+
+
+# Failure modes where the PRIMARY IS INNOCENT — the op still cascades, but the
+# provider FSM must not be penalised for it. Named once and consulted at both
+# classify-then-record sites (the Tier 0 RT path and
+# ``_try_primary_then_fallback``), which previously kept two hand-maintained
+# copies of this list and had already drifted apart by one member.
+_PRIMARY_INNOCENT_MODES: frozenset = frozenset({
+    FailureMode.CONTENT_FAILURE,   # model produced bad output; infra healthy
+    FailureMode.TEMPORAL_SHED,     # OUR routing refusal, not a DW health fact
+    FailureMode.LOCAL_DEFECT,      # OUR bug on the call path
+})
+
+
+# Exception TYPES that can only mean a defect in this codebase, never a
+# provider condition. Matched by type — never by message — because a provider
+# is perfectly capable of returning prose containing the word "attributeerror",
+# and a string match would let an upstream error masquerade as our bug in
+# exactly the direction that hides real outages.
+#
+# Deliberately EXCLUDES the ambiguous ones. ``KeyError`` / ``IndexError`` /
+# ``ValueError`` are usually raised while parsing a provider's response, where
+# the true fault is a malformed upstream payload as often as it is our
+# indexing. Claiming those as local defects would suppress a real provider
+# penalty, so they keep the conservative TIMEOUT default until something
+# proves otherwise.
+_LOCAL_DEFECT_TYPES: tuple = (
+    TypeError,          # signature drift — the Slice 30 `model_id=` class
+    AttributeError,     # a renamed/removed attribute
+    NameError,          # includes UnboundLocalError
+    ImportError,        # includes ModuleNotFoundError
+    IndentationError,   # subclass of SyntaxError; listed for the reader
+    SyntaxError,        # a generated/exec'd fragment that will never parse
+)
+
+
+def _local_defect_classification_enabled() -> bool:
+    """Master gate. Default TRUE — failure-path-only: it changes nothing until
+    an exception that can only be our bug reaches the primary handler. ``=0``
+    restores the byte-identical legacy behaviour where such an exception was
+    classified as a provider TIMEOUT. NEVER raises."""
+    return (os.environ.get(
+        "JARVIS_LOCAL_DEFECT_CLASSIFICATION_ENABLED", "true",
+    ) or "").strip().lower() not in ("0", "false", "no", "off")
 
 
 # Exception class names that indicate transient transport-layer flap rather than
@@ -2118,6 +2178,24 @@ class FailbackStateMachine:
             compatibility with existing callers.
         """
         if self._state is FailbackState.QUEUE_ONLY:
+            return
+        # Structural backstop for the modes where the primary is innocent.
+        #
+        # Their zero-valued `_RECOVERY_PARAMS` entries LOOK like the guarantee
+        # ("no penalty"), and are not: this method sets FALLBACK_ACTIVE and
+        # increments `_consecutive_failures` for any mode it is handed, so
+        # `should_attempt_primary()` goes False after a single call even for
+        # CONTENT_FAILURE. The exemption was only ever a property of each
+        # caller remembering to branch — and one of the two callers had already
+        # forgotten TEMPORAL_SHED.
+        #
+        # Enforced here so the guarantee lives with the invariant instead of
+        # with everyone who calls it, and a third call site inherits it.
+        if mode in _PRIMARY_INNOCENT_MODES:
+            logger.debug(
+                "[FailbackFSM] %s is not a primary-health fact — "
+                "penalty refused, state unchanged", mode.name,
+            )
             return
         if self._state in (
             FailbackState.PRIMARY_READY,
@@ -2462,6 +2540,27 @@ class FailbackStateMachine:
                 # asyncio.TimeoutError because the connection layer is closer
                 # to the truth.
                 return mode
+
+        # Third pass: is this our bug rather than a provider condition?
+        #
+        # Runs LAST, deliberately. Both passes above get first refusal, so an
+        # SDK that wraps a transport flap in a TypeError still classifies as
+        # TRANSIENT_TRANSPORT — the provider layer is closer to the truth
+        # whenever it can speak at all. Only once every provider-shaped
+        # reading has declined do we conclude the fault is ours.
+        #
+        # Before this existed, the conservative TIMEOUT default was applied to
+        # exceptions that cannot possibly be a timeout, and the cost was not
+        # cosmetic: `record_primary_failure(TIMEOUT)` flips
+        # `should_attempt_primary()` to False after ONE occurrence, so a single
+        # `TypeError` on the call path took the whole DoubleWord lane offline
+        # and routed every subsequent op to Claude at ~10× the unit cost —
+        # while the logs read "Primary failed (mode=TIMEOUT)", blaming an
+        # upstream that had never been contacted.
+        if _local_defect_classification_enabled():
+            for layer in chain:
+                if isinstance(layer, _LOCAL_DEFECT_TYPES):
+                    return FailureMode.LOCAL_DEFECT
 
         # All layers landed on the conservative TIMEOUT default.
         return FailureMode.TIMEOUT
@@ -4377,13 +4476,14 @@ class CandidateGenerator:
                             mode.name, type(rt_exc).__name__, rt_exc,
                             self._remaining_seconds(deadline),
                         )
-                        if mode not in (
-                            FailureMode.CONTENT_FAILURE,
-                            # A temporal shed is OUR routing refusal, not a DW
-                            # health fact — penalizing DW here would rotate the
-                            # funded primary out because ONE op ran tight.
-                            FailureMode.TEMPORAL_SHED,
-                        ):
+                        # `_PRIMARY_INNOCENT_MODES` replaces the exemption list
+                        # that used to be spelled out here: CONTENT_FAILURE
+                        # (model produced bad output, infra healthy) and
+                        # TEMPORAL_SHED (OUR routing refusal — penalizing DW
+                        # would rotate the funded primary out because ONE op
+                        # ran tight), now joined by LOCAL_DEFECT. Two hand-kept
+                        # copies of one policy is how they drift.
+                        if mode not in _PRIMARY_INNOCENT_MODES:
                             self.fsm.record_primary_failure(mode=mode)
                             self._record_tier0_failure()
                             if self._latency_tracker is not None:
@@ -7538,12 +7638,37 @@ class CandidateGenerator:
                     )
             except Exception:
                 pass
-            logger.warning(
-                "[CandidateGenerator] Primary failed (mode=%s, %s: %s), "
-                "falling back",
-                mode.name, type(exc).__name__, exc,
-            )
-            if mode is FailureMode.CONTENT_FAILURE:
+            if mode is not FailureMode.LOCAL_DEFECT:
+                # LOCAL_DEFECT gets its own ERROR below, with the traceback.
+                # Emitting this line too would file our bug under the same
+                # "Primary failed … falling back" heading as every genuine
+                # provider blip — which is precisely how it stayed invisible.
+                logger.warning(
+                    "[CandidateGenerator] Primary failed (mode=%s, %s: %s), "
+                    "falling back",
+                    mode.name, type(exc).__name__, exc,
+                )
+            if mode is FailureMode.LOCAL_DEFECT:
+                # OUR bug, not the provider's. The op still cascades — the
+                # operator's payload is never dropped for a defect on the
+                # primary path — but the provider FSM stays untouched, because
+                # blaming DoubleWord for a TypeError is how a five-character
+                # signature drift becomes a lane-wide outage that bills to
+                # Claude until someone reads the code.
+                #
+                # ERROR, with the traceback, deliberately: the WARNING this
+                # replaces was indistinguishable from the ordinary provider
+                # noise it sat among, which is why the class survived long
+                # enough to be discovered by a unit test rather than by anyone
+                # watching production.
+                logger.error(
+                    "[CandidateGenerator] LOCAL DEFECT on the primary call "
+                    "path (%s: %s) — this is a bug in JARVIS, not a provider "
+                    "failure. Cascading so the op survives; FSM UNCHANGED so "
+                    "the primary lane is not falsely quarantined.",
+                    type(exc).__name__, exc, exc_info=True,
+                )
+            elif mode is FailureMode.CONTENT_FAILURE:
                 # Content failure: model produced bad output, but primary infra is healthy.
                 # Do NOT penalise the FSM — only count for observability.
                 self.fsm.content_failure_count += 1
@@ -7551,7 +7676,17 @@ class CandidateGenerator:
                     "[CandidateGenerator] Content failure (count=%d), FSM unchanged",
                     self.fsm.content_failure_count,
                 )
-            else:
+            # ONE predicate, consulted here and at the Tier 0 RT site. This
+            # used to be an `else` on the CONTENT_FAILURE branch, which meant
+            # TEMPORAL_SHED was exempt at the Tier 0 site and penalised HERE —
+            # so a temporal shed arriving on this path flipped the primary to
+            # FALLBACK_ACTIVE in direct contradiction of its own documented
+            # contract ("zero primary penalty ... the NEXT op with a normal
+            # budget must still use DW"). Zero recovery params do not save it:
+            # `record_primary_failure` increments `_consecutive_failures` and
+            # sets FALLBACK_ACTIVE for ANY mode, so exemption has only ever
+            # been a property of the callers remembering.
+            if mode not in _PRIMARY_INNOCENT_MODES:
                 self.fsm.record_primary_failure(mode=mode)
             # CR5 -- header-aware DW recovery. When the primary failed on a DW
             # rate-limit (429) that carried the provider's own Retry-After /
