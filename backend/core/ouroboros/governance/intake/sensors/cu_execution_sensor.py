@@ -324,6 +324,8 @@ class CUExecutionSensor:
         # are contending and duplicates are possible.
         self._claim_lock_failures = 0
         self._owner = _owner_token()
+        # Last coordination reading — what the lock we took was worth.
+        self._substrate: Optional[Any] = None
 
         # Replay BEFORE anything can record, so a pattern that graduated in the
         # previous life is already at threshold in this one.
@@ -483,6 +485,18 @@ class CUExecutionSensor:
             resolve_durable_path,
         )
         path = resolve_durable_path(_journal_path())
+        # What is a host-local lock actually worth here? `flock` excludes other
+        # PROCESSES; on a shared filesystem it does not exclude other HOSTS,
+        # and both sides succeed silently. The reading travels with the
+        # decision so a duplicate produced under a shared mount is explicable
+        # afterwards rather than a mystery.
+        try:
+            from backend.core.ouroboros.governance.coordination_substrate import (
+                cached_probe,
+            )
+            self._substrate = cached_probe(path)
+        except Exception:  # noqa: BLE001
+            self._substrate = None
         with flock_critical_section(path) as ok:
             if not ok:
                 # Another daemon holds it past the timeout. Fall back to the
@@ -911,6 +925,8 @@ class CUExecutionSensor:
             # crossed the threshold, so a postmortem can tell a slow boot from
             # a slow failure.
             "deferred_by_boot": deferred,
+            **(self._substrate.as_evidence() if self._substrate is not None
+               else {}),
             "age_s": round(max(0.0, time.time() - latest.timestamp), 2),
         }
 
@@ -982,6 +998,8 @@ class CUExecutionSensor:
             # but duplicates become possible.
             "claim_lock_failures": self._claim_lock_failures,
             "owner": self._owner,
+            "coordination": (self._substrate.guarantee.value
+                             if self._substrate is not None else "unprobed"),
             "active_patterns": len(self._failure_window),
             "pattern_counts": {
                 sig: len(timestamps)
