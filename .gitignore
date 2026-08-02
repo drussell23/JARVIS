@@ -129,6 +129,9 @@ backend/swift_bridge/*.pyc
 .ouroboros/sessions/
 .ouroboros/state/
 .ouroboros/parse_failures/
+# Voice-intent write-ahead journal — runtime replay state, regenerated
+# on every command. Same churn class as sessions/state above.
+.ouroboros/intents/
 
 # Ouroboros benchmark diagnostic outputs (contain API response bodies; copy to
 # docs/benchmarks/artifacts/ explicitly if you want to include in a report)

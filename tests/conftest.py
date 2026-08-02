@@ -213,4 +213,12 @@ def _isolate_durable_sensor_state(tmp_path, monkeypatch):
         "JARVIS_CU_JOURNAL_PATH",
         str(tmp_path / "cu_journal" / "cu_failure_journal.jsonl"),
     )
+    # The voice-intent WAL is the same hazard with a different name: it is
+    # durable, it lives under `.ouroboros/intents/`, and `unfinished()` is a
+    # replay queue — so a test run against the real path could hand the
+    # operator's next boot a queue of synthetic commands to resume.
+    monkeypatch.setenv(
+        "JARVIS_INTENT_JOURNAL_PATH",
+        str(tmp_path / "intents" / "journal.jsonl"),
+    )
     yield
