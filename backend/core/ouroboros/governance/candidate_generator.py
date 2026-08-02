@@ -627,7 +627,73 @@ _PRIMARY_MAX_TIMEOUT_S = float(
 # Minimum time worth attempting a fallback API call.  Below this threshold
 # the call will almost certainly timeout before the model finishes; skip it
 # and raise immediately to avoid burning network round-trip time.
-_MIN_VIABLE_FALLBACK_S = float(os.environ.get("OUROBOROS_MIN_VIABLE_FALLBACK_S", "10"))
+#
+# ONE AUTHORITY — `admission_gate.min_viable_call_s()`.
+#
+# This used to be an independent `OUROBOROS_MIN_VIABLE_FALLBACK_S` env read
+# defaulting to 10s, while the admission gate answered the SAME question
+# ("what is the least budget in which a Claude fallback can do useful work")
+# with `JARVIS_ADMISSION_MIN_VIABLE_CALL_S`, default 25s. Two floors for one
+# decision: the gate sheds first and is strictly tighter, so with the gate at
+# its default the 10s constant was dead as a decision boundary — the classic
+# "the tighter authority silently becomes the real budget for reasons no log
+# explains". It was not merely redundant: the gate is disableable
+# (`JARVIS_ADMISSION_GATE_ENABLED=0`), and with it off the 10s floor came back
+# to life, so the effective minimum silently changed by 15s depending on an
+# unrelated flag.
+#
+# The gate's number is authoritative because its rationale is the reasoned
+# one: 25s is where a single Venom tool round with no thinking budget can
+# land; below that we admit ops that time out at the API layer instead of at
+# the gate, defeating the gate's purpose. Its clamp floor is 10.0 — exactly
+# the old default — so the legacy value survives as the gate's own lower
+# bound rather than as a second opinion.
+#
+# Read per call (not bound at import) so an operator's flip hot-reverts
+# without a restart, matching the gate's own discipline.
+
+#: Mirrors `admission_gate.min_viable_call_s()`'s documented default. Used
+#: ONLY if that import fails — impossible in a healthy tree, since both
+#: modules ship in the same package — and set to the conservative value
+#: because admitting a doomed call is the worse failure direction.
+_MIN_VIABLE_FALLBACK_FAILSOFT_S: float = 25.0
+
+
+def _min_viable_fallback_s() -> float:
+    """The least budget in which a fallback call is worth launching.
+
+    Delegates to the admission gate so there is exactly one answer. NEVER
+    raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.admission_gate import (
+            min_viable_call_s,
+        )
+        return float(min_viable_call_s())
+    except Exception:  # noqa: BLE001
+        return _MIN_VIABLE_FALLBACK_FAILSOFT_S
+
+
+def _warn_legacy_min_viable_env_once() -> None:
+    """Tell an operator whose `OUROBOROS_MIN_VIABLE_FALLBACK_S` no longer does
+    anything. Silently ignoring it would be the same class of lie this whole
+    reconciliation removes — a number that looks like a control and is not.
+    NEVER raises."""
+    try:
+        raw = (os.environ.get("OUROBOROS_MIN_VIABLE_FALLBACK_S", "") or "").strip()
+        if raw:
+            logger.warning(
+                "[CandidateGenerator] OUROBOROS_MIN_VIABLE_FALLBACK_S=%s is "
+                "SUPERSEDED and ignored — the minimum viable fallback budget "
+                "is now JARVIS_ADMISSION_MIN_VIABLE_CALL_S (currently %.1fs), "
+                "so the gate and the retry loop cannot disagree.",
+                raw, _min_viable_fallback_s(),
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_warn_legacy_min_viable_env_once()
 
 # Guaranteed minimum window for the fallback (Claude) regardless of how much
 # parent-deadline budget Tier 0 consumed before failing. When the parent
@@ -687,16 +753,37 @@ _PLAN_FALLBACK_MAX_TIMEOUT_S = float(
 # This fix adds NO new budget — it just CONSUMES the budget already
 # authorized. Outer retry loop re-invokes the provider (head-of-queue
 # preserved by holding `_fallback_sem`) on transient failures while
-# remaining budget exceeds `_MIN_VIABLE_FALLBACK_S` and the failure
+# remaining budget exceeds `_min_viable_fallback_s()` and the failure
 # mode is in `_FALLBACK_TRANSIENT_MODES`. Cooperative cancel via
 # `OperationCancelledError` (W3(7) cancel-token) is honored immediately
 # — never retried.
-_FALLBACK_OUTER_RETRY_MAX = int(
-    os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_MAX", "3")
-)
-_FALLBACK_OUTER_RETRY_BACKOFF_S = float(
-    os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_BACKOFF_S", "1.0")
-)
+# Read per call rather than bound at import, for the same reason the
+# minimum-viable floor is: an import-bound env constant cannot be changed
+# without re-executing the module, and `importlib.reload` is not a local
+# operation. It replaces every class object the module owns while leaving the
+# `sys.modules` key intact, so any module that already did
+# ``from ... import FailureMode`` keeps a stale class and every subsequent
+# ``mode is FailureMode.X`` silently becomes False — two enums with identical
+# reprs, which is about as confusing as a failure gets.
+#
+# `test_outer_retry_cap_bounds_attempts` reloaded this module for exactly that
+# reason and never restored it, so it poisoned every later test file in the
+# same session. Per-call reads remove the need.
+def _fallback_outer_retry_max() -> int:
+    """Outer-retry attempt cap. NEVER raises."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_MAX", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _fallback_outer_retry_backoff_s() -> float:
+    """Backoff between outer-retry attempts, seconds. NEVER raises."""
+    try:
+        return max(0.0, float(
+            os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_BACKOFF_S", "1.0")))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -8862,7 +8949,7 @@ class CandidateGenerator:
                 remaining = min(_budget_target, _max_cap)
                 _refreshed = remaining > _parent_remaining + 1.0
 
-                if remaining < _MIN_VIABLE_FALLBACK_S:
+                if remaining < _min_viable_fallback_s():
                     self._raise_exhausted(
                         "fallback_budget_starved",
                         context=context,
@@ -8871,7 +8958,7 @@ class CandidateGenerator:
                         pre_sem_remaining_s=round(_pre_sem_remaining, 2),
                         parent_remaining_s=round(_parent_remaining, 2),
                         fallback_budget_s=round(remaining, 2),
-                        min_viable_fallback_s=_MIN_VIABLE_FALLBACK_S,
+                        min_viable_fallback_s=_min_viable_fallback_s(),
                     )
 
                 if _refreshed:
@@ -8897,7 +8984,7 @@ class CandidateGenerator:
                 # W3(7) Slice 2 — race against ambient cancel token (if any).
                 # Outer-retry loop (rooted-problem fix 2026-04-25): re-invoke
                 # the provider on transient failures while remaining budget
-                # exceeds `_MIN_VIABLE_FALLBACK_S`. Holds `_fallback_sem`
+                # exceeds `_min_viable_fallback_s()`. Holds `_fallback_sem`
                 # across attempts so head-of-queue position is preserved
                 # (paying the wait fee twice would penalize the op for
                 # provider flakiness — semantically incorrect).
@@ -8977,7 +9064,7 @@ class CandidateGenerator:
                 _fsm_consec_fails = getattr(
                     self.fsm, "_consecutive_failures", 0,
                 )
-                if _fsm_consec_fails > 0 and _FALLBACK_OUTER_RETRY_MAX_DEGRADED > _FALLBACK_OUTER_RETRY_MAX:
+                if _fsm_consec_fails > 0 and _FALLBACK_OUTER_RETRY_MAX_DEGRADED > _fallback_outer_retry_max():
                     _outer_max = _FALLBACK_OUTER_RETRY_MAX_DEGRADED
                     logger.info(
                         "[CandidateGenerator] Fallback outer-retry: degraded mode "
@@ -8985,11 +9072,11 @@ class CandidateGenerator:
                         "cap from %d to %d for op=%s (rooted-problem fix — failure-"
                         "rate-aware retry headroom)",
                         _fsm_consec_fails,
-                        _FALLBACK_OUTER_RETRY_MAX, _outer_max,
+                        _fallback_outer_retry_max(), _outer_max,
                         getattr(context, "op_id", "?")[:16],
                     )
                 else:
-                    _outer_max = _FALLBACK_OUTER_RETRY_MAX
+                    _outer_max = _fallback_outer_retry_max()
                 _last_inner_exc: Optional[BaseException] = None
                 # ── Slice 3C — outer-retry tool-record carryover ──
                 # Iron Gate (post-GENERATE) inspects
@@ -9010,7 +9097,7 @@ class CandidateGenerator:
                     _outer_attempt += 1
                     _attempt_t0 = time.monotonic()
                     _attempt_remaining = self._remaining_seconds(deadline)
-                    if _attempt_remaining < _MIN_VIABLE_FALLBACK_S:
+                    if _attempt_remaining < _min_viable_fallback_s():
                         # Budget exhausted — break to outer except handler
                         # which fires `fallback_budget_starved` if no prior
                         # exception, else fallback_failed with last exc.
@@ -9024,7 +9111,7 @@ class CandidateGenerator:
                             pre_sem_remaining_s=round(_pre_sem_remaining, 2),
                             parent_remaining_s=round(_attempt_remaining, 2),
                             fallback_budget_s=round(_attempt_remaining, 2),
-                            min_viable_fallback_s=_MIN_VIABLE_FALLBACK_S,
+                            min_viable_fallback_s=_min_viable_fallback_s(),
                         )
                     # Slice 89 — Build ExplorationManifest from DW's just-
                     # completed tool loop and stamp onto context BEFORE the
@@ -9411,7 +9498,7 @@ class CandidateGenerator:
                         # Budget check before backoff.
                         _attempt_elapsed = time.monotonic() - _attempt_t0
                         _budget_after = self._remaining_seconds(deadline)
-                        if _budget_after < _MIN_VIABLE_FALLBACK_S:
+                        if _budget_after < _min_viable_fallback_s():
                             raise
                         logger.info(
                             "[CandidateGenerator] Fallback outer-retry: "
@@ -9449,7 +9536,7 @@ class CandidateGenerator:
                             )
                         else:
                             _backoff = min(
-                                _FALLBACK_OUTER_RETRY_BACKOFF_S,
+                                _fallback_outer_retry_backoff_s(),
                                 max(0.1, _budget_after / 4.0),
                             )
                         await asyncio.sleep(_backoff)
