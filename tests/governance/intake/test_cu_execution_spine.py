@@ -70,15 +70,32 @@ async def test_graduation_emits_envelope_to_router(fresh_cu_sensor):
 
 
 @pytest.mark.asyncio
-async def test_no_router_logs_warning_and_drops(fresh_cu_sensor, caplog):
-    """Without a router, graduation logs a warning and does not raise."""
+async def test_no_router_defers_rather_than_drops(fresh_cu_sensor, caplog):
+    """Without a router, graduation DEFERS — it no longer drops.
+
+    This test previously asserted the defect as the contract: its name was
+    ``test_no_router_logs_warning_and_drops`` and it pinned the behaviour where
+    a qualifying pattern hit ``_emit_envelope``, found no router, logged
+    "No router wired", and discarded the emission.
+
+    That path is real in production. `main.py`'s HUD dispatch reaches this
+    sensor through ``get_cu_execution_sensor()`` (no router) while
+    `IntakeLayerService` attaches the router later in governance boot, so a HUD
+    action failing during that window lost its envelope. The emission is now
+    deferred and reconciled when the router attaches; the still-no-router case
+    is what this test now pins.
+    """
     sensor = CUExecutionSensor(router=None, repo="jarvis")
 
     for _ in range(3):
         await sensor.record(_make_failure_record())
 
+    # Nothing emitted — there is genuinely nowhere to send it yet.
     assert sensor._total_envelopes_emitted == 0
-    assert "No router wired" in caplog.text
+    # But it is recorded as owed, not forgotten.
+    assert sensor.get_stats()["deferred_emissions"] >= 1
+    assert sensor.get_stats()["pending_reconcile"] is True
+    assert "DEFERRED" in caplog.text
 
 
 @pytest.mark.asyncio
