@@ -201,15 +201,59 @@ class TestItSurvivesRealCode:
         assert "lock_screen" in reg.names()
         assert reg.iron_gate_required("lock_screen") is True
 
-    def test_everything_live_is_gated_until_annotated(self):
-        """`macos_controller` carries no per-method metadata today, so every
-        capability must currently require approval. This is the honest state,
-        and the number `unclassified()` reports is the migration's work list."""
+    def test_the_annotation_ratchet_is_CLOSED(self):
+        """THE ratchet. Every capability must be explicitly declared.
+
+        This test superseded `test_everything_live_is_gated_until_annotated`,
+        which pinned the pre-annotation state — 42 of 42 unclassified — as the
+        contract. That WAS the honest state when the registry landed with no
+        metadata to read; it stopped being honest the moment the methods were
+        annotated, and a test asserting the old number would have blocked the
+        very work it was written to motivate.
+
+        `unclassified() == 0` is the invariant from here. A new capability
+        added without an `@os_capability(...)` fails this — which is the point:
+        it defaults to APPROVAL_REQUIRED and would otherwise prompt the
+        operator forever with nobody noticing why.
+        """
         reg = CapabilityRegistry().hydrate()
         if not reg.names():
             pytest.skip("no controller on this host")
-        assert reg.stats()["safe_auto"] == 0
-        assert reg.stats()["unclassified"] == reg.stats()["capabilities"]
+        assert reg.unclassified() == [], (
+            f"undeclared capabilities: {reg.unclassified()} — annotate them "
+            f"with @os_capability(Effect.PURE|EFFECTFUL)")
+        assert reg.stats()["by_provenance"]["defaulted"] == 0
+
+    def test_the_pure_set_is_small_and_deliberate(self):
+        """Reads that must never cost the operator a prompt. Kept explicit so
+        widening it is a visible decision rather than a drift."""
+        reg = CapabilityRegistry().hydrate()
+        if not reg.names():
+            pytest.skip("no controller on this host")
+        pure = {d.name for d in reg.all() if not d.iron_gate_required}
+        assert pure == {
+            "find_installed_application", "get_system_info", "is_safe_path",
+            "list_open_applications", "search_files", "validate_command",
+        }
+
+    def test_take_screenshot_is_EFFECTFUL_because_it_writes_a_file(self):
+        """The classification that had to be READ rather than guessed.
+
+        "Screenshot" sounds like an observation; `take_screenshot` shells out
+        to `screencapture '{path}'` and puts a file on disk. Guessing from the
+        name would have made it PURE and auto-approved.
+        """
+        reg = CapabilityRegistry().hydrate()
+        if not reg.names():
+            pytest.skip("no controller on this host")
+        assert reg.iron_gate_required("take_screenshot") is True
+
+    def test_the_taxonomies_agree(self):
+        """`Effect` mirrors `intent_journal.NodeKind` by value. Two vocabularies
+        for one distinction would eventually disagree about the same method."""
+        from backend.hud.intent_journal import NodeKind
+        from backend.system_control.capability_registry import Effect
+        assert {e.value for e in Effect} == {k.value for k in NodeKind}
 
     @pytest.mark.parametrize("hostile", [None, object(), 42, "not-a-controller"])
     def test_a_hostile_target_yields_an_empty_registry_not_a_crash(self, hostile):

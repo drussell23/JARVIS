@@ -604,6 +604,22 @@ class GenerationSubagentExecutor:
         )
 
 
+def _parked_units(graph: Any) -> set:
+    """Unit ids awaiting operator consent for *graph*. NEVER raises.
+
+    Fail-OPEN: any error yields an empty set, so a broken consent queue makes
+    the scheduler behave exactly as it did before this existed rather than
+    stalling a graph it can no longer reason about.
+    """
+    try:
+        from backend.core.ouroboros.governance.autonomy.consent_pending_queue import (
+            get_consent_queue,
+        )
+        return get_consent_queue().parked_ids(getattr(graph, "graph_id", ""))
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 class SubagentScheduler:
     """Deterministic scheduler for parallel execution graphs."""
 
@@ -1097,10 +1113,23 @@ class SubagentScheduler:
         failed = set(state.failed_units) if state is not None else set()
         cancelled = set(state.cancelled_units) if state is not None else set()
         running = set(state.running_units) if state is not None else set()
+        # THE FIFTH STATE: handed to a human.
+        #
+        # A unit whose tool call suspended on operator consent is not running
+        # (nothing is executing), not completed, not failed and not cancelled —
+        # so without this it re-enters `ready` on every pass and re-asks the
+        # operator forever, while a bounded worker pool can idle behind it.
+        #
+        # Parking is expressed HERE rather than in a second traversal because
+        # the topological logic below is already correct: it only lacked a word
+        # for this condition. Dependents of a parked unit stay blocked, which is
+        # right — they depend on work that has not happened. Independent
+        # branches proceed, which is the entire claim.
+        parked = _parked_units(graph)
 
         ready: List[str] = []
         for unit in graph.units:
-            if unit.unit_id in completed | failed | cancelled | running:
+            if unit.unit_id in completed | failed | cancelled | running | parked:
                 continue
             if all(dep in completed for dep in unit.dependency_ids):
                 ready.append(unit.unit_id)

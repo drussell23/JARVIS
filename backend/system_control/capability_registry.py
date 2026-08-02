@@ -120,6 +120,38 @@ _JSON_TYPES: Dict[Any, str] = {
 }
 
 
+class Effect(str, enum.Enum):
+    """PURE observes; EFFECTFUL changes the world.
+
+    Deliberately the same two words `intent_journal.NodeKind` uses, and for the
+    same reason: a node that only reads may be replayed and auto-approved, one
+    that touched the world may be neither. Two vocabularies for one distinction
+    would guarantee they eventually disagree about the same method.
+
+    Mirrored by VALUE rather than imported — `system_control` importing
+    `hud.intent_journal` would invert the layering to share two strings.
+    `test_the_taxonomies_agree` pins them together.
+    """
+
+    PURE = "pure"
+    EFFECTFUL = "effectful"
+
+
+def os_capability(effect: "Effect", *, description: str = "") -> Callable:
+    """Declare an OS capability's effect at its definition site.
+
+    The name the annotation ratchet uses on `macos_controller`. It is a thin
+    spelling of :func:`capability` rather than a second decorator with its own
+    rules — one concept, one implementation, so a future change to how risk is
+    resolved cannot apply to half the codebase.
+    """
+    return capability(
+        reads_only=(effect is Effect.PURE),
+        mutates=(effect is Effect.EFFECTFUL),
+        description=description,
+    )
+
+
 def capability(*, mutates: Optional[bool] = None,
                reads_only: Optional[bool] = None,
                tier: Optional[str] = None,

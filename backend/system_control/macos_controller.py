@@ -18,6 +18,10 @@ import psutil
 # Import async pipeline for non-blocking operations
 from core.async_pipeline import get_async_pipeline
 
+from backend.system_control.capability_registry import (  # noqa: E402
+    Effect, os_capability,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -388,6 +392,7 @@ class MacOSController:
             f"Your screen is locked, Sir. I cannot execute {command_type} commands while locked. Would you like me to unlock your screen first?",
         )
 
+    @os_capability(Effect.EFFECTFUL)
     async def execute_applescript_pipeline(
         self, script: str, timeout: float = 10.0
     ) -> Tuple[bool, str]:
@@ -409,6 +414,7 @@ class MacOSController:
             logger.error(f"Pipeline AppleScript execution failed: {e}")
             return False, str(e)
 
+    @os_capability(Effect.EFFECTFUL)
     def execute_applescript(self, script: str) -> Tuple[bool, str]:
         """Execute AppleScript (LEGACY - synchronous fallback without pipeline)"""
         # Direct execution without pipeline to avoid timeouts
@@ -427,6 +433,7 @@ class MacOSController:
         except Exception as e:
             return False, str(e)
 
+    @os_capability(Effect.EFFECTFUL)
     async def execute_applescript_async(self, script: str, timeout: float = 10.0) -> Tuple[bool, str]:
         """Execute AppleScript asynchronously without blocking the event loop.
 
@@ -474,6 +481,7 @@ class MacOSController:
             logger.error(f"Async AppleScript execution error: {e}")
             return False, str(e)
 
+    @os_capability(Effect.EFFECTFUL)
     async def execute_shell_async(
         self, command: str, timeout: float = 30.0, safe_mode: bool = True
     ) -> Tuple[bool, str]:
@@ -549,6 +557,7 @@ class MacOSController:
             logger.error(f"[SHELL_ASYNC] Execution error: {e}")
             return False, str(e)
 
+    @os_capability(Effect.EFFECTFUL)
     async def execute_shell_pipeline(
         self, command: str, safe_mode: bool = True, timeout: float = 30.0
     ) -> Tuple[bool, str]:
@@ -580,6 +589,7 @@ class MacOSController:
             logger.error(f"Pipeline shell execution failed: {e}")
             return False, str(e)
 
+    @os_capability(Effect.EFFECTFUL)
     async def execute_shell(
         self, command: str, safe_mode: bool = True, use_pipeline: bool = False
     ) -> Tuple[bool, str]:
@@ -602,6 +612,7 @@ class MacOSController:
 
     # Application Control Methods
 
+    @os_capability(Effect.EFFECTFUL)
     async def open_application_pipeline(self, app_name: str) -> Tuple[bool, str]:
         """Open application through async pipeline — delegates to ApplicationLauncherExecutor
         for unified native app + web service resolution with agentic fallback."""
@@ -648,6 +659,7 @@ class MacOSController:
             logger.error(f"Failed to open {app_name}: {e}")
             return False, f"I'm unable to open {app_name}, Sir"
 
+    @os_capability(Effect.EFFECTFUL)
     def open_application(self, app_name: str) -> Tuple[bool, str]:
         """Open an application directly without pipeline (for system commands).
 
@@ -684,6 +696,7 @@ class MacOSController:
         # via ApplicationLauncherExecutor → PrimeRouter.
         return False, f"Couldn't find application: {app_name}"
 
+    @os_capability(Effect.EFFECTFUL)
     def close_application(self, app_name: str) -> Tuple[bool, str]:
         """Close an application gracefully"""
         # Check if screen is locked
@@ -729,6 +742,7 @@ class MacOSController:
 
         return False, f"Failed to close {app_name}: {message}"
 
+    @os_capability(Effect.EFFECTFUL)
     def switch_to_application(self, app_name: str) -> Tuple[bool, str]:
         """Switch to an already open application"""
         # Check if screen is locked
@@ -750,6 +764,7 @@ class MacOSController:
             return True, f"Switched to {app_name}"
         return False, f"Failed to switch to {app_name}: {message}"
 
+    @os_capability(Effect.PURE)
     def list_open_applications(self) -> List[str]:
         """Get list of currently open applications"""
         script = """
@@ -764,6 +779,7 @@ class MacOSController:
             return [app.strip() for app in apps if app.strip()]
         return []
 
+    @os_capability(Effect.EFFECTFUL)
     def minimize_all_windows(self) -> Tuple[bool, str]:
         """Minimize all windows"""
         script = """
@@ -773,6 +789,7 @@ class MacOSController:
         """
         return self.execute_applescript(script)
 
+    @os_capability(Effect.EFFECTFUL)
     def activate_mission_control(self) -> Tuple[bool, str]:
         """Activate Mission Control"""
         script = """
@@ -782,11 +799,13 @@ class MacOSController:
 
     # File Operations
 
+    @os_capability(Effect.PURE)
     def is_safe_path(self, path: Path) -> bool:
         """Check if a path is in a safe directory"""
         path = path.resolve()
         return any(path.is_relative_to(safe_dir) for safe_dir in self.safe_directories)
 
+    @os_capability(Effect.EFFECTFUL)
     def open_file(self, file_path: str) -> Tuple[bool, str]:
         """Open a file with its default application"""
         # Check if screen is locked
@@ -808,6 +827,7 @@ class MacOSController:
             return True, f"Opened {path.name}"
         return False, f"Failed to open file: {message}"
 
+    @os_capability(Effect.EFFECTFUL)
     def create_file(self, file_path: str, content: str = "") -> Tuple[bool, str]:
         """Create a new file"""
         # Check if screen is locked
@@ -828,6 +848,7 @@ class MacOSController:
         except Exception as e:
             return False, f"Failed to create file: {str(e)}"
 
+    @os_capability(Effect.EFFECTFUL)
     def delete_file(self, file_path: str, confirm: bool = True) -> Tuple[bool, str]:
         """Delete a file (requires confirmation)"""
         # Check if screen is locked
@@ -854,6 +875,7 @@ class MacOSController:
         except Exception as e:
             return False, f"Failed to delete file: {str(e)}"
 
+    @os_capability(Effect.PURE)
     def search_files(self, query: str, directory: Optional[str] = None) -> List[str]:
         """Search for files using Spotlight"""
         if directory:
@@ -874,6 +896,7 @@ class MacOSController:
 
     # System Settings Control
 
+    @os_capability(Effect.EFFECTFUL)
     async def set_volume_async(self, level: int) -> Tuple[bool, str]:
         """Set system volume (0-100) - ASYNC VERSION for better performance"""
         from api.jarvis_voice_api import async_osascript
@@ -886,6 +909,7 @@ class MacOSController:
             return True, f"Setting volume to {level}%"
         return False, "I couldn't adjust the volume"
 
+    @os_capability(Effect.EFFECTFUL)
     def set_volume(self, level: int) -> Tuple[bool, str]:
         """Set system volume (0-100) - LEGACY sync version"""
         level = max(0, min(100, level))
@@ -896,6 +920,7 @@ class MacOSController:
             return True, f"Setting volume to {level}%"
         return False, "I couldn't adjust the volume"
 
+    @os_capability(Effect.EFFECTFUL)
     async def mute_volume_async(self, mute: bool = True) -> Tuple[bool, str]:
         """Mute or unmute system volume - ASYNC VERSION for better performance"""
         from api.jarvis_voice_api import async_osascript
@@ -908,6 +933,7 @@ class MacOSController:
             return True, f"Volume {state}"
         return False, "Failed to change mute state"
 
+    @os_capability(Effect.EFFECTFUL)
     def mute_volume(self, mute: bool = True) -> Tuple[bool, str]:
         """Mute or unmute system volume - LEGACY sync version"""
         script = f"set volume output muted {str(mute).lower()}"
@@ -918,11 +944,13 @@ class MacOSController:
             return True, f"Volume {state}"
         return False, "Failed to change mute state"
 
+    @os_capability(Effect.EFFECTFUL)
     def adjust_brightness(self, level: float) -> Tuple[bool, str]:
         """Adjust screen brightness (0.0-1.0)"""
         # This requires additional setup with brightness control tools
         return False, "Brightness control requires additional setup"
 
+    @os_capability(Effect.EFFECTFUL)
     def toggle_wifi(self, enable: bool) -> Tuple[bool, str]:
         """Toggle WiFi on/off"""
         action = "on" if enable else "off"
@@ -932,6 +960,7 @@ class MacOSController:
             return True, f"WiFi turned {action}"
         return False, f"Failed to toggle WiFi: {message}"
 
+    @os_capability(Effect.EFFECTFUL)
     def take_screenshot(self, save_path: Optional[str] = None) -> Tuple[bool, str]:
         """Take a screenshot"""
         if save_path:
@@ -953,6 +982,7 @@ class MacOSController:
             return True, f"Screenshot saved to {path.name}"
         return False, f"Failed to take screenshot: {message}"
 
+    @os_capability(Effect.EFFECTFUL)
     def sleep_display(self) -> Tuple[bool, str]:
         """Put display to sleep"""
         success, message = self.execute_shell("pmset displaysleepnow")
@@ -961,6 +991,7 @@ class MacOSController:
             return True, "Display sleeping"
         return False, f"Failed to sleep display: {message}"
 
+    @os_capability(Effect.EFFECTFUL)
     async def click_at(self, x: int, y: int) -> Tuple[bool, str]:
         """Click at specific coordinates"""
         # Check if screen is locked
@@ -989,6 +1020,7 @@ class MacOSController:
         except Exception as e:
             return False, f"Click error: {str(e)}"
 
+    @os_capability(Effect.EFFECTFUL)
     async def click_and_hold(self, x: int, y: int, hold_duration: float = 0.2) -> Tuple[bool, str]:
         """Click and hold at specific coordinates (simulates human press-and-hold)"""
         # Check if screen is locked
@@ -1027,6 +1059,7 @@ class MacOSController:
             logger.error(f"Click and hold at {x},{y} failed: {e}")
             return False, str(e)
 
+    @os_capability(Effect.EFFECTFUL)
     async def key_press(self, key: str) -> Tuple[bool, str]:
         """Press a keyboard key"""
         try:
@@ -1061,6 +1094,7 @@ class MacOSController:
 
     # Web Integration
 
+    @os_capability(Effect.EFFECTFUL)
     def open_new_tab(
         self, browser: Optional[str] = None, url: Optional[str] = None
     ) -> Tuple[bool, str]:
@@ -1104,6 +1138,7 @@ class MacOSController:
                 return True, f"Opening new tab in {browser}"
         return False, f"Failed to open new tab: {message}"
 
+    @os_capability(Effect.EFFECTFUL)
     def type_in_browser(
         self, text: str, browser: Optional[str] = None, press_enter: bool = False
     ) -> Tuple[bool, str]:
@@ -1148,6 +1183,7 @@ class MacOSController:
                 return True, f"Typing '{text}'"
         return False, f"Failed to type: {message}"
 
+    @os_capability(Effect.EFFECTFUL)
     async def click_search_bar_async(self, browser: Optional[str] = None) -> Tuple[bool, str]:
         """Click on the browser's search/address bar (ASYNC)"""
         # Check if screen is locked
@@ -1179,6 +1215,7 @@ class MacOSController:
             return True, f"Focusing on search bar"
         return False, f"Failed to focus search bar: {message}"
 
+    @os_capability(Effect.EFFECTFUL)
     def click_search_bar(self, browser: Optional[str] = None) -> Tuple[bool, str]:
         """Click on the browser's search/address bar"""
         # Check if screen is locked
@@ -1210,6 +1247,7 @@ class MacOSController:
             return True, f"Focusing on search bar"
         return False, f"Failed to focus search bar: {message}"
 
+    @os_capability(Effect.EFFECTFUL)
     async def open_url(self, url: str, browser: Optional[str] = None, skip_lock_check: bool = False) -> Tuple[bool, str]:
         """Open URL in browser (async - non-blocking)
         
@@ -1313,6 +1351,7 @@ class MacOSController:
                     return True, f"Navigating to {domain}, Sir"
             return False, f"Failed to open URL: {message}"
 
+    @os_capability(Effect.EFFECTFUL)
     async def web_search(
         self, query: str, engine: str = "google", browser: Optional[str] = None
     ) -> Tuple[bool, str]:
@@ -1329,6 +1368,7 @@ class MacOSController:
 
     # Complex Workflows
 
+    @os_capability(Effect.EFFECTFUL)
     async def execute_workflow(self, workflow_name: str) -> Tuple[bool, str]:
         """Execute predefined workflows"""
         workflows = {
@@ -1374,6 +1414,7 @@ class MacOSController:
 
     # Utility Methods
 
+    @os_capability(Effect.PURE)
     def get_system_info(self) -> Dict[str, Any]:
         """Get system information"""
         info = {
@@ -1390,6 +1431,7 @@ class MacOSController:
 
         return info
 
+    @os_capability(Effect.PURE)
     def validate_command(self, command: str, category: CommandCategory) -> SafetyLevel:
         """Validate command safety level"""
         if category == CommandCategory.DANGEROUS:
@@ -1416,6 +1458,7 @@ class MacOSController:
 
         return SafetyLevel.CAUTION
 
+    @os_capability(Effect.PURE)
     def find_installed_application(self, partial_name: str) -> Optional[str]:
         """Find installed application by partial name"""
         # Common application directories
@@ -1436,6 +1479,7 @@ class MacOSController:
 
         return None
 
+    @os_capability(Effect.EFFECTFUL)
     async def lock_screen(
         self,
         progress_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
@@ -1592,6 +1636,7 @@ class MacOSController:
             await _progress("error", 90, f"Lock error: {e}")
             return False, f"❌ Failed to lock screen: {str(e)}"
 
+    @os_capability(Effect.EFFECTFUL)
     async def unlock_screen(self, password: Optional[str] = None) -> Tuple[bool, str]:
         """
         Unlock the macOS screen using direct async methods (avoiding full pipeline loops)
@@ -1753,6 +1798,7 @@ class MacOSController:
             logger.error(f"[UnlockScreen] Error unlocking screen: {e}")
             return False, f"Failed to unlock screen: {str(e)}"
 
+    @os_capability(Effect.EFFECTFUL)
     async def handle_command(self, command: str) -> Dict[str, Any]:
         """
         Main command handler for system commands
