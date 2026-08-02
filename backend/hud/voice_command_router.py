@@ -49,36 +49,115 @@ class VoiceCommandRouter:
         self._query = QueryExecutor(doubleword)
         self._tool_orchestrator = ToolUseOrchestrator(doubleword, narrate_fn=narrate_fn)
 
-    async def route(self, command: str, screenshot_b64: Optional[str] = None) -> CommandResult:
-        """Classify and route a voice command."""
-        logger.info("[VoiceRouter] Command: %s", command[:100])
+    async def route(self, command: str, screenshot_b64: Optional[str] = None,
+                    intent_id: Optional[str] = None) -> CommandResult:
+        """Classify and route a voice command.
 
-        # Step 1: Classify intent via 35B
-        classification = await self._classify(command)
+        WRITE-AHEAD. The raw command is journalled before anything executes, so
+        a process death mid-flight leaves the operator's sentence recoverable
+        rather than gone. Nothing else in the HUD path checkpoints — the
+        Ouroboros FSM's `.ouroboros/checkpoints` resume machinery covers the
+        governed loop, which `route()` never enters.
+
+        Classification is journalled as a PURE node: deterministic given the
+        same command, no outside effect, so a resumed intent reuses the recorded
+        category instead of paying the model again. Execution deliberately is
+        NOT — see `intent_journal`: the CU steps are type/click/drag/scroll,
+        and replaying one does not recompute a value, it sends a second
+        message.
+        """
+        logger.info("[VoiceRouter] Command: %s", command[:100])
+        _journal = None
+        try:
+            from backend.hud.intent_journal import (
+                NodeKind, get_intent_journal,
+            )
+            _journal = get_intent_journal()
+            if intent_id is None:
+                intent_id = await _journal.open_intent(
+                    command, payload={"has_screenshot": bool(screenshot_b64)})
+        except Exception:  # noqa: BLE001 — a journal never blocks a command
+            _journal = None
+
+        # Step 1: Classify intent via 35B — PURE, so a resume can reuse it.
+        classification = None
+        if _journal is not None and intent_id:
+            try:
+                _v = _journal.resume_plan(intent_id).for_node("classify")
+                if _v.result is not None and _v.action.value == "skip":
+                    classification = _v.result
+                    logger.info("[VoiceRouter] reusing journalled "
+                                "classification (no model call)")
+            except Exception:  # noqa: BLE001
+                classification = None
+        if classification is None:
+            if _journal is not None and intent_id:
+                await _journal.node_started(intent_id, "classify", NodeKind.PURE)
+            classification = await self._classify(command)
+            if _journal is not None and intent_id:
+                await _journal.node_completed(
+                    intent_id, "classify", classification, NodeKind.PURE)
         category = classification.get("category", "composite")
         needs_vision = classification.get("needs_vision", False)
         needs_tools = classification.get("needs_tools", False)
 
         logger.info("[VoiceRouter] Classified: %s (vision=%s, tools=%s)", category, needs_vision, needs_tools)
 
-        # Step 2: Route to executor
-        if category == "app_action":
-            return await self._execute_app_action(command)
-
-        if category == "navigation":
-            return await self._execute_navigation(command)
-
-        if category == "query":
-            return await self._execute_query(command, screenshot_b64)
-
-        if category == "vision_action":
-            return await self._execute_vision(command, screenshot_b64)
-
-        if category == "code_action":
-            return await self._execute_code_action(command)
-
-        # composite or unknown -> tool-use loop (397B)
-        return await self._tool_orchestrator.execute(command, screenshot_b64)
+        # Step 2: Route to executor.
+        #
+        # The dispatch is EFFECTFUL — every branch below can touch the world —
+        # so the journal records that it began and how it ended, and never
+        # offers to replay it. An interrupted dispatch resolves to CONFIRM, not
+        # to a silent second attempt.
+        if _journal is not None and intent_id:
+            try:
+                await _journal.node_started(intent_id, "dispatch",
+                                            NodeKind.EFFECTFUL)
+            except Exception:  # noqa: BLE001
+                pass
+        result: Optional[CommandResult] = None
+        try:
+            if category == "app_action":
+                result = await self._execute_app_action(command)
+            elif category == "navigation":
+                result = await self._execute_navigation(command)
+            elif category == "query":
+                result = await self._execute_query(command, screenshot_b64)
+            elif category == "vision_action":
+                result = await self._execute_vision(command, screenshot_b64)
+            elif category == "code_action":
+                result = await self._execute_code_action(command)
+            else:
+                # composite or unknown -> tool-use loop (397B)
+                result = await self._tool_orchestrator.execute(
+                    command, screenshot_b64)
+            return result
+        except Exception as exc:  # noqa: BLE001 — record, then propagate
+            if _journal is not None and intent_id:
+                try:
+                    # Record the failure and leave the intent OPEN.
+                    #
+                    # Closing here would be the natural-looking mistake: an
+                    # intent is closed when we have stopped caring about it,
+                    # and `unfinished()` is precisely the replay queue. A
+                    # first-attempt timeout that closed its own intent would
+                    # be unrecoverable — measured, when the end-to-end proof
+                    # reported `unfinished intents: 0` after a crash.
+                    # Retention bounds how long it stays open.
+                    await _journal.node_failed(intent_id, "dispatch",
+                                               repr(exc), NodeKind.EFFECTFUL)
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
+        finally:
+            if _journal is not None and intent_id and result is not None:
+                try:
+                    await _journal.node_completed(intent_id, "dispatch", None,
+                                                  NodeKind.EFFECTFUL)
+                    await _journal.close_intent(
+                        intent_id, success=bool(getattr(result, "success", True)))
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def _classify(self, command: str) -> dict:
         """Classify intent via Doubleword 35B."""
