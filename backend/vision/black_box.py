@@ -266,3 +266,76 @@ def forensic_payload(*, step_index: int, action: str, target: str,
     except Exception:  # noqa: BLE001
         return {"schema_version": BLACK_BOX_SCHEMA_VERSION,
                 "step_index": step_index, "error": "payload build failed"}
+
+
+# ---------------------------------------------------------------------------
+# The pending-confirmation store — process-global, transport-safe
+# ---------------------------------------------------------------------------
+#
+# A renderer needs a SOURCE, and the forensics are produced deep inside a step
+# executor instance that no cockpit holds a reference to. `pending_apply` solved
+# exactly this shape for the NOTIFY_APPLY countdown — a module-level store the
+# producer notes into and any surface can snapshot — so this mirrors it rather
+# than inventing a second way for a strip to find its state.
+#
+# Bounded, because an operator who ignores confirmations must not grow the
+# process without limit, and because the strip renders the newest few anyway.
+
+_PENDING_FORENSICS: List[Dict[str, Any]] = []
+
+
+def strip_enabled() -> bool:
+    """Whether the forensic strip renders at all. NEVER raises."""
+    return (os.environ.get("JARVIS_FORENSIC_STRIP_ENABLED", "true")
+            or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def max_pending() -> int:
+    """Ring bound. NEVER raises."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_FORENSIC_MAX_PENDING", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def note_forensics(payload: Optional[Dict[str, Any]]) -> None:
+    """Record a crash's black box for the surfaces to draw. NEVER raises."""
+    if not payload:
+        return
+    try:
+        _PENDING_FORENSICS.append(dict(payload))
+        while len(_PENDING_FORENSICS) > max_pending():
+            _PENDING_FORENSICS.pop(0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def resolve_forensics(step_index: Optional[int] = None) -> None:
+    """Drop a confirmation once the operator has answered it. NEVER raises."""
+    try:
+        if step_index is None:
+            _PENDING_FORENSICS.clear()
+            return
+        for i, p in enumerate(list(_PENDING_FORENSICS)):
+            if p.get("step_index") == step_index:
+                _PENDING_FORENSICS.pop(i)
+                return
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def snapshot() -> Optional[List[Dict[str, Any]]]:
+    """Pending confirmations as a transport-safe list, or None. NEVER raises.
+
+    ``None`` rather than ``[]``, for the reason `pending_apply.snapshot` gives:
+    "no confirmation is pending" and "the daemon never told us" are different
+    facts, and a client that cannot tell them apart draws the first when it
+    means the second — which here would be an operator concluding nothing
+    crashed because a bridge went quiet.
+    """
+    try:
+        if not strip_enabled():
+            return None
+        return [dict(p) for p in _PENDING_FORENSICS]
+    except Exception:  # noqa: BLE001
+        return None

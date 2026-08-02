@@ -606,6 +606,11 @@ class CUStepExecutor:
                 value=str(getattr(step, "value", "") or ""),
                 error=repr(_exc), before=_before, after=None,
             )
+            # ALSO into the process-global store, because the surfaces that
+            # draw this hold no reference to a step-executor instance. Same
+            # shape as `pending_apply.note_pending`: the producer notes, any
+            # surface snapshots.
+            _bb.note_forensics(self._bb_forensics)
             self._bb_last = None
             raise
         _after = await _bb.capture()

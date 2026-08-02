@@ -176,6 +176,27 @@ def _panic_payload(panic: Any) -> Optional[dict]:
         return None
 
 
+def daemon_forensic_rows() -> List[str]:
+    """A crashed UI step's black box, for the process the crash HAPPENED in.
+
+    The same direction of blindness this module was written about: the daemon
+    RUNS the step executor, so it is the only process that can see the machine
+    either side of a step — and until now the evidence was legible only from a
+    remote client, if at all.
+
+    ``width`` is the daemon's own terminal; the attach client passes its own,
+    because the two cockpits are not the same size and a strip laid out for the
+    wrong one wraps in a way that hides the verdict line.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.forensic_delta import rows_for
+        from backend.vision.black_box import snapshot
+        return rows_for(snapshot(), width=_terminal_width())
+    except Exception:  # noqa: BLE001
+        logger.debug("[CockpitMount] forensic rows unavailable", exc_info=True)
+        return []
+
+
 def daemon_queue_rows() -> List[str]:
     """The operator's own backlog — lines typed ahead of the organism."""
     try:
@@ -600,6 +621,10 @@ def build_daemon_mount(repl: Any = None) -> "dict":
         "pending_rows": daemon_pending_rows,
         "panic_rows": daemon_panic_rows,
         "queue_rows": daemon_queue_rows,
+        # The crashed-step confirmation. A factory, not a resolved
+        # value: unlike `search_rows` this strip CAN start empty and
+        # fill later, so it must be re-read per repaint.
+        "forensic_rows": daemon_forensic_rows,
         # Resolved (not a factory): a strip whose provider can never yield should
         # not be in the layout at all.
         "search_rows": daemon_search_rows(),

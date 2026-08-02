@@ -1628,6 +1628,43 @@ def _demo_search_rows() -> Any:
 _PENDING_AT = (20.4, 22.0)
 
 
+#: When the scripted crash lands, in demo-seconds.
+_FORENSIC_BEAT_S: float = float(
+    __import__('os').environ.get('JARVIS_DEMO_FORENSIC_BEAT_S', '14'))
+
+
+def _demo_forensic_rows(elapsed: float, width: int) -> list:
+    """The forensic strip, on a scripted beat. NEVER raises.
+
+    Renders through the SAME `forensic_delta.rows_for` both live surfaces use,
+    so the demo cannot drift into showing a layout that does not exist — the
+    rule the roster and countdown already follow.
+
+    Appears late and stays: a confirmation is a question that WAITS, unlike the
+    countdown beside it which expires. Showing it flicker would teach exactly
+    the wrong reflex.
+    """
+    try:
+        if elapsed < _FORENSIC_BEAT_S:
+            return []
+        from backend.core.ouroboros.battle_test.forensic_delta import rows_for
+        return rows_for([{
+            "step_index": 2,
+            "action": "type",
+            "target": "message body",
+            "value": "on my way",
+            "error": "TimeoutError('VLA layer stalled')",
+            "before": {"app": "Messages", "window_title": "New Message — Alice",
+                       "availability": "observed"},
+            "after": None,
+            "post_captured": False,
+            "changed": None,
+            "summary": "state change could not be determined",
+        }], width=width)
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _pending_rows(elapsed: float, width: int) -> List[str]:
     """The NOTIFY_APPLY countdown, through the REAL renderer. NEVER raises.
 
@@ -2157,6 +2194,13 @@ def scene_live(console: Any, argv: Sequence[str] = ()) -> int:
         pending_rows=lambda: _pending_rows(
             (clock() - start[0]) * speed,
             _deck_width(),
+        ),
+        # A crashed UI step's confirmation, scripted. The demo exists so an
+        # operator recognises a surface BEFORE meeting it live, and a prompt
+        # asking whether a half-applied action landed is precisely the one they
+        # should not be seeing for the first time in anger.
+        forensic_rows=lambda: _demo_forensic_rows(
+            (clock() - start[0]) * speed, _deck_width(),
         ),
     )
     try:
