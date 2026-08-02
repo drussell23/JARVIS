@@ -79,17 +79,49 @@ def test_helper_permanent_modes_not_eligible() -> None:
 def test_outer_retry_max_default_3() -> None:
     """Default outer-retry cap is 3 attempts."""
     from backend.core.ouroboros.governance.candidate_generator import (
-        _FALLBACK_OUTER_RETRY_MAX,
+        _fallback_outer_retry_max,
     )
-    assert _FALLBACK_OUTER_RETRY_MAX == 3
+    assert _fallback_outer_retry_max() == 3
 
 
 def test_outer_retry_backoff_default_1s() -> None:
     """Default backoff between attempts is 1.0s."""
     from backend.core.ouroboros.governance.candidate_generator import (
-        _FALLBACK_OUTER_RETRY_BACKOFF_S,
+        _fallback_outer_retry_backoff_s,
     )
-    assert _FALLBACK_OUTER_RETRY_BACKOFF_S == 1.0
+    assert _fallback_outer_retry_backoff_s() == 1.0
+
+
+def test_the_knobs_are_read_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Why they are functions now.
+
+    They were import-bound constants, so the only way to test a non-default
+    value was ``importlib.reload`` — which keeps the ``sys.modules`` key but
+    REPLACES every class the module owns. Any test file that had already done
+    ``from ... import FailureMode`` kept a stale class, and every later
+    ``mode is FailureMode.X`` silently became False: two enums, identical
+    reprs, no teardown, session-wide. Per-call reads make the reload
+    unnecessary.
+    """
+    from backend.core.ouroboros.governance.candidate_generator import (
+        _fallback_outer_retry_backoff_s, _fallback_outer_retry_max,
+    )
+    monkeypatch.setenv("JARVIS_FALLBACK_OUTER_RETRY_MAX", "7")
+    monkeypatch.setenv("JARVIS_FALLBACK_OUTER_RETRY_BACKOFF_S", "0.25")
+    assert _fallback_outer_retry_max() == 7
+    assert _fallback_outer_retry_backoff_s() == 0.25
+
+
+def test_a_malformed_knob_falls_back_to_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.core.ouroboros.governance.candidate_generator import (
+        _fallback_outer_retry_backoff_s, _fallback_outer_retry_max,
+    )
+    monkeypatch.setenv("JARVIS_FALLBACK_OUTER_RETRY_MAX", "not-a-number")
+    monkeypatch.setenv("JARVIS_FALLBACK_OUTER_RETRY_BACKOFF_S", "")
+    assert _fallback_outer_retry_max() == 3
+    assert _fallback_outer_retry_backoff_s() == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -251,10 +283,11 @@ async def test_outer_retry_cap_bounds_attempts(
     """If every attempt fails transient, the outer loop respects the cap.
     Default cap is 3 → exactly 3 calls before exhaustion fires."""
     monkeypatch.setenv("JARVIS_FALLBACK_OUTER_RETRY_BACKOFF_S", "0.01")  # speed test
-    # Reload module to pick up env change for the const
-    import importlib
+    # NO `importlib.reload` here any more. The backoff is read per call, so
+    # the env change lands without re-executing the module — which used to
+    # replace every class object this module owns and left every test file
+    # that ran afterwards comparing against a stale `FailureMode`.
     import backend.core.ouroboros.governance.candidate_generator as cg_module
-    importlib.reload(cg_module)
 
     call_count = {"n": 0}
 
@@ -262,7 +295,7 @@ async def test_outer_retry_cap_bounds_attempts(
         call_count["n"] += 1
         raise asyncio.TimeoutError(f"attempt {call_count['n']} failed")
 
-    # Build generator using the freshly-reloaded module
+    # Build generator against the live module (no reload — see above).
     primary = MagicMock()
     primary.health_probe = AsyncMock(return_value=False)
     primary.generate = AsyncMock(side_effect=RuntimeError("primary down"))
@@ -280,7 +313,7 @@ async def test_outer_retry_cap_bounds_attempts(
     with pytest.raises(Exception):  # eventual exhaustion
         await gen._call_fallback(ctx, deadline)
     # Default cap is 3 — verify we attempted exactly 3 times, not more
-    assert call_count["n"] == cg_module._FALLBACK_OUTER_RETRY_MAX
+    assert call_count["n"] == cg_module._fallback_outer_retry_max()
     assert call_count["n"] == 3
 
 
@@ -293,31 +326,63 @@ async def test_outer_retry_cap_bounds_attempts(
 async def test_budget_exhaustion_breaks_outer_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If remaining budget falls below `_MIN_VIABLE_FALLBACK_S` between
-    attempts, the loop breaks before launching a doomed call."""
-    from backend.core.ouroboros.governance.candidate_generator import (
-        _MIN_VIABLE_FALLBACK_S,
-    )
+    """If remaining budget falls below the minimum-viable floor between
+    attempts, the loop breaks before launching a doomed call.
 
+    The floor is now `_min_viable_fallback_s()` — a delegate to
+    `admission_gate.min_viable_call_s()`, the single authority. This test
+    previously imported a separate `_MIN_VIABLE_FALLBACK_S` constant (10s)
+    while the admission gate sheds at 25s, so the op never reached the loop
+    under test at all: 0 calls, `assert 0 >= 1`.
+
+    Its arithmetic was also wrong independently of that. `floor * 1.5` leaves
+    half a floor of headroom, and the stub burned 0.01s per attempt, so the
+    budget could never fall through the floor "after ~1 attempt" as the
+    comment claimed — with a 10s floor it would have spun to the retry cap.
+
+    And a third thing, which is why a naive re-tune still failed: after
+    acquiring `_fallback_sem`, `_call_fallback` REBINDS `deadline` to
+    ``max(parent_remaining, _FALLBACK_MIN_GUARANTEED_S)`` — a 90s floor that
+    DW cannot force Claude below. A 25s parent deadline therefore became a 90s
+    working budget ("89.6s budget remains" in the logs), so the loop's
+    budget-break could not be reached from a short parent deadline at all.
+    The guaranteed minimum is pinned down here because it is a DIFFERENT
+    mechanism from the one under test; leaving it live would mean this test
+    could only ever exercise the retry cap.
+    """
+    import backend.core.ouroboros.governance.candidate_generator as cg_mod
+
+    floor = cg_mod._min_viable_fallback_s()
+    burn_s = 2.6
     call_count = {"n": 0}
+
+    # Neutralise the post-acquire budget refresh so `deadline` stays the one
+    # this test set. Not a mock of the code under test — the refresh floor is
+    # a separate guarantee, and it is exactly what must be held still for the
+    # budget-break to be observable.
+    monkeypatch.setattr(cg_mod, "_FALLBACK_MIN_GUARANTEED_S", 1.0)
 
     async def _fb_gen(ctx, deadline):
         call_count["n"] += 1
-        # Burn most of the budget on this attempt
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(burn_s)
         raise asyncio.TimeoutError("simulated")
 
     gen = _make_generator(AsyncMock(side_effect=_fb_gen))
     ctx = _make_context()
-    # Set a deadline that will be sub-MIN_VIABLE after ~1 attempt
+    # Above the floor on entry — so the admission gate admits and the first
+    # attempt launches — by LESS than the attempt burns, so the re-check at
+    # the top of the next iteration is below the floor and breaks.
     deadline = datetime.now(tz=timezone.utc) + timedelta(
-        seconds=_MIN_VIABLE_FALLBACK_S * 1.5,
+        seconds=floor + 2.0,
     )
 
     with pytest.raises(Exception):
         await gen._call_fallback(ctx, deadline)
-    # Should NOT have hit the cap — budget exhausted earlier
+    # Exactly the claim: at least one attempt launched, and the loop broke on
+    # budget rather than spinning to the outer-retry cap.
     assert call_count["n"] >= 1
+    assert call_count["n"] < 3, (
+        f"{call_count['n']} attempts — the loop did not break on budget")
 
 
 # ---------------------------------------------------------------------------

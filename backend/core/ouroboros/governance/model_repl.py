@@ -144,6 +144,22 @@ def _claude_models() -> Tuple[str, ...]:
             continue
         if value and value not in out:
             out.append(value)
+    # The cheap tier, which the env never names. `economic_router` already
+    # resolves it — operator env first, then
+    # `cost_optimization.claude_low_cost_model` in the policy — and reusing
+    # that accessor is the difference between a catalogue and a second,
+    # quietly-disagreeing opinion about what Anthropic can be asked for.
+    # Without it the ONE model the economic failover path actually reaches
+    # was the one model an operator could not pin.
+    try:
+        from backend.core.ouroboros.governance.economic_router import (
+            economic_failover_model,
+        )
+        cheap = (economic_failover_model() or "").strip()
+        if cheap and cheap not in out:
+            out.append(cheap)
+    except Exception:  # noqa: BLE001 — a catalogue is never load-bearing
+        pass
     return tuple(out)
 
 
@@ -417,19 +433,31 @@ def dispatch_model_command(line: str) -> ModelReplDispatchResult:
                       f"[dim]— /model list shows what this policy can "
                       f"reach[/dim]"))
 
-        # THE WRITE. `model_pin_override()` reads this env var per call, so a
-        # process-local set is live for the next routing decision — no restart,
-        # no file, no second store to keep in step.
-        os.environ[PIN_ENV] = model
+        # THE WRITE, through the one interface every lane consults.
+        #
+        # This used to write the DW variable unconditionally and tell the
+        # operator that a Claude or J-Prime id was "recorded but selected by
+        # route" — an honest description of a control that did nothing. The
+        # Claude lane bound its model ONCE in `GovernedLoopConfig.from_env`,
+        # so the pin could not have taken effect before the next restart.
+        # `sovereign_override` is read per REQUEST by each lane instead.
+        from backend.core.ouroboros.governance.sovereign_override import (
+            set_pin,
+        )
+        if not set_pin(lane, model):
+            return ModelReplDispatchResult(
+                ok=False,
+                text=f"  [yellow]{lane} cannot be pinned from here[/yellow]")
         note = ""
-        if lane != "doubleword":
-            # Said plainly rather than discovered later: the Override Matrix
-            # re-ranks the DW ladder. A Claude or J-Prime id is recorded and
-            # visible, and the Claude lane is chosen by route, not by this pin.
-            note = ("\n    [dim]note: the Override Matrix re-ranks the "
-                    "DoubleWord ladder. A " + lane + " id is recorded and "
-                    "shown here, but that lane is selected by ROUTE — see "
-                    "/model help[/dim]")
+        if lane == "j-prime":
+            # The one lane a pin cannot fully own: switching the J-Prime tier
+            # PROVISIONS a VM, which is a spend action the failover controller
+            # owns. Recorded and honoured where it is read; it does not
+            # conjure a node.
+            note = ("\n    [dim]note: recorded for the J-Prime lane. "
+                    "Switching the active tier provisions a node, which the "
+                    "failover controller owns — this does not spin one "
+                    "up[/dim]")
         opened = routes_opened_by_pin()
         if opened:
             note += (f"\n    [yellow]sovereign: opens {', '.join(opened)}"

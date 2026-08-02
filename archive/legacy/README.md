@@ -103,6 +103,34 @@ collection. M10's regression spine
 (`tests/governance/test_m10_*.py` — 173 tests) is the canonical
 successor.
 
+### `test_adaptive_graduation_2026_04_06.py`, `test_rsi_convergence_integration_2026_04_06.py`, `test_phase0_integration_2026_04_06.py`, `test_sandbox_loop_2026_04_06.py`
+
+**Original location**: `tests/test_ouroboros_governance/`
+
+**Salvaged date**: 2026-08-01 (completing the 2026-05-04 archival)
+
+**What they were**: 24 tests across 4 files — the Bayesian
+`AdaptiveThresholdResult` maths, `EphemeralUsageTracker` RSI
+convergence, the Phase 0 `sandbox_loop` pipeline (production-files-
+unchanged, supervisor-blocked, contract gate, deterministic replay),
+and its ledger/comm-phase assertions.
+
+**Why archived**: they import `AdaptiveThresholdResult` /
+`EphemeralUsageTracker` from `graduation_orchestrator` and a
+`sandbox_loop` module — all archived or removed on 2026-05-04 by the
+commit that created this directory. That commit moved
+`test_graduation_orchestrator_2026_04_06.py` here but left these four
+behind, so they had been raising **collection errors** in
+`tests/test_ouroboros_governance/` ever since: four permanently-red
+entries that could never pass and that no amount of failover work
+would fix.
+
+Their subjects are covered by the successor spines — M10's
+`tests/governance/test_m10_*.py` for graduation, and the current
+`autonomous_graduation_engine` / `*_graduation_contract` suites. No
+coverage is lost by archiving them; what is regained is a test board
+whose reds mean something.
+
 ---
 
 ## Architectural Note

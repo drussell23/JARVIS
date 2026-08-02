@@ -6799,7 +6799,11 @@ class ClaudeProvider:
         base_url: Optional[str] = None,
     ) -> None:
         self._api_key = api_key
-        self._model = model
+        # The CONFIGURED model. `_model` below is a property so a sovereign
+        # pin is consulted per request instead of at construction — see its
+        # docstring for why the boot-time binding made `/model` a no-op on the
+        # Claude lane.
+        self._configured_model = model
         # Anthropic-dialect endpoint override, resolved at the instantiation
         # boundary (LongCat resilience-lane Phase 1 — the seam the backlog
         # stub's Mandate 1 names). ``None`` (default) = byte-identical legacy
@@ -6921,6 +6925,35 @@ class ClaudeProvider:
         # matches the "env doesn't change mid-process" assumption.
         _stats["enabled"] = self._prompt_cache_enabled
         _stats["min_chars"] = self._prompt_cache_min_chars
+
+    @property
+    def _model(self) -> str:
+        """The model this request will name — CONFIGURED, unless pinned.
+
+        Read per call, deliberately. `GovernedLoopConfig.from_env` binds
+        `claude_model` ONCE at boot, so ``/model claude-opus-5`` on a running
+        daemon set an environment variable nothing would read again until the
+        next restart: a control that reported success and changed nothing.
+
+        A property rather than five edits at the five request-building sites
+        that already say ``self._model`` — one seam cannot drift out of step
+        with itself, and a sixth site added tomorrow inherits the behaviour
+        instead of being the one that forgot.
+
+        Deliberately read-only: there is exactly one assignment
+        (``self._configured_model`` in ``__init__``), so a setter would only
+        ever serve a future write that wants to bypass the pin.
+
+        Fail-soft to the configured value — an unreadable override must never
+        cost the lane its model.
+        """
+        try:
+            from backend.core.ouroboros.governance.sovereign_override import (
+                pinned_for,
+            )
+            return pinned_for("claude") or self._configured_model
+        except Exception:  # noqa: BLE001
+            return self._configured_model
 
     # ------------------------------------------------------------------
     # Hoisted state accessors (Phase 1 Step 3B)

@@ -627,7 +627,73 @@ _PRIMARY_MAX_TIMEOUT_S = float(
 # Minimum time worth attempting a fallback API call.  Below this threshold
 # the call will almost certainly timeout before the model finishes; skip it
 # and raise immediately to avoid burning network round-trip time.
-_MIN_VIABLE_FALLBACK_S = float(os.environ.get("OUROBOROS_MIN_VIABLE_FALLBACK_S", "10"))
+#
+# ONE AUTHORITY — `admission_gate.min_viable_call_s()`.
+#
+# This used to be an independent `OUROBOROS_MIN_VIABLE_FALLBACK_S` env read
+# defaulting to 10s, while the admission gate answered the SAME question
+# ("what is the least budget in which a Claude fallback can do useful work")
+# with `JARVIS_ADMISSION_MIN_VIABLE_CALL_S`, default 25s. Two floors for one
+# decision: the gate sheds first and is strictly tighter, so with the gate at
+# its default the 10s constant was dead as a decision boundary — the classic
+# "the tighter authority silently becomes the real budget for reasons no log
+# explains". It was not merely redundant: the gate is disableable
+# (`JARVIS_ADMISSION_GATE_ENABLED=0`), and with it off the 10s floor came back
+# to life, so the effective minimum silently changed by 15s depending on an
+# unrelated flag.
+#
+# The gate's number is authoritative because its rationale is the reasoned
+# one: 25s is where a single Venom tool round with no thinking budget can
+# land; below that we admit ops that time out at the API layer instead of at
+# the gate, defeating the gate's purpose. Its clamp floor is 10.0 — exactly
+# the old default — so the legacy value survives as the gate's own lower
+# bound rather than as a second opinion.
+#
+# Read per call (not bound at import) so an operator's flip hot-reverts
+# without a restart, matching the gate's own discipline.
+
+#: Mirrors `admission_gate.min_viable_call_s()`'s documented default. Used
+#: ONLY if that import fails — impossible in a healthy tree, since both
+#: modules ship in the same package — and set to the conservative value
+#: because admitting a doomed call is the worse failure direction.
+_MIN_VIABLE_FALLBACK_FAILSOFT_S: float = 25.0
+
+
+def _min_viable_fallback_s() -> float:
+    """The least budget in which a fallback call is worth launching.
+
+    Delegates to the admission gate so there is exactly one answer. NEVER
+    raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.admission_gate import (
+            min_viable_call_s,
+        )
+        return float(min_viable_call_s())
+    except Exception:  # noqa: BLE001
+        return _MIN_VIABLE_FALLBACK_FAILSOFT_S
+
+
+def _warn_legacy_min_viable_env_once() -> None:
+    """Tell an operator whose `OUROBOROS_MIN_VIABLE_FALLBACK_S` no longer does
+    anything. Silently ignoring it would be the same class of lie this whole
+    reconciliation removes — a number that looks like a control and is not.
+    NEVER raises."""
+    try:
+        raw = (os.environ.get("OUROBOROS_MIN_VIABLE_FALLBACK_S", "") or "").strip()
+        if raw:
+            logger.warning(
+                "[CandidateGenerator] OUROBOROS_MIN_VIABLE_FALLBACK_S=%s is "
+                "SUPERSEDED and ignored — the minimum viable fallback budget "
+                "is now JARVIS_ADMISSION_MIN_VIABLE_CALL_S (currently %.1fs), "
+                "so the gate and the retry loop cannot disagree.",
+                raw, _min_viable_fallback_s(),
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_warn_legacy_min_viable_env_once()
 
 # Guaranteed minimum window for the fallback (Claude) regardless of how much
 # parent-deadline budget Tier 0 consumed before failing. When the parent
@@ -687,16 +753,37 @@ _PLAN_FALLBACK_MAX_TIMEOUT_S = float(
 # This fix adds NO new budget — it just CONSUMES the budget already
 # authorized. Outer retry loop re-invokes the provider (head-of-queue
 # preserved by holding `_fallback_sem`) on transient failures while
-# remaining budget exceeds `_MIN_VIABLE_FALLBACK_S` and the failure
+# remaining budget exceeds `_min_viable_fallback_s()` and the failure
 # mode is in `_FALLBACK_TRANSIENT_MODES`. Cooperative cancel via
 # `OperationCancelledError` (W3(7) cancel-token) is honored immediately
 # — never retried.
-_FALLBACK_OUTER_RETRY_MAX = int(
-    os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_MAX", "3")
-)
-_FALLBACK_OUTER_RETRY_BACKOFF_S = float(
-    os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_BACKOFF_S", "1.0")
-)
+# Read per call rather than bound at import, for the same reason the
+# minimum-viable floor is: an import-bound env constant cannot be changed
+# without re-executing the module, and `importlib.reload` is not a local
+# operation. It replaces every class object the module owns while leaving the
+# `sys.modules` key intact, so any module that already did
+# ``from ... import FailureMode`` keeps a stale class and every subsequent
+# ``mode is FailureMode.X`` silently becomes False — two enums with identical
+# reprs, which is about as confusing as a failure gets.
+#
+# `test_outer_retry_cap_bounds_attempts` reloaded this module for exactly that
+# reason and never restored it, so it poisoned every later test file in the
+# same session. Per-call reads remove the need.
+def _fallback_outer_retry_max() -> int:
+    """Outer-retry attempt cap. NEVER raises."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_MAX", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _fallback_outer_retry_backoff_s() -> float:
+    """Backoff between outer-retry attempts, seconds. NEVER raises."""
+    try:
+        return max(0.0, float(
+            os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_BACKOFF_S", "1.0")))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -1956,6 +2043,18 @@ class FailureMode(Enum):
     #                             zero primary penalty, zero retry, immediate cascade.
     #                             The op's budget was too tight for any DW lane; the
     #                             NEXT op with a normal budget must still use DW.
+    LOCAL_DEFECT = auto()       # A bug in OUR code on the primary call path —
+    #                             TypeError/AttributeError/NameError/ImportError.
+    #                             NOT a provider fact at all. Every unrecognised
+    #                             exception used to land on the TIMEOUT default,
+    #                             so ONE signature drift locked DoubleWord out
+    #                             (should_attempt_primary False after a single
+    #                             occurrence) and silently billed every
+    #                             subsequent op to Claude — with the logs
+    #                             blaming an upstream that was never asked.
+    #                             Zero primary penalty; still cascades so the
+    #                             op is not dropped; logged at ERROR because
+    #                             this one is ours to fix.
 
 
 # Mode-specific recovery parameters for exponential backoff.
@@ -1983,7 +2082,55 @@ _RECOVERY_PARAMS: dict[FailureMode, dict[str, float]] = {
     # because RemoteProtocolError fell through to the TIMEOUT default and the
     # CONNECTION_ERROR-only deep-backoff guard never engaged.
     FailureMode.TRANSIENT_TRANSPORT: {"base_s": 5.0, "max_s": 30.0},
+    # LOCAL_DEFECT: our own bug, not the provider's. Zero backoff — there is
+    # nothing upstream to wait for, and waiting would only hide the defect
+    # behind an outage-shaped delay. Same zero profile as CONTENT_FAILURE.
+    FailureMode.LOCAL_DEFECT:    {"base_s": 0.0,   "max_s": 0.0},
 }
+
+
+# Failure modes where the PRIMARY IS INNOCENT — the op still cascades, but the
+# provider FSM must not be penalised for it. Named once and consulted at both
+# classify-then-record sites (the Tier 0 RT path and
+# ``_try_primary_then_fallback``), which previously kept two hand-maintained
+# copies of this list and had already drifted apart by one member.
+_PRIMARY_INNOCENT_MODES: frozenset = frozenset({
+    FailureMode.CONTENT_FAILURE,   # model produced bad output; infra healthy
+    FailureMode.TEMPORAL_SHED,     # OUR routing refusal, not a DW health fact
+    FailureMode.LOCAL_DEFECT,      # OUR bug on the call path
+})
+
+
+# Exception TYPES that can only mean a defect in this codebase, never a
+# provider condition. Matched by type — never by message — because a provider
+# is perfectly capable of returning prose containing the word "attributeerror",
+# and a string match would let an upstream error masquerade as our bug in
+# exactly the direction that hides real outages.
+#
+# Deliberately EXCLUDES the ambiguous ones. ``KeyError`` / ``IndexError`` /
+# ``ValueError`` are usually raised while parsing a provider's response, where
+# the true fault is a malformed upstream payload as often as it is our
+# indexing. Claiming those as local defects would suppress a real provider
+# penalty, so they keep the conservative TIMEOUT default until something
+# proves otherwise.
+_LOCAL_DEFECT_TYPES: tuple = (
+    TypeError,          # signature drift — the Slice 30 `model_id=` class
+    AttributeError,     # a renamed/removed attribute
+    NameError,          # includes UnboundLocalError
+    ImportError,        # includes ModuleNotFoundError
+    IndentationError,   # subclass of SyntaxError; listed for the reader
+    SyntaxError,        # a generated/exec'd fragment that will never parse
+)
+
+
+def _local_defect_classification_enabled() -> bool:
+    """Master gate. Default TRUE — failure-path-only: it changes nothing until
+    an exception that can only be our bug reaches the primary handler. ``=0``
+    restores the byte-identical legacy behaviour where such an exception was
+    classified as a provider TIMEOUT. NEVER raises."""
+    return (os.environ.get(
+        "JARVIS_LOCAL_DEFECT_CLASSIFICATION_ENABLED", "true",
+    ) or "").strip().lower() not in ("0", "false", "no", "off")
 
 
 # Exception class names that indicate transient transport-layer flap rather than
@@ -2118,6 +2265,24 @@ class FailbackStateMachine:
             compatibility with existing callers.
         """
         if self._state is FailbackState.QUEUE_ONLY:
+            return
+        # Structural backstop for the modes where the primary is innocent.
+        #
+        # Their zero-valued `_RECOVERY_PARAMS` entries LOOK like the guarantee
+        # ("no penalty"), and are not: this method sets FALLBACK_ACTIVE and
+        # increments `_consecutive_failures` for any mode it is handed, so
+        # `should_attempt_primary()` goes False after a single call even for
+        # CONTENT_FAILURE. The exemption was only ever a property of each
+        # caller remembering to branch — and one of the two callers had already
+        # forgotten TEMPORAL_SHED.
+        #
+        # Enforced here so the guarantee lives with the invariant instead of
+        # with everyone who calls it, and a third call site inherits it.
+        if mode in _PRIMARY_INNOCENT_MODES:
+            logger.debug(
+                "[FailbackFSM] %s is not a primary-health fact — "
+                "penalty refused, state unchanged", mode.name,
+            )
             return
         if self._state in (
             FailbackState.PRIMARY_READY,
@@ -2462,6 +2627,27 @@ class FailbackStateMachine:
                 # asyncio.TimeoutError because the connection layer is closer
                 # to the truth.
                 return mode
+
+        # Third pass: is this our bug rather than a provider condition?
+        #
+        # Runs LAST, deliberately. Both passes above get first refusal, so an
+        # SDK that wraps a transport flap in a TypeError still classifies as
+        # TRANSIENT_TRANSPORT — the provider layer is closer to the truth
+        # whenever it can speak at all. Only once every provider-shaped
+        # reading has declined do we conclude the fault is ours.
+        #
+        # Before this existed, the conservative TIMEOUT default was applied to
+        # exceptions that cannot possibly be a timeout, and the cost was not
+        # cosmetic: `record_primary_failure(TIMEOUT)` flips
+        # `should_attempt_primary()` to False after ONE occurrence, so a single
+        # `TypeError` on the call path took the whole DoubleWord lane offline
+        # and routed every subsequent op to Claude at ~10× the unit cost —
+        # while the logs read "Primary failed (mode=TIMEOUT)", blaming an
+        # upstream that had never been contacted.
+        if _local_defect_classification_enabled():
+            for layer in chain:
+                if isinstance(layer, _LOCAL_DEFECT_TYPES):
+                    return FailureMode.LOCAL_DEFECT
 
         # All layers landed on the conservative TIMEOUT default.
         return FailureMode.TIMEOUT
@@ -4377,13 +4563,14 @@ class CandidateGenerator:
                             mode.name, type(rt_exc).__name__, rt_exc,
                             self._remaining_seconds(deadline),
                         )
-                        if mode not in (
-                            FailureMode.CONTENT_FAILURE,
-                            # A temporal shed is OUR routing refusal, not a DW
-                            # health fact — penalizing DW here would rotate the
-                            # funded primary out because ONE op ran tight.
-                            FailureMode.TEMPORAL_SHED,
-                        ):
+                        # `_PRIMARY_INNOCENT_MODES` replaces the exemption list
+                        # that used to be spelled out here: CONTENT_FAILURE
+                        # (model produced bad output, infra healthy) and
+                        # TEMPORAL_SHED (OUR routing refusal — penalizing DW
+                        # would rotate the funded primary out because ONE op
+                        # ran tight), now joined by LOCAL_DEFECT. Two hand-kept
+                        # copies of one policy is how they drift.
+                        if mode not in _PRIMARY_INNOCENT_MODES:
                             self.fsm.record_primary_failure(mode=mode)
                             self._record_tier0_failure()
                             if self._latency_tracker is not None:
@@ -7538,12 +7725,37 @@ class CandidateGenerator:
                     )
             except Exception:
                 pass
-            logger.warning(
-                "[CandidateGenerator] Primary failed (mode=%s, %s: %s), "
-                "falling back",
-                mode.name, type(exc).__name__, exc,
-            )
-            if mode is FailureMode.CONTENT_FAILURE:
+            if mode is not FailureMode.LOCAL_DEFECT:
+                # LOCAL_DEFECT gets its own ERROR below, with the traceback.
+                # Emitting this line too would file our bug under the same
+                # "Primary failed … falling back" heading as every genuine
+                # provider blip — which is precisely how it stayed invisible.
+                logger.warning(
+                    "[CandidateGenerator] Primary failed (mode=%s, %s: %s), "
+                    "falling back",
+                    mode.name, type(exc).__name__, exc,
+                )
+            if mode is FailureMode.LOCAL_DEFECT:
+                # OUR bug, not the provider's. The op still cascades — the
+                # operator's payload is never dropped for a defect on the
+                # primary path — but the provider FSM stays untouched, because
+                # blaming DoubleWord for a TypeError is how a five-character
+                # signature drift becomes a lane-wide outage that bills to
+                # Claude until someone reads the code.
+                #
+                # ERROR, with the traceback, deliberately: the WARNING this
+                # replaces was indistinguishable from the ordinary provider
+                # noise it sat among, which is why the class survived long
+                # enough to be discovered by a unit test rather than by anyone
+                # watching production.
+                logger.error(
+                    "[CandidateGenerator] LOCAL DEFECT on the primary call "
+                    "path (%s: %s) — this is a bug in JARVIS, not a provider "
+                    "failure. Cascading so the op survives; FSM UNCHANGED so "
+                    "the primary lane is not falsely quarantined.",
+                    type(exc).__name__, exc, exc_info=True,
+                )
+            elif mode is FailureMode.CONTENT_FAILURE:
                 # Content failure: model produced bad output, but primary infra is healthy.
                 # Do NOT penalise the FSM — only count for observability.
                 self.fsm.content_failure_count += 1
@@ -7551,7 +7763,17 @@ class CandidateGenerator:
                     "[CandidateGenerator] Content failure (count=%d), FSM unchanged",
                     self.fsm.content_failure_count,
                 )
-            else:
+            # ONE predicate, consulted here and at the Tier 0 RT site. This
+            # used to be an `else` on the CONTENT_FAILURE branch, which meant
+            # TEMPORAL_SHED was exempt at the Tier 0 site and penalised HERE —
+            # so a temporal shed arriving on this path flipped the primary to
+            # FALLBACK_ACTIVE in direct contradiction of its own documented
+            # contract ("zero primary penalty ... the NEXT op with a normal
+            # budget must still use DW"). Zero recovery params do not save it:
+            # `record_primary_failure` increments `_consecutive_failures` and
+            # sets FALLBACK_ACTIVE for ANY mode, so exemption has only ever
+            # been a property of the callers remembering.
+            if mode not in _PRIMARY_INNOCENT_MODES:
                 self.fsm.record_primary_failure(mode=mode)
             # CR5 -- header-aware DW recovery. When the primary failed on a DW
             # rate-limit (429) that carried the provider's own Retry-After /
@@ -8727,7 +8949,7 @@ class CandidateGenerator:
                 remaining = min(_budget_target, _max_cap)
                 _refreshed = remaining > _parent_remaining + 1.0
 
-                if remaining < _MIN_VIABLE_FALLBACK_S:
+                if remaining < _min_viable_fallback_s():
                     self._raise_exhausted(
                         "fallback_budget_starved",
                         context=context,
@@ -8736,7 +8958,7 @@ class CandidateGenerator:
                         pre_sem_remaining_s=round(_pre_sem_remaining, 2),
                         parent_remaining_s=round(_parent_remaining, 2),
                         fallback_budget_s=round(remaining, 2),
-                        min_viable_fallback_s=_MIN_VIABLE_FALLBACK_S,
+                        min_viable_fallback_s=_min_viable_fallback_s(),
                     )
 
                 if _refreshed:
@@ -8762,7 +8984,7 @@ class CandidateGenerator:
                 # W3(7) Slice 2 — race against ambient cancel token (if any).
                 # Outer-retry loop (rooted-problem fix 2026-04-25): re-invoke
                 # the provider on transient failures while remaining budget
-                # exceeds `_MIN_VIABLE_FALLBACK_S`. Holds `_fallback_sem`
+                # exceeds `_min_viable_fallback_s()`. Holds `_fallback_sem`
                 # across attempts so head-of-queue position is preserved
                 # (paying the wait fee twice would penalize the op for
                 # provider flakiness — semantically incorrect).
@@ -8842,7 +9064,7 @@ class CandidateGenerator:
                 _fsm_consec_fails = getattr(
                     self.fsm, "_consecutive_failures", 0,
                 )
-                if _fsm_consec_fails > 0 and _FALLBACK_OUTER_RETRY_MAX_DEGRADED > _FALLBACK_OUTER_RETRY_MAX:
+                if _fsm_consec_fails > 0 and _FALLBACK_OUTER_RETRY_MAX_DEGRADED > _fallback_outer_retry_max():
                     _outer_max = _FALLBACK_OUTER_RETRY_MAX_DEGRADED
                     logger.info(
                         "[CandidateGenerator] Fallback outer-retry: degraded mode "
@@ -8850,11 +9072,11 @@ class CandidateGenerator:
                         "cap from %d to %d for op=%s (rooted-problem fix — failure-"
                         "rate-aware retry headroom)",
                         _fsm_consec_fails,
-                        _FALLBACK_OUTER_RETRY_MAX, _outer_max,
+                        _fallback_outer_retry_max(), _outer_max,
                         getattr(context, "op_id", "?")[:16],
                     )
                 else:
-                    _outer_max = _FALLBACK_OUTER_RETRY_MAX
+                    _outer_max = _fallback_outer_retry_max()
                 _last_inner_exc: Optional[BaseException] = None
                 # ── Slice 3C — outer-retry tool-record carryover ──
                 # Iron Gate (post-GENERATE) inspects
@@ -8875,7 +9097,7 @@ class CandidateGenerator:
                     _outer_attempt += 1
                     _attempt_t0 = time.monotonic()
                     _attempt_remaining = self._remaining_seconds(deadline)
-                    if _attempt_remaining < _MIN_VIABLE_FALLBACK_S:
+                    if _attempt_remaining < _min_viable_fallback_s():
                         # Budget exhausted — break to outer except handler
                         # which fires `fallback_budget_starved` if no prior
                         # exception, else fallback_failed with last exc.
@@ -8889,7 +9111,7 @@ class CandidateGenerator:
                             pre_sem_remaining_s=round(_pre_sem_remaining, 2),
                             parent_remaining_s=round(_attempt_remaining, 2),
                             fallback_budget_s=round(_attempt_remaining, 2),
-                            min_viable_fallback_s=_MIN_VIABLE_FALLBACK_S,
+                            min_viable_fallback_s=_min_viable_fallback_s(),
                         )
                     # Slice 89 — Build ExplorationManifest from DW's just-
                     # completed tool loop and stamp onto context BEFORE the
@@ -9276,7 +9498,7 @@ class CandidateGenerator:
                         # Budget check before backoff.
                         _attempt_elapsed = time.monotonic() - _attempt_t0
                         _budget_after = self._remaining_seconds(deadline)
-                        if _budget_after < _MIN_VIABLE_FALLBACK_S:
+                        if _budget_after < _min_viable_fallback_s():
                             raise
                         logger.info(
                             "[CandidateGenerator] Fallback outer-retry: "
@@ -9314,7 +9536,7 @@ class CandidateGenerator:
                             )
                         else:
                             _backoff = min(
-                                _FALLBACK_OUTER_RETRY_BACKOFF_S,
+                                _fallback_outer_retry_backoff_s(),
                                 max(0.1, _budget_after / 4.0),
                             )
                         await asyncio.sleep(_backoff)

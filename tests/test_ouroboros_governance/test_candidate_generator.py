@@ -1426,9 +1426,14 @@ class TestExhaustionInstrumentation:
         """Depleted parent budget → cause=fallback_budget_starved with
         sem_wait_s, parent_remaining_s, and fallback_budget_s.
 
-        To force the ``remaining < _MIN_VIABLE_FALLBACK_S`` branch we
-        monkey-patch the module constants — guarantees the test triggers
+        To force the ``remaining < _min_viable_fallback_s()`` branch we
+        monkey-patch the module surface — guarantees the test triggers
         the budget-starved raise instead of the sem-wait-refresh path.
+
+        The floor became a FUNCTION delegating to
+        ``admission_gate.min_viable_call_s()`` when the two competing
+        minimum-viable-budget constants were reconciled onto that single
+        authority, so it is patched as a callable rather than a value.
         """
         from backend.core.ouroboros.governance import candidate_generator as cg
 
@@ -1443,7 +1448,7 @@ class TestExhaustionInstrumentation:
         caplog.set_level("ERROR")
         with (
             patch.object(cg, "_FALLBACK_MIN_GUARANTEED_S", 0.5),
-            patch.object(cg, "_MIN_VIABLE_FALLBACK_S", 100.0),
+            patch.object(cg, "_min_viable_fallback_s", lambda: 100.0),
             patch.object(CandidateGenerator, "_FALLBACK_MAX_TIMEOUT_S", 0.5),
         ):
             with pytest.raises(RuntimeError, match="all_providers_exhausted") as ei:

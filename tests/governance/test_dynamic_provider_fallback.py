@@ -170,17 +170,31 @@ async def test_dispatch_skips_primary_when_in_backoff(monkeypatch):
         FailbackStateMachine,
     )
     cg.fsm = FailbackStateMachine()
+    # The backoff branch consults `self._fallback` to decide whether Sovereign
+    # Autarky Backoff-Wait applies (2026-06-20: in DW-only mode there is no
+    # fallback, so waiting out a transient backoff beats a guaranteed
+    # fallback_skipped). A non-None value means "a fallback exists", which is
+    # this test's premise — it asserts the op ROUTES to that fallback. Left
+    # unset, the attribute lookup raised AttributeError from inside the branch
+    # under test, so the fixture, not the code, was deciding the outcome.
+    cg._fallback = object()
 
     primary_calls = []
     fallback_calls = []
 
-    async def stub_primary(ctx, deadline):
+    # `model_id=` was added to the production signature by Slice 30
+    # ("explicit model_id propagation, no ContextVar magic"). A stub that does
+    # not accept it raises TypeError INSIDE the try, which the handler used to
+    # classify as a provider TIMEOUT — so this test failed while reporting a
+    # DoubleWord outage that never happened. **kwargs keeps the stub honest
+    # against future keyword-only additions without re-pinning the signature.
+    async def stub_primary(ctx, deadline, **_kw):
         primary_calls.append(ctx)
         class _R:
             pass
         return _R()
 
-    async def stub_fallback(ctx, deadline):
+    async def stub_fallback(ctx, deadline, **_kw):
         fallback_calls.append(ctx)
         class _R:
             pass
@@ -225,13 +239,19 @@ async def test_dispatch_attempts_primary_when_healthy():
 
     primary_calls = []
 
-    async def stub_primary(ctx, deadline):
+    # `model_id=` was added to the production signature by Slice 30
+    # ("explicit model_id propagation, no ContextVar magic"). A stub that does
+    # not accept it raises TypeError INSIDE the try, which the handler used to
+    # classify as a provider TIMEOUT — so this test failed while reporting a
+    # DoubleWord outage that never happened. **kwargs keeps the stub honest
+    # against future keyword-only additions without re-pinning the signature.
+    async def stub_primary(ctx, deadline, **_kw):
         primary_calls.append(ctx)
         class _R:
             pass
         return _R()
 
-    async def stub_fallback(ctx, deadline):
+    async def stub_fallback(ctx, deadline, **_kw):
         raise AssertionError("fallback called when primary should be tried")
 
     cg._call_primary = stub_primary  # type: ignore[method-assign]
