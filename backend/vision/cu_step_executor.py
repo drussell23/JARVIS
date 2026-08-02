@@ -42,6 +42,15 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+def _bb_enabled() -> bool:
+    """Black-box capture gate, read per call. NEVER raises."""
+    try:
+        from backend.vision.black_box import enabled
+        return enabled()
+    except Exception:  # noqa: BLE001
+        return False
+
 # ---------------------------------------------------------------------------
 # Env-driven config (Manifesto: no hardcoding)
 # ---------------------------------------------------------------------------
@@ -552,7 +561,72 @@ class CUStepExecutor:
             logger.warning("[CUExec] SHM read failed: %s", exc)
             return None
 
+    #: Actions that touch the world. `wait` is the only one that does not, so
+    #: it needs no black box and no CONFIRM on resume — everything else can
+    #: leave the machine changed, which is exactly what makes a blind replay
+    #: unsafe and a forensic record necessary.
+    _EFFECTFUL_ACTIONS = frozenset({
+        "click", "double_click", "right_click", "type", "key", "hotkey",
+        "scroll", "drag", "move",
+    })
+
     async def execute_step(
+        self,
+        step: Any,  # CUStep
+        frame: Optional[np.ndarray] = None,
+        step_index: int = 0,
+    ) -> StepResult:
+        """Execute a single step, keeping a black box around world-touching ones.
+
+        THE WRAPPER, not a rewrite. The cascade below is untouched; this adds a
+        bounded pre/post snapshot so that when a step dies mid-flight the
+        operator's CONFIRM prompt shows evidence instead of asking them to
+        guess from a screen that has since moved on.
+
+        The PRE snapshot is the PREVIOUS step's POST — literally the same
+        instant, and it halves the captures.
+        """
+        _action = str(getattr(step, "action", "") or "").lower()
+        if not _bb_enabled() or _action not in self._EFFECTFUL_ACTIONS:
+            return await self._execute_step_inner(step, frame, step_index)
+
+        from backend.vision import black_box as _bb
+        _before = getattr(self, "_bb_last", None)
+        if _before is None:
+            _before = await _bb.capture()
+        try:
+            _result = await self._execute_step_inner(step, frame, step_index)
+        except BaseException as _exc:      # includes CancelledError/TimeoutError
+            # The step did not return. `after` stays None deliberately — its
+            # ABSENCE is the finding, and fabricating a post-snapshot taken
+            # after the crash would describe a machine that had already moved.
+            self._bb_forensics = _bb.forensic_payload(
+                step_index=step_index, action=_action,
+                target=str(getattr(step, "target", "") or ""),
+                value=str(getattr(step, "value", "") or ""),
+                error=repr(_exc), before=_before, after=None,
+            )
+            self._bb_last = None
+            raise
+        _after = await _bb.capture()
+        self._bb_last = _after            # becomes the next step's `before`
+        self._bb_delta = _bb.delta(_before, _after)
+        return _result
+
+    def take_forensics(self) -> Optional[dict]:
+        """Pop the last crash's black box, if any. NEVER raises.
+
+        Popped rather than read so a later successful run cannot surface a
+        stale confirmation for a step that has since been resolved.
+        """
+        try:
+            payload = getattr(self, "_bb_forensics", None)
+            self._bb_forensics = None
+            return payload
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _execute_step_inner(
         self,
         step: Any,  # CUStep
         frame: Optional[np.ndarray] = None,
