@@ -499,6 +499,50 @@ def status_digest(provider: Optional[Callable[[], Optional[str]]] = None) -> str
 # ---------------------------------------------------------------------------
 
 
+#: The operator-plane glyphs, resolved ONCE through the design language.
+#:
+#: `ui/theme` ships six glyphs with an ASCII degradation each, and says why:
+#: "so 16-color/none terminals keep identical geometry". This client had 75
+#: hardcoded ⏺ / ⎿ / ⚠ / · and ZERO calls to `mark()`, so that degradation
+#: never fired here. `supports_unicode()` is locale-driven — a non-UTF-8
+#: `LANG` is ordinary over ssh, cron and CI — and on those terminals the
+#: cockpit's whole glyph vocabulary rendered as mojibake or nothing.
+#:
+#: Resolved at call time rather than import time: a module-level constant
+#: would freeze the locale of whichever process imported first, and the
+#: attach client and daemon do not share one.
+def _glyph(name: str, fallback: str) -> str:
+    """One operator-plane glyph, ASCII-degraded when the locale demands.
+
+    NEVER raises: a theme that will not import leaves the caller with the
+    literal it already had, so this can only ever improve a terminal.
+    """
+    try:
+        from backend.core.ouroboros.ui.theme import mark
+        return mark(name) or fallback
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+def _tone(token: str, fallback: str = "") -> str:
+    """A semantic style string for the CURRENT terminal tier.
+
+    `ov.py` styles with raw ``rgb(...)`` literals, which `ui/theme` exists to
+    replace — Token.MUTED resolves per tier, so a 16-color terminal gets a
+    16-color answer instead of a truecolor sequence it renders as noise. The
+    repo already ratchets on "raw colour literals only ever decrease".
+
+    ``SUCCESS`` is deliberately NOT used for status here: the theme reserves
+    it for OUTCOMES (apply/verify OK), and spending it on "attached" would
+    make a connection look like an accomplishment.
+    """
+    try:
+        from backend.core.ouroboros.ui.theme import Token, active_tier, style_for
+        return style_for(Token(token), active_tier()) or fallback
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
 def _render_hydration(console: Any, payload: dict) -> None:
     """Instant-state render — the operator NEVER stares at a blank
     screen waiting for the next FSM tick. Pure presentation; the daemon
@@ -511,23 +555,59 @@ def _render_hydration(console: Any, payload: dict) -> None:
         detail = status.get("phase_detail", "")
         cost = status.get("cost_spent_usd", 0.0)
         budget = status.get("cost_budget_usd", 0.0)
-        console.print(
-            f"⏺ attached — phase: {phase}"
-            + (f" {detail}" if detail else "")
-            + f" · cost: ${cost:.2f}/${budget:.2f}",
-            markup=False, highlight=False,
-        )
+        # VISUAL HIERARCHY, matching the boot banner three functions up.
+        #
+        # Every line here was `console.print(str, markup=False)` — flat, one
+        # weight, no dim. The boot banner in this same file builds Rich `Text`
+        # with per-span styles and its comment cites "the CC title grammar
+        # ... exactly like Claude Code v2.1.218". Two standards, one screen:
+        # the operator's first frame was the unstyled one.
+        #
+        # `Text.append(style=)` keeps `markup=False`'s guarantee — daemon
+        # content is never parsed for `[...]` — while restoring the three
+        # tiers the palette already defines: the ACTION reads first, its
+        # metadata recedes, and the labels recede further than their values.
+        from rich.text import Text as _T
+        _dot = _glyph("dot", "·")
+        _muted, _body = _tone("muted", "dim"), _tone("body", "")
+        head = _T()
+        head.append(f"{_glyph('action', '*')} ", style=_tone("accent", "cyan"))
+        head.append("attached", style=_body)
+        head.append("  phase ", style=_muted)
+        head.append(str(phase), style=_body)
+        if detail:
+            head.append(f" {detail}", style=_muted)
+        head.append(f"  {_dot}  cost ", style=_muted)
+        head.append(f"${cost:.2f}", style=_body)
+        head.append(f"/${budget:.2f}", style=_muted)
+        console.print(head, highlight=False)
         if ops:
             console.print(_active_ops_line(ops), markup=False, highlight=False)
         for line in _liquidity_lines(liq.get("providers") or {},
                                      any_exhausted=liq.get("any_exhausted"),
                                      economic=liq.get("economic")):
-            console.print(line, markup=False, highlight=False)
-        console.print(
-            "⎿ type verbs or plain text · Ctrl+C detaches (the organism "
-            "keeps running) · `ov restart` reloads it",
-            markup=False, highlight=False,
-        )
+            # A warning must NOT recede with the rest of the block — it is
+            # the one line here an operator has to act on.
+            _is_warn = line.lstrip().startswith(
+                (_glyph("warn", "!"), "!", "⚠"))
+            console.print(
+                line, markup=False, highlight=False,
+                style=(_tone("warning", "yellow") if _is_warn else _muted),
+            )
+        # The hint is entirely secondary — one tone, no competing emphasis,
+        # and the literal backticks are gone. `markup=False` printed them as
+        # characters, so the line advertised "`ov restart`" with the quoting
+        # visible; a terminal shows a command by styling it, not by fencing it.
+        hint = _T()
+        hint.append(f"{_glyph('detail', '-')} ", style=_muted)
+        hint.append("type verbs or plain text", style=_muted)
+        hint.append(f"  {_dot}  ", style=_muted)
+        hint.append("Ctrl+C", style=_body)
+        hint.append(" detaches, the organism keeps running", style=_muted)
+        hint.append(f"  {_dot}  ", style=_muted)
+        hint.append("ov restart", style=_body)
+        hint.append(" reloads it", style=_muted)
+        console.print(hint, highlight=False)
     except Exception:
         pass
 
@@ -727,7 +807,8 @@ def _liquidity_lines(providers: Any, *, any_exhausted: Any = None,
         else:
             amount = "undeclared"
         mark = " ← dry" if _dry(row) else ""
-        lines.append(f"⎿ liquidity {name}: {amount}{mark}")
+        lines.append(
+            f"{_glyph('detail', '-')} liquidity {name}: {amount}{mark}")
 
     # ECONOMIC DEATH, said FIRST and said plainly.
     #
@@ -748,7 +829,8 @@ def _liquidity_lines(providers: Any, *, any_exhausted: Any = None,
         if failures <= 0:
             continue
         lines.append(
-            f"⚠ {provider}: OUT OF CREDIT — the lane is economically dead "
+            f"{_glyph('warn', '!')} {provider}: OUT OF CREDIT — the lane is "
+            f"economically dead "
             f"({failures} billing refusal(s)); the token count above is a "
             f"RATE LIMIT, not a balance. Add credits to restore it."
         )
@@ -756,14 +838,15 @@ def _liquidity_lines(providers: Any, *, any_exhausted: Any = None,
     if dry_names:
         # NAME them. "a provider" is the one thing the operator cannot look up.
         lines.append(
-            f"⚠ runway exhausted: {', '.join(dry_names)} — "
+            f"{_glyph('warn', '!')} runway exhausted: {', '.join(dry_names)} — "
             f"routing will fall through to the remaining providers"
         )
     elif any_exhausted and not economic:
         # The aggregate flag disagrees with every row we can see. Say that,
         # rather than repeating a claim nothing supports.
         lines.append(
-            "⚠ a runway is reported dry but no provider row shows it — "
+            f"{_glyph('warn', '!')} a runway is reported dry but no provider "
+            "row shows it — "
             "run /provider for the authoritative view"
         )
     return lines
