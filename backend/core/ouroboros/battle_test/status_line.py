@@ -119,6 +119,13 @@ class StatusSnapshot:
     # Route / provider badge
     route: str = ""                    # "complex" / "standard" / "background" / ...
     provider: str = ""                 # "claude" / "dw" / "prime" / ""
+    #: The MODEL, not the family. `provider` answers "which lane"; this
+    #: answers "which brain" — `claude-sonnet-4-6`, `Qwen/Qwen3.5-397B-A17B`.
+    #: Carried on `ctx.generation.model_id` since op_context.py:304 and read by
+    #: nothing: the badge showed the lane, and `_statusline_payload` reported
+    #: the LANE under the key `model`, so a CC-compatible script asking for
+    #: `.model.id` got "claude" and never the model it was actually billed for.
+    model: str = ""
     # Circadian liquidity (item #5) — populated ONLY when a provider's
     # declared token runway is exhausted (presentation restraint: the
     # healthy state renders nothing).
@@ -211,9 +218,19 @@ def _statusline_payload(snapshot: Any = None) -> str:
             payload["phase"] = getattr(snap, "phase", "") or "IDLE"
             if getattr(snap, "route", ""):
                 payload["route"] = snap.route
-            if getattr(snap, "provider", ""):
-                payload["model"] = {"id": snap.provider,
-                                    "display_name": snap.provider}
+            # `.model.id` must be the MODEL. This reported `snap.provider`,
+            # so a status-line script written against CC's documented shape
+            # read "claude" where it expected "claude-sonnet-4-6" — a key that
+            # answered a different question than the one it was named for.
+            _model = getattr(snap, "model", "") or ""
+            _prov = getattr(snap, "provider", "") or ""
+            if _model or _prov:
+                payload["model"] = {
+                    "id": _model or _prov,
+                    "display_name": _short_model(_model) or _prov,
+                }
+                if _prov:
+                    payload["provider"] = _prov
             spent = getattr(snap, "cost_spent_usd", None)
             if spent is not None:
                 cost: Dict[str, Any] = {"total_cost_usd": round(float(spent), 6)}
@@ -301,7 +318,7 @@ class StatusLineBuilder:
         cost_spent, cost_budget = self._sample_cost()
         idle_elapsed, idle_timeout = self._sample_idle()
         primary_op, extra_ops = self._sample_ops()
-        route, provider = self._sample_route_and_provider(primary_op)
+        route, provider, model = self._sample_route_and_provider(primary_op)
         liq_exhausted, liq_provider, liq_reset = self._sample_liquidity()
 
         # §37 Slice 5 — feed cost-band-crossing observer.
@@ -330,6 +347,7 @@ class StatusLineBuilder:
             extra_op_count=extra_ops,
             route=route,
             provider=provider,
+            model=model,
             liquidity_exhausted=liq_exhausted,
             liquidity_provider=liq_provider,
             liquidity_reset_s=liq_reset,
@@ -574,23 +592,33 @@ class StatusLineBuilder:
             return (False, "", None)
 
     def _sample_route_and_provider(self, op_id: str) -> tuple:
-        """Pull route + provider for the primary op. Both optional."""
+        """Pull route + provider + MODEL for the primary op. All optional.
+
+        `model_id` has ridden on the generation result since op_context.py:304
+        ("provider model identifier; empty = not reported") and was read by
+        nothing. An operator asking "which model am I running" could not find
+        out from the cockpit, while every op carried the answer.
+        """
         if not op_id or self._gls is None:
-            return ("", "")
+            return ("", "", "")
         try:
             fsm_contexts = getattr(self._gls, "_fsm_contexts", None) or {}
             ctx = fsm_contexts.get(op_id)
             if ctx is None:
-                return ("", "")
+                return ("", "", "")
             route = str(getattr(ctx, "provider_route", "") or "").lower()
             # Provider usually on ctx.generation.provider_name post-GENERATE.
-            provider = ""
+            provider, model = "", ""
             gen = getattr(ctx, "generation", None)
             if gen is not None:
                 provider = str(getattr(gen, "provider_name", "") or "").lower()
-            return (route, provider)
+                # NOT lowercased: model ids are case-carrying identifiers
+                # ("Qwen/Qwen3.5-397B-A17B-FP8"), and folding them would make
+                # the badge disagree with the provider's own logs.
+                model = str(getattr(gen, "model_id", "") or "").strip()
+            return (route, provider, model)
         except Exception:  # noqa: BLE001
-            return ("", "")
+            return ("", "", "")
 
 
 # ---------------------------------------------------------------------------
@@ -645,9 +673,38 @@ def _format_phase(snap: StatusSnapshot) -> str:
     return snap.phase or "IDLE"
 
 
-def _format_badge(route: str, provider: str) -> str:
-    """Compact route·provider badge. Empty when neither present."""
-    if not route and not provider:
+def _short_model(model: str) -> str:
+    """A model id trimmed to what an operator reads at a glance.
+
+    ``Qwen/Qwen3.5-397B-A17B-FP8-dottxt`` in a one-line status bar costs more
+    width than the rest of the line together, so the vendor prefix and the
+    build suffixes go and the identity stays. Purely subtractive — no
+    abbreviation table, because a table is a second place to update every time
+    a model ships and the id itself already carries the name.
+    """
+    try:
+        text = str(model or "").strip()
+        if not text:
+            return ""
+        text = text.rsplit("/", 1)[-1]          # drop the vendor namespace
+        # Trailing build/quantisation markers carry no identity at a glance.
+        for suffix in ("-dottxt", "-FP8", "-fp8", "-instruct", "-Instruct"):
+            if text.endswith(suffix):
+                text = text[: -len(suffix)]
+        return text[:28]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _format_badge(route: str, provider: str, model: str = "") -> str:
+    """Compact route·provider·model badge. Empty when none present.
+
+    ``model`` is additive and last: the lane answers "where did this go", the
+    model answers "what actually ran", and an operator watching a 3-tier
+    cascade needs both — `[std·claude]` cannot distinguish a sonnet fallback
+    from an opus one. Optional so every existing caller keeps working.
+    """
+    if not route and not provider and not model:
         return ""
     # Abbreviate long route names.
     route_abbrev = {
@@ -664,7 +721,12 @@ def _format_badge(route: str, provider: str) -> str:
         "prime": "prime",
         "j-prime": "prime",
     }.get(provider, provider)
-    parts = [p for p in (route_abbrev, prov_abbrev) if p]
+    short = _short_model(model)
+    # Suppressed when it merely repeats the lane — `[std·claude·claude]` is
+    # noise, and a badge that repeats itself trains the eye to skip it.
+    if short and prov_abbrev and short.lower() == prov_abbrev.lower():
+        short = ""
+    parts = [p for p in (route_abbrev, prov_abbrev, short) if p]
     return "[" + "·".join(parts) + "]" if parts else ""
 
 
