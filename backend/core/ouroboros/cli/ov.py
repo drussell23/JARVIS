@@ -653,18 +653,18 @@ def _restart_daemon(say: Any) -> int:
 
     pid = _live_incumbent()
     if pid is None:
-        say("⎿ no organism running — igniting a fresh one")
+        say(_glyph("detail", "-") + " no organism running — igniting a fresh one")
     else:
-        say(f"⏺ stopping organism (pid {pid}) — SIGTERM, letting it finish")
+        say(_glyph("action", "*") + f" stopping organism (pid {pid}) — SIGTERM, letting it finish")
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pid = None
         except PermissionError:
-            say(f"⚠ not permitted to stop pid {pid} — is it yours?")
+            say(_glyph("warn", "!") + f" not permitted to stop pid {pid} — is it yours?")
             return 1
         except Exception as exc:  # noqa: BLE001
-            say(f"⚠ could not signal pid {pid}: {type(exc).__name__}")
+            say(_glyph("warn", "!") + f" could not signal pid {pid}: {type(exc).__name__}")
             return 1
 
     if pid is not None:
@@ -679,13 +679,13 @@ def _restart_daemon(say: Any) -> int:
                 break
             _t.sleep(0.2)
         else:
-            say("⎿ it did not stop in time — escalating to SIGKILL")
+            say(_glyph("detail", "-") + " it did not stop in time — escalating to SIGKILL")
             try:
                 os.kill(pid, signal.SIGKILL)
                 _t.sleep(0.5)
             except Exception:  # noqa: BLE001
                 pass
-        say("⎿ organism stopped")
+        say(_glyph("detail", "-") + " organism stopped")
     return 0
 
 
@@ -2383,7 +2383,7 @@ async def _split_plane_loop(
         if install_oob_stack_dump():
             hint = oob_hint()
             if hint and os.environ.get("JARVIS_OOB_HINT", "1") != "0":
-                console.print(f"⎿ {hint}", markup=False, highlight=False)
+                console.print(_glyph("detail", "-") + f" {hint}", markup=False, highlight=False)
     except Exception:  # noqa: BLE001 — a missing debugger must not stop a boot
         pass
     # This surface has no container to float the palette into, so it draws it
