@@ -21,13 +21,14 @@ The sensor detects pain; Ouroboros heals the wound.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
 
@@ -113,6 +114,69 @@ def _journal_redacts() -> bool:
 #: Tolerance for clock skew. An entry stamped in the future would never expire
 #: out of the rolling window, so it is clamped rather than trusted.
 _MAX_FUTURE_SKEW_S = 300.0
+
+
+# ---------------------------------------------------------------------------
+# Cross-process coordination — TWO races, and the quieter one is worse
+# ---------------------------------------------------------------------------
+#
+# A soak daemon and an interactive daemon against one repo are two sensors with
+# two in-memory windows over ONE stream of real failures. That splits in both
+# directions:
+#
+#   OVER-FIRE   both cross the threshold and both file the same pattern. The
+#               router dedups, so the cost is a duplicate envelope.
+#   UNDER-FIRE  four real failures land two-and-two. Neither reaches three,
+#               so NOTHING is filed — the pattern is invisible to governance
+#               while the journal on disk plainly shows four occurrences.
+#
+# Measured before the fix: `A local window: 2 · B local window: 2 · journal
+# lines: 4`. Under-fire is the worse defect and the easier one to miss, because
+# a missing envelope looks exactly like a healthy system.
+#
+# THE ROOT CAUSE IS ONE THING: the decision was made against LOCAL state while
+# the truth was already on disk. So the decision moves to the journal, under
+# the journal's own lock — append-and-decide in a single critical section, so
+# no process can count a window that excludes an occurrence already written.
+#
+# The claim is a TTL LEASE, not a lock, and that is deliberate. `op_lease`
+# earned this the hard way: "the static in-flight lock carried no liveness
+# signal", so a worker that died holding it wedged the system for a whole
+# session. A process that dies between claiming and ingesting must not silence
+# a pattern forever, so the claim expires and the next process retries.
+#
+# NOT reused here, and why: `dw_singleflight` dedups via in-process
+# `asyncio.Future` (wrong scope — the racers are different processes), and
+# `lock_manager` would have a leaf sensor taking governance repo locks
+# (dependency inversion). `cross_process_jsonl` already owns this file's lock.
+
+def _claim_ttl_s() -> float:
+    """How long an emission claim is honoured before another process may retry.
+
+    Too short duplicates; too long delays recovery from a crash mid-emit.
+    Clamped so a typo cannot do either permanently. NEVER raises."""
+    try:
+        v = float(os.environ.get("JARVIS_CU_CLAIM_TTL_S", "60"))
+    except (TypeError, ValueError):
+        v = 60.0
+    return max(5.0, min(v, 900.0))
+
+
+def _owner_token() -> str:
+    """Who holds a claim — unique per SENSOR LIFE, not per module.
+
+    PID alone is not enough: the OS reuses them, so a restarted process could
+    inherit its predecessor's claim and skip an emission it never made. The
+    random half fixes that.
+
+    Bound to the INSTANCE rather than the module because the claim belongs to
+    the sensor that made it. In production the two are identical (one singleton
+    per process), but a module global made two sensors in one process
+    indistinguishable — which silently disabled the mutual-exclusion check in
+    exactly the harness written to prove it worked.
+    """
+    import uuid
+    return f"{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +319,11 @@ class CUExecutionSensor:
         self._journal_replayed = 0
         self._journal_corrupt_lines = 0
         self._journal_write_failures = 0
+        # Times the cross-process lock could not be taken, so the
+        # decision fell back to local state. Non-zero means two daemons
+        # are contending and duplicates are possible.
+        self._claim_lock_failures = 0
+        self._owner = _owner_token()
 
         # Replay BEFORE anything can record, so a pattern that graduated in the
         # previous life is already at threshold in this one.
@@ -302,14 +371,12 @@ class CUExecutionSensor:
     def _hydrate(self) -> None:
         """Rebuild in-memory state from the journal. NEVER raises.
 
-        Tolerant per LINE, not per file: a process killed mid-append leaves a
-        torn final line, and discarding the whole journal because its last byte
-        is missing would lose the very evidence this exists to keep.
+        Shares `_parse_journal` with the decision path — one parser, two
+        readers. Two parsers would be two opinions about what the journal says.
         """
         if not _journal_enabled():
             return
         try:
-            import json
             from backend.core.ouroboros.governance.workspace_resolver import (
                 resolve_durable_path,
             )
@@ -317,62 +384,158 @@ class CUExecutionSensor:
             if not path.exists():
                 return
             now = time.time()
-            cutoff = now - _WINDOW_S
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            window, emitted, _claims = self._parse_journal(lines, now)
+            self._failure_window = defaultdict(list, window)
+            self._last_emitted.update(emitted)
+            # The describing record for each live signature. Parsed separately
+            # because only `_hydrate` needs it — the decision path counts and
+            # never renders.
             for raw in lines:
-                raw = raw.strip()
-                if not raw:
-                    continue
                 try:
-                    entry = json.loads(raw)
-                except Exception:  # noqa: BLE001 — torn or corrupt line
-                    self._journal_corrupt_lines += 1
+                    e = json.loads(raw)
+                except Exception:  # noqa: BLE001
                     continue
-                if not isinstance(entry, dict):
-                    self._journal_corrupt_lines += 1
-                    continue
-                if entry.get("repo") not in (None, self._repo):
-                    continue          # another repo's journal, same machine
-                ts = entry.get("t")
-                sig = entry.get("sig")
-                if not isinstance(ts, (int, float)) or not isinstance(sig, str):
-                    self._journal_corrupt_lines += 1
-                    continue
-                ts = min(float(ts), now + _MAX_FUTURE_SKEW_S)
-                if ts < cutoff:
-                    continue          # outside the rolling window
-                kind = entry.get("k")
-                if kind == "e":
-                    # An emission already happened; replaying it restores the
-                    # cooldown so a restart does not re-file the same work.
-                    self._last_emitted[sig] = max(
-                        self._last_emitted.get(sig, 0.0), ts)
-                elif kind == "f":
-                    self._failure_window[sig].append(ts)
-                    rec = entry.get("rec")
-                    if isinstance(rec, dict):
-                        try:
-                            self._latest_by_sig[sig] = CUExecutionRecord(**rec)
-                        except Exception:  # noqa: BLE001 — schema drift
-                            self._journal_corrupt_lines += 1
-                else:
-                    self._journal_corrupt_lines += 1
-            self._journal_replayed = sum(
-                len(v) for v in self._failure_window.values())
+                if (isinstance(e, dict) and e.get("k") == "f"
+                        and isinstance(e.get("rec"), dict)
+                        and e.get("repo") in (None, self._repo)
+                        and e.get("sig") in window):
+                    try:
+                        self._latest_by_sig[e["sig"]] = CUExecutionRecord(**e["rec"])
+                    except Exception:  # noqa: BLE001 — schema drift
+                        self._journal_corrupt_lines += 1
+            self._journal_replayed = sum(len(v) for v in window.values())
             if self._journal_replayed or self._last_emitted:
                 logger.info(
                     "[CUExecutionSensor] journal replayed — %d occurrences "
                     "across %d patterns, %d cooldowns restored%s",
-                    self._journal_replayed, len(self._failure_window),
-                    len(self._last_emitted),
+                    self._journal_replayed, len(window), len(self._last_emitted),
                     f", {self._journal_corrupt_lines} unreadable lines skipped"
                     if self._journal_corrupt_lines else "",
                 )
             if len(lines) > _journal_max_lines():
-                self._compact(cutoff)
+                self._compact(now - _WINDOW_S)
         except Exception:  # noqa: BLE001 — durability must never break boot
             logger.debug("[CUExecutionSensor] journal replay degraded",
                          exc_info=True)
+
+    def _parse_journal(self, lines: Sequence[str], now: float) -> Tuple[
+            Dict[str, List[float]], Dict[str, float], Dict[str, Tuple[float, str]]]:
+        """(occurrences, emissions, live claims) from journal lines. NEVER raises.
+
+        One parser for both readers — `_hydrate` at boot and `_decide` on every
+        failure. Two parsers would be two opinions about what the journal says,
+        which is the shape of bug this whole arc keeps closing.
+        """
+        window: Dict[str, List[float]] = defaultdict(list)
+        emitted: Dict[str, float] = {}
+        claims: Dict[str, Tuple[float, str]] = {}
+        cutoff = now - _WINDOW_S
+        for raw in lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                e = json.loads(raw)
+                if not isinstance(e, dict):
+                    raise ValueError
+                if e.get("repo") not in (None, self._repo):
+                    continue
+                ts = float(e["t"])
+                sig = e["sig"]
+                if not isinstance(sig, str):
+                    raise ValueError
+            except Exception:  # noqa: BLE001 — torn or corrupt line
+                self._journal_corrupt_lines += 1
+                continue
+            ts = min(ts, now + _MAX_FUTURE_SKEW_S)
+            kind = e.get("k")
+            if kind == "f":
+                if ts >= cutoff:
+                    window[sig].append(ts)
+            elif kind == "e":
+                if ts >= cutoff:
+                    emitted[sig] = max(emitted.get(sig, 0.0), ts)
+                claims.pop(sig, None)      # emitted supersedes its own claim
+            elif kind == "c":
+                claims[sig] = (ts, str(e.get("own", "")))
+            elif kind == "x":
+                claims.pop(sig, None)      # released — retry is immediate
+            else:
+                self._journal_corrupt_lines += 1
+        return window, emitted, claims
+
+    def _decide(self, sig: str, rec: Optional["CUExecutionRecord"],
+                now: float) -> Tuple[bool, int, str]:
+        """Append-and-decide atomically. Returns (mine, true_count, why).
+
+        Runs on a worker thread — `flock` is blocking and this holds it across a
+        read. Everything inside is one critical section so a concurrent daemon
+        cannot observe a window that excludes an occurrence already on disk.
+
+        `rec is None` means "decide only" (the reconcile sweep, whose occurrence
+        was written when it happened).
+        """
+        from backend.core.ouroboros.governance.cross_process_jsonl import (
+            flock_critical_section,
+        )
+        from backend.core.ouroboros.governance.workspace_resolver import (
+            resolve_durable_path,
+        )
+        path = resolve_durable_path(_journal_path())
+        with flock_critical_section(path) as ok:
+            if not ok:
+                # Another daemon holds it past the timeout. Fall back to the
+                # LOCAL decision rather than lose the signal: a duplicate
+                # envelope is deduped downstream, a dropped one is gone.
+                self._claim_lock_failures += 1
+                return (True, len(self._failure_window.get(sig, ())), "lock_timeout")
+            try:
+                if rec is not None:
+                    entry = self._entry("f", sig, rec)
+                    with path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(entry, separators=(",", ":"),
+                                            default=str) + "\n")
+                lines = (path.read_text(encoding="utf-8", errors="replace")
+                         .splitlines() if path.exists() else [])
+                window, emitted, claims = self._parse_journal(lines, now)
+                count = len(window.get(sig, ()))
+                if count < _GRADUATION_THRESHOLD:
+                    return (False, count, "below_threshold")
+                if now - emitted.get(sig, 0.0) < _EMIT_COOLDOWN_S:
+                    return (False, count, "cooldown")
+                held = claims.get(sig)
+                if held and held[1] != self._owner and now - held[0] < _claim_ttl_s():
+                    # Another live process is filing it. Not a failure — the
+                    # system is doing exactly one of the thing it should.
+                    return (False, count, "claimed_elsewhere")
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(
+                        self._entry("c", sig), separators=(",", ":"),
+                        default=str) + "\n")
+                return (True, count, "claimed")
+            except Exception:  # noqa: BLE001
+                logger.debug("[CUExecutionSensor] decide degraded", exc_info=True)
+                return (True, len(self._failure_window.get(sig, ())), "degraded")
+
+    def _entry(self, kind: str, sig: str,
+               rec: Optional["CUExecutionRecord"] = None) -> Dict[str, Any]:
+        """One journal record. NEVER raises."""
+        from dataclasses import asdict
+        entry: Dict[str, Any] = {
+            "v": 1, "k": kind, "t": time.time(), "sig": sig, "repo": self._repo,
+        }
+        if kind == "c":
+            entry["own"] = self._owner
+        if kind == "f" and rec is not None:
+            entry["t"] = min(float(rec.timestamp), time.time() + _MAX_FUTURE_SKEW_S)
+            payload = asdict(rec)
+            if _journal_redacts():
+                payload["goal"] = "[redacted]"
+                payload["contact"] = None
+                entry["redacted"] = True
+            entry["rec"] = payload
+        return entry
 
     def _compact(self, cutoff: float) -> None:
         """Drop entries that can no longer influence a decision. NEVER raises.
@@ -545,7 +708,8 @@ class CUExecutionSensor:
         return len(kept)
 
     async def _maybe_emit(self, sig: str, rec: "CUExecutionRecord",
-                          count: int, *, deferred: bool = False) -> bool:
+                          count: int, *, deferred: bool = False,
+                          append_occurrence: bool = False) -> bool:
         """The ONE place that decides whether a pattern emits.
 
         Extracted from `record()` so the decision can be RE-ENTERED. The bug
@@ -556,26 +720,68 @@ class CUExecutionSensor:
 
         Returns True if an envelope was actually ingested.
         """
-        if count < _GRADUATION_THRESHOLD:
-            return False
         now = time.time()
-        last = self._last_emitted.get(sig, 0)
-        if now - last < _EMIT_COOLDOWN_S:
-            logger.debug(
-                "[CUExecutionSensor] Pattern '%s' graduated but in cooldown "
-                "(%.0fs remaining)", sig, _EMIT_COOLDOWN_S - (now - last))
-            return False
+        # ROUTER FIRST — never claim what cannot be filed.
+        #
+        # An earlier ordering decided (and therefore CLAIMED) before checking
+        # whether a router existed, so a process that deferred still took the
+        # lease. It then died, and the next life saw a live claim from a
+        # process that had never filed anything and stood down for the whole
+        # TTL — durability and mutual exclusion combining into a new silence.
+        # A claim means "I am filing this now", so it is only taken by someone
+        # who can.
         if self._router is None:
-            # Not a failure to emit — a decision that cannot be made YET.
-            self._deferred_emissions += 1
-            self._needs_reconcile = True
-            logger.warning(
-                "[CUExecutionSensor] Pattern '%s' qualified (%dx) with no "
-                "router attached — emission DEFERRED, will reconcile when "
-                "governance boot completes (deferred_total=%d)",
-                sig, count, self._deferred_emissions,
-            )
+            if append_occurrence:
+                await self._journal("f", sig, rec)
+            if count >= _GRADUATION_THRESHOLD:
+                self._deferred_emissions += 1
+                self._needs_reconcile = True
+                logger.warning(
+                    "[CUExecutionSensor] Pattern '%s' qualified (%dx) with no "
+                    "router attached — emission DEFERRED, will reconcile when "
+                    "governance boot completes (deferred_total=%d)",
+                    sig, count, self._deferred_emissions,
+                )
             return False
+        authoritative = False
+        if _journal_enabled():
+            # AUTHORITATIVE. The local window is one daemon's view; the journal
+            # is every daemon's. Deciding on the local one under-fires when four
+            # real failures land two-and-two.
+            mine, true_count, why = await asyncio.to_thread(
+                self._decide, sig, rec if append_occurrence else None, now)
+            if why in ("lock_timeout", "degraded"):
+                # The journal could not answer. Fall through to the LOCAL rules
+                # below — which means the local THRESHOLD and COOLDOWN, not a
+                # bypass of them. An earlier draft returned "emit" here and
+                # filed three envelopes for one pattern, because every record
+                # looked like a fresh decision. Degrading may cost a duplicate
+                # under contention; it must never cost the rules.
+                pass
+            elif not mine:
+                if why == "claimed_elsewhere":
+                    logger.debug(
+                        "[CUExecutionSensor] '%s' is being filed by another "
+                        "process — standing down (count=%d)", sig, true_count)
+                elif why == "cooldown":
+                    logger.debug(
+                        "[CUExecutionSensor] '%s' in cooldown (count=%d)",
+                        sig, true_count)
+                return False
+            else:
+                authoritative = True
+                count = true_count
+        elif append_occurrence:
+            await self._journal("f", sig, rec)
+        if not authoritative:
+            if count < _GRADUATION_THRESHOLD:
+                return False
+            last = self._last_emitted.get(sig, 0)
+            if now - last < _EMIT_COOLDOWN_S:
+                logger.debug(
+                    "[CUExecutionSensor] Pattern '%s' graduated but in cooldown "
+                    "(%.0fs remaining)", sig, _EMIT_COOLDOWN_S - (now - last))
+                return False
         return await self._emit_envelope(sig, rec, count, deferred=deferred)
 
     # ------------------------------------------------------------------
@@ -609,9 +815,6 @@ class CUExecutionSensor:
         # a 24h window judged on arrival time would be judging the wrong thing.
         self._failure_window[sig].append(rec.timestamp)
         self._latest_by_sig[sig] = rec
-        # Durable BEFORE the decision: if this process dies between here and
-        # the emission, the next one replays the occurrence and re-decides.
-        await self._journal("f", sig, rec)
 
         now = time.time()
         count = self._live_count(sig, now)
@@ -622,7 +825,9 @@ class CUExecutionSensor:
             rec.error or "partial completion",
         )
 
-        await self._maybe_emit(sig, rec, count)
+        # `append_occurrence` puts the write INSIDE the locked decision, so
+        # no daemon can count a window that excludes it.
+        await self._maybe_emit(sig, rec, count, append_occurrence=True)
 
         # Lazy half of the recovery. If a router arrived while no loop was
         # running — or an earlier pattern was refused for want of one — this
@@ -772,6 +977,11 @@ class CUExecutionSensor:
             "journal_replayed": self._journal_replayed,
             "journal_corrupt_lines": self._journal_corrupt_lines,
             "journal_write_failures": self._journal_write_failures,
+            # Non-zero means two daemons are contending for the journal
+            # lock and the decision fell back to local rules — correct,
+            # but duplicates become possible.
+            "claim_lock_failures": self._claim_lock_failures,
+            "owner": self._owner,
             "active_patterns": len(self._failure_window),
             "pattern_counts": {
                 sig: len(timestamps)

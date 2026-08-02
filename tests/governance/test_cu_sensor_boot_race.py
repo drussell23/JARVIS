@@ -123,7 +123,7 @@ class TestTheRaceItself:
 
         router = _Router()
         CUExecutionSensor(router=router)                  # governance boots
-        await asyncio.sleep(0)                            # let the task run
+        await _settle()
         assert router.ingested, "the deferred pattern never reconciled"
 
     @pytest.mark.asyncio
