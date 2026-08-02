@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 
 from backend.hud.tool_definitions import (
     TOOL_SCHEMAS,
+    derived_tool_schemas,
     ToolCall,
     ToolResult,
     execute_tool,
@@ -93,7 +94,11 @@ class ToolUseOrchestrator:
     async def execute(self, goal: str, screenshot_b64: Optional[str] = None) -> CommandResult:
         """Execute a goal using the 397B tool-use loop."""
         t0 = time.monotonic()
-        tool_list = json.dumps(list(TOOL_SCHEMAS.values()), indent=2)
+        # The DERIVED vocabulary, not the hand-written nine. This is the
+        # line that lets the model say 'lock the screen' at all — the
+        # capability existed in `macos_controller` the whole time and was
+        # simply never named in the prompt.
+        tool_list = json.dumps(list(derived_tool_schemas().values()), indent=2)
 
         system_prompt = (
             "You are JARVIS, an AI organism controlling a MacBook Pro. "
