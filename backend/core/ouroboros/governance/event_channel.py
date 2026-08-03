@@ -486,13 +486,14 @@ class EventChannelServer:
                     assert_loopback_only as _assert_loopback_id,
                 )
                 from backend.core.ouroboros.governance.invariant_drift_auditor import (  # noqa: E501
+                    capture_snapshot_async as _id_capture_async,
                     invariant_drift_auditor_enabled as _id_enabled,
                 )
                 from backend.core.ouroboros.governance.invariant_drift_observability import (  # noqa: E501
                     register_invariant_drift_routes,
                 )
                 from backend.core.ouroboros.governance.invariant_drift_store import (  # noqa: E501
-                    install_boot_snapshot,
+                    install_boot_snapshot_async,
                 )
                 from backend.core.ouroboros.governance.invariant_drift_observer import (  # noqa: E501
                     get_default_observer as _id_get_observer,
@@ -514,9 +515,54 @@ class EventChannelServer:
                         ),
                         cors_headers=_id_helper._cors_headers,
                     )
-                    # Boot snapshot — best-effort, idempotent
+                    # Boot snapshot — best-effort, idempotent, OFF-LOOP.
+                    #
+                    # THE 34-SECOND STOP-THE-WORLD.
+                    #
+                    # This was `install_boot_snapshot()`, called synchronously
+                    # from inside `async def start()`. Measured on this repo:
+                    #
+                    #     validate_all() BLOCKED the caller for 34.43 SECONDS
+                    #
+                    # `capture_snapshot` -> `_capture_shipped_invariants` ->
+                    # `validate_all`, and one of those invariants `rglob`s the
+                    # whole governance tree, reading and `ast.parse`-ing every
+                    # file. None of it yields. An `await` whose body never
+                    # yields does not merely take a long time — it stops the
+                    # event loop dead, and everything the organism owes an
+                    # operator stops with it.
+                    #
+                    # That single call accounts for the observed boot
+                    # pathology: an IPC action received at 01:40:34 and not
+                    # routed until 01:40:49; `LearningDB` "timing out" after
+                    # 15s when it was merely starved of the loop; the
+                    # enrollment lookup doing the same; and
+                    # `GovernedLoopService` blowing its 30s budget, because
+                    # 34s > 30s all on its own.
+                    #
+                    # BOTH halves are needed and neither is sufficient:
+                    #
+                    #   * `capture_snapshot_async` routes the AST work through
+                    #     the canonical PROCESS pool. A thread would not do —
+                    #     `ast.parse` holds the GIL, so `to_thread` alone
+                    #     frees the file-I/O half and leaves the parsing half
+                    #     still blocking the loop.
+                    #   * passing that snapshot into `install_boot_snapshot_
+                    #     async` makes it skip its own sync capture (see
+                    #     `current = snapshot if snapshot is not None else
+                    #     capture_snapshot()`), leaving only the sub-
+                    #     millisecond disk write on the thread hop.
+                    #
+                    # Nothing here weakens the audit: the same invariants are
+                    # checked over the same files with the same fail-closed
+                    # semantics. Only the thread it happens on changed.
+                    #
+                    # Both async entry points already existed and had no
+                    # caller — `install_boot_snapshot_async`'s own docstring
+                    # names this exact scenario as the reason it was written.
                     try:
-                        install_boot_snapshot()
+                        _snap = await _id_capture_async()
+                        await install_boot_snapshot_async(snapshot=_snap)
                     except Exception as boot_exc:  # noqa: BLE001
                         logger.warning(
                             "[EventChannel] invariant-drift boot "
