@@ -216,11 +216,22 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             .replacingOccurrences(of: "# ", with: "")
         if cleaned.count > 400 { cleaned = String(cleaned.prefix(400)) + "..." }
 
-        // Stop the mic BEFORE TTS starts so JARVIS can't hear itself and echo.
-        // isTTSSpeaking flag blocks the connection-status subscription from
-        // accidentally restarting the mic while we're speaking.
+        // v285.0: mute the tap, do not tear the audio graph down.
+        //
+        // This used to call `wakeWord.stop()` — destroying a working
+        // AVAudioEngine on every sentence — and `didFinish` then slept three
+        // seconds before rebuilding, because AVSpeechSynthesizer holds the
+        // output device for ~2-3s and rebuilding early throws -10877. The sleep
+        // was a workaround for a teardown that never needed to happen, and it
+        // left a three-second deaf window after every utterance.
+        //
+        // The claim is taken HERE rather than in `didStart` so the window
+        // between queueing and the first sample is covered too; `didStart`
+        // extends it with a real duration once speaking actually begins.
         isTTSSpeaking = true
-        wakeWord.stop()
+        SpeechGate.shared.claim(.hudSynthesizer,
+                                seconds: Self.estimatedSpeechSeconds(cleaned),
+                                reason: "queued utterance")
 
         let utterance = AVSpeechUtterance(string: cleaned)
         utterance.voice = AVSpeechSynthesisVoice(identifier: "com.apple.voice.compact.en-GB.Daniel")
@@ -231,23 +242,59 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         tts.speak(utterance)
     }
 
-    // Restart the mic once JARVIS finishes speaking — this is the gate that prevents echo.
+    /// Roughly how long this text takes to say, deliberately OVER-estimated.
+    ///
+    /// Under-estimating opens the mic while JARVIS is still talking, which
+    /// feeds the loop this exists to break. Over-estimating costs a fraction of
+    /// a second of not being heard. The asymmetry is why this is not a tight
+    /// fit — and it is only a CEILING regardless: `didFinish` releases the
+    /// claim the instant speech actually ends.
+    ///
+    /// `rate = 0.52` is below AVSpeechUtterance's default, so ~12 chars/second.
+    /// `nonisolated` because it is a pure function of its argument and is
+    /// called from the delegate callbacks, which arrive on an unspecified
+    /// queue. Nothing here touches actor state, so hopping to the MainActor
+    /// just to do arithmetic would be ceremony.
+    nonisolated static func estimatedSpeechSeconds(_ text: String) -> Double {
+        min(1.5 + Double(text.count) / 12.0, 60.0)
+    }
+
+    // The utterance actually began. Extend the claim with a real duration now
+    // that the synthesiser has committed to speaking.
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        let seconds = Self.estimatedSpeechSeconds(utterance.speechString)
+        Task { @MainActor in
+            SpeechGate.shared.claim(.hudSynthesizer, seconds: seconds,
+                                    reason: "speaking")
+        }
+    }
+
+    // Speech ended normally. The mic is live again on THIS runloop turn —
+    // nothing was torn down, so there is nothing to rebuild and no 3s wait.
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.isTTSSpeaking = false
-            // Only restart if cloud is still connected
-            guard self.appState.pythonBridge.connectionStatus == .connected else { return }
-            // Wait 3s for CoreAudio output hardware to fully release before opening input.
-            // AVSpeechSynthesizer holds the output device for ~2-3s after didFinish fires.
-            // Without this delay, beginListening() throws -10877 repeatedly while the audio
-            // subsystem transitions from output to input mode.
-            try? await Task.sleep(for: .seconds(3.0))
-            // Re-check connection state and TTS flag after the sleep — a new TTS may have started
-            guard !self.isTTSSpeaking,
-                  self.appState.pythonBridge.connectionStatus == .connected else { return }
-            print("[JARVIS Voice] TTS done — resuming mic")
-            self.wakeWord.start()
+            SpeechGate.shared.release(.hudSynthesizer, reason: "didFinish")
+        }
+    }
+
+    // THE CALLBACK THAT WAS MISSING.
+    //
+    // A cancelled utterance never fires `didFinish`. With the old code that
+    // left `isTTSSpeaking == true` and the mic stopped, with nothing left to
+    // restart it: permanent deafness, silent, and reproducible simply by
+    // interrupting JARVIS mid-sentence — which `VoiceManager.speak` does on
+    // purpose whenever a higher-priority utterance arrives.
+    //
+    // The gate's deadline would now expire this claim anyway; implementing the
+    // callback means the mic returns immediately instead of at the deadline.
+    // Both layers, because the one we thought of is not the only one.
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isTTSSpeaking = false
+            SpeechGate.shared.release(.hudSynthesizer, reason: "didCancel")
         }
     }
 

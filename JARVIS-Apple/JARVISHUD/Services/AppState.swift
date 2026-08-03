@@ -664,6 +664,13 @@ final class VoiceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegat
         utterance.volume = 0.9
 
         isSpeaking = true
+        // v285.0: the SECOND synthesiser in this app, and until now it
+        // suppressed NOTHING — `HUDAppDelegate` guarded its own utterances
+        // while this one spoke straight into a live microphone. One claim per
+        // speaker is the only arrangement where that cannot happen again.
+        SpeechGate.shared.claim(.voiceManager,
+                                seconds: min(1.5 + Double(text.count) / 12.0, 60.0),
+                                reason: "VoiceManager.speak")
         synthesizer.speak(utterance)
     }
 
@@ -673,6 +680,18 @@ final class VoiceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegat
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         Task { @MainActor [weak self] in
             self?.isSpeaking = false
+            SpeechGate.shared.release(.voiceManager, reason: "didFinish")
+        }
+    }
+
+    // `speak` calls `stopSpeaking(at: .immediate)` whenever a higher-priority
+    // utterance arrives, so cancellation is not an edge case here — it is a
+    // designed, routine event. Without this callback every interruption leaked
+    // a claim, and the mic stayed shut until the gate's deadline expired it.
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            self?.isSpeaking = false
+            SpeechGate.shared.release(.voiceManager, reason: "didCancel")
         }
     }
 

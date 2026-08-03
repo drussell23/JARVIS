@@ -30,6 +30,31 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
     // cancelled-task callback from racing with the newly-started task and killing it.
     private var listenerGeneration = 0
 
+    /// True while JARVIS is speaking. Read from the audio tap on a REAL-TIME
+    /// THREAD, written from the MainActor by `SpeechGate`.
+    ///
+    /// `nonisolated(unsafe)` is the honest annotation rather than a suppression:
+    /// it IS read off-actor, and the race is benign because the value is a
+    /// single word and the cost of reading a stale one is that a single
+    /// 4096-frame buffer (~85ms) slips through on the transition. A lock here
+    /// would let the main thread stall a render callback, which is a priority
+    /// inversion that costs audio drop-outs — far worse than one buffer of
+    /// echo, which is inaudible.
+    nonisolated(unsafe) private var micMuted = false
+
+    /// Drop input while JARVIS is speaking, without stopping the engine.
+    ///
+    /// Lives HERE rather than in `MicSuppression.swift` so the flag can stay
+    /// `private` to the file that owns the tap reading it. An extension in
+    /// another file would force the storage to `internal`, widening a
+    /// real-time-thread variable's blast radius to the whole module for no gain
+    /// — every legitimate writer goes through `SpeechGate` anyway.
+    func setMuted(_ muted: Bool) {
+        micMuted = muted
+    }
+
+    var isMicMuted: Bool { micMuted }
+
     // MARK: - Lifecycle
 
     func start() {
@@ -100,12 +125,12 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
         recognitionTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self, self.listenerGeneration == generation else { return }
 
-            // Mic suppression: if the Python backend is speaking via TTS,
-            // ignore all audio to prevent voice feedback loops (JARVIS hearing
-            // its own speech and treating it as a new command).
-            if FileManager.default.fileExists(atPath: "/tmp/jarvis_speaking") {
-                return
-            }
+            // Mic suppression moved to the TAP (see installTap below), where
+            // dropping a buffer actually keeps JARVIS's voice out of the
+            // recogniser. It used to `stat` /tmp/jarvis_speaking right here —
+            // a synchronous filesystem call several times a second, describing
+            // only ONE of the four things that can speak, and read at a layer
+            // where the audio had already been transcribed.
 
             if let result {
                 let fullText = result.bestTranscription.formattedString
@@ -194,7 +219,21 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
 
         // 4096 frames ≈ 85ms at 48kHz — large enough to prevent HALC I/O overload.
         // Guard against zero-byte buffers produced during audio hardware warmup.
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+            // THE GATE. Dropping the buffer here is what actually stops JARVIS
+            // hearing itself: the audio never reaches the recogniser at all.
+            //
+            // The previous check lived in the recognition RESULT callback and
+            // only skipped handling — the recogniser still received every
+            // sample of JARVIS's own voice, accumulated it into the running
+            // transcript, and delivered the lot as a command the moment
+            // suppression lifted. Suppressing the symptom one layer above the
+            // cause.
+            //
+            // Dropping rather than pausing the node keeps the recognition
+            // request alive: `SFSpeechAudioBufferRecognitionRequest` treats a
+            // gap as silence, which is exactly what it was.
+            guard self?.micMuted != true else { return }
             guard buffer.frameLength > 0 else { return }
             req.append(buffer)
         }
@@ -205,6 +244,15 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
             audioEngine = engine
             request = req
             DispatchQueue.main.async { self.state = .listening }
+            // Re-assert the mute from the GATE on every restart. A restart that
+            // inherited a stale `micMuted` would be silently deaf, and one that
+            // blindly cleared it would open the mic mid-sentence. Neither is a
+            // guess here — the gate is asked.
+            //
+            // `Task { @MainActor }` rather than `DispatchQueue.main.async`
+            // because `bindToSpeechGate` is MainActor-isolated, and a GCD
+            // closure is not: Swift 6 rejects the hop, correctly.
+            Task { @MainActor in self.bindToSpeechGate() }
             print("[JARVIS Voice] Listening...")
         } catch {
             // self.audioEngine was never assigned, so teardown() won't clean up the local engine.
