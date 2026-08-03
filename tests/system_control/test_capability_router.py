@@ -91,10 +91,16 @@ class _Provider:
 
 
 class _Decision:
-    """Shaped like `ApprovalResult` — only `.status.name` is read."""
+    """Shaped like `ApprovalResult`.
 
-    def __init__(self, name: str) -> None:
+    Carries a `nonce` because a verdict without one is no longer an answer:
+    the challenge landed after these tests were written, and they were updated
+    to satisfy it rather than the check being relaxed to satisfy them.
+    """
+
+    def __init__(self, name: str, nonce: str = "") -> None:
         self.status = type("S", (), {"name": name})()
+        self.nonce = nonce
 
 
 def _router(controller: Optional[_MockController] = None) -> tuple:
@@ -150,7 +156,8 @@ class TestTheMandatedScenario:
     async def test_approval_executes_and_re_triggers(self):
         router, ctl, _prov = _router()
         out = await router.route("lock_screen")
-        resumed = await router.resume(out.request_id, _Decision("APPROVED"))
+        resumed = await router.resume(out.request_id,
+                                      _Decision("APPROVED", out.nonce))
         assert resumed.outcome == Outcome.EXECUTED.value
         assert ctl.locked == 1
         assert resumed.should_retrigger is True
@@ -224,8 +231,9 @@ class TestFailingClosed:
         cannot execute a mutation twice."""
         router, ctl, _p = _router()
         out = await router.route("lock_screen")
-        await router.resume(out.request_id, _Decision("APPROVED"))
-        again = await router.resume(out.request_id, _Decision("APPROVED"))
+        await router.resume(out.request_id, _Decision("APPROVED", out.nonce))
+        again = await router.resume(out.request_id,
+                                    _Decision("APPROVED", out.nonce))
         assert ctl.locked == 1
         assert again.outcome == Outcome.FAILED.value
 
@@ -297,3 +305,105 @@ class TestConcurrency:
         assert all(o.suspended for o in outs)
         assert len({o.request_id for o in outs}) == 10
         assert ctl.locked == 0
+
+
+class TestTheNonceChallenge:
+    """A verdict is only an answer to THIS question if it carries THIS nonce.
+
+    The signed-bundle boundary stops an unsigned process from speaking for the
+    Secure Enclave. It does nothing about REPLAY: anything that can write to
+    the local IPC socket could capture one approval and resend it forever,
+    defeating the boundary one layer below it. The nonce closes that.
+    """
+
+    class _Verdict:
+        def __init__(self, name: str, nonce: str = "") -> None:
+            self.status = type("S", (), {"name": name})()
+            self.nonce = nonce
+
+    @pytest.mark.asyncio
+    async def test_a_suspension_mints_a_challenge(self):
+        router, _c, _p = _router()
+        out = await router.route("lock_screen")
+        assert out.nonce, "no challenge was issued with the suspension"
+        assert len(out.nonce) >= 32, "challenge is too short to resist guessing"
+
+    @pytest.mark.asyncio
+    async def test_the_right_nonce_is_accepted(self):
+        router, ctl, _p = _router()
+        out = await router.route("lock_screen")
+        res = await router.resume(out.request_id,
+                                  self._Verdict("APPROVED", out.nonce))
+        assert res.outcome == Outcome.EXECUTED.value
+        assert ctl.locked == 1
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_verdict_from_another_request_is_denied(self):
+        """THE attack. Capture an approval for one call, replay it at the next."""
+        router, ctl, _p = _router()
+        first = await router.route("lock_screen")
+        await router.resume(first.request_id,
+                            self._Verdict("APPROVED", first.nonce))
+        assert ctl.locked == 1
+
+        second = await router.route("lock_screen")
+        replayed = await router.resume(second.request_id,
+                                       self._Verdict("APPROVED", first.nonce))
+        assert replayed.outcome == Outcome.DENIED.value
+        assert ctl.locked == 1, "a replayed approval executed a second lock"
+        assert "nonce" in replayed.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("nonce", ["", None, "wrong", "x" * 43])
+    async def test_a_missing_or_wrong_nonce_fails_closed(self, nonce):
+        router, ctl, _p = _router()
+        out = await router.route("lock_screen")
+        res = await router.resume(out.request_id,
+                                  self._Verdict("APPROVED", nonce))
+        assert res.outcome == Outcome.DENIED.value
+        assert ctl.locked == 0
+
+    @pytest.mark.asyncio
+    async def test_a_dict_verdict_works_too(self):
+        """The IPC delivers JSON, so the verdict arrives as a dict — the
+        surfaces that answer should not have to learn a Python class."""
+        router, ctl, _p = _router()
+        out = await router.route("lock_screen")
+        res = await router.resume(out.request_id,
+                                  {"status": "APPROVED", "nonce": out.nonce})
+        assert res.outcome == Outcome.EXECUTED.value and ctl.locked == 1
+
+    @pytest.mark.asyncio
+    async def test_the_challenge_is_single_use(self):
+        """Consent is popped on resume, so even the CORRECT nonce cannot run
+        the capability twice."""
+        router, ctl, _p = _router()
+        out = await router.route("lock_screen")
+        await router.resume(out.request_id,
+                            self._Verdict("APPROVED", out.nonce))
+        again = await router.resume(out.request_id,
+                                    self._Verdict("APPROVED", out.nonce))
+        assert ctl.locked == 1
+        assert again.outcome == Outcome.FAILED.value
+
+    @pytest.mark.asyncio
+    async def test_two_suspensions_get_different_challenges(self):
+        router, _c, _p = _router()
+        a = await router.route("lock_screen")
+        b = await router.route("lock_screen")
+        assert a.nonce != b.nonce
+
+    def test_comparison_is_constant_time(self):
+        """A verdict over a local socket is attacker-influenced input; an
+        early-exit `==` leaks the prefix one byte at a time to anything that
+        can time it."""
+        import inspect
+        from backend.system_control import capability_router as m
+        assert "compare_digest" in inspect.getsource(m._verify_nonce)
+
+    def test_the_challenge_uses_a_csprng(self):
+        """`uuid4` guarantees uniqueness; an anti-replay token needs
+        UNPREDICTABILITY."""
+        import inspect
+        from backend.system_control import capability_router as m
+        assert "secrets" in inspect.getsource(m._mint_nonce)

@@ -2164,6 +2164,27 @@ async def parallel_lifespan(app: FastAPI):
                                 )
                             except Exception as e:
                                 logger.error("[HUD] Command dispatch failed: %s", e)
+                    elif event_type == "consent_verdict":
+                        # The signed HUD answering a gated capability.
+                        #
+                        # Delivered as a plain dict straight from the IPC —
+                        # `capability_router.resume` reads `status`/`approved`
+                        # and verifies the echoed `nonce` in constant time, so
+                        # nothing is unwrapped or re-shaped here. A verdict that
+                        # cannot prove which challenge it answers is denied by
+                        # that check, not by this branch.
+                        try:
+                            from backend.system_control.capability_router import (
+                                get_capability_router,
+                            )
+                            rid = str(data.get("request_id") or "")
+                            routed = await get_capability_router().resume(rid, data)
+                            logger.info(
+                                "[HUD] consent verdict for %s → %s (%s)",
+                                data.get("capability") or "?",
+                                routed.outcome, routed.detail or "-")
+                        except Exception as _cv:  # noqa: BLE001
+                            logger.error("[HUD] consent verdict failed: %s", _cv)
                     else:
                         logger.debug("[HUD] Unhandled event: %s", event_type)
 
