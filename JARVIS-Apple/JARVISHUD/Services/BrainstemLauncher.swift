@@ -21,6 +21,9 @@ final class BrainstemLauncher {
     /// TCP connection to the brainstem IPC server.
     private var connection: NWConnection?
     private let ipcPort: UInt16 = 8742
+    /// Read-only accessor so other components can NAME the transport they
+    /// are deferring to, without a second copy of the number.
+    var ipcPortNumber: UInt16 { ipcPort }
     /// HTTP port for the backend in HUD mode (separate from supervisor's 8010).
     let httpPort: UInt16 = 8011
 

@@ -183,6 +183,27 @@ class PythonBridge: ObservableObject {
         detailedConnectionState = "Authenticating with cloud..."
 
         // Enter SSE reconnect loop (runs forever with exponential backoff)
+        // SPLIT-BRAIN, ENDED. A loopback backend is reached over the IPC
+        // socket, not over SSE — `BrainstemLauncher` connects 8742 and calls
+        // `onBackendReady()`, which is what actually sets `.connected`.
+        //
+        // The cloud SSE loop was running anyway, against
+        // `POST /api/stream/token` — an endpoint that does not exist in this
+        // backend AT ALL (0 hits in backend/main.py). So it 404'd forever:
+        // first as `Connection refused` while the backend booted, then as a
+        // real 404 once it was up, retrying without end. Two transports for one
+        // conversation, one of them aimed at nothing.
+        //
+        // Detected by LOOPBACK, not by port number: any host that resolves to
+        // this machine is served by the brainstem we spawned. The cloud path is
+        // untouched — JARVIS_HUD_FORCE_CLOUD=1 still gets full SSE.
+        let host = URL(string: creds.baseURL)?.host?.lowercased() ?? ""
+        let isLoopback = ["localhost", "127.0.0.1", "::1", "[::1]"].contains(host)
+        if isLoopback {
+            print("[JARVIS] LOCAL mode — IPC (\(BrainstemLauncher.shared.ipcPortNumber)) is the transport; not starting the cloud SSE loop")
+            detailedConnectionState = "Waiting for local backend IPC..."
+            return
+        }
         await connectLoop(deviceAuth: deviceAuth, config: creds)
     }
 
