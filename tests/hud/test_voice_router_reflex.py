@@ -14,8 +14,20 @@ import pytest
 from backend.hud.tool_use_orchestrator import CommandResult
 from backend.hud.voice_command_router import (
     VoiceCommandRouter, _humanise, _make_failure_speakable,
-    _read_controller_result,
+    _read_controller_result, reset_spoken,
 )
+
+
+@pytest.fixture(autouse=True)
+def _forget_what_jarvis_said():
+    """The router now narrates "On it — lock screen" before acting, and that
+    utterance is recorded so the microphone cannot hear it back as a command.
+    Across tests the ledger would leak, and one test's narration would suppress
+    the next test's command — which is exactly the production bug in miniature.
+    """
+    reset_spoken()
+    yield
+    reset_spoken()
 
 REFUSAL = ("session_budget_preflight_refused:soak_circuit_tripped:"
            "soak_cost_cap_exceeded:$238111.9488>=$2.0000:on_boot: "

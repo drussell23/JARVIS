@@ -64,11 +64,39 @@ def hud_consent_enabled() -> bool:
 class HUDConsentProvider:
     """An `ApprovalProvider` that asks the signed HUD over the IPC. NEVER raises.
 
+    THIS CHANNEL HAS A PRECONDITION
+    ---------------------------------
+    `requires` is the world state this channel needs in order to be ANSWERABLE
+    at all. Touch ID draws a system dialog, and there is no surface to draw on
+    while the screen is locked.
+
+    That is not a theoretical concern. Measured on 2026-08-03 at 00:18:58, an
+    operator said "unlock my screen":
+
+        [HUD] Voice result: awaiting-consent
+        [Brainstem] sendEvent: consent_verdict (249 bytes)      +99ms
+        [HUD] consent verdict for unlock_screen → denied (operator declined)
+
+    Ninety-nine milliseconds. No human declined anything — `canEvaluatePolicy`
+    failed instantly because the screen was locked, and the router rendered it
+    as a refusal the operator does not remember giving.
+
+    So `unlock_screen` could never be authorised through this channel, ever, by
+    construction: **a gate whose only answer channel requires the very state
+    the gated action exists to produce is a deadlock, not a safeguard.**
+
+    Declaring the precondition lets `CapabilityRouter` see that before it
+    suspends, and refuse with the real reason instead of parking a call nothing
+    can answer.
+
     Implements `request` only. `approve`, `reject` and `await_decision` are
     absent on purpose: the verdict arrives as an inbound IPC event and goes
     straight to `CapabilityRouter.resume`, so a second path for the same answer
     would be a second place for the nonce check to be forgotten.
     """
+
+    #: World-state predicates that must hold for this channel to reach a human.
+    requires = ("screen_unlocked",)
 
     def __init__(self, publish: Optional[Callable[[str, Dict[str, Any]], int]] = None) -> None:
         self._publish = publish
@@ -145,6 +173,64 @@ class HUDConsentProvider:
                 "unreachable": self._unreachable, "hud_clients": connected}
 
 
+class VoiceConsentProvider:
+    """Consent by speaker verification. Reachable through a locked screen.
+
+    NEVER raises. The counterpart to `HUDConsentProvider`: same interface, no
+    `requires`, because a microphone does not need a screen to be unlocked.
+
+    IMMEDIATE, NOT SUSPENDED
+    --------------------------
+    Touch ID suspends because a human takes an unbounded amount of time to
+    answer. This does not: the operator ALREADY answered — they spoke, and the
+    evidence was captured with the command. Verification is a local
+    computation on bytes we hold, so it resolves inside the turn.
+
+    That is why this returns a decision rather than a request id, and why
+    `CapabilityRouter` treats it as a distinct kind of authority. Suspending on
+    it would park a call waiting for a human who has nothing left to do.
+    """
+
+    #: Nothing. A microphone works through a locked screen — that is the whole
+    #: reason this authority exists.
+    requires: tuple = ()
+    immediate: bool = True
+
+    def __init__(self) -> None:
+        self._verified = 0
+        self._refused = 0
+
+    async def decide(self, ctx: Any) -> Any:
+        """Verify the held utterance and answer. NEVER raises."""
+        try:
+            from backend.hud.utterance_audio import get_utterance_holder
+            from backend.hud.voice_identity import get_voice_identity
+            held = get_utterance_holder().claim()
+            ident = await get_voice_identity().identify(
+                held.audio if held else None,
+                sample=held.digest if held else "")
+            if ident.approves:
+                self._verified += 1
+            else:
+                self._refused += 1
+            logger.info("[VoiceConsent] '%s' → %s (%s)",
+                        getattr(ctx, "capability", "?"), ident.verdict,
+                        ident.detail or "-")
+            return ident
+        except Exception as exc:  # noqa: BLE001 — a fault is never consent
+            logger.error("[VoiceConsent] degraded: %s", exc)
+            return None
+
+    def stats(self) -> Dict[str, Any]:
+        try:
+            from backend.hud.voice_identity import get_voice_identity
+            v = get_voice_identity().stats()
+        except Exception:  # noqa: BLE001
+            v = {}
+        return {"verified": self._verified, "refused": self._refused,
+                "identity": v}
+
+
 def install(router: Any = None) -> bool:
     """Give the capability router a way to ask. Idempotent. NEVER raises.
 
@@ -165,6 +251,33 @@ def install(router: Any = None) -> bool:
         router._provider = HUDConsentProvider()
         logger.info("[HUDConsent] installed — gated capabilities will now "
                     "prompt for Touch ID on the signed HUD")
+
+        # The authority that answers when Touch ID cannot.
+        #
+        # Registered as a FALLBACK, never a replacement: the router consults it
+        # only after finding the primary channel unreachable, so while a prompt
+        # could have been shown to the operator it still is. Without this,
+        # `unlock_screen` is a gate that can only ever refuse itself.
+        #
+        # Warming starts here rather than at first use because the model took
+        # over 150 seconds to load when measured, and the utterance it would
+        # verify expires in thirty.
+        try:
+            import asyncio as _aio
+            router.add_authority(VoiceConsentProvider())
+            from backend.hud.voice_identity import get_voice_identity
+            ident = get_voice_identity()
+            # `warm()` rather than `start_warming()`: enrollment is a single
+            # database row and resolves in milliseconds, while the speaker
+            # model takes minutes. Asking both at boot means the organism knows
+            # WHO it would be checking for long before it can check — which is
+            # the difference between "give me a moment" and "I don't know you".
+            _aio.get_event_loop().create_task(ident.warm())
+            logger.info("[HUDConsent] voice authority installed — reachable "
+                        "through a locked screen; enrollment + speaker model "
+                        "resolving in the background")
+        except Exception as _va:  # noqa: BLE001
+            logger.error("[HUDConsent] voice authority unavailable: %s", _va)
         return True
     except Exception:  # noqa: BLE001
         logger.error("[HUDConsent] install failed — gated capabilities will "

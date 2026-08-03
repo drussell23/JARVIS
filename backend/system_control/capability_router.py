@@ -417,6 +417,60 @@ class CapabilityRouter:
             # question; minting it afterwards meant the prompt went out with no
             # nonce, `SecureConsent.Challenge` failed closed on the empty field,
             # and the request vanished without the operator ever seeing it.
+            # IS THERE ANYONE WHO CAN ANSWER?
+            #
+            # Asked BEFORE the request, because a channel that cannot be
+            # reached does not fail loudly — it fails like a refusal. Touch ID
+            # on a locked screen returns DENIED in 99ms and the operator is
+            # told they declined something they never saw.
+            #
+            # Refusing here is not worse than suspending; it is the same
+            # outcome with the truth attached. What it buys is a caller that
+            # can DO something: `voice_command_router` reads this detail and
+            # says which authority was missing, instead of narrating a denial
+            # that never happened.
+            # AN AUTHORITY THAT CAN ACTUALLY ANSWER.
+            #
+            # Touch ID needs an unlocked screen; a microphone does not. When
+            # the primary channel's preconditions are not met, a secondary
+            # authority whose preconditions ARE met is asked instead — which
+            # is what makes `unlock_screen` authorisable at all rather than a
+            # gate that can only ever refuse itself.
+            #
+            # An immediate authority resolves INSIDE the turn: the operator
+            # already answered by speaking, so there is no human left to wait
+            # for and suspending would park a call nobody can complete.
+            immediate = await self._immediate_authority()
+            if immediate is not None:
+                decision = await immediate.decide(
+                    _ConsentContext(op_id=op_id or f"cap:{name}",
+                                    capability=name, args=args,
+                                    session=self._session_kind(name)))
+                if _approved(decision):
+                    logger.info("[CapabilityRouter] '%s' authorised by %s",
+                                name, type(immediate).__name__)
+                    out = await self._execute(name, args)
+                    out.tier = tier
+                    return out
+                self._stats["denied"] += 1
+                why = _verdict_reason(decision)
+                logger.warning("[CapabilityRouter] '%s' NOT authorised by %s "
+                               "(%s)", name, type(immediate).__name__, why)
+                return RoutedCall(
+                    outcome=Outcome.DENIED.value, capability=name, tier=tier,
+                    context_note=DENIED_PAYLOAD, detail=why)
+
+            unreachable = await self._channel_unreachable()
+            if unreachable:
+                self._stats["denied"] += 1
+                logger.warning(
+                    "[CapabilityRouter] '%s' needs consent, but no channel "
+                    "can reach the operator: %s", name, unreachable)
+                return RoutedCall(
+                    outcome=Outcome.DENIED.value, capability=name, tier=tier,
+                    context_note=DENIED_PAYLOAD,
+                    detail=f"consent channel unreachable — {unreachable}")
+
             nonce = _mint_nonce()
             rid = await self._request_consent(name, args, op_id=op_id,
                                               nonce=nonce)
@@ -485,14 +539,31 @@ class CapabilityRouter:
                 out.request_id = request_id
                 return out
             self._stats["denied"] += 1
-            logger.info("[CapabilityRouter] '%s' DENIED by operator",
-                        parked.capability)
+            # KEEP THE REASON THE CHANNEL GAVE.
+            #
+            # `SecureConsent.describe()` already distinguishes "operator
+            # denied" from "biometry unavailable", "no biometry enrolled" and
+            # "system cancelled the prompt", and sends it in the verdict. This
+            # branch threw all of it away and wrote "operator declined".
+            #
+            # Measured 2026-08-03 00:18:58 — a verdict arrived 99ms after the
+            # request, which is not a human, and the log read:
+            #
+            #     consent verdict for unlock_screen → denied (operator declined)
+            #
+            # The operator declined nothing; the screen was locked so no dialog
+            # could be drawn. "You said no" and "nobody could be asked" need
+            # opposite follow-ups, and the one surface that knew the difference
+            # was discarding it one line before anybody could read it.
+            why = _verdict_reason(decision)
+            logger.info("[CapabilityRouter] '%s' DENIED (%s)",
+                        parked.capability, why)
             # A RESULT, not an exception: the agent must reason about the
             # refusal rather than retry a reworded version of the same call.
             return RoutedCall(
                 outcome=Outcome.DENIED.value, capability=parked.capability,
                 request_id=request_id, context_note=DENIED_PAYLOAD,
-                detail="operator declined")
+                detail=why)
         except Exception as exc:  # noqa: BLE001
             self._stats["failed"] += 1
             return RoutedCall(outcome=Outcome.FAILED.value,
@@ -501,6 +572,90 @@ class CapabilityRouter:
                               detail=f"{type(exc).__name__}: {exc}")
 
     # -- internals -------------------------------------------------------
+
+    async def _immediate_authority(self) -> Any:
+        """A secondary authority that can decide NOW, or None. NEVER raises.
+
+        Consulted only when the PRIMARY channel cannot be reached. That order
+        is the security property: while Touch ID is presentable it remains the
+        authority, and voice never becomes a way to bypass a prompt the
+        operator could have seen. Voice is what answers when nothing else can
+        — which, for `unlock_screen`, is always.
+
+        An authority is eligible only when every predicate it declares is
+        satisfied. `requires = ()` on the voice provider is therefore a
+        statement, not an omission: it works through a locked screen, and it
+        says so where the router can check.
+        """
+        try:
+            candidates = list(getattr(self, "_authorities", ()) or ())
+            if not candidates:
+                return None
+            if not await self._channel_unreachable():
+                return None      # the primary can still be asked; prefer it
+            from backend.system_control.world_state import get_world_state
+            world = get_world_state()
+            for auth in candidates:
+                if not getattr(auth, "immediate", False):
+                    continue
+                blocked = False
+                for predicate in tuple(getattr(auth, "requires", ()) or ()):
+                    if await world.refutes(predicate):
+                        blocked = True
+                        break
+                if not blocked:
+                    return auth
+            return None
+        except Exception:  # noqa: BLE001
+            logger.debug("[CapabilityRouter] authority selection degraded",
+                         exc_info=True)
+            return None
+
+    def add_authority(self, authority: Any) -> None:
+        """Register a fallback consent authority. Idempotent. NEVER raises."""
+        try:
+            if not hasattr(self, "_authorities"):
+                self._authorities = []
+            if not any(type(a) is type(authority) for a in self._authorities):
+                self._authorities.append(authority)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _channel_unreachable(self) -> str:
+        """Why the consent channel cannot reach a human. "" when it can.
+
+        NEVER raises, and biased toward PROCEEDING: only a predicate the world
+        model KNOWS to be false blocks the request. An UNKNOWN reading means we
+        cannot see whether Touch ID is presentable, and refusing to ask on the
+        strength of not knowing would break every consent prompt on any machine
+        where the probe is blind — which is most of them, since
+        `CGSessionCopyCurrentDictionary` answers only inside a GUI session.
+
+        The asymmetry is deliberate and it is the same one `WorldState` draws:
+        act on positive knowledge, never on absence of it.
+        """
+        try:
+            provider = self._provider
+            if provider is None:
+                return ""      # a missing provider already fails closed below
+            needs = tuple(getattr(provider, "requires", ()) or ())
+            if not needs:
+                return ""
+            from backend.system_control.world_state import get_world_state
+            world = get_world_state()
+            blocked = []
+            for predicate in needs:
+                if await world.refutes(predicate):
+                    blocked.append(predicate)
+            if not blocked:
+                return ""
+            channel = type(provider).__name__
+            return (f"{channel} needs {', '.join(blocked)}, which is not the "
+                    f"case right now")
+        except Exception:  # noqa: BLE001 — never block consent on this check
+            logger.debug("[CapabilityRouter] reachability check degraded",
+                         exc_info=True)
+            return ""
 
     async def _request_consent(self, name: str, args: Dict[str, Any], *,
                                op_id: str, nonce: str = "") -> str:
@@ -820,6 +975,31 @@ def _verify_nonce(expected: str, decision: Any) -> bool:
         return False
 
 
+def _verdict_reason(decision: Any) -> str:
+    """Why a verdict said no, in the CHANNEL's own words. NEVER raises.
+
+    Falls back to "operator declined" only when the channel offered nothing —
+    which is the honest reading of a verdict that carries no explanation, and
+    is exactly what this used to say unconditionally.
+    """
+    try:
+        raw = ""
+        if isinstance(decision, dict):
+            raw = str(decision.get("reason") or "")
+        else:
+            # `spoken_reason` FIRST. A voice verdict already carries a sentence
+            # written for a person — "I don't have a voiceprint for you on this
+            # Mac yet" — and that is exactly what the operator should hear when
+            # their Mac declines to unlock. `detail` is the engineering half
+            # and stays in the log.
+            raw = str(getattr(decision, "spoken_reason", "")
+                      or getattr(decision, "reason", "") or "")
+        raw = " ".join(raw.split())[:200]
+        return raw or "operator declined"
+    except Exception:  # noqa: BLE001
+        return "operator declined"
+
+
 def _approved(decision: Any) -> bool:
     """Did the operator say yes? NEVER raises.
 
@@ -830,6 +1010,14 @@ def _approved(decision: Any) -> bool:
     try:
         if decision is None:
             return False
+        # An authority that has ALREADY decided says so with a boolean. Voice
+        # verification returns an `Identification` whose verdict vocabulary is
+        # its own ("verified" / "rejected" / "not_enrolled" / …), and matching
+        # those against a list of spellings of "yes" here would put the
+        # decision in two places. It answers `approves`; that IS the decision.
+        approves = getattr(decision, "approves", None)
+        if isinstance(approves, bool):
+            return approves
         # The IPC delivers JSON, so a verdict from the signed HUD arrives as a
         # dict. Reading only `.status` would have made every real verdict from
         # Swift fall through to denial — safe, and completely broken.

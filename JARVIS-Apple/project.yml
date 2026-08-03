@@ -101,6 +101,12 @@ schemes:
     run:
       config: Debug
       environmentVariables:
+        # Suppresses the OSLog firehose in the Xcode console. This existed in
+        # the .xcscheme but NOT here, so `xcodegen generate` deleted it — the
+        # generator rebuilds the scheme from this file, and anything only in
+        # the generated artefact is not a setting, it is a countdown. Recorded
+        # at the source so it survives the next regeneration.
+        OS_ACTIVITY_MODE: disable
         JARVIS_DEVICE_ID: mac-m1-derek
         JARVIS_DEVICE_SECRET: b110e2fd04a9baf2d5923373929af3a06e7abac06168120f063a05329de7151d
         JARVIS_VERCEL_URL: https://jarvis-cloud-five.vercel.app

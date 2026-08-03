@@ -14,7 +14,9 @@ import json
 import logging
 import os
 import re
-from typing import Any, Optional
+import threading
+import time
+from typing import Any, List, Optional
 
 from backend.hud.applescript_executor import AppleScriptExecutor
 from backend.hud.query_executor import QueryExecutor
@@ -37,6 +39,144 @@ Categories:
 - "query": answer a question, provide information, no action needed (e.g., "what time is it", "what's on my screen", "how does the vision loop work")
 
 Return: {{"category": "...", "needs_vision": true/false, "needs_tools": true/false}}"""
+
+
+#: What JARVIS has said recently, as token sets, newest last. Bounded.
+_SPOKEN: List[tuple] = []
+_SPOKEN_LOCK = threading.Lock()
+
+
+def echo_grace_s() -> float:
+    """Extra time past the end of speech in which an echo can still arrive.
+
+    NEVER raises. Covers recogniser latency — the transcript of a phrase lands
+    after the phrase finished. ``0`` disables echo suppression entirely.
+    """
+    try:
+        raw = (os.environ.get("JARVIS_ECHO_GRACE_S", "") or "").strip()
+        return max(0.0, min(30.0, float(raw))) if raw else 1.5
+    except (TypeError, ValueError):
+        return 1.5
+
+
+def _echo_expiry(text: str) -> float:
+    """When this utterance stops being a plausible echo. NEVER raises.
+
+    Bounded by HOW LONG JARVIS ACTUALLY SPEAKS, not a flat window, and reusing
+    `speech_bridge.estimate_speech_ms` rather than a second estimate of the
+    same thing.
+
+    A flat window was wrong in a way that mattered. The pre-narration is "On
+    it — lock screen", which is precisely what an operator repeating
+    themselves also says, so a fixed 8s window deafened JARVIS to a genuine
+    second attempt for eight seconds after acknowledging the first. An echo
+    can only arrive while the audio is playing (plus recogniser latency); a
+    person repeating themselves waits for JARVIS to finish. Tying the window
+    to the utterance separates them.
+    """
+    try:
+        from backend.hud.speech_bridge import estimate_speech_ms
+        return time.time() + (estimate_speech_ms(text) / 1000.0) + echo_grace_s()
+    except Exception:  # noqa: BLE001
+        return time.time() + 3.0 + echo_grace_s()
+
+
+def reset_spoken() -> None:
+    """Forget what JARVIS has said. Testing seam. NEVER raises."""
+    try:
+        with _SPOKEN_LOCK:
+            _SPOKEN.clear()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def note_spoken(text: str) -> None:
+    """Record that JARVIS said this. NEVER raises.
+
+    Called from the ONE place all HUD speech passes through, so nothing it
+    utters can be missed. Stores tokens rather than the sentence: speech
+    recognition returns "Lock screen" for a synthesiser that said "On it —
+    lock screen", and comparing strings would match neither.
+    """
+    try:
+        from backend.system_control.capability_reflex import content_tokens
+        toks = tuple(content_tokens(text or ""))
+        if not toks:
+            return
+        with _SPOKEN_LOCK:
+            # ORDER IS KEPT, not a set. See `is_own_echo` — order is the only
+            # thing separating an echo from a command that happens to reuse
+            # JARVIS's own words.
+            _SPOKEN.append((toks, _echo_expiry(text)))
+            del _SPOKEN[:-12]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def is_own_echo(command: str) -> str:
+    """Whether JARVIS is hearing itself. "" when it is not. NEVER raises.
+
+    THE BUG THIS ANSWERS
+    ----------------------
+    Measured 2026-08-03: one spoken "lock my screen" locked the screen TWICE.
+
+        [SpeechGate] claim backend for 4.3s backend:system
+        [SpeechGate] EXPIRED backend — its owner never released it
+        [SpeechGate] mic LIVE
+        [JARVIS Voice] [partial] "Lock screen"        ← its own voice
+
+    `speech_bridge` derives a mute deadline from character count
+    (`1500ms + chars/12 * 1000`). That is an ESTIMATE of how long speech will
+    take, and when the synthesiser runs slower than the estimate the claim
+    expires mid-sentence, the microphone goes live, and JARVIS transcribes
+    itself. The deadline is deliberate — a claim on a microphone must never be
+    able to outlive its own plausible duration — so the answer is not a longer
+    guess; it is recognising the echo when it arrives.
+
+    ORDERED subsequence, not a subset — and the difference is not pedantry.
+    JARVIS's own contextual narration is "Your screen is locked, let me unlock
+    it first", which CONTAINS both `unlock` and `screen`. As a set test, that
+    sentence suppresses a genuine "unlock my screen" from the operator for the
+    whole window: the assistant explains what it is about to do and is thereby
+    deafened to the very command it just described. Caught by
+    `test_the_opposite_command_is_not_an_echo`.
+
+    In that sentence the words arrive as `screen … unlock`; a person asking
+    says `unlock … screen`. A recogniser mishearing a synthesiser drops words,
+    it does not reorder them — so order is exactly the signal that separates
+    an echo from a command reusing JARVIS's vocabulary.
+
+    Deliberately NOT a general repeat-suppressor. "volume up, volume up" is a
+    real thing a person does, and it only matches here if JARVIS itself said
+    "volume up", in that order, within the window.
+    """
+    try:
+        if echo_grace_s() <= 0.0:
+            return ""
+        from backend.system_control.capability_reflex import content_tokens
+        said = tuple(content_tokens(command or ""))
+        if not said:
+            return ""
+        now = time.time()
+        with _SPOKEN_LOCK:
+            live = [(t, exp) for t, exp in _SPOKEN if exp > now]
+            _SPOKEN[:] = live
+        for toks, exp in reversed(live):
+            if _ordered_within(said, toks):
+                return (f"JARVIS is still saying it "
+                        f"({exp - now:.1f}s left)")
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _ordered_within(needle: tuple, haystack: tuple) -> bool:
+    """Whether *needle* appears in *haystack* in order. NEVER raises."""
+    try:
+        it = iter(haystack)
+        return all(any(h == n for h in it) for n in needle)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _humanise(capability: str) -> str:
@@ -215,6 +355,15 @@ class VoiceCommandRouter:
         message.
         """
         logger.info("[VoiceRouter] Command: %s", command[:100])
+        # HEARING YOURSELF IS NOT BEING TOLD SOMETHING.
+        # Checked before the journal opens: an echo is not an intent, and
+        # recording one would put JARVIS's own voice in the replay queue.
+        _echo = is_own_echo(command)
+        if _echo:
+            logger.warning("[VoiceRouter] IGNORED '%s' — %s", command[:60], _echo)
+            return CommandResult(
+                success=True, category="ignored_echo", steps_completed=0,
+                steps_total=0, response_text=None, error=None)
         _journal = None
         reflex = None
         try:
@@ -244,6 +393,18 @@ class VoiceCommandRouter:
             logger.info("[VoiceRouter] REFLEX resolved '%s' -> %s in %.2fms "
                         "(no model call) — %s", command[:60],
                         reflex.capability, reflex.elapsed_ms, reflex.reason)
+            # SAY WHAT YOU ARE ABOUT TO DO, not what you heard.
+            #
+            # The HUD narrates "On it. Executing: lock my screen" BEFORE
+            # routing, so it can only ever echo the raw transcript back — it
+            # is speaking before anything has been understood. Now that the
+            # reflex has resolved a NAME deterministically and for free, the
+            # organism can say what it is actually about to do.
+            #
+            # Said here rather than after the call because a NOTIFY_APPLY
+            # capability may remove the surface the sentence would have
+            # arrived on: `lock_screen` returns, and the screen is gone.
+            await self._say(f"On it — {_humanise(reflex.capability)}.")
 
         # Step 1: Classify intent via 35B — PURE, so a resume can reuse it.
         classification = None
@@ -289,6 +450,15 @@ class VoiceCommandRouter:
                 pass
         result: Optional[CommandResult] = None
         try:
+            # CONTEXTUAL AWARENESS. Clear the way before acting, the way a
+            # person would — unlock the screen before searching the web,
+            # without being told to. Returns non-None only when the way could
+            # not be cleared and the original command must not proceed.
+            blocked_by = await self._clear_the_way(command, category, reflex)
+            if blocked_by is not None:
+                result = blocked_by
+                return result
+
             if reflex is not None and reflex.resolved:
                 result = await self._execute_capability(reflex)
             elif category == "app_action":
@@ -332,6 +502,196 @@ class VoiceCommandRouter:
                         intent_id, success=bool(getattr(result, "success", True)))
                 except Exception:  # noqa: BLE001
                     pass
+
+    # ── Contextual awareness: the flow a person would follow ────────────
+
+    async def _clear_the_way(self, command: str, category: str,
+                             reflex: Any) -> Optional[CommandResult]:
+        """Satisfy what this command needs before running it. NEVER raises.
+
+        Returns a CommandResult ONLY when the way could not be cleared and the
+        caller must stop; ``None`` means proceed.
+
+        THE FLOW A PERSON WOULD FOLLOW
+        --------------------------------
+        Told "search for dogs" at a locked Mac, nobody types the query into the
+        lock screen and reports failure. They unlock it first, because the
+        precondition is obvious to them and they never mention it. That is what
+        this does, and the reason it is not a special case in a branch:
+
+          * WHAT a command needs is a world-state predicate.
+          * WHO can supply it is a registry question — "which capability
+            declares `provides=screen_unlocked`?" — so the remedy is DERIVED.
+            Nothing here names `unlock_screen`, and a capability that gains
+            that declaration tomorrow becomes the remedy tomorrow.
+          * WHETHER it worked is re-observed, never assumed.
+
+        IT ACTS ONLY ON POSITIVE KNOWLEDGE
+        ------------------------------------
+        The chain engages when the world model KNOWS a requirement is false —
+        `refutes`, not `not satisfies`. UNKNOWN proceeds exactly as before.
+
+        That asymmetry is load-bearing rather than cautious. `CGSession`
+        answers only inside a GUI session, so the probe is legitimately blind
+        in a shell, in CI, and anywhere the backend is not a child of the
+        window server. Treating "I cannot see" as "it is locked" would make
+        JARVIS try to unlock a Mac that was never locked, every time it could
+        not look — a fabricated remedy for an imagined problem, which is the
+        blast-radius fabrication class in a new costume.
+        """
+        try:
+            from backend.system_control.world_state import get_world_state
+            world = get_world_state()
+            needs = self._requirements(category, reflex)
+            if not needs:
+                return None
+
+            blocked = [p for p in needs if await world.refutes(p)]
+            if not blocked:
+                return None
+
+            for predicate in blocked:
+                remedy = self._who_provides(predicate)
+                if remedy is None:
+                    logger.info("[VoiceRouter] '%s' is unmet and nothing "
+                                "declares it — proceeding anyway", predicate)
+                    continue
+
+                await self._say(self._explain_detour(predicate, remedy, command))
+                logger.info("[VoiceRouter] CAI: '%s' unmet → running '%s' "
+                            "first", predicate, remedy)
+
+                step = await self._execute_capability(
+                    type("_R", (), {"capability": remedy, "resolved": True})())
+
+                # OBSERVE, NEVER PREDICT. `provides` is a claim the capability
+                # makes about itself; the only evidence it worked is looking
+                # again. `fresh=True` because a cached reading is precisely the
+                # answer we are trying to replace.
+                world.invalidate()
+                if await world.satisfies(predicate, fresh=True):
+                    logger.info("[VoiceRouter] CAI: '%s' now satisfied — "
+                                "continuing with the original command",
+                                predicate)
+                    continue
+
+                # It did not work. Stop, and say which half failed — "I
+                # couldn't unlock" and "I unlocked but still can't see the
+                # screen" need different responses from a person.
+                logger.warning("[VoiceRouter] CAI: '%s' still unmet after "
+                               "'%s' — abandoning the original command",
+                               predicate, remedy)
+                spoken = (getattr(step, "response_text", "") or "").strip()
+                if getattr(step, "pending", False):
+                    return step
+                return CommandResult(
+                    success=False, category="system_action", steps_completed=0,
+                    steps_total=2, error=f"precondition {predicate} unmet",
+                    response_text=(
+                        f"{spoken} I couldn't {_humanise(remedy)}, so I've "
+                        f"left the rest alone." if spoken else
+                        f"I couldn't {_humanise(remedy)} first, so I've left "
+                        f"the rest alone."))
+            return None
+        except Exception:  # noqa: BLE001 — CAI never blocks a command
+            logger.debug("[VoiceRouter] precondition pass degraded",
+                         exc_info=True)
+            return None
+
+    @staticmethod
+    def _requirements(category: str, reflex: Any) -> tuple:
+        """What this command needs to be true. NEVER raises.
+
+        Two sources, neither of them a phrase table:
+
+        * a reflex-resolved capability DECLARES its own `requires` — the exact
+          answer, from the definition site;
+        * otherwise the ROUTER'S OWN CATEGORY answers it. The classifier
+          already decided whether this drives the UI; `app_action`,
+          `navigation`, `vision_action` and `composite` all mean "something is
+          going to happen on screen", and `query` means it is not.
+
+        The dead `ScreenLockContextDetector._command_requires_screen` answered
+        this by matching ~30 hardcoded substrings — including a bare `'open'`,
+        and an exception list for `'lock screen'` to stop it unlocking the Mac
+        in order to lock it. Reusing a decision the router has already made is
+        both more accurate and one fewer vocabulary to keep in sync.
+        """
+        try:
+            if reflex is not None and getattr(reflex, "resolved", False):
+                from backend.system_control.capability_registry import (
+                    get_capability_registry,
+                )
+                cap = get_capability_registry().get(reflex.capability)
+                # A declaring capability speaks for itself — including by
+                # declaring NOTHING. `lock_screen` needs no unlocked screen,
+                # and inferring one from its category would deadlock it
+                # against itself.
+                return tuple(getattr(cap, "requires", ()) or ()) if cap else ()
+            if category in ("app_action", "navigation", "vision_action",
+                            "composite", "code_action"):
+                return ("screen_unlocked",)
+            return ()
+        except Exception:  # noqa: BLE001
+            return ()
+
+    @staticmethod
+    def _who_provides(predicate: str) -> Optional[str]:
+        """The capability that establishes *predicate*, or None. NEVER raises.
+
+        Derived from the registry. Ambiguity is a refusal, not a coin toss: two
+        capabilities claiming the same effect is a declaration bug, and picking
+        one silently is how the wrong one runs for a year.
+        """
+        try:
+            from backend.system_control.capability_registry import (
+                get_capability_registry,
+            )
+            from backend.system_control.world_state import canonical
+            want = canonical(predicate)
+            found = [d.name for d in get_capability_registry().all()
+                     if any(canonical(p) == want
+                            for p in (getattr(d, "provides", ()) or ()))]
+            if len(found) == 1:
+                return found[0]
+            if len(found) > 1:
+                logger.warning("[VoiceRouter] %d capabilities claim to provide "
+                               "'%s' (%s) — refusing to choose",
+                               len(found), predicate, ", ".join(sorted(found)))
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _explain_detour(predicate: str, remedy: str, command: str) -> str:
+        """Say WHY there is about to be an extra step. NEVER raises.
+
+        Spoken before the detour rather than after, because the operator is
+        about to watch their Mac do something they did not ask for, and an
+        unexplained action is indistinguishable from a malfunction.
+        """
+        try:
+            # Say the SITUATION, then the remedy, then the intent to continue.
+            # A capability name read aloud ("I'll unlock screen first") is the
+            # machine's vocabulary leaking into the room; the operator wants
+            # the sentence a colleague would say.
+            if "screen" in predicate:
+                return ("Your screen is locked — let me unlock it first, "
+                        "then I'll carry on.")
+            state = predicate.replace("_", " ")
+            return (f"I need {state} first, so I'll {_humanise(remedy)} — "
+                    f"then I'll carry on.")
+        except Exception:  # noqa: BLE001
+            return "One moment — I need to sort something out first."
+
+    async def _say(self, text: str) -> None:
+        """Narrate, if anything is listening. NEVER raises."""
+        try:
+            if self._narrate_fn and text:
+                note_spoken(text)
+                await self._narrate_fn(text)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── The reflex arc ──────────────────────────────────────────────────
 

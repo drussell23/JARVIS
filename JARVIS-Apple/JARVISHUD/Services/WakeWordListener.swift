@@ -15,7 +15,17 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
     @Published var state: State = .off
     @Published var partialTranscript: String = ""
 
-    var onCommand: ((String) -> Void)?
+    /// The command, and the audio of the sentence that produced it.
+    ///
+    /// The audio is base64 WAV and may be nil — the recogniser can finalise a
+    /// command from a partial transcript after the tap has already been torn
+    /// down, and a missing sample must degrade to "cannot verify", never to a
+    /// crash or to a silently unverified unlock.
+    var onCommand: ((String, String?) -> Void)?
+
+    /// Keeps the audio of the current sentence. See `UtteranceRecorder` for
+    /// why it lives beside the tap and never touches a filesystem.
+    private let recorder = UtteranceRecorder()
 
     private let wakeWords = ["jarvis", "hey jarvis", "yo jarvis"]
     private let audioQueue = DispatchQueue(label: "com.jarvis.hud.audio", qos: .userInitiated)
@@ -117,6 +127,11 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
         }
 
         print("[JARVIS Voice] Audio format: \(format.sampleRate)Hz, \(format.channelCount)ch")
+
+        // Sized to THIS engine's format. The hardware rate changes when the
+        // route does — AirPods in, display speakers out — and a buffer sized
+        // for the previous device would truncate or over-read.
+        recorder.begin(format: format)
 
         // Track state with simple character offset (NOT String.Index)
         var wakeWordFound = false
@@ -236,6 +251,12 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
             guard self?.micMuted != true else { return }
             guard buffer.frameLength > 0 else { return }
             req.append(buffer)
+            // Recorded BEHIND the same gate, deliberately. Everything the
+            // recogniser is allowed to hear, the verifier may hear; everything
+            // suppressed as JARVIS's own voice is suppressed here too. A
+            // voiceprint contaminated with the assistant's synthesiser is a
+            // verifier being taught that JARVIS is its owner.
+            self?.recorder.append(buffer)
         }
 
         do {
@@ -309,12 +330,19 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
 
     private func finalize(_ command: String) {
         print("[JARVIS Voice] >>> \"\(command)\"")
+        // Drained HERE, before teardown, and off the render thread. `finish()`
+        // resamples and frames a WAV, which is far too much work for the audio
+        // callback and perfectly cheap once the sentence is over.
+        let audio = recorder.finish()
+        if let audio {
+            print("[JARVIS Voice] utterance captured (\(audio.count / 1024)KB base64)")
+        }
         DispatchQueue.main.async { [weak self] in
             self?.silenceTimer?.invalidate()
             self?.silenceTimer = nil
             self?.state = .cooldown
             self?.partialTranscript = ""
-            self?.onCommand?(command)
+            self?.onCommand?(command, audio)
         }
         audioQueue.async { [weak self] in
             self?.teardown()
@@ -326,6 +354,11 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
     }
 
     private func restart(delay: TimeInterval) {
+        // A restart means no command came of this audio, so there is no
+        // question for it to answer. Dropped rather than carried into the next
+        // sentence — a verifier handed the tail of an abandoned utterance is
+        // being asked about the wrong moment.
+        recorder.discard()
         audioQueue.async { [weak self] in self?.teardown() }
         DispatchQueue.main.async { [weak self] in
             // Stay in .listening during normal restarts — no visible flicker.
