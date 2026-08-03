@@ -162,22 +162,67 @@ async def test_agent_b_reset_queues_until_agent_a_transaction_completes(repo: Pa
 
 @pytest.mark.asyncio
 async def test_mutex_serializes_overlapping_transactions(repo: Path):
-    """No two transactions may hold the lock simultaneously."""
-    concurrent = 0
-    peak = 0
+    """No two transactions may hold the lock simultaneously.
 
-    async def worker(n: int) -> None:
-        nonlocal concurrent, peak
-        async with git_transaction(f"worker-{n}", cwd=repo):
-            concurrent += 1
-            peak = max(peak, concurrent)
-            await asyncio.sleep(0.05)
-            concurrent -= 1
+    Repeated under contention on purpose. DistributedLockManager alone fails
+    this: its acquire is check-then-write with no test-and-set, so racers all
+    observe "free" and proceed (measured: 6 tasks -> 4 simultaneous holders).
+    A single low-contention round reproduced that only ~1 time in 6, which is
+    exactly the kind of flake that gets dismissed as noise — hence 3 rounds of
+    8, which surfaced it consistently.
+    """
+    for round_index in range(3):
+        concurrent = 0
+        peak = 0
 
-    await asyncio.wait_for(
-        asyncio.gather(*(worker(i) for i in range(6))), timeout=60
-    )
-    assert peak == 1, f"mutex allowed {peak} concurrent holders"
+        async def worker(n: int) -> None:
+            nonlocal concurrent, peak
+            async with git_transaction(f"worker-{n}", cwd=repo):
+                concurrent += 1
+                peak = max(peak, concurrent)
+                await asyncio.sleep(0.05)
+                concurrent -= 1
+
+        await asyncio.wait_for(
+            asyncio.gather(*(worker(i) for i in range(8))), timeout=120
+        )
+        assert peak == 1, (
+            f"mutex allowed {peak} concurrent holders in round {round_index}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_gate_is_released_even_when_body_raises(repo: Path):
+    """A failing transaction must not wedge the repository.
+
+    The exclusive gate is a file; leaking it on the error path would block every
+    later transaction until the owning PID exited.
+    """
+    class Boom(RuntimeError):
+        pass
+
+    with pytest.raises(Boom):
+        async with git_transaction("explodes", cwd=repo):
+            raise Boom()
+
+    # The next transaction must still be able to acquire promptly.
+    async with git_transaction("after", cwd=repo, timeout=10):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_dead_owner_gate_is_reclaimed(repo: Path):
+    """A gate left by a dead process must not block forever."""
+    from backend.core.git_transaction_lock import _gate_path
+
+    gate = _gate_path(repo)
+    gate.parent.mkdir(parents=True, exist_ok=True)
+    # PID 999999 is not running; owner format matches DLM's "jarvis-{pid}-{t}".
+    gate.write_text('{"owner": "jarvis-999999-0.0", "pid": 999999}', encoding="utf-8")
+
+    async with git_transaction("reclaimer", cwd=repo, timeout=20):
+        pass
+    assert not gate.exists(), "gate not released after reclaim"
 
 
 @pytest.mark.asyncio

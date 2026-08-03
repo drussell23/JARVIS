@@ -4,6 +4,11 @@ Test the improved clicking implementation for display connection
 """
 
 import asyncio
+import pytest
+
+# Skips instead of erroring where the optional dependency is absent (headless
+# CI). Must precede the import below, which needs pyautogui directly.
+pytest.importorskip("pyautogui", reason="pyautogui not installed (headless environment)")
 import pyautogui
 import time
 

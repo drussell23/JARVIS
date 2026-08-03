@@ -39,6 +39,18 @@ logger = logging.getLogger("InfiniteEyes")
 # Add backend to path
 sys.path.insert(0, os.path.join(os.getcwd(), "backend"))
 
+import pytest
+
+# Skip instead of erroring where the optional OCR stack is absent (headless CI).
+#
+# This MUST precede the try/except below. That block calls sys.exit(1) on a
+# missing import, and a module-scope sys.exit during collection raises
+# SystemExit, which pytest surfaces as INTERNALERROR — aborting the entire
+# session, not just this module. Skipping first keeps the run intact while the
+# script's own behaviour is unchanged when run directly with the deps present.
+for _dep in ("pytesseract", "PIL", "cv2"):
+    pytest.importorskip(_dep, reason=f"{_dep} not installed (headless environment)")
+
 # Check OCR dependencies
 try:
     import pytesseract

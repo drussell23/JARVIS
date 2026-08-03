@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Git-Mutex: pre-rebase. Bridge only — see _git_mutex_bridge.sh.
+GIT_MUTEX_HOOK_NAME="pre-rebase"
+export GIT_MUTEX_HOOK_NAME
+. "$(dirname "$0")/_git_mutex_bridge.sh"

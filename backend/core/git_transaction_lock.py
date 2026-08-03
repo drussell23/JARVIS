@@ -30,12 +30,31 @@ matters here, and locking it would deadlock any nested inspection.
 
 Scope and honest limits
 -----------------------
-This is a **cooperative advisory** lock, in the same family as ``flock``. It
-constrains processes that call it. A human typing ``git reset --hard`` in a
-terminal, or a third-party tool that does not participate, is NOT stopped by
-this module. Enforcement against non-participants requires a git hook
-(``reference-transaction`` / ``pre-commit``), which git itself invokes
-regardless of caller; see :func:`advisory_scope_note`.
+In-process this is a **cooperative advisory** lock, in the same family as
+``flock``: it constrains processes that call it. Enforcement against
+non-participants comes from the native git hooks installed by
+``scripts/install_hooks.py``, which git invokes regardless of caller and which
+consult :func:`probe_lock`.
+
+What the hooks DO enforce — every operation that moves a ref, via
+``reference-transaction`` (commit, reset that moves HEAD, checkout/switch,
+merge, cherry-pick, fetch, branch) plus ``pre-rebase`` and ``pre-push``.
+
+What NOTHING can enforce — git exposes **no pre-hook for index or working-tree
+mutation that does not move a ref**. So these remain unguarded, and claiming
+otherwise would be false:
+
+  * ``git reset --hard <current-HEAD>``  (exactly the 2026-08-02 shape: wipes
+    the index and worktree while the ref stays put, so no ref transaction opens)
+  * ``git checkout -- .`` / ``git restore .``
+  * ``git stash`` (stash does move a ref, so it IS covered; listed here only to
+    note the boundary is "ref moved?", not "dangerous?")
+
+The hook therefore raises the floor from "cooperating agents only" to "any
+process that moves a ref", which covers the hijack sequence observed
+(checkout → commit → checkout → pull), but not a bare same-commit hard reset.
+For that class the durable mitigations remain: commit early, and use a real
+worktree (separate index + HEAD).
 
 DRY
 ---
@@ -59,12 +78,14 @@ Environment
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shlex
 import subprocess
 import weakref
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator, Iterable, Optional, Sequence
 
@@ -83,6 +104,9 @@ __all__ = [
     "run_git",
     "git_lock_path",
     "advisory_scope_note",
+    "LockProbe",
+    "probe_lock",
+    "TOKEN_ENV",
 ]
 
 LOCK_NAME = "git_transaction"
@@ -225,10 +249,99 @@ def git_lock_path(cwd: Optional[Path] = None) -> Path:
 def advisory_scope_note() -> str:
     """One-line statement of what this lock does and does not constrain."""
     return (
-        "Advisory: serializes participating processes only. A human shell or a "
-        "non-participating tool can still mutate the index; enforce those with a "
-        "git reference-transaction hook."
+        "Advisory in-process; enforced for ref-moving operations by the native "
+        "git hooks installed via scripts/install_hooks.py. Pure index/worktree "
+        "clobbers (reset --hard to the same commit, checkout -- .) have no "
+        "native pre-hook in git and remain unenforceable."
     )
+
+
+# ---------------------------------------------------------------------------
+# Read-only probe — used by the native git hooks, which must NEVER acquire
+# ---------------------------------------------------------------------------
+
+#: Set in the environment for the duration of a held transaction, so a git
+#: subprocess spawned inside the critical section (which inherits the env) is
+#: recognised as the lock OWNER by the hook and allowed through. Without this
+#: the holder's own commit would be blocked by its own lock.
+TOKEN_ENV = "JARVIS_GIT_TXN_TOKEN"
+
+
+@dataclass(frozen=True)
+class LockProbe:
+    """Outcome of a read-only inspection of the git mutex."""
+
+    held_by_other: bool
+    owner: Optional[str] = None
+    token: Optional[str] = None
+    reason: str = "free"
+
+    def as_dict(self) -> dict:
+        return {
+            "held_by_other": self.held_by_other,
+            "owner": self.owner,
+            "token": self.token,
+            "reason": self.reason,
+        }
+
+
+def _read_lock_file(path: Path) -> Optional[dict]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def probe_lock(cwd: Optional[Path] = None) -> LockProbe:
+    """Inspect the git mutex WITHOUT acquiring it.
+
+    Synchronous and event-loop free: a git hook runs in a fresh short-lived
+    process on every ref transaction, so spinning up asyncio and a full
+    DistributedLockManager there would add latency to every git command in the
+    repository.
+
+    Liveness and expiry are delegated to DLM's own primitives
+    (``LockMetadata.is_expired`` and ``_is_process_alive_sync``, which carries
+    the PID-reuse detection), so a dead or expired holder never blocks — the
+    semantics stay identical to the acquire path rather than being restated.
+    """
+    data = _read_lock_file(git_lock_path(cwd))
+    if data is None:
+        return LockProbe(False, reason="no_lock_file")
+
+    owner = data.get("owner")
+    token = data.get("token")
+
+    # Our own transaction (or a git child spawned inside it) — always allowed.
+    env_token = os.getenv(TOKEN_ENV)
+    if env_token and token and env_token == token:
+        return LockProbe(False, owner=owner, token=token, reason="self")
+
+    try:
+        from backend.core.distributed_lock_manager import (
+            DistributedLockManager,
+            LockMetadata,
+        )
+
+        meta = LockMetadata(**{
+            k: v for k, v in data.items()
+            if k in LockMetadata.__dataclass_fields__  # type: ignore[attr-defined]
+        })
+        if meta.is_expired():
+            return LockProbe(False, owner=owner, token=token, reason="expired")
+        alive = DistributedLockManager._is_process_alive_sync(str(owner or ""), data)
+    except Exception as exc:  # noqa: BLE001 — probe must never crash a git command
+        logger.debug("[GitMutex] probe degraded (%s); treating lock as live", exc)
+        alive = True
+
+    if not alive:
+        return LockProbe(False, owner=owner, token=token, reason="owner_dead")
+    return LockProbe(True, owner=owner, token=token, reason="held")
 
 
 #: One DistributedLockManager per repository lock directory.
@@ -294,6 +407,115 @@ async def _get_manager(cwd: Optional[Path]):
         return manager
 
 
+# ---------------------------------------------------------------------------
+# Atomic test-and-set gate
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS — DistributedLockManager is not mutually exclusive.
+#
+# Measured 2026-08-02: six concurrent tasks against a single DLM lock name
+# admitted FOUR simultaneous holders. The acquire path reads the lock file, then
+# writes it via `tmp + os.replace`. The write is atomic but `replace` OVERWRITES
+# — it does not fail when the file appeared in between — so there is no
+# test-and-set anywhere. The per-lock `asyncio.Semaphore` (dlm:843) is taken
+# only inside `_write_lock_metadata` (dlm:1422); its docstring is explicit that
+# it serializes *writes to the lock file*, which protects file integrity, not
+# ownership. Two racers therefore both observe "free" and both proceed.
+#
+# That is a defect in the shared primitive and affects its other consumers
+# (vbia_events, heartbeat, cross-repo state). Fixing DLM itself is the true root
+# fix but has repo-wide blast radius, so it is reported rather than performed
+# here. This gate supplies exactly the missing property — O_CREAT|O_EXCL, where
+# the kernel picks a single winner — and DLM is still composed underneath for
+# metadata, TTL/keepalive, telemetry and dead-owner semantics.
+#
+# Stale gates are reclaimed using DLM's OWN liveness check, so the notion of "a
+# dead owner" stays defined in one place.
+
+_GATE_SUFFIX = ".gate"
+
+
+def _gate_path(cwd: Optional[Path] = None) -> Path:
+    return _lock_dir(cwd) / f"{LOCK_NAME}{_GATE_SUFFIX}"
+
+
+def _gate_owner_alive(path: Path) -> bool:
+    """True if the process recorded in the gate file is still running."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        # Unreadable or half-written: treat as dead so a crash cannot wedge
+        # the repository forever.
+        return False
+    owner = str(payload.get("owner", ""))
+    if not owner:
+        return False
+    try:
+        from backend.core.distributed_lock_manager import DistributedLockManager
+
+        return bool(DistributedLockManager._is_process_alive_sync(owner, payload))
+    except Exception:  # noqa: BLE001 — conservative: assume alive
+        return True
+
+
+def _try_create_gate(path: Path, owner: str) -> bool:
+    """Single atomic attempt. Returns True iff THIS caller created the gate."""
+    payload = json.dumps(
+        {"owner": owner, "pid": os.getpid(), "process_start_time": 0.0},
+        sort_keys=True,
+    )
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    try:
+        os.write(fd, payload.encode("utf-8"))
+    finally:
+        os.close(fd)
+    return True
+
+
+async def _acquire_exclusive_gate(
+    cwd: Optional[Path], *, timeout: float, operation: str
+) -> Optional[Path]:
+    """Block until this caller exclusively owns the gate, or raise."""
+    path = _gate_path(cwd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    owner = f"jarvis-{os.getpid()}-0.0"
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout)
+    delay = 0.01
+    while True:
+        if _try_create_gate(path, owner):
+            return path
+        if not _gate_owner_alive(path):
+            # Owner died holding it — reclaim, then re-race honestly.
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        if loop.time() >= deadline:
+            raise GitTransactionBusy(
+                f"git transaction lock held by another agent; "
+                f"waited {timeout:.1f}s for operation: {operation}"
+            )
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 0.25)
+
+
+def _release_exclusive_gate(path: Optional[Path]) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 @asynccontextmanager
 async def git_transaction(
     operation: str,
@@ -340,17 +562,29 @@ async def git_transaction(
 
     waited_from = asyncio.get_running_loop().time()
 
+    # --- atomic test-and-set gate (see _acquire_exclusive_gate) --------------
+    # DLM alone is NOT mutually exclusive; this gate is what makes the mutex a
+    # mutex. Taken before DLM so the winner is decided by the kernel.
+    gate = await _acquire_exclusive_gate(cwd, timeout=timeout, operation=operation)
+
     # The DLM `acquire` context manager traps exceptions raised inside its body and
     # reports them as "Lock acquire delegation failed", which both loses the caller's
     # exception and leaves its generator un-stopped (RuntimeError: generator didn't
     # stop after athrow()). So the lock is entered and exited EXPLICITLY: the caller's
     # exception propagates in this frame and is never thrown into DLM's generator.
     stack = AsyncExitStack()
-    acquired = await stack.enter_async_context(
-        manager.acquire(LOCK_NAME, timeout=timeout, ttl=ttl, enable_keepalive=True)
-    )
+    try:
+        acquired = await stack.enter_async_context(
+            manager.acquire(LOCK_NAME, timeout=timeout, ttl=ttl, enable_keepalive=True)
+        )
+    except BaseException:
+        # The gate is already ours; never leave it behind on a failed acquire or
+        # it would wedge the repository until the owner PID died.
+        _release_exclusive_gate(gate)
+        raise
     if not acquired:
         await stack.aclose()
+        _release_exclusive_gate(gate)
         raise GitTransactionBusy(
             f"git transaction lock held by another agent; "
             f"waited {timeout:.1f}s for operation: {operation}"
@@ -361,10 +595,27 @@ async def git_transaction(
         logger.info("[GitMutex] acquired after %.2fs queue wait: %s", waited, operation)
     else:
         logger.debug("[GitMutex] acquired: %s", operation)
+
+    # Publish our ownership token so the native hooks let OUR git children
+    # through. Read back from the lock file rather than guessed: DLM mints the
+    # token internally, and the hook compares against exactly that value.
+    meta = _read_lock_file(git_lock_path(cwd))
+    token = (meta or {}).get("token")
+    had_token = TOKEN_ENV in os.environ
+    prev_token = os.environ.get(TOKEN_ENV)
+    if token:
+        os.environ[TOKEN_ENV] = str(token)
+
     try:
         yield
     finally:
+        if token:
+            if had_token:
+                os.environ[TOKEN_ENV] = prev_token or ""
+            else:
+                os.environ.pop(TOKEN_ENV, None)
         await stack.aclose()
+        _release_exclusive_gate(gate)
         logger.debug("[GitMutex] released: %s", operation)
 
 

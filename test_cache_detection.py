@@ -9,6 +9,11 @@ import os
 # Add backend to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
+import pytest
+
+# Skips instead of erroring where the optional dependency is absent (headless
+# CI). Must precede the import below, which needs pyautogui transitively via backend.display.adaptive_control_center_clicker.
+pytest.importorskip("pyautogui", reason="pyautogui not installed (headless environment)")
 from backend.display.adaptive_control_center_clicker import AdaptiveControlCenterClicker, CachedDetection, CoordinateCache
 
 async def test_cache_detection():
