@@ -94,11 +94,47 @@ async def start_hud_governance(project_root: Path) -> HudGovernanceContext:
             active_brain_set=frozenset(),  # No handshake — gate disabled
             say_fn=_say_fn,
         )
-        await asyncio.wait_for(asyncio.shield(gls.start()), timeout=30.0)
+        # THE SHIELD ABANDONS THE WAIT, NOT THE WORK.
+        #
+        # `wait_for` cancels what it waits on; `shield` prevents that, so on
+        # timeout this stops waiting while `gls.start()` KEEPS RUNNING with
+        # nobody watching it. If it later raised, the traceback went to the
+        # loop's default handler and was lost. If it later SUCCEEDED,
+        # governance was running while the system had already announced
+        # itself DEGRADED — and every boot log says exactly that.
+        #
+        # Keeping the shield is right: a governance service half-started and
+        # then cancelled is worse than one still starting. What was missing is
+        # anyone observing how it ends.
+        from backend.core.ouroboros.telemetry.task_harvester import watch
+        _start = asyncio.ensure_future(gls.start())
+        watch(_start, what="GovernedLoopService.start",
+              target_files=("backend/core/ouroboros/governance/"
+                            "governed_loop_service.py",))
+        await asyncio.wait_for(asyncio.shield(_start), timeout=30.0)
         stack.governed_loop_service = gls
         logger.info("[HUD-Gov] GovernedLoopService started (state=%s)", gls.state.name)
     except Exception as exc:
-        logger.warning("[HUD-Gov] GovernedLoopService failed: %s", exc)
+        # NEVER `%s` A BARE EXCEPTION.
+        #
+        # `str(asyncio.TimeoutError())` is the empty string, so this line
+        # printed "[HUD-Gov] GovernedLoopService failed:" and nothing else, on
+        # every boot, for as long as the timeout has been firing. A message
+        # with no content and a level nobody reads are the same bug in
+        # different clothes — `describe_exception` leads with the TYPE, so a
+        # nameless exception still says what it was.
+        #
+        # The shielded task above outlives this handler, so its real outcome
+        # arrives later through the harvester rather than being inferred here.
+        from backend.core.ouroboros.telemetry.task_harvester import (
+            describe_exception, get_task_harvester,
+        )
+        get_task_harvester().record(
+            exc, what="GovernedLoopService boot",
+            target_files=("backend/core/ouroboros/governance/"
+                          "hud_governance_boot.py",))
+        logger.warning("[HUD-Gov] GovernedLoopService failed: %s",
+                       describe_exception(exc))
         return HudGovernanceContext(stack=stack, gls=None, intake=None)
 
     # Step 3: IntakeLayerService (Zone 6.9)

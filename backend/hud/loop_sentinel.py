@@ -76,6 +76,16 @@ def probe_interval_s() -> float:
     return _env_float("JARVIS_LOOP_SENTINEL_INTERVAL_S", 0.25, 0.05, 5.0)
 
 
+def report_stalls_to_ouroboros() -> bool:
+    """Whether a stall becomes an O+V signal. Default TRUE. NEVER raises.
+
+    Off leaves the sentinel a pure observer — it still logs, it just stops
+    asking the organism to do anything about it.
+    """
+    return (os.environ.get("JARVIS_LOOP_SENTINEL_REPORT_ENABLED", "true")
+            or "").strip().lower() not in ("0", "false", "no", "off")
+
+
 def stall_threshold_s() -> float:
     """Lag above which the loop is considered to have stalled. NEVER raises.
 
@@ -126,6 +136,8 @@ class LoopSentinel:
         self._task: Optional[asyncio.Task] = None
         self._health = LoopHealth()
         self._max_recent = 20
+        #: One report per run. Forty stalls are one defect restated.
+        self._reported = False
 
     def start(self) -> None:
         """Begin watching. Idempotent. NEVER raises.
@@ -140,6 +152,7 @@ class LoopSentinel:
             if self._task is not None and not self._task.done():
                 return
             self._health = LoopHealth(started_at=time.monotonic())
+            self._reported = False
             self._task = asyncio.get_event_loop().create_task(self._watch())
             logger.info("[LoopSentinel] watching — will report any window "
                         "longer than %.0fms in which the loop cannot run",
@@ -201,8 +214,72 @@ class LoopSentinel:
                 "%.2fs, availability %.1f%%)",
                 lag, stall.started_wall, h.stalls, h.worst_lag_s,
                 h.availability * 100.0)
+            self._tell_ouroboros(stall)
         except Exception:  # noqa: BLE001
             pass
+
+    def _tell_ouroboros(self, stall: Stall) -> None:
+        """Hand the stall to the organism that can fix it. NEVER raises.
+
+        This is what turns a witness into a self-healing loop: the sentinel
+        measures the starvation, O+V reads the measurement, and the 11-phase
+        pipeline proposes, validates and gates a patch to the code that caused
+        it. A log line only informs whoever is reading; a `RuntimeHealth`
+        finding is something the system can act on while nobody is.
+
+        Reported ONCE per run, not per stall. A boot that stalls forty times
+        has one defect, and forty envelopes would drown the intake queue in
+        restatements of a single fact — the summary carries the count.
+        """
+        try:
+            if not report_stalls_to_ouroboros() or self._reported:
+                return
+            self._reported = True
+            from backend.core.ouroboros.governance.intake.sensors.runtime_health_sensor import (
+                HealthFinding, get_runtime_health_sensor,
+            )
+            sensor = get_runtime_health_sensor()
+            finding = HealthFinding(
+                category="event_loop_starvation",
+                severity="high",
+                summary=(f"Event loop stalled {stall.lag_s:.2f}s — the HUD "
+                         f"could not respond to voice, IPC or timers during "
+                         f"that window"),
+                details={
+                    "first_stall_at": stall.started_wall,
+                    "lag_s": round(stall.lag_s, 3),
+                    "threshold_s": stall_threshold_s(),
+                    "note": ("A synchronous call is blocking the event loop. "
+                             "An awaited coroutine cannot cause this — only a "
+                             "call that never yields."),
+                    "health": self.health(),
+                    "schema_version": LOOP_SENTINEL_SCHEMA_VERSION,
+                },
+                target_files=("backend/main.py",),
+            )
+            if sensor is None:
+                # The interesting stalls happen during boot, BEFORE the intake
+                # layer exists. `TaskHarvester` already owns a buffer that
+                # flushes on sensor registration, so this rides it rather than
+                # keeping a second queue of its own.
+                from backend.core.ouroboros.telemetry.task_harvester import (
+                    TaskFailure, get_task_harvester,
+                )
+                held = TaskFailure(
+                    what="event loop", summary=finding.summary,
+                    traceback_text="", severity="high",
+                    target_files=finding.target_files)
+                held.as_finding = lambda f=finding: f     # keep OUR finding
+                get_task_harvester()._pending.append(held)
+                logger.info("[LoopSentinel] intake not up yet — stall held "
+                            "for O+V until it is")
+                return
+            result = sensor.report(finding)
+            if asyncio.iscoroutine(result):
+                asyncio.get_event_loop().create_task(result)
+        except Exception:  # noqa: BLE001 — a witness never breaks on reporting
+            logger.debug("[LoopSentinel] could not reach O+V intake",
+                         exc_info=True)
 
     def health(self) -> Dict[str, Any]:
         """What the loop has been doing. NEVER raises."""
