@@ -42,6 +42,12 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             // Auto-start the Python brainstem — full backend in HUD mode.
             // The onReady callback fires when IPC connects (backend fully booted),
             // telling the HUD to announce "JARVIS Online" to the user.
+            // `AVSpeechSynthesizer.isSpeaking` is the authority for this synth;
+            // a dropped delegate callback now costs one 250ms sweep, not the
+            // whole estimated deadline.
+            SpeechGate.shared.registerReconciler(.hudSynthesizer) { [weak self] in
+                self?.tts.isSpeaking ?? false
+            }
             BrainstemLauncher.shared.onReady = { [weak self] in
                 guard let self = self else { return }
                 self.appState.pythonBridge.onBackendReady()

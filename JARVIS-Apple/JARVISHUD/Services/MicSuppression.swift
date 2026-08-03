@@ -99,6 +99,16 @@ final class SpeechGate {
     var onMuteChange: ((Bool) -> Void)?
 
     private var claims: [SpeechClaimant: SpeechClaim] = [:]
+    /// Per-claimant "is it actually speaking right now?" probes. The design
+    /// doc always specified this belt-and-braces; the method existed with ZERO
+    /// callers — so a dropped `didFinish` cost the whole estimated deadline
+    /// (observed: ~4.2s of dead mic) instead of one sweep.
+    private var reconcilers: [SpeechClaimant: () -> Bool] = [:]
+
+    /// Let the gate ask the synthesiser itself, every sweep.
+    func registerReconciler(_ who: SpeechClaimant, isSpeaking: @escaping () -> Bool) {
+        reconcilers[who] = isSpeaking
+    }
     private var sweepTask: Task<Void, Never>?
     private var lastPublished = false
 
@@ -187,11 +197,18 @@ final class SpeechGate {
     /// on every sweep and on every mic restart.
     func reconcile(_ who: SpeechClaimant, isSpeaking: Bool) {
         if isSpeaking {
-            // Re-arm on a short lease. If the synthesiser stops and the
-            // callback is lost, the claim dies within one lease rather than
-            // living until the 60s ceiling.
-            claim(who, seconds: 2.0, reason: "(reconciled from synthesizer)")
-        } else {
+            // Extend ONLY when the claim is about to lapse — re-claiming every
+            // 250ms sweep would spam the log and reset deadlines pointlessly.
+            let needsExtend: Bool = {
+                guard let c = claims[who] else { return true }
+                return ContinuousClock.now.advanced(by: .seconds(1.0)) >= c.deadline
+            }()
+            if needsExtend {
+                claim(who, seconds: 2.0, reason: "(reconciled from synthesizer)")
+            }
+        } else if claims[who] != nil {
+            // The synthesiser says idle but a claim is live: the callback was
+            // dropped. Release NOW — one sweep of staleness, not the deadline.
             release(who, reason: "(reconciled: synthesizer idle)")
         }
     }
@@ -221,6 +238,9 @@ final class SpeechGate {
                 guard let self else { return }
                 let stop = await MainActor.run { () -> Bool in
                     self.expire()
+                    for (who, probe) in self.reconcilers {
+                        self.reconcile(who, isSpeaking: probe())
+                    }
                     self.publish()
                     if self.claims.isEmpty {
                         self.sweepTask = nil
