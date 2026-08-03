@@ -64,6 +64,24 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+class _NullMetrics:
+    """Absorbs every telemetry call. See the note at its only construction.
+
+    Deliberately permissive: it cannot know which methods the logger has, so it
+    answers all of them with another absorber rather than a curated list that
+    would drift the first time a stage type is added.
+    """
+
+    def __getattr__(self, _name: str):
+        return self
+
+    def __call__(self, *_a, **_kw):
+        return self
+
+    def __bool__(self) -> bool:
+        return False        # `if metrics_logger:` reads as "no telemetry"
+
+
 # Phase 6: EcapaFacade is the sole ECAPA lifecycle owner (flag removed)
 
 # =============================================================================
@@ -1573,10 +1591,39 @@ class IntelligentVoiceUnlockService:
         # Initialize diagnostics
         diagnostics = UnlockDiagnostics()
 
-        # Initialize advanced metrics logger with stage tracking
-        from voice_unlock.unlock_metrics_logger import get_metrics_logger, StageMetrics
-        metrics_logger = get_metrics_logger()
-        stages: List[StageMetrics] = []
+        # Initialize advanced metrics logger with stage tracking.
+        #
+        # GUARDED, and absolute-first. This import was bare
+        # (`from voice_unlock...`), which resolves ONLY when `backend/` is on
+        # sys.path, and it was UNGUARDED at the top of the unlock handler. So a
+        # launch-path change did not merely stop the telemetry — it raised
+        # ModuleNotFoundError before any unlock could happen. Telemetry must
+        # never be able to break the thing it observes; the metrics record
+        # ending abruptly on 2025-11-29 is consistent with exactly this.
+        metrics_logger = None
+        stages: List[Any] = []
+        try:
+            try:
+                from backend.voice_unlock.unlock_metrics_logger import (
+                    get_metrics_logger,
+                )
+            except ImportError:          # legacy sys.path layout
+                from voice_unlock.unlock_metrics_logger import (  # type: ignore
+                    get_metrics_logger,
+                )
+            metrics_logger = get_metrics_logger()
+        except Exception as _mx:  # noqa: BLE001
+            logger.warning(
+                "[VoiceUnlock] metrics logger unavailable (%s) — unlock "
+                "continues WITHOUT telemetry", type(_mx).__name__)
+        if metrics_logger is None:
+            # NULL OBJECT, not None. There are call sites downstream doing
+            # `metrics_logger.create_stage(...)`; handing them None would trade
+            # an ImportError for an AttributeError a thousand lines later —
+            # the same crash with a worse stack. This absorbs every call and
+            # returns something that absorbs every call, so the unlock path is
+            # byte-identical minus the recording.
+            metrics_logger = _NullMetrics()
 
         # =============================================================================
         # 🧠 UPFRONT VOICE BIOMETRIC INTELLIGENCE: Verify and announce FIRST
