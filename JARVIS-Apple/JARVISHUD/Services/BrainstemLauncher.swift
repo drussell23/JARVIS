@@ -199,11 +199,17 @@ final class BrainstemLauncher {
             }
         }
 
-        // Ensure PYTHONPATH includes the repo root AND Homebrew site-packages.
-        // Xcode's subprocess environment may not include Homebrew's default paths.
-        let sitePackages = "/opt/homebrew/lib/python3.12/site-packages"
+        // PYTHONPATH carries the REPO only — never another interpreter's
+        // site-packages. This used to inject a hardcoded
+        // `/opt/homebrew/lib/python3.12/site-packages`, and PYTHONPATH entries
+        // precede an interpreter's own site-packages: whichever Python the
+        // probe selected then imported python3.12's compiled numpy
+        // (`_multiarray_umath.cpython-312-darwin.so`) into a 3.11 process and
+        // the backend died with exit code 1 at startup. An interpreter that
+        // passed the probe has its own packages; poisoning it with a different
+        // ABI's is how a healthy Python is made to fail anyway.
         let existingPythonPath = env["PYTHONPATH"] ?? ""
-        let pathParts = [repoRoot, sitePackages, existingPythonPath].filter { !$0.isEmpty }
+        let pathParts = [repoRoot, existingPythonPath].filter { !$0.isEmpty }
         env["PYTHONPATH"] = pathParts.joined(separator: ":")
 
         // Ensure PATH includes Homebrew so Python 3.12 can find its packages/tools

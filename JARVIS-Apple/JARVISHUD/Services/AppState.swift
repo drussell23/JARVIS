@@ -586,7 +586,16 @@ class PythonBridge: ObservableObject {
         // Set JARVIS_HUD_FORCE_CLOUD=1 to fall back to the cloud path.
         let forceCloud = (env["JARVIS_HUD_FORCE_CLOUD"] ?? "") == "1"
         if !forceCloud {
-            let localURL = env["JARVIS_LOCAL_BACKEND_URL"] ?? "http://localhost:8010"
+            // Derived from the launcher's own port — ONE source of truth.
+            // This was hardcoded 8010 while BrainstemLauncher binds its spawned
+            // backend on 8011 ("separate port from supervisor's 8010"), so the
+            // HUD spawned a healthy backend and then knocked on the wrong door
+            // forever: every /api/stream/token went to 8010, connection
+            // refused. Two hardcoded ports for one conversation is how they
+            // drift; the env override remains for pointing at an external
+            // supervisor on 8010.
+            let localURL = env["JARVIS_LOCAL_BACKEND_URL"]
+                ?? "http://localhost:\(BrainstemLauncher.shared.httpPort)"
             let id = env["JARVIS_DEVICE_ID"] ?? "mac-local"
             // The default was the literal string "local", and the comment above
             // called a placeholder secret "fine". It was not: the secret is
