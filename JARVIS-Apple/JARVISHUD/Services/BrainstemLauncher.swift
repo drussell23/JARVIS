@@ -30,6 +30,76 @@ final class BrainstemLauncher {
     private let ipcQueue = DispatchQueue(label: "com.jarvis.brainstem.ipc", qos: .userInitiated)
 
     /// The repo root, derived from the known brainstem .env path.
+    /// Every Python on this machine that might run the brainstem, best first.
+    ///
+    /// NOT a hardcoded list. The previous version named three paths and leaned
+    /// on `/usr/bin/env python3` for everything else — and that is a PATH
+    /// LOOKUP, not an interpreter. A GUI app inherits Xcode's PATH, which has
+    /// no pyenv on it, so `env python3` resolved to Homebrew's python3.14 (no
+    /// uvicorn) while the only healthy interpreter on the machine —
+    /// `~/.pyenv/versions/3.11.10/bin/python3`, the one every repo test already
+    /// runs under — appeared in no candidate at all. Every candidate was
+    /// correctly rejected; the list was simply wrong.
+    ///
+    /// Sources are ENUMERATED rather than named, so a Python installed
+    /// tomorrow is found tomorrow:
+    ///   0. `JARVIS_PYTHON` — an explicit operator override always wins
+    ///   1. the repo's own venv
+    ///   2. every pyenv version, newest first, plus the shim
+    ///   3. every Homebrew `python3.N`, newest first
+    ///   4. `/usr/local/bin` (Intel Homebrew / python.org)
+    ///   5. the system Python, and finally a PATH lookup
+    ///
+    /// Ordering is by LIKELIHOOD OF BEING RIGHT, not by preference: a project
+    /// venv is the intended environment, pyenv is what this repo's tooling
+    /// actually uses, and the system Python is a last resort. Correctness does
+    /// not depend on the order — `probeSucceeds` decides — but a good order
+    /// means the first probe usually wins, and each probe costs a subprocess.
+    private static func discoverPythons(repoRoot: String,
+                                        environment: [String: String]) -> [String] {
+        let fm = FileManager.default
+        var out: [String] = []
+        func add(_ path: String) {
+            // Resolve so a shim, a symlink and a real binary are not probed
+            // three times as if they were three different interpreters.
+            let real = (try? fm.destinationOfSymbolicLink(atPath: path)) ?? path
+            let key = real.hasPrefix("/") ? real : path
+            if !out.contains(path) && !out.contains(key) { out.append(path) }
+        }
+        /// Newest-first: `python3.14` should be tried before `python3.9`, and a
+        /// plain lexical sort puts 3.9 above 3.14.
+        func versionedChildren(of dir: String, prefix: String) -> [String] {
+            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
+            return names
+                .filter { $0.hasPrefix(prefix) && !$0.hasSuffix("-config") }
+                .sorted { a, b in
+                    a.compare(b, options: .numeric) == .orderedDescending
+                }
+                .map { dir + "/" + $0 }
+        }
+
+        if let explicit = environment["JARVIS_PYTHON"], !explicit.isEmpty {
+            add(explicit)
+        }
+        add("\(repoRoot)/venv/bin/python3")
+        for p in versionedChildren(of: "\(repoRoot)/venv/bin", prefix: "python3.") { add(p) }
+
+        let home = NSHomeDirectory()
+        let pyenvRoot = environment["PYENV_ROOT"] ?? "\(home)/.pyenv"
+        for v in versionedChildren(of: "\(pyenvRoot)/versions", prefix: "3.") {
+            add("\(v)/bin/python3")
+        }
+        add("\(pyenvRoot)/shims/python3")
+
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            for p in versionedChildren(of: dir, prefix: "python3.") { add(p) }
+            add("\(dir)/python3")
+        }
+        add("/usr/bin/python3")
+
+        return out.filter { fm.isExecutableFile(atPath: $0) }
+    }
+
     /// Can this interpreter actually import what the brainstem needs?
     ///
     /// Bounded on purpose: a hung probe would stall the HUD's startup, and an
@@ -155,8 +225,6 @@ final class BrainstemLauncher {
         // doesn't have them, causing "ModuleNotFoundError: No module named 'uvicorn'".
         //
         // Priority: venv/bin/python3.12 > /opt/homebrew/bin/python3.12 > /usr/bin/env python3
-        let venvPython = "\(repoRoot)/venv/bin/python3.12"
-        let brewPython = "/opt/homebrew/bin/python3.12"
 
         // v286.0: CHOOSE AN INTERPRETER THAT WORKS, NOT ONE THAT EXISTS.
         //
@@ -175,11 +243,13 @@ final class BrainstemLauncher {
         // a guess at what "healthy" means. Bounded, so a wedged interpreter
         // cannot hang startup, and every rejection is logged BY REASON: a
         // launcher that silently picks the third choice is undebuggable.
-        let candidates: [(String, [String])] = [
-            (venvPython, ["-m", "brainstem"]),
-            (brewPython, ["-m", "brainstem"]),
-            ("/usr/bin/env", ["python3", "-m", "brainstem"]),
-        ]
+        var discovered = Self.discoverPythons(repoRoot: repoRoot, environment: env)
+        // A PATH lookup last, never first: it is not an interpreter, it is
+        // whatever this process's PATH happens to resolve — the very
+        // indirection that hid the working Python behind a broken one.
+        var candidates: [(String, [String])] = discovered.map { ($0, ["-m", "brainstem"]) }
+        candidates.append(("/usr/bin/env", ["python3", "-m", "brainstem"]))
+        print("[Brainstem] \(discovered.count) candidate interpreter(s) discovered")
         var chosen: (String, [String])?
         for (path, args) in candidates {
             if path != "/usr/bin/env",
