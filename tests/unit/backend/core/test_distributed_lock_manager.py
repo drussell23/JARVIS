@@ -96,21 +96,36 @@ class TestDistributedLockManager:
         assert not lock_path.exists(), "Lock file should be removed after release"
 
     async def test_concurrent_acquire_fails(self, dlm: DistributedLockManager):
-        """Two tasks try to acquire the same lock — exactly one wins."""
+        """Two contending tasks must never hold the lock at the same time.
+
+        Previously asserted ``results.count(True) == 1``, which this test's own
+        timing makes unachievable: the winner holds for 0.3s while the loser
+        waits up to 0.5s, so the loser legitimately acquires after the release.
+        Two sequential winners is the CORRECT outcome, and the assertion was red
+        for that reason rather than because of any locking defect.
+
+        Mutual exclusion is about overlap, not about counting winners, so that
+        is what is measured now — strictly stronger, and no longer dependent on
+        hold-time vs timeout arithmetic.
+        """
         results: List[bool] = []
+        concurrent = 0
+        peak = 0
 
         async def _grab():
+            nonlocal concurrent, peak
             async with dlm.acquire("contended", timeout=0.5) as acq:
                 results.append(acq)
                 if acq:
+                    concurrent += 1
+                    peak = max(peak, concurrent)
                     await asyncio.sleep(0.3)
+                    concurrent -= 1
 
         await asyncio.gather(_grab(), _grab())
 
-        assert results.count(True) == 1, (
-            f"Exactly one task should win, got {results}"
-        )
-        assert results.count(False) == 1
+        assert peak == 1, f"lock held by {peak} tasks simultaneously"
+        assert any(results), "nobody acquired the lock at all"
 
     async def test_acquire_timeout_when_held(self, dlm: DistributedLockManager):
         """Second acquire times out when the lock is already held."""
@@ -207,21 +222,30 @@ class TestDistributedLockManager:
     async def test_five_concurrent_acquires_one_wins(
         self, dlm: DistributedLockManager
     ):
-        """Five concurrent tasks — exactly one acquires the lock."""
+        """Five contending tasks must be serialized, never concurrent.
+
+        Same correction as ``test_concurrent_acquire_fails``: holding 0.5s while
+        others wait up to 0.8s means later winners are expected and correct, so
+        ``count(True) == 1`` was never satisfiable. Overlap is the property that
+        actually matters.
+        """
         results: List[bool] = []
-        barrier = asyncio.Event()
+        concurrent = 0
+        peak = 0
 
         async def _contender():
-            barrier.set()
+            nonlocal concurrent, peak
             async with dlm.acquire("five_way", timeout=0.8) as acq:
                 results.append(acq)
                 if acq:
+                    concurrent += 1
+                    peak = max(peak, concurrent)
                     await asyncio.sleep(0.5)
+                    concurrent -= 1
 
         await asyncio.gather(*[_contender() for _ in range(5)])
-        assert results.count(True) == 1, (
-            f"Exactly 1 of 5 should win, got {results}"
-        )
+        assert peak == 1, f"lock held by {peak} of 5 tasks simultaneously"
+        assert any(results), "nobody acquired the lock at all"
 
     async def test_acquire_creates_lock_dir_if_missing(self, tmp_path: Path):
         """If lock_dir does not exist, acquire creates it."""
@@ -609,3 +633,93 @@ class TestDLMContextManager:
             assert not _lock_file_path(dlm, "inner").exists()
 
         assert not _lock_file_path(dlm, "outer").exists()
+
+
+class TestDLMSingleArbiter:
+    """A denial from the authoritative backend must never be overruled elsewhere.
+
+    Observed 2026-08-02 with a live local Redis: contender A won via Redis;
+    contender B was DENIED by Redis, and ``acquire_unified`` treated that
+    identically to "Redis is unavailable" and fell through to the file backend —
+    where no lock file existed, because A's lock lived in Redis. Both held the
+    same lock at the same time, arbitrated by two different systems.
+
+    A fallback is only sound when the authority is UNREACHABLE, never when it
+    has answered "no".
+    """
+
+    @staticmethod
+    def _manager(tmp_path):
+        from backend.core.distributed_lock_manager import (
+            DistributedLockManager, LockConfig, LockBackend,
+        )
+        lock_dir = tmp_path / "locks"
+        lock_dir.mkdir(exist_ok=True)
+        return DistributedLockManager(LockConfig(
+            lock_dir=lock_dir,
+            default_ttl_seconds=5.0,
+            default_timeout_seconds=0.4,
+            cleanup_interval_seconds=60.0,
+            backend=LockBackend.FILE,
+        ))
+
+    async def test_redis_denial_does_not_fall_through_to_file(self, tmp_path):
+        """Redis healthy + denying => acquisition fails; it must NOT use the file."""
+        m = self._manager(tmp_path)
+        await m.initialize()
+
+        class _HealthyDenyingRedis:
+            """Reachable Redis that holds the key: every SET NX is refused."""
+            is_available = True
+
+            async def set_nx(self, *_a, **_k):
+                return False
+
+            async def get(self, *_a, **_k):
+                return None
+
+            async def delete(self, *_a, **_k):
+                return False
+
+            async def incr(self, *_a, **_k):
+                return 1
+
+        m._redis_available = True
+        m._redis_client = _HealthyDenyingRedis()
+
+        async with m.acquire("arbiter", timeout=0.4) as acquired:
+            assert acquired is False, (
+                "Redis denied the lock but it was granted anyway — "
+                "the file backend overruled the authoritative arbiter"
+            )
+
+        lock_file = m.config.lock_dir / f"arbiter{m.config.lock_extension}"
+        assert not lock_file.exists(), (
+            "a lock FILE was created despite Redis being the active arbiter"
+        )
+
+    async def test_redis_outage_still_falls_back_to_file(self, tmp_path):
+        """When Redis is genuinely UNREACHABLE the file fallback must still work."""
+        m = self._manager(tmp_path)
+        await m.initialize()
+
+        class _DeadRedis:
+            is_available = False
+
+            async def set_nx(self, *_a, **_k):
+                return False
+
+            async def get(self, *_a, **_k):
+                return None
+
+            async def delete(self, *_a, **_k):
+                return False
+
+            async def incr(self, *_a, **_k):
+                return 0
+
+        m._redis_available = True          # believed available...
+        m._redis_client = _DeadRedis()     # ...but the client reports an outage
+
+        async with m.acquire("fallback", timeout=1.0) as acquired:
+            assert acquired is True, "outage must not block the file fallback"

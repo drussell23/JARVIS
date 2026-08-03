@@ -235,10 +235,10 @@ class IntegrationTester:
         print("=" * 60)
 
         docs = [
-            "ADVANCED_TRAINING_SYSTEM_SUMMARY.md",
-            "QUICK_START_TRAINING.md",
-            "REACTOR_CORE_API_SPECIFICATION.md",
-            "INTEGRATION_VERIFICATION.md",
+            "docs/features/ADVANCED_TRAINING_SYSTEM_SUMMARY.md",
+            "docs/getting-started/QUICK_START_TRAINING.md",
+            "docs/architecture/REACTOR_CORE_API_SPECIFICATION.md",
+            "docs/archive/root-status-reports/INTEGRATION_VERIFICATION.md",
         ]
 
         all_exist = True

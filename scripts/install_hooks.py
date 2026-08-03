@@ -103,11 +103,26 @@ def get_source_hooks_dir() -> Path:
 # "pre-commit" is now the OCA dispatcher; "pre-commit.project" is the
 # file-integrity guardian it chains to after authority passes. Both
 # are versioned + installable so there is no orphan bash-only logic.
+# "reference-transaction" + "pre-rebase" are the Git-Mutex enforcement pair:
+# thin bash stubs that source "_git_mutex_bridge.sh" and delegate the decision
+# to backend.core.git_mutex_hook, so lock semantics exist in exactly one place.
+#
+# reference-transaction is the broad net — git opens a ref transaction for
+# commit, reset that moves HEAD, checkout/switch, merge, cherry-pick, fetch and
+# branch. pre-rebase covers rebase, which can rewrite history before any ref
+# transaction opens.
+#
+# "pre-push" is deliberately NOT managed here: an unmanaged local hook already
+# enforces main-branch protection there, and installing over it would silently
+# drop that guard. Pushes move no local ref, so the mutex has little to add.
 HOOKS_TO_INSTALL = [
     "pre-commit",
     "pre-commit.project",
     "commit-msg",
     "post-commit",
+    "_git_mutex_bridge.sh",
+    "reference-transaction",
+    "pre-rebase",
 ]
 
 

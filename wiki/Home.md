@@ -128,15 +128,15 @@ graph TB
 ## Quick Links
 
 ### Documentation
-- [HYBRID_ARCHITECTURE.md](../HYBRID_ARCHITECTURE.md) - 2000+ line architecture guide
+- [HYBRID_ARCHITECTURE.md](../docs/architecture/HYBRID_ARCHITECTURE.md) - 2000+ line architecture guide
 - [README.md](../README.md) - Main project README
-- [JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md](../JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md) - MAS details
-- [JARVIS_NEURAL_MESH_ARCHITECTURE.md](../JARVIS_NEURAL_MESH_ARCHITECTURE.md) - Neural mesh integration
+- [JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md](../docs/architecture/JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md) - MAS details
+- [JARVIS_NEURAL_MESH_ARCHITECTURE.md](../docs/architecture/JARVIS_NEURAL_MESH_ARCHITECTURE.md) - Neural mesh integration
 
 ### Setup Guides
-- [GCP_VM_AUTO_CREATION_IMPLEMENTATION.md](../GCP_VM_AUTO_CREATION_IMPLEMENTATION.md) - Auto-scaling VMs
-- [CLOUD_SQL_PROXY_SETUP.md](../CLOUD_SQL_PROXY_SETUP.md) - Database setup
-- [VOICE_UNLOCK_INTEGRATION.md](../VOICE_UNLOCK_INTEGRATION.md) - Voice unlock setup
+- [GCP_VM_AUTO_CREATION_IMPLEMENTATION.md](../docs/deployment/GCP_VM_AUTO_CREATION_IMPLEMENTATION.md) - Auto-scaling VMs
+- [CLOUD_SQL_PROXY_SETUP.md](../docs/deployment/CLOUD_SQL_PROXY_SETUP.md) - Database setup
+- [VOICE_UNLOCK_INTEGRATION.md](../docs/voice_unlock/VOICE_UNLOCK_INTEGRATION.md) - Voice unlock setup
 
 ### GitHub Resources
 - [GitHub Actions README](.github/workflows/README.md) - CI/CD workflows

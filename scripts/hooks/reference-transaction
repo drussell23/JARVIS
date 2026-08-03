@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Git-Mutex: reference-transaction. Bridge only — see _git_mutex_bridge.sh.
+GIT_MUTEX_HOOK_NAME="reference-transaction"
+export GIT_MUTEX_HOOK_NAME
+. "$(dirname "$0")/_git_mutex_bridge.sh"

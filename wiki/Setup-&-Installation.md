@@ -882,9 +882,9 @@ After successful installation:
 - [Contributing Guidelines](Contributing-Guidelines.md) - How to contribute
 
 **External Resources:**
-- [HYBRID_ARCHITECTURE.md](../HYBRID_ARCHITECTURE.md) - Detailed architecture guide
-- [CLOUD_SQL_PROXY_SETUP.md](../CLOUD_SQL_PROXY_SETUP.md) - Database setup
-- [VOICE_UNLOCK_INTEGRATION.md](../VOICE_UNLOCK_INTEGRATION.md) - Voice unlock guide
+- [HYBRID_ARCHITECTURE.md](../docs/architecture/HYBRID_ARCHITECTURE.md) - Detailed architecture guide
+- [CLOUD_SQL_PROXY_SETUP.md](../docs/deployment/CLOUD_SQL_PROXY_SETUP.md) - Database setup
+- [VOICE_UNLOCK_INTEGRATION.md](../docs/voice_unlock/VOICE_UNLOCK_INTEGRATION.md) - Voice unlock guide
 
 ---
 

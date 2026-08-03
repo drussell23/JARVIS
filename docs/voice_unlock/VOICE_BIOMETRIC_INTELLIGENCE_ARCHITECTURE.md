@@ -2335,7 +2335,7 @@ Even with component failures, security is maintained:
 
 - **[README.md](README.md)** - Main project documentation
 - **[Architecture & Design](wiki/Architecture-&-Design.md)** - System architecture
-- **[HYBRID_ARCHITECTURE.md](HYBRID_ARCHITECTURE.md)** - Local/cloud routing
+- **[HYBRID_ARCHITECTURE.md](../architecture/HYBRID_ARCHITECTURE.md)** - Local/cloud routing
 - **[ML_ARCHITECTURE.md](backend/voice_unlock/ML_ARCHITECTURE.md)** - ML algorithms detail
 - **[API Documentation](wiki/API-Documentation.md)** - REST/WebSocket APIs
 

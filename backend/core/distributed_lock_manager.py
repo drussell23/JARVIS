@@ -167,6 +167,66 @@ DLM_BLOCKING_OP_TIMEOUT = _env_float("DLM_BLOCKING_OP_TIMEOUT", 5.0)
 DLM_REDIS_CONNECT_TIMEOUT = _env_float("DLM_REDIS_CONNECT_TIMEOUT", 5.0)
 DLM_REDIS_SOCKET_TIMEOUT = _env_float("DLM_REDIS_SOCKET_TIMEOUT", 5.0)
 DLM_STALE_LOCK_WARN_AFTER_SECONDS = _env_float("DLM_STALE_LOCK_WARN_AFTER_SECONDS", 120.0)
+
+
+# --- v4.0 atomic acquisition -------------------------------------------------
+# Read at call time, not import time, so tests and operators can flip them
+# without reimporting the module.
+
+def _dlm_acquire_guard_enabled() -> bool:
+    """flock guard around decide-then-claim. Kill switch for the v4.0 change."""
+    return os.getenv("JARVIS_DLM_ACQUIRE_GUARD_ENABLED", "true").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _dlm_acquire_guard_timeout() -> float:
+    """Ceiling on waiting for the guard. Bounded so a wedged holder cannot stall
+    acquisition indefinitely — on timeout the O_EXCL claim still protects us."""
+    return _env_float("JARVIS_DLM_ACQUIRE_GUARD_TIMEOUT_S", 10.0)
+
+
+def _dlm_claim_verify_enabled() -> bool:
+    """Read-back verification after an O_EXCL claim.
+
+    Off by default: with a real test-and-set the read-back proves nothing on a
+    local filesystem and cost ~85ms of sleeps per acquisition. Turn on where
+    O_EXCL is not reliably atomic (older NFS), where it is informative.
+    """
+    return os.getenv("JARVIS_DLM_CLAIM_VERIFY_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _dlm_strict_backend_enabled() -> bool:
+    """Forbid answering a Redis DENIAL by asking the file backend instead.
+
+    Kill switch for the v4.0 single-arbiter rule. Off restores the legacy
+    cross-backend fallthrough, which is not mutually exclusive.
+    """
+    return os.getenv("JARVIS_DLM_STRICT_BACKEND_ENABLED", "true").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _dlm_backend_retry_cap() -> float:
+    """Ceiling on the backoff between retries against a healthy-but-busy Redis."""
+    return _env_float("JARVIS_DLM_BACKEND_RETRY_CAP_S", 0.25)
+
+
+def _dlm_claim_verify_delays() -> List[float]:
+    """Backoff schedule for read-back verification, when enabled."""
+    raw = os.getenv("JARVIS_DLM_CLAIM_VERIFY_DELAYS", "0.005,0.01,0.02,0.05")
+    out: List[float] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(float(part))
+        except ValueError:
+            continue
+    return out or [0.005, 0.01, 0.02, 0.05]
 DLM_STALE_LOCK_INFO_NAMES = _env_csv("DLM_STALE_LOCK_INFO_NAMES", "heartbeat")
 
 
@@ -1182,61 +1242,75 @@ class DistributedLockManager:
             # Self-heal lock directory if another component cleaned it up.
             await self._ensure_directory(lock_file.parent)
 
-            # Check if lock file exists
-            if await aiofiles.os.path.exists(lock_file):
-                # Read existing lock metadata
-                existing_lock = await self._read_lock_metadata(lock_file)
+            # v4.0: The entire decide-then-claim sequence runs inside a
+            # kernel-arbitrated guard, and the claim itself is O_CREAT|O_EXCL.
+            # See _acquire_guard / _claim_lock_file_exclusive for the rationale.
+            async with self._acquire_guard(lock_name):
+                # Check if lock file exists
+                if await aiofiles.os.path.exists(lock_file):
+                    # Read existing lock metadata
+                    existing_lock = await self._read_lock_metadata(lock_file)
 
-                if existing_lock:
-                    should_remove = False
-                    remove_reason = ""
+                    if existing_lock:
+                        should_remove = False
+                        remove_reason = ""
 
-                    # Check 1: Lock is expired
-                    if existing_lock.is_expired():
-                        should_remove = True
-                        remove_reason = f"expired {-existing_lock.time_remaining():.1f}s ago"
+                        # Check 1: Lock is expired
+                        if existing_lock.is_expired():
+                            should_remove = True
+                            remove_reason = f"expired {-existing_lock.time_remaining():.1f}s ago"
 
-                    # v93.0: Check 2: Owner process is dead - DON'T WAIT!
-                    # v3.5: Now async — blocking syscalls offloaded to executor
-                    elif not await self._is_process_alive(existing_lock.owner):
-                        should_remove = True
-                        remove_reason = f"owner process {existing_lock.owner} is dead"
+                        # v93.0: Check 2: Owner process is dead - DON'T WAIT!
+                        # v3.5: Now async — blocking syscalls offloaded to executor
+                        elif not await self._is_process_alive(existing_lock.owner):
+                            should_remove = True
+                            remove_reason = f"owner process {existing_lock.owner} is dead"
 
-                    if should_remove:
-                        logger.info(
-                            f"[v93.0] Removing lock: {lock_name} ({remove_reason})"
-                        )
-                        await self._remove_lock_file(lock_file)
-                    else:
-                        # Lock is still valid AND owner is alive
-                        logger.debug(
-                            f"Lock held by another process: {lock_name} "
-                            f"(owner: {existing_lock.owner}, expires in {existing_lock.time_remaining():.1f}s)"
-                        )
-                        return False
+                        if should_remove:
+                            logger.info(
+                                f"[v93.0] Removing lock: {lock_name} ({remove_reason})"
+                            )
+                            await self._remove_lock_file(lock_file)
+                        else:
+                            # Lock is still valid AND owner is alive
+                            logger.debug(
+                                f"Lock held by another process: {lock_name} "
+                                f"(owner: {existing_lock.owner}, expires in {existing_lock.time_remaining():.1f}s)"
+                            )
+                            return False
 
-            # v96.0: Create new lock with enhanced metadata for PID reuse detection
-            now = time.time()
-            metadata = LockMetadata(
-                acquired_at=now,
-                expires_at=now + ttl,
-                owner=self._owner_id,
-                token=token,
-                lock_name=lock_name,
-                # v96.0: Process fingerprint for identity validation
-                process_start_time=self._process_start_time,
-                process_name=self._process_name,
-                process_cmdline=self._process_cmdline,
-                machine_id=self._machine_id,
-            )
+                # v96.0: Create new lock with enhanced metadata for PID reuse detection
+                now = time.time()
+                metadata = LockMetadata(
+                    acquired_at=now,
+                    expires_at=now + ttl,
+                    owner=self._owner_id,
+                    token=token,
+                    lock_name=lock_name,
+                    # v96.0: Process fingerprint for identity validation
+                    process_start_time=self._process_start_time,
+                    process_name=self._process_name,
+                    process_cmdline=self._process_cmdline,
+                    machine_id=self._machine_id,
+                )
 
-            # Write lock file atomically (with fsync for durability)
-            await self._write_lock_metadata(lock_file, metadata)
+                # v4.0: Atomic test-and-set. Fails rather than overwriting if
+                # any holder appeared since the checks above.
+                if not await self._claim_lock_file_exclusive(lock_file, metadata):
+                    logger.debug(
+                        f"Lock claim lost to a concurrent acquirer: {lock_name}"
+                    )
+                    return False
 
-            # v93.0: Verify we actually got the lock with exponential backoff
-            # This handles slow filesystems (NFS, cloud storage) that may have delays
-            verification_delays = [0.005, 0.01, 0.02, 0.05]  # Exponential backoff
-            for delay in verification_delays:
+            # v4.0: Read-back verification is OFF by default. The claim is now
+            # decided by O_EXCL, so re-reading proves nothing extra on a local
+            # filesystem and cost ~85ms of sleeps on every acquisition. It stays
+            # available for filesystems where O_EXCL is not reliably atomic
+            # (notably older NFS), where a read-back is genuinely informative.
+            if not _dlm_claim_verify_enabled():
+                return True
+
+            for delay in _dlm_claim_verify_delays():
                 await asyncio.sleep(delay)
                 verify_lock = await self._read_lock_metadata(lock_file)
 
@@ -1258,6 +1332,126 @@ class DistributedLockManager:
 
         except Exception as e:
             logger.error(f"Error acquiring lock {lock_name}: {e}")
+            return False
+
+    @asynccontextmanager
+    async def _acquire_guard(self, lock_name: str) -> AsyncIterator[bool]:
+        """Serialize the decide-then-claim sequence across processes.
+
+        WHY THIS EXISTS
+        ---------------
+        The previous implementation read the lock file, decided, then wrote via
+        ``tmp + os.rename``. ``rename`` is atomic but OVERWRITES, so there was
+        no test-and-set anywhere: concurrent acquirers all observed "free", all
+        wrote, and each read back its own token before the next overwrite landed
+        — so all of them "verified" successfully. Measured: 6 tasks on one lock
+        name yielded 4 simultaneous holders, and the repository's own
+        ``test_concurrent_acquire_fails`` / ``test_five_concurrent_acquires_one_wins``
+        have been red on exactly this.
+
+        The per-lock ``asyncio.Semaphore`` did not help: it is taken only inside
+        ``_write_lock_metadata`` and serializes *writes to the file* (integrity),
+        never ownership.
+
+        Two independent mechanisms now close it, and either alone is sufficient:
+
+        1. This guard — an ``fcntl.flock`` held for the whole decide-then-claim
+           window, so the reclaim-a-stale-lock path is atomic too. Without it,
+           two acquirers could both judge a lock dead and both unlink it, the
+           second unlink deleting a live successor's file.
+        2. ``_claim_lock_file_exclusive`` — ``O_CREAT|O_EXCL``, so even with the
+           guard disabled or unavailable a claim can never overwrite a holder.
+
+        Composes :class:`RobustFileLock` rather than reimplementing flock. It is
+        the codebase's existing kernel-lock primitive and brings release-on-death
+        for free, which is what makes a guard crash-safe: if a holder dies mid
+        decision the kernel drops the flock, with no stale-guard heuristic.
+
+        Degrades open, never closed: if the guard cannot be taken, the body still
+        runs and layer 2 keeps correctness. A guard that could wedge every
+        acquisition would be worse than the race it prevents.
+        """
+        if not _dlm_acquire_guard_enabled():
+            yield False
+            return
+
+        guard = None
+        acquired = False
+        try:
+            from backend.core.robust_file_lock import RobustFileLock
+
+            guard = RobustFileLock(
+                f"{lock_name}.dlm-acquire",
+                source=self._owner_id,
+                lock_dir=self.config.lock_dir,
+            )
+            acquired = await guard.acquire(timeout_s=_dlm_acquire_guard_timeout())
+            if not acquired:
+                logger.debug(
+                    "[DLM] acquire guard busy for %s — relying on O_EXCL claim",
+                    lock_name,
+                )
+        except Exception as exc:  # noqa: BLE001 — guard must never wedge acquisition
+            logger.debug("[DLM] acquire guard unavailable for %s: %r", lock_name, exc)
+            guard, acquired = None, False
+
+        try:
+            yield acquired
+        finally:
+            if guard is not None and acquired:
+                try:
+                    await guard.release()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[DLM] acquire guard release failed: %r", exc)
+
+    async def _claim_lock_file_exclusive(
+        self, lock_file: Path, metadata: LockMetadata
+    ) -> bool:
+        """Atomically create the lock file, or fail if a holder already exists.
+
+        ``O_CREAT|O_EXCL`` is the test-and-set the previous implementation
+        lacked: the kernel picks exactly one winner among concurrent creators.
+        Content is written straight into the exclusively-created descriptor
+        rather than through ``tmp + rename`` — a rename would clobber a
+        concurrent winner and reintroduce last-writer-wins.
+
+        Returns True iff THIS caller created the file.
+        """
+        content = json.dumps(asdict(metadata), indent=2).encode("utf-8")
+
+        def _claim() -> bool:
+            try:
+                fd = os.open(
+                    str(lock_file),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,  # owner-only, matching RobustFileLock (CWE-732)
+                )
+            except FileExistsError:
+                return False
+            try:
+                os.write(fd, content)
+                # Durability before we report ownership: a reader on another
+                # process must not see a truncated claim.
+                os.fsync(fd)
+            except Exception:
+                # Never leave a half-written claim standing — it would look like
+                # a live holder with unparseable metadata.
+                try:
+                    os.close(fd)
+                finally:
+                    try:
+                        os.unlink(str(lock_file))
+                    except OSError:
+                        pass
+                raise
+            else:
+                os.close(fd)
+            return True
+
+        try:
+            return await _run_blocking(_claim, timeout=DLM_BLOCKING_OP_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Exclusive claim failed for %s: %r", lock_file.name, exc)
             return False
 
     async def _release_lock(self, lock_file: Path, token: str) -> None:
@@ -2179,6 +2373,32 @@ class DistributedLockManager:
                     if metadata:
                         acquired = True
                         break
+
+                    # v4.0: A DENIAL is not an OUTAGE.
+                    #
+                    # This previously fell straight through to the file backend
+                    # whenever Redis returned no metadata — conflating "Redis is
+                    # down, use the fallback" with "Redis says another holder has
+                    # it". The second acquirer was denied by Redis and then
+                    # granted the very same lock by the file backend, because the
+                    # winner's lock lives in Redis and no lock FILE exists. Two
+                    # holders, two different arbiters, no mutual exclusion. This
+                    # is what made test_concurrent_acquire_fails and
+                    # test_five_concurrent_acquires_one_wins red.
+                    #
+                    # A fallback is only sound when the authority is UNREACHABLE.
+                    # While Redis is healthy it is the sole arbiter; we wait and
+                    # retry it rather than asking a different oracle for a second
+                    # opinion.
+                    if _dlm_strict_backend_enabled() and self._redis_client.is_available:
+                        attempt += 1
+                        await asyncio.sleep(
+                            min(
+                                self.config.retry_delay_seconds * (2 ** min(attempt, 5)),
+                                _dlm_backend_retry_cap(),
+                            )
+                        )
+                        continue
 
                 # Fall back to file-based lock
                 lock_file = self.config.lock_dir / f"{lock_name}{self.config.lock_extension}"

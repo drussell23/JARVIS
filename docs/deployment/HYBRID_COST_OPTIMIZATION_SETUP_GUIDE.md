@@ -1271,7 +1271,7 @@ gcloud sql instances describe jarvis-learning-db \
 
 ### JARVIS Documentation
 - [HYBRID_COST_OPTIMIZATION.md](./HYBRID_COST_OPTIMIZATION.md) - 94% cost reduction guide (Spot VMs, auto-cleanup)
-- [HYBRID_ARCHITECTURE.md](./HYBRID_ARCHITECTURE.md) - Complete hybrid architecture with UAE/SAI/CAI integration
+- [HYBRID_ARCHITECTURE.md](../architecture/HYBRID_ARCHITECTURE.md) - Complete hybrid architecture with UAE/SAI/CAI integration
 - [README.md](./README.md) - Main project documentation and quick start guide
 - [start_system.py](./start_system.py) - Hybrid system implementation code
 

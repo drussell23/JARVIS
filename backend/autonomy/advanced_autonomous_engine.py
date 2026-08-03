@@ -904,3 +904,23 @@ class AdvancedAutonomousEngine:
                     })
 
         return recent
+
+# Global instance
+#
+# Restored 2026-08-02. This factory was deleted by 4406e11941 ("docs:
+# AI-generated documentation updates", claude-ai[bot], 2025-10-30) — a
+# documentation commit that removed executable code while ADDING the module
+# docstring above, which calls it. The sole consumer,
+# backend.intelligence.goal_autonomous_uae_integration, has therefore raised
+# ImportError at import time ever since. It went unnoticed because the only
+# test exercising that path is a root-level test_*.py, and pytest.ini pinned
+# testpaths=tests. Implementation below is byte-faithful to the original.
+_engine_instance = None
+
+
+def get_advanced_autonomous_engine() -> AdvancedAutonomousEngine:
+    """Get or create the global advanced autonomous engine"""
+    global _engine_instance
+    if _engine_instance is None:
+        _engine_instance = AdvancedAutonomousEngine()
+    return _engine_instance
