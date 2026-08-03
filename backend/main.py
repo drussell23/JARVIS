@@ -1969,6 +1969,24 @@ async def parallel_lifespan(app: FastAPI):
         create_safe_task(_init_agent_runtime_background(), name="agent_runtime_init")
 
         # =================================================================
+        # THE WITNESS. Started before anything heavy, because the stalls worth
+        # knowing about are the ones during boot and a witness that arrives
+        # afterwards has nothing to report.
+        #
+        # `await slow_thing()` does not starve a loop — it yields, and a
+        # 79-second boot can be responsive the whole way through. Only a
+        # SYNCHRONOUS call that never yields starves anything, and the two
+        # produce identical-looking timelines while needing opposite fixes.
+        # This measures the loop itself rather than any suspect, so the next
+        # boot log states which it was instead of inviting us to theorise.
+        # =================================================================
+        try:
+            from backend.hud.loop_sentinel import get_loop_sentinel
+            get_loop_sentinel().start()
+        except Exception as _ls:  # noqa: BLE001 — a witness never blocks a boot
+            logger.debug("[HUD] loop sentinel unavailable: %s", _ls)
+
+        # =================================================================
         # v351.0: HUD MODE — IPC server + SSE consumer for Swift HUD
         # =================================================================
         class _SkipCloudRelay(Exception):
@@ -2235,12 +2253,37 @@ async def parallel_lifespan(app: FastAPI):
                                     # JARVIS_HUD_TTS=0.
                                     _tts_enabled = os.environ.get("JARVIS_HUD_TTS", "1").lower() in ("1", "true", "yes")
                                     if _tts_enabled:
+                                        # AN ACKNOWLEDGEMENT MUST NOT GATE THE ACT.
+                                        #
+                                        # This was `await _hud_tts(...)`, and
+                                        # `_hud_tts` awaits `say` to synthesise a
+                                        # file and then `afplay` to play it TO
+                                        # COMPLETION. So the dispatch stopped and
+                                        # waited for "On it" to finish being
+                                        # spoken before it began doing anything —
+                                        # measured 2026-08-03, an action received
+                                        # at 01:40:34 was not routed until
+                                        # 01:40:49.
+                                        #
+                                        # The entire purpose of saying "On it" is
+                                        # to reassure the operator WHILE the work
+                                        # happens. Awaiting it inverts that: the
+                                        # reassurance becomes the delay it was
+                                        # meant to cover, on every command.
+                                        #
+                                        # Fire-and-forget is safe here precisely
+                                        # because `_hud_tts` now holds a single
+                                        # mouth-lock: the acknowledgement and the
+                                        # result cannot overlap, they queue, and
+                                        # the order they queue in is the order
+                                        # they were decided in.
                                         if _is_messaging and _msg_contact_match:
                                             _contact_name = _msg_contact_match.group(1)
                                             _app_name = app_context or "the messaging app"
-                                            await _hud_tts(f"Sending your message to {_contact_name} on {_app_name}.")
+                                            _ack = f"Sending your message to {_contact_name} on {_app_name}."
                                         else:
-                                            await _hud_tts(f"On it. Executing: {goal[:60]}")
+                                            _ack = f"On it. Executing: {goal[:60]}"
+                                        asyncio.create_task(_hud_tts(_ack))
 
                                     # Route through Ouroboros — classifier decides execution path
                                     logger.info("[HUD] VoiceRouter executing: %s", goal[:80])

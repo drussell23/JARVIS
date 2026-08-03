@@ -922,6 +922,22 @@ class IntakeLayerService:
                         poll_interval_s=_health_poll_s,
                     )
                     self._sensors.append(_health_sensor)
+                # PUBLISH IT, and drain whatever died before it existed.
+                #
+                # `TaskHarvester` and `LoopSentinel` discover health problems
+                # the instant they happen, which is often DURING boot — before
+                # this line runs. They hold those findings; registering here
+                # is what releases them. Without this the one traceback worth
+                # catching (a governance service failing at startup) is the
+                # one guaranteed to be dropped.
+                try:
+                    from backend.core.ouroboros.governance.intake.sensors.runtime_health_sensor import (
+                        register_runtime_health_sensor,
+                    )
+                    register_runtime_health_sensor(_health_sensor)
+                except Exception as _reg:  # noqa: BLE001
+                    logger.debug("[IntakeLayer] health sensor not published: %s",
+                                 _reg)
                 logger.info("[IntakeLayer] RuntimeHealthSensor added (autonomous dependency monitoring)")
             except Exception as exc:
                 logger.debug("[IntakeLayer] RuntimeHealthSensor skipped: %s", exc)

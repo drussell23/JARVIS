@@ -431,40 +431,7 @@ class RuntimeHealthSensor:
         findings.extend(shims)
 
         # Emit envelopes for new findings
-        emitted = 0
-        for finding in findings:
-            if finding.summary in self._seen_findings:
-                continue
-            self._seen_findings.add(finding.summary)
-
-            try:
-                envelope = make_envelope(
-                    source="runtime_health",
-                    description=finding.summary,
-                    target_files=finding.target_files,
-                    repo=self._repo,
-                    confidence=0.95,  # High — these are factual version comparisons
-                    urgency=finding.severity,
-                    evidence={
-                        "category": finding.category,
-                        "details": finding.details,
-                        "python_version": platform.python_version(),
-                        "sensor": "RuntimeHealthSensor",
-                    },
-                    requires_human_ack=False,  # Fully autonomous — Ouroboros handles upgrades without human gate
-                )
-                result = await self._router.ingest(envelope)
-                if result == "enqueued":
-                    emitted += 1
-                    logger.info(
-                        "[RuntimeHealthSensor] Emitted: %s (%s) -> %s",
-                        finding.category, finding.severity, result,
-                    )
-            except Exception:
-                logger.exception(
-                    "[RuntimeHealthSensor] Failed to emit finding: %s",
-                    finding.summary,
-                )
+        emitted = await self._emit(findings)
 
         if findings:
             logger.info(
@@ -891,3 +858,99 @@ class RuntimeHealthSensor:
             "python_version": platform.python_version(),
             "poll_interval_s": self._poll_interval_s,
         }
+
+
+    async def _emit(self, findings) -> int:
+        """Send findings to the intake router. Returns how many landed.
+
+        NEVER raises. Extracted from `scan_once` so the PUSH path
+        (:meth:`report`) and the POLL path share one emitter — two copies of
+        envelope construction would eventually disagree about what a finding
+        looks like, and the push path is the one carrying tracebacks.
+        """
+        emitted = 0
+        for finding in (findings or []):
+            try:
+                if finding.summary in self._seen_findings:
+                    continue
+                self._seen_findings.add(finding.summary)
+                envelope = make_envelope(
+                    source="runtime_health",
+                    description=finding.summary,
+                    target_files=finding.target_files,
+                    repo=self._repo,
+                    confidence=0.95,
+                    urgency=finding.severity,
+                    evidence={
+                        "category": finding.category,
+                        "details": finding.details,
+                        "python_version": platform.python_version(),
+                        "sensor": "RuntimeHealthSensor",
+                    },
+                    requires_human_ack=False,
+                )
+                result = await self._router.ingest(envelope)
+                if result == "enqueued":
+                    emitted += 1
+                    logger.info(
+                        "[RuntimeHealthSensor] Emitted: %s (%s) -> %s",
+                        finding.category, finding.severity, result,
+                    )
+            except Exception:
+                logger.exception(
+                    "[RuntimeHealthSensor] Failed to emit finding: %s",
+                    getattr(finding, "summary", "?"),
+                )
+        return emitted
+
+    async def report(self, finding) -> int:
+        """PUSH a finding discovered elsewhere. NEVER raises.
+
+        The sensor polls on a 24h interval by default, which is right for
+        package staleness and useless for a background task that just died or
+        an event loop that just stalled for three seconds. Those are known the
+        instant they happen and are stale by the next scan.
+
+        This is an entry point, not a second sensor: it goes through the same
+        `_emit`, the same envelope, the same router, and the same
+        deduplication. `TaskHarvester` and `LoopSentinel` are its callers.
+        """
+        try:
+            return await self._emit([finding])
+        except Exception:  # noqa: BLE001
+            logger.debug("[RuntimeHealthSensor] report degraded", exc_info=True)
+            return 0
+
+
+#: The live sensor, so a component that DISCOVERS a health problem can hand it
+#: over without importing the intake layer or holding a reference through five
+#: constructors. Registration rather than import for the same reason
+#: `world_state` registers probes: the reporter must not know what answers it.
+_LIVE_SENSOR = [None]
+
+
+def register_runtime_health_sensor(sensor) -> None:
+    """Publish the live sensor, and drain anything held for it. NEVER raises.
+
+    The flush is the point. A background task that dies during boot does so
+    while the intake layer is still coming up, so `TaskHarvester` holds those
+    failures until something can receive them — without this call, the one
+    traceback worth catching would be the one dropped.
+    """
+    try:
+        _LIVE_SENSOR[0] = sensor
+        from backend.core.ouroboros.telemetry.task_harvester import (
+            get_task_harvester,
+        )
+        get_task_harvester().flush()
+    except Exception:  # noqa: BLE001
+        logger.debug("[RuntimeHealthSensor] registration degraded",
+                     exc_info=True)
+
+
+def get_runtime_health_sensor():
+    """The live sensor, or None if the intake layer is not up. NEVER raises."""
+    try:
+        return _LIVE_SENSOR[0]
+    except Exception:  # noqa: BLE001
+        return None
