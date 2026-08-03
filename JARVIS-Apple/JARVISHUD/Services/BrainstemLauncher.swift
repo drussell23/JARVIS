@@ -259,7 +259,7 @@ final class BrainstemLauncher {
         // a guess at what "healthy" means. Bounded, so a wedged interpreter
         // cannot hang startup, and every rejection is logged BY REASON: a
         // launcher that silently picks the third choice is undebuggable.
-        var discovered = Self.discoverPythons(repoRoot: repoRoot, environment: env)
+        let discovered = Self.discoverPythons(repoRoot: repoRoot, environment: env)
         // A PATH lookup last, never first: it is not an interpreter, it is
         // whatever this process's PATH happens to resolve — the very
         // indirection that hid the working Python behind a broken one.
