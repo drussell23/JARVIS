@@ -4,7 +4,7 @@ uvicorn[standard]==0.27.0
 transformers>=4.36.0
 torch>=2.0.0
 accelerate>=0.25.0
-sentencepiece>=0.1.0
+sentencepiece>=0.2.2
 protobuf>=3.19.6,<4.24
 pydantic==2.5.3
 python-multipart==0.0.6
