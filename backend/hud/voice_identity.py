@@ -199,17 +199,43 @@ class VoiceIdentity:
         return self._readiness
 
     async def warm(self) -> None:
-        """Resolve enrollment now, and start the model loading. NEVER raises.
+        """Resolve enrollment at boot. Does NOT load the model. NEVER raises.
 
-        The boot seam. Enrollment resolves in milliseconds and the model in
-        minutes, so they are started together and awaited separately — the
-        organism knows WHO it is looking for long before it can look.
+        WHY THE MODEL IS NOT WARMED HERE ANY MORE
+        -------------------------------------------
+        It was, and it was the boot starvation. Measured from an OS thread
+        that cannot itself be starved:
+
+            worst loop round-trip lag : 13.82s
+            VERDICT                   : WARM-UP STARVES THE LOOP
+
+        which matches the 14.33s stall in the live boot log almost exactly.
+        `SpeakerVerificationService.initialize()` is `async def`, but its body
+        loads torch and speechbrain without ever yielding — so awaiting it
+        stops the loop for fourteen seconds, during which JARVIS cannot hear,
+        answer, or dispatch anything. I built the sentinel to catch that class
+        of defect and then introduced one with it.
+
+        The obvious fix does not work. `initialize()` creates
+        `asyncio.Lock` and `asyncio.Queue` on whatever loop is running, so
+        pushing it into a worker thread's loop would bind them there and break
+        the moment `verify_speaker` is called from the main loop — precisely
+        the "bound to a different event loop" failure just removed from
+        `ipc_server`. The stall cannot be moved off the loop; it can only be
+        moved off the BOOT PATH.
+
+        So enrollment — one cheap database read, and the only part needed to
+        answer "who would I be checking for" — resolves here. The model loads
+        lazily on the first verification that actually needs it, via
+        `start_warming` inside `identify`, which already reports NOT_READY and
+        invites a retry. The cost is one "give me a moment" on the first
+        unlock of a session. The alternative was fourteen seconds of deafness
+        during every boot, for a capability that may never be used.
         """
         try:
             await self.refresh_enrollment()
         except Exception:  # noqa: BLE001
             pass
-        self.start_warming()
 
     def start_warming(self) -> None:
         """Begin loading the model in the background. Idempotent. NEVER raises.

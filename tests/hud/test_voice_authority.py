@@ -315,3 +315,36 @@ async def test_an_unloaded_service_says_not_ready_so_a_retry_can_succeed():
     r = await VoiceIdentity(service=FailedLoad()).identify(b"RIFFxxxx")
     assert r.verdict == Verdict.NOT_READY.value
     assert "UNKNOWN" in r.detail
+
+
+@pytest.mark.asyncio
+async def test_boot_warm_does_not_load_the_model():
+    """Measured from an unstarvable OS thread: awaiting
+    `SpeakerVerificationService.initialize()` produced a 13.82s loop
+    round-trip lag, matching the 14.33s stall in the live boot log. It is
+    `async def` whose body never yields.
+
+    It cannot be pushed to a worker loop either — it creates `asyncio.Lock`
+    and `asyncio.Queue`, which would then be bound to a dying thread's loop.
+    So boot resolves ENROLLMENT only; the model loads lazily on first need.
+    """
+    import ast
+    import inspect
+    # Parse it, and strip the docstring — this docstring EXPLAINS why
+    # start_warming is absent, so a substring check reads its own prose as
+    # evidence against itself.
+    fn = ast.parse(inspect.getsource(VoiceIdentity.warm).lstrip()).body[0]
+    body = [n for n in fn.body
+            if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+    called = {n.func.attr for n in ast.walk(ast.Module(body=body, type_ignores=[]))
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert "refresh_enrollment" in called
+    assert "start_warming" not in called, "boot must not load the speaker model"
+
+
+@pytest.mark.asyncio
+async def test_the_model_still_warms_on_first_need():
+    """Lazily, not never. The first verification that needs it kicks the load
+    and answers NOT_READY so the operator can retry."""
+    import inspect
+    assert "start_warming" in inspect.getsource(VoiceIdentity.identify)
