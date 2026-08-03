@@ -39,7 +39,7 @@ prompt_toolkit>=3.0.43   # REPL (headless-safe)
 watchdog==6.0.0          # FileWatchGuard / fs sensors (Slice 12K budget runs on it)
 numpy>=1.26.4,<2.5       # semantic index / oracle math
 fastembed>=0.3.0         # Oracle LITE embeddings (graduated default-ON); pulls onnxruntime (CPU)
-aiosqlite==0.19.0        # Oracle SQLite persistence
+aiosqlite==0.22.1        # Oracle SQLite persistence
 aiofiles==23.2.1
 pytest-timeout==2.4.0
 # pytest.ini sets `asyncio_mode = auto` + json/metadata plugins -- WITHOUT these
