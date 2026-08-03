@@ -700,6 +700,38 @@ class PythonBridge: ObservableObject {
     }
 }
 
+// MARK: - JARVISVoice (resolved ONCE, not per utterance)
+
+/// The canonical JARVIS voice, looked up a single time.
+///
+/// `AVSpeechSynthesisVoice(identifier:)` is not a constructor — it is a
+/// SYNCHRONOUS QUERY against the on-device speech-voice catalog, serviced over
+/// XPC. Both synthesisers were calling it (and its `language:` fallback) on
+/// EVERY utterance, from `@MainActor` code. Blocking IPC inside a Swift
+/// Concurrency context is exactly what the runtime reports as:
+///
+///     Potential Structural Swift Concurrency Issue:
+///     unsafeForcedSync called from Swift Concurrent context.
+///
+/// The voice catalog does not change between utterances, so the query was pure
+/// repeated cost — and the diagnostic is the runtime objecting to where that
+/// cost was paid, not to the audio graph.
+///
+/// `static let` resolves lazily, exactly once, under Swift's `swift_once`
+/// guarantee — so the blocking lookup happens a single time at first speech
+/// instead of on every sentence, and never again for the life of the process.
+///
+/// Shared rather than duplicated: two identical lookups in two files was the
+/// literal definition of the thing that drifts.
+enum JARVISVoice {
+    /// Daniel — British English male, the canonical JARVIS voice.
+    /// `nil` is a legal outcome: AVSpeechUtterance then uses the system
+    /// default, which is far better than refusing to speak.
+    static let daniel: AVSpeechSynthesisVoice? =
+        AVSpeechSynthesisVoice(identifier: "com.apple.voice.compact.en-GB.Daniel")
+        ?? AVSpeechSynthesisVoice(language: "en-GB")
+}
+
 // MARK: - VoiceManager (TTS via AVSpeechSynthesizer — Daniel voice)
 
 @MainActor
@@ -726,8 +758,7 @@ final class VoiceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegat
         currentPriority = priority
         let utterance = AVSpeechUtterance(string: text)
         // Daniel = British English male (JARVIS canonical voice)
-        utterance.voice = AVSpeechSynthesisVoice(identifier: "com.apple.voice.compact.en-GB.Daniel")
-            ?? AVSpeechSynthesisVoice(language: "en-GB")
+        utterance.voice = JARVISVoice.daniel
         utterance.rate = 0.52
         utterance.pitchMultiplier = 1.0
         utterance.volume = 0.9
