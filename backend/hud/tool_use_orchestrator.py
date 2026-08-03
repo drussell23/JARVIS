@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from backend.hud.tool_definitions import (
     TOOL_SCHEMAS,
     derived_tool_schemas,
+    open_sessions_note,
     ToolCall,
     ToolResult,
     execute_tool,
@@ -100,12 +101,29 @@ class ToolUseOrchestrator:
         # simply never named in the prompt.
         tool_list = json.dumps(list(derived_tool_schemas().values()), indent=2)
 
+        # Namespaced tools reach whole subsystems — multi-space intelligence,
+        # video streaming, ghost touch. The model needs to be told the dot is
+        # part of the name, or it will helpfully "correct" `video.start_
+        # streaming` to `start_streaming` and be blocked by the Iron Gate for a
+        # tool that exists.
+        namespace_note = (
+            "\nSome tools are namespaced (e.g. 'space.analyze_desktop_spaces', "
+            "'video.start_streaming', 'touch.watch_and_react'). Call them by "
+            "their FULL name including the dot — 'space' reaches multi-space "
+            "desktop intelligence, 'video' reaches continuous screen capture, "
+            "'touch' reaches background UI automation.\n"
+            "Tools that START a session keep running after they return. Only "
+            "start one when the goal actually needs continuous observation, and "
+            "stop it when you are done.\n"
+        )
+
         system_prompt = (
             "You are JARVIS, an AI organism controlling a MacBook Pro. "
             "You have tools to interact with the Mac. Use them to accomplish the goal.\n\n"
             "The user is Derek J. Russell. When they say 'my profile' or 'my account', "
             "use their name to find the right page.\n\n"
-            "Available tools:\n" + tool_list + "\n\n"
+            "Available tools:\n" + tool_list + "\n"
+            + namespace_note + open_sessions_note() + "\n"
             "To call a tool, respond with JSON: {\"tool_calls\": [{\"name\": \"...\", \"args\": {...}}]}\n"
             "When the task is complete, respond with: {\"done\": true, \"summary\": \"what you did\"}\n"
             "If you cannot complete the task, respond with: {\"done\": true, \"summary\": \"why it failed\", \"error\": \"reason\"}\n\n"

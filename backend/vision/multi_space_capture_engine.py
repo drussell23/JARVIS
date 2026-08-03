@@ -368,6 +368,21 @@ class MultiSpaceCaptureEngine:
     """
     Core engine for capturing screenshots across multiple desktop spaces
     Implements PRD requirements FR-1.1 through FR-1.6
+
+    Capability-Namespace: space
+
+    That one line is what makes this engine reachable from the HUD. It is a
+    DOCSTRING tag rather than a decorator so this module gains no import and
+    `vision` stays free of any dependency on `system_control` — the same
+    inversion `silent_actuator` uses. `capability_federation` finds it with a
+    static AST scan, so being discovered costs nothing until something calls it.
+
+    Only methods carrying their own `Capability:` tag are exported. Silence
+    means "not offered", not "gated": `capture_all_spaces` takes a
+    `SpaceCaptureRequest` and `prefetch_spaces` takes a `CaptureQuality`, and
+    offering a language model a parameter it can only fill with a hallucinated
+    object wastes a turn. The natural-language door into this subsystem is
+    `EnhancedMultiSpaceSystem.analyze_desktop_spaces`, which is tagged.
     """
 
     def __init__(self, cache_size_mb: int = 200, memory_manager=None):
@@ -455,6 +470,8 @@ class MultiSpaceCaptureEngine:
     async def check_system_health(self) -> Tuple[bool, str, Optional[Any]]:
         """
         Check system health before capture operations.
+
+        Capability: read-only
 
         Returns:
             Tuple of (is_healthy, message, state_info)
@@ -1155,6 +1172,8 @@ class MultiSpaceCaptureEngine:
         """
         Enumerate all available desktop spaces
         Implements PRD FR-1.2: Enumerate all available desktop spaces
+
+        Capability: read-only
         """
         try:
             # Use window detector to get space info
@@ -1183,6 +1202,8 @@ class MultiSpaceCaptureEngine:
         """
         Get the currently active space
         Implements PRD FR-1.3: Identify which space is currently active
+
+        Capability: read-only
         """
         try:
             from .multi_space_window_detector import MultiSpaceWindowDetector
@@ -1205,6 +1226,8 @@ class MultiSpaceCaptureEngine:
         1. Configured monitored_spaces list (if set)
         2. Memory pressure (active only if under pressure)
         3. All spaces (if no pressure and no filter)
+
+        Capability: read-only
         """
         # If specific spaces configured, use those
         if self.monitored_spaces:
@@ -1258,7 +1281,10 @@ class MultiSpaceCaptureEngine:
         return requested_quality
 
     def get_cache_stats(self) -> Dict[str, Any]:
-        """Get cache statistics"""
+        """Get cache statistics
+
+        Capability: read-only
+        """
         stats = self.cache.get_stats()
 
         # Add memory manager stats if available
@@ -1268,7 +1294,17 @@ class MultiSpaceCaptureEngine:
         return stats
 
     async def clear_cache(self, space_ids: Optional[List[int]] = None):
-        """Clear cache for specific spaces or all"""
+        """Clear cache for specific spaces or all
+
+        Capability: notify_apply
+
+        Not read-only — it discards state. Not approval-required either: the
+        worst case is a re-capture, and a tier that asks a human before dropping
+        a screenshot cache trains them to approve without reading.
+
+        Args:
+            space_ids: Spaces to clear, or omit to clear every cached space
+        """
         if space_ids:
             # Clear specific spaces
             for space_id in space_ids:
@@ -1322,7 +1358,17 @@ class MultiSpaceCaptureEngine:
             logger.info("Space monitoring session timeout, stopping")
 
     async def start_monitoring_session(self) -> bool:
-        """Start monitoring session with purple indicator"""
+        """Start monitoring session with purple indicator
+
+        Capability: session-start, release=stop_monitoring_session
+
+        The purple indicator IS the argument for the session rules. This holds
+        a Swift capture open and lights a system-level recording dot that stays
+        lit until something calls the release — so it is never SAFE_AUTO no
+        matter how read-only the capture itself is, and the lease book must know
+        it is open so the reaper can turn that dot off when whoever asked for it
+        goes away.
+        """
         if self.monitoring_active:
             logger.info("Monitoring session already active")
             return True
@@ -1355,7 +1401,13 @@ class MultiSpaceCaptureEngine:
             return True
 
     def stop_monitoring_session(self):
-        """Stop monitoring session and remove purple indicator"""
+        """Stop monitoring session and remove purple indicator
+
+        Capability: session-end
+
+        Already idempotent — it returns early when nothing is active — which is
+        what lets the reaper call it without first asking whether it needs to.
+        """
         if not self.monitoring_active:
             logger.info("No active monitoring session to stop")
             return

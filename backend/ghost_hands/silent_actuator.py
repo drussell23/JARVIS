@@ -32,7 +32,16 @@ _WORKER_START_TIMEOUT_S = float(os.environ.get("ACTUATOR_START_TIMEOUT_S", "10.0
 
 
 class SilentActuator:
-    """Async interface to the CGEvent worker subprocess."""
+    """Async interface to the CGEvent worker subprocess.
+
+    Capability-Namespace: touch
+    Capability-Factory: get_instance
+
+    Tags below are read by `capability_federation` via a static AST scan and by
+    `capability_registry` at hydrate time. They are DOCSTRING tags rather than
+    decorators on purpose: this module gains no import, and `ghost_hands` stays
+    free of any dependency on `system_control`.
+    """
 
     _instance: Optional["SilentActuator"] = None
 
@@ -52,7 +61,18 @@ class SilentActuator:
     # ------------------------------------------------------------------
 
     async def start(self) -> bool:
-        """Start the CGEvent worker subprocess."""
+        """Start the CGEvent worker subprocess.
+
+        Capability: session-start, release=stop_actuator, as=start_actuator
+
+        A session in the most literal sense — this spawns a PROCESS. Leak the
+        lease and you leak a pid, so the reaper is not a nicety here.
+
+        `as=` because `GhostHandsOrchestrator.start` shares this name, and in a
+        flat vocabulary one would silently shadow the other. Renamed at the
+        declaration rather than in a table elsewhere, and the method keeps the
+        name its twelve existing callers use.
+        """
         if self._started and self._proc and self._proc.returncode is None:
             return True
 
@@ -96,7 +116,10 @@ class SilentActuator:
             return False
 
     async def stop(self) -> None:
-        """Stop the worker subprocess."""
+        """Stop the worker subprocess.
+
+        Capability: session-end, as=stop_actuator
+        """
         await self._kill_proc()
         self._started = False
 
