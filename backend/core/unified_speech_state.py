@@ -230,6 +230,10 @@ class UnifiedSpeechStateManager:
         self._listeners: Set[weakref.ref] = set()
         self._websocket_broadcasters: List[Callable] = []
         self._last_broadcast_time: float = 0
+        #: The last event actually broadcast. Kept so the throttle can tell a
+        #: repeat from a transition — dropping a transition silently strands
+        #: every consumer in the previous state.
+        self._last_broadcast_event: str = ""
         self._config = SpeechStateConfig()
         
         # Thread-safe state access
@@ -631,13 +635,29 @@ class UnifiedSpeechStateManager:
             self._websocket_broadcasters.remove(broadcaster)
     
     async def _broadcast_state_change(self, event: str) -> None:
-        """Broadcast state change to all registered listeners."""
+        """Broadcast state change to all registered listeners.
+
+        v285.0: the throttle no longer drops a CHANGE of event.
+
+        It used to return early whenever two broadcasts fell inside
+        ``MIN_BROADCAST_INTERVAL_MS`` (50ms) regardless of what they said. A
+        short utterance — "Done." — starts and stops well inside that window, so
+        the ``speech_ended`` broadcast was silently discarded while
+        ``speech_started`` had already gone out. Any consumer gating a
+        microphone on those events is then muted with nothing left to unmute it.
+
+        Throttling REPEATS of the same event is still right and still happens:
+        those are heartbeats and a listener loses nothing by missing one. A
+        transition is not a repeat — it is the entire message.
+        """
         now = time.time() * 1000
-        
-        # Throttle broadcasts
-        if now - self._last_broadcast_time < self._config.MIN_BROADCAST_INTERVAL_MS:
+
+        if (event == self._last_broadcast_event
+                and now - self._last_broadcast_time
+                < self._config.MIN_BROADCAST_INTERVAL_MS):
             return
         self._last_broadcast_time = now
+        self._last_broadcast_event = event
         
         with self._state_lock:
             state_dict = self._state.to_dict()

@@ -1971,22 +1971,48 @@ async def parallel_lifespan(app: FastAPI):
                 _hud_shutdown = asyncio.Event()
 
                 # TTS helper — uses macOS `say -v Daniel` for voice feedback.
-                # CRITICAL: Creates /tmp/jarvis_speaking flag file BEFORE speaking
-                # and removes it AFTER. The Swift HUD's WakeWordListener checks
-                # this flag to suppress the mic during Python-side TTS, preventing
-                # the voice feedback loop (mic picking up JARVIS's own speech).
-                _SPEAKING_FLAG = "/tmp/jarvis_speaking"
+                #
+                # v285.0: mic suppression now goes through
+                # `UnifiedSpeechStateManager`, the authority that already owns
+                # this question — it tracks seven speech sources, scales an echo
+                # cooldown by utterance length, catches an echo the gate missed
+                # by text similarity, gates `AudioBus`, and resets itself after
+                # 60s if a stop never arrives.
+                #
+                # It previously wrote `/tmp/jarvis_speaking` and the Swift HUD
+                # stat'd that file. Two problems the manager does not have:
+                # a lockfile records a FACT with no LIVENESS, so a SIGKILL here
+                # (which skips `finally:`) left the HUD deaf until somebody
+                # deleted the file by hand; and the flag described only THIS
+                # source, while three other things in the system also speak.
                 _TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "Daniel")
 
                 async def _hud_tts(text: str) -> None:
                     """Speak text to the user via macOS TTS with mic suppression."""
                     if not text:
                         return
+                    _speech = None
                     try:
                         import tempfile as _tf
-                        # Signal Swift HUD to mute mic
-                        with open(_SPEAKING_FLAG, "w") as f:
-                            f.write("1")
+                        from backend.core.unified_speech_state import (
+                            SpeechSource, get_speech_state_manager,
+                        )
+
+                        # Announce BEFORE any audio plays. The manager
+                        # broadcasts, `hud.speech_bridge` forwards over the IPC
+                        # socket, and the HUD mutes its tap — all before `say`
+                        # has produced a sample.
+                        try:
+                            _speech = await get_speech_state_manager()
+                            await _speech.start_speaking(
+                                text, source=SpeechSource.SYSTEM)
+                        except Exception as _sp_err:  # noqa: BLE001
+                            # Speak anyway. A missing mute risks an echo; a
+                            # refusal to speak because bookkeeping failed is a
+                            # mute button on the whole assistant.
+                            logger.warning("[HUD] speech-state start failed "
+                                           "(%s) — speaking unsuppressed",
+                                           _sp_err)
 
                         with _tf.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp:
                             tmp_path = tmp.name
@@ -2009,11 +2035,20 @@ async def parallel_lifespan(app: FastAPI):
                     except Exception as tts_err:
                         logger.debug("[HUD] TTS failed: %s", tts_err)
                     finally:
-                        # Remove flag — allow mic to resume
-                        try:
-                            os.unlink(_SPEAKING_FLAG)
-                        except OSError:
-                            pass
+                        # Best effort, and NOT the only thing standing between
+                        # the operator and a deaf microphone: every frame this
+                        # sends carries its own deadline, and the manager has
+                        # its own 60s watchdog. `finally:` is the fast path, not
+                        # the guarantee — which is the difference between this
+                        # and the lockfile it replaced.
+                        if _speech is not None:
+                            try:
+                                await _speech.stop_speaking()
+                            except Exception as _sp_err:  # noqa: BLE001
+                                logger.warning(
+                                    "[HUD] speech-state stop failed (%s) — the "
+                                    "HUD mic will un-mute on its own deadline",
+                                    _sp_err)
 
                 # Dispatch IPC events through the same command processor
                 async def _hud_dispatch(event_type: str, data: dict) -> None:
@@ -2077,11 +2112,19 @@ async def parallel_lifespan(app: FastAPI):
                                         )
 
                                     # --- TTS: Voice narration (gated by JARVIS_HUD_TTS) ---
-                                    # OFF by default — causes voice feedback loop until the
-                                    # Swift HUD is rebuilt with the /tmp/jarvis_speaking
-                                    # mic-suppression check in WakeWordListener.swift.
-                                    # Enable with: JARVIS_HUD_TTS=1 after rebuilding Swift.
-                                    _tts_enabled = os.environ.get("JARVIS_HUD_TTS", "0").lower() in ("1", "true", "yes")
+                                    # v285.0: ON by default. It was off because
+                                    # the feedback loop was unsolved — the mic
+                                    # heard JARVIS and treated it as a command.
+                                    #
+                                    # The loop is now closed at the layer that
+                                    # matters: `SpeechGate` in the HUD drops
+                                    # audio buffers AT THE TAP while any of the
+                                    # four speech sources holds a claim, and
+                                    # every claim carries a deadline so a lost
+                                    # callback or a dead socket cannot leave the
+                                    # microphone shut. Turn off with
+                                    # JARVIS_HUD_TTS=0.
+                                    _tts_enabled = os.environ.get("JARVIS_HUD_TTS", "1").lower() in ("1", "true", "yes")
                                     if _tts_enabled:
                                         if _is_messaging and _msg_contact_match:
                                             _contact_name = _msg_contact_match.group(1)
@@ -2204,6 +2247,17 @@ async def parallel_lifespan(app: FastAPI):
                     _install_consent()
                 except Exception as _ce:  # noqa: BLE001
                     logger.error("[HUD] consent bridge install failed: %s", _ce)
+
+                # Tell the HUD when JARVIS is speaking, so it can mute its own
+                # microphone. `UnifiedSpeechStateManager` has always known;
+                # its `register_websocket_broadcaster` had zero callers, so
+                # nothing ever carried the answer to the process that owns the
+                # microphone. This is that wire.
+                try:
+                    from backend.hud.speech_bridge import install as _install_speech
+                    await _install_speech()
+                except Exception as _se:  # noqa: BLE001
+                    logger.error("[HUD] speech bridge install failed: %s", _se)
             except Exception as e:
                 logger.error("[HUD] IPC server failed to start: %s", e)
 

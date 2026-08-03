@@ -350,6 +350,15 @@ final class BrainstemLauncher {
                 }
             case .failed(let error):
                 print("[Brainstem] IPC connection failed: \(error) — retries left: \(retriesLeft - 1)")
+                // THE STRUCTURAL CRASH-SAFETY. If the backend dies mid-utterance
+                // its "stopped speaking" message never arrives — and with the
+                // old `/tmp/jarvis_speaking` lockfile the flag survived the
+                // process, leaving the mic deaf until somebody deleted the file
+                // by hand. A socket cannot lie about this: the connection
+                // dropping IS the notification, so the claim goes with it.
+                Task { @MainActor in
+                    SpeechGate.shared.release(.backend, reason: "IPC connection lost")
+                }
                 conn.cancel()
                 self.ipcQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                     Task { @MainActor in
@@ -367,7 +376,9 @@ final class BrainstemLauncher {
                     }
                 }
             case .cancelled:
-                break
+                Task { @MainActor in
+                    SpeechGate.shared.release(.backend, reason: "IPC cancelled")
+                }
             default:
                 break
             }
@@ -483,6 +494,31 @@ final class BrainstemLauncher {
                     return
                 }
                 SecureConsent.shared.request(challenge)
+            }
+
+        case "speech_state":
+            // The backend is speaking (or has stopped). Values are lifted to
+            // Sendable scalars before the actor hop, same as the consent case.
+            let speaking = (data["speaking"] as? Bool) ?? false
+            let deadlineMs = (data["deadline_ms"] as? Double) ?? 0
+            let nowMs = (data["now_ms"] as? Double) ?? 0
+            let source = (data["source"] as? String) ?? "backend"
+
+            Task { @MainActor in
+                if speaking && deadlineMs > nowMs {
+                    // The deadline is trusted for its DURATION, never for its
+                    // absolute value — the two processes do not share a clock,
+                    // and a backend running five minutes fast must not be able
+                    // to mute this microphone for five minutes.
+                    SpeechGate.shared.claim(.backend,
+                                            untilEpochMs: deadlineMs,
+                                            nowEpochMs: nowMs,
+                                            reason: "backend:\(source)")
+                } else {
+                    // Covers "stopped" AND a stale frame that arrived after its
+                    // own deadline — both mean the backend is not speaking now.
+                    SpeechGate.shared.release(.backend, reason: "backend idle")
+                }
             }
 
         default:
