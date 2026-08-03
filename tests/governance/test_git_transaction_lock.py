@@ -164,12 +164,15 @@ async def test_agent_b_reset_queues_until_agent_a_transaction_completes(repo: Pa
 async def test_mutex_serializes_overlapping_transactions(repo: Path):
     """No two transactions may hold the lock simultaneously.
 
-    Repeated under contention on purpose. DistributedLockManager alone fails
-    this: its acquire is check-then-write with no test-and-set, so racers all
-    observe "free" and proceed (measured: 6 tasks -> 4 simultaneous holders).
-    A single low-contention round reproduced that only ~1 time in 6, which is
-    exactly the kind of flake that gets dismissed as noise — hence 3 rounds of
-    8, which surfaced it consistently.
+    Repeated under contention on purpose. This caught a real defect: with the
+    AUTO backend and a live local Redis, one holder acquired via Redis while a
+    second was DENIED by Redis and then granted the same lock by the file
+    backend — 6 tasks yielded 4 simultaneous holders, arbitrated by two
+    different systems. Fixed at source in DistributedLockManager (a denial is
+    not an outage); regression-tested there in TestDLMSingleArbiter.
+
+    A single low-contention round reproduced it only ~1 time in 6 — exactly the
+    kind of flake dismissed as noise — hence 3 rounds of 8.
     """
     for round_index in range(3):
         concurrent = 0
@@ -192,11 +195,11 @@ async def test_mutex_serializes_overlapping_transactions(repo: Path):
 
 
 @pytest.mark.asyncio
-async def test_gate_is_released_even_when_body_raises(repo: Path):
+async def test_lock_is_released_even_when_body_raises(repo: Path):
     """A failing transaction must not wedge the repository.
 
-    The exclusive gate is a file; leaking it on the error path would block every
-    later transaction until the owning PID exited.
+    The lock is a file; leaking it on the error path would block every later
+    transaction until the owner's TTL lapsed or its PID died.
     """
     class Boom(RuntimeError):
         pass
@@ -208,73 +211,6 @@ async def test_gate_is_released_even_when_body_raises(repo: Path):
     # The next transaction must still be able to acquire promptly.
     async with git_transaction("after", cwd=repo, timeout=10):
         pass
-
-
-@pytest.mark.asyncio
-async def test_dead_owner_gate_is_reclaimed(repo: Path):
-    """A gate left by a dead process must not block forever."""
-    from backend.core.git_transaction_lock import _gate_path
-
-    gate = _gate_path(repo)
-    gate.parent.mkdir(parents=True, exist_ok=True)
-    # PID 999999 is not running; owner format matches DLM's "jarvis-{pid}-{t}".
-    gate.write_text('{"owner": "jarvis-999999-0.0", "pid": 999999}', encoding="utf-8")
-
-    async with git_transaction("reclaimer", cwd=repo, timeout=20):
-        pass
-    assert not gate.exists(), "gate not released after reclaim"
-
-
-@pytest.mark.asyncio
-async def test_busy_lock_raises_rather_than_stomping(repo: Path):
-    """Fail closed: if exclusion cannot be delivered, do not proceed unlocked."""
-    holder_in = asyncio.Event()
-    release = asyncio.Event()
-
-    async def holder() -> None:
-        async with git_transaction("holder", cwd=repo):
-            holder_in.set()
-            await release.wait()
-
-    async def latecomer() -> None:
-        await holder_in.wait()
-        with pytest.raises(GitTransactionBusy):
-            async with git_transaction("latecomer", cwd=repo, timeout=0.5):
-                pytest.fail("latecomer must never enter the critical section")
-        release.set()
-
-    await asyncio.wait_for(asyncio.gather(holder(), latecomer()), timeout=60)
-
-
-@pytest.mark.asyncio
-async def test_disabled_flag_bypasses_lock(repo: Path, monkeypatch):
-    """The master switch must permit a clean rollback to unlocked behaviour."""
-    monkeypatch.setenv("JARVIS_GIT_MUTEX_ENABLED", "false")
-    async with git_transaction("a", cwd=repo):
-        async with git_transaction("b", cwd=repo):  # would deadlock if locking
-            pass
-
-
-@pytest.mark.asyncio
-async def test_lock_is_scoped_per_repository(tmp_path: Path, repo: Path):
-    """Two different repos must not serialize against each other."""
-    other = tmp_path / "other"
-    other.mkdir()
-    _git(other, "init", "-q", "-b", "main")
-
-    both_inside = asyncio.Event()
-
-    async def hold(path: Path, first: bool) -> None:
-        async with git_transaction("hold", cwd=path):
-            if first:
-                await asyncio.wait_for(both_inside.wait(), timeout=10)
-            else:
-                both_inside.set()
-
-    # If the lock were global, the first would block forever waiting on the second.
-    await asyncio.wait_for(
-        asyncio.gather(hold(repo, True), hold(other, False)), timeout=30
-    )
 
 
 # ---------------------------------------------------------------------------

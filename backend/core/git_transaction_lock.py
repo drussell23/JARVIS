@@ -60,10 +60,16 @@ DRY
 ---
 The locking primitive is NOT reimplemented here. This module composes
 ``backend.core.distributed_lock_manager.DistributedLockManager``, the same
-cross-process manager used for ``vbia_events`` and ``heartbeat``. Note that
-DLM's file backend is atomic-create + JSON metadata with dead-owner detection
-(``*.dlm.lock``), not ``fcntl.flock``; it deliberately uses a distinct
-extension so it cannot collide with flock-based locks sharing a directory.
+cross-process manager used for ``vbia_events`` and ``heartbeat``. DLM's file
+backend claims with ``O_CREAT|O_EXCL`` under an ``fcntl.flock`` guard (itself
+``RobustFileLock``), and stores JSON metadata in ``*.dlm.lock`` — a deliberately
+distinct extension so it cannot collide with plain flock files sharing a
+directory.
+
+The backend is pinned to FILE rather than AUTO. Under AUTO this lock would
+migrate to Redis, whose keyspace is global, so every repository on the machine
+would contend on one key and the per-repository ``lock_dir`` would stop meaning
+anything. A per-repository mutex needs a per-repository namespace.
 
 Environment
 -----------
@@ -381,7 +387,11 @@ def _loop_guard() -> asyncio.Lock:
 
 async def _get_manager(cwd: Optional[Path]):
     """Return the DLM bound to this repo's lock directory. Never invents a primitive."""
-    from backend.core.distributed_lock_manager import DistributedLockManager, LockConfig
+    from backend.core.distributed_lock_manager import (
+        DistributedLockManager,
+        LockBackend,
+        LockConfig,
+    )
 
     loop = asyncio.get_running_loop()
     lock_dir = _lock_dir(cwd).resolve()
@@ -400,120 +410,19 @@ async def _get_manager(cwd: Optional[Path]):
             LockConfig(
                 lock_dir=lock_dir,
                 fencing_counter_file=lock_dir / ".fencing_counter",
+                # Pin the FILE backend. Under AUTO this lock would migrate to
+                # Redis, whose key namespace is global — every repository on the
+                # machine would then contend on the single key
+                # "jarvis:lock:trinity:git_transaction", so two unrelated
+                # checkouts would block each other while the per-repo lock_dir
+                # silently stopped meaning anything. A per-repository mutex must
+                # live in a per-repository namespace, and the filesystem is one.
+                backend=LockBackend.FILE,
             )
         )
         await manager.initialize()
         by_dir[lock_dir] = manager
         return manager
-
-
-# ---------------------------------------------------------------------------
-# Atomic test-and-set gate
-# ---------------------------------------------------------------------------
-#
-# WHY THIS EXISTS — DistributedLockManager is not mutually exclusive.
-#
-# Measured 2026-08-02: six concurrent tasks against a single DLM lock name
-# admitted FOUR simultaneous holders. The acquire path reads the lock file, then
-# writes it via `tmp + os.replace`. The write is atomic but `replace` OVERWRITES
-# — it does not fail when the file appeared in between — so there is no
-# test-and-set anywhere. The per-lock `asyncio.Semaphore` (dlm:843) is taken
-# only inside `_write_lock_metadata` (dlm:1422); its docstring is explicit that
-# it serializes *writes to the lock file*, which protects file integrity, not
-# ownership. Two racers therefore both observe "free" and both proceed.
-#
-# That is a defect in the shared primitive and affects its other consumers
-# (vbia_events, heartbeat, cross-repo state). Fixing DLM itself is the true root
-# fix but has repo-wide blast radius, so it is reported rather than performed
-# here. This gate supplies exactly the missing property — O_CREAT|O_EXCL, where
-# the kernel picks a single winner — and DLM is still composed underneath for
-# metadata, TTL/keepalive, telemetry and dead-owner semantics.
-#
-# Stale gates are reclaimed using DLM's OWN liveness check, so the notion of "a
-# dead owner" stays defined in one place.
-
-_GATE_SUFFIX = ".gate"
-
-
-def _gate_path(cwd: Optional[Path] = None) -> Path:
-    return _lock_dir(cwd) / f"{LOCK_NAME}{_GATE_SUFFIX}"
-
-
-def _gate_owner_alive(path: Path) -> bool:
-    """True if the process recorded in the gate file is still running."""
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        # Unreadable or half-written: treat as dead so a crash cannot wedge
-        # the repository forever.
-        return False
-    owner = str(payload.get("owner", ""))
-    if not owner:
-        return False
-    try:
-        from backend.core.distributed_lock_manager import DistributedLockManager
-
-        return bool(DistributedLockManager._is_process_alive_sync(owner, payload))
-    except Exception:  # noqa: BLE001 — conservative: assume alive
-        return True
-
-
-def _try_create_gate(path: Path, owner: str) -> bool:
-    """Single atomic attempt. Returns True iff THIS caller created the gate."""
-    payload = json.dumps(
-        {"owner": owner, "pid": os.getpid(), "process_start_time": 0.0},
-        sort_keys=True,
-    )
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        return False
-    except OSError:
-        return False
-    try:
-        os.write(fd, payload.encode("utf-8"))
-    finally:
-        os.close(fd)
-    return True
-
-
-async def _acquire_exclusive_gate(
-    cwd: Optional[Path], *, timeout: float, operation: str
-) -> Optional[Path]:
-    """Block until this caller exclusively owns the gate, or raise."""
-    path = _gate_path(cwd)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    owner = f"jarvis-{os.getpid()}-0.0"
-
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(0.0, timeout)
-    delay = 0.01
-    while True:
-        if _try_create_gate(path, owner):
-            return path
-        if not _gate_owner_alive(path):
-            # Owner died holding it — reclaim, then re-race honestly.
-            try:
-                path.unlink()
-            except OSError:
-                pass
-            continue
-        if loop.time() >= deadline:
-            raise GitTransactionBusy(
-                f"git transaction lock held by another agent; "
-                f"waited {timeout:.1f}s for operation: {operation}"
-            )
-        await asyncio.sleep(delay)
-        delay = min(delay * 2, 0.25)
-
-
-def _release_exclusive_gate(path: Optional[Path]) -> None:
-    if path is None:
-        return
-    try:
-        path.unlink()
-    except OSError:
-        pass
 
 
 @asynccontextmanager
@@ -562,29 +471,17 @@ async def git_transaction(
 
     waited_from = asyncio.get_running_loop().time()
 
-    # --- atomic test-and-set gate (see _acquire_exclusive_gate) --------------
-    # DLM alone is NOT mutually exclusive; this gate is what makes the mutex a
-    # mutex. Taken before DLM so the winner is decided by the kernel.
-    gate = await _acquire_exclusive_gate(cwd, timeout=timeout, operation=operation)
-
     # The DLM `acquire` context manager traps exceptions raised inside its body and
     # reports them as "Lock acquire delegation failed", which both loses the caller's
     # exception and leaves its generator un-stopped (RuntimeError: generator didn't
     # stop after athrow()). So the lock is entered and exited EXPLICITLY: the caller's
     # exception propagates in this frame and is never thrown into DLM's generator.
     stack = AsyncExitStack()
-    try:
-        acquired = await stack.enter_async_context(
-            manager.acquire(LOCK_NAME, timeout=timeout, ttl=ttl, enable_keepalive=True)
-        )
-    except BaseException:
-        # The gate is already ours; never leave it behind on a failed acquire or
-        # it would wedge the repository until the owner PID died.
-        _release_exclusive_gate(gate)
-        raise
+    acquired = await stack.enter_async_context(
+        manager.acquire(LOCK_NAME, timeout=timeout, ttl=ttl, enable_keepalive=True)
+    )
     if not acquired:
         await stack.aclose()
-        _release_exclusive_gate(gate)
         raise GitTransactionBusy(
             f"git transaction lock held by another agent; "
             f"waited {timeout:.1f}s for operation: {operation}"
@@ -615,7 +512,6 @@ async def git_transaction(
             else:
                 os.environ.pop(TOKEN_ENV, None)
         await stack.aclose()
-        _release_exclusive_gate(gate)
         logger.debug("[GitMutex] released: %s", operation)
 
 

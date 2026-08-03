@@ -90,21 +90,42 @@ class RobustFileLock:
     the count and only truly releases when count reaches 0.
     """
 
-    def __init__(self, lock_name: str, source: str = "jarvis"):
+    def __init__(
+        self,
+        lock_name: str,
+        source: str = "jarvis",
+        lock_dir: Optional[Path] = None,
+    ):
         """
         Initialize lock.
 
         Args:
             lock_name: Unique name for this lock (e.g., "vbia_state")
             source: Identifier for the process holding the lock (for debugging)
+            lock_dir: Directory to place the lock file in. Defaults to
+                ``$JARVIS_LOCK_DIR`` as before. Callers that own a scoped lock
+                directory (DistributedLockManager, whose lock_dir is
+                per-configuration, and the per-repository git mutex) pass it
+                explicitly so their locks stay inside their own boundary
+                instead of leaking into the shared cross-repo directory.
         """
         self._lock_name = lock_name
         self._source = source
 
-        # Expand path at runtime (handles both ~ and $VAR)
-        lock_dir_raw = os.environ.get("JARVIS_LOCK_DIR", "~/.jarvis/cross_repo/locks")
-        self._lock_dir = Path(os.path.expanduser(os.path.expandvars(lock_dir_raw)))
+        if lock_dir is not None:
+            self._lock_dir = Path(lock_dir)
+        else:
+            # Expand path at runtime (handles both ~ and $VAR)
+            lock_dir_raw = os.environ.get("JARVIS_LOCK_DIR", "~/.jarvis/cross_repo/locks")
+            self._lock_dir = Path(os.path.expanduser(os.path.expandvars(lock_dir_raw)))
         self._lock_file = self._lock_dir / f"{lock_name}.lock"
+
+        # Reentrancy registry key. Keyed by the resolved lock FILE, not the bare
+        # name: with per-caller lock_dir the same name can legitimately denote
+        # different locks in different directories, and a name-only key would
+        # make two unrelated locks alias each other (one release deleting the
+        # other's registry entry, dropping a live flock fd).
+        self._registry_key = str(self._lock_file)
 
         self._fd: Optional[int] = None
         self._acquired = False
@@ -126,11 +147,11 @@ class RobustFileLock:
         # v214.0: Check for reentrant acquisition by same task
         held_lock = _get_held_locks_lock()
         async with held_lock:
-            if self._lock_name in _held_locks:
-                holder_task_id, count, existing_fd = _held_locks[self._lock_name]
+            if self._registry_key in _held_locks:
+                holder_task_id, count, existing_fd = _held_locks[self._registry_key]
                 if holder_task_id == task_id:
                     # Same task - this is a reentrant acquire
-                    _held_locks[self._lock_name] = (task_id, count + 1, existing_fd)
+                    _held_locks[self._registry_key] = (task_id, count + 1, existing_fd)
                     self._acquired = True
                     self._is_reentrant_acquire = True
                     self._fd = existing_fd  # Reuse existing fd
@@ -178,7 +199,7 @@ class RobustFileLock:
 
                     # Register in held locks with task ID and count
                     async with held_lock:
-                        _held_locks[self._lock_name] = (task_id, 1, self._fd)
+                        _held_locks[self._registry_key] = (task_id, 1, self._fd)
 
                     # Write metadata
                     await loop.run_in_executor(None, self._write_metadata_sync)
@@ -213,13 +234,13 @@ class RobustFileLock:
         held_lock = _get_held_locks_lock()
         
         async with held_lock:
-            if self._lock_name in _held_locks:
-                holder_task_id, count, existing_fd = _held_locks[self._lock_name]
+            if self._registry_key in _held_locks:
+                holder_task_id, count, existing_fd = _held_locks[self._registry_key]
                 
                 if holder_task_id == task_id:
                     if count > 1:
                         # Decrement count, don't actually release
-                        _held_locks[self._lock_name] = (task_id, count - 1, existing_fd)
+                        _held_locks[self._registry_key] = (task_id, count - 1, existing_fd)
                         self._acquired = False
                         logger.debug(
                             f"[Lock v214.0] Reentrant release: {self._lock_name} "
@@ -228,7 +249,7 @@ class RobustFileLock:
                         return
                     else:
                         # count == 1, actually release
-                        del _held_locks[self._lock_name]
+                        del _held_locks[self._registry_key]
         
         # Actually release the lock
         if self._fd is not None and not self._is_reentrant_acquire:
