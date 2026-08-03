@@ -2772,6 +2772,16 @@ async def parallel_lifespan(app: FastAPI):
                     _hud_shutdown.set()
                 _hud_ipc_server.close()
                 await _hud_ipc_server.wait_closed()
+                # Stop the dispatch loop AFTER the socket, so nothing new
+                # arrives while it is draining. It cancels and gathers what is
+                # still in flight rather than closing underneath it — a
+                # shutdown that orphaned tasks would reproduce, in miniature,
+                # the exact defect the long-lived loop removes.
+                try:
+                    from backend.hud.ipc_server import shutdown_dispatch_loop
+                    shutdown_dispatch_loop()
+                except Exception as _dl:  # noqa: BLE001
+                    logger.debug("[HUD] dispatch loop shutdown: %s", _dl)
                 logger.info("[HUD] IPC server shutdown complete")
             except Exception as e:
                 logger.debug(f"[HUD] IPC shutdown error (non-critical): {e}")
