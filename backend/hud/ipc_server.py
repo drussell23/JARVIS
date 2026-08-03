@@ -44,6 +44,110 @@ _CLIENTS: Set[asyncio.StreamWriter] = set()
 #: undefined behaviour that usually presents as a silently dropped write.
 _SERVER_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
+#: The ONE loop every IPC dispatch runs on.
+#:
+#: Long-lived and deliberately separate from the server loop. Separate,
+#: because a dispatch must not stall when the main loop is busy — that
+#: isolation is the reason the old per-event-loop design existed and it is
+#: worth keeping. Long-lived, because a loop that dies between events takes
+#: every loop-bound object with it: `asyncio.Lock` refuses to cross loops,
+#: `create_task` work is destroyed mid-flight, and subprocess child watchers
+#: are orphaned. All three were measured in one boot.
+_DISPATCH_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_DISPATCH_THREAD: Optional[threading.Thread] = None
+_DISPATCH_LOCK = threading.Lock()
+
+
+def _dispatch_loop() -> asyncio.AbstractEventLoop:
+    """The dispatch loop, started on first use. Thread-safe.
+
+    Lazily created rather than started with the server so that importing this
+    module costs nothing — and so a process that never receives an IPC event
+    never spawns the thread.
+    """
+    global _DISPATCH_LOOP, _DISPATCH_THREAD
+    with _DISPATCH_LOCK:
+        live = (_DISPATCH_LOOP is not None
+                and _DISPATCH_THREAD is not None
+                and _DISPATCH_THREAD.is_alive()
+                and not _DISPATCH_LOOP.is_closed())
+        if live:
+            return _DISPATCH_LOOP
+
+        ready = threading.Event()
+        loop = asyncio.new_event_loop()
+
+        def _serve() -> None:
+            asyncio.set_event_loop(loop)
+            ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                # Drain what is still scheduled before closing, so a shutdown
+                # mid-dispatch does not reproduce in miniature the exact
+                # "Task was destroyed but it is pending" this design removes.
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(
+                            *pending, return_exceptions=True))
+                except Exception:  # noqa: BLE001
+                    pass
+                loop.close()
+
+        thread = threading.Thread(target=_serve, name="hud-ipc-dispatch",
+                                  daemon=True)
+        thread.start()
+        # Wait for `set_event_loop` before handing the loop out: scheduling
+        # onto a loop that is not yet running is legal but silently queues
+        # until it starts, which is the "unreliable call_soon_threadsafe"
+        # behaviour that produced the old design.
+        ready.wait(timeout=5.0)
+        _DISPATCH_LOOP, _DISPATCH_THREAD = loop, thread
+        logger.info("[IPC] dispatch loop started on '%s' — one loop for every "
+                    "event, so locks and background tasks survive between them",
+                    thread.name)
+        return loop
+
+
+def _report_dispatch_outcome(fut: Any) -> None:
+    """Surface a dispatch that raised. NEVER raises.
+
+    `run_coroutine_threadsafe` returns a `concurrent.futures.Future` nobody
+    awaits, and an unretrieved exception on one of those is silent — the same
+    black hole `TaskHarvester` exists to close, arriving through a different
+    door. This is that door.
+    """
+    try:
+        exc = fut.exception()
+        if exc is None:
+            return
+        from backend.core.ouroboros.telemetry.task_harvester import (
+            get_task_harvester,
+        )
+        get_task_harvester().record(
+            exc, what="HUD IPC dispatch",
+            target_files=("backend/main.py",))
+    except Exception:  # noqa: BLE001
+        logger.debug("[IPC] dispatch outcome unreadable", exc_info=True)
+
+
+def shutdown_dispatch_loop() -> None:
+    """Stop the dispatch loop. Idempotent. NEVER raises."""
+    global _DISPATCH_LOOP, _DISPATCH_THREAD
+    with _DISPATCH_LOCK:
+        loop, thread = _DISPATCH_LOOP, _DISPATCH_THREAD
+        _DISPATCH_LOOP, _DISPATCH_THREAD = None, None
+    try:
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None:
+            thread.join(timeout=5.0)
+    except Exception:  # noqa: BLE001
+        logger.debug("[IPC] dispatch loop shutdown degraded", exc_info=True)
+
 
 def connected_clients() -> int:
     """How many HUDs are listening. NEVER raises."""
@@ -139,27 +243,74 @@ async def start_ipc_server(
                 if port is None else int(port))
 
     def _dispatch_in_thread(event_type: str, data: dict, principal: str) -> None:
-        """Run async dispatch in a fresh event loop on a daemon thread.
+        """Hand the event to the dedicated dispatch loop. NEVER raises.
 
-        macOS subprocess contexts make call_soon_threadsafe unreliable,
-        so each dispatch gets its own short-lived loop.
+        WHAT THIS USED TO DO, AND WHY IT COST SO MUCH
+        -----------------------------------------------
+        This created `asyncio.new_event_loop()` per EVENT, ran the dispatch on
+        it, and closed it — with the note that "macOS subprocess contexts make
+        call_soon_threadsafe unreliable".
 
-        The principal is stamped INSIDE this function rather than passed down
-        through dispatch: a new thread starts with an empty context, so setting
-        the contextvar here is what makes it visible to everything the dispatch
-        awaits — and scoping it to this thread is what stops two clients'
-        sessions from being attributed to each other.
+        That diagnosis was almost certainly a symptom of something else. A
+        main loop blocked for 34 seconds by the synchronous invariant audit
+        (see `event_channel`) makes `call_soon_threadsafe` look exactly
+        "unreliable": the callback is queued correctly and simply never runs,
+        because nothing is running the loop. The workaround outlived its
+        cause.
+
+        And a loop that is created and destroyed per event breaks every
+        loop-bound primitive in the process. Measured 2026-08-03 08:47:
+
+          * `<asyncio.locks.Lock object ...> is bound to a different event
+            loop` — three times. The TTS mutex that makes JARVIS speak with
+            ONE voice binds to the first dispatch's loop and is unusable from
+            the second.
+          * `Task was destroyed but it is pending!` — every
+            `asyncio.create_task` scheduled during a dispatch dies the instant
+            `run_until_complete` returns and the loop closes. That includes
+            the fire-and-forget acknowledgement TTS, which is the whole reason
+            commands stopped waiting 15 seconds.
+          * `Loop <...closed=True> that handles pid 24496 is closed` — the
+            child watcher for a subprocess spawned during dispatch, orphaned
+            when its loop went away.
+
+        ONE LOOP, LONG-LIVED
+        ----------------------
+        The isolation the old design bought is real and worth keeping: a
+        dispatch must not stall because the MAIN loop is busy. So this keeps a
+        dedicated loop on a dedicated thread — created once, never closed
+        between events. Isolation from the main loop, and a stable identity for
+        anything loop-bound.
+
+        Events still run concurrently: `run_coroutine_threadsafe` schedules
+        each as its own task on that loop, exactly as before, minus the
+        teardown.
+
+        The principal is set INSIDE the coroutine rather than here. The
+        contextvar must be visible to what the dispatch awaits, and that now
+        runs on the dispatch loop's thread rather than this one — setting it
+        here would stamp the reader thread and leave the actual work
+        unattributed.
         """
+        async def _run() -> None:
+            try:
+                from backend.system_control.capability_leases import (
+                    set_principal,
+                )
+                set_principal(principal)
+            except Exception:  # noqa: BLE001 — an unowned lease still has a TTL
+                pass
+            await dispatch(event_type, data)
+
         try:
-            from backend.system_control.capability_leases import set_principal
-            set_principal(principal)
-        except Exception:  # noqa: BLE001 — an unowned lease still has a TTL
-            pass
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(dispatch(event_type, data))
-        finally:
-            loop.close()
+            loop = _dispatch_loop()
+            fut = asyncio.run_coroutine_threadsafe(_run(), loop)
+            # Observed, never awaited: blocking this reader thread on the
+            # dispatch would serialise the socket behind the slowest command.
+            fut.add_done_callback(_report_dispatch_outcome)
+        except Exception:  # noqa: BLE001 — a bad event never kills the reader
+            logger.exception("[IPC] could not schedule dispatch for %r",
+                             event_type)
 
     def _note(present: bool, principal: str) -> None:
         """Tell the lease book this principal came or went. NEVER raises."""
