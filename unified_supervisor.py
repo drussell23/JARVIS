@@ -76496,6 +76496,42 @@ class JarvisSystemKernel:
             "JARVIS_GHOST_REGISTRATION_WAIT_SECONDS",
             _get_env_float("JARVIS_GHOST_DISPLAY_TIMEOUT", 30.0) * 0.6,
         )
+
+        # v284.0: CONVERGE before ensuring. `ensure` can only add; it has no way
+        # to notice that the last nine boots each added one. Measured on this
+        # machine: nine virtual screens all named "JARVIS GHOST", because the
+        # old existence check ran `system_profiler`, which cannot see
+        # BetterDisplay virtual screens at all. The design doc records a
+        # historical high-water mark of ~150.
+        #
+        # Runs here for the same reason `WorktreeManager.reap_orphans()` runs at
+        # boot: the leftovers of a crashed or memory-shed session will not
+        # remove themselves, and boot is the one moment nothing is using them.
+        # Fail-soft — a sweep that cannot run must not stop the display from
+        # coming up.
+        try:
+            report = await phantom_mgr.reconcile_ghost_displays_async()
+            if report.get("discarded"):
+                self.logger.warning(
+                    "[GhostDisplay] Converged: discarded %d surplus display(s) "
+                    "(tagIDs %s)", len(report["discarded"]),
+                    ", ".join(report["discarded"]))
+            if report.get("reconnected"):
+                self.logger.info(
+                    "[GhostDisplay] Reconnected existing display %s rather "
+                    "than creating a new one", report["reconnected"])
+            if report.get("refused"):
+                self.logger.warning("[GhostDisplay] Reconcile refused: %s",
+                                    report["refused"])
+            _orphans = (report.get("inventory") or {}).get("orphans") or 0
+            if _orphans:
+                self.logger.error(
+                    "[GhostDisplay] %d orphaned framebuffer(s) attached that "
+                    "BetterDisplay does not own — quit BetterDisplay to "
+                    "release them", _orphans)
+        except Exception as e:
+            self.logger.debug(f"[GhostDisplay] Reconcile skipped: {e}")
+
         try:
             success, error = await phantom_mgr.ensure_ghost_display_exists_async(
                 wait_for_registration=True,
