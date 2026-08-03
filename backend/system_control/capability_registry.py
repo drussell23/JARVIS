@@ -216,7 +216,8 @@ def capability(*, mutates: Optional[bool] = None,
                description: str = "",
                session: str = Session.NONE.value,
                release: str = "",
-               alias: str = "") -> Callable:
+               alias: str = "",
+               phrases: Any = ()) -> Callable:
     """Declare a method's risk where the method is written. NEVER raises.
 
     A decorator rather than a central table for the reason `repl_dispatch_
@@ -238,6 +239,7 @@ def capability(*, mutates: Optional[bool] = None,
                 "session": session,
                 "release": release,
                 "alias": alias,
+                "phrases": _normalise_phrases(phrases),
             })
         except Exception:  # noqa: BLE001 — a decorator never breaks an import
             pass
@@ -251,7 +253,7 @@ class CapabilityDef:
 
     name: str
     description: str
-    parameters: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    parameters: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     tier: str = _DEFAULT_TIER.value
     provenance: str = Provenance.DEFAULTED.value
     is_async: bool = True
@@ -261,6 +263,13 @@ class CapabilityDef:
     #: THIS, so a start whose release is unnamed cannot be cleaned up — which
     #: `Session.START` refuses to be, at hydrate time rather than at 3am.
     release: str = ""
+    #: How an operator might SAY this, when the method name is not how anyone
+    #: says it. Optional and usually empty — `lock_screen` needs none, because
+    #: its name already IS the phrase. Declared at the method (``say=...``)
+    #: rather than in a lookup table elsewhere, for the same reason `alias`
+    #: is: a table beside the code is a second thing to update, and the update
+    #: that gets forgotten is invisible.
+    phrases: tuple = ()
     #: The name this capability is EXPORTED as, when its method name would
     #: collide with another provider's in the same namespace. Declared at the
     #: method (``as=stop_actuator``) rather than in a table elsewhere, so the
@@ -284,16 +293,89 @@ class CapabilityDef:
 
     @property
     def iron_gate_required(self) -> bool:
-        """The only question most callers ask.
+        """Whether this is GOVERNED at all — i.e. not plain SAFE_AUTO.
 
         Anything above SAFE_AUTO goes through the gate. A defaulted capability
         answers True — the point of the inversion.
+
+        This is NOT the same question as "must a human be asked", and the two
+        were conflated for as long as there was only one of them. See
+        :attr:`requires_consent`.
         """
         return self.tier != Tier.SAFE_AUTO.value
 
     @property
+    def requires_consent(self) -> bool:
+        """Whether a HUMAN must say yes before this runs.
+
+        WHY THIS IS SEPARATE FROM `iron_gate_required`
+        ------------------------------------------------
+        The registry declares four tiers, mirroring `risk_engine.RiskTier` by
+        value. The router asked exactly one question — `iron_gate_required` —
+        and that question is False only for SAFE_AUTO. So NOTIFY_APPLY and
+        APPROVAL_REQUIRED produced byte-identical behaviour, and a four-word
+        vocabulary described two behaviours.
+
+        A word that cannot change what happens is not a word. Worse, it is a
+        word an author will reach for believing it means something: declaring
+        a capability NOTIFY_APPLY looked like "apply it and tell me" and
+        delivered "block until Touch ID", which is what APPROVAL_REQUIRED was
+        already for.
+
+        The tiers now mean what the rest of the codebase has always meant by
+        them (CLAUDE.md: "Green/Yellow auto-apply, Orange blocks for human"):
+
+            SAFE_AUTO          run it
+            NOTIFY_APPLY       run it, and SAY SO
+            APPROVAL_REQUIRED  ask first
+            BLOCKED            refuse, and do not even ask
+
+        BLOCKED answering True here would be a bug in the safe direction and
+        is still wrong: a blocked capability must never reach an operator as a
+        prompt, because a prompt is an invitation to approve it. See
+        :attr:`blocked`, which the router checks first.
+        """
+        return self.tier in (Tier.APPROVAL_REQUIRED.value, Tier.BLOCKED.value)
+
+    @property
+    def notifies(self) -> bool:
+        """Runs without asking, but never silently. NEVER raises."""
+        return self.tier == Tier.NOTIFY_APPLY.value
+
+    @property
+    def blocked(self) -> bool:
+        """Refused outright. Not a question to put to anyone. NEVER raises."""
+        return self.tier == Tier.BLOCKED.value
+
+    @property
     def classified(self) -> bool:
         return self.provenance != Provenance.DEFAULTED.value
+
+    @property
+    def required_parameters(self) -> List[str]:
+        """Parameters with no default — the call cannot be made without them.
+
+        NEVER raises. Note what is NOT here: a withheld credential parameter
+        was dropped from `parameters` entirely, so it cannot appear as
+        "required" and cause a caller to go looking for a password. The method
+        sources it from the Keychain, which is the only correct answer.
+        """
+        try:
+            return sorted(n for n, p in (self.parameters or {}).items()
+                          if bool(p.get("required")))
+        except Exception:  # noqa: BLE001
+            return []
+
+    @property
+    def callable_with_no_args(self) -> bool:
+        """Whether ``fn()`` is a complete call. NEVER raises.
+
+        The deterministic reflex's licence to fire. A capability that needs an
+        argument needs something extracted from a sentence, and extracting a
+        value from a sentence is exactly the job that belongs to a model — so
+        the reflex declines rather than guessing.
+        """
+        return not self.required_parameters
 
     def to_tool_schema(self) -> Dict[str, Any]:
         """The exact shape `TOOL_SCHEMAS` already uses. NEVER raises."""
@@ -365,12 +447,34 @@ def _summary(doc: str, fallback: str) -> str:
     return fallback
 
 
+def _normalise_phrases(raw: Any) -> tuple:
+    """A declared ``phrases``/``say=`` value as a clean tuple. NEVER raises.
+
+    Accepts a string (``"lock the mac|lock it down"``) or any iterable of
+    strings, because a decorator author and a docstring tag author naturally
+    reach for different shapes and neither should have to care.
+    """
+    try:
+        if not raw:
+            return ()
+        items = raw.split("|") if isinstance(raw, str) else list(raw)
+        out = []
+        for it in items:
+            s = " ".join(str(it).strip().lower().split())
+            if s and s not in out:
+                out.append(s)
+        return tuple(out)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
 class _Classification(NamedTuple):
     tier: str
     provenance: str
     session: str = Session.NONE.value
     release: str = ""
     alias: str = ""
+    phrases: tuple = ()
 
 
 def _apply_session_rules(c: _Classification) -> _Classification:
@@ -407,11 +511,14 @@ def _parse_tag(body: str) -> _Classification:
     parts = [p.strip() for p in (body or "").lower().split(",") if p.strip()]
     joined = " ".join(parts)
     session, release, alias = Session.NONE.value, "", ""
+    phrases: tuple = ()
     for p in parts:
         if p.startswith("release="):
             release = p.split("=", 1)[1].strip()
         elif p.startswith("as=") or p.startswith("alias="):
             alias = p.split("=", 1)[1].strip()
+        elif p.startswith("say=") or p.startswith("phrases="):
+            phrases = _normalise_phrases(p.split("=", 1)[1].strip())
         elif p in ("session-start", "session_start"):
             session = Session.START.value
         elif p in ("session-end", "session_end"):
@@ -426,7 +533,8 @@ def _parse_tag(body: str) -> _Classification:
                 tier = t.value
                 break
     return _apply_session_rules(
-        _Classification(tier, Provenance.TAGGED.value, session, release, alias))
+        _Classification(tier, Provenance.TAGGED.value, session, release, alias,
+                        phrases))
 
 
 def _classify(fn: Any, doc: str) -> _Classification:
@@ -445,7 +553,8 @@ def _classify(fn: Any, doc: str) -> _Classification:
                 Provenance.DECLARED.value,
                 str(declared.get("session") or Session.NONE.value),
                 str(declared.get("release") or ""),
-                str(declared.get("alias") or "")))
+                str(declared.get("alias") or ""),
+                _normalise_phrases(declared.get("phrases"))))
         tag = _DOC_TAG.search(doc or "")
         if tag:
             return _parse_tag(tag.group("body") or "")
@@ -459,7 +568,7 @@ def describe(name: str, fn: Any) -> Optional[CapabilityDef]:
     try:
         doc = inspect.getdoc(fn) or ""
         cls = _classify(fn, doc)
-        params: Dict[str, Dict[str, str]] = {}
+        params: Dict[str, Dict[str, Any]] = {}
         try:
             sig = inspect.signature(fn)
         except (TypeError, ValueError):
@@ -485,6 +594,16 @@ def describe(name: str, fn: Any) -> Optional[CapabilityDef]:
                 params[pname] = {
                     "type": _json_type(p.annotation),
                     "description": descs.get(pname, f"{pname} parameter"),
+                    # Whether the method genuinely cannot be called without
+                    # it. Recorded rather than inferred by a consumer, because
+                    # the ONE place that already holds the signature is here —
+                    # and a consumer that re-introspects to find out is the
+                    # second vocabulary this module exists to delete.
+                    #
+                    # The deterministic reflex arc reads this to decide it may
+                    # not fire: a capability it cannot call COMPLETELY is one
+                    # it must hand to a model rather than call with a guess.
+                    "required": p.default is inspect.Parameter.empty,
                 }
         declared = getattr(fn, "__capability__", None) or {}
         return CapabilityDef(
@@ -498,6 +617,7 @@ def describe(name: str, fn: Any) -> Optional[CapabilityDef]:
             session=cls.session,
             release=cls.release,
             alias=cls.alias,
+            phrases=cls.phrases,
         )
     except Exception:  # noqa: BLE001
         logger.debug("[CapabilityRegistry] describe(%s) degraded", name,

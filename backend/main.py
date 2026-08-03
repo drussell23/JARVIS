@@ -1599,6 +1599,24 @@ PARALLEL_STARTUP_ENABLED = os.getenv("JARVIS_PARALLEL_STARTUP", "true").lower() 
 # Adds: IPC server on 8742, optional SSE consumer for Vercel cloud relay.
 HUD_MODE = os.getenv("JARVIS_MODE", "").lower() == "hud"
 
+# DECLARE THE ROLE. Set before anything that gates on it is constructed.
+#
+# `.env` carries `JARVIS_SOAK_CIRCUIT_BREAKER_ENABLED=true` with a $2 cap,
+# and `.env` is loaded by every process in this repo — so the attended HUD
+# inherited an UNATTENDED soak's fail-closed budget breaker. Measured
+# consequence: an operator said "lock my screen", every LLM dispatch was
+# refused against a cap that was never meant for this process, and the
+# machine answered by reading the refusal string aloud.
+#
+# `soak_circuit_breaker.role_is_attended` fails closed — silence means
+# unattended and fully armed — so this line is the ONLY thing that exempts
+# this process, and a soak that never runs it stays protected. Nothing is
+# weakened: SessionBudgetAuthority and CostGovernor still gate every
+# dispatch here, and the real-money risk the breaker guards (auto-spinning
+# a GCE node) is separately held by JARVIS_FAILOVER_VM_ORCHESTRATION_HOLD.
+if HUD_MODE and not os.environ.get("JARVIS_PROCESS_ROLE"):
+    os.environ["JARVIS_PROCESS_ROLE"] = "hud"
+
 # v351.0: When BOTH supervisor (8010) and HUD (8011) run simultaneously,
 # hardware singletons must have a single owner to avoid contention:
 #
@@ -2151,7 +2169,10 @@ async def parallel_lifespan(app: FastAPI):
 
                                     logger.info(
                                         "[HUD] Voice result: %s (category=%s, steps=%d/%d)",
-                                        "success" if result.success else "failed",
+                                        "success" if result.success
+                                        else ("awaiting-consent"
+                                              if getattr(result, "pending", False)
+                                              else "failed"),
                                         result.category, result.steps_completed, result.steps_total,
                                     )
                                     if result.response_text:
@@ -2168,6 +2189,16 @@ async def parallel_lifespan(app: FastAPI):
                                                 await _hud_tts(result.response_text[:200])
                                             else:
                                                 await _hud_tts(f"Done. Completed {result.steps_completed} steps.")
+                                        elif getattr(result, "pending", False):
+                                            # Understood, dispatched, and now
+                                            # waiting on the operator at a Touch
+                                            # ID prompt. Not a failure, and
+                                            # saying "action incomplete" here
+                                            # would teach them the consent
+                                            # boundary is a malfunction. The
+                                            # verdict handler speaks the ending.
+                                            if result.response_text:
+                                                await _hud_tts(result.response_text[:200])
                                         else:
                                             if _is_messaging and _msg_contact_match:
                                                 _cn = _msg_contact_match.group(1)
@@ -2175,6 +2206,18 @@ async def parallel_lifespan(app: FastAPI):
                                                     f"I had trouble sending that message to {_cn}. "
                                                     f"Got through {result.steps_completed} of {result.steps_total} steps."
                                                 )
+                                            elif result.response_text:
+                                                # PREFER THE REASON. This branch
+                                                # used to speak only the step
+                                                # count, so "Action incomplete.
+                                                # Finished 0 of 1 steps" was the
+                                                # entire explanation an operator
+                                                # got for a provider outage — a
+                                                # sentence that says something
+                                                # went wrong and nothing about
+                                                # what, when the router had
+                                                # already worked out what.
+                                                await _hud_tts(result.response_text[:200])
                                             else:
                                                 await _hud_tts(
                                                     f"Action incomplete. Finished {result.steps_completed} of {result.steps_total} steps."
@@ -2235,6 +2278,43 @@ async def parallel_lifespan(app: FastAPI):
                                 "[HUD] consent verdict for %s → %s (%s)",
                                 data.get("capability") or "?",
                                 routed.outcome, routed.detail or "-")
+
+                            # SAY WHAT HAPPENED.
+                            #
+                            # A suspended call resolves OUT OF BAND: the turn
+                            # that asked for it ended cleanly the moment it
+                            # suspended (see `capability_router` on why it must
+                            # never await a human), so by the time the operator
+                            # touches the sensor there is nobody left holding a
+                            # response to speak. Without this the whole circuit
+                            # completes in silence — Touch ID, execution and all
+                            # — and from where the operator stands that is
+                            # indistinguishable from having been ignored.
+                            try:
+                                from backend.hud.voice_command_router import (
+                                    _humanise, _read_controller_result,
+                                )
+                                from backend.system_control.capability_router import (
+                                    Outcome as _CapOutcome,
+                                )
+                                _cap = _humanise(
+                                    routed.capability
+                                    or str(data.get("capability") or ""))
+                                if routed.outcome == _CapOutcome.EXECUTED.value:
+                                    _ok, _say = _read_controller_result(
+                                        routed.result, _cap)
+                                elif routed.outcome == _CapOutcome.DENIED.value:
+                                    _say = f"Alright, I won't {_cap}."
+                                elif routed.outcome == _CapOutcome.EXPIRED.value:
+                                    _say = (f"That approval to {_cap} expired, "
+                                            f"so I left it alone.")
+                                else:
+                                    _say = f"I couldn't {_cap}."
+                                if _say:
+                                    await _hud_tts(_say[:200])
+                            except Exception as _cs:  # noqa: BLE001
+                                logger.debug(
+                                    "[HUD] consent narration degraded: %s", _cs)
                         except Exception as _cv:  # noqa: BLE001
                             logger.error("[HUD] consent verdict failed: %s", _cv)
                     else:

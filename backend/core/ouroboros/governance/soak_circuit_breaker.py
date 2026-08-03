@@ -72,6 +72,26 @@ ENV_ENABLED = "JARVIS_SOAK_CIRCUIT_BREAKER_ENABLED"
 ENV_MAX_COST_USD = "JARVIS_SOAK_MAX_COST_USD"
 ENV_MAX_GCE_RUNTIME_S = "JARVIS_SOAK_MAX_GCE_RUNTIME_S"
 ENV_WARN_PCT = "JARVIS_SOAK_BUDGET_WARN_PCT"
+#: How far back the durable baseline replay reaches. See
+#: :meth:`SoakCircuitBreaker._replay_committed_spend`. ``0`` = all-time.
+ENV_BASELINE_HORIZON_S = "JARVIS_SOAK_BASELINE_HORIZON_S"
+#: The process role that ARMS this breaker. See :func:`process_role`.
+ENV_PROCESS_ROLE = "JARVIS_PROCESS_ROLE"
+
+#: The ``route`` this module stamps on its own WAL rows — and therefore the
+#: rows the baseline replay must never sum. A named constant rather than a
+#: literal in two places precisely because the two places must agree: a writer
+#: and a reader that disagree about this string is the self-amplification loop
+#: rebuilding itself.
+_WAL_SELF_ROUTE = "soak_circuit_breaker"
+
+#: Roles that mean "a human is at the keyboard". See :func:`role_is_attended`.
+#: Not a policy table — a vocabulary. The POLICY is the one line in
+#: `SoakBreakerConfig.from_env` that reads it, and it fails closed.
+ATTENDED_ROLES = frozenset({"hud", "interactive", "repl", "desktop"})
+
+#: The role a soak declares. Named so a launcher can say it out loud.
+ROLE_SOAK = "soak"
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -94,6 +114,31 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def process_role() -> str:
+    """What KIND of process this is. ``""`` when nobody has said. NEVER raises.
+
+    Declared, never sniffed. A heuristic ("is stdin a TTY?", "is the module
+    named main?") would answer for a soak launched from a terminal exactly as
+    it answers for the HUD, and the two need opposite answers.
+    """
+    try:
+        return (os.environ.get(ENV_PROCESS_ROLE, "") or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def role_is_attended() -> bool:
+    """Whether a human is at the keyboard of THIS process. NEVER raises.
+
+    Fails closed toward *unattended*. Silence answers False, so a soak that
+    forgets to declare anything stays fully protected — the direction where
+    being wrong costs real money. Only a process that positively names itself
+    as an attended surface is exempt, and the only thing that can name it is
+    its own boot path.
+    """
+    return process_role() in ATTENDED_ROLES
+
+
 @dataclass(frozen=True)
 class SoakBreakerConfig:
     """Immutable per-assessment snapshot of the env-resolved thresholds.
@@ -112,8 +157,35 @@ class SoakBreakerConfig:
         warn = _env_float(ENV_WARN_PCT, 0.8)
         if not (0.0 < warn <= 1.0):
             warn = 0.8
+        # SCOPE. This breaker's whole purpose statement is the first line of
+        # the module docstring: "let an *unattended* graduation soak run
+        # without runaway cloud spend... real money, no human at the
+        # keyboard." Fail-closed refusal of every LLM dispatch is exactly
+        # right for that, and exactly wrong for the attended HUD — where the
+        # human IS at the keyboard, is speaking to the machine, and gets
+        # silence plus a stack trace read aloud.
+        #
+        # The three JARVIS_SOAK_* knobs live in `.env`, which every process in
+        # this repo loads, so the HUD inherited a $2 per-soak cap it had no
+        # way to know was not meant for it. That is a scope error, not a
+        # budget one: an armed soak breaker in an attended process is
+        # measuring the wrong episode against the wrong ceiling.
+        #
+        # Disarming here removes NO protection from the thing this guards.
+        # The attended HUD still has `SessionBudgetAuthority` + `CostGovernor`
+        # on every dispatch, and the real-money risk the breaker exists for —
+        # auto-provisioning a GCE node — is separately held by
+        # `JARVIS_FAILOVER_VM_ORCHESTRATION_HOLD`.
+        enabled = _env_bool(ENV_ENABLED, False)
+        if enabled and role_is_attended():
+            logger.info(
+                "[SoakCB] disarmed for attended role '%s' — the soak breaker "
+                "guards UNATTENDED runs; this process has an operator, a "
+                "session budget authority and a cost governor.",
+                process_role())
+            enabled = False
         return cls(
-            enabled=_env_bool(ENV_ENABLED, False),
+            enabled=enabled,
             max_cost_usd=max(0.0, _env_float(ENV_MAX_COST_USD, 0.0)),
             max_gce_runtime_s=max(0.0, _env_float(ENV_MAX_GCE_RUNTIME_S, 0.0)),
             warn_pct=warn,
@@ -466,6 +538,106 @@ class SoakCircuitBreaker:
 
     # ── Boot reconciliation (mandate 4 — restart durability) ─────────────
 
+    @staticmethod
+    def baseline_horizon_s() -> float:
+        """How far back the durable baseline reaches, in seconds. NEVER raises.
+
+        WHY A HORIZON AT ALL
+        ----------------------
+        The cap this baseline is compared against is a PER-SOAK cap — $2 for
+        one unattended episode. The WAL it was replayed from is ALL-TIME. On
+        this machine that ledger held 685 rows going back a fortnight, so even
+        with the amplification loop closed the honest total ($3.63) still
+        exceeded a $2 episode cap, on boot, permanently, and would have again
+        at every future boot forever. A ceiling that measures one episode
+        against the sum of all episodes is not strict — it is stuck.
+
+        The durable baseline exists for ONE reason, stated in
+        :meth:`reconcile_on_boot`: a soak that already spent $8 of a $10 cap
+        must resume at 80% used rather than 0% after a restart. That is a
+        statement about restarts WITHIN an episode. Spend from a different
+        episode a fortnight ago is not this episode's spend.
+
+        WHERE THE NUMBER COMES FROM
+        -----------------------------
+        Derived from what the operator has already declared about how long an
+        episode lasts, rather than invented: the soak's own GCE runtime
+        ceiling and the battle-test harness's wall-clock cap are both explicit
+        statements of episode length. The widest one wins, floored at an hour
+        so a tiny configured cap cannot shrink the window to nothing.
+        ``JARVIS_SOAK_BASELINE_HORIZON_S`` overrides; ``0`` restores the
+        all-time behaviour for anyone who wants it.
+        """
+        try:
+            explicit = _env_float(ENV_BASELINE_HORIZON_S, -1.0)
+            if explicit >= 0.0:
+                return explicit
+            declared = max(
+                _env_float(ENV_MAX_GCE_RUNTIME_S, 0.0),
+                _env_float("OUROBOROS_BATTLE_MAX_WALL_SECONDS", 0.0),
+            )
+            return max(3600.0, declared)
+        except Exception:  # noqa: BLE001
+            return 3600.0
+
+    def _replay_committed_spend(self, now: Optional[float] = None) -> float:
+        """Sum COMMITTED spend from the durable WAL. NEVER raises.
+
+        Two exclusions, and both are load-bearing.
+
+        **This module's own rows.** :meth:`_durable_append` writes a summary
+        of what this method computed. Summing those makes the reader an input
+        to itself, and a self-referential sum does not drift — it doubles.
+        Excluded by ``route``, so it holds for every row this module has ever
+        written, including the seventeen poisoned ones already on disk (which
+        this makes inert without touching the file: an append-only ledger is
+        not rewritten to fix a reader that was wrong).
+
+        **Rows older than the horizon.** See :meth:`baseline_horizon_s`.
+
+        Everything else is summed fail-CLOSED exactly as before — an
+        un-reconciled in-flight lease still counts against us via its reserve
+        or estimate, because at boot a lease we cannot prove settled is a
+        lease we must assume spent.
+        """
+        try:
+            from backend.core.ouroboros.aegis import flags as _aegis_flags
+            from backend.core.ouroboros.aegis.spend_wal import replay_wal
+            entries = replay_wal(_aegis_flags.wal_path())
+        except Exception:  # noqa: BLE001
+            logger.debug("[SoakCB] WAL replay unavailable", exc_info=True)
+            return 0.0
+
+        horizon = self.baseline_horizon_s()
+        cutoff = ((now if now is not None else time.time()) - horizon
+                  if horizon > 0.0 else float("-inf"))
+        baseline = 0.0
+        counted = skipped_self = skipped_old = 0
+        for e in entries:
+            try:
+                if (getattr(e, "route", None) or "") == _WAL_SELF_ROUTE:
+                    skipped_self += 1
+                    continue
+                if float(getattr(e, "ts", 0.0) or 0.0) < cutoff:
+                    skipped_old += 1
+                    continue
+                val = e.actual_cost_usd
+                if val is None:
+                    val = e.reserve_cost_usd
+                if val is None:
+                    val = e.estimated_cost_usd
+                if val:
+                    baseline += float(val)
+                    counted += 1
+            except Exception:  # noqa: BLE001 — one bad row never blinds the sum
+                continue
+        logger.info(
+            "[SoakCB] baseline replay: $%.4f from %d row(s); skipped %d "
+            "self-written summar%s and %d row(s) older than %.0fs",
+            baseline, counted, skipped_self,
+            "y" if skipped_self == 1 else "ies", skipped_old, horizon)
+        return max(0.0, baseline)
+
     async def reconcile_on_boot(self) -> Dict[str, Any]:
         """Reconstruct spend + active-node runtime from the durable ledger +
         live GCP API BEFORE the loop resumes, then assess (trips immediately
@@ -486,22 +658,7 @@ class SoakCircuitBreaker:
         }
         # 1. Durable LLM-spend baseline from the Aegis spend WAL.
         try:
-            from backend.core.ouroboros.aegis import flags as _aegis_flags
-            from backend.core.ouroboros.aegis.spend_wal import replay_wal
-            entries = replay_wal(_aegis_flags.wal_path())
-            baseline = 0.0
-            for e in entries:
-                # Prefer settled actuals; fall back to reserved/estimated so
-                # an un-reconciled in-flight lease still counts against us
-                # (fail-CLOSED: never under-count spend at boot).
-                val = e.actual_cost_usd
-                if val is None:
-                    val = e.reserve_cost_usd
-                if val is None:
-                    val = e.estimated_cost_usd
-                if val:
-                    baseline += float(val)
-            self._boot_cost_baseline_usd = max(0.0, baseline)
+            self._boot_cost_baseline_usd = self._replay_committed_spend()
             summary["cost_baseline_usd"] = self._boot_cost_baseline_usd
         except Exception:  # noqa: BLE001
             logger.debug("[SoakCB] boot spend replay degraded", exc_info=True)
@@ -585,9 +742,30 @@ class SoakCircuitBreaker:
     def _durable_append(tag: str, detail: Dict[str, Any]) -> None:
         """Durable-DB side — a RECONCILE row on the sealed Aegis spend WAL
         (mandate 3: integrate into the EXISTING logging schema, no new
-        table). The row carries the assessment in ``detail`` and the current
-        spend in ``actual_cost_usd`` so a post-hoc audit reconstructs the
-        trip from the same ledger crash recovery already replays."""
+        table). The row carries the whole assessment in ``detail``, which is
+        what a post-hoc audit reconstructs the trip from.
+
+        AN OBSERVATION IS NOT AN EVENT
+        --------------------------------
+        This row used to carry the observed TOTAL in ``actual_cost_usd``.
+        That field means "money this row spent", and the replay in
+        :meth:`reconcile_on_boot` sums it across every row. So the breaker
+        was writing its own answer into the question, and the next boot read
+        it back as fresh spend on top of the spend it already summarised.
+
+        Measured on this machine's WAL, seventeen consecutive boots:
+
+            3.63 → 7.27 → 14.53 → 29.07 → … → 119055.97 → 238111.95
+
+        Exactly 2ⁿ. A true spend of $3.63 presented as $238,111.95, and every
+        LLM dispatch in the process — including the attended HUD's voice
+        path — refused against it. Nothing overspent; the ledger ate itself.
+
+        So the total goes in ``detail`` (where it already was, in full) and
+        the spend field stays ``None``. A summary row spent nothing.
+        :meth:`_replay_committed_spend` independently refuses to sum rows
+        this method wrote, because one guard on a self-referential loop is
+        one edit away from being none."""
         try:
             from backend.core.ouroboros.aegis import flags as _aegis_flags
             from backend.core.ouroboros.aegis.spend_wal import (
@@ -596,9 +774,11 @@ class SoakCircuitBreaker:
             entry = SpendEntry(
                 kind=SpendEntryKind.RECONCILE,
                 ts=time.time(),
-                op_id=f"soak_circuit_breaker:{tag}",
-                route="soak_circuit_breaker",
-                actual_cost_usd=float(detail.get("cost_used_usd", 0.0) or 0.0),
+                op_id=f"{_WAL_SELF_ROUTE}:{tag}",
+                route=_WAL_SELF_ROUTE,
+                # Deliberately None — see the docstring. The observed total
+                # lives in `detail["cost_used_usd"]`, losslessly.
+                actual_cost_usd=None,
                 detail=str(detail)[:500],
             )
             append_entry_sync(_aegis_flags.wal_path(), entry)

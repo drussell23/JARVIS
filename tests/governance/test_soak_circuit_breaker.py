@@ -9,6 +9,7 @@ the Aegis spend WAL + live GCP node runtime.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -218,8 +219,18 @@ def test_boot_reconcile_rebuilds_cost_baseline(tmp_path, monkeypatch):
         SpendEntry, SpendEntryKind, append_entry_sync,
     )
     # Seed durable spend that already blew the $1.00 cap.
+    #
+    # `ts` is NOW rather than the 1.0 it used to be. The baseline replay is
+    # bounded to an episode horizon (see `baseline_horizon_s`), because a
+    # per-soak cap compared against an all-time ledger trips on boot forever —
+    # measured: $3.63 of real all-time spend against a $2 episode cap, on a
+    # machine that had done nothing wrong. A restart-durability test is about
+    # a restart WITHIN an episode, so a timestamp from 1970 was never the
+    # scenario this describes; it only happened to work while the replay was
+    # unbounded. The horizon's own semantics are pinned in
+    # `test_soak_ledger_amplification.py`.
     append_entry_sync(AF.wal_path(), SpendEntry(
-        kind=SpendEntryKind.RECONCILE, ts=1.0, op_id="o1",
+        kind=SpendEntryKind.RECONCILE, ts=time.time(), op_id="o1",
         route="immediate", actual_cost_usd=1.40,
     ))
     b = SCB.get_soak_breaker()
