@@ -22,7 +22,11 @@ class WatchSessionManager: ObservableObject {
             return
         }
 
-        let deviceAuth = DeviceAuth(deviceId: deviceId, deviceType: .watch, deviceSecret: secret)
+        guard let deviceAuth = DeviceAuth(deviceId: deviceId, deviceType: .watch,
+                                          deviceSecret: secret) else {
+            lastDaemon = "Stored credentials are corrupt — re-pair on iPhone."
+            return
+        }
         auth = deviceAuth
         sender = CommandSender(baseURL: baseURL, auth: deviceAuth)
 

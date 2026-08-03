@@ -23,7 +23,13 @@ class PhoneSessionManager: ObservableObject {
             return
         }
 
-        let deviceAuth = DeviceAuth(deviceId: deviceId, deviceType: .iphone, deviceSecret: secret)
+        guard let deviceAuth = DeviceAuth(deviceId: deviceId, deviceType: .iphone,
+                                          deviceSecret: secret) else {
+            // Paired, but the stored secret cannot be decoded. Re-pairing is
+            // the fix, and saying "not paired" would be a lie that hides it.
+            lastDaemon = "Stored credentials are corrupt — re-pair in Settings"
+            return
+        }
         auth = deviceAuth
         sender = CommandSender(baseURL: baseURL, auth: deviceAuth)
 
