@@ -27,7 +27,7 @@ aiohttp==3.13.2
 psutil==7.1.3
 uuid6==2025.0.1          # NOT pinned in root requirements.txt (Mac had it out-of-band)
 rich==14.2.0             # serpent_flow/TUI render layer (headless still imports)
-pytest>=9.0,<10          # TestRunner VERIFY phase runs pytest subprocesses
+pytest>=9.1.1,<10          # TestRunner VERIFY phase runs pytest subprocesses
 
 # --- ARMED: import-guarded features the Brain must have live -----------------
 anthropic==0.75.0        # Tier-1 provider (Claude) -- silent-degrade without it
@@ -49,7 +49,7 @@ pytest-timeout==2.4.0
 # a1-brain-20260705-173831: the lean venv had pytest but not these -> the A1
 # isolated-vector injection could not go RED on the node. Pinned to the repo's
 # own versions.
-pytest-asyncio==1.3.0
+pytest-asyncio==1.4.0
 pytest-json-report==1.5.0
 pytest-metadata==3.1.1
 anyio==4.12.0
