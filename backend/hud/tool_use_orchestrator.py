@@ -140,6 +140,8 @@ class ToolUseOrchestrator:
 
         conversation = f"Goal: {goal}"
         steps_completed = 0
+        # One corrective re-prompt per goal — see the no-tool-calls branch.
+        nudged = False
 
         for iteration in range(self._max_iter):
             # Timeout check
@@ -186,7 +188,41 @@ class ToolUseOrchestrator:
             # Tool calls
             tool_calls = parsed.get("tool_calls", [])
             if not tool_calls:
-                # Model didn't return tool_calls or done — treat raw text as summary
+                # PROSE IS NOT COMPLETION.
+                #
+                # This branch used to `return success=True` with
+                # steps_completed=0 — so a model that answered "Sure, I'll lock
+                # your screen for you" ended the turn having done NOTHING, and
+                # reported success while doing it. Every capability behind the
+                # tool loop was reachable and none of them fired. That is the
+                # worst available outcome: silent no-op dressed as a result.
+                #
+                # A goal may legitimately be conversational ("what's on my
+                # screen?" answered from a screenshot the model already has),
+                # so prose is not an error either. The distinction is not
+                # knowable from the text — but it IS knowable from whether we
+                # have already asked.
+                #
+                # So: nudge ONCE, naming the failure, then believe the second
+                # answer. No tool name is hardcoded; the correction points at
+                # the tool list already in the prompt, so a capability added
+                # tomorrow is covered by the same sentence.
+                if not nudged and steps_completed == 0:
+                    nudged = True
+                    logger.info(
+                        "[ToolUse] Model answered in prose with no tool call — "
+                        "re-prompting once before accepting it as an answer")
+                    conversation += (
+                        "\n\nYou replied with text and called no tool, and the "
+                        "goal has not been carried out yet. If it needs an "
+                        "action on this Mac, respond ONLY with "
+                        "{\"tool_calls\": [{\"name\": \"...\", \"args\": {...}}]} "
+                        "using a tool from the list above — full name including "
+                        "any dot. If the goal genuinely needs no action, "
+                        "respond with {\"done\": true, \"summary\": \"...\"}."
+                    )
+                    continue
+
                 return CommandResult(
                     success=True, category="composite", steps_completed=steps_completed,
                     steps_total=steps_completed, response_text=raw.strip()[:500],
