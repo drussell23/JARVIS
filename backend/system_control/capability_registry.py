@@ -107,6 +107,38 @@ _EXCLUDED_PARAMS = frozenset({"self", "cls", "progress_callback", "callback",
                               "on_progress", "loop", "session", "ctx",
                               "context", "_internal"})
 
+#: Parameters a language model must NEVER be offered, because the only values
+#: it can supply are invented or stolen.
+#:
+#: `unlock_screen(password=None)` was reaching the model with `password` as a
+#: fillable string. A model asked to unlock a Mac will either hallucinate a
+#: password — a guaranteed failed auth attempt — or, on a screen carrying
+#: injected text, be induced to echo a REAL one into a tool call that is then
+#: written to the conversation log and the intent journal in plaintext.
+#:
+#: The authority for these values is never the model. `unlock_screen` already
+#: defaults to None and reads the macOS Keychain; every capability that takes a
+#: secret has the same shape, because a secret a caller must pass in is a
+#: secret that has already leaked.
+#:
+#: Matched by SUBSTRING on a normalised name, so `password`, `db_password`,
+#: `apiKey` and `auth_token` are all covered without a list of spellings to
+#: keep — the same reason this module derives its vocabulary instead of
+#: declaring it. Silence is not the default here: this is a DENY list applied
+#: on top of a schema that is otherwise complete.
+_SECRET_PARAM_MARKERS = ("password", "passwd", "secret", "token", "apikey",
+                         "api_key", "credential", "passphrase", "private_key")
+
+
+def _is_secret_param(name: str) -> bool:
+    """Whether a parameter carries a credential. NEVER raises."""
+    try:
+        n = (name or "").strip().lower().replace("-", "_")
+        flat = n.replace("_", "")
+        return any(m.replace("_", "") in flat for m in _SECRET_PARAM_MARKERS)
+    except Exception:  # noqa: BLE001
+        return True   # unreadable name -> withhold, never offer
+
 _DOC_TAG = re.compile(r"^\s*Capability:\s*(?P<body>.+)$",
                       re.IGNORECASE | re.MULTILINE)
 _ARGS_BLOCK = re.compile(
@@ -436,6 +468,10 @@ def describe(name: str, fn: Any) -> Optional[CapabilityDef]:
             descs = _arg_descriptions(doc)
             for pname, p in sig.parameters.items():
                 if pname in _EXCLUDED_PARAMS:
+                    continue
+                if _is_secret_param(pname):
+                    # Withheld from the schema, NOT from the call: the method
+                    # keeps its default and sources the value from the Keychain.
                     continue
                 if p.kind in (inspect.Parameter.VAR_POSITIONAL,
                               inspect.Parameter.VAR_KEYWORD):
