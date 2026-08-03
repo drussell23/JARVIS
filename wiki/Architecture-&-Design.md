@@ -771,7 +771,7 @@ graph TB
 - Authentication Latency: 1.2s (cached)
 - False Rejection Rate: 2.1%
 
-📚 **Complete Documentation:** [VOICE_BIOMETRIC_INTELLIGENCE_ARCHITECTURE.md](../VOICE_BIOMETRIC_INTELLIGENCE_ARCHITECTURE.md)
+📚 **Complete Documentation:** [VOICE_BIOMETRIC_INTELLIGENCE_ARCHITECTURE.md](../docs/voice_unlock/VOICE_BIOMETRIC_INTELLIGENCE_ARCHITECTURE.md)
 
 ### End-to-End Voice Flow
 
@@ -884,9 +884,9 @@ The architecture supports current production features while enabling future expa
 - [Troubleshooting Guide](Troubleshooting-Guide.md) - Common issues
 
 **External Resources:**
-- [HYBRID_ARCHITECTURE.md](../HYBRID_ARCHITECTURE.md) - 7500+ line detailed guide
-- [JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md](../JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md)
-- [JARVIS_NEURAL_MESH_ARCHITECTURE.md](../JARVIS_NEURAL_MESH_ARCHITECTURE.md)
+- [HYBRID_ARCHITECTURE.md](../docs/architecture/HYBRID_ARCHITECTURE.md) - 7500+ line detailed guide
+- [JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md](../docs/architecture/JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md)
+- [JARVIS_NEURAL_MESH_ARCHITECTURE.md](../docs/architecture/JARVIS_NEURAL_MESH_ARCHITECTURE.md)
 
 ---
 

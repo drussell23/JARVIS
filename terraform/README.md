@@ -423,9 +423,9 @@ Check the Triple-Lock system:
 
 ## 📚 Related Documentation
 
-- [GCP VM Auto-Creation Flow](../GCP_VM_AUTO_CREATE_AND_SHUTDOWN_FLOW.md)
-- [Cost Optimization Guide](../GCP_COST_OPTIMIZATION_IMPROVEMENTS.md)
-- [Infrastructure Gap Analysis](../GCP_INFRASTRUCTURE_GAP_ANALYSIS.md)
+- [GCP VM Auto-Creation Flow](../docs/deployment/GCP_VM_AUTO_CREATE_AND_SHUTDOWN_FLOW.md)
+- [Cost Optimization Guide](../docs/deployment/GCP_COST_OPTIMIZATION_IMPROVEMENTS.md)
+- [Infrastructure Gap Analysis](../docs/deployment/GCP_INFRASTRUCTURE_GAP_ANALYSIS.md)
 
 ---
 

@@ -127,7 +127,7 @@ JARVIS includes **10 core components** + **6 intelligent systems**:
 ## Need More Details?
 
 - **Full Usage Examples**: See [STARTUP_EXAMPLES.md](STARTUP_EXAMPLES.md)
-- **Goal Inference Guide**: See [GOAL_INFERENCE_GUIDE.md](GOAL_INFERENCE_GUIDE.md)
+- **Goal Inference Guide**: See [GOAL_INFERENCE_GUIDE.md](../guides/GOAL_INFERENCE_GUIDE.md)
 - **Configuration**: Run `python configure_goal_inference.py --interactive`
 
 ---

@@ -633,7 +633,7 @@ gcloud billing budgets create \
 ## 📚 Related Documentation
 
 ### **JARVIS Documentation**
-- [HYBRID_ARCHITECTURE.md](./HYBRID_ARCHITECTURE.md) - Complete hybrid architecture with UAE/SAI/CAI integration
+- [HYBRID_ARCHITECTURE.md](../architecture/HYBRID_ARCHITECTURE.md) - Complete hybrid architecture with UAE/SAI/CAI integration
 - [README.md](./README.md) - Main project documentation and setup guide
 - [start_system.py](./start_system.py) - Implementation code for hybrid system
 

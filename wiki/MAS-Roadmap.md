@@ -359,8 +359,8 @@ The JARVIS MAS roadmap represents a **12-month journey** from intelligent hybrid
 
 **Related Documentation:**
 - [Architecture & Design](Architecture-&-Design.md) - Current architecture
-- [JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md](../JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md) - MAS details
-- [JARVIS_NEURAL_MESH_ARCHITECTURE.md](../JARVIS_NEURAL_MESH_ARCHITECTURE.md) - Neural mesh vision
+- [JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md](../docs/architecture/JARVIS_MULTI_AGENT_SYSTEM_DOCUMENTATION.md) - MAS details
+- [JARVIS_NEURAL_MESH_ARCHITECTURE.md](../docs/architecture/JARVIS_NEURAL_MESH_ARCHITECTURE.md) - Neural mesh vision
 
 ---
 

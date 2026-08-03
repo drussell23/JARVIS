@@ -393,7 +393,7 @@ After setup:
 - [Cloud SQL Documentation](https://cloud.google.com/sql/docs)
 - [Cloud SQL Proxy Guide](https://cloud.google.com/sql/docs/postgres/sql-proxy)
 - [asyncpg Documentation](https://magicstack.github.io/asyncpg/)
-- [JARVIS Hybrid Architecture](./HYBRID_ARCHITECTURE.md)
+- [JARVIS Hybrid Architecture](../architecture/HYBRID_ARCHITECTURE.md)
 
 ---
 

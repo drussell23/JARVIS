@@ -4430,13 +4430,13 @@ Unify the Neural Mesh multi-agent system with the Autonomy System's tool registr
 - **GCP:** `GCP_ENABLED`, `GCP_PROJECT_ID`, memory thresholds (`JARVIS_MIN_FREE_RAM_GB`, etc.).
 - **Trinity:** `TRINITY_ENABLED`, `HOLLOW_CLIENT_MODE` (auto when RAM &lt; 32GB).
 
-See [README_v2.md](./README_v2.md) for full configuration and troubleshooting.
+See [README_v2.md](archive/root-status-reports/README_v2.md) for full configuration and troubleshooting.
 
 ---
 
 ## Documentation and Changelog
 
-The sections below contain the **documentation index**, **unified kernel details**, and **version-specific changelog** (v259.1 vision/Ghost Display, v258.x CPU pressure/cloud shift, v3.0–v3.2 parallel initializer/enterprise hardening, v245.0 Google Workspace, v241.1 multi-model, v238.0 voice conversation/degenerate fix, v237.0 TTS audio fix, plus cross-repo changelogs for JARVIS-Prime and Reactor-Core, and older versions: v107.0 startup, v108.0 lifecycle, v116.0 Cloud SQL/ECAPA, v117.5 Trinity, v131/v132 supervisor/voice, v221.0 model loading handoff, etc.). For API references, deployment, and troubleshooting, use **[README_v2.md](./README_v2.md)**.
+The sections below contain the **documentation index**, **unified kernel details**, and **version-specific changelog** (v259.1 vision/Ghost Display, v258.x CPU pressure/cloud shift, v3.0–v3.2 parallel initializer/enterprise hardening, v245.0 Google Workspace, v241.1 multi-model, v238.0 voice conversation/degenerate fix, v237.0 TTS audio fix, plus cross-repo changelogs for JARVIS-Prime and Reactor-Core, and older versions: v107.0 startup, v108.0 lifecycle, v116.0 Cloud SQL/ECAPA, v117.5 Trinity, v131/v132 supervisor/voice, v221.0 model loading handoff, etc.). For API references, deployment, and troubleshooting, use **[README_v2.md](archive/root-status-reports/README_v2.md)**.
 
 ---
 
@@ -4448,14 +4448,14 @@ The sections below contain the **documentation index**, **unified kernel details
 
 | README File | Purpose | Audience | Focus |
 |-------------|---------|----------|-------|
-| **[README_v2.md](./README_v2.md)** | 🔧 Technical deep-dive | Developers, DevOps | APIs, configuration, deployment, troubleshooting |
+| **[README_v2.md](archive/root-status-reports/README_v2.md)** | 🔧 Technical deep-dive | Developers, DevOps | APIs, configuration, deployment, troubleshooting |
 | **README.md** *(this file)* | 🏗️ Architecture & features | Users, architects | 4-repo ecosystem, interaction flows, features |
 
 ### When to Use Each:
 
 - **Want to understand the system architecture?** → You're in the right place (README.md)
-- **Need API references, configuration, or deployment guides?** → See [README_v2.md](./README_v2.md)
-- **Troubleshooting issues?** → See [README_v2.md § Troubleshooting](./README_v2.md#troubleshooting)
+- **Need API references, configuration, or deployment guides?** → See [README_v2.md](archive/root-status-reports/README_v2.md)
+- **Troubleshooting issues?** → See [README_v2.md § Troubleshooting](archive/root-status-reports/README_v2.md#troubleshooting)
 - **Understanding how repos work together?** → Continue reading below
 - **🆕 Startup architecture & v107.0 improvements?** → See [STARTUP_ARCHITECTURE_V2.md](./docs/STARTUP_ARCHITECTURE_V2.md)
 - **🆕 Vision never-skip, LLaVA default, Ghost Display?** → See [§ v259.0/v259.1](#v2590v2591--vision-never-skip-architecture--ghost-display-management-february-2026)
@@ -15020,7 +15020,7 @@ curl -X POST http://localhost:8010/api/voice/unlock \
   -F "command=unlock my screen"
 ```
 
-📚 **Complete VBI Documentation:** [VOICE_BIOMETRIC_INTELLIGENCE_ARCHITECTURE.md](VOICE_BIOMETRIC_INTELLIGENCE_ARCHITECTURE.md)
+📚 **Complete VBI Documentation:** [VOICE_BIOMETRIC_INTELLIGENCE_ARCHITECTURE.md](voice_unlock/VOICE_BIOMETRIC_INTELLIGENCE_ARCHITECTURE.md)
 
 This comprehensive guide covers:
 - System architecture with Mermaid diagrams
@@ -22834,7 +22834,7 @@ Intelligent Triggers:
 
 ### 🎓 Advanced Edge Cases & Algorithmic Solutions
 
-JARVIS v17.1 handles sophisticated, nuanced scenarios using data structures, algorithms, and statistical analysis. See [`GCP_COST_OPTIMIZATION_IMPROVEMENTS.md`](./GCP_COST_OPTIMIZATION_IMPROVEMENTS.md) for full technical details.
+JARVIS v17.1 handles sophisticated, nuanced scenarios using data structures, algorithms, and statistical analysis. See [`GCP_COST_OPTIMIZATION_IMPROVEMENTS.md`](deployment/GCP_COST_OPTIMIZATION_IMPROVEMENTS.md) for full technical details.
 
 **1. Oscillating Memory Pressure (Bistable System)**
 ```
@@ -22931,7 +22931,7 @@ Cost Saved: ~$0.029/hr per duplicate prevented
 
 ### 📖 Comprehensive Documentation
 
-**Full Technical Deep-Dive:** [`GCP_COST_OPTIMIZATION_IMPROVEMENTS.md`](./GCP_COST_OPTIMIZATION_IMPROVEMENTS.md)
+**Full Technical Deep-Dive:** [`GCP_COST_OPTIMIZATION_IMPROVEMENTS.md`](deployment/GCP_COST_OPTIMIZATION_IMPROVEMENTS.md)
 
 **Contents:**
 - ✅ Problem analysis with old vs new system comparisons
@@ -29105,7 +29105,7 @@ GITHUB_REPOSITORY=user/repo   # GitHub repository
 - **Total: $11-15/month** (vs. old cost: $180/month)
 - **Savings: $165-170/month (94% reduction!)**
 
-📄 **See detailed cost breakdown:** [HYBRID_COST_OPTIMIZATION.md](./HYBRID_COST_OPTIMIZATION.md)
+📄 **See detailed cost breakdown:** [HYBRID_COST_OPTIMIZATION.md](deployment/HYBRID_COST_OPTIMIZATION.md)
 
 **Prerequisites (✅ COMPLETE):**
 1. ✅ Install gcloud CLI: `brew install google-cloud-sdk`
@@ -29244,7 +29244,7 @@ Total: $11-15/month (vs. $180/month)
 2. Heavy processing? RAM > 85% - creates Spot VM (32GB, ~$0.01/hour)
 3. Stop JARVIS (Ctrl+C) - auto-deletes VM, cost stops immediately
 
-📄 **Full documentation:** [HYBRID_COST_OPTIMIZATION.md](./HYBRID_COST_OPTIMIZATION.md)
+📄 **Full documentation:** [HYBRID_COST_OPTIMIZATION.md](deployment/HYBRID_COST_OPTIMIZATION.md)
 
 **What Changed:**
 - File: `start_system.py:909-914` (Spot VM configuration)
@@ -29909,9 +29909,9 @@ export GCP_VM_MAX_LIFETIME_HOURS=3.0
 - ✅ **Cost Transparency**: Full audit trail in cost_tracker database
 
 **Documentation:**
-- 📖 [Implementation Guide](./GCP_VM_AUTO_CREATION_IMPLEMENTATION.md) - Full technical details
-- 📚 [Auto-Create & Shutdown Flow](./GCP_VM_AUTO_CREATE_AND_SHUTDOWN_FLOW.md) - Complete lifecycle
-- 🔧 [start_system.py vs gcp_vm_startup.sh](./START_SYSTEM_VS_GCP_STARTUP.md) - Architecture explanation
+- 📖 [Implementation Guide](deployment/GCP_VM_AUTO_CREATION_IMPLEMENTATION.md) - Full technical details
+- 📚 [Auto-Create & Shutdown Flow](deployment/GCP_VM_AUTO_CREATE_AND_SHUTDOWN_FLOW.md) - Complete lifecycle
+- 🔧 [start_system.py vs gcp_vm_startup.sh](deployment/START_SYSTEM_VS_GCP_STARTUP.md) - Architecture explanation
 
 ---
 
@@ -29965,7 +29965,7 @@ Total: ~8s warmup → 🎉 JARVIS READY
 ```
 
 **Documentation:**
-- 📖 [Quick Start Guide](./WARMUP_SYSTEM.md) - Basic usage and configuration
+- 📖 [Quick Start Guide](features/WARMUP_SYSTEM.md) - Basic usage and configuration
 - 📚 [Deep Dive](./docs/architecture/ADVANCED_WARMUP_DEEP_DIVE.md) - Architecture, edge cases, and enhancements
 - 🔧 [API Reference](./docs/architecture/ADVANCED_WARMUP_DEEP_DIVE.md#implementation-details) - Complete technical reference
 - 🐛 [Troubleshooting](./docs/architecture/ADVANCED_WARMUP_DEEP_DIVE.md#troubleshooting-guide) - Common issues and solutions
@@ -33222,7 +33222,7 @@ Message: fix: Complete --restart flag to continue to full system startup
 - **GCP Cloud (32GB RAM):** Claude Vision AI, ML Models, Memory Management, Heavy Processing
 - **Intelligent Routing:** Automatic capability-based routing with UAE/SAI/CAI integration
 
-See [HYBRID_ARCHITECTURE.md](HYBRID_ARCHITECTURE.md) for complete details.
+See [HYBRID_ARCHITECTURE.md](architecture/HYBRID_ARCHITECTURE.md) for complete details.
 
 ### Database Infrastructure
 
@@ -38113,7 +38113,7 @@ Before testing JARVIS live, verify all of these:
 
 **Testing Documentation:**
 - [backend/tests/TESTING_GUIDE.md](backend/tests/TESTING_GUIDE.md) - Complete testing guide
-- [TESTING_QUICK_START.md](TESTING_QUICK_START.md) - Quick start guide
+- [TESTING_QUICK_START.md](development/TESTING_QUICK_START.md) - Quick start guide
 
 **Safety Documentation:**
 - [docs/FEEDBACK_LEARNING_AND_COMMAND_SAFETY.md](docs/FEEDBACK_LEARNING_AND_COMMAND_SAFETY.md) - Command safety guide
@@ -38129,7 +38129,7 @@ Before testing JARVIS live, verify all of these:
 
 
 **Architecture Documentation:**
-- [HYBRID_ARCHITECTURE.md](HYBRID_ARCHITECTURE.md) - Complete hybrid architecture guide
+- [HYBRID_ARCHITECTURE.md](architecture/HYBRID_ARCHITECTURE.md) - Complete hybrid architecture guide
   - Intelligence systems (UAE/SAI/CAI)
   - Component distribution
   - Routing examples

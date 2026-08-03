@@ -149,11 +149,33 @@ class PythonBridge: ObservableObject {
         deviceId = creds.deviceId
         baseURL = creds.baseURL
 
-        let deviceAuth = DeviceAuth(
+        // MALFORMED is a third state, distinct from PRESENT and MISSING.
+        //
+        // `loadCredentials()` returning nil already lands cleanly on "not
+        // paired". Credentials that exist but cannot be used had no handling at
+        // all — they went straight into `DeviceAuth`, which trapped, and the
+        // app died at launch with `Fatal error: String index is out of bounds`.
+        //
+        // The message is deliberately NOT the "not paired" one: the remedies
+        // are opposite. "Not paired" means go and pair the device. This means
+        // the value you already have is corrupt — re-pair or fix the `.env`.
+        // Telling an operator to pair a device that IS paired sends them
+        // looking in the one place the problem is not.
+        guard let deviceAuth = DeviceAuth(
             deviceId: creds.deviceId,
             deviceType: .mac,
             deviceSecret: creds.deviceSecret
-        )
+        ) else {
+            let hint = "JARVIS_DEVICE_SECRET must be an even number of hex "
+                     + "characters (got \(creds.deviceSecret.count))"
+            print("[JARVIS] Device secret is not usable — \(hint)")
+            updateLoading(progress: 0, message: "Device secret is malformed")
+            connectionStatus = .error
+            detailedConnectionState = "Malformed device secret — \(hint)"
+            hudState = .offline
+            isRunning = false
+            return
+        }
         auth = deviceAuth
         commandSender = CommandSender(baseURL: creds.baseURL, auth: deviceAuth)
 
@@ -566,7 +588,21 @@ class PythonBridge: ObservableObject {
         if !forceCloud {
             let localURL = env["JARVIS_LOCAL_BACKEND_URL"] ?? "http://localhost:8010"
             let id = env["JARVIS_DEVICE_ID"] ?? "mac-local"
-            let secret = env["JARVIS_DEVICE_SECRET"] ?? "local"
+            // The default was the literal string "local", and the comment above
+            // called a placeholder secret "fine". It was not: the secret is
+            // hex-encoded by contract on all three implementations, and "local"
+            // is five characters — odd-length, so `DeviceAuth` trapped and the
+            // app died at launch on the DEFAULT path. Running the HUD from
+            // Xcode without JARVIS_DEVICE_SECRET set reproduced it every time.
+            //
+            // Derived rather than replaced with a hex literal: no magic
+            // constant to drift, deterministic per device id, and valid input
+            // for Python's `bytes.fromhex` and TypeScript's
+            // `Buffer.from(_, "hex")` as well as ours — so pointing the local
+            // path at a backend that DOES verify signatures becomes a
+            // configuration change rather than another crash.
+            let secret = env["JARVIS_DEVICE_SECRET"]
+                ?? DeviceAuth.derivedLocalSecret(forDeviceId: id)
             print("[JARVIS] LOCAL-FIRST: connecting to \(localURL) (device: \(id))")
             return HUDCredentials(deviceId: id, deviceSecret: secret, baseURL: localURL)
         }
