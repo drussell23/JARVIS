@@ -49,14 +49,32 @@ _SPOKEN_LOCK = threading.Lock()
 def echo_grace_s() -> float:
     """Extra time past the end of speech in which an echo can still arrive.
 
-    NEVER raises. Covers recogniser latency — the transcript of a phrase lands
-    after the phrase finished. ``0`` disables echo suppression entirely.
+    NEVER raises. ``0`` disables echo suppression entirely.
+
+    WHY 4 SECONDS AND NOT 1.5
+    ---------------------------
+    This was 1.5s, chosen as "recogniser latency", and it was too small by a
+    factor that let a real echo through. Measured 2026-08-03 08:47:47 —
+    JARVIS said "🔒 Locking the screen now, Derek. See you soon." (estimated
+    5.33s of speech), and at 08:47:56 the microphone delivered "See you soon"
+    as a COMMAND. The window had closed 2.17s earlier.
+
+    The gap is not latency, it is the recogniser's own design.
+    `WakeWordListener.commandSilenceTimeout` is 2.5s: it waits for two and a
+    half seconds of silence before deciding an utterance has ended, and only
+    then finalises and dispatches. So a transcript necessarily arrives at
+    least 2.5s AFTER the audio stopped, plus recognition time.
+
+    4s covers that with room, and the cost of being generous is bounded and
+    small: the only thing suppressed is a phrase JARVIS itself said, in that
+    order, within seconds. The cost of being stingy is JARVIS obeying its own
+    voice — which is how "See you soon" became an unlock attempt.
     """
     try:
         raw = (os.environ.get("JARVIS_ECHO_GRACE_S", "") or "").strip()
-        return max(0.0, min(30.0, float(raw))) if raw else 1.5
+        return max(0.0, min(30.0, float(raw))) if raw else 4.0
     except (TypeError, ValueError):
-        return 1.5
+        return 4.0
 
 
 def _echo_expiry(text: str) -> float:

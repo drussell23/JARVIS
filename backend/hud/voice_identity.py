@@ -294,9 +294,27 @@ class VoiceIdentity:
             if svc is not None:
                 for attr in ("speaker_profiles", "profiles", "_profiles"):
                     profiles = getattr(svc, attr, None)
-                    if isinstance(profiles, dict):
+                    # NON-EMPTY only. An empty dict is NOT a statement that
+                    # nobody is enrolled — it is the state a service is in
+                    # before `_load_speaker_profiles` has succeeded, and that
+                    # load fails routinely: measured 2026-08-03 08:47,
+                    #
+                    #   EcapaFacade error ... falling back to local engine
+                    #   CloudSQL init timed out after 10.0s - SQLite-only mode
+                    #
+                    # left `speaker_profiles == {}` on a live service, and this
+                    # branch reported "I don't have a voiceprint for you on
+                    # this Mac yet" while "Derek J. Russell / 272 samples" sat
+                    # in the local SQLite one query away. Same defect as
+                    # `is_screen_locked` answering False when it could not see:
+                    # an empty container from a FAILED load, read as absence.
+                    #
+                    # A populated dict is authoritative. An empty one means
+                    # "ask something that actually knows".
+                    if isinstance(profiles, dict) and profiles:
                         names = [str(k) for k in profiles if k]
-                        return sorted(names)[0] if names else ""
+                        if names:
+                            return sorted(names)[0]
             # Whatever the cheap database lookup last found. See
             # :meth:`refresh_enrollment` — enrollment is a ROW, not a model.
             return self._enrolled_cache
