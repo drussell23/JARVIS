@@ -5523,7 +5523,62 @@ class PrimeProvider:
     ) -> GenerationResult:
         """Generation entrypoint. Brackets the J-Prime generation with the
         in-flight guard (the failover Zero-Drop Drain awaits this count before
-        teardown -- no op severed mid-generation), then delegates to the impl."""
+        teardown -- no op severed mid-generation), then delegates to the impl.
+
+        ADMISSION FIRST, IN-FLIGHT GUARD SECOND.
+        ------------------------------------------
+        The memory check runs OUTSIDE the guard deliberately. A deferred
+        request never started, so counting it in-flight would make the
+        failover drain wait on generation that is not happening -- and the
+        guard exists to prevent severing real work, not imaginary work.
+
+        Tier 2 is now LOCAL: Ollama shares unified memory with the GPU, the
+        vision pipeline and the CoreAudio graph. There is no separate VRAM and
+        no pressure valve except swap, so a background op deciding to think
+        can take the microphone down with it. This is the one line between an
+        18 GB model load and the 37 ms voice path.
+        """
+        _adm = None
+        try:
+            from backend.core.ouroboros.governance import (
+                local_model_admission as _lma,
+            )
+            _adm = _lma.assess()
+            if not _adm.proceeds:
+                _lma.report(_adm, what="J-Prime generation")
+                logger.warning("[PrimeProvider] %s %s",
+                               _lma.DEFERRED_PAYLOAD, _adm.reason)
+                # EMPTY CANDIDATES, NOT AN EXCEPTION.
+                #
+                # `candidate_generator` treats a raising provider as a "lane
+                # failed" fault and falls through -- which would log this as a
+                # provider outage, feed the DW/Prime heartbeat a false drop,
+                # and on a bad day contribute to waking a real-money GCE
+                # failover node. For a machine that is merely busy.
+                #
+                # It already distinguishes this class: `is_budget_refusal` is
+                # re-raised with the comment "local wallet gate, NOT a
+                # lane/provider fault". Memory pressure is the same axis -- a
+                # LOCAL RESOURCE gate. An empty result falls through to the
+                # next provider cleanly and blames nobody.
+                #
+                # The deferral is not lost by returning empty: `report()` has
+                # already filed it as a `RuntimeHealthFinding` for O+V, and
+                # the WARNING above carries `DEFERRED_PAYLOAD` for the log.
+                return GenerationResult(
+                    candidates=(),
+                    provider_name=self.provider_name,
+                    generation_duration_s=0.0,
+                )
+            if _adm.action == _lma.Admission.PRUNE.value:
+                _lma.report(_adm, what="J-Prime generation")
+        except Exception as _adm_err:  # noqa: BLE001
+            # Admission control NEVER blocks generation on its own fault. A
+            # broken probe must not silently disable Tier 2 for a session --
+            # that is a bigger outage than the swap storm it guards against.
+            logger.debug("[PrimeProvider] admission check degraded: %s",
+                         _adm_err)
+
         with _jprime_inflight_guard():
             return await self._generate_impl(
                 context, deadline, repair_context, temperature=temperature,
