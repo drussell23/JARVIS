@@ -240,8 +240,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                                 reason: "queued utterance")
 
         let utterance = AVSpeechUtterance(string: cleaned)
-        utterance.voice = AVSpeechSynthesisVoice(identifier: "com.apple.voice.compact.en-GB.Daniel")
-            ?? AVSpeechSynthesisVoice(language: "en-GB")
+        utterance.voice = JARVISVoice.daniel
         utterance.rate = 0.52
         utterance.volume = 0.85
 
