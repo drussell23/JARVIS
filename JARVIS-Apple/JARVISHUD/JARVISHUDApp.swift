@@ -184,8 +184,35 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             .receive(on: RunLoop.main)
             .sink { [weak self] status in
                 guard let self else { return }
-                if status == .connected && self.wakeWord.state == .off && !self.isTTSSpeaking {
-                    print("[JARVIS] Cloud connected — starting wake word listener")
+                // THE MICROPHONE NEVER STARTED. This is the only
+                // `wakeWord.start()` in the app, and its `!isTTSSpeaking`
+                // guard made it unreachable:
+                //
+                //   onBackendReady()  connectionStatus = .connected   (fires this
+                //                     sink — but `.receive(on: RunLoop.main)`
+                //                     delivers it on the NEXT runloop turn)
+                //   onBackendReady()  onSpeak("JARVIS Online...")     -> isTTSSpeaking = true
+                //   next turn         guard sees isTTSSpeaking == true -> SKIP
+                //
+                // The greeting always wins that race, because it is emitted
+                // synchronously two lines below the assignment that schedules
+                // this. So the listener was skipped on every single launch and
+                // no voice command could ever be heard — which is exactly what
+                // "JARVIS never got my message" means.
+                //
+                // The guard was correct when `speak()` STOPPED the mic: it kept
+                // a reconnect from rebuilding an audio graph mid-utterance.
+                // That teardown is gone (#70349) — the engine now runs
+                // continuously and SpeechGate mutes the TAP instead — so the
+                // condition it protected against can no longer occur, while its
+                // side effect (never starting) survived. Removing it restores
+                // the invariant the gate assumes: the mic is always ON, and
+                // muting is the gate's job alone.
+                //
+                // `state == .off` is retained and is what makes this idempotent
+                // across reconnects.
+                if status == .connected && self.wakeWord.state == .off {
+                    print("[JARVIS] Backend connected — starting wake word listener")
                     self.wakeWord.start()
                 }
             }
