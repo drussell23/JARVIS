@@ -24,6 +24,49 @@ from backend.system_control.capability_registry import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+_OPERATOR_NAME_CACHE: List[Optional[str]] = [None]
+
+
+def _operator_name() -> str:
+    """What to call the person at this Mac. "" if unknown. NEVER raises.
+
+    DERIVED, not written down. macOS already stores the account's full name in
+    the passwd GECOS field, which is where "Derek J. Russell" in the tool-use
+    system prompt came from in the first place — so reading it here means the
+    name is right on any machine without anybody editing a constant.
+
+    `pwd` rather than `id -F` deliberately: this is called from
+    `lock_screen`, whose entire design note is that it must not block, and a
+    subprocess on the event loop is exactly what that note forbids. `pwd` is
+    stdlib and reads an already-resolved struct.
+
+    First name only. "Locking the screen now, Derek J. Russell" is not how a
+    person addresses anyone.
+
+    Override with ``JARVIS_OPERATOR_NAME`` — the account name is a good
+    default, not an authority on what somebody likes being called.
+    """
+    if _OPERATOR_NAME_CACHE[0] is not None:
+        return _OPERATOR_NAME_CACHE[0]
+    name = ""
+    try:
+        override = (os.environ.get("JARVIS_OPERATOR_NAME", "") or "").strip()
+        if override:
+            name = override
+        else:
+            import pwd
+            gecos = (pwd.getpwuid(os.getuid()).pw_gecos or "").split(",")[0]
+            name = gecos.strip()
+        # A full name is for a form; a first name is for a sentence.
+        name = name.split()[0] if name.split() else ""
+        # Guard against a GECOS field holding a username or junk.
+        if not name.isalpha() or len(name) > 24:
+            name = ""
+    except Exception:  # noqa: BLE001 — never break a lock on a nicety
+        name = ""
+    _OPERATOR_NAME_CACHE[0] = name
+    return name
+
 
 class CommandCategory(Enum):
     """Categories of system commands"""
@@ -1479,7 +1522,7 @@ class MacOSController:
 
         return None
 
-    @capability(mutates=True, tier="notify_apply")
+    @capability(mutates=True, tier="notify_apply", provides="screen_locked")
     async def lock_screen(
         self,
         progress_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
@@ -1506,8 +1549,17 @@ class MacOSController:
         start_time = time.perf_counter()
 
         # Use provided speaker_name or default - NO async calls that could block
+        #
+        # "there" made the Mac greet its owner as a stranger: measured, the
+        # live response was "🔒 Locking the screen now, there. See you soon."
+        # The operator's name is already known to this process — the tool-use
+        # system prompt states it, and `UserPreferenceMemory` persists it — so
+        # the fallback reads what is on record rather than inventing a
+        # placeholder. Still no async and no blocking call: `_operator_name`
+        # is a cached env/file read, and it returns "" rather than raising, in
+        # which case we land on the original placeholder.
         if speaker_name is None:
-            speaker_name = "there"
+            speaker_name = _operator_name() or "there"
 
         async def _progress(stage: str, pct: int, msg: str):
             """Send transparent progress update (fire-and-forget)."""
@@ -1636,7 +1688,23 @@ class MacOSController:
             await _progress("error", 90, f"Lock error: {e}")
             return False, f"❌ Failed to lock screen: {str(e)}"
 
-    @os_capability(Effect.EFFECTFUL)
+    # Stays APPROVAL_REQUIRED — unlocking a Mac is not a notify-and-proceed
+    # action. What changed is WHO can answer.
+    #
+    # Touch ID cannot. `SecureConsent` needs to draw a system dialog, and there
+    # is no surface to draw on while the screen is locked: measured, the
+    # verdict came back DENIED 99ms after the request, and the log recorded
+    # "operator declined" for a prompt no operator ever saw. A gate whose only
+    # answer channel requires the very state the gated action exists to
+    # produce is a deadlock, not a safeguard — `unlock_screen` could never be
+    # authorised, by construction.
+    #
+    # `consent_authorities` now picks a channel whose own preconditions are
+    # MET, and speaker verification is reachable through a locked screen
+    # because a microphone is. See that module for why this is a stronger
+    # answer than removing the gate.
+    @capability(mutates=True, tier="approval_required",
+                requires="screen_locked", provides="screen_unlocked")
     async def unlock_screen(self, password: Optional[str] = None) -> Tuple[bool, str]:
         """
         Unlock the macOS screen using direct async methods (avoiding full pipeline loops)

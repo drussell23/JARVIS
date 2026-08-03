@@ -2018,6 +2018,18 @@ async def parallel_lifespan(app: FastAPI):
                     """Speak text to the user via macOS TTS with mic suppression."""
                     if not text:
                         return
+                    # THE ECHO LEDGER. Every word JARVIS utters passes through
+                    # here, which is the only reason a single call can cover
+                    # all of them — the mute claim's deadline is an ESTIMATE
+                    # derived from character count, so when the synthesiser
+                    # runs slower than the guess the mic goes live mid-sentence
+                    # and JARVIS transcribes itself. Measured: one spoken "lock
+                    # my screen" locked the screen twice.
+                    try:
+                        from backend.hud.voice_command_router import note_spoken
+                        note_spoken(text)
+                    except Exception:  # noqa: BLE001 — never block speech
+                        pass
                     _speech = None
                     try:
                         import tempfile as _tf
@@ -2085,6 +2097,34 @@ async def parallel_lifespan(app: FastAPI):
                         payload = data.get("payload", {})
                         cmd_id = data.get("command_id", "")
                         logger.info("[HUD] Action: %s (cmd=%s)", action_type, cmd_id)
+
+                        # THE AUDIO OF THE SENTENCE ITSELF.
+                        #
+                        # Until this line the backend received only the
+                        # TRANSCRIPT of what was said, which is why speaker
+                        # verification could not be the consent authority for
+                        # `unlock_screen`: the one authority that works through
+                        # a locked screen had no evidence to work from. It is
+                        # also what enrollment needs — a voiceprint cannot be
+                        # built from text.
+                        #
+                        # Deposited rather than passed down. The consent flow
+                        # SUSPENDS and resumes on a different call stack, so an
+                        # argument threaded through `route()` would not be in
+                        # scope by the time anything wanted it. The holder
+                        # validates, bounds and expires the bytes, and never
+                        # writes them anywhere.
+                        try:
+                            _aud = payload.get("utterance_audio")
+                            if _aud:
+                                from backend.hud.utterance_audio import (
+                                    get_utterance_holder,
+                                )
+                                get_utterance_holder().deposit(
+                                    _aud,
+                                    payload.get("utterance_audio_format", ""))
+                        except Exception as _ua:  # noqa: BLE001
+                            logger.debug("[HUD] utterance audio ignored: %s", _ua)
 
                         if action_type == "vision_task":
                             goal = payload.get("goal", "")

@@ -107,7 +107,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
 
         // ALL commands route through local IPC (brainstem backend).
         // Vercel cloud is disabled (402). IPC is the PRIMARY and ONLY path.
-        wakeWord.onCommand = { [weak self] command in
+        wakeWord.onCommand = { [weak self] command, utteranceAudio in
             guard let self else { return }
             print("[JARVIS] Voice command: \"\(command)\"")
 
@@ -166,6 +166,26 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                 if let b64 = await ScreenCaptureService.shared.captureFresh() {
                     actionPayload["screenshot"] = b64
                     print("[JARVIS] Screenshot attached (\(b64.count / 1024)KB)")
+                }
+
+                // Attach the audio of the sentence itself.
+                //
+                // Until now Python received only the TRANSCRIPT, which is why
+                // speaker verification could not be the authority for
+                // `unlock_screen` — the one authority that works through a
+                // locked screen had no evidence to work from. It is also what
+                // enrollment needs: you cannot build a voiceprint from text.
+                //
+                // Sent on the existing `action` event rather than a new
+                // request/response pair. A screenshot of the entire desktop
+                // already travels on this wire; a few seconds of speech the
+                // operator deliberately addressed to the assistant is strictly
+                // less than that, and a second event type would be a second
+                // place for the two sides to fall out of step.
+                if let utteranceAudio {
+                    actionPayload["utterance_audio"] = utteranceAudio
+                    actionPayload["utterance_audio_format"] = "wav16k_b64"
+                    print("[JARVIS] Utterance audio attached (\(utteranceAudio.count / 1024)KB)")
                 }
 
                 BrainstemLauncher.shared.sendEvent(

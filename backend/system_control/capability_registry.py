@@ -217,7 +217,9 @@ def capability(*, mutates: Optional[bool] = None,
                session: str = Session.NONE.value,
                release: str = "",
                alias: str = "",
-               phrases: Any = ()) -> Callable:
+               phrases: Any = (),
+               requires: Any = (),
+               provides: Any = ()) -> Callable:
     """Declare a method's risk where the method is written. NEVER raises.
 
     A decorator rather than a central table for the reason `repl_dispatch_
@@ -240,6 +242,8 @@ def capability(*, mutates: Optional[bool] = None,
                 "release": release,
                 "alias": alias,
                 "phrases": _normalise_phrases(phrases),
+                "requires": _normalise_predicates(requires),
+                "provides": _normalise_predicates(provides),
             })
         except Exception:  # noqa: BLE001 — a decorator never breaks an import
             pass
@@ -270,6 +274,17 @@ class CapabilityDef:
     #: is: a table beside the code is a second thing to update, and the update
     #: that gets forgotten is invisible.
     phrases: tuple = ()
+    #: World-state predicates that must hold BEFORE this can run, and the ones
+    #: it establishes by running. Declared at the method, like everything else
+    #: here, so the chain that unlocks a screen before searching the web is
+    #: DERIVED — "who provides `screen_unlocked`?" is a question the registry
+    #: answers, not a branch somebody wrote in the voice router.
+    #:
+    #: `provides` is a claim, never a proof. The world model re-observes after
+    #: the call; a capability that says it unlocks the screen and did not is
+    #: exactly the case the re-observation exists to catch.
+    requires: tuple = ()
+    provides: tuple = ()
     #: The name this capability is EXPORTED as, when its method name would
     #: collide with another provider's in the same namespace. Declared at the
     #: method (``as=stop_actuator``) rather than in a table elsewhere, so the
@@ -468,6 +483,29 @@ def _normalise_phrases(raw: Any) -> tuple:
         return ()
 
 
+def _normalise_predicates(raw: Any) -> tuple:
+    """A declared ``requires``/``provides`` value as a clean tuple. NEVER raises.
+
+    Deliberately does NOT import `world_state` to canonicalise the names. The
+    registry describes what a method claims; resolving `screen_unlocked` to
+    "not screen_locked" is the world model's job, and a leaf registry that
+    imports the world model to store two strings is the layering inversion
+    this module keeps refusing elsewhere.
+    """
+    try:
+        if not raw:
+            return ()
+        items = raw.split(",") if isinstance(raw, str) else list(raw)
+        out = []
+        for it in items:
+            s = " ".join(str(it).strip().lower().split())
+            if s and s not in out:
+                out.append(s)
+        return tuple(out)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
 class _Classification(NamedTuple):
     tier: str
     provenance: str
@@ -475,6 +513,8 @@ class _Classification(NamedTuple):
     release: str = ""
     alias: str = ""
     phrases: tuple = ()
+    requires: tuple = ()
+    provides: tuple = ()
 
 
 def _apply_session_rules(c: _Classification) -> _Classification:
@@ -512,6 +552,8 @@ def _parse_tag(body: str) -> _Classification:
     joined = " ".join(parts)
     session, release, alias = Session.NONE.value, "", ""
     phrases: tuple = ()
+    requires: tuple = ()
+    provides: tuple = ()
     for p in parts:
         if p.startswith("release="):
             release = p.split("=", 1)[1].strip()
@@ -519,6 +561,10 @@ def _parse_tag(body: str) -> _Classification:
             alias = p.split("=", 1)[1].strip()
         elif p.startswith("say=") or p.startswith("phrases="):
             phrases = _normalise_phrases(p.split("=", 1)[1].strip())
+        elif p.startswith("needs=") or p.startswith("requires="):
+            requires = _normalise_predicates(p.split("=", 1)[1].strip())
+        elif p.startswith("gives=") or p.startswith("provides="):
+            provides = _normalise_predicates(p.split("=", 1)[1].strip())
         elif p in ("session-start", "session_start"):
             session = Session.START.value
         elif p in ("session-end", "session_end"):
@@ -534,7 +580,7 @@ def _parse_tag(body: str) -> _Classification:
                 break
     return _apply_session_rules(
         _Classification(tier, Provenance.TAGGED.value, session, release, alias,
-                        phrases))
+                        phrases, requires, provides))
 
 
 def _classify(fn: Any, doc: str) -> _Classification:
@@ -554,7 +600,9 @@ def _classify(fn: Any, doc: str) -> _Classification:
                 str(declared.get("session") or Session.NONE.value),
                 str(declared.get("release") or ""),
                 str(declared.get("alias") or ""),
-                _normalise_phrases(declared.get("phrases"))))
+                _normalise_phrases(declared.get("phrases")),
+                _normalise_predicates(declared.get("requires")),
+                _normalise_predicates(declared.get("provides"))))
         tag = _DOC_TAG.search(doc or "")
         if tag:
             return _parse_tag(tag.group("body") or "")
@@ -618,6 +666,8 @@ def describe(name: str, fn: Any) -> Optional[CapabilityDef]:
             release=cls.release,
             alias=cls.alias,
             phrases=cls.phrases,
+            requires=cls.requires,
+            provides=cls.provides,
         )
     except Exception:  # noqa: BLE001
         logger.debug("[CapabilityRegistry] describe(%s) degraded", name,
