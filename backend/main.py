@@ -2427,6 +2427,17 @@ async def parallel_lifespan(app: FastAPI):
                     name="hud_sse_consumer",
                 )
                 logger.info("[HUD] SSE consumer started (Vercel cloud relay)")
+            except _SkipCloudRelay:
+                # A DELIBERATE skip, not a failure. Reusing the generic handler
+                # for it made the log say "[HUD] SSE consumer failed:" with an
+                # empty reason directly under the line explaining the relay was
+                # switched off on purpose — two lines contradicting each other,
+                # and the alarming one last.
+                #
+                # The "one exit path" this sentinel was meant to preserve is not
+                # worth a log that cries wolf: an operator scanning for real
+                # faults must never have to learn which warnings to ignore.
+                pass
             except (ImportError, ValueError) as e:
                 logger.info("[HUD] SSE consumer not available (local-only mode): %s", e)
             except Exception as e:
