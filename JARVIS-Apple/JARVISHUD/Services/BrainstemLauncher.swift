@@ -30,6 +30,38 @@ final class BrainstemLauncher {
     private let ipcQueue = DispatchQueue(label: "com.jarvis.brainstem.ipc", qos: .userInitiated)
 
     /// The repo root, derived from the known brainstem .env path.
+    /// Can this interpreter actually import what the brainstem needs?
+    ///
+    /// Bounded on purpose: a hung probe would stall the HUD's startup, and an
+    /// interpreter that cannot answer in a few seconds is not one to launch a
+    /// backend with. A timeout counts as FAILURE — the candidate has to earn
+    /// selection, not merely avoid disproving itself.
+    private static func probeSucceeds(executable: String, arguments: [String],
+                                      environment: [String: String],
+                                      cwd: String,
+                                      timeout: TimeInterval = 12) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: executable)
+        p.arguments = arguments
+        p.environment = environment
+        p.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        // Discarded rather than piped: an unread pipe that fills would block
+        // the child forever, which is the deadlock a health check must not add.
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while p.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if p.isRunning {
+            p.terminate()
+            return false
+        }
+        return p.terminationStatus == 0
+    }
+
     private let repoRoot: String = {
         // Same path the HUD uses to find brainstem/.env
         let home = NSHomeDirectory()
@@ -125,19 +157,61 @@ final class BrainstemLauncher {
         // Priority: venv/bin/python3.12 > /opt/homebrew/bin/python3.12 > /usr/bin/env python3
         let venvPython = "\(repoRoot)/venv/bin/python3.12"
         let brewPython = "/opt/homebrew/bin/python3.12"
-        let python: String
-        let pythonArgs: [String]
 
-        if FileManager.default.fileExists(atPath: venvPython) {
-            python = venvPython
-            pythonArgs = ["-m", "brainstem"]
-        } else if FileManager.default.fileExists(atPath: brewPython) {
-            python = brewPython
-            pythonArgs = ["-m", "brainstem"]
-        } else {
-            python = "/usr/bin/env"
-            pythonArgs = ["python3", "-m", "brainstem"]
+        // v286.0: CHOOSE AN INTERPRETER THAT WORKS, NOT ONE THAT EXISTS.
+        //
+        // This used to take the first candidate whose FILE was present. That is
+        // the wrong predicate, and it failed in the field: `venv/` inside this
+        // repo had 5,980 files whose originals were replaced by iCloud
+        // duplicate-renames (`auto.py` -> `auto 2.py`), so
+        // `uvicorn/protocols/http/` had no `__init__.py` and uvicorn could not
+        // start. The venv binary existed, was selected, and every launch died
+        // with `Could not import module "uvicorn.protocols.http.auto"` — while
+        // a perfectly healthy pyenv interpreter sat two candidates further down
+        // the list, never reached.
+        //
+        // So each candidate is PROBED with the exact import whose absence
+        // killed the brainstem — a test of the failure actually hit rather than
+        // a guess at what "healthy" means. Bounded, so a wedged interpreter
+        // cannot hang startup, and every rejection is logged BY REASON: a
+        // launcher that silently picks the third choice is undebuggable.
+        let candidates: [(String, [String])] = [
+            (venvPython, ["-m", "brainstem"]),
+            (brewPython, ["-m", "brainstem"]),
+            ("/usr/bin/env", ["python3", "-m", "brainstem"]),
+        ]
+        var chosen: (String, [String])?
+        for (path, args) in candidates {
+            if path != "/usr/bin/env",
+               !FileManager.default.fileExists(atPath: path) {
+                print("[Brainstem] skip \(path) — not present")
+                continue
+            }
+            let probeArgs = Array(args.dropLast(2))
+                + ["-c", "import uvicorn.protocols.http.auto"]
+            if Self.probeSucceeds(executable: path, arguments: probeArgs,
+                                  environment: env, cwd: repoRoot) {
+                chosen = (path, args)
+                break
+            }
+            print("[Brainstem] reject \(path) — cannot import "
+                  + "uvicorn.protocols.http.auto (broken or incomplete install)")
         }
+
+        guard let picked = chosen else {
+            print("""
+            [Brainstem] FATAL: no usable Python interpreter.
+              Tried: \(candidates.map(\.0).joined(separator: ", "))
+              Each failed to `import uvicorn.protocols.http.auto`.
+              If `\(repoRoot)/venv` was touched by iCloud, files may have been
+              renamed (`auto.py` -> `auto 2.py`); rebuild the venv or remove it
+              so a healthy system interpreter is used instead.
+            """)
+            return
+        }
+        let python = picked.0
+        let pythonArgs = picked.1
+        print("[Brainstem] interpreter: \(python) (probe passed)")
 
         proc.executableURL = URL(fileURLWithPath: python)
         proc.arguments = pythonArgs
