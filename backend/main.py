@@ -2013,11 +2013,53 @@ async def parallel_lifespan(app: FastAPI):
                 # deleted the file by hand; and the flag described only THIS
                 # source, while three other things in the system also speak.
                 _TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "Daniel")
+                # How long a reply may wait for the voice before it stops
+                # being worth saying. Bounded because the queue drains at
+                # speaking speed while commands arrive at speaking speed — a
+                # backlog never catches up, it only gets older.
+                try:
+                    _TTS_MAX_QUEUE_S = max(1.0, min(60.0, float(
+                        os.environ.get("JARVIS_TTS_MAX_QUEUE_S", "") or 12.0)))
+                except (TypeError, ValueError):
+                    _TTS_MAX_QUEUE_S = 12.0
+
+                # ONE MOUTH.
+                #
+                # `say` writes an aiff and `afplay` plays it, and NOTHING
+                # serialised the pair. Two responses arriving 0.65s apart
+                # produced two concurrent `afplay` processes — measured
+                # 2026-08-03 01:41:27, "You declined unlock screen" and
+                # "Locking the screen now, Derek" playing over each other.
+                # From the room that is not a race condition, it is two
+                # JARVISes talking at once.
+                #
+                # A lock rather than a queue-with-worker because the ordering
+                # that matters is already the order the results arrived in,
+                # and a second scheduling layer would be a second place for an
+                # utterance to get lost.
+                _tts_mouth = asyncio.Lock()
 
                 async def _hud_tts(text: str) -> None:
                     """Speak text to the user via macOS TTS with mic suppression."""
                     if not text:
                         return
+                    # STALE SPEECH IS WORSE THAN SILENCE. An utterance that
+                    # waited out the whole queue is describing something the
+                    # operator has stopped caring about, and saying it anyway
+                    # is how an assistant ends up narrating its own backlog.
+                    _queued_at = time.monotonic()
+                    async with _tts_mouth:
+                        _waited = time.monotonic() - _queued_at
+                        if _waited > _TTS_MAX_QUEUE_S:
+                            logger.info(
+                                "[HUD] dropped a reply that waited %.1fs for "
+                                "the voice — it is no longer about anything: "
+                                "%s", _waited, text[:60])
+                            return
+                        await _hud_tts_locked(text)
+
+                async def _hud_tts_locked(text: str) -> None:
+                    """The actual speaking. Only ever called holding the lock."""
                     # THE ECHO LEDGER. Every word JARVIS utters passes through
                     # here, which is the only reason a single call can cover
                     # all of them — the mute claim's deadline is an ESTIMATE

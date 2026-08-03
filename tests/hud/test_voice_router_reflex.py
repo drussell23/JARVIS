@@ -9,6 +9,8 @@ answered by reading the refusal string aloud through a speech synthesiser.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from backend.hud.tool_use_orchestrator import CommandResult
@@ -249,3 +251,58 @@ def test_controller_results_speak_for_themselves():
         True, "🔒 Locking now.")
     ok, say = _read_controller_result(None, "lock screen")
     assert ok and "lock screen" in say
+
+
+# ── The 2026-08-03 01:41 log ────────────────────────────────────────────────
+
+def test_a_real_reason_is_never_replaced_with_you_declined():
+    """Measured 01:41:27. The voice authority answered "I don't have a
+    voiceprint for you on this Mac yet"; the DENIED branch recognised only the
+    no-provider case and said "You declined unlock screen, so I left it
+    alone." Derek declined nothing — the truth was discarded and replaced with
+    a fabrication about the operator's own behaviour."""
+    from backend.hud.voice_command_router import _reads_like_a_sentence
+    authority = ("I don't have a voiceprint for you on this Mac yet, so I "
+                 "can't confirm it's you.")
+    assert _reads_like_a_sentence(authority)
+    assert not _reads_like_a_sentence(
+        "consent channel unreachable — HUDConsentProvider needs screen_unlocked")
+
+
+@pytest.mark.asyncio
+async def test_the_same_action_does_not_run_twice_concurrently(monkeypatch):
+    """Boot held the loop for 31s, so Derek said it again and the screen
+    locked TWICE. Echo suppression is blind to this: the repeat arrived before
+    JARVIS had spoken, so there was nothing to be an echo of."""
+    import backend.system_control.capability_router as CR
+    calls = []
+
+    class Slow:
+        async def route(self, name, args=None, *, op_id=""):
+            calls.append(name)
+            await asyncio.sleep(0.3)
+            return _Routed("executed", result=(True, "Locked."))
+
+    monkeypatch.setattr(CR, "get_capability_router", lambda: Slow())
+    r = VoiceCommandRouter(DeadCortex())
+    await asyncio.gather(r.route("lock my screen"), r.route("Lock screen"))
+    assert calls == ["lock_screen"], f"ran twice: {calls}"
+
+
+@pytest.mark.asyncio
+async def test_the_slot_is_released_so_a_capability_still_works_after(monkeypatch):
+    """A leaked slot would turn one crash into "JARVIS will not lock my screen
+    any more" — worse than the double-lock it prevents."""
+    import backend.system_control.capability_router as CR
+    calls = []
+
+    class Boom:
+        async def route(self, name, args=None, *, op_id=""):
+            calls.append(name)
+            raise RuntimeError("router exploded")
+
+    monkeypatch.setattr(CR, "get_capability_router", lambda: Boom())
+    r = VoiceCommandRouter(DeadCortex())
+    await r.route("lock my screen")
+    await r.route("lock my screen")
+    assert calls == ["lock_screen", "lock_screen"], "the slot leaked"
