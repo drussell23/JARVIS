@@ -2193,8 +2193,128 @@ async def parallel_lifespan(app: FastAPI):
                     shutdown=_hud_shutdown,
                 )
                 logger.info("[HUD] IPC server started — Swift HUD can connect")
+
+                # Give the router a way to ASK. `SecureConsent.swift` has been
+                # complete and waiting; `consent_verdict` above has been handled
+                # all along; nothing sent the question, so every gated
+                # capability denied with "no approval provider available". A
+                # gate that always refuses looks exactly like a gate that works.
+                try:
+                    from backend.hud.consent_bridge import install as _install_consent
+                    _install_consent()
+                except Exception as _ce:  # noqa: BLE001
+                    logger.error("[HUD] consent bridge install failed: %s", _ce)
             except Exception as e:
                 logger.error("[HUD] IPC server failed to start: %s", e)
+
+            # =============================================================
+            # CAPABILITY FEDERATION — multi-space, video, ghost touch
+            # =============================================================
+            # Three subsystems the HUD could name none of: multi-space
+            # intelligence, video multi-space intelligence, and ghost touch.
+            # Roughly 11,000 lines of working capability behind a vocabulary
+            # derived from a single controller — the capabilities were never
+            # missing, their NAMES were.
+            #
+            # This block is what makes the federation live. Without it the
+            # module is present, tested, and reaches nothing: `discover()` is
+            # never called, no namespace ever hydrates, and `derived_tool_
+            # schemas` unions in an empty dict forever. Wired-but-inert is the
+            # failure mode that looks most like success.
+            try:
+                from backend.system_control import capability_federation as _fed
+
+                if _fed.federation_enabled():
+                    # 1. BIND what providers cannot construct for themselves.
+                    #    `VideoStreamCapture` takes a required `vision_analyzer`
+                    #    and the HUD already builds one. Bound as a FACTORY so
+                    #    nothing is constructed until a video capability is
+                    #    actually called — binding an eager instance here would
+                    #    put a model client on the boot path.
+                    def _bind_vision_analyzer():
+                        from backend.hud.tool_use_orchestrator import (
+                            ToolUseOrchestrator,
+                        )
+                        from backend.core.ouroboros.governance.doubleword_provider import (
+                            DoublewordProvider,
+                        )
+                        router = getattr(app.state, "voice_router", None)
+                        orch = getattr(router, "_tool_orchestrator", None)
+                        if orch is None:
+                            orch = ToolUseOrchestrator(DoublewordProvider())
+                        return orch._vision_analyzer
+
+                    _fed.bind("vision_analyzer", _bind_vision_analyzer)
+
+                    # 2. WARM off the boot path. Hydration measured 8.4s for
+                    #    `space` alone; awaiting it here would add that to
+                    #    startup, and `ensure()` is what correctness depends on
+                    #    anyway. This only decides whether the FIRST command
+                    #    pays for it.
+                    _fed_federation = _fed.get_federation()
+                    logger.info(
+                        "[HUD] Capability federation: %d provider(s) across %s",
+                        len(_fed_federation.providers()),
+                        ", ".join(_fed_federation.namespaces()) or "no namespaces")
+
+                    async def _warm_federation() -> None:
+                        try:
+                            result = await _fed_federation.warm()
+                            from backend.hud.tool_definitions import (
+                                tool_surface_report,
+                            )
+                            report = tool_surface_report()
+                            logger.info(
+                                "[HUD] Capability surface: %d tools "
+                                "(%d hand-written + %d macOS + %d federated) — %s",
+                                report.get("total", 0),
+                                report.get("handwritten", 0),
+                                report.get("derived_macos", 0),
+                                report.get("federated", 0), result)
+                            # Defects that are cheap here and expensive at 3am.
+                            stats = _fed_federation.stats()
+                            for label, key in (
+                                ("name claimed by two providers", "conflicts"),
+                                ("session with no declared release", "unreleasable"),
+                                ("release the reaper cannot call", "broken_releases"),
+                            ):
+                                if stats.get(key):
+                                    logger.error(
+                                        "[HUD] Capability federation — %s: %s",
+                                        label, stats[key])
+                            if report.get("degraded"):
+                                logger.warning(
+                                    "[HUD] DEGRADED namespaces (their "
+                                    "capabilities are NOT offered): %s",
+                                    report["degraded"])
+                        except Exception as _we:  # noqa: BLE001
+                            logger.warning("[HUD] federation warm failed: %s", _we)
+
+                    asyncio.create_task(_warm_federation())
+
+                    # 3. REAP. The organ that stops a video stream surviving
+                    #    the HUD that asked for it. Deliberately blind to every
+                    #    application state-ledger — it reads monotonic time and
+                    #    the lease book, so a WEDGED session is still reapable
+                    #    (CLAUDE.md Slice 47, Watchdog Isolation Invariant).
+                    from backend.system_control.capability_leases import (
+                        get_lease_book, leases_enabled,
+                    )
+                    if leases_enabled():
+                        _lease_book = get_lease_book()
+                        # Install the releaser now rather than on first use, so
+                        # a session opened by any path can be reaped even if
+                        # nothing has routed through the singleton router yet.
+                        from backend.system_control.capability_router import (
+                            get_capability_router,
+                        )
+                        _lease_book.set_releaser(
+                            get_capability_router()._release)
+                        asyncio.create_task(
+                            _lease_book.run_reaper(stop=_hud_shutdown))
+            except Exception as _fe:  # noqa: BLE001 — the HUD boots regardless
+                logger.error("[HUD] capability federation wiring failed: %s", _fe,
+                             exc_info=True)
 
             # Optional: SSE consumer for Vercel cloud relay
             try:
@@ -2350,6 +2470,28 @@ async def parallel_lifespan(app: FastAPI):
                 logger.info("[HUD] IPC server shutdown complete")
             except Exception as e:
                 logger.debug(f"[HUD] IPC shutdown error (non-critical): {e}")
+
+            # Close every open session BEFORE the loop goes away. A screen
+            # capture, a purple recording indicator and a spawned actuator pid
+            # do not stop because their Python process did — this is the only
+            # moment left where something can still call their release, and it
+            # runs while the operator is watching the app quit. Whatever cannot
+            # be closed is logged BY NAME as an orphan rather than forgotten.
+            try:
+                from backend.system_control.capability_leases import (
+                    get_lease_book,
+                )
+                _book = get_lease_book()
+                if _book.active():
+                    logger.info("[HUD] releasing %d open capability session(s)",
+                                len(_book.active()))
+                    await asyncio.wait_for(_book.release_all(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.error("[HUD] session release exceeded 30s — sessions may "
+                             "still be running: %s",
+                             [l.capability for l in get_lease_book().active()])
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[HUD] session release failed: %s", e)
 
         await initializer.shutdown()
 
@@ -7137,6 +7279,54 @@ async def contract_capabilities():
         "policy_hash": policy_hash,
         "timestamp": _time.time(),
     }
+
+
+@app.get("/capabilities/surface")
+async def capability_surface():
+    """What the organism can currently NAME, and what is currently RUNNING.
+
+    Deliberately separate from `/capabilities` above, which answers a different
+    question — that one is the cross-repo contract manifest the Unified
+    Supervisor probes. This one is about reach: how many capabilities the tool
+    loop can actually call, which federated namespaces are ready, and which
+    sessions are open right now.
+
+    Read-only and authority-free. It reports state; it never hydrates a
+    namespace, constructs a provider, or closes a session — an observability
+    surface that changes what it observes is how a dashboard becomes a cause.
+
+    The two lists worth watching are `degraded` (a namespace whose capabilities
+    are NOT being offered) and `sessions.orphaned_capabilities` (something is
+    still running that nothing left in this process can stop).
+    """
+    import time as _time
+
+    out = {"schema_version": "capability_surface.v1", "timestamp": _time.time()}
+    try:
+        from backend.hud.tool_definitions import tool_surface_report
+        out["surface"] = tool_surface_report()
+    except Exception as exc:  # noqa: BLE001
+        out["surface"] = {"error": f"{type(exc).__name__}: {exc}"}
+    try:
+        from backend.system_control.capability_federation import get_federation
+        fed = get_federation()
+        out["federation"] = fed.stats()
+        out["names"] = fed.names()
+    except Exception as exc:  # noqa: BLE001
+        out["federation"] = {"error": f"{type(exc).__name__}: {exc}"}
+    try:
+        from backend.system_control.capability_leases import get_lease_book
+        out["sessions"] = get_lease_book().stats()
+    except Exception as exc:  # noqa: BLE001
+        out["sessions"] = {"error": f"{type(exc).__name__}: {exc}"}
+    try:
+        from backend.system_control.capability_router import (
+            get_capability_router,
+        )
+        out["router"] = get_capability_router().stats()
+    except Exception as exc:  # noqa: BLE001
+        out["router"] = {"error": f"{type(exc).__name__}: {exc}"}
+    return out
 
 
 # ============================================================================

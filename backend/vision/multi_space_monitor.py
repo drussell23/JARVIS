@@ -97,6 +97,15 @@ class MultiSpaceMonitor:
     """
     Proactive monitoring system for multi-space activities
     Implements PRD Phase 3 requirements
+
+    Capability-Namespace: space
+
+    Shares the namespace with the capture engine and the enhanced system, and
+    collides with neither: `start_monitoring` here watches for ACTIVITY, while
+    the engine's `start_monitoring_session` holds a CAPTURE open. Two different
+    sessions with two different releases, distinguishable by name, which is the
+    outcome namespacing is supposed to produce rather than the near-miss it
+    would be in a flat vocabulary.
     """
     
     def __init__(self, vision_intelligence=None):
@@ -126,7 +135,16 @@ class MultiSpaceMonitor:
         self.current_space_id = 1
         
     async def start_monitoring(self, callback: Optional[Callable] = None):
-        """Start the proactive monitoring system"""
+        """Start the proactive monitoring system
+
+        Capability: session-start, release=stop_monitoring
+
+        Spawns `_monitor_loop` as a task that runs until cancelled. Without a
+        lease, nothing in the process remembers that task exists once the caller
+        that started it is gone — it would keep polling the workspace forever,
+        cheaply enough that nobody would notice and indefinitely enough that it
+        would still be running tomorrow.
+        """
         if self.monitoring_active:
             logger.warning("Monitoring already active")
             return
@@ -137,7 +155,10 @@ class MultiSpaceMonitor:
         logger.info("Multi-space monitoring started")
         
     async def stop_monitoring(self):
-        """Stop the monitoring system"""
+        """Stop the monitoring system
+
+        Capability: session-end
+        """
         self.monitoring_active = False
         if self.monitor_task:
             self.monitor_task.cancel()
@@ -493,7 +514,10 @@ class MultiSpaceMonitor:
                 
     # Public API
     async def get_activity_summary(self) -> Dict[str, Any]:
-        """Get current activity summary"""
+        """Get current activity summary
+
+        Capability: read-only
+        """
         return {
             "global_activity_level": self.global_activity_level.value,
             "active_spaces": len(self.space_activities),
@@ -518,7 +542,10 @@ class MultiSpaceMonitor:
         }
         
     async def get_space_recommendations(self) -> List[Dict[str, Any]]:
-        """Get intelligent recommendations based on monitoring"""
+        """Get intelligent recommendations based on monitoring
+
+        Capability: read-only
+        """
         recommendations = []
         
         # Check for idle spaces
@@ -553,7 +580,10 @@ class MultiSpaceMonitor:
         return recommendations
         
     def get_pattern_insights(self) -> List[WorkflowPattern]:
-        """Get detected workflow patterns"""
+        """Get detected workflow patterns
+
+        Capability: read-only
+        """
         return list(self.detected_patterns.values())
 
 

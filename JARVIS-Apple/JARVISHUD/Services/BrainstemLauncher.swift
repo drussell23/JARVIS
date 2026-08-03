@@ -428,12 +428,65 @@ final class BrainstemLauncher {
                     continue
                 }
 
-                // Other events can be handled here in the future
                 print("[Brainstem] Received IPC event: \(eventType)")
+                dispatchInbound(eventType: eventType, json: json)
             } catch {
                 // Skip malformed lines silently
                 continue
             }
+        }
+    }
+
+    /// Route one inbound backend event to whoever handles it.
+    ///
+    /// The socket carried traffic in one direction for its whole life and this
+    /// was a `print` with a comment about the future. That is why the consent
+    /// gate was decorative: `SecureConsent` was complete and waiting for a
+    /// challenge, `main.py` was handling the verdict, and the question in
+    /// between was never delivered — so every gated capability on the backend
+    /// resolved to "no approval provider available" and the operator was never
+    /// asked anything.
+    ///
+    /// Unknown event types are IGNORED rather than treated as errors: the
+    /// backend ships independently of this app, and a HUD that logged a warning
+    /// for every event it had not learned about yet would be noisy about
+    /// nothing.
+    private func dispatchInbound(eventType: String, json: [String: Any]) {
+        let data = (json["data"] as? [String: Any]) ?? [:]
+
+        switch eventType {
+        case "consent_request":
+            // Fields are lifted to Strings HERE, before the hop. `[String: Any]`
+            // is not Sendable, so capturing `data` in a `@MainActor` Task is a
+            // Swift 6 concurrency error — and the fix is not to silence it. Only
+            // these four values are needed, all of them Strings, all Sendable.
+            let requestId = (data["request_id"] as? String) ?? ""
+            let nonce = (data["nonce"] as? String) ?? ""
+            let capability = (data["capability"] as? String) ?? "unknown"
+            let detail = (data["detail"] as? String) ?? ""
+
+            // `SecureConsent` is MainActor-isolated: LAContext must present its
+            // dialog from the main thread, and this handler runs on the
+            // connection's background queue.
+            Task { @MainActor in
+                // Parsing fails CLOSED on a malformed challenge — a request we
+                // cannot bind to a nonce is one we must not answer at all,
+                // because a verdict that cannot prove which question it answers
+                // is replayable by anything that can write to the socket.
+                guard let challenge = SecureConsent.Challenge([
+                    "request_id": requestId,
+                    "nonce": nonce,
+                    "capability": capability,
+                    "detail": detail,
+                ]) else {
+                    print("[Brainstem] consent_request rejected — malformed challenge")
+                    return
+                }
+                SecureConsent.shared.request(challenge)
+            }
+
+        default:
+            break
         }
     }
 

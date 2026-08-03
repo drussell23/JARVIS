@@ -350,6 +350,21 @@ class GhostHandsOrchestrator:
 
     Connects N-Optic Nerve (vision), Background Actuator (actions), and
     Narration Engine (voice) into a unified intelligent automation system.
+
+    Capability-Namespace: touch
+    Capability-Factory: get_instance
+
+    Shares the `touch` namespace with `SilentActuator`, and that sharing is the
+    reason `as=` exists. Both classes have `start` and `stop`; in a flat
+    vocabulary one would silently shadow the other and a model asking to "start"
+    would reach whichever sorted first. Both rename themselves AT THE
+    DECLARATION — `start_ghost_hands` here, `start_actuator` there — so twelve
+    existing call sites keep the method names they already use and the rename is
+    readable from the thing being renamed rather than from a table elsewhere.
+
+    `Capability-Factory: get_instance` because this is a `__new__`-based
+    singleton: constructing it a second time would hand back the same object
+    with `_initialized` reset, and the factory is the accessor that knows that.
     """
 
     _instance: Optional["GhostHandsOrchestrator"] = None
@@ -401,7 +416,16 @@ class GhostHandsOrchestrator:
         return cls(config)
 
     async def start(self) -> bool:
-        """Start the Ghost Hands system."""
+        """Start the Ghost Hands system.
+
+        Capability: session-start, release=stop_ghost_hands, as=start_ghost_hands
+
+        Brings up vision watchers, the actuator subprocess and the narration
+        engine, and leaves all three running. `release=` names the EXPORT
+        (`stop_ghost_hands`), not the method — the reaper calls capabilities, and
+        a release pointing at `stop` would resolve to whatever else in this
+        namespace is called that.
+        """
         if self._is_running:
             return True
 
@@ -444,7 +468,10 @@ class GhostHandsOrchestrator:
         return True
 
     async def stop(self) -> None:
-        """Stop the Ghost Hands system."""
+        """Stop the Ghost Hands system.
+
+        Capability: session-end, as=stop_ghost_hands
+        """
         logger.info("[GHOST-HANDS] Stopping Ghost Hands system...")
 
         self._shutdown_event.set()
@@ -711,7 +738,16 @@ class GhostHandsOrchestrator:
         task.state = GhostTaskState.WATCHING
 
     async def pause_task(self, name: str) -> bool:
-        """Pause a task (stops watching but keeps task defined)."""
+        """Pause a task (stops watching but keeps task defined).
+
+        Capability: notify_apply
+
+        Not a session-end: the task survives, so no lease is discharged. Pausing
+        a watcher only stops it acting, which is the safe direction.
+
+        Args:
+            name: The ghost task's name
+        """
         if name not in self._tasks:
             return False
 
@@ -729,7 +765,17 @@ class GhostHandsOrchestrator:
         return True
 
     async def resume_task(self, name: str) -> bool:
-        """Resume a paused task."""
+        """Resume a paused task.
+
+        Capability: approval_required
+
+        Asymmetric with `pause_task` on purpose. Pausing removes an autonomous
+        actor's ability to type into applications; resuming gives it back. The
+        tiers follow the CONSEQUENCE, not the symmetry of the method names.
+
+        Args:
+            name: The ghost task's name
+        """
         if name not in self._tasks:
             return False
 
@@ -742,7 +788,13 @@ class GhostHandsOrchestrator:
         return True
 
     async def cancel_task(self, name: str) -> bool:
-        """Cancel and remove a task."""
+        """Cancel and remove a task.
+
+        Capability: notify_apply
+
+        Args:
+            name: The ghost task's name
+        """
         if name not in self._tasks:
             return False
 
@@ -763,11 +815,20 @@ class GhostHandsOrchestrator:
                 await self._n_optic.stop_watching(window_id)
 
     def get_task(self, name: str) -> Optional[GhostTask]:
-        """Get a task by name."""
+        """Get a task by name.
+
+        Capability: read-only
+
+        Args:
+            name: The ghost task's name
+        """
         return self._tasks.get(name)
 
     def list_tasks(self) -> List[Dict[str, Any]]:
-        """List all tasks with their status."""
+        """List all tasks with their status.
+
+        Capability: read-only
+        """
         return [
             {
                 "name": task.name,
@@ -1072,6 +1133,22 @@ class GhostHandsOrchestrator:
         """
         Convenience method to quickly set up a watch-and-react task.
 
+        Capability: approval_required
+
+        The flagship ghost-touch verb, and the one that most deserves its tier.
+        It ARMS something: from here on, text appearing in another app causes
+        keystrokes to be typed into it, with no human in the loop at the moment
+        it fires. Approving this is approving every future firing of it, which
+        is a different question from approving one click — so it is asked once,
+        deliberately, rather than degraded to a notify because the call itself
+        returns quickly.
+
+        Deliberately not a session. The task it creates is durable state this
+        orchestrator already tracks and already exposes through `list_tasks` and
+        `cancel_task`; wrapping it in a lease would put a TTL on an automation
+        the operator asked to persist, and a reaper would cancel it at 3am for
+        no reason it could name.
+
         Args:
             app_name: Application to watch
             trigger_text: Text that triggers the reaction
@@ -1111,6 +1188,14 @@ class GhostHandsOrchestrator:
         """
         Set up automatic retry when a failure is detected.
 
+        Capability: approval_required
+
+        Strictly sharper than `watch_and_react`: the reaction is a SHELL
+        COMMAND, re-run automatically up to `max_retries` times with nobody
+        watching. Same tier because there is no sharper one short of BLOCKED,
+        and blocking a capability the operator explicitly asked for would be the
+        registry deciding rather than asking.
+
         Args:
             app_name: Application to watch (e.g., "Terminal")
             failure_text: Text indicating failure (e.g., "BUILD FAILED")
@@ -1142,6 +1227,13 @@ class GhostHandsOrchestrator:
         """
         Set up notification when a task completes.
 
+        Capability: notify_apply
+
+        The one watcher in this trio that only SPEAKS. It narrates and types
+        nothing, so it does not need the tier its two neighbours do — tiering it
+        the same out of family resemblance would train an operator to approve
+        watchers without reading which kind they are.
+
         Args:
             app_name: Application to watch
             completion_text: Text indicating completion
@@ -1164,7 +1256,10 @@ class GhostHandsOrchestrator:
     # =========================================================================
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get orchestrator statistics."""
+        """Get orchestrator statistics.
+
+        Capability: read-only
+        """
         component_status = {
             "n_optic": self._n_optic is not None,
             "actuator": self._actuator is not None,
@@ -1185,7 +1280,13 @@ class GhostHandsOrchestrator:
         }
 
     def get_execution_history(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get recent execution history."""
+        """Get recent execution history.
+
+        Capability: read-only
+
+        Args:
+            limit: How many recent executions to return
+        """
         return [
             {
                 "task_name": r.task_name,

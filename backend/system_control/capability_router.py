@@ -110,6 +110,10 @@ class RoutedCall:
     #: without telling the model why is a turn the model will simply repeat.
     context_note: str = ""
     detail: str = ""
+    #: Set when this call OPENED a session. Surfaced rather than kept internal
+    #: because a model that started a stream and was never told it holds
+    #: something open has no reason to ever stop it.
+    lease_id: str = ""
     schema_version: str = CAPABILITY_ROUTER_SCHEMA_VERSION
 
     @property
@@ -150,10 +154,21 @@ class CapabilityRouter:
     """Registry + gate + executor, with a suspension boundary. NEVER raises."""
 
     def __init__(self, *, registry: Any = None, provider: Any = None,
-                 target: Any = None) -> None:
+                 target: Any = None, federation: Any = None,
+                 leases: Any = None) -> None:
         self._registry = registry
         self._provider = provider
         self._target = target
+        self._federation = federation
+        self._leases = leases
+        # Distinct "we already tried and could not" flags rather than parking a
+        # False in the slot itself. Overloading the value would make `None` mean
+        # both "not looked up yet" and "unavailable", and every reader would
+        # have to know which — the same conflation `Readiness.UNHYDRATED` exists
+        # to prevent one layer up.
+        self._federation_tried = federation is not None
+        self._leases_tried = leases is not None
+        self._releaser_installed = False
         self._parked: Dict[str, _Suspended] = {}
         self._stats: Dict[str, int] = {
             "executed": 0, "suspended": 0, "denied": 0, "expired": 0,
@@ -169,6 +184,73 @@ class CapabilityRouter:
             )
             self._registry = get_capability_registry()
         return self._registry
+
+    def _fed(self) -> Any:
+        """The federated vocabulary. NEVER raises.
+
+        Separate from `_reg` rather than merged behind one resolver because the
+        two answer different questions. The registry describes ONE controller
+        and needs no hydration; the federation spans subsystems whose imports
+        measured 8.4 s, and a call that silently blocked on that inside `route`
+        would stall the IPC loop the HUD reads from. Keeping them distinct is
+        what makes `get()` honestly synchronous on both.
+        """
+        if self._federation is None and not self._federation_tried:
+            self._federation_tried = True
+            try:
+                from backend.system_control.capability_federation import (
+                    get_federation,
+                )
+                self._federation = get_federation()
+            except Exception:  # noqa: BLE001 — macOS capabilities still work
+                logger.debug("[CapabilityRouter] federation unavailable",
+                             exc_info=True)
+        return self._federation
+
+    def _book(self) -> Any:
+        """The lease book, with this router installed as its releaser.
+
+        Installed HERE rather than at import: the book is constructed before any
+        router exists, and a releaser bound at import time would capture whatever
+        singleton happened to exist first — which in tests is never the one under
+        test.
+        """
+        if self._leases is None and not self._leases_tried:
+            self._leases_tried = True
+            try:
+                from backend.system_control.capability_leases import (
+                    get_lease_book,
+                )
+                self._leases = get_lease_book()
+            except Exception:  # noqa: BLE001
+                logger.debug("[CapabilityRouter] lease book unavailable",
+                             exc_info=True)
+        book = self._leases
+        if book is not None and not self._releaser_installed:
+            try:
+                book.set_releaser(self._release)
+                self._releaser_installed = True
+            except Exception:  # noqa: BLE001
+                pass
+        return book
+
+    def _lookup(self, name: str) -> Any:
+        """The CapabilityDef for a name, local or federated. NEVER raises.
+
+        A dot decides. `lock_screen` is the derived macOS vocabulary;
+        `video.start_streaming` is a federated namespace. Trying both for every
+        name would let a federated capability shadow a controller method that
+        happened to share its bare name, which is exactly the ambiguity
+        namespacing was introduced to end.
+        """
+        try:
+            if "." in (name or ""):
+                fed = self._fed()
+                return fed.get(name) if fed is not None else None
+            reg = self._reg()
+            return reg.get(name) if reg is not None else None
+        except Exception:  # noqa: BLE001
+            return None
 
     def _instance(self) -> Any:
         """The controller INSTANCE — needed to execute, unlike describing.
@@ -198,28 +280,35 @@ class CapabilityRouter:
         try:
             if not router_enabled():
                 return await self._execute(name, args)
-            reg = self._reg()
-            cap = reg.get(name) if reg is not None else None
+            cap = self._lookup(name)
             if cap is None:
                 self._stats["unknown"] += 1
                 return RoutedCall(
                     outcome=Outcome.UNKNOWN_CAPABILITY.value, capability=name,
                     context_note=f"[SYSTEM: UNKNOWN_CAPABILITY {name}]",
-                    detail="not in the derived registry")
+                    detail=self._why_unknown(name))
             if not cap.iron_gate_required:
                 return await self._execute(name, args)
 
             # GATED. Request consent and RETURN — do not await the human.
-            rid = await self._request_consent(name, args, op_id=op_id)
+            #
+            # The nonce is minted BEFORE the request, not after. The signed HUD
+            # must ECHO this exact challenge, so it has to travel WITH the
+            # question; minting it afterwards meant the prompt went out with no
+            # nonce, `SecureConsent.Challenge` failed closed on the empty field,
+            # and the request vanished without the operator ever seeing it.
+            nonce = _mint_nonce()
+            rid = await self._request_consent(name, args, op_id=op_id,
+                                              nonce=nonce)
             if not rid:
-                # No provider wired. Fail CLOSED: a gated capability with no way
-                # to ask is not permission to proceed.
+                # No provider wired, or nothing connected to ask. Fail CLOSED: a
+                # gated capability with no way to ask is not permission to
+                # proceed.
                 self._stats["denied"] += 1
                 return RoutedCall(
                     outcome=Outcome.DENIED.value, capability=name,
                     context_note=DENIED_PAYLOAD,
                     detail="no approval provider available — failing closed")
-            nonce = _mint_nonce()
             self._parked[rid] = _Suspended(rid, name, args, nonce=nonce)
             self._stats["suspended"] += 1
             logger.info("[CapabilityRouter] '%s' SUSPENDED awaiting consent "
@@ -293,14 +382,15 @@ class CapabilityRouter:
     # -- internals -------------------------------------------------------
 
     async def _request_consent(self, name: str, args: Dict[str, Any], *,
-                               op_id: str) -> str:
+                               op_id: str, nonce: str = "") -> str:
         """Ask, and return the request id. NEVER waits. NEVER raises."""
         try:
             provider = self._provider
             if provider is None:
                 return ""
             ctx = _ConsentContext(op_id=op_id or f"cap:{name}",
-                                  capability=name, args=args)
+                                  capability=name, args=args, nonce=nonce,
+                                  session=self._session_kind(name))
             rid = await provider.request(ctx)
             return str(rid or "")
         except Exception:  # noqa: BLE001
@@ -308,22 +398,102 @@ class CapabilityRouter:
                          exc_info=True)
             return ""
 
+    def _session_kind(self, name: str) -> str:
+        """"start" if approving this opens something continuous. NEVER raises."""
+        try:
+            cap = self._lookup(name)
+            return "start" if getattr(cap, "starts_session", False) else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _why_unknown(self, name: str) -> str:
+        """Explain an unknown name. NEVER raises.
+
+        "Not in the derived registry" is true of a typo AND of a real capability
+        whose namespace has not finished importing — and a model told the same
+        sentence for both will abandon a tool that would have worked in another
+        second. UNHYDRATED and ABSENT are different facts, so they get different
+        words, the same distinction `Readiness` refuses to collapse.
+        """
+        try:
+            if "." not in (name or ""):
+                return "not in the derived registry"
+            fed = self._fed()
+            if fed is None:
+                return "federation unavailable; namespaced capabilities are off"
+            from backend.system_control.capability_federation import (
+                Readiness, split,
+            )
+            ns, _ = split(name)
+            if ns not in fed.namespaces():
+                return (f"no namespace '{ns}' — known: "
+                        f"{', '.join(fed.namespaces()) or 'none'}")
+            st = fed.stats().get("namespaces", {}).get(ns, {})
+            readiness = st.get("readiness")
+            if readiness == Readiness.UNHYDRATED.value:
+                return (f"namespace '{ns}' has not hydrated yet — retry, or "
+                        f"call warm() at boot")
+            if readiness == Readiness.DEGRADED.value:
+                return (f"namespace '{ns}' is DEGRADED: "
+                        f"{str(st.get('detail') or 'no detail')[:160]}")
+            return f"namespace '{ns}' is ready but exports no '{name}'"
+        except Exception:  # noqa: BLE001
+            return "not in the derived registry"
+
+    def _resolve_call(self, name: str) -> Any:
+        """(callable, capability_def) for a name. (None, def) if uncallable.
+
+        The one place a federated EXPORT name becomes a METHOD. `stop_actuator`
+        is exported under an alias and implemented as `stop`; invoking the
+        export name on the instance would raise `AttributeError` — the collision
+        fix breaking the very calls it was added to make possible.
+        """
+        cap = self._lookup(name)
+        if "." not in (name or ""):
+            return (getattr(self._instance(), name, None), cap)
+        fed = self._fed()
+        if fed is None:
+            return (None, cap)
+        target = fed.resolve_target(name)
+        if target is None:
+            return (None, cap)
+        return (getattr(target, fed.method_for(name) or "", None), cap)
+
     async def _execute(self, name: str, args: Dict[str, Any]) -> RoutedCall:
-        """Invoke the capability. NEVER raises."""
+        """Invoke the capability, and book its session if it opened one.
+
+        NEVER raises. This is the ONE seam both entry paths funnel through —
+        an ungated direct call and a post-consent `resume` — which is why the
+        lease bookkeeping lives here and not in `route`. Putting it in `route`
+        would have left every approved session unbooked, and an approved session
+        is precisely the long-running one.
+        """
         try:
             import inspect
-            fn = getattr(self._instance(), name, None)
+            fn, cap = self._resolve_call(name)
             if not callable(fn):
                 self._stats["unknown"] += 1
                 return RoutedCall(
                     outcome=Outcome.UNKNOWN_CAPABILITY.value, capability=name,
-                    context_note=f"[SYSTEM: UNKNOWN_CAPABILITY {name}]")
+                    context_note=f"[SYSTEM: UNKNOWN_CAPABILITY {name}]",
+                    detail=self._unbuildable_detail(name))
             result = fn(**args)
             if inspect.isawaitable(result):
                 result = await result
             self._stats["executed"] += 1
-            return RoutedCall(outcome=Outcome.EXECUTED.value, capability=name,
-                              result=result, context_note=str(result)[:2000])
+            out = RoutedCall(outcome=Outcome.EXECUTED.value, capability=name,
+                             result=result, context_note=str(result)[:2000])
+            self._book_session(name, args, cap, result, out)
+            return out
+        except TypeError as exc:
+            # Separated from the general case because it is almost always the
+            # model inventing an argument, and a note that says so is worth more
+            # to the next turn than a bare type name.
+            self._stats["failed"] += 1
+            return RoutedCall(
+                outcome=Outcome.FAILED.value, capability=name,
+                context_note=f"[SYSTEM: TOOL_FAILED {name}: bad arguments]",
+                detail=f"{exc} — check the tool's declared parameters")
         except Exception as exc:  # noqa: BLE001
             self._stats["failed"] += 1
             logger.debug("[CapabilityRouter] execute(%s) failed", name,
@@ -333,6 +503,88 @@ class CapabilityRouter:
                 context_note=f"[SYSTEM: TOOL_FAILED {name}: "
                              f"{type(exc).__name__}]",
                 detail=f"{type(exc).__name__}: {exc}")
+
+    def _unbuildable_detail(self, name: str) -> str:
+        """Why a KNOWN federated capability had no instance. NEVER raises."""
+        try:
+            fed = self._fed()
+            if fed is None or "." not in name:
+                return "capability is not callable on its target"
+            from backend.system_control.capability_federation import split
+            ns, _ = split(name)
+            for key, why in fed.unbuildable().items():
+                if any(s.key == key for s in fed.providers(ns)):
+                    return f"provider {key} could not be constructed: {why}"
+            return "capability is not callable on its target"
+        except Exception:  # noqa: BLE001
+            return "capability is not callable on its target"
+
+    def _book_session(self, name: str, args: Dict[str, Any], cap: Any,
+                      result: Any, out: RoutedCall) -> None:
+        """Open or discharge a lease for a call that just succeeded. NEVER raises.
+
+        A START that RETURNED FALSE opened nothing, and booking it would have
+        the reaper later call `stop_streaming` on a stream that never started —
+        harmless here, but it is the shape of bug that makes a lease book stop
+        being believed.
+        """
+        try:
+            if cap is None:
+                return
+            book = self._book()
+            if book is None:
+                return
+            from backend.system_control.capability_leases import (
+                current_principal,
+            )
+            if getattr(cap, "starts_session", False):
+                if result is False:
+                    logger.info("[CapabilityRouter] '%s' reported failure — "
+                                "no lease opened", name)
+                    return
+                lease = book.open(
+                    name, _qualify(name, cap.release),
+                    owner=current_principal(), args=dict(args or {}))
+                if lease is not None:
+                    out.lease_id = lease.lease_id
+                    out.context_note = (
+                        f"{out.context_note}\n[SYSTEM: SESSION OPEN — '{name}' "
+                        f"is now running continuously. Call "
+                        f"'{_qualify(name, cap.release)}' to stop it.]")[:2400]
+            elif getattr(cap, "ends_session", False):
+                # The release already ran; this only records it. See
+                # `LeaseBook.discharge` on why this must not call anything.
+                book.discharge(name, owner=current_principal())
+        except Exception:  # noqa: BLE001
+            logger.debug("[CapabilityRouter] session bookkeeping degraded",
+                         exc_info=True)
+
+    async def _release(self, name: str, args: Dict[str, Any]) -> bool:
+        """Stop a session on the reaper's behalf. NEVER raises.
+
+        Goes through `route`, not around it. An END is forced SAFE_AUTO at
+        classification time, so this executes without consent by the RULE rather
+        than by a bypass — and if that rule is ever violated the call SUSPENDS,
+        which is reported here as a failure the operator can see instead of a
+        silent success the book would believe.
+        """
+        try:
+            from backend.system_control.capability_leases import (
+                REAPER_PRINCIPAL, set_principal,
+            )
+            set_principal(REAPER_PRINCIPAL)
+            routed = await self.route(name, args)
+            if routed.outcome != Outcome.EXECUTED.value:
+                logger.error("[CapabilityRouter] release '%s' did not execute "
+                             "(%s: %s) — the session is still open", name,
+                             routed.outcome, routed.detail or "-")
+                return False
+            # A stop method returning None is the normal Python spelling of
+            # "done". Only an explicit False is a refusal.
+            return routed.result is not False
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[CapabilityRouter] release '%s' raised: %s", name, exc)
+            return False
 
     # -- observability ---------------------------------------------------
 
@@ -344,9 +596,24 @@ class CapabilityRouter:
             return {}
 
     def stats(self) -> Dict[str, Any]:
-        return {"schema_version": CAPABILITY_ROUTER_SCHEMA_VERSION,
-                "enabled": router_enabled(), "pending": len(self._parked),
-                **self._stats}
+        out: Dict[str, Any] = {
+            "schema_version": CAPABILITY_ROUTER_SCHEMA_VERSION,
+            "enabled": router_enabled(), "pending": len(self._parked),
+            **self._stats,
+        }
+        # Folded in rather than left to a second endpoint: "what is running"
+        # and "what did the router do" are one question when the answer is a
+        # session somebody has to go and stop.
+        try:
+            book = self._leases
+            if book is not None:
+                ls = book.stats()
+                out["sessions_active"] = ls.get("active", 0)
+                out["sessions_orphaned"] = ls.get("orphaned", 0)
+                out["sessions"] = ls.get("capabilities", [])
+        except Exception:  # noqa: BLE001
+            pass
+        return out
 
 
 @dataclass
@@ -356,10 +623,41 @@ class _ConsentContext:
     op_id: str
     capability: str
     args: Dict[str, Any] = field(default_factory=dict)
+    #: The one-time challenge the verdict must echo. Carried WITH the question
+    #: because a challenge that arrives after the prompt is not a challenge.
+    nonce: str = ""
+    #: "start" when approving this opens something that keeps running.
+    session: str = ""
 
     @property
     def description(self) -> str:
-        return f"Run macOS capability '{self.capability}' with {self.args or '{}'}"
+        """What the operator is actually being asked. This becomes the text of
+        the Touch ID dialog, so it says what will happen rather than naming a
+        method — and it says out loud when a session is about to be opened,
+        because approving a continuous observer is a different decision from
+        approving one action that ends when it returns.
+        """
+        detail = f"Run '{self.capability}'"
+        if self.args:
+            detail += f" with {self.args}"
+        if self.session == "start":
+            detail += " — this will KEEP RUNNING until it is stopped"
+        return detail
+
+
+def _qualify(start_name: str, release: str) -> str:
+    """Put a release in the same namespace as the start that named it.
+
+    A tag says ``release=stop_streaming`` because that is what the author of
+    `video.start_streaming` calls it. The reaper routes by FULL name, so an
+    unqualified release would be looked up as a bare macOS capability, miss, and
+    leave the session open — a leak whose only symptom is an
+    `UNKNOWN_CAPABILITY` line in a log nobody is reading at the time.
+    """
+    if not release or "." in release:
+        return release
+    ns, _, bare = (start_name or "").partition(".")
+    return f"{ns}.{release}" if bare else release
 
 
 def _mint_nonce() -> str:
