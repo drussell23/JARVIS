@@ -16,7 +16,7 @@ import pytest
 from backend.hud.tool_use_orchestrator import CommandResult
 from backend.hud.voice_command_router import (
     VoiceCommandRouter, _humanise, _make_failure_speakable,
-    _read_controller_result, reset_spoken,
+    _read_controller_result, is_own_echo, note_spoken, reset_spoken,
 )
 
 
@@ -306,3 +306,26 @@ async def test_the_slot_is_released_so_a_capability_still_works_after(monkeypatc
     await r.route("lock my screen")
     await r.route("lock my screen")
     assert calls == ["lock_screen", "lock_screen"], "the slot leaked"
+
+
+def test_the_echo_window_outlives_the_recognisers_silence_timeout():
+    """Live 2026-08-03: JARVIS said "...See you soon." at 08:47:47 and the mic
+    delivered "See you soon" as a COMMAND at 08:47:56. The old 1.5s grace
+    closed the window 2.17s early.
+
+    `WakeWordListener.commandSilenceTimeout` is 2.5s — a transcript CANNOT
+    arrive sooner than 2.5s after the audio stops, by design."""
+    from backend.hud.speech_bridge import estimate_speech_ms
+    from backend.hud.voice_command_router import echo_grace_s
+
+    spoken = "🔒 Locking the screen now, Derek. See you soon."
+    window = estimate_speech_ms(spoken) / 1000.0 + echo_grace_s()
+    assert window >= 9.0, f"window {window:.2f}s still misses the measured echo"
+    assert echo_grace_s() > 2.5, "must outlast the recogniser's silence timeout"
+
+
+def test_that_exact_echo_is_now_suppressed():
+    reset_spoken()
+    note_spoken("🔒 Locking the screen now, Derek. See you soon.")
+    assert is_own_echo("See you soon")
+    assert not is_own_echo("unlock my screen")

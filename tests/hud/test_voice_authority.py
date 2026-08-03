@@ -136,16 +136,26 @@ async def test_an_unloaded_service_says_not_ready_not_not_enrolled():
 
 @pytest.mark.asyncio
 async def test_a_loaded_service_with_no_profile_is_a_fact():
-    r = await VoiceIdentity(service=_Service({})).identify(b"RIFFxxxx")
+    vi = VoiceIdentity(service=_Service({}))
+    vi._enrolled_cache = ""               # the store answered, and found none
+    r = await vi.identify(b"RIFFxxxx")
     assert r.verdict == Verdict.NOT_ENROLLED.value
 
 
 def test_unknown_enrollment_is_none_not_empty():
     """None and "" are different claims: 'nothing has looked' vs 'it looked and
-    found nobody'."""
+    found nobody'.
+
+    A service with an EMPTY profiles dict is ALSO None — it has not looked
+    either; its load failed. Only a populated dict, or a completed database
+    lookup, is a statement about the world."""
     assert VoiceIdentity().enrolled_speaker() is None
-    assert VoiceIdentity(service=_Service({})).enrolled_speaker() == ""
+    assert VoiceIdentity(service=_Service({})).enrolled_speaker() is None
     assert VoiceIdentity(service=_Service({"Derek": {}})).enrolled_speaker() == "Derek"
+
+    settled = VoiceIdentity(service=_Service({}))
+    settled._enrolled_cache = ""          # the store answered: genuinely nobody
+    assert settled.enrolled_speaker() == ""
 
 
 @pytest.mark.asyncio
@@ -217,7 +227,9 @@ async def test_the_router_reads_the_verdict_without_a_translation_table():
 
 @pytest.mark.asyncio
 async def test_the_operator_hears_a_sentence_not_a_state_name():
-    r = await VoiceIdentity(service=_Service({})).identify(b"RIFFxxxx")
+    vi = VoiceIdentity(service=_Service({}))
+    vi._enrolled_cache = ""               # the store answered: nobody enrolled
+    r = await vi.identify(b"RIFFxxxx")
     spoken = _verdict_reason(r)
     assert "voiceprint" in spoken.lower()
     assert "not_enrolled" not in spoken
@@ -263,3 +275,43 @@ async def test_a_reachable_store_with_no_profile_still_says_not_enrolled():
     vi._enrolled_cache = ""
     r = await vi.identify(b"RIFFxxxx")
     assert r.verdict == Verdict.NOT_ENROLLED.value
+
+
+def test_an_empty_profile_dict_is_not_a_statement_that_nobody_is_enrolled():
+    """Live 2026-08-03 08:47. `EcapaFacade error ... falling back to local
+    engine` + `CloudSQL init timed out after 10.0s` left a LIVE service whose
+    `speaker_profiles` was `{}` — and this reported "I don't have a voiceprint
+    for you on this Mac yet" while "Derek J. Russell / 272 samples" sat in the
+    local SQLite one query away.
+
+    Third instance of one defect: an empty container produced by a FAILED
+    load, read as a positive statement of absence.
+    """
+    class FailedLoad:
+        speaker_profiles = {}
+        async def verify_speaker(self, a, n=None):
+            return {"verified": True, "confidence": 0.9}
+
+    vi = VoiceIdentity(service=FailedLoad())
+    assert vi.enrolled_speaker() is None, "empty != nobody"
+
+    class Loaded:
+        speaker_profiles = {"Derek J. Russell": {}}
+        async def verify_speaker(self, a, n=None):
+            return {"verified": True, "confidence": 0.9}
+
+    assert VoiceIdentity(service=Loaded()).enrolled_speaker() == "Derek J. Russell"
+
+
+@pytest.mark.asyncio
+async def test_an_unloaded_service_says_not_ready_so_a_retry_can_succeed():
+    """NOT_ENROLLED is terminal advice ("go enroll"); NOT_READY invites the
+    retry that actually works once the database answers."""
+    class FailedLoad:
+        speaker_profiles = {}
+        async def verify_speaker(self, a, n=None):
+            return {"verified": True, "confidence": 0.9}
+
+    r = await VoiceIdentity(service=FailedLoad()).identify(b"RIFFxxxx")
+    assert r.verdict == Verdict.NOT_READY.value
+    assert "UNKNOWN" in r.detail
