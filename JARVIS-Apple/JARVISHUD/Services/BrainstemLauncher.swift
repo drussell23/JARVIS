@@ -29,6 +29,13 @@ final class BrainstemLauncher {
     var onReady: (() -> Void)?
     private let ipcQueue = DispatchQueue(label: "com.jarvis.brainstem.ipc", qos: .userInitiated)
 
+    /// IPC reconnect delay: 1s → 2s → 4s → 8s, reset on a successful connect.
+    /// A fixed 1s retry against a backend that takes minutes to boot is log
+    /// spam and socket churn for no information gain. `nonisolated(unsafe)`
+    /// because the NWConnection state handler runs off-actor; the race is a
+    /// benign double-read of a Double.
+    nonisolated(unsafe) private var reconnectDelay: Double = 1.0
+
     /// The repo root, derived from the known brainstem .env path.
     /// Every Python on this machine that might run the brainstem, best first.
     ///
@@ -478,6 +485,7 @@ final class BrainstemLauncher {
             guard let self = self else { return }
             switch state {
             case .ready:
+                self.reconnectDelay = 1.0
                 print("[Brainstem] IPC connected to localhost:\(self.ipcPort)")
                 Task { @MainActor in
                     self.connection = conn
@@ -510,7 +518,9 @@ final class BrainstemLauncher {
                     SpeechGate.shared.release(.backend, reason: "IPC connection lost")
                 }
                 conn.cancel()
-                self.ipcQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                let delay = self.reconnectDelay
+                self.reconnectDelay = min(delay * 2.0, 8.0)
+                self.ipcQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
                     Task { @MainActor in
                         self?.connectToBrainstem(retriesLeft: retriesLeft - 1)
                     }
@@ -520,7 +530,9 @@ final class BrainstemLauncher {
                 // during brainstem boot. Cancel and retry after a delay.
                 print("[Brainstem] IPC connection waiting: \(error) — retries left: \(retriesLeft - 1)")
                 conn.cancel()
-                self.ipcQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                let delay = self.reconnectDelay
+                self.reconnectDelay = min(delay * 2.0, 8.0)
+                self.ipcQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
                     Task { @MainActor in
                         self?.connectToBrainstem(retriesLeft: retriesLeft - 1)
                     }

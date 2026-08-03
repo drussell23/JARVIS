@@ -692,6 +692,9 @@ final class VoiceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegat
     override init() {
         super.init()
         synthesizer.delegate = self
+        SpeechGate.shared.registerReconciler(.voiceManager) { [weak self] in
+            self?.synthesizer.isSpeaking ?? false
+        }
     }
 
     func speak(_ text: String, priority: SpeechPriority = .normal) {
