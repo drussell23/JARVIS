@@ -60,7 +60,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 logger = logging.getLogger("JARVIS.CapabilityRegistry")
 
@@ -120,6 +120,32 @@ _JSON_TYPES: Dict[Any, str] = {
 }
 
 
+class Session(str, enum.Enum):
+    """A capability that OUTLIVES its own call.
+
+    `lock_screen` finishes when it returns. `start_streaming` returns
+    immediately and then holds the display capture open forever. The registry
+    had no word for the difference, and without one every long-running claim
+    looks like a completed action — which is how a video stream survives the
+    HUD that asked for it.
+
+    Two forced rules make the lease design safe, and both are stated here
+    because they are load-bearing rather than stylistic:
+
+    * **START is never SAFE_AUTO**, even tagged read-only. One screenshot and a
+      permanent screen recording differ in KIND, not degree; duration is itself
+      the risk. A continuous observer gets asked for, every time.
+    * **END is always SAFE_AUTO.** If stopping needed consent, a leaked session
+      could not be reaped without a human — and the reaper runs precisely when
+      no human is there. A gate on the release path is a deadlock wearing the
+      costume of caution.
+    """
+
+    NONE = ""
+    START = "start"
+    END = "end"
+
+
 class Effect(str, enum.Enum):
     """PURE observes; EFFECTFUL changes the world.
 
@@ -155,7 +181,10 @@ def os_capability(effect: "Effect", *, description: str = "") -> Callable:
 def capability(*, mutates: Optional[bool] = None,
                reads_only: Optional[bool] = None,
                tier: Optional[str] = None,
-               description: str = "") -> Callable:
+               description: str = "",
+               session: str = Session.NONE.value,
+               release: str = "",
+               alias: str = "") -> Callable:
     """Declare a method's risk where the method is written. NEVER raises.
 
     A decorator rather than a central table for the reason `repl_dispatch_
@@ -174,6 +203,9 @@ def capability(*, mutates: Optional[bool] = None,
                 "tier": resolved or _DEFAULT_TIER.value,
                 "declared": True,
                 "description": description,
+                "session": session,
+                "release": release,
+                "alias": alias,
             })
         except Exception:  # noqa: BLE001 — a decorator never breaks an import
             pass
@@ -191,7 +223,32 @@ class CapabilityDef:
     tier: str = _DEFAULT_TIER.value
     provenance: str = Provenance.DEFAULTED.value
     is_async: bool = True
+    #: "" | "start" | "end" — see :class:`Session`.
+    session: str = Session.NONE.value
+    #: For a START, the capability that releases it. The lease reaper calls
+    #: THIS, so a start whose release is unnamed cannot be cleaned up — which
+    #: `Session.START` refuses to be, at hydrate time rather than at 3am.
+    release: str = ""
+    #: The name this capability is EXPORTED as, when its method name would
+    #: collide with another provider's in the same namespace. Declared at the
+    #: method (``as=stop_actuator``) rather than in a table elsewhere, so the
+    #: method keeps the name its existing callers already use and the rename is
+    #: readable from the thing being renamed.
+    alias: str = ""
     schema_version: str = CAPABILITY_REGISTRY_SCHEMA_VERSION
+
+    @property
+    def export_name(self) -> str:
+        """What a federated vocabulary should call this. NEVER raises."""
+        return self.alias or self.name
+
+    @property
+    def starts_session(self) -> bool:
+        return self.session == Session.START.value
+
+    @property
+    def ends_session(self) -> bool:
+        return self.session == Session.END.value
 
     @property
     def iron_gate_required(self) -> bool:
@@ -230,16 +287,35 @@ def _json_type(annotation: Any) -> str:
 
 
 def _arg_descriptions(doc: str) -> Dict[str, str]:
-    """Parameter descriptions from a Google-style ``Args:`` block. NEVER raises."""
+    """Parameter descriptions from a Google-style ``Args:`` block. NEVER raises.
+
+    Continuation lines are JOINED onto the parameter they belong to. Google
+    style wraps a long description across lines, and matching only the first one
+    cut every wrapped description at the wrap — the model was being handed
+    "What to find out across the desktop spaces, in plain", which reads as a
+    sentence that simply stops. Silent truncation of the text whose entire job
+    is to tell a model what to put in a field.
+    """
     out: Dict[str, str] = {}
     try:
         m = _ARGS_BLOCK.search(doc or "")
         if not m:
             return out
+        current = ""
         for line in (m.group("body") or "").splitlines():
             am = _ARG_LINE.match(line)
             if am:
-                out[am.group("name").lstrip("*")] = am.group("desc").strip()
+                current = am.group("name").lstrip("*")
+                out[current] = am.group("desc").strip()
+                continue
+            # An indented line that is not a new parameter continues the last
+            # one. A blank line ends the run, so a stray paragraph after the
+            # block cannot graft itself onto the final argument.
+            text = line.strip()
+            if current and text and line[:1].isspace():
+                out[current] = f"{out[current]} {text}".strip()
+            elif not text:
+                current = ""
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -257,8 +333,72 @@ def _summary(doc: str, fallback: str) -> str:
     return fallback
 
 
-def _classify(fn: Any, doc: str) -> Tuple[str, str]:
-    """(tier, provenance) for one method. NEVER raises.
+class _Classification(NamedTuple):
+    tier: str
+    provenance: str
+    session: str = Session.NONE.value
+    release: str = ""
+    alias: str = ""
+
+
+def _apply_session_rules(c: _Classification) -> _Classification:
+    """The two rules from :class:`Session`, enforced in ONE place. NEVER raises.
+
+    Written here rather than at each tag site so a future capability cannot opt
+    out of them by being declared somewhere new.
+    """
+    if c.session == Session.START.value:
+        # Duration is the risk. A read-only tag describes the ACTION; it says
+        # nothing about holding that action open indefinitely.
+        if c.tier == Tier.SAFE_AUTO.value:
+            return c._replace(tier=_DEFAULT_TIER.value)
+    elif c.session == Session.END.value:
+        # The reaper runs when nobody is watching. It must never need consent.
+        return c._replace(tier=Tier.SAFE_AUTO.value)
+    return c
+
+
+def _parse_tag(body: str) -> _Classification:
+    """Read one ``Capability:`` tag body. NEVER raises.
+
+    Grammar is comma-separated attributes so one line carries every fact:
+
+        Capability: read-only
+        Capability: session-start, release=stop_streaming
+        Capability: session-end, as=stop_actuator
+
+    Attributes are parsed HERE and only here. The federation used to re-read the
+    same docstring with its own regex to find ``as=``, which is two parsers for
+    one grammar — the arrangement that guarantees they eventually disagree about
+    the same line.
+    """
+    parts = [p.strip() for p in (body or "").lower().split(",") if p.strip()]
+    joined = " ".join(parts)
+    session, release, alias = Session.NONE.value, "", ""
+    for p in parts:
+        if p.startswith("release="):
+            release = p.split("=", 1)[1].strip()
+        elif p.startswith("as=") or p.startswith("alias="):
+            alias = p.split("=", 1)[1].strip()
+        elif p in ("session-start", "session_start"):
+            session = Session.START.value
+        elif p in ("session-end", "session_end"):
+            session = Session.END.value
+
+    tier = _DEFAULT_TIER.value
+    if any(k in joined for k in ("read-only", "read only", "readonly")):
+        tier = Tier.SAFE_AUTO.value
+    else:
+        for t in Tier:
+            if t.value in joined.replace("-", "_"):
+                tier = t.value
+                break
+    return _apply_session_rules(
+        _Classification(tier, Provenance.TAGGED.value, session, release, alias))
+
+
+def _classify(fn: Any, doc: str) -> _Classification:
+    """Tier, provenance and session shape for one method. NEVER raises.
 
     Order matters: an explicit decorator beats a docstring tag, and both beat
     the default — but the DEFAULT IS NOT SAFE. A capability nobody has looked
@@ -268,27 +408,25 @@ def _classify(fn: Any, doc: str) -> Tuple[str, str]:
     try:
         declared = getattr(fn, "__capability__", None)
         if isinstance(declared, dict) and declared.get("declared"):
-            return (str(declared.get("tier") or _DEFAULT_TIER.value),
-                    Provenance.DECLARED.value)
+            return _apply_session_rules(_Classification(
+                str(declared.get("tier") or _DEFAULT_TIER.value),
+                Provenance.DECLARED.value,
+                str(declared.get("session") or Session.NONE.value),
+                str(declared.get("release") or ""),
+                str(declared.get("alias") or "")))
         tag = _DOC_TAG.search(doc or "")
         if tag:
-            body = (tag.group("body") or "").strip().lower()
-            if "read-only" in body or "read only" in body or "readonly" in body:
-                return (Tier.SAFE_AUTO.value, Provenance.TAGGED.value)
-            for t in Tier:
-                if t.value in body.replace("-", "_"):
-                    return (t.value, Provenance.TAGGED.value)
-            return (_DEFAULT_TIER.value, Provenance.TAGGED.value)
+            return _parse_tag(tag.group("body") or "")
     except Exception:  # noqa: BLE001
         pass
-    return (_DEFAULT_TIER.value, Provenance.DEFAULTED.value)
+    return _Classification(_DEFAULT_TIER.value, Provenance.DEFAULTED.value)
 
 
 def describe(name: str, fn: Any) -> Optional[CapabilityDef]:
     """Turn one bound method into a CapabilityDef. None if unusable. NEVER raises."""
     try:
         doc = inspect.getdoc(fn) or ""
-        tier, prov = _classify(fn, doc)
+        cls = _classify(fn, doc)
         params: Dict[str, Dict[str, str]] = {}
         try:
             sig = inspect.signature(fn)
@@ -318,9 +456,12 @@ def describe(name: str, fn: Any) -> Optional[CapabilityDef]:
             description=(declared.get("description")
                          or _summary(doc, f"Invoke {name} on macOS.")),
             parameters=params,
-            tier=tier,
-            provenance=prov,
+            tier=cls.tier,
+            provenance=cls.provenance,
             is_async=inspect.iscoroutinefunction(fn),
+            session=cls.session,
+            release=cls.release,
+            alias=cls.alias,
         )
     except Exception:  # noqa: BLE001
         logger.debug("[CapabilityRegistry] describe(%s) degraded", name,
@@ -331,10 +472,26 @@ def describe(name: str, fn: Any) -> Optional[CapabilityDef]:
 class CapabilityRegistry:
     """Every public capability of a controller, derived. NEVER raises."""
 
-    def __init__(self, target: Any = None) -> None:
+    def __init__(self, target: Any = None, *,
+                 require_declaration: bool = False) -> None:
         self._target = target
         self._defs: Dict[str, CapabilityDef] = {}
         self._hydrated = False
+        #: Export ONLY what has been classified.
+        #:
+        #: `MacOSController` is a capability façade — every public method IS a
+        #: capability, so collecting them all is right there. A federated
+        #: subsystem is not: measured on the real classes, `public and callable`
+        #: also yields `get_instance`, `cleanup` and `register_callback` —
+        #: lifecycle plumbing that a language model can only waste a turn on.
+        #:
+        #: The fix is not a list of exclusions (that is the hand-kept table this
+        #: module exists to delete). It is the same inversion applied one level
+        #: up: a method joins the surface by SAYING SO. Silence stops meaning
+        #: "gated" and starts meaning "not offered" — strictly safer, and it
+        #: makes `unclassified()` the honest measure of remaining work rather
+        #: than a number inflated by plumbing nobody will ever declare.
+        self._require_declaration = bool(require_declaration)
 
     def hydrate(self) -> "CapabilityRegistry":
         """Introspect the target. Idempotent. NEVER raises."""
@@ -350,8 +507,11 @@ class CapabilityRegistry:
                 if name.startswith("_"):
                     continue            # private is not a capability
                 d = describe(name, member)
-                if d is not None:
-                    self._defs[name] = d
+                if d is None:
+                    continue
+                if self._require_declaration and not d.classified:
+                    continue
+                self._defs[name] = d
         except Exception:  # noqa: BLE001
             logger.debug("[CapabilityRegistry] hydrate degraded", exc_info=True)
         return self
@@ -392,6 +552,23 @@ class CapabilityRegistry:
         self._ensure()
         return sorted(n for n, d in self._defs.items() if not d.classified)
 
+    def sessions(self) -> List[CapabilityDef]:
+        """Capabilities that outlive their own call. NEVER raises."""
+        self._ensure()
+        return [self._defs[n] for n in sorted(self._defs)
+                if self._defs[n].starts_session]
+
+    def unreleasable(self) -> List[str]:
+        """Session starts whose release nobody named. NEVER raises.
+
+        A leak that is CURRENTLY invisible: the stream runs, the lease expires,
+        and the reaper has nothing to call. Surfacing it as a number means the
+        defect is found at hydrate time by a test, not at 3am by a fan.
+        """
+        self._ensure()
+        return sorted(n for n, d in self._defs.items()
+                      if d.starts_session and not d.release)
+
     def stats(self) -> Dict[str, Any]:
         self._ensure()
         gated = [d for d in self._defs.values() if d.iron_gate_required]
@@ -402,6 +579,8 @@ class CapabilityRegistry:
             "iron_gate_required": len(gated),
             "safe_auto": len(self._defs) - len(gated),
             "unclassified": len(self.unclassified()),
+            "sessions": len(self.sessions()),
+            "unreleasable": len(self.unreleasable()),
             # An empty registry MUST explain itself. Zero capabilities and
             # "the controller would not import" are different facts, and a
             # consumer that cannot tell them apart shows an operator a Mac

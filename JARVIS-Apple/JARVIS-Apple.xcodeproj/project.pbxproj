@@ -24,6 +24,7 @@
 		95909137A4CE7F24654D6776 /* JARVISKit in Frameworks */ = {isa = PBXBuildFile; productRef = 31F47BC187C21A0EAA566686 /* JARVISKit */; };
 		9675A57D67D07E9D157B8468 /* JARVISPhoneApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 698E4531C1F4FD5A0215C9B1 /* JARVISPhoneApp.swift */; };
 		993234F1A4D7A1BCA27374BB /* BrainstemLauncher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6A777442955E499D4E22D3B /* BrainstemLauncher.swift */; };
+		5EC04E11A2B3C4D5E6F70002 /* SecureConsent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EC04E11A2B3C4D5E6F70001 /* SecureConsent.swift */; };
 		99C3D3109F5801D5ED6F638A /* HapticEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 266CC1C8FBBB302AD623A3D9 /* HapticEngine.swift */; };
 		9FC588C57049591237CF032F /* HUDView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A0A5C4460F31FD5CB53DD10 /* HUDView.swift */; };
 		A0BD7790CE0BF3EDAC6D6372 /* ArcReactorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26744ECD2240E57AF517188D /* ArcReactorView.swift */; };
@@ -60,6 +61,7 @@
 		853E0D7E9218220610520FB8 /* StatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusView.swift; sourceTree = "<group>"; };
 		899F7DC5BF2FA227AA8CEA81 /* LivingBorderWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LivingBorderWindow.swift; sourceTree = "<group>"; };
 		A6A777442955E499D4E22D3B /* BrainstemLauncher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrainstemLauncher.swift; sourceTree = "<group>"; };
+		5EC04E11A2B3C4D5E6F70001 /* SecureConsent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureConsent.swift; sourceTree = "<group>"; };
 		AF2D1789D766C67E4B4A3D2A /* JARVISHUD.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JARVISHUD.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B91850E89902256710524BEA /* LoadingHUDView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadingHUDView.swift; sourceTree = "<group>"; };
 		BD8C21EBA8B80C1A39D30C8A /* JARVISPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISPanel.swift; sourceTree = "<group>"; };
@@ -166,6 +168,7 @@
 				4784C00A28BAB42B47C1A4F1 /* AppState.swift */,
 				A6A777442955E499D4E22D3B /* BrainstemLauncher.swift */,
 				7F97771D9894460348ABB0ED /* ScreenCaptureService.swift */,
+				5EC04E11A2B3C4D5E6F70001 /* SecureConsent.swift */,
 				62C68475EAAD735E3FB66AAE /* WakeWordListener.swift */,
 			);
 			path = Services;
@@ -414,6 +417,7 @@
 				FBBDB0313A52CEA7D67AFF62 /* LivingBorderWindow.swift in Sources */,
 				F2372C4356B52F4C5EE16B1C /* LoadingHUDView.swift in Sources */,
 				D3F64926FE39007A1202CB78 /* ScreenCaptureService.swift in Sources */,
+				5EC04E11A2B3C4D5E6F70002 /* SecureConsent.swift in Sources */,
 				8343F8E9601E5B1F4058448D /* TransparentWindow.swift in Sources */,
 				7E167813DA477376FA50A02A /* WakeWordListener.swift in Sources */,
 			);

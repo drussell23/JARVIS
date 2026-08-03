@@ -353,7 +353,24 @@ elif not MACOS_CAPTURE_AVAILABLE:
 # else: Advanced capture is available, use its VideoFrameDelegate
 
 class VideoStreamCapture:
-    """Main video stream capture manager with memory-safe processing"""
+    """Main video stream capture manager with memory-safe processing
+
+    Capability-Namespace: video
+
+    This class is why `ProviderBindings` exists. Its constructor takes a
+    REQUIRED `vision_analyzer`, so the federation's no-arg fallback raised
+    `TypeError` and the whole video namespace described perfectly and could not
+    be built — the worst available shape, because the model is offered a tool
+    that fails on every call.
+
+    Neither obvious fix was acceptable: naming this class in the federation is
+    the hand-kept table the federation exists to delete, and defaulting the
+    parameter to None would edit a working subsystem to suit its consumer and
+    hand it a half-built object to fail on later. Instead the host binds
+    `vision_analyzer` once at boot and the federation resolves it BY PARAMETER
+    NAME — so the analyzer the HUD already built is the one this gets, rather
+    than a second one constructed in the dark.
+    """
     
     def __init__(self, vision_analyzer, config: Optional[VideoStreamConfig] = None):
         self.vision_analyzer = vision_analyzer
@@ -393,7 +410,16 @@ class VideoStreamCapture:
         logger.info(f"Video Stream Capture initialized with config: {self.config}")
     
     async def start_streaming(self) -> bool:
-        """Start video stream capture"""
+        """Start video stream capture
+
+        Capability: session-start, release=stop_streaming
+
+        THE case the whole session vocabulary was written for. This returns
+        `True` and then holds the display capture open forever, spawning a
+        capture thread and a process thread that outlive every call frame above
+        them. A registry with no word for that reads the `True` as a completed
+        action, and the stream survives the HUD that asked for it.
+        """
         logger.info("[VIDEO] start_streaming called")
         logger.info(f"[VIDEO] Current state - is_capturing: {self.is_capturing}")
 
@@ -882,7 +908,15 @@ class VideoStreamCapture:
                 logger.warning(f"Reduced capture FPS to {self.capture_impl.config.target_fps}")
     
     async def stop_streaming(self):
-        """Stop video streaming"""
+        """Stop video streaming
+
+        Capability: session-end
+
+        Returns None, which the lease book reads as success — a release is
+        judged by whether the call COMPLETED, not by what it handed back, since
+        `is_capturing = False` is a perfectly ordinary way for a stop method to
+        report that it worked.
+        """
         self.is_capturing = False
 
         # Stop advanced capture if using it (v10.6)
@@ -981,7 +1015,14 @@ class VideoStreamCapture:
             self.event_callbacks[event_type].add(callback)
     
     def get_metrics(self) -> Dict[str, Any]:
-        """Get streaming metrics"""
+        """Get streaming metrics
+
+        Capability: read-only
+
+        The honest way to ask "is the camera still on". Read-only and ungated on
+        purpose: an operator checking whether a stream is running must never be
+        the one thing that needs approval.
+        """
         recent_metrics = self.metrics[-10:] if self.metrics else []
 
         # Determine capture method

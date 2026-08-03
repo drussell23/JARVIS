@@ -25,6 +25,20 @@ logger = logging.getLogger(__name__)
 class EnhancedMultiSpaceSystem:
     """
     Enhanced multi-space system with all improvements integrated
+
+    Capability-Namespace: space
+
+    The natural-language door into multi-space intelligence, and the reason the
+    capture engine's own `capture_all_spaces` is left undeclared: a model asking
+    "what am I working on across my desktops" should hand over a SENTENCE, not
+    assemble a `SpaceCaptureRequest`. Everything underneath — native space
+    detection, reliable capture, cross-space context analysis — is reached
+    through this one string.
+
+    Both methods here are read-only in the sense that matters: they observe
+    screens and return a description. Neither holds anything open, so neither is
+    a session; the engine's `start_monitoring_session` is where that distinction
+    lives.
     """
 
     def __init__(self, vision_intelligence=None):
@@ -47,6 +61,12 @@ class EnhancedMultiSpaceSystem:
     async def analyze_desktop_spaces(self, query: str) -> Dict[str, Any]:
         """
         Main entry point for desktop space analysis with all enhancements
+
+        Capability: read-only
+
+        Args:
+            query: What to find out across the desktop spaces, in plain
+                language (e.g. "what is running on my other desktops")
         """
         start_time = datetime.now()
 
@@ -346,6 +366,17 @@ Be specific and mention actual applications, files, and content you observe."""
     async def handle_vision_command(self, command: str) -> Dict[str, Any]:
         """
         Main handler for vision commands - replaces existing handler
+
+        Capability: read-only
+
+        Routes to `analyze_desktop_spaces` when its adaptive detector is
+        confident the command is multi-space, and otherwise returns
+        `handled: False` rather than guessing. Declared alongside the method it
+        delegates to because a caller that cannot tell whether a command is
+        multi-space is exactly who should be allowed to ask.
+
+        Args:
+            command: The user's vision command, verbatim
         """
         # Check if this is a multi-space query using enhanced detection
         intent, confidence = self.adaptive_learning.detect_intent_adaptive(command)

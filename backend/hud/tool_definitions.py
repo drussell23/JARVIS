@@ -330,38 +330,153 @@ def _discover_app(name: str) -> str:
 
 
 def derived_tool_names() -> frozenset:
-    """Capabilities the registry derives from `macos_controller`. NEVER raises.
+    """Every capability the model may name. NEVER raises.
 
     Read per call rather than snapshotted at import: a capability annotated
-    tomorrow becomes callable without a restart, which is the whole point of
-    deriving rather than declaring.
+    tomorrow becomes callable without a restart, and a namespace that finishes
+    hydrating a second from now becomes callable a second from now — which is
+    the whole point of deriving rather than declaring.
+
+    THE GATE THIS FEEDS
+    ---------------------
+    `validate_tool_call` blocks any name that is in neither `TOOL_SCHEMAS` nor
+    this set. So a federated capability missing from here is not merely
+    unmentioned in the prompt — it is BLOCKED at the Iron Gate even when the
+    model somehow guesses it correctly. This function and `derived_tool_schemas`
+    must therefore draw from the same sources, which is why they share
+    `_federated_schemas` instead of each reaching for what it needs.
     """
     try:
         from backend.system_control.capability_registry import (
             get_capability_registry,
         )
-        return frozenset(get_capability_registry().names())
+        local = set(get_capability_registry().names())
     except Exception:  # noqa: BLE001 — the hand-written tools still work
-        return frozenset()
+        local = set()
+    return frozenset(local | set(_federated_schemas()))
+
+
+def _federated_schemas() -> Dict[str, Dict[str, Any]]:
+    """Namespaced capabilities from every hydrated subsystem. NEVER raises.
+
+    Multi-space intelligence, video streaming and ghost touch reach the HUD
+    through this one call. They were never missing — roughly 11,000 lines of
+    working capability sat behind a vocabulary derived from a single controller,
+    so nothing in the prompt could NAME them. The same defect the registry was
+    built to delete, one level up.
+
+    Only HYDRATED namespaces contribute, and that is a feature rather than a
+    compromise: hydration measured 8.4 s for `space` alone, so blocking a prompt
+    on it would stall the turn, and offering a tool whose provider has not
+    imported would produce a call that cannot be served. A namespace that is not
+    ready is simply not offered YET — `warm()` at boot is what makes "yet" mean
+    "for the first few seconds" rather than "until someone asks twice".
+    """
+    try:
+        from backend.system_control.capability_federation import (
+            federation_enabled, get_federation,
+        )
+        if not federation_enabled():
+            return {}
+        return dict(get_federation().tool_schemas())
+    except Exception:  # noqa: BLE001
+        logger.debug("[Tools] federated schemas unavailable", exc_info=True)
+        return {}
 
 
 def derived_tool_schemas() -> Dict[str, Dict[str, Any]]:
-    """`TOOL_SCHEMAS` UNION the derived capabilities, for the prompt.
+    """`TOOL_SCHEMAS` UNION the derived capabilities UNION the federated ones.
 
-    The hand-written entries win on a name collision: `take_screenshot` exists
-    in both, and the hand-written one is wired to the vision analyzer while the
-    derived one is not. Deriving must never silently downgrade a tool that was
-    deliberately specialised.
+    Precedence runs federated → local-derived → hand-written, weakest first, and
+    the hand-written entries win outright. `take_screenshot` exists in both the
+    list and the registry, and the hand-written one is wired to the vision
+    analyzer while the derived one is not; deriving must never silently
+    downgrade a tool that was deliberately specialised.
+
+    Federated names cannot collide with either — they all carry a namespace and
+    a dot — so their position in that order is a statement of intent rather than
+    a live contest: if a bare name ever did clash, the specialised
+    implementation is still the one that wins.
     """
+    merged: Dict[str, Dict[str, Any]] = {}
+    try:
+        merged.update(_federated_schemas())
+    except Exception:  # noqa: BLE001
+        pass
     try:
         from backend.system_control.capability_registry import (
             get_capability_registry,
         )
-        merged = dict(get_capability_registry().tool_schemas())
-        merged.update(TOOL_SCHEMAS)
-        return merged
+        merged.update(get_capability_registry().tool_schemas())
     except Exception:  # noqa: BLE001
-        return dict(TOOL_SCHEMAS)
+        pass
+    merged.update(TOOL_SCHEMAS)
+    return merged
+
+
+def open_sessions_note() -> str:
+    """What is currently running, phrased for the model. "" if nothing is.
+
+    NEVER raises. The other half of `RoutedCall.lease_id`: telling the model it
+    opened a session at the moment it opens one is necessary but not sufficient,
+    because a tool loop is many turns and a turn is a fresh prompt. Four turns
+    later, nothing in the context says the camera is still on — so the model
+    plans as though it is not, and never stops it.
+
+    The TTL and the reaper mean nothing leaks either way. This is about the
+    organism being able to reason about what it holds, rather than merely being
+    cleaned up after.
+    """
+    try:
+        from backend.system_control.capability_leases import get_lease_book
+        active = get_lease_book().active()
+        if not active:
+            return ""
+        lines = sorted({
+            f"- '{l.capability}' has been running for {int(l.age_s)}s "
+            f"(stop it with '{l.release}')"
+            for l in active
+        })
+        return ("\nSessions you currently have open — these keep running until "
+                "stopped:\n" + "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def tool_surface_report() -> Dict[str, Any]:
+    """What the model can currently reach, and what it cannot. NEVER raises.
+
+    Exists because "the HUD offers 9 tools" was true for months while 42 derived
+    macOS capabilities and three whole subsystems sat one name away. A count
+    nobody prints is a count nobody notices is wrong, so this is what the boot
+    log and `/observability` both read — including the DEGRADED namespaces,
+    which are the ones an operator can actually do something about.
+    """
+    out: Dict[str, Any] = {"handwritten": len(TOOL_SCHEMAS)}
+    try:
+        from backend.system_control.capability_registry import (
+            get_capability_registry,
+        )
+        out["derived_macos"] = len(get_capability_registry().names())
+    except Exception:  # noqa: BLE001
+        out["derived_macos"] = 0
+    try:
+        from backend.system_control.capability_federation import get_federation
+        fed = get_federation()
+        stats = fed.stats()
+        out["federated"] = len(fed.names())
+        out["namespaces"] = {
+            n: d.get("readiness") for n, d in stats.get("namespaces", {}).items()
+        }
+        out["degraded"] = sorted(
+            n for n, d in stats.get("namespaces", {}).items()
+            if d.get("readiness") != "ready")
+        out["conflicts"] = stats.get("conflicts", {})
+        out["unbuildable"] = stats.get("unbuildable", {})
+    except Exception:  # noqa: BLE001
+        out["federated"] = 0
+    out["total"] = len(derived_tool_schemas())
+    return out
 
 
 async def _exec_derived_capability(call: "ToolCall") -> "ToolResult":
