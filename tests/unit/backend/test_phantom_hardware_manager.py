@@ -1,6 +1,7 @@
 """Unit tests for PhantomHardwareManager concurrency and compatibility paths."""
 
 import asyncio
+import json
 import logging
 from unittest.mock import AsyncMock
 
@@ -176,8 +177,22 @@ async def test_ensure_logs_info_when_yabai_recognized_without_stable_ghost_space
         }
         return None
 
+    # v284.0: the existence probe now runs through the reconciler, so the fake
+    # CLI has to ANSWER rather than merely exist. Stubbing the runner instead of
+    # stubbing `_creation_is_authorised` keeps the new guard in the path: this
+    # payload is a genuine, measured "no ghost displays", which is the only
+    # thing that authorises a create. Returning nothing here would (correctly)
+    # be UNKNOWN and refuse.
+    async def _cli(*_args, **_kwargs):
+        return (0, json.dumps({
+            "UUID": "u-1", "deviceType": "Display", "displayID": "1",
+            "name": "Built-in Display", "originalName": "Color LCD",
+            "tagID": "2",
+        }))
+
     monkeypatch.setattr(manager, "_find_display_via_system_profiler", _none)
     monkeypatch.setattr(manager, "_discover_cli_path_async", AsyncMock(return_value="/tmp/betterdisplaycli"))
+    monkeypatch.setattr(manager, "_run_cli_async", _cli)
     monkeypatch.setattr(manager, "_check_app_running_async", _true)
     monkeypatch.setattr(manager, "_find_existing_ghost_display_async", _none)
     monkeypatch.setattr(manager, "_create_virtual_display_async", _create)

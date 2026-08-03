@@ -576,11 +576,35 @@ Impact:    User may briefly see windows flash during repatriation
 ### Failure: Duplicate Virtual Screens Accumulated
 
 ```
-Detection: get -virtualScreenName -list returns many entries
-Root Cause: Repeated create without connect → orphaned definitions
-Prevention: v283.1 connect fix eliminates this; STEP 0 detects existing connected display
-Recovery:   `betterdisplaycli discard -virtualScreenName="JARVIS GHOST"` cleans all
+Detection: get -identifiers reports many VirtualScreen entries, all same name
+Root Cause: The existence check was BLIND to the thing it guarded.
+            STEP 0 ran `system_profiler SPDisplaysDataType` — measured with
+            NINE ghosts defined, that command reported one display, "Color LCD".
+            system_profiler cannot see BetterDisplay virtual screens, so the
+            check answered "absent" every time and STEP 4 created another.
+            Compounded by DisplayPressureController, which deliberately
+            DISCONNECTS the ghost under memory pressure: a probe that only sees
+            attached displays reports absent for one the system just detached.
+Prevention: v284.0 (`ghost_display_reconciler.py`). Three-valued probe —
+            PRESENT / ABSENT / UNKNOWN — over `get -identifiers` (the only
+            source that sees unattached definitions) plus CoreGraphics.
+            **UNKNOWN NEVER AUTHORISES A CREATE.** A defined-but-detached ghost
+            is RECONNECTED, never re-created.
+Recovery:   Automatic. `reconcile_ghost_displays_async()` converges to
+            JARVIS_GHOST_TARGET_COUNT (default 1), discarding surplus BY tagID,
+            newest first. Runs at boot from the supervisor, next to
+            WorktreeManager.reap_orphans() and for the same reason.
 ```
+
+⚠️ **Discard order is load-bearing: DETACH, then discard.** Discarding a
+*connected* virtual screen removes its BetterDisplay definition and leaves the
+framebuffer attached — measured live: `get -identifiers` reported one virtual
+screen while `CGGetOnlineDisplayList` reported ten displays. Because
+BetterDisplay no longer owned them, nothing could address them; they survived a
+20s settle and only died when BetterDisplay itself was quit. `_discard()` now
+issues `set -connected=off` first, and `GhostInventory.orphans` detects the
+state by set-difference on displayIDs (so a real external monitor is never
+mistaken for an orphan).
 
 ---
 
@@ -626,8 +650,9 @@ Recovery:   `betterdisplaycli discard -virtualScreenName="JARVIS GHOST"` cleans 
 
 ### Phase 1: Hardening (Near-term)
 
-- [ ] **Duplicate prevention gate**: Check for existing JARVIS GHOST before create (prevent accumulation if connect fails)
-- [ ] **Health check via CLI**: Use `betterdisplaycli get -nameLike=... -connected` instead of system_profiler (faster, more reliable)
+- [x] **Duplicate prevention gate** (v284.0): creation is refused unless the existing count was MEASURED. Nine had accumulated by the time this landed.
+- [x] **Health check via CLI** (v284.0): `get -identifiers` replaces `system_profiler`, which was measured blind to all nine virtual screens.
+- [x] **Convergence** (v284.0): `reconcile_ghost_displays_async()` can subtract, which "ensure exists" structurally cannot.
 - [ ] **Disconnect on shutdown**: `set -connected=off` during graceful shutdown to clean up macOS display topology
 - [ ] **Resolution negotiation**: Detect primary display resolution and set ghost display to match for consistent capture quality
 - [ ] **Display layout management**: Position ghost display adjacent to primary via yabai (prevent user accidentally focusing it)

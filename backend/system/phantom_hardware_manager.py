@@ -176,7 +176,93 @@ class PhantomHardwareManager:
             "reconnects": 0,
         }
 
+        # v284.0: The organ that can COUNT. Constructed here and handed this
+        # manager's own CLI runner, so multi-path discovery, app auto-launch and
+        # path caching are not reimplemented next door — the reconciler owns the
+        # arithmetic, this class keeps owning the plumbing.
+        self._reconciler = None  # lazily built; see _get_reconciler()
+        self._last_inventory = None
+
         logger.info("[v68.0] 👻 PHANTOM HARDWARE: Manager initialized")
+
+    # =========================================================================
+    # v284.0: GHOST DISPLAY RECONCILIATION
+    # =========================================================================
+
+    def _get_reconciler(self):
+        """The reconciler, wired to this manager's CLI. NEVER raises.
+
+        Built lazily so importing this module never drags in the reconciler,
+        and so the CLI runner it receives is bound to THIS manager instance
+        rather than whichever singleton happened to exist first.
+        """
+        if self._reconciler is None:
+            try:
+                from backend.system.ghost_display_reconciler import (
+                    GhostDisplayReconciler,
+                )
+                self._reconciler = GhostDisplayReconciler(
+                    self.ghost_display_name, run_cli=self._run_cli_async)
+            except Exception:  # noqa: BLE001
+                logger.debug("[v284.0] reconciler unavailable", exc_info=True)
+                return None
+        return self._reconciler
+
+    async def _run_cli_async(self, *args: str) -> Tuple[int, str]:
+        """Run one BetterDisplay CLI command. Returns (rc, output). NEVER raises.
+
+        The ONE seam the reconciler reaches the CLI through. Combines stdout and
+        stderr because BetterDisplay reports refusal as prose on stdout with a
+        zero exit code — a caller reading only the return code would treat
+        "Failed. Request timed out." as success.
+        """
+        try:
+            cli_path = await self._discover_cli_path_async()
+            if not cli_path:
+                return (1, "BetterDisplay CLI not found")
+            proc = await asyncio.create_subprocess_exec(
+                cli_path, *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            return (proc.returncode or 0,
+                    (stdout.decode(errors="replace")
+                     + stderr.decode(errors="replace")))
+        except asyncio.TimeoutError:
+            return (1, "CLI call timed out")
+        except Exception as exc:  # noqa: BLE001
+            return (1, f"{type(exc).__name__}: {exc}")
+
+    async def reconcile_ghost_displays_async(self) -> Dict[str, Any]:
+        """Converge the machine to exactly one Ghost Display. NEVER raises.
+
+        The sweep that undoes accumulation. Measured before this existed: NINE
+        virtual screens all named "JARVIS GHOST" (tagIDs 153-201), because the
+        existence check ran ``system_profiler``, which cannot see BetterDisplay
+        virtual screens at all — so every call read "absent" and created one
+        more. Historical high-water mark in the design doc: ~150.
+
+        Intended to run at boot, next to `WorktreeManager.reap_orphans()`, for
+        the same reason: the leftovers of a crashed or shed session are not
+        going to remove themselves.
+        """
+        rec = self._get_reconciler()
+        if rec is None:
+            return {"acted": False, "refused": "reconciler unavailable"}
+        report = await rec.reconcile()
+        if report.get("create_needed"):
+            # The reconciler measures and subtracts; it deliberately does not
+            # create, because aspect ratio, resolution and the yabai
+            # registration wait are this class's policy, not its arithmetic.
+            logger.info("[v284.0] reconcile: %d ghost display(s) short — "
+                        "creating", report.get("create_count", 1))
+            ok, err = await self.ensure_ghost_display_exists_async(
+                wait_for_registration=False)
+            report["created"] = bool(ok)
+            if not ok:
+                report["create_error"] = err
+        return report
 
     def _effective_registration_wait_seconds(self, requested_wait_seconds: float) -> float:
         """Compute dynamic wait budget from current request + observed registration latency."""
@@ -299,15 +385,26 @@ class PhantomHardwareManager:
         logger.info("[v68.0] 🔧 Ensuring Ghost Display exists...")
 
         # =================================================================
-        # STEP 0: Quick check — does the display already exist?
-        # v251.2: system_profiler works without CLI integration.
-        # If the display is already present, skip all CLI operations.
+        # STEP 0: Does one already exist?
+        #
+        # v284.0: This step used to run ``system_profiler SPDisplaysDataType``
+        # and search for the display name. Measured with NINE ghost displays
+        # defined on the machine, that command reported exactly one display —
+        # "Color LCD". system_profiler cannot see BetterDisplay virtual screens
+        # while they are unattached, which is their normal resting state after
+        # `DisplayPressureController` sheds them under memory pressure.
+        #
+        # So the check answered "absent" every time and STEP 4 created another
+        # one. Every boot, every health recovery, every command. The reconciler
+        # asks the only source that can actually enumerate definitions, and
+        # answers PRESENT / ABSENT / UNKNOWN rather than a boolean that has
+        # nowhere to put "I could not tell".
         # =================================================================
-        existing_display = await self._find_display_via_system_profiler()
+        existing_display = await self._probe_existing_ghost()
         if existing_display:
             logger.info(
                 f"[v68.0] Ghost Display '{self.ghost_display_name}' already "
-                f"exists (detected via system_profiler)"
+                f"exists — not creating another"
             )
             self._ghost_display_info = existing_display
 
@@ -361,9 +458,13 @@ class PhantomHardwareManager:
             return False, error_msg
 
         # =================================================================
-        # STEP 3: Check if Ghost Display Already Exists (via CLI)
+        # STEP 3: Re-check now that the app is up and the CLI answers.
+        #
+        # STEP 0 may have run while BetterDisplay was still launching, which
+        # yields UNKNOWN rather than ABSENT. This is the re-ask, and it is the
+        # one whose answer authorises creation.
         # =================================================================
-        existing_display = await self._find_existing_ghost_display_async(cli_path)
+        existing_display = await self._probe_existing_ghost()
 
         if existing_display:
             logger.info(
@@ -380,6 +481,24 @@ class PhantomHardwareManager:
                     self._ghost_display_info.space_id = space_id
 
             return True, None
+
+        # =================================================================
+        # STEP 3b: THE CREATE GUARD.
+        #
+        # An unmeasured count must never authorise a create. Every one of the
+        # nine accumulated ghosts came from this exact branch answering "go
+        # ahead" when the truth was "nobody could tell" — the CLI timed out, or
+        # BetterDisplay's integration was off, or the app had not finished
+        # launching. Failing here is a display that is missing for one cycle;
+        # not failing here is a display that is duplicated forever.
+        # =================================================================
+        if not await self._creation_is_authorised():
+            return False, (
+                "Refusing to create a Ghost Display: the existing count could "
+                "not be measured (BetterDisplay CLI unavailable, integration "
+                "disabled, or the request timed out). Creating blind is what "
+                "accumulated nine duplicates."
+            )
 
         # =================================================================
         # STEP 4: Create New Virtual Display
@@ -581,6 +700,86 @@ class PhantomHardwareManager:
     # =========================================================================
     # DISPLAY MANAGEMENT
     # =========================================================================
+
+    async def _probe_existing_ghost(self) -> Optional[VirtualDisplayInfo]:
+        """The authoritative "does one already exist" answer. NEVER raises.
+
+        Returns the display when one is DEFINED — attached or not. That
+        distinction is the whole fix: `DisplayPressureController` disconnects
+        the ghost under memory pressure and shutdown is meant to as well, so a
+        probe that only recognises ATTACHED displays reports "absent" for a
+        display the system itself just detached, and the caller creates a
+        replacement. Nine times, on this machine.
+
+        Reconnection is left to `reconcile_ghost_displays_async`; this method
+        only answers the question, so a probe can never have side effects.
+        """
+        try:
+            rec = self._get_reconciler()
+            if rec is None:
+                return None
+            inv = await rec.probe()
+            self._last_inventory = inv
+            if inv.presence != "present" or not inv.displays:
+                return None
+            survivor = inv.survivor()
+            if survivor is None:
+                return None
+            if inv.surplus > 0:
+                # Surfaced, not silently tolerated. Convergence is the sweep's
+                # job; announcing it here is what makes the leak visible on the
+                # very path that used to cause it.
+                logger.warning(
+                    "[v284.0] %d surplus Ghost Display(s) present (%d defined, "
+                    "target %d). Run reconcile_ghost_displays_async() to "
+                    "converge.", inv.surplus, inv.defined, inv.defined - inv.surplus)
+            return VirtualDisplayInfo(
+                display_id=int(survivor.display_id) if survivor.display_id.isdigit() else None,
+                name=survivor.name or self.ghost_display_name,
+                resolution=self.preferred_resolution,
+                is_active=bool(survivor.connected),
+                is_jarvis_ghost=True,
+                created_at=datetime.now(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[v284.0] ghost probe degraded", exc_info=True)
+            return None
+
+    async def _creation_is_authorised(self) -> bool:
+        """Whether it is SAFE to create one. NEVER raises.
+
+        True only on a measured, certain zero. UNKNOWN returns False — that is
+        the inversion the accumulation class dies on. Mirrors the capability
+        registry's rule that silence means gated rather than safe, applied
+        where being wrong costs a virtual display per boot rather than a prompt.
+        """
+        try:
+            rec = self._get_reconciler()
+            if rec is None:
+                # No reconciler at all is a different fact from an unmeasurable
+                # one: the legacy path is all that is left, and refusing here
+                # would make the ghost display unobtainable rather than merely
+                # un-duplicated.
+                return True
+            inv = await rec.probe()
+            self._last_inventory = inv
+            if inv.presence == "absent":
+                return True
+            if inv.presence == "present":
+                logger.info("[v284.0] not creating — %d Ghost Display(s) "
+                            "already defined", inv.defined)
+                return False
+            logger.error(
+                "[v284.0] REFUSING to create a Ghost Display: the count could "
+                "not be measured (%s). Creating on an unmeasured count is what "
+                "accumulated nine duplicates.", inv.detail or "no detail")
+            return False
+        except Exception:  # noqa: BLE001
+            # Fail CLOSED. An exception here is exactly the "could not tell"
+            # case, and the safe answer to that is not to create.
+            logger.debug("[v284.0] creation authorisation degraded",
+                         exc_info=True)
+            return False
 
     async def _find_existing_ghost_display_async(
         self,
