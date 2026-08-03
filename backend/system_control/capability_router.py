@@ -102,6 +102,9 @@ class RoutedCall:
     outcome: str
     capability: str = ""
     request_id: str = ""
+    #: The challenge the signed HUD must echo back. Never logged in full and
+    #: never reused — see `_mint_nonce`.
+    nonce: str = ""
     result: Any = None
     #: What to append to the LLM context. ALWAYS populated — a turn that ends
     #: without telling the model why is a turn the model will simply repeat.
@@ -135,6 +138,9 @@ class _Suspended:
     capability: str
     args: Dict[str, Any] = field(default_factory=dict)
     created: float = field(default_factory=time.time)
+    #: One-time challenge. The verdict must echo THIS value or it is not an
+    #: answer to THIS question — see `_verify_nonce`.
+    nonce: str = ""
 
     def expired(self) -> bool:
         return (time.time() - self.created) > consent_ttl_s()
@@ -213,13 +219,14 @@ class CapabilityRouter:
                     outcome=Outcome.DENIED.value, capability=name,
                     context_note=DENIED_PAYLOAD,
                     detail="no approval provider available — failing closed")
-            self._parked[rid] = _Suspended(rid, name, args)
+            nonce = _mint_nonce()
+            self._parked[rid] = _Suspended(rid, name, args, nonce=nonce)
             self._stats["suspended"] += 1
             logger.info("[CapabilityRouter] '%s' SUSPENDED awaiting consent "
                         "(request=%s) — turn released", name, rid[:12])
             return RoutedCall(
                 outcome=Outcome.SUSPENDED.value, capability=name,
-                request_id=rid, context_note=SUSPENDED_NOTE,
+                request_id=rid, nonce=nonce, context_note=SUSPENDED_NOTE,
                 detail="operator consent required")
         except Exception as exc:  # noqa: BLE001 — a router never kills a turn
             self._stats["failed"] += 1
@@ -249,6 +256,20 @@ class CapabilityRouter:
                     outcome=Outcome.EXPIRED.value, capability=parked.capability,
                     request_id=request_id, context_note=EXPIRED_PAYLOAD,
                     detail=f"consent not given within {consent_ttl_s():.0f}s")
+            # CHALLENGE-RESPONSE. A verdict is only an answer to THIS question
+            # if it carries THIS question's nonce. Without it, anything that can
+            # write to the IPC socket can replay a captured approval — the
+            # attack the signed-bundle boundary exists to stop, defeated one
+            # layer below it.
+            if parked.nonce and not _verify_nonce(parked.nonce, decision):
+                self._stats["denied"] += 1
+                logger.warning(
+                    "[CapabilityRouter] verdict for '%s' failed the nonce "
+                    "challenge — treating as DENIED", parked.capability)
+                return RoutedCall(
+                    outcome=Outcome.DENIED.value, capability=parked.capability,
+                    request_id=request_id, context_note=DENIED_PAYLOAD,
+                    detail="verdict did not echo the challenge nonce")
             if _approved(decision):
                 out = await self._execute(parked.capability, parked.args)
                 out.request_id = request_id
@@ -341,6 +362,45 @@ class _ConsentContext:
         return f"Run macOS capability '{self.capability}' with {self.args or '{}'}"
 
 
+def _mint_nonce() -> str:
+    """A one-time challenge. NEVER raises.
+
+    `secrets.token_urlsafe` rather than uuid4: this is an anti-replay token, so
+    it wants a CSPRNG, and uuid4's guarantee is uniqueness rather than
+    unpredictability. 32 bytes because the cost is nothing and the value is a
+    socket anyone on the box can write to.
+    """
+    try:
+        import secrets
+        return secrets.token_urlsafe(32)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _verify_nonce(expected: str, decision: Any) -> bool:
+    """Does this verdict answer THIS challenge? NEVER raises.
+
+    Constant-time compare — a verdict arriving over a local socket is attacker-
+    influenced input, and an early-exit `==` leaks the prefix one byte at a
+    time to anything that can time it.
+
+    Fails CLOSED on a missing or unreadable nonce: a verdict that cannot prove
+    which question it answers is not an answer.
+    """
+    try:
+        import hmac
+        got = ""
+        if isinstance(decision, dict):
+            got = str(decision.get("nonce") or "")
+        else:
+            got = str(getattr(decision, "nonce", "") or "")
+        if not got or not expected:
+            return False
+        return hmac.compare_digest(str(expected), got)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _approved(decision: Any) -> bool:
     """Did the operator say yes? NEVER raises.
 
@@ -351,9 +411,18 @@ def _approved(decision: Any) -> bool:
     try:
         if decision is None:
             return False
-        status = getattr(decision, "status", decision)
+        # The IPC delivers JSON, so a verdict from the signed HUD arrives as a
+        # dict. Reading only `.status` would have made every real verdict from
+        # Swift fall through to denial — safe, and completely broken.
+        if isinstance(decision, dict):
+            status = decision.get("status", decision.get("approved"))
+            if isinstance(status, bool):
+                return status
+        else:
+            status = getattr(decision, "status", decision)
         name = getattr(status, "name", None) or str(status)
-        return str(name).strip().upper() in ("APPROVED", "APPROVE", "YES", "Y")
+        return str(name).strip().upper() in ("APPROVED", "APPROVE", "YES", "Y",
+                                             "TRUE")
     except Exception:  # noqa: BLE001
         return False
 
