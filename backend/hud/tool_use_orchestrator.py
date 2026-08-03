@@ -43,6 +43,13 @@ class CommandResult:
     steps_total: int
     response_text: Optional[str]
     error: Optional[str]
+    #: The command was understood and correctly dispatched, and is now waiting
+    #: on somebody — an operator at a Touch ID prompt. Distinct from BOTH
+    #: success and failure, and it needs to be: a gated capability suspends by
+    #: design, and reporting that as `failed` would teach an operator that the
+    #: consent boundary is a malfunction. Nothing that reads `success` breaks
+    #: by ignoring this; the surfaces that narrate to a human read it.
+    pending: bool = False
 
 
 class ToolUseOrchestrator:

@@ -19,7 +19,7 @@ import psutil
 from core.async_pipeline import get_async_pipeline
 
 from backend.system_control.capability_registry import (  # noqa: E402
-    Effect, os_capability,
+    Effect, capability, os_capability,
 )
 
 logger = logging.getLogger(__name__)
@@ -1479,7 +1479,7 @@ class MacOSController:
 
         return None
 
-    @os_capability(Effect.EFFECTFUL)
+    @capability(mutates=True, tier="notify_apply")
     async def lock_screen(
         self,
         progress_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,

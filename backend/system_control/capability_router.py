@@ -64,6 +64,72 @@ SUSPENDED_NOTE: str = "[SYSTEM: Awaiting operator consent]"
 EXPIRED_PAYLOAD: str = "[SYSTEM: OPERATOR_CONSENT_TIMED_OUT]"
 
 
+#: Tier names, mirrored by VALUE rather than imported — the same layering rule
+#: `capability_registry.Tier` states: a leaf router that imports the governance
+#: risk engine drags the whole pipeline into any process that wants to call a
+#: Mac capability.
+_T_SAFE_AUTO = "safe_auto"
+_T_NOTIFY_APPLY = "notify_apply"
+_T_APPROVAL_REQUIRED = "approval_required"
+_T_BLOCKED = "blocked"
+
+
+def risk_floor_enabled() -> bool:
+    """Whether the operator's standing risk floor is composed in. Default TRUE.
+
+    NEVER raises. Off means a capability is judged purely at its declared tier
+    — which is the behaviour before the floor was wired, and is strictly more
+    permissive, so this is a rollback switch rather than a hardening one.
+    """
+    return (os.environ.get("JARVIS_CAPABILITY_RISK_FLOOR_ENABLED", "true")
+            or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _effective_tier(cap: Any, name: str) -> tuple:
+    """(tier, floor_that_raised_it_or_"") for one capability. NEVER raises.
+
+    Fails toward the DECLARED tier on any fault. That is deliberate and it is
+    the safe direction here: the declared tier is what the author of the method
+    chose, and a floor subsystem that cannot answer must not be able to make a
+    capability MORE permissive than its own declaration by failing.
+    """
+    declared = str(getattr(cap, "tier", "") or _T_APPROVAL_REQUIRED)
+    if not risk_floor_enabled():
+        return declared, ""
+    try:
+        from backend.core.ouroboros.governance.risk_tier_floor import (
+            apply_floor_to_name,
+        )
+        effective, applied = apply_floor_to_name(declared)
+        return (str(effective or declared), str(applied or ""))
+    except Exception:  # noqa: BLE001
+        logger.debug("[CapabilityRouter] risk floor unavailable for '%s'",
+                     name, exc_info=True)
+        return declared, ""
+
+
+def _floor_note(floored: str) -> str:
+    """" (raised to X by the operator's risk floor)" or "". NEVER raises."""
+    return f" (raised to {floored} by the operator's risk floor)" if floored else ""
+
+
+def _redact(args: Dict[str, Any]) -> str:
+    """Arguments, safe to log. NEVER raises.
+
+    The registry withholds credential-shaped PARAMETERS from the schema, so a
+    model cannot be offered one — but a caller can still pass a key this
+    module has never seen, and a NOTIFY_APPLY call logs its arguments by
+    design. Matched on the same substring rule the registry uses, so the two
+    cannot drift into disagreeing about what a secret looks like.
+    """
+    try:
+        from backend.system_control.capability_registry import _is_secret_param
+        return str({k: ("***" if _is_secret_param(str(k)) else v)
+                    for k, v in (args or {}).items()})[:300]
+    except Exception:  # noqa: BLE001
+        return "<unprintable>"
+
+
 def router_enabled() -> bool:
     """Master gate. Default TRUE. NEVER raises."""
     return (os.environ.get("JARVIS_CAPABILITY_ROUTER_ENABLED", "true")
@@ -110,6 +176,14 @@ class RoutedCall:
     #: without telling the model why is a turn the model will simply repeat.
     context_note: str = ""
     detail: str = ""
+    #: The tier this call was actually judged at — which is not always the one
+    #: the capability declares, because the operator's standing risk floor can
+    #: raise it. Surfaced so "why did that ask me?" has an answer.
+    tier: str = ""
+    #: Set when the call RAN WITHOUT ASKING and the operator was told instead.
+    #: Distinct from `EXECUTED` alone: a SAFE_AUTO call and a NOTIFY_APPLY call
+    #: both execute, and only one of them owes anybody an explanation.
+    notified: bool = False
     #: Set when this call OPENED a session. Surfaced rather than kept internal
     #: because a model that started a stream and was never told it holds
     #: something open has no reason to ever stop it.
@@ -287,8 +361,54 @@ class CapabilityRouter:
                     outcome=Outcome.UNKNOWN_CAPABILITY.value, capability=name,
                     context_note=f"[SYSTEM: UNKNOWN_CAPABILITY {name}]",
                     detail=self._why_unknown(name))
-            if not cap.iron_gate_required:
+
+            # THE EFFECTIVE TIER, not the declared one.
+            #
+            # `risk_tier_floor` is the operator's standing posture — paranoia
+            # mode, a minimum tier, quiet hours in a declared timezone — and it
+            # already existed, fully tested, consumed only by the Ouroboros
+            # risk engine. Composing it here rather than re-deriving a second
+            # notion of "how careful are we being right now" is the same DRY
+            # rule the registry applies to vocabularies.
+            #
+            # It matters most precisely because NOTIFY_APPLY now really does
+            # run without asking: the operator keeps a way to take that back
+            # globally, at 2am or before a demo, without editing a decorator.
+            # The floor only ever RAISES — `apply_floor_to_name` returns the
+            # input untouched when the floor is weaker.
+            tier, floored = _effective_tier(cap, name)
+
+            if tier == _T_BLOCKED:
+                # Never asked, never run. A prompt is an invitation to approve,
+                # and a blocked capability is not a question.
+                self._stats["denied"] += 1
+                logger.warning("[CapabilityRouter] '%s' is BLOCKED — refused "
+                               "without asking anyone", name)
+                return RoutedCall(
+                    outcome=Outcome.DENIED.value, capability=name,
+                    context_note=DENIED_PAYLOAD,
+                    detail=f"capability is BLOCKED{_floor_note(floored)}")
+
+            if tier == _T_SAFE_AUTO:
                 return await self._execute(name, args)
+
+            if tier == _T_NOTIFY_APPLY:
+                # RUN IT, AND SAY SO. The distinction from SAFE_AUTO is not
+                # whether it happens — it is whether the operator finds out.
+                # The notice is emitted BEFORE the call, because a capability
+                # that locks a screen, kills a window or starts a stream can
+                # take away the surface the notice would have arrived on.
+                logger.warning("[CapabilityRouter] NOTIFY_APPLY '%s' args=%s "
+                               "— running WITHOUT consent%s", name,
+                               _redact(args), _floor_note(floored))
+                out = await self._execute(name, args)
+                out.notified = True
+                out.tier = tier
+                out.context_note = (
+                    f"[SYSTEM: APPLIED WITHOUT CONSENT — '{name}' is "
+                    f"NOTIFY_APPLY; the operator was told, not asked]\n"
+                    f"{out.context_note}")[:2400]
+                return out
 
             # GATED. Request consent and RETURN — do not await the human.
             #
@@ -316,7 +436,8 @@ class CapabilityRouter:
             return RoutedCall(
                 outcome=Outcome.SUSPENDED.value, capability=name,
                 request_id=rid, nonce=nonce, context_note=SUSPENDED_NOTE,
-                detail="operator consent required")
+                tier=tier,
+                detail=f"operator consent required{_floor_note(floored)}")
         except Exception as exc:  # noqa: BLE001 — a router never kills a turn
             self._stats["failed"] += 1
             logger.debug("[CapabilityRouter] route degraded", exc_info=True)
