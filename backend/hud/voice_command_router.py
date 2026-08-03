@@ -179,6 +179,98 @@ def _ordered_within(needle: tuple, haystack: tuple) -> bool:
         return False
 
 
+#: Capabilities currently executing, name → started-at. Bounded by the number
+#: of things that can be in flight, which is small.
+_IN_FLIGHT: dict = {}
+_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def in_flight_window_s() -> float:
+    """How long a capability counts as still running. NEVER raises.
+
+    A ceiling, not a measurement — the entry is removed when the call
+    finishes. This only stops a crashed or wedged call from blocking its own
+    capability forever.
+    """
+    try:
+        raw = (os.environ.get("JARVIS_IN_FLIGHT_WINDOW_S", "") or "").strip()
+        return max(1.0, min(300.0, float(raw))) if raw else 45.0
+    except (TypeError, ValueError):
+        return 45.0
+
+
+def _claim_in_flight(capability: str) -> bool:
+    """Take the slot for *capability*. False if it is already running.
+
+    NEVER raises.
+
+    THE REPEAT ECHO SUPPRESSION CANNOT SEE
+    ----------------------------------------
+    Measured 2026-08-03: boot held the event loop, so "lock my screen" took
+    31 seconds to produce a sound. Derek did what anyone does when nothing
+    happens — he said it again. Both ran; the screen locked twice.
+
+    `is_own_echo` is blind to this by construction: the repeat arrived at
+    01:40:49 and JARVIS did not speak until 01:41:05, so there was nothing to
+    be an echo OF. They are different problems with different fixes — one is
+    the assistant hearing itself, this is the operator being ignored long
+    enough to ask twice.
+
+    Keyed on the CAPABILITY rather than the words, so "lock my screen" and
+    "Lock screen" coalesce — they resolve to the same act, which is the thing
+    that must not happen twice. Two people asking for two different things
+    still get both.
+    """
+    try:
+        now = time.time()
+        with _IN_FLIGHT_LOCK:
+            started = _IN_FLIGHT.get(capability)
+            if started is not None and (now - started) < in_flight_window_s():
+                return False
+            _IN_FLIGHT[capability] = now
+            # Sweep anything that outlived the ceiling; a wedged call must not
+            # disable its capability for the rest of the session.
+            for k, t in list(_IN_FLIGHT.items()):
+                if (now - t) > in_flight_window_s():
+                    _IN_FLIGHT.pop(k, None)
+        return True
+    except Exception:  # noqa: BLE001 — never block a command on bookkeeping
+        return True
+
+
+def _release_in_flight(capability: str) -> None:
+    """Give the slot back. NEVER raises."""
+    try:
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT.pop(capability, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _reads_like_a_sentence(text: str) -> bool:
+    """Whether *text* was written for a person to hear. NEVER raises.
+
+    The test is shape, not vocabulary: a sentence starts with a capital, ends
+    in punctuation, and has several words. `capability_router` details come in
+    both kinds — "I don't have a voiceprint for you on this Mac yet." is meant
+    for the operator's ears, while "consent channel unreachable —
+    HUDConsentProvider needs screen_unlocked" is meant for the log.
+
+    Deciding by shape rather than by matching known phrases is what keeps this
+    correct when a new authority is added: an authority that writes properly
+    for a person is understood without this function learning about it.
+    """
+    try:
+        t = (text or "").strip()
+        if len(t) < 12 or len(t.split()) < 4:
+            return False
+        if not t[0].isupper():
+            return False
+        return t.endswith((".", "!", "?"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _humanise(capability: str) -> str:
     """A capability name as a person would say it. NEVER raises.
 
@@ -728,6 +820,27 @@ class VoiceCommandRouter:
         resolve anything whose signature has a required parameter, so an empty
         call here is a guarantee rather than an omission.
         """
+        capability = str(getattr(reflex, "capability", "") or "")
+        if not _claim_in_flight(capability):
+            logger.warning("[VoiceRouter] COALESCED '%s' — the same action is "
+                           "already running; not starting a second one",
+                           capability)
+            return CommandResult(
+                success=True, category="system_action", steps_completed=0,
+                steps_total=0, error=None,
+                response_text=f"Already {_humanise(capability)} — one moment.")
+        try:
+            return await self._route_capability(reflex, capability)
+        finally:
+            # Released on EVERY path, including the suspended one. A slot that
+            # leaks disables its own capability until the ceiling sweeps it,
+            # which would turn a crash into "JARVIS will not lock my screen
+            # any more" — a worse failure than the double-lock it prevents.
+            _release_in_flight(capability)
+
+    async def _route_capability(self, reflex: Any,
+                                capability: str) -> CommandResult:
+        """Route one already-claimed capability. NEVER raises."""
         try:
             from backend.system_control.capability_router import (
                 Outcome, get_capability_router,
@@ -768,19 +881,36 @@ class VoiceCommandRouter:
                               f"Check the prompt on screen.")
 
         if outcome == Outcome.DENIED.value:
-            # Two very different situations wearing one outcome, and an
-            # operator needs opposite follow-ups: they said no, or nothing
-            # could ask them. The router already writes the distinction into
-            # `detail`; dropping it here would make a disconnected HUD look
-            # like a refusal the operator does not remember giving.
-            unasked = "no approval provider" in (routed.detail or "").lower()
+            # PREFER THE REASON THE AUTHORITY GAVE.
+            #
+            # DENIED covers many situations and only one of them is "you said
+            # no". Measured 2026-08-03 01:41:27 — the voice authority answered
+            # "I don't have a voiceprint for you on this Mac yet", and this
+            # branch recognised only the no-provider case, fell through, and
+            # said:
+            #
+            #     "You declined unlock screen, so I left it alone."
+            #
+            # Derek declined nothing. The true reason was already a finished
+            # sentence in `routed.detail` and was overwritten with a
+            # fabrication about the operator's own behaviour — the same defect
+            # as the consent verdict reporting "operator declined" for a
+            # prompt nobody drew, one layer up and in my own code.
+            #
+            # So: if the authority wrote a sentence, that IS the answer.
+            # Matching keywords to pick a canned line is what produced the lie,
+            # and a longer keyword list would only postpone the next one.
+            detail = (routed.detail or "").strip()
+            if _reads_like_a_sentence(detail):
+                spoken = detail
+            elif "no approval provider" in detail.lower():
+                spoken = (f"I couldn't ask anyone to approve {human}, so I "
+                          f"didn't do it.")
+            else:
+                spoken = f"I couldn't {human}: {detail or 'it was refused'}."
             return CommandResult(
                 success=False, category="system_action", steps_completed=0,
-                steps_total=1, error=routed.detail or "denied",
-                response_text=(
-                    f"I couldn't ask anyone to approve {human}, so I didn't "
-                    f"do it." if unasked
-                    else f"You declined {human}, so I left it alone."))
+                steps_total=1, error=detail or "denied", response_text=spoken)
 
         if outcome == Outcome.EXPIRED.value:
             return CommandResult(

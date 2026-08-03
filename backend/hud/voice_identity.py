@@ -88,6 +88,15 @@ def min_confidence() -> float:
         return 0.75
 
 
+def _enrollment_timeout_s() -> float:
+    """How long the profile lookup may take. NEVER raises."""
+    try:
+        raw = (os.environ.get("JARVIS_ENROLLMENT_TIMEOUT_S", "") or "").strip()
+        return max(5.0, min(180.0, float(raw))) if raw else 60.0
+    except (TypeError, ValueError):
+        return 60.0
+
+
 def warm_timeout_s() -> float:
     """How long the background warm-up may take before it is called failed."""
     try:
@@ -331,10 +340,27 @@ class VoiceIdentity:
             if (self._enrolled_cache is not None
                     and (now - self._enrolled_at) < 300.0):
                 return self._enrolled_cache
+            # PATIENT, because nothing is waiting on this.
+            #
+            # Measured 2026-08-03 01:40:34 — this timed out at 15s and left
+            # enrollment UNKNOWN for the whole session, while `LearningDB`
+            # itself logged "Initialization timed out (15s) — retrying with
+            # fast_mode (SQLite-first)" and fell back to a local database that
+            # holds no profiles. Two 15s ceilings racing the same cold
+            # CloudSQL connect, both losing.
+            #
+            # A cold connect measured 5.2s idle and rather more during boot,
+            # when it competes with everything else waking up. This runs in
+            # the background and has no operator waiting on it — the ONLY cost
+            # of waiting longer is that enrollment stays UNKNOWN a little
+            # longer, and UNKNOWN is already handled honestly. The cost of
+            # giving up early is a whole session that cannot verify anybody.
+            timeout = _enrollment_timeout_s()
             from intelligence.learning_database import get_learning_database
-            db = await asyncio.wait_for(get_learning_database(), timeout=15.0)
+            db = await asyncio.wait_for(get_learning_database(),
+                                        timeout=timeout)
             profiles = await asyncio.wait_for(
-                db.get_all_speaker_profiles(), timeout=15.0)
+                db.get_all_speaker_profiles(), timeout=timeout)
             names = []
             for p in (profiles or []):
                 n = (p.get("speaker_name") if isinstance(p, dict)
@@ -430,10 +456,28 @@ class VoiceIdentity:
                 return _out(Verdict.UNAVAILABLE,
                             detail=self._detail or f"model {state.value}")
 
-            # Loaded, and it says there is no profile. NOW this is a fact.
-            if not owner:
+            # UNKNOWN IS NOT "NOBODY". Checked as `is None`, never `not owner`.
+            #
+            # Measured 2026-08-03 01:41:27, with 272 samples sitting in
+            # CloudSQL: the enrollment lookup timed out, returned None, and
+            # `if not owner` treated that identically to "" — so JARVIS told
+            # its owner "I don't have a voiceprint for you on this Mac yet"
+            # and suggested he enroll a voice he enrolled last October.
+            #
+            # Three states were designed precisely so this could not happen,
+            # and then two of them were collapsed by one falsy check. `None`
+            # and `""` are different claims and the operator acts on them
+            # differently: one is "wait", the other is "enroll".
+            if owner is None:
+                self._schedule_enrollment_refresh()
+                return _out(Verdict.NOT_READY,
+                            detail="enrollment UNKNOWN — the profile store "
+                                   "could not be reached; NOT a statement "
+                                   "that nobody is enrolled")
+            if owner == "":
                 return _out(Verdict.NOT_ENROLLED,
-                            detail="service loaded and holds no voiceprint")
+                            detail="profile store reachable and holds no "
+                                   "voiceprint")
 
             result = await self._service.verify_speaker(audio, owner)
             verified = bool((result or {}).get("verified"))

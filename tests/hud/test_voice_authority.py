@@ -226,3 +226,40 @@ async def test_the_operator_hears_a_sentence_not_a_state_name():
 def test_readiness_reports_disabled_honestly(monkeypatch):
     monkeypatch.setenv("JARVIS_VOICE_AUTHORITY_ENABLED", "false")
     assert VoiceIdentity().readiness is Readiness.DISABLED
+
+
+# ── The 2026-08-03 01:41 log, defect by defect ──────────────────────────────
+
+@pytest.mark.asyncio
+async def test_unknown_enrollment_is_never_reported_as_not_enrolled():
+    """Measured 01:41:27, with 272 samples sitting in CloudSQL.
+
+    The enrollment lookup timed out and returned None, `if not owner` treated
+    that identically to "", and JARVIS told its owner "I don't have a
+    voiceprint for you on this Mac yet" — suggesting he enroll a voice he
+    enrolled last October. Three states were designed so this could not
+    happen, then two were collapsed by one falsy check.
+    """
+    # The measured shape: the ECAPA facade came up ("falling back to local
+    # engine") so the service is present and answers verifications, but it
+    # exposes no loaded profile dict, and the database lookup behind it timed
+    # out — so enrollment is genuinely UNKNOWN.
+    class _NoProfilesLoaded:
+        async def verify_speaker(self, audio, name=None):
+            return {"verified": True, "confidence": 0.9}
+
+    vi = VoiceIdentity(service=_NoProfilesLoaded())
+    vi._enrolled_cache = None                     # the lookup timed out
+    r = await vi.identify(b"RIFFxxxx")
+    assert r.verdict == Verdict.NOT_READY.value
+    assert "UNKNOWN" in r.detail
+    assert "voiceprint" not in r.spoken_reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_reachable_store_with_no_profile_still_says_not_enrolled():
+    """The other side of the same coin — "" must keep meaning nobody."""
+    vi = VoiceIdentity(service=_Service({}))
+    vi._enrolled_cache = ""
+    r = await vi.identify(b"RIFFxxxx")
+    assert r.verdict == Verdict.NOT_ENROLLED.value
