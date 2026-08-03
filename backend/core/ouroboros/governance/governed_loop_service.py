@@ -19,6 +19,7 @@ STARTING -> FAILED (on error)
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -1068,6 +1069,27 @@ def _wrap_subagent_narration(gls: Any, inner: Any) -> Any:
         return SubagentNarrationSink(inner, _emit)
     except Exception:  # noqa: BLE001
         return inner
+
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await *value* only if it is awaitable. NEVER assumes.
+
+    Oracle has TWO interchangeable implementations and they disagree about
+    async-ness: `oracle.Oracle.get_metrics` is a plain `def` returning a dict,
+    while `oracle_adapter`'s is `async def`. `self._oracle` may be either, so a
+    hardcoded `await` is correct for one and fatal for the other — which is
+    exactly what happened:
+
+        [GovernedLoop] Oracle initialization failed:
+          object dict can't be used in 'await' expression; codebase graph unavailable
+
+    The whole codebase graph was discarded on every boot because a call site
+    guessed which implementation it had. Deleting the `await` would only move
+    the breakage to the other implementation; asking the VALUE whether it is
+    awaitable works for both, and keeps working if a third arrives.
+    """
+    return await value if inspect.isawaitable(value) else value
 
 
 class GovernedLoopService:
@@ -7794,7 +7816,7 @@ class GovernedLoopService:
             if self._oracle is not None:
                 logger.info(
                     "[GovernedLoop] Oracle already injected (%s nodes), skipping re-init",
-                    (await self._oracle.get_metrics()).get("total_nodes", "?"),
+                    (await _maybe_await(self._oracle.get_metrics())).get("total_nodes", "?"),
                 )
             elif TheOracle is None:
                 raise ImportError("TheOracle not available")
@@ -7826,7 +7848,7 @@ class GovernedLoopService:
                 )
             logger.info(
                 "[GovernedLoop] Oracle indexed %s nodes across all repos",
-                (await self._oracle.get_metrics()).get("total_nodes", "?"),
+                (await _maybe_await(self._oracle.get_metrics())).get("total_nodes", "?"),
             )
         except asyncio.CancelledError:
             return
@@ -7917,9 +7939,9 @@ class GovernedLoopService:
                         _consec_skips, _max_consec_skips,
                     )
                 _consec_skips = 0
-                await self._oracle.incremental_update([])
+                await _maybe_await(self._oracle.incremental_update([]))
             except asyncio.CancelledError:
-                await self._oracle.shutdown()
+                await _maybe_await(self._oracle.shutdown())
                 return
             except Exception as exc:
                 logger.warning("[GovernedLoop] Oracle incremental update failed: %s", exc)

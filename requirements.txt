@@ -318,3 +318,5 @@ google-cloud-monitoring>=2.0.0
 # Requires-Python: >=3.12
 
 discord.py>=2.3  # Slice 156 — interactive Discord control gateway (bot)
+pyobjc-framework-libdispatch  # advanced video capture (macos_video_capture_advanced) — dispatch_queue_create
+langgraph  # autonomy.langgraph_engine — falls back to sequential execution when absent

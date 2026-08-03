@@ -21,6 +21,9 @@ final class BrainstemLauncher {
     /// TCP connection to the brainstem IPC server.
     private var connection: NWConnection?
     private let ipcPort: UInt16 = 8742
+    /// Read-only accessor so other components can NAME the transport they
+    /// are deferring to, without a second copy of the number.
+    var ipcPortNumber: UInt16 { ipcPort }
     /// HTTP port for the backend in HUD mode (separate from supervisor's 8010).
     let httpPort: UInt16 = 8011
 
@@ -29,7 +32,116 @@ final class BrainstemLauncher {
     var onReady: (() -> Void)?
     private let ipcQueue = DispatchQueue(label: "com.jarvis.brainstem.ipc", qos: .userInitiated)
 
+    /// IPC reconnect delay: 1s → 2s → 4s → 8s, reset on a successful connect.
+    /// A fixed 1s retry against a backend that takes minutes to boot is log
+    /// spam and socket churn for no information gain. `nonisolated(unsafe)`
+    /// because the NWConnection state handler runs off-actor; the race is a
+    /// benign double-read of a Double.
+    nonisolated(unsafe) private var reconnectDelay: Double = 1.0
+
     /// The repo root, derived from the known brainstem .env path.
+    /// Every Python on this machine that might run the brainstem, best first.
+    ///
+    /// NOT a hardcoded list. The previous version named three paths and leaned
+    /// on `/usr/bin/env python3` for everything else — and that is a PATH
+    /// LOOKUP, not an interpreter. A GUI app inherits Xcode's PATH, which has
+    /// no pyenv on it, so `env python3` resolved to Homebrew's python3.14 (no
+    /// uvicorn) while the only healthy interpreter on the machine —
+    /// `~/.pyenv/versions/3.11.10/bin/python3`, the one every repo test already
+    /// runs under — appeared in no candidate at all. Every candidate was
+    /// correctly rejected; the list was simply wrong.
+    ///
+    /// Sources are ENUMERATED rather than named, so a Python installed
+    /// tomorrow is found tomorrow:
+    ///   0. `JARVIS_PYTHON` — an explicit operator override always wins
+    ///   1. the repo's own venv
+    ///   2. every pyenv version, newest first, plus the shim
+    ///   3. every Homebrew `python3.N`, newest first
+    ///   4. `/usr/local/bin` (Intel Homebrew / python.org)
+    ///   5. the system Python, and finally a PATH lookup
+    ///
+    /// Ordering is by LIKELIHOOD OF BEING RIGHT, not by preference: a project
+    /// venv is the intended environment, pyenv is what this repo's tooling
+    /// actually uses, and the system Python is a last resort. Correctness does
+    /// not depend on the order — `probeSucceeds` decides — but a good order
+    /// means the first probe usually wins, and each probe costs a subprocess.
+    private static func discoverPythons(repoRoot: String,
+                                        environment: [String: String]) -> [String] {
+        let fm = FileManager.default
+        var out: [String] = []
+        func add(_ path: String) {
+            // Resolve so a shim, a symlink and a real binary are not probed
+            // three times as if they were three different interpreters.
+            let real = (try? fm.destinationOfSymbolicLink(atPath: path)) ?? path
+            let key = real.hasPrefix("/") ? real : path
+            if !out.contains(path) && !out.contains(key) { out.append(path) }
+        }
+        /// Newest-first: `python3.14` should be tried before `python3.9`, and a
+        /// plain lexical sort puts 3.9 above 3.14.
+        func versionedChildren(of dir: String, prefix: String) -> [String] {
+            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
+            return names
+                .filter { $0.hasPrefix(prefix) && !$0.hasSuffix("-config") }
+                .sorted { a, b in
+                    a.compare(b, options: .numeric) == .orderedDescending
+                }
+                .map { dir + "/" + $0 }
+        }
+
+        if let explicit = environment["JARVIS_PYTHON"], !explicit.isEmpty {
+            add(explicit)
+        }
+        add("\(repoRoot)/venv/bin/python3")
+        for p in versionedChildren(of: "\(repoRoot)/venv/bin", prefix: "python3.") { add(p) }
+
+        let home = NSHomeDirectory()
+        let pyenvRoot = environment["PYENV_ROOT"] ?? "\(home)/.pyenv"
+        for v in versionedChildren(of: "\(pyenvRoot)/versions", prefix: "3.") {
+            add("\(v)/bin/python3")
+        }
+        add("\(pyenvRoot)/shims/python3")
+
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            for p in versionedChildren(of: dir, prefix: "python3.") { add(p) }
+            add("\(dir)/python3")
+        }
+        add("/usr/bin/python3")
+
+        return out.filter { fm.isExecutableFile(atPath: $0) }
+    }
+
+    /// Can this interpreter actually import what the brainstem needs?
+    ///
+    /// Bounded on purpose: a hung probe would stall the HUD's startup, and an
+    /// interpreter that cannot answer in a few seconds is not one to launch a
+    /// backend with. A timeout counts as FAILURE — the candidate has to earn
+    /// selection, not merely avoid disproving itself.
+    private static func probeSucceeds(executable: String, arguments: [String],
+                                      environment: [String: String],
+                                      cwd: String,
+                                      timeout: TimeInterval = 12) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: executable)
+        p.arguments = arguments
+        p.environment = environment
+        p.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        // Discarded rather than piped: an unread pipe that fills would block
+        // the child forever, which is the deadlock a health check must not add.
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while p.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if p.isRunning {
+            p.terminate()
+            return false
+        }
+        return p.terminationStatus == 0
+    }
+
     private let repoRoot: String = {
         // Same path the HUD uses to find brainstem/.env
         let home = NSHomeDirectory()
@@ -97,11 +209,17 @@ final class BrainstemLauncher {
             }
         }
 
-        // Ensure PYTHONPATH includes the repo root AND Homebrew site-packages.
-        // Xcode's subprocess environment may not include Homebrew's default paths.
-        let sitePackages = "/opt/homebrew/lib/python3.12/site-packages"
+        // PYTHONPATH carries the REPO only — never another interpreter's
+        // site-packages. This used to inject a hardcoded
+        // `/opt/homebrew/lib/python3.12/site-packages`, and PYTHONPATH entries
+        // precede an interpreter's own site-packages: whichever Python the
+        // probe selected then imported python3.12's compiled numpy
+        // (`_multiarray_umath.cpython-312-darwin.so`) into a 3.11 process and
+        // the backend died with exit code 1 at startup. An interpreter that
+        // passed the probe has its own packages; poisoning it with a different
+        // ABI's is how a healthy Python is made to fail anyway.
         let existingPythonPath = env["PYTHONPATH"] ?? ""
-        let pathParts = [repoRoot, sitePackages, existingPythonPath].filter { !$0.isEmpty }
+        let pathParts = [repoRoot, existingPythonPath].filter { !$0.isEmpty }
         env["PYTHONPATH"] = pathParts.joined(separator: ":")
 
         // Ensure PATH includes Homebrew so Python 3.12 can find its packages/tools
@@ -123,21 +241,63 @@ final class BrainstemLauncher {
         // doesn't have them, causing "ModuleNotFoundError: No module named 'uvicorn'".
         //
         // Priority: venv/bin/python3.12 > /opt/homebrew/bin/python3.12 > /usr/bin/env python3
-        let venvPython = "\(repoRoot)/venv/bin/python3.12"
-        let brewPython = "/opt/homebrew/bin/python3.12"
-        let python: String
-        let pythonArgs: [String]
 
-        if FileManager.default.fileExists(atPath: venvPython) {
-            python = venvPython
-            pythonArgs = ["-m", "brainstem"]
-        } else if FileManager.default.fileExists(atPath: brewPython) {
-            python = brewPython
-            pythonArgs = ["-m", "brainstem"]
-        } else {
-            python = "/usr/bin/env"
-            pythonArgs = ["python3", "-m", "brainstem"]
+        // v286.0: CHOOSE AN INTERPRETER THAT WORKS, NOT ONE THAT EXISTS.
+        //
+        // This used to take the first candidate whose FILE was present. That is
+        // the wrong predicate, and it failed in the field: `venv/` inside this
+        // repo had 5,980 files whose originals were replaced by iCloud
+        // duplicate-renames (`auto.py` -> `auto 2.py`), so
+        // `uvicorn/protocols/http/` had no `__init__.py` and uvicorn could not
+        // start. The venv binary existed, was selected, and every launch died
+        // with `Could not import module "uvicorn.protocols.http.auto"` — while
+        // a perfectly healthy pyenv interpreter sat two candidates further down
+        // the list, never reached.
+        //
+        // So each candidate is PROBED with the exact import whose absence
+        // killed the brainstem — a test of the failure actually hit rather than
+        // a guess at what "healthy" means. Bounded, so a wedged interpreter
+        // cannot hang startup, and every rejection is logged BY REASON: a
+        // launcher that silently picks the third choice is undebuggable.
+        let discovered = Self.discoverPythons(repoRoot: repoRoot, environment: env)
+        // A PATH lookup last, never first: it is not an interpreter, it is
+        // whatever this process's PATH happens to resolve — the very
+        // indirection that hid the working Python behind a broken one.
+        var candidates: [(String, [String])] = discovered.map { ($0, ["-m", "brainstem"]) }
+        candidates.append(("/usr/bin/env", ["python3", "-m", "brainstem"]))
+        print("[Brainstem] \(discovered.count) candidate interpreter(s) discovered")
+        var chosen: (String, [String])?
+        for (path, args) in candidates {
+            if path != "/usr/bin/env",
+               !FileManager.default.fileExists(atPath: path) {
+                print("[Brainstem] skip \(path) — not present")
+                continue
+            }
+            let probeArgs = Array(args.dropLast(2))
+                + ["-c", "import uvicorn.protocols.http.auto"]
+            if Self.probeSucceeds(executable: path, arguments: probeArgs,
+                                  environment: env, cwd: repoRoot) {
+                chosen = (path, args)
+                break
+            }
+            print("[Brainstem] reject \(path) — cannot import "
+                  + "uvicorn.protocols.http.auto (broken or incomplete install)")
         }
+
+        guard let picked = chosen else {
+            print("""
+            [Brainstem] FATAL: no usable Python interpreter.
+              Tried: \(candidates.map(\.0).joined(separator: ", "))
+              Each failed to `import uvicorn.protocols.http.auto`.
+              If `\(repoRoot)/venv` was touched by iCloud, files may have been
+              renamed (`auto.py` -> `auto 2.py`); rebuild the venv or remove it
+              so a healthy system interpreter is used instead.
+            """)
+            return
+        }
+        let python = picked.0
+        let pythonArgs = picked.1
+        print("[Brainstem] interpreter: \(python) (probe passed)")
 
         proc.executableURL = URL(fileURLWithPath: python)
         proc.arguments = pythonArgs
@@ -328,6 +488,7 @@ final class BrainstemLauncher {
             guard let self = self else { return }
             switch state {
             case .ready:
+                self.reconnectDelay = 1.0
                 print("[Brainstem] IPC connected to localhost:\(self.ipcPort)")
                 Task { @MainActor in
                     self.connection = conn
@@ -360,7 +521,9 @@ final class BrainstemLauncher {
                     SpeechGate.shared.release(.backend, reason: "IPC connection lost")
                 }
                 conn.cancel()
-                self.ipcQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                let delay = self.reconnectDelay
+                self.reconnectDelay = min(delay * 2.0, 8.0)
+                self.ipcQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
                     Task { @MainActor in
                         self?.connectToBrainstem(retriesLeft: retriesLeft - 1)
                     }
@@ -370,7 +533,9 @@ final class BrainstemLauncher {
                 // during brainstem boot. Cancel and retry after a delay.
                 print("[Brainstem] IPC connection waiting: \(error) — retries left: \(retriesLeft - 1)")
                 conn.cancel()
-                self.ipcQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                let delay = self.reconnectDelay
+                self.reconnectDelay = min(delay * 2.0, 8.0)
+                self.ipcQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
                     Task { @MainActor in
                         self?.connectToBrainstem(retriesLeft: retriesLeft - 1)
                     }

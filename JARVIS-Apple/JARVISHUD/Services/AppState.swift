@@ -183,6 +183,27 @@ class PythonBridge: ObservableObject {
         detailedConnectionState = "Authenticating with cloud..."
 
         // Enter SSE reconnect loop (runs forever with exponential backoff)
+        // SPLIT-BRAIN, ENDED. A loopback backend is reached over the IPC
+        // socket, not over SSE — `BrainstemLauncher` connects 8742 and calls
+        // `onBackendReady()`, which is what actually sets `.connected`.
+        //
+        // The cloud SSE loop was running anyway, against
+        // `POST /api/stream/token` — an endpoint that does not exist in this
+        // backend AT ALL (0 hits in backend/main.py). So it 404'd forever:
+        // first as `Connection refused` while the backend booted, then as a
+        // real 404 once it was up, retrying without end. Two transports for one
+        // conversation, one of them aimed at nothing.
+        //
+        // Detected by LOOPBACK, not by port number: any host that resolves to
+        // this machine is served by the brainstem we spawned. The cloud path is
+        // untouched — JARVIS_HUD_FORCE_CLOUD=1 still gets full SSE.
+        let host = URL(string: creds.baseURL)?.host?.lowercased() ?? ""
+        let isLoopback = ["localhost", "127.0.0.1", "::1", "[::1]"].contains(host)
+        if isLoopback {
+            print("[JARVIS] LOCAL mode — IPC (\(BrainstemLauncher.shared.ipcPortNumber)) is the transport; not starting the cloud SSE loop")
+            detailedConnectionState = "Waiting for local backend IPC..."
+            return
+        }
         await connectLoop(deviceAuth: deviceAuth, config: creds)
     }
 
@@ -586,7 +607,16 @@ class PythonBridge: ObservableObject {
         // Set JARVIS_HUD_FORCE_CLOUD=1 to fall back to the cloud path.
         let forceCloud = (env["JARVIS_HUD_FORCE_CLOUD"] ?? "") == "1"
         if !forceCloud {
-            let localURL = env["JARVIS_LOCAL_BACKEND_URL"] ?? "http://localhost:8010"
+            // Derived from the launcher's own port — ONE source of truth.
+            // This was hardcoded 8010 while BrainstemLauncher binds its spawned
+            // backend on 8011 ("separate port from supervisor's 8010"), so the
+            // HUD spawned a healthy backend and then knocked on the wrong door
+            // forever: every /api/stream/token went to 8010, connection
+            // refused. Two hardcoded ports for one conversation is how they
+            // drift; the env override remains for pointing at an external
+            // supervisor on 8010.
+            let localURL = env["JARVIS_LOCAL_BACKEND_URL"]
+                ?? "http://localhost:\(BrainstemLauncher.shared.httpPort)"
             let id = env["JARVIS_DEVICE_ID"] ?? "mac-local"
             // The default was the literal string "local", and the comment above
             // called a placeholder secret "fine". It was not: the secret is
@@ -670,6 +700,38 @@ class PythonBridge: ObservableObject {
     }
 }
 
+// MARK: - JARVISVoice (resolved ONCE, not per utterance)
+
+/// The canonical JARVIS voice, looked up a single time.
+///
+/// `AVSpeechSynthesisVoice(identifier:)` is not a constructor — it is a
+/// SYNCHRONOUS QUERY against the on-device speech-voice catalog, serviced over
+/// XPC. Both synthesisers were calling it (and its `language:` fallback) on
+/// EVERY utterance, from `@MainActor` code. Blocking IPC inside a Swift
+/// Concurrency context is exactly what the runtime reports as:
+///
+///     Potential Structural Swift Concurrency Issue:
+///     unsafeForcedSync called from Swift Concurrent context.
+///
+/// The voice catalog does not change between utterances, so the query was pure
+/// repeated cost — and the diagnostic is the runtime objecting to where that
+/// cost was paid, not to the audio graph.
+///
+/// `static let` resolves lazily, exactly once, under Swift's `swift_once`
+/// guarantee — so the blocking lookup happens a single time at first speech
+/// instead of on every sentence, and never again for the life of the process.
+///
+/// Shared rather than duplicated: two identical lookups in two files was the
+/// literal definition of the thing that drifts.
+enum JARVISVoice {
+    /// Daniel — British English male, the canonical JARVIS voice.
+    /// `nil` is a legal outcome: AVSpeechUtterance then uses the system
+    /// default, which is far better than refusing to speak.
+    static let daniel: AVSpeechSynthesisVoice? =
+        AVSpeechSynthesisVoice(identifier: "com.apple.voice.compact.en-GB.Daniel")
+        ?? AVSpeechSynthesisVoice(language: "en-GB")
+}
+
 // MARK: - VoiceManager (TTS via AVSpeechSynthesizer — Daniel voice)
 
 @MainActor
@@ -683,6 +745,9 @@ final class VoiceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegat
     override init() {
         super.init()
         synthesizer.delegate = self
+        SpeechGate.shared.registerReconciler(.voiceManager) { [weak self] in
+            self?.synthesizer.isSpeaking ?? false
+        }
     }
 
     func speak(_ text: String, priority: SpeechPriority = .normal) {
@@ -693,8 +758,7 @@ final class VoiceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegat
         currentPriority = priority
         let utterance = AVSpeechUtterance(string: text)
         // Daniel = British English male (JARVIS canonical voice)
-        utterance.voice = AVSpeechSynthesisVoice(identifier: "com.apple.voice.compact.en-GB.Daniel")
-            ?? AVSpeechSynthesisVoice(language: "en-GB")
+        utterance.voice = JARVISVoice.daniel
         utterance.rate = 0.52
         utterance.pitchMultiplier = 1.0
         utterance.volume = 0.9

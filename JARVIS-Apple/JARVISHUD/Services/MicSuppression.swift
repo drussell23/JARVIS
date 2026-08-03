@@ -77,6 +77,11 @@ private struct SpeechClaim {
     /// Monotonic. `Date()` would let an NTP step or a daylight-saving change
     /// extend a mute by an hour, and the operator would simply be unheard.
     let deadline: ContinuousClock.Instant
+    /// When this claim was taken. Distinct from `deadline`, which moves every
+    /// time the claim is extended — age must be measured from the ORIGINAL
+    /// grab, or an extending claim looks perpetually new and never qualifies
+    /// as stale.
+    let opened: ContinuousClock.Instant
     let reason: String
 
     func isLive(_ now: ContinuousClock.Instant) -> Bool { now < deadline }
@@ -99,6 +104,16 @@ final class SpeechGate {
     var onMuteChange: ((Bool) -> Void)?
 
     private var claims: [SpeechClaimant: SpeechClaim] = [:]
+    /// Per-claimant "is it actually speaking right now?" probes. The design
+    /// doc always specified this belt-and-braces; the method existed with ZERO
+    /// callers — so a dropped `didFinish` cost the whole estimated deadline
+    /// (observed: ~4.2s of dead mic) instead of one sweep.
+    private var reconcilers: [SpeechClaimant: () -> Bool] = [:]
+
+    /// Let the gate ask the synthesiser itself, every sweep.
+    func registerReconciler(_ who: SpeechClaimant, isSpeaking: @escaping () -> Bool) {
+        reconcilers[who] = isSpeaking
+    }
     private var sweepTask: Task<Void, Never>?
     private var lastPublished = false
 
@@ -131,9 +146,14 @@ final class SpeechGate {
                seconds: Double? = nil,
                reason: String = "") {
         let bounded = min(max(seconds ?? defaultClaimSeconds, 0.1), maxClaimSeconds)
+        // Preserve the ORIGINAL grab time across extensions: `claim()` is
+        // called again on didStart and on every reconcile, and resetting
+        // `opened` each time would mean a stuck claim never ages.
+        let firstSeen = claims[who]?.opened ?? ContinuousClock.now
         claims[who] = SpeechClaim(
             claimant: who,
             deadline: ContinuousClock.now.advanced(by: .seconds(bounded)),
+            opened: firstSeen,
             reason: reason)
         print("[SpeechGate] claim \(who.rawValue) for \(String(format: "%.1f", bounded))s \(reason)")
         startSweeping()
@@ -187,11 +207,18 @@ final class SpeechGate {
     /// on every sweep and on every mic restart.
     func reconcile(_ who: SpeechClaimant, isSpeaking: Bool) {
         if isSpeaking {
-            // Re-arm on a short lease. If the synthesiser stops and the
-            // callback is lost, the claim dies within one lease rather than
-            // living until the 60s ceiling.
-            claim(who, seconds: 2.0, reason: "(reconciled from synthesizer)")
-        } else {
+            // Extend ONLY when the claim is about to lapse — re-claiming every
+            // 250ms sweep would spam the log and reset deadlines pointlessly.
+            let needsExtend: Bool = {
+                guard let c = claims[who] else { return true }
+                return ContinuousClock.now.advanced(by: .seconds(1.0)) >= c.deadline
+            }()
+            if needsExtend {
+                claim(who, seconds: 2.0, reason: "(reconciled from synthesizer)")
+            }
+        } else if claims[who] != nil {
+            // The synthesiser says idle but a claim is live: the callback was
+            // dropped. Release NOW — one sweep of staleness, not the deadline.
             release(who, reason: "(reconciled: synthesizer idle)")
         }
     }
@@ -221,6 +248,7 @@ final class SpeechGate {
                 guard let self else { return }
                 let stop = await MainActor.run { () -> Bool in
                     self.expire()
+                    self.reconcileStaleClaimsOnly()
                     self.publish()
                     if self.claims.isEmpty {
                         self.sweepTask = nil
@@ -230,6 +258,39 @@ final class SpeechGate {
                 }
                 if stop { return }
             }
+        }
+    }
+
+    /// Consult the synthesisers ONLY where a dropped callback is plausible.
+    ///
+    /// HANG RISK, self-inflicted. The first version probed every registered
+    /// reconciler on every 250ms sweep. `AVSpeechSynthesizer.isSpeaking` is not
+    /// a stored property — reading it performs a SYNCHRONOUS THREAD HOP
+    /// (`-[_NSThreadPerformInfo wait]` in the trace), so a user-interactive
+    /// sweep blocked on a default-QoS thread four times a second, forever, and
+    /// Xcode correctly flagged the priority inversion.
+    ///
+    /// The probe is an ANOMALY DETECTOR: it exists to catch a `didFinish` that
+    /// never arrived. So it should run only when an anomaly is actually
+    /// possible, and the conditions are precise:
+    ///
+    ///   * NO live claim -> nothing could have been dropped. Skip entirely.
+    ///     This is the common case, and it now costs zero blocking calls.
+    ///   * A claim YOUNGER than the grace period -> a normal utterance still
+    ///     in flight. Its callback has not had time to be late yet.
+    ///
+    /// What remains is exactly the suspicious case: a claim old enough that a
+    /// well-behaved synthesiser should already have released it. The cost of
+    /// the blocking read is then paid once per sweep per genuinely-stuck claim
+    /// rather than continuously, and the recovery window is unchanged.
+    private func reconcileStaleClaimsOnly() {
+        guard !reconcilers.isEmpty, !claims.isEmpty else { return }
+        let now = ContinuousClock.now
+        for (who, probe) in reconcilers {
+            guard let claim = claims[who], claim.isLive(now) else { continue }
+            // Old enough that `didFinish` is overdue, not merely pending.
+            guard now >= claim.opened.advanced(by: .seconds(1.5)) else { continue }
+            reconcile(who, isSpeaking: probe())
         }
     }
 

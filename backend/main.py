@@ -1953,6 +1953,15 @@ async def parallel_lifespan(app: FastAPI):
         # =================================================================
         # v351.0: HUD MODE — IPC server + SSE consumer for Swift HUD
         # =================================================================
+        class _SkipCloudRelay(Exception):
+            """Not an error — the cloud relay was deliberately not started.
+
+            A typed sentinel rather than a bare flag check wrapped around the
+            whole block: the existing `except Exception` already logs and
+            degrades gracefully, so raising through it keeps ONE exit path
+            instead of duplicating the teardown logic under an `if`.
+            """
+
         _hud_ipc_server = None
         _hud_shutdown = None
         if HUD_MODE:
@@ -2370,8 +2379,34 @@ async def parallel_lifespan(app: FastAPI):
                 logger.error("[HUD] capability federation wiring failed: %s", _fe,
                              exc_info=True)
 
-            # Optional: SSE consumer for Vercel cloud relay
+            # Optional: SSE consumer for Vercel cloud relay.
+            #
+            # v287.0: NOT started in HUD mode by default. The HUD reaches this
+            # backend over the local IPC socket; the cloud relay is a SECOND
+            # transport for the same conversation, and it was being opened
+            # every boot only to be torn down seconds later:
+            #
+            #   [SSE] Requesting stream token from https://...vercel.app
+            #   [SSE] Vercel deployment disabled (402) — stopping SSE consumer.
+            #         HUD operates via local IPC.
+            #
+            # The consumer's own shutdown message states the conclusion — the
+            # HUD operates via local IPC — so opening it at all was work done
+            # to discover something already known. This is the Python mirror of
+            # the loopback gate added to the Swift side: one transport per
+            # conversation, chosen up front rather than discovered by failure.
+            #
+            # Opt back in with JARVIS_HUD_CLOUD_RELAY=1 for a genuinely
+            # cloud-relayed HUD (phone/watch pairing, remote command).
+            _cloud_relay = (os.environ.get("JARVIS_HUD_CLOUD_RELAY", "0")
+                            or "").strip().lower() in ("1", "true", "yes")
+            if not _cloud_relay:
+                logger.info(
+                    "[HUD] Cloud SSE relay disabled (local IPC is the "
+                    "transport). Set JARVIS_HUD_CLOUD_RELAY=1 to enable.")
             try:
+                if not _cloud_relay:
+                    raise _SkipCloudRelay()
                 from brainstem.config import BrainstemConfig
                 from brainstem.sse_consumer import SSEConsumer
                 from brainstem.auth import BrainstemAuth
@@ -2392,6 +2427,17 @@ async def parallel_lifespan(app: FastAPI):
                     name="hud_sse_consumer",
                 )
                 logger.info("[HUD] SSE consumer started (Vercel cloud relay)")
+            except _SkipCloudRelay:
+                # A DELIBERATE skip, not a failure. Reusing the generic handler
+                # for it made the log say "[HUD] SSE consumer failed:" with an
+                # empty reason directly under the line explaining the relay was
+                # switched off on purpose — two lines contradicting each other,
+                # and the alarming one last.
+                #
+                # The "one exit path" this sentinel was meant to preserve is not
+                # worth a log that cries wolf: an operator scanning for real
+                # faults must never have to learn which warnings to ignore.
+                pass
             except (ImportError, ValueError) as e:
                 logger.info("[HUD] SSE consumer not available (local-only mode): %s", e)
             except Exception as e:
