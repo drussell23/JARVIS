@@ -28,6 +28,17 @@ import sys
 HUD_DEFAULT_PORT = 8011
 
 if __name__ == "__main__":
+    # DO NOT OUTLIVE THE LAUNCHER.
+    #
+    # Armed here, before anything binds a port or claims a microphone, and
+    # before the legacy branch, so every way of entering this module is
+    # covered by one call. Xcode's Stop button SIGKILLs the HUD, which means
+    # the HUD cannot tell us anything on its way out — so we watch it instead.
+    # Inert unless JARVIS_PARENT_PID was declared, so a standalone
+    # `python3 -m brainstem` is unaffected.
+    from brainstem.parent_watch import install as _install_parent_watch
+    _install_parent_watch()
+
     # Legacy mode: use old brainstem for backwards compatibility
     if os.environ.get("JARVIS_BRAINSTEM_LEGACY", "").lower() in ("1", "true"):
         import asyncio

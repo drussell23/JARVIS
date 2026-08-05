@@ -222,6 +222,20 @@ final class BrainstemLauncher {
         let pathParts = [repoRoot, existingPythonPath].filter { !$0.isEmpty }
         env["PYTHONPATH"] = pathParts.joined(separator: ":")
 
+        // TELL THE CHILD WHO ITS LAUNCHER IS, SO IT CAN OUTLIVE NOTHING.
+        //
+        // Xcode's Stop button SIGKILLs this process. SIGKILL is uncatchable,
+        // so `terminationHandler` below, `deinit`, and every atexit hook are
+        // never reached — there is no instant between alive and gone in which
+        // this process could clean anything up. The child therefore watches
+        // US (`brainstem/parent_watch.py`) and leaves when we do.
+        //
+        // Load-bearing: the watch is INERT without this line. It refuses to
+        // supervise on an undeclared parent so that a developer running
+        // `python3 -m brainstem` in a terminal is never killed by their shell
+        // exiting. Deleting this variable silently restores the orphan bug.
+        env["JARVIS_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
+
         // Ensure PATH includes Homebrew so Python 3.12 can find its packages/tools
         let existingPath = env["PATH"] ?? "/usr/bin:/bin"
         if !existingPath.contains("/opt/homebrew") {
@@ -709,17 +723,92 @@ final class BrainstemLauncher {
 
     // MARK: - Stale process cleanup
 
-    /// Kill orphaned Python processes from previous Xcode runs.
-    /// When Xcode's Stop button kills the HUD, the child Python backend
-    /// can survive as an orphan, holding ports 8011 and 8742.
+    /// Run a command and return its trimmed stdout. Empty on any failure.
+    private func shellOutput(_ command: String) -> String {
+        let task = Process()
+        let pipe = Pipe()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        task.arguments = ["bash", "-c", command]
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch { return "" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    /// Reap orphaned backends from previous runs — BY IDENTITY, never by port.
+    ///
+    /// This used to be `lsof -ti :8011 | xargs kill -9`, which kills whatever
+    /// holds the port. Holding a port is not evidence of being ours. Anything
+    /// else a developer had bound to 8011 — another project's dev server, a
+    /// database console — was SIGKILLed by starting the HUD, with no message
+    /// and no way to tell afterwards what had happened to it.
+    ///
+    /// So a PID is now only a candidate. It is killed only if the kernel says
+    /// its command line is our program: a Python running `-m brainstem` out of
+    /// THIS repository. A second checkout on the same machine has a different
+    /// repo root and is left alone, which the port test could never express.
+    ///
+    /// SIGTERM first — an orphan that has just been told to leave should get
+    /// the chance to close its sockets and flush, and `parent_watch` means a
+    /// modern orphan is already on its way out. SIGKILL only for what ignores
+    /// that. The previous code opened with SIGKILL, which is why ports then
+    /// sat in TIME_WAIT long enough to need a five-attempt retry loop.
+    ///
+    /// This is the compensating path, not the guarantee. The guarantee is
+    /// `brainstem/parent_watch.py`: the child dies with its launcher, so there
+    /// is nothing here to find. This exists for orphans predating that watch,
+    /// and for the case where the child was SIGKILLed too.
     private func killStaleProcesses() {
         let ports = [httpPort, ipcPort]
+
+        // Candidates: whoever holds our ports, plus any `-m brainstem` from
+        // this repo that is not holding a port at all. The second set matters
+        // — the 46.8%-CPU orphan measured on 2026-08-04 had no listening
+        // socket, so a port-only sweep could never have found it.
+        var candidates = Set<Int32>()
         for port in ports {
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            task.arguments = ["bash", "-c", "lsof -ti :\(port) | xargs kill -9 2>/dev/null"]
-            try? task.run()
-            task.waitUntilExit()
+            for pid in shellOutput("lsof -ti :\(port)").split(separator: "\n") {
+                if let p = Int32(pid.trimmingCharacters(in: .whitespaces)) { candidates.insert(p) }
+            }
+        }
+        for pid in shellOutput("pgrep -f 'brainstem'").split(separator: "\n") {
+            if let p = Int32(pid.trimmingCharacters(in: .whitespaces)) { candidates.insert(p) }
+        }
+
+        let me = ProcessInfo.processInfo.processIdentifier
+        var doomed: [Int32] = []
+        for pid in candidates where pid != me && pid > 1 {
+            // `ps -o command=` is the kernel's account of what this process
+            // is, which a stale pidfile or a port table cannot contradict.
+            let cmd = shellOutput("ps -p \(pid) -o command=")
+            guard cmd.contains("brainstem"),
+                  cmd.contains(repoRoot) || cmd.contains("-m brainstem") else {
+                if !cmd.isEmpty {
+                    print("[Brainstem] leaving pid \(pid) alone — not ours: \(cmd.prefix(60))")
+                }
+                continue
+            }
+            doomed.append(pid)
+        }
+
+        if doomed.isEmpty {
+            print("[Brainstem] no orphaned backends to reap")
+            return
+        }
+        print("[Brainstem] reaping \(doomed.count) orphaned backend(s): \(doomed)")
+        for pid in doomed { kill(pid, SIGTERM) }
+
+        // Give them the grace we just asked for, then insist.
+        for _ in 1...10 {
+            Thread.sleep(forTimeInterval: 0.2)
+            if doomed.allSatisfy({ kill($0, 0) != 0 }) { break }
+        }
+        for pid in doomed where kill(pid, 0) == 0 {
+            print("[Brainstem] pid \(pid) ignored SIGTERM — SIGKILL")
+            kill(pid, SIGKILL)
         }
         // Wait for ports to actually be released (SIGKILL + TIME_WAIT)
         for attempt in 1...5 {
