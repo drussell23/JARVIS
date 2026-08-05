@@ -267,6 +267,7 @@ def _emit_blocked(
     threshold_ms: float,
     kind: str,
     cpu_ms: Optional[float] = None,
+    stalled_ms: Optional[float] = None,
 ) -> None:
     """Single log line for over-threshold events. Format is stable —
     the v27 probe runbook grep's `[LoopSink] callsite=...` to extract
@@ -279,6 +280,24 @@ def _emit_blocked(
     (thread_time() unsupported/failed) the legacy line is emitted
     byte-identical so existing log-grep consumers are unaffected.
     """
+    if stalled_ms is not None and stalled_ms >= 0.0:
+        # The async line, now decidable. `blocked_ms` keeps its name so the
+        # v27 runbook's grep still works, but the verdict after it is no
+        # longer an assertion that the loop was blocked — that is measured
+        # separately and printed beside it.
+        share = (stalled_ms / elapsed_ms * 100.0) if elapsed_ms > 0 else 0.0
+        if stalled_ms < max(threshold_ms, elapsed_ms * 0.1):
+            verdict = ("OFF-LOOP: the loop stayed responsive for this region "
+                       "— slow, but not a starver")
+        else:
+            verdict = (f"LOOP STARVED {share:.0f}% of this region — either "
+                       f"this callsite or something overlapping it")
+        logger.warning(
+            "[LoopSink] callsite=%s kind=%s blocked_ms=%.2f loop_stalled_ms=%.2f "
+            "threshold_ms=%.1f — %s",
+            callsite, kind, elapsed_ms, stalled_ms, threshold_ms, verdict,
+        )
+        return
     if cpu_ms is None:
         logger.warning(
             "[LoopSink] callsite=%s kind=%s blocked_ms=%.2f "
@@ -383,7 +402,38 @@ async def sink_async(
             stats = _get_or_create_stats(callsite)
             stats.record(elapsed_ms, eff_threshold)
             if elapsed_ms >= eff_threshold:
-                _emit_blocked(callsite, elapsed_ms, eff_threshold, "async")
+                # ELAPSED IS NOT BLOCKED, AND SAYING SO COST HOURS.
+                #
+                # This measures wall-clock around a `yield`. Work correctly
+                # offloaded to a thread takes just as long here while the loop
+                # runs perfectly freely — so a big number is a QUESTION, not a
+                # finding. The emitted line used to answer it "on-loop call
+                # exceeded threshold" regardless, and on 2026-08-05 that sent
+                # an investigation at `posture_observer.run_one_cycle`
+                # (7,146 ms) which turned out to be entirely innocent: its
+                # collectors were already off-loop, and the elapsed time was
+                # inflated by boot work elsewhere — a 15s learning-DB timeout,
+                # a 10s CloudSQL timeout, a 22s capability federation.
+                #
+                # `LoopSentinel` already measures true unresponsiveness from
+                # inside the loop, so ask it how much of this region the loop
+                # was actually unable to run. Now the two cases are decidable:
+                #
+                #   elapsed high, stall ~0    off-loop and healthy — IGNORE
+                #   elapsed high, stall high  the loop really was starved
+                #
+                # Which does not by itself prove THIS callsite caused the
+                # stall — only that it overlapped one. That is still strictly
+                # more than the previous line said, and it no longer asserts
+                # something that is often false.
+                stalled_ms = 0.0
+                try:
+                    from backend.hud.loop_sentinel import stalled_ms_since
+                    stalled_ms = stalled_ms_since(t0)
+                except Exception:  # noqa: BLE001 — telemetry never raises
+                    stalled_ms = -1.0
+                _emit_blocked(callsite, elapsed_ms, eff_threshold, "async",
+                              stalled_ms=stalled_ms)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[LoopSink] internal error in sink_async(%s): %s",

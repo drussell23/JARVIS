@@ -233,6 +233,31 @@ def _strictest(a: PressureLevel, b: PressureLevel) -> PressureLevel:
     return a if _LEVEL_RANK[a] >= _LEVEL_RANK[b] else b
 
 
+#: How the Rust arena names its own pressure, mapped onto this module's
+#: vocabulary. An unrecognised string maps to OK deliberately: a native
+#: library that grows a new level in a future build must not be able to gate
+#: the whole system by a name this side has never heard of.
+_RUST_POOL_LEVELS: Dict[str, PressureLevel] = {
+    "low": PressureLevel.OK,
+    "moderate": PressureLevel.WARN,
+    "medium": PressureLevel.WARN,
+    "elevated": PressureLevel.WARN,
+    "high": PressureLevel.HIGH,
+    "critical": PressureLevel.CRITICAL,
+}
+
+
+def rust_pool_dim_enabled() -> bool:
+    """Master switch for the native-arena dimension. Default TRUE.
+
+    Safe on by default because it composes strictest-wins and fails to OK: it
+    can only tighten the gate, never loosen it, and any fault contributes
+    nothing at all.
+    """
+    return (os.environ.get("JARVIS_MEMORY_PRESSURE_RUST_POOL_DIM", "true")
+            or "").strip().lower() not in ("0", "false", "no", "off")
+
+
 @dataclass(frozen=True)
 class MemoryProbe:
     """Result of one probe attempt. ``source`` identifies which cascade
@@ -497,7 +522,51 @@ class MemoryPressureGate:
         # reservation dim (granted-but-not-yet-resident model-init
         # budgets shrink the effective free-%).
         resv_level, _resv_mb = self._reservation_dim(probe)
-        return _strictest(_strictest(free_level, proc_level), resv_level)
+        # The native arena's own view, composed the same strictest-wins way.
+        # It can only ever make the gate MORE conservative, never less.
+        pool_level, _pool_src = self._rust_pool_dim()
+        return _strictest(
+            _strictest(_strictest(free_level, proc_level), resv_level),
+            pool_level,
+        )
+
+    # -- rust pool dimension ------------------------------------------------
+
+    def _rust_pool_dim(self) -> Tuple[PressureLevel, str]:
+        """The Rust arena's own pressure, if one is actually in use.
+
+        WHY THE LIVE INSTANCE AND NOT A FRESH POOL
+        --------------------------------------------
+        `RustAdvancedMemoryPool()` is cheap to construct and a brand-new one
+        reports `memory_pressure: 'Low'` forever, because it has allocated
+        nothing. Wiring that in would produce a dimension that is always OK —
+        a reading that looks like evidence and is not. So this reads the
+        accelerator singleton the vision pipeline actually allocates through,
+        and contributes nothing when no accelerator exists.
+
+        Returning OK when there is no pool is honest here specifically because
+        this composes strictest-wins: "no native arena in use" genuinely adds
+        no constraint, unlike a probe failure, which would.
+
+        Free-% alone cannot see this. On a 16GB M1 the arena and the process
+        share one unified pool, so an arena filling its 16MiB size classes is
+        an early warning that the free-% probe reports only later, once the
+        pressure has already reached the audio graph.
+        """
+        try:
+            if not rust_pool_dim_enabled():
+                return PressureLevel.OK, "disabled"
+            from backend.vision import rust_integration as _ri
+            acc = getattr(_ri, "_global_accelerator", None)
+            pool = getattr(acc, "memory_pool", None) if acc is not None else None
+            if pool is None:
+                return PressureLevel.OK, "no_pool"
+            raw = str((pool.stats() or {}).get("memory_pressure", "")).strip().lower()
+            return _RUST_POOL_LEVELS.get(raw, PressureLevel.OK), raw or "unknown"
+        except Exception:  # noqa: BLE001 — a native probe never gates the gate
+            logger.debug("[MemoryPressureGate] rust pool dim degraded",
+                         exc_info=True)
+            return PressureLevel.OK, "error"
 
     # -- fanout decision ----------------------------------------------------
 
