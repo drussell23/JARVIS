@@ -1986,6 +1986,20 @@ async def parallel_lifespan(app: FastAPI):
         except Exception as _ls:  # noqa: BLE001 — a witness never blocks a boot
             logger.debug("[HUD] loop sentinel unavailable: %s", _ls)
 
+        # The sentinel says a stall HAPPENED. This says what was RUNNING.
+        #
+        # Started immediately after it, and deliberately here rather than
+        # later: the stalls worth catching (6.71s, 8.05s, 7.66s on
+        # 2026-08-05) all occur DURING boot, so a sampler armed after boot
+        # completes would arrive after the evidence. It runs on its own
+        # thread precisely because the loop is the thing being observed —
+        # anything scheduled on the loop cannot witness the loop being dead.
+        try:
+            from backend.hud.stall_sampler import get_stall_sampler
+            get_stall_sampler().start()
+        except Exception as _ss:  # noqa: BLE001 — a witness never blocks a boot
+            logger.debug("[HUD] stall sampler unavailable: %s", _ss)
+
         # =================================================================
         # v351.0: HUD MODE — IPC server + SSE consumer for Swift HUD
         # =================================================================

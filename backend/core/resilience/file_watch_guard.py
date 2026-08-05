@@ -736,6 +736,56 @@ class FileWatchGuard:
         logger.info("[FileWatchGuard] Stopped")
 
     async def _start_watchdog(self) -> None:
+        """Start the observer WITHOUT holding the event loop.
+
+        The body of this used to run here, and it is 239 lines of pure
+        synchronous filesystem work — resolving roots, walking exclusions,
+        calling ``observer.schedule()`` per root and finally
+        ``observer.start()``. There is not a single ``await`` in it. It was
+        ``async`` in name only, so every millisecond of it ran ON the loop.
+
+        Caught in the act by ``stall_sampler``, which dumps stacks from a
+        thread WHILE the loop is wedged rather than after it recovers. This
+        chain appeared in 5 of 8 boot dumps on 2026-08-05:
+
+            intake_layer_service.start
+              -> _build_components
+                -> fs_event_bridge.start
+                  -> file_watch_guard.start
+                    -> _start_watchdog        <- the loop stopped here
+
+        which matches the boot stalls the sentinel had been reporting for
+        weeks without ever being able to name them (6.71s, 8.05s, 7.66s,
+        availability 41-65%).
+
+        Offloaded through ``cooperative_fs_io.offload`` — the substrate that
+        exists for exactly this and that the posture collectors already use.
+        No new threading mechanism, no second policy. Threads rather than a
+        process pool deliberately: this is filesystem and syscall work, which
+        RELEASES the GIL, so a thread genuinely frees the loop here. That is
+        the opposite of the posture case, where a wholesale thread offload was
+        measured and rejected because pure-Python work carries the GIL with it.
+
+        Fails soft to the direct call: a substrate fault must not stop a
+        watcher from starting. That degrades to the old behaviour — a blocked
+        loop — which is strictly better than no file watching at all.
+        """
+        try:
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                offload,
+                is_offload_error,
+            )
+        except Exception:  # noqa: BLE001 — substrate unavailable
+            return self._start_watchdog_blocking()
+        result = await offload(self._start_watchdog_blocking, cpu_bound=False)
+        if is_offload_error(result):
+            # The collector raised inside the worker. Re-run inline so the
+            # exception surfaces to the caller exactly as it always has,
+            # rather than being swallowed into a silently watcher-less boot.
+            return self._start_watchdog_blocking()
+        return result
+
+    def _start_watchdog_blocking(self) -> None:
         """Start the watchdog observer.
 
         Backend selection:
