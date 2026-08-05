@@ -24,3 +24,15 @@ repos:
           git rm --cached <file>
         language: fail
         files: '(\.pyc$|(^|/)__pycache__/)'
+
+      # A Swift file that is not in the generated .xcodeproj is never
+      # compiled, so it can be committed, reviewed and referenced by other
+      # Swift code while doing nothing at all. Catch the drift at the commit
+      # that introduces it rather than during the debugging session weeks
+      # later. Runs on the git index, so it sees exactly what is staged.
+      - id: xcodegen-parity
+        name: Xcode project matches project.yml
+        entry: scripts/check_xcodegen_parity.sh
+        language: script
+        pass_filenames: false
+        files: '(^JARVIS-Apple/|\.pbxproj$|\.xcscheme$)'

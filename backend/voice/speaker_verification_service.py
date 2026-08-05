@@ -5743,6 +5743,37 @@ class SpeakerVerificationService:
         original_size = len(audio_data)
         logger.info(f"🔄 Starting audio conversion: {original_size} bytes input")
 
+        # RESOLVE THE LAZILY-LOADED CONVERTERS BEFORE USING THEM.
+        #
+        # `_init_ml_components` imports these four into the module-level dict
+        # `_audio_converter_funcs` and deliberately does NOT bind them as
+        # globals — that is the whole point of deferring a heavy import. This
+        # function was still written against the bare names, so every strategy
+        # below raised `NameError` before it could convert a single byte:
+        #
+        #     [VoiceIdentity] unavailable  NameError: name
+        #     'AudioConverterConfig' is not defined
+        #
+        # which `VoiceIdentity.identify` reports as UNAVAILABLE and the router
+        # reads as "not consent". Speaker verification could therefore never
+        # succeed, for any audio, since the lazy-loading refactor — the failure
+        # was invisible because a fault on a consent path is indistinguishable
+        # from a refusal unless you read the detail string.
+        #
+        # `get_audio_converter` is the accessor that already existed for this;
+        # it initialises ML components on demand and returns None if the import
+        # genuinely failed.
+        prepare_audio_with_analysis = get_audio_converter('prepare_audio_with_analysis')
+        prepare_audio_for_stt_async = get_audio_converter('prepare_audio_for_stt_async')
+        prepare_audio_for_stt = get_audio_converter('prepare_audio_for_stt')
+        AudioConverterConfig = get_audio_converter('AudioConverterConfig')
+        if AudioConverterConfig is None:
+            # A missing converter is a fault, not a verdict. Returning empty
+            # here lets the caller fail closed with a reason rather than
+            # crashing mid-strategy with a NameError that reads as a decline.
+            logger.error("❌ Audio conversion unavailable: converters did not load")
+            return b''
+
         # Create dynamic config from environment
         config = AudioConverterConfig.from_env()
         logger.debug(f"   Config: {config.target_sample_rate}Hz, {config.target_channels}ch, {config.target_bit_depth}bit")

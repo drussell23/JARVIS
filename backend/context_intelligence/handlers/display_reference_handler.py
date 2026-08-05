@@ -908,6 +908,51 @@ class AdvancedDisplayReferenceHandler:
 
         return len(intersection) / len(union) if union else 0.0
 
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get handler statistics"""
+        return {
+            **self.stats,
+            "known_displays": len(self.known_displays),
+            "learned_patterns": sum(len(v) for v in self.learned_patterns.values()),
+            "cache_size": len(self.resolution_cache),
+            "action_keywords_learned": {
+                action.value: len(keywords) for action, keywords in self.action_keywords.items()
+            },
+            "mode_keywords_learned": {
+                mode.value: len(keywords) for mode, keywords in self.mode_keywords.items()
+            },
+        }
+
+    def get_display_stats(self, display_name: str) -> Optional[Dict[str, Any]]:
+        """Get statistics for a specific display"""
+        if display_name in self.known_displays:
+            event = self.known_displays[display_name]
+            return {
+                "display_name": event.display_name,
+                "display_id": event.display_id,
+                "first_detected": event.detected_at.isoformat(),
+                "last_seen": event.last_seen.isoformat(),
+                "detection_count": event.detection_count,
+                "connection_attempts": event.connection_attempts,
+                "successful_connections": event.successful_connections,
+                "success_rate": (
+                    event.successful_connections / event.connection_attempts
+                    if event.connection_attempts > 0
+                    else 0.0
+                ),
+            }
+        return None
+
+    def get_known_displays(self) -> List[str]:
+        """Get list of known display names"""
+        return list(self.known_displays.keys())
+
+    def _record_command(self, command: str, reference: DisplayReference):
+        """Record command in history"""
+        self.command_history.append(
+            {"command": command, "reference": reference.to_dict(), "timestamp": datetime.now()}
+        )
+
 
 # =============================================================================
 # BACKWARDS COMPATIBILITY ALIAS

@@ -897,6 +897,161 @@ class ClaudeContentStreamer:
 
                 section_name = line.lstrip("#").lstrip("0123456789. ").strip
 
+    async def _mock_stream(self, prompt: str) -> AsyncIterator[str]:
+        """Enhanced mock content streaming for testing"""
+        # Detect document type from prompt
+        prompt_lower = prompt.lower()
+
+        if "mla" in prompt_lower:
+            mock_content = """Student Name
+Instructor Name
+Course Name
+1 October 2025
+
+Dogs: Loyal Companions
+
+## Introduction
+
+Dogs have been humanity's faithful companions for thousands of years. From ancient hunting partners to modern family pets, dogs have played crucial roles in human society (Smith 45).
+
+## The History of Dog Domestication
+
+Archaeological evidence suggests that dogs were first domesticated from wolves approximately 15,000 years ago (Johnson and Brown 112). This partnership between humans and canines represents one of the most successful interspecies relationships in history.
+
+## Characteristics and Breeds
+
+Modern dogs exhibit remarkable diversity, with over 300 recognized breeds worldwide. Each breed possesses unique characteristics suited to specific roles, from herding sheep to providing emotional support.
+
+## The Human-Canine Bond
+
+Research demonstrates that dogs provide numerous physical and psychological benefits to their owners. Studies show that dog ownership can reduce stress, lower blood pressure, and increase physical activity levels (Williams 78).
+
+## Conclusion
+
+Dogs remain invaluable companions in contemporary society. Their loyalty, intelligence, and adaptability ensure their continued importance in human lives for generations to come.
+
+Works Cited
+
+Johnson, Mary, and Robert Brown. "Canine Domestication History." Journal of Archaeological Science, vol. 45, 2020, pp. 110-125.
+
+Smith, John. The Evolution of Dogs. Academic Press, 2019.
+
+Williams, Sarah. "Health Benefits of Pet Ownership." Medical Journal, vol. 12, no. 3, 2021, pp. 75-82."""
+
+        elif "apa" in prompt_lower:
+            mock_content = """Running head: DOGS AS COMPANIONS
+
+Dogs as Loyal Companions
+
+Student Name
+Institution Name
+
+## Abstract
+
+This paper examines the historical and contemporary role of dogs in human society, their domestication, breed diversity, and the psychological benefits of dog ownership.
+
+## Dogs as Loyal Companions
+
+Dogs have been humanity's faithful companions for millennia (Smith, 2019). Their domestication represents a pivotal moment in human history.
+
+## History of Domestication
+
+Archaeological evidence indicates that dogs were first domesticated approximately 15,000 years ago (Johnson & Brown, 2020). This partnership has proven remarkably successful.
+
+## Modern Dog Breeds
+
+Contemporary dogs exhibit tremendous diversity, with over 300 recognized breeds globally. Each breed possesses characteristics suited to specific functions.
+
+## Psychological Benefits
+
+Research demonstrates that dogs provide significant health benefits to owners, including stress reduction and increased physical activity (Williams, 2021).
+
+## Conclusion
+
+Dogs continue to serve as invaluable companions in modern society, providing both practical assistance and emotional support.
+
+References
+
+Johnson, M., & Brown, R. (2020). Canine domestication history. Journal of Archaeological Science, 45, 110-125.
+
+Smith, J. (2019). The evolution of dogs. Academic Press.
+
+Williams, S. (2021). Health benefits of pet ownership. Medical Journal, 12(3), 75-82."""
+
+        else:
+            mock_content = """# Dogs: Loyal Companions
+
+## Introduction
+
+Dogs have been humanity's faithful companions for thousands of years, serving roles from hunting partners to beloved family pets.
+
+## History
+
+Archaeological evidence suggests dogs were first domesticated from wolves approximately 15,000 years ago, making them one of the first domesticated animals.
+
+## Breeds and Characteristics
+
+Modern dogs display remarkable diversity, with over 300 recognized breeds worldwide. Each breed has unique characteristics suited to specific roles.
+
+## Human-Canine Bond
+
+Research shows that dogs provide numerous benefits to their owners, including reduced stress, increased physical activity, and emotional support.
+
+## Conclusion
+
+Dogs remain invaluable companions in contemporary society, their loyalty and intelligence ensuring their continued importance in human lives."""
+
+        # Stream the mock content with natural pacing
+        words = mock_content.split()
+        for i, word in enumerate(words):
+            # Add space except for first word and after newlines
+            chunk = word if i == 0 or words[i - 1].endswith("\n") else " " + word
+            yield chunk
+            # Variable delay for more natural feel
+            await asyncio.sleep(0.03 if len(word) < 5 else 0.05)
+
+    def get_cache_size(self) -> int:
+        """Get number of cached outlines"""
+        return len(self._outline_cache)
+
+    def clear_cache(self):
+        """Clear the outline cache"""
+        cleared = len(self._outline_cache)
+        self._outline_cache.clear()
+        logger.info(f"Cleared {cleared} cached outlines")
+
+    def get_session_statistics(self) -> Dict[str, Any]:
+        """
+        Get comprehensive session statistics
+
+        Returns:
+            Dictionary of session stats
+        """
+        if not self._session_stats:
+            return {"sessions": 0, "total_tokens": 0}
+
+        return {
+            "sessions": len(self._session_stats),
+            "total_tokens": sum(s.total_tokens for s in self._session_stats),
+            "total_duration": sum(s.get_duration() for s in self._session_stats),
+            "average_tokens_per_second": sum(s.get_tokens_per_second() for s in self._session_stats)
+            / len(self._session_stats),
+            "total_errors": sum(s.errors_encountered for s in self._session_stats),
+            "total_retries": sum(s.retries_attempted for s in self._session_stats),
+            "models_used": list(set(s.model_used for s in self._session_stats)),
+        }
+
+    def _mock_outline(self) -> Dict[str, Any]:
+        """Generate a mock outline for testing"""
+        return {
+            "title": "Sample Document",
+            "sections": [
+                {"name": "Introduction", "points": ["Context and background", "Thesis statement"]},
+                {"name": "Main Content", "points": ["Key point 1", "Key point 2", "Key point 3"]},
+                {"name": "Conclusion", "points": ["Summary", "Final thoughts"]},
+            ],
+        }
+
 # Singleton instance
 _claude_streamer_instance = None
 

@@ -799,4 +799,630 @@ class ActivityCorrelationEngine:
 
         return score
 
-# Module truncated - needs restoration from backup
+    def record_behavior_pattern(self, pattern: Dict[str, Any]):
+        """Record a behavior pattern for learning"""
+        self.behavior_patterns.append({
+            **pattern,
+            'timestamp': datetime.now()
+        })
+
+
+# ============================================================================
+# MULTI-SOURCE SYNTHESIZER - Information Synthesis
+# ============================================================================
+
+class MultiSourceSynthesizer:
+    """
+    Synthesizes information from multiple spaces into coherent understanding.
+    Combines terminal output + browser content + code changes = full story.
+    """
+
+    def __init__(self):
+        pass
+
+    def synthesize_story(self, relationship: CrossSpaceRelationship) -> Dict[str, Any]:
+        """
+        Create a coherent narrative from related activities.
+
+        Returns:
+            {
+                'summary': str,           # High-level summary
+                'timeline': List[str],    # Chronological steps
+                'key_insights': List[str], # Important findings
+                'current_state': str,     # What's happening now
+                'suggestions': List[str]  # What to do next
+            }
+        """
+        activities = sorted(relationship.activities, key=lambda a: a.timestamp)
+
+        # Extract key information
+        errors = [a for a in activities if a.has_error]
+        solutions = [a for a in activities if a.has_solution]
+        terminal_acts = [a for a in activities if a.activity_type == "terminal"]
+        browser_acts = [a for a in activities if a.activity_type == "browser"]
+        ide_acts = [a for a in activities if a.activity_type == "ide"]
+
+        # Build summary
+        summary = self._generate_summary(relationship, errors, solutions,
+                                        terminal_acts, browser_acts, ide_acts)
+
+        # Build timeline
+        timeline = [
+            f"{act.timestamp.strftime('%H:%M:%S')} - {act.app_name} (Space {act.space_id}): {act.content_summary[:80]}"
+            for act in activities
+        ]
+
+        # Extract key insights
+        key_insights = self._extract_insights(activities, errors, solutions)
+
+        # Determine current state
+        current_state = self._determine_current_state(activities)
+
+        # Generate suggestions
+        suggestions = self._generate_suggestions(relationship, errors, solutions)
+
+        return {
+            'summary': summary,
+            'timeline': timeline,
+            'key_insights': key_insights,
+            'current_state': current_state,
+            'suggestions': suggestions,
+            'spaces_involved': list(relationship.get_spaces()),
+            'confidence': relationship.confidence
+        }
+
+    def _generate_summary(self, rel: CrossSpaceRelationship,
+                         errors: List, solutions: List,
+                         terminal: List, browser: List, ide: List) -> str:
+        """Generate high-level summary"""
+        spaces_count = len(rel.get_spaces())
+
+        if rel.relationship_type == RelationshipType.DEBUGGING:
+            if errors and browser:
+                return f"Debugging workflow across {spaces_count} spaces: encountered error in terminal, researching solution in browser"
+            elif errors and ide:
+                return f"Debugging workflow: fixing error in code editor (Space {ide[0].space_id})"
+
+        elif rel.relationship_type == RelationshipType.PROBLEM_SOLVING:
+            if errors and solutions:
+                return f"Problem-solving workflow: error detected, solution found and being implemented across {spaces_count} spaces"
+
+        elif rel.relationship_type == RelationshipType.CODE_AND_TEST:
+            return f"Development workflow: writing code and running tests across {spaces_count} spaces"
+
+        # Generic summary
+        return f"{rel.relationship_type.value.replace('_', ' ').title()} workflow across {spaces_count} spaces with {len(rel.activities)} related activities"
+
+    def _extract_insights(self, activities: List[ActivitySignature],
+                         errors: List, solutions: List) -> List[str]:
+        """Extract key insights from activities"""
+        insights = []
+
+        # Extract common keywords across activities
+        all_keywords = []
+        for act in activities:
+            all_keywords.extend(act.keywords.technical_terms)
+            all_keywords.extend(act.keywords.command_names)
+            all_keywords.extend(list(act.keywords.domain_concepts)[:5])
+
+        # Find most common
+        if all_keywords:
+            common = Counter(all_keywords).most_common(5)
+            key_terms = [term for term, count in common if count > 1]
+            if key_terms:
+                insights.append(f"Key technologies: {', '.join(key_terms)}")
+
+        # Error insights
+        if errors:
+            error_types = set()
+            for err in errors:
+                error_types.update(err.keywords.error_indicators)
+            if error_types:
+                insights.append(f"Issues encountered: {', '.join(list(error_types)[:3])}")
+
+        # Solution insights
+        if solutions:
+            insights.append(f"Found {len(solutions)} potential solution(s)")
+
+        return insights
+
+    def _determine_current_state(self, activities: List[ActivitySignature]) -> str:
+        """Determine what's currently happening"""
+        if not activities:
+            return "No recent activity"
+
+        latest = activities[-1]
+
+        if latest.has_error:
+            return f"Error state in {latest.app_name} (Space {latest.space_id})"
+        elif latest.has_solution:
+            return f"Solution found in {latest.app_name} (Space {latest.space_id})"
+        elif latest.activity_type == "browser":
+            return f"Researching in browser (Space {latest.space_id})"
+        elif latest.activity_type == "terminal":
+            return f"Running commands in terminal (Space {latest.space_id})"
+        elif latest.activity_type == "ide":
+            return f"Editing code in IDE (Space {latest.space_id})"
+        else:
+            return f"Active in {latest.app_name} (Space {latest.space_id})"
+
+    def _generate_suggestions(self, rel: CrossSpaceRelationship,
+                             errors: List, solutions: List) -> List[str]:
+        """Generate actionable suggestions"""
+        suggestions = []
+
+        if errors and not solutions:
+            suggestions.append("Consider searching for solutions to the error")
+
+        if solutions and errors:
+            suggestions.append("Try implementing the solution found in browser")
+
+        if rel.relationship_type == RelationshipType.CODE_AND_TEST:
+            latest = sorted(rel.activities, key=lambda a: a.timestamp)[-1]
+            if latest.has_error:
+                suggestions.append("Tests are failing - review the error output")
+
+        return suggestions
+
+
+# ============================================================================
+# RELATIONSHIP GRAPH - Dynamic Relationship Tracking
+# ============================================================================
+
+class RelationshipGraph:
+    """
+    Tracks discovered relationships over time.
+    Maintains graph of how spaces and activities are connected.
+    """
+
+    def __init__(self, max_relationships: int = 100):
+        self.relationships: Dict[str, CrossSpaceRelationship] = {}
+        self.max_relationships = max_relationships
+        self.space_connections: Dict[int, Set[int]] = defaultdict(set)  # space_id → connected spaces
+
+    def add_relationship(self, relationship: CrossSpaceRelationship):
+        """Add or update a relationship in the graph"""
+        rel_id = relationship.relationship_id
+
+        if rel_id in self.relationships:
+            # Update existing
+            existing = self.relationships[rel_id]
+            existing.last_updated = datetime.now()
+            existing.confidence = min(1.0, existing.confidence + 0.1)
+            existing.evidence.extend(relationship.evidence)
+        else:
+            # Add new
+            self.relationships[rel_id] = relationship
+
+            # Update space connections
+            spaces = list(relationship.get_spaces())
+            for i, space1 in enumerate(spaces):
+                for space2 in spaces[i+1:]:
+                    self.space_connections[space1].add(space2)
+                    self.space_connections[space2].add(space1)
+
+        # Prune old relationships if too many
+        if len(self.relationships) > self.max_relationships:
+            self._prune_old_relationships()
+
+        logger.info(f"[RELATIONSHIP-GRAPH] Relationship {rel_id}: {relationship.description}")
+
+    def get_relationships_for_space(self, space_id: int) -> List[CrossSpaceRelationship]:
+        """Get all relationships involving a specific space"""
+        return [rel for rel in self.relationships.values() if rel.involves_space(space_id)]
+
+    def get_connected_spaces(self, space_id: int) -> Set[int]:
+        """Get all spaces connected to this space"""
+        return self.space_connections.get(space_id, set())
+
+    def find_relationship_by_activities(self, space_ids: List[int],
+                                       within_seconds: int = 300) -> Optional[CrossSpaceRelationship]:
+        """Find an existing relationship involving these spaces"""
+        cutoff = datetime.now() - timedelta(seconds=within_seconds)
+
+        for rel in self.relationships.values():
+            if rel.last_updated >= cutoff:
+                rel_spaces = rel.get_spaces()
+                if all(sid in rel_spaces for sid in space_ids):
+                    return rel
+
+        return None
+
+    def _prune_old_relationships(self):
+        """Remove oldest relationships to maintain size limit"""
+        sorted_rels = sorted(
+            self.relationships.items(),
+            key=lambda x: x[1].last_updated
+        )
+
+        # Keep newest 80% of max
+        keep_count = int(self.max_relationships * 0.8)
+        to_keep = sorted_rels[-keep_count:]
+
+        self.relationships = dict(to_keep)
+
+        # Rebuild space connections
+        self.space_connections = defaultdict(set)
+        for rel in self.relationships.values():
+            spaces = list(rel.get_spaces())
+            for i, space1 in enumerate(spaces):
+                for space2 in spaces[i+1:]:
+                    self.space_connections[space1].add(space2)
+                    self.space_connections[space2].add(space1)
+
+
+# ============================================================================
+# WORKSPACE QUERY RESOLVER - Workspace-Wide Query Answering
+# ============================================================================
+
+class WorkspaceQueryResolver:
+    """
+    Answers queries by drawing from the entire workspace.
+    Synthesizes information across all spaces to provide complete answers.
+    """
+
+    def __init__(self, relationship_graph: RelationshipGraph,
+                 synthesizer: MultiSourceSynthesizer):
+        self.relationship_graph = relationship_graph
+        self.synthesizer = synthesizer
+
+    async def resolve_workspace_query(self, query: str,
+                                      current_space_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Resolve a query using information from entire workspace.
+
+        Examples:
+        - "What's the error?" → finds error across any space
+        - "What am I working on?" → synthesizes from all active spaces
+        - "How do I fix this?" → combines error + solution from different spaces
+        """
+        query_lower = query.lower()
+
+        # Determine query type
+        if any(kw in query_lower for kw in ["error", "wrong", "problem", "failed"]):
+            return await self._resolve_error_query(current_space_id)
+
+        elif any(kw in query_lower for kw in ["working on", "doing", "current"]):
+            return await self._resolve_activity_query(current_space_id)
+
+        elif any(kw in query_lower for kw in ["how", "fix", "solve", "solution"]):
+            return await self._resolve_solution_query(current_space_id)
+
+        elif any(kw in query_lower for kw in ["related", "connected", "together"]):
+            return await self._resolve_relationship_query(current_space_id)
+
+        else:
+            # Generic workspace summary
+            return await self._resolve_generic_query(query)
+
+    async def _resolve_error_query(self, current_space_id: Optional[int]) -> Dict[str, Any]:
+        """Find and explain errors across workspace"""
+        # Find relationships with errors
+        error_relationships = [
+            rel for rel in self.relationship_graph.relationships.values()
+            if any(act.has_error for act in rel.activities)
+        ]
+
+        if not error_relationships:
+            return {
+                'found': False,
+                'response': "I don't see any recent errors in your workspace."
+            }
+
+        # Most recent error relationship
+        latest_error_rel = max(error_relationships, key=lambda r: r.last_updated)
+
+        # Synthesize story
+        story = self.synthesizer.synthesize_story(latest_error_rel)
+
+        return {
+            'found': True,
+            'relationship': latest_error_rel,
+            'story': story,
+            'response': self._format_error_response(story, latest_error_rel)
+        }
+
+    async def _resolve_activity_query(self, current_space_id: Optional[int]) -> Dict[str, Any]:
+        """Summarize current work across workspace"""
+        recent_rels = [
+            rel for rel in self.relationship_graph.relationships.values()
+            if (datetime.now() - rel.last_updated).total_seconds() < 300
+        ]
+
+        if not recent_rels:
+            return {
+                'found': False,
+                'response': "I don't see any recent activity in your workspace."
+            }
+
+        # Get stories for all recent relationships
+        stories = [self.synthesizer.synthesize_story(rel) for rel in recent_rels]
+
+        return {
+            'found': True,
+            'relationships': recent_rels,
+            'stories': stories,
+            'response': self._format_activity_response(stories, recent_rels)
+        }
+
+    async def _resolve_solution_query(self, current_space_id: Optional[int]) -> Dict[str, Any]:
+        """Find solutions to problems across workspace"""
+        # Find relationships with both errors and solutions
+        solution_relationships = [
+            rel for rel in self.relationship_graph.relationships.values()
+            if any(act.has_error for act in rel.activities) and
+               any(act.has_solution for act in rel.activities)
+        ]
+
+        if not solution_relationships:
+            return {
+                'found': False,
+                'response': "I haven't found any solutions yet. Try searching for the error online."
+            }
+
+        # Most recent solution
+        latest_solution_rel = max(solution_relationships, key=lambda r: r.last_updated)
+        story = self.synthesizer.synthesize_story(latest_solution_rel)
+
+        return {
+            'found': True,
+            'relationship': latest_solution_rel,
+            'story': story,
+            'response': self._format_solution_response(story, latest_solution_rel)
+        }
+
+    async def _resolve_relationship_query(self, current_space_id: Optional[int]) -> Dict[str, Any]:
+        """Explain how spaces are related"""
+        if current_space_id:
+            connected = self.relationship_graph.get_connected_spaces(current_space_id)
+            rels = self.relationship_graph.get_relationships_for_space(current_space_id)
+
+            if not connected:
+                return {
+                    'found': False,
+                    'response': f"Space {current_space_id} doesn't have detected connections to other spaces yet."
+                }
+
+            return {
+                'found': True,
+                'connected_spaces': connected,
+                'relationships': rels,
+                'response': f"Space {current_space_id} is connected to spaces: {', '.join(map(str, connected))}. {len(rels)} related workflows detected."
+            }
+        else:
+            return {
+                'found': False,
+                'response': "Please specify which space you'd like to know about."
+            }
+
+    async def _resolve_generic_query(self, query: str) -> Dict[str, Any]:
+        """Generic query resolution"""
+        all_rels = list(self.relationship_graph.relationships.values())
+
+        if not all_rels:
+            return {
+                'found': False,
+                'response': "No workspace activity detected yet."
+            }
+
+        return {
+            'found': True,
+            'response': f"Your workspace has {len(all_rels)} active workflows across multiple spaces."
+        }
+
+    def _format_error_response(self, story: Dict, rel: CrossSpaceRelationship) -> str:
+        """Format error response with full context"""
+        response = f"**Error detected across {len(story['spaces_involved'])} space(s):**\n\n"
+
+        # Include actual error content from activities
+        error_activities = [act for act in rel.activities if act.has_error]
+        if error_activities:
+            latest_error = error_activities[-1]
+            response += f"{latest_error.content_summary}\n\n"
+
+        response += f"{story['summary']}\n\n"
+
+        if story['key_insights']:
+            response += "**Key details:**\n"
+            for insight in story['key_insights']:
+                response += f"- {insight}\n"
+
+        response += f"\n**Current state:** {story['current_state']}"
+
+        return response
+
+    def _format_activity_response(self, stories: List[Dict], rels: List) -> str:
+        """Format activity summary"""
+        response = f"**You're working on {len(stories)} active workflow(s):**\n\n"
+
+        for i, story in enumerate(stories, 1):
+            response += f"{i}. {story['summary']}\n"
+
+        return response
+
+    def _format_solution_response(self, story: Dict, rel: CrossSpaceRelationship) -> str:
+        """Format solution response"""
+        response = f"**Solution found:**\n\n{story['summary']}\n\n"
+
+        if story['suggestions']:
+            response += "**Suggested next steps:**\n"
+            for suggestion in story['suggestions']:
+                response += f"- {suggestion}\n"
+
+        return response
+
+
+# ============================================================================
+# MAIN CROSS-SPACE INTELLIGENCE COORDINATOR
+# ============================================================================
+
+class CrossSpaceIntelligence:
+    """
+    Main coordinator for cross-space intelligence.
+    Integrates all components to provide advanced multi-space understanding.
+    """
+
+    def __init__(self):
+        self.semantic_correlator = SemanticCorrelator()
+        self.correlation_engine = ActivityCorrelationEngine()
+        self.synthesizer = MultiSourceSynthesizer()
+        self.relationship_graph = RelationshipGraph()
+        self.workspace_resolver = WorkspaceQueryResolver(self.relationship_graph, self.synthesizer)
+
+        logger.info("[CROSS-SPACE-INTELLIGENCE] Initialized")
+
+    def record_activity(self, space_id: int, app_name: str, content: str,
+                       activity_type: str, has_error: bool = False,
+                       significance: str = "normal") -> ActivitySignature:
+        """
+        Record an activity and check for cross-space relationships.
+
+        This is the main entry point - call this whenever something happens
+        in any space.
+        """
+        # Create signature
+        signature = self.semantic_correlator.create_signature(
+            space_id, app_name, content, activity_type, has_error, significance
+        )
+
+        # Find related activities
+        related = self.semantic_correlator.find_related_activities(signature)
+
+        # If we found related activities, analyze relationships
+        if related:
+            asyncio.create_task(self._analyze_and_record_relationships(signature, related))
+
+        return signature
+
+    async def _analyze_and_record_relationships(self, signature: ActivitySignature,
+                                                related: List[Tuple[ActivitySignature, float]]):
+        """Analyze related activities and record relationships"""
+        for related_sig, similarity in related:
+            # Calculate full correlation
+            correlation = self.correlation_engine.correlate(signature, related_sig)
+
+            # If significant correlation, create/update relationship
+            if correlation.is_significant(threshold=0.5):
+                relationship_type = self._determine_relationship_type(signature, related_sig, correlation)
+
+                # Check if relationship already exists
+                involved_spaces = [signature.space_id, related_sig.space_id]
+                existing = self.relationship_graph.find_relationship_by_activities(involved_spaces)
+
+                if existing:
+                    # Update existing relationship
+                    existing.activities.append(signature)
+                    existing.last_updated = datetime.now()
+                    existing.confidence = min(1.0, existing.confidence + 0.05)
+                else:
+                    # Create new relationship
+                    rel_id = hashlib.md5(
+                        f"{signature.space_id}_{related_sig.space_id}_{signature.timestamp}".encode()
+                    ).hexdigest()[:12]
+
+                    description = self._generate_relationship_description(
+                        signature, related_sig, relationship_type
+                    )
+
+                    relationship = CrossSpaceRelationship(
+                        relationship_id=rel_id,
+                        relationship_type=relationship_type,
+                        activities=[related_sig, signature],
+                        correlation_score=correlation,
+                        first_detected=datetime.now(),
+                        last_updated=datetime.now(),
+                        confidence=correlation.overall_score,
+                        evidence=[{
+                            'correlation': asdict(correlation),
+                            'similarity': similarity
+                        }],
+                        description=description
+                    )
+
+                    self.relationship_graph.add_relationship(relationship)
+
+    def _determine_relationship_type(self, act1: ActivitySignature,
+                                    act2: ActivitySignature,
+                                    correlation: CorrelationScore) -> RelationshipType:
+        """Determine the type of relationship based on activities"""
+        # Debugging: error + browser research
+        if (act1.has_error and act2.activity_type == "browser") or \
+           (act2.has_error and act1.activity_type == "browser"):
+            return RelationshipType.DEBUGGING
+
+        # Problem solving: error + solution + action
+        if (act1.has_error and act2.has_solution) or \
+           (act2.has_error and act1.has_solution):
+            return RelationshipType.PROBLEM_SOLVING
+
+        # Code and test: IDE + terminal with test keywords
+        if (act1.activity_type == "ide" and act2.activity_type == "terminal") or \
+           (act2.activity_type == "ide" and act1.activity_type == "terminal"):
+            return RelationshipType.CODE_AND_TEST
+
+        # Research and code: browser + IDE
+        if (act1.activity_type == "browser" and act2.activity_type == "ide") or \
+           (act2.activity_type == "browser" and act1.activity_type == "ide"):
+            return RelationshipType.RESEARCH_AND_CODE
+
+        # Multi-terminal: both terminals
+        if act1.activity_type == "terminal" and act2.activity_type == "terminal":
+            return RelationshipType.MULTI_TERMINAL
+
+        # Default: investigation
+        return RelationshipType.INVESTIGATION
+
+    def _generate_relationship_description(self, act1: ActivitySignature,
+                                          act2: ActivitySignature,
+                                          rel_type: RelationshipType) -> str:
+        """Generate human-readable description of relationship"""
+        return f"{rel_type.value.replace('_', ' ').title()}: {act1.app_name} (Space {act1.space_id}) ↔ {act2.app_name} (Space {act2.space_id})"
+
+    async def answer_workspace_query(self, query: str,
+                                    current_space_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Answer a query using workspace-wide context.
+        This is the main query interface.
+        """
+        return await self.workspace_resolver.resolve_workspace_query(query, current_space_id)
+
+    def get_workspace_summary(self) -> Dict[str, Any]:
+        """Get a summary of all workspace relationships"""
+        all_rels = list(self.relationship_graph.relationships.values())
+
+        if not all_rels:
+            return {
+                'relationships_count': 0,
+                'active_workflows': [],
+                'connected_spaces': {}
+            }
+
+        # Recent relationships (last 5 minutes)
+        recent = [r for r in all_rels
+                 if (datetime.now() - r.last_updated).total_seconds() < 300]
+
+        return {
+            'relationships_count': len(all_rels),
+            'recent_count': len(recent),
+            'active_workflows': [
+                {
+                    'type': r.relationship_type.value,
+                    'spaces': list(r.get_spaces()),
+                    'description': r.description,
+                    'confidence': r.confidence
+                }
+                for r in recent
+            ],
+            'connected_spaces': dict(self.relationship_graph.space_connections)
+        }
+
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+def initialize_cross_space_intelligence() -> CrossSpaceIntelligence:
+    """Initialize the cross-space intelligence system"""
+    intelligence = CrossSpaceIntelligence()
+    logger.info("[CROSS-SPACE-INTELLIGENCE] System initialized and ready")
+    return intelligence

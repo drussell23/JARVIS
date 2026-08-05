@@ -26,6 +26,7 @@
 		9675A57D67D07E9D157B8468 /* JARVISPhoneApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 698E4531C1F4FD5A0215C9B1 /* JARVISPhoneApp.swift */; };
 		993234F1A4D7A1BCA27374BB /* BrainstemLauncher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6A777442955E499D4E22D3B /* BrainstemLauncher.swift */; };
 		99C3D3109F5801D5ED6F638A /* HapticEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 266CC1C8FBBB302AD623A3D9 /* HapticEngine.swift */; };
+		9D8F259F3A4877CC70B36F0C /* BootLogFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 633E90E2380BBC6CB188BB57 /* BootLogFile.swift */; };
 		9FC588C57049591237CF032F /* HUDView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A0A5C4460F31FD5CB53DD10 /* HUDView.swift */; };
 		A0BD7790CE0BF3EDAC6D6372 /* ArcReactorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26744ECD2240E57AF517188D /* ArcReactorView.swift */; };
 		A348802554BD9C09EE824952 /* UtteranceRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86A3C5DDD4D1D44D8569C39B /* UtteranceRecorder.swift */; };
@@ -55,6 +56,7 @@
 		4784C00A28BAB42B47C1A4F1 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		496ADA6BEACAC0F28324C87E /* JARVISWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JARVISWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		62C68475EAAD735E3FB66AAE /* WakeWordListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WakeWordListener.swift; sourceTree = "<group>"; };
+		633E90E2380BBC6CB188BB57 /* BootLogFile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootLogFile.swift; sourceTree = "<group>"; };
 		698E4531C1F4FD5A0215C9B1 /* JARVISPhoneApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISPhoneApp.swift; sourceTree = "<group>"; };
 		6A73D85D2FBC6659D4A47810 /* JARVISHUD.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JARVISHUD.entitlements; sourceTree = "<group>"; };
 		7A0A5C4460F31FD5CB53DD10 /* HUDView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HUDView.swift; sourceTree = "<group>"; };
@@ -125,7 +127,6 @@
 				2AD0E9678194BFE8A1EC9B1B /* Info.plist */,
 				6A73D85D2FBC6659D4A47810 /* JARVISHUD.entitlements */,
 				7F9345DF8825258B0773BAA5 /* JARVISHUDApp.swift */,
-				F9DF9FDDEC7F5849BAF5A642 /* .claude */,
 				4C449CDADB043C7331150D64 /* Services */,
 				243C003B3193F42692D7BF8F /* Views */,
 			);
@@ -172,6 +173,7 @@
 			isa = PBXGroup;
 			children = (
 				4784C00A28BAB42B47C1A4F1 /* AppState.swift */,
+				633E90E2380BBC6CB188BB57 /* BootLogFile.swift */,
 				A6A777442955E499D4E22D3B /* BrainstemLauncher.swift */,
 				A2FEA2CE20F48E377D68D971 /* MicSuppression.swift */,
 				7F97771D9894460348ABB0ED /* ScreenCaptureService.swift */,
@@ -188,13 +190,6 @@
 				C953EA1271F55784A7D1004B /* JARVISColors.swift */,
 			);
 			path = Shared;
-			sourceTree = "<group>";
-		};
-		5322F8483534485E0A88943F /* .cc-writes */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = ".cc-writes";
 			sourceTree = "<group>";
 		};
 		58867042BBEE470FD16CA4E2 /* Products */ = {
@@ -265,14 +260,6 @@
 				CE05089C690A3B7B63861CF9 /* PhoneSessionManager.swift */,
 			);
 			path = Services;
-			sourceTree = "<group>";
-		};
-		F9DF9FDDEC7F5849BAF5A642 /* .claude */ = {
-			isa = PBXGroup;
-			children = (
-				5322F8483534485E0A88943F /* .cc-writes */,
-			);
-			path = .claude;
 			sourceTree = "<group>";
 		};
 		FC6CA73ACD325BAEB067CCC8 /* Views */ = {
@@ -423,6 +410,7 @@
 			files = (
 				18B2C64EE92544B8575B5EEC /* AppState.swift in Sources */,
 				A0BD7790CE0BF3EDAC6D6372 /* ArcReactorView.swift in Sources */,
+				9D8F259F3A4877CC70B36F0C /* BootLogFile.swift in Sources */,
 				993234F1A4D7A1BCA27374BB /* BrainstemLauncher.swift in Sources */,
 				4E11F20BF61331B7C669DA94 /* CompactHeaderBar.swift in Sources */,
 				9FC588C57049591237CF032F /* HUDView.swift in Sources */,

@@ -1761,6 +1761,264 @@ Classification:"""
 
         return result
 
+    async def trigger_cost_optimization(self) -> Dict[str, Any]:
+        """
+        Check if cost optimization should be triggered (GCP shutdown)
+        Based on:
+        - GCP idle time >10 minutes
+        - Local RAM pressure <40%
+        - No pending high-priority tasks
+
+        Returns:
+            Dict with optimization actions taken
+        """
+        ram_monitor_factory = _get_ram_monitor()
+        if not ram_monitor_factory:
+            return {"error": "RAM monitor not available"}
+
+        ram_monitor = ram_monitor_factory(self.client.config)
+        current_pressure = ram_monitor.get_current_pressure_percent()
+
+        gcp_idle = self.router._get_backend_idle_minutes("gcp")
+        local_pressure_ok = current_pressure < 40  # Local has capacity
+        gcp_been_idle = gcp_idle > 10  # GCP idle for >10 minutes
+
+        if local_pressure_ok and gcp_been_idle:
+            logger.info(
+                f"💰 Cost optimization triggered: Local RAM {current_pressure:.1f}%, "
+                f"GCP idle {gcp_idle:.1f}min"
+            )
+
+            # TODO: Implement GCP shutdown logic
+            # For now, just return recommendation
+            return {
+                "action": "recommend_gcp_shutdown",
+                "reason": "Cost optimization - local has capacity, GCP idle",
+                "local_ram_percent": current_pressure,
+                "gcp_idle_minutes": gcp_idle,
+                "estimated_savings": "$0.029/hr (~$0.48/day if idle)",
+            }
+        else:
+            return {
+                "action": "no_optimization",
+                "reason": "Conditions not met",
+                "local_ram_percent": current_pressure,
+                "gcp_idle_minutes": gcp_idle,
+                "local_pressure_ok": local_pressure_ok,
+                "gcp_been_idle": gcp_been_idle,
+            }
+
+    def get_activity_summary(self) -> Dict[str, Any]:
+        """Get activity summary for all backends"""
+        return self.router._get_activity_summary()
+
+    def get_idle_time(self, backend_name: str) -> float:
+        """Get idle time in minutes for a backend"""
+        return self.router._get_backend_idle_minutes(backend_name)
+
+    def get_backends_for_capability(self, capability: str) -> List[str]:
+        """Get list of backends that support a capability"""
+        return self.router.get_backends_for_capability(capability)
+
+    def get_backend_capabilities(self, backend_name: str) -> List[str]:
+        """Get capabilities for a specific backend"""
+        if backend_name in self.client.backends:
+            return self.client.backends[backend_name].capabilities
+        return []
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        await self.stop()
+
+    async def __aenter__(self):
+        """Async context manager entry"""
+        await self.start()
+        return self
+
+    def get_detailed_diagnostics(self) -> Dict[str, Any]:
+        """
+        Get comprehensive diagnostics for debugging
+        Includes Phase 2.5 features: idle tracking, capabilities, cost optimization
+        """
+        # Get RAM monitor status
+        ram_monitor_factory = _get_ram_monitor()
+        ram_status = None
+        if ram_monitor_factory:
+            try:
+                ram_monitor = ram_monitor_factory(self.client.config)
+                ram_status = {
+                    "current_pressure_percent": ram_monitor.get_current_pressure_percent(),
+                    "should_prefer_gcp": ram_monitor.should_prefer_gcp(),
+                    "should_force_gcp": ram_monitor.should_force_gcp(),
+                    "can_reclaim_to_local": ram_monitor.can_reclaim_to_local(),
+                    "monitoring_active": ram_monitor.is_running,
+                }
+            except Exception as e:
+                ram_status = {"error": str(e)}
+
+        # Get cost optimization status
+        gcp_idle = self.router._get_backend_idle_minutes("gcp")
+        local_idle = self.router._get_backend_idle_minutes("local")
+
+        return {
+            "orchestrator": {
+                "running": self.is_running,
+                "request_count": self.request_count,
+            },
+            "ram_monitor": ram_status,
+            "backends": {
+                name: {
+                    "type": backend.type.value,
+                    "priority": backend.priority,
+                    "enabled": backend.enabled,
+                    "healthy": backend.health.healthy,
+                    "idle_minutes": round(self.router._get_backend_idle_minutes(name), 2),
+                    "capabilities": backend.capabilities,
+                    "circuit_state": backend.circuit_breaker.state.value,
+                }
+                for name, backend in self.client.backends.items()
+            },
+            "routing": {
+                "total_rules": len(self.router.rules),
+                "strategy": self.router.strategy,
+                "history_size": len(self.router.routing_history),
+            },
+            "cost_optimization": {
+                "gcp_idle_minutes": round(gcp_idle, 2),
+                "local_idle_minutes": round(local_idle, 2),
+                "can_shutdown_gcp": gcp_idle > 10
+                and ram_status
+                and ram_status.get("can_reclaim_to_local", False),
+            },
+            "capabilities_registry": {
+                backend_name: {
+                    "count": len(caps),
+                    "capabilities": caps,
+                    "cache_age_seconds": (
+                        round(
+                            __import__("time").time()
+                            - self.router._capabilities_last_updated.get(backend_name, 0),
+                            2,
+                        )
+                        if backend_name in self.router._capabilities_last_updated
+                        else None
+                    ),
+                }
+                for backend_name, caps in self.router._backend_capabilities.items()
+            },
+        }
+
+    def get_backend_health(self) -> Dict[str, Any]:
+        """Get health of all backends with Phase 2.5 enhancements"""
+        health_data = {}
+
+        for name, backend in self.client.backends.items():
+            idle_minutes = self.router._get_backend_idle_minutes(name)
+
+            health_data[name] = {
+                "healthy": backend.health.healthy,
+                "response_time": backend.health.response_time,
+                "success_rate": backend.health.success_rate,
+                "circuit_state": backend.circuit_breaker.state.value,
+                "last_check": backend.health.last_check.isoformat(),
+                # Phase 2.5: Activity tracking
+                "idle_minutes": round(idle_minutes, 2),
+                "is_idle": idle_minutes > 10,
+                # Phase 2.5: Capabilities
+                "capabilities_count": len(backend.capabilities),
+                "capabilities": backend.capabilities[:5],  # First 5 for overview
+            }
+
+        return health_data
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get orchestrator status with enhanced Phase 2.5 metrics"""
+        routing_analytics = self.router.get_analytics()
+
+        return {
+            "running": self.is_running,
+            "request_count": self.request_count,
+            "client_metrics": self.client.get_metrics(),
+            "routing_analytics": routing_analytics,
+            # Phase 2.5: Backend activity tracking
+            "backend_activity": routing_analytics.get("backend_activity", {}),
+            # Phase 2.5: Capabilities mapping
+            "registered_capabilities": {
+                name: len(caps) for name, caps in self.router._backend_capabilities.items()
+            },
+        }
+
+    def _get_capability_from_decision(self, decision: RouteDecision, command: str) -> Optional[str]:
+        """Determine capability requirement from routing decision"""
+        if decision == RouteDecision.LOCAL:
+            # Check for specific local capabilities
+            command_lower = command.lower()
+            if any(kw in command_lower for kw in ["screenshot", "screen", "capture", "vision"]):
+                return "vision_capture"
+            elif any(kw in command_lower for kw in ["unlock", "password", "login"]):
+                return "screen_unlock"
+            elif any(kw in command_lower for kw in ["hey jarvis", "voice", "listen"]):
+                return "voice_activation"
+            else:
+                return "macos_automation"
+
+        elif decision == RouteDecision.CLOUD:
+            # Check for specific cloud capabilities
+            command_lower = command.lower()
+            if any(kw in command_lower for kw in ["analyze", "understand", "explain", "summarize"]):
+                return "nlp_analysis"
+            elif any(kw in command_lower for kw in ["chat", "talk", "conversation"]):
+                return "chatbot_inference"
+            else:
+                return "ml_processing"
+
+        return None
+
+    async def analyze_with_ml(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Perform ML analysis (routed to cloud for heavy processing)"""
+        return await self.client.execute(
+            path="/api/ml/analyze", method="POST", data=data, capability="ml_processing"
+        )
+
+    async def unlock_screen(self, **kwargs) -> Dict[str, Any]:
+        """Unlock screen (always routed to local)"""
+        return await self.client.execute(
+            path="/api/unlock", method="POST", data=kwargs, capability="screen_unlock"
+        )
+
+    async def capture_screen(self, **kwargs) -> Dict[str, Any]:
+        """Capture screen (always routed to local)"""
+        return await self.client.execute(
+            path="/api/vision/capture", method="POST", data=kwargs, capability="vision_capture"
+        )
+
+    async def execute_action(self, action: str, **kwargs) -> Dict[str, Any]:
+        """Execute an action command"""
+        return await self.execute_command(command=action, command_type="action", metadata=kwargs)
+
+    async def execute_query(self, query: str, **kwargs) -> Dict[str, Any]:
+        """Execute a natural language query"""
+        return await self.execute_command(command=query, command_type="query", metadata=kwargs)
+
+    async def generate_response_with_llm(
+        self, command: str, context: Optional[Dict] = None
+    ) -> Dict[str, Any]:
+        """Generate response using LLM with context"""
+        # Build prompt with context
+        prompt = f"User command: {command}\n\n"
+
+        if context:
+            if "uae" in context:
+                prompt += f"Context: {context['uae']}\n"
+            if "cai" in context:
+                prompt += f"Intent: {context['cai'].get('predicted_intent')}\n"
+
+        prompt += "\nRespond naturally and helpfully:\n"
+
+        result = await self.execute_llm_inference(prompt, max_tokens=256, temperature=0.7)
+
+        return result
+
 
 # ============================================================================
 # GLOBAL ORCHESTRATOR INSTANCE
@@ -1955,3 +2213,21 @@ async def get_voice_auth_status() -> Dict[str, Any]:
         pass
 
     return status
+
+
+async def execute_hybrid_command(command: str, **kwargs) -> Dict[str, Any]:
+    """Convenience function for executing commands"""
+    orchestrator = get_orchestrator()
+    if not orchestrator.is_running:
+        await orchestrator.start()
+    return await orchestrator.execute_command(command, **kwargs)
+
+def _get_ram_monitor():
+    """Lazy load RAM monitor"""
+    try:
+        from backend.core.advanced_ram_monitor import get_ram_monitor
+
+        return get_ram_monitor
+    except ImportError:
+        logger.warning("RAM monitor not available for cost optimization")
+        return None

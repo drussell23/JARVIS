@@ -17,8 +17,16 @@ targets:
     type: application
     platform: iOS
     sources:
-      - JARVISPhone
-      - Shared
+      # `excludes` on every source root, because `generateEmptyDirectories`
+      # is on and agent tooling leaves empty `.claude/.cc-writes` scratch
+      # directories inside source trees. Git cannot see an empty directory,
+      # so one got committed into the generated project without ever
+      # appearing in `git status` — a machine-local path baked into an
+      # artefact every other machine has to reproduce byte for byte.
+      - path: JARVISPhone
+        excludes: ["**/.claude", ".claude"]
+      - path: Shared
+        excludes: ["**/.claude", ".claude"]
     dependencies:
       - package: JARVISKit
     settings:
@@ -37,7 +45,8 @@ targets:
     type: application
     platform: watchOS
     sources:
-      - JARVISWatch
+      - path: JARVISWatch
+        excludes: ["**/.claude", ".claude"]
     dependencies:
       - package: JARVISKit
     settings:
@@ -56,8 +65,10 @@ targets:
     type: application
     platform: macOS
     sources:
-      - JARVISHUD
-      - Shared
+      - path: JARVISHUD
+        excludes: ["**/.claude", ".claude"]
+      - path: Shared
+        excludes: ["**/.claude", ".claude"]
     dependencies:
       - package: JARVISKit
     settings:

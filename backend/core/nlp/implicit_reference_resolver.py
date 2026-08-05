@@ -912,6 +912,189 @@ class ImplicitReferenceResolver:
 
         return parsed
 
+    def record_visual_attention(self, space_id: int, app_name: str, ocr_text: str,
+                               content_type: str = "unknown", significance: str = "normal"):
+        """Helper to record visual attention from OCR analysis"""
+        import hashlib
+        ocr_hash = hashlib.md5(ocr_text.encode()).hexdigest()[:16]
+
+        # Create brief summary
+        summary = ocr_text[:200].replace('\n', ' ')
+
+        self.attention_tracker.record_attention(
+            space_id=space_id,
+            app_name=app_name,
+            content_summary=summary,
+            content_type=content_type,
+            significance=significance,
+            ocr_text_hash=ocr_hash
+        )
+
+    def _generate_recall_response(self, referent: Dict[str, Any], context: Dict[str, Any]) -> str:
+        """Generate recall response"""
+        return self._generate_explanation_response(referent, context)
+
+    def _generate_status_response(self, context: Dict[str, Any]) -> str:
+        """Generate status response"""
+        space_id = context.get("space_id")
+        apps = context.get("app_context", {}).get("app_name", "unknown")
+
+        response = f"In Space {space_id}:\n\n"
+        response += f"Active application: {apps}\n"
+
+        # Add recent activity
+        if "recent_events" in context:
+            recent = context["recent_events"][:3]
+            if recent:
+                response += f"\nRecent activity:\n"
+                for event in recent:
+                    response += f"  • {event['event_type']}\n"
+
+        return response
+
+    def _generate_fix_response(self, referent: Dict[str, Any], context: Dict[str, Any]) -> str:
+        """Generate fix response"""
+        if referent.get("type") == "error":
+            error_text = referent.get("entity", "")
+
+            # Check if we have terminal intelligence integration
+            response = f"To fix this error:\n\n{error_text}\n\n"
+            response += "I can suggest a fix. Would you like me to analyze it further?"
+
+            return response
+        else:
+            return "I'm not sure what you want to fix. Could you clarify?"
+
+    def _generate_diagnosis_response(self, referent: Dict[str, Any], context: Dict[str, Any]) -> str:
+        """Generate diagnosis response"""
+        if referent.get("type") == "error":
+            return self._generate_explanation_response(referent, context) + "\n\nI can help you fix this if you'd like."
+        else:
+            return "I don't see a specific problem. What would you like help with?"
+
+    def _generate_explanation_response(self, referent: Dict[str, Any], context: Dict[str, Any]) -> str:
+        """Generate explanation response"""
+        entity_type = referent.get("type", "unknown")
+
+        if entity_type == "error":
+            error_text = referent.get("entity", "Unknown error")
+            app_name = context.get("app_name", "unknown application")
+            space_id = context.get("space_id")
+
+            response = f"The error in {app_name}"
+            if space_id:
+                response += f" (Space {space_id})"
+            response += f" is:\n\n{error_text}"
+
+            # Add command context if available
+            if "app_context" in context and "terminal" in context["app_context"]:
+                cmd = context["app_context"]["terminal"].get("last_command")
+                if cmd:
+                    response += f"\n\nThis happened when you ran: `{cmd}`"
+
+            return response
+        else:
+            # Generic explanation
+            entity = referent.get("entity", "that")
+            return f"I see: {entity}"
+
+    async def _generate_response(self, parsed: QueryParsed, referent: Dict[str, Any], context: Dict[str, Any]) -> str:
+        """Generate natural language response based on intent and context"""
+        if referent["source"] == "none":
+            return "I don't see anything recent to reference. Could you be more specific?"
+
+        intent = parsed.intent
+
+        # Intent-specific responses
+        if intent == QueryIntent.EXPLAIN or intent == QueryIntent.DESCRIBE:
+            return self._generate_explanation_response(referent, context)
+        elif intent == QueryIntent.DIAGNOSE:
+            return self._generate_diagnosis_response(referent, context)
+        elif intent == QueryIntent.FIX:
+            return self._generate_fix_response(referent, context)
+        elif intent == QueryIntent.STATUS:
+            return self._generate_status_response(context)
+        elif intent == QueryIntent.RECALL:
+            return self._generate_recall_response(referent, context)
+        else:
+            # Default: explain what we found
+            return self._generate_explanation_response(referent, context)
+
+    def _serialize_app_context(self, app_ctx) -> Dict[str, Any]:
+        """Serialize application context for response"""
+        from backend.core.context.multi_space_context_graph import ContextType
+
+        base = {
+            "app_name": app_ctx.app_name,
+            "context_type": app_ctx.context_type.value,
+            "last_activity": app_ctx.last_activity.isoformat(),
+            "significance": app_ctx.significance.value
+        }
+
+        # Add type-specific context
+        if app_ctx.context_type == ContextType.TERMINAL and app_ctx.terminal_context:
+            base["terminal"] = {
+                "last_command": app_ctx.terminal_context.last_command,
+                "errors": app_ctx.terminal_context.errors,
+                "exit_code": app_ctx.terminal_context.exit_code,
+                "working_directory": app_ctx.terminal_context.working_directory
+            }
+        elif app_ctx.context_type == ContextType.BROWSER and app_ctx.browser_context:
+            base["browser"] = {
+                "url": app_ctx.browser_context.active_url,
+                "title": app_ctx.browser_context.page_title,
+                "is_researching": app_ctx.browser_context.is_researching
+            }
+        elif app_ctx.context_type == ContextType.IDE and app_ctx.ide_context:
+            base["ide"] = {
+                "active_file": app_ctx.ide_context.active_file,
+                "open_files": app_ctx.ide_context.open_files,
+                "errors": app_ctx.ide_context.errors_in_file
+            }
+
+        return base
+
+    async def _get_full_context(self, referent: Dict[str, Any], parsed: QueryParsed) -> Dict[str, Any]:
+        """Get full context about the resolved referent"""
+        if referent["source"] == "none":
+            return {"type": "no_context", "message": "I don't have enough context to answer that."}
+
+        # Get context from the workspace graph
+        if referent.get("space_id") and referent.get("app_name"):
+            space_id = referent["space_id"]
+            app_name = referent["app_name"]
+
+            if space_id in self.context_graph.spaces:
+                space = self.context_graph.spaces[space_id]
+                if app_name in space.applications:
+                    app_ctx = space.applications[app_name]
+
+                    # Build rich context based on app type
+                    context = {
+                        "type": referent["type"],
+                        "source": referent["source"],
+                        "space_id": space_id,
+                        "app_name": app_name,
+                        "entity": referent["entity"],
+                        "app_context": self._serialize_app_context(app_ctx),
+                        "recent_events": [e.to_dict() for e in space.get_recent_events(within_seconds=180)],
+                        "space_tags": list(space.tags)
+                    }
+
+                    # Add error-specific context
+                    if referent.get("details"):
+                        context["error_details"] = referent["details"]
+
+                    return context
+
+        # Fallback: return what we have
+        return {
+            "type": referent["type"],
+            "source": referent["source"],
+            "entity": referent["entity"],
+            "details": referent.get("details", {})
+        }
+
 
 # ============================================================================
 # SINGLETON PATTERN - Global accessor
@@ -977,3 +1160,11 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
     asyncio.run(test_resolver())
+
+
+def initialize_implicit_resolver(context_graph) -> ImplicitReferenceResolver:
+    """Initialize the global implicit reference resolver"""
+    global _global_resolver
+    _global_resolver = ImplicitReferenceResolver(context_graph)
+    logger.info("[IMPLICIT-RESOLVER] Global instance initialized")
+    return _global_resolver

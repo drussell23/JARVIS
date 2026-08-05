@@ -29,12 +29,15 @@ Integration Points:
     - FeedbackLearningLoop (core/learning/feedback_loop.py)
 """
 
+import asyncio
+import json
 import logging
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -915,26 +918,74 @@ class MultiSpaceContextGraph:
 
     def __init__(
         self,
+        context_store=None,
+        decay_ttl_seconds: Optional[int] = None,
+        enable_cross_space_correlation: bool = True,
         max_history_size: int = 1000,
-        temporal_decay_minutes: int = 5,
+        temporal_decay_minutes: Optional[int] = None,
     ):
         """
         Initialize the Multi-Space Context Graph.
 
+        TWO PARAMETER SETS, BOTH LIVE
+        ------------------------------
+        Commit 4406e11941 rewrote this signature from
+        `(context_store, decay_ttl_seconds, enable_cross_space_correlation)`
+        to `(max_history_size, temporal_decay_minutes)` and deleted the
+        nineteen methods that used the first set. Callers then split:
+        `context_integration_bridge` was adapted to the new names, while
+        `backend/tests/test_multi_space_context_graph.py` still constructs
+        with `decay_ttl_seconds=300` — and had been failing ever since.
+
+        Neither set is wrong and they do not conflict, so both are accepted
+        rather than one consumer being broken to satisfy the other. The two
+        decay knobs express the same quantity in different units and are kept
+        consistent below; passing neither yields the historical default of
+        five minutes.
+
         Args:
+            context_store: Optional ContextStore backend for persistence
+            decay_ttl_seconds: How long to keep context before decay
+            enable_cross_space_correlation: Enable cross-space detection
             max_history_size: Maximum activities to store per space
-            temporal_decay_minutes: Minutes before context decays
+            temporal_decay_minutes: Decay window, in minutes
         """
+        # One quantity, two units. An explicit value in either unit wins; the
+        # other is derived so no method can read a stale companion value.
+        if decay_ttl_seconds is None and temporal_decay_minutes is None:
+            decay_ttl_seconds = 300
+        elif decay_ttl_seconds is None:
+            decay_ttl_seconds = int(temporal_decay_minutes) * 60
+        temporal_decay_minutes = decay_ttl_seconds / 60.0
+
+        # Core state
         self.spaces: Dict[int, SpaceContext] = {}
-        self.correlator = CrossSpaceCorrelator()
-        self.max_history_size = max_history_size
+        self.current_space_id: Optional[int] = None
+
+        # Temporal decay configuration
+        self.decay_ttl = timedelta(seconds=decay_ttl_seconds)
         self.temporal_decay_minutes = temporal_decay_minutes
+        self._decay_task: Optional["asyncio.Task"] = None
+
+        # Cross-space correlation
+        self.enable_correlation = enable_cross_space_correlation
+        self.correlator = (CrossSpaceCorrelator()
+                           if enable_cross_space_correlation else None)
+        self._correlation_task: Optional["asyncio.Task"] = None
+
+        # Integration with existing systems
+        self.context_store = context_store
+        self.max_history_size = max_history_size
         self._initialized = False
 
+        # Callbacks for external systems
+        self.on_critical_event: Optional[Callable] = None
+        self.on_relationship_detected: Optional[Callable] = None
+
         logger.info(
-            f"Initialized MultiSpaceContextGraph "
-            f"(history={max_history_size}, decay={temporal_decay_minutes}m)"
-        )
+            "[MULTI-SPACE-GRAPH] Initialized with decay_ttl=%ss, "
+            "history=%s, correlation=%s",
+            decay_ttl_seconds, max_history_size, enable_cross_space_correlation)
 
     async def initialize(self):
         """Initialize the context graph and start monitoring."""
@@ -1096,6 +1147,408 @@ class MultiSpaceContextGraph:
 
         logger.debug(f"Cleaned up contexts older than {self.temporal_decay_minutes} minutes")
 
+    def export_to_json(self, filepath: Path):
+        """Export current state to JSON for debugging/analysis"""
+        summary = self.get_summary()
+        with open(filepath, 'w') as f:
+            json.dump(summary, f, indent=2, default=str)
+        logger.info(f"[MULTI-SPACE-GRAPH] Exported state to {filepath}")
+
+    def get_summary(self) -> Dict[str, Any]:
+        """Get comprehensive summary of current context graph state"""
+        return {
+            "total_spaces": len(self.spaces),
+            "current_space_id": self.current_space_id,
+            "active_spaces": [s.space_id for s in self.spaces.values() if s.is_active],
+            "spaces": {
+                space_id: space.to_dict()
+                for space_id, space in self.spaces.items()
+            },
+            "cross_space_relationships": [
+                {
+                    "relationship_id": rel.relationship_id,
+                    "type": rel.relationship_type,
+                    "involved_spaces": rel.involved_spaces,
+                    "confidence": rel.confidence,
+                    "description": rel.description
+                }
+                for rel in (self.correlator.relationships.values() if self.correlator else [])
+            ] if self.enable_correlation else [],
+            "decay_ttl_seconds": self.decay_ttl.total_seconds()
+        }
+
+    async def _safe_callback(self, callback: Callable, *args, **kwargs):
+        """Safely execute callback without crashing the graph"""
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback(*args, **kwargs)
+            else:
+                callback(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"[MULTI-SPACE-GRAPH] Error in callback: {e}")
+
+    async def _correlation_loop(self):
+        """Background task to detect cross-space correlations"""
+        while True:
+            try:
+                await asyncio.sleep(15)  # Check every 15 seconds
+                if self.correlator:
+                    relationships = await self.correlator.analyze_relationships(self.spaces)
+
+                    if relationships and self.on_relationship_detected:
+                        for rel in relationships:
+                            await self._safe_callback(self.on_relationship_detected, rel)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[MULTI-SPACE-GRAPH] Error in correlation loop: {e}")
+
+    async def _apply_decay(self):
+        """Remove or decay old context based on TTL"""
+        cutoff = datetime.now() - self.decay_ttl
+        spaces_to_remove = []
+
+        for space_id, space in self.spaces.items():
+            # If space hasn't been active recently, consider removing it
+            if space.last_activity < cutoff and not space.is_active:
+                # But only if it has no recent critical events
+                recent_critical = any(
+                    e.significance == ActivitySignificance.CRITICAL
+                    for e in space.get_recent_events(within_seconds=self.decay_ttl.total_seconds())
+                )
+                if not recent_critical:
+                    spaces_to_remove.append(space_id)
+
+        for space_id in spaces_to_remove:
+            logger.info(f"[MULTI-SPACE-GRAPH] Decaying Space {space_id} (inactive for {self.decay_ttl})")
+            self.remove_space(space_id)
+
+    async def _decay_loop(self):
+        """Background task to decay old context"""
+        while True:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                await self._apply_decay()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[MULTI-SPACE-GRAPH] Error in decay loop: {e}")
+
+    def get_cross_space_summary(self) -> str:
+        """
+        Generate natural language summary of cross-space activity.
+
+        This is what JARVIS uses to say things like:
+        "I see you're debugging an error in Space 1, researching solutions in Space 3,
+         and editing the fix in Space 2."
+        """
+        if not self.correlator or not self.correlator.relationships:
+            return "No cross-space relationships detected."
+
+        summaries = []
+        for rel in self.correlator.relationships.values():
+            if (datetime.now() - rel.last_detected).total_seconds() < 300:  # Recent (5 minutes)
+                summaries.append(rel.description)
+
+        if summaries:
+            return " ".join(summaries)
+        else:
+            return "No recent cross-space activity."
+
+    def find_context_for_query(self, query: str) -> Dict[str, Any]:
+        """
+        Find relevant context based on natural language query.
+
+        Examples:
+        - "what does it say?" → Find most recent error/message
+        - "what's the error?" → Find most recent error
+        - "what's happening in the terminal?" → Find terminal context
+
+        This is the foundation for implicit reference resolution.
+        """
+        query_lower = query.lower()
+
+        # Implicit reference queries - "what does it say?" "what happened?" etc.
+        # These should check for the most critical/recent thing first
+        implicit_queries = ["what does it say", "what did it say", "what happened", "what's that"]
+        if any(q in query_lower for q in implicit_queries):
+            # First check for errors (most important)
+            error = self.find_most_recent_error()
+            if error:
+                space_id, app_name, details = error
+                return {
+                    "type": "error",
+                    "space_id": space_id,
+                    "app_name": app_name,
+                    "details": details,
+                    "message": f"The error in {app_name} (Space {space_id}) is: {details.get('error', 'Unknown error')}"
+                }
+
+        # Error-related queries
+        if any(word in query_lower for word in ["error", "wrong", "failed", "problem"]):
+            error = self.find_most_recent_error()
+            if error:
+                space_id, app_name, details = error
+                return {
+                    "type": "error",
+                    "space_id": space_id,
+                    "app_name": app_name,
+                    "details": details,
+                    "message": f"The error in {app_name} (Space {space_id}) is: {details.get('error', 'Unknown error')}"
+                }
+
+        # Terminal-specific queries
+        if "terminal" in query_lower:
+            # Find most recent terminal activity
+            for space in sorted(self.spaces.values(), key=lambda s: s.last_activity, reverse=True):
+                for app_name, app_ctx in space.applications.items():
+                    if app_ctx.context_type == ContextType.TERMINAL and app_ctx.is_recent():
+                        terminal = app_ctx.terminal_context
+                        return {
+                            "type": "terminal",
+                            "space_id": space.space_id,
+                            "app_name": app_name,
+                            "last_command": terminal.last_command if terminal else None,
+                            "last_output": terminal.last_output if terminal else None,
+                            "errors": terminal.errors if terminal else []
+                        }
+
+        # Current space context
+        if self.current_space_id and self.current_space_id in self.spaces:
+            current_space = self.spaces[self.current_space_id]
+            return {
+                "type": "current_space",
+                "space_id": current_space.space_id,
+                "applications": list(current_space.applications.keys()),
+                "recent_events": [e.to_dict() for e in current_space.get_recent_events()]
+            }
+
+        return {"type": "no_relevant_context", "message": "I don't see any recent activity to reference."}
+
+    def find_most_recent_error(self, within_seconds: int = 300) -> Optional[Tuple[int, str, Dict[str, Any]]]:
+        """
+        Find the most recent error across all spaces.
+
+        This is what powers "what does it say?" when there's an error on screen.
+
+        Returns: (space_id, app_name, error_details) or None
+        """
+        most_recent = None
+        most_recent_time = None
+
+        for space in self.spaces.values():
+            errors = space.get_recent_errors(within_seconds=within_seconds)
+            for app_name, event in errors:
+                if most_recent_time is None or event.timestamp > most_recent_time:
+                    most_recent_time = event.timestamp
+                    most_recent = (space.space_id, app_name, event.details)
+
+        return most_recent
+
+    def update_generic_context(self, space_id: int, app_name: str, content: str):
+        """Update generic application context (fallback for unknown app types)"""
+        space = self.get_or_create_space(space_id)
+        app_ctx = space.add_application(app_name, ContextType.GENERIC)
+
+        if app_ctx.generic_context is None:
+            app_ctx.generic_context = GenericAppContext()
+
+        generic = app_ctx.generic_context
+        generic.extracted_text = content[:500]  # Store first 500 chars
+        generic.interaction_count += 1
+        generic.last_interaction = datetime.now()
+
+        app_ctx.update_activity(ActivitySignificance.LOW)
+        logger.debug(f"[MULTI-SPACE-GRAPH] Updated generic context: Space {space_id}, {app_name}")
+
+    def add_screenshot_reference(self,
+                                space_id: int,
+                                app_name: str,
+                                screenshot_path: str,
+                                ocr_text: Optional[str] = None):
+        """Add screenshot reference to application context"""
+        space = self.get_or_create_space(space_id)
+        if app_name in space.applications:
+            space.applications[app_name].add_screenshot(screenshot_path, ocr_text)
+
+    def update_ide_context(self,
+                          space_id: int,
+                          app_name: str,
+                          active_file: Optional[str] = None,
+                          open_files: Optional[List[str]] = None,
+                          errors: Optional[List[str]] = None):
+        """Update IDE context in a specific space"""
+        space = self.get_or_create_space(space_id)
+        app_ctx = space.add_application(app_name, ContextType.IDE)
+
+        if app_ctx.ide_context is None:
+            app_ctx.ide_context = IDEContext()
+
+        ide = app_ctx.ide_context
+
+        if active_file:
+            ide.active_file = active_file
+        if open_files:
+            ide.open_files = open_files
+        if errors:
+            ide.errors_in_file.extend(errors)
+            significance = ActivitySignificance.HIGH
+        else:
+            significance = ActivitySignificance.NORMAL
+
+        app_ctx.update_activity(significance)
+        logger.debug(f"[MULTI-SPACE-GRAPH] Updated IDE context: Space {space_id}, {app_name}")
+
+    def update_browser_context(self,
+                              space_id: int,
+                              app_name: str,
+                              url: Optional[str] = None,
+                              title: Optional[str] = None,
+                              extracted_text: Optional[str] = None,
+                              search_query: Optional[str] = None):
+        """Update browser context in a specific space"""
+        space = self.get_or_create_space(space_id)
+        app_ctx = space.add_application(app_name, ContextType.BROWSER)
+
+        if app_ctx.browser_context is None:
+            app_ctx.browser_context = BrowserContext()
+
+        browser = app_ctx.browser_context
+
+        if url:
+            browser.active_url = url
+        if title:
+            browser.page_title = title
+        if extracted_text:
+            browser.reading_content = extracted_text
+            # Detect if this looks like research
+            research_indicators = ["documentation", "docs", "stack overflow", "github", "tutorial", "guide"]
+            if any(indicator in extracted_text.lower() for indicator in research_indicators):
+                browser.is_researching = True
+        if search_query:
+            browser.search_query = search_query
+            browser.is_researching = True
+
+        significance = ActivitySignificance.HIGH if browser.is_researching else ActivitySignificance.NORMAL
+        app_ctx.update_activity(significance)
+
+        logger.debug(f"[MULTI-SPACE-GRAPH] Updated browser context: Space {space_id}, {app_name}")
+
+    def update_terminal_context(self,
+                                space_id: int,
+                                app_name: str,
+                                command: Optional[str] = None,
+                                output: Optional[str] = None,
+                                errors: Optional[List[str]] = None,
+                                exit_code: Optional[int] = None,
+                                working_dir: Optional[str] = None):
+        """
+        Update terminal context in a specific space.
+
+        This is called when we detect terminal activity via OCR or system monitoring.
+        """
+        space = self.get_or_create_space(space_id)
+        app_ctx = space.add_application(app_name, ContextType.TERMINAL)
+
+        if app_ctx.terminal_context is None:
+            app_ctx.terminal_context = TerminalContext()
+
+        terminal = app_ctx.terminal_context
+
+        if command:
+            terminal.last_command = command
+            terminal.recent_commands.append((command, datetime.now()))
+        if output:
+            terminal.last_output = output
+        if errors:
+            terminal.errors.extend(errors)
+            # Critical event - terminal error!
+            significance = ActivitySignificance.CRITICAL
+            space.add_event(ActivityEvent(
+                event_type="terminal_error",
+                timestamp=datetime.now(),
+                app_name=app_name,
+                significance=significance,
+                details={"errors": errors, "command": command}
+            ))
+
+            if self.on_critical_event:
+                asyncio.create_task(self._safe_callback(self.on_critical_event, {
+                    "type": "terminal_error",
+                    "space_id": space_id,
+                    "app_name": app_name,
+                    "errors": errors,
+                    "command": command
+                }))
+        if exit_code is not None:
+            terminal.exit_code = exit_code
+            if exit_code != 0:
+                significance = ActivitySignificance.HIGH
+            else:
+                significance = ActivitySignificance.NORMAL
+        else:
+            significance = ActivitySignificance.NORMAL
+        if working_dir:
+            terminal.working_directory = working_dir
+
+        app_ctx.update_activity(significance)
+        logger.debug(f"[MULTI-SPACE-GRAPH] Updated terminal context: Space {space_id}, {app_name}")
+
+    def remove_space(self, space_id: int):
+        """Remove a space from tracking"""
+        if space_id in self.spaces:
+            del self.spaces[space_id]
+            logger.info(f"[MULTI-SPACE-GRAPH] Removed Space {space_id}")
+
+    def set_active_space(self, space_id: int):
+        """Mark a space as currently active"""
+        # Deactivate previous space
+        if self.current_space_id is not None and self.current_space_id in self.spaces:
+            self.spaces[self.current_space_id].deactivate()
+
+        # Activate new space
+        space = self.get_or_create_space(space_id)
+        space.activate()
+        self.current_space_id = space_id
+
+        logger.debug(f"[MULTI-SPACE-GRAPH] Switched to Space {space_id}")
+
+    def get_or_create_space(self, space_id: int) -> SpaceContext:
+        """Get existing space context or create new one"""
+        if space_id not in self.spaces:
+            self.spaces[space_id] = SpaceContext(space_id)
+            logger.info(f"[MULTI-SPACE-GRAPH] Created new space context: Space {space_id}")
+
+        return self.spaces[space_id]
+
+    async def stop(self):
+        """Stop background tasks"""
+        if self._decay_task:
+            self._decay_task.cancel()
+            try:
+                await self._decay_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._correlation_task:
+            self._correlation_task.cancel()
+            try:
+                await self._correlation_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info("[MULTI-SPACE-GRAPH] Stopped all background tasks")
+
+    async def start(self):
+        """Start background tasks (decay, correlation)"""
+        if self._decay_task is None or self._decay_task.done():
+            self._decay_task = asyncio.create_task(self._decay_loop())
+            logger.info("[MULTI-SPACE-GRAPH] Started decay loop")
+
+        if self.enable_correlation and (self._correlation_task is None or self._correlation_task.done()):
+            self._correlation_task = asyncio.create_task(self._correlation_loop())
+            logger.info("[MULTI-SPACE-GRAPH] Started correlation loop")
+
 
 # ============================================================================
 # SINGLETON PATTERN - Global accessor
@@ -1153,3 +1606,16 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
     asyncio.run(test_multi_space_context())
+
+
+def set_context_graph(graph: MultiSpaceContextGraph):
+    """Set the global context graph (for testing or custom configuration)"""
+    global _global_context_graph
+    _global_context_graph = graph
+
+def get_context_graph() -> MultiSpaceContextGraph:
+    """Get or create the global context graph singleton"""
+    global _global_context_graph
+    if _global_context_graph is None:
+        _global_context_graph = MultiSpaceContextGraph()
+    return _global_context_graph

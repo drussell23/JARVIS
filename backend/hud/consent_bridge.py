@@ -204,9 +204,42 @@ class VoiceConsentProvider:
         """Verify the held utterance and answer. NEVER raises."""
         try:
             from backend.hud.utterance_audio import get_utterance_holder
-            from backend.hud.voice_identity import get_voice_identity
-            held = get_utterance_holder().claim()
-            ident = await get_voice_identity().identify(
+            from backend.hud.voice_identity import Readiness, get_voice_identity
+
+            # DO NOT SPEND THE EVIDENCE ON AN ATTEMPT THAT CANNOT SUCCEED.
+            #
+            # Measured live 2026-08-04 19:10:13, saying "unlock my screen":
+            #
+            #   [VoiceRouter] CAI: 'screen_unlocked' unmet -> running
+            #                 'unlock_screen' first
+            #   [VoiceConsent] 'unlock_screen' -> not_ready (model cold;
+            #                  enrollment Derek J. Russell)
+            #   [CapabilityRouter] 'unlock_screen' NOT authorised (I'm still
+            #                  loading my voice recognition -- give me a
+            #                  moment and ask again.)
+            #   [VoiceIdentity] speaker model READY after 2.8s
+            #
+            # Every part of that is correct except the order. The model is
+            # lazy on purpose — warming it at boot was the 14s deafness — so
+            # the FIRST verification of a session is guaranteed to report
+            # NOT_READY, because it is the thing that starts the load.
+            #
+            # But `claim()` is destructive, and it ran first. So the one
+            # attempt that could never succeed was also the one that deleted
+            # the sentence, and the invitation to "ask again" required the
+            # operator to say it again — while the model became ready 2.8
+            # seconds later, holding nothing.
+            #
+            # Claim only when a verdict is actually reachable; otherwise look
+            # without taking. Anti-replay is untouched: verification still
+            # consumes, and nothing verifies from a peek.
+            svc = get_voice_identity()
+            holder = get_utterance_holder()
+            if svc.readiness is Readiness.READY:
+                held = holder.claim()
+            else:
+                held = holder.peek()
+            ident = await svc.identify(
                 held.audio if held else None,
                 sample=held.digest if held else "")
             if ident.approves:
