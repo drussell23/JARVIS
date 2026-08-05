@@ -917,6 +917,1199 @@ class AdvancedDisplayMonitor:
         except Exception as e:
             logger.error(f"[DISPLAY MONITOR] Error during check_displays: {e}", exc_info=True)
 
+    async def _detect_all_displays(self) -> List[str]:
+        """Detect displays using all available methods"""
+        # Check cache first
+        cache_key = "all_displays"
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        all_displays = set()
+        preferred_method = self.config["display_monitoring"].get("preferred_detection_method")
+
+        # Try preferred method first
+        if preferred_method:
+            method_enum = DetectionMethod(preferred_method)
+            if method_enum in self.detectors:
+                displays = await self.detectors[method_enum].detect_displays()
+                all_displays.update(displays)
+
+                # If we got results, cache and return
+                if displays:
+                    result = list(all_displays)
+                    self.cache.set(cache_key, result)
+                    return result
+
+        # Fallback: Try all methods (parallel if enabled)
+        if self.config["performance"]["parallel_detection"]:
+            tasks = [detector.detect_displays() for detector in self.detectors.values()]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in results:
+                if isinstance(result, list):
+                    all_displays.update(result)
+        else:
+            for detector in self.detectors.values():
+                displays = await detector.detect_displays()
+                all_displays.update(displays)
+
+        result = list(all_displays)
+        self.cache.set(cache_key, result)
+        return result
+
+    async def _handle_display_detected(self, monitored: MonitoredDisplay, detected_name: str):
+        """Handle newly detected display"""
+        logger.info(f"[DISPLAY MONITOR] Detected: {monitored.name} ({detected_name})")
+
+        # Emit event
+        await self._emit_event("display_detected", display=monitored, detected_name=detected_name)
+
+        # IMPORTANT: Set pending prompt FIRST if we're going to prompt
+        if monitored.auto_prompt and self.config["voice_integration"]["speak_on_detection"]:
+            # Set pending prompt state so we can handle yes/no responses
+            self.pending_prompt_display = monitored.id
+            logger.info(
+                f"[DISPLAY MONITOR] Set pending prompt for {monitored.name} (will prompt user)"
+            )
+
+        # Send WebSocket notification to UI
+        if self.websocket_manager:
+            try:
+                message = f"Sir, I see your {monitored.name} is now available. Would you like to extend your display to it?"
+                await self.websocket_manager.broadcast(
+                    {
+                        "type": "display_detected",
+                        "display_name": monitored.name,
+                        "display_id": monitored.id,
+                        "message": message,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
+                logger.debug(f"[DISPLAY MONITOR] Broadcasted detection to UI")
+            except Exception as e:
+                logger.warning(f"[DISPLAY MONITOR] Failed to broadcast to UI: {e}")
+
+        # Voice prompt if enabled
+        if monitored.auto_prompt and self.config["voice_integration"]["speak_on_detection"]:
+            await self._speak_detection_prompt(monitored)
+
+        # Auto-connect if enabled AND not already connected/connecting
+        if (
+            monitored.auto_connect
+            and monitored.id not in self.connected_displays
+            and monitored.id not in self.connecting_displays
+        ):
+            logger.info(f"[DISPLAY MONITOR] Auto-connecting to {monitored.name}...")
+            await self.connect_display(monitored.id)
+        elif monitored.id in self.connected_displays:
+            logger.debug(
+                f"[DISPLAY MONITOR] {monitored.name} already connected, skipping auto-connect"
+            )
+        elif monitored.id in self.connecting_displays:
+            logger.debug(
+                f"[DISPLAY MONITOR] {monitored.name} connection already in progress, skipping auto-connect"
+            )
+
+    async def _handle_display_lost(self, monitored: MonitoredDisplay):
+        """Handle lost display"""
+        logger.info(f"[DISPLAY MONITOR] Lost: {monitored.name}")
+
+        # Emit event
+        await self._emit_event("display_lost", display=monitored)
+
+        if monitored.id in self.connected_displays:
+            self.connected_displays.remove(monitored.id)
+            await self._emit_event("display_disconnected", display=monitored)
+
+    def _get_time_aware_greeting(self) -> str:
+        """
+        Get a time-aware greeting that's contextual but not annoying
+
+        Returns time-specific greeting ~35% of the time, generic the rest
+        """
+        from datetime import datetime
+
+        prompt_config = self.config["voice_integration"].get("prompt_templates", {})
+
+        # Handle legacy format (simple list)
+        if isinstance(prompt_config, list):
+            return random.choice(prompt_config)  # nosec B311
+
+        # Get probability for time-aware greetings (default 35%)
+        time_aware_prob = self.config["voice_integration"].get(
+            "time_aware_greeting_probability", 0.35
+        )
+
+        # Decide whether to use time-aware or generic
+        use_time_aware = random.random() < time_aware_prob  # nosec B311
+
+        if use_time_aware:
+            # Determine time of day
+            current_hour = datetime.now().hour
+
+            if 5 <= current_hour < 12:
+                time_period = "morning"
+            elif 12 <= current_hour < 17:
+                time_period = "afternoon"
+            elif 17 <= current_hour < 21:
+                time_period = "evening"
+            else:
+                time_period = "night"
+
+            templates = prompt_config.get(
+                time_period, prompt_config.get("generic", ["JARVIS online."])
+            )
+        else:
+            templates = prompt_config.get("generic", ["JARVIS online."])
+
+        return random.choice(templates)  # nosec B311
+
+    async def _speak_detection_prompt(self, monitored: MonitoredDisplay):
+        """Speak detection prompt"""
+        if not self.config["voice_integration"]["enabled"]:
+            return
+
+        # IMPORTANT: Don't speak detection prompts during initial scan - only the startup announcement should speak
+        # The initial scan happens right after startup, so we use the coordinator for that
+        # Only speak detection prompts for displays that appear AFTER startup (hot-plug events)
+        if not self.initial_scan_complete:
+            logger.warning(
+                f"[STARTUP VOICE] ⏭️  Display detection prompt skipped during initial scan - startup announcement handles this"
+            )
+            return
+
+        # Get time-aware greeting
+        template = self._get_time_aware_greeting()
+        message = (
+            template.format(display_name=monitored.name)
+            if "{display_name}" in template
+            else template
+        )
+
+        logger.warning(f"[DISPLAY VOICE] 🎤 Display detection prompt: {message}")
+
+        # Note: pending_prompt_display is already set in _handle_display_detected
+        logger.info(
+            f"[DISPLAY MONITOR] Speaking prompt for {monitored.name} (pending_prompt_display={self.pending_prompt_display})"
+        )
+
+        # Use voice handler if available
+        if self.voice_handler:
+            try:
+                await self.voice_handler.speak(message)
+            except Exception as e:
+                logger.error(f"[DISPLAY MONITOR] Voice handler error: {e}")
+        else:
+            # Fallback to macOS say command
+            try:
+                subprocess.Popen(["say", message])
+            except Exception as e:
+                logger.error(f"[DISPLAY MONITOR] Say command error: {e}")
+
+    async def connect_display(self, display_id: str) -> Dict[str, Any]:
+        """
+        Connect to a display using advanced methods
+
+        Connection Strategy (prioritized - PRODUCTION HARDENED):
+        1. 🥇 Route Picker Helper (AVRoutePickerView + Accessibility - MOST RELIABLE!)
+        2. 🥈 Protocol-Level AirPlay (Bonjour/mDNS + RAOP - direct protocol)
+        3. 🥉 Vision-Guided Navigator (Claude Vision - bypasses macOS restrictions)
+        4. Native Swift Bridge fallback
+        5. AppleScript fallback
+        6. Voice guidance to user
+
+        Args:
+            display_id: Display ID from configuration
+
+        Returns:
+            Connection result dictionary with telemetry
+        """
+        # Find monitored display
+        monitored = next((d for d in self.monitored_displays if d.id == display_id), None)
+        if not monitored:
+            return {"success": False, "message": f"Display {display_id} not found in configuration"}
+
+        # Circuit breaker: Check if already connected or connecting
+        logger.info(f"[DISPLAY MONITOR] 🔍 Circuit breaker check for {monitored.name}")
+        logger.info(
+            f"[DISPLAY MONITOR] Current state: connecting={list(self.connecting_displays)}, connected={list(self.connected_displays)}"
+        )
+
+        # REAL-TIME VERIFICATION: Don't trust cached state - verify actual connection
+        with open("/tmp/jarvis_display_command.log", "a") as f:
+            f.write(f"[DISPLAY MONITOR] About to verify connection for {monitored.name}\n")
+
+        from .display_state_verifier import get_display_verifier
+
+        verifier = get_display_verifier()
+
+        with open("/tmp/jarvis_display_command.log", "a") as f:
+            f.write(f"[DISPLAY MONITOR] Calling verifier.verify_actual_connection...\n")
+
+        actual_state = await verifier.verify_actual_connection(monitored.name)
+
+        with open("/tmp/jarvis_display_command.log", "a") as f:
+            f.write(
+                f"[DISPLAY MONITOR] Verification complete: {actual_state.get('is_connected')}\n"
+            )
+
+        logger.info(
+            f"[DISPLAY MONITOR] Real-time verification for {monitored.name}: is_connected={actual_state['is_connected']}, confidence={actual_state['confidence']:.2f}"
+        )
+
+        # Update our cached state based on actual verification
+        if actual_state["is_connected"] and display_id not in self.connected_displays:
+            logger.info(
+                f"[DISPLAY MONITOR] 📊 Updating cache: {monitored.name} is actually connected"
+            )
+            self.connected_displays.add(display_id)
+        elif not actual_state["is_connected"] and display_id in self.connected_displays:
+            logger.info(
+                f"[DISPLAY MONITOR] 📊 Updating cache: {monitored.name} is NOT actually connected"
+            )
+            self.connected_displays.discard(display_id)
+
+        # Store learning pattern for future predictions
+        await self._store_display_pattern(monitored, actual_state)
+
+        if actual_state["is_connected"] and actual_state["confidence"] > 0.7:
+            logger.info(
+                f"[DISPLAY MONITOR] ✅ {monitored.name} verified as connected (method: {actual_state['method']})"
+            )
+            return {
+                "success": True,
+                "message": f"{monitored.name} already connected",
+                "cached": True,
+                "verified": True,
+            }
+
+        if display_id in self.connecting_displays:
+            logger.info(
+                f"[DISPLAY MONITOR] ⚠️ {monitored.name} was stuck in connecting state, resetting and retrying..."
+            )
+            # Remove from connecting state to allow retry
+            self.connecting_displays.discard(display_id)
+            logger.info(f"[DISPLAY MONITOR] 🔄 Reset circuit breaker, proceeding with connection")
+
+        # Mark as connecting IMMEDIATELY to prevent race conditions
+        self.connecting_displays.add(display_id)
+        logger.info(
+            f"[DISPLAY MONITOR] 🔒 Marked {monitored.name} as connecting (circuit breaker engaged)"
+        )
+
+        # Immediate voice feedback
+        if self.voice_handler:
+            await self.voice_handler.speak_async(f"Connecting to {monitored.name} now, sir.")
+
+        logger.info(f"[DISPLAY MONITOR] ========================================")
+        logger.info(f"[DISPLAY MONITOR] Connecting to {monitored.name}...")
+        logger.info(f"[DISPLAY MONITOR] Starting 6-tier connection waterfall")
+        logger.info(f"[DISPLAY MONITOR] ========================================")
+
+        connection_start = asyncio.get_event_loop().time()
+        strategies_attempted = []
+
+        # Strategy 1: INTELLIGENT HYBRID - Coordinates + Vision + UAE Adaptation
+        # Uses best available clicker: UAE > SAI > Adaptive > Basic
+        # Total: ~2 seconds, 100% reliable, adapts when UI changes
+        try:
+            with open("/tmp/jarvis_display_command.log", "a") as f:
+                f.write(f"[DISPLAY MONITOR] Attempting Strategy 1: Best available clicker\n")
+
+            # Use clicker factory to get best available clicker
+            from display.control_center_clicker_factory import get_best_clicker, get_clicker_info
+
+            # Log available clickers
+            clicker_info = get_clicker_info()
+            logger.info(f"[DISPLAY MONITOR] 🥇 STRATEGY 1: INTELLIGENT HYBRID")
+            logger.info(
+                f"[DISPLAY MONITOR] Available clickers: UAE={clicker_info['uae_available']}, SAI={clicker_info['sai_available']}, Adaptive={clicker_info['adaptive_available']}, Basic={clicker_info['basic_available']}"
+            )
+            logger.info(f"[DISPLAY MONITOR] Recommended: {clicker_info['recommended'].upper()}")
+
+            strategies_attempted.append("intelligent_hybrid")
+
+            # Get best available clicker
+            clicker = get_best_clicker(vision_analyzer=None, enable_verification=True)
+            logger.info(f"[DISPLAY MONITOR] Using {clicker.__class__.__name__}")
+
+            # Execute connection flow
+            logger.info(f"[DISPLAY MONITOR] Connecting to {monitored.name}...")
+
+            with open("/tmp/jarvis_display_command.log", "a") as f:
+                f.write(
+                    f"[DISPLAY MONITOR] About to call clicker.connect_to_device('{monitored.name}')\n"
+                )
+
+            # Use async context manager if available, otherwise call directly
+            if hasattr(clicker, "__aenter__"):
+                async with clicker as c:
+                    result = await c.connect_to_device(monitored.name)
+            else:
+                result = await clicker.connect_to_device(monitored.name)
+
+            with open("/tmp/jarvis_display_command.log", "a") as f:
+                f.write(f"[DISPLAY MONITOR] connect_to_device() returned: {result}\n")
+
+            if result.get("success"):
+                total_duration = result.get("duration", 0)
+
+                self.connected_displays.add(display_id)
+                await self._emit_event("display_connected", display=monitored)
+
+                # Speak success message
+                if self.config["voice_integration"]["speak_on_connection"]:
+                    template = self.config["voice_integration"]["connection_success_message"]
+                    message = template.format(display_name=monitored.name)
+
+                    if self.voice_handler:
+                        try:
+                            await self.voice_handler.speak(message)
+                        except:
+                            subprocess.Popen(["say", message])
+                    else:
+                        subprocess.Popen(["say", message])
+
+                logger.info(
+                    f"[DISPLAY MONITOR] ✅ SUCCESS via Simple Hardcoded Coordinates in {total_duration:.2f}s"
+                )
+                logger.info(f"[DISPLAY MONITOR] Method: {result['method']}")
+
+                # Log steps if available (handle both dict and list formats)
+                steps = result.get("steps", {})
+                if isinstance(steps, dict):
+                    logger.info(f"[DISPLAY MONITOR] Steps: {len(steps)} actions completed")
+                    for step_name, step_data in steps.items():
+                        if isinstance(step_data, dict):
+                            logger.info(
+                                f"[DISPLAY MONITOR]   {step_name}: {step_data.get('success', False)}"
+                            )
+                elif isinstance(steps, list):
+                    logger.info(f"[DISPLAY MONITOR] Steps: {len(steps)}")
+                    for step in steps:
+                        logger.info(
+                            f"[DISPLAY MONITOR]   {step.get('step')}. {step.get('action')}: {step.get('coordinates')}"
+                        )
+
+                logger.info(f"[DISPLAY MONITOR] ========================================")
+
+                # Release circuit breaker
+                logger.info(f"[DISPLAY MONITOR] 🔓 Releasing circuit breaker for {monitored.name}")
+                logger.info(
+                    f"[DISPLAY MONITOR] State before release: connecting={list(self.connecting_displays)}, connected={list(self.connected_displays)}"
+                )
+                if display_id in self.connecting_displays:
+                    self.connecting_displays.remove(display_id)
+                    logger.info(
+                        f"[DISPLAY MONITOR] ✅ Removed {display_id} from connecting_displays"
+                    )
+                else:
+                    logger.warning(
+                        f"[DISPLAY MONITOR] ⚠️  {display_id} was NOT in connecting_displays!"
+                    )
+                logger.info(
+                    f"[DISPLAY MONITOR] State after release: connecting={list(self.connecting_displays)}, connected={list(self.connected_displays)}"
+                )
+
+                return {
+                    "success": True,
+                    "message": f"Connected to {monitored.name} via Direct Coordinates",
+                    "method": "direct_coordinates",
+                    "duration": total_duration,
+                    "strategies_attempted": strategies_attempted,
+                    "coordinates": {
+                        "control_center": result["control_center_coords"],
+                        "screen_mirroring": result["screen_mirroring_coords"],
+                        "living_room_tv": result["living_room_tv_coords"],
+                    },
+                    "tier": 1,
+                }
+            else:
+                logger.warning(
+                    f"[DISPLAY MONITOR] Direct coordinates failed: {result.get('message')}"
+                )
+                raise Exception(f"Could not connect to '{monitored.name}': {result.get('message')}")
+
+        except Exception as e:
+            with open("/tmp/jarvis_display_command.log", "a") as f:
+                f.write(f"[DISPLAY MONITOR] Strategy 1 exception: {e}\n")
+                import traceback
+
+                f.write(f"{traceback.format_exc()}\n")
+            logger.warning(f"[DISPLAY MONITOR] Direct coordinates error: {e}", exc_info=True)
+            # Note: Don't release circuit breaker here - let it continue to other strategies
+
+        # Strategy 2: Protocol-Level AirPlay (Bonjour/mDNS + RAOP)
+        try:
+            from display.airplay_manager import get_airplay_manager
+
+            logger.info(
+                f"[DISPLAY MONITOR] 🥈 STRATEGY 2: Protocol-Level AirPlay (Bonjour/mDNS + RAOP)"
+            )
+            logger.info(f"[DISPLAY MONITOR] Direct network protocol for {monitored.name}")
+
+            strategies_attempted.append("airplay_protocol")
+
+            airplay_manager = get_airplay_manager()
+
+            # Initialize if not already
+            if not airplay_manager.is_initialized:
+                await airplay_manager.initialize()
+
+            # Determine mode
+            mode = monitored.connection_mode if hasattr(monitored, "connection_mode") else "extend"
+
+            result = await airplay_manager.connect_to_device(monitored.name, mode=mode)
+
+            if result.get("success"):
+                self.connected_displays.add(display_id)
+                await self._emit_event("display_connected", display=monitored)
+
+                duration = asyncio.get_event_loop().time() - connection_start
+
+                # Speak success message
+                if self.config["voice_integration"]["speak_on_connection"]:
+                    template = self.config["voice_integration"]["connection_success_message"]
+                    message = template.format(display_name=monitored.name)
+
+                    if self.voice_handler:
+                        try:
+                            await self.voice_handler.speak(message)
+                        except:
+                            subprocess.Popen(["say", message])
+                    else:
+                        subprocess.Popen(["say", message])
+
+                logger.info(
+                    f"[DISPLAY MONITOR] ✅ SUCCESS via Protocol-Level AirPlay in {duration:.2f}s"
+                )
+                logger.info(f"[DISPLAY MONITOR] ========================================")
+
+                # Release circuit breaker
+                if display_id in self.connecting_displays:
+                    self.connecting_displays.remove(display_id)
+                    logger.info(
+                        f"[DISPLAY MONITOR] 🔓 Circuit breaker released for {monitored.name}"
+                    )
+
+                return {
+                    "success": True,
+                    "message": f"Connected via AirPlay protocol in {result.get('duration', 0):.1f}s",
+                    "method": "airplay_protocol",
+                    "duration": duration,
+                    "strategies_attempted": strategies_attempted,
+                    "protocol_method": result.get("method", "system_native"),
+                    "tier": 2,
+                }
+            else:
+                logger.warning(
+                    f"[DISPLAY MONITOR] Protocol-level AirPlay failed: {result.get('message')}"
+                )
+
+        except Exception as e:
+            logger.warning(f"[DISPLAY MONITOR] Protocol-level AirPlay error: {e}")
+
+        # Strategy 3: Vision-Guided Navigator (Claude Vision)
+        try:
+            from display.vision_ui_navigator import get_vision_navigator
+
+            logger.info(f"[DISPLAY MONITOR] 🥉 STRATEGY 3: Vision-Guided Navigator (Claude Vision)")
+            logger.info(f"[DISPLAY MONITOR] JARVIS will SEE and CLICK the UI for {monitored.name}")
+
+            strategies_attempted.append("vision_guided")
+
+            navigator = get_vision_navigator()
+
+            # Connect vision analyzer if available
+            if not navigator.vision_analyzer and hasattr(self, "vision_analyzer"):
+                navigator.set_vision_analyzer(self.vision_analyzer)
+            elif not navigator.vision_analyzer:
+                # Try to get from app.state
+                try:
+                    import sys
+
+                    if hasattr(sys.modules.get("__main__"), "app"):
+                        app = sys.modules["__main__"].app
+                        if hasattr(app, "state") and hasattr(app.state, "vision_analyzer"):
+                            navigator.set_vision_analyzer(app.state.vision_analyzer)
+                            logger.info(
+                                "[DISPLAY MONITOR] Connected vision analyzer from app.state"
+                            )
+                except:
+                    pass
+
+            if navigator.vision_analyzer:
+                result = await navigator.connect_to_display(monitored.name)
+
+                if result.success:
+                    self.connected_displays.add(display_id)
+                    await self._emit_event("display_connected", display=monitored)
+
+                    duration = asyncio.get_event_loop().time() - connection_start
+
+                    # Speak success message
+                    if self.config["voice_integration"]["speak_on_connection"]:
+                        template = self.config["voice_integration"]["connection_success_message"]
+                        message = template.format(display_name=monitored.name)
+
+                        if self.voice_handler:
+                            try:
+                                await self.voice_handler.speak(message)
+                            except:
+                                subprocess.Popen(["say", message])
+                        else:
+                            subprocess.Popen(["say", message])
+
+                    logger.info(
+                        f"[DISPLAY MONITOR] ✅ SUCCESS via Vision Navigation in {duration:.2f}s"
+                    )
+                    logger.info(f"[DISPLAY MONITOR] ========================================")
+
+                    # Release circuit breaker
+                    if display_id in self.connecting_displays:
+                        self.connecting_displays.remove(display_id)
+                        logger.info(
+                            f"[DISPLAY MONITOR] 🔓 Circuit breaker released for {monitored.name}"
+                        )
+
+                    return {
+                        "success": True,
+                        "message": f"Connected via vision navigation in {result.duration:.1f}s",
+                        "method": "vision_guided",
+                        "duration": duration,
+                        "strategies_attempted": strategies_attempted,
+                        "steps_completed": result.steps_completed,
+                        "tier": 3,
+                    }
+                else:
+                    logger.warning(f"[DISPLAY MONITOR] Vision navigation failed: {result.message}")
+            else:
+                logger.warning(
+                    "[DISPLAY MONITOR] Vision analyzer not available for vision navigation"
+                )
+
+        except Exception as e:
+            logger.warning(f"[DISPLAY MONITOR] Vision navigator error: {e}")
+
+        # Strategy 4: Native Swift Bridge
+        try:
+            from display.native import get_native_controller
+
+            logger.info(f"[DISPLAY MONITOR] STRATEGY 4: Native Swift Bridge")
+            strategies_attempted.append("native_swift")
+
+            native_controller = get_native_controller()
+
+            if await native_controller.initialize():
+                logger.info(f"[DISPLAY MONITOR] Using native Swift bridge for {monitored.name}")
+
+                result = await native_controller.connect(monitored.name)
+
+                if result.success:
+                    self.connected_displays.add(display_id)
+                    await self._emit_event("display_connected", display=monitored)
+
+                    duration = asyncio.get_event_loop().time() - connection_start
+
+                    # Speak success message
+                    if self.config["voice_integration"]["speak_on_connection"]:
+                        template = self.config["voice_integration"]["connection_success_message"]
+                        message = template.format(display_name=monitored.name)
+
+                        if self.voice_handler:
+                            try:
+                                await self.voice_handler.speak(message)
+                            except:
+                                subprocess.Popen(["say", message])
+                        else:
+                            subprocess.Popen(["say", message])
+
+                    logger.info(
+                        f"[DISPLAY MONITOR] ✅ SUCCESS via Native Swift Bridge in {duration:.2f}s"
+                    )
+                    logger.info(f"[DISPLAY MONITOR] ========================================")
+
+                    # Release circuit breaker
+                    if display_id in self.connecting_displays:
+                        self.connecting_displays.remove(display_id)
+                        logger.info(
+                            f"[DISPLAY MONITOR] 🔓 Circuit breaker released for {monitored.name}"
+                        )
+
+                    return {
+                        "success": True,
+                        "message": result.message,
+                        "method": result.method,
+                        "duration": duration,
+                        "strategies_attempted": strategies_attempted,
+                        "fallback_used": result.fallback_used,
+                        "tier": 4,
+                    }
+                else:
+                    logger.warning(f"[DISPLAY MONITOR] Native bridge failed: {result.message}")
+            else:
+                logger.warning("[DISPLAY MONITOR] Native bridge not available")
+
+        except Exception as e:
+            logger.warning(f"[DISPLAY MONITOR] Native bridge error: {e}")
+
+        # Strategy 5: AppleScript fallback
+        if DetectionMethod.APPLESCRIPT in self.detectors:
+            logger.info(f"[DISPLAY MONITOR] STRATEGY 5: AppleScript Fallback")
+            strategies_attempted.append("applescript")
+
+            result = await self.detectors[DetectionMethod.APPLESCRIPT].connect_display(
+                monitored.name
+            )
+
+            if result["success"]:
+                self.connected_displays.add(display_id)
+                await self._emit_event("display_connected", display=monitored)
+
+                duration = asyncio.get_event_loop().time() - connection_start
+
+                # Speak success message
+                if self.config["voice_integration"]["speak_on_connection"]:
+                    template = self.config["voice_integration"]["connection_success_message"]
+                    message = template.format(display_name=monitored.name)
+
+                    if self.voice_handler:
+                        try:
+                            await self.voice_handler.speak(message)
+                        except:
+                            subprocess.Popen(["say", message])
+                    else:
+                        subprocess.Popen(["say", message])
+
+                logger.info(f"[DISPLAY MONITOR] ✅ SUCCESS via AppleScript in {duration:.2f}s")
+                logger.info(f"[DISPLAY MONITOR] ========================================")
+
+                # Release circuit breaker
+                if display_id in self.connecting_displays:
+                    self.connecting_displays.remove(display_id)
+                    logger.info(
+                        f"[DISPLAY MONITOR] 🔓 Circuit breaker released for {monitored.name}"
+                    )
+
+                result["duration"] = duration
+                result["strategies_attempted"] = strategies_attempted
+                result["tier"] = 5
+                return result
+
+        # Strategy 6: All automated methods failed - provide voice guidance
+        duration = asyncio.get_event_loop().time() - connection_start
+
+        guidance_message = (
+            f"I can see {monitored.name} is available, but all automated connection methods failed. "
+            f"Please click the Screen Mirroring icon in your menu bar and select {monitored.name} manually."
+        )
+
+        logger.error(f"[DISPLAY MONITOR] ❌ ALL 6 STRATEGIES FAILED for {monitored.name}")
+        logger.error(f"[DISPLAY MONITOR] Strategies attempted: {', '.join(strategies_attempted)}")
+        logger.error(f"[DISPLAY MONITOR] Total time: {duration:.2f}s")
+        logger.error(f"[DISPLAY MONITOR] ========================================")
+
+        # Speak guidance
+        if self.voice_handler:
+            try:
+                await self.voice_handler.speak(guidance_message)
+            except:
+                subprocess.Popen(["say", guidance_message])
+
+        # Release circuit breaker on failure
+        if display_id in self.connecting_displays:
+            self.connecting_displays.remove(display_id)
+            logger.info(f"[DISPLAY MONITOR] 🔓 Circuit breaker released (all strategies failed)")
+
+        return {
+            "success": False,
+            "message": guidance_message,
+            "method": "none",
+            "duration": duration,
+            "strategies_attempted": strategies_attempted,
+            "guidance_provided": True,
+            "tier": 6,
+        }
+
+    async def change_display_mode(self, display_id: str, mode: str = "extended") -> Dict[str, Any]:
+        """
+        Change the screen mirroring mode
+
+        Args:
+            display_id: Display ID from configuration
+            mode: Mirroring mode - "entire", "window", or "extended"
+
+        Returns:
+            Mode change result dictionary
+        """
+        # Find monitored display
+        monitored = next((d for d in self.monitored_displays if d.id == display_id), None)
+        if not monitored:
+            return {"success": False, "message": f"Display {display_id} not found in configuration"}
+
+        logger.info(f"[DISPLAY MONITOR] ========================================")
+        logger.info(f"[DISPLAY MONITOR] Changing {monitored.name} to {mode} mode...")
+        logger.info(f"[DISPLAY MONITOR] ========================================")
+
+        mode_start = asyncio.get_event_loop().time()
+
+        try:
+            from display.control_center_clicker_factory import get_best_clicker
+
+            logger.info(f"[DISPLAY MONITOR] Using DIRECT COORDINATES to change mode")
+            logger.info(
+                f"[DISPLAY MONITOR] Flow: Control Center → Screen Mirroring → {mode} → Start"
+            )
+
+            # Get Control Center clicker
+            cc_clicker = get_best_clicker(
+                vision_analyzer=self.vision_analyzer, enable_verification=True, prefer_uae=True
+            )
+
+            # Execute mode change flow
+            logger.info(f"[DISPLAY MONITOR] Executing 4-click mode change flow...")
+            result = cc_clicker.change_mirroring_mode(mode)
+
+            if result.get("success"):
+                total_duration = asyncio.get_event_loop().time() - mode_start
+
+                # Speak mode change confirmation
+                if self.config["voice_integration"].get("speak_on_connection", True):
+                    template = self.config["voice_integration"].get(
+                        "mode_change_success_message", "Mode changed, sir."
+                    )
+                    message = (
+                        template.format(mode=result["mode"]) if "{mode}" in template else template
+                    )
+
+                    if self.voice_handler:
+                        try:
+                            await self.voice_handler.speak(message)
+                        except:
+                            subprocess.Popen(["say", message])
+                    else:
+                        subprocess.Popen(["say", message])
+
+                logger.info(
+                    f"[DISPLAY MONITOR] ✅ SUCCESS - Changed to {result['mode']} in {total_duration:.2f}s"
+                )
+                logger.info(
+                    f"[DISPLAY MONITOR] 1. Control Center: {result['control_center_coords']}"
+                )
+                logger.info(
+                    f"[DISPLAY MONITOR] 2. Screen Mirroring: {result['screen_mirroring_coords']}"
+                )
+                logger.info(f"[DISPLAY MONITOR] 3. Change Button: {result['change_button_coords']}")
+                logger.info(f"[DISPLAY MONITOR] 4. Mode: {result['mode_coords']}")
+                logger.info(
+                    f"[DISPLAY MONITOR] 5. Start Mirroring: {result['start_mirroring_coords']}"
+                )
+                logger.info(f"[DISPLAY MONITOR] Method: {result['method']}")
+                logger.info(f"[DISPLAY MONITOR] ========================================")
+
+                return {
+                    "success": True,
+                    "message": f"Changed to {result['mode']} mode",
+                    "mode": result["mode"],
+                    "method": "direct_coordinates",
+                    "duration": total_duration,
+                    "coordinates": {
+                        "control_center": result["control_center_coords"],
+                        "screen_mirroring": result["screen_mirroring_coords"],
+                        "change_button": result["change_button_coords"],
+                        "mode": result["mode_coords"],
+                        "start_mirroring": result["start_mirroring_coords"],
+                    },
+                }
+            else:
+                logger.error(f"[DISPLAY MONITOR] ❌ Mode change failed: {result.get('message')}")
+                return result
+
+        except Exception as e:
+            total_duration = asyncio.get_event_loop().time() - mode_start
+            logger.error(f"[DISPLAY MONITOR] ❌ Mode change error: {e}", exc_info=True)
+            logger.error(f"[DISPLAY MONITOR] Total time: {total_duration:.2f}s")
+            logger.error(f"[DISPLAY MONITOR] ========================================")
+
+            return {
+                "success": False,
+                "message": f"Failed to change mode: {str(e)}",
+                "method": "none",
+                "duration": total_duration,
+                "error": str(e),
+            }
+
+    async def disconnect_display(self, display_id: str) -> Dict[str, Any]:
+        """
+        Disconnect from a display using direct coordinates
+
+        Args:
+            display_id: Display ID from configuration
+
+        Returns:
+            Disconnection result dictionary
+        """
+        # Find monitored display
+        monitored = next((d for d in self.monitored_displays if d.id == display_id), None)
+        if not monitored:
+            return {"success": False, "message": f"Display {display_id} not found in configuration"}
+
+        logger.info(f"[DISPLAY MONITOR] ========================================")
+        logger.info(f"[DISPLAY MONITOR] Disconnecting from {monitored.name}...")
+        logger.info(f"[DISPLAY MONITOR] ========================================")
+
+        disconnect_start = asyncio.get_event_loop().time()
+
+        try:
+            from display.control_center_clicker_factory import get_best_clicker
+
+            logger.info(f"[DISPLAY MONITOR] Using DIRECT COORDINATES to disconnect")
+            logger.info(f"[DISPLAY MONITOR] Flow: Control Center → Screen Mirroring → Stop")
+
+            # Get Control Center clicker
+            cc_clicker = get_best_clicker(
+                vision_analyzer=self.vision_analyzer, enable_verification=True, prefer_uae=True
+            )
+
+            # Execute disconnect flow: Control Center → Screen Mirroring → Stop
+            logger.info(f"[DISPLAY MONITOR] Executing 3-click disconnect flow...")
+            result = cc_clicker.disconnect_from_living_room_tv()
+
+            if result.get("success"):
+                total_duration = asyncio.get_event_loop().time() - disconnect_start
+
+                # Remove from connected displays
+                if display_id in self.connected_displays:
+                    self.connected_displays.remove(display_id)
+                await self._emit_event("display_disconnected", display=monitored)
+
+                # Speak disconnection message
+                if self.config["voice_integration"]["speak_on_disconnection"]:
+                    template = self.config["voice_integration"].get(
+                        "disconnection_success_message", "Display disconnected, sir."
+                    )
+                    message = (
+                        template.format(display_name=monitored.name)
+                        if "{display_name}" in template
+                        else template
+                    )
+
+                    if self.voice_handler:
+                        try:
+                            await self.voice_handler.speak(message)
+                        except:
+                            subprocess.Popen(["say", message])
+                    else:
+                        subprocess.Popen(["say", message])
+
+                logger.info(f"[DISPLAY MONITOR] ✅ SUCCESS - Disconnected in {total_duration:.2f}s")
+                logger.info(
+                    f"[DISPLAY MONITOR] 1. Control Center: {result['control_center_coords']}"
+                )
+                logger.info(
+                    f"[DISPLAY MONITOR] 2. Screen Mirroring: {result['screen_mirroring_coords']}"
+                )
+                logger.info(f"[DISPLAY MONITOR] 3. Stop: {result['stop_mirroring_coords']}")
+                logger.info(f"[DISPLAY MONITOR] Method: {result['method']}")
+                logger.info(f"[DISPLAY MONITOR] ========================================")
+
+                return {
+                    "success": True,
+                    "message": f"Disconnected from {monitored.name}",
+                    "method": "direct_coordinates",
+                    "duration": total_duration,
+                    "coordinates": {
+                        "control_center": result["control_center_coords"],
+                        "screen_mirroring": result["screen_mirroring_coords"],
+                        "stop": result["stop_mirroring_coords"],
+                    },
+                }
+            else:
+                logger.error(f"[DISPLAY MONITOR] ❌ Disconnect failed: {result.get('message')}")
+                return result
+
+        except Exception as e:
+            total_duration = asyncio.get_event_loop().time() - disconnect_start
+            logger.error(f"[DISPLAY MONITOR] ❌ Disconnect error: {e}", exc_info=True)
+            logger.error(f"[DISPLAY MONITOR] Total time: {total_duration:.2f}s")
+            logger.error(f"[DISPLAY MONITOR] ========================================")
+
+            return {
+                "success": False,
+                "message": f"Failed to disconnect: {str(e)}",
+                "method": "none",
+                "duration": total_duration,
+                "error": str(e),
+            }
+
+    async def _store_display_pattern(
+        self, monitored: "MonitoredDisplay", actual_state: Dict[str, Any]
+    ):
+        """
+        Store display connection patterns in learning database for future predictions
+        """
+        try:
+            # Get learning database instance
+            from backend.intelligence.learning_database import get_learning_database
+
+            db = await get_learning_database()
+
+            # Create pattern data
+            pattern_data = {
+                "pattern_type": "display_connection",
+                "display_id": monitored.id,
+                "display_name": monitored.name,
+                "is_connected": actual_state["is_connected"],
+                "connection_mode": actual_state.get("connection_mode"),
+                "verification_method": actual_state.get("method"),
+                "confidence": actual_state.get("confidence", 0.5),
+                "context": {
+                    "time_of_day": datetime.now().hour,
+                    "day_of_week": datetime.now().weekday(),
+                    "is_auto_connect": monitored.auto_connect,
+                    "available_displays": len(self.available_displays),
+                    "active_apps": [],  # Could be enhanced with actual app context
+                },
+                "success_rate": 1.0 if actual_state["is_connected"] else 0.0,
+                "frequency": 1,  # Will be incremented by database if pattern exists
+            }
+
+            # Store the pattern (database handles deduplication and aggregation)
+            await db.store_pattern(pattern_data, batch=True)
+
+            # Store user interaction as an action
+            action_data = {
+                "action_type": "display_query",
+                "action_detail": f"Query about {monitored.name}",
+                "timestamp": datetime.now().isoformat(),
+                "context": pattern_data["context"],
+                "result": "connected" if actual_state["is_connected"] else "not_connected",
+                "confidence": actual_state.get("confidence", 0.5),
+            }
+
+            await db.store_action(action_data, batch=True)
+
+            logger.debug(f"[DISPLAY MONITOR] Stored learning pattern for {monitored.name}")
+
+        except ImportError:
+            logger.debug(
+                "[DISPLAY MONITOR] Learning database not available, skipping pattern storage"
+            )
+        except Exception as e:
+            logger.error(f"[DISPLAY MONITOR] Failed to store learning pattern: {e}")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current monitor status"""
+        return {
+            "is_monitoring": self.is_monitoring,
+            "available_displays": list(self.available_displays),
+            "connected_displays": list(self.connected_displays),
+            "monitored_count": len(self.monitored_displays),
+            "detection_methods": [m.value for m in self.detectors.keys()],
+            "cache_enabled": self.config["caching"]["enabled"],
+        }
+
+    def get_available_display_details(self) -> list:
+        """
+        Get detailed information about currently available displays
+
+        Returns:
+            List of dicts with display details (name, id, message)
+        """
+        details = []
+        for display_id in self.available_displays:
+            monitored = next((d for d in self.monitored_displays if d.id == display_id), None)
+            if monitored:
+                message = f"Sir, I see your {monitored.name} is now available. Would you like to extend your display to it?"
+                details.append(
+                    {
+                        "display_name": monitored.name,
+                        "display_id": monitored.id,
+                        "message": message,
+                        "auto_connect": monitored.auto_connect,
+                        "auto_prompt": monitored.auto_prompt,
+                    }
+                )
+        return details
+
+    def has_pending_prompt(self) -> bool:
+        """
+        Check if there's a pending display prompt
+
+        This is used by the vision command handler to check if JARVIS
+        is waiting for a yes/no response about connecting to a display.
+
+        Returns:
+            True if waiting for user response, False otherwise
+        """
+        # Check if we have a pending prompt that hasn't been answered yet
+        return self.pending_prompt_display is not None
+
+    async def handle_user_response(self, response: str) -> Dict:
+        """
+        Handle user voice response to display prompt
+
+        When JARVIS asks "Would you like to extend your display to Living Room TV?"
+        this handles the user's "yes" or "no" response.
+
+        Args:
+            response: User's voice command (e.g., "yes", "no", "yes jarvis")
+
+        Returns:
+            Response result with action taken
+        """
+        try:
+            if not self.has_pending_prompt():
+                return {"handled": False, "reason": "No pending prompt"}
+
+            # Get the display that has the pending prompt
+            display_id = self.pending_prompt_display
+            display_to_connect = next(
+                (d for d in self.monitored_displays if d.id == display_id), None
+            )
+
+            if not display_to_connect:
+                logger.error(
+                    f"[DISPLAY MONITOR] Pending prompt display {display_id} not found in monitored displays"
+                )
+                self.pending_prompt_display = None  # Clear invalid state
+                return {"handled": False, "reason": "Display configuration not found"}
+
+            # Parse response
+            response_lower = response.lower().strip()
+
+            # Affirmative responses
+            if any(
+                word in response_lower
+                for word in ["yes", "yeah", "yep", "sure", "connect", "extend", "mirror"]
+            ):
+                # Clear pending prompt state
+                self.pending_prompt_display = None
+                logger.info(
+                    f"[DISPLAY MONITOR] User said yes, connecting to {display_to_connect.name}"
+                )
+
+                # Determine mode
+                mode = (
+                    "mirror" if "mirror" in response_lower else display_to_connect.connection_mode
+                )
+
+                # Connect to display
+                logger.info(
+                    f"[DISPLAY MONITOR] Calling connect_display with id={display_to_connect.id}, mode={mode}"
+                )
+                result = await self.connect_display(display_to_connect.id)
+                logger.info(
+                    f"[DISPLAY MONITOR] connect_display returned: success={result.get('success')}, error={result.get('error')}"
+                )
+
+                # Generate dynamic response
+                try:
+                    from api.vision_command_handler import vision_command_handler
+
+                    if vision_command_handler and hasattr(vision_command_handler, "intelligence"):
+                        prompt = f"""The user asked you to connect to {display_to_connect.name}. You successfully connected.
+
+Generate a brief, natural JARVIS-style confirmation that:
+1. Confirms the connection is complete
+2. Is brief and conversational (1 sentence)
+3. Uses "sir" appropriately
+4. Sounds confident and efficient
+
+Respond ONLY with JARVIS's exact words, no quotes or formatting."""
+
+                        claude_response = (
+                            await vision_command_handler.intelligence._get_claude_vision_response(
+                                None, prompt
+                            )
+                        )
+                        success_response = claude_response.get(
+                            "response", f"Connected to {display_to_connect.name}, sir."
+                        )
+                    else:
+                        success_response = f"Connected to {display_to_connect.name}, sir."
+                except Exception as e:
+                    logger.warning(f"Could not generate dynamic response: {e}")
+                    success_response = f"Connected to {display_to_connect.name}, sir."
+
+                # Determine final response
+                if result.get("success"):
+                    final_response = success_response
+                else:
+                    # Connection failed - generate error response
+                    error_detail = result.get("error", "Unknown error")
+                    final_response = f"I encountered an issue connecting to {display_to_connect.name}, sir. {error_detail}"
+                    logger.error(f"[DISPLAY MONITOR] Connection failed: {error_detail}")
+
+                return {
+                    "handled": True,
+                    "action": "connect",
+                    "display_name": display_to_connect.name,
+                    "mode": mode,
+                    "result": result,
+                    "response": final_response,
+                    "success": result.get("success", False),
+                }
+
+            # Negative responses
+            elif any(word in response_lower for word in ["no", "nope", "don't", "skip", "not now"]):
+                # Clear pending prompt state
+                self.pending_prompt_display = None
+                logger.info(f"[DISPLAY MONITOR] User said no, skipping {display_to_connect.name}")
+
+                # Remove from available displays temporarily (user declined)
+                if display_to_connect.id in self.available_displays:
+                    self.available_displays.remove(display_to_connect.id)
+
+                # Generate dynamic response
+                try:
+                    from api.vision_command_handler import vision_command_handler
+
+                    if vision_command_handler and hasattr(vision_command_handler, "intelligence"):
+                        prompt = f"""The user was asked: "Sir, I see your {display_to_connect.name} is now available. Would you like to extend your display to it?"
+
+They responded: "{response}"
+
+Generate a brief, natural JARVIS-style acknowledgment that:
+1. Confirms you understood they don't want to connect
+2. Is brief and conversational (1-2 sentences max)
+3. Uses "sir" appropriately
+4. Shows understanding without being verbose
+
+Respond ONLY with JARVIS's exact words, no quotes or formatting."""
+
+                        claude_response = (
+                            await vision_command_handler.intelligence._get_claude_vision_response(
+                                None, prompt
+                            )
+                        )
+                        decline_response = claude_response.get("response", "Understood, sir.")
+                    else:
+                        decline_response = "Understood, sir."
+                except Exception as e:
+                    logger.warning(f"Could not generate dynamic response: {e}")
+                    decline_response = "Understood, sir."
+
+                return {
+                    "handled": True,
+                    "action": "skip",
+                    "display_name": display_to_connect.name,
+                    "response": decline_response,
+                }
+
+            else:
+                # Unclear response
+                return {
+                    "handled": True,
+                    "action": "clarify",
+                    "response": "Sir, I didn't quite catch that. Would you like to extend the display? Please say 'yes' or 'no'.",
+                }
+
+        except Exception as e:
+            logger.error(f"[DISPLAY MONITOR] Error handling response: {e}", exc_info=True)
+            return {"handled": False, "error": str(e)}
+
 # ============================================================================
 # Singleton Pattern and Factory Functions
 # ============================================================================

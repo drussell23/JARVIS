@@ -905,6 +905,747 @@ class AdvancedAutonomousEngine:
 
         return recent
 
+    async def load_state(self):
+        """Load engine state"""
+        state_path = Path("backend/data/autonomous_engine_state.json")
+
+        if state_path.exists():
+            async with aiofiles.open(state_path, 'r') as f:
+                content = await f.read()
+                state = json.loads(content)
+
+            self.success_metrics = defaultdict(
+                lambda: {'success': 0, 'total': 0},
+                state.get('success_metrics', {})
+            )
+            self.config.update(state.get('config', {}))
+            self.feedback_memory = defaultdict(
+                list,
+                state.get('feedback_memory', {})
+            )
+
+    async def save_state(self):
+        """Save engine state"""
+        state = {
+            'success_metrics': dict(self.success_metrics),
+            'config': self.config,
+            'feedback_memory': dict(self.feedback_memory)
+        }
+
+        state_path = Path("backend/data/autonomous_engine_state.json")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+
+        async with aiofiles.open(state_path, 'w') as f:
+            await f.write(json.dumps(state, indent=2, default=str))
+
+    async def _retrain_models(self):
+        """Retrain ML models with new data"""
+        logger.info("Retraining ML models with recent data")
+
+        # Prepare training data from history
+        # This would involve extracting features and labels from decision history
+        # and retraining the various models
+
+        # For now, just save the current state
+        await self.save_state()
+
+    async def _learn_from_execution(self, decision: AutonomousDecision):
+        """Learn from execution results"""
+
+        # Update feedback memory
+        feedback_key = f"{decision.predicted_action.goal_type}_{decision.predicted_action.action_type}"
+        self.feedback_memory[feedback_key].append({
+            'outcome': decision.outcome,
+            'confidence': decision.ml_confidence,
+            'risk': decision.risk_level.value,
+            'timestamp': decision.execution_time,
+            'delay_minutes': (
+                decision.execution_time - decision.predicted_action.predicted_time
+            ).total_seconds() / 60
+        })
+
+        # Update temporal patterns
+        if decision.outcome == ActionOutcome.SUCCESS:
+            goal = decision.decision_context.active_goals.get(
+                decision.predicted_action.goal_id
+            )
+            if goal:
+                await self.temporal_learner.learn_pattern(
+                    [goal],
+                    [decision.predicted_action.action_type]
+                )
+
+        # Retrain models periodically
+        if len(self.decision_history) % 100 == 0:
+            asyncio.create_task(self._retrain_models())
+
+    async def _update_metrics(self, decision: AutonomousDecision):
+        """Update success metrics"""
+        action_type = decision.predicted_action.action_type
+
+        if action_type not in self.success_metrics:
+            self.success_metrics[action_type] = {'success': 0, 'total': 0}
+
+        self.success_metrics[action_type]['total'] += 1
+
+        if decision.outcome == ActionOutcome.SUCCESS:
+            self.success_metrics[action_type]['success'] += 1
+
+    async def _execute_action(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> Dict[str, Any]:
+        """Execute the actual action"""
+
+        # This would integrate with actual system actions
+        # For now, return simulated results
+
+        logger.info(f"Executing action: {predicted_action.action_type} on {predicted_action.target}")
+
+        # Simulate execution
+        await asyncio.sleep(0.5)
+
+        # Simulate success based on confidence
+        success_prob = predicted_action.confidence
+        success = np.random.random() < success_prob
+
+        return {
+            'success': success,
+            'action_type': predicted_action.action_type,
+            'target': predicted_action.target,
+            'execution_time': datetime.now().isoformat()
+        }
+
+    async def execute_decision(
+        self,
+        decision: AutonomousDecision,
+        override_permission: bool = False
+    ) -> ActionOutcome:
+        """Execute an autonomous decision"""
+
+        # Check permission
+        if decision.requires_permission() and not override_permission:
+            logger.info(f"Decision {decision.action_id} requires permission")
+            return ActionOutcome.CANCELLED
+
+        # Record execution time
+        decision.execution_time = datetime.now()
+
+        try:
+            # Execute based on action type
+            result = await self._execute_action(
+                decision.predicted_action,
+                decision.decision_context
+            )
+
+            # Determine outcome
+            if result.get('success', False):
+                outcome = ActionOutcome.SUCCESS
+            elif result.get('partial', False):
+                outcome = ActionOutcome.PARTIAL_SUCCESS
+            else:
+                outcome = ActionOutcome.FAILURE
+
+            decision.outcome = outcome
+            decision.feedback = result
+
+            # Update success metrics
+            await self._update_metrics(decision)
+
+            # Learn from execution
+            await self._learn_from_execution(decision)
+
+            return outcome
+
+        except Exception as e:
+            logger.error(f"Error executing decision {decision.action_id}: {e}")
+            decision.outcome = ActionOutcome.FAILURE
+            decision.feedback = {'error': str(e)}
+            return ActionOutcome.FAILURE
+
+    async def _exploratory_strategy(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> Dict[str, Any]:
+        """Exploratory strategy - try new actions"""
+        return {
+            'timing': 'exploratory',
+            'confidence_boost': -0.2,
+            'explanation': 'Exploring new action possibility'
+        }
+
+    async def _learning_strategy(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> Dict[str, Any]:
+        """Learning strategy - act to improve knowledge"""
+        return {
+            'timing': 'experimental',
+            'confidence_boost': -0.1,
+            'explanation': 'Trying action to learn effectiveness'
+        }
+
+    async def _predictive_strategy(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> Dict[str, Any]:
+        """Predictive strategy - act based on predictions"""
+        return {
+            'timing': 'predicted',
+            'confidence_boost': 0.15,
+            'explanation': 'Acting based on ML predictions'
+        }
+
+    async def _reactive_strategy(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> Dict[str, Any]:
+        """Reactive strategy - act when triggered"""
+        return {
+            'timing': 'on_trigger',
+            'confidence_boost': 0.0,
+            'explanation': 'Waiting for explicit trigger'
+        }
+
+    async def _proactive_strategy(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> Dict[str, Any]:
+        """Proactive strategy - act before user asks"""
+        return {
+            'timing': 'immediate',
+            'confidence_boost': 0.1,
+            'explanation': 'Acting proactively based on detected pattern'
+        }
+
+    async def _record_decisions(self, decisions: List[AutonomousDecision]):
+        """Record decisions for learning"""
+        for decision in decisions:
+            self.decision_history.append(decision)
+            self.active_decisions[decision.action_id] = decision
+
+    async def _filter_and_rank_decisions(
+        self,
+        decisions: List[AutonomousDecision]
+    ) -> List[AutonomousDecision]:
+        """Filter and rank decisions by priority"""
+
+        # Filter out low-confidence decisions
+        filtered = [
+            d for d in decisions
+            if d.ml_confidence >= self.config['min_confidence'] * 0.5
+        ]
+
+        # Calculate priority scores
+        for decision in filtered:
+            score = 0.0
+
+            # Confidence component
+            score += decision.ml_confidence * 0.3
+
+            # Risk component (lower risk is better)
+            score += (1.0 - decision.risk_level.value / 4.0) * 0.2
+
+            # Expected success component
+            score += decision.expected_outcome.get('success', 0.5) * 0.3
+
+            # Strategy component
+            if decision.decision_strategy == DecisionStrategy.PREDICTIVE:
+                score += 0.1
+            elif decision.decision_strategy == DecisionStrategy.PROACTIVE:
+                score += 0.05
+
+            # Time urgency component
+            time_until = (decision.predicted_action.predicted_time - datetime.now()).total_seconds()
+            if time_until < 300:  # Less than 5 minutes
+                score += 0.1
+
+            decision.priority_score = score
+
+        # Sort by priority score
+        filtered.sort(key=lambda d: d.priority_score, reverse=True)
+
+        # Limit to max concurrent actions
+        max_actions = self.config.get('max_concurrent_actions', 5)
+        return filtered[:max_actions]
+
+    def _generate_action_id(self, predicted_action: PredictedAction) -> str:
+        """Generate unique action ID"""
+        timestamp = datetime.now().isoformat()
+        data = f"{predicted_action.action_type}_{timestamp}_{predicted_action.goal_id}"
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+    async def _needs_human_approval(
+        self,
+        predicted_action: PredictedAction,
+        risk_level: RiskLevel,
+        ml_confidence: float,
+        context: DecisionContext
+    ) -> bool:
+        """Determine if human approval is needed"""
+
+        # High risk always needs approval
+        if risk_level.value >= RiskLevel.HIGH_RISK.value:
+            return True
+
+        # Low confidence needs approval
+        if ml_confidence < self.config['min_confidence']:
+            return True
+
+        # Prepare features for permission model
+        features = torch.FloatTensor([
+            ml_confidence,
+            risk_level.value / 4.0,
+            predicted_action.confidence,
+            context.risk_tolerance,
+            1.0 if predicted_action.action_type in self.action_registry else 0.0,
+            context.system_resources.get('cpu', 0.5),
+            context.system_resources.get('memory', 0.5),
+            len(context.recent_actions) / 100.0,
+            1.0 if context.temporal_context.get('is_business_hours', False) else 0.0,
+            1.0 if predicted_action.action_type in self.success_metrics else 0.0,
+            # Pad to 15 features
+            0.0, 0.0, 0.0, 0.0, 0.0
+        ])
+
+        # Use permission model
+        with torch.no_grad():
+            needs_approval_prob = self.permission_model(features).item()
+
+        return needs_approval_prob > 0.5
+
+    async def _calculate_ml_confidence(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext,
+        risk_level: RiskLevel,
+        expected_outcome: Dict[str, float]
+    ) -> float:
+        """Calculate overall ML confidence for decision"""
+
+        # Base confidence from prediction
+        confidence = predicted_action.confidence
+
+        # Adjust based on risk
+        risk_factor = 1.0 - (risk_level.value / 10.0)
+        confidence *= risk_factor
+
+        # Adjust based on expected success
+        success_prob = expected_outcome.get('success', 0.5)
+        confidence *= (0.5 + success_prob * 0.5)
+
+        # Adjust based on historical performance
+        if predicted_action.action_type in self.success_metrics:
+            metrics = self.success_metrics[predicted_action.action_type]
+            if metrics['total'] > 5:
+                success_rate = metrics['success'] / metrics['total']
+                confidence *= (0.7 + success_rate * 0.3)
+
+        # Adjust based on context confidence
+        if context.workspace_state:
+            confidence *= context.workspace_state.confidence
+
+        return min(confidence, 1.0)
+
+    def _prepare_outcome_features(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> List[float]:
+        """Prepare features for outcome prediction"""
+        features = []
+
+        # Action confidence
+        features.append(predicted_action.confidence)
+
+        # Goal progress
+        if predicted_action.goal_id in context.active_goals:
+            goal = context.active_goals[predicted_action.goal_id]
+            features.append(goal.progress)
+            features.append(goal.confidence)
+        else:
+            features.append(0.0)
+            features.append(0.0)
+
+        # Historical success rate
+        if predicted_action.action_type in self.success_metrics:
+            metrics = self.success_metrics[predicted_action.action_type]
+            success_rate = metrics['success'] / max(metrics['total'], 1)
+            features.append(success_rate)
+        else:
+            features.append(0.5)
+
+        # Context features
+        features.extend(context.to_feature_vector()[:5])  # Use first 5 context features
+
+        return features
+
+    async def _predict_outcome(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> Dict[str, float]:
+        """Predict outcome probabilities for action"""
+
+        # Prepare features for outcome prediction
+        features = self._prepare_outcome_features(predicted_action, context)
+
+        # Default predictions
+        outcome_probs = {
+            'success': 0.5,
+            'partial_success': 0.3,
+            'failure': 0.2
+        }
+
+        # Use ML model if trained
+        try:
+            if hasattr(self.outcome_predictor, 'predict'):
+                predicted_success = self.outcome_predictor.predict([features])[0]
+
+                outcome_probs['success'] = max(0, min(1, predicted_success))
+                outcome_probs['partial_success'] = (1 - predicted_success) * 0.6
+                outcome_probs['failure'] = (1 - predicted_success) * 0.4
+        except Exception as e:
+            logger.warning(f"ML outcome prediction failed: {e}")
+
+        return outcome_probs
+
+    def _prepare_risk_features(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> List[float]:
+        """Prepare features for risk assessment"""
+        features = []
+
+        # Action features
+        features.append(predicted_action.confidence)
+        features.append(1.0 if predicted_action.action_type in self.action_registry else 0.0)
+
+        # Context features
+        features.append(context.risk_tolerance)
+        features.append(len(context.recent_actions) / 100.0)  # Normalized
+
+        # System resource features
+        features.append(context.system_resources.get('cpu', 0.5))
+        features.append(context.system_resources.get('memory', 0.5))
+
+        # Success history
+        if predicted_action.action_type in self.success_metrics:
+            metrics = self.success_metrics[predicted_action.action_type]
+            success_rate = metrics['success'] / max(metrics['total'], 1)
+            features.append(success_rate)
+        else:
+            features.append(0.5)  # Unknown success rate
+
+        return features
+
+    async def _assess_risk(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> RiskLevel:
+        """Assess risk level of predicted action"""
+
+        # Get base risk from action registry
+        base_risk = RiskLevel.MEDIUM_RISK
+        if predicted_action.action_type in self.action_registry:
+            base_risk = self.action_registry[predicted_action.action_type]['risk']
+
+        # Prepare features for ML risk assessment
+        features = self._prepare_risk_features(predicted_action, context)
+
+        # Use ML model if trained
+        try:
+            if hasattr(self.risk_assessor, 'predict'):
+                risk_prob = self.risk_assessor.predict_proba([features])[0]
+
+                # Map probability to risk level
+                max_risk_idx = np.argmax(risk_prob)
+                risk_levels = list(RiskLevel)
+                if max_risk_idx < len(risk_levels):
+                    return risk_levels[max_risk_idx]
+        except Exception as e:
+            logger.warning(f"ML risk assessment failed: {e}")
+
+        return base_risk
+
+    def _is_routine_action(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> bool:
+        """Check if action is routine based on patterns"""
+
+        # Check if action happens regularly
+        action_history = [
+            d for d in self.decision_history
+            if d.predicted_action.action_type == predicted_action.action_type
+        ]
+
+        if len(action_history) < 5:
+            return False
+
+        # Check for regular timing
+        times = [d.execution_time for d in action_history[-5:] if d.execution_time]
+        if len(times) >= 3:
+            # Check if times follow a pattern (e.g., daily)
+            intervals = [
+                (times[i+1] - times[i]).total_seconds() / 3600
+                for i in range(len(times)-1)
+            ]
+
+            # If intervals are consistent (within 2 hours), it's routine
+            if intervals:
+                std_dev = np.std(intervals)
+                if std_dev < 2.0:
+                    return True
+
+        return False
+
+    def _select_strategy(
+        self,
+        predicted_action: PredictedAction,
+        context: DecisionContext
+    ) -> DecisionStrategy:
+        """Select decision strategy based on action and context"""
+
+        # High confidence predictions use predictive strategy
+        if predicted_action.confidence > 0.85:
+            return DecisionStrategy.PREDICTIVE
+
+        # New or uncommon actions use exploratory
+        action_key = predicted_action.action_type
+        if action_key in self.success_metrics:
+            total_attempts = self.success_metrics[action_key]['total']
+            if total_attempts < 10:
+                return DecisionStrategy.EXPLORATORY
+
+        # Learning strategy for improving performance
+        if action_key in self.success_metrics:
+            success_rate = (self.success_metrics[action_key]['success'] /
+                          max(self.success_metrics[action_key]['total'], 1))
+            if 0.3 < success_rate < 0.7:
+                return DecisionStrategy.LEARNING
+
+        # Proactive for routine tasks
+        if self._is_routine_action(predicted_action, context):
+            return DecisionStrategy.PROACTIVE
+
+        # Default to reactive
+        return DecisionStrategy.REACTIVE
+
+    def _determine_target(
+        self,
+        action_type: str,
+        goal: Goal,
+        context: DecisionContext
+    ) -> Any:
+        """Determine target for action based on goal and context"""
+
+        # Extract target from goal evidence
+        for evidence in goal.evidence:
+            if 'target' in evidence.get('data', {}):
+                return evidence['data']['target']
+
+        # Infer target based on action type
+        if action_type == 'connect_display':
+            # Look for display references in context
+            if context.workspace_state:
+                # This would normally extract from workspace analysis
+                return "Living Room TV"
+
+        elif action_type == 'open_application':
+            # Determine which app based on goal type
+            if 'communication' in goal.goal_type:
+                return "Slack"
+            elif 'project' in goal.goal_type:
+                return "VSCode"
+
+        return "default_target"
+
+    def _calculate_urgency(self, goal: Goal, context: DecisionContext) -> float:
+        """Calculate urgency score for goal"""
+        urgency = 0.0
+
+        # Goal level urgency
+        if goal.level == GoalLevel.IMMEDIATE:
+            urgency += 0.5
+        elif goal.level == GoalLevel.INTERMEDIATE:
+            urgency += 0.3
+        else:
+            urgency += 0.1
+
+        # Confidence-based urgency
+        urgency += goal.confidence * 0.3
+
+        # Progress-based urgency (near completion is urgent)
+        if goal.progress > 0.8:
+            urgency += 0.2
+
+        # Time-based urgency
+        age_minutes = (datetime.now() - goal.created_at).total_seconds() / 60
+        if age_minutes > 30:
+            urgency += 0.1
+
+        return min(urgency, 1.0)
+
+    async def _get_pattern_based_time(
+        self,
+        goal: Goal,
+        action_type: str
+    ) -> Optional[datetime]:
+        """Get predicted time based on learned patterns"""
+        # Check if we have timing patterns for this goal-action pair
+        pattern_key = f"{goal.goal_type}_{action_type}"
+
+        if pattern_key in self.feedback_memory:
+            recent_timings = self.feedback_memory[pattern_key][-10:]
+            if recent_timings:
+                # Calculate average timing
+                avg_minutes = np.mean([t.get('delay_minutes', 0) for t in recent_timings])
+                return datetime.now() + timedelta(minutes=avg_minutes)
+
+        return None
+
+    async def _predict_action_time(
+        self,
+        goal: Goal,
+        action_type: str,
+        context: DecisionContext
+    ) -> datetime:
+        """Predict when action should be taken"""
+
+        # Use temporal pattern learner
+        pattern_time = await self._get_pattern_based_time(goal, action_type)
+        if pattern_time:
+            return pattern_time
+
+        # Urgency-based prediction
+        urgency = self._calculate_urgency(goal, context)
+
+        if urgency > 0.8:
+            # Immediate
+            return datetime.now()
+        elif urgency > 0.6:
+            # Within 5 minutes
+            return datetime.now() + timedelta(minutes=5)
+        elif urgency > 0.4:
+            # Within 15 minutes
+            return datetime.now() + timedelta(minutes=15)
+        else:
+            # Within an hour
+            return datetime.now() + timedelta(hours=1)
+
+    def _index_to_action_type(self, index: int) -> Optional[str]:
+        """Convert model output index to action type"""
+        action_types = list(self.action_registry.keys())
+        if 0 <= index < len(action_types):
+            return action_types[index]
+        return None
+
+    def _encode_goal_type(self, goal_type: str) -> List[float]:
+        """Encode goal type for ML"""
+        # Simple one-hot encoding for demonstration
+        all_types = [
+            'project_completion', 'problem_solving', 'information_gathering',
+            'communication', 'learning_research'
+        ]
+
+        encoding = [0.0] * len(all_types)
+        if goal_type in all_types:
+            encoding[all_types.index(goal_type)] = 1.0
+
+        return encoding
+
+    def _extract_goal_features(self, goal: Goal, context: DecisionContext) -> np.ndarray:
+        """Extract ML features from goal and context"""
+        features = []
+
+        # Goal features
+        features.append(goal.confidence)
+        features.append(goal.progress)
+        features.append(1.0 if goal.is_active else 0.0)
+        features.append(len(goal.evidence))
+
+        # Goal type encoding (one-hot or embedding)
+        goal_type_encoding = self._encode_goal_type(goal.goal_type)
+        features.extend(goal_type_encoding)
+
+        # Context features
+        features.extend(context.to_feature_vector())
+
+        # Pad or truncate to fixed size
+        target_size = 20
+        if len(features) < target_size:
+            features.extend([0.0] * (target_size - len(features)))
+        else:
+            features = features[:target_size]
+
+        return np.array(features)
+
+    def _get_cache_key(self, goal: Goal, context: DecisionContext) -> str:
+        """Generate cache key for predictions"""
+        key_data = {
+            'goal_id': goal.goal_id,
+            'goal_type': goal.goal_type,
+            'hour': context.temporal_context.get('hour', 0),
+            'risk_tolerance': context.risk_tolerance
+        }
+        key_str = json.dumps(key_data, sort_keys=True)
+        return hashlib.md5(key_str.encode()).hexdigest()
+
+    def _get_temporal_context(self) -> Dict[str, Any]:
+        """Get temporal context"""
+        now = datetime.now()
+        return {
+            'timestamp': now,
+            'hour': now.hour,
+            'minute': now.minute,
+            'day': now.day,
+            'month': now.month,
+            'weekday': now.weekday(),
+            'is_morning': 6 <= now.hour < 12,
+            'is_afternoon': 12 <= now.hour < 18,
+            'is_evening': 18 <= now.hour < 24
+        }
+
+    async def _get_system_resources(self) -> Dict[str, float]:
+        """Get current system resource usage"""
+        try:
+            import psutil
+            return {
+                'cpu': psutil.cpu_percent() / 100.0,
+                'memory': psutil.virtual_memory().percent / 100.0,
+                'disk': psutil.disk_usage('/').percent / 100.0
+            }
+        except ImportError:
+            return {'cpu': 0.5, 'memory': 0.5, 'disk': 0.5}
+
+    async def _load_user_preferences(self) -> Dict[str, Any]:
+        """Load learned user preferences"""
+        prefs_path = Path("backend/data/user_preferences.json")
+        if prefs_path.exists():
+            async with aiofiles.open(prefs_path, 'r') as f:
+                content = await f.read()
+                return json.loads(content)
+        return {}
+
+    async def _gather_environmental_factors(self) -> Dict[str, Any]:
+        """Gather environmental context"""
+        return {
+            'day_of_week': datetime.now().weekday(),
+            'hour': datetime.now().hour,
+            'is_weekend': datetime.now().weekday() >= 5,
+            'is_business_hours': 9 <= datetime.now().hour < 17
+        }
+
 # Global instance
 #
 # Restored 2026-08-02. This factory was deleted by 4406e11941 ("docs:
@@ -924,3 +1665,54 @@ def get_advanced_autonomous_engine() -> AdvancedAutonomousEngine:
     if _engine_instance is None:
         _engine_instance = AdvancedAutonomousEngine()
     return _engine_instance
+
+
+async def test_advanced_engine():
+    """Test the advanced autonomous engine"""
+    print("🚀 Testing Advanced Autonomous Engine with Goal Inference")
+    print("=" * 60)
+
+    engine = get_advanced_autonomous_engine()
+
+    # Create test context
+    test_context = {
+        'active_applications': ['vscode', 'chrome', 'terminal'],
+        'recent_actions': ['typing', 'switching_tabs'],
+        'content': {
+            'type': 'code',
+            'language': 'python',
+            'project': 'JARVIS'
+        },
+        'workspace_state': WorkspaceAnalysis(
+            focused_task="Implementing Goal Inference integration",
+            workspace_context="Development environment",
+            important_notifications=[],
+            suggestions=["Connect to display for presentation"],
+            confidence=0.9
+        )
+    }
+
+    print("\n📊 Making autonomous decisions based on inferred goals...")
+    decisions = await engine.make_decision(test_context)
+
+    print(f"\n✨ Generated {len(decisions)} autonomous decisions:\n")
+
+    for i, decision in enumerate(decisions, 1):
+        print(f"{i}. Action: {decision.predicted_action.action_type}")
+        print(f"   Target: {decision.predicted_action.target}")
+        print(f"   Goal Type: {decision.predicted_action.goal_type}")
+        print(f"   Strategy: {decision.decision_strategy.name}")
+        print(f"   Risk Level: {decision.risk_level.name}")
+        print(f"   ML Confidence: {decision.ml_confidence:.2%}")
+        print(f"   Needs Approval: {decision.requires_permission()}")
+        print(f"   Predicted Time: {decision.predicted_action.predicted_time}")
+        print(f"   Expected Success: {decision.expected_outcome.get('success', 0):.2%}")
+        print()
+
+    # Test execution
+    if decisions:
+        print("🎯 Executing first decision...")
+        outcome = await engine.execute_decision(decisions[0], override_permission=True)
+        print(f"   Outcome: {outcome.name}")
+
+    print("\n✅ Advanced Autonomous Engine test complete!")

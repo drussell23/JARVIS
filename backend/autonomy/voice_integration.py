@@ -901,4 +901,528 @@ Generate a natural response:"""
             except Exception as e:
                 logger.warning(f"Intelligent selection failed, falling back to direct API: {e}")
 
+    async def _listen_for_approval_response(self, timeout: int) -> ApprovalResponse:
+        """Listen for and interpret approval response"""
+        try:
+            # This would integrate with the actual voice recognition system
+            # For now, we'll simulate the process
+            
+            # In a real implementation, this would:
+            # 1. Listen for voice input with timeout
+            # 2. Process the speech-to-text
+            # 3. Analyze the response using Claude
+            # 4. Return appropriate ApprovalResponse
+            
+            # Placeholder implementation
+            await asyncio.sleep(2)  # Simulate listening time
+            return ApprovalResponse.APPROVED
+            
+        except Exception as e:
+            logger.error(f"Error listening for approval: {e}")
+            return ApprovalResponse.DENIED
+
+    async def request_voice_approval(self, 
+                                   request: str, 
+                                   context: str = "",
+                                   timeout: int = 30) -> ApprovalResponse:
+        """Request approval via voice interaction"""
+        try:
+            # Generate approval request
+            approval_prompt = f"""You are JARVIS requesting approval for an action.
+
+Action to approve: {request}
+Context: {context}
+
+Generate a natural approval request that:
+1. Clearly explains what you want to do
+2. Provides relevant context
+3. Asks for permission naturally
+4. Is concise but informative
+
+Example: "Sir, I'd like to close the inactive applications to improve system performance. This will close Safari and TextEdit which have been idle for over an hour. Shall I proceed?"
+
+Generate the approval request:"""
+
+            message = await asyncio.to_thread(
+                self.claude.messages.create,
+                model="claude-3-haiku-20240307",
+                max_tokens=150,
+                temperature=0.3,
+                messages=[{"role": "user", "content": approval_prompt}]
+            )
+            
+            approval_text = message.content[0].text.strip()
+            
+            # Speak the approval request
+            await self.voice_engine.speak(approval_text)
+            
+            # Listen for response (this would integrate with voice recognition)
+            # For now, simulate user response
+            return await self._listen_for_approval_response(timeout)
+            
+        except Exception as e:
+            logger.error(f"Error requesting voice approval: {e}")
+            return ApprovalResponse.DENIED
+
+    def _generate_fallback_response(self, command: str, confidence: float) -> str:
+        """Generate fallback response when Claude API fails"""
+        if confidence < 0.5:
+            return "I'm having trouble understanding you clearly, sir. Could you please repeat that?"
+        elif "?" in command:
+            return "I understand you have a question, sir. Let me think about that for a moment."
+        else:
+            return "I'm processing your request, sir. How may I assist you further?"
+
+    async def _build_conversation_context(self) -> str:
+        """Build context for conversation"""
+        context_parts = []
+        
+        # Time context
+        current_time = datetime.now()
+        time_str = current_time.strftime("%I:%M %p on %A")
+        context_parts.append(f"Current time: {time_str}")
+        
+        # Conversation state
+        if self.conversation_state.active:
+            context_parts.append(f"Active conversation about: {self.conversation_state.topic}")
+            
+        # User availability context
+        context_parts.append("User is actively engaged")
+        
+        return "; ".join(context_parts)
+
+    def _format_conversation_history(self, history: List[Dict[str, str]]) -> str:
+        """Format conversation history for Claude"""
+        formatted = []
+        for entry in history:
+            role = "User" if entry["role"] == "user" else "JARVIS"
+            formatted.append(f"{role}: {entry['content']}")
+        return "\n".join(formatted)
+
+class VoiceIntegrationSystem:
+    """
+    Main voice integration system that coordinates all voice-related functionality
+    Provides the unified interface for JARVIS voice capabilities
+    """
+    
+    def __init__(self, claude_api_key: Optional[str] = None, use_intelligent_selection: bool = True):
+        # API setup
+        self.claude_api_key = claude_api_key or os.getenv("ANTHROPIC_API_KEY")
+        if not self.claude_api_key:
+            raise ValueError("Claude API key required for Voice Integration System")
+
+        self.use_intelligent_selection = use_intelligent_selection
+
+        # Voice engine setup
+        voice_config = VoiceConfig(
+            tts_engine=TTSEngine.EDGE_TTS,
+            language="en",
+            speech_rate=1.0,
+            volume=0.9
+        )
+        self.voice_engine = VoiceAssistant(voice_config)
+
+        # Core systems with intelligent selection
+        self.announcement_system = VoiceAnnouncementSystem(
+            self.claude_api_key, self.voice_engine, use_intelligent_selection
+        )
+        self.communication_system = NaturalVoiceCommunication(
+            self.claude_api_key, self.voice_engine, use_intelligent_selection
+        )
+        
+        # Integration components
+        self.notification_intelligence = NotificationIntelligence()
+        self.decision_engine = AutonomousDecisionEngine()
+        self.workspace_monitor = EnhancedWorkspaceMonitor()
+        
+        # Voice context tracking
+        self.voice_context = VoiceContext()
+        self.interaction_history = deque(maxlen=1000)
+        
+        # System state
+        self.is_active = False
+        self.monitoring_tasks = []
+        
+        # Integration settings
+        self.auto_announce_notifications = True
+        self.voice_approval_threshold = 0.7  # Actions above this threshold need approval
+        self.smart_interruption_detection = True
+        
+    async def start_voice_integration(self):
+        """Start the complete voice integration system"""
+        if self.is_active:
+            return
+            
+        self.is_active = True
+        
+        # Start core systems
+        await self.announcement_system.start_announcement_system()
+        await self.communication_system.start_voice_communication()
+        
+        # Start monitoring and integration tasks
+        self.monitoring_tasks = [
+            asyncio.create_task(self._monitor_notifications()),
+            asyncio.create_task(self._monitor_system_actions()),
+            asyncio.create_task(self._update_voice_context()),
+            asyncio.create_task(self._proactive_suggestions())
+        ]
+        
+        # Initial greeting
+        await self._deliver_startup_greeting()
+        
+        logger.info("🎯 JARVIS Voice Integration System fully activated")
+        
+    async def stop_voice_integration(self):
+        """Stop the voice integration system"""
+        self.is_active = False
+        
+        # Stop core systems
+        await self.announcement_system.stop_announcement_system()
+        
+        # Cancel monitoring tasks
+        for task in self.monitoring_tasks:
+            task.cancel()
+            
+        await asyncio.gather(*self.monitoring_tasks, return_exceptions=True)
+        
+        # Farewell message
+        await self.voice_engine.speak("Voice integration system deactivated. Goodbye, sir.")
+        
+        logger.info("🎯 Voice Integration System deactivated")
+        
+    async def _deliver_startup_greeting(self):
+        """Deliver dynamic JARVIS-style startup greeting"""
+        try:
+            # Try to use our dynamic response generator first
+            try:
+                from voice.dynamic_response_generator import get_response_generator
+                generator = get_response_generator()
+                greeting = generator.generate_startup_greeting()
+                await self.voice_engine.speak(greeting)
+                logger.info(f"Delivered startup greeting: {greeting}")
+                return
+            except ImportError:
+                pass  # Fall through to Claude generation
+            
+            # If dynamic generator not available, use Claude
+            current_time = datetime.now()
+            time_context = ""
+            
+            if current_time.hour < 12:
+                time_context = "morning"
+            elif current_time.hour < 17:
+                time_context = "afternoon"
+            else:
+                time_context = "evening"
+                
+            greeting_prompt = f"""Generate a sophisticated JARVIS-style startup greeting for the {time_context}.
+
+Requirements:
+1. Sound like JARVIS from Iron Man - professional, sophisticated, with subtle personality
+2. Include system status (e.g., "all systems operational", "neural networks calibrated")
+3. Be concise but impressive (1-2 sentences)
+4. Match the time of day naturally
+5. Vary between technical and warm approaches
+
+Examples:
+- "Good morning, sir. All primary systems are operational and standing by for your command."
+- "Welcome back, sir. JARVIS systems initialized. How may I be of service this evening?"
+- "System boot sequence complete. Ready to tackle whatever challenges the day brings."
+
+Generate a unique greeting:"""
+
+            message = await asyncio.to_thread(
+                self.claude.messages.create,
+                model="claude-3-haiku-20240307",
+                max_tokens=100,
+                temperature=0.7,  # Increased for more variety
+                messages=[{"role": "user", "content": greeting_prompt}]
+            )
+            
+            greeting = message.content[0].text.strip()
+            await self.voice_engine.speak(greeting)
+            logger.info(f"Delivered Claude-generated greeting: {greeting}")
+            
+        except Exception as e:
+            logger.error(f"Error generating startup greeting: {e}")
+            # Enhanced fallback greetings with variety
+            import random
+            fallback_greetings = [
+                "JARVIS systems online. How may I assist you, sir?",
+                "System initialization complete. At your service, sir.",
+                "Welcome back, sir. All systems operational.",
+                "JARVIS ready. Standing by for your command.",
+                "Voice integration active. Ready to proceed, sir."
+            ]
+            greeting = random.choice(fallback_greetings)
+            await self.voice_engine.speak(greeting)
+            
+    async def _monitor_notifications(self):
+        """Monitor for notifications to announce"""
+        while self.is_active:
+            try:
+                if self.auto_announce_notifications:
+                    # This would integrate with the notification intelligence system
+                    # to get detected notifications and automatically announce them
+                    
+                    # Get workspace state
+                    workspace_state = await self.workspace_monitor.get_complete_workspace_state()
+                    
+                    # Check for new notifications (placeholder)
+                    # In real implementation, this would detect actual notifications
+                    
+                    pass
+                    
+                await asyncio.sleep(5)  # Check every 5 seconds
+                
+            except Exception as e:
+                logger.error(f"Error monitoring notifications: {e}")
+                await asyncio.sleep(10)
+                
+    async def _monitor_system_actions(self):
+        """Monitor system actions that may need voice confirmation"""
+        while self.is_active:
+            try:
+                # Get pending actions from decision engine
+                pending_actions = self.decision_engine.get_pending_actions()
+                
+                for action in pending_actions:
+                    if action.confidence < self.voice_approval_threshold:
+                        # Request voice approval
+                        approval = await self.communication_system.request_voice_approval(
+                            request=action.reasoning,
+                            context=f"Action: {action.action_type} on {action.target}"
+                        )
+                        
+                        if approval == ApprovalResponse.APPROVED:
+                            # Execute action
+                            await self.decision_engine.execute_action(action)
+                            await self.announcement_system.queue_announcement(
+                                f"Action completed: {action.action_type}",
+                                urgency=0.3,
+                                context="system_action"
+                            )
+                        elif approval == ApprovalResponse.DENIED:
+                            # Cancel action
+                            self.decision_engine.cancel_action(action)
+                            
+                await asyncio.sleep(3)  # Check every 3 seconds
+                
+            except Exception as e:
+                logger.error(f"Error monitoring system actions: {e}")
+                await asyncio.sleep(10)
+                
+    async def _update_voice_context(self):
+        """Update voice context based on system state"""
+        while self.is_active:
+            try:
+                # Update context based on system state
+                current_time = datetime.now()
+                
+                # Update time context
+                if current_time.hour < 12:
+                    self.voice_context.time_of_day = "morning"
+                elif current_time.hour < 17:
+                    self.voice_context.time_of_day = "afternoon"
+                else:
+                    self.voice_context.time_of_day = "evening"
+                    
+                # Update user availability based on system activity
+                # This would integrate with the contextual understanding engine
+                
+                await asyncio.sleep(60)  # Update every minute
+                
+            except Exception as e:
+                logger.error(f"Error updating voice context: {e}")
+                await asyncio.sleep(60)
+                
+    async def _proactive_suggestions(self):
+        """Generate proactive voice suggestions"""
+        while self.is_active:
+            try:
+                # Generate proactive suggestions based on context
+                # This would analyze workspace state and suggest improvements
+                
+                # Check if user has been inactive for a while
+                # Suggest breaks, workspace optimization, etc.
+                
+                await asyncio.sleep(300)  # Check every 5 minutes
+                
+            except Exception as e:
+                logger.error(f"Error generating proactive suggestions: {e}")
+                await asyncio.sleep(300)
+                
+    async def announce_notification(self, 
+                                  notification: IntelligentNotification,
+                                  force: bool = False) -> str:
+        """Announce a notification via voice"""
+        try:
+            # Generate announcement content
+            announcement_content = f"New {notification.context.value.replace('_', ' ')} from {notification.app_name}"
+            
+            if notification.detected_text:
+                # Summarize the notification content
+                content_summary = ' '.join(notification.detected_text[:2])  # First 2 text elements
+                if len(content_summary) > 100:
+                    content_summary = content_summary[:97] + "..."
+                announcement_content += f": {content_summary}"
+                
+            # Queue announcement
+            announcement_id = await self.announcement_system.queue_announcement(
+                content=announcement_content,
+                urgency=notification.urgency_score,
+                context=notification.context.value,
+                requires_approval=False
+            )
+            
+            return announcement_id
+            
+        except Exception as e:
+            logger.error(f"Error announcing notification: {e}")
+            return ""
+            
+    async def process_voice_command(self, command: str, confidence: float = 1.0) -> str:
+        """Process a voice command through the natural communication system"""
+        try:
+            # Record interaction
+            self.interaction_history.append({
+                'command': command,
+                'confidence': confidence,
+                'timestamp': datetime.now(),
+                'type': VoiceInteractionType.CONVERSATION
+            })
+            
+            # Process through communication system
+            response = await self.communication_system.process_voice_command(command, confidence)
+            
+            # Record response
+            self.interaction_history.append({
+                'response': response,
+                'timestamp': datetime.now(),
+                'type': VoiceInteractionType.CONVERSATION
+            })
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error processing voice command: {e}")
+            return "I apologize, sir. I encountered an error processing your command."
+            
+    async def request_approval(self, 
+                             action: AutonomousAction,
+                             timeout: int = 30) -> ApprovalResponse:
+        """Request approval for an action via voice"""
+        try:
+            request_text = f"Execute {action.action_type} on {action.target}: {action.reasoning}"
+            
+            approval = await self.communication_system.request_voice_approval(
+                request=request_text,
+                context=f"Priority: {action.priority.value}, Confidence: {action.confidence:.2f}",
+                timeout=timeout
+            )
+            
+            # Record approval interaction
+            self.interaction_history.append({
+                'approval_request': request_text,
+                'approval_response': approval.value,
+                'timestamp': datetime.now(),
+                'type': VoiceInteractionType.APPROVAL_REQUEST
+            })
+            
+            return approval
+            
+        except Exception as e:
+            logger.error(f"Error requesting approval: {e}")
+            return ApprovalResponse.DENIED
+            
+    def get_voice_statistics(self) -> Dict[str, Any]:
+        """Get voice system statistics"""
+        total_interactions = len(self.interaction_history)
+        
+        if total_interactions == 0:
+            return {"error": "No interactions recorded"}
+            
+        # Calculate statistics
+        recent_interactions = [i for i in self.interaction_history 
+                             if (datetime.now() - i['timestamp']).seconds < 3600]
+        
+        interaction_types = defaultdict(int)
+        for interaction in self.interaction_history:
+            interaction_types[interaction.get('type', 'unknown').value] += 1
+            
+        return {
+            'total_interactions': total_interactions,
+            'recent_interactions': len(recent_interactions),
+            'interaction_types': dict(interaction_types),
+            'announcement_queue_size': self.announcement_system.announcement_queue.qsize(),
+            'conversation_active': self.communication_system.conversation_state.active,
+            'system_active': self.is_active
+        }
+
+
         # Fall
+
+async def test_voice_integration():
+    """Test the voice integration system"""
+    print("🎯 Testing JARVIS Voice Integration System")
+    print("=" * 60)
+    
+    try:
+        # Initialize system
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            print("❌ Error: ANTHROPIC_API_KEY not set")
+            return
+            
+        voice_system = VoiceIntegrationSystem(api_key)
+        
+        # Start system
+        print("🚀 Starting voice integration...")
+        await voice_system.start_voice_integration()
+        
+        # Test announcement
+        print("📢 Testing announcement...")
+        await voice_system.announcement_system.queue_announcement(
+            "Test notification from Slack",
+            urgency=0.6,
+            context="test"
+        )
+        
+        # Test conversation
+        print("🎤 Testing conversation...")
+        response = await voice_system.process_voice_command("What's the weather like?")
+        print(f"Response: {response}")
+        
+        # Test approval request
+        print("✅ Testing approval request...")
+        from autonomy.autonomous_decision_engine import AutonomousAction, ActionPriority
+        test_action = AutonomousAction(
+            action_type="test_action",
+            target="test_target",
+            params={},
+            priority=ActionPriority.MEDIUM,
+            confidence=0.8,
+            category="test",
+            reasoning="This is a test action"
+        )
+        
+        approval = await voice_system.request_approval(test_action)
+        print(f"Approval response: {approval.value}")
+        
+        # Show statistics
+        stats = voice_system.get_voice_statistics()
+        print(f"📊 Statistics: {json.dumps(stats, indent=2, default=str)}")
+        
+        # Run for a short time
+        print("⏱️  Running system for 30 seconds...")
+        await asyncio.sleep(30)
+        
+        # Stop system
+        print("🛑 Stopping voice integration...")
+        await voice_system.stop_voice_integration()
+        
+        print("✅ Voice integration test completed successfully!")
+        
+    except Exception as e:
+        print(f"❌ Error during test: {e}")
+        logger.error(f"Voice integration test error: {e}")
