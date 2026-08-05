@@ -128,6 +128,7 @@ from uuid import uuid4
 
 import aiofiles
 import aiofiles.os
+from backend.core.app_lifecycle import spawn_managed_task  # managed: dies with its shutdown phase
 
 logger = logging.getLogger(__name__)
 
@@ -984,7 +985,7 @@ class DistributedLockManager:
 
             # Start cleanup task
             if self.config.cleanup_enabled:
-                self._cleanup_task = asyncio.create_task(
+                self._cleanup_task = spawn_managed_task(
                     self._cleanup_loop(),
                     name="lock_cleanup_loop"
                 )

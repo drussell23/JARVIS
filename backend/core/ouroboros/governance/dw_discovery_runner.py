@@ -827,6 +827,7 @@ import threading
 from backend.core.ouroboros.governance.dw_catalog_client import (
     _refresh_interval_s as _refresh_interval_s_internal,
 )
+from backend.core.app_lifecycle import spawn_managed_task  # managed: dies with its shutdown phase
 
 
 _BOOT_DISCOVERY_LOCK = asyncio.Lock()
@@ -1260,7 +1261,7 @@ async def boot_discovery_once(
         # Spawn the refresh loop. We DON'T await; it runs forever
         # until cancellation. Capture in module-level for shutdown.
         try:
-            _REFRESH_TASK = asyncio.create_task(
+            _REFRESH_TASK = spawn_managed_task(
                 _discovery_refresh_loop(
                     session=session,
                     base_url=base_url,
@@ -1289,7 +1290,7 @@ async def boot_discovery_once(
                 heavy_probe_enabled,
             )
             if heavy_probe_enabled():
-                _HEAVY_PROBE_TASK = asyncio.create_task(
+                _HEAVY_PROBE_TASK = spawn_managed_task(
                     _heavy_probe_loop(
                         session=session,
                         base_url=base_url,

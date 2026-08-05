@@ -497,6 +497,15 @@ class ParentWatch:
         # BEFORE the SIGTERM, not after. Shutdown begins the instant the signal
         # is delivered, and it is shutdown's own logging that blocks on the
         # dead pipe — redirecting afterwards would race the thing it prevents.
+        # The token, before anything else. This thread learns the launcher is
+        # gone microseconds before SIGTERM is delivered, and that head start is
+        # exactly the window in which a subsystem would otherwise spawn one
+        # more recovery task for shutdown to wait on.
+        try:
+            from backend.core.app_lifecycle import LIFECYCLE
+            LIFECYCLE.request_shutdown(f"launcher gone: {reason}")
+        except Exception:  # noqa: BLE001 — the watch never depends on the app
+            pass
         detached = _detach_dead_output()
         _record(f"launcher (pid {self.parent_pid}) is gone — {reason}. "
                 f"Raising SIGTERM; hard exit in {self.grace_s:.1f}s if that "
