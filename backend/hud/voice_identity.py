@@ -264,8 +264,35 @@ class VoiceIdentity:
         t0 = time.monotonic()
         try:
             from backend.voice.speaker_verification_service import (
-                SpeakerVerificationService,
+                SpeakerVerificationService, _init_ml_components,
             )
+
+            # THE 14 SECONDS, TAKEN OFF THE LOOP.
+            #
+            # `_init_ml_components` says it in its own docstring: "moves 12+
+            # seconds of import time from startup to first request". That
+            # import is what stalled the boot when warm-up lived on the boot
+            # path, and it is why warming was made lazy — at the cost of the
+            # first unlock of every session failing with NOT_READY, which is
+            # exactly what the operator hits when they say "unlock my screen"
+            # and are told to ask again.
+            #
+            # But it is a MODULE IMPORT. It creates no asyncio primitives and
+            # has no loop affinity, so it never needed to be on the loop at
+            # all. Running it in a worker thread gets the cost off the event
+            # loop without moving `initialize()` — which DOES create an
+            # `asyncio.Lock` and an `asyncio.Queue`, and must therefore stay on
+            # the loop that will later call `verify_speaker`, or those objects
+            # end up bound to a thread's loop and fail the moment they are used.
+            #
+            # That split is the whole fix: the heavy half is loop-independent,
+            # the loop-bound half is cheap once the imports are cached.
+            loop = asyncio.get_event_loop()
+            _t_imp = time.monotonic()
+            await loop.run_in_executor(None, _init_ml_components)
+            logger.info("[VoiceIdentity] ML imports resolved off-loop in %.1fs",
+                        time.monotonic() - _t_imp)
+
             svc = SpeakerVerificationService()
             await asyncio.wait_for(svc.initialize(), timeout=warm_timeout_s())
             self._service = svc

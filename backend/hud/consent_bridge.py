@@ -306,6 +306,33 @@ def install(router: Any = None) -> bool:
             # WHO it would be checking for long before it can check — which is
             # the difference between "give me a moment" and "I don't know you".
             _aio.get_event_loop().create_task(ident.warm())
+
+            # AND LOAD THE MODEL NOW, NOT AT THE FIRST UNLOCK.
+            #
+            # Measured live 2026-08-05 11:10:14, saying "unlock my screen":
+            #
+            #   [CapabilityRouter] 'unlock_screen' NOT authorised by
+            #       VoiceConsentProvider (I'm still loading my voice
+            #       recognition — give me a moment and ask again.)
+            #   ...4s later: [INIT] EcapaFacade ... falling back to local engine
+            #
+            # The model only STARTED loading because the operator asked. So the
+            # first unlock of every session is guaranteed to fail, and the
+            # operator is told to repeat themselves for a reason that has
+            # nothing to do with them.
+            #
+            # Warming was made lazy because it stalled the boot for fourteen
+            # seconds. That stall was the ML module import, and `_warm` now
+            # runs that import in a worker thread — so starting here costs the
+            # loop almost nothing, and the model is ready long before anyone
+            # can finish booting the HUD and speak to it.
+            #
+            # Fire-and-forget on purpose: nothing here waits for it. Readiness
+            # is a state anyone can query, and a boot that blocks on a speaker
+            # model is the defect this replaces.
+            ident.start_warming()
+            logger.info("[HUDConsent] speaker model warming at BOOT — the "
+                        "first unlock should no longer be told to ask again")
             logger.info("[HUDConsent] voice authority installed — reachable "
                         "through a locked screen; enrollment + speaker model "
                         "resolving in the background")
