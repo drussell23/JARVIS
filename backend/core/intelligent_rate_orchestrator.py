@@ -68,6 +68,7 @@ import json
 from functools import wraps
 from contextlib import asynccontextmanager
 import threading
+from backend.core.app_lifecycle import spawn_managed_task  # managed: dies with its shutdown phase
 
 logger = logging.getLogger(__name__)
 
@@ -1018,13 +1019,13 @@ class IntelligentRateOrchestrator:
         self._running = True
         
         # Start throttle adjustment loop
-        self._adjustment_task = asyncio.create_task(
+        self._adjustment_task = spawn_managed_task(
             self._adjustment_loop(),
             name="rate_orchestrator_adjustment"
         )
         
         # Start forecast update loop
-        self._forecast_task = asyncio.create_task(
+        self._forecast_task = spawn_managed_task(
             self._forecast_loop(),
             name="rate_orchestrator_forecast"
         )

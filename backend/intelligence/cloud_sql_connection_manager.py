@@ -157,6 +157,7 @@ from typing import Tuple
 import json
 from pathlib import Path
 import random
+from backend.core.app_lifecycle import spawn_managed_task  # managed: dies with its shutdown phase
 
 
 # v260.4: Safe env var parsing helper — prevents ValueError from killing coroutines
@@ -5254,15 +5255,15 @@ class CloudSQLConnectionManager:
                     pass
 
         # Start new tasks
-        self._cleanup_task = asyncio.create_task(
+        self._cleanup_task = spawn_managed_task(
             self._cleanup_loop(),
             name="cloudsql_cleanup"
         )
-        self._leak_monitor_task = asyncio.create_task(
+        self._leak_monitor_task = spawn_managed_task(
             self._leak_monitor_loop(),
             name="cloudsql_leak_monitor"
         )
-        self._health_check_task = asyncio.create_task(
+        self._health_check_task = spawn_managed_task(
             self._health_check_loop(),
             name="cloudsql_health_check"
         )

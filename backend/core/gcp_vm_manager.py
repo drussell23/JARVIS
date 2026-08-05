@@ -120,6 +120,7 @@ except ImportError:
     pass
 
 from backend.core.async_safety import LazyAsyncLock, create_safe_task
+from backend.core.app_lifecycle import spawn_managed_task  # managed: dies with its shutdown phase
 
 # Log severity bridge for criticality-aware logging
 try:
@@ -3226,14 +3227,14 @@ class GCPVMManager:
 
                 # Start monitoring if enabled
                 if self.config.enable_monitoring:
-                    self.monitoring_task = asyncio.create_task(
+                    self.monitoring_task = spawn_managed_task(
                         self._monitoring_loop(),
                         name="gcp_vm_monitoring"
                     )
                     logger.info("✅ VM monitoring started")
 
                 # v235.3: Start periodic orphan cleanup (runs every 30min)
-                self._orphan_cleanup_task = asyncio.create_task(
+                self._orphan_cleanup_task = spawn_managed_task(
                     self._periodic_orphan_cleanup(),
                     name="gcp_orphan_cleanup"
                 )

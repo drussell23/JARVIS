@@ -98,6 +98,21 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+def _shutdown_total_budget_s() -> float:
+    """Wall-clock ceiling for the entire shutdown, all phases together.
+
+    Read through `app_lifecycle` so the manager and the task factory cannot
+    disagree about how long the system has — two copies of one deadline is how
+    a budget silently stops being one. Falls back to a local default if that
+    import is unavailable, because shutdown must not depend on it.
+    """
+    try:
+        from backend.core.app_lifecycle import total_budget_s
+        return total_budget_s()
+    except Exception:  # noqa: BLE001
+        return _env_float("JARVIS_SHUTDOWN_TOTAL_BUDGET_S", 5.0)
+
+
 def _env_int(key: str, default: int) -> int:
     try:
         return int(os.getenv(key, str(default)))
@@ -774,13 +789,41 @@ class CoordinatedShutdownManager:
             last_successful_phase = ShutdownPhase.ANNOUNCE
             processes_terminated = 0
 
+            # TOTAL BUDGET, not just per-phase.
+            #
+            # Every phase was already bounded by `wait_for`, and the process
+            # still needed a hard `os._exit` every time — because six phases
+            # each allowed their own generous timeout is a shutdown whose
+            # worst case is the SUM, and the sum exceeded the window the
+            # parent watch gives before it takes the axe. A per-step bound
+            # says nothing about the whole.
+            #
+            # So phases now draw down one shared budget: each is allowed the
+            # smaller of its own timeout and whatever is actually left. The
+            # last phases get squeezed rather than the process being killed
+            # mid-sentence, which is the right trade — TERMINATE and VERIFY
+            # are the cheap ones, and being squeezed is visible in the log
+            # whereas a hard exit erases the reason.
+            _budget_s = _shutdown_total_budget_s()
+            _budget_deadline = start_time + _budget_s
+            logger.info("[ShutdownManager] total shutdown budget: %.1fs", _budget_s)
+
             for phase in phases:
                 self._current_phase = phase
-                phase_timeout = self._phase_timeouts[phase]
+                _remaining = _budget_deadline - time.time()
+                if _remaining <= 0:
+                    all_errors.append(
+                        f"budget exhausted before phase {phase.name}")
+                    logger.warning(
+                        "[ShutdownManager] %.1fs budget exhausted — skipping "
+                        "%s and everything after it", _budget_s, phase.name)
+                    break
+                phase_timeout = min(self._phase_timeouts[phase], _remaining)
 
                 logger.info(
                     f"[ShutdownManager] Executing phase {phase.name} "
-                    f"(timeout={phase_timeout}s)"
+                    f"(timeout={phase_timeout:.2f}s, "
+                    f"{_remaining:.2f}s of budget left)"
                 )
 
                 try:

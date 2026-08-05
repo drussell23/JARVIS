@@ -2667,6 +2667,56 @@ async def parallel_lifespan(app: FastAPI):
 
         yield
 
+        # ── SHUTDOWN BEGINS HERE (this is the LIVE lifespan) ─────────────
+        #
+        # `selected_lifespan = parallel_lifespan if PARALLEL_STARTUP_ENABLED
+        # else lifespan`, and `JARVIS_PARALLEL_STARTUP` defaults to true — so
+        # this function is the one that runs, and the other `lifespan()` below
+        # is dead in every normal boot. Anything added there for shutdown is
+        # never executed, which is worth stating out loud because it has now
+        # happened once.
+        #
+        # Two things, in this order, before any resource is closed:
+        #
+        #   1. Set the cancellation token. Until it is set, daemons parked in
+        #      `await asyncio.sleep(300)` cannot learn anything has changed,
+        #      and subsystems keep SPAWNING — `FailoverLifecycle` was observed
+        #      starting new recovery work mid-shutdown. A population that grows
+        #      while being torn down cannot be torn down.
+        #
+        #   2. Run the coordinated phases. `spawn_managed_task` files every
+        #      long-lived task under a phase and registers one hook per phase
+        #      to cancel them, but a hook is a promise until something executes
+        #      the phases. The manager enforces a single wall-clock budget
+        #      across all of them (JARVIS_SHUTDOWN_TOTAL_BUDGET_S, default 5s)
+        #      so this cannot itself become where shutdown hangs.
+        #
+        # Daemons first, resources second: a health-check loop still running
+        # while its connection pool closes is how a clean shutdown becomes an
+        # exception storm.
+        try:
+            from backend.core.app_lifecycle import LIFECYCLE
+            LIFECYCLE.request_shutdown("lifespan shutdown")
+        except Exception as _lc:  # noqa: BLE001 — never block shutdown on this
+            logger.debug("[Lifecycle] token not set: %s", _lc)
+
+        try:
+            from backend.core.coordinated_shutdown import (
+                ShutdownReason, get_shutdown_manager,
+            )
+            _mgr = await get_shutdown_manager()
+            _sd = await _mgr.initiate_shutdown(reason=ShutdownReason.SIGNAL_RECEIVED)
+            logger.info("[Shutdown] coordinated phases done in %.2fs "
+                        "(hooks=%d failed=%d)", _sd.elapsed_seconds,
+                        _sd.hooks_executed, _sd.hooks_failed)
+        except Exception as _cs:  # noqa: BLE001
+            logger.warning("[Shutdown] coordinated phases degraded: %s", _cs)
+            try:
+                from backend.core.app_lifecycle import cancel_all_managed
+                await cancel_all_managed()
+            except Exception:  # noqa: BLE001
+                pass
+
         # =====================================================================
         # v4.0: Run deferred debug tasks in background AFTER server is serving
         # =====================================================================
@@ -5038,6 +5088,65 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
             app.state.hud_gov_ctx = None
 
     yield
+
+    # ── SET THE CANCELLATION TOKEN FIRST ─────────────────────────────
+    #
+    # Before a single subsystem is asked to stop. Everything below this line
+    # takes time, and until the token is set two things keep happening that
+    # make shutdown impossible to finish:
+    #
+    #   * daemons parked in `await asyncio.sleep(300)` have no way to learn
+    #     that anything has changed, so they can only be stopped by a
+    #     cancellation that has to reach them one at a time;
+    #   * subsystems keep SPAWNING. `FailoverLifecycle` was observed starting
+    #     new recovery work while shutdown was already under way, and a system
+    #     that grows new tasks while being torn down cannot be torn down.
+    #
+    # Setting it here makes `sleep_or_shutdown` return immediately everywhere
+    # and makes `spawn_managed_task` refuse, so the population being shut down
+    # stops changing while we shut it down. See backend/core/app_lifecycle.py.
+    try:
+        from backend.core.app_lifecycle import LIFECYCLE
+        LIFECYCLE.request_shutdown("lifespan shutdown")
+    except Exception as _lc:  # noqa: BLE001 — never block shutdown on this
+        logger.debug("[Lifecycle] token not set: %s", _lc)
+
+    # ── RUN THE COORDINATED SHUTDOWN PHASES ──────────────────────────
+    #
+    # This call is what makes the registry real. `spawn_managed_task` files
+    # every long-lived task under a shutdown phase and registers ONE hook per
+    # phase to cancel them — but a hook is only a promise until something
+    # executes the phases, and nothing did. Registering with a manager nobody
+    # invokes produces exactly the state it was meant to fix: tasks that
+    # believe they are managed, and are not.
+    #
+    # Runs BEFORE the resource teardown below, deliberately. Those daemons
+    # hold the connections the next few hundred lines are trying to close; a
+    # health-check loop that is still running while its pool is closed is how
+    # a clean shutdown turns into an exception storm.
+    #
+    # The manager enforces a single wall-clock budget across all phases
+    # (JARVIS_SHUTDOWN_TOTAL_BUDGET_S, default 5s), so this cannot become the
+    # new place shutdown hangs — the thing it exists to prevent.
+    try:
+        from backend.core.coordinated_shutdown import (
+            ShutdownReason, get_shutdown_manager,
+        )
+        _mgr = await get_shutdown_manager()
+        _sd = await _mgr.initiate_shutdown(reason=ShutdownReason.SIGNAL_RECEIVED)
+        logger.info("[Shutdown] coordinated phases done in %.2fs "
+                    "(hooks=%d failed=%d)", _sd.elapsed_seconds,
+                    _sd.hooks_executed, _sd.hooks_failed)
+    except Exception as _cs:  # noqa: BLE001
+        logger.warning("[Shutdown] coordinated phases degraded: %s", _cs)
+        # Fall back to cancelling managed tasks directly. The manager is the
+        # preferred owner, but an unmanaged daemon is the original defect and
+        # must not survive because orchestration was unavailable.
+        try:
+            from backend.core.app_lifecycle import cancel_all_managed
+            await cancel_all_managed()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── HUD Governance Shutdown (Sub-project E) ──────────────────────
     _gov_ctx = getattr(app.state, "hud_gov_ctx", None)
