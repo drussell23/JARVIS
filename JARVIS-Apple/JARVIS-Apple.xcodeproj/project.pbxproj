@@ -125,7 +125,6 @@
 				2AD0E9678194BFE8A1EC9B1B /* Info.plist */,
 				6A73D85D2FBC6659D4A47810 /* JARVISHUD.entitlements */,
 				7F9345DF8825258B0773BAA5 /* JARVISHUDApp.swift */,
-				F9DF9FDDEC7F5849BAF5A642 /* .claude */,
 				4C449CDADB043C7331150D64 /* Services */,
 				243C003B3193F42692D7BF8F /* Views */,
 			);
@@ -188,13 +187,6 @@
 				C953EA1271F55784A7D1004B /* JARVISColors.swift */,
 			);
 			path = Shared;
-			sourceTree = "<group>";
-		};
-		5322F8483534485E0A88943F /* .cc-writes */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = ".cc-writes";
 			sourceTree = "<group>";
 		};
 		58867042BBEE470FD16CA4E2 /* Products */ = {
@@ -265,14 +257,6 @@
 				CE05089C690A3B7B63861CF9 /* PhoneSessionManager.swift */,
 			);
 			path = Services;
-			sourceTree = "<group>";
-		};
-		F9DF9FDDEC7F5849BAF5A642 /* .claude */ = {
-			isa = PBXGroup;
-			children = (
-				5322F8483534485E0A88943F /* .cc-writes */,
-			);
-			path = .claude;
 			sourceTree = "<group>";
 		};
 		FC6CA73ACD325BAEB067CCC8 /* Views */ = {

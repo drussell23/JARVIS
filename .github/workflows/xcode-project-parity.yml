@@ -1,0 +1,47 @@
+# The committed Xcode project must equal what XcodeGen generates from
+# project.yml.
+#
+# This exists because a Swift file can be written, committed, reviewed and
+# referenced by other Swift code while never being compiled — Xcode builds
+# what is in `.xcodeproj`, and a new file only gets there when `xcodegen`
+# runs. `UtteranceRecorder.swift` sat in that state: present in git, absent
+# from the binary, and indistinguishable from working code at review time.
+#
+# The inverse failed too. `OS_ACTIVITY_MODE` had been hand-added to the
+# generated `.xcscheme`, so the regeneration that fixed the dark file
+# deleted it. Anything living only in a generated artefact is a countdown.
+#
+# One check covers both directions: regenerate and demand a byte-for-byte
+# match. See scripts/check_xcodegen_parity.sh.
+
+name: Xcode Project Parity
+
+on:
+  push:
+    paths:
+      - 'JARVIS-Apple/**'
+      - 'scripts/check_xcodegen_parity.sh'
+      - '.github/workflows/xcode-project-parity.yml'
+  pull_request:
+    paths:
+      - 'JARVIS-Apple/**'
+      - 'scripts/check_xcodegen_parity.sh'
+      - '.github/workflows/xcode-project-parity.yml'
+
+jobs:
+  parity:
+    # macOS because XcodeGen is a Swift binary distributed through Homebrew;
+    # there is no Linux build to fall back to.
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Check generated project matches its spec
+        # No exemption env var here, deliberately. The whole point of the
+        # check is that it cannot pass by being unable to run.
+        run: ./scripts/check_xcodegen_parity.sh
