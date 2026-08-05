@@ -177,6 +177,11 @@ class LoopSentinel:
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
         self._health = LoopHealth()
+        #: Last time the probe woke, published for off-loop readers. Starts at
+        #: 0.0 so a sampler can tell "never ticked" from "ticked long ago" —
+        #: before `start()`, a stale heartbeat means nothing has begun, not
+        #: that the loop is wedged.
+        self._last_tick: float = 0.0
         self._max_recent = 20
         #: One report per run. Forty stalls are one defect restated.
         self._reported = False
@@ -222,10 +227,26 @@ class LoopSentinel:
                 threshold = stall_threshold_s()
                 before = time.monotonic()
                 await asyncio.sleep(interval)
+                # HEARTBEAT, published for readers OFF this loop.
+                #
+                # This task can only notice a stall AFTER it ends — it is the
+                # thing being starved, so while the loop is dead it is not
+                # running to observe anything. That is fine for measuring, and
+                # useless for catching the culprit in the act: by the time
+                # `_record` runs, whatever held the loop has already let go.
+                #
+                # A single float write, which is atomic under CPython, so a
+                # sampler thread can read it without a lock and without any
+                # chance of blocking the loop to ask. `stall_sampler` watches
+                # this timestamp go stale and dumps the stacks WHILE the loop
+                # is still wedged — the same separation that makes the parent
+                # watch work: the observer must not share the fate of the
+                # observed.
+                self._last_tick = time.monotonic()
                 # Everything past the interval is time the loop owed this task
                 # and could not pay. No attribution, no instrumentation — the
                 # measurement IS the starvation.
-                lag = (time.monotonic() - before) - interval
+                lag = self._last_tick - before - interval
                 self._health.probes += 1
                 if lag >= threshold:
                     self._record(before, lag)
