@@ -2126,7 +2126,70 @@ async def parallel_lifespan(app: FastAPI):
                             stdout=asyncio.subprocess.DEVNULL,
                             stderr=asyncio.subprocess.DEVNULL,
                         )
-                        await asyncio.wait_for(play.communicate(), timeout=15)
+
+                        # HOLD THE MUTE FOR AS LONG AS SOUND IS ACTUALLY
+                        # COMING OUT — NOT FOR AS LONG AS WE GUESSED.
+                        #
+                        # The claim above was opened BEFORE `say` had rendered
+                        # a single sample, with a deadline estimated from the
+                        # character count. It has to cover render AND playback,
+                        # and on a loop measured at 41-65% availability it does
+                        # not. Live, 2026-08-05:
+                        #
+                        #   [SpeechGate] EXPIRED backend — its owner never
+                        #                released it
+                        #   [SpeechGate] mic LIVE
+                        #   [JARVIS Voice] >>> "Executing lock my screen"
+                        #   [JARVIS Voice] >>> "See you soon"
+                        #
+                        # Those are JARVIS's OWN WORDS, transcribed and
+                        # executed as commands. `lock_screen` ran five times
+                        # from one request, and the session never reached
+                        # "unlock" because the feedback loop consumed it.
+                        #
+                        # An estimate cannot fix this — any margin large enough
+                        # to be safe leaves the microphone dead after short
+                        # replies, and any margin small enough to feel
+                        # responsive reopens it mid-sentence. So this stops
+                        # predicting: `afplay` either exists or it does not,
+                        # and while it exists the mute is renewed. The claim
+                        # cannot outlive the sound (the `finally` releases it)
+                        # and cannot die before it (this renews it), whatever
+                        # the loop is doing.
+                        _hold_ms = 2500.0
+
+                        async def _hold_mute_while_playing() -> None:
+                            """Renew the claim while the player is alive.
+
+                            `_speech` is None when the manager lookup above
+                            failed. There is then no claim to renew, and
+                            speaking unsuppressed is already the documented
+                            fallback for that case — it must not become a
+                            crash on the audio path.
+                            """
+                            if _speech is None:
+                                return
+                            try:
+                                while play.returncode is None:
+                                    await asyncio.sleep(_hold_ms / 3000.0)
+                                    if play.returncode is not None:
+                                        return
+                                    await _speech.start_speaking(
+                                        text, source=SpeechSource.SYSTEM,
+                                        estimated_duration_ms=_hold_ms)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:  # noqa: BLE001
+                                # A failed renewal must never stop playback;
+                                # the deadline and the manager's own watchdog
+                                # remain underneath it.
+                                return
+
+                        _holder = asyncio.ensure_future(_hold_mute_while_playing())
+                        try:
+                            await asyncio.wait_for(play.communicate(), timeout=15)
+                        finally:
+                            _holder.cancel()
                         try:
                             os.unlink(tmp_path)
                         except OSError:
