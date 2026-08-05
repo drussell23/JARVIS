@@ -348,3 +348,87 @@ async def test_the_model_still_warms_on_first_need():
     and answers NOT_READY so the operator can retry."""
     import inspect
     assert "start_warming" in inspect.getsource(VoiceIdentity.identify)
+
+
+# ---------------------------------------------------------------------------
+# The retry the operator is invited to make must still have evidence to use.
+# ---------------------------------------------------------------------------
+
+
+def test_peek_does_not_consume():
+    """`peek` is the non-destructive counterpart to `claim`."""
+    h = UtteranceHolder()
+    assert h.deposit(_b64(_wav()), FORMAT_WAV16K)
+    first = h.peek()
+    second = h.peek()
+    assert first is not None and second is not None
+    assert first.audio == second.audio, "peek must be repeatable"
+    assert h.claim() is not None, "peek must leave the utterance claimable"
+    assert h.claim() is None, "claim is still destructive"
+
+
+def test_a_stale_utterance_is_not_peekable(monkeypatch):
+    """Expiry is enforced on the non-destructive path too, or `peek` becomes
+    a way to verify against evidence `claim` would have refused."""
+    monkeypatch.setenv("JARVIS_UTTERANCE_TTL_S", "1")
+    h = UtteranceHolder()
+    assert h.deposit(_b64(_wav()), FORMAT_WAV16K)
+    h._held.captured_at -= 60          # age it past the TTL
+    assert h.peek() is None
+
+
+@pytest.mark.asyncio
+async def test_a_cold_model_does_not_destroy_the_utterance():
+    """The regression this pins, measured live 2026-08-04 19:10:13.
+
+    The first verification of a session ALWAYS reports NOT_READY — it is what
+    starts the lazy model load. If that attempt consumes the sentence, the
+    operator is told "ask again" with the evidence for the retry deleted, and
+    the model becomes ready 2.8s later holding nothing.
+    """
+    from backend.hud.consent_bridge import VoiceConsentProvider
+    from backend.hud.utterance_audio import get_utterance_holder
+
+    holder = get_utterance_holder()
+    assert holder.deposit(_b64(_wav()), FORMAT_WAV16K)
+
+    class _Ctx:
+        capability = "unlock_screen"
+
+    result = await VoiceConsentProvider().decide(_Ctx())
+    assert result is not None
+    assert result.verdict == Verdict.NOT_READY.value, result.verdict
+    assert not result.approves, "a cold model is never consent"
+
+    # The whole point: the retry still has something to verify.
+    assert holder.peek() is not None, (
+        "the utterance was destroyed by an attempt that could not succeed — "
+        "the operator was asked to retry with the evidence deleted")
+
+
+@pytest.mark.asyncio
+async def test_a_ready_model_does_consume_the_utterance():
+    """The other half. Anti-replay depends on a real verification claiming."""
+    from backend.hud.consent_bridge import VoiceConsentProvider
+    from backend.hud.utterance_audio import get_utterance_holder
+    from backend.hud import voice_identity as vi
+
+    class _Svc:
+        async def verify_speaker(self, audio, name):
+            return {"verified": True, "confidence": 0.99, "speaker_name": name}
+
+    ident = vi.VoiceIdentity(service=_Svc())
+    ident._enrolled_cache = "Derek J. Russell"
+    ident._enrolled_at = float("inf")
+    vi._IDENTITY = ident
+    assert ident.readiness is Readiness.READY
+
+    holder = get_utterance_holder()
+    assert holder.deposit(_b64(_wav()), FORMAT_WAV16K)
+
+    class _Ctx:
+        capability = "unlock_screen"
+
+    result = await VoiceConsentProvider().decide(_Ctx())
+    assert result is not None and result.verdict == Verdict.VERIFIED.value, result
+    assert holder.peek() is None, "a real verification must consume the evidence"

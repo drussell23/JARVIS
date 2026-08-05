@@ -183,6 +183,32 @@ class UtteranceHolder:
         except Exception:  # noqa: BLE001
             return None
 
+    def peek(self) -> Optional["Utterance"]:
+        """Read the held utterance WITHOUT consuming it. NEVER raises.
+
+        For an authority that must look at the evidence before it knows
+        whether it can reach a verdict at all. Measured live 2026-08-04:
+
+            [VoiceConsent] 'unlock_screen' -> not_ready (model cold)
+            [VoiceIdentity] speaker model READY after 2.8s
+
+        The first verification of a session always reports NOT_READY, because
+        it is what kicks the lazy model load. `claim()` had already destroyed
+        the sentence by then, so the operator was told "ask again" with the
+        evidence for the retry deleted — and the model landed 2.8 seconds
+        later, into a holder with nothing in it.
+
+        **Evidence must not be spent by an attempt that cannot succeed.**
+        Anti-replay is unaffected: a claim still happens on every path that
+        actually verifies, and only there.
+        """
+        try:
+            with self._lock:
+                u = self._held
+            return None if u is None or u.expired else u
+        except Exception:  # noqa: BLE001
+            return None
+
     def peek_age_s(self) -> Optional[float]:
         """Age of what is held, without claiming it. NEVER raises.
 
