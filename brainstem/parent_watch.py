@@ -66,6 +66,47 @@ event loop, the application state, or anything the shutdown it is bounding
 could wedge — for the same reason the wall-clock watchdog in the battle
 harness is forbidden from reading the op-ledger.
 
+WHY THE HARD EXIT FIRES EVERY TIME (MEASURED, NOT YET FIXED)
+--------------------------------------------------------------
+Escalation is meant to be the exception. It is currently the rule: detection
+is instantaneous, and the entire delay is graceful shutdown never finishing.
+The dumps below were taken by this module and are what the finding rests on.
+
+    standalone, SIGTERM by hand                          1s, clean
+    drained pipe, parent SIGKILLed, no brainstem/.env    0s, clean
+    drained pipe, parent SIGKILLed, WITH brainstem/.env  22s, hard exit
+    the real HUD                                         11s, hard exit
+
+`.env` is the discriminator, and the reason is what it turns on. At the hard
+exit there are twenty-plus long-lived daemon tasks still pending — CloudSQL
+cleanup/health/leak monitors, GCP VM monitoring and orphan cleanup, DW
+discovery and heavy-probe loops, learning-DB auto-flush and auto-optimise,
+the distributed lock cleanup, the background agent pool workers, the rate
+orchestrator's forecast and adjustment loops. Without `.env` most of them
+never start, and shutdown is instant.
+
+None of them is individually buggy: the ones inspected handle
+`asyncio.CancelledError` correctly. **The defect is that nobody owns them.**
+They are created ad hoc with `asyncio.create_task` across the codebase, no
+shutdown path knows they exist, and they are left for
+`asyncio.Runner.close()` to cancel en masse after uvicorn has already
+finished. Twenty tasks — several parked on network I/O to CloudSQL, GCP and
+DoubleWord — do not all unwind inside any sane grace period. The logs show
+`FailoverLifecycle` STARTING new work while shutdown is under way, which is
+the same absence of ownership seen from the other end.
+
+The architecture for this already exists and is not wired up:
+`backend/core/coordinated_shutdown.py` provides `CoordinatedShutdownManager`
+with ordered phases, per-hook timeouts, critical/non-critical hooks and
+process-group termination. `backend/main.py`'s lifespan does not call it —
+it hand-rolls 535 sequential lines instead, with roughly twenty awaits that
+have no timeout at all. Fixing this means registering those tasks as hooks,
+not writing a new shutdown system.
+
+Until that lands, this module's hard exit is what keeps a dead launcher from
+leaving a live backend, and every occurrence is recorded with the stacks and
+the task list that explain it.
+
 Python 3.9+, ``from __future__ import annotations``.
 """
 from __future__ import annotations
@@ -102,6 +143,10 @@ EXIT_PARENT_GONE: int = 143
 #: Where this subsystem records what it did, independently of everything else.
 ENV_LOG_PATH: str = "JARVIS_PARENT_WATCH_LOG"
 
+#: Set once stdout/stderr have been pointed at the log file. After that, fd 2
+#: IS the log file, so writing to both would record every line twice.
+_DETACHED: bool = False
+
 
 def _default_log_path() -> str:
     return os.path.join(os.path.expanduser("~/Library/Logs/JARVIS"),
@@ -133,10 +178,13 @@ def _record(message: str) -> None:
     """
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [ParentWatch] {message}\n"
     data = line.encode("utf-8", "replace")
-    try:
-        os.write(2, data)          # stderr, for when anyone is still reading
-    except Exception:  # noqa: BLE001
-        pass
+    if not _DETACHED:
+        # Skipped once detached: fd 2 has been dup2'd onto the log file, so
+        # this write and the one below would be the same line, twice.
+        try:
+            os.write(2, data)      # stderr, for when anyone is still reading
+        except Exception:  # noqa: BLE001
+            pass
     try:
         path = (os.environ.get(ENV_LOG_PATH, "") or "").strip() or _default_log_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -147,6 +195,145 @@ def _record(message: str) -> None:
             os.close(fd)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _dump_stacks() -> None:
+    """Record every thread's stack at the moment of the hard exit. NEVER raises.
+
+    A hard exit that says only "shutdown did not finish" reports a symptom and
+    destroys the evidence in the same instant. This is the one moment the
+    answer is still in memory, and it is the last moment anybody can ask.
+
+    `faulthandler.dump_traceback` is used rather than `traceback` because it
+    writes to a raw file descriptor from C, taking no Python-level lock and
+    allocating nothing. It is designed to work in exactly the state that makes
+    this necessary — a process too wedged to run ordinary Python reliably.
+    Using `traceback.format_stack` here would mean acquiring the very locks
+    the wedge may be holding, which is how a diagnostic becomes the hang.
+    """
+    try:
+        import faulthandler
+        path = (os.environ.get(ENV_LOG_PATH, "") or "").strip() or _default_log_path()
+        _record("--- thread stacks at hard exit (what shutdown was waiting on) ---")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            faulthandler.dump_traceback(file=fd, all_threads=True)
+        finally:
+            os.close(fd)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _dump_pending_tasks(limit: int = 40) -> None:
+    """Name the asyncio tasks that were still alive at the hard exit.
+
+    Thread stacks are not enough. The measured wedge was the MAIN thread
+    sitting in `asyncio.runners._cancel_all_tasks`, which cancels every
+    remaining task and then waits for all of them to finish — so the thread
+    stack says "waiting for tasks" and stops exactly where the interesting
+    part begins. A coroutine that swallows `CancelledError`, or that is
+    blocked somewhere cancellation cannot reach, holds the process open
+    forever and appears in no thread dump.
+
+    Found by walking the garbage collector rather than `asyncio.all_tasks()`,
+    which must be called from the loop's own thread — the thread that is, by
+    construction, the one that is stuck. This costs a full heap scan, which
+    would be indefensible anywhere except here: the process is already leaving,
+    and this is the last instant the answer exists.
+    """
+    try:
+        import asyncio
+        import gc
+        alive = []
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, asyncio.Task) and not obj.done():
+                    alive.append(obj)
+            except Exception:  # noqa: BLE001
+                continue
+        if not alive:
+            _record("no pending asyncio tasks — the wedge is not task cancellation")
+            return
+        _record(f"--- {len(alive)} pending asyncio task(s) at hard exit "
+                f"(these are what _cancel_all_tasks was waiting for) ---")
+        for t in alive[:limit]:
+            try:
+                coro = t.get_coro()
+                name = getattr(coro, "__qualname__", None) or repr(coro)
+                where = ""
+                frame = getattr(coro, "cr_frame", None)
+                if frame is not None:
+                    where = (f" at {os.path.basename(frame.f_code.co_filename)}"
+                             f":{frame.f_lineno}")
+                _record(f"    cancelling={t.cancelled()} name={t.get_name()} "
+                        f"coro={name}{where}")
+            except Exception:  # noqa: BLE001
+                continue
+        if len(alive) > limit:
+            _record(f"    ... and {len(alive) - limit} more")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _detach_dead_output() -> bool:
+    """Point stdout/stderr somewhere that cannot block. NEVER raises.
+
+    WHAT THIS IS, AND WHAT IT IS NOT
+    ----------------------------------
+    It is NOT the fix for the slow shutdown. That was measured and disproved:
+    a faithful repro — a parent that DRAINS the pipe exactly as
+    `readabilityHandler` does, then is SIGKILLed — shuts the backend down in
+    **0 seconds** with or without this. The real cause is elsewhere and is
+    recorded in the module docstring.
+
+    What it does fix is a real and separately measured failure: a pipe that is
+    NOT being drained. A 64KB buffer fills, the child blocks in `write()`, and
+    everything downstream of that write stops:
+
+        undrained pipe, reader killed   17s, never completed, 17 tasks pending
+        file sink, reader killed         1s, clean
+
+    That is not hypothetical. A HUD that is alive but has stopped reading — a
+    beachball, a suspended debugger, a paused process under Instruments — puts
+    the backend in exactly that state, and no watch fires because nobody has
+    died. Severing the connection when the reader is known dead removes one
+    version of it cheaply.
+
+    The general form of the defect is worth stating plainly: **a process's
+    ability to make progress must not depend on a consumer of its logs.** The
+    complete answer is for the launcher to hand the child a FILE rather than a
+    pipe, so no reader can ever apply backpressure. That is a Swift-side
+    change, and it is the honest fix for the class.
+
+    By the time this runs the watch has already established that the reader is
+    dead — that is the entire reason it fired — so this severs a connection to
+    a corpse and loses no output that was still going anywhere. The
+    replacement is the watch's own log file rather than `/dev/null`, because
+    what arrives now is shutdown's account of itself.
+    """
+    try:
+        path = (os.environ.get(ENV_LOG_PATH, "") or "").strip() or _default_log_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        except Exception:  # noqa: BLE001
+            # Anywhere that accepts writes beats a pipe nobody is reading.
+            fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            # dup2 onto the raw descriptors, so every writer is covered at once
+            # — `sys.stdout`, `sys.stderr`, C extensions, and any handler that
+            # captured `sys.__stderr__` at import time and would otherwise keep
+            # its own reference to the dead pipe.
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+        finally:
+            if fd > 2:
+                os.close(fd)
+        global _DETACHED
+        _DETACHED = True
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _enabled() -> bool:
@@ -307,10 +494,15 @@ class ParentWatch:
             return
         self._fired.set()
         self._fired_at = time.monotonic()
+        # BEFORE the SIGTERM, not after. Shutdown begins the instant the signal
+        # is delivered, and it is shutdown's own logging that blocks on the
+        # dead pipe — redirecting afterwards would race the thing it prevents.
+        detached = _detach_dead_output()
         _record(f"launcher (pid {self.parent_pid}) is gone — {reason}. "
                 f"Raising SIGTERM; hard exit in {self.grace_s:.1f}s if that "
                 f"does not finish. Better an abrupt exit than an orphan "
-                f"holding ports, a microphone claim and memory.")
+                f"holding ports, a microphone claim and memory. "
+                f"stdout/stderr detached from the dead reader: {detached}")
         threading.Thread(target=self._escalate, name="parent-watch-escalate",
                          daemon=True).start()
         try:
@@ -335,6 +527,8 @@ class ParentWatch:
         _record(f"graceful shutdown did not complete within {self.grace_s:.1f}s "
                 f"— exiting hard (status {EXIT_PARENT_GONE}). An orphan that "
                 f"will not die is worse than an abrupt exit.")
+        _dump_stacks()
+        _dump_pending_tasks()
         os._exit(EXIT_PARENT_GONE)
 
     # -- lifecycle -------------------------------------------------------
