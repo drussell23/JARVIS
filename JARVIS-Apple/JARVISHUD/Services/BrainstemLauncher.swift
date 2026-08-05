@@ -343,12 +343,23 @@ final class BrainstemLauncher {
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             for line in text.components(separatedBy: "\n") where !line.isEmpty {
                 print("[Brainstem] \(line)")
+                // The file gets every line. The console filter below is a
+                // reading aid for a human watching in real time; the record
+                // must not be filtered, because the line you need later is
+                // always the one nobody thought to whitelist.
+                BootLogFile.shared.write("[Brainstem] \(line)")
             }
         }
         stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             for line in text.components(separatedBy: "\n") where !line.isEmpty {
+                // UNFILTERED to the file, filtered to the console. The
+                // questions this log exists to answer — did the speaker model
+                // reach READY, did the voice authority install — are decided
+                // by lines that match none of the patterns below.
+                BootLogFile.shared.write("[Backend] \(line)")
+
                 // Only show important log lines — filter out verbose startup noise
                 let isImportant = importantPatterns.contains { line.contains($0) }
                 if isImportant {
