@@ -2221,25 +2221,71 @@ class ParallelInitializer:
             # Get the global AI Manager (singleton)
             ai_manager = get_ai_manager()
 
-            # Discover available optimization engines
+            # DISCOVERY IS ALREADY LAZY. BOOT WAS DEFEATING IT.
+            #
+            # `discover_engines()` probes each optimization engine by IMPORTING
+            # it — `import torch`, `import onnxruntime`, and for the JIT probe
+            # it builds and traces a small `nn.Module`. Caught by
+            # `stall_sampler` as the worst remaining boot blocker at 14.24s,
+            # inside an `async def` with nothing to yield to.
+            #
+            # It did not need to happen here at all:
+            #
+            #   * it caches — `if self._discovered: return self._engine_cache`
+            #   * it is ALREADY called on demand, from the router's own routing
+            #     methods (ai_loader.py:966 and :1166)
+            #
+            # So the eager call bought nothing except fourteen seconds of a
+            # deaf assistant. The models were never the problem — this method's
+            # own docstring says registrations use Ghost Proxies for instant
+            # startup with background loading, and that was already true. Only
+            # the CAPABILITY PROBE was eager.
+            #
+            # The router is published to app.state immediately, which is what
+            # callers actually need; discovery warms behind it.
             router = get_optimization_router()
-            engines = router.discover_engines()
-
-            # Count available engines
-            available_engines = [
-                (e.name, c.speedup_factor)
-                for e, c in engines.items()
-                if c.available
-            ]
-
-            logger.info(f"   Optimization Router: {len(available_engines)} engines available")
-            for name, speedup in available_engines[:4]:  # Show top 4
-                logger.info(f"      {name}: {speedup}x speedup")
-
-            # Store in app state for global access
             self.app.state.ai_manager = ai_manager
             self.app.state.optimization_router = router
             self.app.state.ai_loader_ready = True
+
+            async def _warm_engines() -> None:
+                """Probe the engines off the loop, after boot is serving.
+
+                Through `cooperative_fs_io.offload` rather than a process pool:
+                these are module imports, dominated by reading and mapping
+                shared objects, and that work releases the GIL. Measured on
+                this codebase today — the same treatment took the speaker
+                model's import stall from ~14s to 3.1s. A process pool would
+                be actively wrong here: it would have to re-import torch in
+                the child anyway, and on 16GB of unified memory a second
+                interpreter holding a second copy is how a boot becomes a swap
+                storm.
+                """
+                try:
+                    from backend.core.ouroboros.governance.cooperative_fs_io import (
+                        offload,
+                    )
+                    found = await offload(router.discover_engines, cpu_bound=False)
+                except Exception:  # noqa: BLE001 — substrate unavailable
+                    found = router.discover_engines()
+                try:
+                    available = [(e.name, c.speedup_factor)
+                                 for e, c in (found or {}).items() if c.available]
+                    logger.info("   Optimization Router: %d engines available "
+                                "(discovered off the boot path)", len(available))
+                    for name, speedup in available[:4]:
+                        logger.info("      %s: %sx speedup", name, speedup)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Owned by a shutdown phase rather than orphaned: an import that
+            # outlives the process it was warming is the exact class of
+            # unmanaged task that made shutdown unkillable.
+            try:
+                from backend.core.app_lifecycle import spawn_managed_task
+                spawn_managed_task(_warm_engines(), name="ai_engine_discovery")
+            except Exception:  # noqa: BLE001
+                asyncio.get_event_loop().create_task(_warm_engines())
 
             logger.info("   ✅ AI Loader ready - Ghost Proxy pattern enabled")
             logger.info("   All ML models will now use non-blocking background loading")
