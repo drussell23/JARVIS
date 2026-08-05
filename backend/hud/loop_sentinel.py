@@ -129,6 +129,48 @@ class LoopHealth:
             return 1.0
 
 
+def stalled_ms_since(t0: float) -> float:
+    """How long the loop was UNRESPONSIVE since monotonic ``t0``. NEVER raises.
+
+    THE QUESTION THIS EXISTS TO ANSWER
+    ------------------------------------
+    "This await took 7 seconds" and "this blocked the loop for 7 seconds" are
+    completely different findings, and telling them apart is the difference
+    between fixing the right subsystem and rewriting an innocent one.
+
+    `loop_sink.sink_async` measures wall-clock around a `yield`, which for
+    correctly-offloaded work is long while the loop runs perfectly freely. Its
+    own docstring says so — "EITHER sync hot-spots inside the region OR
+    loop-starvation-inflated awaits" — but the emitted line said "on-loop call
+    exceeded threshold" for both, and on 2026-08-05 that sent an investigation
+    at `posture_observer` for hours. Posture was a victim: its collectors are
+    already off-loop, and their elapsed time was inflated by boot-time work
+    elsewhere (a 15s learning-DB timeout, a 10s CloudSQL timeout, a 22s
+    capability federation, seven provider entitlement probes).
+
+    The sentinel already measures true unresponsiveness from inside the loop,
+    so this asks IT rather than adding a second, disagreeing clock.
+
+    Returns 0.0 when the sentinel is not running — "no evidence of a stall",
+    which callers must not read as "proof there was none".
+    """
+    try:
+        s = _SENTINEL
+        if s is None:
+            return 0.0
+        total = 0.0
+        for stall in list(s._health.recent):
+            end = stall.started_at + stall.lag_s
+            if end <= t0:
+                continue                      # finished before we started
+            # Only the part that overlaps [t0, now]: a stall straddling the
+            # start of the region is partly somebody else's problem.
+            total += min(stall.lag_s, end - t0)
+        return total * 1000.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 class LoopSentinel:
     """Watches the event loop from inside it. NEVER raises."""
 
