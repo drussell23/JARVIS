@@ -7,22 +7,6 @@
 #import <Carbon/Carbon.h>
 #import <os/log.h>
 
-NSString *const JARVISGrantSchemaVersion = @"grant.1";
-
-NSString *JARVISGrantVerdictName(JARVISGrantVerdict verdict) {
-    switch (verdict) {
-        case JARVISGrantVerdictGranted:      return @"granted";
-        case JARVISGrantVerdictNoGrant:      return @"no_grant";
-        case JARVISGrantVerdictExpired:      return @"expired";
-        case JARVISGrantVerdictRejected:     return @"rejected";
-        case JARVISGrantVerdictTimedOut:     return @"timed_out";
-        case JARVISGrantVerdictUnavailable:  return @"unavailable";
-        case JARVISGrantVerdictPanicBypass:  return @"panic_bypass";
-    }
-    // Not a default: case, so the compiler still warns when the enum grows.
-    return [NSString stringWithFormat:@"unknown(%ld)", (long)verdict];
-}
-
 #pragma mark - Defaults and bounds
 
 // Named constants rather than literals at the point of use: the bound and the
