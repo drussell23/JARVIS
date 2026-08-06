@@ -9250,6 +9250,23 @@ async def _singleton_instance_has_healthy_connection(db_instance: "JARVISLearnin
             return True
 
 
+def local_first_enabled(env=None) -> bool:
+    """Is local SQLite authoritative for startup? Default TRUE. NEVER raises.
+
+    Extracted so the decision can be tested without standing up a database.
+    Buried inline it was reachable only through a 9000-line init path, which is
+    how a load-bearing default goes unverified.
+
+    "Local-first" is an ORDERING, not an exclusion: fast_mode still initialises
+    Cloud SQL in the background and still syncs. What it refuses is blocking a
+    boot on a remote database for data already on local disk.
+    """
+    import os as _os
+    source = _os.environ if env is None else env
+    raw = source.get("JARVIS_LEARNING_DB_LOCAL_FIRST", "true")
+    return (raw or "").strip().lower() not in ("0", "false", "no", "off")
+
+
 async def get_learning_database(
     config: Optional[Dict] = None,
     fast_mode: bool = False,
@@ -9274,6 +9291,48 @@ async def get_learning_database(
     the gate state is unknown, the call cannot block indefinitely.
     """
     global _db_instance
+
+    # ── LOCAL-FIRST: an operator declaration, checked before any inference ──
+    #
+    # Measured 2026-08-06 13:11:08, on a real unlock attempt:
+    #
+    #   [LearningDB v265.1] Initialization timed out (15s)
+    #       — retrying with fast_mode (SQLite-first)
+    #
+    # and downstream of it:
+    #
+    #   No speaker match found. Primary user: None, Best confidence: 0.00%
+    #   'unlock_screen' NOT authorised (That didn't sound like you...)
+    #
+    # The voiceprint was never missing. `~/.jarvis/learning/jarvis_learning.db`
+    # holds "Derek J. Russell", a 768-byte 192-dimension embedding from 272
+    # samples, is_primary_user=1 — at exactly the path this class opens. It did
+    # not load because init spent its whole budget reaching for Cloud SQL and
+    # timed out before the profile query ran.
+    #
+    # WHY THIS IS NOT A FOURTH INFERENCE
+    # The three promotions below are all guesses about whether Cloud SQL is
+    # reachable — gate state, startup memory mode, gate import failure. Every
+    # one of them said "go standard" on the run above, and every one was wrong,
+    # because a gate reporting READY is a claim about a proxy, not about whether
+    # a query will return inside 15 seconds. Adding a fourth guess would be
+    # more of what already failed. This is an operator STATEMENT, and it is
+    # checked first so no inference can overrule it.
+    #
+    # WHY IT DEFAULTS ON
+    # fast_mode is "SQLite-first, Cloud SQL deferred to background" — an
+    # ORDERING, not an exclusion. Cloud SQL still initialises and still syncs.
+    # What stops is blocking a boot on a remote database for data that is
+    # already on the local disk, which is not a defensible thing to do even
+    # when the account is in good standing.
+    if not fast_mode:
+        if local_first_enabled():
+            logger.info(
+                "[LearningDB] LOCAL-FIRST — SQLite is authoritative for startup; "
+                "Cloud SQL deferred to background (set "
+                "JARVIS_LEARNING_DB_LOCAL_FIRST=false to restore cloud-first init)"
+            )
+            fast_mode = True
 
     # ── v265.1→v286.0: Gate-aware + mode-aware fast_mode promotion ────
     # v283.3: Added UNKNOWN and CHECKING to the gate promotion set.
