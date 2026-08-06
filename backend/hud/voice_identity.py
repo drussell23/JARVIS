@@ -52,7 +52,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger("JARVIS.VoiceIdentity")
 
@@ -556,8 +556,34 @@ class VoiceIdentity:
             who = str((result or {}).get("speaker_name") or owner)
 
             if not verified:
+                # `verified=false` is TWO different claims wearing one value:
+                # "I compared you and it was not you", and "I had nothing to
+                # compare you against". Mapping both to REJECTED is the same
+                # collapse the comment above warns about, seventeen lines later.
+                #
+                # Measured 2026-08-06 13:12:23: the ECAPA facade failed to
+                # create, the fallback engine held no voiceprints, and a
+                # comparison that never happened was reported as
+                # "That didn't sound like you, so I've left it locked."
+                #
+                # So ask the verifier whether a comparison was POSSIBLE rather
+                # than inferring it from a zero confidence -- a genuine mismatch
+                # can score zero too, and guessing between them would just move
+                # the ambiguity somewhere harder to see.
+                capable, reason = self._comparison_capability(who)
+                if not capable:
+                    # Still refuses the unlock: an unverifiable voice is not
+                    # consent, and this path can only ever be stricter. What
+                    # changes is that the operator is told the truth, and the
+                    # truth points at repairing enrollment rather than at
+                    # speaking more clearly.
+                    verdict = (Verdict.NOT_ENROLLED
+                               if reason in ("no_profiles_loaded", "speaker_not_loaded")
+                               else Verdict.UNAVAILABLE)
+                    return _out(verdict, conf=conf, speaker=who,
+                                detail=f"comparison not possible: {reason}")
                 return _out(Verdict.REJECTED, conf=conf, speaker=who,
-                            detail="service returned verified=false")
+                            detail="compared against a loaded voiceprint and did not match")
             floor = min_confidence()
             if conf < floor:
                 # The service said yes; the confidence says otherwise. Refuse
@@ -568,6 +594,26 @@ class VoiceIdentity:
         except Exception as exc:  # noqa: BLE001 — a fault is never consent
             return _out(Verdict.UNAVAILABLE,
                         detail=f"{type(exc).__name__}: {exc}")
+
+    def _comparison_capability(self, speaker: str) -> Tuple[bool, str]:
+        """
+        Ask the verifier whether it could have compared anything.
+
+        Fails toward "a comparison happened" ONLY when the verifier cannot be
+        asked at all. That direction is deliberate: claiming a fault we cannot
+        evidence would let a genuine mismatch be reported as a broken verifier,
+        which is the same dishonesty in the other direction. A service too old
+        to answer keeps the previous behaviour rather than acquiring a new
+        excuse.
+        """
+        probe = getattr(self._service, "verification_capability", None)
+        if not callable(probe):
+            return (True, "capability_probe_unavailable")
+        try:
+            capable, reason = probe(speaker)
+            return (bool(capable), str(reason))
+        except Exception as exc:  # noqa: BLE001 — the probe must never decide by throwing
+            return (True, f"capability_probe_failed:{type(exc).__name__}")
 
     def stats(self) -> Dict[str, Any]:
         return {
