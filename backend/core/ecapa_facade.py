@@ -76,10 +76,24 @@ class _FileFence:
                     pass
                 self._lock_fd = None
 
+            # The PID here comes from the lock FILE's contents, which the
+            # current holder may never have rewritten -- the file persists
+            # across runs while the flock does not. Presenting it as the
+            # holder's identity is a claim this code cannot support, and on
+            # 2026-08-06 it produced a months-dead PID (20415, from May) and a
+            # confident diagnosis of a "stale lock" that did not exist. flock is
+            # advisory and the kernel drops it when a process dies, so a stale
+            # FILE blocks nothing; only a live holder can fail this call.
+            #
+            # So: report the contents as what they are -- a hint, possibly from a
+            # previous run -- and name the fact we actually know.
             existing_info = self._read_lock_info()
+            recorded_pid = existing_info.get("pid", "?")
             raise DualAuthorityError(
-                f"Another process (PID {existing_info.get('pid', '?')}) "
-                f"already owns the ECAPA facade lock at {self._lock_path}"
+                f"Another LIVE process currently holds the ECAPA facade lock at "
+                f"{self._lock_path}. The file records pid={recorded_pid}, but "
+                f"that metadata may be from an earlier run and is not proof of "
+                f"which process holds it — use `lsof {self._lock_path}` for that."
             ) from exc
 
         # Write our ownership metadata into the lock file.
@@ -946,15 +960,74 @@ async def get_ecapa_facade(
             cloud_client=cloud_client,
             config=config,
         )
+
+        # START THE LIFECYCLE. Nobody else does.
+        #
+        # `start()` is documented "Non-blocking and idempotent" and has ZERO
+        # call sites in this codebase. Every caller does:
+        #
+        #     facade = await get_ecapa_facade()
+        #     await facade.ensure_ready(...)        # or extract_embedding(...)
+        #
+        # But `ensure_ready()` only waits on `_ready_event`, and that event is
+        # set by a state transition that only `start()` initiates. With nothing
+        # driving the machine it stays UNINITIALIZED forever, every
+        # `ensure_ready()` burns its full timeout and returns False, and the
+        # operator is told "I'm still loading my voice recognition" — for a load
+        # that was never begun.
+        #
+        # Observed 2026-08-06 14:24:14, ninety seconds after boot, on an unlock
+        # that then refused.
+        #
+        # This belongs here for the same reason registry resolution does: the
+        # singleton has one owner, and six callers each remembering a two-phase
+        # construction protocol is six chances to forget it. Idempotent by
+        # contract, so a caller that also starts it loses nothing.
+        try:
+            await _facade_instance.start()
+        except Exception as exc:  # noqa: BLE001 — see below
+            # `start()` acquires a cross-process fence and raises
+            # DualAuthorityError when another process already owns ECAPA. That
+            # is a real condition, not a bug, and it must not take down the
+            # caller: the facade is returned unstarted, `ensure_ready()` reports
+            # not-ready, and the voice layer says so honestly. Failing soft here
+            # keeps a second JARVIS process from breaking the first one's caller.
+            logger.warning(
+                "ECAPA facade created but could not start (%s: %s) — it will "
+                "report not-ready until this resolves",
+                type(exc).__name__,
+                exc,
+            )
+
         logger.info(
-            "ECAPA facade created (registry=%s, source=%s)",
+            "ECAPA facade created (registry=%s, source=%s, state=%s)",
             type(resolved).__name__,
             "injected" if registry is not None else "resolved",
+            getattr(getattr(_facade_instance, "_state", None), "value", "unknown"),
         )
         return _facade_instance
 
 
 def _reset_facade() -> None:
-    """Reset the singleton for testing.  Not for production use."""
+    """Reset the singleton for testing.  Not for production use.
+
+    Releases the process fence before dropping the reference.
+
+    It used to only clear the global. The fence's file descriptor stayed open,
+    so the flock stayed held for the life of the process -- and since ``start()``
+    acquires it, the NEXT facade could never start. Two consecutive resets in
+    one process produced a facade permanently stuck in UNINITIALIZED, reporting
+    a lock "held by another process" that was in fact held by this one.
+
+    Found by exactly that: two tests in one file, the second unable to start
+    because the first had leaked the lock. Production never resets the
+    singleton, which is why a process-wide leak in the reset path went unseen --
+    the shape of a bug that only bites the thing trying to verify it.
+    """
     global _facade_instance
+    if _facade_instance is not None:
+        try:
+            _facade_instance._fence.release()
+        except Exception as exc:  # noqa: BLE001 — reset must never raise
+            logger.debug("ECAPA fence release during reset failed: %s", exc)
     _facade_instance = None
