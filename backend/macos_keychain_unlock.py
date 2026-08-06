@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
 
 from backend.core.async_safety import LazyAsyncLock
+from backend.security.credential_eradication import eradicated_path
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +37,10 @@ logger = logging.getLogger(__name__)
 class KeychainServiceConfig:
     """Dynamic keychain service configuration"""
 
-    # Service configurations in priority order (highest priority first)
-    # These are discovered dynamically, not hardcoded
-    SERVICES: List[Tuple[str, str, int]] = [
-        ("com.jarvis.voiceunlock", "unlock_token", 0),      # Primary
-        ("jarvis_voice_unlock", "jarvis", 1),               # Alternative
-        ("JARVIS_Screen_Unlock", "jarvis_user", 2),         # Legacy
-    ]
+    # Emptied by the credential eradication sweep. Retained as a named, typed
+    # structure so lookup helpers keep working (and find nothing) rather than
+    # raising AttributeError on a shape that used to exist.
+    SERVICES: List[Tuple[str, str, int]] = []
 
     # Cache configuration
     DEFAULT_CACHE_TTL_SECONDS = 3600.0  # 1 hour
@@ -213,8 +211,10 @@ class MacOSKeychainUnlock:
         self.enable_cache = enable_cache
 
         # Primary service info (for backwards compatibility)
-        self.service_name = "com.jarvis.voiceunlock"
-        self.account_name = "unlock_token"
+        # Credential coordinates deliberately absent: there is no stored login
+        # credential, and naming one here would be a resurrection foothold.
+        self.service_name = ""
+        self.account_name = ""
         self.keychain_item_name = "JARVIS Voice Unlock"
 
         # Cache state
@@ -239,108 +239,40 @@ class MacOSKeychainUnlock:
 
     async def get_password_from_keychain(self, force_refresh: bool = False) -> Optional[str]:
         """
-        Retrieve password from keychain with intelligent caching.
+        ERADICATED. Cleartext login-credential retrieval no longer exists.
 
-        This method:
-        1. Checks cache first (if enabled)
-        2. Falls back to async keychain query if cache miss/expired
-        3. Uses parallel lookup across multiple service names
-        4. Records metrics for monitoring
+        This was the chokepoint every unlock path funnelled through. It fetched
+        the macOS login password in cleartext so it could be typed into the lock
+        screen -- a premise that cannot work, because ``SecurityAgent`` holds
+        SecureEventInput and drops every synthesised keystroke (47/47 recorded
+        sessions typed 13/13 characters into a void with the screen still
+        locked).
 
-        Args:
-            force_refresh: Bypass cache and fetch fresh from keychain
+        The signature is retained so that callers fail loudly at the seam rather
+        than silently taking a different dead-end branch.
 
-        Returns:
-            Password string or None if not found
+        Raises:
+            CleartextCredentialEradicated: Always.
         """
-        start_time = time.time()
-
-        # Check circuit breaker
-        if self._is_circuit_open():
-            logger.warning("Keychain circuit breaker is OPEN - skipping lookup")
-            return None
-
-        # Check cache first (unless force refresh or cache disabled)
-        if self.enable_cache and not force_refresh:
-            async with self._cache_lock:
-                if self._cache and not self._cache.is_expired:
-                    self._cache.touch()
-                    duration_ms = (time.time() - start_time) * 1000
-                    self._metrics.record_lookup(duration_ms, cache_hit=True)
-                    logger.debug(f"Password cache HIT (access #{self._cache.access_count})")
-                    return self._cache.password
-
-        # Cache miss or expired - fetch from keychain
-        logger.debug("Password cache MISS - fetching from keychain...")
-
-        password, service_name = await self._fetch_password_async()
-        duration_ms = (time.time() - start_time) * 1000
-
-        if password:
-            # Update cache
-            if self.enable_cache:
-                async with self._cache_lock:
-                    self._cache = CachedPassword(
-                        password=password,
-                        password_hash=hashlib.sha256(password.encode()).hexdigest(),
-                        service_name=service_name,
-                        account_name=self._get_account_for_service(service_name),
-                        cached_at=time.time(),
-                        ttl_seconds=self.cache_ttl_seconds,
-                    )
-
-            # Update metrics and circuit breaker
-            self._reset_circuit_breaker()
-            self._metrics.last_success_service = service_name
-            self._metrics.last_success_time = time.time()
-            self._metrics.record_lookup(duration_ms, cache_hit=False, parallel=self.enable_parallel_lookup)
-
-            logger.info(f"Password retrieved from keychain ({service_name}) in {duration_ms:.1f}ms")
-            return password
-        else:
-            self._record_failure()
-            self._metrics.failures += 1
-            logger.error(f"Failed to retrieve password from keychain after {duration_ms:.1f}ms")
-            return None
+        eradicated_path("MacOSKeychainUnlock.get_password_from_keychain")
 
     async def get_password_hash(self, force_refresh: bool = False) -> Optional[str]:
         """
-        Get SHA-256 hash of password (for verification without exposing password).
+        ERADICATED. Hashing the credential still required retrieving it.
 
-        Args:
-            force_refresh: Bypass cache
-
-        Returns:
-            SHA-256 hash string or None
+        Raises:
+            CleartextCredentialEradicated: Always.
         """
-        # Check cache for hash
-        if self.enable_cache and not force_refresh:
-            async with self._cache_lock:
-                if self._cache and not self._cache.is_expired:
-                    self._cache.touch()
-                    return self._cache.password_hash
-
-        # Fetch password and compute hash
-        password = await self.get_password_from_keychain(force_refresh=force_refresh)
-        if password:
-            return hashlib.sha256(password.encode()).hexdigest()
-        return None
+        eradicated_path("MacOSKeychainUnlock.get_password_hash")
 
     async def preload_cache(self) -> bool:
         """
-        Preload password into cache (call during service initialization).
+        ERADICATED. There is no credential to preload.
 
-        Returns:
-            True if password was successfully loaded into cache
+        Raises:
+            CleartextCredentialEradicated: Always.
         """
-        logger.info("Preloading keychain password into cache...")
-        password = await self.get_password_from_keychain()
-        success = password is not None
-        if success:
-            logger.info("Keychain cache preloaded successfully")
-        else:
-            logger.warning("Keychain cache preload failed - first unlock will be slower")
-        return success
+        eradicated_path("MacOSKeychainUnlock.preload_cache")
 
     async def invalidate_cache(self) -> None:
         """Invalidate the cached password"""
@@ -354,194 +286,50 @@ class MacOSKeychainUnlock:
 
     async def _fetch_password_async(self) -> Tuple[Optional[str], Optional[str]]:
         """
-        Fetch password using async subprocess (non-blocking).
+        ERADICATED. The keychain fetch machinery has been removed.
 
-        Returns:
-            Tuple of (password, service_name) or (None, None)
+        Previously fanned out ``security find-generic-password`` across the
+        service list in :class:`KeychainServiceConfig`, in parallel or
+        sequentially, and returned the login password in cleartext.
+
+        Raises:
+            CleartextCredentialEradicated: Always.
         """
-        if self.enable_parallel_lookup:
-            return await self._fetch_password_parallel()
-        else:
-            return await self._fetch_password_sequential()
-
-    async def _fetch_password_parallel(self) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Query all keychain services in parallel - first success wins.
-        """
-        async def try_service(service_name: str, account_name: str, priority: int):
-            """Try to get password from a single service"""
-            password = await self._query_keychain_async(service_name, account_name)
-            return (password, service_name, priority) if password else (None, service_name, priority)
-
-        # Create tasks for all services
-        tasks = [
-            asyncio.create_task(try_service(svc, acct, pri))
-            for svc, acct, pri in KeychainServiceConfig.SERVICES
-        ]
-
-        try:
-            # Wait for all with timeout
-            results = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=KeychainServiceConfig.PARALLEL_LOOKUP_TIMEOUT_SECONDS
-            )
-
-            # Find successful results and sort by priority
-            successful = []
-            for result in results:
-                if isinstance(result, Exception):
-                    continue
-                password, service_name, priority = result
-                if password:
-                    successful.append((password, service_name, priority))
-
-            if successful:
-                # Return highest priority (lowest number)
-                successful.sort(key=lambda x: x[2])
-                password, service_name, _ = successful[0]
-                return (password, service_name)
-
-            return (None, None)
-
-        except asyncio.TimeoutError:
-            logger.error(f"Parallel keychain lookup timed out")
-            self._metrics.timeouts += 1
-            # Cancel remaining tasks
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            return (None, None)
-        except asyncio.CancelledError:
-            # Handle external cancellation
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-
-    async def _fetch_password_sequential(self) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Query keychain services sequentially (fallback mode).
-        """
-        for service_name, account_name, _ in KeychainServiceConfig.SERVICES:
-            try:
-                password = await asyncio.wait_for(
-                    self._query_keychain_async(service_name, account_name),
-                    timeout=KeychainServiceConfig.QUERY_TIMEOUT_SECONDS
-                )
-                if password:
-                    return (password, service_name)
-            except asyncio.TimeoutError:
-                logger.warning(f"Keychain query timed out for {service_name}")
-                self._metrics.timeouts += 1
-                continue
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning(f"Keychain query failed for {service_name}: {e}")
-                continue
-
-        return (None, None)
+        eradicated_path("MacOSKeychainUnlock._fetch_password_async")
 
     async def _query_keychain_async(self, service_name: str, account_name: str) -> Optional[str]:
         """
-        Query keychain using async subprocess (non-blocking).
+        ERADICATED. No code path may shell out to retrieve a login credential.
+
+        Raises:
+            CleartextCredentialEradicated: Always.
         """
-        for attempt in range(KeychainServiceConfig.MAX_RETRIES + 1):
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    "security",
-                    "find-generic-password",
-                    "-s", service_name,
-                    "-a", account_name,
-                    "-w",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
+        eradicated_path(
+            f"MacOSKeychainUnlock._query_keychain_async({service_name}/{account_name})"
+        )
 
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=KeychainServiceConfig.QUERY_TIMEOUT_SECONDS
-                )
-
-                if process.returncode == 0:
-                    password = stdout.decode().strip()
-                    if password:
-                        logger.debug(f"Found password in keychain (service: {service_name})")
-                        return password
-                elif process.returncode != 44:  # 44 = item not found (not an error)
-                    logger.debug(f"Keychain query returned code {process.returncode}")
-
-            except asyncio.TimeoutError:
-                # v253.1: Kill zombie subprocess on timeout
-                try:
-                    process.kill()
-                    await process.wait()
-                except Exception:
-                    pass
-                logger.warning(f"Keychain query timeout for {service_name} (attempt {attempt + 1})")
-                if attempt < KeychainServiceConfig.MAX_RETRIES:
-                    await asyncio.sleep(
-                        KeychainServiceConfig.RETRY_BACKOFF_BASE_SECONDS * (attempt + 1)
-                    )
-                continue
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(f"Keychain query error for {service_name}: {e}")
-                if attempt < KeychainServiceConfig.MAX_RETRIES:
-                    await asyncio.sleep(
-                        KeychainServiceConfig.RETRY_BACKOFF_BASE_SECONDS * (attempt + 1)
-                    )
-                continue
-
-        return None
 
     # =========================================================================
     # STORE PASSWORD
     # =========================================================================
 
     async def store_password_in_keychain(self, password: str) -> bool:
-        """Store password securely in macOS Keychain (one-time setup)"""
-        try:
-            cmd = [
-                "security",
-                "add-generic-password",
-                "-a", self.account_name,
-                "-s", self.service_name,
-                "-w", password,
-                "-T", "/usr/bin/security",
-                "-U",  # Update if exists
-                "-l", self.keychain_item_name,
-            ]
+        """
+        ERADICATED. Wrote the login password into the login keychain.
 
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
-            # v253.1: Timeout to prevent infinite stall (was missing unlike query path)
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=10.0,
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-                logger.error("Keychain store timed out after 10s")
-                return False
+        Two distinct defects, both fatal:
 
-            if process.returncode == 0:
-                logger.info(f"Password stored in Keychain as '{self.keychain_item_name}'")
-                # Invalidate cache so next get picks up new password
-                await self.invalidate_cache()
-                return True
-            else:
-                logger.error(f"Failed to store password: {stderr.decode()}")
-                return False
+        * The password was passed as ``-w <password>`` on the argv of a
+          subprocess, so it was visible to any process able to read the process
+          table while the command ran.
+        * ``-T /usr/bin/security`` added the ``security`` binary to the item's
+          ACL, which is why the credential could later be read back in cleartext
+          with no authorisation prompt.
 
-        except Exception as e:
-            logger.error(f"Keychain storage error: {e}")
-            return False
+        Raises:
+            CleartextCredentialEradicated: Always.
+        """
+        eradicated_path("MacOSKeychainUnlock.store_password_in_keychain")
 
     # =========================================================================
     # SCREEN LOCK DETECTION
@@ -588,146 +376,36 @@ class MacOSKeychainUnlock:
 
     async def unlock_screen(self, verified_speaker: Optional[str] = None) -> Dict[str, Any]:
         """
-        Perform screen unlock using cached keychain password.
+        Refuse the keystroke-synthesis unlock; name the mechanism that replaces it.
 
-        Uses intelligent caching for near-instant password retrieval on
-        subsequent unlocks.
+        This returns a structured refusal rather than raising, because it sits on
+        the voice-command response path: the operator needs a spoken explanation,
+        not a traceback. The credential paths beneath it raise; this seam reports.
+
+        Args:
+            verified_speaker: Speaker whose identity was verified upstream.
+
+        Returns:
+            A result dict with ``success=False`` and ``action="eradicated"``.
         """
-        # Check if screen is locked
-        is_locked = await self.check_screen_locked()
-
-        if not is_locked:
-            return {
-                "success": True,
-                "message": f"Screen already unlocked{f' for {verified_speaker}' if verified_speaker else ''}",
-                "action": "none_needed",
-            }
-
-        logger.info(
-            f"Screen locked, attempting unlock{f' for {verified_speaker}' if verified_speaker else ''}..."
+        logger.error(
+            "unlock_screen called on the eradicated keystroke path "
+            "(speaker=%s); SecureEventInput makes this mechanism impossible",
+            verified_speaker or "unverified",
         )
+        return {
+            "success": False,
+            "message": (
+                "Screen unlock by simulated typing is not possible on this version of "
+                "macOS: the lock screen holds SecureEventInput, so synthesised "
+                "keystrokes are discarded. Install the JARVIS Authorization Plugin to "
+                "unlock without a password."
+            ),
+            "action": "eradicated",
+            "replacement": "backend/voice_unlock/authplugin",
+            "verified_speaker": verified_speaker,
+        }
 
-        # Get password (uses cache if available)
-        password = await self.get_password_from_keychain()
-
-        if not password:
-            return {
-                "success": False,
-                "message": "Password not found in Keychain. Run setup first.",
-                "action": "setup_required",
-                "metrics": self._metrics.to_dict(),
-            }
-
-        try:
-            # Use advanced secure password typer
-            from voice_unlock.secure_password_typer import (
-                get_secure_typer,
-                TypingConfig
-            )
-
-            logger.info("Using secure password typer (Core Graphics)")
-            typer = get_secure_typer()
-
-            config = TypingConfig(
-                wake_screen=True,
-                submit_after_typing=True,
-                randomize_timing=True,
-                adaptive_timing=True,
-                detect_system_load=True,
-                clear_memory_after=True,
-                enable_applescript_fallback=True,
-                max_retries=3
-            )
-
-            success, metrics = await typer.type_password_secure(
-                password=password,
-                submit=True,
-                config_override=config
-            )
-
-            logger.info(
-                f"[METRICS] Typing: {metrics.typing_time_ms:.0f}ms, "
-                f"Wake: {metrics.wake_time_ms:.0f}ms, "
-                f"Submit: {metrics.submit_time_ms:.0f}ms, "
-                f"Total: {metrics.total_duration_ms:.0f}ms"
-            )
-
-            if not success:
-                logger.warning(f"Secure typer failed: {metrics.error_message}")
-                # Fallback to AppleScript
-                await self._applescript_fallback(password)
-
-            # Wait for unlock
-            await asyncio.sleep(1.5)
-
-            # Verify unlock
-            still_locked = await self.check_screen_locked()
-
-            if not still_locked:
-                logger.info(
-                    f"Screen unlocked successfully{f' for {verified_speaker}' if verified_speaker else ''}"
-                )
-                return {
-                    "success": True,
-                    "message": f"Screen unlocked{f' for {verified_speaker}' if verified_speaker else ''}",
-                    "action": "unlocked",
-                    "verified_speaker": verified_speaker,
-                    "keychain_metrics": self._metrics.to_dict(),
-                }
-            else:
-                logger.warning("Screen still locked after unlock attempt")
-                return {
-                    "success": False,
-                    "message": "Unlock failed - check password",
-                    "action": "failed",
-                    "keychain_metrics": self._metrics.to_dict(),
-                }
-
-        except Exception as e:
-            logger.error(f"Unlock error: {e}")
-            return {
-                "success": False,
-                "message": f"Unlock error: {str(e)}",
-                "action": "error",
-                "keychain_metrics": self._metrics.to_dict(),
-            }
-
-    async def _applescript_fallback(self, password: str) -> None:
-        """AppleScript fallback for password typing"""
-        # Wake display via caffeinate -u (does NOT inject key events).
-        # Using key code 49 (space) would type a space into the password
-        # field if the lock screen is already visible, corrupting the password.
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "caffeinate", "-u", "-t", "1",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=3.0)
-        except Exception:
-            pass
-        await asyncio.sleep(0.5)
-
-        type_script = """
-        tell application "System Events"
-            keystroke (system attribute "JARVIS_UNLOCK_PASS")
-            delay 0.1
-            key code 36
-        end tell
-        """
-        env = os.environ.copy()
-        env["JARVIS_UNLOCK_PASS"] = password
-
-        await asyncio.create_subprocess_exec(
-            "osascript", "-e", type_script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-
-    # =========================================================================
-    # CIRCUIT BREAKER
-    # =========================================================================
 
     def _is_circuit_open(self) -> bool:
         """Check if circuit breaker is open"""
@@ -806,44 +484,17 @@ class MacOSKeychainUnlock:
     # =========================================================================
 
     async def setup_keychain_password(self):
-        """Interactive setup to store password in Keychain"""
-        import getpass
+        """
+        ERADICATED. Prompted for the login password and stored it.
 
-        print("\n" + "=" * 60)
-        print("JARVIS SCREEN UNLOCK SETUP")
-        print("=" * 60)
-        print("\nThis will securely store your login password in macOS Keychain")
-        print("so JARVIS can unlock your screen when you're verified by voice.\n")
+        This was the other half of the vulnerability: eradicating retrieval while
+        leaving the storer intact would let any setup script re-plant the
+        credential.
 
-        username = input(f"macOS username [{self.account_name}]: ").strip() or self.account_name
-        self.account_name = username
-
-        password = getpass.getpass("Enter your macOS login password: ")
-
-        if password:
-            success = await self.store_password_in_keychain(password)
-
-            if success:
-                print("\nSuccess! Password stored in Keychain")
-                print(f"  - Service: {self.service_name}")
-                print(f"  - Account: {self.account_name}")
-                print("  - JARVIS can now unlock your screen\n")
-
-                # Test retrieval
-                test_pwd = await self.get_password_from_keychain()
-                if test_pwd:
-                    print("Verified: Password retrieval working")
-                    print(f"Metrics: {self.get_metrics()}")
-                else:
-                    print("Warning: Could not verify password retrieval")
-
-                return True
-            else:
-                print("\nFailed to store password in Keychain")
-                return False
-        else:
-            print("\nNo password entered")
-            return False
+        Raises:
+            CleartextCredentialEradicated: Always.
+        """
+        eradicated_path("MacOSKeychainUnlock.setup_keychain_password")
 
 
 # =============================================================================
@@ -870,21 +521,33 @@ async def get_keychain_unlock_service() -> MacOSKeychainUnlock:
 
 
 async def get_password_async() -> Optional[str]:
-    """Convenience function to get password from keychain"""
-    service = await get_keychain_unlock_service()
-    return await service.get_password_from_keychain()
+    """
+    ERADICATED. Module-level shortcut to the removed credential fetch.
+
+    Raises:
+        CleartextCredentialEradicated: Always.
+    """
+    eradicated_path("macos_keychain_unlock.get_password_async")
 
 
 async def get_password_hash_async() -> Optional[str]:
-    """Convenience function to get password hash"""
-    service = await get_keychain_unlock_service()
-    return await service.get_password_hash()
+    """
+    ERADICATED. Hashing still required retrieving the credential.
+
+    Raises:
+        CleartextCredentialEradicated: Always.
+    """
+    eradicated_path("macos_keychain_unlock.get_password_hash_async")
 
 
 async def preload_keychain_cache() -> bool:
-    """Preload keychain cache during startup"""
-    service = await get_keychain_unlock_service()
-    return await service.preload_cache()
+    """
+    ERADICATED. Nothing to preload; boot must not warm a credential cache.
+
+    Raises:
+        CleartextCredentialEradicated: Always.
+    """
+    eradicated_path("macos_keychain_unlock.preload_keychain_cache")
 
 
 # =============================================================================
@@ -892,33 +555,20 @@ async def preload_keychain_cache() -> bool:
 # =============================================================================
 
 async def main():
-    """Set up or test Keychain unlock"""
+    """Report that the keychain setup/test CLI has been eradicated."""
     logging.basicConfig(level=logging.INFO)
 
-    unlock_service = MacOSKeychainUnlock()
-
-    # Check if password is already stored
-    password = await unlock_service.get_password_from_keychain()
-
-    if not password:
-        print("\nNo password found in Keychain")
-        setup = input("Would you like to set it up now? (y/n): ").lower()
-
-        if setup == "y":
-            await unlock_service.setup_keychain_password()
-        else:
-            print("Setup cancelled")
-            return
-
-    # Show metrics
-    print("\nKeychain Metrics:")
-    for key, value in unlock_service.get_metrics().items():
-        print(f"  {key}: {value}")
-
-    # Test unlock
-    print("\nTesting screen unlock...")
-    result = await unlock_service.unlock_screen(verified_speaker="Derek")
-    print(f"Result: {result}")
+    print("\n" + "=" * 68)
+    print("JARVIS SCREEN UNLOCK -- KEYCHAIN PATH ERADICATED")
+    print("=" * 68)
+    print(
+        "\nStoring the macOS login password so JARVIS could type it at the lock\n"
+        "screen has been removed. It could never work: SecurityAgent holds\n"
+        "SecureEventInput, so every synthesised keystroke was discarded.\n\n"
+        "The replacement is the JARVIS Authorization Plugin, which satisfies the\n"
+        "system.login.screensaver right directly and needs no password at all:\n\n"
+        "    backend/voice_unlock/authplugin/\n"
+    )
 
 
 if __name__ == "__main__":
