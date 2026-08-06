@@ -345,17 +345,70 @@ else
     rm -f "${DAEMON_TMP}"
     chown -R root:wheel "${JARVIS_PLUGIN_PATH}"
 
+    # A failure from here on can leave the rule pointing at a mechanism whose
+    # broker is down. That is fail-open safe -- the mechanism yields and
+    # builtin:authenticate prompts -- but it is a half-installed system, which is
+    # exactly the wired-but-inert state this project keeps having to dig out of.
+    # So: if we cannot bring the broker up and the rule already names us from an
+    # earlier install, put the stock rule back before dying.
+    _abort_incoherent() {
+        if jarvis_rule_references_plugin; then
+            _jarvis_warn "${JARVIS_AUTH_RIGHT} still names ${JARVIS_PLUGIN_NAME} from an earlier install"
+            if jarvis_restore_auth_rule_from_pointer; then
+                _jarvis_warn "restored the stock authorization rule -- your lock screen is back to default"
+            else
+                _jarvis_warn "COULD NOT restore the rule automatically. Run:"
+                _jarvis_warn "  sudo ${_here}/uninstall.sh"
+            fi
+        fi
+        _jarvis_die "$1"
+    }
+
     _jarvis_log "loading ${JARVIS_BROKER_LABEL}"
     launchctl bootout "system/${JARVIS_BROKER_LABEL}" >/dev/null 2>&1 || true
-    launchctl bootstrap system "${JARVIS_BROKER_PLIST}" \
-        || _jarvis_die "launchctl bootstrap failed; authorization rule NOT touched"
+
+    # bootout is asynchronous: it returns before teardown finishes, and
+    # bootstrapping into a label that is still unloading fails with
+    # "Bootstrap failed: 5: Input/output error". Wait for the actual condition.
+    if ! jarvis_wait_for_service_gone "${JARVIS_BROKER_LABEL}"; then
+        _abort_incoherent "${JARVIS_BROKER_LABEL} did not unload; refusing to bootstrap over it"
+    fi
+
+    # Bounded retries. launchctl can still transiently refuse while the previous
+    # instance's Mach ports are reclaimed, and one more attempt is cheaper than
+    # sending the operator back to the shell.
+    _bootstrap_attempts="${JARVIS_BOOTSTRAP_ATTEMPTS:-3}"
+    _attempt=1
+    _bootstrap_err=""
+    while : ; do
+        if _bootstrap_err="$(launchctl bootstrap system "${JARVIS_BROKER_PLIST}" 2>&1)"; then
+            break
+        fi
+        if [ "${_attempt}" -ge "${_bootstrap_attempts}" ]; then
+            _jarvis_warn "launchctl: ${_bootstrap_err}"
+            _abort_incoherent "launchctl bootstrap failed after ${_attempt} attempt(s)"
+        fi
+        _jarvis_log "bootstrap attempt ${_attempt} failed (${_bootstrap_err}); retrying"
+        _attempt=$(( _attempt + 1 ))
+        sleep 1
+    done
 
     # The daemon refuses to start on bad config and exits non-zero, so "is it
     # running" is a real answer about whether its configuration is coherent.
+    #
+    # `launchctl print` succeeding only means the job is REGISTERED. A job that
+    # execs and immediately exits 1 is still registered, so the process itself
+    # has to be confirmed -- otherwise "broker is running" would be a claim about
+    # launchd's bookkeeping rather than about a broker.
     if ! launchctl print "system/${JARVIS_BROKER_LABEL}" >/dev/null 2>&1; then
-        _jarvis_die "broker did not come up; see ${JARVIS_STATE_DIR}/broker.err.log -- authorization rule NOT touched"
+        _abort_incoherent "broker job did not register; see ${JARVIS_STATE_DIR}/broker.err.log"
     fi
-    _jarvis_log "broker is running"
+    if ! pgrep -qf "${JARVIS_BROKER_BIN}" 2>/dev/null; then
+        _jarvis_warn "the job registered but no broker process is alive -- it started and exited"
+        _jarvis_warn "see ${JARVIS_STATE_DIR}/broker.err.log"
+        _abort_incoherent "broker is not running"
+    fi
+    _jarvis_log "broker is running (pid $(pgrep -f "${JARVIS_BROKER_BIN}" | head -1))"
 
     # =========================================================================
     # 6b. THE FIRST INTEGRATION TEST THIS SYSTEM HAS EVER HAD
