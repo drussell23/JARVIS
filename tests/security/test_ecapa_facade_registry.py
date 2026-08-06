@@ -144,3 +144,107 @@ def test_no_call_site_passes_a_registry():
         f"a call site now passes arguments: {with_registry}. Re-read this test; "
         f"the accessor-side resolution may no longer be the right shape."
     )
+
+
+# =============================================================================
+# LIFECYCLE — construction is not enough; something must START it
+# =============================================================================
+
+
+def test_the_accessor_starts_the_lifecycle():
+    """
+    `start()` had ZERO call sites.
+
+    It is documented "Non-blocking and idempotent", and every caller does
+    `get_ecapa_facade()` then `ensure_ready()`. But `ensure_ready()` only waits
+    on an event that a state transition sets, and only `start()` initiates that
+    transition. With nothing driving the machine it stayed UNINITIALIZED
+    forever, every `ensure_ready()` burned its full timeout, and the operator
+    was told "I'm still loading my voice recognition" — for a load never begun.
+
+    Observed 2026-08-06 14:24:14, ninety seconds after boot, on an unlock that
+    then refused.
+
+    STRUCTURAL, BECAUSE THE OUTCOME IS NOT OURS TO ASSERT
+    -----------------------------------------------------
+    An earlier version asserted the resulting STATE. That is undecidable here:
+    the facade takes a machine-global `flock`, so on any machine where another
+    JARVIS process is running — a battle test, a daemon, a second HUD — the
+    correct outcome is DualAuthorityError and an unstarted facade. Measured
+    exactly that on 2026-08-06 with `ouroboros_battle_test.py` live.
+
+    A test that fails when the system is behaving correctly trains people to
+    ignore it. What IS ours to assert is that the accessor calls `start()` at
+    all — the thing that was missing.
+    """
+    source = (REPO_ROOT / "backend/core/ecapa_facade.py").read_text()
+    tree = ast.parse(source)
+
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "get_ecapa_facade"
+    )
+    starts = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "start"
+    ]
+    assert starts, (
+        "get_ecapa_facade() no longer calls start(); the state machine will "
+        "never leave UNINITIALIZED and every ensure_ready() will time out"
+    )
+
+
+def test_start_failure_does_not_break_the_caller():
+    """
+    The cross-process fence can legitimately refuse — another JARVIS process may
+    own ECAPA. That must not raise into a voice command: the facade is returned
+    unstarted, ensure_ready() reports not-ready, and the voice layer says so.
+    A second process must not break the first one's callers.
+    """
+    class _Exploding(_Registry):
+        pass
+
+    import backend.core.ecapa_facade as mod
+
+    original = mod.EcapaFacade.start
+
+    async def _boom(self):
+        raise RuntimeError("fence held elsewhere")
+
+    mod.EcapaFacade.start = _boom
+    try:
+        facade = asyncio.run(get_ecapa_facade(registry=_Exploding()))
+        assert facade is not None, "a failed start must still yield a facade"
+    finally:
+        mod.EcapaFacade.start = original
+
+
+def test_lock_error_does_not_present_stale_file_contents_as_the_holder():
+    """
+    The fence's error used to read the lock FILE and name its pid as the holder.
+
+    The file persists across runs; the flock does not. On 2026-08-06 that
+    surfaced a months-dead pid (20415, from May) and produced a confident
+    diagnosis of a stale lock that did not exist — flock is advisory and the
+    kernel drops it when a process dies, so a stale file blocks nothing.
+    """
+    source = (REPO_ROOT / "backend/core/ecapa_facade.py").read_text()
+    tree = ast.parse(source)
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef,
+                             ast.FunctionDef, ast.AsyncFunctionDef)):
+            doc = ast.get_docstring(node, clean=False)
+            if doc:
+                docstrings.add(doc)
+
+    claims = [
+        n.value for n in ast.walk(tree)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        and n.value not in docstrings
+        and "Another process (PID" in n.value
+    ]
+    assert not claims, (
+        "the lock error again asserts a holder identity it cannot know"
+    )
