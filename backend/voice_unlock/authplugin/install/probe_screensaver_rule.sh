@@ -138,7 +138,15 @@ disown "${REVERTER_PID}" 2>/dev/null || true
 _jarvis_log "dead man's switch armed (pid ${REVERTER_PID}, fires in ${PROBE_WINDOW_S}s)"
 
 # Layer 2: instant revert on Ctrl-C or normal exit. The timer remains the backstop.
+#
+# Idempotent. Ctrl-C previously fired the handler once for INT and again for
+# EXIT, reverting twice and printing the whole thing twice -- harmless against
+# the authorization database, but a script that reports two reverts for one
+# revert is lying about what it did.
+_reverted=0
 _revert_now() {
+    [ "${_reverted}" -eq 1 ] && return 0
+    _reverted=1
     _jarvis_log "reverting ${JARVIS_AUTH_RIGHT} now"
     if jarvis_authdb_write "${JARVIS_AUTH_RIGHT}" "${BACKUP}" >/dev/null 2>&1; then
         _jarvis_log "reverted"
@@ -148,7 +156,15 @@ _revert_now() {
         _jarvis_warn "or: sudo ${_here}/uninstall.sh"
     fi
 }
-trap _revert_now EXIT INT TERM
+
+# Ctrl-C means "I am done testing early", NOT "discard what I measured".
+# Previously INT exited straight through the trap and skipped the capture, so
+# the documented escape hatch destroyed the very data the probe exists to
+# collect. It now ends the countdown and falls through to revert + capture.
+_interrupted=0
+_on_interrupt() { _interrupted=1; }
+trap _on_interrupt INT TERM
+trap _revert_now EXIT
 
 # =============================================================================
 # 4. MUTATE
@@ -195,15 +211,19 @@ cat <<BANNER
 BANNER
 
 _remaining="${PROBE_WINDOW_S}"
-while [ "${_remaining}" -gt 0 ]; do
-    printf '\r[jarvis-authplugin] reverting in %3ds (Ctrl-C to revert now) ' "${_remaining}" >&2
-    sleep 1
+while [ "${_remaining}" -gt 0 ] && [ "${_interrupted}" -eq 0 ]; do
+    printf '\r[jarvis-authplugin] reverting in %3ds (Ctrl-C to finish early) ' "${_remaining}" >&2
+    # `|| true`: an interrupted sleep exits non-zero, and `set -e` would tear
+    # the script down before the capture that Ctrl-C is supposed to reach.
+    sleep 1 || true
     _remaining=$((_remaining - 1))
 done
 printf '\r%*s\r' 60 '' >&2
 
-# EXIT trap performs the revert; step 6 reports what is actually true afterwards.
-trap - EXIT INT TERM
+if [ "${_interrupted}" -eq 1 ]; then
+    _jarvis_log "interrupted with ${_remaining}s left -- reverting, then recording what you saw"
+fi
+
 _revert_now
 
 _jarvis_log "final state of ${JARVIS_AUTH_RIGHT}:"
