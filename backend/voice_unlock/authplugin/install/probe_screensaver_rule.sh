@@ -45,7 +45,11 @@ jarvis_require_macos
 jarvis_require_root
 
 # --- Tunables (no hardcoded literals in the body) ----------------------------
-PROBE_WINDOW_S="${JARVIS_PROBE_WINDOW_S:-60}"
+# Default sized to the protocol this script actually prints: lock, wait for
+# Apple Watch to trigger (10-20s on its own), retry Touch ID, test the password,
+# unlock, return to the terminal. A 60s window fit about three of those five
+# steps, so the first run measured nothing.
+PROBE_WINDOW_S="${JARVIS_PROBE_WINDOW_S:-180}"
 # The SecurityAgent-evaluated rule we swap in. Named by the stock rule's own
 # comment as the supported alternative to use-login-window-ui.
 PROBE_RULE_NAME="${JARVIS_PROBE_RULE:-authenticate-session-owner-or-admin}"
@@ -210,6 +214,51 @@ else
     _jarvis_warn "  NOT STOCK. Restore by hand:"
     _jarvis_warn "    sudo security authorizationdb write ${JARVIS_AUTH_RIGHT} < ${BACKUP}"
     exit 1
+fi
+
+# =============================================================================
+# 7. CAPTURE THE MEASUREMENT  (a result that lives only in a terminal is not a
+#    result -- the first run reverted cleanly and recorded nothing)
+# =============================================================================
+PROBE_RESULTS="${JARVIS_STATE_DIR}/probe-results.log"
+
+if [ -t 0 ]; then
+    printf '\n[jarvis-authplugin] recording the measurement (Enter to skip any answer)\n' >&2
+
+    _ask() {  # _ask <prompt> -> echoes normalised answer
+        local reply=""
+        read -r -p "  $1 [y/n/skip]: " reply </dev/tty || reply=""
+        case "${reply}" in
+            [Yy]*) printf 'yes' ;;
+            [Nn]*) printf 'no' ;;
+            *)     printf 'not-tested' ;;
+        esac
+    }
+
+    _locked="$(_ask 'Did you actually LOCK the screen during the window?')"
+    if [ "${_locked}" != "yes" ]; then
+        _jarvis_warn "screen was not locked -- this run measured nothing."
+        _jarvis_warn "re-run and lock the screen inside the window:"
+        _jarvis_warn "  sudo JARVIS_PROBE_WINDOW_S=${PROBE_WINDOW_S} $0"
+    fi
+
+    _touchid="$(_ask 'Did TOUCH ID work?')"
+    _watch="$(_ask 'Did APPLE WATCH auto-unlock work?')"
+    _password="$(_ask 'Did your PASSWORD unlock?')"
+
+    {
+        printf '%s rule=%s window=%ss locked=%s touchid=%s watch=%s password=%s\n' \
+            "$(date -u +%FT%TZ)" "${PROBE_RULE_NAME}" "${PROBE_WINDOW_S}" \
+            "${_locked}" "${_touchid}" "${_watch}" "${_password}"
+    } >> "${PROBE_RESULTS}"
+
+    _jarvis_log "recorded to ${PROBE_RESULTS}"
+
+    if [ "${_password}" = "no" ]; then
+        _jarvis_warn "PASSWORD FAILED under SecurityAgent. Do not build the plugin."
+    fi
+else
+    _jarvis_log "non-interactive; skipping capture. Record answers in ${PROBE_RESULTS}"
 fi
 
 cat <<'NEXT'
