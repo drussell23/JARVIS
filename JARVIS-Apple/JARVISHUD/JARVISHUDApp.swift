@@ -32,7 +32,11 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         Task { @MainActor in
             for w in NSApp.windows { w.orderOut(nil) }
             NSApp.setActivationPolicy(.accessory)
-            self.terminateOlderInstancesIfNeeded()
+            // Awaited: everything below claims ports, the microphone and the UDS
+            // socket, and a stale instance still holds all three until it is
+            // actually gone. The previous fire-and-forget call let startup race
+            // a process it had merely asked to leave.
+            await self.terminateOlderInstancesIfNeeded()
             self.setupMenuBar()
             self.setupVoice()
             // Request Screen Recording permission early, then start persistent stream.
@@ -387,17 +391,58 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
 
     // MARK: - Menu Bar
 
-    private func terminateOlderInstancesIfNeeded() {
+    /// Remove HUD instances left over from previous runs, and PROVE they are gone.
+    ///
+    /// The previous implementation called `forceTerminate()` and returned. That
+    /// method's `Bool` was discarded, nothing waited, and nothing verified — so
+    /// on 2026-08-06 this ran at 12:04:24 against orphan pid 80876, failed, and
+    /// said nothing. A request is not an outcome.
+    ///
+    /// Graceful `terminate()` first, deliberately. `forceTerminate()` is
+    /// uncatchable, so the target never runs its shutdown and its Python
+    /// brainstem child is orphaned at the instant we kill its parent — reaping
+    /// one orphan by creating another. `terminate()` routes through AppKit's
+    /// normal quit path, and the target takes its own children with it.
+    ///
+    /// Async because it now actually waits. Startup must not race a dying
+    /// instance for the ports, microphone and socket it has not released yet,
+    /// and the wait must not block the main thread while it happens.
+    private func terminateOlderInstancesIfNeeded() async {
         guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
 
         let currentPID = ProcessInfo.processInfo.processIdentifier
+
+        // Identity, not ports — the same principle BrainstemLauncher's reaper
+        // documents. A bundle identifier says "this is another copy of us";
+        // holding a port says only "something is here".
         let duplicates = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
             .filter { $0.processIdentifier != currentPID }
 
         guard !duplicates.isEmpty else { return }
 
-        for app in duplicates {
-            app.forceTerminate()
+        print("[HUD] found \(duplicates.count) older instance(s) — reaping before startup")
+
+        // Phased, not a task group. `NSRunningApplication` is not Sendable, and
+        // a task group would carry it across an isolation boundary — which Swift
+        // 6's region checker rejects, and rightly. `reapAll` asks all of them at
+        // once and shares a single grace window, so N stale instances still cost
+        // one wait rather than N.
+        let outcomes = await ProcessReaper.reapAll(
+            duplicates.map { app in
+                ProcessReaper.Target(
+                    pid: app.processIdentifier,
+                    requestExit: { app.terminate() },
+                    force: { app.forceTerminate() }
+                )
+            },
+            label: "HUD instance"
+        )
+
+        if outcomes.contains(.survived) {
+            // Named at startup rather than discovered later as "the app is
+            // behaving strangely". The instance is still there; the operator
+            // should know why things may contend.
+            print("[HUD] ⚠️ an older instance could not be removed — expect contention for ports, mic and socket")
         }
     }
 
