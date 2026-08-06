@@ -35,38 +35,22 @@ _jarvis_log "starting removal"
 # 1. RESTORE THE AUTHORIZATION RULE  (first -- this is what unwedges a machine)
 # =============================================================================
 restore_auth_rule() {
-    if [ ! -f "${JARVIS_AUTHDB_BACKUP_POINTER}" ]; then
-        _jarvis_log "no authdb backup pointer; checking whether the right is stock"
-        _remove_mechanism_in_place
+    # The backup-pointer restore lives in common.sh because install.sh needs the
+    # identical operation when it has to abandon a half-finished install. Two
+    # copies of "how do we put the authorization rule back" is the last thing
+    # this system should have -- they would drift, and the one that drifted would
+    # be discovered by someone whose screen will not unlock.
+    #
+    # Every path this function can take is a REPAIR, so it degrades rather than
+    # aborting: a failed restore falls through to stripping our mechanism out of
+    # whatever rule is live.
+    if jarvis_restore_auth_rule_from_pointer; then
+        _jarvis_log "authorization rule restored from backup"
         return
     fi
 
-    local backup
-    backup="$(cat "${JARVIS_AUTHDB_BACKUP_POINTER}" 2>/dev/null || true)"
-
-    if [ -z "${backup}" ] || [ ! -f "${backup}" ]; then
-        _jarvis_warn "backup pointer names a missing file: ${backup:-<empty>}"
-        _remove_mechanism_in_place
-        return
-    fi
-
-    # Refuse to write a backup that is not a readable plist: restoring garbage
-    # into the authorization database is the one way this script could make
-    # things worse than it found them.
-    if ! plutil -lint "${backup}" >/dev/null 2>&1; then
-        _jarvis_warn "backup at ${backup} is not a valid plist; refusing to restore it"
-        _remove_mechanism_in_place
-        return
-    fi
-
-    _jarvis_log "restoring ${JARVIS_AUTH_RIGHT} from ${backup}"
-    if jarvis_authdb_write "${JARVIS_AUTH_RIGHT}" "${backup}"; then
-        _jarvis_log "authorization rule restored"
-        rm -f "${JARVIS_AUTHDB_BACKUP_POINTER}"
-    else
-        _note_failure "could not restore ${JARVIS_AUTH_RIGHT} from backup"
-        _remove_mechanism_in_place
-    fi
+    _jarvis_warn "no usable backup (absent pointer, missing file, or unparseable plist)"
+    _remove_mechanism_in_place
 }
 
 # Fallback: no usable backup. Strip only our own mechanism from whatever rule is
