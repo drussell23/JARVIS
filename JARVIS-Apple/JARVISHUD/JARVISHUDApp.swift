@@ -53,6 +53,19 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                 self.appState.pythonBridge.onBackendReady()
             }
             BrainstemLauncher.shared.start()
+
+            // Armed AFTER the brainstem launches, so an orphaning during startup
+            // finds a child that already knows who its parent is and will follow
+            // us out. Arming first would open a window where we can exit while
+            // the child is still unsupervised — trading one orphan for another.
+            //
+            // NSApp.terminate runs the normal shutdown path, so the brainstem is
+            // stopped the way any quit stops it. A bare exit() here would leave
+            // the very orphan this watch exists to prevent.
+            ParentWatch.arm {
+                NSApp.terminate(nil)
+            }
+
             self.appState.boot()
 
             // Living Border setup — the halo is always visible (JARVIS is ambient:
