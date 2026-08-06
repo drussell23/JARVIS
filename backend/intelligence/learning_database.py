@@ -9327,7 +9327,18 @@ async def get_learning_database(
     # when the account is in good standing.
     if not fast_mode:
         if local_first_enabled():
-            logger.info(
+            # WARNING, not INFO, and the reason is not severity.
+            #
+            # This line was INFO. The brainstem console filters this module to
+            # WARNING and above, so the one line that says WHICH database is
+            # authoritative for boot never reached the operator — and on
+            # 2026-08-06 its absence was read as evidence the promotion had not
+            # fired, when nothing in the log could have shown either way.
+            #
+            # A decision that changes which store a boot depends on has to be
+            # visible at the level the operator actually sees, or it is not
+            # auditable. This fires once per process.
+            logger.warning(
                 "[LearningDB] LOCAL-FIRST — SQLite is authoritative for startup; "
                 "Cloud SQL deferred to background (set "
                 "JARVIS_LEARNING_DB_LOCAL_FIRST=false to restore cloud-first init)"
@@ -9425,11 +9436,38 @@ async def get_learning_database(
                 timeout=_init_timeout,
             )
         except asyncio.TimeoutError:
-            logger.warning(
-                "[LearningDB v265.1] Initialization timed out (%.0fs) "
-                "— retrying with fast_mode (SQLite-first)",
-                _init_timeout,
-            )
+            # SAY WHICH MODE ACTUALLY TIMED OUT.
+            #
+            # This message used to read "— retrying with fast_mode
+            # (SQLite-first)" unconditionally, which is a claim about the FIRST
+            # attempt that it never checked. When fast_mode was already true the
+            # line asserted a transition that did not happen.
+            #
+            # On 2026-08-06 that cost a wrong diagnosis: the log was read as
+            # proof that cloud-first init was still running, when the honest
+            # reading is that SQLite-first may have timed out on its own. Those
+            # point at completely different causes — an unreachable Cloud SQL,
+            # versus a starved event loop making 15s of wall clock worth far
+            # less than 15s of progress (that run: 30-46% loop availability,
+            # 14.05s worst stall).
+            #
+            # A diagnostic that names the wrong subsystem is worse than none:
+            # it spends the next hour of work.
+            if fast_mode:
+                logger.warning(
+                    "[LearningDB] SQLite-first init timed out (%.0fs) — the local "
+                    "path alone did not finish. Cloud SQL was NOT the blocker; "
+                    "look at event-loop starvation (LoopSentinel/StallSampler) "
+                    "or raise JARVIS_LEARNING_DB_INIT_TIMEOUT.",
+                    _init_timeout,
+                )
+            else:
+                logger.warning(
+                    "[LearningDB] Cloud-first init timed out (%.0fs) — retrying "
+                    "with fast_mode (SQLite-first). Set "
+                    "JARVIS_LEARNING_DB_LOCAL_FIRST=true to skip this attempt.",
+                    _init_timeout,
+                )
             # Discard partial state and retry with fast_mode
             try:
                 if _db_instance:
