@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Info.plist for JARVISUnlock.bundle.
+
+    This is the plugin's ONLY configuration channel, and that is deliberate: the
+    bundle is loaded into SecurityAgent, a process the operator never launches
+    and whose environment they cannot set. An env var here would be unreadable
+    in production and settable only in a test harness -- the worst possible
+    property for a security control.
+
+    Every key below is read by JARVISUnlockConfig. Because Info.plist is covered
+    by the bundle's code signature, editing a tunable after signing invalidates
+    the signature the broker checks. Configuration and integrity are the same
+    artifact.
+
+    TWO KEYS ARE INTENTIONALLY ABSENT AND WRITTEN BY THE INSTALLER:
+
+      JARVISBrokerMachServiceName
+      JARVISBrokerCodeRequirement
+
+    Neither can be known before install. The requirement must be COMPUTED from
+    the signed broker binary (`codesign -d -r-`), so it depends on the signing
+    identity used on this machine. Shipping a placeholder would be worse than
+    shipping nothing: JARVISUnlockConfig treats an absent key as "yield without
+    contacting anything", while a plausible-looking wrong value would send the
+    unlock question to whatever process won that Mach name.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.jarvis.unlockplugin</string>
+
+    <key>CFBundleName</key>
+    <string>JARVISUnlock</string>
+
+    <key>CFBundleExecutable</key>
+    <string>JARVISUnlock</string>
+
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <key>NSHumanReadableCopyright</key>
+    <string>JARVIS. Grants a voice-authenticated screen unlock without storing a password.</string>
+
+    <!-- ===================================================================
+         JARVIS configuration
+         =================================================================== -->
+
+    <!-- Wire schema. Must match the broker's JARVIS_BROKER_SCHEMA_VERSION;
+         a mismatch is refused rather than best-effort interpreted. -->
+    <key>JARVISGrantSchemaVersion</key>
+    <string>grant.1</string>
+
+    <!-- Master switch. NO means the mechanism loads, logs, and immediately
+         yields. It deliberately does not mean "do not load": a mechanism named
+         in the authorization database that fails to load is a broken chain, so
+         the safe way to disable this without editing the database is to make it
+         trivially transparent. -->
+    <key>JARVISGrantMechanismEnabled</key>
+    <true/>
+
+    <!-- How long the lock screen will wait for the broker before showing the
+         normal password prompt. Clamped by the code to [50, 2000]ms. Small on
+         purpose: the cost of being slow here is a user staring at a frozen lock
+         screen, which is how an unlock feature becomes a support call. -->
+    <key>JARVISGrantTimeoutMilliseconds</key>
+    <integer>500</integer>
+
+    <!-- Hardware escape hatch. 58 (0x3A) is kVK_Option. Held during Invoke, it
+         bypasses JARVIS entirely and goes straight to the password prompt.
+         Read from the HID state, which no synthetic event can forge, so this
+         works when every other layer is misbehaving. -->
+    <key>JARVISPanicChokeEnabled</key>
+    <true/>
+
+    <key>JARVISPanicKeyCode</key>
+    <integer>58</integer>
+</dict>
+</plist>
