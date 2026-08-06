@@ -5939,6 +5939,54 @@ class SpeakerVerificationService:
                 logger.warning("   ⚠️ Returning original audio data (may not be PCM!)")
                 return audio_data
 
+    def verification_capability(self, speaker_name: Optional[str] = None) -> Tuple[bool, str]:
+        """
+        Could a comparison happen at all right now? If not, why not.
+
+        WHY THIS EXISTS
+        ---------------
+        Measured 2026-08-06 13:12:23, on a real unlock attempt::
+
+            EcapaFacade error: registry required for first facade creation
+                - falling back to local engine
+            No speaker match found. Primary user: None, Best confidence: 0.00%
+            'unlock_screen' NOT authorised (That didn't sound like you...)
+
+        ``Best confidence: 0.00%`` is not a low score. It is the absence of a
+        score: nothing was compared, because the fallback engine held no
+        voiceprints. The operator was told his voice did not match, when the
+        truth was that his voice was never checked.
+
+        A FAULT ON A CONSENT PATH IS INDISTINGUISHABLE FROM A REFUSAL unless
+        something makes it distinguishable, and only the verifier knows which
+        one happened. ``verified: False`` cannot carry that distinction --
+        it is the same value for "I compared you and it was not you" and for
+        "I had nothing to compare you against".
+
+        The two demand opposite responses from the operator: speak again, or
+        repair enrollment. Reporting the second as the first sends them to do
+        the one thing that cannot help.
+
+        Returns:
+            ``(can_compare, reason)``. ``reason`` is a stable machine token,
+            never a sentence -- the caller owns the wording.
+        """
+        if not self.initialized:
+            return (False, "not_initialized")
+
+        profiles = getattr(self, "speaker_profiles", None) or {}
+        if not profiles:
+            # The enrollment STORE may well hold a voiceprint; this says the
+            # running verifier does not have one loaded. Distinct claims, and
+            # conflating them is how "enroll your voice" gets said to someone
+            # who enrolled months ago.
+            return (False, "no_profiles_loaded")
+
+        if speaker_name and speaker_name not in profiles:
+            return (False, "speaker_not_loaded")
+
+        return (True, "ready")
+
     async def verify_speaker(self, audio_data: bytes, speaker_name: Optional[str] = None) -> dict:
         """
         Verify speaker from audio with adaptive learning
