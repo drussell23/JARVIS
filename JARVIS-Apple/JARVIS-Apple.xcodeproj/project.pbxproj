@@ -29,6 +29,7 @@
 		9D8F259F3A4877CC70B36F0C /* BootLogFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 633E90E2380BBC6CB188BB57 /* BootLogFile.swift */; };
 		9FC588C57049591237CF032F /* HUDView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A0A5C4460F31FD5CB53DD10 /* HUDView.swift */; };
 		A0BD7790CE0BF3EDAC6D6372 /* ArcReactorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26744ECD2240E57AF517188D /* ArcReactorView.swift */; };
+		A2C3549A6EDDCEC8A4D1FF98 /* ParentWatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFD1B9697A7D560891A59E78 /* ParentWatch.swift */; };
 		A348802554BD9C09EE824952 /* UtteranceRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86A3C5DDD4D1D44D8569C39B /* UtteranceRecorder.swift */; };
 		ADEA3EDEC8E9800EB2E4B351 /* JARVISKit in Frameworks */ = {isa = PBXBuildFile; productRef = 15EECA930D551D91AC5C18B4 /* JARVISKit */; };
 		B382A284A476CA2ACA805D56 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4A8BD3E8642F43ADBDD9BB1 /* SettingsView.swift */; };
@@ -73,6 +74,7 @@
 		B91850E89902256710524BEA /* LoadingHUDView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadingHUDView.swift; sourceTree = "<group>"; };
 		BD8C21EBA8B80C1A39D30C8A /* JARVISPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISPanel.swift; sourceTree = "<group>"; };
 		BE156A6B63F5362F9FD12522 /* CompactHeaderBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompactHeaderBar.swift; sourceTree = "<group>"; };
+		BFD1B9697A7D560891A59E78 /* ParentWatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParentWatch.swift; sourceTree = "<group>"; };
 		C953EA1271F55784A7D1004B /* JARVISColors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISColors.swift; sourceTree = "<group>"; };
 		CE05089C690A3B7B63861CF9 /* PhoneSessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneSessionManager.swift; sourceTree = "<group>"; };
 		DC9BBC1069F12BD5BEB30913 /* JARVISKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = JARVISKit; path = JARVISKit; sourceTree = SOURCE_ROOT; };
@@ -176,6 +178,7 @@
 				633E90E2380BBC6CB188BB57 /* BootLogFile.swift */,
 				A6A777442955E499D4E22D3B /* BrainstemLauncher.swift */,
 				A2FEA2CE20F48E377D68D971 /* MicSuppression.swift */,
+				BFD1B9697A7D560891A59E78 /* ParentWatch.swift */,
 				7F97771D9894460348ABB0ED /* ScreenCaptureService.swift */,
 				95D0EF17C00CB1001F596D74 /* SecureConsent.swift */,
 				86A3C5DDD4D1D44D8569C39B /* UtteranceRecorder.swift */,
@@ -421,6 +424,7 @@
 				FBBDB0313A52CEA7D67AFF62 /* LivingBorderWindow.swift in Sources */,
 				F2372C4356B52F4C5EE16B1C /* LoadingHUDView.swift in Sources */,
 				C2EAD5E8889A90385FDA3E14 /* MicSuppression.swift in Sources */,
+				A2C3549A6EDDCEC8A4D1FF98 /* ParentWatch.swift in Sources */,
 				D3F64926FE39007A1202CB78 /* ScreenCaptureService.swift in Sources */,
 				67836362453377C25CE3CB3D /* SecureConsent.swift in Sources */,
 				8343F8E9601E5B1F4058448D /* TransparentWindow.swift in Sources */,
