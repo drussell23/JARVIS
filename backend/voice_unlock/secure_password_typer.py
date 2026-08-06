@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
 from typing import Optional, Dict, List, Tuple, Any
+
+from backend.security.credential_eradication import eradicated_path
 from weakref import WeakValueDictionary
 
 try:
@@ -505,6 +507,10 @@ class SecurePasswordTyper:
         Returns:
             Tuple of (success: bool, metrics: TypingMetrics)
         """
+        # ERADICATED: no code path may type a login credential. The
+        # machinery below is unreachable and retained only so the module
+        # stays importable for its metrics dataclasses.
+        eradicated_path("SecurePasswordTyper.type_password_secure")
         # Use config override or instance config
         config = config_override or self.config
         submit = submit if submit is not None else config.submit_after_typing
@@ -877,71 +883,19 @@ class SecurePasswordTyper:
         except Exception as e:
             logger.error(f"❌ Failed to release shift: {e}")
 
-    async def _fallback_applescript(self, password: str, submit: bool, metrics: TypingMetrics) -> Tuple[bool, TypingMetrics]:
-        """Fallback to AppleScript if Core Graphics fails"""
-        try:
-            logger.info("🔄 Using AppleScript fallback for password typing")
-            metrics.fallback_used = True
-            
-            # Wake screen via caffeinate -u (no key events injected).
-            # key code 49 (space) would type into the password field if
-            # the lock screen is already visible, corrupting the password.
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "caffeinate", "-u", "-t", "1",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(proc.wait(), timeout=3.0)
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
-            
-            # Type password using AppleScript with environment variable for security
-            type_script = """
-            tell application "System Events"
-                keystroke (system attribute "JARVIS_UNLOCK_PASS")
-            end tell
-            """
-            
-            env = os.environ.copy()
-            env["JARVIS_UNLOCK_PASS"] = password
-            
-            proc = await asyncio.create_subprocess_exec(
-                "osascript", "-e", type_script,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env
-            )
-            await proc.communicate()
-            
-            # Clear from environment
-            if "JARVIS_UNLOCK_PASS" in env:
-                del env["JARVIS_UNLOCK_PASS"]
-            
-            # Submit if requested
-            if submit:
-                await asyncio.sleep(0.1)
-                submit_script = """
-                tell application "System Events"
-                    key code 36
-                end tell
-                """
-                proc = await asyncio.create_subprocess_exec(
-                    "osascript", "-e", submit_script,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                await proc.communicate()
-            
-            metrics.success = True
-            logger.info("✅ AppleScript fallback succeeded")
-            return True, metrics
-            
-        except Exception as e:
-            logger.error(f"❌ AppleScript fallback failed: {e}")
-            metrics.error_message = f"Fallback failed: {str(e)}"
-            return False, metrics
+    async def _fallback_applescript(self, *args, **kwargs):
+        """
+        ERADICATED. Injected the login password into a child process
+        environment (``JARVIS_UNLOCK_PASS``) for an osascript keystroke.
+    
+        A child's environment is readable by same-user processes, so this
+        traded an argv leak for an environment leak -- and the keystrokes
+        were discarded by SecureEventInput regardless.
+    
+        Raises:
+            CleartextCredentialEradicated: Always.
+        """
+        eradicated_path("SecurePasswordTyper._fallback_applescript")
     
     async def _type_password_characters(self, password: str, config: TypingConfig, metrics: TypingMetrics) -> bool:
         """
@@ -1297,6 +1251,10 @@ async def type_password_with_display_awareness(
     Returns:
         Tuple of (success, metrics_dict, display_context)
     """
+    # ERADICATED: no code path may type a login credential. The
+    # machinery below is unreachable and retained only so the module
+    # stays importable for its metrics dataclasses.
+    eradicated_path("secure_password_typer.type_password_with_display_awareness")
     start_time = time.time()
     display_context_dict = None
     typing_config_dict = None
@@ -1526,113 +1484,19 @@ async def _store_display_tracking_data(
         # Don't let DB errors affect the unlock flow
 
 
-async def _type_password_applescript_sai(
-    password: str,
-    submit: bool,
-    config,  # TypingConfig from SAI
-    attempt_id: Optional[int]
-) -> Tuple[bool, Optional[Dict[str, Any]]]:
+async def _type_password_applescript_sai(self, *args, **kwargs):
     """
-    Type password using AppleScript with SAI-recommended timing.
-    Most reliable for mirrored/TV displays.
+    ERADICATED. Injected the login password into a child process
+    environment (``JARVIS_UNLOCK_PASS``) for an osascript keystroke.
+
+    A child's environment is readable by same-user processes, so this
+    traded an argv leak for an environment leak -- and the keystrokes
+    were discarded by SecureEventInput regardless.
+
+    Raises:
+        CleartextCredentialEradicated: Always.
     """
-    metrics = TypingMetrics()
-    metrics.characters_typed = len(password)
-    metrics.fallback_used = True
-
-    try:
-        logger.info(f"🔐 [APPLESCRIPT-SAI] Starting secure input (strategy: AppleScript)")
-
-        # Wake screen via caffeinate -u (no key events injected).
-        # key code 49 (space) would type into the password field if
-        # the lock screen is already visible, corrupting the password.
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "caffeinate", "-u", "-t", "1",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=3.0)
-        except Exception:
-            pass
-
-        # SAI-recommended wake delay (longer for TV)
-        await asyncio.sleep(config.wake_delay_ms / 1000.0)
-        logger.info(f"🔐 [APPLESCRIPT-SAI] Wake delay: {config.wake_delay_ms}ms")
-
-        # Type password character by character for reliability
-        # Using keystroke with character-level control
-        type_script = """
-        tell application "System Events"
-            keystroke (system attribute "JARVIS_UNLOCK_PASS")
-        end tell
-        """
-
-        env = os.environ.copy()
-        env["JARVIS_UNLOCK_PASS"] = password
-
-        typing_start = time.time()
-
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", type_script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env
-        )
-        stdout, stderr = await proc.communicate()
-
-        metrics.typing_time_ms = (time.time() - typing_start) * 1000
-
-        # Clear from environment
-        if "JARVIS_UNLOCK_PASS" in env:
-            del env["JARVIS_UNLOCK_PASS"]
-
-        if proc.returncode != 0:
-            logger.error(f"❌ [APPLESCRIPT-SAI] AppleScript failed: {stderr.decode()}")
-            metrics.error_message = stderr.decode()
-            return False, metrics.to_dict()
-
-        # Submit if requested
-        if submit:
-            await asyncio.sleep(config.submit_delay_ms / 1000.0)
-            submit_script = """
-            tell application "System Events"
-                key code 36
-            end tell
-            """
-            proc = await asyncio.create_subprocess_exec(
-                "osascript", "-e", submit_script,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            await proc.communicate()
-            logger.info("🔐 [APPLESCRIPT-SAI] Return key pressed")
-
-        # Verify unlock
-        await asyncio.sleep(2.0)  # Longer delay for TV display
-
-        try:
-            from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
-
-            if is_screen_locked():
-                metrics.success = False
-                metrics.error_message = "Password incorrect - screen still locked"
-                logger.error("❌ [APPLESCRIPT-SAI] Screen still locked after AppleScript typing")
-                return False, metrics.to_dict()
-            else:
-                metrics.success = True
-                logger.info("✅ [APPLESCRIPT-SAI] Screen unlocked successfully!")
-                return True, metrics.to_dict()
-
-        except Exception as e:
-            logger.warning(f"⚠️ Could not verify unlock status: {e}")
-            metrics.success = True  # Assume success if can't verify
-            return True, metrics.to_dict()
-
-    except Exception as e:
-        logger.error(f"❌ [APPLESCRIPT-SAI] Error: {e}", exc_info=True)
-        metrics.error_message = str(e)
-        return False, metrics.to_dict()
+    eradicated_path("SecurePasswordTyper._type_password_applescript_sai")
 
 
 async def _type_password_cg_sai(
@@ -1735,6 +1599,10 @@ async def type_password_securely(
         ...     print("Password typed securely")
         ...     print(f"Collected {len(metrics['character_metrics'])} character metrics")
     """
+    # ERADICATED: no code path may type a login credential. The
+    # machinery below is unreachable and retained only so the module
+    # stays importable for its metrics dataclasses.
+    eradicated_path("secure_password_typer.type_password_securely")
     typer = get_secure_typer()
 
     # Create config with randomize_timing setting

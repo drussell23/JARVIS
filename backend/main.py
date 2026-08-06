@@ -775,6 +775,34 @@ try:
 except ImportError:
     pass
 
+# =============================================================================
+# CREDENTIAL SANITISATION — must run immediately after dotenv, before any
+# subsystem reads the environment.
+# =============================================================================
+# A stale `.env` is the one way an eradicated credential can re-enter the
+# process after the keychain item is gone, so the sweep is anchored to the load
+# rather than to a later lifecycle hook. Idempotent; safe if nothing is present.
+#
+# Failure is logged at CRITICAL rather than raised: the credential path is
+# already structurally removed, so an unavailable sanitiser is a visibility
+# problem, not an exposure. Killing boot here would be a worse failure mode.
+try:
+    from backend.security.credential_eradication import sanitize_process_environment
+
+    _sanitized_keys = sanitize_process_environment()
+    if _sanitized_keys:
+        print(
+            f"[SECURITY] Removed {len(_sanitized_keys)} legacy unlock credential "
+            f"key(s) from the environment: {', '.join(sorted(_sanitized_keys))}",
+            flush=True,
+        )
+except Exception as _sanitize_error:  # pragma: no cover - defensive
+    print(
+        f"[SECURITY][CRITICAL] Credential environment sanitisation did not run: "
+        f"{_sanitize_error}",
+        flush=True,
+    )
+
 # Global component storage
 components = {}
 import_times = {}

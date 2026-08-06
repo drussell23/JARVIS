@@ -18,6 +18,8 @@ import psutil
 # Import async pipeline for non-blocking operations
 from core.async_pipeline import get_async_pipeline
 
+from backend.security.credential_eradication import eradicated_path
+
 from backend.system_control.capability_registry import (  # noqa: E402
     Effect, capability, os_capability,
 )
@@ -331,52 +333,16 @@ class MacOSController:
             logger.error(f"[Pipeline] Unlock WebSocket error: {e}")
 
     async def _screen_unlock_applescript_async(self, context):
-        """Non-blocking screen unlock via AppleScript (fallback)"""
-        password = context.metadata.get("password")
+        """
+        ERADICATED. Fetched the login password from the keychain and typed it.
 
-        if not password:
-            # Try to retrieve from keychain
-            try:
-                from api.jarvis_voice_api import async_subprocess_run
+        Kept as a named seam so the pipeline stage fails loudly at the point of
+        use rather than silently degrading to another dead end.
 
-                stdout, stderr, returncode = await async_subprocess_run(
-                    [
-                        "security",
-                        "find-generic-password",
-                        "-s",
-                        "com.jarvis.voiceunlock",
-                        "-a",
-                        "unlock_token",
-                        "-w",
-                    ],
-                    timeout=5.0,
-                )
-                if returncode == 0 and stdout:
-                    password = stdout.decode().strip()
-                else:
-                    context.metadata["success"] = False
-                    context.metadata["error"] = "No password available for unlock"
-                    return
-            except Exception as e:
-                context.metadata["success"] = False
-                context.metadata["error"] = f"Failed to retrieve password: {e}"
-                return
-
-        # Use simple_unlock_handler's direct unlock method
-        try:
-            from api.simple_unlock_handler import _perform_direct_unlock
-
-            success = await _perform_direct_unlock(password)
-
-            if success:
-                context.metadata["success"] = True
-                context.metadata["message"] = "Screen unlocked successfully via AppleScript"
-            else:
-                context.metadata["success"] = False
-                context.metadata["error"] = "AppleScript unlock failed"
-        except Exception as e:
-            context.metadata["success"] = False
-            context.metadata["error"] = f"AppleScript unlock error: {e}"
+        Raises:
+            CleartextCredentialEradicated: Always.
+        """
+        eradicated_path("MacOSController._screen_unlock_applescript_async")
 
     async def _check_screen_lock_status_async(self) -> bool:
         """
@@ -1755,59 +1721,23 @@ class MacOSController:
             except Exception as e:
                 logger.warning(f"[UnlockScreen] WebSocket error: {e}")
 
-            # Method 2: Try direct AppleScript unlock (fallback)
+            # The former Method 2 retrieved the login password from the keychain
+            # and typed it. Eradicated: SecureEventInput discards synthesised
+            # keystrokes at the lock screen, so the path could not succeed, and
+            # holding the credential in cleartext bought nothing.
             if not password:
-                # Try to retrieve from keychain
-                try:
-                    from api.jarvis_voice_api import async_subprocess_run
-
-                    stdout, stderr, returncode = await async_subprocess_run(
-                        [
-                            "security",
-                            "find-generic-password",
-                            "-s",
-                            "com.jarvis.voiceunlock",
-                            "-a",
-                            "unlock_token",
-                            "-w",
-                        ],
-                        timeout=5.0,
-                    )
-                    if returncode == 0 and stdout:
-                        password = stdout.decode().strip()
-                    else:
-                        logger.info("[UnlockScreen] No password in keychain")
-                        return (
-                            False,
-                            "Unable to unlock screen. The Voice Unlock daemon is not running. Please run './backend/voice_unlock/enable_screen_unlock.sh' to enable it.",
-                        )
-                except Exception as e:
-                    logger.warning(f"[UnlockScreen] Failed to retrieve password: {e}")
-                    return (
-                        False,
-                        "Unable to unlock screen without password. Please setup Voice Unlock first.",
-                    )
+                logger.info("[UnlockScreen] No unlock grant available")
+                return (
+                    False,
+                    "I can't unlock the screen yet. The JARVIS Authorization Plugin "
+                    "isn't installed, and the old typing method cannot work on this "
+                    "version of macOS.",
+                )
 
             # DYNAMIC DIAGNOSTIC: Intelligently diagnose the issue
             logger.info("[UnlockScreen] Performing dynamic diagnostics...")
 
-            # Build diagnostic report
             diagnostic_issues = []
-
-            # Check keychain password
-            try:
-                result = subprocess.run(
-                    ["security", "find-generic-password", "-s", "com.jarvis.voiceunlock", "-a", "unlock_token", "-w"],
-                    capture_output=True,
-                    text=True,
-                    timeout=2
-                )
-                has_password = (result.returncode == 0)
-            except Exception:
-                has_password = False
-
-            if not has_password:
-                diagnostic_issues.append("Keychain password not configured")
 
             # Check enrollment data
             import json

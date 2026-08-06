@@ -16,6 +16,7 @@ import subprocess
 from typing import Any, Dict, List, Tuple
 
 from backend.core.async_safety import LazyAsyncLock
+from backend.security.credential_eradication import eradicated_path
 
 # Import async pipeline
 from core.async_pipeline import get_async_pipeline
@@ -214,95 +215,26 @@ async def _applescript_unlock_async(context):
         context.metadata["error"] = str(e)
 
 
-def _escape_password_for_applescript(password: str) -> str:
-    """Escape special characters in password for AppleScript"""
-    escaped = password.replace("\\", "\\\\")  # Escape backslashes
-    escaped = escaped.replace('"', '\\"')  # Escape double quotes
-    return escaped
-
-
 async def _perform_direct_unlock(password: str) -> bool:
     """
-    Perform direct screen unlock using SecurePasswordTyper with voice biometric integration
+    ERADICATED. Typed the login password into the lock screen via CGEvent.
 
-    Args:
-        password: The user's Mac password from keychain
+    Removed for two independent reasons:
 
-    Returns:
-        bool: True if unlock succeeded, False otherwise
+    1. It could never work. ``SecurityAgent`` holds SecureEventInput while the
+       lock screen is up, so every synthesised keystroke was discarded. All 47
+       recorded sessions reported 13/13 characters "typed" with the screen still
+       locked.
+    2. It reported success regardless. ``type_password_securely`` returns
+       ``Tuple[bool, Optional[Dict]]``; the result was bound to a single name and
+       truth-tested, and a 2-tuple is always truthy -- so the failure branch was
+       unreachable and the ``except`` around verification returned ``True`` on
+       any error.
+
+    Raises:
+        CleartextCredentialEradicated: Always.
     """
-    caffeinate_process = None
-    try:
-        logger.info("[DIRECT UNLOCK] Starting secure unlock sequence with biometric integration")
-
-        # CRITICAL: Keep screen awake during entire unlock process
-        # This prevents screen from going black while JARVIS processes audio
-        logger.info("[DIRECT UNLOCK] Starting caffeinate to prevent screen sleep...")
-        caffeinate_process = await asyncio.create_subprocess_exec(
-            "caffeinate", "-d", "-u",  # -d = prevent display sleep, -u = wake display
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-
-        # Give caffeinate a moment to activate
-        await asyncio.sleep(0.3)
-
-        # Import secure password typer
-        from voice_unlock.secure_password_typer import type_password_securely
-
-        # Type password using secure, native Core Graphics method
-        # This method:
-        # - Uses CGEventCreateKeyboardEvent (native macOS API)
-        # - Never exposes password in logs or process list
-        # - Implements adaptive timing based on system load
-        # - Has AppleScript fallback if Core Graphics fails
-        # - Automatically wakes screen and submits password
-        logger.info(f"[DIRECT UNLOCK] Using SecurePasswordTyper ({len(password)} characters)")
-
-        success = await type_password_securely(
-            password=password,
-            submit=True,  # Automatically press Return
-            randomize_timing=True  # Human-like typing with adaptive timing
-        )
-
-        if success:
-            # Wait for unlock to complete
-            await asyncio.sleep(1.5)
-
-            # Verify unlock by checking screen state
-            try:
-                from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
-
-                is_locked = is_screen_locked()
-
-                if not is_locked:
-                    logger.info("[DIRECT UNLOCK] ✅ Unlock verified successful with biometric authentication")
-                    return True
-                else:
-                    logger.warning("[DIRECT UNLOCK] ⚠️ Screen still locked after attempt")
-                    return False
-            except Exception as verify_error:
-                # If we can't verify, assume success since typing succeeded
-                logger.info(f"[DIRECT UNLOCK] ✅ Unlock completed (verification unavailable: {verify_error})")
-                return True
-        else:
-            logger.error("[DIRECT UNLOCK] ❌ SecurePasswordTyper failed")
-            return False
-
-    except Exception as e:
-        logger.error(f"[DIRECT UNLOCK] ❌ Error during unlock: {e}", exc_info=True)
-        return False
-    finally:
-        # Always terminate caffeinate process to restore normal power management
-        if caffeinate_process:
-            try:
-                caffeinate_process.terminate()
-                await asyncio.sleep(0.1)  # Give it a moment to terminate gracefully
-                if caffeinate_process.returncode is None:
-                    caffeinate_process.kill()  # Force kill if still running
-                logger.info("[DIRECT UNLOCK] Caffeinate process terminated")
-            except Exception as cleanup_error:
-                logger.warning(f"[DIRECT UNLOCK] Failed to cleanup caffeinate: {cleanup_error}")
+    eradicated_path("simple_unlock_handler._perform_direct_unlock")
 
 
 async def handle_unlock_command(command: str, jarvis_instance=None) -> Dict[str, Any]:
@@ -1199,30 +1131,15 @@ async def _try_keychain_unlock(context: Dict[str, Any]) -> Tuple[bool, str]:
                 )
 
     except ImportError:
+        # The former fallback shelled out to `security find-generic-password`
+        # and fed the cleartext login password to _perform_direct_unlock.
+        # Both are eradicated; there is no second way in.
         logger.error("MacOS Keychain integration not available")
-        # Fallback to old method
-        result = subprocess.run(
-            [
-                "security",
-                "find-generic-password",
-                "-s",
-                "com.jarvis.voiceunlock",
-                "-a",
-                "unlock_token",
-                "-w",
-            ],
-            capture_output=True,
-            text=True,
+        return (
+            False,
+            "Screen unlock is unavailable: the keystroke-based unlock path has been "
+            "removed. Install the JARVIS Authorization Plugin to unlock without a password.",
         )
-
-        if result.returncode == 0:
-            password = result.stdout.strip()
-            unlock_result = await _perform_direct_unlock(password)
-
-            if unlock_result:
-                return True, f"Screen unlocked by {verified_speaker or 'verified user'}"
-
-        return False, "Password not found in keychain"
 
 
 async def _try_manual_unlock_fallback(context: Dict[str, Any]) -> Tuple[bool, str]:
