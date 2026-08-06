@@ -836,6 +836,41 @@ _facade_instance: Optional[EcapaFacade] = None
 _facade_lock = asyncio.Lock()
 
 
+async def _resolve_ml_registry() -> Any:
+    """Obtain the canonical ML engine registry, or None.
+
+    Reuses the resolution ladder `main.py` already established for this exact
+    module -- async accessor first, then the sync accessor with
+    ``auto_create=True`` -- including its dual-import fallback, because
+    `voice_unlock.ml_engine_registry` is reachable under both the ``backend.``
+    prefixed and bare package names depending on how the process was started.
+
+    Deliberately NOT a seventh way to get a registry. The registry is a
+    singleton with an owner; this asks that owner rather than constructing
+    anything, so no second ECAPA model can be loaded into the process.
+    """
+    try:
+        try:
+            from backend.voice_unlock.ml_engine_registry import get_ml_registry
+        except ImportError:
+            from voice_unlock.ml_engine_registry import get_ml_registry
+        registry = await get_ml_registry()
+        if registry is not None:
+            return registry
+    except Exception as exc:  # noqa: BLE001 — fall through to the sync ladder
+        logger.debug("ECAPA facade: async registry accessor failed: %s", exc)
+
+    try:
+        try:
+            from backend.voice_unlock.ml_engine_registry import get_ml_registry_sync
+        except ImportError:
+            from voice_unlock.ml_engine_registry import get_ml_registry_sync
+        return get_ml_registry_sync(auto_create=True)
+    except Exception as exc:  # noqa: BLE001 — caller reports the failure
+        logger.debug("ECAPA facade: sync registry accessor failed: %s", exc)
+        return None
+
+
 async def get_ecapa_facade(
     registry: Any = None,
     cloud_client: Any = None,
@@ -843,8 +878,40 @@ async def get_ecapa_facade(
 ) -> EcapaFacade:
     """Return the module-level ``EcapaFacade`` singleton.
 
-    On the first call, *registry* is required.  Subsequent calls return the
-    existing instance regardless of arguments.
+    *registry* may be injected (tests, and any caller that already holds one).
+    When it is not, the canonical ML engine registry is resolved here.
+
+    WHY THIS NO LONGER DEMANDS A REGISTRY FROM THE CALLER
+    ----------------------------------------------------
+    It used to raise ``ValueError("registry required for first facade
+    creation")`` when none was passed. Every one of the six call sites in this
+    codebase calls ``get_ecapa_facade()`` with no arguments::
+
+        cloud_ml_router.py:718          parallel_vbi_orchestrator.py:930
+        vbi_debug_tracer.py:555         speaker_verification_service.py:3435
+        speaker_verification_service.py:3979, :4017
+
+    So the first call always raised, the singleton was uncreatable by
+    construction, and the facade was dead code that announced itself as a
+    configuration error. Observed on every boot::
+
+        [INIT] EcapaFacade error: registry required for first facade creation
+            - falling back to local engine
+
+    and downstream, at 13:57:04 on 2026-08-06, an unlock refused because the
+    fallback engine held no voiceprints.
+
+    The requirement WAS the defect. A precondition that no caller in the
+    program can satisfy is not a precondition; it is an unreachable branch
+    wearing a contract. Fixing the six call sites would have spread knowledge of
+    which registry to use across six modules -- the singleton has one owner, and
+    asking that owner belongs here, once.
+
+    Raises:
+        ValueError: only when the registry genuinely cannot be obtained. The
+            message says the registry was unreachable, not that the caller
+            failed to supply one -- blaming callers for something none of them
+            can provide is what made this take eight months to find.
     """
     global _facade_instance
     if _facade_instance is not None:
@@ -853,12 +920,36 @@ async def get_ecapa_facade(
     async with _facade_lock:
         if _facade_instance is not None:
             return _facade_instance
-        if registry is None:
-            raise ValueError("registry required for first facade creation")
+
+        resolved = registry if registry is not None else await _resolve_ml_registry()
+        if resolved is None:
+            raise ValueError(
+                "ECAPA facade unavailable: the ML engine registry could not be "
+                "resolved (get_ml_registry / get_ml_registry_sync both returned "
+                "nothing). This is a registry availability problem, not a missing "
+                "argument."
+            )
+
+        # A registry that cannot answer for this model is not a usable registry,
+        # and finding that out here -- once, at construction -- beats discovering
+        # it later inside a verification, where the failure looks like a voice
+        # that did not match.
+        if not hasattr(resolved, "get_wrapper"):
+            raise ValueError(
+                f"ECAPA facade unavailable: resolved registry "
+                f"{type(resolved).__name__} exposes no get_wrapper(); it cannot "
+                f"supply the 'ecapa_tdnn' wrapper this facade requires."
+            )
+
         _facade_instance = EcapaFacade(
-            registry=registry,
+            registry=resolved,
             cloud_client=cloud_client,
             config=config,
+        )
+        logger.info(
+            "ECAPA facade created (registry=%s, source=%s)",
+            type(resolved).__name__,
+            "injected" if registry is not None else "resolved",
         )
         return _facade_instance
 
