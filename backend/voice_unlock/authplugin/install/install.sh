@@ -43,7 +43,9 @@ _root="$(cd "${_here}/.." && pwd)"
 . "${_here}/common.sh"
 
 jarvis_require_macos
-jarvis_require_root
+# NOTE: the root check deliberately happens AFTER argument parsing, below.
+# `--help` that requires sudo is a help message nobody reads, and a `--dry-run`
+# that demands privileges it does not need is a safety feature people skip.
 
 # --- Tunables ---------------------------------------------------------------
 # Ad-hoc ("-") works for a single machine and needs no developer account. A
@@ -63,6 +65,74 @@ if [ "${CONSUME_SERVICE}" = "${DEPOSIT_SERVICE}" ]; then
 fi
 
 # =============================================================================
+# MODES
+# =============================================================================
+# There are two useful places to stop short of a full install, and they answer
+# different questions:
+#
+#   --dry-run     Build, sign, derive every requirement, generate both plists,
+#                 validate all of it -- and mutate NOTHING. Answers "would this
+#                 install produce a coherent configuration?" Safe to run at any
+#                 time on any machine.
+#
+#   --skip-authdb Everything except the authorization rule. Files installed,
+#                 daemon loaded, and the deposit path exercised against the LIVE
+#                 broker. Answers "does the XPC channel actually work, and does
+#                 the code signing validation actually accept the real peer?"
+#                 The lock screen is untouched, so a failure here costs nothing.
+#
+# The second is the one that matters. Until it passes, no signature in this
+# system has ever been checked by a live peer, and a full install would make its
+# first integration test the run that rewrites the authorization database.
+DRY_RUN=0
+SKIP_AUTHDB=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run)     DRY_RUN=1; SKIP_AUTHDB=1 ;;
+        --skip-authdb) SKIP_AUTHDB=1 ;;
+        -h|--help)
+            cat <<USAGE
+usage: install.sh [--dry-run | --skip-authdb]
+
+  (no flags)      full install, including the authorization rule
+  --skip-authdb   install and load, exercise the deposit path, leave the
+                  lock screen completely untouched
+  --dry-run       mutate nothing; prove the configuration would be coherent
+
+Environment: JARVIS_SIGN_IDENTITY, JARVIS_CONSUME_SERVICE,
+             JARVIS_DEPOSIT_SERVICE, JARVIS_MAX_GRANT_TTL_S,
+             JARVIS_GRANT_SCHEMA, JARVIS_HELPER_PATH
+USAGE
+            exit 0 ;;
+        *) _jarvis_die "unknown argument: $1 (try --help)" ;;
+    esac
+    shift
+done
+
+if [ "${DRY_RUN}" -eq 1 ]; then
+    # Signing is NOT skipped, and cannot be: a requirement is derived from a
+    # signature, so refusing to sign would mean refusing to check the one thing
+    # a dry run exists to check. Signatures land on build output under dist/,
+    # which is scratch. Nothing outside the repo is touched.
+    _jarvis_log "DRY RUN -- nothing outside ${_root}/dist will be modified"
+    # Deliberately NOT requiring root: a dry run writes only to build output, and
+    # making it need sudo would be asking for privilege to do nothing with it.
+else
+    jarvis_require_root
+fi
+
+# Narrates an action that a dry run declines to take. Returns 1 when skipped, so
+# callers read as `_would "..." || <do it>` and the skip is impossible to forget.
+_would() {
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[jarvis-authplugin][dry-run] would %s\n' "$*" >&2
+        return 0
+    fi
+    return 1
+}
+
+# =============================================================================
 # 1. BUILD
 # =============================================================================
 _jarvis_log "building"
@@ -73,13 +143,62 @@ for artifact in "${DIST}/${JARVIS_BUNDLE_NAME}" "${DIST}/jarvis-unlock-broker" "
 done
 
 # =============================================================================
+# 1b. STAGE OUTSIDE THE REPOSITORY BEFORE SIGNING
+# =============================================================================
+# codesign refuses to sign anything carrying "resource fork, Finder information,
+# or similar detritus". This repository lives inside a fileprovider-managed tree,
+# so directories acquire com.apple.FinderInfo and com.apple.fileprovider.fpfs#P
+# merely by existing -- and stripping them does not stick: the daemon re-adds
+# them asynchronously, so a clear-then-sign in place is a race that codesign
+# usually loses.
+#
+# Clearing harder is the wrong answer; there is no number of `xattr -cr` calls
+# that wins against a daemon whose job is to put them back. The signature-
+# sensitive work moves out of its domain instead. Everything downstream operates
+# on the staging copy, so the reassignment below is the only change needed.
+STAGE="$(mktemp -d -t jarvis-authplugin-stage)" || _jarvis_die "could not create staging directory"
+trap 'rm -rf "${STAGE}"' EXIT
+
+cp -R "${DIST}/${JARVIS_BUNDLE_NAME}" "${DIST}/jarvis-unlock-broker" \
+      "${DIST}/jarvis-unlock-grant" "${STAGE}/" \
+    || _jarvis_die "could not stage build artifacts into ${STAGE}"
+xattr -cr "${STAGE}" 2>/dev/null || true
+
+# Prove the staging area is actually free of the attributes that block signing,
+# rather than assuming a different filesystem behaves differently.
+_detritus="$(xattr -r "${STAGE}" 2>/dev/null | grep -cE 'FinderInfo|fileprovider' || true)"
+if [ "${_detritus}" -ne 0 ]; then
+    _jarvis_die "staging area ${STAGE} still carries signing-hostile xattrs; set TMPDIR to a plain filesystem"
+fi
+
+_jarvis_log "staged for signing in ${STAGE}"
+DIST="${STAGE}"
+
+# =============================================================================
 # 2. SIGN BROKER AND HELPER
 # =============================================================================
 _sign() {
-    local path="$1"
-    codesign --force --options runtime --timestamp=none \
-             --sign "${SIGN_IDENTITY}" "${path}" >/dev/null 2>&1 \
-        || _jarvis_die "codesign failed for ${path} with identity '${SIGN_IDENTITY}'"
+    local path="$1" err
+
+    # Strip extended attributes before every signature.
+    #
+    # codesign refuses to sign anything carrying "resource fork, Finder
+    # information, or similar detritus", and a bundle built inside this repo
+    # carries exactly that: the tree lives on an iCloud-adjacent filesystem, so
+    # directories pick up com.apple.FinderInfo and com.apple.fileprovider.fpfs#P
+    # merely by existing. PlistBuddy re-adds them when it edits Info.plist, so
+    # clearing once at build time is not enough -- it has to happen here, at the
+    # one seam every artifact passes through, immediately before each signature.
+    xattr -cr "${path}" 2>/dev/null || true
+
+    if ! err="$(codesign --force --options runtime --timestamp=none \
+                         --sign "${SIGN_IDENTITY}" "${path}" 2>&1)"; then
+        # Report what codesign actually said. Swallowing it into a generic
+        # "codesign failed" is what made this defect take a diagnosis rather
+        # than a read.
+        _jarvis_warn "codesign: ${err}"
+        _jarvis_die "codesign failed for ${path} with identity '${SIGN_IDENTITY}'"
+    fi
 }
 
 # Reads a binary's designated requirement. This is the whole point: the string
@@ -186,34 +305,107 @@ plutil -lint "${DAEMON_TMP}" >/dev/null 2>&1 || _jarvis_die "generated LaunchDae
 # =============================================================================
 # 6. INSTALL AND LOAD
 # =============================================================================
-mkdir -p "${JARVIS_STATE_DIR}" "${JARVIS_AUTHDB_BACKUP_DIR}" "$(dirname "${JARVIS_BROKER_BIN}")" \
-         "$(dirname "${HELPER_INSTALL_PATH}")" "${JARVIS_PLUGIN_DIR}"
-chmod 700 "${JARVIS_STATE_DIR}"
+if _would "install plugin -> ${JARVIS_PLUGIN_PATH}, broker -> ${JARVIS_BROKER_BIN}, helper -> ${HELPER_INSTALL_PATH}, daemon plist -> ${JARVIS_BROKER_PLIST}"; then
+    _would "load ${JARVIS_BROKER_LABEL} and exercise the deposit path"
+    rm -f "${DAEMON_TMP}"
+else
+    mkdir -p "${JARVIS_STATE_DIR}" "${JARVIS_AUTHDB_BACKUP_DIR}" "$(dirname "${JARVIS_BROKER_BIN}")" \
+             "$(dirname "${HELPER_INSTALL_PATH}")" "${JARVIS_PLUGIN_DIR}"
+    chmod 700 "${JARVIS_STATE_DIR}"
 
-_jarvis_log "installing files"
-rm -rf "${JARVIS_PLUGIN_PATH}"
-cp -R "${DIST}/${JARVIS_BUNDLE_NAME}" "${JARVIS_PLUGIN_PATH}"
-install -m 755 -o root -g wheel "${DIST}/jarvis-unlock-broker" "${JARVIS_BROKER_BIN}"
-install -m 755 -o root -g wheel "${DIST}/jarvis-unlock-grant" "${HELPER_INSTALL_PATH}"
-install -m 644 -o root -g wheel "${DAEMON_TMP}" "${JARVIS_BROKER_PLIST}"
-rm -f "${DAEMON_TMP}"
-chown -R root:wheel "${JARVIS_PLUGIN_PATH}"
+    _jarvis_log "installing files"
+    rm -rf "${JARVIS_PLUGIN_PATH}"
+    cp -R "${DIST}/${JARVIS_BUNDLE_NAME}" "${JARVIS_PLUGIN_PATH}"
+    install -m 755 -o root -g wheel "${DIST}/jarvis-unlock-broker" "${JARVIS_BROKER_BIN}"
+    install -m 755 -o root -g wheel "${DIST}/jarvis-unlock-grant" "${HELPER_INSTALL_PATH}"
+    install -m 644 -o root -g wheel "${DAEMON_TMP}" "${JARVIS_BROKER_PLIST}"
+    rm -f "${DAEMON_TMP}"
+    chown -R root:wheel "${JARVIS_PLUGIN_PATH}"
 
-_jarvis_log "loading ${JARVIS_BROKER_LABEL}"
-launchctl bootout "system/${JARVIS_BROKER_LABEL}" >/dev/null 2>&1 || true
-launchctl bootstrap system "${JARVIS_BROKER_PLIST}" \
-    || _jarvis_die "launchctl bootstrap failed; authorization rule NOT touched"
+    _jarvis_log "loading ${JARVIS_BROKER_LABEL}"
+    launchctl bootout "system/${JARVIS_BROKER_LABEL}" >/dev/null 2>&1 || true
+    launchctl bootstrap system "${JARVIS_BROKER_PLIST}" \
+        || _jarvis_die "launchctl bootstrap failed; authorization rule NOT touched"
 
-# The daemon refuses to start on bad config and exits non-zero, so "is it
-# running" is a real answer about whether its configuration is coherent.
-if ! launchctl print "system/${JARVIS_BROKER_LABEL}" >/dev/null 2>&1; then
-    _jarvis_die "broker did not come up; see ${JARVIS_STATE_DIR}/broker.err.log -- authorization rule NOT touched"
+    # The daemon refuses to start on bad config and exits non-zero, so "is it
+    # running" is a real answer about whether its configuration is coherent.
+    if ! launchctl print "system/${JARVIS_BROKER_LABEL}" >/dev/null 2>&1; then
+        _jarvis_die "broker did not come up; see ${JARVIS_STATE_DIR}/broker.err.log -- authorization rule NOT touched"
+    fi
+    _jarvis_log "broker is running"
+
+    # =========================================================================
+    # 6b. THE FIRST INTEGRATION TEST THIS SYSTEM HAS EVER HAD
+    # =========================================================================
+    # Deposits a real grant through the real helper into the real broker. This
+    # is the first time a code signing requirement is checked by a live peer,
+    # and it happens BEFORE the authorization rule is touched -- so a failure
+    # costs a log line, not a lock screen.
+    #
+    # It exercises the deposit half only. The consume half runs inside
+    # SecurityAgent and cannot be invoked without the rule change, which is
+    # exactly why the rule change comes after everything testable has been
+    # tested.
+    _jarvis_log "self-test: depositing a grant through the installed helper"
+    _selftest_out=""
+    if _selftest_out="$(JARVIS_BROKER_DEPOSIT_SERVICE="${DEPOSIT_SERVICE}" \
+                        JARVIS_BROKER_CODE_REQUIREMENT="${BROKER_REQ}" \
+                        JARVIS_GRANT_DEPOSIT_TIMEOUT_S=5 \
+                        "${HELPER_INSTALL_PATH}" "install self-test" 2>&1)"; then
+        _jarvis_log "self-test PASSED -- grant ${_selftest_out}"
+        _jarvis_log "  the broker accepted the helper's signature over a live XPC connection"
+    else
+        _selftest_rc=$?
+        _jarvis_warn "self-test FAILED (exit ${_selftest_rc}): ${_selftest_out}"
+        case "${_selftest_rc}" in
+            69) _jarvis_warn "  broker unreachable, or it refused the helper's signature" ;;
+            77) _jarvis_warn "  broker answered and refused -- signature or schema mismatch" ;;
+            75) _jarvis_warn "  no answer in time" ;;
+            78) _jarvis_warn "  helper could not read its own configuration" ;;
+        esac
+        _jarvis_warn "see ${JARVIS_STATE_DIR}/broker.err.log and"
+        _jarvis_warn "  log show --predicate 'subsystem == \"com.jarvis.unlockbroker\"' --last 5m"
+        # Fail closed. The rule change is the only irreversible step, and taking
+        # it after the channel it depends on demonstrably does not work would be
+        # betting the lock screen on a component that just failed in front of us.
+        _jarvis_die "refusing to rewrite ${JARVIS_AUTH_RIGHT}; nothing about unlocking has changed"
+    fi
 fi
-_jarvis_log "broker is running"
 
 # =============================================================================
 # 7. REWRITE THE AUTHORIZATION RULE  (last, backed up, proof-gated)
 # =============================================================================
+if [ "${SKIP_AUTHDB}" -eq 1 ]; then
+    cat <<STOPPED
+
+stopped before the authorization rule.
+
+  ${JARVIS_AUTH_RIGHT} is unchanged. Your lock screen behaves exactly as it did
+  before this script ran, and nothing here can affect your ability to unlock.
+
+  derived requirements (each pins its own binary):
+    plugin   ${PLUGIN_REQ}
+    broker   ${BROKER_REQ}
+    helper   ${HELPER_REQ}
+
+STOPPED
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        # ${DIST} has been reassigned to the staging directory by now, and
+        # naming it here would under-report: the build also wrote ${_root}/dist.
+        # Both are scratch, but saying "nothing outside <temp dir>" when a second
+        # directory changed is the kind of small inaccuracy that erodes trust in
+        # everything else the script claims.
+        echo "  This was a dry run. Build output under ${_root}/dist was rebuilt,"
+        echo "  and a temporary staging copy was signed. No system state changed."
+        echo "  Next: sudo $0 --skip-authdb   (installs, and proves the XPC channel works)"
+    else
+        echo "  The deposit path is installed and self-tested."
+        echo "  Next: sudo $0                 (rewrites the rule; reversible via uninstall.sh)"
+    fi
+    echo
+    exit 0
+fi
+
 _stamp="$(date +%Y%m%d-%H%M%S)"
 BACKUP="${JARVIS_AUTHDB_BACKUP_DIR}/${JARVIS_AUTH_RIGHT}.${_stamp}.install.plist"
 
