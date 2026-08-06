@@ -238,10 +238,33 @@ HELPER_REQ="$(_requirement_of "${DIST}/jarvis-unlock-grant")"
 _jarvis_log "writing broker identity into the plugin Info.plist"
 PLUGIN_PLIST="${DIST}/${JARVIS_BUNDLE_NAME}/Contents/Info.plist"
 
-/usr/libexec/PlistBuddy -c "Delete :JARVISBrokerMachServiceName" "${PLUGIN_PLIST}" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c "Delete :JARVISBrokerCodeRequirement" "${PLUGIN_PLIST}" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c "Add :JARVISBrokerMachServiceName string ${CONSUME_SERVICE}" "${PLUGIN_PLIST}"
-/usr/libexec/PlistBuddy -c "Add :JARVISBrokerCodeRequirement string ${BROKER_REQ}" "${PLUGIN_PLIST}"
+# plutil, NOT PlistBuddy.
+#
+# PlistBuddy takes its whole operation as ONE shell word:
+#     PlistBuddy -c "Add :K string ${REQ}"
+# and a requirement contains double quotes -- `cdhash H"732e..."`. The shell
+# consumes them while assembling that word, so the value that lands is
+# `cdhash H732e...`: syntactically present, semantically empty, and unparseable
+# as a requirement. It fails at the lock screen and looks like an unreachable
+# broker.
+#
+# plutil takes the value as its own argv element, so nothing re-parses it.
+plutil -replace JARVISBrokerMachServiceName -string "${CONSUME_SERVICE}" "${PLUGIN_PLIST}" \
+    || _jarvis_die "could not write JARVISBrokerMachServiceName"
+plutil -replace JARVISBrokerCodeRequirement -string "${BROKER_REQ}" "${PLUGIN_PLIST}" \
+    || _jarvis_die "could not write JARVISBrokerCodeRequirement"
+
+# Read it back and compare byte-for-byte. Writing a value is not the same as the
+# value landing, and this specific field is unverifiable at runtime -- it is only
+# exercised inside SecurityAgent at a locked screen, which is the worst possible
+# place to discover it was mangled.
+_written_req="$(plutil -extract JARVISBrokerCodeRequirement raw "${PLUGIN_PLIST}" 2>/dev/null)"
+if [ "${_written_req}" != "${BROKER_REQ}" ]; then
+    _jarvis_warn "wrote:    ${BROKER_REQ}"
+    _jarvis_warn "read back: ${_written_req}"
+    _jarvis_die "the broker requirement did not survive being written to the plugin Info.plist"
+fi
+_jarvis_log "verified: plugin Info.plist carries the broker requirement intact"
 
 # =============================================================================
 # 4. SIGN THE PLUGIN  (Info.plist is inside the signature -- order matters)
