@@ -137,18 +137,18 @@ enum ProcessReaper {
 
         // Phase 2 — one shared grace window. Polling, so a process that leaves
         // immediately does not cost the worst case.
-        pending = await waitForExit(targets, pending: pending, outcomes: &outcomes, as: .exitedGracefully)
+        pending = await waitForExit(targets, pending: pending, label: label, outcomes: &outcomes, as: .exitedGracefully)
         guard !pending.isEmpty else { return outcomes }
 
         // Phase 3 — insist, only on what ignored the request.
         for index in pending {
-            print("[Reaper] \(label) pid \(targets[index].pid) ignored the request after \(graceSeconds)s — forcing")
+            BootLogFile.shared.note("[Reaper] \(label) pid \(targets[index].pid) ignored the request after \(graceSeconds)s — forcing")
             targets[index].force()
         }
 
         // Phase 4 — force is not instantaneous either, and claiming success
         // without looking is the defect this type exists to remove.
-        pending = await waitForExit(targets, pending: pending, outcomes: &outcomes, as: .forced)
+        pending = await waitForExit(targets, pending: pending, label: label, outcomes: &outcomes, as: .forced)
 
         // Deliberately loud. A process that survives force is wedged in the
         // kernel (uninterruptible I/O, or a debugger holding it), and the next
@@ -156,7 +156,7 @@ enum ProcessReaper {
         // UDS socket. Silence here is what produced the 12:04 duplicate.
         for index in pending {
             outcomes[index] = .survived
-            print("[Reaper] ⚠️ \(label) pid \(targets[index].pid) SURVIVED force — it will contend with this instance")
+            BootLogFile.shared.note("[Reaper] ⚠️ \(label) pid \(targets[index].pid) SURVIVED force — it will contend with this instance")
         }
         return outcomes
     }
@@ -166,6 +166,7 @@ enum ProcessReaper {
     private static func waitForExit(
         _ targets: [Target],
         pending: [Int],
+        label: String,
         outcomes: inout [Outcome],
         as outcome: Outcome
     ) async -> [Int] {
@@ -177,6 +178,14 @@ enum ProcessReaper {
             remaining = remaining.filter { index in
                 if isAlive(targets[index].pid) { return true }
                 outcomes[index] = outcome
+                // Success is recorded, not assumed.
+                //
+                // The first version logged only escalation and survival, so a
+                // reap that WORKED left no trace -- and "no trace" is exactly
+                // what the old forceTerminate() left when it FAILED. A record
+                // that only exists on failure cannot distinguish the two, which
+                // is the whole defect this type was written to remove.
+                BootLogFile.shared.note("[Reaper] \(label) pid \(targets[index].pid) \(outcome)")
                 return false
             }
         }

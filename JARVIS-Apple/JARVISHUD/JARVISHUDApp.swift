@@ -420,7 +420,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
 
         guard !duplicates.isEmpty else { return }
 
-        print("[HUD] found \(duplicates.count) older instance(s) — reaping before startup")
+        BootLogFile.shared.note("[HUD] found \(duplicates.count) older instance(s) — reaping before startup")
 
         // Phased, not a task group. `NSRunningApplication` is not Sendable, and
         // a task group would carry it across an isolation boundary — which Swift
@@ -442,7 +442,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             // Named at startup rather than discovered later as "the app is
             // behaving strangely". The instance is still there; the operator
             // should know why things may contend.
-            print("[HUD] ⚠️ an older instance could not be removed — expect contention for ports, mic and socket")
+            BootLogFile.shared.note("[HUD] ⚠️ an older instance could not be removed — expect contention for ports, mic and socket")
         }
     }
 

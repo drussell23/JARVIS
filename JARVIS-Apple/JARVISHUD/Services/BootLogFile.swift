@@ -100,4 +100,21 @@ final class BootLogFile: @unchecked Sendable {
             try? h.write(contentsOf: data)
         }
     }
+
+    /// Say it once, to both audiences.
+    ///
+    /// The live Xcode console is for the developer watching right now; the file
+    /// is for every question asked afterwards. Code that calls only `print()`
+    /// reaches the first and not the second, which is precisely the failure this
+    /// type was built to end — and new code kept reintroducing it, because
+    /// `print` is what comes to hand.
+    ///
+    /// Verified 2026-08-06: `ParentWatch` and `ProcessReaper` shipped with bare
+    /// `print()`, and afterwards there was no way to answer "did the watch arm?"
+    /// for a session that had already happened. One call, both destinations, no
+    /// decision to get wrong at the call site.
+    func note(_ line: String) {
+        print(line)
+        write(line)
+    }
 }

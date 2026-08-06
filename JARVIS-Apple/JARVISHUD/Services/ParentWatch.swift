@@ -81,7 +81,7 @@ enum ParentWatch {
         guard source == nil else { return }
 
         if ProcessInfo.processInfo.environment[disableKey] == "1" {
-            print("[ParentWatch] \(disableKey)=1 — not watching; this process can outlive its launcher")
+            BootLogFile.shared.note("[ParentWatch] \(disableKey)=1 — not watching; this process can outlive its launcher")
             return
         }
 
@@ -89,7 +89,7 @@ enum ParentWatch {
 
         guard parent != launchdPID else {
             // Normal launch. There is no parent whose death should end us.
-            print("[ParentWatch] parent is launchd — not arming (normal app launch)")
+            BootLogFile.shared.note("[ParentWatch] parent is launchd — not arming (normal app launch)")
             return
         }
 
@@ -109,21 +109,21 @@ enum ParentWatch {
         // premise ever stops holding it traps here rather than racing silently.
         src.setEventHandler {
             MainActor.assumeIsolated {
-                print("[ParentWatch] launcher (\(parentName)) exited — leaving rather than orphaning")
+                BootLogFile.shared.note("[ParentWatch] launcher (\(parentName)) exited — leaving rather than orphaning")
                 onOrphaned()
             }
         }
         src.resume()
         source = src
 
-        print("[ParentWatch] watching launcher \(parentName); this process will not outlive it")
+        BootLogFile.shared.note("[ParentWatch] watching launcher \(parentName); this process will not outlive it")
 
         // A DispatchSourceProcess established on an ALREADY-dead pid never
         // fires. The window is small but real: the parent can die between
         // getppid() and resume(). Re-check afterwards, because the failure mode
         // of missing it is exactly the orphan this exists to prevent.
         if getppid() != parent {
-            print("[ParentWatch] launcher exited while arming — leaving now")
+            BootLogFile.shared.note("[ParentWatch] launcher exited while arming — leaving now")
             onOrphaned()
         }
     }
